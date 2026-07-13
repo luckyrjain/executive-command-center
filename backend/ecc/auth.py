@@ -46,6 +46,7 @@ def require_auth_context(
         ),
         {"token_hash": token_hash, "now": datetime.now(UTC)},
     ).mappings().one_or_none()
+    session.rollback()
 
     if row is None:
         raise HTTPException(
