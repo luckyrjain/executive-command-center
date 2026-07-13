@@ -16,10 +16,10 @@ _NIL_UUID = UUID(int=0)
 
 def _task_id_from_path(path: str) -> UUID:
     parts = path.strip("/").split("/")
-    if len(parts) < 5:
+    if len(parts) < 4:
         return _NIL_UUID
     try:
-        return UUID(parts[4])
+        return UUID(parts[3])
     except ValueError:
         return _NIL_UUID
 
@@ -49,12 +49,12 @@ def _record_rejected_task_mutation(request: Request, response: Response) -> None
             connection.execute(
                 text(
                     """
-                SELECT workspace_id, user_id
-                FROM sessions
-                WHERE token_hash = :token_hash
-                  AND revoked_at IS NULL
-                  AND expires_at > :now
-                """
+                    SELECT workspace_id, user_id
+                    FROM sessions
+                    WHERE token_hash = :token_hash
+                      AND revoked_at IS NULL
+                      AND expires_at > :now
+                    """
                 ),
                 {"token_hash": token_hash, "now": now},
             )
