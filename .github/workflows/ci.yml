@@ -10,6 +10,27 @@ permissions:
   pull-requests: read
 
 jobs:
+  mypy-diagnostic:
+    runs-on: ubuntu-latest
+    env:
+      ECC_SESSION_SECRET: ci-secret-value-that-is-at-least-32-characters
+      ECC_DATABASE_URL: postgresql+psycopg://ecc:ecc@localhost:5432/ecc
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: 3.14.6
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+        with:
+          version: 0.7.19
+      - run: uv sync --frozen --all-groups --python 3.14.6 --quiet
+      - name: Capture mypy report
+        run: uv run mypy backend > mypy-report.txt || true
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mypy-report
+          path: mypy-report.txt
+
   backend:
     runs-on: ubuntu-latest
     services:
