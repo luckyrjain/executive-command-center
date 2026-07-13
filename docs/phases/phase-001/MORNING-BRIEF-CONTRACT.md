@@ -2,7 +2,7 @@
 id: PHASE-001-MORNING-BRIEF
 title: Phase 1 Morning Brief Contract
 status: Approved
-version: 1.0.1
+version: 1.0.2
 owner: Lucky Jain
 ---
 
@@ -20,7 +20,7 @@ The morning brief is a persisted, explainable snapshot for one workspace date. I
 4. Risks — maximum 5 open risks, ordered by probability×impact then review date.
 5. Waiting On — maximum 5 commitments with `direction=made_to_me` or blocked tasks with `blocked_on_person_id`.
 6. Recently Changed — maximum 5 audited changes from the previous 24 hours.
-7. Recommended Actions — maximum 3 eligible pending-confirmation rule/AI recommendations.
+7. Recommended Actions — maximum 3 eligible `pending_confirmation` rule/AI recommendations.
 
 Duplicate underlying entities appear only in the highest-priority applicable section, except meetings may also be evidence.
 
@@ -38,7 +38,7 @@ AI enrichment is disabled by default behind `phase1.ai_brief_enrichment`. It may
 
 ## Evidence and explanation
 
-Every non-calendar item includes why, score factors, source entity reference/version and evidence summaries. Missing or inaccessible evidence is shown explicitly.
+Every non-calendar item includes why, score factors, source entity reference/version and evidence summaries. Evidence status uses exactly `available|missing|permission_denied|deleted`. Missing, inaccessible or deleted evidence is shown explicitly and never silently omitted.
 
 ## Staleness and degraded behavior
 
@@ -48,4 +48,4 @@ Empty sections are omitted except Today's Schedule and Top Priorities, which ret
 
 ## Observability and tests
 
-Record generation duration, section counts, refresh eligibility, stale returns, AI fallback count, refresh reason and failure category without private content or high-cardinality labels. Snapshot tests cover empty data, all-day meetings, cross-midnight events, timezone rollover, duplicate suppression, AI unavailable, stale versions, refresh-eligible versus stale-by-age behavior, recommendation confirmation links and representative-data p95.
+Record generation duration, section counts, refresh eligibility, stale returns, AI fallback count, refresh reason and failure category without private content or high-cardinality labels. Snapshot tests cover empty data, all-day meetings, cross-midnight events, timezone rollover, duplicate suppression, AI unavailable, stale versions, refresh-eligible versus stale-by-age behavior, recommendation publication/confirmation links, all four evidence states and representative-data p95.
