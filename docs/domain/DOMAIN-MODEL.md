@@ -2,7 +2,7 @@
 id: DOMAIN-MODEL
 title: Executive Command Center Canonical Domain Model
 status: Accepted
-version: 1.1.0
+version: 1.1.1
 owner: Lucky Jain
 related:
   - RFC-001
@@ -16,7 +16,7 @@ related:
 
 ## Universal rules
 
-Every entity has an immutable UUID, `workspace_id`, UTC timestamps, optimistic `version`, source references and provenance where derived. Soft deletion records `deleted_at` or `archived_at`. External identifiers are never primary keys. Workspace and actor are derived from the authenticated server-side session; browser payloads may not select them.
+Every entity has an immutable UUID, `workspace_id`, UTC timestamps, optimistic `version`, source references and provenance where derived. Soft deletion records `deleted_at` or `archived_at`. External identifiers are never primary keys. Workspace, actor and Phase 1 accountable owner are derived from the authenticated server-side session; browser payloads may not select them.
 
 Domains may reference another domain’s entity ID but may not directly mutate another domain’s storage. Composite workspace foreign keys enforce isolation.
 
@@ -48,22 +48,22 @@ People and groups known to ECC. Non-deterministic high-impact merges require hum
 Projects are bounded outcomes; goals are measurable outcomes. Project lifecycle: `proposed -> active -> blocked|on_hold -> completed|cancelled -> archived`.
 
 ### Task
-Discrete work with owner, status, manual priority, due date and source. Lifecycle: `captured -> planned -> in_progress -> blocked -> completed|cancelled -> archived`.
+Discrete work with owner, status, manual priority, due date and source. In Phase 1 `owner_id` is always the authenticated user. Lifecycle: `captured -> planned -> in_progress -> blocked -> completed|cancelled -> archived`, with `archived -> previous_terminal_or_active_state` on restore.
 
 ### Commitment
-A promise made by or to a person, preserving parties and evidence. Lifecycle: `detected -> confirmed -> active -> fulfilled|broken|cancelled -> archived`. AI-detected commitments remain detected until confirmed.
+A promise made by or to a person, preserving parties and evidence. In Phase 1 `owner_id` is always the authenticated user; counterparty identity remains user-selectable. Lifecycle: `detected -> confirmed -> active -> fulfilled|broken|cancelled -> archived`, with restore returning to the state held before archive. AI-detected commitments remain detected until confirmed.
 
 ### CalendarEvent
 A scheduled interval. In Phase 1 only local/manual events are supported; external calendar authority is deferred to connector phases.
 
 ### Meeting
-Semantic meeting view with agenda, preparation, notes, decisions and follow-ups. It may reference zero or one CalendarEvent; rescheduling preserves Meeting identity.
+Semantic meeting view with agenda, preparation, notes, decisions and follow-ups. It may reference zero or one CalendarEvent. A linked Meeting projects timing from its CalendarEvent and cannot edit timing independently; a standalone Meeting owns its timing. Linking a standalone Meeting adopts CalendarEvent timing while preserving Meeting identity.
 
 ### Conversation and Message
 A conversation is an ordered communication thread. Messages are immutable artifacts; source content is preserved as Evidence.
 
 ### Note
-A user-authored Knowledge Platform item with title, body, type, optional meeting link, version history, search projection and archival state. Hard delete is not exposed in Phase 1.
+A user-authored Knowledge Platform item with title, body, type, optional meeting link, searchable projection and archival state. Audit preserves change history, checksum and field metadata, not reconstructable body revisions. Hard delete is not exposed in Phase 1.
 
 ### Document, Decision, KnowledgeItem and Relationship
 Documents are versioned source artifacts. Decisions preserve context, alternatives and rationale. KnowledgeItems are normalized assertions with confidence and provenance. Relationships are typed, directed, temporal and evidence-backed.
@@ -72,13 +72,22 @@ Documents are versioned source artifacts. Decisions preserve context, alternativ
 Immutable source pointer with location, checksum, capture time, excerpt boundaries and access status. Derived knowledge is never source evidence.
 
 ### Risk
-Uncertain condition with probability, impact, owner, mitigation, trigger and review date. Lifecycle: `identified -> assessed -> monitoring|mitigating -> materialized|closed`.
+Uncertain condition with probability, impact, owner, mitigation, trigger and review date. In Phase 1 `owner_id` is the authenticated user. Lifecycle: `identified -> assessed -> monitoring|mitigating -> materialized|closed`.
 
 ### AttentionItem
 Deterministic ranked projection referencing an underlying entity and exposing score factors, explanation, confidence and expiry. It is not a recommendation.
 
 ### Recommendation
-A rule- or AI-generated proposed action. It never mutates domain state directly. Lifecycle: `proposed -> pending_confirmation -> accepted|rejected|expired|superseded -> executed|failed`. Confirmation records actor, target version, evidence and execution result.
+A rule- or AI-generated proposed action. It never mutates domain state directly. Explicit transitions are:
+
+```text
+proposed -> pending_confirmation
+pending_confirmation -> rejected | expired | superseded
+pending_confirmation -> accepted
+accepted -> executed | failed
+```
+
+`confirm` is the API action that transitions `pending_confirmation -> accepted` and attempts the local transactional execution. Confirmation records actor, target version, evidence and execution result.
 
 ### RecommendationFeedback and UserFeedback
 Append-only user responses such as dismiss, defer, pin, accept or reject. Feedback does not silently mutate the underlying entity.
