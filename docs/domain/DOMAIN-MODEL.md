@@ -2,7 +2,7 @@
 id: DOMAIN-MODEL
 title: Executive Command Center Canonical Domain Model
 status: Accepted
-version: 1.1.1
+version: 1.1.2
 owner: Lucky Jain
 related:
   - RFC-001
@@ -69,7 +69,7 @@ A user-authored Knowledge Platform item with title, body, type, optional meeting
 Documents are versioned source artifacts. Decisions preserve context, alternatives and rationale. KnowledgeItems are normalized assertions with confidence and provenance. Relationships are typed, directed, temporal and evidence-backed.
 
 ### Evidence
-Immutable source pointer with location, checksum, capture time, excerpt boundaries and access status. Derived knowledge is never source evidence.
+Immutable source pointer with location, checksum, capture time, excerpt boundaries and access status `available|missing|permission_denied|deleted`. Derived knowledge is never source evidence.
 
 ### Risk
 Uncertain condition with probability, impact, owner, mitigation, trigger and review date. In Phase 1 `owner_id` is the authenticated user. Lifecycle: `identified -> assessed -> monitoring|mitigating -> materialized|closed`.
@@ -87,7 +87,7 @@ pending_confirmation -> accepted
 accepted -> executed | failed
 ```
 
-`confirm` is the API action that transitions `pending_confirmation -> accepted` and attempts the local transactional execution. Confirmation records actor, target version, evidence and execution result.
+`GenerateRecommendation` creates `proposed`. `PublishRecommendation` is the only transition to `pending_confirmation`. `ConfirmRecommendation` is valid only from `pending_confirmation`, transitions to accepted and attempts the local transactional execution. Publication and confirmation each record actor, target version, evidence and audit metadata.
 
 ### RecommendationFeedback and UserFeedback
 Append-only user responses such as dismiss, defer, pin, accept or reject. Feedback does not silently mutate the underlying entity.
