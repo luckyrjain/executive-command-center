@@ -1,7 +1,7 @@
 """Create Phase 0 foundation schema."""
 
-from alembic import op
 import sqlalchemy as sa
+from alembic import op
 from sqlalchemy.dialects import postgresql
 
 revision = "0001_foundation"
@@ -43,7 +43,12 @@ def upgrade() -> None:
         sa.Column("workspace_id", uuid, sa.ForeignKey("workspaces.id"), nullable=False, index=True),
         sa.Column("node_type", sa.String(100), nullable=False),
         sa.Column("canonical_name", sa.Text(), nullable=False),
-        sa.Column("attributes", postgresql.JSONB(), nullable=False, server_default=sa.text("'{}'::jsonb")),
+        sa.Column(
+            "attributes",
+            postgresql.JSONB(),
+            nullable=False,
+            server_default=sa.text("'{}'::jsonb"),
+        ),
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
         sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
     )
@@ -54,7 +59,12 @@ def upgrade() -> None:
         sa.Column("source_node_id", uuid, sa.ForeignKey("pkos_nodes.id"), nullable=False),
         sa.Column("target_node_id", uuid, sa.ForeignKey("pkos_nodes.id"), nullable=False),
         sa.Column("edge_type", sa.String(100), nullable=False),
-        sa.Column("attributes", postgresql.JSONB(), nullable=False, server_default=sa.text("'{}'::jsonb")),
+        sa.Column(
+            "attributes",
+            postgresql.JSONB(),
+            nullable=False,
+            server_default=sa.text("'{}'::jsonb"),
+        ),
     )
     op.create_table(
         "pkos_evidence",
@@ -97,7 +107,14 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     for table in [
-        "event_dead_letters", "event_inbox", "event_outbox", "pkos_evidence",
-        "pkos_edges", "pkos_nodes", "sessions", "users", "workspaces"
+        "event_dead_letters",
+        "event_inbox",
+        "event_outbox",
+        "pkos_evidence",
+        "pkos_edges",
+        "pkos_nodes",
+        "sessions",
+        "users",
+        "workspaces",
     ]:
         op.drop_table(table)
