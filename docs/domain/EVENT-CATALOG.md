@@ -2,7 +2,7 @@
 id: EVENT-CATALOG
 title: Domain Event Catalog
 status: Accepted
-version: 1.1.1
+version: 1.1.2
 owner: Lucky Jain
 related:
   - ADR-0005
@@ -62,9 +62,13 @@ Every event is immutable and uses the canonical Phase 0 envelope. Events are pas
 
 Existing foundation events remain valid.
 
+## Recommendation publication rule
+
+`recommendation.generated.v1` records creation in `proposed`. `recommendation.confirmation_requested.v1` is emitted only by `PublishRecommendation`, which transitions the aggregate from `proposed` to `pending_confirmation`. Confirmation and execution events cannot occur before that publication event.
+
 ## Audit relationship
 
-Domain events do not replace audit events. `AUDIT-CONTRACT.md` contains the normative API-action → audit-event → domain-event mapping. Successful mutations write the aggregate, redacted audit record and outbox event in one transaction. Rejected authorization and version-conflict attempts may create audit records without domain events.
+Domain events do not replace audit events. `AUDIT-CONTRACT.md` contains the normative API-action -> audit-event -> domain-event mapping. Successful mutations write the aggregate, redacted audit record and outbox event in one transaction. Rejected authorization and version-conflict attempts may create audit records without domain events.
 
 ## Compatibility and failure handling
 
