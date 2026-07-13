@@ -2,7 +2,7 @@
 id: API-CONTRACTS
 title: Domain API Contracts
 status: Accepted
-version: 1.1.1
+version: 1.1.2
 owner: Lucky Jain
 related:
   - DOMAIN-MODEL
@@ -25,6 +25,7 @@ related:
 - Dates are ISO-8601; storage is UTC; daily interpretation uses the workspace IANA timezone.
 - Pagination uses opaque signed cursors.
 - Cross-workspace and absent entity IDs both return 404.
+- Every successful Phase 1 lifecycle action returns `200` with the current entity representation. `204` is not used by Phase 1 lifecycle actions.
 
 Error envelope:
 
@@ -51,7 +52,7 @@ Queries: GetNote, ListNotes, SearchKnowledge, GetEvidence, GetDecision, GetRelat
 
 ### Executive Intelligence
 
-Commands: GenerateMorningBrief, CreateRisk, UpdateRisk, CloseRisk, GenerateRecommendation, ConfirmRecommendation, RejectRecommendation, DeferRecommendation, PinRecommendation.
+Commands: GenerateMorningBrief, CreateRisk, UpdateRisk, CloseRisk, GenerateRecommendation, PublishRecommendation, ConfirmRecommendation, RejectRecommendation, DeferRecommendation, PinRecommendation.
 Queries: GetDashboard, GetMorningBrief, ListAttentionItems, ListRisks, ListRecommendations.
 
 ### Audit
@@ -101,6 +102,7 @@ GET    /api/v1/briefs/morning
 POST   /api/v1/briefs/morning
 GET    /api/v1/recommendations
 GET    /api/v1/recommendations/{id}
+POST   /api/v1/recommendations/{id}/publish
 POST   /api/v1/recommendations/{id}/confirm
 POST   /api/v1/recommendations/{id}/reject
 POST   /api/v1/recommendations/{id}/defer
@@ -111,7 +113,9 @@ GET    /api/v1/audit
 
 Exact Phase 1 request, response, filter, validation and error schemas are normative in `docs/phases/phase-001/API-SCHEMAS.md`.
 
-## Concurrency and recommendation confirmation
+## Recommendation publication and confirmation
+
+`GenerateRecommendation` creates status `proposed`. `PublishRecommendation` is the only transition from `proposed` to `pending_confirmation` and emits `recommendation.confirmation_requested.v1` plus its mapped audit record.
 
 Stale mutations return `409 VERSION_CONFLICT` with the current version. Phase 1 recommendation execution is limited to local database mutations that can complete in one transaction:
 
