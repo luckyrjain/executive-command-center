@@ -2,7 +2,7 @@
 id: PHASE-001-SEARCH-CONTRACT
 title: Phase 1 Search Contract
 status: Approved
-version: 1.0.0
+version: 1.0.1
 owner: Lucky Jain
 ---
 
@@ -15,6 +15,12 @@ Phase 1 search is deterministic and PostgreSQL-only. It does not require embeddi
 ## Indexed entities
 
 Task, Commitment, Note, Meeting, CalendarEvent, and Risk. Archived entities are excluded by default.
+
+The API filter enum is exactly:
+
+```text
+task | commitment | note | meeting | calendar_event | risk
+```
 
 ## Query normalization
 
@@ -45,7 +51,7 @@ Filters: entity types, updated-from/to, due-from/to, statuses, include_archived.
 
 ## Evidence and permissions
 
-Evidence access follows the original source. Results may identify that evidence exists while returning access status `missing` or `permission_denied`. Search never leaks cross-workspace existence; inaccessible and absent entities both behave as not found.
+Evidence access follows the original source. The canonical evidence access enum is `available|missing|permission_denied|deleted`. Results may identify that evidence exists while returning any non-available state. Search never leaks cross-workspace existence; inaccessible and absent entities both behave as not found.
 
 ## Performance
 
@@ -57,4 +63,4 @@ Search remains available when AI is disabled. Index projection failure falls bac
 
 ## Tests
 
-Exact/prefix/full-text ranking, stable pagination, archived handling, HTML escaping, timezone timestamp context, evidence access states, cross-workspace isolation, malformed cursors, performance budget, and deterministic snapshots.
+Exact/prefix/full-text ranking, all six entity types, stable pagination, archived handling, HTML escaping, timezone timestamp context, all four evidence access states, cross-workspace isolation, malformed cursors, performance budget, and deterministic snapshots.
