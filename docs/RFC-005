@@ -1,0 +1,737 @@
+---
+id: RFC-005
+title: Approved Technology Registry
+status: Draft
+version: 1.0.0
+owner: Lucky Jain
+reviewers:
+  - Lucky Jain
+created: 2026-07-13
+type: Engineering RFC
+depends_on:
+  - RFC-001
+  - RFC-002
+  - RFC-003
+  - RFC-004
+related_standard:
+  - STD-001
+---
+
+# RFC-005 — Approved Technology Registry
+
+---
+
+# Executive Summary
+
+This RFC defines the **official technology stack** for Executive Command Center (ECC).
+
+Its purpose is to eliminate technology drift.
+
+No engineer or AI coding agent may introduce a new framework, library, database, protocol, runtime, or infrastructure component unless it is:
+
+1. Listed in this registry, or
+2. Approved through an Architecture Decision Record (ADR).
+
+This document is the canonical source of truth for technology decisions.
+
+---
+
+# Goals
+
+The Technology Registry exists to:
+
+- Standardize development.
+- Prevent technology sprawl.
+- Improve AI-generated code consistency.
+- Simplify onboarding.
+- Reduce operational complexity.
+- Ensure long-term maintainability.
+
+---
+
+# Technology Selection Principles
+
+Every approved technology must satisfy the following criteria.
+
+## TR-001
+
+Open standards preferred.
+
+---
+
+## TR-002
+
+Actively maintained.
+
+---
+
+## TR-003
+
+Strong ecosystem.
+
+---
+
+## TR-004
+
+Production maturity.
+
+---
+
+## TR-005
+
+Replaceable.
+
+No technology should become architecturally irreplaceable.
+
+---
+
+## TR-006
+
+Excellent developer experience.
+
+---
+
+## TR-007
+
+Works locally.
+
+Cloud-only technologies are prohibited for core functionality.
+
+---
+
+# Architecture Overview
+
+```
+React
+
+↓
+
+FastAPI
+
+↓
+
+Business Domains
+
+↓
+
+PKOS
+
+↓
+
+PostgreSQL
+Neo4j
+Qdrant
+Redis
+
+↓
+
+Ollama
+```
+
+---
+
+# Programming Languages
+
+| Technology | Version | Status |
+|------------|---------|--------|
+| Python | 3.14.x | Approved |
+| TypeScript | 5.x | Approved |
+| SQL | PostgreSQL dialect | Approved |
+| Markdown | Latest | Approved |
+| YAML | Latest | Approved |
+
+No additional backend languages are approved.
+
+---
+
+# Backend
+
+| Technology | Version | Purpose |
+|------------|---------|---------|
+| FastAPI | Latest Stable | HTTP API |
+| Pydantic | v2 | Validation |
+| Uvicorn | Latest | ASGI Runtime |
+| SQLAlchemy | Latest | ORM |
+| Alembic | Latest | Database Migrations |
+
+No Django.
+
+No Flask.
+
+No Spring.
+
+No Express.
+
+---
+
+# Frontend
+
+| Technology | Version |
+|------------|---------|
+| React | 19 |
+| TypeScript | Latest |
+| Vite | Latest |
+| React Router | Latest |
+| TanStack Query | Latest |
+| Zustand | Latest |
+| Tailwind CSS | v4 |
+| shadcn/ui | Latest |
+| Lucide Icons | Latest |
+
+Material UI is not approved.
+
+Bootstrap is not approved.
+
+---
+
+# Desktop
+
+| Technology | Status |
+|------------|--------|
+| Electron | Deferred |
+| Tauri | Approved Future |
+
+Phase 1 uses Web UI.
+
+---
+
+# AI Runtime
+
+## Local Inference
+
+| Technology | Purpose |
+|------------|---------|
+| Ollama | Model Runtime |
+
+Mandatory.
+
+---
+
+## Primary Models
+
+| Model | Purpose |
+|--------|---------|
+| qwen3-coder | Coding |
+| qwen3 | Planning |
+| deepseek-r1 | Deep reasoning |
+| llama3.3 | Summaries |
+| nomic-embed-text | Embeddings |
+
+Model versions are pinned in configuration.
+
+---
+
+# AI Framework
+
+| Technology | Status |
+|------------|--------|
+| Native Runtime | Primary |
+| LangGraph | Not Approved |
+| CrewAI | Not Approved |
+| AutoGen | Not Approved |
+
+ECC owns its orchestration.
+
+---
+
+# Knowledge Platform
+
+| Technology | Purpose |
+|------------|---------|
+| Neo4j | Graph |
+| Qdrant | Vectors |
+| PostgreSQL | Structured Data |
+
+All accessed through PKOS.
+
+---
+
+# Cache
+
+| Technology |
+|------------|
+| Redis |
+
+Single approved cache.
+
+---
+
+# Object Storage
+
+Phase 1
+
+Local Filesystem
+
+Future
+
+S3-compatible storage
+
+---
+
+# Event Store
+
+Phase 1
+
+PostgreSQL Append-only
+
+Future
+
+Dedicated Event Store
+
+---
+
+# Search
+
+Hybrid
+
+Keyword
+
+Semantic
+
+Graph
+
+Temporal
+
+No ElasticSearch for Phase 1.
+
+---
+
+# Authentication
+
+| Technology |
+|------------|
+| OAuth2 |
+| Passkeys (Future) |
+
+JWT internally.
+
+---
+
+# Connectors
+
+Approved
+
+- Gmail
+- Google Calendar
+- GitHub
+- GitLab
+- Slack
+- Google Drive
+- Local Files
+- MCP
+
+Future connectors require ADR approval.
+
+---
+
+# API Standards
+
+REST
+
+OpenAPI
+
+JSON
+
+No GraphQL.
+
+No gRPC in Phase 1.
+
+---
+
+# Background Processing
+
+| Technology |
+|------------|
+| APScheduler |
+
+Future
+
+Temporal (ADR Required)
+
+---
+
+# Messaging
+
+Phase 1
+
+In-process Event Bus
+
+Future
+
+NATS
+
+Kafka
+
+ADR Required.
+
+---
+
+# Testing
+
+## Backend
+
+| Tool |
+|------|
+| pytest |
+| pytest-asyncio |
+| httpx |
+
+---
+
+## Frontend
+
+| Tool |
+|------|
+| Vitest |
+| React Testing Library |
+| Playwright |
+
+---
+
+## AI
+
+Golden Dataset
+
+Regression Suite
+
+Prompt Tests
+
+Evaluation Harness
+
+Mandatory.
+
+---
+
+# Code Quality
+
+| Tool |
+|------|
+| Ruff |
+| Black |
+| mypy |
+| ESLint |
+| Prettier |
+
+Every commit passes all checks.
+
+---
+
+# Documentation
+
+Markdown.
+
+Mermaid.
+
+OpenAPI.
+
+ADR.
+
+RFC.
+
+No Word documents.
+
+---
+
+# Package Managers
+
+Backend
+
+uv
+
+Frontend
+
+pnpm
+
+Docker images pinned.
+
+---
+
+# Containers
+
+Docker
+
+Docker Compose
+
+Kubernetes (Future)
+
+---
+
+# CI/CD
+
+GitHub Actions
+
+Future
+
+Self-hosted runners.
+
+---
+
+# Observability
+
+| Technology |
+|------------|
+| OpenTelemetry |
+| Prometheus |
+| Grafana |
+
+Structured logging mandatory.
+
+---
+
+# Secrets
+
+Environment variables.
+
+Encrypted secret store.
+
+Never Git.
+
+Never source code.
+
+---
+
+# Encryption
+
+AES-256
+
+TLS
+
+bcrypt/Argon2id for passwords.
+
+---
+
+# Development Environment
+
+Mandatory
+
+Docker
+
+Docker Compose
+
+VS Code
+
+Cursor
+
+Claude Code
+
+Git
+
+GitHub
+
+macOS and Linux fully supported.
+
+Windows best-effort.
+
+---
+
+# Dependency Policy
+
+Every dependency must satisfy:
+
+- Active maintenance
+- Permissive license
+- Security scan
+- SBOM inclusion
+- Version pinning
+
+---
+
+# Version Pinning
+
+Every dependency is pinned.
+
+Floating versions prohibited.
+
+---
+
+# Upgrade Policy
+
+Minor upgrades
+
+Monthly.
+
+Major upgrades
+
+ADR Required.
+
+---
+
+# Deprecated Technologies
+
+The following are intentionally excluded.
+
+- MongoDB
+- Firebase
+- LangChain
+- CrewAI
+- AutoGen
+- Bootstrap
+- Material UI
+- Flask
+- Django
+- Express
+- Electron (Phase 1)
+
+Using these requires an ADR.
+
+---
+
+# Technology Decision Matrix
+
+| Capability | Approved Technology | Why |
+|------------|---------------------|-----|
+| Backend | FastAPI | Async, typed, OpenAPI |
+| Frontend | React | Mature ecosystem |
+| Desktop | Web (Phase 1) | Simplicity |
+| AI Runtime | Ollama | Local-first |
+| Graph | Neo4j | Relationship traversal |
+| Vector | Qdrant | High-performance semantic search |
+| Database | PostgreSQL | Mature transactional store |
+| Cache | Redis | Proven performance |
+| Styling | Tailwind CSS | Utility-first consistency |
+| Components | shadcn/ui | Composable primitives |
+| Event Store | PostgreSQL | Simplicity for MVP |
+| CI | GitHub Actions | Native integration |
+| Observability | OpenTelemetry | Vendor-neutral |
+
+---
+
+# Technology Introduction Process
+
+Introducing a new technology requires:
+
+1. Architecture Decision Record (ADR)
+2. Problem statement
+3. Alternatives considered
+4. Benchmark or rationale
+5. Migration strategy
+6. Rollback strategy
+7. Approval
+
+No technology may bypass this process.
+
+---
+
+# Architecture Constraints
+
+## ARC-TECH-001
+
+Only approved technologies may be used.
+
+---
+
+## ARC-TECH-002
+
+All versions must be pinned.
+
+---
+
+## ARC-TECH-003
+
+Core AI must execute locally.
+
+---
+
+## ARC-TECH-004
+
+Business domains may not depend on storage implementations.
+
+---
+
+## ARC-TECH-005
+
+Every technology must remain replaceable.
+
+---
+
+# Architecture Fitness Functions
+
+AFF-TECH-001
+
+No unapproved dependency appears in lock files.
+
+---
+
+AFF-TECH-002
+
+100% dependency license compliance.
+
+---
+
+AFF-TECH-003
+
+Quarterly dependency review completed.
+
+---
+
+AFF-TECH-004
+
+SBOM generated for every release.
+
+---
+
+AFF-TECH-005
+
+Technology drift detected automatically in CI.
+
+---
+
+# Future Evaluation Candidates
+
+These are under evaluation only.
+
+- Tauri
+- NATS
+- Temporal
+- LiteLLM
+- Open Policy Agent
+- Apache Iceberg
+- DuckDB
+- pgvector (comparison only)
+
+Evaluation does **not** imply approval.
+
+---
+
+# Summary
+
+RFC-005 establishes the official technology baseline for Executive Command Center.
+
+Its objectives are to:
+
+- eliminate technology sprawl
+- improve consistency
+- simplify AI-assisted development
+- preserve architectural replaceability
+- provide a stable implementation target
+
+All implementation work must comply with this registry unless an Architecture Decision Record explicitly approves a deviation.
+
+---
+
+# Changelog
+
+## Version 1.0.0
+
+Initial technology registry.
+
+Defines:
+
+- Approved languages
+- Frameworks
+- Databases
+- AI stack
+- Development tools
+- Testing tools
+- Observability
+- Security
+- Dependency policy
+- Technology governance
+
+---
+
+**Status:** Draft
+
+**Estimated Review Time:** 20–30 minutes
+
+**Next Document:** STD-001 — Repository Standards
