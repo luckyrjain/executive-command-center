@@ -1,429 +1,129 @@
 # Executive Command Center Roadmap
 
-Status
+## Current status
 
-Current Phase
+**Foundation specification:** Draft — under review  
+**Current delivery phase:** [PHASE-000 — Repository Foundation](phases/PHASE-000-repository-foundation.md)  
+**Next delivery phase:** [PHASE-001 — Executive Dashboard MVP](phases/PHASE-001-executive-dashboard-mvp.md)
 
-```
-Specification Complete
-```
+The foundation documents exist, but the specification is not considered approved until the normative RFCs and standards complete review and their statuses are updated consistently.
 
-Repository Version
+## Delivery principles
 
-```
-spec-v1.0-foundation
-```
+Every phase must:
 
----
+- deliver usable value
+- compile and pass tests
+- remain locally deployable
+- preserve architecture and privacy boundaries
+- define acceptance and exit criteria before implementation
+- avoid speculative work outside the approved phase
 
-# Vision
+## Delivery sequence
 
-Executive Command Center will be built incrementally.
-
-Every phase delivers usable software.
-
-No phase exists solely to support future work.
-
-Every phase must produce value.
-
----
-
-# Guiding Principles
-
-Every phase must
-
-- compile
-- pass tests
-- remain deployable
-- preserve architecture
-- avoid speculative development
-
----
-
-# Delivery Strategy
-
-```
-Specification
-
-↓
-
-Foundation
-
-↓
-
-MVP
-
-↓
-
-Executive Intelligence
-
-↓
-
-Automation
-
-↓
-
-Platform
-
-↓
-
-Enterprise
+```text
+Foundation specification review
+        ↓
+Phase 0 — Repository Foundation
+        ↓
+Phase 1 — Executive Dashboard MVP
+        ↓
+Phase 2 — Knowledge Platform
+        ↓
+Phase 3 — Human Attention Engine
+        ↓
+Phase 4 — AI Runtime
+        ↓
+Phase 5 — Automation
+        ↓
+Phase 6 — Engineering Workspace
+        ↓
+Phase 7 — Personal Intelligence
+        ↓
+Phase 8 — Multi-user
+        ↓
+Phase 9 — Enterprise
 ```
 
----
+## Phase 0 — Repository Foundation
 
-# Phase 0
+**Status:** Specification drafted; implementation not started.
 
-Repository Foundation
+Primary outcomes:
 
-Status
+- canonical repository layout
+- reproducible local development
+- CI, testing and architecture enforcement
+- typed configuration and secret handling
+- observability foundation
+- backend, frontend and design-system skeletons
 
-Not Started
+Exit criteria are defined in [PHASE-000](phases/PHASE-000-repository-foundation.md).
 
-Goals
+## Phase 1 — Executive Dashboard MVP
 
-- Repository setup
-- Docker
-- CI/CD
-- Local Development
-- PKOS Skeleton
-- Authentication
-- Design System
-- Documentation
+**Status:** Specification drafted; blocked on Phase 0.
 
-Exit Criteria
+Primary outcomes:
 
-- Build passes
-- Tests pass
-- One-command startup
+- morning brief
+- today's dashboard
+- tasks and commitments
+- notes
+- meetings
+- local search
+- explainable recommendations
+- human confirmation for state-changing actions
 
----
+Exit criteria are defined in [PHASE-001](phases/PHASE-001-executive-dashboard-mvp.md).
 
-# Phase 1
+## Later phases
 
-Executive Dashboard MVP
+### Phase 2 — Knowledge Platform
 
-Goals
+Persistent memory, entity resolution, relationships, timeline and hybrid retrieval.
 
-Morning Brief
+### Phase 3 — Human Attention Engine
 
-Dashboard
+Priority, waiting-on, waiting-for, risk, planning and meeting preparation.
 
-Calendar
+### Phase 4 — AI Runtime
 
-Tasks
+Model routing, tool runtime, prompt versioning, evaluation, reflection and reliability controls.
 
-Notes
+### Phase 5 — Automation
 
-Search
+Approval-based workflows, scheduling, background execution and automation policies.
 
-Knowledge
+### Phase 6 — Engineering Workspace
 
-Local AI
+GitHub, GitLab, Jira, delivery intelligence, architecture decisions and engineering health.
 
-Outcome
+### Phase 7 — Personal Intelligence
 
-Daily personal use.
+Health, finance, learning, travel, habits and personal relationships.
 
----
+### Phase 8 — Multi-user
 
-# Phase 2
+Family and team workspaces, delegation, shared knowledge and permissions.
 
-Knowledge Platform
+### Phase 9 — Enterprise
 
-Goals
+SSO, audit, compliance, multi-tenancy and policy enforcement.
 
-PKOS
+## Roadmap governance
 
-Knowledge Graph
+A new phase or material phase change requires:
 
-Relationships
+1. an approved phase specification
+2. linked RFC and standard references
+3. architecture review
+4. acceptance criteria
+5. rollback strategy
+6. exit review
 
-Timeline
+No implementation may silently skip or expand an approved phase.
 
-Entity Resolution
+## Long-term goal
 
-Hybrid Search
-
-Outcome
-
-Persistent executive memory.
-
----
-
-# Phase 3
-
-Human Attention Engine
-
-Goals
-
-Priority Engine
-
-Waiting On
-
-Waiting For
-
-Risk Engine
-
-Daily Planning
-
-Meeting Preparation
-
-Outcome
-
-ECC becomes useful every day.
-
----
-
-# Phase 4
-
-AI Runtime
-
-Goals
-
-Agent Runtime
-
-Reflection
-
-Tool Runtime
-
-Evaluation
-
-Prompt Versioning
-
-Model Routing
-
-Outcome
-
-Reliable AI recommendations.
-
----
-
-# Phase 5
-
-Automation
-
-Goals
-
-Workflow Engine
-
-Approvals
-
-Background Jobs
-
-Scheduling
-
-Automation Rules
-
-Outcome
-
-Executive assistant.
-
----
-
-# Phase 6
-
-Engineering Workspace
-
-Goals
-
-GitHub
-
-GitLab
-
-PR Intelligence
-
-Architecture Decisions
-
-Engineering Health
-
-Outcome
-
-Engineering leadership dashboard.
-
----
-
-# Phase 7
-
-Personal Intelligence
-
-Goals
-
-Health
-
-Finance
-
-Travel
-
-Learning
-
-Habits
-
-Relationships
-
-Outcome
-
-Life Operating System.
-
----
-
-# Phase 8
-
-Multi-user
-
-Goals
-
-Family
-
-Teams
-
-Delegation
-
-Shared Knowledge
-
-Permissions
-
-Outcome
-
-Collaborative executive platform.
-
----
-
-# Phase 9
-
-Enterprise
-
-Goals
-
-Authentication
-
-SSO
-
-Audit
-
-Compliance
-
-Multi-tenancy
-
-Policy Engine
-
-Outcome
-
-Enterprise-ready.
-
----
-
-# Long-Term Vision
-
-Executive Command Center evolves into
-
-```
-Personal Dashboard
-
-↓
-
-Knowledge System
-
-↓
-
-Executive Operating System
-
-↓
-
-Decision Support System
-
-↓
-
-Executive Intelligence Platform
-```
-
----
-
-# Out of Scope
-
-Until explicitly approved
-
-- Mobile Apps
-- SaaS-first deployment
-- Public APIs
-- Plugin Marketplace
-- Multi-cloud architecture
-- Microservice decomposition beyond documented architecture
-
----
-
-# Success Metrics
-
-Phase 1
-
-Used daily.
-
----
-
-Phase 3
-
-Reduces executive context switching.
-
----
-
-Phase 5
-
-Saves measurable executive time.
-
----
-
-Phase 7
-
-Trusted as the primary executive workspace.
-
----
-
-Phase 9
-
-Enterprise deployment ready.
-
----
-
-# Roadmap Governance
-
-New phases require
-
-RFC
-
-Architecture Review
-
-Acceptance Criteria
-
-Exit Review
-
-Approval
-
-No implementation may skip phases.
-
----
-
-# Current Milestone
-
-```
-██████████████████████████████████
-
-Foundation Specification
-
-Complete
-```
-
-Next Milestone
-
-```
-Phase 0
-
-Repository & Development Environment
-```
-
----
-
-# Final Goal
-
-Build software that executives trust enough to use every day.
-
-Everything else is secondary.
+Build a local-first executive operating system that users trust enough to open every morning and rely on for decisions, commitments and attention management.
