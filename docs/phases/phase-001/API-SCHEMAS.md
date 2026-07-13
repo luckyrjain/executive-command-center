@@ -2,7 +2,7 @@
 id: PHASE-001-API-SCHEMAS
 title: Phase 1 API Schemas
 status: Approved
-version: 1.0.1
+version: 1.0.2
 owner: Lucky Jain
 ---
 
@@ -15,6 +15,8 @@ All endpoints are under `/api/v1`. Actor, workspace and Phase 1 accountable owne
 Mutations require `Idempotency-Key` and `expected_version` when updating or transitioning an existing aggregate. Responses include `request_id`, `correlation_id`, and entity `version`. Pagination uses `{items,next_cursor}`. Errors use the canonical envelope.
 
 Due inputs use mutually exclusive `due_date` (`YYYY-MM-DD`) and `due_at` (ISO-8601 datetime). Supplying both returns `422 MUTUALLY_EXCLUSIVE_FIELDS`.
+
+Every successful lifecycle action returns `200` with the current entity representation. Phase 1 lifecycle actions do not return `204`.
 
 ## Task endpoints
 
@@ -33,7 +35,7 @@ Initial status cannot be completed or cancelled. Idempotent completion/cancel/ar
 
 `POST /commitments`, `GET /commitments`, `GET /commitments/{id}`, `PATCH /commitments/{id}`, and actions `/confirm`, `/fulfil`, `/cancel`, `/archive`, `/restore`.
 
-Create accepts summary, direction, optional counterparty_person_id/name, importance, mutually exclusive due_date/due_at and optional evidence_id. Owner is session-derived. Detected commitments cannot become active without confirm. Lifecycle actions require expected_version.
+Create accepts summary, direction, optional counterparty_person_id/name, importance, mutually exclusive due_date/due_at and optional evidence_id. Owner is session-derived. Detected commitments cannot become active without confirm. Lifecycle actions require expected_version and return the current representation.
 
 ## Note endpoints
 
@@ -45,7 +47,13 @@ Create/update accepts title, body, note_type and optional meeting_id. Body is 1.
 
 `GET /calendar/events?date=YYYY-MM-DD`, `POST /calendar/events`, `PATCH /calendar/events/{id}`, `GET /meetings`, `GET /meetings/{id}`, `POST /meetings`, `PATCH /meetings/{id}`.
 
-Phase 1 supports local/manual events only. Linked meetings reject independent timing fields with `422 LINKED_MEETING_TIMING_READ_ONLY`; timing is projected from CalendarEvent. Standalone meetings require starts_at, ends_at and timezone. Linking a standalone meeting adopts CalendarEvent timing.
+Phase 1 supports local/manual events only. Linked meetings reject independent timing fields with `422 LINKED_MEETING_TIMING_READ_ONLY`; timing is projected from CalendarEvent. Standalone Meeting API fields map as follows:
+
+- `starts_at` -> `meetings.standalone_starts_at`
+- `ends_at` -> `meetings.standalone_ends_at`
+- `timezone` -> `meetings.standalone_timezone`
+
+Standalone meetings require all three API fields. Linked Meeting responses expose projected `starts_at`, `ends_at`, and `timezone` from CalendarEvent. Linking a standalone Meeting adopts CalendarEvent timing.
 
 ## Risk endpoints
 
@@ -61,13 +69,16 @@ Phase 1 supports local/manual events only. Linked meetings reject independent ti
 
 ## Recommendations
 
-`GET /recommendations`, `GET /recommendations/{id}`, and actions `/confirm`, `/reject`, `/defer`, `/pin`.
+`GET /recommendations`, `GET /recommendations/{id}`, and actions `/publish`, `/confirm`, `/reject`, `/defer`, `/pin`.
 
-Confirm includes expected_recommendation_version and target expected_version. It is available only from `pending_confirmation`; it atomically transitions to accepted, mutates the local target, transitions to executed, writes audit records and outbox events, then commits. Rejected, expired and superseded recommendations cannot execute. Failures roll back the target and successful state transitions; a separate failed-attempt record may then be written.
+- `POST /recommendations/{id}/publish` requires `expected_version`, is valid only from `proposed`, transitions to `pending_confirmation`, and returns the current recommendation.
+- `POST /recommendations/{id}/confirm` includes expected_recommendation_version and target expected_version. It is valid only from `pending_confirmation`; it atomically transitions to accepted, mutates the local target, transitions to executed, writes audit records and outbox events, then commits.
+- Rejected, expired and superseded recommendations cannot execute.
+- Failures roll back the target and successful state transitions; a separate failed-attempt record may then be written.
 
 ## Search
 
-`GET /search`: q 1..500, types[]=task|commitment|note|meeting|risk, include_archived=false, cursor, limit. Results include entity type/id, title, snippet, matched_fields, score_components, source, updated_at, archived and evidence references.
+`GET /search`: q 1..500, types[]=task|commitment|note|meeting|calendar_event|risk, include_archived=false, cursor, limit. Results include entity type/id, title, snippet, matched_fields, score_components, source, updated_at, archived and evidence references.
 
 ## Audit
 
@@ -75,6 +86,6 @@ Confirm includes expected_recommendation_version and target expected_version. It
 
 ## Common response models and status codes
 
-Every entity contains id, timestamps, version, archived_at and links.audit. Evidence summaries contain id, source_type, label, captured_at, optional excerpt and access status `available|missing|permission_denied`.
+Every entity contains id, timestamps, version, archived_at and links.audit. Evidence summaries contain id, source_type, label, captured_at, optional excerpt and access status `available|missing|permission_denied|deleted`.
 
-Status codes: 200 query/update, 201 create, 204 no-content action, 400 malformed, 401 unauthenticated, 403 forbidden capability, 404 absent or cross-workspace, 409 version/idempotency/state conflict, 422 validation, 429 throttled and 503 dependency unavailable with fallback metadata where available.
+Status codes: 200 query/update/lifecycle action, 201 create, 400 malformed, 401 unauthenticated, 403 forbidden capability, 404 absent or cross-workspace, 409 version/idempotency/state conflict, 422 validation, 429 throttled and 503 dependency unavailable with fallback metadata where available.
