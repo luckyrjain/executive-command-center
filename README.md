@@ -6,9 +6,9 @@ Executive Command Center (ECC) is a specification-driven platform for helping ex
 
 ## Current status
 
-**Foundation specification:** Draft — critical Phase 0 architecture decisions recorded  
+**Foundation specification:** Phase 0 baseline approved  
 **Implementation:** Not started  
-**Current delivery phase:** Phase 0 — Repository Foundation, ready for implementation review
+**Current delivery phase:** Phase 0 — Repository Foundation, approved for implementation
 
 ## Start here
 
@@ -26,9 +26,11 @@ Read the documents in this order:
 10. [PKOS Schema](docs/domain/PKOS-SCHEMA.md)
 11. [Domain Event Catalog](docs/domain/EVENT-CATALOG.md)
 12. [Domain API Contracts](docs/domain/API-CONTRACTS.md)
-13. [PHASE-000 — Repository Foundation](docs/phases/PHASE-000-repository-foundation.md)
-14. [Roadmap](docs/ROADMAP.md)
-15. [Contributing](docs/CONTRIBUTING.md)
+13. [Phase 0 Security Baseline](docs/security/PHASE-0-SECURITY-BASELINE.md)
+14. [Phase 0 Backup and Restore](docs/operations/PHASE-0-BACKUP-RESTORE.md)
+15. [PHASE-000 — Repository Foundation](docs/phases/PHASE-000-repository-foundation.md)
+16. [Roadmap](docs/ROADMAP.md)
+17. [Contributing](docs/CONTRIBUTING.md)
 
 ## Architecture decisions
 
@@ -44,6 +46,12 @@ The accepted Phase 0 decisions are recorded under [`docs/adr`](docs/adr/):
 - ADR-0008 — Authentication and Workspace Identity
 - ADR-0009 — Connector Synchronization
 - ADR-0010 — Deployment Strategy
+
+## Phase 0 technology boundary
+
+Phase 0 uses a React web application, a FastAPI modular monolith and PostgreSQL 18. Neo4j, Qdrant, Redis, distributed messaging, Kubernetes, cloud services and the AI model runtime are explicitly deferred.
+
+All direct dependency, runtime, scanner and container versions are pinned in [RFC-005](docs/RFC-005.md). Lockfiles remain the source of truth for transitive dependency resolution.
 
 ## Architecture chapters
 
