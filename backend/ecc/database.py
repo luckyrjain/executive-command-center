@@ -10,6 +10,6 @@ engine = create_engine(settings.database_url, pool_pre_ping=True)
 SessionFactory = sessionmaker(bind=engine, expire_on_commit=False)
 
 
-def get_session() -> Generator[Session, None, None]:
+def get_session() -> Generator[Session]:
     with SessionFactory() as session:
         yield session
