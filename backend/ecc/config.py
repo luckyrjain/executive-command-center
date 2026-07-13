@@ -5,12 +5,17 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_prefix="ECC_", env_file=".env", extra="ignore")
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
-    environment: str = Field(default="development", alias="ENV")
-    database_url: str = "postgresql+psycopg://ecc:ecc@localhost:5432/ecc"
-    session_secret: str = Field(min_length=32)
-    cors_origins: str = "http://localhost:5173"
+    environment: str = Field(default="development", validation_alias="ECC_ENV")
+    database_url: str = Field(
+        default="postgresql+psycopg://ecc:ecc@localhost:5432/ecc",
+        validation_alias="ECC_DATABASE_URL",
+    )
+    session_secret: str = Field(min_length=32, validation_alias="ECC_SESSION_SECRET")
+    cors_origins: str = Field(
+        default="http://localhost:5173", validation_alias="ECC_CORS_ORIGINS"
+    )
 
     @property
     def cors_origin_list(self) -> list[str]:

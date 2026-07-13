@@ -6,35 +6,25 @@
 *.key
 
 # Python
+.venv/
 __pycache__/
 *.py[cod]
-.venv/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
-.coverage
-htmlcov/
 
 # Node
 node_modules/
-.next/
-dist/
-build/
+frontend/dist/
 coverage/
 
-# Local data
-.data/
-data/
-*.db
-*.sqlite
-*.sqlite3
+# Local runtime data
+.local/
+backups/
+*.dump
+*.sha256
 
-# IDE and OS
+# Editors and OS
 .DS_Store
 .idea/
 .vscode/
-
-# Logs and temporary files
-*.log
-tmp/
-.cache/
