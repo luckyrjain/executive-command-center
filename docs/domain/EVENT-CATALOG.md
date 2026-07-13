@@ -2,93 +2,87 @@
 id: EVENT-CATALOG
 title: Domain Event Catalog
 status: Accepted
-version: 1.0.0
+version: 1.1.0
 owner: Lucky Jain
 related:
   - ADR-0005
   - DOMAIN-MODEL
+  - PHASE-001
 ---
 
 # Domain Event Catalog
 
-## Event envelope
+## Envelope
 
-Every event uses the following envelope:
+Every event is immutable and uses:
 
 ```json
 {
-  "event_id": "uuid",
-  "event_type": "task.created.v1",
-  "occurred_at": "2026-07-13T00:00:00Z",
-  "published_at": "2026-07-13T00:00:00Z",
-  "workspace_id": "uuid",
-  "actor_id": "uuid|null",
-  "aggregate_type": "task",
-  "aggregate_id": "uuid",
-  "aggregate_version": 1,
-  "correlation_id": "uuid",
-  "causation_id": "uuid|null",
-  "producer": "planning",
-  "data": {}
+  "event_id":"uuid",
+  "event_type":"task.created.v1",
+  "occurred_at":"2026-07-13T00:00:00Z",
+  "published_at":"2026-07-13T00:00:00Z|null",
+  "workspace_id":"uuid",
+  "actor_id":"uuid|null",
+  "aggregate_type":"task",
+  "aggregate_id":"uuid",
+  "aggregate_version":1,
+  "correlation_id":"uuid",
+  "causation_id":"uuid|null",
+  "producer":"planning",
+  "data":{}
 }
 ```
 
-Rules:
+Events are named in past tense, schema version is part of `event_type`, consumers are idempotent by `event_id`, sensitive content is referenced rather than copied, and breaking changes create a new version.
 
-- Events are immutable and named in past tense.
-- Schema version is part of `event_type`.
-- Consumers are idempotent by `event_id`.
-- Personally sensitive content is referenced by entity ID rather than copied unless required.
-- Breaking payload changes create a new event version.
+## Phase 1 catalog
 
-## Catalog
+| Event | Producer | Required payload |
+|---|---|---|
+| `task.created.v1` | Planning | task_id, owner_id, status, priority |
+| `task.updated.v1` | Planning | task_id, changed_fields |
+| `task.completed.v1` | Planning | task_id, completed_at |
+| `task.cancelled.v1` | Planning | task_id, reason |
+| `task.archived.v1` | Planning | task_id, archived_at |
+| `commitment.created.v1` | Communication | commitment_id, direction, importance |
+| `commitment.detected.v1` | Communication | commitment_id, evidence_ids, confidence |
+| `commitment.confirmed.v1` | Communication | commitment_id, owner_id, due_at |
+| `commitment.updated.v1` | Communication | commitment_id, changed_fields |
+| `commitment.fulfilled.v1` | Communication | commitment_id, fulfilled_at |
+| `commitment.cancelled.v1` | Communication | commitment_id, reason |
+| `commitment.archived.v1` | Communication | commitment_id, archived_at |
+| `note.created.v1` | Knowledge | note_id, note_type, meeting_id |
+| `note.updated.v1` | Knowledge | note_id, changed_fields, body_checksum |
+| `note.archived.v1` | Knowledge | note_id, archived_at |
+| `calendar_event.created.v1` | Planning | calendar_event_id, starts_at, ends_at |
+| `calendar_event.changed.v1` | Planning | calendar_event_id, changed_fields |
+| `meeting.created.v1` | Planning | meeting_id, calendar_event_id |
+| `meeting.updated.v1` | Planning | meeting_id, changed_fields |
+| `risk.identified.v1` | Executive Intelligence | risk_id, probability, impact, owner_id |
+| `risk.updated.v1` | Executive Intelligence | risk_id, changed_fields |
+| `risk.closed.v1` | Executive Intelligence | risk_id, closed_at |
+| `attention_item.created.v1` | Executive Intelligence | attention_item_id, entity_ref, score, factors |
+| `attention_item.updated.v1` | Executive Intelligence | attention_item_id, score, changed_factors |
+| `recommendation.generated.v1` | Executive Intelligence | recommendation_id, source, evidence_ids, confidence |
+| `recommendation.confirmation_requested.v1` | Executive Intelligence | recommendation_id, target_ref, target_version |
+| `recommendation.accepted.v1` | Executive Intelligence | recommendation_id, accepted_by |
+| `recommendation.rejected.v1` | Executive Intelligence | recommendation_id, rejected_by, reason |
+| `recommendation.deferred.v1` | Executive Intelligence | recommendation_id, deferred_until |
+| `recommendation.pinned.v1` | Executive Intelligence | recommendation_id, pinned_by |
+| `recommendation.executed.v1` | Owning domain | recommendation_id, target_ref, resulting_version |
+| `recommendation.failed.v1` | Owning domain | recommendation_id, error_code, retryable |
+| `morning_brief.requested.v1` | Executive Intelligence | user_id, briefing_date, refresh_reason |
+| `morning_brief.generated.v1` | Executive Intelligence | brief_id, user_id, evidence_ids, generation_version |
+| `morning_brief.stale.v1` | Executive Intelligence | brief_id, stale_reason |
+| `feedback.recorded.v1` | Executive Intelligence | feedback_id, recommendation_id, action |
 
-| Event | Producer | Primary consumers | Required payload |
-|---|---|---|---|
-| `workspace.created.v1` | Identity | Audit, Configuration | workspace_id, owner_id |
-| `person.created.v1` | Identity | Knowledge | person_id, display_name |
-| `person.merge_proposed.v1` | Knowledge | Identity, Executive UI | candidate_ids, confidence, evidence_ids |
-| `person.merged.v1` | Identity | All referencing domains | surviving_id, alias_ids, merge_record_id |
-| `organization.created.v1` | Identity | Knowledge, Planning | organization_id, name |
-| `project.created.v1` | Planning | Knowledge, Executive Intelligence | project_id, owner_id, status |
-| `project.status_changed.v1` | Planning | Knowledge, Risk, Executive Intelligence | project_id, old_status, new_status |
-| `goal.created.v1` | Planning | Knowledge, Executive Intelligence | goal_id, owner_id |
-| `task.created.v1` | Planning | Knowledge, Executive Intelligence | task_id, owner_id, status, priority |
-| `task.updated.v1` | Planning | Knowledge, Executive Intelligence | task_id, changed_fields |
-| `task.completed.v1` | Planning | Knowledge, Executive Intelligence | task_id, completed_at |
-| `commitment.detected.v1` | Communication | Executive Intelligence | commitment_id, parties, evidence_ids, confidence |
-| `commitment.confirmed.v1` | Communication | Planning, Knowledge | commitment_id, owner_id, due_at |
-| `commitment.fulfilled.v1` | Communication | Knowledge, Executive Intelligence | commitment_id, fulfilled_at |
-| `calendar_event.imported.v1` | Integration | Planning, Knowledge | calendar_event_id, source_ref |
-| `calendar_event.changed.v1` | Planning | Knowledge, Executive Intelligence | calendar_event_id, changed_fields |
-| `meeting.preparation_requested.v1` | Executive Intelligence | Knowledge, AI Platform | meeting_id, requested_sections |
-| `meeting.preparation_generated.v1` | Executive Intelligence | Planning, Audit | meeting_id, brief_id, evidence_ids |
-| `conversation.imported.v1` | Integration | Communication, Knowledge | conversation_id, source_ref |
-| `message.received.v1` | Communication | Knowledge, Commitment Extraction | message_id, conversation_id, evidence_id |
-| `document.imported.v1` | Integration | Knowledge | document_id, evidence_id, checksum |
-| `document.indexed.v1` | Knowledge | Search, Executive Intelligence | document_id, index_version |
-| `decision.recorded.v1` | Knowledge | Planning, Executive Intelligence | decision_id, decision_maker_ids, evidence_ids |
-| `decision.superseded.v1` | Knowledge | Executive Intelligence | decision_id, superseded_by |
-| `knowledge_item.created.v1` | Knowledge | Search, Executive Intelligence | knowledge_item_id, kind, confidence |
-| `relationship.created.v1` | Knowledge | Search, Executive Intelligence | relationship_id, from_id, type, to_id |
-| `relationship.invalidated.v1` | Knowledge | Search, Executive Intelligence | relationship_id, reason |
-| `risk.identified.v1` | Executive Intelligence | Planning, Knowledge | risk_id, probability, impact, owner_id |
-| `risk.status_changed.v1` | Executive Intelligence | Planning, Knowledge | risk_id, old_status, new_status |
-| `attention_item.created.v1` | Executive Intelligence | Dashboard | attention_item_id, entity_ref, score, explanation |
-| `recommendation.generated.v1` | AI Platform | Executive Intelligence, Audit | recommendation_id, evidence_ids, confidence |
-| `recommendation.accepted.v1` | Executive Intelligence | Owning domain, Audit | recommendation_id, accepted_by |
-| `recommendation.rejected.v1` | Executive Intelligence | AI Evaluation, Audit | recommendation_id, rejected_by, reason |
-| `reminder.triggered.v1` | Planning | Notification, Executive Intelligence | reminder_id, entity_ref |
-| `connector.sync_started.v1` | Integration | Operations | connector_id, cursor |
-| `connector.sync_completed.v1` | Integration | Operations | connector_id, new_cursor, counts |
-| `connector.sync_failed.v1` | Integration | Operations, Executive Intelligence | connector_id, error_code, retryable |
-| `morning_brief.requested.v1` | Scheduler | Executive Intelligence | user_id, briefing_date |
-| `morning_brief.generated.v1` | Executive Intelligence | Dashboard, Audit | brief_id, user_id, evidence_ids |
+Existing foundation events for workspace, person, organization, project, goal, document, knowledge, relationship, connector, message and decision remain valid.
 
-## Compatibility
+## Audit relationship
 
-Producers must support the current event version. Consumers may support the current and previous version during migrations. Deprecated versions require a migration plan and replay test before removal.
+Domain events do not replace audit events. A successful mutation writes the domain aggregate, redacted audit record and outbox event in one transaction. Rejected authorization and version-conflict attempts may create audit records without publishing domain events.
 
-## Delivery and failure handling
+## Compatibility and failure handling
 
-Failed events move to a dead-letter store with the original envelope, failure category, retry count and next action. Manual replay must preserve the original `event_id` and assign a new delivery attempt identifier.
+Consumers support current versions and may support the previous version during migrations. Deprecated versions require migration and replay tests. Failed deliveries move to the dead-letter store with the original envelope, failure category, retry count and next action. Manual replay preserves `event_id` and creates a new delivery-attempt identifier.
