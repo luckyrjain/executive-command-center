@@ -45,18 +45,22 @@ def _record_rejected_task_mutation(request: Request, response: Response) -> None
     now = datetime.now(UTC)
 
     with engine.begin() as connection:
-        auth = connection.execute(
-            text(
-                """
+        auth = (
+            connection.execute(
+                text(
+                    """
                 SELECT workspace_id, user_id
                 FROM sessions
                 WHERE token_hash = :token_hash
                   AND revoked_at IS NULL
                   AND expires_at > :now
                 """
-            ),
-            {"token_hash": token_hash, "now": now},
-        ).mappings().one_or_none()
+                ),
+                {"token_hash": token_hash, "now": now},
+            )
+            .mappings()
+            .one_or_none()
+        )
         if auth is None:
             return
 
@@ -95,9 +99,8 @@ async def rejected_mutation_audit_middleware(
     call_next: Callable[[Request], Awaitable[Response]],
 ) -> Response:
     response = await call_next(request)
-    is_task_mutation = (
-        request.method in {"POST", "PATCH"}
-        and request.url.path.startswith("/api/v1/tasks")
+    is_task_mutation = request.method in {"POST", "PATCH"} and request.url.path.startswith(
+        "/api/v1/tasks"
     )
     if is_task_mutation and response.status_code in _REJECTED_STATUSES:
         try:
