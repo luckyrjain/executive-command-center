@@ -6,6 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from sqlalchemy import text
 
+from ecc.audit import rejected_mutation_audit_middleware
 from ecc.config import get_settings
 from ecc.database import engine
 from ecc.domains.planning.tasks import router as tasks_router
@@ -27,6 +28,7 @@ app.add_middleware(
     ],
 )
 app.include_router(tasks_router)
+app.middleware("http")(rejected_mutation_audit_middleware)
 
 
 @app.middleware("http")
