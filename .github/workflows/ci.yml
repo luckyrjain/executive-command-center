@@ -10,6 +10,15 @@ permissions:
   pull-requests: read
 
 jobs:
+  lint-diagnostic:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+        with:
+          version: 0.7.19
+      - run: uvx ruff==0.12.3 check backend tests --output-format concise
+
   backend:
     runs-on: ubuntu-latest
     services:
