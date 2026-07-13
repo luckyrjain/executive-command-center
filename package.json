@@ -1,0 +1,10 @@
+{
+  "name": "executive-command-center",
+  "private": true,
+  "packageManager": "pnpm@10.12.4",
+  "scripts": {
+    "dev": "pnpm --filter @ecc/frontend dev",
+    "build": "pnpm --filter @ecc/frontend build",
+    "test": "pnpm --filter @ecc/frontend test -- --run"
+  }
+}

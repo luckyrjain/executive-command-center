@@ -1,0 +1,85 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18.0
+        env:
+          POSTGRES_DB: ecc
+          POSTGRES_USER: ecc
+          POSTGRES_PASSWORD: ecc
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U ecc -d ecc"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      ECC_SESSION_SECRET: ci-secret-value-that-is-at-least-32-characters
+      ECC_DATABASE_URL: postgresql+psycopg://ecc:ecc@localhost:5432/ecc
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: 3.14.6
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+        with:
+          version: 0.7.19
+          enable-cache: true
+      - run: uv sync --frozen --all-groups --python 3.14.6
+      - run: uv run ruff check backend tests
+      - run: uv run ruff format --check backend tests
+      - run: uv run mypy backend
+      - run: uv run alembic -c backend/alembic.ini upgrade head
+      - run: uv run pytest
+      - run: uv run pip-audit
+
+  frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22.17.0
+      - run: corepack enable
+      - run: corepack prepare pnpm@10.12.4 --activate
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm --filter @ecc/frontend typecheck
+      - run: pnpm --filter @ecc/frontend test -- --run
+      - run: pnpm --filter @ecc/frontend build
+
+  containers:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - run: docker build -f backend/Dockerfile -t ecc-backend:ci .
+      - run: docker build -f frontend/Dockerfile -t ecc-frontend:ci .
+
+  security:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with: { fetch-depth: 0 }
+      - name: Scan repository for leaked secrets
+        uses: gitleaks/gitleaks-action@ff98106e4c7b2bc287b24eaf42907196329070c7 # v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0
+        with: { path: ".", artifact-name: "ecc-sbom.spdx.json" }
+      - uses: aquasecurity/trivy-action@c07df6fec6fa692e6fd1200d50aaa1fdd66f03c8
+        with:
+          scan-type: fs
+          scan-ref: .
+          severity: CRITICAL
+          exit-code: "1"

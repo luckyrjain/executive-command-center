@@ -1,0 +1,6 @@
+:root { font-family: Inter, ui-sans-serif, system-ui, sans-serif; color: #18212f; background: #f4f6f8; }
+body { margin: 0; min-height: 100vh; display: grid; place-items: center; }
+main { width: min(680px, calc(100vw - 48px)); background: white; border: 1px solid #dfe4ea; border-radius: 20px; padding: 48px; box-shadow: 0 20px 60px rgba(24,33,47,.08); }
+.eyebrow { font-size: 12px; letter-spacing: .18em; font-weight: 700; }
+h1 { font-size: clamp(38px, 7vw, 68px); line-height: .95; margin: 20px 0; }
+section { margin-top: 36px; display: flex; justify-content: space-between; border-top: 1px solid #e7ebef; padding-top: 20px; }
