@@ -34,18 +34,22 @@ def require_auth_context(
         )
 
     token_hash = sha256(ecc_session.encode("utf-8")).hexdigest()
-    row = session.execute(
-        text(
-            """
+    row = (
+        session.execute(
+            text(
+                """
             SELECT workspace_id, user_id
             FROM sessions
             WHERE token_hash = :token_hash
               AND revoked_at IS NULL
               AND expires_at > :now
             """
-        ),
-        {"token_hash": token_hash, "now": datetime.now(UTC)},
-    ).mappings().one_or_none()
+            ),
+            {"token_hash": token_hash, "now": datetime.now(UTC)},
+        )
+        .mappings()
+        .one_or_none()
+    )
     session.rollback()
 
     if row is None:

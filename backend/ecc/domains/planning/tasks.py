@@ -151,9 +151,10 @@ def _load_idempotent_response(
     key: str,
     request_hash: str,
 ) -> TaskResponse | None:
-    existing = session.execute(
-        text(
-            """
+    existing = (
+        session.execute(
+            text(
+                """
             SELECT request_hash, response_body
             FROM idempotency_records
             WHERE workspace_id = :workspace_id
@@ -161,14 +162,17 @@ def _load_idempotent_response(
               AND key = :key
               AND expires_at > :now
             """
-        ),
-        {
-            "workspace_id": auth.workspace_id,
-            "actor_id": auth.user_id,
-            "key": key,
-            "now": datetime.now(UTC),
-        },
-    ).mappings().one_or_none()
+            ),
+            {
+                "workspace_id": auth.workspace_id,
+                "actor_id": auth.user_id,
+                "key": key,
+                "now": datetime.now(UTC),
+            },
+        )
+        .mappings()
+        .one_or_none()
+    )
     if existing is None:
         return None
     if existing["request_hash"] != request_hash:
@@ -308,17 +312,21 @@ def _get_task_row(
     for_update: bool = False,
 ) -> dict[str, Any] | None:
     lock = "FOR UPDATE" if for_update else ""
-    row = session.execute(
-        text(
-            f"""
+    row = (
+        session.execute(
+            text(
+                f"""
             SELECT {_SELECT_FIELDS}
             FROM tasks
             WHERE workspace_id = :workspace_id AND id = :task_id
             {lock}
             """
-        ),
-        {"workspace_id": auth.workspace_id, "task_id": task_id},
-    ).mappings().one_or_none()
+            ),
+            {"workspace_id": auth.workspace_id, "task_id": task_id},
+        )
+        .mappings()
+        .one_or_none()
+    )
     return dict(row) if row is not None else None
 
 
@@ -381,9 +389,10 @@ def create_task(
             return cached
 
         task_id = uuid4()
-        row = session.execute(
-            text(
-                f"""
+        row = (
+            session.execute(
+                text(
+                    f"""
                 INSERT INTO tasks (
                     id, workspace_id, owner_id, title, description, status,
                     manual_priority, due_date, due_at, pinned, source_type,
@@ -396,22 +405,25 @@ def create_task(
                 )
                 RETURNING {_SELECT_FIELDS}
                 """
-            ),
-            {
-                "id": task_id,
-                "workspace_id": auth.workspace_id,
-                "owner_id": auth.user_id,
-                "title": payload.title,
-                "description": payload.description,
-                "status": payload.status,
-                "manual_priority": payload.manual_priority,
-                "due_date": payload.due_date,
-                "due_at": payload.due_at,
-                "source_ref": payload.source_ref,
-                "actor_id": auth.user_id,
-                "now": now,
-            },
-        ).mappings().one()
+                ),
+                {
+                    "id": task_id,
+                    "workspace_id": auth.workspace_id,
+                    "owner_id": auth.user_id,
+                    "title": payload.title,
+                    "description": payload.description,
+                    "status": payload.status,
+                    "manual_priority": payload.manual_priority,
+                    "due_date": payload.due_date,
+                    "due_at": payload.due_at,
+                    "source_ref": payload.source_ref,
+                    "actor_id": auth.user_id,
+                    "now": now,
+                },
+            )
+            .mappings()
+            .one()
+        )
         response = _to_response(dict(row))
         after = response.model_dump(mode="json")
         changed = [
@@ -500,18 +512,22 @@ def list_tasks(
         params["cursor_created_at"] = cursor_created_at
         params["cursor_id"] = cursor_id
 
-    rows = session.execute(
-        text(
-            f"""
+    rows = (
+        session.execute(
+            text(
+                f"""
             SELECT {_SELECT_FIELDS}
             FROM tasks
-            WHERE {' AND '.join(clauses)}
+            WHERE {" AND ".join(clauses)}
             ORDER BY created_at DESC, id DESC
             LIMIT :limit
             """
-        ),
-        params,
-    ).mappings().all()
+            ),
+            params,
+        )
+        .mappings()
+        .all()
+    )
     has_more = len(rows) > limit
     page = rows[:limit]
     items = [_to_response(dict(row)) for row in page]
@@ -593,7 +609,9 @@ def update_task(
         }
         changed_fields = sorted(fields & allowed)
         assignments = [f"{field} = :{field}" for field in changed_fields]
-        assignments.extend(["updated_by = :updated_by", "updated_at = :now", "version = version + 1"])
+        assignments.extend(
+            ["updated_by = :updated_by", "updated_at = :now", "version = version + 1"]
+        )
         values = payload.model_dump(include=set(changed_fields))
         values.update(
             {
@@ -603,17 +621,21 @@ def update_task(
                 "now": now,
             }
         )
-        row = session.execute(
-            text(
-                f"""
+        row = (
+            session.execute(
+                text(
+                    f"""
                 UPDATE tasks
-                SET {', '.join(assignments)}
+                SET {", ".join(assignments)}
                 WHERE workspace_id = :workspace_id AND id = :task_id
                 RETURNING {_SELECT_FIELDS}
                 """
-            ),
-            values,
-        ).mappings().one()
+                ),
+                values,
+            )
+            .mappings()
+            .one()
+        )
         response = _to_response(dict(row))
         before = _to_response(current).model_dump(mode="json")
         after = response.model_dump(mode="json")
@@ -725,33 +747,34 @@ def _lifecycle_task(
             changed_fields = ["archived_at", "pre_archive_status"]
         else:
             restored_status = current["pre_archive_status"] or "captured"
-            assignments = (
-                "archived_at = NULL, pre_archive_status = NULL, "
-                "status = :restored_status"
-            )
+            assignments = "archived_at = NULL, pre_archive_status = NULL, status = :restored_status"
             audit_type = "task.restored"
             event_type = "task.restored.v1"
             event_payload = {"restored_status": restored_status}
             changed_fields = ["archived_at", "pre_archive_status", "status"]
 
-        row = session.execute(
-            text(
-                f"""
+        row = (
+            session.execute(
+                text(
+                    f"""
                 UPDATE tasks
                 SET {assignments}, updated_by = :updated_by,
                     updated_at = :now, version = version + 1
                 WHERE workspace_id = :workspace_id AND id = :task_id
                 RETURNING {_SELECT_FIELDS}
                 """
-            ),
-            {
-                "workspace_id": auth.workspace_id,
-                "task_id": task_id,
-                "updated_by": auth.user_id,
-                "restored_status": current["pre_archive_status"] or "captured",
-                "now": now,
-            },
-        ).mappings().one()
+                ),
+                {
+                    "workspace_id": auth.workspace_id,
+                    "task_id": task_id,
+                    "updated_by": auth.user_id,
+                    "restored_status": current["pre_archive_status"] or "captured",
+                    "now": now,
+                },
+            )
+            .mappings()
+            .one()
+        )
         response = _to_response(dict(row))
         before = _to_response(current).model_dump(mode="json")
         after = response.model_dump(mode="json")
