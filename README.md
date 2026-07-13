@@ -7,8 +7,8 @@ Executive Command Center (ECC) is a specification-driven platform for helping ex
 ## Current status
 
 **Foundation specification:** Phase 0 baseline approved  
-**Implementation:** Not started  
-**Current delivery phase:** Phase 0 — Repository Foundation, approved for implementation
+**Implementation:** Phase 1 task vertical slice in progress  
+**Current delivery phase:** Phase 1 — Executive Dashboard MVP
 
 ## Start here
 
@@ -29,8 +29,9 @@ Read the documents in this order:
 13. [Phase 0 Security Baseline](docs/security/PHASE-0-SECURITY-BASELINE.md)
 14. [Phase 0 Backup and Restore](docs/operations/PHASE-0-BACKUP-RESTORE.md)
 15. [PHASE-000 — Repository Foundation](docs/phases/PHASE-000-repository-foundation.md)
-16. [Roadmap](docs/ROADMAP.md)
-17. [Contributing](docs/CONTRIBUTING.md)
+16. [PHASE-001 — Executive Dashboard MVP](docs/phases/PHASE-001-executive-dashboard-mvp.md)
+17. [Roadmap](docs/ROADMAP.md)
+18. [Contributing](docs/CONTRIBUTING.md)
 
 ## Architecture decisions
 
