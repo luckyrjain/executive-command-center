@@ -1,0 +1,71 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18.0
+        env:
+          POSTGRES_DB: ecc
+          POSTGRES_USER: ecc
+          POSTGRES_PASSWORD: ecc
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U ecc -d ecc"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      ECC_SESSION_SECRET: ci-secret-value-that-is-at-least-32-characters
+      ECC_DATABASE_URL: postgresql+psycopg://ecc:ecc@localhost:5432/ecc
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: 0.7.19
+          python-version: 3.14.5
+      - run: uv sync --all-groups
+      - run: uv run ruff check backend tests
+      - run: uv run ruff format --check backend tests
+      - run: uv run mypy backend
+      - run: uv run alembic -c backend/alembic.ini upgrade head
+      - run: uv run pytest
+      - run: uv run pip-audit
+
+  frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.17.0
+      - run: corepack enable
+      - run: corepack prepare pnpm@10.12.4 --activate
+      - run: pnpm install --no-frozen-lockfile
+      - run: pnpm --filter @ecc/frontend typecheck
+      - run: pnpm --filter @ecc/frontend test -- --run
+      - run: pnpm --filter @ecc/frontend build
+
+  security:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: gitleaks/gitleaks-action@v2
+      - uses: anchore/sbom-action@v0
+        with: { path: ".", artifact-name: "ecc-sbom.spdx.json" }
+      - uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: fs
+          scan-ref: .
+          severity: CRITICAL
+          exit-code: "1"

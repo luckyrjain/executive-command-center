@@ -1,0 +1,41 @@
+[project]
+name = "executive-command-center"
+version = "0.1.0"
+description = "Local-first AI Executive Operating System"
+requires-python = "==3.14.*"
+dependencies = [
+  "alembic==1.16.4",
+  "argon2-cffi==25.1.0",
+  "fastapi==0.116.1",
+  "httpx==0.28.1",
+  "pydantic==2.11.7",
+  "pydantic-settings==2.10.1",
+  "psycopg[binary]==3.2.9",
+  "sqlalchemy==2.0.41",
+  "uvicorn[standard]==0.35.0",
+]
+
+[dependency-groups]
+dev = [
+  "mypy==1.16.1",
+  "pip-audit==2.9.0",
+  "pytest==8.4.1",
+  "pytest-asyncio==1.0.0",
+  "ruff==0.12.3",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["backend"]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py314"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+
+[tool.mypy]
+python_version = "3.14"
+strict = true
+mypy_path = "backend"
