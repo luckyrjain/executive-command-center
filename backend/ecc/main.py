@@ -1,6 +1,7 @@
+from collections.abc import Awaitable, Callable
 from uuid import uuid4
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from sqlalchemy import text
@@ -22,7 +23,10 @@ app.add_middleware(
 
 
 @app.middleware("http")
-async def correlation_middleware(request: Request, call_next):
+async def correlation_middleware(
+    request: Request,
+    call_next: Callable[[Request], Awaitable[Response]],
+) -> Response:
     correlation_id = request.headers.get("X-Correlation-ID", str(uuid4()))
     request.state.correlation_id = correlation_id
     response = await call_next(request)
