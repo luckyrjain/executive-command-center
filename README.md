@@ -6,9 +6,9 @@ Executive Command Center (ECC) is a specification-driven platform for helping ex
 
 ## Current status
 
-**Foundation specification:** Draft — under review  
+**Foundation specification:** Draft — critical Phase 0 architecture decisions recorded  
 **Implementation:** Not started  
-**Current delivery phase:** Phase 0 — Repository Foundation
+**Current delivery phase:** Phase 0 — Repository Foundation, ready for implementation review
 
 ## Start here
 
@@ -22,8 +22,28 @@ Read the documents in this order:
 6. [RFC-004 — System Architecture](docs/RFC-004.md)
 7. [RFC-005 — Approved Technology Registry](docs/RFC-005.md)
 8. [STD-001 — Repository Standards](docs/standards/STD-001.md)
-9. [Roadmap](docs/ROADMAP.md)
-10. [Contributing](docs/CONTRIBUTING.md)
+9. [Canonical Domain Model](docs/domain/DOMAIN-MODEL.md)
+10. [PKOS Schema](docs/domain/PKOS-SCHEMA.md)
+11. [Domain Event Catalog](docs/domain/EVENT-CATALOG.md)
+12. [Domain API Contracts](docs/domain/API-CONTRACTS.md)
+13. [PHASE-000 — Repository Foundation](docs/phases/PHASE-000-repository-foundation.md)
+14. [Roadmap](docs/ROADMAP.md)
+15. [Contributing](docs/CONTRIBUTING.md)
+
+## Architecture decisions
+
+The accepted Phase 0 decisions are recorded under [`docs/adr`](docs/adr/):
+
+- ADR-0001 — Repository Layout
+- ADR-0002 — Local-First Architecture
+- ADR-0003 — Knowledge Platform and PKOS
+- ADR-0004 — AI Runtime
+- ADR-0005 — Event Bus
+- ADR-0006 — Storage Strategy
+- ADR-0007 — Model Router
+- ADR-0008 — Authentication and Workspace Identity
+- ADR-0009 — Connector Synchronization
+- ADR-0010 — Deployment Strategy
 
 ## Architecture chapters
 
