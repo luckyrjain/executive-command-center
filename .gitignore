@@ -1,0 +1,37 @@
+# Environment and secrets
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+coverage.xml
+htmlcov/
+
+# Node
+node_modules/
+.next/
+dist/
+coverage/
+
+# Editors and OS
+.DS_Store
+.idea/
+.vscode/
+
+# Local ECC data
+.data/
+data/
+logs/
+*.db
+*.sqlite
+*.sqlite3
+
+# Build artifacts
+build/
+tmp/
