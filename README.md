@@ -55,7 +55,11 @@ Implementation should not begin until the Phase 0 specification is approved.
 ### Governance support
 
 - [ADR register](docs/adr/README.md)
-- [Document templates](docs/templates/)
+- [ADR template](docs/adr/ADR-TEMPLATE.md)
+- [RFC template](docs/templates/RFC-TEMPLATE.md)
+- [Standard template](docs/templates/STD-TEMPLATE.md)
+- [Phase template](docs/templates/PHASE-TEMPLATE.md)
+- [Specification change request template](docs/templates/SPEC-CHANGE-REQUEST.md)
 
 ## Development model
 
@@ -89,4 +93,4 @@ Every externally visible behavior must be traceable to an approved requirement.
 
 ## License
 
-See [LICENSE](LICENSE).
+No license has been selected yet. Until a license is added, reuse and redistribution rights are not granted.
