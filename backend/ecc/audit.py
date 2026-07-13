@@ -1,3 +1,4 @@
+import logging
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from hashlib import sha256
@@ -7,9 +8,8 @@ from fastapi import Request, Response
 from sqlalchemy import text
 
 from ecc.database import engine
-from ecc.logging import get_logger
 
-logger = get_logger(__name__)
+logger = logging.getLogger(__name__)
 _REJECTED_STATUSES = {403, 404, 409, 422}
 _NIL_UUID = UUID(int=0)
 
@@ -45,22 +45,18 @@ def _record_rejected_task_mutation(request: Request, response: Response) -> None
     now = datetime.now(UTC)
 
     with engine.begin() as connection:
-        auth = (
-            connection.execute(
-                text(
-                    """
+        auth = connection.execute(
+            text(
+                """
                 SELECT workspace_id, user_id
                 FROM sessions
                 WHERE token_hash = :token_hash
                   AND revoked_at IS NULL
                   AND expires_at > :now
                 """
-                ),
-                {"token_hash": token_hash, "now": now},
-            )
-            .mappings()
-            .one_or_none()
-        )
+            ),
+            {"token_hash": token_hash, "now": now},
+        ).mappings().one_or_none()
         if auth is None:
             return
 
@@ -73,10 +69,10 @@ def _record_rejected_task_mutation(request: Request, response: Response) -> None
                     idempotency_key_hash, changed_fields, authorization_result,
                     source, failure_code, metadata, occurred_at
                 ) VALUES (
-                    :id, :workspace_id, 'task.mutation_rejected', 'task', :aggregate_id,
-                    0, :actor_id, :request_id, :correlation_id,
+                    :id, :workspace_id, 'task.mutation_rejected', 'task',
+                    :aggregate_id, 0, :actor_id, :request_id, :correlation_id,
                     :idempotency_key_hash, '{}'::text[], 'rejected',
-                    'user', :failure_code, CAST(:metadata AS jsonb), :occurred_at
+                    'user', :failure_code, '{}'::jsonb, :occurred_at
                 )
                 """
             ),
@@ -89,7 +85,6 @@ def _record_rejected_task_mutation(request: Request, response: Response) -> None
                 "correlation_id": _correlation_id(request),
                 "idempotency_key_hash": idempotency_hash,
                 "failure_code": f"HTTP_{response.status_code}",
-                "metadata": "{}",
                 "occurred_at": now,
             },
         )
@@ -100,8 +95,9 @@ async def rejected_mutation_audit_middleware(
     call_next: Callable[[Request], Awaitable[Response]],
 ) -> Response:
     response = await call_next(request)
-    is_task_mutation = request.method in {"POST", "PATCH"} and request.url.path.startswith(
-        "/api/v1/tasks"
+    is_task_mutation = (
+        request.method in {"POST", "PATCH"}
+        and request.url.path.startswith("/api/v1/tasks")
     )
     if is_task_mutation and response.status_code in _REJECTED_STATUSES:
         try:
