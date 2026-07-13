@@ -190,29 +190,37 @@ def test_task_lifecycle_is_transactional_and_workspace_scoped(
     assert restore.json()["archived_at"] is None
 
     with engine.connect() as connection:
-        audit_types = connection.execute(
-            text(
-                """
+        audit_types = (
+            connection.execute(
+                text(
+                    """
                 SELECT event_type
                 FROM audit_events
                 WHERE workspace_id = :workspace_id
                   AND aggregate_id = :task_id
                 ORDER BY occurred_at
                 """
-            ),
-            {"workspace_id": workspace_id, "task_id": task_id},
-        ).scalars().all()
-        outbox_types = connection.execute(
-            text(
-                """
+                ),
+                {"workspace_id": workspace_id, "task_id": task_id},
+            )
+            .scalars()
+            .all()
+        )
+        outbox_types = (
+            connection.execute(
+                text(
+                    """
                 SELECT event_type
                 FROM event_outbox
                 WHERE workspace_id = :workspace_id
                 ORDER BY occurred_at
                 """
-            ),
-            {"workspace_id": workspace_id},
-        ).scalars().all()
+                ),
+                {"workspace_id": workspace_id},
+            )
+            .scalars()
+            .all()
+        )
 
     assert "task.created" in audit_types
     assert "task.updated" in audit_types
