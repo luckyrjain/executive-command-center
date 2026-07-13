@@ -2,233 +2,80 @@
 id: PKOS-SCHEMA
 title: Personal Knowledge Operating System Schema
 status: Accepted
-version: 1.0.0
+version: 1.1.1
 owner: Lucky Jain
 related:
   - ADR-0003
   - ADR-0006
   - DOMAIN-MODEL
   - EVENT-CATALOG
+  - PHASE-001
+  - PHASE-001-SEARCH-CONTRACT
 ---
 
 # PKOS Schema
 
 ## Purpose
 
-PKOS is the canonical knowledge subsystem for ECC. It preserves evidence, normalizes entities, stores typed relationships and supports temporal, lexical, semantic and graph retrieval.
+PKOS is ECC's canonical knowledge subsystem. It preserves immutable evidence, normalizes entity references, stores typed relationships and supports temporal and lexical retrieval. Semantic/vector retrieval remains deferred in Phase 1.
 
 ## Architectural rules
 
-1. Source evidence is immutable.
-2. Derived knowledge never overwrites source evidence.
-3. Every derived assertion records provenance and confidence.
-4. Every relationship is typed and temporally bounded.
-5. Embeddings, summaries and search indexes are rebuildable projections.
-6. Entity merges are auditable and reversible.
-7. Workspace isolation applies to every row and retrieval query.
+Source evidence is immutable; derived knowledge never overwrites evidence; derived assertions record provenance and confidence; relationships are typed and temporal; projections are rebuildable; workspace isolation applies to every row and query; actor/workspace come from the server-side session.
 
-## Logical schema
+## Logical-to-physical mapping
 
-### `pkos_entities`
+Domain aggregate tables are authoritative. `pkos_nodes` and `pkos_edges` are rebuildable projections and relationships, not a second aggregate store.
 
-| Field | Type | Rule |
+| Logical field | Phase 0 physical source | Phase 1 rule |
 |---|---|---|
-| id | uuid | primary key |
-| workspace_id | uuid | required, indexed |
-| entity_type | text | controlled vocabulary |
-| canonical_name | text | required where meaningful |
-| attributes | jsonb | type-specific attributes |
-| status | text | lifecycle status |
-| valid_from | timestamptz | optional temporal start |
-| valid_to | timestamptz | optional temporal end |
-| confidence | decimal | 0..1 for derived entities; 1 for authoritative local entities |
-| provenance_id | uuid | nullable for authoritative local entities |
-| version | bigint | optimistic concurrency |
-| created_at | timestamptz | required |
-| updated_at | timestamptz | required |
-| deleted_at | timestamptz | soft deletion |
+| entity identity | `pkos_nodes.id` plus domain aggregate ID | add/use `entity_id` and unique `(workspace_id,entity_type,entity_id)` |
+| workspace boundary | `pkos_nodes.workspace_id` | retain composite workspace constraints |
+| entity type | `pkos_nodes.node_type` | map/rename logically to controlled `entity_type` |
+| canonical name | `pkos_nodes.label` or attributes | use approved label column/projection; nullable |
+| attributes | `pkos_nodes.properties` JSONB | only approved searchable/display projection fields |
+| lifecycle status | absent or properties JSONB | Phase 1 migration adds explicit `status` or documented generated projection |
+| confidence | absent or properties JSONB | Phase 1 migration adds explicit decimal 0..1 |
+| source version | absent | Phase 1 migration adds `version bigint` copied from aggregate |
+| temporal validity | absent on nodes | deferred for nodes; edges use valid_from/valid_to in Phase 1 migration |
+| provenance | evidence relation/properties | dedicated provenance table deferred; evidence IDs and rule/model metadata remain explicit |
+| deleted state | existing deleted/archived marker where present | normalize to `deleted_at` projection semantics |
 
-Allowed initial `entity_type` values:
-
-```text
-workspace user person organization project goal task commitment
-calendar_event meeting conversation message document decision
-knowledge_item evidence risk attention_item recommendation reminder
-```
-
-### `pkos_relationships`
-
-| Field | Type | Rule |
+| Logical relationship field | Phase 0 physical source | Phase 1 rule |
 |---|---|---|
-| id | uuid | primary key |
-| workspace_id | uuid | required |
-| from_entity_id | uuid | required |
-| relationship_type | text | controlled vocabulary |
-| to_entity_id | uuid | required |
-| attributes | jsonb | relationship metadata |
-| confidence | decimal | 0..1 |
-| provenance_id | uuid | required for inferred/imported relationships |
-| valid_from | timestamptz | optional |
-| valid_to | timestamptz | optional |
-| status | text | active, disputed, invalidated |
-| created_at | timestamptz | required |
-| invalidated_at | timestamptz | optional |
+| from/to entity | `pkos_edges.source_node_id`, `target_node_id` | retain with composite `(workspace_id,id)` FKs |
+| relationship type | `pkos_edges.edge_type` | controlled vocabulary |
+| attributes | `pkos_edges.properties` JSONB | approved metadata only |
+| confidence | absent or JSONB | Phase 1 migration adds explicit decimal |
+| evidence | evidence reference absent/JSONB | Phase 1 migration adds nullable `evidence_id` composite FK |
+| validity | absent | Phase 1 migration adds valid_from/valid_to |
+| status | absent | Phase 1 migration adds `active|disputed|invalidated` |
 
-Initial relationship vocabulary:
-
-```text
-MEMBER_OF PARTICIPATES_IN OWNS ASSIGNED_TO MAKES MADE_TO
-RELATES_TO ADVANCES THREATENS BLOCKS DEPENDS_ON PRODUCES
-SUPPORTS SUPERSEDES ABOUT MENTIONS DERIVED_FROM SCHEDULED_FOR
-```
-
-### `pkos_evidence`
-
-| Field | Type | Rule |
+| Logical concept | Physical representation | Status |
 |---|---|---|
-| id | uuid | primary key |
-| workspace_id | uuid | required |
-| source_system | text | local, gmail, calendar, github, jira, file, etc. |
-| source_id | text | immutable source identifier |
-| source_revision | text | optional revision/etag |
-| media_type | text | required |
-| content_uri | text | content-addressed object reference |
-| checksum | text | SHA-256 |
-| captured_at | timestamptz | required |
-| observed_at | timestamptz | required |
-| excerpt_start | integer | optional |
-| excerpt_end | integer | optional |
-| metadata | jsonb | source-specific metadata |
+| `pkos_entities` | domain tables plus `pkos_nodes` projection | active |
+| `pkos_relationships` | `pkos_edges` | active with Phase 1 column migrations above |
+| `pkos_evidence` | `pkos_evidence` | active authoritative evidence metadata |
+| `pkos_provenance` | evidence references and projection metadata | dedicated table deferred |
+| aliases and merge records | none | deferred until identity-resolution phase |
+| embeddings and chunks | none | explicitly deferred |
 
-Unique constraint: `(workspace_id, source_system, source_id, source_revision)` where supported.
+No statement in this document implies that Phase 0 already contains every logical field; the tables become Phase 1-compatible only after the listed migrations.
 
-### `pkos_provenance`
+## Phase 1 entity and relationship vocabulary
 
-| Field | Type | Rule |
-|---|---|---|
-| id | uuid | primary key |
-| workspace_id | uuid | required |
-| derivation_type | text | imported, user_asserted, rule_derived, model_derived |
-| evidence_ids | uuid[] | at least one for imported/model-derived assertions |
-| model_execution_id | uuid | required for model-derived output |
-| rule_id | text | required for rule-derived output |
-| explanation | text | human-readable rationale |
-| confidence | decimal | 0..1 |
-| created_at | timestamptz | required |
+Entity types: task, commitment, note, calendar_event, meeting, risk, attention_item, recommendation, brief, evidence, person, organization, project, goal and decision.
 
-### `pkos_aliases`
+Relationships: MEMBER_OF, PARTICIPATES_IN, OWNS, ASSIGNED_TO, MAKES, MADE_TO, RELATES_TO, ADVANCES, THREATENS, BLOCKS, DEPENDS_ON, PRODUCES, SUPPORTS, SUPERSEDES, ABOUT, MENTIONS, DERIVED_FROM, SCHEDULED_FOR, PROPOSES_ACTION_ON and HIGHLIGHTS.
 
-Maps source identities and historical merged IDs to canonical entities.
+## Evidence contract
 
-| Field | Type |
-|---|---|
-| workspace_id | uuid |
-| alias_type | text |
-| alias_value | text |
-| entity_id | uuid |
-| source_system | text |
-| valid_from | timestamptz |
-| valid_to | timestamptz |
+`pkos_evidence` stores id, workspace_id, source_system, source_id/revision, media_type, content_uri, SHA-256 checksum, captured_at, observed_at, excerpt boundaries, redacted metadata and access_state `available|missing|permission_denied|deleted`. Source identity is unique per workspace where supported.
 
-Unique active alias: `(workspace_id, alias_type, alias_value, source_system)`.
+## Phase 1 search boundary
 
-### `pkos_merge_records`
+Search is PostgreSQL-only: normalized exact, prefix, full-text, approved trigram, recency and entity-type boosts. Results expose score components, timestamps, source context and evidence access state. Embeddings, ANN, semantic similarity, external vector databases, dedicated graph databases and multi-hop ranking are not permitted Phase 1 dependencies.
 
-Stores entity-resolution decisions:
+## Indexing, backup and change policy
 
-- surviving entity ID
-- merged entity IDs
-- proposal evidence
-- actor or model execution
-- timestamp
-- reversible field-level change set
-- status: proposed, confirmed, reversed
-
-### `pkos_embeddings`
-
-| Field | Type | Rule |
-|---|---|---|
-| workspace_id | uuid | required |
-| object_type | text | entity, evidence, chunk |
-| object_id | uuid | required |
-| model_id | text | exact embedding model/version |
-| content_hash | text | detects stale embeddings |
-| embedding | vector | dimension determined by approved model |
-| created_at | timestamptz | required |
-
-Unique constraint: `(workspace_id, object_type, object_id, model_id, content_hash)`.
-
-### `pkos_chunks`
-
-Documents and long messages are chunked into immutable content-derived units with:
-
-- parent evidence ID
-- ordinal
-- start/end offsets
-- text checksum
-- text content or secure content reference
-- token count
-- heading/path metadata
-
-## Retrieval contract
-
-PKOS supports four retrieval modes through one service contract:
-
-1. Exact/entity lookup
-2. Filtered lexical search
-3. Semantic similarity search
-4. Relationship traversal
-
-Hybrid search combines normalized lexical score, semantic score, recency, authority and relationship proximity. The response must include score components and evidence references.
-
-## Temporal reasoning
-
-Relationships and assertions may use `valid_from` and `valid_to`. `created_at` records when ECC learned the information; validity records when it was true. Queries must distinguish transaction time from valid time.
-
-## Conflict handling
-
-Conflicting assertions are stored independently. PKOS marks them as disputed and retains all evidence. Resolution creates a new authoritative assertion or invalidates a relationship; it does not delete contradictory evidence.
-
-## Entity resolution
-
-Resolution stages:
-
-```text
-normalize identifiers
--> generate candidates
--> score candidates
--> auto-link only below-risk deterministic matches
--> propose high-impact merges
--> human confirmation
--> preserve aliases and merge record
-```
-
-Persons, organizations, commitments and decisions require human confirmation for non-deterministic merges during Phase 0/1.
-
-## Indexing
-
-Required indexes:
-
-- workspace + entity type + status
-- canonical name trigram/full-text
-- relationship from/type/to
-- evidence source identity
-- validity ranges
-- embedding ANN index
-- JSONB GIN only for approved query paths
-
-## Backup and rebuild
-
-Authoritative backup includes transactional tables and source evidence objects. Embeddings, lexical indexes, summaries and attention projections may be excluded because they are rebuildable. Restore validation must prove referential integrity, checksums and workspace isolation.
-
-## Schema change policy
-
-All breaking changes require:
-
-- migration plan
-- rollback plan
-- event compatibility review
-- API contract update
-- retrieval regression tests
-- backup/restore verification
-- ADR when ownership or storage technology changes
+Required indexes cover workspace/entity/status, entity identity, normalized/prefix/full-text labels, optional trigram, edge source/type/target, evidence identity and validity ranges. Backups include authoritative aggregates, relationships and evidence. Rebuildable projections may be regenerated, but restore validates checksums, referential integrity, composite workspace constraints and representative search results. Breaking changes require migration, rollback/forward-fix, API/event review, retrieval tests, backup/restore verification and an ADR when ownership or technology changes.
