@@ -1,34 +1,62 @@
-# Executive Command Center – Engineering Specification v1.1
+# Executive Command Center
 
-This repository contains the modular engineering specification for the Executive Command Center.
+> A local-first AI Executive Operating System.
 
-## Document set
-- `docs/00-document-control.md`
-- `docs/01-product-definition.md`
-- `docs/02-design-principles.md`
-- `docs/03-system-architecture.md`
-- `docs/04-approved-technology-registry.md`
-- `docs/05-repository-standards.md`
-- `docs/06-ai-architecture.md`
-- `docs/07-security-architecture.md`
-- `docs/08-local-first-architecture.md`
-- `docs/09-observability.md`
-- `docs/10-development-process.md`
-- `docs/phases/phase-0-foundation.md`
-- `docs/phases/phase-1-executive-daily-assistant.md`
-- `docs/phases/phase-2-engineering-workspace.md`
-- `docs/phases/phase-3-executive-brain.md`
-- `docs/phases/phase-4-chief-of-staff.md`
-- `docs/phases/phase-5-automation-platform.md`
-- `docs/phases/phase-6-personal-os.md`
-- `docs/phases/phase-7-digital-chief-of-staff.md`
-- `docs/adr/README.md`
-- `docs/appendices/glossary.md`
-- `docs/appendices/api-guidelines.md`
-- `docs/appendices/coding-standards.md`
-- `docs/appendices/prompt-standards.md`
-- `docs/appendices/testing-strategy.md`
-- `docs/99-ai-implementation-playbook.md`
+Executive Command Center (ECC) is a specification-driven platform for helping executives manage attention, context, commitments, decisions, knowledge, meetings and execution.
 
-## Rule
-If it is not documented in the current phase, it does not get implemented.
+## Current status
+
+**Foundation specification:** Draft — under review  
+**Implementation:** Not started  
+**Current delivery phase:** Phase 0 — Repository Foundation
+
+## Start here
+
+Read the documents in this order:
+
+1. [SPEC-000 — Constitution](docs/specifications/SPEC-000.md)
+2. [RFC-000 — Specification Governance](docs/RFC-000.md)
+3. [RFC-001 — Product Definition](docs/RFC-001.md)
+4. [RFC-002 — Engineering Philosophy](docs/RFC-002.md)
+5. [RFC-003 — Design Principles](docs/RFC-003.md)
+6. [RFC-004 — System Architecture](docs/RFC-004.md)
+7. [RFC-005 — Approved Technology Registry](docs/RFC-005.md)
+8. [STD-001 — Repository Standards](docs/standards/STD-001.md)
+9. [Roadmap](docs/ROADMAP.md)
+10. [Contributing](docs/CONTRIBUTING.md)
+
+## Architecture chapters
+
+RFC-004 is split into independently reviewable chapters under [`docs/architecture`](docs/architecture/):
+
+- Architectural vision and system context
+- Core platform and service architecture
+- Runtime, deployment and operations
+- AI runtime
+- Knowledge platform and memory
+- Human attention engine
+- Connector and integration platform
+- Frontend and executive experience
+- Data platform
+- Security, privacy and local-first architecture
+- Platform operations
+
+## Governance support
+
+- [ADR process](docs/adr/README.md)
+- [RFC template](docs/templates/RFC-TEMPLATE.md)
+- [ADR template](docs/templates/ADR-TEMPLATE.md)
+- [Standard template](docs/templates/STD-TEMPLATE.md)
+- [Phase template](docs/templates/PHASE-TEMPLATE.md)
+- [Specification change request](docs/templates/SPEC-CHANGE-REQUEST.md)
+
+## Phase specifications
+
+- [PHASE-000 — Repository Foundation](docs/phases/PHASE-000-repository-foundation.md)
+- [PHASE-001 — Executive Dashboard MVP](docs/phases/PHASE-001-executive-dashboard-mvp.md)
+
+## Repository rule
+
+> If a capability is not documented in the current phase specification, it does not get implemented.
+
+Every behavior-changing change must include its specification, implementation, tests and documentation in the same pull request.
