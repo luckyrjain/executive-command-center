@@ -8,18 +8,25 @@ from sqlalchemy import text
 
 from ecc.config import get_settings
 from ecc.database import engine
+from ecc.domains.planning.tasks import router as tasks_router
 from ecc.logging import configure_logging
 
 configure_logging()
 settings = get_settings()
-app = FastAPI(title="Executive Command Center", version="0.1.0")
+app = FastAPI(title="Executive Command Center", version="0.2.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origin_list,
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
-    allow_headers=["Content-Type", "X-CSRF-Token", "X-Correlation-ID"],
+    allow_headers=[
+        "Content-Type",
+        "X-CSRF-Token",
+        "X-Correlation-ID",
+        "Idempotency-Key",
+    ],
 )
+app.include_router(tasks_router)
 
 
 @app.middleware("http")
