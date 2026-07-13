@@ -2,171 +2,110 @@
 id: API-CONTRACTS
 title: Domain API Contracts
 status: Accepted
-version: 1.0.0
+version: 1.1.0
 owner: Lucky Jain
 related:
   - DOMAIN-MODEL
   - EVENT-CATALOG
   - RFC-004
+  - PHASE-001
+  - PHASE-001-API-SCHEMAS
 ---
 
 # Domain API Contracts
 
 ## Contract rules
 
-- External HTTP APIs use `/api/v1` and JSON.
-- Internal domains communicate through typed application interfaces and events.
+- External APIs use `/api/v1` and JSON.
 - Commands may change state; queries never change state.
-- Every request carries `workspace_id`, `request_id` and authenticated actor context.
-- All mutations require an idempotency key.
-- Dates are ISO-8601 UTC. IDs are UUID strings.
-- Pagination uses opaque cursors.
-- Errors use the common envelope below.
+- Actor and workspace are derived exclusively from the authenticated opaque server-side session.
+- Browser-supplied `workspace_id`, `actor_id` or ownership fields are rejected.
+- Mutations require `Idempotency-Key`; updates require `expected_version`.
+- Repeating a mutation with the same key and request hash returns the original response; a different hash returns `409 IDEMPOTENCY_CONFLICT`.
+- Dates are ISO-8601; storage is UTC; daily interpretation uses the workspace IANA timezone.
+- Pagination uses opaque signed cursors.
+- Cross-workspace and absent entity IDs both return 404.
+
+Error envelope:
 
 ```json
-{
-  "error": {
-    "code": "TASK_NOT_FOUND",
-    "message": "Task was not found",
-    "request_id": "uuid",
-    "details": {}
-  }
-}
+{"error":{"code":"TASK_NOT_FOUND","message":"Task was not found","request_id":"uuid","details":{}}}
 ```
 
-## Identity
+## Domain commands and queries
 
-### Commands
+### Planning
 
-- `CreateWorkspace(owner)` -> `Workspace`
-- `CreatePerson(display_name, source_refs[])` -> `Person`
-- `ProposePersonMerge(candidate_ids, evidence_ids[])` -> `MergeProposal`
-- `ConfirmPersonMerge(proposal_id)` -> `MergeRecord`
+Commands: CreateTask, UpdateTask, CompleteTask, CancelTask, ArchiveTask, CreateCalendarEvent, UpdateCalendarEvent, CreateMeeting, UpdateMeeting, CreateReminder.
+Queries: GetToday, GetTask, ListTasks, ListCalendarEvents, GetMeeting, ListMeetings.
 
-### Queries
+### Communication
 
-- `GetWorkspace(workspace_id)`
-- `GetPerson(person_id)`
-- `FindPeople(query, source_ref?)`
+Commands: CreateCommitment, UpdateCommitment, ConfirmCommitment, FulfilCommitment, CancelCommitment, ArchiveCommitment.
+Queries: GetCommitment, ListCommitments, GetConversation, ListMessages.
 
-## Planning
+### Knowledge Platform
 
-### Commands
+Commands: CreateNote, UpdateNote, ArchiveNote, ImportDocument, RecordDecision, CreateKnowledgeItem, CreateRelationship, InvalidateRelationship.
+Queries: GetNote, ListNotes, SearchKnowledge, GetEvidence, GetDecision, GetRelated.
 
-- `CreateProject(title, owner_id, goal_ids[])`
-- `ChangeProjectStatus(project_id, expected_version, status)`
-- `CreateTask(title, owner_id, project_id?, due_at?, priority)`
-- `UpdateTask(task_id, expected_version, patch)`
-- `CompleteTask(task_id, expected_version)`
-- `CreateReminder(entity_ref, trigger)`
+### Executive Intelligence
 
-### Queries
+Commands: GenerateMorningBrief, CreateRisk, UpdateRisk, CloseRisk, GenerateRecommendation, ConfirmRecommendation, RejectRecommendation, DeferRecommendation, PinRecommendation.
+Queries: GetDashboard, GetMorningBrief, ListAttentionItems, ListRisks, ListRecommendations.
 
-- `GetToday(user_id, date)`
-- `GetTask(task_id)`
-- `ListTasks(filters, cursor)`
-- `GetProject(project_id)`
-- `ListCalendarEvents(range, cursor)`
+### Audit
 
-## Communication
+Query only: ListAuditEvents. Audit writes are internal transactional behavior, not a public command.
 
-### Commands
-
-- `ConfirmCommitment(commitment_id, owner_id, due_at?)`
-- `FulfilCommitment(commitment_id, evidence_id?)`
-- `RejectDetectedCommitment(commitment_id, reason)`
-
-### Queries
-
-- `GetConversation(conversation_id)`
-- `ListMessages(conversation_id, cursor)`
-- `GetCommitment(commitment_id)`
-- `ListCommitments(filters, cursor)`
-
-## Knowledge Platform
-
-### Commands
-
-- `ImportDocument(source_ref, content_ref, metadata)`
-- `RecordDecision(context, choice, rationale, alternatives, evidence_ids[])`
-- `CreateKnowledgeItem(kind, content, evidence_ids[], confidence)`
-- `CreateRelationship(from_ref, type, to_ref, evidence_ids[], confidence)`
-- `InvalidateRelationship(relationship_id, reason)`
-
-### Queries
-
-- `GetEntity(entity_ref)`
-- `GetTimeline(entity_ref, range, cursor)`
-- `GetRelated(entity_ref, relationship_types[], depth)`
-- `SearchKnowledge(query, filters, cursor)`
-- `GetDecision(decision_id)`
-- `GetEvidence(evidence_id)`
-
-## Executive Intelligence
-
-### Commands
-
-- `GenerateMorningBrief(user_id, date)`
-- `RequestMeetingPreparation(meeting_id, sections[])`
-- `CreateRisk(project_id?, description, probability, impact, owner_id)`
-- `AcceptRecommendation(recommendation_id)`
-- `RejectRecommendation(recommendation_id, reason)`
-
-### Queries
-
-- `GetDashboard(user_id, date)`
-- `GetMorningBrief(user_id, date)`
-- `ListAttentionItems(user_id, filters)`
-- `GetMeetingPreparation(meeting_id)`
-- `ListRisks(filters, cursor)`
-
-## AI Platform
-
-### Commands
-
-- `ExecuteModel(task_type, input_refs[], output_schema, policy)`
-- `RunAgent(agent_definition_id, objective, context_refs[])`
-- `RecordEvaluation(execution_id, metric, result)`
-
-### Queries
-
-- `GetModelExecution(execution_id)`
-- `GetPromptDefinition(prompt_id, version?)`
-- `ListEvaluations(filters, cursor)`
-
-## Integration Platform
-
-### Commands
-
-- `RegisterConnector(type, credentials_ref, configuration)`
-- `StartSync(connector_id, cursor?)`
-- `DisableConnector(connector_id)`
-
-### Queries
-
-- `GetConnector(connector_id)`
-- `GetSyncStatus(connector_id)`
-- `ListSourceRecords(connector_id, cursor)`
-
-## HTTP surface for Phase 0/1
+## Phase 1 HTTP surface
 
 ```text
-GET    /api/v1/health
 GET    /api/v1/dashboard/today
 GET    /api/v1/tasks
 POST   /api/v1/tasks
-PATCH  /api/v1/tasks/{task_id}
-POST   /api/v1/tasks/{task_id}/complete
-GET    /api/v1/calendar/events
+GET    /api/v1/tasks/{id}
+PATCH  /api/v1/tasks/{id}
+POST   /api/v1/tasks/{id}/complete
+POST   /api/v1/tasks/{id}/archive
 GET    /api/v1/commitments
+POST   /api/v1/commitments
+GET    /api/v1/commitments/{id}
+PATCH  /api/v1/commitments/{id}
 POST   /api/v1/commitments/{id}/confirm
-GET    /api/v1/knowledge/search
-GET    /api/v1/meetings/{id}/preparation
-POST   /api/v1/meetings/{id}/preparation
+POST   /api/v1/commitments/{id}/fulfil
+POST   /api/v1/commitments/{id}/archive
+GET    /api/v1/notes
+POST   /api/v1/notes
+GET    /api/v1/notes/{id}
+PATCH  /api/v1/notes/{id}
+POST   /api/v1/notes/{id}/archive
+GET    /api/v1/calendar/events
+POST   /api/v1/calendar/events
+PATCH  /api/v1/calendar/events/{id}
+GET    /api/v1/meetings
+POST   /api/v1/meetings
+GET    /api/v1/meetings/{id}
+PATCH  /api/v1/meetings/{id}
+GET    /api/v1/risks
+POST   /api/v1/risks
+GET    /api/v1/risks/{id}
+PATCH  /api/v1/risks/{id}
+POST   /api/v1/risks/{id}/close
 GET    /api/v1/briefs/morning
 POST   /api/v1/briefs/morning
+GET    /api/v1/recommendations
+GET    /api/v1/recommendations/{id}
+POST   /api/v1/recommendations/{id}/confirm
+POST   /api/v1/recommendations/{id}/reject
+POST   /api/v1/recommendations/{id}/defer
+POST   /api/v1/recommendations/{id}/pin
+GET    /api/v1/search
+GET    /api/v1/audit
 ```
 
-## Concurrency and idempotency
+Exact Phase 1 request, response, filter, validation and error schemas are normative in `docs/phases/phase-001/API-SCHEMAS.md`.
 
-Mutations reject stale `expected_version` with `409 VERSION_CONFLICT`. Repeating a mutation with the same idempotency key returns the original result. Commands that invoke external side effects require explicit approval state and audit records.
+## Concurrency and confirmation
+
+Stale mutations return `409 VERSION_CONFLICT` with the current version. Recommendation confirmation revalidates recommendation expiry, evidence availability and the target aggregate version before execution. Confirmation, execution, domain mutation, audit record and outbox event follow the transactional rules in the Phase 1 contracts.
