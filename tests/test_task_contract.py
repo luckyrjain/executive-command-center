@@ -1,9 +1,17 @@
 from datetime import UTC, date, datetime
+from uuid import uuid4
 
 import pytest
 from pydantic import ValidationError
 
-from ecc.domains.planning.tasks import TaskAction, TaskCreate, TaskPatch, router
+from ecc.domains.planning.tasks import (
+    TaskAction,
+    TaskCreate,
+    TaskPatch,
+    _decode_cursor,
+    _encode_cursor,
+    router,
+)
 
 
 def test_task_create_defaults_to_captured_medium() -> None:
@@ -72,3 +80,12 @@ def test_task_router_exposes_frozen_phase_one_routes() -> None:
         ("/api/v1/tasks/{task_id}/restore", "POST"),
     }
     assert expected <= routes
+
+
+def test_task_cursor_is_signed_and_round_trips() -> None:
+    created_at = datetime(2026, 7, 14, 9, 30, tzinfo=UTC)
+    task_id = uuid4()
+
+    cursor = _encode_cursor(created_at, task_id)
+
+    assert _decode_cursor(cursor) == (created_at, task_id)
