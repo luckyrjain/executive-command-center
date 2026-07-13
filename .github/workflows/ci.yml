@@ -41,17 +41,18 @@ jobs:
         run: python --version
       - run: uv sync --all-groups --python 3.14.6
       - name: Ruff lint
+        run: uv run ruff check backend tests
+      - name: Ruff format
         shell: bash
         run: |
           set -o pipefail
-          uv run ruff check backend tests 2>&1 | tee backend-diagnostics.log
-      - name: Upload backend diagnostics
+          uv run ruff format --check --diff backend tests 2>&1 | tee backend-format-diagnostics.log
+      - name: Upload backend format diagnostics
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: backend-diagnostics
-          path: backend-diagnostics.log
-      - run: uv run ruff format --check backend tests
+          name: backend-format-diagnostics
+          path: backend-format-diagnostics.log
       - run: uv run mypy backend
       - run: uv run alembic -c backend/alembic.ini upgrade head
       - run: uv run pytest
