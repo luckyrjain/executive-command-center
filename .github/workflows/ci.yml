@@ -30,14 +30,16 @@ jobs:
       ECC_DATABASE_URL: postgresql+psycopg://ecc:ecc@localhost:5432/ecc
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v6
+        with:
+          python-version: 3.14.6
       - uses: astral-sh/setup-uv@v6
         with:
           version: 0.7.19
-      - name: Install approved Python runtime
-        run: uv python install 3.14.5
+          enable-cache: true
       - name: Verify Python runtime
-        run: uv run --python 3.14.5 python --version
-      - run: uv sync --all-groups --python 3.14.5
+        run: python --version
+      - run: uv sync --all-groups --python 3.14.6
       - run: uv run ruff check backend tests
       - run: uv run ruff format --check backend tests
       - run: uv run mypy backend
