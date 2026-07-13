@@ -24,8 +24,8 @@ class AuthContext:
 
 
 def require_auth_context(
+    session: SessionDep,
     ecc_session: SessionCookie = None,
-    session: SessionDep = None,
 ) -> AuthContext:
     if not ecc_session:
         raise HTTPException(
