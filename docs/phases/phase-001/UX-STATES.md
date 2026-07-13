@@ -2,7 +2,7 @@
 id: PHASE-001-UX-STATES
 title: Phase 1 UX States
 status: Approved
-version: 1.0.0
+version: 1.0.1
 owner: Lucky Jain
 ---
 
@@ -26,21 +26,21 @@ The frontend never trusts browser-provided workspace identity. Authentication ex
 
 Create forms validate inline and preserve entered data after recoverable errors. Edit screens show save state. On `409 VERSION_CONFLICT`, show the latest server version, the user's unsaved changes, and actions to reload or manually reapply; silent overwrite is prohibited.
 
-Archive is reversible and requires confirmation only when the action removes the item from normal views. Complete and fulfil actions use an undo toast where the domain transition is reversible by a new audited mutation.
+Every successful lifecycle action returns the current entity representation and updates the UI from that response. Archive is reversible and requires confirmation only when the action removes the item from normal views.
 
-## Recommendation confirmation
+## Recommendation publication and confirmation
 
-A recommendation detail page shows source `rule|ai`, rationale, confidence, evidence, proposed action, before/after preview, target version, expiry, and possible side effects.
+A generated recommendation begins in `proposed`. The detail page offers an explicit Publish action that moves it to `pending_confirmation`. Only pending-confirmation recommendations expose Confirm. The page shows source `rule|ai`, rationale, confidence, evidence, proposed action, before/after preview, target version, expiry, and possible side effects.
 
 State flow:
 
 `proposed -> pending_confirmation -> accepted|rejected|expired|superseded -> executed|failed`.
 
-Confirm is disabled when evidence is unavailable, the recommendation is expired, or the target version changed. Confirmation requires an explicit button; no default-focused destructive action. Failed execution remains visible with retry rules and audit link.
+Confirm is disabled when evidence is unavailable, missing, permission-denied, deleted, expired, or when the target version changed. Confirmation requires an explicit button; no default-focused destructive action. Failed execution remains visible with retry rules and audit link.
 
 ## Evidence
 
-Evidence components show label, source type, captured time, excerpt when permitted, and status `available|missing|permission_denied`. External links require an explicit user click and never auto-open.
+Evidence components show label, source type, captured time, excerpt when permitted, and status `available|missing|permission_denied|deleted`. Deleted evidence is shown as previously existing but no longer available. External links require an explicit user click and never auto-open.
 
 ## Notes
 
@@ -48,7 +48,7 @@ The editor autosaves after a debounce, displays last saved time and version, and
 
 ## Search
 
-Search supports keyboard submission, filters, clear state, stable result focus, escaped highlights, loading more, empty results, malformed cursor recovery, and degraded prefix-only mode.
+Search supports keyboard submission, filters including `calendar_event`, clear state, stable result focus, escaped highlights, loading more, empty results, malformed cursor recovery, and degraded prefix-only mode.
 
 ## Time handling
 
@@ -60,4 +60,4 @@ All user-facing daily boundaries use the workspace IANA timezone. All-day and cr
 
 ## Accessibility tests
 
-Automated axe checks cover core pages; Playwright covers keyboard-only task creation, recommendation confirmation, conflict resolution, note autosave recovery, search navigation, and focus restoration after dialogs.
+Automated axe checks cover core pages; Playwright covers keyboard-only task creation, recommendation publication and confirmation, conflict resolution, note autosave recovery, search navigation, and focus restoration after dialogs.
