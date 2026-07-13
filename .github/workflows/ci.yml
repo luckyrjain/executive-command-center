@@ -6,41 +6,10 @@ on:
     branches: [main]
 
 permissions:
-  contents: write
+  contents: read
   pull-requests: read
 
 jobs:
-  lockfiles:
-    if: github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-        with:
-          ref: ${{ github.head_ref }}
-      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
-        with:
-          python-version: 3.14.6
-      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
-        with:
-          version: 0.7.19
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
-        with:
-          node-version: 22.17.0
-      - run: uv lock --python 3.14.6
-      - run: corepack enable && corepack prepare pnpm@10.12.4 --activate
-      - run: pnpm install --lockfile-only --no-frozen-lockfile
-      - name: Commit lockfiles
-        shell: bash
-        run: |
-          if git diff --quiet -- uv.lock pnpm-lock.yaml && git ls-files --error-unmatch uv.lock pnpm-lock.yaml >/dev/null 2>&1; then
-            exit 0
-          fi
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add uv.lock pnpm-lock.yaml
-          git commit -m "build: add reproducible dependency lockfiles"
-          git push
-
   backend:
     runs-on: ubuntu-latest
     services:
@@ -68,7 +37,7 @@ jobs:
         with:
           version: 0.7.19
           enable-cache: true
-      - run: uv sync --all-groups --python 3.14.6
+      - run: uv sync --frozen --all-groups --python 3.14.6
       - run: uv run ruff check backend tests
       - run: uv run ruff format --check backend tests
       - run: uv run mypy backend
@@ -85,10 +54,17 @@ jobs:
           node-version: 22.17.0
       - run: corepack enable
       - run: corepack prepare pnpm@10.12.4 --activate
-      - run: pnpm install --no-frozen-lockfile
+      - run: pnpm install --frozen-lockfile
       - run: pnpm --filter @ecc/frontend typecheck
       - run: pnpm --filter @ecc/frontend test -- --run
       - run: pnpm --filter @ecc/frontend build
+
+  containers:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - run: docker build -f backend/Dockerfile -t ecc-backend:ci .
+      - run: docker build -f frontend/Dockerfile -t ecc-frontend:ci .
 
   security:
     runs-on: ubuntu-latest
