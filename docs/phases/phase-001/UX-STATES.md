@@ -2,7 +2,7 @@
 id: PHASE-001-UX-STATES
 title: Phase 1 UX States
 status: Approved
-version: 1.0.1
+version: 1.0.2
 owner: Lucky Jain
 ---
 
@@ -32,11 +32,16 @@ Every successful lifecycle action returns the current entity representation and 
 
 A generated recommendation begins in `proposed`. The detail page offers an explicit Publish action that moves it to `pending_confirmation`. Only pending-confirmation recommendations expose Confirm. The page shows source `rule|ai`, rationale, confidence, evidence, proposed action, before/after preview, target version, expiry, and possible side effects.
 
-State flow:
+State transitions are exactly:
 
-`proposed -> pending_confirmation -> accepted|rejected|expired|superseded -> executed|failed`.
+```text
+proposed -> pending_confirmation
+pending_confirmation -> rejected | expired | superseded
+pending_confirmation -> accepted
+accepted -> executed | failed
+```
 
-Confirm is disabled when evidence is unavailable, missing, permission-denied, deleted, expired, or when the target version changed. Confirmation requires an explicit button; no default-focused destructive action. Failed execution remains visible with retry rules and audit link.
+Confirm is enabled only when all required evidence has access state `available`, the recommendation has not expired, and the target version still matches. Confirmation requires an explicit button; no default-focused destructive action. Failed execution remains visible with retry rules and audit link.
 
 ## Evidence
 
