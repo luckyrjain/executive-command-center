@@ -2,7 +2,7 @@
 id: PHASE-001
 title: Executive Dashboard MVP
 status: Approved for Implementation
-version: 1.0.1
+version: 1.0.2
 owner: Lucky Jain
 depends_on:
   - PHASE-000
@@ -11,9 +11,9 @@ depends_on:
   - RFC-004
   - RFC-005@1.1.0
   - STD-001
-  - DOMAIN-MODEL@1.1.1
-  - API-CONTRACTS@1.1.1
-  - EVENT-CATALOG@1.1.1
+  - DOMAIN-MODEL@1.1.2
+  - API-CONTRACTS@1.1.2
+  - EVENT-CATALOG@1.1.2
   - PKOS-SCHEMA@1.1.1
 contracts:
   - phase-001/DATA-MODEL.md
@@ -38,10 +38,10 @@ Deliver a local, authenticated dashboard showing today's schedule, priorities, c
 - Local/manual calendar events and meetings; external connectors deferred.
 - Task, commitment, note and risk workflows.
 - Complete, fulfil, cancel, archive and restore actions where defined by the API contract.
-- Deterministic attention ranking and PostgreSQL-only search.
-- Recommendations with durable human confirmation.
-- Evidence presentation and immutable audit history.
-- Workspace-timezone-aware daily boundaries.
+- Deterministic attention ranking and PostgreSQL-only search, including CalendarEvent results.
+- Recommendations with explicit publication and durable human confirmation.
+- Evidence presentation using `available|missing|permission_denied|deleted`.
+- Immutable audit history and workspace-timezone-aware daily boundaries.
 
 ## Out of scope
 
@@ -59,9 +59,10 @@ The server derives actor, workspace and Phase 1 accountable owner from the authe
 - Every ranked item and recommendation exposes factors, confidence, evidence and source.
 - Deterministic dashboard, brief and search remain available without AI.
 - Recommendation transitions are exactly: `proposed -> pending_confirmation`; `pending_confirmation -> rejected|expired|superseded|accepted`; `accepted -> executed|failed`.
-- The `/confirm` action is available only from pending_confirmation and atomically performs accepted transition, local target mutation, executed transition, audit and outbox writes.
+- `GenerateRecommendation` creates proposed; `/publish` is the only transition to pending_confirmation; `/confirm` is available only from pending_confirmation and atomically performs accepted transition, local target mutation, executed transition, audit and outbox writes.
 - Every listed mutation writes a redacted append-only audit record.
 - Updates enforce optimistic concurrency and idempotency.
+- Every successful lifecycle action returns `200` with the current entity representation.
 
 ## Canonical API
 
@@ -85,7 +86,7 @@ GET|POST /api/v1/briefs/morning
 GET /api/v1/search
 GET /api/v1/audit
 GET /api/v1/recommendations
-POST /api/v1/recommendations/{id}/confirm|reject|defer|pin
+POST /api/v1/recommendations/{id}/publish|confirm|reject|defer|pin
 ```
 
 ## Deterministic behavior
@@ -94,7 +95,7 @@ Priority weights, waiting-on signals, dismissal versioning, tie-breakers and con
 
 ## Search, UX and feature flags
 
-Search uses normalized exact, prefix, PostgreSQL full-text and approved trigram matching. Embeddings and external vectors are deferred. Primary surfaces implement loading, empty, degraded, recoverable error, offline and version-conflict states, with WCAG 2.2 AA core flows.
+Search uses normalized exact, prefix, PostgreSQL full-text and approved trigram matching for task, commitment, note, meeting, calendar_event and risk. Embeddings and external vectors are deferred. Primary surfaces implement loading, empty, degraded, recoverable error, offline and version-conflict states, with WCAG 2.2 AA core flows.
 
 Feature flags: `phase1.recommendations=false`, `phase1.ai_brief_enrichment=false`, `phase1.search_trigram=true`. Flags are typed restart-required server configuration and do not change migration requirements.
 
@@ -102,9 +103,9 @@ Feature flags: `phase1.recommendations=false`, `phase1.ai_brief_enrichment=false
 
 - Frozen contracts and migrations pass CI.
 - Dashboard p95 <2 seconds; search p95 <500 ms locally and <800 ms CI; ranking 10,000 entities <500 ms.
-- Core CRUD/lifecycle, search, brief, recommendation, audit and Playwright tests pass.
+- Core CRUD/lifecycle, search, brief, recommendation publication/confirmation, audit and Playwright tests pass.
 - Every Phase 1 table has workspace-isolation tests.
-- Every mutation has audit coverage and recommendation execution requires durable confirmation.
+- Every mutation has audit coverage and recommendation execution requires publication plus durable confirmation.
 - AI-disabled/unavailable, backup/restore and accessibility tests pass.
 - Zero open critical/high/medium specification or code-review findings and zero known critical/high dependency vulnerabilities.
 
