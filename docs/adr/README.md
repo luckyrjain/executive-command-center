@@ -2,6 +2,19 @@
 
 Architecture Decision Records capture decisions that materially affect system structure, technology, data ownership, security boundaries, deployment or long-term maintainability.
 
+## Accepted Phase 0 decisions
+
+1. [ADR-0001 — Repository Layout](ADR-0001-repository-layout.md)
+2. [ADR-0002 — Local-First Architecture](ADR-0002-local-first-architecture.md)
+3. [ADR-0003 — Knowledge Platform and PKOS](ADR-0003-knowledge-platform-pkos.md)
+4. [ADR-0004 — AI Runtime](ADR-0004-ai-runtime.md)
+5. [ADR-0005 — Event Bus](ADR-0005-event-bus.md)
+6. [ADR-0006 — Storage Strategy](ADR-0006-storage-strategy.md)
+7. [ADR-0007 — Model Router](ADR-0007-model-router.md)
+8. [ADR-0008 — Authentication and Workspace Identity](ADR-0008-authentication.md)
+9. [ADR-0009 — Connector Synchronization](ADR-0009-synchronization.md)
+10. [ADR-0010 — Deployment Strategy](ADR-0010-deployment-strategy.md)
+
 ## Naming
 
 ```text
