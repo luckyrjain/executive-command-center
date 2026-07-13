@@ -25,17 +25,24 @@ def upgrade() -> None:
         sa.Column("email", sa.String(320), nullable=False),
         sa.Column("password_hash", sa.Text(), nullable=False),
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
-        sa.UniqueConstraint("workspace_id", "email"),
+        sa.UniqueConstraint("workspace_id", "id", name="uq_users_workspace_id_id"),
+        sa.UniqueConstraint("workspace_id", "email", name="uq_users_workspace_email"),
     )
     op.create_table(
         "sessions",
         sa.Column("id", uuid, primary_key=True),
         sa.Column("workspace_id", uuid, sa.ForeignKey("workspaces.id"), nullable=False, index=True),
-        sa.Column("user_id", uuid, sa.ForeignKey("users.id"), nullable=False, index=True),
+        sa.Column("user_id", uuid, nullable=False, index=True),
         sa.Column("token_hash", sa.String(64), nullable=False, unique=True),
         sa.Column("expires_at", sa.DateTime(timezone=True), nullable=False),
         sa.Column("last_seen_at", sa.DateTime(timezone=True), nullable=False),
         sa.Column("revoked_at", sa.DateTime(timezone=True)),
+        sa.ForeignKeyConstraint(
+            ["workspace_id", "user_id"],
+            ["users.workspace_id", "users.id"],
+            name="fk_sessions_workspace_user",
+            ondelete="CASCADE",
+        ),
     )
     op.create_table(
         "pkos_nodes",
@@ -51,13 +58,14 @@ def upgrade() -> None:
         ),
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
         sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
+        sa.UniqueConstraint("workspace_id", "id", name="uq_pkos_nodes_workspace_id_id"),
     )
     op.create_table(
         "pkos_edges",
         sa.Column("id", uuid, primary_key=True),
         sa.Column("workspace_id", uuid, sa.ForeignKey("workspaces.id"), nullable=False, index=True),
-        sa.Column("source_node_id", uuid, sa.ForeignKey("pkos_nodes.id"), nullable=False),
-        sa.Column("target_node_id", uuid, sa.ForeignKey("pkos_nodes.id"), nullable=False),
+        sa.Column("source_node_id", uuid, nullable=False),
+        sa.Column("target_node_id", uuid, nullable=False),
         sa.Column("edge_type", sa.String(100), nullable=False),
         sa.Column(
             "attributes",
@@ -65,16 +73,34 @@ def upgrade() -> None:
             nullable=False,
             server_default=sa.text("'{}'::jsonb"),
         ),
+        sa.ForeignKeyConstraint(
+            ["workspace_id", "source_node_id"],
+            ["pkos_nodes.workspace_id", "pkos_nodes.id"],
+            name="fk_pkos_edges_workspace_source",
+            ondelete="CASCADE",
+        ),
+        sa.ForeignKeyConstraint(
+            ["workspace_id", "target_node_id"],
+            ["pkos_nodes.workspace_id", "pkos_nodes.id"],
+            name="fk_pkos_edges_workspace_target",
+            ondelete="CASCADE",
+        ),
     )
     op.create_table(
         "pkos_evidence",
         sa.Column("id", uuid, primary_key=True),
         sa.Column("workspace_id", uuid, sa.ForeignKey("workspaces.id"), nullable=False, index=True),
-        sa.Column("node_id", uuid, sa.ForeignKey("pkos_nodes.id"), nullable=False),
+        sa.Column("node_id", uuid, nullable=False),
         sa.Column("source_type", sa.String(100), nullable=False),
         sa.Column("source_ref", sa.Text(), nullable=False),
         sa.Column("sha256", sa.String(64), nullable=False),
         sa.Column("captured_at", sa.DateTime(timezone=True), nullable=False),
+        sa.ForeignKeyConstraint(
+            ["workspace_id", "node_id"],
+            ["pkos_nodes.workspace_id", "pkos_nodes.id"],
+            name="fk_pkos_evidence_workspace_node",
+            ondelete="CASCADE",
+        ),
     )
     op.create_table(
         "event_outbox",
