@@ -1,8 +1,8 @@
 ---
 id: PHASE-001-MORNING-BRIEF
- title: Phase 1 Morning Brief Contract
+title: Phase 1 Morning Brief Contract
 status: Approved
-version: 1.0.0
+version: 1.0.1
 owner: Lucky Jain
 ---
 
@@ -16,40 +16,36 @@ The morning brief is a persisted, explainable snapshot for one workspace date. I
 
 1. Today's Schedule — maximum 8 meetings, ordered by start time.
 2. Top Priorities — maximum 7 attention items, ordered by the priority model.
-3. Overdue Commitments — maximum 5, ordered by score then oldest due date.
+3. Overdue Commitments — maximum 5, ordered by score then oldest due date/time.
 4. Risks — maximum 5 open risks, ordered by probability×impact then review date.
-5. Waiting On — maximum 5 commitments made to the user or blocked tasks.
+5. Waiting On — maximum 5 commitments with `direction=made_to_me` or blocked tasks with `blocked_on_person_id`.
 6. Recently Changed — maximum 5 audited changes from the previous 24 hours.
-7. Recommended Actions — maximum 3 approved rule/AI proposals requiring confirmation.
+7. Recommended Actions — maximum 3 eligible pending-confirmation rule/AI recommendations.
 
-Duplicate underlying entities appear in only the highest-priority applicable section, except meetings may also be referenced as evidence.
+Duplicate underlying entities appear only in the highest-priority applicable section, except meetings may also be evidence.
 
 ## Generation lifecycle
 
-A brief is keyed by `(workspace_id,user_id,briefing_date,generation_version)`. Generation occurs on first request after 04:00 local time, on explicit refresh, or after a material event when the existing brief is older than 15 minutes. Explicit refresh is idempotent.
+A brief is keyed by `(workspace_id,user_id,briefing_date,generation_version)`. Generation occurs on first request after 04:00 local time or explicit refresh.
 
-The deterministic generator reads a transactionally consistent snapshot. It stores section payloads, source entity versions, evidence IDs, generated_at, timezone, algorithm version, optional AI enrichment status, and stale reason.
+After a material source event, a brief older than 15 minutes becomes **refresh-eligible**. Independently, any brief older than 30 minutes becomes **stale-by-age**. These are distinct states: refresh eligibility permits regeneration; staleness requires the response to set `stale=true` or use live projections.
+
+Explicit refresh is idempotent. The deterministic generator reads a transactionally consistent snapshot and stores section payloads, source versions, evidence IDs, generated_at, timezone, algorithm version, optional AI enrichment status and stale reason.
 
 ## AI behavior
 
-AI enrichment is disabled by default behind `phase1.ai_brief_enrichment`. It may rewrite summaries but may not change inclusion, order, score, or proposed action. If AI fails, the deterministic brief is returned with `ai_status=unavailable` and no error to the user-facing dashboard.
+AI enrichment is disabled by default behind `phase1.ai_brief_enrichment`. It may rewrite summaries but may not change inclusion, order, score or proposed action. AI failure returns the deterministic brief with `ai_status=unavailable`.
 
 ## Evidence and explanation
 
-Every non-calendar item includes `why`, score factors, source entity reference, source version, and evidence summaries. Missing or inaccessible evidence is shown explicitly and never silently omitted.
+Every non-calendar item includes why, score factors, source entity reference/version and evidence summaries. Missing or inaccessible evidence is shown explicitly.
 
-## Staleness
+## Staleness and degraded behavior
 
-A brief is stale when any included entity version changes, the workspace date changes, or it is older than 30 minutes. Stale briefs may be returned immediately with `stale=true` while a deterministic refresh runs synchronously only when it can complete within the two-second dashboard budget; otherwise the dashboard uses live projections.
+A brief is stale when an included source version changes, the workspace date changes, or it is stale-by-age. Stale briefs may be returned immediately with `stale=true`. A synchronous deterministic refresh occurs only when it can finish within the two-second dashboard budget; otherwise the dashboard uses live projections.
 
-## Empty and degraded states
+Empty sections are omitted except Today's Schedule and Top Priorities, which return explicit empty messages. Database unavailability returns 503; AI unavailability never blocks the brief.
 
-Empty sections are omitted except Today's Schedule and Top Priorities, which return an explicit empty-state message. Database unavailability returns `503`; AI unavailability never blocks the brief.
+## Observability and tests
 
-## Observability
-
-Record generation duration, section counts, stale returns, AI fallback count, refresh reason, and failure category. Do not record private content, raw note text, entity IDs as metric labels, or raw search text.
-
-## Acceptance tests
-
-Snapshot tests freeze ordering and explanations. Tests cover empty data, all-day meetings, cross-midnight events, timezone rollover, duplicate suppression, AI unavailable, stale entity versions, recommendation confirmation links, and representative-data p95 under two seconds.
+Record generation duration, section counts, refresh eligibility, stale returns, AI fallback count, refresh reason and failure category without private content or high-cardinality labels. Snapshot tests cover empty data, all-day meetings, cross-midnight events, timezone rollover, duplicate suppression, AI unavailable, stale versions, refresh-eligible versus stale-by-age behavior, recommendation confirmation links and representative-data p95.
