@@ -2,7 +2,7 @@
 id: EVENT-CATALOG
 title: Domain Event Catalog
 status: Accepted
-version: 1.1.0
+version: 1.1.1
 owner: Lucky Jain
 related:
   - ADR-0005
@@ -14,27 +14,7 @@ related:
 
 ## Envelope
 
-Every event is immutable and uses:
-
-```json
-{
-  "event_id":"uuid",
-  "event_type":"task.created.v1",
-  "occurred_at":"2026-07-13T00:00:00Z",
-  "published_at":"2026-07-13T00:00:00Z|null",
-  "workspace_id":"uuid",
-  "actor_id":"uuid|null",
-  "aggregate_type":"task",
-  "aggregate_id":"uuid",
-  "aggregate_version":1,
-  "correlation_id":"uuid",
-  "causation_id":"uuid|null",
-  "producer":"planning",
-  "data":{}
-}
-```
-
-Events are named in past tense, schema version is part of `event_type`, consumers are idempotent by `event_id`, sensitive content is referenced rather than copied, and breaking changes create a new version.
+Every event is immutable and uses the canonical Phase 0 envelope. Events are past tense, schema version is part of `event_type`, consumers are idempotent by `event_id`, sensitive content is referenced rather than copied, and breaking payload changes create a new version.
 
 ## Phase 1 catalog
 
@@ -44,17 +24,20 @@ Events are named in past tense, schema version is part of `event_type`, consumer
 | `task.updated.v1` | Planning | task_id, changed_fields |
 | `task.completed.v1` | Planning | task_id, completed_at |
 | `task.cancelled.v1` | Planning | task_id, reason |
-| `task.archived.v1` | Planning | task_id, archived_at |
+| `task.archived.v1` | Planning | task_id, archived_at, pre_archive_status |
+| `task.restored.v1` | Planning | task_id, restored_status |
 | `commitment.created.v1` | Communication | commitment_id, direction, importance |
 | `commitment.detected.v1` | Communication | commitment_id, evidence_ids, confidence |
-| `commitment.confirmed.v1` | Communication | commitment_id, owner_id, due_at |
+| `commitment.confirmed.v1` | Communication | commitment_id, owner_id, due_date, due_at |
 | `commitment.updated.v1` | Communication | commitment_id, changed_fields |
 | `commitment.fulfilled.v1` | Communication | commitment_id, fulfilled_at |
 | `commitment.cancelled.v1` | Communication | commitment_id, reason |
-| `commitment.archived.v1` | Communication | commitment_id, archived_at |
+| `commitment.archived.v1` | Communication | commitment_id, archived_at, pre_archive_status |
+| `commitment.restored.v1` | Communication | commitment_id, restored_status |
 | `note.created.v1` | Knowledge | note_id, note_type, meeting_id |
 | `note.updated.v1` | Knowledge | note_id, changed_fields, body_checksum |
 | `note.archived.v1` | Knowledge | note_id, archived_at |
+| `note.restored.v1` | Knowledge | note_id |
 | `calendar_event.created.v1` | Planning | calendar_event_id, starts_at, ends_at |
 | `calendar_event.changed.v1` | Planning | calendar_event_id, changed_fields |
 | `meeting.created.v1` | Planning | meeting_id, calendar_event_id |
@@ -77,11 +60,11 @@ Events are named in past tense, schema version is part of `event_type`, consumer
 | `morning_brief.stale.v1` | Executive Intelligence | brief_id, stale_reason |
 | `feedback.recorded.v1` | Executive Intelligence | feedback_id, recommendation_id, action |
 
-Existing foundation events for workspace, person, organization, project, goal, document, knowledge, relationship, connector, message and decision remain valid.
+Existing foundation events remain valid.
 
 ## Audit relationship
 
-Domain events do not replace audit events. A successful mutation writes the domain aggregate, redacted audit record and outbox event in one transaction. Rejected authorization and version-conflict attempts may create audit records without publishing domain events.
+Domain events do not replace audit events. `AUDIT-CONTRACT.md` contains the normative API-action → audit-event → domain-event mapping. Successful mutations write the aggregate, redacted audit record and outbox event in one transaction. Rejected authorization and version-conflict attempts may create audit records without domain events.
 
 ## Compatibility and failure handling
 
