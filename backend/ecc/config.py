@@ -12,7 +12,11 @@ class Settings(BaseSettings):
         default="postgresql+psycopg://ecc:ecc@localhost:5432/ecc",
         validation_alias="ECC_DATABASE_URL",
     )
-    session_secret: str = Field(min_length=32, validation_alias="ECC_SESSION_SECRET")
+    session_secret: str = Field(
+        default="",
+        min_length=32,
+        validation_alias="ECC_SESSION_SECRET",
+    )
     cors_origins: str = Field(default="http://localhost:5173", validation_alias="ECC_CORS_ORIGINS")
 
     @property
