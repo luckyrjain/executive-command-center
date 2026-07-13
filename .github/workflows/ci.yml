@@ -40,7 +40,17 @@ jobs:
       - name: Verify Python runtime
         run: python --version
       - run: uv sync --all-groups --python 3.14.6
-      - run: uv run ruff check backend tests
+      - name: Ruff lint
+        shell: bash
+        run: |
+          set -o pipefail
+          uv run ruff check backend tests 2>&1 | tee backend-diagnostics.log
+      - name: Upload backend diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backend-diagnostics
+          path: backend-diagnostics.log
       - run: uv run ruff format --check backend tests
       - run: uv run mypy backend
       - run: uv run alembic -c backend/alembic.ini upgrade head
