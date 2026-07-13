@@ -17,7 +17,12 @@ jobs:
       - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
         with:
           version: 0.7.19
-      - run: uvx ruff==0.12.3 check backend tests --output-format concise
+      - name: Capture Ruff report
+        run: uvx ruff==0.12.3 check backend tests --output-format concise > ruff-report.txt || true
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ruff-report
+          path: ruff-report.txt
 
   backend:
     runs-on: ubuntu-latest
