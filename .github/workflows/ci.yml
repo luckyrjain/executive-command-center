@@ -10,6 +10,29 @@ permissions:
   pull-requests: read
 
 jobs:
+  lockfiles:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: 3.14.6
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+        with:
+          version: 0.7.19
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22.17.0
+      - run: uv lock --python 3.14.6
+      - run: corepack enable && corepack prepare pnpm@10.12.4 --activate
+      - run: pnpm install --lockfile-only --no-frozen-lockfile
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: dependency-lockfiles
+          path: |
+            uv.lock
+            pnpm-lock.yaml
+
   backend:
     runs-on: ubuntu-latest
     services:
@@ -29,52 +52,27 @@ jobs:
       ECC_SESSION_SECRET: ci-secret-value-that-is-at-least-32-characters
       ECC_DATABASE_URL: postgresql+psycopg://ecc:ecc@localhost:5432/ecc
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v6
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: 3.14.6
-      - uses: astral-sh/setup-uv@v6
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
         with:
           version: 0.7.19
           enable-cache: true
-      - name: Verify Python runtime
-        run: python --version
-      - name: Sync backend dependencies
-        shell: bash
-        run: |
-          set -o pipefail
-          uv sync --all-groups --python 3.14.6 2>&1 | tee backend-sync-diagnostics.log
-      - name: Upload backend sync diagnostics
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: backend-sync-diagnostics
-          path: backend-sync-diagnostics.log
-      - name: Ruff lint
-        run: uv run ruff check backend tests
-      - name: Ruff format
-        run: uv run ruff format --check backend tests
-      - name: Mypy
-        run: uv run mypy backend
+      - run: uv sync --all-groups --python 3.14.6
+      - run: uv run ruff check backend tests
+      - run: uv run ruff format --check backend tests
+      - run: uv run mypy backend
       - run: uv run alembic -c backend/alembic.ini upgrade head
       - run: uv run pytest
-      - name: Pip audit
-        shell: bash
-        run: |
-          set -o pipefail
-          uv run pip-audit 2>&1 | tee backend-pip-audit-diagnostics.log
-      - name: Upload backend pip-audit diagnostics
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: backend-pip-audit-diagnostics
-          path: backend-pip-audit-diagnostics.log
+      - run: uv run pip-audit
 
   frontend:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22.17.0
       - run: corepack enable
@@ -87,15 +85,15 @@ jobs:
   security:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with: { fetch-depth: 0 }
       - name: Scan repository for leaked secrets
-        uses: gitleaks/gitleaks-action@v2
+        uses: gitleaks/gitleaks-action@ff98106e4c7b2bc287b24eaf42907196329070c7 # v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      - uses: anchore/sbom-action@v0
+      - uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0
         with: { path: ".", artifact-name: "ecc-sbom.spdx.json" }
-      - uses: aquasecurity/trivy-action@master
+      - uses: aquasecurity/trivy-action@c07df6fec6fa692e6fd1200d50aaa1fdd66f03c8
         with:
           scan-type: fs
           scan-ref: .
