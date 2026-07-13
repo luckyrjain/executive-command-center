@@ -1,4 +1,4 @@
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from hashlib import sha256
 from json import dumps
 from typing import Literal
@@ -98,22 +98,7 @@ def create_task(
     except ValueError:
         correlation_id = uuid4()
 
-    values = {
-        "id": task_id,
-        "workspace_id": auth.workspace_id,
-        "owner_id": auth.user_id,
-        "title": payload.title,
-        "description": payload.description,
-        "status": payload.status,
-        "manual_priority": payload.manual_priority,
-        "due_date": payload.due_date,
-        "due_at": payload.due_at,
-        "source_ref": payload.source_ref,
-        "actor_id": auth.user_id,
-        "now": now,
-    }
-
-    with session.begin():
+    try:
         row = session.execute(
             text(
                 """
@@ -130,7 +115,20 @@ def create_task(
                           pinned, source_type, source_ref, created_at, updated_at, version, archived_at
                 """
             ),
-            values,
+            {
+                "id": task_id,
+                "workspace_id": auth.workspace_id,
+                "owner_id": auth.user_id,
+                "title": payload.title,
+                "description": payload.description,
+                "status": payload.status,
+                "manual_priority": payload.manual_priority,
+                "due_date": payload.due_date,
+                "due_at": payload.due_at,
+                "source_ref": payload.source_ref,
+                "actor_id": auth.user_id,
+                "now": now,
+            },
         ).mappings().one()
         response = _to_response(dict(row))
         response_body = response.model_dump(mode="json")
@@ -180,9 +178,13 @@ def create_task(
                 "request_hash": request_hash,
                 "response_body": dumps(response_body),
                 "created_at": now,
-                "expires_at": now.replace(year=now.year + 1),
+                "expires_at": now + timedelta(days=365),
             },
         )
+        session.commit()
+    except Exception:
+        session.rollback()
+        raise
     return response
 
 
