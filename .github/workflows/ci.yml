@@ -10,41 +10,6 @@ permissions:
   pull-requests: read
 
 jobs:
-  pytest-diagnostic:
-    runs-on: ubuntu-latest
-    services:
-      postgres:
-        image: postgres:18.0
-        env:
-          POSTGRES_DB: ecc
-          POSTGRES_USER: ecc
-          POSTGRES_PASSWORD: ecc
-        ports: ["5432:5432"]
-        options: >-
-          --health-cmd "pg_isready -U ecc -d ecc"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 20
-    env:
-      ECC_SESSION_SECRET: ci-secret-value-that-is-at-least-32-characters
-      ECC_DATABASE_URL: postgresql+psycopg://ecc:ecc@localhost:5432/ecc
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
-        with:
-          python-version: 3.14.6
-      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
-        with:
-          version: 0.7.19
-      - run: uv sync --frozen --all-groups --python 3.14.6 --quiet
-      - run: uv run alembic -c backend/alembic.ini upgrade head
-      - name: Capture pytest report
-        run: uv run pytest -vv --tb=long > pytest-report.txt 2>&1 || true
-      - uses: actions/upload-artifact@v4
-        with:
-          name: pytest-report
-          path: pytest-report.txt
-
   backend:
     runs-on: ubuntu-latest
     services:
