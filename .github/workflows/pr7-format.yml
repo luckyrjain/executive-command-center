@@ -20,13 +20,12 @@ jobs:
       - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e
       - run: uv sync --frozen --all-groups --python 3.14.6
       - run: |
-          uv run ruff format backend tests
-          uv run ruff check --fix backend tests
-      - name: Commit formatting
+          uv run ruff check backend tests > pr7-ruff.txt 2>&1 || true
+          uv run ruff format --check backend tests >> pr7-ruff.txt 2>&1 || true
+      - name: Commit diagnostics
         run: |
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
-          git add backend tests
-          if git diff --cached --quiet; then exit 0; fi
-          git commit -m "style: format calendar and meetings"
+          git add pr7-ruff.txt
+          git commit -m "chore: capture pr7 ruff diagnostics"
           git push origin HEAD:feature/phase-1-calendar-meetings
