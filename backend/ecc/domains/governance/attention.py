@@ -314,7 +314,7 @@ def regenerate_attention(auth: AuthDep, session: SessionDep, _csrf: CsrfDep) -> 
         for raw in risks:
             row = dict(raw)
             _upsert(session, auth, "risk", row, *_score_risk(row, now), now, expires_at)
-    return list_attention(auth, session)
+    return list_attention(auth, session, 50)
 
 
 @router.get("", response_model=AttentionList)
