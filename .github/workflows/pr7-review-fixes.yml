@@ -20,13 +20,14 @@ jobs:
       - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e
       - run: uv sync --frozen --all-groups --python 3.14.6
       - run: |
-          python scripts/pr7_duplicate_fix.py
-          uv run ruff check --fix backend tests
-          uv run ruff format backend tests
+          set +e
+          python scripts/pr7_duplicate_fix.py > pr7-final-report.txt 2>&1
+          uv run ruff check --fix backend tests >> pr7-final-report.txt 2>&1
+          uv run ruff format backend tests >> pr7-final-report.txt 2>&1
+          exit 0
       - run: |
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
-          git rm -f pr7-test-layout.txt pr7-fix-report.txt scripts/pr7_review_fix.py scripts/pr7_duplicate_fix.py || true
-          git add backend tests
-          git commit -m "fix: close calendar meetings review findings"
+          git add backend tests pr7-final-report.txt
+          git commit -m "chore: capture final pr7 validation result"
           git push origin HEAD:feature/phase-1-calendar-meetings
