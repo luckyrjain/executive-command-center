@@ -131,13 +131,12 @@ def _to_response(row: dict[str, Any]) -> TaskResponse:
 
 
 def _request_ids(request: Request) -> tuple[UUID, UUID]:
-    request_id = uuid4()
-    raw = request.headers.get("X-Correlation-ID")
+    request_id = getattr(request.state, "request_id", None)
+    correlation_id = getattr(request.state, "correlation_id", None)
     try:
-        correlation_id = UUID(raw) if raw else uuid4()
-    except ValueError:
-        correlation_id = uuid4()
-    return request_id, correlation_id
+        return UUID(request_id), UUID(correlation_id)
+    except (TypeError, ValueError):
+        return uuid4(), uuid4()
 
 
 def _request_hash(payload: BaseModel, action: str) -> str:

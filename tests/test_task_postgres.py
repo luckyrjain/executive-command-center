@@ -239,6 +239,18 @@ def test_task_lifecycle_is_transactional_and_workspace_scoped(
     assert "task.archived.v1" in outbox_types
     assert "task.restored.v1" in outbox_types
 
+    with engine.connect() as connection:
+        trace = connection.execute(
+            text(
+                "SELECT request_id, correlation_id FROM audit_events "
+                "WHERE workspace_id = :workspace_id AND aggregate_id = :task_id "
+                "AND event_type = 'task.created'"
+            ),
+            {"workspace_id": workspace_id, "task_id": task_id},
+        ).one()
+    assert str(trace.request_id) == created["request_id"]
+    assert str(trace.correlation_id) == created["correlation_id"]
+
 
 def test_terminal_transitions_and_workspace_timezone_are_enforced(
     task_test_context: tuple[TestClient, UUID, UUID, str],
