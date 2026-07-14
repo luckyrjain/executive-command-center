@@ -724,6 +724,7 @@ def _lifecycle_task(
         if action in {"complete", "cancel"} and current["archived_at"] is not None:
             raise HTTPException(status_code=409, detail="TASK_ARCHIVED")
 
+        event_payload: dict[str, Any]
         if action == "complete":
             assignments = "status = 'completed', completed_at = :now"
             audit_type = "task.completed"
