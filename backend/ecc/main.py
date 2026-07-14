@@ -10,9 +10,11 @@ from sqlalchemy import text
 from ecc.audit import rejected_mutation_audit_middleware
 from ecc.config import get_settings
 from ecc.database import engine
+from ecc.domains.calendar.events import router as calendar_events_router
 from ecc.domains.communication.commitments import router as commitments_router
 from ecc.domains.knowledge.notes import router as notes_router
 from ecc.domains.planning.tasks import router as tasks_router
+from ecc.domains.scheduling.meetings import router as meetings_router
 from ecc.logging import configure_logging
 
 configure_logging()
@@ -33,6 +35,8 @@ app.add_middleware(
 app.include_router(tasks_router)
 app.include_router(commitments_router)
 app.include_router(notes_router)
+app.include_router(calendar_events_router)
+app.include_router(meetings_router)
 app.middleware("http")(rejected_mutation_audit_middleware)
 
 
