@@ -20,7 +20,7 @@ from ecc.database import get_session
 router = APIRouter(prefix="/api/v1/search", tags=["search"])
 SessionDep = Annotated[Session, Depends(get_session)]
 EntityType = Literal["task", "commitment", "note", "meeting", "calendar_event", "risk"]
-EntityTypeFilter = Annotated[list[EntityType] | None, Query(alias="entity_type[]")]
+EntityTypeFilter = Annotated[list[EntityType] | None, Query(alias="types[]")]
 
 _TYPE_ORDER = {
     "task": 1,
@@ -51,6 +51,7 @@ class SearchResult(BaseModel):
     timestamp_context: datetime | None
     source_type: str
     archived: bool
+    evidence_refs: list[UUID]
 
 
 class SearchResponse(BaseModel):
@@ -66,6 +67,14 @@ def _normalize_query(value: str) -> str:
     if len(normalized) > 500:
         raise HTTPException(status_code=422, detail="SEARCH_QUERY_TOO_LONG")
     return normalized
+
+
+def _validate_range(start: datetime | None, end: datetime | None) -> None:
+    for value in (start, end):
+        if value is not None and value.utcoffset() is None:
+            raise HTTPException(status_code=422, detail="TIMEZONE_OFFSET_REQUIRED")
+    if start is not None and end is not None and start > end:
+        raise HTTPException(status_code=422, detail="INVALID_DATE_RANGE")
 
 
 def _sign_cursor(payload: dict[str, object]) -> str:
@@ -93,6 +102,8 @@ def _decode_cursor(cursor: str) -> CursorPayload:
         entity_id = UUID(str(payload["id"]))
         if not 0 <= score <= 1 or type_order not in _TYPE_ORDER.values():
             raise ValueError
+        if updated_at.utcoffset() is None:
+            raise ValueError
         return {
             "score": score,
             "updated_at": updated_at,
@@ -107,7 +118,7 @@ def _snippet(value: str | None) -> str:
     if not value:
         return ""
     collapsed = " ".join(value.split())
-    return escape(collapsed[:240])
+    return escape(collapsed)[:240]
 
 
 @router.get("", response_model=SearchResponse)
@@ -123,6 +134,7 @@ def search(
     limit: Annotated[int, Query(ge=1, le=100)] = 20,
 ) -> SearchResponse:
     query = _normalize_query(q)
+    _validate_range(updated_from, updated_to)
     selected_types = list(entity_types or _TYPE_ORDER)
     cursor_payload = _decode_cursor(cursor) if cursor else None
 
@@ -138,7 +150,8 @@ def search(
                      setweight(to_tsvector('simple', coalesce(title, '')), 'A') ||
                      setweight(to_tsvector('simple', coalesce(description, '')), 'B'),
                      plainto_tsquery('simple', :query)
-                   ) AS fulltext_score
+                   ) AS fulltext_score,
+                   NULL::uuid AS evidence_id
             FROM tasks
             WHERE workspace_id = :workspace_id
 
@@ -150,7 +163,7 @@ def search(
                      setweight(to_tsvector('simple', coalesce(summary, '')), 'A') ||
                      setweight(to_tsvector('simple', coalesce(description, '')), 'B'),
                      plainto_tsquery('simple', :query)
-                   )
+                   ), evidence_id
             FROM commitments
             WHERE workspace_id = :workspace_id
 
@@ -159,7 +172,7 @@ def search(
                    NULL::timestamptz, source_type::text, archived_at, false,
                    lower(coalesce(title, '')),
                    similarity(lower(coalesce(title, '')), :query),
-                   ts_rank_cd(search_document, plainto_tsquery('simple', :query))
+                   ts_rank_cd(search_document, plainto_tsquery('simple', :query)), NULL::uuid
             FROM notes
             WHERE workspace_id = :workspace_id
 
@@ -174,7 +187,7 @@ def search(
                      setweight(to_tsvector('simple', concat_ws(' ', m.agenda, m.preparation,
                        m.notes_summary)), 'B'),
                      plainto_tsquery('simple', :query)
-                   )
+                   ), NULL::uuid
             FROM meetings m
             LEFT JOIN calendar_events ce
               ON ce.workspace_id = m.workspace_id AND ce.id = m.calendar_event_id
@@ -188,7 +201,7 @@ def search(
                      setweight(to_tsvector('simple', coalesce(title, '')), 'A') ||
                      setweight(to_tsvector('simple', concat_ws(' ', description, location)), 'B'),
                      plainto_tsquery('simple', :query)
-                   )
+                   ), NULL::uuid
             FROM calendar_events
             WHERE workspace_id = :workspace_id
 
@@ -201,7 +214,7 @@ def search(
                      setweight(to_tsvector('simple', coalesce(description, '')), 'A') ||
                      setweight(to_tsvector('simple', concat_ws(' ', mitigation, trigger)), 'B'),
                      plainto_tsquery('simple', :query)
-                   )
+                   ), NULL::uuid
             FROM risks
             WHERE workspace_id = :workspace_id
         ), ranked AS (
@@ -246,7 +259,7 @@ def search(
         )
         SELECT entity_type, entity_id, title, body, updated_at, timestamp_context,
                source_type, archived_at, normalized_title, trigram_score,
-               fulltext_score, score
+               fulltext_score, score, evidence_id
         FROM ranked
         WHERE (
           CAST(:cursor_score AS double precision) IS NULL
@@ -310,6 +323,7 @@ def search(
             matched_fields.append("title_trigram")
         if row["fulltext_score"] > 0:
             matched_fields.append("full_text")
+        evidence_refs = [row["evidence_id"]] if row["evidence_id"] is not None else []
         items.append(
             SearchResult(
                 entity_type=row["entity_type"],
@@ -326,6 +340,7 @@ def search(
                 timestamp_context=row["timestamp_context"],
                 source_type=row["source_type"],
                 archived=row["archived_at"] is not None,
+                evidence_refs=evidence_refs,
             )
         )
 
