@@ -12,6 +12,9 @@ from ecc.config import get_settings
 from ecc.database import engine
 from ecc.domains.calendar.events import router as calendar_events_router
 from ecc.domains.communication.commitments import router as commitments_router
+from ecc.domains.governance.attention import router as attention_router
+from ecc.domains.governance.risk_mutations import router as risk_mutations_router
+from ecc.domains.governance.risks import router as risks_router
 from ecc.domains.knowledge.notes import router as notes_router
 from ecc.domains.planning.tasks import router as tasks_router
 from ecc.domains.scheduling.meetings import router as meetings_router
@@ -37,6 +40,9 @@ app.include_router(commitments_router)
 app.include_router(notes_router)
 app.include_router(calendar_events_router)
 app.include_router(meetings_router)
+app.include_router(risks_router)
+app.include_router(risk_mutations_router)
+app.include_router(attention_router)
 app.middleware("http")(rejected_mutation_audit_middleware)
 
 
