@@ -11,7 +11,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
-      - name: Show PKOS table definitions
+      - name: Capture PKOS table definitions
         run: |
-          grep -R -n -A40 -B5 "create_table(.*pkos\|create_table(.*evidence\|create_table(.*person" backend/migrations/versions || true
-          grep -R -n "pkos_nodes\|pkos_evidence" backend/migrations/versions || true
+          { grep -R -n -A60 -B5 "pkos_nodes\|pkos_evidence" backend/migrations/versions || true; } > schema.txt
+          find backend/migrations/versions -maxdepth 1 -type f -print >> schema.txt
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: pr5-schema
+          path: schema.txt
