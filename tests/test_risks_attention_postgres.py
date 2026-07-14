@@ -308,6 +308,30 @@ def test_risk_is_hidden_across_workspaces(
     assert response.status_code == 404
 
 
+def test_closed_risk_cannot_reopen(
+    risk_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    client, _, _, token = risk_test_context
+    created = client.post(
+        "/api/v1/risks",
+        headers=_headers(token, "closed-risk"),
+        json={
+            "description": "Terminal risk",
+            "probability": 2,
+            "impact": 2,
+            "status": "closed",
+        },
+    )
+    assert created.status_code == 201
+    response = client.patch(
+        f"/api/v1/risks/{created.json()['id']}",
+        headers=_headers(token, "reopen-risk"),
+        json={"expected_version": 1, "status": "monitoring"},
+    )
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "RISK_TERMINAL"
+
+
 def test_priority_scoring_10000_entities_under_500ms() -> None:
     now = datetime.now(UTC)
     today = now.date()

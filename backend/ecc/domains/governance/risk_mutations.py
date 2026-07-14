@@ -261,6 +261,12 @@ def update_risk(
             raise HTTPException(status_code=409, detail="RISK_ARCHIVED")
         if current["version"] != payload.expected_version:
             raise HTTPException(status_code=409, detail="VERSION_CONFLICT")
+        if (
+            current["status"] == "closed"
+            and payload.status is not None
+            and payload.status != "closed"
+        ):
+            raise HTTPException(status_code=409, detail="RISK_TERMINAL")
 
         fields = payload.model_fields_set - {"expected_version"}
         assignments: list[str] = []

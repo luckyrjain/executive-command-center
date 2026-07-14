@@ -221,9 +221,13 @@ def _upsert(
 @router.post("/regenerate", response_model=AttentionList)
 def regenerate_attention(auth: AuthDep, session: SessionDep, _csrf: CsrfDep) -> AttentionList:
     now = datetime.now(UTC)
-    today, day_end = _workspace_day(session, auth, now)
-    expires_at = min(now + timedelta(minutes=30), day_end)
     with session.begin():
+        today, day_end = _workspace_day(session, auth, now)
+        expires_at = min(now + timedelta(minutes=30), day_end)
+        session.execute(
+            text("SELECT pg_advisory_xact_lock(hashtextextended(:lock_key, 0))"),
+            {"lock_key": f"attention-regenerate:{auth.workspace_id}"},
+        )
         tasks = (
             session.execute(
                 text("""
@@ -265,6 +269,34 @@ def regenerate_attention(auth: AuthDep, session: SessionDep, _csrf: CsrfDep) -> 
             .mappings()
             .all()
         )
+        session.execute(
+            text(
+                """
+                DELETE FROM attention_items ai
+                WHERE ai.workspace_id = :workspace_id
+                  AND (
+                    (ai.entity_type = 'task' AND NOT EXISTS (
+                        SELECT 1 FROM tasks t
+                        WHERE t.workspace_id = ai.workspace_id AND t.id = ai.entity_id
+                          AND t.archived_at IS NULL
+                          AND t.status NOT IN ('completed','cancelled')
+                    ))
+                    OR (ai.entity_type = 'commitment' AND NOT EXISTS (
+                        SELECT 1 FROM commitments c
+                        WHERE c.workspace_id = ai.workspace_id AND c.id = ai.entity_id
+                          AND c.archived_at IS NULL
+                          AND c.status NOT IN ('fulfilled','cancelled')
+                    ))
+                    OR (ai.entity_type = 'risk' AND NOT EXISTS (
+                        SELECT 1 FROM risks r
+                        WHERE r.workspace_id = ai.workspace_id AND r.id = ai.entity_id
+                          AND r.archived_at IS NULL AND r.status <> 'closed'
+                    ))
+                  )
+                """
+            ),
+            {"workspace_id": auth.workspace_id},
+        )
         for raw in tasks:
             row = dict(raw)
             _upsert(session, auth, "task", row, *_score_task(row, today, now), now, expires_at)
@@ -293,15 +325,39 @@ def list_attention(
     rows = (
         session.execute(
             text("""
-            SELECT id, entity_type, entity_id, source_entity_version, score,
-                   confidence, factors, explanation, generated_at, expires_at,
-                   pinned, dismissed_at, dismissed_entity_version, deferred_until
-            FROM attention_items
-            WHERE workspace_id = :workspace_id
-              AND expires_at > :now
-              AND (dismissed_at IS NULL OR dismissed_entity_version <> source_entity_version)
-              AND (deferred_until IS NULL OR deferred_until <= :now)
-            ORDER BY pinned DESC, score DESC, generated_at DESC, entity_id
+            SELECT ai.id, ai.entity_type, ai.entity_id, ai.source_entity_version, ai.score,
+                   ai.confidence, ai.factors, ai.explanation, ai.generated_at, ai.expires_at,
+                   ai.pinned, ai.dismissed_at, ai.dismissed_entity_version, ai.deferred_until
+            FROM attention_items ai
+            JOIN workspaces w ON w.id = ai.workspace_id
+            LEFT JOIN tasks t ON ai.entity_type = 'task'
+                AND t.workspace_id = ai.workspace_id AND t.id = ai.entity_id
+            LEFT JOIN commitments c ON ai.entity_type = 'commitment'
+                AND c.workspace_id = ai.workspace_id AND c.id = ai.entity_id
+            LEFT JOIN risks r ON ai.entity_type = 'risk'
+                AND r.workspace_id = ai.workspace_id AND r.id = ai.entity_id
+            WHERE ai.workspace_id = :workspace_id
+              AND ai.expires_at > :now
+              AND (ai.dismissed_at IS NULL
+                   OR ai.dismissed_entity_version <> ai.source_entity_version)
+              AND (ai.deferred_until IS NULL OR ai.deferred_until <= :now)
+            ORDER BY ai.pinned DESC, ai.score DESC,
+              COALESCE(
+                t.due_at,
+                (t.due_date::timestamp + time '23:59:59') AT TIME ZONE w.timezone,
+                c.due_at,
+                (c.due_date::timestamp + time '23:59:59') AT TIME ZONE w.timezone,
+                r.review_at
+              ) ASC NULLS LAST,
+              CASE
+                WHEN t.manual_priority = 'critical' THEN 4
+                WHEN t.manual_priority = 'high' THEN 3
+                WHEN t.manual_priority = 'medium' THEN 2
+                WHEN t.manual_priority = 'low' THEN 1
+                ELSE 0
+              END DESC,
+              COALESCE(t.created_at, c.created_at, r.created_at) ASC,
+              ai.entity_id ASC
             LIMIT :limit
         """),
             {"workspace_id": auth.workspace_id, "now": now, "limit": limit},
@@ -340,12 +396,25 @@ def _mutate_attention(
         if row is None:
             raise HTTPException(status_code=404, detail="ATTENTION_ITEM_NOT_FOUND")
         if action == "dismiss":
+            if (
+                row["dismissed_at"] is not None
+                and row["dismissed_entity_version"] == row["source_entity_version"]
+            ):
+                return AttentionItem.model_validate(dict(row))
             values = {"dismissed_at": now, "dismissed_entity_version": row["source_entity_version"]}
         elif action == "defer":
             if payload.deferred_until is None or payload.deferred_until <= now:
                 raise HTTPException(status_code=422, detail="DEFER_UNTIL_MUST_BE_FUTURE")
+            if row["deferred_until"] == payload.deferred_until:
+                return AttentionItem.model_validate(dict(row))
             values = {"deferred_until": payload.deferred_until}
         else:
+            if (
+                row["dismissed_at"] is None
+                and row["dismissed_entity_version"] is None
+                and row["deferred_until"] is None
+            ):
+                return AttentionItem.model_validate(dict(row))
             values = {
                 "dismissed_at": None,
                 "dismissed_entity_version": None,
@@ -399,7 +468,13 @@ def _mutate_attention(
                 "actor_id": auth.user_id,
                 "request_id": request_id,
                 "correlation_id": correlation_id,
-                "changed_fields": ["dismissed_at"] if action == "dismiss" else ["deferred_until"],
+                "changed_fields": (
+                    ["dismissed_at", "dismissed_entity_version"]
+                    if action == "dismiss"
+                    else ["deferred_until"]
+                    if action == "defer"
+                    else ["dismissed_at", "dismissed_entity_version", "deferred_until"]
+                ),
                 "occurred_at": now,
             },
         )
