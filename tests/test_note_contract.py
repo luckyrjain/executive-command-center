@@ -24,8 +24,9 @@ def test_note_create_rejects_owner_and_workspace_fields() -> None:
 
 
 def test_note_body_bounds_are_enforced_by_schema() -> None:
-    from ecc.domains.knowledge.notes import NoteCreate
     from pydantic import ValidationError
+
+    from ecc.domains.knowledge.notes import NoteCreate
 
     try:
         NoteCreate(body="")

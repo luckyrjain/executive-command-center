@@ -245,9 +245,10 @@ def test_note_lifecycle_autosave_search_and_redacted_audit(
         "note.archived.v1",
         "note.restored.v1",
     ]
-    assert outbox_rows[1]["payload"]["body_checksum"] == sha256(
-        (body + " and liquidity review").encode()
-    ).hexdigest()
+    assert (
+        outbox_rows[1]["payload"]["body_checksum"]
+        == sha256((body + " and liquidity review").encode()).hexdigest()
+    )
 
 
 def test_note_cursor_restore_guard_and_workspace_isolation(
