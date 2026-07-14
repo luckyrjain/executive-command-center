@@ -57,7 +57,7 @@ class CommitmentCreate(BaseModel):
     pinned: bool = False
 
     @model_validator(mode="after")
-    def validate_due_precision(self) -> "CommitmentCreate":
+    def validate_due_precision(self) -> CommitmentCreate:
         if self.due_date is not None and self.due_at is not None:
             raise ValueError("due_date and due_at are mutually exclusive")
         if self.due_at is not None and self.due_at.utcoffset() is None:
@@ -81,7 +81,7 @@ class CommitmentPatch(BaseModel):
     pinned: bool | None = None
 
     @model_validator(mode="after")
-    def validate_due_precision(self) -> "CommitmentPatch":
+    def validate_due_precision(self) -> CommitmentPatch:
         if self.due_date is not None and self.due_at is not None:
             raise ValueError("due_date and due_at are mutually exclusive")
         if self.due_at is not None and self.due_at.utcoffset() is None:
@@ -132,10 +132,7 @@ class CommitmentListResponse(BaseModel):
 def _to_response(row: dict[str, Any]) -> CommitmentResponse:
     commitment_id = row["id"]
     row["links"] = {
-        "audit": (
-            "/api/v1/audit?aggregate_type=commitment"
-            f"&aggregate_id={commitment_id}"
-        )
+        "audit": (f"/api/v1/audit?aggregate_type=commitment&aggregate_id={commitment_id}")
     }
     return CommitmentResponse.model_validate(row)
 
@@ -152,9 +149,7 @@ def _request_hash(payload: BaseModel, action: str) -> str:
         "action": action,
         "payload": payload.model_dump(mode="json", exclude_none=False),
     }
-    return sha256(
-        dumps(material, sort_keys=True, separators=(",", ":")).encode()
-    ).hexdigest()
+    return sha256(dumps(material, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
 def _lock_idempotency(session: Session, auth: AuthContext, key: str) -> None:
@@ -309,9 +304,7 @@ def _write_outbox(
             "workspace_id": auth.workspace_id,
             "event_type": event_type,
             "correlation_id": correlation_id,
-            "payload": dumps(
-                {"commitment_id": str(commitment_id), "version": version, **payload}
-            ),
+            "payload": dumps({"commitment_id": str(commitment_id), "version": version, **payload}),
             "occurred_at": now,
         },
     )
@@ -419,9 +412,7 @@ def create_commitment(
             now,
         )
         event_type = (
-            "commitment.detected.v1"
-            if initial_status == "detected"
-            else "commitment.created.v1"
+            "commitment.detected.v1" if initial_status == "detected" else "commitment.created.v1"
         )
         _write_outbox(
             session,
@@ -480,14 +471,10 @@ def list_commitments(
         clauses.append("direction = :direction")
         params["direction"] = direction
     if due_before:
-        clauses.append(
-            "COALESCE(due_date, (due_at AT TIME ZONE :timezone)::date) <= :due_before"
-        )
+        clauses.append("COALESCE(due_date, (due_at AT TIME ZONE :timezone)::date) <= :due_before")
         params.update({"timezone": auth.timezone, "due_before": due_before})
     if due_after:
-        clauses.append(
-            "COALESCE(due_date, (due_at AT TIME ZONE :timezone)::date) >= :due_after"
-        )
+        clauses.append("COALESCE(due_date, (due_at AT TIME ZONE :timezone)::date) >= :due_after")
         params.update({"timezone": auth.timezone, "due_after": due_after})
     if pinned is not None:
         clauses.append("pinned = :pinned")
@@ -570,13 +557,9 @@ def _mutate_commitment(
         fields = payload.model_fields_set - {"expected_version"}
         if not fields:
             response = _to_response(current)
-            _store_cached(
-                session, auth, idempotency_key, request_hash, response, 200, now
-            )
+            _store_cached(session, auth, idempotency_key, request_hash, response, 200, now)
             return response
-        effective_due_date = (
-            payload.due_date if "due_date" in fields else current["due_date"]
-        )
+        effective_due_date = payload.due_date if "due_date" in fields else current["due_date"]
         effective_due_at = payload.due_at if "due_at" in fields else current["due_at"]
         if effective_due_date is not None and effective_due_at is not None:
             raise HTTPException(status_code=422, detail="MUTUALLY_EXCLUSIVE_FIELDS")
@@ -636,9 +619,7 @@ def _mutate_commitment(
             {"changed_fields": changed_fields},
             now,
         )
-        _store_cached(
-            session, auth, idempotency_key, request_hash, response, 200, now
-        )
+        _store_cached(session, auth, idempotency_key, request_hash, response, 200, now)
         return response
 
 
@@ -673,9 +654,7 @@ def _lifecycle(
         )
         if target_reached:
             response = _to_response(current)
-            _store_cached(
-                session, auth, idempotency_key, request_hash, response, 200, now
-            )
+            _store_cached(session, auth, idempotency_key, request_hash, response, 200, now)
             return response
 
         if action in {"confirm", "fulfil", "cancel"} and current["archived_at"]:
@@ -723,10 +702,7 @@ def _lifecycle(
             changed_fields = ["archived_at", "pre_archive_status"]
         else:
             restored_status = current["pre_archive_status"] or "confirmed"
-            assignments = (
-                "archived_at = NULL, pre_archive_status = NULL, "
-                "status = :restored_status"
-            )
+            assignments = "archived_at = NULL, pre_archive_status = NULL, status = :restored_status"
             audit_type = "commitment.restored"
             event_type = "commitment.restored.v1"
             event_payload = {"restored_status": restored_status}
@@ -783,9 +759,7 @@ def _lifecycle(
             event_payload,
             now,
         )
-        _store_cached(
-            session, auth, idempotency_key, request_hash, response, 200, now
-        )
+        _store_cached(session, auth, idempotency_key, request_hash, response, 200, now)
         return response
 
 
@@ -799,9 +773,7 @@ def confirm_commitment(
     _csrf: CsrfDep,
     idempotency_key: IdempotencyHeader,
 ) -> CommitmentResponse:
-    return _lifecycle(
-        commitment_id, payload, request, auth, session, idempotency_key, "confirm"
-    )
+    return _lifecycle(commitment_id, payload, request, auth, session, idempotency_key, "confirm")
 
 
 @router.post("/{commitment_id}/fulfil", response_model=CommitmentResponse)
@@ -814,9 +786,7 @@ def fulfil_commitment(
     _csrf: CsrfDep,
     idempotency_key: IdempotencyHeader,
 ) -> CommitmentResponse:
-    return _lifecycle(
-        commitment_id, payload, request, auth, session, idempotency_key, "fulfil"
-    )
+    return _lifecycle(commitment_id, payload, request, auth, session, idempotency_key, "fulfil")
 
 
 @router.post("/{commitment_id}/cancel", response_model=CommitmentResponse)
@@ -829,9 +799,7 @@ def cancel_commitment(
     _csrf: CsrfDep,
     idempotency_key: IdempotencyHeader,
 ) -> CommitmentResponse:
-    return _lifecycle(
-        commitment_id, payload, request, auth, session, idempotency_key, "cancel"
-    )
+    return _lifecycle(commitment_id, payload, request, auth, session, idempotency_key, "cancel")
 
 
 @router.post("/{commitment_id}/archive", response_model=CommitmentResponse)
@@ -844,9 +812,7 @@ def archive_commitment(
     _csrf: CsrfDep,
     idempotency_key: IdempotencyHeader,
 ) -> CommitmentResponse:
-    return _lifecycle(
-        commitment_id, payload, request, auth, session, idempotency_key, "archive"
-    )
+    return _lifecycle(commitment_id, payload, request, auth, session, idempotency_key, "archive")
 
 
 @router.post("/{commitment_id}/restore", response_model=CommitmentResponse)
@@ -859,6 +825,4 @@ def restore_commitment(
     _csrf: CsrfDep,
     idempotency_key: IdempotencyHeader,
 ) -> CommitmentResponse:
-    return _lifecycle(
-        commitment_id, payload, request, auth, session, idempotency_key, "restore"
-    )
+    return _lifecycle(commitment_id, payload, request, auth, session, idempotency_key, "restore")
