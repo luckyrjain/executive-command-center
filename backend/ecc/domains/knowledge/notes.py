@@ -230,7 +230,7 @@ def _write_audit(
                 :id, :workspace_id, :event_type, 'note', :aggregate_id,
                 :aggregate_version, :actor_id, :request_id, :correlation_id,
                 :key_hash, CAST(:before AS jsonb), CAST(:after AS jsonb),
-                :changed_fields, 'allowed', 'user', :metadata::jsonb, :occurred_at
+                :changed_fields, 'allowed', 'user', CAST(:metadata AS jsonb), :occurred_at
             )
             """
         ),
