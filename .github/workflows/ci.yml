@@ -6,10 +6,27 @@ on:
     branches: [main]
 
 permissions:
-  contents: read
+  contents: write
   pull-requests: read
 
 jobs:
+  format-commitments:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          ref: ${{ github.head_ref }}
+      - run: python -m pip install ruff==0.12.3
+      - run: ruff format backend tests
+      - run: ruff check --fix backend tests
+      - name: Commit formatting
+        run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add backend tests
+          git diff --cached --quiet || git commit -m "style: format commitments implementation"
+          git push
+
   backend:
     runs-on: ubuntu-latest
     services:
