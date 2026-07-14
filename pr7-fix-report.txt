@@ -1,4 +1,14 @@
 warning: Support for Python 3.14 is under development and may be unstable. Enable `preview` to remove this warning.
+backend/ecc/domains/calendar/events.py:528:5: SyntaxError: Duplicate parameter "request"
+    |
+526 |     payload: CalendarEventAction,
+527 |     request: Request,
+528 |     request: Request,
+    |     ^^^^^^^
+529 |     auth: AuthContext,
+530 |     session: Session,
+    |
+
 scripts/pr7_review_fix.py:109:101: E501 Line too long (106 > 100)
     |
 107 |     text = text.replace(
@@ -11,7 +21,7 @@ scripts/pr7_review_fix.py:109:101: E501 Line too long (106 > 100)
 
 scripts/pr7_review_fix.py:117:101: E501 Line too long (112 > 100)
     |
-115 |         "        return response\n\n\n@router.post(\"/{event_id}/archive\"",
+115 |         '        return response\n\n\n@router.post("/{event_id}/archive"',
 116 |         "response = CalendarEventResponse.model_validate(row)\n"
 117 |         "        event_type = 'calendar_event.archived' if action == 'archive' else 'calendar_event.restored'\n"
     |                                                                                                     ^^^^^^^^^^^^ E501
@@ -19,25 +29,5 @@ scripts/pr7_review_fix.py:117:101: E501 Line too long (112 > 100)
 119 |         "            session, auth, request, event_type, event_id, response.version,\n"
     |
 
-scripts/pr7_review_fix.py:131:101: E501 Line too long (101 > 100)
-    |
-129 |     text = text.replace(
-130 |         "return _lifecycle(event_id, payload, auth, session, idempotency_key, \"archive\")",
-131 |         "return _lifecycle(event_id, payload, request, auth, session, idempotency_key, \"archive\")",
-    |                                                                                                     ^ E501
-132 |     )
-133 |     text = text.replace(
-    |
-
-scripts/pr7_review_fix.py:135:101: E501 Line too long (101 > 100)
-    |
-133 |     text = text.replace(
-134 |         "return _lifecycle(event_id, payload, auth, session, idempotency_key, \"restore\")",
-135 |         "return _lifecycle(event_id, payload, request, auth, session, idempotency_key, \"restore\")",
-    |                                                                                                     ^ E501
-136 |     )
-137 |     path.write_text(text)
-    |
-
-Found 4 errors.
-3 files reformatted, 33 files left unchanged
+Found 6 errors (3 fixed, 3 remaining).
+37 files left unchanged

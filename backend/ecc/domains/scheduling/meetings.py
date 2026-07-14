@@ -106,6 +106,7 @@ class MeetingResponse(BaseModel):
 class MeetingListResponse(BaseModel):
     items: list[MeetingResponse]
     next_cursor: str | None = None
+    next_cursor: str | None = None
 
 
 def _encode_cursor(updated_at: datetime, meeting_id: UUID) -> str:
@@ -441,6 +442,10 @@ def list_meetings(
     if status_filter is not None:
         clauses.append("status = :status")
         params["status"] = status_filter
+    if cursor:
+        updated_at, meeting_id = _decode_cursor(cursor)
+        clauses.append("(updated_at, id) < (:cursor_updated_at, :cursor_id)")
+        params.update({"cursor_updated_at": updated_at, "cursor_id": meeting_id})
     if cursor:
         updated_at, meeting_id = _decode_cursor(cursor)
         clauses.append("(updated_at, id) < (:cursor_updated_at, :cursor_id)")

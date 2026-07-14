@@ -525,6 +525,7 @@ def _lifecycle(
     event_id: UUID,
     payload: CalendarEventAction,
     request: Request,
+    request: Request,
     auth: AuthContext,
     session: Session,
     idempotency_key: str,
