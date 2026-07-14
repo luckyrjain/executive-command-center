@@ -1,0 +1,28 @@
+name: pr7-review-diagnostic
+
+on:
+  pull_request:
+
+permissions:
+  contents: write
+
+jobs:
+  inspect:
+    if: github.head_ref == 'feature/phase-1-calendar-meetings'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: feature/phase-1-calendar-meetings
+      - run: |
+          find tests -maxdepth 3 -type f -print | sort > pr7-test-layout.txt
+          for f in $(find tests -maxdepth 2 -type f -name '*.py' | sort); do
+            echo "===== $f =====" >> pr7-test-layout.txt
+            sed -n '1,260p' "$f" >> pr7-test-layout.txt
+          done
+      - run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add pr7-test-layout.txt
+          git commit -m "chore: capture pr7 test layout"
+          git push origin HEAD:feature/phase-1-calendar-meetings
