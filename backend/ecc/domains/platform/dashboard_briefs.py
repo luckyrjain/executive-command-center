@@ -143,9 +143,7 @@ def _build_sections(
         if key in seen:
             continue
         seen.add(key)
-        versions[f"{row['entity_type']}:{row['entity_id']}"] = int(
-            row["source_entity_version"]
-        )
+        versions[f"{row['entity_type']}:{row['entity_id']}"] = int(row["source_entity_version"])
         priorities.append(
             {
                 "entity_type": row["entity_type"],
@@ -361,9 +359,7 @@ def _generate(
             {"w": workspace_id, "u": user_id, "d": day},
         ).scalar_one()
     )
-    sections, source_versions, evidence_ids = _build_sections(
-        session, workspace_id, day, timezone
-    )
+    sections, source_versions, evidence_ids = _build_sections(session, workspace_id, day, timezone)
     brief_id = uuid4()
     row = (
         session.execute(
@@ -500,9 +496,7 @@ def get_morning_brief(
         .one_or_none()
     )
     if row is None:
-        return _generate(
-            request, session, auth.workspace_id, auth.user_id, auth.timezone, target
-        )
+        return _generate(request, session, auth.workspace_id, auth.user_id, auth.timezone, target)
     stale, reason = _brief_staleness(
         session, auth.workspace_id, row["generated_at"], row["source_versions"]
     )
@@ -519,6 +513,4 @@ def refresh_morning_brief(
     day: date | None = Query(default=None, alias="date"),
 ) -> MorningBriefResponse:
     target = _target_date(day, auth.timezone)
-    return _generate(
-        request, session, auth.workspace_id, auth.user_id, auth.timezone, target
-    )
+    return _generate(request, session, auth.workspace_id, auth.user_id, auth.timezone, target)

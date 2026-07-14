@@ -1,0 +1,32 @@
+warning: Support for Python 3.14 is under development and may be unstable. Enable `preview` to remove this warning.
+backend/ecc/domains/platform/dashboard_briefs.py:461:24: B008 Do not perform function call `Query` in argument defaults; instead, perform the call within the function, or read the default from a module-level singleton variable
+    |
+459 |     auth: AuthDep,
+460 |     session: SessionDep,
+461 |     day: date | None = Query(default=None, alias="date"),
+    |                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ B008
+462 | ) -> DashboardResponse:
+463 |     target = _target_date(day, auth.timezone)
+    |
+
+backend/ecc/domains/platform/dashboard_briefs.py:480:24: B008 Do not perform function call `Query` in argument defaults; instead, perform the call within the function, or read the default from a module-level singleton variable
+    |
+478 |     auth: AuthDep,
+479 |     session: SessionDep,
+480 |     day: date | None = Query(default=None, alias="date"),
+    |                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ B008
+481 | ) -> MorningBriefResponse:
+482 |     target = _target_date(day, auth.timezone)
+    |
+
+backend/ecc/domains/platform/dashboard_briefs.py:513:24: B008 Do not perform function call `Query` in argument defaults; instead, perform the call within the function, or read the default from a module-level singleton variable
+    |
+511 |     _: CsrfDep,
+512 |     session: SessionDep,
+513 |     day: date | None = Query(default=None, alias="date"),
+    |                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ B008
+514 | ) -> MorningBriefResponse:
+515 |     target = _target_date(day, auth.timezone)
+    |
+
+Found 3 errors.

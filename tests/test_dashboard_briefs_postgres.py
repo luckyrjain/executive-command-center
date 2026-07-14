@@ -102,9 +102,7 @@ def dashboard_context() -> Iterator[tuple[TestClient, UUID, UUID, str]]:
 
 def _headers(token: str) -> dict[str, str]:
     return {
-        "X-CSRF-Token": new(
-            settings.session_secret.encode(), token.encode(), "sha256"
-        ).hexdigest(),
+        "X-CSRF-Token": new(settings.session_secret.encode(), token.encode(), "sha256").hexdigest(),
         "X-Correlation-ID": str(uuid4()),
     }
 
