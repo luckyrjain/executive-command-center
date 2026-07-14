@@ -1,6 +1,8 @@
+from base64 import urlsafe_b64decode, urlsafe_b64encode
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
-from json import dumps
+from hmac import compare_digest, new
+from json import dumps, loads
 from typing import Annotated, Any, Literal
 from uuid import UUID, uuid4
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -11,6 +13,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from ecc.auth import AuthContext, AuthDep, CsrfDep
+from ecc.config import get_settings
 from ecc.database import get_session
 
 router = APIRouter(prefix="/api/v1/meetings", tags=["meetings"])
@@ -102,6 +105,26 @@ class MeetingResponse(BaseModel):
 
 class MeetingListResponse(BaseModel):
     items: list[MeetingResponse]
+    next_cursor: str | None = None
+
+
+def _encode_cursor(updated_at: datetime, meeting_id: UUID) -> str:
+    payload = dumps({"updated_at": updated_at.isoformat(), "id": str(meeting_id)}).encode()
+    signature = new(get_settings().session_secret.encode(), payload, "sha256").hexdigest().encode()
+    return urlsafe_b64encode(payload + b"." + signature).decode().rstrip("=")
+
+
+def _decode_cursor(cursor: str) -> tuple[datetime, UUID]:
+    try:
+        raw = urlsafe_b64decode((cursor + "=" * (-len(cursor) % 4)).encode())
+        payload, signature = raw.rsplit(b".", 1)
+        expected = new(get_settings().session_secret.encode(), payload, "sha256").hexdigest()
+        if not compare_digest(signature.decode(), expected):
+            raise ValueError
+        decoded = loads(payload)
+        return datetime.fromisoformat(decoded["updated_at"]), UUID(decoded["id"])
+    except (ValueError, KeyError, TypeError, UnicodeDecodeError) as exc:
+        raise HTTPException(status_code=400, detail="MALFORMED_CURSOR") from exc
 
 
 def _validate_aware(value: datetime, field: str) -> None:
@@ -408,15 +431,20 @@ def list_meetings(
     session: SessionDep,
     status_filter: MeetingStatusFilter = None,
     include_archived: bool = False,
+    cursor: str | None = None,
     limit: int = Query(default=50, ge=1, le=100),
 ) -> MeetingListResponse:
     clauses = ["workspace_id = :workspace_id"]
-    params: dict[str, Any] = {"workspace_id": auth.workspace_id, "limit": limit}
+    params: dict[str, Any] = {"workspace_id": auth.workspace_id, "limit": limit + 1}
     if not include_archived:
         clauses.append("archived_at IS NULL")
     if status_filter is not None:
         clauses.append("status = :status")
         params["status"] = status_filter
+    if cursor:
+        updated_at, meeting_id = _decode_cursor(cursor)
+        clauses.append("(updated_at, id) < (:cursor_updated_at, :cursor_id)")
+        params.update({"cursor_updated_at": updated_at, "cursor_id": meeting_id})
     rows = (
         session.execute(
             text(

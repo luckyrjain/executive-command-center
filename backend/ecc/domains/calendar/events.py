@@ -206,6 +206,74 @@ def _store_cached(
     )
 
 
+def _request_ids(request: Request) -> tuple[UUID, UUID]:
+    try:
+        return UUID(request.state.request_id), UUID(request.state.correlation_id)
+    except (AttributeError, TypeError, ValueError):
+        return uuid4(), uuid4()
+
+
+def _write_audit_and_outbox(
+    session: Session,
+    auth: AuthContext,
+    request: Request,
+    event_type: str,
+    event_id: UUID,
+    version: int,
+    changed_fields: list[str],
+    now: datetime,
+) -> None:
+    request_id, correlation_id = _request_ids(request)
+    session.execute(
+        text(
+            """
+            INSERT INTO audit_events (
+                id, workspace_id, event_type, aggregate_type, aggregate_id,
+                aggregate_version, actor_id, request_id, correlation_id,
+                changed_fields, authorization_result, source, metadata, occurred_at
+            ) VALUES (
+                :id, :workspace_id, :event_type, 'calendar_event', :aggregate_id,
+                :aggregate_version, :actor_id, :request_id, :correlation_id,
+                :changed_fields, 'allowed', 'user', '{}'::jsonb, :occurred_at
+            )
+            """
+        ),
+        {
+            "id": uuid4(),
+            "workspace_id": auth.workspace_id,
+            "event_type": event_type,
+            "aggregate_id": event_id,
+            "aggregate_version": version,
+            "actor_id": auth.user_id,
+            "request_id": request_id,
+            "correlation_id": correlation_id,
+            "changed_fields": changed_fields,
+            "occurred_at": now,
+        },
+    )
+    session.execute(
+        text(
+            """
+            INSERT INTO event_outbox (
+                event_id, workspace_id, event_type, event_version,
+                correlation_id, payload, occurred_at, attempt_count
+            ) VALUES (
+                :event_id, :workspace_id, :event_type, 1,
+                :correlation_id, CAST(:payload AS jsonb), :occurred_at, 0
+            )
+            """
+        ),
+        {
+            "event_id": uuid4(),
+            "workspace_id": auth.workspace_id,
+            "event_type": f"{event_type}.v1",
+            "correlation_id": correlation_id,
+            "payload": dumps({"calendar_event_id": str(event_id), "version": version}),
+            "occurred_at": now,
+        },
+    )
+
+
 def _get_row(
     session: Session,
     auth: AuthContext,
@@ -302,6 +370,9 @@ def create_calendar_event(
             .one()
         )
         response = CalendarEventResponse.model_validate(row)
+        _write_audit_and_outbox(
+            session, auth, request, "calendar_event.created", event_id, 1, ["*"], now
+        )
         _store_cached(session, auth, idempotency_key, request_hash, response, 201, now)
         return response
 
@@ -436,6 +507,16 @@ def update_calendar_event(
             .one()
         )
         response = CalendarEventResponse.model_validate(row)
+        _write_audit_and_outbox(
+            session,
+            auth,
+            request,
+            "calendar_event.updated",
+            event_id,
+            response.version,
+            sorted(fields),
+            now,
+        )
         _store_cached(session, auth, idempotency_key, request_hash, response, 200, now)
         return response
 
@@ -443,6 +524,7 @@ def update_calendar_event(
 def _lifecycle(
     event_id: UUID,
     payload: CalendarEventAction,
+    request: Request,
     auth: AuthContext,
     session: Session,
     idempotency_key: str,
@@ -496,6 +578,17 @@ def _lifecycle(
             .one()
         )
         response = CalendarEventResponse.model_validate(row)
+        event_type = "calendar_event.archived" if action == "archive" else "calendar_event.restored"
+        _write_audit_and_outbox(
+            session,
+            auth,
+            request,
+            event_type,
+            event_id,
+            response.version,
+            ["archived_at", "pre_archive_status"],
+            now,
+        )
         _store_cached(session, auth, idempotency_key, request_hash, response, 200, now)
         return response
 
@@ -504,21 +597,23 @@ def _lifecycle(
 def archive_calendar_event(
     event_id: UUID,
     payload: CalendarEventAction,
+    request: Request,
     auth: AuthDep,
     session: SessionDep,
     _csrf: CsrfDep,
     idempotency_key: IdempotencyHeader,
 ) -> CalendarEventResponse:
-    return _lifecycle(event_id, payload, auth, session, idempotency_key, "archive")
+    return _lifecycle(event_id, payload, request, auth, session, idempotency_key, "archive")
 
 
 @router.post("/{event_id}/restore", response_model=CalendarEventResponse)
 def restore_calendar_event(
     event_id: UUID,
     payload: CalendarEventAction,
+    request: Request,
     auth: AuthDep,
     session: SessionDep,
     _csrf: CsrfDep,
     idempotency_key: IdempotencyHeader,
 ) -> CalendarEventResponse:
-    return _lifecycle(event_id, payload, auth, session, idempotency_key, "restore")
+    return _lifecycle(event_id, payload, request, auth, session, idempotency_key, "restore")

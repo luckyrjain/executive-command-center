@@ -112,7 +112,7 @@ def patch_events() -> None:
     text = text.replace(
         "response = CalendarEventResponse.model_validate(row)\n"
         "        _store_cached(session, auth, idempotency_key, request_hash, response, 200, now)\n"
-        "        return response\n\n\n@router.post(\"/{event_id}/archive\"",
+        '        return response\n\n\n@router.post("/{event_id}/archive"',
         "response = CalendarEventResponse.model_validate(row)\n"
         "        event_type = 'calendar_event.archived' if action == 'archive' else 'calendar_event.restored'\n"
         "        _write_audit_and_outbox(\n"
@@ -120,19 +120,19 @@ def patch_events() -> None:
         "            ['archived_at', 'pre_archive_status'], now\n"
         "        )\n"
         "        _store_cached(session, auth, idempotency_key, request_hash, response, 200, now)\n"
-        "        return response\n\n\n@router.post(\"/{event_id}/archive\"",
+        '        return response\n\n\n@router.post("/{event_id}/archive"',
     )
     text = text.replace(
         "    payload: CalendarEventAction,\n    auth: AuthDep,",
         "    payload: CalendarEventAction,\n    request: Request,\n    auth: AuthDep,",
     )
     text = text.replace(
-        "return _lifecycle(event_id, payload, auth, session, idempotency_key, \"archive\")",
-        "return _lifecycle(event_id, payload, request, auth, session, idempotency_key, \"archive\")",
+        'return _lifecycle(event_id, payload, auth, session, idempotency_key, "archive")',
+        'return _lifecycle(event_id, payload, request, auth, session, idempotency_key, "archive")',
     )
     text = text.replace(
-        "return _lifecycle(event_id, payload, auth, session, idempotency_key, \"restore\")",
-        "return _lifecycle(event_id, payload, request, auth, session, idempotency_key, \"restore\")",
+        'return _lifecycle(event_id, payload, auth, session, idempotency_key, "restore")',
+        'return _lifecycle(event_id, payload, request, auth, session, idempotency_key, "restore")',
     )
     path.write_text(text)
 
@@ -191,8 +191,7 @@ def patch_meetings() -> None:
     if "def _encode_cursor(" not in text:
         text = text.replace(marker, helper + marker)
     text = text.replace(
-        "    include_archived: bool = False,\n"
-        "    limit: int = Query(default=50, ge=1, le=100),",
+        "    include_archived: bool = False,\n    limit: int = Query(default=50, ge=1, le=100),",
         "    include_archived: bool = False,\n"
         "    cursor: str | None = None,\n"
         "    limit: int = Query(default=50, ge=1, le=100),",
@@ -202,14 +201,14 @@ def patch_meetings() -> None:
         'params: dict[str, Any] = {"workspace_id": auth.workspace_id, "limit": limit + 1}',
     )
     text = text.replace(
-        '    if status_filter is not None:\n'
+        "    if status_filter is not None:\n"
         '        clauses.append("status = :status")\n'
         '        params["status"] = status_filter\n',
-        '    if status_filter is not None:\n'
+        "    if status_filter is not None:\n"
         '        clauses.append("status = :status")\n'
         '        params["status"] = status_filter\n'
-        '    if cursor:\n'
-        '        updated_at, meeting_id = _decode_cursor(cursor)\n'
+        "    if cursor:\n"
+        "        updated_at, meeting_id = _decode_cursor(cursor)\n"
         '        clauses.append("(updated_at, id) < (:cursor_updated_at, :cursor_id)")\n'
         '        params.update({"cursor_updated_at": updated_at, "cursor_id": meeting_id})\n',
     )
