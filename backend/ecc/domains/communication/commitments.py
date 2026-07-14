@@ -1,6 +1,8 @@
+from base64 import urlsafe_b64decode, urlsafe_b64encode
 from datetime import UTC, date, datetime, timedelta
 from hashlib import sha256
-from json import dumps
+from hmac import compare_digest, new
+from json import dumps, loads
 from typing import Annotated, Any, Literal
 from uuid import UUID, uuid4
 
@@ -10,6 +12,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from ecc.auth import AuthContext, AuthDep, CsrfDep
+from ecc.config import get_settings
 from ecc.database import get_session
 
 router = APIRouter(prefix="/api/v1/commitments", tags=["commitments"])
@@ -339,6 +342,61 @@ def _get_row(
     return dict(row) if row is not None else None
 
 
+def _encode_cursor(created_at: datetime, commitment_id: UUID) -> str:
+    payload = dumps(
+        {"created_at": created_at.isoformat(), "id": str(commitment_id)},
+        separators=(",", ":"),
+    ).encode()
+    signature = new(get_settings().session_secret.encode(), payload, "sha256").hexdigest().encode()
+    return urlsafe_b64encode(payload + b"." + signature).decode().rstrip("=")
+
+
+def _decode_cursor(cursor: str) -> tuple[datetime, UUID]:
+    try:
+        padded = cursor + "=" * (-len(cursor) % 4)
+        raw = urlsafe_b64decode(padded.encode())
+        payload, signature = raw.rsplit(b".", 1)
+        expected = new(get_settings().session_secret.encode(), payload, "sha256").hexdigest()
+        if not compare_digest(signature.decode(), expected):
+            raise ValueError
+        decoded = loads(payload)
+        return datetime.fromisoformat(decoded["created_at"]), UUID(decoded["id"])
+    except (ValueError, KeyError, TypeError, UnicodeDecodeError) as exc:
+        raise HTTPException(status_code=400, detail="MALFORMED_CURSOR") from exc
+
+
+def _validate_references(
+    session: Session,
+    auth: AuthContext,
+    counterparty_person_id: UUID | None,
+    evidence_id: UUID | None,
+) -> None:
+    if counterparty_person_id is not None:
+        found = session.execute(
+            text(
+                """
+                SELECT 1 FROM pkos_nodes
+                WHERE workspace_id = :workspace_id AND id = :id AND node_type = 'person'
+                """
+            ),
+            {"workspace_id": auth.workspace_id, "id": counterparty_person_id},
+        ).scalar_one_or_none()
+        if found is None:
+            raise HTTPException(status_code=404, detail="COUNTERPARTY_NOT_FOUND")
+    if evidence_id is not None:
+        found = session.execute(
+            text(
+                """
+                SELECT 1 FROM pkos_evidence
+                WHERE workspace_id = :workspace_id AND id = :id
+                """
+            ),
+            {"workspace_id": auth.workspace_id, "id": evidence_id},
+        ).scalar_one_or_none()
+        if found is None:
+            raise HTTPException(status_code=404, detail="EVIDENCE_NOT_FOUND")
+
+
 def _check_version(row: dict[str, Any], expected_version: int) -> None:
     if row["version"] != expected_version:
         raise HTTPException(status_code=409, detail="VERSION_CONFLICT")
@@ -364,6 +422,7 @@ def create_commitment(
         cached = _load_cached(session, auth, idempotency_key, request_hash)
         if cached is not None:
             return cached
+        _validate_references(session, auth, payload.counterparty_person_id, payload.evidence_id)
         row = (
             session.execute(
                 text(
@@ -452,12 +511,13 @@ def list_commitments(
     due_after: date | None = None,
     pinned: bool | None = None,
     include_archived: bool = False,
+    cursor: str | None = None,
     limit: int = Query(default=20, ge=1, le=100),
 ) -> CommitmentListResponse:
     clauses = ["workspace_id = :workspace_id"]
     params: dict[str, Any] = {
         "workspace_id": auth.workspace_id,
-        "limit": limit,
+        "limit": limit + 1,
     }
     if not include_archived:
         clauses.append("archived_at IS NULL")
@@ -479,6 +539,11 @@ def list_commitments(
     if pinned is not None:
         clauses.append("pinned = :pinned")
         params["pinned"] = pinned
+    if cursor:
+        cursor_created_at, cursor_id = _decode_cursor(cursor)
+        clauses.append("(created_at, id) < (:cursor_created_at, :cursor_id)")
+        params["cursor_created_at"] = cursor_created_at
+        params["cursor_id"] = cursor_id
     rows = (
         session.execute(
             text(
@@ -495,7 +560,16 @@ def list_commitments(
         .mappings()
         .all()
     )
-    return CommitmentListResponse(items=[_to_response(dict(row)) for row in rows])
+    has_more = len(rows) > limit
+    page = rows[:limit]
+    next_cursor = None
+    if has_more and page:
+        last = page[-1]
+        next_cursor = _encode_cursor(last["created_at"], last["id"])
+    return CommitmentListResponse(
+        items=[_to_response(dict(row)) for row in page],
+        next_cursor=next_cursor,
+    )
 
 
 @router.get("/{commitment_id}", response_model=CommitmentResponse)
@@ -555,6 +629,8 @@ def _mutate_commitment(
         if current["status"] in {"fulfilled", "broken", "cancelled"}:
             raise HTTPException(status_code=409, detail="COMMITMENT_TERMINAL")
         fields = payload.model_fields_set - {"expected_version"}
+        if "counterparty_person_id" in fields:
+            _validate_references(session, auth, payload.counterparty_person_id, None)
         if not fields:
             response = _to_response(current)
             _store_cached(session, auth, idempotency_key, request_hash, response, 200, now)
@@ -650,7 +726,6 @@ def _lifecycle(
             or (action == "fulfil" and current["status"] == "fulfilled")
             or (action == "cancel" and current["status"] == "cancelled")
             or (action == "archive" and current["archived_at"] is not None)
-            or (action == "restore" and current["archived_at"] is None)
         )
         if target_reached:
             response = _to_response(current)

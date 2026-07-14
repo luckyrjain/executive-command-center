@@ -91,6 +91,9 @@ def commitment_test_context() -> Iterator[tuple[TestClient, UUID, UUID, str]]:
                 "audit_events",
                 "idempotency_records",
                 "commitments",
+                "pkos_evidence",
+                "pkos_edges",
+                "pkos_nodes",
                 "sessions",
                 "users",
             ):
@@ -122,6 +125,45 @@ def test_commitment_lifecycle_is_transactional_and_workspace_scoped(
 ) -> None:
     client, workspace_id, user_id, token = commitment_test_context
     evidence_id = uuid4()
+    evidence_node_id = uuid4()
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                """
+                INSERT INTO pkos_nodes (
+                    id, workspace_id, node_type, canonical_name, attributes,
+                    created_at, updated_at
+                ) VALUES (
+                    :id, :workspace_id, 'evidence', :name, '{}'::jsonb, :now, :now
+                )
+                """
+            ),
+            {
+                "id": evidence_node_id,
+                "workspace_id": workspace_id,
+                "name": "Commitment evidence",
+                "now": datetime.now(UTC),
+            },
+        )
+        connection.execute(
+            text(
+                """
+                INSERT INTO pkos_evidence (
+                    id, workspace_id, node_id, source_type, source_ref, sha256, captured_at
+                ) VALUES (
+                    :id, :workspace_id, :node_id, 'test', :source_ref, :sha256, :captured_at
+                )
+                """
+            ),
+            {
+                "id": evidence_id,
+                "workspace_id": workspace_id,
+                "node_id": evidence_node_id,
+                "source_ref": str(evidence_id),
+                "sha256": "0" * 64,
+                "captured_at": datetime.now(UTC),
+            },
+        )
 
     create = client.post(
         "/api/v1/commitments",
@@ -257,3 +299,64 @@ def test_commitment_lifecycle_is_transactional_and_workspace_scoped(
     assert "commitment.fulfilled.v1" in outbox_types
     assert "commitment.archived.v1" in outbox_types
     assert "commitment.restored.v1" in outbox_types
+
+
+def test_restore_requires_archived_state(
+    commitment_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    client, _, _, token = commitment_test_context
+    created = client.post(
+        "/api/v1/commitments",
+        headers=_headers(token, "restore-create"),
+        json={"summary": "Never archived", "direction": "made_by_me"},
+    ).json()
+    response = client.post(
+        f"/api/v1/commitments/{created['id']}/restore",
+        headers=_headers(token, "restore-invalid"),
+        json={"expected_version": created["version"]},
+    )
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "COMMITMENT_NOT_ARCHIVED"
+
+
+def test_commitment_list_uses_signed_cursor_pagination(
+    commitment_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    client, _, _, token = commitment_test_context
+    for index in range(3):
+        response = client.post(
+            "/api/v1/commitments",
+            headers=_headers(token, f"page-create-{index}"),
+            json={"summary": f"Commitment {index}", "direction": "made_by_me"},
+        )
+        assert response.status_code == 201
+    first = client.get("/api/v1/commitments?limit=2")
+    assert first.status_code == 200
+    assert len(first.json()["items"]) == 2
+    assert first.json()["next_cursor"] is not None
+    second = client.get(
+        "/api/v1/commitments",
+        params={"limit": 2, "cursor": first.json()["next_cursor"]},
+    )
+    assert second.status_code == 200
+    assert len(second.json()["items"]) >= 1
+    malformed = client.get("/api/v1/commitments?cursor=not-signed")
+    assert malformed.status_code == 400
+
+
+def test_cross_workspace_references_are_not_disclosed(
+    commitment_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    client, _, _, token = commitment_test_context
+    response = client.post(
+        "/api/v1/commitments",
+        headers=_headers(token, "cross-workspace-reference"),
+        json={
+            "summary": "Invalid evidence",
+            "direction": "made_by_me",
+            "status": "detected",
+            "evidence_id": str(uuid4()),
+        },
+    )
+    assert response.status_code == 404
+    assert response.json()["error"]["code"] == "EVIDENCE_NOT_FOUND"

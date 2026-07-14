@@ -13,6 +13,12 @@ depends_on = None
 def upgrade() -> None:
     uuid = postgresql.UUID(as_uuid=True)
 
+    op.create_unique_constraint(
+        "uq_pkos_evidence_workspace_id_id",
+        "pkos_evidence",
+        ["workspace_id", "id"],
+    )
+
     op.create_table(
         "commitments",
         sa.Column("id", uuid, primary_key=True),
@@ -64,6 +70,16 @@ def upgrade() -> None:
             name="fk_commitments_workspace_owner",
         ),
         sa.ForeignKeyConstraint(
+            ["workspace_id", "counterparty_person_id"],
+            ["pkos_nodes.workspace_id", "pkos_nodes.id"],
+            name="fk_commitments_workspace_counterparty",
+        ),
+        sa.ForeignKeyConstraint(
+            ["workspace_id", "evidence_id"],
+            ["pkos_evidence.workspace_id", "pkos_evidence.id"],
+            name="fk_commitments_workspace_evidence",
+        ),
+        sa.ForeignKeyConstraint(
             ["workspace_id", "created_by"],
             ["users.workspace_id", "users.id"],
             name="fk_commitments_workspace_created_by",
@@ -108,3 +124,8 @@ def downgrade() -> None:
     op.drop_index("ix_commitments_workspace_status_due_at", table_name="commitments")
     op.drop_index("ix_commitments_workspace_status_due_date", table_name="commitments")
     op.drop_table("commitments")
+    op.drop_constraint(
+        "uq_pkos_evidence_workspace_id_id",
+        "pkos_evidence",
+        type_="unique",
+    )
