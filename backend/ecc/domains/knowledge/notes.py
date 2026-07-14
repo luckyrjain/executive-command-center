@@ -7,7 +7,7 @@ from typing import Annotated, Any, Literal
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
@@ -53,6 +53,13 @@ class NotePatch(BaseModel):
     meeting_id: UUID | None = None
     source_type: SourceType | None = None
     source_ref: str | None = Field(default=None, max_length=2000)
+
+    @model_validator(mode="after")
+    def reject_null_required_fields(self) -> NotePatch:
+        for field in ("body", "note_type", "source_type"):
+            if field in self.model_fields_set and getattr(self, field) is None:
+                raise ValueError(f"{field} cannot be null")
+        return self
 
 
 class NoteAction(BaseModel):

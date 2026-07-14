@@ -310,3 +310,25 @@ def test_note_meeting_reference_is_non_disclosing_until_meetings_exist(
     )
     assert response.status_code == 404
     assert response.json()["error"]["code"] == "MEETING_NOT_FOUND"
+
+
+def test_note_patch_rejects_null_required_fields(
+    note_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    client, _, _, token = note_test_context
+    created = client.post(
+        "/api/v1/notes",
+        headers=_headers(token, "null-fields-create"),
+        json={"title": "Required fields", "body": "Body"},
+    )
+    assert created.status_code == 201
+    note = created.json()
+
+    for field in ("body", "note_type", "source_type"):
+        response = client.patch(
+            f"/api/v1/notes/{note['id']}",
+            headers=_headers(token, f"null-{field}"),
+            json={"expected_version": note["version"], field: None},
+        )
+        assert response.status_code == 422
+        assert response.json()["error"]["code"] == "VALIDATION_ERROR"
