@@ -1,0 +1,13 @@
+warning: Support for Python 3.14 is under development and may be unstable. Enable `preview` to remove this warning.
+backend/ecc/domains/calendar/events.py:528:5: SyntaxError: Duplicate parameter "request"
+    |
+526 |     payload: CalendarEventAction,
+527 |     request: Request,
+528 |     request: Request,
+    |     ^^^^^^^
+529 |     auth: AuthContext,
+530 |     session: Session,
+    |
+
+Found 1 error.
+36 files left unchanged
