@@ -1,2 +1,0 @@
-backend/ecc/domains/scheduling/meetings.py:109: error: Name "next_cursor" already defined on line 108  [no-redef]
-Found 1 error in 1 file (checked 26 source files)

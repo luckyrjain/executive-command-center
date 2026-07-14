@@ -106,7 +106,6 @@ class MeetingResponse(BaseModel):
 class MeetingListResponse(BaseModel):
     items: list[MeetingResponse]
     next_cursor: str | None = None
-    next_cursor: str | None = None
 
 
 def _encode_cursor(updated_at: datetime, meeting_id: UUID) -> str:
