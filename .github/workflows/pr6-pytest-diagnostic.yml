@@ -23,9 +23,10 @@ jobs:
           --health-cmd "pg_isready -U ecc -d ecc"
           --health-interval 5s
           --health-timeout 5s
-          --health-retries 10
+          --health-retries 20
     env:
-      DATABASE_URL: postgresql+psycopg://ecc:ecc@localhost:5432/ecc
+      ECC_SESSION_SECRET: ci-secret-value-that-is-at-least-32-characters
+      ECC_DATABASE_URL: postgresql+psycopg://ecc:ecc@localhost:5432/ecc
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
