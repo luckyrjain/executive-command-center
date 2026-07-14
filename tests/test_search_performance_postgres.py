@@ -120,7 +120,7 @@ def test_search_10000_entity_ci_budget(
     started = perf_counter()
     response = client.get(
         "/api/v1/search",
-        params={"q": "needle quarterly", "entity_type[]": "task", "limit": 20},
+        params={"q": "needle quarterly", "types[]": "task", "limit": 20},
     )
     elapsed_ms = (perf_counter() - started) * 1000
 
