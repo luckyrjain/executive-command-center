@@ -20,7 +20,6 @@ jobs:
       - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e
       - run: uv sync --frozen --all-groups --python 3.14.6
       - run: |
-          python scripts/pr7_review_fix.py
           python scripts/pr7_duplicate_fix.py
           uv run ruff check --fix backend tests
           uv run ruff format backend tests
