@@ -16,6 +16,8 @@ from ecc.database import get_session
 
 router = APIRouter(prefix="/api/v1/audit", tags=["audit"])
 SessionDep = Annotated[Session, Depends(get_session)]
+OccurredFrom = Annotated[datetime | None, Query(alias="from")]
+OccurredTo = Annotated[datetime | None, Query(alias="to")]
 
 
 class AuditEventResponse(BaseModel):
@@ -64,9 +66,20 @@ def _decode(cursor: str) -> tuple[datetime, UUID]:
         if not compare_digest(signature, expected):
             raise ValueError
         payload = loads(urlsafe_b64decode(body.encode()).decode())
-        return datetime.fromisoformat(payload["occurred_at"]), UUID(payload["id"])
-    except (ValueError, KeyError, TypeError):
+        occurred_at = datetime.fromisoformat(payload["occurred_at"])
+        if occurred_at.utcoffset() is None:
+            raise ValueError
+        return occurred_at, UUID(payload["id"])
+    except (ValueError, KeyError, TypeError, UnicodeDecodeError):
         raise HTTPException(status_code=400, detail="INVALID_CURSOR") from None
+
+
+def _validate_range(start: datetime | None, end: datetime | None) -> None:
+    for value in (start, end):
+        if value is not None and value.utcoffset() is None:
+            raise HTTPException(status_code=422, detail="TIMEZONE_OFFSET_REQUIRED")
+    if start is not None and end is not None and start > end:
+        raise HTTPException(status_code=422, detail="INVALID_DATE_RANGE")
 
 
 @router.get("", response_model=AuditListResponse)
@@ -77,11 +90,12 @@ def list_audit_events(
     aggregate_id: UUID | None = None,
     actor_id: UUID | None = None,
     event_type: str | None = None,
-    occurred_from: datetime | None = None,
-    occurred_to: datetime | None = None,
+    occurred_from: OccurredFrom = None,
+    occurred_to: OccurredTo = None,
     cursor: str | None = None,
     limit: int = Query(default=20, ge=1, le=100),
 ) -> AuditListResponse:
+    _validate_range(occurred_from, occurred_to)
     conditions = ["workspace_id = :workspace_id"]
     params: dict[str, Any] = {"workspace_id": auth.workspace_id, "limit": limit + 1}
 
