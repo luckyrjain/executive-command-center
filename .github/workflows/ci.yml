@@ -6,39 +6,10 @@ on:
     branches: [main]
 
 permissions:
-  contents: write
+  contents: read
   pull-requests: read
 
 jobs:
-  mypy-autofix:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-        with:
-          ref: ${{ github.head_ref }}
-      - name: Fix lifecycle event payload typing
-        run: |
-          python - <<'PY'
-          from pathlib import Path
-
-          path = Path("backend/ecc/domains/planning/tasks.py")
-          content = path.read_text()
-          old = '        if action == "complete":\n'
-          new = '        event_payload: dict[str, Any]\n        if action == "complete":\n'
-          if old not in content:
-              raise SystemExit("target lifecycle block not found")
-          path.write_text(content.replace(old, new, 1))
-          PY
-      - name: Commit typing fix
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add backend/ecc/domains/planning/tasks.py
-          if ! git diff --cached --quiet; then
-            git commit -m "fix: type lifecycle event payload"
-            git push origin HEAD:${{ github.head_ref }}
-          fi
-
   backend:
     runs-on: ubuntu-latest
     services:
