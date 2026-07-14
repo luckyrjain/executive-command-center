@@ -6,29 +6,10 @@ on:
     branches: [main]
 
 permissions:
-  contents: write
+  contents: read
   pull-requests: read
 
 jobs:
-  review-fix:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-        with:
-          ref: ${{ github.head_ref }}
-      - run: python scripts/apply_pr4_review_fixes.py
-      - run: python -m pip install ruff==0.12.3
-      - run: ruff format backend tests
-      - name: Commit review fixes
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add backend tests
-          if ! git diff --cached --quiet; then
-            git commit -m "fix: address task PR review findings"
-            git push origin HEAD:${{ github.head_ref }}
-          fi
-
   backend:
     runs-on: ubuntu-latest
     services:
