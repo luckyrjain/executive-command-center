@@ -1,4 +1,4 @@
-"""Add Phase 1 risks and deterministic attention-item projection."""
+"""Add the Phase 1 risks and deterministic attention-item projection."""
 
 import sqlalchemy as sa
 from alembic import op
