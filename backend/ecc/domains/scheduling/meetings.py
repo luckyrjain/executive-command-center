@@ -17,6 +17,7 @@ router = APIRouter(prefix="/api/v1/meetings", tags=["meetings"])
 
 MeetingStatus = Literal["planned", "in_progress", "completed", "cancelled"]
 SessionDep = Annotated[Session, Depends(get_session)]
+MeetingStatusFilter = Annotated[MeetingStatus | None, Query(alias="status")]
 IdempotencyHeader = Annotated[
     str,
     Header(alias="Idempotency-Key", min_length=1, max_length=255),
@@ -43,7 +44,7 @@ class MeetingCreate(BaseModel):
     notes_summary: str | None = None
 
     @model_validator(mode="after")
-    def validate_timing(self) -> "MeetingCreate":
+    def validate_timing(self) -> MeetingCreate:
         if self.calendar_event_id is not None:
             if any(value is not None for value in (self.starts_at, self.ends_at, self.timezone)):
                 raise ValueError("linked meetings derive timing from the calendar event")
@@ -69,7 +70,7 @@ class MeetingPatch(BaseModel):
     notes_summary: str | None = None
 
     @model_validator(mode="after")
-    def reject_null_required_fields(self) -> "MeetingPatch":
+    def reject_null_required_fields(self) -> MeetingPatch:
         for field in ("title", "status"):
             if field in self.model_fields_set and getattr(self, field) is None:
                 raise ValueError(f"{field} cannot be null")
@@ -405,7 +406,7 @@ def create_meeting(
 def list_meetings(
     auth: AuthDep,
     session: SessionDep,
-    status_filter: MeetingStatus | None = Query(default=None, alias="status"),
+    status_filter: MeetingStatusFilter = None,
     include_archived: bool = False,
     limit: int = Query(default=50, ge=1, le=100),
 ) -> MeetingListResponse:
@@ -422,7 +423,7 @@ def list_meetings(
                 f"""
                 SELECT {_MEETING_FIELDS}
                 FROM meetings
-                WHERE {' AND '.join(clauses)}
+                WHERE {" AND ".join(clauses)}
                 ORDER BY updated_at DESC, id DESC
                 LIMIT :limit
                 """
@@ -481,9 +482,7 @@ def update_meeting(
             _store_cached(session, auth, idempotency_key, request_hash, response, 200, now)
             return response
         assignments = [f"{field} = :{field}" for field in sorted(fields)]
-        assignments.extend(
-            ["updated_by = :actor_id", "updated_at = :now", "version = version + 1"]
-        )
+        assignments.extend(["updated_by = :actor_id", "updated_at = :now", "version = version + 1"])
         values = payload.model_dump(include=fields)
         values.update(
             {
@@ -498,7 +497,7 @@ def update_meeting(
                 text(
                     f"""
                     UPDATE meetings
-                    SET {', '.join(assignments)}
+                    SET {", ".join(assignments)}
                     WHERE workspace_id = :workspace_id AND id = :meeting_id
                     RETURNING {_MEETING_FIELDS}
                     """
@@ -605,9 +604,7 @@ def archive_meeting(
     _csrf: CsrfDep,
     idempotency_key: IdempotencyHeader,
 ) -> MeetingResponse:
-    return _lifecycle(
-        meeting_id, payload, request, auth, session, idempotency_key, "archive"
-    )
+    return _lifecycle(meeting_id, payload, request, auth, session, idempotency_key, "archive")
 
 
 @router.post("/{meeting_id}/restore", response_model=MeetingResponse)
@@ -620,6 +617,4 @@ def restore_meeting(
     _csrf: CsrfDep,
     idempotency_key: IdempotencyHeader,
 ) -> MeetingResponse:
-    return _lifecycle(
-        meeting_id, payload, request, auth, session, idempotency_key, "restore"
-    )
+    return _lifecycle(meeting_id, payload, request, auth, session, idempotency_key, "restore")

@@ -46,7 +46,7 @@ class CalendarEventCreate(BaseModel):
     external_id: str | None = None
 
     @model_validator(mode="after")
-    def validate_timing(self) -> "CalendarEventCreate":
+    def validate_timing(self) -> CalendarEventCreate:
         _validate_datetime(self.starts_at, "starts_at")
         _validate_datetime(self.ends_at, "ends_at")
         _validate_timezone(self.timezone)
@@ -69,7 +69,7 @@ class CalendarEventPatch(BaseModel):
     status: EventStatus | None = None
 
     @model_validator(mode="after")
-    def validate_patch(self) -> "CalendarEventPatch":
+    def validate_patch(self) -> CalendarEventPatch:
         for field in ("title", "starts_at", "ends_at", "all_day", "timezone", "status"):
             if field in self.model_fields_set and getattr(self, field) is None:
                 raise ValueError(f"{field} cannot be null")
@@ -337,7 +337,7 @@ def list_calendar_events(
                 f"""
                 SELECT {_SELECT_FIELDS}
                 FROM calendar_events
-                WHERE {' AND '.join(clauses)}
+                WHERE {" AND ".join(clauses)}
                 ORDER BY starts_at ASC, id ASC
                 LIMIT :limit
                 """
@@ -408,7 +408,9 @@ def update_calendar_event(
         if candidate["ends_at"] <= candidate["starts_at"]:
             raise HTTPException(status_code=422, detail="INVALID_EVENT_TIME_RANGE")
         assignments = [f"{field} = :{field}" for field in sorted(fields)]
-        assignments.extend(["updated_by = :updated_by", "updated_at = :now", "version = version + 1"])
+        assignments.extend(
+            ["updated_by = :updated_by", "updated_at = :now", "version = version + 1"]
+        )
         values = payload.model_dump(include=set(fields))
         values.update(
             {
@@ -423,7 +425,7 @@ def update_calendar_event(
                 text(
                     f"""
                     UPDATE calendar_events
-                    SET {', '.join(assignments)}
+                    SET {", ".join(assignments)}
                     WHERE workspace_id = :workspace_id AND id = :event_id
                     RETURNING {_SELECT_FIELDS}
                     """
