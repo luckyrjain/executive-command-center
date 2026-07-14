@@ -114,7 +114,7 @@ def list_audit_events(
                        before, after, changed_fields, authorization_result, source,
                        failure_code, metadata, occurred_at
                 FROM audit_events
-                WHERE {' AND '.join(conditions)}
+                WHERE {" AND ".join(conditions)}
                 ORDER BY occurred_at DESC, id DESC
                 LIMIT :limit
                 """
@@ -129,9 +129,7 @@ def list_audit_events(
     next_cursor = None
     if has_more and visible:
         tail = visible[-1]
-        next_cursor = _sign(
-            {"occurred_at": tail["occurred_at"].isoformat(), "id": str(tail["id"])}
-        )
+        next_cursor = _sign({"occurred_at": tail["occurred_at"].isoformat(), "id": str(tail["id"])})
     return AuditListResponse(
         items=[AuditEventResponse.model_validate(dict(row)) for row in visible],
         next_cursor=next_cursor,
