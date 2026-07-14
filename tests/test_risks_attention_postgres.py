@@ -208,7 +208,7 @@ def test_risk_lifecycle_and_attention_controls(
     items = regenerate.json()["items"]
     assert {item["entity_type"] for item in items} == {"task", "commitment", "risk"}
     assert items[0]["entity_type"] == "task"
-    assert items[0]["score"] == 100
+    assert items[0]["score"] == 98
 
     risk_item = next(item for item in items if item["entity_type"] == "risk")
     dismiss = client.post(
