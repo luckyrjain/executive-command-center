@@ -1,1 +1,1 @@
-"""Platform query surfaces for search and immutable audit history."""
+"""Platform read surfaces for search and immutable audit history."""
