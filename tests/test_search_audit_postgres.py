@@ -246,10 +246,10 @@ def test_audit_filters_pagination_redaction_and_isolation(
                     "actor_id": user_id,
                     "request_id": uuid4(),
                     "correlation_id": uuid4(),
-                    "before": '{}',
+                    "before": "{}",
                     "after": '{"body_checksum":"abc123","body_length":42}',
                     "changed_fields": ["body_checksum"],
-                    "metadata": '{}',
+                    "metadata": "{}",
                     "occurred_at": now - timedelta(minutes=offset),
                 },
             )
