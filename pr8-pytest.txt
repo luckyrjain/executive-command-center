@@ -523,11 +523,11 @@ backend/ecc/domains/governance/attention.py:226: in regenerate_attention
     raise sa_exc.InvalidRequestError(
 E   sqlalchemy.exc.InvalidRequestError: A transaction is already begun on this Session.
 ----------------------------- Captured stderr call -----------------------------
-{"timestamp":"2026-07-14T12:40:46.031599+00:00","level":"INFO","service":"ecc-backend","domain":"platform","correlation_id":null,"request_id":null,"message":"HTTP Request: POST http://testserver/api/v1/risks \"HTTP/1.1 201 Created\""}
-{"timestamp":"2026-07-14T12:40:46.039212+00:00","level":"INFO","service":"ecc-backend","domain":"platform","correlation_id":null,"request_id":null,"message":"HTTP Request: PATCH http://testserver/api/v1/risks/d64a87b5-f410-4221-b682-1a0c265082f8 \"HTTP/1.1 409 Conflict\""}
+{"timestamp":"2026-07-14T12:46:47.057468+00:00","level":"INFO","service":"ecc-backend","domain":"platform","correlation_id":null,"request_id":null,"message":"HTTP Request: POST http://testserver/api/v1/risks \"HTTP/1.1 201 Created\""}
+{"timestamp":"2026-07-14T12:46:47.065055+00:00","level":"INFO","service":"ecc-backend","domain":"platform","correlation_id":null,"request_id":null,"message":"HTTP Request: PATCH http://testserver/api/v1/risks/ca77c2bf-81b3-4742-b4ce-a306d372dbfd \"HTTP/1.1 409 Conflict\""}
 ------------------------------ Captured log call -------------------------------
 INFO     httpx:_client.py:1025 HTTP Request: POST http://testserver/api/v1/risks "HTTP/1.1 201 Created"
-INFO     httpx:_client.py:1025 HTTP Request: PATCH http://testserver/api/v1/risks/d64a87b5-f410-4221-b682-1a0c265082f8 "HTTP/1.1 409 Conflict"
+INFO     httpx:_client.py:1025 HTTP Request: PATCH http://testserver/api/v1/risks/ca77c2bf-81b3-4742-b4ce-a306d372dbfd "HTTP/1.1 409 Conflict"
 =============================== warnings summary ===============================
 .venv/lib/python3.14/site-packages/fastapi/testclient.py:1
   /home/runner/work/executive-command-center/executive-command-center/.venv/lib/python3.14/site-packages/fastapi/testclient.py:1: StarletteDeprecationWarning: Using `httpx` with `starlette.testclient` is deprecated; install `httpx2` instead.
@@ -536,4 +536,4 @@ INFO     httpx:_client.py:1025 HTTP Request: PATCH http://testserver/api/v1/risk
 -- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
 =========================== short test summary info ============================
 FAILED tests/test_risks_attention_postgres.py::test_risk_lifecycle_and_attention_controls - sqlalchemy.exc.InvalidRequestError: A transaction is already begun on this Session.
-1 failed, 39 passed, 1 warning in 3.33s
+1 failed, 39 passed, 1 warning in 3.42s
