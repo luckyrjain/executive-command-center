@@ -1,0 +1,28 @@
+name: pr10-format
+on:
+  workflow_dispatch:
+  push:
+    branches: [feature/phase-1-dashboard-morning-brief]
+permissions:
+  contents: write
+jobs:
+  format:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: feature/phase-1-dashboard-morning-brief
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: '3.14.6'
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e
+      - run: uv sync --frozen --all-groups --python 3.14.6
+      - run: uv run ruff format backend tests
+      - run: uv run ruff check --fix backend tests
+      - run: rm .github/workflows/pr10-format.yml
+      - run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add backend tests .github/workflows/pr10-format.yml
+          git commit -m "style: format dashboard and morning brief slice" || exit 0
+          git push
