@@ -21,6 +21,7 @@ CsrfHeader = Annotated[str | None, Header(alias="X-CSRF-Token")]
 class AuthContext:
     workspace_id: UUID
     user_id: UUID
+    timezone: str
 
 
 def require_auth_context(
@@ -38,11 +39,12 @@ def require_auth_context(
         session.execute(
             text(
                 """
-            SELECT workspace_id, user_id
-            FROM sessions
-            WHERE token_hash = :token_hash
-              AND revoked_at IS NULL
-              AND expires_at > :now
+            SELECT s.workspace_id, s.user_id, w.timezone
+            FROM sessions AS s
+            JOIN workspaces AS w ON w.id = s.workspace_id
+            WHERE s.token_hash = :token_hash
+              AND s.revoked_at IS NULL
+              AND s.expires_at > :now
             """
             ),
             {"token_hash": token_hash, "now": datetime.now(UTC)},
@@ -58,7 +60,11 @@ def require_auth_context(
             detail="Invalid session",
         )
 
-    return AuthContext(workspace_id=row["workspace_id"], user_id=row["user_id"])
+    return AuthContext(
+        workspace_id=row["workspace_id"],
+        user_id=row["user_id"],
+        timezone=row["timezone"],
+    )
 
 
 def require_csrf(

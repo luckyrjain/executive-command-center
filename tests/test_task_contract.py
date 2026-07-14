@@ -89,3 +89,19 @@ def test_task_cursor_is_signed_and_round_trips() -> None:
     cursor = _encode_cursor(created_at, task_id)
 
     assert _decode_cursor(cursor) == (created_at, task_id)
+
+
+def test_task_create_rejects_timezone_naive_due_at() -> None:
+    with pytest.raises(ValidationError):
+        TaskCreate(
+            title="Timezone required",
+            due_at=datetime(2026, 7, 14, 9, 0),
+        )
+
+
+def test_task_patch_rejects_timezone_naive_due_at() -> None:
+    with pytest.raises(ValidationError):
+        TaskPatch(
+            expected_version=1,
+            due_at=datetime(2026, 7, 14, 9, 0),
+        )

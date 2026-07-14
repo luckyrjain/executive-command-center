@@ -1,4 +1,5 @@
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from hmac import new
@@ -136,6 +137,8 @@ def test_task_lifecycle_is_transactional_and_workspace_scoped(
     )
     assert create.status_code == 201
     created = create.json()
+    assert created["request_id"]
+    assert created["correlation_id"]
     task_id = created["id"]
     assert created["owner_id"] == str(user_id)
     assert created["version"] == 1
@@ -163,6 +166,8 @@ def test_task_lifecycle_is_transactional_and_workspace_scoped(
         json={"expected_version": 1, "title": "Stale update"},
     )
     assert conflict.status_code == 409
+    assert conflict.json()["error"]["code"] == "VERSION_CONFLICT"
+    assert conflict.json()["error"]["request_id"]
 
     complete = client.post(
         f"/api/v1/tasks/{task_id}/complete",
@@ -233,3 +238,89 @@ def test_task_lifecycle_is_transactional_and_workspace_scoped(
     assert "task.completed.v1" in outbox_types
     assert "task.archived.v1" in outbox_types
     assert "task.restored.v1" in outbox_types
+
+
+def test_terminal_transitions_and_workspace_timezone_are_enforced(
+    task_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    client, workspace_id, _user_id, token = task_test_context
+    with engine.begin() as connection:
+        connection.execute(
+            text("UPDATE workspaces SET timezone = 'Asia/Kolkata' WHERE id = :workspace_id"),
+            {"workspace_id": workspace_id},
+        )
+
+    created = client.post(
+        "/api/v1/tasks",
+        headers=_headers(token, "timezone-task"),
+        json={
+            "title": "Local next-day task",
+            "due_at": "2026-07-14T20:00:00Z",
+        },
+    )
+    assert created.status_code == 201
+    task_id = created.json()["id"]
+
+    before_local_day = client.get("/api/v1/tasks?due_before=2026-07-14")
+    assert before_local_day.status_code == 200
+    assert task_id not in {item["id"] for item in before_local_day.json()["items"]}
+
+    on_local_day = client.get("/api/v1/tasks?due_after=2026-07-15")
+    assert on_local_day.status_code == 200
+    assert task_id in {item["id"] for item in on_local_day.json()["items"]}
+
+    complete = client.post(
+        f"/api/v1/tasks/{task_id}/complete",
+        headers=_headers(token, "terminal-complete"),
+        json={"expected_version": 1},
+    )
+    assert complete.status_code == 200
+
+    reopen = client.patch(
+        f"/api/v1/tasks/{task_id}",
+        headers=_headers(token, "terminal-reopen"),
+        json={"expected_version": 2, "status": "in_progress"},
+    )
+    assert reopen.status_code == 409
+    assert reopen.json()["error"]["code"] == "TASK_TERMINAL"
+
+    cancel = client.post(
+        f"/api/v1/tasks/{task_id}/cancel",
+        headers=_headers(token, "terminal-cancel"),
+        json={"expected_version": 2},
+    )
+    assert cancel.status_code == 409
+    assert cancel.json()["error"]["code"] == "TASK_TERMINAL"
+
+
+def test_concurrent_idempotent_create_returns_one_task(
+    task_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    _client, workspace_id, _user_id, token = task_test_context
+
+    def create_once() -> tuple[int, str]:
+        worker = TestClient(app)
+        worker.cookies.set("ecc_session", token)
+        try:
+            response = worker.post(
+                "/api/v1/tasks",
+                headers=_headers(token, "concurrent-create"),
+                json={"title": "Concurrent idempotent task"},
+            )
+            return response.status_code, response.json()["id"]
+        finally:
+            worker.close()
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(lambda _: create_once(), range(2)))
+
+    assert [status for status, _task_id in results] == [201, 201]
+    assert len({task_id for _status, task_id in results}) == 1
+    with engine.connect() as connection:
+        count = connection.execute(
+            text(
+                "SELECT count(*) FROM tasks WHERE workspace_id = :workspace_id AND title = :title"
+            ),
+            {"workspace_id": workspace_id, "title": "Concurrent idempotent task"},
+        ).scalar_one()
+    assert count == 1

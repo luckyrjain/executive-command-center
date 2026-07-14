@@ -56,6 +56,8 @@ class TaskCreate(BaseModel):
     def validate_due_precision(self) -> TaskCreate:
         if self.due_date is not None and self.due_at is not None:
             raise ValueError("due_date and due_at are mutually exclusive")
+        if self.due_at is not None and self.due_at.utcoffset() is None:
+            raise ValueError("due_at must include a timezone offset")
         return self
 
 
@@ -78,6 +80,8 @@ class TaskPatch(BaseModel):
     def validate_due_precision(self) -> TaskPatch:
         if self.due_date is not None and self.due_at is not None:
             raise ValueError("due_date and due_at are mutually exclusive")
+        if self.due_at is not None and self.due_at.utcoffset() is None:
+            raise ValueError("due_at must include a timezone offset")
         return self
 
 
@@ -143,6 +147,14 @@ def _request_hash(payload: BaseModel, action: str) -> str:
     }
     encoded = dumps(material, sort_keys=True, separators=(",", ":")).encode()
     return sha256(encoded).hexdigest()
+
+
+def _lock_idempotency_key(session: Session, auth: AuthContext, key: str) -> None:
+    lock_key = f"{auth.workspace_id}:{auth.user_id}:{key}"
+    session.execute(
+        text("SELECT pg_advisory_xact_lock(hashtextextended(:lock_key, 0))"),
+        {"lock_key": lock_key},
+    )
 
 
 def _load_idempotent_response(
@@ -379,6 +391,7 @@ def create_task(
     request_id, correlation_id = _request_ids(request)
 
     with session.begin():
+        _lock_idempotency_key(session, auth, idempotency_key)
         cached = _load_idempotent_response(
             session,
             auth,
@@ -498,10 +511,16 @@ def list_tasks(
         clauses.append("manual_priority = ANY(:priorities)")
         params["priorities"] = priority_filter
     if due_before:
-        clauses.append("COALESCE(due_date, due_at::date) <= :due_before")
+        clauses.append(
+            "COALESCE(due_date, (due_at AT TIME ZONE :workspace_timezone)::date) <= :due_before"
+        )
+        params["workspace_timezone"] = auth.timezone
         params["due_before"] = due_before
     if due_after:
-        clauses.append("COALESCE(due_date, due_at::date) >= :due_after")
+        clauses.append(
+            "COALESCE(due_date, (due_at AT TIME ZONE :workspace_timezone)::date) >= :due_after"
+        )
+        params["workspace_timezone"] = auth.timezone
         params["due_after"] = due_after
     if pinned is not None:
         clauses.append("pinned = :pinned")
@@ -561,6 +580,7 @@ def update_task(
     request_id, correlation_id = _request_ids(request)
 
     with session.begin():
+        _lock_idempotency_key(session, auth, idempotency_key)
         cached = _load_idempotent_response(
             session,
             auth,
@@ -575,6 +595,12 @@ def update_task(
         _raise_version_conflict(current, payload.expected_version)
         if current["archived_at"] is not None:
             raise HTTPException(status_code=409, detail="TASK_ARCHIVED")
+        if (
+            current["status"] in {"completed", "cancelled"}
+            and "status" in payload.model_fields_set
+            and payload.status != current["status"]
+        ):
+            raise HTTPException(status_code=409, detail="TASK_TERMINAL")
 
         fields = payload.model_fields_set - {"expected_version"}
         if not fields:
@@ -689,6 +715,7 @@ def _lifecycle_task(
     request_id, correlation_id = _request_ids(request)
 
     with session.begin():
+        _lock_idempotency_key(session, auth, idempotency_key)
         cached = _load_idempotent_response(
             session,
             auth,
@@ -720,6 +747,9 @@ def _lifecycle_task(
                 now,
             )
             return response
+
+        if action in {"complete", "cancel"} and current["status"] in {"completed", "cancelled"}:
+            raise HTTPException(status_code=409, detail="TASK_TERMINAL")
 
         if action in {"complete", "cancel"} and current["archived_at"] is not None:
             raise HTTPException(status_code=409, detail="TASK_ARCHIVED")

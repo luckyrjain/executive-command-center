@@ -13,6 +13,16 @@ depends_on = None
 def upgrade() -> None:
     uuid = postgresql.UUID(as_uuid=True)
 
+    op.add_column(
+        "workspaces",
+        sa.Column(
+            "timezone",
+            sa.String(64),
+            nullable=False,
+            server_default="UTC",
+        ),
+    )
+
     op.create_table(
         "tasks",
         sa.Column("id", uuid, primary_key=True),
@@ -146,3 +156,4 @@ def downgrade() -> None:
     op.drop_index("ix_tasks_workspace_due_date", table_name="tasks")
     op.drop_index("ix_tasks_workspace_status", table_name="tasks")
     op.drop_table("tasks")
+    op.drop_column("workspaces", "timezone")

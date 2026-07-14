@@ -1,5 +1,6 @@
 from collections.abc import Awaitable, Callable
-from uuid import uuid4
+from json import JSONDecodeError, loads
+from uuid import UUID, uuid4
 
 from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -31,16 +32,87 @@ app.include_router(tasks_router)
 app.middleware("http")(rejected_mutation_audit_middleware)
 
 
+def _request_uuid(raw: str | None) -> str:
+    try:
+        return str(UUID(raw)) if raw else str(uuid4())
+    except ValueError:
+        return str(uuid4())
+
+
+def _error_payload(detail: object, request_id: str, correlation_id: str) -> dict[str, object]:
+    if isinstance(detail, str):
+        code = detail
+        message = detail.replace("_", " ").title()
+        details: object = {}
+    elif isinstance(detail, dict):
+        code = str(detail.get("code", "REQUEST_FAILED"))
+        message = str(detail.get("message", code.replace("_", " ").title()))
+        details = {key: value for key, value in detail.items() if key not in {"code", "message"}}
+    else:
+        code = "VALIDATION_ERROR"
+        message = "Request validation failed"
+        details = {"violations": detail}
+    return {
+        "error": {
+            "code": code,
+            "message": message,
+            "request_id": request_id,
+            "details": details,
+        },
+        "correlation_id": correlation_id,
+    }
+
+
 @app.middleware("http")
-async def correlation_middleware(
+async def response_contract_middleware(
     request: Request,
     call_next: Callable[[Request], Awaitable[Response]],
 ) -> Response:
-    correlation_id = request.headers.get("X-Correlation-ID", str(uuid4()))
+    request_id = str(uuid4())
+    correlation_id = _request_uuid(request.headers.get("X-Correlation-ID"))
+    request.state.request_id = request_id
     request.state.correlation_id = correlation_id
     response = await call_next(request)
     response.headers["X-Correlation-ID"] = correlation_id
-    return response
+    response.headers["X-Request-ID"] = request_id
+
+    if not request.url.path.startswith("/api/v1"):
+        return response
+    if "application/json" not in response.headers.get("content-type", ""):
+        return response
+
+    body_iterator = getattr(response, "body_iterator", None)
+    if body_iterator is None:
+        return response
+    body = b"".join([chunk async for chunk in body_iterator])
+    try:
+        payload = loads(body)
+    except (JSONDecodeError, UnicodeDecodeError):
+        return Response(
+            content=body,
+            status_code=response.status_code,
+            headers=dict(response.headers),
+            media_type=response.media_type,
+        )
+
+    if response.status_code >= 400:
+        detail = payload.get("detail") if isinstance(payload, dict) else payload
+        payload = _error_payload(detail, request_id, correlation_id)
+    elif isinstance(payload, dict):
+        payload["request_id"] = request_id
+        payload["correlation_id"] = correlation_id
+
+    headers = {
+        key: value
+        for key, value in response.headers.items()
+        if key.lower() not in {"content-length", "content-type"}
+    }
+    return JSONResponse(
+        content=payload,
+        status_code=response.status_code,
+        headers=headers,
+        background=response.background,
+    )
 
 
 @app.get("/health/live")
