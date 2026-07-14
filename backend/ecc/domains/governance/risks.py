@@ -178,7 +178,9 @@ def _risk_factors(row: dict[str, Any], now: datetime) -> tuple[int, list[dict[st
         )
     score = sum(int(factor["points"]) for factor in factors)
     score = min(100 if row["pinned"] else 95, score)
-    explanation = "; ".join(str(factor["label"]) for factor in factors) or "No active priority factors"
+    explanation = (
+        "; ".join(str(factor["label"]) for factor in factors) or "No active priority factors"
+    )
     return score, factors, explanation
 
 
@@ -428,7 +430,7 @@ def list_risks(
                 f"""
                 SELECT {_RISK_FIELDS}
                 FROM risks
-                WHERE {' AND '.join(clauses)}
+                WHERE {" AND ".join(clauses)}
                 ORDER BY updated_at DESC, id DESC
                 LIMIT :limit
                 """

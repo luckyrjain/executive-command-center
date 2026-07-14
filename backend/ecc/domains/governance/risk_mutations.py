@@ -49,7 +49,7 @@ class RiskPatch(BaseModel):
         return value
 
     @model_validator(mode="after")
-    def reject_null_required_fields(self) -> "RiskPatch":
+    def reject_null_required_fields(self) -> RiskPatch:
         for field in ("description", "probability", "impact", "status", "pinned"):
             if field in self.model_fields_set and getattr(self, field) is None:
                 raise ValueError(f"{field} cannot be null")
@@ -279,7 +279,7 @@ def update_risk(
                 text(
                     f"""
                     UPDATE risks
-                    SET {', '.join(assignments)}
+                    SET {", ".join(assignments)}
                     WHERE workspace_id = :workspace_id AND id = :risk_id
                     RETURNING {_RISK_FIELDS}
                     """

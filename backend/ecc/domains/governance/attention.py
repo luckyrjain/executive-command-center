@@ -5,7 +5,7 @@ from uuid import UUID, uuid4
 from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, field_validator
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
@@ -62,7 +62,9 @@ def _workspace_day(session: Session, auth: AuthContext, now: datetime) -> tuple[
     return local_day, end
 
 
-def _due_points(due_date: date | None, due_at: datetime | None, today: date, now: datetime) -> tuple[int, str | None]:
+def _due_points(
+    due_date: date | None, due_at: datetime | None, today: date, now: datetime
+) -> tuple[int, str | None]:
     if due_at is not None:
         delta = due_at - now
         if delta.total_seconds() < 0:
@@ -81,17 +83,28 @@ def _factor(code: str, label: str, points: int, source_field: str) -> dict[str, 
     return {"code": code, "label": label, "points": points, "source_field": source_field}
 
 
-def _score_task(row: dict[str, Any], today: date, now: datetime) -> tuple[int, float, list[dict[str, Any]]]:
+def _score_task(
+    row: dict[str, Any], today: date, now: datetime
+) -> tuple[int, float, list[dict[str, Any]]]:
     factors: list[dict[str, Any]] = []
     priority = {"critical": 35, "high": 25, "medium": 15, "low": 5}[row["manual_priority"]]
-    factors.append(_factor("manual_priority", f"Manual priority {row['manual_priority']}", priority, "manual_priority"))
+    factors.append(
+        _factor(
+            "manual_priority",
+            f"Manual priority {row['manual_priority']}",
+            priority,
+            "manual_priority",
+        )
+    )
     due_points, due_code = _due_points(row["due_date"], row["due_at"], today, now)
     if due_points:
         factors.append(_factor(due_code or "due", "Due timing", due_points, "due_date,due_at"))
     if row["pinned"]:
         factors.append(_factor("pinned", "Explicitly pinned", 20, "pinned"))
     if row["blocked_on_person_id"] is not None:
-        factors.append(_factor("waiting_on", "Waiting on another person", 8, "blocked_on_person_id"))
+        factors.append(
+            _factor("waiting_on", "Waiting on another person", 8, "blocked_on_person_id")
+        )
     if row["status"] == "blocked":
         factors.append(_factor("blocked", "Task is blocked", -12, "status"))
     age = now - row["updated_at"]
@@ -104,10 +117,14 @@ def _score_task(row: dict[str, Any], today: date, now: datetime) -> tuple[int, f
     return score, confidence, factors
 
 
-def _score_commitment(row: dict[str, Any], today: date, now: datetime) -> tuple[int, float, list[dict[str, Any]]]:
+def _score_commitment(
+    row: dict[str, Any], today: date, now: datetime
+) -> tuple[int, float, list[dict[str, Any]]]:
     factors: list[dict[str, Any]] = []
     importance = {"critical": 25, "high": 18, "medium": 10, "low": 4}[row["importance"]]
-    factors.append(_factor("importance", f"Importance {row['importance']}", importance, "importance"))
+    factors.append(
+        _factor("importance", f"Importance {row['importance']}", importance, "importance")
+    )
     due_points, due_code = _due_points(row["due_date"], row["due_at"], today, now)
     if due_points:
         factors.append(_factor(due_code or "due", "Due timing", due_points, "due_date,due_at"))
@@ -127,20 +144,34 @@ def _score_risk(row: dict[str, Any], now: datetime) -> tuple[int, float, list[di
     impact = int(row["probability"]) * int(row["impact"])
     points = 25 if impact >= 20 else 15 if impact >= 12 else 8 if impact >= 6 else 0
     if points:
-        factors.append(_factor("risk_impact", f"Risk impact {impact}", points, "probability,impact"))
+        factors.append(
+            _factor("risk_impact", f"Risk impact {impact}", points, "probability,impact")
+        )
     if row["review_at"] is not None:
         delta = row["review_at"] - now
         if delta.total_seconds() < 0:
             factors.append(_factor("review_overdue", "Risk review overdue", 35, "review_at"))
         elif delta <= timedelta(hours=48):
-            factors.append(_factor("review_due_soon", "Risk review due within 48 hours", 15, "review_at"))
+            factors.append(
+                _factor("review_due_soon", "Risk review due within 48 hours", 15, "review_at")
+            )
     if row["pinned"]:
         factors.append(_factor("pinned", "Explicitly pinned", 20, "pinned"))
     score = min(100 if row["pinned"] else 95, sum(item["points"] for item in factors))
     return score, 1.0, factors
 
 
-def _upsert(session: Session, auth: AuthContext, entity_type: EntityType, row: dict[str, Any], score: int, confidence: float, factors: list[dict[str, Any]], now: datetime, expires_at: datetime) -> None:
+def _upsert(
+    session: Session,
+    auth: AuthContext,
+    entity_type: EntityType,
+    row: dict[str, Any],
+    score: int,
+    confidence: float,
+    factors: list[dict[str, Any]],
+    now: datetime,
+    expires_at: datetime,
+) -> None:
     explanation = "; ".join(item["label"] for item in factors) or "No active priority factors"
     session.execute(
         text(
@@ -193,41 +224,61 @@ def regenerate_attention(auth: AuthDep, session: SessionDep, _csrf: CsrfDep) -> 
     today, day_end = _workspace_day(session, auth, now)
     expires_at = min(now + timedelta(minutes=30), day_end)
     with session.begin():
-        tasks = session.execute(
-            text("""
+        tasks = (
+            session.execute(
+                text("""
                 SELECT id, version, manual_priority, due_date, due_at, status,
                        blocked_on_person_id, pinned, updated_at
                 FROM tasks
                 WHERE workspace_id = :workspace_id AND archived_at IS NULL
                   AND status NOT IN ('completed','cancelled')
             """),
-            {"workspace_id": auth.workspace_id},
-        ).mappings().all()
-        commitments = session.execute(
-            text("""
+                {"workspace_id": auth.workspace_id},
+            )
+            .mappings()
+            .all()
+        )
+        commitments = (
+            session.execute(
+                text("""
                 SELECT id, version, importance, direction, due_date, due_at,
                        confidence, pinned, updated_at
                 FROM commitments
                 WHERE workspace_id = :workspace_id AND archived_at IS NULL
                   AND status NOT IN ('fulfilled','cancelled')
             """),
-            {"workspace_id": auth.workspace_id},
-        ).mappings().all()
-        risks = session.execute(
-            text("""
+                {"workspace_id": auth.workspace_id},
+            )
+            .mappings()
+            .all()
+        )
+        risks = (
+            session.execute(
+                text("""
                 SELECT id, version, probability, impact, review_at, pinned, updated_at
                 FROM risks
                 WHERE workspace_id = :workspace_id AND archived_at IS NULL
                   AND status <> 'closed'
             """),
-            {"workspace_id": auth.workspace_id},
-        ).mappings().all()
+                {"workspace_id": auth.workspace_id},
+            )
+            .mappings()
+            .all()
+        )
         for raw in tasks:
             row = dict(raw)
             _upsert(session, auth, "task", row, *_score_task(row, today, now), now, expires_at)
         for raw in commitments:
             row = dict(raw)
-            _upsert(session, auth, "commitment", row, *_score_commitment(row, today, now), now, expires_at)
+            _upsert(
+                session,
+                auth,
+                "commitment",
+                row,
+                *_score_commitment(row, today, now),
+                now,
+                expires_at,
+            )
         for raw in risks:
             row = dict(raw)
             _upsert(session, auth, "risk", row, *_score_risk(row, now), now, expires_at)
@@ -235,10 +286,13 @@ def regenerate_attention(auth: AuthDep, session: SessionDep, _csrf: CsrfDep) -> 
 
 
 @router.get("", response_model=AttentionList)
-def list_attention(auth: AuthDep, session: SessionDep, limit: int = Query(default=50, ge=1, le=100)) -> AttentionList:
+def list_attention(
+    auth: AuthDep, session: SessionDep, limit: int = Query(default=50, ge=1, le=100)
+) -> AttentionList:
     now = datetime.now(UTC)
-    rows = session.execute(
-        text("""
+    rows = (
+        session.execute(
+            text("""
             SELECT id, entity_type, entity_id, source_entity_version, score,
                    confidence, factors, explanation, generated_at, expires_at,
                    pinned, dismissed_at, dismissed_entity_version, deferred_until
@@ -250,16 +304,27 @@ def list_attention(auth: AuthDep, session: SessionDep, limit: int = Query(defaul
             ORDER BY pinned DESC, score DESC, generated_at DESC, entity_id
             LIMIT :limit
         """),
-        {"workspace_id": auth.workspace_id, "now": now, "limit": limit},
-    ).mappings().all()
+            {"workspace_id": auth.workspace_id, "now": now, "limit": limit},
+        )
+        .mappings()
+        .all()
+    )
     return AttentionList(items=[AttentionItem.model_validate(dict(row)) for row in rows])
 
 
-def _mutate_attention(item_id: UUID, action: str, payload: AttentionAction, request: Request, auth: AuthContext, session: Session) -> AttentionItem:
+def _mutate_attention(
+    item_id: UUID,
+    action: str,
+    payload: AttentionAction,
+    request: Request,
+    auth: AuthContext,
+    session: Session,
+) -> AttentionItem:
     now = datetime.now(UTC)
     with session.begin():
-        row = session.execute(
-            text("""
+        row = (
+            session.execute(
+                text("""
                 SELECT id, entity_type, entity_id, source_entity_version, score,
                        confidence, factors, explanation, generated_at, expires_at,
                        pinned, dismissed_at, dismissed_entity_version, deferred_until
@@ -267,8 +332,11 @@ def _mutate_attention(item_id: UUID, action: str, payload: AttentionAction, requ
                 WHERE workspace_id = :workspace_id AND id = :item_id
                 FOR UPDATE
             """),
-            {"workspace_id": auth.workspace_id, "item_id": item_id},
-        ).mappings().one_or_none()
+                {"workspace_id": auth.workspace_id, "item_id": item_id},
+            )
+            .mappings()
+            .one_or_none()
+        )
         if row is None:
             raise HTTPException(status_code=404, detail="ATTENTION_ITEM_NOT_FOUND")
         if action == "dismiss":
@@ -278,9 +346,14 @@ def _mutate_attention(item_id: UUID, action: str, payload: AttentionAction, requ
                 raise HTTPException(status_code=422, detail="DEFER_UNTIL_MUST_BE_FUTURE")
             values = {"deferred_until": payload.deferred_until}
         else:
-            values = {"dismissed_at": None, "dismissed_entity_version": None, "deferred_until": None}
-        updated = session.execute(
-            text("""
+            values = {
+                "dismissed_at": None,
+                "dismissed_entity_version": None,
+                "deferred_until": None,
+            }
+        updated = (
+            session.execute(
+                text("""
                 UPDATE attention_items SET
                     dismissed_at = :dismissed_at,
                     dismissed_entity_version = :dismissed_entity_version,
@@ -290,14 +363,19 @@ def _mutate_attention(item_id: UUID, action: str, payload: AttentionAction, requ
                           confidence, factors, explanation, generated_at, expires_at,
                           pinned, dismissed_at, dismissed_entity_version, deferred_until
             """),
-            {
-                "workspace_id": auth.workspace_id,
-                "item_id": item_id,
-                "dismissed_at": values.get("dismissed_at", row["dismissed_at"]),
-                "dismissed_entity_version": values.get("dismissed_entity_version", row["dismissed_entity_version"]),
-                "deferred_until": values.get("deferred_until", row["deferred_until"]),
-            },
-        ).mappings().one()
+                {
+                    "workspace_id": auth.workspace_id,
+                    "item_id": item_id,
+                    "dismissed_at": values.get("dismissed_at", row["dismissed_at"]),
+                    "dismissed_entity_version": values.get(
+                        "dismissed_entity_version", row["dismissed_entity_version"]
+                    ),
+                    "deferred_until": values.get("deferred_until", row["deferred_until"]),
+                },
+            )
+            .mappings()
+            .one()
+        )
         request_id = UUID(request.state.request_id)
         correlation_id = UUID(request.state.correlation_id)
         session.execute(
@@ -329,15 +407,36 @@ def _mutate_attention(item_id: UUID, action: str, payload: AttentionAction, requ
 
 
 @router.post("/{item_id}/dismiss", response_model=AttentionItem)
-def dismiss_attention(item_id: UUID, payload: AttentionAction, request: Request, auth: AuthDep, session: SessionDep, _csrf: CsrfDep) -> AttentionItem:
+def dismiss_attention(
+    item_id: UUID,
+    payload: AttentionAction,
+    request: Request,
+    auth: AuthDep,
+    session: SessionDep,
+    _csrf: CsrfDep,
+) -> AttentionItem:
     return _mutate_attention(item_id, "dismiss", payload, request, auth, session)
 
 
 @router.post("/{item_id}/defer", response_model=AttentionItem)
-def defer_attention(item_id: UUID, payload: AttentionAction, request: Request, auth: AuthDep, session: SessionDep, _csrf: CsrfDep) -> AttentionItem:
+def defer_attention(
+    item_id: UUID,
+    payload: AttentionAction,
+    request: Request,
+    auth: AuthDep,
+    session: SessionDep,
+    _csrf: CsrfDep,
+) -> AttentionItem:
     return _mutate_attention(item_id, "defer", payload, request, auth, session)
 
 
 @router.post("/{item_id}/restore", response_model=AttentionItem)
-def restore_attention(item_id: UUID, payload: AttentionAction, request: Request, auth: AuthDep, session: SessionDep, _csrf: CsrfDep) -> AttentionItem:
+def restore_attention(
+    item_id: UUID,
+    payload: AttentionAction,
+    request: Request,
+    auth: AuthDep,
+    session: SessionDep,
+    _csrf: CsrfDep,
+) -> AttentionItem:
     return _mutate_attention(item_id, "restore", payload, request, auth, session)

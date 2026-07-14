@@ -34,7 +34,9 @@ def upgrade() -> None:
         sa.Column("version", sa.BigInteger(), nullable=False, server_default="1"),
         sa.Column("archived_at", sa.DateTime(timezone=True)),
         sa.Column("pre_archive_status", sa.String(32)),
-        sa.CheckConstraint("char_length(description) BETWEEN 1 AND 5000", name="ck_risks_description"),
+        sa.CheckConstraint(
+            "char_length(description) BETWEEN 1 AND 5000", name="ck_risks_description"
+        ),
         sa.CheckConstraint("probability BETWEEN 1 AND 5", name="ck_risks_probability"),
         sa.CheckConstraint("impact BETWEEN 1 AND 5", name="ck_risks_impact"),
         sa.CheckConstraint(
@@ -67,7 +69,9 @@ def upgrade() -> None:
         sa.Column("source_entity_version", sa.BigInteger(), nullable=False),
         sa.Column("score", sa.SmallInteger(), nullable=False),
         sa.Column("confidence", sa.Numeric(4, 3), nullable=False),
-        sa.Column("factors", postgresql.JSONB(), nullable=False, server_default=sa.text("'{}'::jsonb")),
+        sa.Column(
+            "factors", postgresql.JSONB(), nullable=False, server_default=sa.text("'{}'::jsonb")
+        ),
         sa.Column("explanation", sa.Text(), nullable=False),
         sa.Column("generated_at", sa.DateTime(timezone=True), nullable=False),
         sa.Column("expires_at", sa.DateTime(timezone=True), nullable=False),
