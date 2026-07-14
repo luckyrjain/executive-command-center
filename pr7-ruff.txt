@@ -1,0 +1,66 @@
+warning: Support for Python 3.14 is under development and may be unstable. Enable `preview` to remove this warning.
+backend/ecc/domains/calendar/events.py:49:34: UP037 [*] Remove quotes from type annotation
+   |
+48 |     @model_validator(mode="after")
+49 |     def validate_timing(self) -> "CalendarEventCreate":
+   |                                  ^^^^^^^^^^^^^^^^^^^^^ UP037
+50 |         _validate_datetime(self.starts_at, "starts_at")
+51 |         _validate_datetime(self.ends_at, "ends_at")
+   |
+   = help: Remove quotes
+
+backend/ecc/domains/calendar/events.py:72:33: UP037 [*] Remove quotes from type annotation
+   |
+71 |     @model_validator(mode="after")
+72 |     def validate_patch(self) -> "CalendarEventPatch":
+   |                                 ^^^^^^^^^^^^^^^^^^^^ UP037
+73 |         for field in ("title", "starts_at", "ends_at", "all_day", "timezone", "status"):
+74 |             if field in self.model_fields_set and getattr(self, field) is None:
+   |
+   = help: Remove quotes
+
+backend/ecc/domains/calendar/events.py:411:101: E501 Line too long (102 > 100)
+    |
+409 |             raise HTTPException(status_code=422, detail="INVALID_EVENT_TIME_RANGE")
+410 |         assignments = [f"{field} = :{field}" for field in sorted(fields)]
+411 |         assignments.extend(["updated_by = :updated_by", "updated_at = :now", "version = version + 1"])
+    |                                                                                                     ^^ E501
+412 |         values = payload.model_dump(include=set(fields))
+413 |         values.update(
+    |
+
+backend/ecc/domains/scheduling/meetings.py:46:34: UP037 [*] Remove quotes from type annotation
+   |
+45 |     @model_validator(mode="after")
+46 |     def validate_timing(self) -> "MeetingCreate":
+   |                                  ^^^^^^^^^^^^^^^ UP037
+47 |         if self.calendar_event_id is not None:
+48 |             if any(value is not None for value in (self.starts_at, self.ends_at, self.timezone)):
+   |
+   = help: Remove quotes
+
+backend/ecc/domains/scheduling/meetings.py:72:46: UP037 [*] Remove quotes from type annotation
+   |
+71 |     @model_validator(mode="after")
+72 |     def reject_null_required_fields(self) -> "MeetingPatch":
+   |                                              ^^^^^^^^^^^^^^ UP037
+73 |         for field in ("title", "status"):
+74 |             if field in self.model_fields_set and getattr(self, field) is None:
+   |
+   = help: Remove quotes
+
+backend/ecc/domains/scheduling/meetings.py:408:43: B008 Do not perform function call `Query` in argument defaults; instead, perform the call within the function, or read the default from a module-level singleton variable
+    |
+406 |     auth: AuthDep,
+407 |     session: SessionDep,
+408 |     status_filter: MeetingStatus | None = Query(default=None, alias="status"),
+    |                                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ B008
+409 |     include_archived: bool = False,
+410 |     limit: int = Query(default=50, ge=1, le=100),
+    |
+
+Found 6 errors.
+[*] 4 fixable with the `--fix` option.
+Would reformat: backend/ecc/domains/calendar/events.py
+Would reformat: backend/ecc/domains/scheduling/meetings.py
+2 files would be reformatted, 33 files already formatted
