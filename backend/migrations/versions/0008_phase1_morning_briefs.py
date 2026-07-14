@@ -53,7 +53,10 @@ def upgrade() -> None:
             "generation_version",
             name="uq_morning_briefs_workspace_user_date_version",
         ),
-        sa.CheckConstraint("generation_version >= 1", name="ck_morning_briefs_generation_version"),
+        sa.CheckConstraint(
+            "generation_version >= 1",
+            name="ck_morning_briefs_generation_version",
+        ),
         sa.CheckConstraint(
             "ai_status IN ('disabled', 'available', 'unavailable')",
             name="ck_morning_briefs_ai_status",
@@ -62,7 +65,12 @@ def upgrade() -> None:
     op.create_index(
         "ix_morning_briefs_current",
         "morning_briefs",
-        ["workspace_id", "user_id", "briefing_date", sa.text("generation_version DESC")],
+        [
+            "workspace_id",
+            "user_id",
+            "briefing_date",
+            sa.text("generation_version DESC"),
+        ],
     )
     op.create_index(
         "ix_morning_briefs_generated_at",
