@@ -7,7 +7,7 @@ Executive Command Center (ECC) is a specification-driven platform for helping ex
 ## Current status
 
 **Foundation specification:** Phase 0 baseline approved  
-**Implementation:** Phase 1 task vertical slice in progress  
+**Implementation:** Phase 1 task vertical slice in review  
 **Current delivery phase:** Phase 1 — Executive Dashboard MVP
 
 ## Start here
