@@ -287,8 +287,17 @@ def test_risk_lifecycle_and_attention_controls(
             )
         }
     assert {"risk.created", "risk.updated", "risk.archived", "risk.restored"} <= audit_types
-    assert {"attention_item.dismiss", "attention_item.defer", "attention_item.restore"} <= audit_types
-    assert {"risk.created.v1", "risk.updated.v1", "risk.archived.v1", "risk.restored.v1"} <= outbox_types
+    assert {
+        "attention_item.dismiss",
+        "attention_item.defer",
+        "attention_item.restore",
+    } <= audit_types
+    assert {
+        "risk.created.v1",
+        "risk.updated.v1",
+        "risk.archived.v1",
+        "risk.restored.v1",
+    } <= outbox_types
 
 
 def test_risk_is_hidden_across_workspaces(
