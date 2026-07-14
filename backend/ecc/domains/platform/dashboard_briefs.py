@@ -13,6 +13,7 @@ from ecc.database import get_session
 
 router = APIRouter(prefix="/api/v1", tags=["dashboard", "briefs"])
 SessionDep = Annotated[Session, Depends(get_session)]
+DateQuery = Annotated[date | None, Query(alias="date")]
 ALGORITHM_VERSION = "phase1-deterministic-v1"
 
 
@@ -458,7 +459,7 @@ def _generate(
 def dashboard_today(
     auth: AuthDep,
     session: SessionDep,
-    day: date | None = Query(default=None, alias="date"),
+    day: DateQuery = None,
 ) -> DashboardResponse:
     target = _target_date(day, auth.timezone)
     sections, _, _ = _build_sections(session, auth.workspace_id, target, auth.timezone)
@@ -477,7 +478,7 @@ def get_morning_brief(
     request: Request,
     auth: AuthDep,
     session: SessionDep,
-    day: date | None = Query(default=None, alias="date"),
+    day: DateQuery = None,
 ) -> MorningBriefResponse:
     target = _target_date(day, auth.timezone)
     row = (
@@ -510,7 +511,7 @@ def refresh_morning_brief(
     auth: AuthDep,
     _: CsrfDep,
     session: SessionDep,
-    day: date | None = Query(default=None, alias="date"),
+    day: DateQuery = None,
 ) -> MorningBriefResponse:
     target = _target_date(day, auth.timezone)
     return _generate(request, session, auth.workspace_id, auth.user_id, auth.timezone, target)
