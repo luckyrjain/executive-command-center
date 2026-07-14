@@ -1,0 +1,34 @@
+name: pr8-finalize
+
+on:
+  pull_request:
+
+permissions:
+  contents: write
+
+jobs:
+  finalize:
+    if: github.head_ref == 'feature/phase-1-risks-priority'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: feature/phase-1-risks-priority
+      - run: |
+          python - <<'PY'
+          from pathlib import Path
+          path = Path('backend/ecc/domains/governance/attention.py')
+          text = path.read_text().replace(
+              '    return list_attention(auth, session)\n',
+              '    return list_attention(auth, session, 50)\n',
+              1,
+          )
+          path.write_text(text)
+          PY
+      - run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git rm -f pr8-pytest.txt .github/workflows/pr8-pytest-diagnostic.yml .github/workflows/pr8-finalize.yml
+          git add backend/ecc/domains/governance/attention.py
+          git commit -m "fix: pass explicit attention list limit"
+          git push origin HEAD:feature/phase-1-risks-priority
