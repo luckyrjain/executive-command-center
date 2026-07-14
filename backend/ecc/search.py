@@ -4,7 +4,7 @@ from hashlib import sha256
 from hmac import compare_digest, new
 from html import escape
 from json import dumps, loads
-from typing import Annotated, Literal
+from typing import Annotated, Literal, TypedDict
 from unicodedata import normalize
 from uuid import UUID
 
@@ -30,6 +30,13 @@ _TYPE_ORDER = {
     "risk": 5,
     "calendar_event": 6,
 }
+
+
+class CursorPayload(TypedDict):
+    score: float
+    updated_at: datetime
+    type_order: int
+    id: UUID
 
 
 class SearchResult(BaseModel):
@@ -67,10 +74,12 @@ def _sign_cursor(payload: dict[str, object]) -> str:
     return urlsafe_b64encode(raw + signature).decode().rstrip("=")
 
 
-def _decode_cursor(cursor: str) -> dict[str, object]:
+def _decode_cursor(cursor: str) -> CursorPayload:
     try:
         padded = cursor + "=" * (-len(cursor) % 4)
         decoded = urlsafe_b64decode(padded.encode())
+        if len(decoded) <= 32:
+            raise ValueError
         raw, signature = decoded[:-32], decoded[-32:]
         expected = new(get_settings().session_secret.encode(), raw, sha256).digest()
         if not compare_digest(signature, expected):
@@ -78,8 +87,19 @@ def _decode_cursor(cursor: str) -> dict[str, object]:
         payload = loads(raw)
         if not isinstance(payload, dict):
             raise ValueError
-        return payload
-    except (ValueError, TypeError, UnicodeDecodeError):
+        score = float(payload["score"])
+        updated_at = datetime.fromisoformat(str(payload["updated_at"]))
+        type_order = int(payload["type_order"])
+        entity_id = UUID(str(payload["id"]))
+        if not 0 <= score <= 1 or type_order not in _TYPE_ORDER.values():
+            raise ValueError
+        return {
+            "score": score,
+            "updated_at": updated_at,
+            "type_order": type_order,
+            "id": entity_id,
+        }
+    except (KeyError, ValueError, TypeError, UnicodeDecodeError):
         raise HTTPException(status_code=400, detail="INVALID_CURSOR") from None
 
 
@@ -111,7 +131,7 @@ def search(
         WITH candidates AS (
             SELECT 'task'::text AS entity_type, id AS entity_id, title,
                    description AS body, updated_at, due_at AS timestamp_context,
-                   source_type, archived_at, pinned,
+                   source_type::text, archived_at, pinned,
                    lower(title) AS normalized_title,
                    similarity(lower(title), :query) AS trigram_score,
                    ts_rank_cd(
@@ -123,8 +143,8 @@ def search(
             WHERE workspace_id = :workspace_id
 
             UNION ALL
-            SELECT 'commitment', id, summary, description, updated_at, due_at,
-                   'local', archived_at, pinned, lower(summary),
+            SELECT 'commitment'::text, id, summary, description, updated_at, due_at,
+                   'local'::text, archived_at, pinned, lower(summary),
                    similarity(lower(summary), :query),
                    ts_rank_cd(
                      setweight(to_tsvector('simple', coalesce(summary, '')), 'A') ||
@@ -135,18 +155,19 @@ def search(
             WHERE workspace_id = :workspace_id
 
             UNION ALL
-            SELECT 'note', id, coalesce(title, 'Untitled note'), body, updated_at, NULL,
-                   source_type, archived_at, false, lower(coalesce(title, '')),
+            SELECT 'note'::text, id, coalesce(title, 'Untitled note'), body, updated_at,
+                   NULL::timestamptz, source_type::text, archived_at, false,
+                   lower(coalesce(title, '')),
                    similarity(lower(coalesce(title, '')), :query),
                    ts_rank_cd(search_document, plainto_tsquery('simple', :query))
             FROM notes
             WHERE workspace_id = :workspace_id
 
             UNION ALL
-            SELECT 'meeting', m.id, m.title,
+            SELECT 'meeting'::text, m.id, m.title,
                    concat_ws(' ', m.agenda, m.preparation, m.notes_summary),
                    m.updated_at, coalesce(ce.starts_at, m.standalone_starts_at),
-                   'local', m.archived_at, false, lower(m.title),
+                   'local'::text, m.archived_at, false, lower(m.title),
                    similarity(lower(m.title), :query),
                    ts_rank_cd(
                      setweight(to_tsvector('simple', coalesce(m.title, '')), 'A') ||
@@ -160,8 +181,8 @@ def search(
             WHERE m.workspace_id = :workspace_id
 
             UNION ALL
-            SELECT 'calendar_event', id, title, concat_ws(' ', description, location),
-                   updated_at, starts_at, external_source, archived_at, false,
+            SELECT 'calendar_event'::text, id, title, concat_ws(' ', description, location),
+                   updated_at, starts_at, external_source::text, archived_at, false,
                    lower(title), similarity(lower(title), :query),
                    ts_rank_cd(
                      setweight(to_tsvector('simple', coalesce(title, '')), 'A') ||
@@ -172,9 +193,9 @@ def search(
             WHERE workspace_id = :workspace_id
 
             UNION ALL
-            SELECT 'risk', id, left(description, 500),
+            SELECT 'risk'::text, id, left(description, 500),
                    concat_ws(' ', description, mitigation, trigger), updated_at, review_at,
-                   'local', archived_at, pinned, lower(description),
+                   'local'::text, archived_at, pinned, lower(description),
                    similarity(lower(description), :query),
                    ts_rank_cd(
                      setweight(to_tsvector('simple', coalesce(description, '')), 'A') ||
@@ -205,10 +226,16 @@ def search(
                 - CASE WHEN archived_at IS NOT NULL THEN 0.20 ELSE 0 END
               )::double precision AS score
             FROM candidates
-            WHERE entity_type = ANY(:entity_types)
-              AND (:include_archived OR archived_at IS NULL)
-              AND (:updated_from IS NULL OR updated_at >= :updated_from)
-              AND (:updated_to IS NULL OR updated_at <= :updated_to)
+            WHERE entity_type = ANY(CAST(:entity_types AS text[]))
+              AND (CAST(:include_archived AS boolean) OR archived_at IS NULL)
+              AND (
+                CAST(:updated_from AS timestamptz) IS NULL
+                OR updated_at >= CAST(:updated_from AS timestamptz)
+              )
+              AND (
+                CAST(:updated_to AS timestamptz) IS NULL
+                OR updated_at <= CAST(:updated_to AS timestamptz)
+              )
               AND (
                 normalized_title = :query
                 OR normalized_title LIKE :query || '%'
@@ -222,20 +249,29 @@ def search(
                fulltext_score, score
         FROM ranked
         WHERE (
-          :cursor_score IS NULL
-          OR score < :cursor_score
-          OR (score = :cursor_score AND updated_at < :cursor_updated_at)
-          OR (score = :cursor_score AND updated_at = :cursor_updated_at
-              AND CASE entity_type
-                    WHEN 'task' THEN 1 WHEN 'commitment' THEN 2 WHEN 'meeting' THEN 3
-                    WHEN 'note' THEN 4 WHEN 'risk' THEN 5 ELSE 6
-                  END > :cursor_type_order)
-          OR (score = :cursor_score AND updated_at = :cursor_updated_at
-              AND CASE entity_type
-                    WHEN 'task' THEN 1 WHEN 'commitment' THEN 2 WHEN 'meeting' THEN 3
-                    WHEN 'note' THEN 4 WHEN 'risk' THEN 5 ELSE 6
-                  END = :cursor_type_order
-              AND entity_id > :cursor_id)
+          CAST(:cursor_score AS double precision) IS NULL
+          OR score < CAST(:cursor_score AS double precision)
+          OR (
+            score = CAST(:cursor_score AS double precision)
+            AND updated_at < CAST(:cursor_updated_at AS timestamptz)
+          )
+          OR (
+            score = CAST(:cursor_score AS double precision)
+            AND updated_at = CAST(:cursor_updated_at AS timestamptz)
+            AND CASE entity_type
+                  WHEN 'task' THEN 1 WHEN 'commitment' THEN 2 WHEN 'meeting' THEN 3
+                  WHEN 'note' THEN 4 WHEN 'risk' THEN 5 ELSE 6
+                END > CAST(:cursor_type_order AS integer)
+          )
+          OR (
+            score = CAST(:cursor_score AS double precision)
+            AND updated_at = CAST(:cursor_updated_at AS timestamptz)
+            AND CASE entity_type
+                  WHEN 'task' THEN 1 WHEN 'commitment' THEN 2 WHEN 'meeting' THEN 3
+                  WHEN 'note' THEN 4 WHEN 'risk' THEN 5 ELSE 6
+                END = CAST(:cursor_type_order AS integer)
+            AND entity_id > CAST(:cursor_id AS uuid)
+          )
         )
         ORDER BY score DESC, updated_at DESC,
           CASE entity_type
@@ -254,12 +290,10 @@ def search(
         "include_archived": include_archived,
         "updated_from": updated_from,
         "updated_to": updated_to,
-        "cursor_score": cursor_payload.get("score") if cursor_payload else None,
-        "cursor_updated_at": (
-            datetime.fromisoformat(str(cursor_payload["updated_at"])) if cursor_payload else None
-        ),
-        "cursor_type_order": cursor_payload.get("type_order") if cursor_payload else None,
-        "cursor_id": UUID(str(cursor_payload["id"])) if cursor_payload else None,
+        "cursor_score": cursor_payload["score"] if cursor_payload else None,
+        "cursor_updated_at": cursor_payload["updated_at"] if cursor_payload else None,
+        "cursor_type_order": cursor_payload["type_order"] if cursor_payload else None,
+        "cursor_id": cursor_payload["id"] if cursor_payload else None,
         "fetch_limit": limit + 1,
     }
     rows = session.execute(sql, params).mappings().all()
