@@ -1,7 +1,7 @@
 from pathlib import Path
 
-path = Path("backend/ecc/domains/scheduling/meetings.py")
-text = path.read_text()
+meetings_path = Path("backend/ecc/domains/scheduling/meetings.py")
+text = meetings_path.read_text()
 needle = '''        if payload.calendar_event_id is not None:
             event = _calendar_event(session, auth, payload.calendar_event_id)
             if event is None or event["archived_at"] is not None:
@@ -37,4 +37,11 @@ replacement = '''        if payload.calendar_event_id is not None:
 '''
 if needle in text:
     text = text.replace(needle, replacement, 1)
-path.write_text(text)
+meetings_path.write_text(text)
+
+events_path = Path("backend/ecc/domains/calendar/events.py")
+events = events_path.read_text().replace(
+    "    request: Request,\n    request: Request,\n",
+    "    request: Request,\n",
+)
+events_path.write_text(events)
