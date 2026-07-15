@@ -68,6 +68,15 @@ def generate_recommendation(
     cached = _start(session, auth, idempotency_key, digest)
     if cached is not None:
         return cached
+    session.execute(
+        text("SELECT pg_advisory_xact_lock(hashtextextended(:key, 0))"),
+        {
+            "key": (
+                f"recommendation-target:{auth.workspace_id}:"
+                f"{payload.target_type}:{payload.target_id}"
+            )
+        },
+    )
     current_version = target_version(
         session,
         auth.workspace_id,
@@ -79,6 +88,43 @@ def generate_recommendation(
     if current_version != payload.expected_version:
         raise HTTPException(status_code=409, detail="TARGET_VERSION_CONFLICT")
     now = datetime.now(UTC)
+    superseded = (
+        session.execute(
+            text(
+                f"""
+                UPDATE recommendations
+                SET status='superseded', version=version+1,
+                    updated_at=:now, updated_by=:actor_id
+                WHERE workspace_id=:workspace_id
+                  AND target_type=:target_type
+                  AND target_id=:target_id
+                  AND status IN ('proposed','pending_confirmation')
+                  AND archived_at IS NULL
+                RETURNING {FIELDS}
+                """
+            ),
+            {
+                "now": now,
+                "actor_id": auth.user_id,
+                "workspace_id": auth.workspace_id,
+                "target_type": payload.target_type,
+                "target_id": payload.target_id,
+            },
+        )
+        .mappings()
+        .all()
+    )
+    for previous in superseded:
+        previous_row = dict(previous)
+        record_event(
+            request,
+            session,
+            auth,
+            previous_row,
+            "recommendation.superseded",
+            {"status": "active"},
+            ["status"],
+        )
     row = (
         session.execute(
             text(
@@ -161,6 +207,7 @@ def _transition(
         session,
         auth,
         get_row(session, auth, recommendation_id, for_update=True),
+        request=request,
     )
     check_version(row, int(payload.expected_version))
     if row["status"] not in allowed_statuses:
@@ -341,8 +388,11 @@ def confirm_recommendation(
         session,
         auth,
         get_row(session, auth, recommendation_id, for_update=True),
+        request=request,
     )
     check_version(row, payload.expected_version)
+    if payload.target_expected_version != int(row["expected_version"]):
+        raise HTTPException(status_code=409, detail="TARGET_VERSION_CONFLICT")
     if row["status"] != "pending_confirmation":
         raise HTTPException(status_code=409, detail="INVALID_RECOMMENDATION_STATE")
     if row["deferred_until"] is not None and row["deferred_until"] > datetime.now(UTC):
@@ -386,7 +436,7 @@ def confirm_recommendation(
         row["target_type"],
         row["target_id"],
         row["proposed_action"],
-        payload.target_expected_version,
+        int(row["expected_version"]),
     )
     executed_at = datetime.now(UTC)
     executed = (

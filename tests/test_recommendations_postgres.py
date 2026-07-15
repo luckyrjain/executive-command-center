@@ -348,3 +348,74 @@ def test_reject_defer_pin_expiry_and_isolation(
                 text("DELETE FROM users WHERE workspace_id=:id"), {"id": other_workspace}
             )
             connection.execute(text("DELETE FROM workspaces WHERE id=:id"), {"id": other_workspace})
+
+
+def test_supersession_and_stored_target_version_enforcement(
+    recommendation_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    client, workspace_id, user_id, token = recommendation_context
+    task_id = _task(workspace_id, user_id)
+    first = _generate(client, token, task_id)
+    second = _generate(client, token, task_id)
+
+    first_loaded = client.get(f"/api/v1/recommendations/{first['id']}")
+    assert first_loaded.status_code == 200
+    assert first_loaded.json()["status"] == "superseded"
+
+    published = client.post(
+        f"/api/v1/recommendations/{second['id']}/publish",
+        headers=_headers(token),
+        json={"expected_version": 1},
+    )
+    assert published.status_code == 200
+
+    rejected_override = client.post(
+        f"/api/v1/recommendations/{second['id']}/confirm",
+        headers=_headers(token),
+        json={"expected_version": 2, "target_expected_version": 2},
+    )
+    assert rejected_override.status_code == 409
+    assert rejected_override.json()["detail"] == "TARGET_VERSION_CONFLICT"
+
+
+def test_expiry_emits_audit_and_outbox(
+    recommendation_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    client, workspace_id, user_id, token = recommendation_context
+    task_id = _task(workspace_id, user_id)
+    expired = _generate(
+        client,
+        token,
+        task_id,
+        expires_at=datetime.now(UTC) - timedelta(minutes=1),
+    )
+    loaded = client.get(f"/api/v1/recommendations/{expired['id']}")
+    assert loaded.status_code == 200
+    assert loaded.json()["status"] == "expired"
+    with engine.connect() as connection:
+        audit_count = connection.execute(
+            text(
+                """
+                SELECT count(*) FROM audit_events
+                WHERE workspace_id=:workspace_id
+                  AND aggregate_id=:recommendation_id
+                  AND event_type='recommendation.expired'
+                """
+            ),
+            {
+                "workspace_id": workspace_id,
+                "recommendation_id": UUID(str(expired["id"])),
+            },
+        ).scalar_one()
+        outbox_count = connection.execute(
+            text(
+                """
+                SELECT count(*) FROM event_outbox
+                WHERE workspace_id=:workspace_id
+                  AND event_type='recommendation.expired.v1'
+                """
+            ),
+            {"workspace_id": workspace_id},
+        ).scalar_one()
+    assert audit_count == 1
+    assert outbox_count == 1

@@ -4,12 +4,13 @@ from json import dumps
 from typing import Any
 from uuid import UUID
 
-from fastapi import HTTPException
+from fastapi import HTTPException, Request
 from pydantic import BaseModel
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from ecc.auth import AuthContext
+from ecc.domains.governance.recommendation_events import record_event
 from ecc.domains.governance.recommendation_models import RecommendationResponse
 
 FIELDS = """
@@ -142,6 +143,8 @@ def expire_if_needed(
     session: Session,
     auth: AuthContext,
     row: dict[str, Any],
+    *,
+    request: Request | None = None,
 ) -> dict[str, Any]:
     if (
         row["expires_at"] is not None
@@ -170,5 +173,16 @@ def expire_if_needed(
             .mappings()
             .one()
         )
-        return dict(updated)
+        current = dict(updated)
+        if request is not None:
+            record_event(
+                request,
+                session,
+                auth,
+                current,
+                "recommendation.expired",
+                {"status": row["status"]},
+                ["status"],
+            )
+        return current
     return row

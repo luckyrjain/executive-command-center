@@ -5,7 +5,7 @@ from json import dumps, loads
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
@@ -103,9 +103,12 @@ def list_recommendations(
 @router.get("/{recommendation_id}", response_model=RecommendationResponse)
 def get_recommendation(
     recommendation_id: UUID,
+    request: Request,
     auth: AuthDep,
     session: SessionDep,
 ) -> RecommendationResponse:
-    row = expire_if_needed(session, auth, get_row(session, auth, recommendation_id))
+    row = expire_if_needed(
+        session, auth, get_row(session, auth, recommendation_id), request=request
+    )
     session.commit()
     return project(row)
