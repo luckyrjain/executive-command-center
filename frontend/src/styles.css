@@ -16,7 +16,8 @@ button { font: inherit; }
 }
 
 .topbar,
-.brief-heading {
+.brief-heading,
+.recommendation-heading {
   display: flex;
   align-items: flex-start;
   justify-content: space-between;
@@ -123,19 +124,68 @@ button:disabled { opacity: .6; cursor: wait; }
 .brief-panel .dashboard-card { grid-column: span 6; min-height: 220px; color: #18212f; box-shadow: none; }
 .brief-panel .inline-status { color: #18212f; }
 
+.recommendation-panel {
+  margin-top: 36px;
+  border: 1px solid #dce2ea;
+  border-radius: 28px;
+  background: white;
+  padding: clamp(24px, 4vw, 42px);
+  box-shadow: 0 18px 48px rgba(24, 33, 47, .06);
+}
+.recommendation-heading h2 { margin: 0; font-size: clamp(28px, 4vw, 44px); letter-spacing: -.035em; }
+.recommendation-heading p:not(.eyebrow) { max-width: 720px; margin: 10px 0 0; color: #667085; }
+.recommendation-list { list-style: none; margin: 26px 0 0; padding: 0; }
+.recommendation-list > li {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 28px;
+  border-top: 1px solid #e7ebf0;
+  padding: 26px 0;
+}
+.recommendation-list > li:first-child { border-top: 0; padding-top: 4px; }
+.recommendation-list > li.is-pinned { border-radius: 18px; background: #f7f9ff; padding-inline: 20px; }
+.recommendation-copy h3 { margin: 12px 0 8px; font-size: 22px; text-transform: capitalize; }
+.recommendation-copy > p { max-width: 760px; margin: 0; color: #4f5b6d; line-height: 1.6; }
+.recommendation-meta { display: flex; flex-wrap: wrap; gap: 8px; }
+.recommendation-meta span {
+  border-radius: 999px;
+  background: #eef1f5;
+  padding: 5px 9px;
+  color: #4f5b6d;
+  font-size: 12px;
+  font-weight: 700;
+  text-transform: capitalize;
+}
+.recommendation-copy dl { display: flex; flex-wrap: wrap; gap: 14px 28px; margin: 18px 0 0; }
+.recommendation-copy dl div { display: grid; gap: 3px; }
+.recommendation-copy dt { color: #7b8493; font-size: 11px; font-weight: 800; letter-spacing: .08em; text-transform: uppercase; }
+.recommendation-copy dd { margin: 0; color: #293344; font-size: 13px; text-transform: capitalize; }
+.execution-result { margin-top: 14px !important; color: #28724f !important; font-weight: 700; }
+.recommendation-actions { display: flex; min-width: 190px; flex-direction: column; align-items: stretch; gap: 9px; }
+.recommendation-actions button { text-align: center; }
+.recommendation-actions .primary-action { border-color: #18212f; background: #18212f; color: white; }
+.recommendation-actions span { color: #667085; font-size: 12px; text-align: center; }
+.recommendation-empty { margin: 32px 0 0; }
+
 @media (max-width: 800px) {
   .app-shell { padding-top: 28px; }
   .topbar { align-items: center; }
   .dashboard-card,
   .brief-panel .dashboard-card { grid-column: 1 / -1; min-height: auto; }
+  .recommendation-list > li { grid-template-columns: 1fr; }
+  .recommendation-actions { min-width: 0; flex-direction: row; flex-wrap: wrap; }
 }
 
 @media (max-width: 520px) {
   .topbar,
-  .brief-heading { align-items: flex-start; flex-direction: column; }
+  .brief-heading,
+  .recommendation-heading { align-items: flex-start; flex-direction: column; }
   .topbar button,
-  .brief-heading button { padding: 9px 14px; }
+  .brief-heading button,
+  .recommendation-heading button { padding: 9px 14px; }
   .dashboard-card { padding: 18px; border-radius: 16px; }
   .item-list li { gap: 12px; }
-  .brief-panel { border-radius: 20px; }
+  .brief-panel,
+  .recommendation-panel { border-radius: 20px; }
+  .recommendation-actions { flex-direction: column; }
 }
