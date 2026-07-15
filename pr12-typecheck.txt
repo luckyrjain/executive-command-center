@@ -1,0 +1,8 @@
+
+> @ecc/frontend@0.1.0 typecheck /home/runner/work/executive-command-center/executive-command-center/frontend
+> tsc --noEmit
+
+src/App.tsx(3,30): error TS2339: Property 'env' does not exist on type 'ImportMeta'.
+/home/runner/work/executive-command-center/executive-command-center/frontend:
+ ERR_PNPM_RECURSIVE_RUN_FIRST_FAIL  @ecc/frontend@0.1.0 typecheck: `tsc --noEmit`
+Exit status 2
