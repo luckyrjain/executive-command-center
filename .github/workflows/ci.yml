@@ -25,11 +25,11 @@ jobs:
           version: 0.7.19
       - run: uv sync --frozen --all-groups --python 3.14.6
       - run: uv run ruff format backend/ecc/domains/governance/recommendation_*.py tests/test_recommendations_postgres.py backend/migrations/versions/0009_phase1_recommendations.py backend/ecc/main.py
-      - run: uv run ruff check --fix backend/ecc/domains/governance/recommendation_*.py tests/test_recommendations_postgres.py backend/migrations/versions/0009_phase1_recommendations.py backend/ecc/main.py
+      - run: uv run ruff check --fix backend/ecc/domains/governance/recommendation_*.py tests/test_recommendations_postgres.py backend/migrations/versions/0009_phase1_recommendations.py backend/ecc/main.py > pr11-ruff.txt 2>&1 || true
       - run: |
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
-          git add backend tests
+          git add backend tests pr11-ruff.txt
           git commit -m "style: format PR11 recommendation slice" || exit 0
           git push
 
