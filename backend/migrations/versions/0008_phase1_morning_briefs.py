@@ -10,6 +10,7 @@ branch_labels = None
 depends_on = None
 
 
+# Morning brief rows are immutable generation snapshots.
 def upgrade() -> None:
     uuid = postgresql.UUID(as_uuid=True)
 
