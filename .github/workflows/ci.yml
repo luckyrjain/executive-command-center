@@ -58,6 +58,8 @@ jobs:
       - run: pnpm --filter @ecc/frontend typecheck
       - run: pnpm --filter @ecc/frontend test -- --run
       - run: pnpm --filter @ecc/frontend build
+      - run: pnpm --filter @ecc/frontend exec playwright install --with-deps chromium
+      - run: pnpm --filter @ecc/frontend test:e2e
 
   containers:
     runs-on: ubuntu-latest

@@ -8,7 +8,8 @@
     "build": "tsc -b && vite build",
     "lint": "tsc --noEmit",
     "typecheck": "tsc --noEmit",
-    "test": "vitest"
+    "test": "vitest",
+    "test:e2e": "VITE_API_BASE_URL=http://127.0.0.1:4173 pnpm build && node e2e/run.mjs"
   },
   "dependencies": {
     "@tanstack/react-query": "5.81.5",
