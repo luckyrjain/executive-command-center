@@ -49,10 +49,12 @@ type ErrorEnvelope = {
 }
 
 async function api<T>(path: string, init?: RequestInit): Promise<T> {
+  const headers = new Headers(init?.headers)
+  headers.set('Accept', 'application/json')
   const response = await fetch(`${API_BASE}${path}`, {
     credentials: 'include',
     ...init,
-    headers: { Accept: 'application/json', ...init?.headers },
+    headers,
   })
   if (!response.ok) {
     const payload = (await response.json().catch(() => ({}))) as ErrorEnvelope
