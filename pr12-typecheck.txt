@@ -1,4 +1,0 @@
-
-> @ecc/frontend@0.1.0 typecheck /home/runner/work/executive-command-center/executive-command-center/frontend
-> tsc --noEmit
-
