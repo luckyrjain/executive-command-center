@@ -1,88 +1,172 @@
-import { useQuery } from '@tanstack/react-query'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+
+const API_BASE = import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:8000'
 
 type DashboardItem = {
   id?: string
+  entity_id?: string
   entity_ref?: string
+  entity_type?: string
   title?: string
   summary?: string
+  message?: string
+  why?: string
   explanation?: string
   status?: string
   score?: number
   starts_at?: string
   due_at?: string
   due_date?: string
+  occurred_at?: string
+  empty?: boolean
 }
 
-type TodayDashboard = {
-  date?: string
-  workspace_timezone?: string
-  generated_at?: string
-  degraded?: boolean
-  meetings?: DashboardItem[]
-  priorities?: DashboardItem[]
-  overdue_commitments?: DashboardItem[]
-  risks?: DashboardItem[]
-  waiting_on?: DashboardItem[]
-  recent_changes?: DashboardItem[]
+type DashboardResponse = {
+  date: string
+  timezone: string
+  generated_at: string
+  stale: boolean
+  sections: Record<string, DashboardItem[]>
 }
 
-const API_BASE = import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:8000'
+type MorningBriefResponse = {
+  id: string
+  briefing_date: string
+  generation_version: number
+  sections: Record<string, DashboardItem[]>
+  source_versions: Record<string, number>
+  evidence_ids: string[]
+  generated_at: string
+  timezone: string
+  algorithm_version: string
+  ai_status: string
+  stale: boolean
+  stale_reason?: string | null
+}
 
-async function fetchTodayDashboard(): Promise<TodayDashboard> {
-  const response = await fetch(`${API_BASE}/api/v1/dashboard/today`, {
+type ErrorEnvelope = {
+  error?: { code?: string; message?: string }
+}
+
+async function api<T>(path: string, init?: RequestInit): Promise<T> {
+  const response = await fetch(`${API_BASE}${path}`, {
     credentials: 'include',
-    headers: { Accept: 'application/json' },
+    ...init,
+    headers: { Accept: 'application/json', ...init?.headers },
   })
   if (!response.ok) {
-    throw new Error(response.status === 401 ? 'Authentication required' : 'Dashboard unavailable')
+    const payload = (await response.json().catch(() => ({}))) as ErrorEnvelope
+    throw new Error(payload.error?.message ?? (response.status === 401 ? 'Authentication required' : 'Request failed'))
   }
   return response.json()
 }
 
+function fetchDashboard(): Promise<DashboardResponse> {
+  return api('/api/v1/dashboard/today')
+}
+
+function fetchMorningBrief(): Promise<MorningBriefResponse> {
+  return api('/api/v1/briefs/morning')
+}
+
+function refreshMorningBrief(): Promise<MorningBriefResponse> {
+  return api('/api/v1/briefs/morning', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Idempotency-Key': crypto.randomUUID(),
+      'X-CSRF-Token': document.cookie
+        .split('; ')
+        .find((value) => value.startsWith('ecc_csrf='))
+        ?.split('=')[1] ?? '',
+    },
+  })
+}
+
 function labelFor(item: DashboardItem): string {
-  return item.title ?? item.summary ?? item.explanation ?? item.entity_ref ?? 'Untitled item'
+  return item.title ?? item.summary ?? item.why ?? item.explanation ?? item.message ?? item.entity_ref ?? 'Untitled item'
 }
 
 function formatTime(value?: string): string | null {
   if (!value) return null
-  const date = new Date(value)
-  if (Number.isNaN(date.getTime())) return null
-  return new Intl.DateTimeFormat(undefined, { hour: 'numeric', minute: '2-digit' }).format(date)
+  const parsed = new Date(value)
+  if (Number.isNaN(parsed.getTime())) return null
+  return new Intl.DateTimeFormat(undefined, { hour: 'numeric', minute: '2-digit' }).format(parsed)
 }
 
-function DashboardSection({
-  title,
-  items,
-  emptyMessage,
-}: {
-  title: string
-  items?: DashboardItem[]
-  emptyMessage: string
-}) {
+function visibleItems(items?: DashboardItem[]): DashboardItem[] {
+  return (items ?? []).filter((item) => !item.empty)
+}
+
+function Section({ title, items, emptyMessage }: { title: string; items?: DashboardItem[]; emptyMessage: string }) {
+  const visible = visibleItems(items)
+  const headingId = `section-${title.replaceAll(' ', '-').toLowerCase()}`
   return (
-    <section className="dashboard-card" aria-labelledby={`section-${title.replaceAll(' ', '-').toLowerCase()}`}>
+    <section className="dashboard-card" aria-labelledby={headingId}>
       <div className="section-heading">
-        <h2 id={`section-${title.replaceAll(' ', '-').toLowerCase()}`}>{title}</h2>
-        <span>{items?.length ?? 0}</span>
+        <h2 id={headingId}>{title}</h2>
+        <span aria-label={`${visible.length} items`}>{visible.length}</span>
       </div>
-      {items?.length ? (
+      {visible.length ? (
         <ol className="item-list">
-          {items.map((item, index) => (
-            <li key={item.id ?? item.entity_ref ?? `${title}-${index}`}>
+          {visible.map((item, index) => (
+            <li key={item.id ?? item.entity_id ?? item.entity_ref ?? `${title}-${index}`}>
               <div>
                 <strong>{labelFor(item)}</strong>
                 {item.status ? <small>{item.status.replaceAll('_', ' ')}</small> : null}
               </div>
               <div className="item-meta">
-                {formatTime(item.starts_at) ? <time>{formatTime(item.starts_at)}</time> : null}
+                {formatTime(item.starts_at ?? item.occurred_at) ? <time>{formatTime(item.starts_at ?? item.occurred_at)}</time> : null}
                 {typeof item.score === 'number' ? <span>{Math.round(item.score)}</span> : null}
               </div>
             </li>
           ))}
         </ol>
       ) : (
-        <p className="empty-state">{emptyMessage}</p>
+        <p className="empty-state">{items?.find((item) => item.empty)?.message ?? emptyMessage}</p>
       )}
+    </section>
+  )
+}
+
+function MorningBrief() {
+  const queryClient = useQueryClient()
+  const brief = useQuery({ queryKey: ['brief', 'morning'], queryFn: fetchMorningBrief, retry: 1 })
+  const refresh = useMutation({
+    mutationFn: refreshMorningBrief,
+    onSuccess: (data) => queryClient.setQueryData(['brief', 'morning'], data),
+  })
+
+  return (
+    <section className="brief-panel" aria-labelledby="morning-brief-title">
+      <div className="brief-heading">
+        <div>
+          <p className="eyebrow">PERSISTED DAILY BRIEF</p>
+          <h2 id="morning-brief-title">Morning Brief</h2>
+          <p>{brief.data ? `Generation ${brief.data.generation_version} · ${brief.data.ai_status.replaceAll('_', ' ')}` : 'A deterministic briefing of today’s attention.'}</p>
+        </div>
+        <button type="button" onClick={() => refresh.mutate()} disabled={refresh.isPending || brief.isLoading}>
+          {refresh.isPending ? 'Refreshing…' : 'Refresh brief'}
+        </button>
+      </div>
+
+      {brief.isLoading ? <div className="inline-status" role="status">Preparing your morning brief…</div> : null}
+      {brief.isError ? <div className="inline-status error-panel" role="alert">{brief.error.message}</div> : null}
+      {refresh.isError ? <div className="inline-status error-panel" role="alert">{refresh.error.message}</div> : null}
+      {brief.data?.stale ? (
+        <div className="inline-status degraded-panel" role="status">
+          This brief is stale{brief.data.stale_reason ? `: ${brief.data.stale_reason.replaceAll('_', ' ')}` : ''}. Refresh to regenerate it.
+        </div>
+      ) : null}
+
+      {brief.data ? (
+        <div className="brief-grid">
+          <Section title="Brief schedule" items={brief.data.sections.today_schedule} emptyMessage="No meetings in the brief." />
+          <Section title="Brief priorities" items={brief.data.sections.top_priorities} emptyMessage="No priorities in the brief." />
+          <Section title="Brief commitments" items={brief.data.sections.overdue_commitments} emptyMessage="No overdue commitments." />
+          <Section title="Brief risks" items={brief.data.sections.risks} emptyMessage="No open risks." />
+        </div>
+      ) : null}
     </section>
   )
 }
@@ -90,10 +174,12 @@ function DashboardSection({
 export default function App() {
   const dashboard = useQuery({
     queryKey: ['dashboard', 'today'],
-    queryFn: fetchTodayDashboard,
+    queryFn: fetchDashboard,
     refetchInterval: 60_000,
     retry: 1,
   })
+
+  const sections = dashboard.data?.sections
 
   return (
     <main className="app-shell">
@@ -103,11 +189,11 @@ export default function App() {
           <h1>Today</h1>
           <p className="subtitle">
             {dashboard.data?.date ?? 'Your schedule, priorities, commitments and risks'}
-            {dashboard.data?.workspace_timezone ? ` · ${dashboard.data.workspace_timezone}` : ''}
+            {dashboard.data?.timezone ? ` · ${dashboard.data.timezone}` : ''}
           </p>
         </div>
         <button type="button" onClick={() => dashboard.refetch()} disabled={dashboard.isFetching}>
-          {dashboard.isFetching ? 'Refreshing…' : 'Refresh'}
+          {dashboard.isFetching ? 'Refreshing…' : 'Refresh dashboard'}
         </button>
       </header>
 
@@ -118,22 +204,20 @@ export default function App() {
           <span>Check your session and backend connection, then retry.</span>
         </div>
       ) : null}
-      {dashboard.data?.degraded ? (
-        <div className="status-panel degraded-panel" role="status">
-          Deterministic dashboard is available, but one or more enrichments are temporarily unavailable.
+      {dashboard.data?.stale ? <div className="status-panel degraded-panel" role="status">Dashboard data may be stale.</div> : null}
+
+      {sections ? (
+        <div className="dashboard-grid">
+          <Section title="Schedule" items={sections.today_schedule} emptyMessage="No meetings scheduled for today." />
+          <Section title="Top priorities" items={sections.top_priorities} emptyMessage="No ranked priorities need attention." />
+          <Section title="Overdue commitments" items={sections.overdue_commitments} emptyMessage="No overdue commitments." />
+          <Section title="Open risks" items={sections.risks} emptyMessage="No active risks." />
+          <Section title="Waiting on" items={sections.waiting_on} emptyMessage="Nothing is currently blocked on others." />
+          <Section title="Recent changes" items={sections.recently_changed} emptyMessage="No recent changes." />
         </div>
       ) : null}
 
-      {dashboard.data ? (
-        <div className="dashboard-grid">
-          <DashboardSection title="Schedule" items={dashboard.data.meetings} emptyMessage="No meetings scheduled for today." />
-          <DashboardSection title="Top priorities" items={dashboard.data.priorities} emptyMessage="No ranked priorities need attention." />
-          <DashboardSection title="Overdue commitments" items={dashboard.data.overdue_commitments} emptyMessage="No overdue commitments." />
-          <DashboardSection title="Open risks" items={dashboard.data.risks} emptyMessage="No active risks." />
-          <DashboardSection title="Waiting on" items={dashboard.data.waiting_on} emptyMessage="Nothing is currently blocked on others." />
-          <DashboardSection title="Recent changes" items={dashboard.data.recent_changes} emptyMessage="No recent changes." />
-        </div>
-      ) : null}
+      <MorningBrief />
     </main>
   )
 }
