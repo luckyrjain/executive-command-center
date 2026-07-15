@@ -315,7 +315,10 @@ def test_reject_defer_pin_expiry_and_isolation(
     with engine.begin() as connection:
         connection.execute(
             text(
-                "INSERT INTO workspaces (id,name,timezone,created_at) VALUES (:id,'Other','UTC',:now)"
+                """
+                INSERT INTO workspaces (id,name,timezone,created_at)
+                VALUES (:id,'Other','UTC',:now)
+                """
             ),
             {"id": other_workspace, "now": now},
         )
