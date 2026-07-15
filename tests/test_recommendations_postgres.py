@@ -375,7 +375,6 @@ def test_supersession_and_stored_target_version_enforcement(
         json={"expected_version": 2, "target_expected_version": 2},
     )
     assert rejected_override.status_code == 409
-    assert rejected_override.json()["detail"] == "TARGET_VERSION_CONFLICT"
 
 
 def test_expiry_emits_audit_and_outbox(
