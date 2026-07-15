@@ -18,6 +18,7 @@ from ecc.domains.governance.risks import router as risks_router
 from ecc.domains.knowledge.notes import router as notes_router
 from ecc.domains.planning.tasks import router as tasks_router
 from ecc.domains.platform.audit_queries import router as audit_queries_router
+from ecc.domains.platform.dashboard_briefs import router as dashboard_briefs_router
 from ecc.domains.scheduling.meetings import router as meetings_router
 from ecc.logging import configure_logging
 from ecc.search import router as search_router
@@ -47,6 +48,7 @@ app.include_router(risk_mutations_router)
 app.include_router(attention_router)
 app.include_router(audit_queries_router)
 app.include_router(search_router)
+app.include_router(dashboard_briefs_router)
 app.middleware("http")(rejected_mutation_audit_middleware)
 
 
