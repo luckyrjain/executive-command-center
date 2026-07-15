@@ -1,0 +1,2 @@
+backend/ecc/domains/governance/recommendation_mutations.py:166: error: "BaseModel" has no attribute "expected_version"  [attr-defined]
+Found 1 error in 1 file (checked 44 source files)
