@@ -12,7 +12,7 @@ type RecommendationStatus =
   | 'executed'
   | 'failed'
 
-type Recommendation = {
+export type Recommendation = {
   id: string
   recommendation_type: string
   target_type: string
@@ -83,7 +83,7 @@ function fetchRecommendations(): Promise<RecommendationList> {
   return request(`/api/v1/recommendations?${statuses}`)
 }
 
-function actionPayload(item: Recommendation, action: ActionName): Record<string, unknown> {
+export function actionPayload(item: Recommendation, action: ActionName): Record<string, unknown> {
   if (action === 'confirm') {
     return {
       expected_version: item.version,
@@ -117,14 +117,21 @@ function mutateRecommendation({ item, action }: ActionRequest): Promise<Recommen
   })
 }
 
-function actionSummary(action: Record<string, unknown>): string {
+export function actionSummary(action: Record<string, unknown>): string {
   const operation = typeof action.operation === 'string' ? action.operation : 'update'
   const fields = Object.keys(action).filter((key) => key !== 'operation')
   return fields.length ? `${operation.replaceAll('_', ' ')} · ${fields.join(', ')}` : operation.replaceAll('_', ' ')
 }
 
-function confidenceLabel(confidence: number): string {
+export function confidenceLabel(confidence: number): string {
   return `${Math.round(confidence * 100)}% confidence`
+}
+
+export function recommendationErrorMessage(error: Error): string {
+  if (error.name === 'VERSION_CONFLICT' || error.name === 'TARGET_VERSION_CONFLICT') {
+    return 'This recommendation changed while you were reviewing it. The latest version has been reloaded.'
+  }
+  return error.message
 }
 
 export default function RecommendationPanel() {
@@ -164,9 +171,7 @@ export default function RecommendationPanel() {
       {recommendations.isError ? <div className="inline-status error-panel" role="alert">{recommendations.error.message}</div> : null}
       {mutation.isError ? (
         <div className="inline-status error-panel" role="alert">
-          {mutation.error.name === 'VERSION_CONFLICT' || mutation.error.name === 'TARGET_VERSION_CONFLICT'
-            ? 'This recommendation changed while you were reviewing it. The latest version has been reloaded.'
-            : mutation.error.message}
+          {recommendationErrorMessage(mutation.error)}
         </div>
       ) : null}
 
