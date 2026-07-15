@@ -1,6 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
 import RecommendationPanel from './RecommendationPanel'
+import SearchAuditPanel from './SearchAuditPanel'
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:8000'
 
@@ -223,6 +224,7 @@ export default function App() {
 
       <MorningBrief />
       <RecommendationPanel />
+      <SearchAuditPanel />
     </main>
   )
 }
