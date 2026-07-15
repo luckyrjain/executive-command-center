@@ -80,9 +80,10 @@ def generate_recommendation(
     if current_version != payload.expected_version:
         raise HTTPException(status_code=409, detail="TARGET_VERSION_CONFLICT")
     now = datetime.now(UTC)
-    row = session.execute(
-        text(
-            f"""
+    row = (
+        session.execute(
+            text(
+                f"""
             INSERT INTO recommendations (
                 id, workspace_id, recommendation_type, target_type, target_id,
                 proposed_action, expected_version, rationale, confidence, status,
@@ -95,24 +96,27 @@ def generate_recommendation(
                 false, :actor_id, :actor_id, :created_at, :created_at, 1
             ) RETURNING {FIELDS}
             """
-        ),
-        {
-            "id": uuid4(),
-            "workspace_id": auth.workspace_id,
-            "recommendation_type": payload.recommendation_type,
-            "target_type": payload.target_type,
-            "target_id": payload.target_id,
-            "proposed_action": dumps(payload.proposed_action),
-            "expected_version": payload.expected_version,
-            "rationale": payload.rationale,
-            "confidence": payload.confidence,
-            "evidence_ids": payload.evidence_ids,
-            "expires_at": payload.expires_at,
-            "source": payload.source,
-            "actor_id": auth.user_id,
-            "created_at": now,
-        },
-    ).mappings().one()
+            ),
+            {
+                "id": uuid4(),
+                "workspace_id": auth.workspace_id,
+                "recommendation_type": payload.recommendation_type,
+                "target_type": payload.target_type,
+                "target_id": payload.target_id,
+                "proposed_action": dumps(payload.proposed_action),
+                "expected_version": payload.expected_version,
+                "rationale": payload.rationale,
+                "confidence": payload.confidence,
+                "evidence_ids": payload.evidence_ids,
+                "expires_at": payload.expires_at,
+                "source": payload.source,
+                "actor_id": auth.user_id,
+                "created_at": now,
+            },
+        )
+        .mappings()
+        .one()
+    )
     current = dict(row)
     response = project(current)
     record_event(
@@ -159,7 +163,7 @@ def _transition(
         auth,
         get_row(session, auth, recommendation_id, for_update=True),
     )
-    check_version(row, int(getattr(payload, "expected_version")))
+    check_version(row, int(payload.expected_version))
     if row["status"] not in allowed_statuses:
         raise HTTPException(status_code=409, detail="INVALID_RECOMMENDATION_STATE")
     before = {
@@ -177,13 +181,17 @@ def _transition(
     for field, value in updates.items():
         clauses.append(f"{field}=:{field}")
         params[field] = value
-    updated = session.execute(
-        text(
-            f"UPDATE recommendations SET {', '.join(clauses)} "
-            f"WHERE workspace_id=:workspace_id AND id=:recommendation_id RETURNING {FIELDS}"
-        ),
-        params,
-    ).mappings().one()
+    updated = (
+        session.execute(
+            text(
+                f"UPDATE recommendations SET {', '.join(clauses)} "
+                f"WHERE workspace_id=:workspace_id AND id=:recommendation_id RETURNING {FIELDS}"
+            ),
+            params,
+        )
+        .mappings()
+        .one()
+    )
     current = dict(updated)
     if feedback_action is not None:
         record_feedback(
@@ -341,23 +349,27 @@ def confirm_recommendation(
     if row["deferred_until"] is not None and row["deferred_until"] > datetime.now(UTC):
         raise HTTPException(status_code=409, detail="RECOMMENDATION_DEFERRED")
     accepted_at = datetime.now(UTC)
-    accepted = session.execute(
-        text(
-            f"""
+    accepted = (
+        session.execute(
+            text(
+                f"""
             UPDATE recommendations
             SET status='accepted', confirmed_by=:actor_id, confirmed_at=:confirmed_at,
                 version=version+1, updated_at=:confirmed_at, updated_by=:actor_id
             WHERE workspace_id=:workspace_id AND id=:recommendation_id
             RETURNING {FIELDS}
             """
-        ),
-        {
-            "actor_id": auth.user_id,
-            "confirmed_at": accepted_at,
-            "workspace_id": auth.workspace_id,
-            "recommendation_id": recommendation_id,
-        },
-    ).mappings().one()
+            ),
+            {
+                "actor_id": auth.user_id,
+                "confirmed_at": accepted_at,
+                "workspace_id": auth.workspace_id,
+                "recommendation_id": recommendation_id,
+            },
+        )
+        .mappings()
+        .one()
+    )
     accepted_row = dict(accepted)
     record_feedback(session, auth, recommendation_id, "accept")
     record_event(
@@ -378,24 +390,28 @@ def confirm_recommendation(
         payload.target_expected_version,
     )
     executed_at = datetime.now(UTC)
-    executed = session.execute(
-        text(
-            f"""
+    executed = (
+        session.execute(
+            text(
+                f"""
             UPDATE recommendations
             SET status='executed', execution_result=CAST(:execution_result AS jsonb),
                 version=version+1, updated_at=:updated_at, updated_by=:actor_id
             WHERE workspace_id=:workspace_id AND id=:recommendation_id
             RETURNING {FIELDS}
             """
-        ),
-        {
-            "execution_result": dumps(execution_result),
-            "updated_at": executed_at,
-            "actor_id": auth.user_id,
-            "workspace_id": auth.workspace_id,
-            "recommendation_id": recommendation_id,
-        },
-    ).mappings().one()
+            ),
+            {
+                "execution_result": dumps(execution_result),
+                "updated_at": executed_at,
+                "actor_id": auth.user_id,
+                "workspace_id": auth.workspace_id,
+                "recommendation_id": recommendation_id,
+            },
+        )
+        .mappings()
+        .one()
+    )
     current = dict(executed)
     record_event(
         request,

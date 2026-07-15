@@ -44,22 +44,26 @@ def load_cached(
     key: str,
     digest: str,
 ) -> RecommendationResponse | None:
-    row = session.execute(
-        text(
-            """
+    row = (
+        session.execute(
+            text(
+                """
             SELECT request_hash, response_body
             FROM idempotency_records
             WHERE workspace_id=:workspace_id AND actor_id=:actor_id
               AND key=:key AND expires_at>:now
             """
-        ),
-        {
-            "workspace_id": auth.workspace_id,
-            "actor_id": auth.user_id,
-            "key": key,
-            "now": datetime.now(UTC),
-        },
-    ).mappings().one_or_none()
+            ),
+            {
+                "workspace_id": auth.workspace_id,
+                "actor_id": auth.user_id,
+                "key": key,
+                "now": datetime.now(UTC),
+            },
+        )
+        .mappings()
+        .one_or_none()
+    )
     if row is None:
         return None
     if row["request_hash"] != digest:
@@ -113,10 +117,14 @@ def get_row(
     query = f"SELECT {FIELDS} FROM recommendations WHERE workspace_id=:workspace_id AND id=:recommendation_id"
     if for_update:
         query += " FOR UPDATE"
-    row = session.execute(
-        text(query),
-        {"workspace_id": auth.workspace_id, "recommendation_id": recommendation_id},
-    ).mappings().one_or_none()
+    row = (
+        session.execute(
+            text(query),
+            {"workspace_id": auth.workspace_id, "recommendation_id": recommendation_id},
+        )
+        .mappings()
+        .one_or_none()
+    )
     if row is None:
         raise HTTPException(status_code=404, detail="RECOMMENDATION_NOT_FOUND")
     return dict(row)
@@ -137,21 +145,25 @@ def expire_if_needed(
         and row["expires_at"] <= datetime.now(UTC)
         and row["status"] in {"proposed", "pending_confirmation"}
     ):
-        updated = session.execute(
-            text(
-                f"""
+        updated = (
+            session.execute(
+                text(
+                    f"""
                 UPDATE recommendations
                 SET status='expired', version=version+1, updated_at=:now, updated_by=:actor
                 WHERE workspace_id=:workspace_id AND id=:recommendation_id
                 RETURNING {FIELDS}
                 """
-            ),
-            {
-                "now": datetime.now(UTC),
-                "actor": auth.user_id,
-                "workspace_id": auth.workspace_id,
-                "recommendation_id": row["id"],
-            },
-        ).mappings().one()
+                ),
+                {
+                    "now": datetime.now(UTC),
+                    "actor": auth.user_id,
+                    "workspace_id": auth.workspace_id,
+                    "recommendation_id": row["id"],
+                },
+            )
+            .mappings()
+            .one()
+        )
         return dict(updated)
     return row

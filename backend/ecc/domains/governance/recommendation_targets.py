@@ -8,7 +8,6 @@ from sqlalchemy.orm import Session
 
 from ecc.auth import AuthContext
 
-
 _ALLOWED: dict[str, dict[str, set[Any]]] = {
     "task": {
         "set_status": {"captured", "planned", "in_progress", "blocked", "completed", "cancelled"},
@@ -21,7 +20,14 @@ _ALLOWED: dict[str, dict[str, set[Any]]] = {
         "set_pinned": {True, False},
     },
     "risk": {
-        "set_status": {"identified", "assessed", "monitoring", "mitigating", "materialized", "closed"},
+        "set_status": {
+            "identified",
+            "assessed",
+            "monitoring",
+            "mitigating",
+            "materialized",
+            "closed",
+        },
         "set_probability": {1, 2, 3, 4, 5},
         "set_impact": {1, 2, 3, 4, 5},
         "set_pinned": {True, False},
@@ -72,28 +78,62 @@ def execute_target(
     validate_action(target_type, action)
     operation = action["operation"]
     queries = {
-        ("task", "set_status"): "UPDATE tasks SET status=:value,version=version+1,updated_at=:now,updated_by=:actor WHERE workspace_id=:workspace_id AND id=:target_id AND version=:expected_version AND archived_at IS NULL RETURNING id,version",
-        ("task", "set_priority"): "UPDATE tasks SET manual_priority=:value,version=version+1,updated_at=:now,updated_by=:actor WHERE workspace_id=:workspace_id AND id=:target_id AND version=:expected_version AND archived_at IS NULL RETURNING id,version",
-        ("task", "set_pinned"): "UPDATE tasks SET pinned=:value,version=version+1,updated_at=:now,updated_by=:actor WHERE workspace_id=:workspace_id AND id=:target_id AND version=:expected_version AND archived_at IS NULL RETURNING id,version",
-        ("commitment", "set_status"): "UPDATE commitments SET status=:value,version=version+1,updated_at=:now,updated_by=:actor WHERE workspace_id=:workspace_id AND id=:target_id AND version=:expected_version AND archived_at IS NULL RETURNING id,version",
-        ("commitment", "set_importance"): "UPDATE commitments SET importance=:value,version=version+1,updated_at=:now,updated_by=:actor WHERE workspace_id=:workspace_id AND id=:target_id AND version=:expected_version AND archived_at IS NULL RETURNING id,version",
-        ("commitment", "set_pinned"): "UPDATE commitments SET pinned=:value,version=version+1,updated_at=:now,updated_by=:actor WHERE workspace_id=:workspace_id AND id=:target_id AND version=:expected_version AND archived_at IS NULL RETURNING id,version",
-        ("risk", "set_status"): "UPDATE risks SET status=:value,version=version+1,updated_at=:now,updated_by=:actor WHERE workspace_id=:workspace_id AND id=:target_id AND version=:expected_version AND archived_at IS NULL RETURNING id,version",
-        ("risk", "set_probability"): "UPDATE risks SET probability=:value,version=version+1,updated_at=:now,updated_by=:actor WHERE workspace_id=:workspace_id AND id=:target_id AND version=:expected_version AND archived_at IS NULL RETURNING id,version",
-        ("risk", "set_impact"): "UPDATE risks SET impact=:value,version=version+1,updated_at=:now,updated_by=:actor WHERE workspace_id=:workspace_id AND id=:target_id AND version=:expected_version AND archived_at IS NULL RETURNING id,version",
-        ("risk", "set_pinned"): "UPDATE risks SET pinned=:value,version=version+1,updated_at=:now,updated_by=:actor WHERE workspace_id=:workspace_id AND id=:target_id AND version=:expected_version AND archived_at IS NULL RETURNING id,version",
+        (
+            "task",
+            "set_status",
+        ): "UPDATE tasks SET status=:value,version=version+1,updated_at=:now,updated_by=:actor WHERE workspace_id=:workspace_id AND id=:target_id AND version=:expected_version AND archived_at IS NULL RETURNING id,version",
+        (
+            "task",
+            "set_priority",
+        ): "UPDATE tasks SET manual_priority=:value,version=version+1,updated_at=:now,updated_by=:actor WHERE workspace_id=:workspace_id AND id=:target_id AND version=:expected_version AND archived_at IS NULL RETURNING id,version",
+        (
+            "task",
+            "set_pinned",
+        ): "UPDATE tasks SET pinned=:value,version=version+1,updated_at=:now,updated_by=:actor WHERE workspace_id=:workspace_id AND id=:target_id AND version=:expected_version AND archived_at IS NULL RETURNING id,version",
+        (
+            "commitment",
+            "set_status",
+        ): "UPDATE commitments SET status=:value,version=version+1,updated_at=:now,updated_by=:actor WHERE workspace_id=:workspace_id AND id=:target_id AND version=:expected_version AND archived_at IS NULL RETURNING id,version",
+        (
+            "commitment",
+            "set_importance",
+        ): "UPDATE commitments SET importance=:value,version=version+1,updated_at=:now,updated_by=:actor WHERE workspace_id=:workspace_id AND id=:target_id AND version=:expected_version AND archived_at IS NULL RETURNING id,version",
+        (
+            "commitment",
+            "set_pinned",
+        ): "UPDATE commitments SET pinned=:value,version=version+1,updated_at=:now,updated_by=:actor WHERE workspace_id=:workspace_id AND id=:target_id AND version=:expected_version AND archived_at IS NULL RETURNING id,version",
+        (
+            "risk",
+            "set_status",
+        ): "UPDATE risks SET status=:value,version=version+1,updated_at=:now,updated_by=:actor WHERE workspace_id=:workspace_id AND id=:target_id AND version=:expected_version AND archived_at IS NULL RETURNING id,version",
+        (
+            "risk",
+            "set_probability",
+        ): "UPDATE risks SET probability=:value,version=version+1,updated_at=:now,updated_by=:actor WHERE workspace_id=:workspace_id AND id=:target_id AND version=:expected_version AND archived_at IS NULL RETURNING id,version",
+        (
+            "risk",
+            "set_impact",
+        ): "UPDATE risks SET impact=:value,version=version+1,updated_at=:now,updated_by=:actor WHERE workspace_id=:workspace_id AND id=:target_id AND version=:expected_version AND archived_at IS NULL RETURNING id,version",
+        (
+            "risk",
+            "set_pinned",
+        ): "UPDATE risks SET pinned=:value,version=version+1,updated_at=:now,updated_by=:actor WHERE workspace_id=:workspace_id AND id=:target_id AND version=:expected_version AND archived_at IS NULL RETURNING id,version",
     }
-    result = session.execute(
-        text(queries[(target_type, operation)]),
-        {
-            "value": action["value"],
-            "now": datetime.now(UTC),
-            "actor": auth.user_id,
-            "workspace_id": auth.workspace_id,
-            "target_id": target_id,
-            "expected_version": expected_version,
-        },
-    ).mappings().one_or_none()
+    result = (
+        session.execute(
+            text(queries[(target_type, operation)]),
+            {
+                "value": action["value"],
+                "now": datetime.now(UTC),
+                "actor": auth.user_id,
+                "workspace_id": auth.workspace_id,
+                "target_id": target_id,
+                "expected_version": expected_version,
+            },
+        )
+        .mappings()
+        .one_or_none()
+    )
     if result is None:
         current = target_version(session, auth.workspace_id, target_type, target_id)
         if current is None:

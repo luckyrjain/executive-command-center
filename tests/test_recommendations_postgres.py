@@ -196,10 +196,14 @@ def test_generate_publish_confirm_execute_and_replay(
     assert replay.json()["id"] == confirmed.json()["id"]
 
     with engine.connect() as connection:
-        task = connection.execute(
-            text("SELECT manual_priority,version FROM tasks WHERE id=:id"),
-            {"id": task_id},
-        ).mappings().one()
+        task = (
+            connection.execute(
+                text("SELECT manual_priority,version FROM tasks WHERE id=:id"),
+                {"id": task_id},
+            )
+            .mappings()
+            .one()
+        )
         audit_count = connection.execute(
             text(
                 """
@@ -310,7 +314,9 @@ def test_reject_defer_pin_expiry_and_isolation(
     now = datetime.now(UTC)
     with engine.begin() as connection:
         connection.execute(
-            text("INSERT INTO workspaces (id,name,timezone,created_at) VALUES (:id,'Other','UTC',:now)"),
+            text(
+                "INSERT INTO workspaces (id,name,timezone,created_at) VALUES (:id,'Other','UTC',:now)"
+            ),
             {"id": other_workspace, "now": now},
         )
         connection.execute(
@@ -335,5 +341,7 @@ def test_reject_defer_pin_expiry_and_isolation(
         assert all(item["id"] != str(uuid4()) for item in listed.json()["items"])
     finally:
         with engine.begin() as connection:
-            connection.execute(text("DELETE FROM users WHERE workspace_id=:id"), {"id": other_workspace})
+            connection.execute(
+                text("DELETE FROM users WHERE workspace_id=:id"), {"id": other_workspace}
+            )
             connection.execute(text("DELETE FROM workspaces WHERE id=:id"), {"id": other_workspace})

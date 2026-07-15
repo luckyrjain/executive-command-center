@@ -13,7 +13,9 @@ from ecc.database import engine
 from ecc.domains.calendar.events import router as calendar_events_router
 from ecc.domains.communication.commitments import router as commitments_router
 from ecc.domains.governance.attention import router as attention_router
-from ecc.domains.governance.recommendation_mutations import router as recommendation_mutations_router
+from ecc.domains.governance.recommendation_mutations import (
+    router as recommendation_mutations_router,
+)
 from ecc.domains.governance.recommendation_queries import router as recommendation_queries_router
 from ecc.domains.governance.risk_mutations import router as risk_mutations_router
 from ecc.domains.governance.risks import router as risks_router

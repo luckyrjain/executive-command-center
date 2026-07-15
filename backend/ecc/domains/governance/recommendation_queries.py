@@ -55,9 +55,10 @@ def list_recommendations(
     cursor_id: UUID | None = None
     if cursor:
         cursor_created, cursor_id = _decode_cursor(cursor)
-    rows = session.execute(
-        text(
-            f"""
+    rows = (
+        session.execute(
+            text(
+                f"""
             SELECT {FIELDS} FROM recommendations
             WHERE workspace_id=:workspace_id
               AND (:include_archived OR archived_at IS NULL)
@@ -66,16 +67,19 @@ def list_recommendations(
             ORDER BY created_at DESC,id DESC
             LIMIT :fetch_limit
             """
-        ),
-        {
-            "workspace_id": auth.workspace_id,
-            "include_archived": include_archived,
-            "statuses": statuses,
-            "cursor_created": cursor_created,
-            "cursor_id": cursor_id,
-            "fetch_limit": limit + 1,
-        },
-    ).mappings().all()
+            ),
+            {
+                "workspace_id": auth.workspace_id,
+                "include_archived": include_archived,
+                "statuses": statuses,
+                "cursor_created": cursor_created,
+                "cursor_id": cursor_id,
+                "fetch_limit": limit + 1,
+            },
+        )
+        .mappings()
+        .all()
+    )
     session.rollback()
     items = [project(dict(row)) for row in rows[:limit]]
     next_cursor = None
