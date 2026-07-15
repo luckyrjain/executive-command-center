@@ -48,11 +48,11 @@ def load_cached(
         session.execute(
             text(
                 """
-            SELECT request_hash, response_body
-            FROM idempotency_records
-            WHERE workspace_id=:workspace_id AND actor_id=:actor_id
-              AND key=:key AND expires_at>:now
-            """
+                SELECT request_hash, response_body
+                FROM idempotency_records
+                WHERE workspace_id=:workspace_id AND actor_id=:actor_id
+                  AND key=:key AND expires_at>:now
+                """
             ),
             {
                 "workspace_id": auth.workspace_id,
@@ -114,7 +114,10 @@ def get_row(
     *,
     for_update: bool = False,
 ) -> dict[str, Any]:
-    query = f"SELECT {FIELDS} FROM recommendations WHERE workspace_id=:workspace_id AND id=:recommendation_id"
+    query = (
+        f"SELECT {FIELDS} FROM recommendations "
+        "WHERE workspace_id=:workspace_id AND id=:recommendation_id"
+    )
     if for_update:
         query += " FOR UPDATE"
     row = (
@@ -149,11 +152,13 @@ def expire_if_needed(
             session.execute(
                 text(
                     f"""
-                UPDATE recommendations
-                SET status='expired', version=version+1, updated_at=:now, updated_by=:actor
-                WHERE workspace_id=:workspace_id AND id=:recommendation_id
-                RETURNING {FIELDS}
-                """
+                    UPDATE recommendations
+                    SET status='expired', version=version+1,
+                        updated_at=:now, updated_by=:actor
+                    WHERE workspace_id=:workspace_id
+                      AND id=:recommendation_id
+                    RETURNING {FIELDS}
+                    """
                 ),
                 {
                     "now": datetime.now(UTC),
