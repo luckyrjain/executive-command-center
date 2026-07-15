@@ -4,7 +4,6 @@ from typing import Annotated, Any
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
-from pydantic import BaseModel
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
@@ -141,7 +140,7 @@ def generate_recommendation(
 
 def _transition(
     recommendation_id: UUID,
-    payload: BaseModel,
+    payload: VersionAction,
     request: Request,
     auth: AuthContext,
     session: Session,
