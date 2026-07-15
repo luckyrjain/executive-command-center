@@ -1,14 +1,4 @@
 warning: Support for Python 3.14 is under development and may be unstable. Enable `preview` to remove this warning.
-backend/ecc/domains/governance/recommendation_queries.py:49:51: B008 Do not perform function call `Query` in argument defaults; instead, perform the call within the function, or read the default from a module-level singleton variable
-   |
-47 |     auth: AuthDep,
-48 |     session: SessionDep,
-49 |     statuses: list[RecommendationStatus] | None = Query(default=None, alias="status"),
-   |                                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ B008
-50 |     include_archived: bool = False,
-51 |     cursor: str | None = None,
-   |
-
 backend/ecc/domains/governance/recommendation_storage.py:117:101: E501 Line too long (110 > 100)
     |
 115 |     for_update: bool = False,
@@ -159,4 +149,4 @@ tests/test_recommendations_postgres.py:318:101: E501 Line too long (102 > 100)
 320 |             {"id": other_workspace, "now": now},
     |
 
-Found 18 errors (2 fixed, 16 remaining).
+Found 15 errors.
