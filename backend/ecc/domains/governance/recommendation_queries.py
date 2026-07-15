@@ -21,6 +21,8 @@ from ecc.domains.governance.recommendation_storage import FIELDS, expire_if_need
 
 router = APIRouter(prefix="/api/v1/recommendations", tags=["recommendations"])
 SessionDep = Annotated[Session, Depends(get_session)]
+StatusQuery = Annotated[list[RecommendationStatus] | None, Query(alias="status")]
+LimitQuery = Annotated[int, Query(ge=1, le=100)]
 
 
 def _encode_cursor(created_at: datetime, recommendation_id: UUID) -> str:
@@ -46,10 +48,10 @@ def _decode_cursor(cursor: str) -> tuple[datetime, UUID]:
 def list_recommendations(
     auth: AuthDep,
     session: SessionDep,
-    statuses: list[RecommendationStatus] | None = Query(default=None, alias="status"),
+    statuses: StatusQuery = None,
     include_archived: bool = False,
     cursor: str | None = None,
-    limit: int = Query(default=20, ge=1, le=100),
+    limit: LimitQuery = 20,
 ) -> RecommendationListResponse:
     cursor_created: datetime | None = None
     cursor_id: UUID | None = None
@@ -59,14 +61,20 @@ def list_recommendations(
         session.execute(
             text(
                 f"""
-            SELECT {FIELDS} FROM recommendations
-            WHERE workspace_id=:workspace_id
-              AND (:include_archived OR archived_at IS NULL)
-              AND (CAST(:statuses AS text[]) IS NULL OR status=ANY(CAST(:statuses AS text[])))
-              AND (:cursor_created IS NULL OR (created_at,id)<(:cursor_created,:cursor_id))
-            ORDER BY created_at DESC,id DESC
-            LIMIT :fetch_limit
-            """
+                SELECT {FIELDS} FROM recommendations
+                WHERE workspace_id=:workspace_id
+                  AND (:include_archived OR archived_at IS NULL)
+                  AND (
+                    CAST(:statuses AS text[]) IS NULL
+                    OR status=ANY(CAST(:statuses AS text[]))
+                  )
+                  AND (
+                    :cursor_created IS NULL
+                    OR (created_at,id)<(:cursor_created,:cursor_id)
+                  )
+                ORDER BY created_at DESC,id DESC
+                LIMIT :fetch_limit
+                """
             ),
             {
                 "workspace_id": auth.workspace_id,
