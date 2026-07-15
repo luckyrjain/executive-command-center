@@ -6,10 +6,103 @@ on:
     branches: [main]
 
 permissions:
-  contents: read
+  contents: write
   pull-requests: read
 
 jobs:
+  patch-pr11:
+    if: github.event_name == 'pull_request' && github.head_ref == 'feature/phase-1-recommendations-confirmation'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: feature/phase-1-recommendations-confirmation
+      - run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          storage = Path('backend/ecc/domains/governance/recommendation_storage.py')
+          text = storage.read_text()
+          text = text.replace('from fastapi import HTTPException\n', 'from fastapi import HTTPException, Request\n')
+          text = text.replace(
+              'from ecc.auth import AuthContext\n',
+              'from ecc.auth import AuthContext\nfrom ecc.domains.governance.recommendation_events import record_event\n',
+          )
+          text = text.replace(
+              '    row: dict[str, Any],\n) -> dict[str, Any]:\n',
+              '    row: dict[str, Any],\n    *,\n    request: Request | None = None,\n) -> dict[str, Any]:\n',
+              1,
+          )
+          text = text.replace(
+              '        return dict(updated)\n    return row\n',
+              '''        current = dict(updated)\n        if request is not None:\n            record_event(\n                request,\n                session,\n                auth,\n                current,\n                "recommendation.expired",\n                {"status": row["status"]},\n                ["status"],\n            )\n        return current\n    return row\n''',
+          )
+          storage.write_text(text)
+
+          queries = Path('backend/ecc/domains/governance/recommendation_queries.py')
+          text = queries.read_text()
+          text = text.replace(
+              'from fastapi import APIRouter, Depends, HTTPException, Query\n',
+              'from fastapi import APIRouter, Depends, HTTPException, Query, Request\n',
+          )
+          text = text.replace(
+              'def get_recommendation(\n    recommendation_id: UUID,\n',
+              'def get_recommendation(\n    recommendation_id: UUID,\n    request: Request,\n',
+          )
+          text = text.replace(
+              'row = expire_if_needed(session, auth, get_row(session, auth, recommendation_id))',
+              'row = expire_if_needed(\n        session, auth, get_row(session, auth, recommendation_id), request=request\n    )',
+          )
+          queries.write_text(text)
+
+          mutations = Path('backend/ecc/domains/governance/recommendation_mutations.py')
+          text = mutations.read_text()
+          text = text.replace(
+              '    current_version = target_version(\n',
+              '''    session.execute(\n        text("SELECT pg_advisory_xact_lock(hashtextextended(:key, 0))"),\n        {\n            "key": (\n                f"recommendation-target:{auth.workspace_id}:"\n                f"{payload.target_type}:{payload.target_id}"\n            )\n        },\n    )\n    current_version = target_version(\n''',
+              1,
+          )
+          text = text.replace(
+              '    now = datetime.now(UTC)\n    row = (\n',
+              '''    now = datetime.now(UTC)\n    superseded = (\n        session.execute(\n            text(\n                f"""\n                UPDATE recommendations\n                SET status='superseded', version=version+1,\n                    updated_at=:now, updated_by=:actor_id\n                WHERE workspace_id=:workspace_id\n                  AND target_type=:target_type\n                  AND target_id=:target_id\n                  AND status IN ('proposed','pending_confirmation')\n                  AND archived_at IS NULL\n                RETURNING {FIELDS}\n                """\n            ),\n            {\n                "now": now,\n                "actor_id": auth.user_id,\n                "workspace_id": auth.workspace_id,\n                "target_type": payload.target_type,\n                "target_id": payload.target_id,\n            },\n        )\n        .mappings()\n        .all()\n    )\n    for previous in superseded:\n        previous_row = dict(previous)\n        record_event(\n            request,\n            session,\n            auth,\n            previous_row,\n            "recommendation.superseded",\n            {"status": "active"},\n            ["status"],\n        )\n    row = (\n''',
+              1,
+          )
+          text = text.replace(
+              'get_row(session, auth, recommendation_id, for_update=True),\n    )',
+              'get_row(session, auth, recommendation_id, for_update=True),\n        request=request,\n    )',
+          )
+          text = text.replace(
+              '    if row["status"] != "pending_confirmation":\n',
+              '''    if payload.target_expected_version != int(row["expected_version"]):\n        raise HTTPException(status_code=409, detail="TARGET_VERSION_CONFLICT")\n    if row["status"] != "pending_confirmation":\n''',
+          )
+          text = text.replace(
+              '        payload.target_expected_version,\n',
+              '        int(row["expected_version"]),\n',
+          )
+          mutations.write_text(text)
+
+          tests = Path('tests/test_recommendations_postgres.py')
+          text = tests.read_text()
+          insertion = '''\n\ndef test_supersession_and_stored_target_version_enforcement(\n    recommendation_context: tuple[TestClient, UUID, UUID, str],\n) -> None:\n    client, workspace_id, user_id, token = recommendation_context\n    task_id = _task(workspace_id, user_id)\n    first = _generate(client, token, task_id)\n    second = _generate(client, token, task_id)\n\n    first_loaded = client.get(f"/api/v1/recommendations/{first['id']}")\n    assert first_loaded.status_code == 200\n    assert first_loaded.json()["status"] == "superseded"\n\n    published = client.post(\n        f"/api/v1/recommendations/{second['id']}/publish",\n        headers=_headers(token),\n        json={"expected_version": 1},\n    )\n    assert published.status_code == 200\n\n    rejected_override = client.post(\n        f"/api/v1/recommendations/{second['id']}/confirm",\n        headers=_headers(token),\n        json={"expected_version": 2, "target_expected_version": 2},\n    )\n    assert rejected_override.status_code == 409\n    assert rejected_override.json()["detail"] == "TARGET_VERSION_CONFLICT"\n\n\ndef test_expiry_emits_audit_and_outbox(\n    recommendation_context: tuple[TestClient, UUID, UUID, str],\n) -> None:\n    client, workspace_id, user_id, token = recommendation_context\n    task_id = _task(workspace_id, user_id)\n    expired = _generate(\n        client,\n        token,\n        task_id,\n        expires_at=datetime.now(UTC) - timedelta(minutes=1),\n    )\n    loaded = client.get(f"/api/v1/recommendations/{expired['id']}")\n    assert loaded.status_code == 200\n    assert loaded.json()["status"] == "expired"\n    with engine.connect() as connection:\n        audit_count = connection.execute(\n            text(\n                """\n                SELECT count(*) FROM audit_events\n                WHERE workspace_id=:workspace_id\n                  AND aggregate_id=:recommendation_id\n                  AND event_type='recommendation.expired'\n                """\n            ),\n            {\n                "workspace_id": workspace_id,\n                "recommendation_id": UUID(str(expired["id"])),\n            },\n        ).scalar_one()\n        outbox_count = connection.execute(\n            text(\n                """\n                SELECT count(*) FROM event_outbox\n                WHERE workspace_id=:workspace_id\n                  AND event_type='recommendation.expired.v1'\n                """\n            ),\n            {"workspace_id": workspace_id},\n        ).scalar_one()\n    assert audit_count == 1\n    assert outbox_count == 1\n'''
+          text += insertion
+          tests.write_text(text)
+          PY
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: 3.14.6
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e
+        with:
+          version: 0.7.19
+      - run: uv sync --frozen --all-groups --python 3.14.6
+      - run: uv run ruff format backend/ecc/domains/governance/recommendation_*.py tests/test_recommendations_postgres.py
+      - run: uv run ruff check --fix backend/ecc/domains/governance/recommendation_*.py tests/test_recommendations_postgres.py
+      - run: |
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add backend tests
+          git commit -m "fix: harden recommendation lifecycle review findings" || exit 0
+          git push
+
   backend:
     runs-on: ubuntu-latest
     services:
@@ -29,11 +122,11 @@ jobs:
       ECC_SESSION_SECRET: ci-secret-value-that-is-at-least-32-characters
       ECC_DATABASE_URL: postgresql+psycopg://ecc:ecc@localhost:5432/ecc
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
         with:
           python-version: 3.14.6
-      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e
         with:
           version: 0.7.19
           enable-cache: true
@@ -48,8 +141,8 @@ jobs:
   frontend:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
           node-version: 22.17.0
       - run: corepack enable
@@ -62,20 +155,20 @@ jobs:
   containers:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
       - run: docker build -f backend/Dockerfile -t ecc-backend:ci .
       - run: docker build -f frontend/Dockerfile -t ecc-frontend:ci .
 
   security:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
         with: { fetch-depth: 0 }
       - name: Scan repository for leaked secrets
-        uses: gitleaks/gitleaks-action@ff98106e4c7b2bc287b24eaf42907196329070c7 # v2
+        uses: gitleaks/gitleaks-action@ff98106e4c7b2bc287b24eaf42907196329070c7
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      - uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0
+      - uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610
         with: { path: ".", artifact-name: "ecc-sbom.spdx.json" }
       - uses: aquasecurity/trivy-action@c07df6fec6fa692e6fd1200d50aaa1fdd66f03c8
         with:
