@@ -51,9 +51,10 @@ jobs:
       - run: uv sync --frozen --all-groups --python 3.14.6
       - run: uv run alembic -c backend/alembic.ini upgrade head
       - run: createdb -h localhost -U ecc ecc_restore
-      - id: backup
-        run: echo "archive=$(./scripts/backup.sh)" >> "$GITHUB_OUTPUT"
-      - run: ./scripts/verify_restore.sh "${{ steps.backup.outputs.archive }}"
+      - name: Backup and verify clean restore
+        run: |
+          archive=$(./scripts/backup.sh)
+          ./scripts/verify_restore.sh "${archive}"
       - run: uv run pytest tests/test_phase1_acceptance.py
 
   accessibility-smoke:
