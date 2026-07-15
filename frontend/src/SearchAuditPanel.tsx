@@ -1,4 +1,4 @@
-import { FormEvent, useState } from 'react'
+import { FormEvent, KeyboardEvent, useRef, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:8000'
@@ -42,7 +42,6 @@ type AuditResponse = {
 }
 
 type ErrorEnvelope = { error?: { message?: string } }
-
 type View = 'search' | 'audit'
 
 async function request<T>(path: string): Promise<T> {
@@ -73,6 +72,8 @@ export default function SearchAuditPanel() {
   const [searchCursor, setSearchCursor] = useState<string | null>(null)
   const [auditCursor, setAuditCursor] = useState<string | null>(null)
   const [eventType, setEventType] = useState('')
+  const searchTabRef = useRef<HTMLButtonElement>(null)
+  const auditTabRef = useRef<HTMLButtonElement>(null)
 
   const search = useQuery({
     queryKey: ['search', query, searchCursor],
@@ -105,6 +106,28 @@ export default function SearchAuditPanel() {
     setQuery(normalized)
   }
 
+  function selectView(next: View) {
+    setView(next)
+    if (next === 'search') searchTabRef.current?.focus()
+    else auditTabRef.current?.focus()
+  }
+
+  function handleTabKey(event: KeyboardEvent<HTMLButtonElement>) {
+    if (event.key === 'ArrowRight' || event.key === 'ArrowDown') {
+      event.preventDefault()
+      selectView(view === 'search' ? 'audit' : 'search')
+    } else if (event.key === 'ArrowLeft' || event.key === 'ArrowUp') {
+      event.preventDefault()
+      selectView(view === 'search' ? 'audit' : 'search')
+    } else if (event.key === 'Home') {
+      event.preventDefault()
+      selectView('search')
+    } else if (event.key === 'End') {
+      event.preventDefault()
+      selectView('audit')
+    }
+  }
+
   return (
     <section className="explore-panel" aria-labelledby="explore-title">
       <div className="explore-heading">
@@ -115,17 +138,27 @@ export default function SearchAuditPanel() {
         </div>
         <div className="tab-list" role="tablist" aria-label="Search and audit views">
           <button
+            ref={searchTabRef}
+            id="search-tab"
             type="button"
             role="tab"
             aria-selected={view === 'search'}
+            aria-controls="search-panel"
+            tabIndex={view === 'search' ? 0 : -1}
+            onKeyDown={handleTabKey}
             onClick={() => setView('search')}
           >
             Search
           </button>
           <button
+            ref={auditTabRef}
+            id="audit-tab"
             type="button"
             role="tab"
             aria-selected={view === 'audit'}
+            aria-controls="audit-panel"
+            tabIndex={view === 'audit' ? 0 : -1}
+            onKeyDown={handleTabKey}
             onClick={() => setView('audit')}
           >
             Audit history
@@ -134,12 +167,13 @@ export default function SearchAuditPanel() {
       </div>
 
       {view === 'search' ? (
-        <div role="tabpanel" aria-label="Global search">
-          <form className="search-form" onSubmit={submitSearch}>
+        <div id="search-panel" role="tabpanel" aria-labelledby="search-tab">
+          <form className="search-form" role="search" onSubmit={submitSearch}>
             <label htmlFor="global-search">Search tasks, commitments, notes, meetings, events and risks</label>
             <div>
               <input
                 id="global-search"
+                type="search"
                 value={draftQuery}
                 onChange={(event) => setDraftQuery(event.target.value)}
                 maxLength={500}
@@ -182,7 +216,7 @@ export default function SearchAuditPanel() {
           ) : null}
         </div>
       ) : (
-        <div role="tabpanel" aria-label="Audit history">
+        <div id="audit-panel" role="tabpanel" aria-labelledby="audit-tab">
           <div className="audit-toolbar">
             <label htmlFor="audit-event-type">Filter by event type</label>
             <input
