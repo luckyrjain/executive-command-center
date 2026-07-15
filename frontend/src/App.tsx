@@ -1,5 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
+import RecommendationPanel from './RecommendationPanel'
+
 const API_BASE = import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:8000'
 
 type DashboardItem = {
@@ -220,6 +222,7 @@ export default function App() {
       ) : null}
 
       <MorningBrief />
+      <RecommendationPanel />
     </main>
   )
 }
