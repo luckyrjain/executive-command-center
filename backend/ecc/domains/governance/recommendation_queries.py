@@ -69,8 +69,11 @@ def list_recommendations(
                     OR status=ANY(CAST(:statuses AS text[]))
                   )
                   AND (
-                    :cursor_created IS NULL
-                    OR (created_at,id)<(:cursor_created,:cursor_id)
+                    CAST(:cursor_created AS timestamptz) IS NULL
+                    OR (created_at,id)<(
+                        CAST(:cursor_created AS timestamptz),
+                        CAST(:cursor_id AS uuid)
+                    )
                   )
                 ORDER BY created_at DESC,id DESC
                 LIMIT :fetch_limit
