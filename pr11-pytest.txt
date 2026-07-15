@@ -1,0 +1,488 @@
+..F                                                                      [100%]
+=================================== FAILURES ===================================
+__________________ test_reject_defer_pin_expiry_and_isolation __________________
+
+self = <sqlalchemy.engine.base.Connection object at 0x7f66a6b2a120>
+dialect = <sqlalchemy.dialects.postgresql.psycopg.PGDialect_psycopg object at 0x7f66aa930c20>
+context = <sqlalchemy.dialects.postgresql.psycopg.PGExecutionContext_psycopg object at 0x7f66a7c717b0>
+statement = <sqlalchemy.dialects.postgresql.psycopg.PGCompiler_psycopg object at 0x7f66a7cc2490>
+parameters = [{'cursor_created': None, 'cursor_id': None, 'fetch_limit': 21, 'include_archived': False, ...}]
+
+    def _exec_single_context(
+        self,
+        dialect: Dialect,
+        context: ExecutionContext,
+        statement: Union[str, Compiled],
+        parameters: Optional[_AnyMultiExecuteParams],
+    ) -> CursorResult[Any]:
+        """continue the _execute_context() method for a single DBAPI
+        cursor.execute() or cursor.executemany() call.
+    
+        """
+        if dialect.bind_typing is BindTyping.SETINPUTSIZES:
+            generic_setinputsizes = context._prepare_set_input_sizes()
+    
+            if generic_setinputsizes:
+                try:
+                    dialect.do_set_input_sizes(
+                        context.cursor, generic_setinputsizes, context
+                    )
+                except BaseException as e:
+                    self._handle_dbapi_exception(
+                        e, str(statement), parameters, None, context
+                    )
+    
+        cursor, str_statement, parameters = (
+            context.cursor,
+            context.statement,
+            context.parameters,
+        )
+    
+        effective_parameters: Optional[_AnyExecuteParams]
+    
+        if not context.executemany:
+            effective_parameters = parameters[0]
+        else:
+            effective_parameters = parameters
+    
+        if self._has_events or self.engine._has_events:
+            for fn in self.dispatch.before_cursor_execute:
+                str_statement, effective_parameters = fn(
+                    self,
+                    cursor,
+                    str_statement,
+                    effective_parameters,
+                    context,
+                    context.executemany,
+                )
+    
+        if self._echo:
+            self._log_info(str_statement)
+    
+            stats = context._get_cache_stats()
+    
+            if not self.engine.hide_parameters:
+                self._log_info(
+                    "[%s] %r",
+                    stats,
+                    sql_util._repr_params(
+                        effective_parameters,
+                        batches=10,
+                        ismulti=context.executemany,
+                    ),
+                )
+            else:
+                self._log_info(
+                    "[%s] [SQL parameters hidden due to hide_parameters=True]",
+                    stats,
+                )
+    
+        evt_handled: bool = False
+        try:
+            if context.execute_style is ExecuteStyle.EXECUTEMANY:
+                effective_parameters = cast(
+                    "_CoreMultiExecuteParams", effective_parameters
+                )
+                if self.dialect._has_events:
+                    for fn in self.dialect.dispatch.do_executemany:
+                        if fn(
+                            cursor,
+                            str_statement,
+                            effective_parameters,
+                            context,
+                        ):
+                            evt_handled = True
+                            break
+                if not evt_handled:
+                    self.dialect.do_executemany(
+                        cursor,
+                        str_statement,
+                        effective_parameters,
+                        context,
+                    )
+            elif not effective_parameters and context.no_parameters:
+                if self.dialect._has_events:
+                    for fn in self.dialect.dispatch.do_execute_no_params:
+                        if fn(cursor, str_statement, context):
+                            evt_handled = True
+                            break
+                if not evt_handled:
+                    self.dialect.do_execute_no_params(
+                        cursor, str_statement, context
+                    )
+            else:
+                effective_parameters = cast(
+                    "_CoreSingleExecuteParams", effective_parameters
+                )
+                if self.dialect._has_events:
+                    for fn in self.dialect.dispatch.do_execute:
+                        if fn(
+                            cursor,
+                            str_statement,
+                            effective_parameters,
+                            context,
+                        ):
+                            evt_handled = True
+                            break
+                if not evt_handled:
+>                   self.dialect.do_execute(
+                        cursor, str_statement, effective_parameters, context
+                    )
+
+.venv/lib/python3.14/site-packages/sqlalchemy/engine/base.py:1963: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+.venv/lib/python3.14/site-packages/sqlalchemy/engine/default.py:943: in do_execute
+    cursor.execute(statement, parameters)
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <psycopg.Cursor [closed] [IDLE] (host=localhost database=ecc) at 0x7f66a91ab110>
+query = '\n                SELECT \nid, recommendation_type, target_type, target_id, proposed_action, expected_version,\nratio...          )\n                ORDER BY created_at DESC,id DESC\n                LIMIT %(fetch_limit)s\n                '
+params = {'cursor_created': None, 'cursor_id': None, 'fetch_limit': 21, 'include_archived': False, ...}
+
+    def execute(
+        self,
+        query: Query,
+        params: Params | None = None,
+        *,
+        prepare: bool | None = None,
+        binary: bool | None = None,
+    ) -> Self:
+        """
+        Execute a query or command to the database.
+        """
+        try:
+            with self._conn.lock:
+                self._conn.wait(
+                    self._execute_gen(query, params, prepare=prepare, binary=binary)
+                )
+        except e._NO_TRACEBACK as ex:
+>           raise ex.with_traceback(None)
+E           psycopg.errors.AmbiguousParameter: could not determine data type of parameter $4
+E           LINE 15:                     $4 IS NULL
+E                                        ^
+
+.venv/lib/python3.14/site-packages/psycopg/cursor.py:117: AmbiguousParameter
+
+The above exception was the direct cause of the following exception:
+
+recommendation_context = (<starlette.testclient.TestClient object at 0x7f66a7cc2710>, UUID('8cab7931-73b4-4ac5-b539-e6cfa79eea58'), UUID('a8d5cbc2-47d0-4b9b-97d0-5be4fe574724'), 'session-a7177903-6380-4644-8d36-c012fe55a4e6')
+
+    def test_reject_defer_pin_expiry_and_isolation(
+        recommendation_context: tuple[TestClient, UUID, UUID, str],
+    ) -> None:
+        client, workspace_id, user_id, token = recommendation_context
+        task_id = _task(workspace_id, user_id)
+        generated = _generate(client, token, task_id)
+        recommendation_id = generated["id"]
+    
+        pinned = client.post(
+            f"/api/v1/recommendations/{recommendation_id}/pin",
+            headers=_headers(token),
+            json={"expected_version": 1, "pinned": True},
+        )
+        assert pinned.status_code == 200
+        assert pinned.json()["pinned"] is True
+    
+        deferred = client.post(
+            f"/api/v1/recommendations/{recommendation_id}/defer",
+            headers=_headers(token),
+            json={
+                "expected_version": 2,
+                "defer_until": (datetime.now(UTC) + timedelta(hours=2)).isoformat(),
+            },
+        )
+        assert deferred.status_code == 200
+    
+        published = client.post(
+            f"/api/v1/recommendations/{recommendation_id}/publish",
+            headers=_headers(token),
+            json={"expected_version": 3},
+        )
+        assert published.status_code == 200
+        rejected = client.post(
+            f"/api/v1/recommendations/{recommendation_id}/reject",
+            headers=_headers(token),
+            json={"expected_version": 4, "reason": "Not the right priority."},
+        )
+        assert rejected.status_code == 200
+        assert rejected.json()["status"] == "rejected"
+    
+        expired_task = _task(workspace_id, user_id, "Expired target")
+        expired = _generate(
+            client,
+            token,
+            expired_task,
+            expires_at=datetime.now(UTC) - timedelta(minutes=1),
+        )
+        loaded = client.get(f"/api/v1/recommendations/{expired['id']}")
+        assert loaded.status_code == 200
+        assert loaded.json()["status"] == "expired"
+    
+        other_workspace = uuid4()
+        other_user = uuid4()
+        now = datetime.now(UTC)
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO workspaces (id,name,timezone,created_at)
+                    VALUES (:id,'Other','UTC',:now)
+                    """
+                ),
+                {"id": other_workspace, "now": now},
+            )
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO users (id,workspace_id,email,password_hash,created_at)
+                    VALUES (:id,:workspace_id,:email,'hash',:now)
+                    """
+                ),
+                {
+                    "id": other_user,
+                    "workspace_id": other_workspace,
+                    "email": f"{other_user}@example.test",
+                    "now": now,
+                },
+            )
+        try:
+            cross = client.get(f"/api/v1/recommendations/{uuid4()}")
+            assert cross.status_code == 404
+>           listed = client.get("/api/v1/recommendations")
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/test_recommendations_postgres.py:342: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+.venv/lib/python3.14/site-packages/starlette/testclient.py:482: in get
+    return super().get(
+.venv/lib/python3.14/site-packages/httpx/_client.py:1053: in get
+    return self.request(
+.venv/lib/python3.14/site-packages/starlette/testclient.py:454: in request
+    return super().request(
+.venv/lib/python3.14/site-packages/httpx/_client.py:825: in request
+    return self.send(request, auth=auth, follow_redirects=follow_redirects)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+.venv/lib/python3.14/site-packages/httpx/_client.py:914: in send
+    response = self._send_handling_auth(
+.venv/lib/python3.14/site-packages/httpx/_client.py:942: in _send_handling_auth
+    response = self._send_handling_redirects(
+.venv/lib/python3.14/site-packages/httpx/_client.py:979: in _send_handling_redirects
+    response = self._send_single_request(request)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+.venv/lib/python3.14/site-packages/httpx/_client.py:1014: in _send_single_request
+    response = transport.handle_request(request)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+.venv/lib/python3.14/site-packages/starlette/testclient.py:356: in handle_request
+    raise exc
+.venv/lib/python3.14/site-packages/starlette/testclient.py:353: in handle_request
+    portal.call(self.app, scope, receive, send)
+.venv/lib/python3.14/site-packages/anyio/from_thread.py:338: in call
+    return cast(T_Retval, self.start_task_soon(func, *args).result())
+                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/opt/hostedtoolcache/Python/3.14.6/x64/lib/python3.14/concurrent/futures/_base.py:454: in result
+    return self.__get_result()
+           ^^^^^^^^^^^^^^^^^^^
+/opt/hostedtoolcache/Python/3.14.6/x64/lib/python3.14/concurrent/futures/_base.py:396: in __get_result
+    raise self._exception
+.venv/lib/python3.14/site-packages/anyio/from_thread.py:263: in _call_func
+    retval = await retval_or_awaitable
+             ^^^^^^^^^^^^^^^^^^^^^^^^^
+.venv/lib/python3.14/site-packages/fastapi/applications.py:1163: in __call__
+    await super().__call__(scope, receive, send)
+.venv/lib/python3.14/site-packages/starlette/applications.py:90: in __call__
+    await self.middleware_stack(scope, receive, send)
+.venv/lib/python3.14/site-packages/starlette/middleware/errors.py:186: in __call__
+    raise exc
+.venv/lib/python3.14/site-packages/starlette/middleware/errors.py:164: in __call__
+    await self.app(scope, receive, _send)
+.venv/lib/python3.14/site-packages/starlette/middleware/base.py:193: in __call__
+    response = await self.dispatch_func(request, call_next)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+backend/ecc/main.py:101: in response_contract_middleware
+    response = await call_next(request)
+               ^^^^^^^^^^^^^^^^^^^^^^^^
+.venv/lib/python3.14/site-packages/starlette/middleware/base.py:168: in call_next
+    raise app_exc from app_exc.__cause__ or app_exc.__context__
+.venv/lib/python3.14/site-packages/starlette/middleware/base.py:144: in coro
+    await self.app(scope, receive_or_disconnect, send_no_error)
+.venv/lib/python3.14/site-packages/starlette/middleware/base.py:193: in __call__
+    response = await self.dispatch_func(request, call_next)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+backend/ecc/audit.py:101: in rejected_mutation_audit_middleware
+    response = await call_next(request)
+               ^^^^^^^^^^^^^^^^^^^^^^^^
+.venv/lib/python3.14/site-packages/starlette/middleware/base.py:168: in call_next
+    raise app_exc from app_exc.__cause__ or app_exc.__context__
+.venv/lib/python3.14/site-packages/starlette/middleware/base.py:144: in coro
+    await self.app(scope, receive_or_disconnect, send_no_error)
+.venv/lib/python3.14/site-packages/starlette/middleware/cors.py:88: in __call__
+    await self.app(scope, receive, send)
+.venv/lib/python3.14/site-packages/starlette/middleware/exceptions.py:63: in __call__
+    await wrap_app_handling_exceptions(self.app, conn)(scope, receive, send)
+.venv/lib/python3.14/site-packages/starlette/_exception_handler.py:53: in wrapped_app
+    raise exc
+.venv/lib/python3.14/site-packages/starlette/_exception_handler.py:42: in wrapped_app
+    await app(scope, receive, sender)
+.venv/lib/python3.14/site-packages/fastapi/middleware/asyncexitstack.py:18: in __call__
+    await self.app(scope, receive, send)
+.venv/lib/python3.14/site-packages/starlette/routing.py:660: in __call__
+    await self.middleware_stack(scope, receive, send)
+.venv/lib/python3.14/site-packages/fastapi/routing.py:2683: in app
+    await route.handle(scope, receive, send)
+.venv/lib/python3.14/site-packages/fastapi/routing.py:1753: in handle
+    await self.original_router.handle(scope, receive, send)
+.venv/lib/python3.14/site-packages/fastapi/routing.py:2738: in handle
+    await included_router._handle_selected(scope, receive, send)
+.venv/lib/python3.14/site-packages/fastapi/routing.py:1773: in _handle_selected
+    await original_route.handle(scope, receive, send)
+.venv/lib/python3.14/site-packages/fastapi/routing.py:1264: in handle
+    await app(scope, receive, send)
+.venv/lib/python3.14/site-packages/fastapi/routing.py:150: in app
+    await wrap_app_handling_exceptions(app, request)(scope, receive, send)
+.venv/lib/python3.14/site-packages/starlette/_exception_handler.py:53: in wrapped_app
+    raise exc
+.venv/lib/python3.14/site-packages/starlette/_exception_handler.py:42: in wrapped_app
+    await app(scope, receive, sender)
+.venv/lib/python3.14/site-packages/fastapi/routing.py:136: in app
+    response = await f(request)
+               ^^^^^^^^^^^^^^^^
+.venv/lib/python3.14/site-packages/fastapi/routing.py:690: in app
+    raw_response = await run_endpoint_function(
+.venv/lib/python3.14/site-packages/fastapi/routing.py:346: in run_endpoint_function
+    return await run_in_threadpool(dependant.call, **values)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+.venv/lib/python3.14/site-packages/starlette/concurrency.py:34: in run_in_threadpool
+    return await anyio.to_thread.run_sync(func)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+.venv/lib/python3.14/site-packages/anyio/to_thread.py:65: in run_sync
+    return await get_async_backend().run_sync_in_worker_thread(
+.venv/lib/python3.14/site-packages/anyio/_backends/_asyncio.py:2641: in run_sync_in_worker_thread
+    return await future
+           ^^^^^^^^^^^^
+.venv/lib/python3.14/site-packages/anyio/_backends/_asyncio.py:1033: in run
+    result = context.run(func, *args)
+             ^^^^^^^^^^^^^^^^^^^^^^^^
+backend/ecc/domains/governance/recommendation_queries.py:61: in list_recommendations
+    session.execute(
+.venv/lib/python3.14/site-packages/sqlalchemy/orm/session.py:2365: in execute
+    return self._execute_internal(
+.venv/lib/python3.14/site-packages/sqlalchemy/orm/session.py:2260: in _execute_internal
+    result = conn.execute(
+.venv/lib/python3.14/site-packages/sqlalchemy/engine/base.py:1415: in execute
+    return meth(
+.venv/lib/python3.14/site-packages/sqlalchemy/sql/elements.py:523: in _execute_on_connection
+    return connection._execute_clauseelement(
+.venv/lib/python3.14/site-packages/sqlalchemy/engine/base.py:1637: in _execute_clauseelement
+    ret = self._execute_context(
+.venv/lib/python3.14/site-packages/sqlalchemy/engine/base.py:1842: in _execute_context
+    return self._exec_single_context(
+.venv/lib/python3.14/site-packages/sqlalchemy/engine/base.py:1982: in _exec_single_context
+    self._handle_dbapi_exception(
+.venv/lib/python3.14/site-packages/sqlalchemy/engine/base.py:2351: in _handle_dbapi_exception
+    raise sqlalchemy_exception.with_traceback(exc_info[2]) from e
+.venv/lib/python3.14/site-packages/sqlalchemy/engine/base.py:1963: in _exec_single_context
+    self.dialect.do_execute(
+.venv/lib/python3.14/site-packages/sqlalchemy/engine/default.py:943: in do_execute
+    cursor.execute(statement, parameters)
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <psycopg.Cursor [closed] [IDLE] (host=localhost database=ecc) at 0x7f66a91ab110>
+query = '\n                SELECT \nid, recommendation_type, target_type, target_id, proposed_action, expected_version,\nratio...          )\n                ORDER BY created_at DESC,id DESC\n                LIMIT %(fetch_limit)s\n                '
+params = {'cursor_created': None, 'cursor_id': None, 'fetch_limit': 21, 'include_archived': False, ...}
+
+    def execute(
+        self,
+        query: Query,
+        params: Params | None = None,
+        *,
+        prepare: bool | None = None,
+        binary: bool | None = None,
+    ) -> Self:
+        """
+        Execute a query or command to the database.
+        """
+        try:
+            with self._conn.lock:
+                self._conn.wait(
+                    self._execute_gen(query, params, prepare=prepare, binary=binary)
+                )
+        except e._NO_TRACEBACK as ex:
+>           raise ex.with_traceback(None)
+E           sqlalchemy.exc.ProgrammingError: (psycopg.errors.AmbiguousParameter) could not determine data type of parameter $4
+E           LINE 15:                     $4 IS NULL
+E                                        ^
+E           [SQL: 
+E                           SELECT 
+E           id, recommendation_type, target_type, target_id, proposed_action, expected_version,
+E           rationale, confidence, status, evidence_ids, expires_at, confirmed_by, confirmed_at,
+E           execution_result, source, pinned, deferred_until, created_by, updated_by, created_at,
+E           updated_at, version, archived_at, pre_archive_status
+E            FROM recommendations
+E                           WHERE workspace_id=%(workspace_id)s
+E                             AND (%(include_archived)s OR archived_at IS NULL)
+E                             AND (
+E                               CAST(%(statuses)s AS text[]) IS NULL
+E                               OR status=ANY(CAST(%(statuses)s AS text[]))
+E                             )
+E                             AND (
+E                               %(cursor_created)s IS NULL
+E                               OR (created_at,id)<(%(cursor_created)s,%(cursor_id)s)
+E                             )
+E                           ORDER BY created_at DESC,id DESC
+E                           LIMIT %(fetch_limit)s
+E                           ]
+E           [parameters: {'workspace_id': UUID('8cab7931-73b4-4ac5-b539-e6cfa79eea58'), 'include_archived': False, 'statuses': None, 'cursor_created': None, 'cursor_id': None, 'fetch_limit': 21}]
+E           (Background on this error at: https://sqlalche.me/e/20/f405)
+
+.venv/lib/python3.14/site-packages/psycopg/cursor.py:117: ProgrammingError
+----------------------------- Captured stderr call -----------------------------
+{"timestamp":"2026-07-15T04:54:07.501312+00:00","level":"INFO","service":"ecc-backend","domain":"platform","correlation_id":null,"request_id":null,"message":"HTTP Request: POST http://testserver/api/v1/recommendations \"HTTP/1.1 201 Created\""}
+{"timestamp":"2026-07-15T04:54:07.512759+00:00","level":"INFO","service":"ecc-backend","domain":"platform","correlation_id":null,"request_id":null,"message":"HTTP Request: POST http://testserver/api/v1/recommendations/772ebf82-44e8-49ac-9aac-ac8166c01f64/pin \"HTTP/1.1 200 OK\""}
+{"timestamp":"2026-07-15T04:54:07.523747+00:00","level":"INFO","service":"ecc-backend","domain":"platform","correlation_id":null,"request_id":null,"message":"HTTP Request: POST http://testserver/api/v1/recommendations/772ebf82-44e8-49ac-9aac-ac8166c01f64/defer \"HTTP/1.1 200 OK\""}
+{"timestamp":"2026-07-15T04:54:07.535453+00:00","level":"INFO","service":"ecc-backend","domain":"platform","correlation_id":null,"request_id":null,"message":"HTTP Request: POST http://testserver/api/v1/recommendations/772ebf82-44e8-49ac-9aac-ac8166c01f64/publish \"HTTP/1.1 200 OK\""}
+{"timestamp":"2026-07-15T04:54:07.546818+00:00","level":"INFO","service":"ecc-backend","domain":"platform","correlation_id":null,"request_id":null,"message":"HTTP Request: POST http://testserver/api/v1/recommendations/772ebf82-44e8-49ac-9aac-ac8166c01f64/reject \"HTTP/1.1 200 OK\""}
+{"timestamp":"2026-07-15T04:54:07.558981+00:00","level":"INFO","service":"ecc-backend","domain":"platform","correlation_id":null,"request_id":null,"message":"HTTP Request: POST http://testserver/api/v1/recommendations \"HTTP/1.1 201 Created\""}
+{"timestamp":"2026-07-15T04:54:07.566464+00:00","level":"INFO","service":"ecc-backend","domain":"platform","correlation_id":null,"request_id":null,"message":"HTTP Request: GET http://testserver/api/v1/recommendations/3406d8d7-8288-4c03-9327-709ec81fc9ac \"HTTP/1.1 200 OK\""}
+{"timestamp":"2026-07-15T04:54:07.574932+00:00","level":"INFO","service":"ecc-backend","domain":"platform","correlation_id":null,"request_id":null,"message":"HTTP Request: GET http://testserver/api/v1/recommendations/ad002fbc-3ec0-4146-8009-fc483551d0a2 \"HTTP/1.1 404 Not Found\""}
+------------------------------ Captured log call -------------------------------
+INFO     httpx:_client.py:1025 HTTP Request: POST http://testserver/api/v1/recommendations "HTTP/1.1 201 Created"
+INFO     httpx:_client.py:1025 HTTP Request: POST http://testserver/api/v1/recommendations/772ebf82-44e8-49ac-9aac-ac8166c01f64/pin "HTTP/1.1 200 OK"
+INFO     httpx:_client.py:1025 HTTP Request: POST http://testserver/api/v1/recommendations/772ebf82-44e8-49ac-9aac-ac8166c01f64/defer "HTTP/1.1 200 OK"
+INFO     httpx:_client.py:1025 HTTP Request: POST http://testserver/api/v1/recommendations/772ebf82-44e8-49ac-9aac-ac8166c01f64/publish "HTTP/1.1 200 OK"
+INFO     httpx:_client.py:1025 HTTP Request: POST http://testserver/api/v1/recommendations/772ebf82-44e8-49ac-9aac-ac8166c01f64/reject "HTTP/1.1 200 OK"
+INFO     httpx:_client.py:1025 HTTP Request: POST http://testserver/api/v1/recommendations "HTTP/1.1 201 Created"
+INFO     httpx:_client.py:1025 HTTP Request: GET http://testserver/api/v1/recommendations/3406d8d7-8288-4c03-9327-709ec81fc9ac "HTTP/1.1 200 OK"
+INFO     httpx:_client.py:1025 HTTP Request: GET http://testserver/api/v1/recommendations/ad002fbc-3ec0-4146-8009-fc483551d0a2 "HTTP/1.1 404 Not Found"
+=============================== warnings summary ===============================
+.venv/lib/python3.14/site-packages/fastapi/testclient.py:1
+  /home/runner/work/executive-command-center/executive-command-center/.venv/lib/python3.14/site-packages/fastapi/testclient.py:1: StarletteDeprecationWarning: Using `httpx` with `starlette.testclient` is deprecated; install `httpx2` instead.
+    from starlette.testclient import TestClient as TestClient  # noqa
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+FAILED tests/test_recommendations_postgres.py::test_reject_defer_pin_expiry_and_isolation - sqlalchemy.exc.ProgrammingError: (psycopg.errors.AmbiguousParameter) could not determine data type of parameter $4
+LINE 15:                     $4 IS NULL
+                             ^
+[SQL: 
+                SELECT 
+id, recommendation_type, target_type, target_id, proposed_action, expected_version,
+rationale, confidence, status, evidence_ids, expires_at, confirmed_by, confirmed_at,
+execution_result, source, pinned, deferred_until, created_by, updated_by, created_at,
+updated_at, version, archived_at, pre_archive_status
+ FROM recommendations
+                WHERE workspace_id=%(workspace_id)s
+                  AND (%(include_archived)s OR archived_at IS NULL)
+                  AND (
+                    CAST(%(statuses)s AS text[]) IS NULL
+                    OR status=ANY(CAST(%(statuses)s AS text[]))
+                  )
+                  AND (
+                    %(cursor_created)s IS NULL
+                    OR (created_at,id)<(%(cursor_created)s,%(cursor_id)s)
+                  )
+                ORDER BY created_at DESC,id DESC
+                LIMIT %(fetch_limit)s
+                ]
+[parameters: {'workspace_id': UUID('8cab7931-73b4-4ac5-b539-e6cfa79eea58'), 'include_archived': False, 'statuses': None, 'cursor_created': None, 'cursor_id': None, 'fetch_limit': 21}]
+(Background on this error at: https://sqlalche.me/e/20/f405)
+1 failed, 2 passed, 1 warning in 3.26s
