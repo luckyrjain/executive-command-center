@@ -10,7 +10,14 @@ from ecc.auth import AuthContext
 
 _ALLOWED: dict[str, dict[str, set[Any]]] = {
     "task": {
-        "set_status": {"captured", "planned", "in_progress", "blocked", "completed", "cancelled"},
+        "set_status": {
+            "captured",
+            "planned",
+            "in_progress",
+            "blocked",
+            "completed",
+            "cancelled",
+        },
         "set_priority": {"low", "medium", "high", "critical"},
         "set_pinned": {True, False},
     },
@@ -53,9 +60,21 @@ def target_version(
     target_id: UUID,
 ) -> int | None:
     queries = {
-        "task": "SELECT version FROM tasks WHERE workspace_id=:workspace_id AND id=:target_id AND archived_at IS NULL",
-        "commitment": "SELECT version FROM commitments WHERE workspace_id=:workspace_id AND id=:target_id AND archived_at IS NULL",
-        "risk": "SELECT version FROM risks WHERE workspace_id=:workspace_id AND id=:target_id AND archived_at IS NULL",
+        "task": """
+            SELECT version FROM tasks
+            WHERE workspace_id=:workspace_id AND id=:target_id
+              AND archived_at IS NULL
+        """,
+        "commitment": """
+            SELECT version FROM commitments
+            WHERE workspace_id=:workspace_id AND id=:target_id
+              AND archived_at IS NULL
+        """,
+        "risk": """
+            SELECT version FROM risks
+            WHERE workspace_id=:workspace_id AND id=:target_id
+              AND archived_at IS NULL
+        """,
     }
     query = queries.get(target_type)
     if query is None:
@@ -65,6 +84,17 @@ def target_version(
         {"workspace_id": workspace_id, "target_id": target_id},
     ).scalar_one_or_none()
     return int(value) if value is not None else None
+
+
+def _update_query(table: str, column: str) -> str:
+    return f"""
+        UPDATE {table}
+        SET {column}=:value, version=version+1,
+            updated_at=:now, updated_by=:actor
+        WHERE workspace_id=:workspace_id AND id=:target_id
+          AND version=:expected_version AND archived_at IS NULL
+        RETURNING id,version
+    """
 
 
 def execute_target(
@@ -77,51 +107,22 @@ def execute_target(
 ) -> dict[str, Any]:
     validate_action(target_type, action)
     operation = action["operation"]
-    queries = {
-        (
-            "task",
-            "set_status",
-        ): "UPDATE tasks SET status=:value,version=version+1,updated_at=:now,updated_by=:actor WHERE workspace_id=:workspace_id AND id=:target_id AND version=:expected_version AND archived_at IS NULL RETURNING id,version",
-        (
-            "task",
-            "set_priority",
-        ): "UPDATE tasks SET manual_priority=:value,version=version+1,updated_at=:now,updated_by=:actor WHERE workspace_id=:workspace_id AND id=:target_id AND version=:expected_version AND archived_at IS NULL RETURNING id,version",
-        (
-            "task",
-            "set_pinned",
-        ): "UPDATE tasks SET pinned=:value,version=version+1,updated_at=:now,updated_by=:actor WHERE workspace_id=:workspace_id AND id=:target_id AND version=:expected_version AND archived_at IS NULL RETURNING id,version",
-        (
-            "commitment",
-            "set_status",
-        ): "UPDATE commitments SET status=:value,version=version+1,updated_at=:now,updated_by=:actor WHERE workspace_id=:workspace_id AND id=:target_id AND version=:expected_version AND archived_at IS NULL RETURNING id,version",
-        (
-            "commitment",
-            "set_importance",
-        ): "UPDATE commitments SET importance=:value,version=version+1,updated_at=:now,updated_by=:actor WHERE workspace_id=:workspace_id AND id=:target_id AND version=:expected_version AND archived_at IS NULL RETURNING id,version",
-        (
-            "commitment",
-            "set_pinned",
-        ): "UPDATE commitments SET pinned=:value,version=version+1,updated_at=:now,updated_by=:actor WHERE workspace_id=:workspace_id AND id=:target_id AND version=:expected_version AND archived_at IS NULL RETURNING id,version",
-        (
-            "risk",
-            "set_status",
-        ): "UPDATE risks SET status=:value,version=version+1,updated_at=:now,updated_by=:actor WHERE workspace_id=:workspace_id AND id=:target_id AND version=:expected_version AND archived_at IS NULL RETURNING id,version",
-        (
-            "risk",
-            "set_probability",
-        ): "UPDATE risks SET probability=:value,version=version+1,updated_at=:now,updated_by=:actor WHERE workspace_id=:workspace_id AND id=:target_id AND version=:expected_version AND archived_at IS NULL RETURNING id,version",
-        (
-            "risk",
-            "set_impact",
-        ): "UPDATE risks SET impact=:value,version=version+1,updated_at=:now,updated_by=:actor WHERE workspace_id=:workspace_id AND id=:target_id AND version=:expected_version AND archived_at IS NULL RETURNING id,version",
-        (
-            "risk",
-            "set_pinned",
-        ): "UPDATE risks SET pinned=:value,version=version+1,updated_at=:now,updated_by=:actor WHERE workspace_id=:workspace_id AND id=:target_id AND version=:expected_version AND archived_at IS NULL RETURNING id,version",
+    columns = {
+        ("task", "set_status"): ("tasks", "status"),
+        ("task", "set_priority"): ("tasks", "manual_priority"),
+        ("task", "set_pinned"): ("tasks", "pinned"),
+        ("commitment", "set_status"): ("commitments", "status"),
+        ("commitment", "set_importance"): ("commitments", "importance"),
+        ("commitment", "set_pinned"): ("commitments", "pinned"),
+        ("risk", "set_status"): ("risks", "status"),
+        ("risk", "set_probability"): ("risks", "probability"),
+        ("risk", "set_impact"): ("risks", "impact"),
+        ("risk", "set_pinned"): ("risks", "pinned"),
     }
+    table, column = columns[(target_type, operation)]
     result = (
         session.execute(
-            text(queries[(target_type, operation)]),
+            text(_update_query(table, column)),
             {
                 "value": action["value"],
                 "now": datetime.now(UTC),
