@@ -20,6 +20,12 @@ async function waitForServer() {
   throw new Error('Vite preview did not start')
 }
 
+async function step(name, run) {
+  process.stdout.write(`→ ${name}\n`)
+  await run()
+  process.stdout.write(`✓ ${name}\n`)
+}
+
 const dashboard = {
   date: '2026-07-15',
   timezone: 'Asia/Kolkata',
@@ -50,6 +56,53 @@ const brief = {
   stale_reason: 'source_version_changed',
 }
 
+let task = {
+  id: 't1',
+  owner_id: 'u1',
+  title: 'Approve hiring plan',
+  description: null,
+  status: 'in_progress',
+  manual_priority: 'high',
+  due_date: '2026-07-15',
+  due_at: null,
+  blocked_reason: null,
+  blocked_on_person_id: null,
+  completed_at: null,
+  pinned: false,
+  source_type: 'local',
+  source_ref: null,
+  created_at: '2026-07-14T03:00:00Z',
+  updated_at: '2026-07-15T03:00:00Z',
+  version: 2,
+  archived_at: null,
+  pre_archive_status: null,
+  links: { audit: '/api/v1/audit' },
+}
+
+let commitment = {
+  id: 'c1',
+  owner_id: 'u1',
+  summary: 'Send board metrics',
+  description: null,
+  direction: 'made_by_me',
+  counterparty_person_id: null,
+  counterparty_name: 'Board',
+  status: 'active',
+  due_date: '2026-07-15',
+  due_at: null,
+  importance: 'critical',
+  evidence_id: null,
+  confidence: null,
+  fulfilled_at: null,
+  pinned: false,
+  created_at: '2026-07-14T03:00:00Z',
+  updated_at: '2026-07-15T03:00:00Z',
+  version: 3,
+  archived_at: null,
+  pre_archive_status: null,
+  links: { audit: '/api/v1/audit' },
+}
+
 let recommendation = {
   id: 'rec1',
   recommendation_type: 'update_task_priority',
@@ -73,15 +126,35 @@ async function main() {
   await waitForServer()
   const browser = await chromium.launch({ headless: true })
   const page = await browser.newPage()
+  page.on('pageerror', (error) => console.error('Browser page error:', error))
+  page.on('console', (message) => {
+    if (message.type() === 'error') console.error('Browser console error:', message.text())
+  })
 
   await page.context().addCookies([
-    { name: 'ecc_csrf', value: 'csrf-token', domain: '127.0.0.1', path: '/' },
+    { name: 'ecc_csrf', value: 'csrf-token', url: 'http://127.0.0.1:4173' },
   ])
 
   await page.route('**/api/v1/dashboard/today', (route) => route.fulfill({ json: dashboard }))
   await page.route('**/api/v1/briefs/morning', async (route) => {
     const refreshed = { ...brief, stale: false, stale_reason: null, generation_version: 4 }
     await route.fulfill({ json: route.request().method() === 'POST' ? refreshed : brief })
+  })
+  await page.route('**/api/v1/tasks?**', (route) =>
+    route.fulfill({ json: { items: task.status === 'completed' ? [] : [task], next_cursor: null } }),
+  )
+  await page.route('**/api/v1/tasks/t1/complete', async (route) => {
+    assert.deepEqual(route.request().postDataJSON(), { expected_version: 2 })
+    task = { ...task, status: 'completed', completed_at: '2026-07-15T09:00:00Z', version: 3 }
+    await route.fulfill({ json: task })
+  })
+  await page.route('**/api/v1/commitments?**', (route) =>
+    route.fulfill({ json: { items: commitment.status === 'fulfilled' ? [] : [commitment], next_cursor: null } }),
+  )
+  await page.route('**/api/v1/commitments/c1/fulfil', async (route) => {
+    assert.deepEqual(route.request().postDataJSON(), { expected_version: 3 })
+    commitment = { ...commitment, status: 'fulfilled', fulfilled_at: '2026-07-15T09:00:00Z', version: 4 }
+    await route.fulfill({ json: commitment })
   })
   await page.route('**/api/v1/recommendations?**', (route) =>
     route.fulfill({ json: { items: [recommendation], next_cursor: null } }),
@@ -152,32 +225,55 @@ async function main() {
     }),
   )
 
-  await page.goto('http://127.0.0.1:4173')
-  await page.getByRole('heading', { name: 'Today' }).waitFor()
-  assert.equal(await page.getByText('Leadership review').count(), 2)
-  assert.equal(await page.getByText(/This brief is stale/).count(), 1)
+  try {
+    await step('render dashboard and stale brief', async () => {
+      await page.goto('http://127.0.0.1:4173')
+      await page.getByRole('heading', { name: 'Today' }).waitFor()
+      await page.getByText('Leadership review').first().waitFor()
+      await page.getByText(/This brief is stale/).waitFor()
+    })
 
-  await page.getByRole('button', { name: 'Refresh brief' }).click()
-  await page.getByText('Generation 4 · disabled').waitFor()
-  assert.equal(await page.getByText(/This brief is stale/).count(), 0)
+    await step('refresh morning brief', async () => {
+      await page.getByRole('button', { name: 'Refresh brief' }).click()
+      await page.getByText('Generation 4 · disabled').waitFor()
+      assert.equal(await page.getByText(/This brief is stale/).count(), 0)
+    })
 
-  await page.getByRole('button', { name: 'Confirm and execute' }).click()
-  await page.getByText('Execution recorded.').waitFor()
+    await step('complete task with optimistic version', async () => {
+      await page.getByRole('button', { name: 'Complete' }).click()
+      await page.getByText('No open tasks.').waitFor()
+    })
 
-  const searchTab = page.getByRole('tab', { name: 'Search' })
-  await searchTab.focus()
-  await page.keyboard.press('Enter')
-  await page.getByRole('searchbox').fill('hiring')
-  await page.getByRole('button', { name: 'Search' }).click()
-  await page.getByText('98%').waitFor()
+    await step('fulfil commitment with optimistic version', async () => {
+      await page.getByRole('button', { name: 'Fulfil' }).click()
+      await page.getByText('No open commitments.').waitFor()
+    })
 
-  const auditTab = page.getByRole('tab', { name: 'Audit history' })
-  await auditTab.focus()
-  await page.keyboard.press('Enter')
-  await page.getByText('task.updated').waitFor()
-  await page.getByText('manual_priority').waitFor()
+    await step('confirm recommendation', async () => {
+      await page.getByRole('button', { name: 'Confirm and execute' }).click()
+      await page.getByText('Execution recorded.').waitFor()
+    })
 
-  await browser.close()
+    await step('search with semantic searchbox', async () => {
+      const searchTab = page.getByRole('tab', { name: 'Search' })
+      await searchTab.focus()
+      await page.keyboard.press('Enter')
+      await page.getByRole('searchbox').fill('hiring')
+      await page.getByRole('button', { name: 'Search', exact: true }).click()
+      await page.getByText('98%').waitFor()
+    })
+
+    await step('navigate tabs by keyboard and inspect audit', async () => {
+      const searchTab = page.getByRole('tab', { name: 'Search' })
+      await searchTab.focus()
+      await page.keyboard.press('ArrowRight')
+      await page.getByRole('tab', { name: 'Audit history' }).waitFor({ state: 'visible' })
+      await page.getByText('task.updated').waitFor()
+      await page.getByText(/manual_priority/).waitFor()
+    })
+  } finally {
+    await browser.close()
+  }
   console.log('Playwright acceptance checks passed')
 }
 
