@@ -100,10 +100,13 @@ def dashboard_context() -> Iterator[tuple[TestClient, UUID, UUID, str]]:
             )
 
 
-def _headers(token: str) -> dict[str, str]:
+def _headers(token: str, *, key: str | None = None) -> dict[str, str]:
     return {
-        "X-CSRF-Token": new(settings.session_secret.encode(), token.encode(), "sha256").hexdigest(),
+        "X-CSRF-Token": new(
+            settings.session_secret.encode(), token.encode(), "sha256"
+        ).hexdigest(),
         "X-Correlation-ID": str(uuid4()),
+        "Idempotency-Key": key or str(uuid4()),
     }
 
 
@@ -257,10 +260,143 @@ def test_dashboard_empty_state_and_budget(
 ) -> None:
     client, _, _, _ = dashboard_context
     started = perf_counter()
-    response = client.get("/api/v1/dashboard/today", params={"date": date.today().isoformat()})
+    response = client.get(
+        "/api/v1/dashboard/today",
+        params={"date": date.today().isoformat()},
+    )
     elapsed = perf_counter() - started
     assert response.status_code == 200
     sections = response.json()["sections"]
     assert sections["today_schedule"][0]["empty"] is True
     assert sections["top_priorities"][0]["empty"] is True
     assert elapsed < 2.0
+
+
+def test_dashboard_review_regressions(
+    dashboard_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    client, workspace_id, user_id, token = dashboard_context
+    now = datetime.now(UTC)
+    local_day = datetime.now().date()
+    future_commitment = uuid4()
+    blocked_task = uuid4()
+    event_id = uuid4()
+    meeting_id = uuid4()
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                """
+                INSERT INTO commitments (
+                    id, workspace_id, owner_id, summary, direction, status,
+                    due_date, importance, confidence, pinned, created_by, updated_by,
+                    created_at, updated_at, version
+                ) VALUES (
+                    :id, :w, :u, 'Future response', 'made_to_me', 'active', :due_date,
+                    'medium', 1.0, false, :u, :u, :now, :now, 1
+                )
+                """
+            ),
+            {
+                "id": future_commitment,
+                "w": workspace_id,
+                "u": user_id,
+                "due_date": local_day + timedelta(days=1),
+                "now": now,
+            },
+        )
+        connection.execute(
+            text(
+                """
+                INSERT INTO tasks (
+                    id, workspace_id, owner_id, title, status, manual_priority,
+                    blocked_on_person_id, pinned, source_type, created_by, updated_by,
+                    created_at, updated_at, version
+                ) VALUES (
+                    :id, :w, :u, 'Blocked approval', 'blocked', 'high', :person,
+                    false, 'local', :u, :u, :now, :now, 1
+                )
+                """
+            ),
+            {
+                "id": blocked_task,
+                "w": workspace_id,
+                "u": user_id,
+                "person": uuid4(),
+                "now": now,
+            },
+        )
+        connection.execute(
+            text(
+                """
+                INSERT INTO calendar_events (
+                    id, workspace_id, external_source, title, starts_at, ends_at,
+                    all_day, timezone, status, source_authoritative,
+                    created_by, updated_by, created_at, updated_at, version
+                ) VALUES (
+                    :id, :w, 'local', 'Review meeting', :starts, :ends, false,
+                    'Asia/Kolkata', 'confirmed', true, :u, :u, :now, :now, 1
+                )
+                """
+            ),
+            {
+                "id": event_id,
+                "w": workspace_id,
+                "u": user_id,
+                "starts": now,
+                "ends": now + timedelta(hours=1),
+                "now": now,
+            },
+        )
+        connection.execute(
+            text(
+                """
+                INSERT INTO meetings (
+                    id, workspace_id, calendar_event_id, title, status,
+                    created_by, updated_by, created_at, updated_at, version
+                ) VALUES (
+                    :id, :w, :event_id, 'Review meeting', 'planned',
+                    :u, :u, :now, :now, 1
+                )
+                """
+            ),
+            {
+                "id": meeting_id,
+                "w": workspace_id,
+                "event_id": event_id,
+                "u": user_id,
+                "now": now,
+            },
+        )
+
+    dashboard = client.get("/api/v1/dashboard/today")
+    assert dashboard.status_code == 200
+    sections = dashboard.json()["sections"]
+    overdue_ids = {
+        item["entity_id"] for item in sections.get("overdue_commitments", [])
+    }
+    waiting_ids = {item["entity_id"] for item in sections.get("waiting_on", [])}
+    assert str(future_commitment) not in overdue_ids
+    assert str(future_commitment) in waiting_ids
+    assert str(blocked_task) in waiting_ids
+
+    key = str(uuid4())
+    headers = _headers(token, key=key)
+    first = client.post("/api/v1/briefs/morning", headers=headers)
+    replay = client.post("/api/v1/briefs/morning", headers=headers)
+    assert first.status_code == 200
+    assert replay.status_code == 200
+    assert replay.json()["id"] == first.json()["id"]
+    assert replay.json()["generation_version"] == first.json()["generation_version"]
+
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "UPDATE calendar_events SET version=2, updated_at=:now "
+                "WHERE id=:id AND workspace_id=:w"
+            ),
+            {"now": datetime.now(UTC), "id": event_id, "w": workspace_id},
+        )
+    stale = client.get("/api/v1/briefs/morning")
+    assert stale.status_code == 200
+    assert stale.json()["stale"] is True
+    assert stale.json()["stale_reason"] == "source_version_changed"
