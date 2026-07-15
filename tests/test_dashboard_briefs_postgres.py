@@ -102,9 +102,7 @@ def dashboard_context() -> Iterator[tuple[TestClient, UUID, UUID, str]]:
 
 def _headers(token: str, *, key: str | None = None) -> dict[str, str]:
     return {
-        "X-CSRF-Token": new(
-            settings.session_secret.encode(), token.encode(), "sha256"
-        ).hexdigest(),
+        "X-CSRF-Token": new(settings.session_secret.encode(), token.encode(), "sha256").hexdigest(),
         "X-Correlation-ID": str(uuid4()),
         "Idempotency-Key": key or str(uuid4()),
     }
@@ -371,9 +369,7 @@ def test_dashboard_review_regressions(
     dashboard = client.get("/api/v1/dashboard/today")
     assert dashboard.status_code == 200
     sections = dashboard.json()["sections"]
-    overdue_ids = {
-        item["entity_id"] for item in sections.get("overdue_commitments", [])
-    }
+    overdue_ids = {item["entity_id"] for item in sections.get("overdue_commitments", [])}
     waiting_ids = {item["entity_id"] for item in sections.get("waiting_on", [])}
     assert str(future_commitment) not in overdue_ids
     assert str(future_commitment) in waiting_ids

@@ -156,9 +156,7 @@ def _build_sections(
         if key in seen:
             continue
         seen.add(key)
-        versions[f"{row['entity_type']}:{row['entity_id']}"] = int(
-            row["source_entity_version"]
-        )
+        versions[f"{row['entity_type']}:{row['entity_id']}"] = int(row["source_entity_version"])
         priorities.append(
             {
                 "entity_type": row["entity_type"],
@@ -220,13 +218,9 @@ def _build_sections(
                 "due_date": row["due_date"],
                 "due_at": row["due_at"],
                 "score": (
-                    int(row["attention_score"])
-                    if row["attention_score"] is not None
-                    else None
+                    int(row["attention_score"]) if row["attention_score"] is not None else None
                 ),
-                "evidence_ids": (
-                    [str(row["evidence_id"])] if row["evidence_id"] else []
-                ),
+                "evidence_ids": ([str(row["evidence_id"])] if row["evidence_id"] else []),
             }
         )
         if len(overdue) == 5:
@@ -413,9 +407,7 @@ def _response(
         briefing_date=row["briefing_date"],
         generation_version=row["generation_version"],
         sections=row["sections"],
-        source_versions={
-            key: int(value) for key, value in row["source_versions"].items()
-        },
+        source_versions={key: int(value) for key, value in row["source_versions"].items()},
         evidence_ids=row["evidence_ids"],
         generated_at=row["generated_at"],
         timezone=row["timezone"],
@@ -646,12 +638,7 @@ def refresh_morning_brief(
     now = datetime.now(UTC)
     session.execute(
         text("SELECT pg_advisory_xact_lock(hashtext(:key))"),
-        {
-            "key": (
-                f"brief-refresh:{auth.workspace_id}:"
-                f"{auth.user_id}:{idempotency_key}"
-            )
-        },
+        {"key": (f"brief-refresh:{auth.workspace_id}:{auth.user_id}:{idempotency_key}")},
     )
     existing = (
         session.execute(
