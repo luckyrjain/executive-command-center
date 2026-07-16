@@ -10,28 +10,75 @@ Executive Command Center (ECC) is a specification-driven platform for helping ex
 **Implementation:** Phase 1 backend vertical slices implemented through Recommendations and confirmation execution  
 **Current delivery phase:** Phase 1 — Executive Dashboard MVP
 
+## Quick start
+
+The recommended development workflow runs PostgreSQL in Docker and the backend/frontend locally.
+
+```bash
+git clone https://github.com/luckyrjain/executive-command-center.git
+cd executive-command-center
+cp .env.example .env
+```
+
+Set a random `ECC_SESSION_SECRET` of at least 32 characters in `.env`, then run:
+
+```bash
+docker compose up -d postgres
+uv sync --frozen --all-groups --python 3.14
+set -a; source .env; set +a
+uv run alembic -c backend/alembic.ini upgrade head
+uv run python scripts/bootstrap_dev.py
+```
+
+Start the backend:
+
+```bash
+uv run uvicorn ecc.main:app --app-dir backend --reload --host 127.0.0.1 --port 8000
+```
+
+Start the frontend in another terminal:
+
+```bash
+corepack enable
+corepack prepare pnpm@10.12.4 --activate
+pnpm install --frozen-lockfile
+pnpm --filter @ecc/frontend dev
+```
+
+Open the one-time URL printed by `scripts/bootstrap_dev.py`. The backend exchanges the code for an `HttpOnly` seven-day session cookie and redirects to `http://localhost:5173`.
+
+For prerequisites, Docker usage, testing, troubleshooting, reset instructions, and first-use guidance, read [Setup and Usage](docs/SETUP.md).
+
+Useful endpoints:
+
+- frontend: `http://localhost:5173`
+- backend: `http://localhost:8000`
+- API docs: `http://localhost:8000/docs`
+- readiness: `http://localhost:8000/health/ready`
+
 ## Start here
 
 Read the documents in this order:
 
-1. [SPEC-000 — Constitution](docs/specifications/SPEC-000.md)
-2. [RFC-000 — Specification Governance](docs/RFC-000.md)
-3. [RFC-001 — Product Definition](docs/RFC-001.md)
-4. [RFC-002 — Engineering Philosophy](docs/RFC-002.md)
-5. [RFC-003 — Design Principles](docs/RFC-003.md)
-6. [RFC-004 — System Architecture](docs/RFC-004.md)
-7. [RFC-005 — Approved Technology Registry](docs/RFC-005.md)
-8. [STD-001 — Repository Standards](docs/standards/STD-001.md)
-9. [Canonical Domain Model](docs/domain/DOMAIN-MODEL.md)
-10. [PKOS Schema](docs/domain/PKOS-SCHEMA.md)
-11. [Domain Event Catalog](docs/domain/EVENT-CATALOG.md)
-12. [Domain API Contracts](docs/domain/API-CONTRACTS.md)
-13. [Phase 0 Security Baseline](docs/security/PHASE-0-SECURITY-BASELINE.md)
-14. [Phase 0 Backup and Restore](docs/operations/PHASE-0-BACKUP-RESTORE.md)
-15. [PHASE-000 — Repository Foundation](docs/phases/PHASE-000-repository-foundation.md)
-16. [PHASE-001 — Executive Dashboard MVP](docs/phases/PHASE-001-executive-dashboard-mvp.md)
-17. [Roadmap](docs/ROADMAP.md)
-18. [Contributing](docs/CONTRIBUTING.md)
+1. [Setup and Usage](docs/SETUP.md)
+2. [SPEC-000 — Constitution](docs/specifications/SPEC-000.md)
+3. [RFC-000 — Specification Governance](docs/RFC-000.md)
+4. [RFC-001 — Product Definition](docs/RFC-001.md)
+5. [RFC-002 — Engineering Philosophy](docs/RFC-002.md)
+6. [RFC-003 — Design Principles](docs/RFC-003.md)
+7. [RFC-004 — System Architecture](docs/RFC-004.md)
+8. [RFC-005 — Approved Technology Registry](docs/RFC-005.md)
+9. [STD-001 — Repository Standards](docs/standards/STD-001.md)
+10. [Canonical Domain Model](docs/domain/DOMAIN-MODEL.md)
+11. [PKOS Schema](docs/domain/PKOS-SCHEMA.md)
+12. [Domain Event Catalog](docs/domain/EVENT-CATALOG.md)
+13. [Domain API Contracts](docs/domain/API-CONTRACTS.md)
+14. [Phase 0 Security Baseline](docs/security/PHASE-0-SECURITY-BASELINE.md)
+15. [Phase 0 Backup and Restore](docs/operations/PHASE-0-BACKUP-RESTORE.md)
+16. [PHASE-000 — Repository Foundation](docs/phases/PHASE-000-repository-foundation.md)
+17. [PHASE-001 — Executive Dashboard MVP](docs/phases/PHASE-001-executive-dashboard-mvp.md)
+18. [Roadmap](docs/ROADMAP.md)
+19. [Contributing](docs/CONTRIBUTING.md)
 
 ## Architecture decisions
 
