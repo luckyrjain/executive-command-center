@@ -9,6 +9,7 @@ import CommitmentWorkspace from './features/commitments/CommitmentWorkspace'
 import NoteWorkspace from './features/notes/NoteWorkspace'
 import { createNoteDraftRecoveryStore } from './features/notes/draftRecovery'
 import TaskWorkspace from './features/tasks/TaskWorkspace'
+import ScheduleWorkspace from './features/schedule/ScheduleWorkspace'
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:8000'
 
@@ -204,7 +205,7 @@ export default function App() {
             <TaskWorkspace />
             <CommitmentWorkspace />
           </div>
-        ) : currentView === 'notes' ? <NoteWorkspace recoveryStore={noteDraftRecovery} /> : <><header className="topbar">
+        ) : currentView === 'notes' ? <NoteWorkspace recoveryStore={noteDraftRecovery} /> : currentView === 'schedule' ? <ScheduleWorkspace /> : <><header className="topbar">
           <div>
             <p className="eyebrow">EXECUTIVE COMMAND CENTER</p>
             <h1>Today</h1>
