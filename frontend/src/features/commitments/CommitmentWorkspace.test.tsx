@@ -138,4 +138,21 @@ describe('CommitmentWorkspace', () => {
     resolveCreate(new Response(JSON.stringify(commitment), { status: 201, headers: { 'Content-Type': 'application/json' } }))
     await waitFor(() => expect(fetch).toHaveBeenCalledTimes(3))
   })
+
+  it('blocks stale retry when conflict reload fails and recovers with an explicit reload', async () => {
+    const current = { ...commitment, version: 3 }
+    const conflict = { error: { code: 'VERSION_CONFLICT', message: 'changed', details: {} } }
+    const fetch = vi.fn().mockImplementationOnce(() => response({ items: [commitment], next_cursor: null })).mockImplementationOnce(() => response(conflict, 409)).mockRejectedValueOnce(new TypeError('network')).mockImplementationOnce(() => response(current))
+    vi.stubGlobal('fetch', fetch)
+    renderWorkspace()
+    await screen.findByText('Send the revised forecast')
+    fireEvent.click(screen.getByRole('button', { name: 'Edit Send the revised forecast' }))
+    fireEvent.change(screen.getByLabelText('Edit commitment summary'), { target: { value: 'Kept promise' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Save commitment' }))
+    await screen.findByText(/could not reload the latest commitment/i)
+    expect(screen.queryByRole('button', { name: 'Retry with latest version' })).toBeNull()
+    expect((screen.getByLabelText('Edit commitment summary') as HTMLInputElement).value).toBe('Kept promise')
+    fireEvent.click(screen.getByRole('button', { name: 'Reload latest commitment' }))
+    await screen.findByRole('button', { name: 'Retry with latest version' })
+  })
 })

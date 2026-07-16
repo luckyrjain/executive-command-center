@@ -138,4 +138,42 @@ describe('TaskWorkspace', () => {
     expect(JSON.parse(String((fetch.mock.calls[1][1] as RequestInit).body)).due_at).toBe('2026-07-20T04:30:00.000Z')
     process.env.TZ = originalTimezone
   })
+
+  it('blocks stale retry when conflict reload fails and recovers with an explicit reload', async () => {
+    const current = { ...task, version: 5 }
+    const conflict = { error: { code: 'VERSION_CONFLICT', message: 'changed', details: { current_version: 5 } } }
+    const fetch = vi.fn()
+      .mockImplementationOnce(() => response({ items: [task], next_cursor: null }))
+      .mockImplementationOnce(() => response(conflict, 409))
+      .mockRejectedValueOnce(new TypeError('network'))
+      .mockImplementationOnce(() => response(current))
+    vi.stubGlobal('fetch', fetch)
+    renderWorkspace()
+    await screen.findByText('Prepare board pack')
+    fireEvent.click(screen.getByRole('button', { name: 'Edit Prepare board pack' }))
+    fireEvent.change(screen.getByLabelText('Edit task title'), { target: { value: 'Kept edit' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Save task' }))
+    await screen.findByText(/could not reload the latest task/i)
+    expect(screen.queryByRole('button', { name: 'Retry with latest version' })).toBeNull()
+    expect((screen.getByLabelText('Edit task title') as HTMLInputElement).value).toBe('Kept edit')
+    fireEvent.click(screen.getByRole('button', { name: 'Reload latest task' }))
+    await screen.findByRole('button', { name: 'Retry with latest version' })
+  })
+
+  it('disables row edit and lifecycle controls while an edit save is pending', async () => {
+    const second = { ...task, id: 'task-2', title: 'Second task' }
+    let resolveSave!: (value: Response) => void
+    const pending = new Promise<Response>((resolve) => { resolveSave = resolve })
+    const fetch = vi.fn().mockImplementationOnce(() => response({ items: [task, second], next_cursor: null })).mockImplementationOnce(() => pending).mockImplementationOnce(() => response({ items: [], next_cursor: null }))
+    vi.stubGlobal('fetch', fetch)
+    renderWorkspace()
+    await screen.findByText('Second task')
+    fireEvent.click(screen.getByRole('button', { name: 'Edit Prepare board pack' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Save task' }))
+    await waitFor(() => expect((screen.getByRole('button', { name: 'Edit Second task' }) as HTMLButtonElement).disabled).toBe(true))
+    expect((screen.getByRole('button', { name: 'Complete Second task' }) as HTMLButtonElement).disabled).toBe(true)
+    fireEvent.click(screen.getByRole('button', { name: 'Edit Second task' }))
+    expect(screen.queryByLabelText('Edit task title') && (screen.getByLabelText('Edit task title') as HTMLInputElement).value).toBe('Prepare board pack')
+    resolveSave(new Response(JSON.stringify({ ...task, version: 5 }), { status: 200 }))
+  })
 })

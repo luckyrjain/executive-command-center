@@ -17,7 +17,7 @@ type Task = {
 
 type TaskList = { items: Task[]; next_cursor?: string | null }
 type TaskDraft = { title: string; description: string; priority: Task['manual_priority']; dueDate: string; dueAt: string; originalDueAt?: string }
-type EditState = TaskDraft & { task: Task; latestVersion: number; conflict: boolean }
+type EditState = TaskDraft & { task: Task; latestVersion: number; conflict: boolean; reloadFailed: boolean }
 type Action = 'complete' | 'cancel' | 'archive' | 'restore'
 
 const emptyDraft: TaskDraft = { title: '', description: '', priority: 'medium', dueDate: '', dueAt: '' }
@@ -68,6 +68,16 @@ export default function TaskWorkspace() {
   const [create, setCreate] = useState<TaskDraft>(emptyDraft)
   const [edit, setEdit] = useState<EditState | null>(null)
 
+  async function reloadLatestTask(taskId: string, envelopeVersion?: number) {
+    try {
+      const current = await apiRequest<Task>(`/api/v1/tasks/${taskId}`)
+      const latestVersion = Math.max(current.version, envelopeVersion ?? current.version)
+      setEdit((value) => value?.task.id === taskId ? { ...value, latestVersion, conflict: true, reloadFailed: false } : value)
+    } catch {
+      setEdit((value) => value?.task.id === taskId ? { ...value, latestVersion: 0, conflict: false, reloadFailed: true } : value)
+    }
+  }
+
   const refresh = () => queryClient.invalidateQueries({ queryKey: ['tasks'] })
   const createMutation = useMutation({
     mutationFn: (draft: TaskDraft) => apiRequest<Task>('/api/v1/tasks', {
@@ -80,25 +90,18 @@ export default function TaskWorkspace() {
     onSuccess: () => { setCreate(emptyDraft); void refresh() },
   })
   const editMutation = useMutation({
-    mutationFn: ({ draft, version }: { draft: TaskDraft; version: number }) => apiRequest<Task>(`/api/v1/tasks/${edit?.task.id}`, {
+    mutationFn: ({ id, draft, version }: { id: string; draft: TaskDraft; version: number }) => apiRequest<Task>(`/api/v1/tasks/${id}`, {
       method: 'PATCH',
       body: {
         expected_version: version, title: draft.title.trim(), description: draft.description.trim() || null,
         manual_priority: draft.priority, ...duePayload(draft),
       },
     }),
-    onSuccess: () => { setEdit(null); void refresh() },
+    onSuccess: (_data, variables) => { setEdit((value) => value?.task.id === variables.id ? null : value); void refresh() },
     onError: async (error) => {
       if (!(error instanceof ApiError) || error.code !== 'VERSION_CONFLICT') return
       const detail = error.current as { current_version?: number } | undefined
-      if (!edit) return
-      try {
-        const current = await apiRequest<Task>(`/api/v1/tasks/${edit.task.id}`)
-        const latestVersion = Math.max(current.version, detail?.current_version ?? current.version)
-        setEdit((value) => value ? { ...value, latestVersion, conflict: true } : value)
-      } catch {
-        setEdit((value) => value ? { ...value, conflict: true } : value)
-      }
+      if (edit) await reloadLatestTask(edit.task.id, detail?.current_version)
     },
   })
   const actionMutation = useMutation({
@@ -116,7 +119,7 @@ export default function TaskWorkspace() {
 
   function submitEdit(event?: FormEvent) {
     event?.preventDefault()
-    if (edit?.title.trim()) editMutation.mutate({ draft: edit, version: edit.latestVersion })
+    if (edit?.title.trim() && edit.latestVersion > 0) editMutation.mutate({ id: edit.task.id, draft: edit, version: edit.latestVersion })
   }
 
   const mutationError = createMutation.error ?? editMutation.error ?? actionMutation.error
@@ -143,8 +146,8 @@ export default function TaskWorkspace() {
           return <li key={task.id}>
             <div><strong>{task.title}</strong><small>{task.status.replaceAll('_', ' ')} · {task.manual_priority}</small></div>
             <div className="work-actions" aria-label={`Actions for ${task.title}`}>
-              {!archived && !terminal ? <><button type="button" disabled={actionMutation.isPending} aria-label={`Edit ${task.title}`} onClick={() => setEdit({ task, ...taskDraft(task), latestVersion: task.version, conflict: false })}>Edit</button><button type="button" disabled={actionMutation.isPending} aria-label={`Complete ${task.title}`} onClick={() => actionMutation.mutate({ task, action: 'complete' })}>Complete</button><button type="button" disabled={actionMutation.isPending} aria-label={`Cancel ${task.title}`} onClick={() => actionMutation.mutate({ task, action: 'cancel' })}>Cancel</button></> : null}
-              {!archived ? <button type="button" disabled={actionMutation.isPending} aria-label={`Archive ${task.title}`} onClick={() => actionMutation.mutate({ task, action: 'archive' })}>Archive</button> : <button type="button" disabled={actionMutation.isPending} aria-label={`Restore ${task.title}`} onClick={() => actionMutation.mutate({ task, action: 'restore' })}>Restore</button>}
+              {!archived && !terminal ? <><button type="button" disabled={actionMutation.isPending || editMutation.isPending} aria-label={`Edit ${task.title}`} onClick={() => setEdit({ task, ...taskDraft(task), latestVersion: task.version, conflict: false, reloadFailed: false })}>Edit</button><button type="button" disabled={actionMutation.isPending || editMutation.isPending} aria-label={`Complete ${task.title}`} onClick={() => actionMutation.mutate({ task, action: 'complete' })}>Complete</button><button type="button" disabled={actionMutation.isPending || editMutation.isPending} aria-label={`Cancel ${task.title}`} onClick={() => actionMutation.mutate({ task, action: 'cancel' })}>Cancel</button></> : null}
+              {!archived ? <button type="button" disabled={actionMutation.isPending || editMutation.isPending} aria-label={`Archive ${task.title}`} onClick={() => actionMutation.mutate({ task, action: 'archive' })}>Archive</button> : <button type="button" disabled={actionMutation.isPending || editMutation.isPending} aria-label={`Restore ${task.title}`} onClick={() => actionMutation.mutate({ task, action: 'restore' })}>Restore</button>}
             </div>
           </li>
         })}
@@ -157,7 +160,7 @@ export default function TaskWorkspace() {
         <label>Edit priority<select value={edit.priority} onChange={(event) => setEdit({ ...edit, priority: event.target.value as Task['manual_priority'] })}><option>low</option><option>medium</option><option>high</option><option>critical</option></select></label>
         <label>Edit due date<input type="date" value={edit.dueDate} disabled={Boolean(edit.dueAt)} onChange={(event) => setEdit({ ...edit, dueDate: event.target.value })} /></label>
         <label>Edit due time<input type="datetime-local" value={edit.dueAt} disabled={Boolean(edit.dueDate)} onChange={(event) => setEdit({ ...edit, dueAt: event.target.value })} /></label>
-        {edit.conflict ? <button type="button" disabled={editMutation.isPending} onClick={() => submitEdit()}>Retry with latest version</button> : <button type="submit" disabled={editMutation.isPending}>Save task</button>}
+        {edit.reloadFailed ? <><p role="alert">Could not reload the latest task. Your edits are preserved.</p><button type="button" onClick={() => void reloadLatestTask(edit.task.id)}>Reload latest task</button></> : edit.conflict ? <button type="button" disabled={editMutation.isPending} onClick={() => submitEdit()}>Retry with latest version</button> : <button type="submit" disabled={editMutation.isPending}>Save task</button>}
         <button type="button" disabled={editMutation.isPending} onClick={() => setEdit(null)}>Discard edit</button>
       </form> : null}
     </section>

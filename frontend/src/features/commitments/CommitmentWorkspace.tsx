@@ -10,7 +10,7 @@ type Commitment = {
 }
 type CommitmentList = { items: Commitment[]; next_cursor?: string | null }
 type Draft = { summary: string; description: string; direction: Commitment['direction']; counterpartyName: string; importance: Commitment['importance']; dueDate: string; dueAt: string; originalDueAt?: string }
-type EditState = Draft & { commitment: Commitment; latestVersion: number; conflict: boolean }
+type EditState = Draft & { commitment: Commitment; latestVersion: number; conflict: boolean; reloadFailed: boolean }
 type Action = 'confirm' | 'fulfil' | 'cancel' | 'archive' | 'restore'
 
 const emptyDraft: Draft = { summary: '', description: '', direction: 'made_by_me', counterpartyName: '', importance: 'medium', dueDate: '', dueAt: '' }
@@ -41,6 +41,15 @@ export default function CommitmentWorkspace() {
   const query = useQuery({ queryKey: ['commitments', filters], queryFn: () => apiRequest<CommitmentList>('/api/v1/commitments?include_archived=true&limit=100'), retry: 1 })
   const [create, setCreate] = useState(emptyDraft)
   const [edit, setEdit] = useState<EditState | null>(null)
+
+  async function reloadLatestCommitment(id: string) {
+    try {
+      const current = await apiRequest<Commitment>(`/api/v1/commitments/${id}`)
+      setEdit((value) => value?.commitment.id === id ? { ...value, latestVersion: current.version, conflict: true, reloadFailed: false } : value)
+    } catch {
+      setEdit((value) => value?.commitment.id === id ? { ...value, latestVersion: 0, conflict: false, reloadFailed: true } : value)
+    }
+  }
   const refresh = () => queryClient.invalidateQueries({ queryKey: ['commitments'] })
 
   const createMutation = useMutation({
@@ -48,17 +57,11 @@ export default function CommitmentWorkspace() {
     onSuccess: () => { setCreate(emptyDraft); void refresh() },
   })
   const editMutation = useMutation({
-    mutationFn: ({ draft, version }: { draft: Draft; version: number }) => apiRequest<Commitment>(`/api/v1/commitments/${edit?.commitment.id}`, { method: 'PATCH', body: { expected_version: version, summary: draft.summary.trim(), description: draft.description.trim() || null, counterparty_name: draft.counterpartyName.trim() || null, importance: draft.importance, ...duePayload(draft) } }),
-    onSuccess: () => { setEdit(null); void refresh() },
+    mutationFn: ({ id, draft, version }: { id: string; draft: Draft; version: number }) => apiRequest<Commitment>(`/api/v1/commitments/${id}`, { method: 'PATCH', body: { expected_version: version, summary: draft.summary.trim(), description: draft.description.trim() || null, counterparty_name: draft.counterpartyName.trim() || null, importance: draft.importance, ...duePayload(draft) } }),
+    onSuccess: (_data, variables) => { setEdit((value) => value?.commitment.id === variables.id ? null : value); void refresh() },
     onError: async (error) => {
       if (!(error instanceof ApiError) || error.code !== 'VERSION_CONFLICT') return
-      if (!edit) return
-      try {
-        const current = await apiRequest<Commitment>(`/api/v1/commitments/${edit.commitment.id}`)
-        setEdit((value) => value ? { ...value, latestVersion: current.version, conflict: true } : value)
-      } catch {
-        setEdit((value) => value ? { ...value, conflict: true } : value)
-      }
+      if (edit) await reloadLatestCommitment(edit.commitment.id)
     },
   })
   const actionMutation = useMutation({
@@ -67,7 +70,7 @@ export default function CommitmentWorkspace() {
   })
 
   function submitCreate(event: FormEvent) { event.preventDefault(); if (create.summary.trim()) createMutation.mutate(create) }
-  function submitEdit(event?: FormEvent) { event?.preventDefault(); if (edit?.summary.trim()) editMutation.mutate({ draft: edit, version: edit.latestVersion }) }
+  function submitEdit(event?: FormEvent) { event?.preventDefault(); if (edit?.summary.trim() && edit.latestVersion > 0) editMutation.mutate({ id: edit.commitment.id, draft: edit, version: edit.latestVersion }) }
   const mutationError = createMutation.error ?? editMutation.error ?? actionMutation.error
 
   return <section className="work-panel" aria-labelledby="commitments-title">
@@ -89,11 +92,11 @@ export default function CommitmentWorkspace() {
     <ol className="work-list">{(query.data?.items ?? []).map((value) => {
       const archived = Boolean(value.archived_at); const terminal = ['fulfilled', 'broken', 'cancelled'].includes(value.status)
       return <li key={value.id}><div><strong>{value.summary}</strong><small>{value.direction.replaceAll('_', ' ')} · {value.counterparty_name ?? 'No counterparty'} · {value.status}</small></div><div className="work-actions" aria-label={`Actions for ${value.summary}`}>
-        {!archived && !terminal ? <button type="button" disabled={actionMutation.isPending} aria-label={`Edit ${value.summary}`} onClick={() => setEdit({ commitment: value, ...fromCommitment(value), latestVersion: value.version, conflict: false })}>Edit</button> : null}
-        {!archived && ['detected', 'confirmed'].includes(value.status) ? <button type="button" disabled={actionMutation.isPending} aria-label={`Confirm ${value.summary}`} onClick={() => actionMutation.mutate({ commitment: value, action: 'confirm' })}>Confirm</button> : null}
-        {!archived && ['confirmed', 'active'].includes(value.status) ? <button type="button" disabled={actionMutation.isPending} aria-label={`Fulfil ${value.summary}`} onClick={() => actionMutation.mutate({ commitment: value, action: 'fulfil' })}>Fulfil</button> : null}
-        {!archived && !terminal ? <button type="button" disabled={actionMutation.isPending} aria-label={`Cancel ${value.summary}`} onClick={() => actionMutation.mutate({ commitment: value, action: 'cancel' })}>Cancel</button> : null}
-        {!archived ? <button type="button" disabled={actionMutation.isPending} aria-label={`Archive ${value.summary}`} onClick={() => actionMutation.mutate({ commitment: value, action: 'archive' })}>Archive</button> : <button type="button" disabled={actionMutation.isPending} aria-label={`Restore ${value.summary}`} onClick={() => actionMutation.mutate({ commitment: value, action: 'restore' })}>Restore</button>}
+        {!archived && !terminal ? <button type="button" disabled={actionMutation.isPending || editMutation.isPending} aria-label={`Edit ${value.summary}`} onClick={() => setEdit({ commitment: value, ...fromCommitment(value), latestVersion: value.version, conflict: false, reloadFailed: false })}>Edit</button> : null}
+        {!archived && ['detected', 'confirmed'].includes(value.status) ? <button type="button" disabled={actionMutation.isPending || editMutation.isPending} aria-label={`Confirm ${value.summary}`} onClick={() => actionMutation.mutate({ commitment: value, action: 'confirm' })}>Confirm</button> : null}
+        {!archived && ['confirmed', 'active'].includes(value.status) ? <button type="button" disabled={actionMutation.isPending || editMutation.isPending} aria-label={`Fulfil ${value.summary}`} onClick={() => actionMutation.mutate({ commitment: value, action: 'fulfil' })}>Fulfil</button> : null}
+        {!archived && !terminal ? <button type="button" disabled={actionMutation.isPending || editMutation.isPending} aria-label={`Cancel ${value.summary}`} onClick={() => actionMutation.mutate({ commitment: value, action: 'cancel' })}>Cancel</button> : null}
+        {!archived ? <button type="button" disabled={actionMutation.isPending || editMutation.isPending} aria-label={`Archive ${value.summary}`} onClick={() => actionMutation.mutate({ commitment: value, action: 'archive' })}>Archive</button> : <button type="button" disabled={actionMutation.isPending || editMutation.isPending} aria-label={`Restore ${value.summary}`} onClick={() => actionMutation.mutate({ commitment: value, action: 'restore' })}>Restore</button>}
       </div></li>
     })}</ol>
     {edit ? <form onSubmit={submitEdit}><h2>Edit commitment</h2>
@@ -103,7 +106,7 @@ export default function CommitmentWorkspace() {
       <label>Edit importance<select value={edit.importance} onChange={(e) => setEdit({ ...edit, importance: e.target.value as Draft['importance'] })}><option>low</option><option>medium</option><option>high</option><option>critical</option></select></label>
       <label>Edit commitment due date<input aria-label="Edit commitment due date" type="date" value={edit.dueDate} disabled={Boolean(edit.dueAt)} onChange={(e) => setEdit({ ...edit, dueDate: e.target.value })} /></label>
       <label>Edit commitment due time<input aria-label="Edit commitment due time" type="datetime-local" value={edit.dueAt} disabled={Boolean(edit.dueDate)} onChange={(e) => setEdit({ ...edit, dueAt: e.target.value })} /></label>
-      {edit.conflict ? <button type="button" disabled={editMutation.isPending} onClick={() => submitEdit()}>Retry with latest version</button> : <button type="submit" disabled={editMutation.isPending}>Save commitment</button>}
+      {edit.reloadFailed ? <><p role="alert">Could not reload the latest commitment. Your edits are preserved.</p><button type="button" onClick={() => void reloadLatestCommitment(edit.commitment.id)}>Reload latest commitment</button></> : edit.conflict ? <button type="button" disabled={editMutation.isPending} onClick={() => submitEdit()}>Retry with latest version</button> : <button type="submit" disabled={editMutation.isPending}>Save commitment</button>}
       <button type="button" disabled={editMutation.isPending} onClick={() => setEdit(null)}>Discard edit</button>
     </form> : null}
   </section>
