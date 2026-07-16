@@ -1,5 +1,8 @@
+import { useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
+import type { WorkspaceView } from './api/types'
+import WorkspaceNavigation from './navigation/WorkspaceNavigation'
 import RecommendationPanel from './RecommendationPanel'
 import SearchAuditPanel from './SearchAuditPanel'
 import WorkActionCenter from './WorkActionCenter'
@@ -178,6 +181,7 @@ function MorningBrief() {
 }
 
 export default function App() {
+  const [currentView, setCurrentView] = useState<WorkspaceView>('today')
   const dashboard = useQuery({
     queryKey: ['dashboard', 'today'],
     queryFn: fetchDashboard,
@@ -188,7 +192,8 @@ export default function App() {
   const sections = dashboard.data?.sections
 
   return (
-    <main className="app-shell">
+    <main id="workspace-main" className="app-shell">
+      <WorkspaceNavigation currentView={currentView} onNavigate={setCurrentView} />
       <header className="topbar">
         <div>
           <p className="eyebrow">EXECUTIVE COMMAND CENTER</p>
