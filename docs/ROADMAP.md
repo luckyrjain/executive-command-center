@@ -2,128 +2,155 @@
 
 ## Current status
 
-**Foundation specification:** Draft — under review  
-**Current delivery phase:** [PHASE-000 — Repository Foundation](phases/PHASE-000-repository-foundation.md)  
-**Next delivery phase:** [PHASE-001 — Executive Dashboard MVP](phases/PHASE-001-executive-dashboard-mvp.md)
+**Foundation:** Phase 0 baseline approved and implemented  
+**Current delivery:** [Phase 1 — Executive Dashboard MVP](phases/PHASE-001-executive-dashboard-mvp.md), implementation in progress  
+**Future specifications:** Phases 2–9 published as Draft / Planned
 
-The foundation documents exist, but the specification is not considered approved until the normative RFCs and standards complete review and their statuses are updated consistently.
+The [canonical phase index](phases/README.md) lists every primary specification and supporting contract. The [Phase 0–9 documentation review](phases/PHASE-REVIEW.md) records completeness findings and approval gates.
 
 ## Delivery principles
 
 Every phase must:
 
-- deliver usable value
-- compile and pass tests
-- remain locally deployable
-- preserve architecture and privacy boundaries
-- define acceptance and exit criteria before implementation
-- avoid speculative work outside the approved phase
+- deliver independently usable value
+- preserve local-first ownership and deterministic fallback
+- compile, migrate, test and remain recoverable
+- preserve architecture, privacy and authorization boundaries
+- define measurable acceptance and exit criteria before implementation
+- identify rollback and deferred scope
+- receive explicit approval after all dependency exit gates pass
+- avoid implementation outside the approved phase
 
 ## Delivery sequence
 
 ```text
-Foundation specification review
-        ↓
-Phase 0 — Repository Foundation
-        ↓
-Phase 1 — Executive Dashboard MVP
-        ↓
-Phase 2 — Knowledge Platform
-        ↓
-Phase 3 — Human Attention Engine
-        ↓
-Phase 4 — AI Runtime
-        ↓
-Phase 5 — Automation
-        ↓
-Phase 6 — Engineering Workspace
-        ↓
-Phase 7 — Personal Intelligence
-        ↓
-Phase 8 — Multi-user
-        ↓
-Phase 9 — Enterprise
+Phase 0 — Repository Foundation         [Implemented]
+  -> Phase 1 — Executive Dashboard MVP [In progress]
+  -> Phase 2 — Knowledge Platform      [Draft]
+  -> Phase 3 — Human Attention Engine  [Draft]
+  -> Phase 4 — AI Runtime              [Draft]
+  -> Phase 5 — Automation              [Draft]
+  -> Phase 6 — Engineering Workspace   [Draft]
+  -> Phase 7 — Personal Intelligence   [Draft]
+  -> Phase 8 — Multi-user Workspaces   [Draft]
+  -> Phase 9 — Enterprise              [Draft]
 ```
+
+A later phase may be designed or reviewed early, but implementation begins only after its dependencies satisfy exit criteria and its status is changed to Approved for Implementation.
 
 ## Phase 0 — Repository Foundation
 
-**Status:** Specification drafted; implementation not started.
+**Status:** Approved baseline; implemented.
 
 Primary outcomes:
 
-- canonical repository layout
-- reproducible local development
-- CI, testing and architecture enforcement
-- typed configuration and secret handling
-- observability foundation
-- backend, frontend and design-system skeletons
+- reproducible local development and CI
+- modular-monolith architecture enforcement
+- PostgreSQL persistence and migrations
+- authentication, workspace isolation and security baseline
+- durable event/outbox foundation
+- observability, backup and restore
 
-Exit criteria are defined in [PHASE-000](phases/PHASE-000-repository-foundation.md).
+Specification: [PHASE-000](phases/PHASE-000-repository-foundation.md)
 
 ## Phase 1 — Executive Dashboard MVP
 
-**Status:** Specification drafted; blocked on Phase 0.
+**Status:** Approved for Implementation; delivery in progress.
 
 Primary outcomes:
 
-- morning brief
-- today's dashboard
-- tasks and commitments
-- notes
-- meetings
-- local search
-- explainable recommendations
-- human confirmation for state-changing actions
+- Today dashboard and Morning Brief
+- tasks, commitments, notes, meetings and risks
+- deterministic attention ranking and local search
+- immutable audit
+- explainable recommendations with durable human confirmation
+- executive frontend and browser acceptance
 
-Exit criteria are defined in [PHASE-001](phases/PHASE-001-executive-dashboard-mvp.md).
+Specification: [PHASE-001](phases/PHASE-001-executive-dashboard-mvp.md)  
+Delivery status: [Phase 1 Implementation Status](phases/phase-001/IMPLEMENTATION-STATUS.md)
 
-## Later phases
+## Phase 2 — Knowledge Platform
 
-### Phase 2 — Knowledge Platform
+**Status:** Draft / Planned.
 
-Persistent memory, entity resolution, relationships, timeline and hybrid retrieval.
+Persistent entities, claims, relationships, entity resolution, reversible merge/split, timelines and lexical-first hybrid retrieval.
 
-### Phase 3 — Human Attention Engine
+Specification: [PHASE-002](phases/PHASE-002-knowledge-platform.md)
 
-Priority, waiting-on, waiting-for, risk, planning and meeting preparation.
+## Phase 3 — Human Attention Engine
 
-### Phase 4 — AI Runtime
+**Status:** Draft / Planned.
 
-Model routing, tool runtime, prompt versioning, evaluation, reflection and reliability controls.
+Explainable attention, waiting direction, risk review, capacity-aware planning and evidence-backed meeting preparation.
 
-### Phase 5 — Automation
+Specification: [PHASE-003](phases/PHASE-003-human-attention-engine.md)
 
-Approval-based workflows, scheduling, background execution and automation policies.
+## Phase 4 — AI Runtime
 
-### Phase 6 — Engineering Workspace
+**Status:** Draft / Planned.
 
-GitHub, GitLab, Jira, delivery intelligence, architecture decisions and engineering health.
+Local-first model routing, typed prompts/tools, structured output, budgets, safety, evaluation and deterministic degradation.
 
-### Phase 7 — Personal Intelligence
+Specification: [PHASE-004](phases/PHASE-004-ai-runtime.md)
 
-Health, finance, learning, travel, habits and personal relationships.
+## Phase 5 — Automation
 
-### Phase 8 — Multi-user
+**Status:** Draft / Planned.
 
-Family and team workspaces, delegation, shared knowledge and permissions.
+Versioned workflows, simulation, explicit approval, durable execution, schedules, cancellation, compensation and kill switches.
 
-### Phase 9 — Enterprise
+Specification: [PHASE-005](phases/PHASE-005-automation.md)
 
-SSO, audit, compliance, multi-tenancy and policy enforcement.
+## Phase 6 — Engineering Workspace
+
+**Status:** Draft / Planned.
+
+GitHub, GitLab and Jira connectors; delivery/reliability intelligence; incidents; decisions; evidence and source coverage without person scoring.
+
+Specification: [PHASE-006](phases/PHASE-006-engineering-workspace.md)
+
+## Phase 7 — Personal Intelligence
+
+**Status:** Draft / Planned.
+
+Opt-in private domains for health, finance, learning, travel, habits and relationships, with consent, bounded insights, export and deletion.
+
+Specification: [PHASE-007](phases/PHASE-007-personal-intelligence.md)
+
+## Phase 8 — Multi-user Workspaces
+
+**Status:** Draft / Planned.
+
+Membership, invitations, least-privilege permissions, explicit sharing, delegation acceptance, ownership transfer and privacy-preserving collaboration.
+
+Specification: [PHASE-008](phases/PHASE-008-multi-user.md)
+
+## Phase 9 — Enterprise
+
+**Status:** Draft / Planned.
+
+Tenant isolation, SSO/SCIM, policy administration, keys/residency, retention/legal hold, audit export, compliance evidence and disaster recovery.
+
+Specification: [PHASE-009](phases/PHASE-009-enterprise.md)
+
+## Approval gates
+
+Before a Draft phase becomes Approved for Implementation:
+
+1. dependency exit criteria are evidenced
+2. phase scope and supporting contracts are reviewed
+3. technology additions are approved through RFC-005 and an ADR where required
+4. threat model and privacy boundaries are approved
+5. measurable acceptance, performance and recovery datasets are frozen
+6. rollback and operational runbooks are reviewable
+7. zero Critical, High or Medium findings remain
+
+Phase-specific decisions are recorded in [PHASE-REVIEW](phases/PHASE-REVIEW.md).
 
 ## Roadmap governance
 
-A new phase or material phase change requires:
-
-1. an approved phase specification
-2. linked RFC and standard references
-3. architecture review
-4. acceptance criteria
-5. rollback strategy
-6. exit review
-
-No implementation may silently skip or expand an approved phase.
+A material phase change requires an explicit version update and reviewed pull request. Implementation status documents report evidence but never override normative contracts. No phase may silently skip dependencies or expand approved scope.
 
 ## Long-term goal
 
-Build a local-first executive operating system that users trust enough to open every morning and rely on for decisions, commitments and attention management.
+Build a local-first executive operating system trusted as the first application opened each morning for decisions, commitments, knowledge and attention.

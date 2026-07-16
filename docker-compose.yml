@@ -8,7 +8,7 @@ services:
     ports:
       - "127.0.0.1:5432:5432"
     volumes:
-      - ecc_postgres:/var/lib/postgresql/data
+      - ecc_postgres:/var/lib/postgresql
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-ecc} -d ${POSTGRES_DB:-ecc}"]
       interval: 5s

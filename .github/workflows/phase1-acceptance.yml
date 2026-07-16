@@ -1,0 +1,72 @@
+name: phase1-acceptance
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  acceptance-contract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: 3.14.6
+      - run: python scripts/check_phase1_acceptance.py
+
+  backup-restore:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18.0
+        env:
+          POSTGRES_DB: ecc
+          POSTGRES_USER: ecc
+          POSTGRES_PASSWORD: ecc
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U ecc -d ecc"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      PGPASSWORD: ecc
+      ECC_SESSION_SECRET: ci-secret-value-that-is-at-least-32-characters
+      ECC_DATABASE_URL: postgresql+psycopg://ecc:ecc@localhost:5432/ecc
+      RESTORE_DATABASE_URL: postgresql://ecc:ecc@localhost:5432/ecc_restore
+      BACKUP_DIR: .local/backups
+      SCHEMA_VERSION: phase1-ci
+      PG_CLIENT_IMAGE: postgres:18.0
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: 3.14.6
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+        with:
+          version: 0.7.19
+      - run: uv sync --frozen --all-groups --python 3.14.6
+      - run: uv run alembic -c backend/alembic.ini upgrade head
+      - run: createdb -h localhost -U ecc ecc_restore
+      - name: Backup and verify clean restore
+        run: |
+          archive=$(./scripts/backup.sh)
+          ./scripts/verify_restore.sh "${archive}"
+      - run: uv run pytest tests/test_phase1_acceptance.py
+
+  accessibility-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22.17.0
+      - run: corepack enable
+      - run: corepack prepare pnpm@10.12.4 --activate
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm --filter @ecc/frontend exec playwright install --with-deps chromium
+      - run: pnpm --filter @ecc/frontend test:e2e

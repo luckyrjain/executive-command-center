@@ -2,7 +2,7 @@
 id: PHASE-001
 title: Executive Dashboard MVP
 status: Approved for Implementation
-version: 1.0.2
+version: 1.0.3
 owner: Lucky Jain
 depends_on:
   - PHASE-000
@@ -32,85 +32,98 @@ contracts:
 
 Deliver a local, authenticated dashboard showing today's schedule, priorities, commitments, notes and risks with traceable evidence and deterministic behavior when AI is unavailable.
 
+## User value
+
+The user opens one application each morning, understands what requires attention, captures or updates executive work, retrieves recent context and confirms recommendations without depending on cloud services.
+
 ## In scope
 
-- Today dashboard and morning brief.
+- Today dashboard and Morning Brief.
 - Local/manual calendar events and meetings; external connectors deferred.
 - Task, commitment, note and risk workflows.
-- Complete, fulfil, cancel, archive and restore actions where defined by the API contract.
-- Deterministic attention ranking and PostgreSQL-only search, including CalendarEvent results.
+- Complete, fulfil, cancel, archive and restore actions defined by the API contract.
+- Deterministic attention ranking and PostgreSQL search, including CalendarEvent results.
 - Recommendations with explicit publication and durable human confirmation.
-- Evidence presentation using `available|missing|permission_denied|deleted`.
+- Evidence states: `available|missing|permission_denied|deleted`.
 - Immutable audit history and workspace-timezone-aware daily boundaries.
 
 ## Out of scope
 
-Gmail, Google Calendar, GitHub, Jira and connector marketplace integration; autonomous actions; semantic/vector search; dedicated graph databases; multi-user collaboration; cloud deployment; predictive risk modelling; external or multi-step recommendation execution.
-
-## Security boundary
-
-The server derives actor, workspace and Phase 1 accountable owner from the authenticated opaque server-side session. Browser payloads may not assert workspace, actor or owner. Counterparty/related-person references are allowed only where explicitly contracted. All Phase 1 tables use composite workspace constraints. Cross-workspace IDs return 404.
+External connectors; autonomous actions; semantic/vector search; dedicated graph databases; multi-user collaboration; cloud deployment; predictive risk modelling; external or multi-step recommendation execution.
 
 ## Functional requirements
 
-- Dashboard shows today's local meetings, ranked priorities, overdue commitments, risks, waiting-on items and recent changes.
-- Users can create, update, complete/fulfil, cancel, archive and restore supported entities.
-- Users can create, autosave, archive, restore and search notes locally.
-- Every ranked item and recommendation exposes factors, confidence, evidence and source.
-- Deterministic dashboard, brief and search remain available without AI.
+- Dashboard shows today's meetings, priorities, overdue commitments, risks, waiting-on items and recent changes.
+- Users can create, update and perform contracted lifecycle actions on supported entities.
+- Notes support autosave, archive, restore and local search.
+- Ranked items and recommendations expose factors, confidence, evidence and source.
+- Dashboard, brief and search remain available without AI.
 - Recommendation transitions are exactly: `proposed -> pending_confirmation`; `pending_confirmation -> rejected|expired|superseded|accepted`; `accepted -> executed|failed`.
-- `GenerateRecommendation` creates proposed; `/publish` is the only transition to pending_confirmation; `/confirm` is available only from pending_confirmation and atomically performs accepted transition, local target mutation, executed transition, audit and outbox writes.
+- `/publish` is the only transition to pending confirmation; `/confirm` atomically accepts, applies the local mutation, records execution, audit and outbox.
 - Every listed mutation writes a redacted append-only audit record.
 - Updates enforce optimistic concurrency and idempotency.
-- Every successful lifecycle action returns `200` with the current entity representation.
 
-## Canonical API
+## Non-functional requirements
 
-The frozen HTTP surface is defined by `phase-001/API-SCHEMAS.md` and includes:
+- Dashboard p95 <2 seconds on the acceptance dataset.
+- Search p95 <500 ms locally and <800 ms in CI.
+- Ranking 10,000 eligible records completes within 500 ms.
+- Core flows work offline after application load and without AI.
+- Primary flows meet WCAG 2.2 AA.
+- No cross-workspace identifiers or content are observable.
 
-```text
-GET /api/v1/dashboard/today
-GET|POST /api/v1/tasks
-GET|PATCH /api/v1/tasks/{id}
-POST /api/v1/tasks/{id}/complete|cancel|archive|restore
-GET|POST /api/v1/commitments
-GET|PATCH /api/v1/commitments/{id}
-POST /api/v1/commitments/{id}/confirm|fulfil|cancel|archive|restore
-GET|POST /api/v1/notes
-GET|PATCH /api/v1/notes/{id}
-POST /api/v1/notes/{id}/archive|restore
-GET|POST /api/v1/calendar/events
-GET|POST /api/v1/meetings
-GET|POST /api/v1/risks
-GET|POST /api/v1/briefs/morning
-GET /api/v1/search
-GET /api/v1/audit
-GET /api/v1/recommendations
-POST /api/v1/recommendations/{id}/publish|confirm|reject|defer|pin
-```
+## Architecture impact
 
-## Deterministic behavior
+Phase 1 adds task, commitment, note, calendar, meeting, risk, attention, brief, search, audit and recommendation modules to the Phase 0 modular monolith. PostgreSQL remains authoritative; outbox events remain durable; no new infrastructure technology is introduced.
 
-Priority weights, waiting-on signals, dismissal versioning, tie-breakers and confidence are normative in `PRIORITY-MODEL.md`. Brief sections, refresh eligibility, stale-by-age rules, duplicate suppression and AI fallback are normative in `MORNING-BRIEF-CONTRACT.md`. Date-only and datetime due precision are separate fields.
+## Data changes
 
-## Search, UX and feature flags
+Normative tables, fields, constraints, lifecycle states, indexes and migration rules are defined in `phase-001/DATA-MODEL.md`. Every table is workspace scoped with composite workspace constraints. Date-only and datetime due precision remain separate.
 
-Search uses normalized exact, prefix, PostgreSQL full-text and approved trigram matching for task, commitment, note, meeting, calendar_event and risk. Embeddings and external vectors are deferred. Primary surfaces implement loading, empty, degraded, recoverable error, offline and version-conflict states, with WCAG 2.2 AA core flows.
+## API changes
 
-Feature flags: `phase1.recommendations=false`, `phase1.ai_brief_enrichment=false`, `phase1.search_trigram=true`. Flags are typed restart-required server configuration and do not change migration requirements.
+The frozen HTTP surface is defined in `phase-001/API-SCHEMAS.md` and covers dashboard, tasks, commitments, notes, calendar events, meetings, risks, Morning Brief, search, audit and recommendations. Server-side sessions derive actor, workspace and accountable owner.
 
-## Automated acceptance and exit gates
+## Frontend changes
 
-- Frozen contracts and migrations pass CI.
-- Dashboard p95 <2 seconds; search p95 <500 ms locally and <800 ms CI; ranking 10,000 entities <500 ms.
-- Core CRUD/lifecycle, search, brief, recommendation publication/confirmation, audit and Playwright tests pass.
-- Every Phase 1 table has workspace-isolation tests.
-- Every mutation has audit coverage and recommendation execution requires publication plus durable confirmation.
-- AI-disabled/unavailable, backup/restore and accessibility tests pass.
-- Zero open critical/high/medium specification or code-review findings and zero known critical/high dependency vulnerabilities.
+Add Today, Morning Brief, Work Actions, Recommendations, Search and Audit surfaces. Required loading, empty, degraded, offline, recoverable error and version-conflict behavior is defined in `UX-STATES.md`. Feature flags are typed, restart-required configuration.
 
-The one-week daily-use validation remains a separate product outcome.
+## Security and privacy
 
-## Rollback
+Browser payloads may not assert workspace, actor or owner. Cross-workspace IDs return 404. Every mutation is audited with redaction. Search snippets and evidence respect lifecycle and permission state. Recommendation execution requires durable confirmation.
 
-Migrations must have tested downgrade or documented forward-fix paths. Recommendation and AI enrichment flags may be disabled without affecting deterministic dashboard, local search, audit or authoritative data.
+## Observability
+
+Record request latency/error rate, lifecycle mutation outcomes, search latency/result counts, ranking duration/input size, brief generation/fallback/staleness, recommendation transitions, idempotency conflicts, audit/outbox failures and correlation IDs. Metrics contain no note bodies or sensitive content.
+
+## Test strategy
+
+Normative coverage is in `TEST-PLAN.md`: CRUD/lifecycle, isolation, audit, ranking, search, brief, recommendation, migration, backup/restore, AI-disabled, accessibility and Chromium acceptance.
+
+## Acceptance criteria
+
+- Frozen schemas and migrations pass CI.
+- All contracted entity and lifecycle flows pass.
+- Performance thresholds pass on the documented dataset.
+- Every table has workspace-isolation coverage and every mutation has audit coverage.
+- AI-disabled, offline/degraded, accessibility and backup/restore tests pass.
+- Frontend typecheck, unit, production build and Chromium acceptance pass.
+
+## Exit criteria
+
+- All Phase 1 delivery slices are merged.
+- Required CI checks pass on the final head.
+- Zero open Critical, High or Medium specification/code findings.
+- Zero known Critical or High dependency vulnerabilities without accepted exception.
+- Clean backup/restore succeeds.
+- One-week daily-use validation is completed and recorded.
+
+## Rollback plan
+
+Migrations have tested downgrade or documented forward-fix paths. Recommendation and AI-enrichment flags may be disabled without affecting deterministic dashboard, local search, audit or authoritative data. Failed projections can be rebuilt from authoritative records.
+
+## Deferred backlog
+
+External connectors, semantic/vector search, autonomous workflows, multi-user collaboration, cloud deployment, predictive models and external recommendation execution.
+
+> Version 1.0.3 is a documentation-completeness clarification. It does not change the previously frozen Phase 1 runtime behavior.

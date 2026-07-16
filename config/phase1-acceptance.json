@@ -1,0 +1,44 @@
+{
+  "schema_version": 1,
+  "performance": {
+    "dashboard_p95_ms_local": 2000,
+    "search_p95_ms_local": 500,
+    "search_p95_ms_ci": 800,
+    "ranking_10000_entities_ms": 500
+  },
+  "accessibility": {
+    "standard": "WCAG 2.2 AA",
+    "required_landmarks": ["main", "navigation"],
+    "keyboard_core_flows": true,
+    "visible_focus": true,
+    "document_title_required": true
+  },
+  "backup_restore": {
+    "postgres_major": 18,
+    "format": "custom",
+    "checksum": "sha256",
+    "rto_seconds": 600,
+    "migration_head_must_match": true,
+    "row_counts_must_match": true
+  },
+  "final_gate": {
+    "critical_findings": 0,
+    "high_findings": 0,
+    "medium_findings": 0,
+    "critical_dependency_vulnerabilities": 0,
+    "workspace_isolation_required": true,
+    "audit_coverage_required": true,
+    "ai_disabled_acceptance_required": true
+  },
+  "evidence": {
+    "acceptance_contract": "tests/test_phase1_acceptance.py",
+    "search_performance": "tests/test_search_performance_postgres.py",
+    "priority_performance": "tests/test_risks_attention_postgres.py",
+    "browser_acceptance": "frontend/e2e/run.mjs",
+    "backup": "scripts/backup.sh",
+    "restore": "scripts/restore.sh",
+    "restore_verification": "scripts/verify_restore.sh",
+    "acceptance_workflow": ".github/workflows/phase1-acceptance.yml",
+    "standard_ci_workflow": ".github/workflows/ci.yml"
+  }
+}

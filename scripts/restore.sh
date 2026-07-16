@@ -1,14 +1,44 @@
 #!/usr/bin/env bash
 set -euo pipefail
-backup=${1:?usage: restore.sh BACKUP [TARGET_DB]}
-target_db=${2:-ecc_restore}
 
-sha256sum -c "${backup}.sha256"
-docker compose exec -T postgres dropdb -U "${POSTGRES_USER:-ecc}" --if-exists "$target_db"
-docker compose exec -T postgres createdb -U "${POSTGRES_USER:-ecc}" "$target_db"
-docker compose exec -T postgres pg_restore \
-  -U "${POSTGRES_USER:-ecc}" \
-  -d "$target_db" \
-  --clean \
-  --if-exists \
-  --exit-on-error < "$backup"
+BACKUP=${1:?usage: restore.sh BACKUP}
+TARGET_DATABASE_URL="${RESTORE_DATABASE_URL:-${2:-}}"
+PG_CLIENT_IMAGE="${PG_CLIENT_IMAGE:-}"
+
+if [[ -z "${TARGET_DATABASE_URL}" ]]; then
+  echo "RESTORE_DATABASE_URL or a target database URL is required" >&2
+  exit 2
+fi
+
+if [[ ! -f "${BACKUP}" || ! -f "${BACKUP}.sha256" ]]; then
+  echo "backup archive and checksum are required" >&2
+  exit 2
+fi
+
+if command -v sha256sum >/dev/null 2>&1; then
+  sha256sum -c "${BACKUP}.sha256"
+else
+  expected=$(awk '{print $1}' "${BACKUP}.sha256")
+  actual=$(shasum -a 256 "${BACKUP}" | awk '{print $1}')
+  [[ "${expected}" == "${actual}" ]]
+fi
+
+PG_URL="${TARGET_DATABASE_URL/postgresql+psycopg:/postgresql:}"
+
+if [[ -n "${PG_CLIENT_IMAGE}" ]]; then
+  backup_dir="$(cd "$(dirname "${BACKUP}")" && pwd)"
+  docker run --rm --network host \
+    -v "${backup_dir}:/backups:ro" \
+    "${PG_CLIENT_IMAGE}" \
+    pg_restore --clean --if-exists --exit-on-error --no-owner --no-privileges \
+    --dbname="${PG_URL}" "/backups/$(basename "${BACKUP}")"
+else
+  pg_restore \
+    --clean \
+    --if-exists \
+    --exit-on-error \
+    --no-owner \
+    --no-privileges \
+    --dbname="${PG_URL}" \
+    "${BACKUP}"
+fi
