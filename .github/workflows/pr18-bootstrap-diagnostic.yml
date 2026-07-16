@@ -5,10 +5,11 @@ on:
     branches: [feature/setup-and-usage-clean]
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   diagnose:
+    if: github.actor != 'github-actions[bot]'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
@@ -17,15 +18,14 @@ jobs:
           python-version: '3.14.6'
       - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e
       - run: uv sync --frozen --all-groups --python 3.14.6
-      - name: Run focused tests
+      - name: Capture focused tests
         run: |
           set +e
-          uv run pytest tests/test_bootstrap_dev.py tests/test_dev_bootstrap.py -vv > bootstrap-test-report.txt 2>&1
-          status=$?
-          cat bootstrap-test-report.txt
-          exit $status
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: bootstrap-test-report
-          path: bootstrap-test-report.txt
+          uv run pytest tests/test_bootstrap_dev.py tests/test_dev_bootstrap.py -vv > pr18-bootstrap-report.txt 2>&1
+          tail -n 160 pr18-bootstrap-report.txt > pr18-bootstrap-report.tmp
+          mv pr18-bootstrap-report.tmp pr18-bootstrap-report.txt
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add pr18-bootstrap-report.txt
+          git commit -m 'ci: capture pr18 bootstrap report' || true
+          git push
