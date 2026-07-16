@@ -2,7 +2,7 @@
 id: PHASE-000
 title: Repository Foundation
 status: Approved for Implementation
-version: 1.1.0
+version: 1.1.1
 owner: Lucky Jain
 depends_on:
   - SPEC-000
@@ -161,6 +161,22 @@ The repository MUST provide non-interactive logical backup, restore and integrit
 - migrations are forward-tested and rollback-documented
 - foundation restore completes within 10 minutes on a supported developer machine
 
+## Architecture impact
+
+Establish the modular-monolith boundaries, repository dependency rules, PostgreSQL persistence, opaque session identity, durable in-process event delivery and replaceable infrastructure ports used by every later phase. Phase 0 introduces no product workflows or unapproved infrastructure.
+
+## Data changes
+
+Create only the foundation schema approved by the Domain Model, PKOS Schema, Event Catalog and Phase 0 security baseline: workspace/local identity, sessions, evidence/provenance, outbox/inbox and migration metadata. All records are workspace scoped. Product entity tables belong to later phases.
+
+## API changes
+
+Expose health, readiness, liveness, version, local authentication/session bootstrap and contract skeletons required for Phase 1. Generated OpenAPI must match the accepted API contracts. Phase 0 does not expose Phase 1 business behavior.
+
+## Frontend changes
+
+Create the React/design-system application shell, authenticated routing, error boundary, health/version display and reusable loading/error/accessibility primitives. Executive dashboard workflows remain out of scope.
+
 ## Required deliverables
 
 ```text
@@ -273,3 +289,5 @@ Every tooling, schema or structural change must be independently reversible. Irr
 - connector implementations
 - AI model runtime
 - dedicated graph, vector, cache or distributed messaging infrastructure
+
+> Version 1.1.1 is a documentation-completeness clarification and does not change the approved Phase 0 runtime contract.
