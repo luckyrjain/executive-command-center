@@ -8,7 +8,8 @@ Executive Command Center (ECC) is a specification-driven platform for helping ex
 
 **Foundation specification:** Phase 0 baseline approved  
 **Implementation:** Phase 1 backend vertical slices implemented through Recommendations and confirmation execution  
-**Current delivery phase:** Phase 1 — Executive Dashboard MVP
+**Current delivery phase:** Phase 1 — Executive Dashboard MVP  
+**Published specifications:** Phases 0–9; Phases 2–9 remain Draft / Planned
 
 ## Quick start
 
@@ -77,8 +78,10 @@ Read the documents in this order:
 15. [Phase 0 Backup and Restore](docs/operations/PHASE-0-BACKUP-RESTORE.md)
 16. [PHASE-000 — Repository Foundation](docs/phases/PHASE-000-repository-foundation.md)
 17. [PHASE-001 — Executive Dashboard MVP](docs/phases/PHASE-001-executive-dashboard-mvp.md)
-18. [Roadmap](docs/ROADMAP.md)
-19. [Contributing](docs/CONTRIBUTING.md)
+18. [Phase Documentation Index](docs/phases/README.md)
+19. [Phase 0–9 Documentation Review](docs/phases/PHASE-REVIEW.md)
+20. [Roadmap](docs/ROADMAP.md)
+21. [Contributing](docs/CONTRIBUTING.md)
 
 ## Architecture decisions
 
@@ -130,6 +133,15 @@ RFC-004 is split into independently reviewable chapters under [`docs/architectur
 
 - [PHASE-000 — Repository Foundation](docs/phases/PHASE-000-repository-foundation.md)
 - [PHASE-001 — Executive Dashboard MVP](docs/phases/PHASE-001-executive-dashboard-mvp.md)
+- [PHASE-002 — Knowledge Platform](docs/phases/PHASE-002-knowledge-platform.md)
+- [PHASE-003 — Human Attention Engine](docs/phases/PHASE-003-human-attention-engine.md)
+- [PHASE-004 — AI Runtime](docs/phases/PHASE-004-ai-runtime.md)
+- [PHASE-005 — Automation](docs/phases/PHASE-005-automation.md)
+- [PHASE-006 — Engineering Workspace](docs/phases/PHASE-006-engineering-workspace.md)
+- [PHASE-007 — Personal Intelligence](docs/phases/PHASE-007-personal-intelligence.md)
+- [PHASE-008 — Multi-user Workspaces](docs/phases/PHASE-008-multi-user.md)
+- [PHASE-009 — Enterprise](docs/phases/PHASE-009-enterprise.md)
+- [Canonical Phase Index and Supporting Contracts](docs/phases/README.md)
 
 ## Repository rule
 
