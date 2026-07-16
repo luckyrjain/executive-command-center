@@ -8,7 +8,8 @@ from uuid import UUID, uuid4
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from fastapi.exceptions import RequestValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
@@ -71,28 +72,42 @@ class MeetingPatch(BaseModel):
     agenda: str | None = None
     preparation: str | None = None
     notes_summary: str | None = None
-    starts_at: datetime | None = None
-    ends_at: datetime | None = None
-    timezone: str | None = Field(default=None, max_length=128)
+    # Timing remains raw until the locked row establishes linked vs standalone authority.
+    starts_at: Any = None
+    ends_at: Any = None
+    timezone: Any = None
 
     @model_validator(mode="after")
     def reject_null_required_fields(self) -> MeetingPatch:
         for field in ("title", "status"):
             if field in self.model_fields_set and getattr(self, field) is None:
                 raise ValueError(f"{field} cannot be null")
-        timing_fields = {"starts_at", "ends_at", "timezone"}
-        supplied_timing = timing_fields & self.model_fields_set
-        if supplied_timing and supplied_timing != timing_fields:
-            raise ValueError("starts_at, ends_at and timezone must be updated together")
-        if supplied_timing:
-            if self.starts_at is None or self.ends_at is None or self.timezone is None:
-                raise ValueError("standalone meeting timing fields cannot be null")
-            _validate_aware(self.starts_at, "starts_at")
-            _validate_aware(self.ends_at, "ends_at")
-            _validate_timezone(self.timezone)
-            if self.ends_at <= self.starts_at:
-                raise ValueError("ends_at must be after starts_at")
         return self
+
+
+class _StandalonePatchTiming(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    starts_at: datetime
+    ends_at: datetime
+    timezone: str = Field(min_length=1, max_length=128)
+
+    @model_validator(mode="after")
+    def validate_timing(self) -> _StandalonePatchTiming:
+        _validate_aware(self.starts_at, "starts_at")
+        _validate_aware(self.ends_at, "ends_at")
+        _validate_timezone(self.timezone)
+        if self.ends_at <= self.starts_at:
+            raise ValueError("ends_at must be after starts_at")
+        return self
+
+
+def _validate_standalone_patch_timing(
+    payload: MeetingPatch,
+) -> _StandalonePatchTiming:
+    timing_fields = {"starts_at", "ends_at", "timezone"}
+    raw = payload.model_dump(include=timing_fields & payload.model_fields_set)
+    return _StandalonePatchTiming.model_validate(raw)
 
 
 class MeetingAction(BaseModel):
@@ -548,6 +563,12 @@ def update_meeting(
                 status_code=422,
                 detail="LINKED_MEETING_TIMING_READ_ONLY",
             )
+        validated_timing = None
+        if fields & timing_fields:
+            try:
+                validated_timing = _validate_standalone_patch_timing(payload)
+            except ValidationError as exc:
+                raise RequestValidationError(exc.errors()) from exc
         if current["status"] in {"completed", "cancelled"} and payload.status not in {
             None,
             current["status"],
@@ -568,6 +589,8 @@ def update_meeting(
             "timezone",
         )
         values = payload.model_dump()
+        if validated_timing is not None:
+            values.update(validated_timing.model_dump())
         values.update({f"set_{field}": field in fields for field in mutable_fields})
         values.update(
             {

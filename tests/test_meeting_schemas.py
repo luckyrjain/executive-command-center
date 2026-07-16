@@ -3,7 +3,10 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from pydantic import ValidationError
 
-from ecc.domains.scheduling.meetings import MeetingPatch
+from ecc.domains.scheduling.meetings import (
+    MeetingPatch,
+    _validate_standalone_patch_timing,
+)
 
 
 def test_meeting_patch_accepts_complete_standalone_timing() -> None:
@@ -17,6 +20,17 @@ def test_meeting_patch_accepts_complete_standalone_timing() -> None:
 
     assert patch.starts_at == starts_at
     assert patch.timezone == "Asia/Kolkata"
+
+
+def test_meeting_patch_preserves_raw_timing_presence_for_state_aware_validation() -> None:
+    for field, value in (
+        ("starts_at", "not-a-datetime"),
+        ("ends_at", None),
+        ("timezone", {"invalid": "shape"}),
+    ):
+        patch = MeetingPatch(expected_version=2, **{field: value})
+        assert field in patch.model_fields_set
+        assert getattr(patch, field) == value
 
 
 @pytest.mark.parametrize(
@@ -45,7 +59,8 @@ def test_meeting_patch_accepts_complete_standalone_timing() -> None:
     ],
 )
 def test_meeting_patch_rejects_incoherent_standalone_timing(
-    timing: dict[str, str],
+    timing: dict[str, object],
 ) -> None:
+    patch = MeetingPatch(expected_version=2, **timing)
     with pytest.raises(ValidationError):
-        MeetingPatch(expected_version=2, **timing)
+        _validate_standalone_patch_timing(patch)
