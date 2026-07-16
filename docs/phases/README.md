@@ -2,6 +2,8 @@
 
 This is the canonical index for phase-wise product, architecture, API, data, UX, security, testing and implementation documentation.
 
+- [Phase 0–9 documentation completeness review](./PHASE-REVIEW.md)
+
 ## Governance
 
 - A top-level phase specification defines objective, scope, dependencies, boundaries and exit criteria.
