@@ -6,6 +6,7 @@ import WorkspaceNavigation from './navigation/WorkspaceNavigation'
 import RecommendationPanel from './RecommendationPanel'
 import SearchAuditPanel from './SearchAuditPanel'
 import CommitmentWorkspace from './features/commitments/CommitmentWorkspace'
+import NoteWorkspace from './features/notes/NoteWorkspace'
 import TaskWorkspace from './features/tasks/TaskWorkspace'
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:8000'
@@ -201,7 +202,7 @@ export default function App() {
             <TaskWorkspace />
             <CommitmentWorkspace />
           </div>
-        ) : <><header className="topbar">
+        ) : currentView === 'notes' ? <NoteWorkspace /> : <><header className="topbar">
           <div>
             <p className="eyebrow">EXECUTIVE COMMAND CENTER</p>
             <h1>Today</h1>
