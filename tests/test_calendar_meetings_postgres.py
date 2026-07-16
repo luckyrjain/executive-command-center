@@ -250,3 +250,94 @@ def test_linked_meeting_rejects_cross_workspace_event(
         json={"calendar_event_id": str(uuid4()), "title": "Hidden event"},
     )
     assert response.status_code == 404
+
+
+def test_standalone_meeting_reschedule_and_linked_timing_rejection(
+    calendar_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    client, workspace_id, _, token = calendar_test_context
+    starts_at = datetime(2026, 7, 20, 9, tzinfo=UTC)
+    standalone = client.post(
+        "/api/v1/meetings",
+        headers=_headers(token, "create-standalone-reschedule"),
+        json={
+            "title": "Standalone planning",
+            "starts_at": starts_at.isoformat(),
+            "ends_at": (starts_at + timedelta(hours=1)).isoformat(),
+            "timezone": "UTC",
+        },
+    )
+    assert standalone.status_code == 201
+    meeting = standalone.json()
+
+    patch_payload = {
+        "expected_version": 1,
+        "starts_at": (starts_at + timedelta(hours=2)).isoformat(),
+        "ends_at": (starts_at + timedelta(hours=3)).isoformat(),
+        "timezone": "Asia/Kolkata",
+    }
+    rescheduled = client.patch(
+        f"/api/v1/meetings/{meeting['id']}",
+        headers=_headers(token, "reschedule-standalone"),
+        json=patch_payload,
+    )
+    assert rescheduled.status_code == 200
+    assert rescheduled.json()["version"] == 2
+    assert rescheduled.json()["starts_at"] == patch_payload["starts_at"]
+    assert rescheduled.json()["timezone"] == "Asia/Kolkata"
+
+    replay = client.patch(
+        f"/api/v1/meetings/{meeting['id']}",
+        headers=_headers(token, "reschedule-standalone"),
+        json=patch_payload,
+    )
+    assert replay.status_code == 200
+    assert replay.json() == rescheduled.json()
+
+    with engine.connect() as connection:
+        stored = connection.execute(
+            text(
+                """
+                SELECT standalone_starts_at, standalone_ends_at, standalone_timezone
+                FROM meetings WHERE workspace_id = :workspace_id AND id = :meeting_id
+                """
+            ),
+            {"workspace_id": workspace_id, "meeting_id": meeting["id"]},
+        ).one()
+        audit = connection.execute(
+            text(
+                """
+                SELECT changed_fields FROM audit_events
+                WHERE workspace_id = :workspace_id AND aggregate_id = :meeting_id
+                  AND event_type = 'meeting.updated'
+                """
+            ),
+            {"workspace_id": workspace_id, "meeting_id": meeting["id"]},
+        ).one()
+    assert stored.standalone_starts_at == starts_at + timedelta(hours=2)
+    assert stored.standalone_ends_at == starts_at + timedelta(hours=3)
+    assert stored.standalone_timezone == "Asia/Kolkata"
+    assert set(audit.changed_fields) == {"starts_at", "ends_at", "timezone"}
+
+    event = client.post(
+        "/api/v1/calendar/events",
+        headers=_headers(token, "linked-rejection-event"),
+        json={
+            "title": "Linked event",
+            "starts_at": starts_at.isoformat(),
+            "ends_at": (starts_at + timedelta(hours=1)).isoformat(),
+            "timezone": "UTC",
+        },
+    )
+    linked = client.post(
+        "/api/v1/meetings",
+        headers=_headers(token, "linked-rejection-meeting"),
+        json={"calendar_event_id": event.json()["id"], "title": "Linked meeting"},
+    )
+    rejection = client.patch(
+        f"/api/v1/meetings/{linked.json()['id']}",
+        headers=_headers(token, "linked-rejection-patch"),
+        json=patch_payload,
+    )
+    assert rejection.status_code == 422
+    assert rejection.json()["error"]["code"] == "LINKED_MEETING_TIMING_READ_ONLY"

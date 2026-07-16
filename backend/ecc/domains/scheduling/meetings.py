@@ -71,12 +71,27 @@ class MeetingPatch(BaseModel):
     agenda: str | None = None
     preparation: str | None = None
     notes_summary: str | None = None
+    starts_at: datetime | None = None
+    ends_at: datetime | None = None
+    timezone: str | None = Field(default=None, max_length=128)
 
     @model_validator(mode="after")
     def reject_null_required_fields(self) -> MeetingPatch:
         for field in ("title", "status"):
             if field in self.model_fields_set and getattr(self, field) is None:
                 raise ValueError(f"{field} cannot be null")
+        timing_fields = {"starts_at", "ends_at", "timezone"}
+        supplied_timing = timing_fields & self.model_fields_set
+        if supplied_timing and supplied_timing != timing_fields:
+            raise ValueError("starts_at, ends_at and timezone must be updated together")
+        if supplied_timing:
+            if self.starts_at is None or self.ends_at is None or self.timezone is None:
+                raise ValueError("standalone meeting timing fields cannot be null")
+            _validate_aware(self.starts_at, "starts_at")
+            _validate_aware(self.ends_at, "ends_at")
+            _validate_timezone(self.timezone)
+            if self.ends_at <= self.starts_at:
+                raise ValueError("ends_at must be after starts_at")
         return self
 
 
@@ -526,19 +541,34 @@ def update_meeting(
             )
         if current["archived_at"] is not None:
             raise HTTPException(status_code=409, detail="MEETING_ARCHIVED")
+        timing_fields = {"starts_at", "ends_at", "timezone"}
+        fields = payload.model_fields_set - {"expected_version"}
+        if current["calendar_event_id"] is not None and fields & timing_fields:
+            raise HTTPException(
+                status_code=422,
+                detail="LINKED_MEETING_TIMING_READ_ONLY",
+            )
         if current["status"] in {"completed", "cancelled"} and payload.status not in {
             None,
             current["status"],
         }:
             raise HTTPException(status_code=409, detail="INVALID_MEETING_TRANSITION")
-        fields = payload.model_fields_set - {"expected_version"}
         if not fields:
             response = _project(session, auth, current)
             _store_cached(session, auth, idempotency_key, request_hash, response, 200, now)
             return response
-        assignments = [f"{field} = :{field}" for field in sorted(fields)]
-        assignments.extend(["updated_by = :actor_id", "updated_at = :now", "version = version + 1"])
-        values = payload.model_dump(include=fields)
+        mutable_fields = (
+            "title",
+            "status",
+            "agenda",
+            "preparation",
+            "notes_summary",
+            "starts_at",
+            "ends_at",
+            "timezone",
+        )
+        values = payload.model_dump()
+        values.update({f"set_{field}": field in fields for field in mutable_fields})
         values.update(
             {
                 "workspace_id": auth.workspace_id,
@@ -552,7 +582,22 @@ def update_meeting(
                 text(
                     f"""
                     UPDATE meetings
-                    SET {", ".join(assignments)}
+                    SET title = CASE WHEN :set_title THEN :title ELSE title END,
+                        status = CASE WHEN :set_status THEN :status ELSE status END,
+                        agenda = CASE WHEN :set_agenda THEN :agenda ELSE agenda END,
+                        preparation = CASE
+                            WHEN :set_preparation THEN :preparation ELSE preparation END,
+                        notes_summary = CASE
+                            WHEN :set_notes_summary THEN :notes_summary ELSE notes_summary END,
+                        standalone_starts_at = CASE
+                            WHEN :set_starts_at THEN :starts_at ELSE standalone_starts_at END,
+                        standalone_ends_at = CASE
+                            WHEN :set_ends_at THEN :ends_at ELSE standalone_ends_at END,
+                        standalone_timezone = CASE
+                            WHEN :set_timezone THEN :timezone ELSE standalone_timezone END,
+                        updated_by = :actor_id,
+                        updated_at = :now,
+                        version = version + 1
                     WHERE workspace_id = :workspace_id AND id = :meeting_id
                     RETURNING {_MEETING_FIELDS}
                     """

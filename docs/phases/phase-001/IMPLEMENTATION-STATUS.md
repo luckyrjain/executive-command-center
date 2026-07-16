@@ -2,7 +2,7 @@
 id: PHASE-001-IMPLEMENTATION-STATUS
 title: Phase 1 Implementation Status
 status: Active
-version: 1.0.0
+version: 1.0.1
 owner: Lucky Jain
 updated: 2026-07-16
 ---
@@ -24,7 +24,7 @@ Phase 1 backend capabilities are implemented across the core domain, determinist
 | Commitments | Implemented | CRUD, confirmation/fulfilment/cancellation lifecycle, audit and outbox |
 | Notes | Implemented | Local note workflows, archive/restore and search support |
 | Calendar events | Implemented | Local event CRUD, timezone handling, archive/restore and signed pagination |
-| Meetings | Implemented | Linked and standalone meetings, timing projection and lifecycle rules |
+| Meetings | Implemented | Linked timing projection, direct standalone rescheduling, optimistic concurrency and lifecycle rules |
 | Risks | Implemented | CRUD, lifecycle, deterministic risk scoring, audit and outbox |
 | Attention ranking | Implemented | Persisted deterministic projections, dismiss/defer/restore and regeneration |
 | Global search | Implemented | Six-entity PostgreSQL search, ranking, snippets, filters and signed cursors |

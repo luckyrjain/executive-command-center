@@ -2,7 +2,7 @@
 id: PHASE-001-API-SCHEMAS
 title: Phase 1 API Schemas
 status: Approved
-version: 1.0.2
+version: 1.0.3
 owner: Lucky Jain
 ---
 
@@ -54,6 +54,8 @@ Phase 1 supports local/manual events only. Linked meetings reject independent ti
 - `timezone` -> `meetings.standalone_timezone`
 
 Standalone meetings require all three API fields. Linked Meeting responses expose projected `starts_at`, `ends_at`, and `timezone` from CalendarEvent. Linking a standalone Meeting adopts CalendarEvent timing.
+
+`PATCH /meetings/{id}` accepts meeting-owned content plus `expected_version`. For a standalone Meeting, rescheduling supplies `starts_at`, `ends_at`, and `timezone` together; partial or null timing, offset-naive instants, invalid IANA zones, and `ends_at <= starts_at` return `422`. These public fields update the corresponding `standalone_*` columns. A linked Meeting rejects any of the three timing fields with `422 LINKED_MEETING_TIMING_READ_ONLY`; clients reschedule it only through `PATCH /calendar/events/{calendar_event_id}`.
 
 ## Risk endpoints
 
