@@ -1,95 +1,153 @@
 # Executive Command Center — Phase Documentation
 
-This directory is the canonical index for phase-wise product, architecture, API, data, UX, security, testing and implementation documentation.
+This is the canonical index for phase-wise product, architecture, API, data, UX, security, testing and implementation documentation.
 
-## Documentation rules
+## Governance
 
-- The top-level phase document defines scope, dependencies and exit criteria.
-- Supporting documents under the matching phase directory are normative contracts for implementation.
-- Draft contracts are planning artifacts and are not approved implementation authority.
-- Approved contracts change only through a reviewed pull request with an explicit version bump.
-- Implementation status documents report delivery progress; they do not override contracts.
-- Code, migrations, tests and CI must remain consistent with the approved phase documents.
+- A top-level phase specification defines objective, scope, dependencies, boundaries and exit criteria.
+- Supporting documents are normative only after the phase is approved for implementation.
+- Draft contracts are planning artifacts and do not authorize implementation.
+- Approved behavior changes require review and explicit version updates.
+- Implementation status reports delivery evidence and never overrides a contract.
+
+## Status
+
+| Phase | Name | Specification | Delivery status |
+|---:|---|---|---|
+| 0 | Repository Foundation | Approved baseline | Implemented |
+| 1 | Executive Dashboard MVP | Approved for implementation | In progress |
+| 2 | Knowledge Platform | Draft | Not started |
+| 3 | Human Attention Engine | Draft | Not started |
+| 4 | AI Runtime | Draft | Not started |
+| 5 | Automation | Draft | Not started |
+| 6 | Engineering Workspace | Draft | Not started |
+| 7 | Personal Intelligence | Draft | Not started |
+| 8 | Multi-user Workspaces | Draft | Not started |
+| 9 | Enterprise | Draft | Not started |
 
 ## Phase 0 — Repository Foundation
 
-Phase 0 establishes the repository, engineering standards, architecture decisions, core domain model, API conventions, event contracts, security boundaries and PKOS foundation.
+- [Primary phase specification](./PHASE-000-repository-foundation.md)
 
-- [PHASE-000 — Repository Foundation](./PHASE-000-repository-foundation.md)
-
-Canonical foundation material is also maintained under `docs/architecture/`, `docs/domain/`, `docs/adr/`, `docs/security/` and `docs/standards/`.
 
 ## Phase 1 — Executive Dashboard MVP
 
-Status: approved for implementation; delivery in progress.
-
-Primary phase document:
-
-- [PHASE-001 — Executive Dashboard MVP](./PHASE-001-executive-dashboard-mvp.md)
-
-Normative supporting contracts:
-
-- [Data model](./phase-001/DATA-MODEL.md)
-- [API schemas](./phase-001/API-SCHEMAS.md)
-- [Priority model](./phase-001/PRIORITY-MODEL.md)
-- [Morning Brief contract](./phase-001/MORNING-BRIEF-CONTRACT.md)
-- [Audit contract](./phase-001/AUDIT-CONTRACT.md)
-- [Search contract](./phase-001/SEARCH-CONTRACT.md)
-- [UX states](./phase-001/UX-STATES.md)
-- [Test plan](./phase-001/TEST-PLAN.md)
-- [Implementation status](./phase-001/IMPLEMENTATION-STATUS.md)
+- [Primary phase specification](./PHASE-001-executive-dashboard-mvp.md)
+- [DATA MODEL](./phase-001/DATA-MODEL.md)
+- [API SCHEMAS](./phase-001/API-SCHEMAS.md)
+- [PRIORITY MODEL](./phase-001/PRIORITY-MODEL.md)
+- [MORNING BRIEF CONTRACT](./phase-001/MORNING-BRIEF-CONTRACT.md)
+- [AUDIT CONTRACT](./phase-001/AUDIT-CONTRACT.md)
+- [SEARCH CONTRACT](./phase-001/SEARCH-CONTRACT.md)
+- [UX STATES](./phase-001/UX-STATES.md)
+- [TEST PLAN](./phase-001/TEST-PLAN.md)
+- [IMPLEMENTATION STATUS](./phase-001/IMPLEMENTATION-STATUS.md)
 
 ## Phase 2 — Knowledge Platform
 
-Status: draft; implementation has not started.
-
-Primary phase document:
-
-- [PHASE-002 — Knowledge Platform](./PHASE-002-knowledge-platform.md)
-
-Draft supporting contracts:
-
-- [Data model](./phase-002/DATA-MODEL.md)
-- [API schemas](./phase-002/API-SCHEMAS.md)
-- [Entity resolution contract](./phase-002/ENTITY-RESOLUTION-CONTRACT.md)
-- [Hybrid retrieval contract](./phase-002/RETRIEVAL-CONTRACT.md)
-- [UX states](./phase-002/UX-STATES.md)
-- [Test plan](./phase-002/TEST-PLAN.md)
-- [Implementation status](./phase-002/IMPLEMENTATION-STATUS.md)
+- [Primary phase specification](./PHASE-002-knowledge-platform.md)
+- [DATA MODEL](./phase-002/DATA-MODEL.md)
+- [API SCHEMAS](./phase-002/API-SCHEMAS.md)
+- [ENTITY RESOLUTION CONTRACT](./phase-002/ENTITY-RESOLUTION-CONTRACT.md)
+- [RETRIEVAL CONTRACT](./phase-002/RETRIEVAL-CONTRACT.md)
+- [UX STATES](./phase-002/UX-STATES.md)
+- [TEST PLAN](./phase-002/TEST-PLAN.md)
+- [IMPLEMENTATION STATUS](./phase-002/IMPLEMENTATION-STATUS.md)
 
 ## Phase 3 — Human Attention Engine
 
-Status: draft; implementation has not started.
+- [Primary phase specification](./PHASE-003-human-attention-engine.md)
+- [DATA MODEL](./phase-003/DATA-MODEL.md)
+- [API SCHEMAS](./phase-003/API-SCHEMAS.md)
+- [ATTENTION MODEL](./phase-003/ATTENTION-MODEL.md)
+- [PLANNING CONTRACT](./phase-003/PLANNING-CONTRACT.md)
+- [MEETING PREP CONTRACT](./phase-003/MEETING-PREP-CONTRACT.md)
+- [UX STATES](./phase-003/UX-STATES.md)
+- [TEST PLAN](./phase-003/TEST-PLAN.md)
+- [IMPLEMENTATION STATUS](./phase-003/IMPLEMENTATION-STATUS.md)
 
-Primary phase document:
+## Phase 4 — AI Runtime
 
-- [PHASE-003 — Human Attention Engine](./PHASE-003-human-attention-engine.md)
+- [Primary phase specification](./PHASE-004-ai-runtime.md)
+- [DATA MODEL](./phase-004/DATA-MODEL.md)
+- [API SCHEMAS](./phase-004/API-SCHEMAS.md)
+- [MODEL ROUTING CONTRACT](./phase-004/MODEL-ROUTING-CONTRACT.md)
+- [EVALUATION CONTRACT](./phase-004/EVALUATION-CONTRACT.md)
+- [UX STATES](./phase-004/UX-STATES.md)
+- [TEST PLAN](./phase-004/TEST-PLAN.md)
+- [IMPLEMENTATION STATUS](./phase-004/IMPLEMENTATION-STATUS.md)
 
-Draft supporting contracts:
+## Phase 5 — Automation
 
-- [Data model](./phase-003/DATA-MODEL.md)
-- [API schemas](./phase-003/API-SCHEMAS.md)
-- [Attention model](./phase-003/ATTENTION-MODEL.md)
-- [Planning contract](./phase-003/PLANNING-CONTRACT.md)
-- [Meeting preparation contract](./phase-003/MEETING-PREP-CONTRACT.md)
-- [UX states](./phase-003/UX-STATES.md)
-- [Test plan](./phase-003/TEST-PLAN.md)
-- [Implementation status](./phase-003/IMPLEMENTATION-STATUS.md)
+- [Primary phase specification](./PHASE-005-automation.md)
+- [DATA MODEL](./phase-005/DATA-MODEL.md)
+- [API SCHEMAS](./phase-005/API-SCHEMAS.md)
+- [EXECUTION CONTRACT](./phase-005/EXECUTION-CONTRACT.md)
+- [APPROVAL POLICY](./phase-005/APPROVAL-POLICY.md)
+- [UX STATES](./phase-005/UX-STATES.md)
+- [TEST PLAN](./phase-005/TEST-PLAN.md)
+- [IMPLEMENTATION STATUS](./phase-005/IMPLEMENTATION-STATUS.md)
 
-## Capability ownership
+## Phase 6 — Engineering Workspace
 
-| Capability | Phase | Primary contract |
-|---|---:|---|
-| Tasks, commitments, notes and local calendar | 1 | Phase 1 API and data model |
-| Today dashboard and Morning Brief | 1 | Phase 1 phase and brief contracts |
-| Local search and audit | 1 | Phase 1 search and audit contracts |
-| Persistent entities, claims and relationships | 2 | Phase 2 data model |
-| Identity matching, merge and split | 2 | Entity resolution contract |
-| Timeline and hybrid retrieval | 2 | Retrieval contract and data model |
-| Explainable executive attention | 3 | Attention model |
-| Waiting direction and risk review | 3 | Phase 3 phase, API and data model |
-| Daily and weekly planning | 3 | Planning contract |
-| Evidence-backed meeting preparation | 3 | Meeting preparation contract |
+- [Primary phase specification](./PHASE-006-engineering-workspace.md)
+- [DATA MODEL](./phase-006/DATA-MODEL.md)
+- [API SCHEMAS](./phase-006/API-SCHEMAS.md)
+- [CONNECTOR CONTRACT](./phase-006/CONNECTOR-CONTRACT.md)
+- [DELIVERY INTELLIGENCE CONTRACT](./phase-006/DELIVERY-INTELLIGENCE-CONTRACT.md)
+- [UX STATES](./phase-006/UX-STATES.md)
+- [TEST PLAN](./phase-006/TEST-PLAN.md)
+- [IMPLEMENTATION STATUS](./phase-006/IMPLEMENTATION-STATUS.md)
+
+## Phase 7 — Personal Intelligence
+
+- [Primary phase specification](./PHASE-007-personal-intelligence.md)
+- [DATA MODEL](./phase-007/DATA-MODEL.md)
+- [API SCHEMAS](./phase-007/API-SCHEMAS.md)
+- [DOMAIN PRIVACY CONTRACT](./phase-007/DOMAIN-PRIVACY-CONTRACT.md)
+- [INSIGHT CONTRACT](./phase-007/INSIGHT-CONTRACT.md)
+- [UX STATES](./phase-007/UX-STATES.md)
+- [TEST PLAN](./phase-007/TEST-PLAN.md)
+- [IMPLEMENTATION STATUS](./phase-007/IMPLEMENTATION-STATUS.md)
+
+## Phase 8 — Multi-user Workspaces
+
+- [Primary phase specification](./PHASE-008-multi-user.md)
+- [DATA MODEL](./phase-008/DATA-MODEL.md)
+- [API SCHEMAS](./phase-008/API-SCHEMAS.md)
+- [PERMISSION CONTRACT](./phase-008/PERMISSION-CONTRACT.md)
+- [DELEGATION CONTRACT](./phase-008/DELEGATION-CONTRACT.md)
+- [UX STATES](./phase-008/UX-STATES.md)
+- [TEST PLAN](./phase-008/TEST-PLAN.md)
+- [IMPLEMENTATION STATUS](./phase-008/IMPLEMENTATION-STATUS.md)
+
+## Phase 9 — Enterprise
+
+- [Primary phase specification](./PHASE-009-enterprise.md)
+- [DATA MODEL](./phase-009/DATA-MODEL.md)
+- [API SCHEMAS](./phase-009/API-SCHEMAS.md)
+- [TENANCY CONTRACT](./phase-009/TENANCY-CONTRACT.md)
+- [COMPLIANCE CONTRACT](./phase-009/COMPLIANCE-CONTRACT.md)
+- [UX STATES](./phase-009/UX-STATES.md)
+- [TEST PLAN](./phase-009/TEST-PLAN.md)
+- [IMPLEMENTATION STATUS](./phase-009/IMPLEMENTATION-STATUS.md)
+
+## Dependency sequence
+
+```text
+Phase 0 Foundation
+  -> Phase 1 Dashboard
+  -> Phase 2 Knowledge
+  -> Phase 3 Attention
+  -> Phase 4 AI Runtime
+  -> Phase 5 Automation
+  -> Phase 6 Engineering Workspace
+  -> Phase 7 Personal Intelligence
+  -> Phase 8 Multi-user
+  -> Phase 9 Enterprise
+```
+
+Implementation begins only after dependencies meet exit criteria and the phase is explicitly Approved for Implementation.
 
 ## Standard layout
 
@@ -104,5 +162,3 @@ docs/phases/
     TEST-PLAN.md
     IMPLEMENTATION-STATUS.md
 ```
-
-Only relevant contracts should be added. A phase remains Draft until its dependencies, architecture impact, security boundary, acceptance criteria and rollback plan have completed review.
