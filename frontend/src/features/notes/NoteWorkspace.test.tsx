@@ -22,6 +22,10 @@ function renderWorkspace() {
   return render(<QueryClientProvider client={client}><NoteWorkspace /></QueryClientProvider>)
 }
 
+async function settleFakeTimers() {
+  await act(async () => { await vi.runAllTimersAsync() })
+}
+
 beforeEach(() => {
   document.cookie = 'ecc_csrf=test-token; Secure; SameSite=Strict'
   vi.stubGlobal('crypto', { randomUUID: vi.fn(() => 'request-id') })
@@ -114,7 +118,6 @@ describe('NoteWorkspace', () => {
       .mockImplementationOnce(() => response(conflict, 409))
       .mockImplementationOnce(() => response(current))
       .mockImplementationOnce(() => response(saved))
-      .mockImplementationOnce(() => response({ items: [saved], next_cursor: null }))
       .mockImplementationOnce(() => response(savedAgain))
     vi.stubGlobal('fetch', fetch)
     renderWorkspace()
@@ -134,8 +137,8 @@ describe('NoteWorkspace', () => {
     expect(JSON.parse(String((fetch.mock.calls[4][1] as RequestInit).body))).toEqual({ expected_version: 5, body: 'My preserved draft' })
     fireEvent.change(editor, { target: { value: 'Draft after conflict' } })
     fireEvent.blur(editor)
-    await waitFor(() => expect(fetch).toHaveBeenCalledTimes(7))
-    expect(JSON.parse(String((fetch.mock.calls[6][1] as RequestInit).body))).toEqual({ expected_version: 6, body: 'Draft after conflict' })
+    await waitFor(() => expect(fetch).toHaveBeenCalledTimes(6))
+    expect(JSON.parse(String((fetch.mock.calls[5][1] as RequestInit).body))).toEqual({ expected_version: 6, body: 'Draft after conflict' })
   })
 
   it('blocks stale conflict retries until the latest note can be reloaded', async () => {
@@ -159,5 +162,134 @@ describe('NoteWorkspace', () => {
     expect(editor.value).toBe('Keep this conflict draft')
     fireEvent.click(screen.getByRole('button', { name: 'Reload latest note' }))
     await screen.findByRole('button', { name: 'Retry with latest version' })
+  })
+
+  it('flushes a pending draft before closing the editor', async () => {
+    vi.useFakeTimers()
+    const saved = { ...note, body: 'Close-safe draft', version: 5 }
+    const fetch = vi.fn()
+      .mockImplementationOnce(() => response({ items: [note], next_cursor: null }))
+      .mockImplementationOnce(() => response(saved))
+    vi.stubGlobal('fetch', fetch)
+    renderWorkspace()
+    await settleFakeTimers()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Edit Board preparation' }))
+    fireEvent.change(screen.getByLabelText('Edit note body'), { target: { value: 'Close-safe draft' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Close editor' }))
+    await settleFakeTimers()
+
+    expect(JSON.parse(String((fetch.mock.calls[1][1] as RequestInit).body))).toEqual({ expected_version: 4, body: 'Close-safe draft' })
+    expect(screen.queryByLabelText('Edit note body')).toBeNull()
+  })
+
+  it('flushes the current draft before switching notes', async () => {
+    vi.useFakeTimers()
+    const second = { ...note, id: 'note-2', title: 'Hiring plan', body: 'Candidate pipeline' }
+    const fetch = vi.fn()
+      .mockImplementationOnce(() => response({ items: [note, second], next_cursor: null }))
+      .mockImplementationOnce(() => response({ ...note, body: 'Switch-safe draft', version: 5 }))
+    vi.stubGlobal('fetch', fetch)
+    renderWorkspace()
+    await settleFakeTimers()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Edit Board preparation' }))
+    fireEvent.change(screen.getByLabelText('Edit note body'), { target: { value: 'Switch-safe draft' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Edit Hiring plan' }))
+    await settleFakeTimers()
+
+    expect(JSON.parse(String((fetch.mock.calls[1][1] as RequestInit).body))).toEqual({ expected_version: 4, body: 'Switch-safe draft' })
+    expect((screen.getByLabelText('Edit note body') as HTMLTextAreaElement).value).toBe('Candidate pipeline')
+  })
+
+  it('flushes a pending draft when the workspace unmounts', async () => {
+    vi.useFakeTimers()
+    const fetch = vi.fn()
+      .mockImplementationOnce(() => response({ items: [note], next_cursor: null }))
+      .mockImplementationOnce(() => response({ ...note, body: 'Unmount-safe draft', version: 5 }))
+    vi.stubGlobal('fetch', fetch)
+    const rendered = renderWorkspace()
+    await settleFakeTimers()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Edit Board preparation' }))
+    fireEvent.change(screen.getByLabelText('Edit note body'), { target: { value: 'Unmount-safe draft' } })
+    rendered.unmount()
+    await settleFakeTimers()
+
+    expect(JSON.parse(String((fetch.mock.calls[1][1] as RequestInit).body))).toEqual({ expected_version: 4, body: 'Unmount-safe draft' })
+  })
+
+  it('recovers a draft when closing flush fails', async () => {
+    vi.useFakeTimers()
+    const recoveryNote = { ...note, id: 'note-recovery' }
+    const fetch = vi.fn()
+      .mockImplementationOnce(() => response({ items: [recoveryNote], next_cursor: null }))
+      .mockRejectedValueOnce(new TypeError('network'))
+    vi.stubGlobal('fetch', fetch)
+    renderWorkspace()
+    await settleFakeTimers()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Edit Board preparation' }))
+    fireEvent.change(screen.getByLabelText('Edit note body'), { target: { value: 'Recoverable close draft' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Close editor' }))
+    await settleFakeTimers()
+    fireEvent.click(screen.getByRole('button', { name: 'Edit Board preparation' }))
+
+    expect((screen.getByLabelText('Edit note body') as HTMLTextAreaElement).value).toBe('Recoverable close draft')
+  })
+
+  it('updates list and detail caches after autosave so reopen and archive use the saved version', async () => {
+    const saved = { ...note, body: 'Cached saved body', version: 5 }
+    const archived = { ...saved, version: 6, archived_at: '2026-07-16T10:00:00Z' }
+    const fetch = vi.fn()
+      .mockImplementationOnce(() => response({ items: [note], next_cursor: null }))
+      .mockImplementationOnce(() => response(saved))
+      .mockImplementationOnce(() => response(archived))
+      .mockImplementationOnce(() => response({ items: [archived], next_cursor: null }))
+    vi.stubGlobal('fetch', fetch)
+    renderWorkspace()
+
+    await screen.findByText('Board preparation')
+    fireEvent.click(screen.getByRole('button', { name: 'Edit Board preparation' }))
+    fireEvent.change(screen.getByLabelText('Edit note body'), { target: { value: 'Cached saved body' } })
+    fireEvent.blur(screen.getByLabelText('Edit note body'))
+    await screen.findByText('Cached saved body')
+    fireEvent.click(screen.getByRole('button', { name: 'Close editor' }))
+    await waitFor(() => expect(screen.queryByLabelText('Edit note body')).toBeNull())
+    fireEvent.click(screen.getByRole('button', { name: 'Edit Board preparation' }))
+    expect((screen.getByLabelText('Edit note body') as HTMLTextAreaElement).value).toBe('Cached saved body')
+    fireEvent.click(screen.getByRole('button', { name: 'Archive Board preparation' }))
+    await waitFor(() => expect(fetch).toHaveBeenCalledTimes(4))
+    expect(JSON.parse(String((fetch.mock.calls[2][1] as RequestInit).body))).toEqual({ expected_version: 5 })
+  })
+
+  it('serializes text typed during a conflict retry against the returned version', async () => {
+    const conflict = { error: { code: 'VERSION_CONFLICT', message: 'changed', details: { current_version: 5 } } }
+    const current = { ...note, version: 5 }
+    let finishRetry!: (value: Response) => void
+    const retry = new Promise<Response>((resolve) => { finishRetry = resolve })
+    const fetch = vi.fn()
+      .mockImplementationOnce(() => response({ items: [note], next_cursor: null }))
+      .mockImplementationOnce(() => response(conflict, 409))
+      .mockImplementationOnce(() => response(current))
+      .mockImplementationOnce(() => retry)
+      .mockImplementationOnce(() => response({ ...note, body: 'Newest conflict draft', version: 7 }))
+    vi.stubGlobal('fetch', fetch)
+    renderWorkspace()
+
+    await screen.findByText('Board preparation')
+    fireEvent.click(screen.getByRole('button', { name: 'Edit Board preparation' }))
+    const editor = screen.getByLabelText('Edit note body') as HTMLTextAreaElement
+    fireEvent.change(editor, { target: { value: 'Conflict retry draft' } })
+    fireEvent.blur(editor)
+    await screen.findByRole('button', { name: 'Retry with latest version' })
+    fireEvent.click(screen.getByRole('button', { name: 'Retry with latest version' }))
+    await waitFor(() => expect(fetch).toHaveBeenCalledTimes(4))
+    fireEvent.change(editor, { target: { value: 'Newest conflict draft' } })
+    fireEvent.blur(editor)
+    finishRetry(new Response(JSON.stringify({ ...note, body: 'Conflict retry draft', version: 6 }), { status: 200 }))
+
+    await waitFor(() => expect(fetch).toHaveBeenCalledTimes(5))
+    expect(JSON.parse(String((fetch.mock.calls[4][1] as RequestInit).body))).toEqual({ expected_version: 6, body: 'Newest conflict draft' })
   })
 })

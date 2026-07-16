@@ -17,7 +17,8 @@ type AutosaveOptions = {
 export type AutosaveController = {
   update: (text: string) => void
   flush: () => Promise<void>
-  dispose: () => void
+  rebase: (version: number) => void
+  dispose: () => Promise<void>
 }
 
 export function createAutosaveController({ delayMs, initialVersion, save, onStateChange }: AutosaveOptions): AutosaveController {
@@ -30,8 +31,8 @@ export function createAutosaveController({ delayMs, initialVersion, save, onStat
   let activeSave: Promise<void> | undefined
   let saveAfterActive = false
 
-  const notify = (status: AutosaveStatus, error?: Error) => {
-    if (!disposed) onStateChange({ status, text, version, ...(error ? { error } : {}) })
+  const notify = (status: AutosaveStatus, stateText = text, error?: Error) => {
+    if (!disposed) onStateChange({ status, text: stateText, version, ...(error ? { error } : {}) })
   }
 
   const runSave = (): Promise<void> => {
@@ -48,12 +49,13 @@ export function createAutosaveController({ delayMs, initialVersion, save, onStat
     activeSave = save(savedText, version)
       .then((nextVersion) => {
         version = nextVersion
-        notify('saved')
+        if (revision === savedRevision && !dirty) notify('saved', savedText)
+        else notify('saving')
       })
       .catch((reason: unknown) => {
-        if (revision === savedRevision) dirty = true
+        dirty = true
         const error = reason instanceof Error ? reason : new Error('Autosave failed')
-        notify('error', error)
+        notify('error', text, error)
         saveAfterActive = false
       })
       .finally(() => {
@@ -88,7 +90,12 @@ export function createAutosaveController({ delayMs, initialVersion, save, onStat
       clearTimer()
       return runSave()
     },
-    dispose() {
+    rebase(nextVersion) {
+      version = nextVersion
+    },
+    async dispose() {
+      clearTimer()
+      await runSave()
       disposed = true
       clearTimer()
     },

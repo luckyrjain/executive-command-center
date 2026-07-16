@@ -19,6 +19,7 @@ type Action = 'archive' | 'restore'
 
 const emptyDraft: NoteDraft = { title: '', body: '', noteType: 'general' }
 const filters = { include_archived: true }
+const recoverableDrafts = new Map<string, string>()
 
 function listNotes(): Promise<NoteList> {
   return apiRequest('/api/v1/notes?include_archived=true&limit=100')
@@ -66,7 +67,20 @@ export default function NoteWorkspace() {
     )
   }, [query.data?.items, search])
 
-  useEffect(() => () => controller.current?.dispose(), [])
+  useEffect(() => () => {
+    const activeController = controller.current
+    controller.current = null
+    void activeController?.dispose()
+  }, [])
+
+  function updateNoteCaches(saved: Note) {
+    queryClient.setQueryData<Note>(['note', saved.id], saved)
+    queryClient.setQueriesData<NoteList>({ queryKey: ['notes'] }, (current) => current ? {
+      ...current,
+      items: current.items.map((note) => note.id === saved.id ? saved : note),
+    } : current)
+    setEditing((current) => current?.id === saved.id ? saved : current)
+  }
 
   async function reloadLatestNote(noteId: string) {
     try {
@@ -81,7 +95,6 @@ export default function NoteWorkspace() {
   }
 
   function installController(note: Note) {
-    controller.current?.dispose()
     controller.current = createAutosaveController({
       delayMs: 750,
       initialVersion: note.version,
@@ -90,7 +103,8 @@ export default function NoteWorkspace() {
           const saved = await apiRequest<Note>(`/api/v1/notes/${note.id}`, {
             method: 'PATCH', body: { expected_version: version, body: nextBody },
           })
-          queryClient.setQueryData<Note>(['note', note.id], saved)
+          updateNoteCaches(saved)
+          if (recoverableDrafts.get(note.id) === nextBody) recoverableDrafts.delete(note.id)
           return saved.version
         } catch (error) {
           if (error instanceof ApiError && error.code === 'VERSION_CONFLICT') {
@@ -103,13 +117,30 @@ export default function NoteWorkspace() {
     })
   }
 
-  function beginEditing(note: Note) {
+  async function retireController() {
+    const activeController = controller.current
+    if (!activeController) return
+    await activeController.dispose()
+    if (controller.current === activeController) controller.current = null
+  }
+
+  function activateEditor(note: Note) {
+    const draft = recoverableDrafts.get(note.id) ?? note.body
     setEditing(note)
-    setBody(note.body)
+    setBody(draft)
     setConflictVersion(null)
     setConflictReloadFailed(false)
-    setSaveState({ ...initialSaveState, text: note.body, version: note.version })
+    setSaveState({ ...initialSaveState, text: draft, version: note.version })
     installController(note)
+    if (draft !== note.body) controller.current?.update(draft)
+  }
+
+  function beginEditing(note: Note) {
+    if (!controller.current) {
+      activateEditor(note)
+      return
+    }
+    void retireController().then(() => activateEditor(note))
   }
 
   function submitCreate(event: FormEvent) {
@@ -119,6 +150,7 @@ export default function NoteWorkspace() {
 
   function updateBody(nextBody: string) {
     setBody(nextBody)
+    if (editing) recoverableDrafts.set(editing.id, nextBody)
     setConflictVersion(null)
     setConflictReloadFailed(false)
     controller.current?.update(nextBody)
@@ -126,21 +158,10 @@ export default function NoteWorkspace() {
 
   async function retryConflict() {
     if (!editing || conflictVersion === null) return
-    setSaveState((state) => ({ ...state, status: 'saving' }))
-    try {
-      const saved = await apiRequest<Note>(`/api/v1/notes/${editing.id}`, {
-        method: 'PATCH', body: { expected_version: conflictVersion, body },
-      })
-      setConflictVersion(null)
-      setConflictReloadFailed(false)
-      setEditing(saved)
-      installController(saved)
-      setSaveState({ status: 'saved', text: body, version: saved.version })
-      queryClient.setQueryData(['note', editing.id], saved)
-      void refresh()
-    } catch (error) {
-      setSaveState({ status: 'error', text: body, version: conflictVersion, error: error instanceof Error ? error : new Error('Autosave failed') })
-    }
+    setConflictVersion(null)
+    setConflictReloadFailed(false)
+    controller.current?.rebase(conflictVersion)
+    await controller.current?.flush()
   }
 
   const mutationError = createMutation.error ?? actionMutation.error
@@ -165,7 +186,7 @@ export default function NoteWorkspace() {
     <ol className="work-list note-list">{visibleNotes.map((note) => {
       const title = displayTitle(note)
       return <li key={note.id}><div><strong>{title}</strong><small>{note.note_type}{note.archived_at ? ' · archived' : ''}</small><p>{note.body}</p></div><div className="work-actions" aria-label={`Actions for ${title}`}>
-        {!note.archived_at ? <button type="button" aria-label={`Edit ${title}`} onClick={() => beginEditing(note)}>Edit</button> : null}
+        {!note.archived_at ? <button type="button" aria-label={`Edit ${title}`} onClick={() => { void beginEditing(note) }}>Edit</button> : null}
         {!note.archived_at ? <button type="button" aria-label={`Archive ${title}`} disabled={actionMutation.isPending} onClick={() => actionMutation.mutate({ note, action: 'archive' })}>Archive</button> : <button type="button" aria-label={`Restore ${title}`} disabled={actionMutation.isPending} onClick={() => actionMutation.mutate({ note, action: 'restore' })}>Restore</button>}
       </div></li>
     })}</ol>
@@ -176,7 +197,7 @@ export default function NoteWorkspace() {
       {saveState.status === 'error' && conflictVersion === null && !conflictReloadFailed ? <button type="button" onClick={() => { void controller.current?.flush() }}>Retry save</button> : null}
       {conflictReloadFailed ? <><p>Your note changed elsewhere, but the latest version could not be loaded. Your text is preserved.</p><button type="button" onClick={() => { void reloadLatestNote(editing.id) }}>Reload latest note</button></> : null}
       {conflictVersion !== null ? <><p>Your note changed elsewhere. Your text is preserved.</p><button type="button" onClick={() => { void retryConflict() }}>Retry with latest version</button></> : null}
-      <button type="button" onClick={() => { controller.current?.dispose(); controller.current = null; setEditing(null) }}>Close editor</button>
+      <button type="button" onClick={() => { void retireController().then(() => setEditing(null)) }}>Close editor</button>
     </section> : null}
   </section>
 }

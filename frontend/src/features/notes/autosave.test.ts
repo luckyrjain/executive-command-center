@@ -70,4 +70,41 @@ describe('createAutosaveController', () => {
     expect(save).toHaveBeenLastCalledWith('Keep this text', 4)
     expect(states.at(-1)).toMatchObject({ status: 'saved', text: 'Keep this text', version: 5 })
   })
+
+  it('does not announce a newer revision as saved while it is still pending', async () => {
+    vi.useFakeTimers()
+    const states: AutosaveState[] = []
+    let finishFirst!: (version: number) => void
+    let finishSecond!: (version: number) => void
+    const save = vi.fn()
+      .mockImplementationOnce(() => new Promise<number>((resolve) => { finishFirst = resolve }))
+      .mockImplementationOnce(() => new Promise<number>((resolve) => { finishSecond = resolve }))
+    const controller = createAutosaveController({ delayMs: 750, initialVersion: 4, save, onStateChange: (state) => states.push(state) })
+
+    controller.update('Persisting revision')
+    await vi.advanceTimersByTimeAsync(750)
+    controller.update('Newer pending revision')
+    await vi.advanceTimersByTimeAsync(750)
+    finishFirst(5)
+    await vi.advanceTimersByTimeAsync(0)
+
+    expect(states.some((state) => state.status === 'saved' && state.text === 'Newer pending revision')).toBe(false)
+    expect(states.at(-1)).toMatchObject({ status: 'saving', text: 'Newer pending revision' })
+    expect(save).toHaveBeenLastCalledWith('Newer pending revision', 5)
+
+    finishSecond(6)
+    await vi.runAllTimersAsync()
+    expect(states.at(-1)).toMatchObject({ status: 'saved', text: 'Newer pending revision', version: 6 })
+  })
+
+  it('flushes pending text before disposal', async () => {
+    vi.useFakeTimers()
+    const save = vi.fn(async (_text: string, version: number) => version + 1)
+    const controller = createAutosaveController({ delayMs: 750, initialVersion: 4, save, onStateChange: vi.fn() })
+
+    controller.update('Close-safe draft')
+    await controller.dispose()
+
+    expect(save).toHaveBeenCalledWith('Close-safe draft', 4)
+  })
 })
