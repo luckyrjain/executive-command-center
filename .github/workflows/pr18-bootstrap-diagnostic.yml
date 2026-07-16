@@ -1,0 +1,31 @@
+name: pr18-bootstrap-diagnostic
+
+on:
+  push:
+    branches: [feature/setup-and-usage-clean]
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: '3.14.6'
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e
+      - run: uv sync --frozen --all-groups --python 3.14.6
+      - name: Run focused tests
+        run: |
+          set +e
+          uv run pytest tests/test_bootstrap_dev.py tests/test_dev_bootstrap.py -vv > bootstrap-test-report.txt 2>&1
+          status=$?
+          cat bootstrap-test-report.txt
+          exit $status
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bootstrap-test-report
+          path: bootstrap-test-report.txt
