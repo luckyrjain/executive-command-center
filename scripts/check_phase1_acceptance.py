@@ -18,6 +18,18 @@ REQUIRED_BUDGETS = {
     "final_gate.critical_dependency_vulnerabilities": 0,
 }
 
+REQUIRED_EVIDENCE = {
+    "acceptance_contract",
+    "search_performance",
+    "priority_performance",
+    "browser_acceptance",
+    "backup",
+    "restore",
+    "restore_verification",
+    "acceptance_workflow",
+    "standard_ci_workflow",
+}
+
 
 def _get(document: dict[str, Any], dotted_key: str) -> Any:
     value: Any = document
@@ -28,7 +40,7 @@ def _get(document: dict[str, Any], dotted_key: str) -> Any:
     return value
 
 
-def validate(document: dict[str, Any]) -> list[str]:
+def validate(document: dict[str, Any], root: Path = Path(".")) -> list[str]:
     errors: list[str] = []
     if document.get("schema_version") != 1:
         errors.append("schema_version must be 1")
@@ -62,6 +74,18 @@ def validate(document: dict[str, Any]) -> list[str]:
     ):
         if final_gate.get(flag) is not True:
             errors.append(f"final_gate.{flag} must be true")
+
+    evidence = document.get("evidence", {})
+    if not isinstance(evidence, dict):
+        errors.append("evidence must be an object")
+    else:
+        for key in sorted(REQUIRED_EVIDENCE):
+            value = evidence.get(key)
+            if not isinstance(value, str) or not value:
+                errors.append(f"missing required evidence: {key}")
+                continue
+            if not (root / value).is_file():
+                errors.append(f"evidence file does not exist: {value}")
     return errors
 
 
@@ -80,7 +104,7 @@ def main() -> int:
         for error in errors:
             print(f"ERROR: {error}")
         return 1
-    print("Phase 1 acceptance contract is valid")
+    print("Phase 1 acceptance contract and executable evidence are valid")
     return 0
 
 
