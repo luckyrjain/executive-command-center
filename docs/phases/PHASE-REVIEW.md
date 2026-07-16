@@ -53,7 +53,7 @@ Required supporting artifacts for a feature phase:
 
 | Phase | Top-level template | Data | API | Capability contracts | UX | Test | Status | Result |
 |---:|---|---|---|---|---|---|---|---|
-| 0 | Complete | Foundation domain contracts | Foundation API contracts | Security, backup, ADRs | Repository shell | Complete | Implemented baseline | Complete |
+| 0 | Complete at 1.1.1 | Foundation domain contracts | Foundation API contracts | Security, backup, ADRs | Repository shell | Complete | Implemented baseline | Complete |
 | 1 | Complete at 1.0.3 | Yes | Yes | Priority, Brief, Audit, Search | Yes | Yes | Active | Complete |
 | 2 | Complete at 0.2.0 | Yes | Yes | Resolution, Retrieval | Yes | Yes | Planned | Complete for Draft |
 | 3 | Complete at 0.2.0 | Yes | Yes | Attention, Planning, Meeting Prep | Yes | Yes | Planned | Complete for Draft |
@@ -68,9 +68,9 @@ Required supporting artifacts for a feature phase:
 
 ### F-01 — Missing explicit template sections
 
-Phase 1 and Draft Phases 2–9 compressed or omitted explicit data, API, frontend, observability, test, acceptance, exit or backlog headings.
+Phase 0, Phase 1 and Draft Phases 2–9 compressed or omitted one or more explicit data, API, frontend, observability, test, acceptance, exit or backlog headings.
 
-Resolution: normalized every primary phase specification to the full template. Phase 1 received a documentation-only patch bump to 1.0.3. Draft phases moved to 0.2.0.
+Resolution: normalized every primary phase specification to the full template. Phase 0 and Phase 1 received documentation-only patch bumps to 1.1.1 and 1.0.3. Draft phases moved to 0.2.0.
 
 ### F-02 — Phase 2 embedding dependency
 
