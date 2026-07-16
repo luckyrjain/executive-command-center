@@ -194,44 +194,46 @@ export default function App() {
   return (
     <main id="workspace-main" className="app-shell">
       <WorkspaceNavigation currentView={currentView} onNavigate={setCurrentView} />
-      <header className="topbar">
-        <div>
-          <p className="eyebrow">EXECUTIVE COMMAND CENTER</p>
-          <h1>Today</h1>
-          <p className="subtitle">
-            {dashboard.data?.date ?? 'Your schedule, priorities, commitments and risks'}
-            {dashboard.data?.timezone ? ` · ${dashboard.data.timezone}` : ''}
-          </p>
-        </div>
-        <button type="button" onClick={() => dashboard.refetch()} disabled={dashboard.isFetching}>
-          {dashboard.isFetching ? 'Refreshing…' : 'Refresh dashboard'}
-        </button>
-      </header>
+      <div id="workspace-panel" role="tabpanel" aria-labelledby={`workspace-tab-${currentView}`}>
+        <header className="topbar">
+          <div>
+            <p className="eyebrow">EXECUTIVE COMMAND CENTER</p>
+            <h1>Today</h1>
+            <p className="subtitle">
+              {dashboard.data?.date ?? 'Your schedule, priorities, commitments and risks'}
+              {dashboard.data?.timezone ? ` · ${dashboard.data.timezone}` : ''}
+            </p>
+          </div>
+          <button type="button" onClick={() => dashboard.refetch()} disabled={dashboard.isFetching}>
+            {dashboard.isFetching ? 'Refreshing…' : 'Refresh dashboard'}
+          </button>
+        </header>
 
-      {dashboard.isLoading ? <div className="status-panel" role="status">Loading today’s command center…</div> : null}
-      {dashboard.isError ? (
-        <div className="status-panel error-panel" role="alert">
-          <strong>{dashboard.error.message}</strong>
-          <span>Check your session and backend connection, then retry.</span>
-        </div>
-      ) : null}
-      {dashboard.data?.stale ? <div className="status-panel degraded-panel" role="status">Dashboard data may be stale.</div> : null}
+        {dashboard.isLoading ? <div className="status-panel" role="status">Loading today’s command center…</div> : null}
+        {dashboard.isError ? (
+          <div className="status-panel error-panel" role="alert">
+            <strong>{dashboard.error.message}</strong>
+            <span>Check your session and backend connection, then retry.</span>
+          </div>
+        ) : null}
+        {dashboard.data?.stale ? <div className="status-panel degraded-panel" role="status">Dashboard data may be stale.</div> : null}
 
-      {sections ? (
-        <div className="dashboard-grid">
-          <Section title="Schedule" items={sections.today_schedule} emptyMessage="No meetings scheduled for today." />
-          <Section title="Top priorities" items={sections.top_priorities} emptyMessage="No ranked priorities need attention." />
-          <Section title="Overdue commitments" items={sections.overdue_commitments} emptyMessage="No overdue commitments." />
-          <Section title="Open risks" items={sections.risks} emptyMessage="No active risks." />
-          <Section title="Waiting on" items={sections.waiting_on} emptyMessage="Nothing is currently blocked on others." />
-          <Section title="Recent changes" items={sections.recently_changed} emptyMessage="No recent changes." />
-        </div>
-      ) : null}
+        {sections ? (
+          <div className="dashboard-grid">
+            <Section title="Schedule" items={sections.today_schedule} emptyMessage="No meetings scheduled for today." />
+            <Section title="Top priorities" items={sections.top_priorities} emptyMessage="No ranked priorities need attention." />
+            <Section title="Overdue commitments" items={sections.overdue_commitments} emptyMessage="No overdue commitments." />
+            <Section title="Open risks" items={sections.risks} emptyMessage="No active risks." />
+            <Section title="Waiting on" items={sections.waiting_on} emptyMessage="Nothing is currently blocked on others." />
+            <Section title="Recent changes" items={sections.recently_changed} emptyMessage="No recent changes." />
+          </div>
+        ) : null}
 
-      <MorningBrief />
-      <WorkActionCenter />
-      <RecommendationPanel />
-      <SearchAuditPanel />
+        <MorningBrief />
+        <WorkActionCenter />
+        <RecommendationPanel />
+        <SearchAuditPanel />
+      </div>
     </main>
   )
 }

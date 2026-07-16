@@ -57,10 +57,11 @@ export default function WorkspaceNavigation({ currentView, onNavigate }: Workspa
           return (
             <button
               key={view}
+              id={`workspace-tab-${view}`}
               ref={(element) => { tabs.current[index] = element }}
               type="button"
               role="tab"
-              aria-controls="workspace-main"
+              aria-controls="workspace-panel"
               aria-selected={selected}
               tabIndex={selected ? 0 : -1}
               onClick={() => onNavigate(view)}
