@@ -2,104 +2,28 @@
 
 > A local-first AI Executive Operating System.
 
-Executive Command Center (ECC) helps an executive manage attention, context, commitments, decisions, knowledge, meetings and execution from one trusted workspace.
+Executive Command Center (ECC) is a specification-driven platform for helping executives manage attention, context, commitments, decisions, knowledge, meetings and execution.
 
-The product is built around a simple rule:
+## Current status
 
-> Stability is more valuable than optimization.
+**Foundation specification:** Phase 0 baseline approved  
+**Implementation:** Phase 1 backend vertical slices implemented through Recommendations and confirmation execution  
+**Current delivery phase:** Phase 1 — Executive Dashboard MVP  
+**Published specifications:** Phases 0–9; Phases 2–9 remain Draft / Planned
 
-The repository structure and Batch 1 specification set are frozen at version 1.0. New architecture or document types require an explicit user request.
+## Quick start
 
-## Product principles
-
-- Local first: user data remains locally owned and the core product works without cloud AI.
-- Human authority: ECC recommends and explains; people decide.
-- Explainability: consequential output must show evidence, reasoning and confidence.
-- Durable memory: facts, decisions and commitments preserve provenance and history.
-- Attention first: every feature must reduce cognitive overhead.
-- Progressive automation: observe, recommend, assist, automate, then consider autonomy.
-
-## Frozen project structure
-
-```text
-executive-command-center/
-├── README.md
-├── specification/
-│   ├── rfc/
-│   ├── adr/
-│   ├── standards/
-│   ├── phases/
-│   ├── templates/
-│   ├── schemas/
-│   ├── prompts/
-│   ├── diagrams/
-│   └── wireframes/
-├── backend/
-├── frontend/
-├── infra/
-├── tools/
-└── scripts/
-```
-
-Runtime manifests, lockfiles, tests and CI configuration remain at their required implementation locations. They are not specification document types.
-
-## Frozen document types
-
-Only four authoritative document types are permitted:
-
-| Type | Purpose | Location |
-|---|---|---|
-| RFC | Product, engineering and architecture decisions | `specification/rfc/` |
-| ADR | A proposed or accepted architecture decision | `specification/adr/` |
-| STD | Normative engineering and repository rules | `specification/standards/` |
-| SPEC | Phase or capability requirements | `specification/phases/` |
-
-Supporting schemas, prompts, diagrams and wireframes are artifacts referenced by an RFC, ADR, STD or SPEC. They are not independent document types.
-
-## Frozen Batch 1
-
-Batch 1 contains exactly these eight documents:
-
-1. [README.md](README.md)
-2. [RFC-001 — Product Definition](specification/rfc/RFC-001.md)
-3. [RFC-002 — Engineering Philosophy](specification/rfc/RFC-002.md)
-4. [RFC-003 — Design Principles](specification/rfc/RFC-003.md)
-5. [RFC-004 — System Architecture](specification/rfc/RFC-004.md)
-6. [RFC-005 — Technology Registry](specification/rfc/RFC-005.md)
-7. [STD-001 — Repository Standards](specification/standards/STD-001.md)
-8. [RFC-000 — Document Control](specification/rfc/RFC-000.md)
-
-Nothing is added to or removed from Batch 1 without an explicit user request.
-
-## Frozen delivery process
-
-Every specification document follows the same sequence:
-
-```text
-Write -> Review -> Revise -> Commit -> Next document
-```
-
-An improvement idea does not interrupt the active document. Record it later as `ADR-Proposed-XXX` and continue with the frozen specification.
-
-## Implementation status
-
-The backend and frontend contain an implemented Phase 1 product baseline. The frozen Batch 1 documents now govern future specification work. Existing implementation is preserved; this documentation reset does not claim that removed historical documents remain authoritative.
-
-## Local development
-
-Prerequisites:
-
-- Python 3.14.6
-- Node.js 22.17.0
-- pnpm 10.12.4
-- uv 0.7.19
-- Docker Engine 28.3.2
-- Docker Compose 2.38.2
-
-Bootstrap:
+The recommended development workflow runs PostgreSQL in Docker and the backend/frontend locally.
 
 ```bash
+git clone https://github.com/luckyrjain/executive-command-center.git
+cd executive-command-center
 cp .env.example .env
+```
+
+Set a random `ECC_SESSION_SECRET` of at least 32 characters in `.env`, then run:
+
+```bash
 docker compose up -d postgres
 uv sync --frozen --all-groups --python 3.14
 set -a; source .env; set +a
@@ -107,13 +31,13 @@ uv run alembic -c backend/alembic.ini upgrade head
 uv run python scripts/bootstrap_dev.py
 ```
 
-Run the backend:
+Start the backend:
 
 ```bash
 uv run uvicorn ecc.main:app --app-dir backend --reload --host 127.0.0.1 --port 8000
 ```
 
-Run the frontend:
+Start the frontend in another terminal:
 
 ```bash
 corepack enable
@@ -122,15 +46,105 @@ pnpm install --frozen-lockfile
 pnpm --filter @ecc/frontend dev
 ```
 
+Open the one-time URL printed by `scripts/bootstrap_dev.py`. The backend exchanges the code for an `HttpOnly` seven-day session cookie and redirects to `http://localhost:5173`.
+
+For prerequisites, Docker usage, testing, troubleshooting, reset instructions, and first-use guidance, read [Setup and Usage](docs/SETUP.md).
+
 Useful endpoints:
 
-- Frontend: `http://localhost:5173`
-- Backend: `http://localhost:8000`
-- OpenAPI: `http://localhost:8000/docs`
-- Readiness: `http://localhost:8000/health/ready`
+- frontend: `http://localhost:5173`
+- backend: `http://localhost:8000`
+- API docs: `http://localhost:8000/docs`
+- readiness: `http://localhost:8000/health/ready`
+
+## Start here
+
+Read the documents in this order:
+
+1. [Setup and Usage](docs/SETUP.md)
+2. [SPEC-000 — Constitution](docs/specifications/SPEC-000.md)
+3. [RFC-000 — Specification Governance](docs/RFC-000.md)
+4. [RFC-001 — Product Definition](docs/RFC-001.md)
+5. [RFC-002 — Engineering Philosophy](docs/RFC-002.md)
+6. [RFC-003 — Design Principles](docs/RFC-003.md)
+7. [RFC-004 — System Architecture](docs/RFC-004.md)
+8. [RFC-005 — Approved Technology Registry](docs/RFC-005.md)
+9. [STD-001 — Repository Standards](docs/standards/STD-001.md)
+10. [Canonical Domain Model](docs/domain/DOMAIN-MODEL.md)
+11. [PKOS Schema](docs/domain/PKOS-SCHEMA.md)
+12. [Domain Event Catalog](docs/domain/EVENT-CATALOG.md)
+13. [Domain API Contracts](docs/domain/API-CONTRACTS.md)
+14. [Phase 0 Security Baseline](docs/security/PHASE-0-SECURITY-BASELINE.md)
+15. [Phase 0 Backup and Restore](docs/operations/PHASE-0-BACKUP-RESTORE.md)
+16. [PHASE-000 — Repository Foundation](docs/phases/PHASE-000-repository-foundation.md)
+17. [PHASE-001 — Executive Dashboard MVP](docs/phases/PHASE-001-executive-dashboard-mvp.md)
+18. [Phase Documentation Index](docs/phases/README.md)
+19. [Phase 0–9 Documentation Review](docs/phases/PHASE-REVIEW.md)
+20. [Roadmap](docs/ROADMAP.md)
+21. [Contributing](docs/CONTRIBUTING.md)
+
+## Architecture decisions
+
+The accepted Phase 0 decisions are recorded under [`docs/adr`](docs/adr/):
+
+- ADR-0001 — Repository Layout
+- ADR-0002 — Local-First Architecture
+- ADR-0003 — Knowledge Platform and PKOS
+- ADR-0004 — AI Runtime
+- ADR-0005 — Event Bus
+- ADR-0006 — Storage Strategy
+- ADR-0007 — Model Router
+- ADR-0008 — Authentication and Workspace Identity
+- ADR-0009 — Connector Synchronization
+- ADR-0010 — Deployment Strategy
+
+## Phase 0 technology boundary
+
+Phase 0 uses a React web application, a FastAPI modular monolith and PostgreSQL 18. Neo4j, Qdrant, Redis, distributed messaging, Kubernetes, cloud services and the AI model runtime are explicitly deferred.
+
+All direct dependency, runtime, scanner and container versions are pinned in [RFC-005](docs/RFC-005.md). Lockfiles remain the source of truth for transitive dependency resolution.
+
+## Architecture chapters
+
+RFC-004 is split into independently reviewable chapters under [`docs/architecture`](docs/architecture/):
+
+- Architectural vision and system context
+- Core platform and service architecture
+- Runtime, deployment and operations
+- AI runtime
+- Knowledge platform and memory
+- Human attention engine
+- Connector and integration platform
+- Frontend and executive experience
+- Data platform
+- Security, privacy and local-first architecture
+- Platform operations
+
+## Governance support
+
+- [ADR process](docs/adr/README.md)
+- [RFC template](docs/templates/RFC-TEMPLATE.md)
+- [ADR template](docs/templates/ADR-TEMPLATE.md)
+- [Standard template](docs/templates/STD-TEMPLATE.md)
+- [Phase template](docs/templates/PHASE-TEMPLATE.md)
+- [Specification change request](docs/templates/SPEC-CHANGE-REQUEST.md)
+
+## Phase specifications
+
+- [PHASE-000 — Repository Foundation](docs/phases/PHASE-000-repository-foundation.md)
+- [PHASE-001 — Executive Dashboard MVP](docs/phases/PHASE-001-executive-dashboard-mvp.md)
+- [PHASE-002 — Knowledge Platform](docs/phases/PHASE-002-knowledge-platform.md)
+- [PHASE-003 — Human Attention Engine](docs/phases/PHASE-003-human-attention-engine.md)
+- [PHASE-004 — AI Runtime](docs/phases/PHASE-004-ai-runtime.md)
+- [PHASE-005 — Automation](docs/phases/PHASE-005-automation.md)
+- [PHASE-006 — Engineering Workspace](docs/phases/PHASE-006-engineering-workspace.md)
+- [PHASE-007 — Personal Intelligence](docs/phases/PHASE-007-personal-intelligence.md)
+- [PHASE-008 — Multi-user Workspaces](docs/phases/PHASE-008-multi-user.md)
+- [PHASE-009 — Enterprise](docs/phases/PHASE-009-enterprise.md)
+- [Canonical Phase Index and Supporting Contracts](docs/phases/README.md)
 
 ## Repository rule
 
-> If a capability is not defined by an approved RFC, ADR, STD or SPEC, it does not get implemented.
+> If a capability is not documented in the current phase specification, it does not get implemented.
 
-No process redesign, repository restructuring or additional document type is permitted unless the user requests it explicitly.
+Every behavior-changing change must include its specification, implementation, tests and documentation in the same pull request.
