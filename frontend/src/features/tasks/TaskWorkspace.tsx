@@ -16,7 +16,7 @@ type Task = {
 }
 
 type TaskList = { items: Task[]; next_cursor?: string | null }
-type TaskDraft = { title: string; description: string; priority: Task['manual_priority']; dueDate: string; dueAt: string }
+type TaskDraft = { title: string; description: string; priority: Task['manual_priority']; dueDate: string; dueAt: string; originalDueAt?: string }
 type EditState = TaskDraft & { task: Task; latestVersion: number; conflict: boolean }
 type Action = 'complete' | 'cancel' | 'archive' | 'restore'
 
@@ -29,8 +29,21 @@ function listTasks(): Promise<TaskList> {
 
 function duePayload(draft: TaskDraft): Record<string, string | null> {
   if (draft.dueDate) return { due_date: draft.dueDate, due_at: null }
-  if (draft.dueAt) return { due_date: null, due_at: new Date(draft.dueAt).toISOString() }
+  if (draft.dueAt) {
+    const dueAt = draft.originalDueAt && serverInstantToLocalInput(draft.originalDueAt) === draft.dueAt
+      ? draft.originalDueAt
+      : new Date(draft.dueAt).toISOString()
+    return { due_date: null, due_at: dueAt }
+  }
   return { due_date: null, due_at: null }
+}
+
+function pad(value: number): string { return String(value).padStart(2, '0') }
+
+export function serverInstantToLocalInput(value: string): string {
+  const instant = new Date(value)
+  if (Number.isNaN(instant.getTime())) return ''
+  return `${instant.getFullYear()}-${pad(instant.getMonth() + 1)}-${pad(instant.getDate())}T${pad(instant.getHours())}:${pad(instant.getMinutes())}`
 }
 
 function taskDraft(task: Task): TaskDraft {
@@ -39,7 +52,8 @@ function taskDraft(task: Task): TaskDraft {
     description: task.description ?? '',
     priority: task.manual_priority,
     dueDate: task.due_date ?? '',
-    dueAt: task.due_at ? task.due_at.slice(0, 16) : '',
+    dueAt: task.due_at ? serverInstantToLocalInput(task.due_at) : '',
+    originalDueAt: task.due_at ?? undefined,
   }
 }
 
@@ -74,10 +88,17 @@ export default function TaskWorkspace() {
       },
     }),
     onSuccess: () => { setEdit(null); void refresh() },
-    onError: (error) => {
+    onError: async (error) => {
       if (!(error instanceof ApiError) || error.code !== 'VERSION_CONFLICT') return
-      const current = error.current as Task | undefined
-      setEdit((value) => value ? { ...value, latestVersion: current?.version ?? value.latestVersion, conflict: true } : value)
+      const detail = error.current as { current_version?: number } | undefined
+      if (!edit) return
+      try {
+        const current = await apiRequest<Task>(`/api/v1/tasks/${edit.task.id}`)
+        const latestVersion = Math.max(current.version, detail?.current_version ?? current.version)
+        setEdit((value) => value ? { ...value, latestVersion, conflict: true } : value)
+      } catch {
+        setEdit((value) => value ? { ...value, conflict: true } : value)
+      }
     },
   })
   const actionMutation = useMutation({
@@ -122,8 +143,8 @@ export default function TaskWorkspace() {
           return <li key={task.id}>
             <div><strong>{task.title}</strong><small>{task.status.replaceAll('_', ' ')} · {task.manual_priority}</small></div>
             <div className="work-actions" aria-label={`Actions for ${task.title}`}>
-              {!archived && !terminal ? <><button type="button" aria-label={`Edit ${task.title}`} onClick={() => setEdit({ task, ...taskDraft(task), latestVersion: task.version, conflict: false })}>Edit</button><button type="button" aria-label={`Complete ${task.title}`} onClick={() => actionMutation.mutate({ task, action: 'complete' })}>Complete</button><button type="button" aria-label={`Cancel ${task.title}`} onClick={() => actionMutation.mutate({ task, action: 'cancel' })}>Cancel</button></> : null}
-              {!archived ? <button type="button" aria-label={`Archive ${task.title}`} onClick={() => actionMutation.mutate({ task, action: 'archive' })}>Archive</button> : <button type="button" aria-label={`Restore ${task.title}`} onClick={() => actionMutation.mutate({ task, action: 'restore' })}>Restore</button>}
+              {!archived && !terminal ? <><button type="button" disabled={actionMutation.isPending} aria-label={`Edit ${task.title}`} onClick={() => setEdit({ task, ...taskDraft(task), latestVersion: task.version, conflict: false })}>Edit</button><button type="button" disabled={actionMutation.isPending} aria-label={`Complete ${task.title}`} onClick={() => actionMutation.mutate({ task, action: 'complete' })}>Complete</button><button type="button" disabled={actionMutation.isPending} aria-label={`Cancel ${task.title}`} onClick={() => actionMutation.mutate({ task, action: 'cancel' })}>Cancel</button></> : null}
+              {!archived ? <button type="button" disabled={actionMutation.isPending} aria-label={`Archive ${task.title}`} onClick={() => actionMutation.mutate({ task, action: 'archive' })}>Archive</button> : <button type="button" disabled={actionMutation.isPending} aria-label={`Restore ${task.title}`} onClick={() => actionMutation.mutate({ task, action: 'restore' })}>Restore</button>}
             </div>
           </li>
         })}
@@ -136,8 +157,8 @@ export default function TaskWorkspace() {
         <label>Edit priority<select value={edit.priority} onChange={(event) => setEdit({ ...edit, priority: event.target.value as Task['manual_priority'] })}><option>low</option><option>medium</option><option>high</option><option>critical</option></select></label>
         <label>Edit due date<input type="date" value={edit.dueDate} disabled={Boolean(edit.dueAt)} onChange={(event) => setEdit({ ...edit, dueDate: event.target.value })} /></label>
         <label>Edit due time<input type="datetime-local" value={edit.dueAt} disabled={Boolean(edit.dueDate)} onChange={(event) => setEdit({ ...edit, dueAt: event.target.value })} /></label>
-        {edit.conflict ? <button type="button" onClick={() => submitEdit()}>Retry with latest version</button> : <button type="submit">Save task</button>}
-        <button type="button" onClick={() => setEdit(null)}>Discard edit</button>
+        {edit.conflict ? <button type="button" disabled={editMutation.isPending} onClick={() => submitEdit()}>Retry with latest version</button> : <button type="submit" disabled={editMutation.isPending}>Save task</button>}
+        <button type="button" disabled={editMutation.isPending} onClick={() => setEdit(null)}>Discard edit</button>
       </form> : null}
     </section>
   )

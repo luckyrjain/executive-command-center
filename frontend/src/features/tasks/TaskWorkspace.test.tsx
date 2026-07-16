@@ -6,6 +6,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import TaskWorkspace from './TaskWorkspace'
 
+declare const process: { env: Record<string, string | undefined> }
+
 const task = {
   id: 'task-1', title: 'Prepare board pack', description: 'Draft', status: 'planned',
   manual_priority: 'high', due_date: '2026-07-20', due_at: null, version: 4, archived_at: null,
@@ -94,10 +96,11 @@ describe('TaskWorkspace', () => {
   it('reloads current state on conflict and lets the user retry their edit', async () => {
     const current = { ...task, title: 'Board pack from another tab', version: 5 }
     const saved = { ...current, title: 'My board pack', version: 6 }
-    const conflict = { error: { code: 'VERSION_CONFLICT', message: 'changed', details: { current } } }
+    const conflict = { error: { code: 'VERSION_CONFLICT', message: 'changed', details: { current_version: 5 } } }
     const fetch = vi.fn()
       .mockImplementationOnce(() => response({ items: [task], next_cursor: null }))
       .mockImplementationOnce(() => response(conflict, 409))
+      .mockImplementationOnce(() => response(current))
       .mockImplementationOnce(() => response(saved))
       .mockImplementationOnce(() => response({ items: [saved], next_cursor: null }))
     vi.stubGlobal('fetch', fetch)
@@ -109,8 +112,30 @@ describe('TaskWorkspace', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Save task' }))
     await screen.findByText(/changed while you were editing/i)
     expect((screen.getByLabelText('Edit task title') as HTMLInputElement).value).toBe('My board pack')
+    await waitFor(() => expect(fetch).toHaveBeenCalledTimes(3))
+    expect(fetch.mock.calls[2][0]).toContain('/api/v1/tasks/task-1')
     fireEvent.click(screen.getByRole('button', { name: 'Retry with latest version' }))
-    await waitFor(() => expect(fetch).toHaveBeenCalledTimes(4))
-    expect(JSON.parse(String((fetch.mock.calls[2][1] as RequestInit).body))).toMatchObject({ expected_version: 5, title: 'My board pack' })
+    await waitFor(() => expect(fetch).toHaveBeenCalledTimes(5))
+    expect(JSON.parse(String((fetch.mock.calls[3][1] as RequestInit).body))).toMatchObject({ expected_version: 5, title: 'My board pack' })
+  })
+
+  it('preserves a server due instant when editing another field outside UTC', async () => {
+    const originalTimezone = process.env.TZ
+    process.env.TZ = 'Asia/Kolkata'
+    const timed = { ...task, due_date: null, due_at: '2026-07-20T04:30:00.000Z' }
+    const fetch = vi.fn()
+      .mockImplementationOnce(() => response({ items: [timed], next_cursor: null }))
+      .mockImplementationOnce(() => response({ ...timed, title: 'Updated title', version: 5 }))
+      .mockImplementationOnce(() => response({ items: [], next_cursor: null }))
+    vi.stubGlobal('fetch', fetch)
+    renderWorkspace()
+    await screen.findByText('Prepare board pack')
+    fireEvent.click(screen.getByRole('button', { name: 'Edit Prepare board pack' }))
+    expect((screen.getByLabelText('Edit due time') as HTMLInputElement).value).toBe('2026-07-20T10:00')
+    fireEvent.change(screen.getByLabelText('Edit task title'), { target: { value: 'Updated title' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Save task' }))
+    await waitFor(() => expect(fetch).toHaveBeenCalledTimes(3))
+    expect(JSON.parse(String((fetch.mock.calls[1][1] as RequestInit).body)).due_at).toBe('2026-07-20T04:30:00.000Z')
+    process.env.TZ = originalTimezone
   })
 })
