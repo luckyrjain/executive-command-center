@@ -5,6 +5,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-libra
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import NoteWorkspace from './NoteWorkspace'
+import { createNoteDraftRecoveryStore, type NoteDraftRecoveryStore } from './draftRecovery'
 
 const note = {
   id: 'note-1', owner_id: 'user-1', title: 'Board preparation', body: 'Review revenue and hiring',
@@ -17,9 +18,9 @@ function response(body: unknown, status = 200) {
   return Promise.resolve(new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } }))
 }
 
-function renderWorkspace() {
+function renderWorkspace(recoveryStore?: NoteDraftRecoveryStore) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } })
-  return render(<QueryClientProvider client={client}><NoteWorkspace /></QueryClientProvider>)
+  return render(<QueryClientProvider client={client}><NoteWorkspace recoveryStore={recoveryStore} /></QueryClientProvider>)
 }
 
 async function settleFakeTimers() {
@@ -291,5 +292,60 @@ describe('NoteWorkspace', () => {
 
     await waitFor(() => expect(fetch).toHaveBeenCalledTimes(5))
     expect(JSON.parse(String((fetch.mock.calls[4][1] as RequestInit).body))).toEqual({ expected_version: 6, body: 'Newest conflict draft' })
+  })
+
+  it('requires explicit reconciliation when a recovered draft base version is older than the server', async () => {
+    vi.useFakeTimers()
+    const recoveryStore = createNoteDraftRecoveryStore({ namespace: 'recovery-version-test' })
+    recoveryStore.put(note.id, { text: 'Failed version four draft', baseVersion: 4 })
+    const advanced = { ...note, body: 'Remote version five content', version: 5 }
+    const fetch = vi.fn()
+      .mockImplementationOnce(() => response({ items: [advanced], next_cursor: null }))
+      .mockImplementationOnce(() => response({ ...advanced, body: 'Failed version four draft', version: 6 }))
+    vi.stubGlobal('fetch', fetch)
+    renderWorkspace(recoveryStore)
+    await settleFakeTimers()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Edit Board preparation' }))
+    expect((screen.getByLabelText('Edit note body') as HTMLTextAreaElement).value).toBe('Failed version four draft')
+    expect(screen.getByRole('button', { name: 'Retry with latest version' })).toBeTruthy()
+    await act(async () => { await vi.advanceTimersByTimeAsync(751) })
+    expect(fetch).toHaveBeenCalledTimes(1)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Retry with latest version' }))
+    await settleFakeTimers()
+    expect(JSON.parse(String((fetch.mock.calls[1][1] as RequestInit).body))).toEqual({ expected_version: 5, body: 'Failed version four draft' })
+  })
+
+  it('does not activate a pending note switch after unmount', async () => {
+    vi.useFakeTimers()
+    const second = { ...note, id: 'note-2', title: 'Hiring plan', body: 'Remote hiring plan' }
+    const recoveryStore = createNoteDraftRecoveryStore({ namespace: 'unmount-race-test' })
+    let finishSave!: (value: Response) => void
+    const pendingSave = new Promise<Response>((resolve) => { finishSave = resolve })
+    const fetch = vi.fn()
+      .mockImplementationOnce(() => response({ items: [note, second], next_cursor: null }))
+      .mockRejectedValueOnce(new TypeError('note two offline'))
+      .mockRejectedValueOnce(new TypeError('note two still offline'))
+      .mockImplementationOnce(() => pendingSave)
+    vi.stubGlobal('fetch', fetch)
+    const rendered = renderWorkspace(recoveryStore)
+    await settleFakeTimers()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Edit Hiring plan' }))
+    fireEvent.change(screen.getByLabelText('Edit note body'), { target: { value: 'Recovered hiring draft' } })
+    fireEvent.blur(screen.getByLabelText('Edit note body'))
+    await settleFakeTimers()
+    fireEvent.click(screen.getByRole('button', { name: 'Edit Board preparation' }))
+    await settleFakeTimers()
+    fireEvent.change(screen.getByLabelText('Edit note body'), { target: { value: 'Pending first draft' } })
+    fireEvent.blur(screen.getByLabelText('Edit note body'))
+    fireEvent.click(screen.getByRole('button', { name: 'Edit Hiring plan' }))
+    rendered.unmount()
+    finishSave(new Response(JSON.stringify({ ...note, body: 'Pending first draft', version: 5 }), { status: 200 }))
+    await settleFakeTimers()
+
+    expect(fetch).toHaveBeenCalledTimes(4)
+    expect(fetch.mock.calls.slice(4).some(([url]) => String(url).includes('/notes/note-2'))).toBe(false)
   })
 })

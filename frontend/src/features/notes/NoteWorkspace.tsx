@@ -3,6 +3,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
 import { ApiError, apiRequest } from '../../api/client'
 import { createAutosaveController, type AutosaveController, type AutosaveState } from './autosave'
+import { createNoteDraftRecoveryStore, type NoteDraftRecoveryStore } from './draftRecovery'
 
 type Note = {
   id: string
@@ -19,8 +20,6 @@ type Action = 'archive' | 'restore'
 
 const emptyDraft: NoteDraft = { title: '', body: '', noteType: 'general' }
 const filters = { include_archived: true }
-const recoverableDrafts = new Map<string, string>()
-
 function listNotes(): Promise<NoteList> {
   return apiRequest('/api/v1/notes?include_archived=true&limit=100')
 }
@@ -31,8 +30,15 @@ function displayTitle(note: Note): string {
 
 const initialSaveState: AutosaveState = { status: 'idle', text: '', version: 1 }
 
-export default function NoteWorkspace() {
+type NoteWorkspaceProps = { recoveryStore?: NoteDraftRecoveryStore }
+
+export default function NoteWorkspace({ recoveryStore }: NoteWorkspaceProps) {
   const queryClient = useQueryClient()
+  const fallbackRecoveryStore = useRef<NoteDraftRecoveryStore | null>(null)
+  if (!fallbackRecoveryStore.current) {
+    fallbackRecoveryStore.current = createNoteDraftRecoveryStore({ namespace: crypto.randomUUID() })
+  }
+  const drafts = recoveryStore ?? fallbackRecoveryStore.current
   const query = useQuery({ queryKey: ['notes', filters], queryFn: listNotes, retry: 1 })
   const [create, setCreate] = useState<NoteDraft>(emptyDraft)
   const [search, setSearch] = useState('')
@@ -42,6 +48,9 @@ export default function NoteWorkspace() {
   const [conflictVersion, setConflictVersion] = useState<number | null>(null)
   const [conflictReloadFailed, setConflictReloadFailed] = useState(false)
   const controller = useRef<AutosaveController | null>(null)
+  const baseVersion = useRef(1)
+  const mounted = useRef(true)
+  const transition = useRef(0)
 
   const refresh = () => queryClient.invalidateQueries({ queryKey: ['notes'] })
   const createMutation = useMutation({
@@ -67,10 +76,15 @@ export default function NoteWorkspace() {
     )
   }, [query.data?.items, search])
 
-  useEffect(() => () => {
-    const activeController = controller.current
-    controller.current = null
-    void activeController?.dispose()
+  useEffect(() => {
+    mounted.current = true
+    return () => {
+      mounted.current = false
+      transition.current += 1
+      const activeController = controller.current
+      controller.current = null
+      void activeController?.dispose()
+    }
   }, [])
 
   function updateNoteCaches(saved: Note) {
@@ -79,32 +93,38 @@ export default function NoteWorkspace() {
       ...current,
       items: current.items.map((note) => note.id === saved.id ? saved : note),
     } : current)
-    setEditing((current) => current?.id === saved.id ? saved : current)
+    if (mounted.current) setEditing((current) => current?.id === saved.id ? saved : current)
   }
 
   async function reloadLatestNote(noteId: string) {
     try {
       const latest = await apiRequest<Note>(`/api/v1/notes/${noteId}`)
       queryClient.setQueryData(['note', noteId], latest)
-      setConflictVersion(latest.version)
-      setConflictReloadFailed(false)
+      if (mounted.current) {
+        setConflictVersion(latest.version)
+        setConflictReloadFailed(false)
+      }
     } catch {
-      setConflictVersion(null)
-      setConflictReloadFailed(true)
+      if (mounted.current) {
+        setConflictVersion(null)
+        setConflictReloadFailed(true)
+      }
     }
   }
 
-  function installController(note: Note) {
+  function installController(note: Note, initialVersion = note.version) {
     controller.current = createAutosaveController({
       delayMs: 750,
-      initialVersion: note.version,
+      initialVersion,
       save: async (nextBody, version) => {
         try {
           const saved = await apiRequest<Note>(`/api/v1/notes/${note.id}`, {
             method: 'PATCH', body: { expected_version: version, body: nextBody },
           })
           updateNoteCaches(saved)
-          if (recoverableDrafts.get(note.id) === nextBody) recoverableDrafts.delete(note.id)
+          drafts.removePersisted(note.id, { text: nextBody, baseVersion: version })
+          if (drafts.get(note.id)) drafts.rebase(note.id, saved.version)
+          baseVersion.current = saved.version
           return saved.version
         } catch (error) {
           if (error instanceof ApiError && error.code === 'VERSION_CONFLICT') {
@@ -125,22 +145,30 @@ export default function NoteWorkspace() {
   }
 
   function activateEditor(note: Note) {
-    const draft = recoverableDrafts.get(note.id) ?? note.body
+    const recovered = drafts.get(note.id)
+    const draft = recovered?.text ?? note.body
+    const draftBaseVersion = recovered?.baseVersion ?? note.version
+    baseVersion.current = draftBaseVersion
     setEditing(note)
     setBody(draft)
-    setConflictVersion(null)
+    setConflictVersion(recovered && draftBaseVersion !== note.version ? note.version : null)
     setConflictReloadFailed(false)
-    setSaveState({ ...initialSaveState, text: draft, version: note.version })
-    installController(note)
-    if (draft !== note.body) controller.current?.update(draft)
+    setSaveState(recovered && draftBaseVersion !== note.version
+      ? { status: 'error', text: draft, version: draftBaseVersion, error: new Error('Recovered draft needs reconciliation') }
+      : { ...initialSaveState, text: draft, version: draftBaseVersion })
+    installController(note, draftBaseVersion)
+    if (recovered && draftBaseVersion === note.version) controller.current?.update(draft)
   }
 
   function beginEditing(note: Note) {
+    const generation = ++transition.current
     if (!controller.current) {
-      activateEditor(note)
+      if (mounted.current) activateEditor(note)
       return
     }
-    void retireController().then(() => activateEditor(note))
+    void retireController().then(() => {
+      if (mounted.current && transition.current === generation) activateEditor(note)
+    })
   }
 
   function submitCreate(event: FormEvent) {
@@ -150,16 +178,18 @@ export default function NoteWorkspace() {
 
   function updateBody(nextBody: string) {
     setBody(nextBody)
-    if (editing) recoverableDrafts.set(editing.id, nextBody)
-    setConflictVersion(null)
-    setConflictReloadFailed(false)
+    if (editing) drafts.put(editing.id, { text: nextBody, baseVersion: baseVersion.current })
+    if (conflictVersion !== null || conflictReloadFailed) return
     controller.current?.update(nextBody)
   }
 
   async function retryConflict() {
     if (!editing || conflictVersion === null) return
+    drafts.rebase(editing.id, conflictVersion)
+    baseVersion.current = conflictVersion
     setConflictVersion(null)
     setConflictReloadFailed(false)
+    controller.current?.update(body)
     controller.current?.rebase(conflictVersion)
     await controller.current?.flush()
   }
@@ -197,7 +227,12 @@ export default function NoteWorkspace() {
       {saveState.status === 'error' && conflictVersion === null && !conflictReloadFailed ? <button type="button" onClick={() => { void controller.current?.flush() }}>Retry save</button> : null}
       {conflictReloadFailed ? <><p>Your note changed elsewhere, but the latest version could not be loaded. Your text is preserved.</p><button type="button" onClick={() => { void reloadLatestNote(editing.id) }}>Reload latest note</button></> : null}
       {conflictVersion !== null ? <><p>Your note changed elsewhere. Your text is preserved.</p><button type="button" onClick={() => { void retryConflict() }}>Retry with latest version</button></> : null}
-      <button type="button" onClick={() => { void retireController().then(() => setEditing(null)) }}>Close editor</button>
+      <button type="button" onClick={() => {
+        const generation = ++transition.current
+        void retireController().then(() => {
+          if (mounted.current && transition.current === generation) setEditing(null)
+        })
+      }}>Close editor</button>
     </section> : null}
   </section>
 }

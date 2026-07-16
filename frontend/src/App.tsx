@@ -7,6 +7,7 @@ import RecommendationPanel from './RecommendationPanel'
 import SearchAuditPanel from './SearchAuditPanel'
 import CommitmentWorkspace from './features/commitments/CommitmentWorkspace'
 import NoteWorkspace from './features/notes/NoteWorkspace'
+import { createNoteDraftRecoveryStore } from './features/notes/draftRecovery'
 import TaskWorkspace from './features/tasks/TaskWorkspace'
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:8000'
@@ -184,6 +185,7 @@ function MorningBrief() {
 
 export default function App() {
   const [currentView, setCurrentView] = useState<WorkspaceView>('today')
+  const [noteDraftRecovery] = useState(() => createNoteDraftRecoveryStore({ namespace: crypto.randomUUID() }))
   const dashboard = useQuery({
     queryKey: ['dashboard', 'today'],
     queryFn: fetchDashboard,
@@ -202,7 +204,7 @@ export default function App() {
             <TaskWorkspace />
             <CommitmentWorkspace />
           </div>
-        ) : currentView === 'notes' ? <NoteWorkspace /> : <><header className="topbar">
+        ) : currentView === 'notes' ? <NoteWorkspace recoveryStore={noteDraftRecovery} /> : <><header className="topbar">
           <div>
             <p className="eyebrow">EXECUTIVE COMMAND CENTER</p>
             <h1>Today</h1>
