@@ -29,5 +29,16 @@
     "workspace_isolation_required": true,
     "audit_coverage_required": true,
     "ai_disabled_acceptance_required": true
+  },
+  "evidence": {
+    "acceptance_contract": "tests/test_phase1_acceptance.py",
+    "search_performance": "tests/test_search_performance_postgres.py",
+    "priority_performance": "tests/test_risks_attention_postgres.py",
+    "browser_acceptance": "frontend/e2e/run.mjs",
+    "backup": "scripts/backup.sh",
+    "restore": "scripts/restore.sh",
+    "restore_verification": "scripts/verify_restore.sh",
+    "acceptance_workflow": ".github/workflows/phase1-acceptance.yml",
+    "standard_ci_workflow": ".github/workflows/ci.yml"
   }
 }
