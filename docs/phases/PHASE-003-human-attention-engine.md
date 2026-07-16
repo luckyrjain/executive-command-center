@@ -2,11 +2,15 @@
 id: PHASE-003
 title: Human Attention Engine
 status: Draft
-version: 0.1.0
+version: 0.2.0
 owner: Lucky Jain
 depends_on:
-  - PHASE-001
   - PHASE-002
+  - RFC-001
+  - RFC-003
+  - RFC-004
+  - RFC-005
+  - STD-001
 contracts:
   - phase-003/DATA-MODEL.md
   - phase-003/API-SCHEMAS.md
@@ -21,68 +25,86 @@ contracts:
 
 ## Objective
 
-Convert trusted commitments, risks, meetings and connected knowledge into an explainable, user-controlled system for allocating executive attention.
+Convert trusted commitments, risks, meetings and knowledge into an explainable, user-controlled system for allocating executive attention.
 
 ## User value
 
-The user understands what deserves attention, why it matters, who is waiting on whom, what can safely wait, how the day should be planned and what context is needed before each meeting.
+The user understands what matters, why it matters, who owes the next action, what can wait, how to plan available capacity and how to prepare for meetings.
 
 ## In scope
 
-- Unified attention items derived from authoritative work and knowledge.
-- Explainable deterministic priority scoring and bounded policy configuration.
-- Waiting-on-me, waiting-on-them and blocked-by tracking.
-- Risk escalation, review cadence and staleness.
-- Daily and weekly planning with capacity and protected focus windows.
-- Meeting preparation packs built from authorized knowledge and current obligations.
-- Dismiss, defer, pin, accept and correct feedback loops.
-- Scenario preview before a planning change is applied.
-- Audit, provenance, workspace isolation and deterministic AI-disabled operation.
+Unified attention projection; deterministic priority; waiting-on-me/them and blocked-by; risk review cadence; daily/weekly planning; capacity and focus windows; meeting-preparation packs; pin/dismiss/defer/feedback; scenario and replan diffs; deterministic AI-disabled operation.
 
 ## Out of scope
 
-Autonomous scheduling; external calendar writes; background agents; predictive ML risk models; employee scoring; performance surveillance; automatic messaging; multi-user delegation; optimization across personal domains.
+Autonomous scheduling, external calendar writes, background agents, predictive ML risk, person/employee scoring, performance surveillance, automatic messaging, multi-user delegation and cross-domain optimization.
 
 ## Functional requirements
 
-- Every attention item exposes factors, evidence, confidence, freshness and policy version.
-- Hard safety and user-pinned constraints cannot be overridden by inferred priority.
+- Attention items expose factors, evidence, confidence, freshness and policy version.
+- Hard safety constraints and explicit pins cannot be overridden by inference.
 - Waiting direction and accountable owner are explicit and history preserving.
-- Plans never exceed declared capacity without showing an unresolved conflict.
-- Plan suggestions remain proposals until the user accepts them.
-- Meeting packs cite sources and distinguish fact, unresolved question and suggestion.
-- Missing or permission-denied evidence lowers confidence and remains visible.
-- Feedback updates user-controlled preferences or labelled evaluation data; it does not silently rewrite history.
+- Plans show every capacity/deadline/constraint conflict.
+- Plan proposals require explicit acceptance and do not mutate external calendars.
+- Replanning produces a user-reviewable diff; accepted plans are never silently rewritten.
+- Meeting packs cite sources and separate fact, unresolved question and suggestion.
+- Feedback is explicit labelled evidence and never rewrites history automatically.
+- Missing/permission-denied evidence lowers confidence visibly.
 
 ## Non-functional requirements
 
-- Today attention query p95 <500 ms for 10,000 active inputs.
-- Daily plan generation p95 <1 second using deterministic planning.
-- Meeting pack retrieval p95 <2 seconds excluding optional enrichment.
-- Equivalent inputs, policy and time produce equivalent deterministic output.
-- Core workflows function without AI or internet access.
+Attention query p95 <500 ms for 10,000 inputs; deterministic daily plan p95 <1 second; meeting pack p95 <2 seconds excluding optional enrichment. Equivalent input/policy/time gives equivalent output. Core flows work without AI/internet and meet WCAG 2.2 AA.
 
 ## Architecture impact
 
-Add attention projection, dependency/waiting, planning and meeting-preparation modules to the modular monolith. Phase 2 knowledge remains the context source. Phase 1 records remain authoritative for tasks, commitments, meetings and risks.
+Add attention projection, waiting/dependency, risk-review, planning and meeting-preparation modules. Phase 1 remains authoritative for work; Phase 2 provides knowledge. Overrides and accepted plans are authoritative; scores and draft plans are rebuildable.
 
-## Security and ethics
+## Data changes
 
-No ranking by protected characteristics, inferred personality or employee productivity. Private notes and restricted sources appear only when authorized. The UI must not present the score as an objective judgement of a person.
+Add attention projections/overrides, waiting links, risk reviews, capacity profiles, constraints, plans/blocks, meeting packs and feedback defined in `phase-003/DATA-MODEL.md`.
 
-## Acceptance and exit criteria
+## API changes
 
-- Contracts and policy versions approved.
-- Deterministic score, waiting, risk, plan and meeting-pack tests pass.
-- Explainability, feedback, staleness and AI-disabled flows pass.
-- Fairness review confirms excluded signals and absence of person-ranking behavior.
-- Browser acceptance, isolation, redaction, backup/restore and performance gates pass.
-- Two weeks of daily-use validation show useful plans without missed critical commitments.
+Add attention, waiting, risk-review, capacity, plan and meeting-preparation endpoints defined in `phase-003/API-SCHEMAS.md`. Plan acceptance and accountable-state changes are idempotent, concurrency checked and audited.
 
-## Rollback
+## Frontend changes
 
-Disable planning and meeting-enrichment flags independently. Rebuild projections from authoritative Phase 1/2 records. Preserve manual pins, deferrals and accepted plans through forward fixes.
+Add Attention Queue, Waiting views, Risk Review, daily/weekly Planner, conflict/replan review and Meeting Preparation. Scores are secondary to plain-language explanation. Accessible list views accompany timelines.
+
+## Security and privacy
+
+No protected characteristics, inferred personality, activity-volume or response-speed performance proxies. Private/restricted evidence is used only when authorized. The system ranks work, never people. Cross-workspace IDs return 404.
+
+## Observability
+
+Measure projection lag, policy version distribution, score duration/input count, critical-item recall fixtures, dismiss/defer/pin rates, waiting ageing, plan feasibility/conflicts/churn, meeting-pack staleness/coverage and fallback. Telemetry contains no private content or person scores.
+
+## Test strategy
+
+Policy scenario tests, deterministic/property tests, prohibited-signal checks, waiting lifecycle, planning constraints/timezone/DST, meeting citation/staleness, isolation/redaction, accessibility, performance, backup/restore and two-week dogfood.
+
+## Acceptance criteria
+
+- Every attention result has inspectable factors/evidence.
+- Determinism, stable tie and prohibited-signal tests pass.
+- No plan silently violates a hard constraint or hides unscheduled work.
+- Waiting/risk lifecycle and meeting citations pass.
+- Performance, AI-disabled, isolation, accessibility and browser gates pass.
+- Fairness/ethics review confirms work-not-people ranking.
+
+## Exit criteria
+
+- Contracts explicitly approved before implementation.
+- All slices and migrations merged with benchmark evidence.
+- Two-week dogfood records top-five usefulness, critical misses, false urgency, plan acceptance/churn and meeting corrections.
+- No missed critical item or unsupported meeting fact remains unresolved.
+- Zero open Critical, High or Medium findings.
+- Phase 4 can consume stable context and proposal contracts.
+
+## Rollback plan
+
+Disable planning and meeting enrichment independently. Rebuild projections from Phase 1/2 sources. Preserve overrides, feedback and accepted plans. Revert policy versions without rewriting history.
 
 ## Deferred backlog
 
-External calendar writes, automatic delegation, predictive risk, agentic replanning, team capacity optimization and cross-domain personal planning.
+External calendar writes, automatic delegation, predictive risk, agentic replanning, team capacity optimization and cross-domain planning.
