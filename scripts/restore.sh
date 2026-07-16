@@ -3,6 +3,7 @@ set -euo pipefail
 
 BACKUP=${1:?usage: restore.sh BACKUP}
 TARGET_DATABASE_URL="${RESTORE_DATABASE_URL:-${2:-}}"
+PG_CLIENT_IMAGE="${PG_CLIENT_IMAGE:-}"
 
 if [[ -z "${TARGET_DATABASE_URL}" ]]; then
   echo "RESTORE_DATABASE_URL or a target database URL is required" >&2
@@ -23,11 +24,21 @@ else
 fi
 
 PG_URL="${TARGET_DATABASE_URL/postgresql+psycopg:/postgresql:}"
-pg_restore \
-  --clean \
-  --if-exists \
-  --exit-on-error \
-  --no-owner \
-  --no-privileges \
-  --dbname="${PG_URL}" \
-  "${BACKUP}"
+
+if [[ -n "${PG_CLIENT_IMAGE}" ]]; then
+  backup_dir="$(cd "$(dirname "${BACKUP}")" && pwd)"
+  docker run --rm --network host \
+    -v "${backup_dir}:/backups:ro" \
+    "${PG_CLIENT_IMAGE}" \
+    pg_restore --clean --if-exists --exit-on-error --no-owner --no-privileges \
+    --dbname="${PG_URL}" "/backups/$(basename "${BACKUP}")"
+else
+  pg_restore \
+    --clean \
+    --if-exists \
+    --exit-on-error \
+    --no-owner \
+    --no-privileges \
+    --dbname="${PG_URL}" \
+    "${BACKUP}"
+fi
