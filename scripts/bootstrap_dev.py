@@ -36,7 +36,7 @@ def _allow_remote_database() -> bool:
 
 
 def _validate_environment(database_url: str) -> None:
-    if os.getenv("ECC_ENV", "development").casefold() != "development":
+    if os.getenv("ECC_ENV", "").casefold() != "development":
         raise SystemExit("bootstrap_dev.py may only run when ECC_ENV=development.")
 
     hostname = urlsplit(database_url).hostname
