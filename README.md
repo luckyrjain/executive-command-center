@@ -61,27 +61,28 @@ Useful endpoints:
 
 Read the documents in this order:
 
-1. [Setup and Usage](docs/SETUP.md)
-2. [SPEC-000 — Constitution](docs/specifications/SPEC-000.md)
-3. [RFC-000 — Specification Governance](docs/RFC-000.md)
-4. [RFC-001 — Product Definition](docs/RFC-001.md)
-5. [RFC-002 — Engineering Philosophy](docs/RFC-002.md)
-6. [RFC-003 — Design Principles](docs/RFC-003.md)
-7. [RFC-004 — System Architecture](docs/RFC-004.md)
-8. [RFC-005 — Approved Technology Registry](docs/RFC-005.md)
-9. [STD-001 — Repository Standards](docs/standards/STD-001.md)
-10. [Canonical Domain Model](docs/domain/DOMAIN-MODEL.md)
-11. [PKOS Schema](docs/domain/PKOS-SCHEMA.md)
-12. [Domain Event Catalog](docs/domain/EVENT-CATALOG.md)
-13. [Domain API Contracts](docs/domain/API-CONTRACTS.md)
-14. [Phase 0 Security Baseline](docs/security/PHASE-0-SECURITY-BASELINE.md)
-15. [Phase 0 Backup and Restore](docs/operations/PHASE-0-BACKUP-RESTORE.md)
-16. [PHASE-000 — Repository Foundation](docs/phases/PHASE-000-repository-foundation.md)
-17. [PHASE-001 — Executive Dashboard MVP](docs/phases/PHASE-001-executive-dashboard-mvp.md)
-18. [Phase Documentation Index](docs/phases/README.md)
-19. [Phase 0–9 Documentation Review](docs/phases/PHASE-REVIEW.md)
-20. [Roadmap](docs/ROADMAP.md)
-21. [Contributing](docs/CONTRIBUTING.md)
+1. [Document Control](docs/00-document-control.md)
+2. [Setup and Usage](docs/SETUP.md)
+3. [SPEC-000 — Constitution](docs/specifications/SPEC-000.md)
+4. [RFC-000 — Specification Governance](docs/RFC-000.md)
+5. [RFC-001 — Product Definition](docs/RFC-001.md)
+6. [RFC-002 — Engineering Philosophy](docs/RFC-002.md)
+7. [RFC-003 — Design Principles](docs/RFC-003.md)
+8. [RFC-004 — System Architecture](docs/RFC-004.md)
+9. [RFC-005 — Approved Technology Registry](docs/RFC-005.md)
+10. [STD-001 — Repository Standards](docs/standards/STD-001.md)
+11. [Canonical Domain Model](docs/domain/DOMAIN-MODEL.md)
+12. [PKOS Schema](docs/domain/PKOS-SCHEMA.md)
+13. [Domain Event Catalog](docs/domain/EVENT-CATALOG.md)
+14. [Domain API Contracts](docs/domain/API-CONTRACTS.md)
+15. [Phase 0 Security Baseline](docs/security/PHASE-0-SECURITY-BASELINE.md)
+16. [Phase 0 Backup and Restore](docs/operations/PHASE-0-BACKUP-RESTORE.md)
+17. [PHASE-000 — Repository Foundation](docs/phases/PHASE-000-repository-foundation.md)
+18. [PHASE-001 — Executive Dashboard MVP](docs/phases/PHASE-001-executive-dashboard-mvp.md)
+19. [Phase Documentation Index](docs/phases/README.md)
+20. [Phase 0–9 Documentation Review](docs/phases/PHASE-REVIEW.md)
+21. [Roadmap](docs/ROADMAP.md)
+22. [Contributing](docs/CONTRIBUTING.md)
 
 ## Architecture decisions
 
@@ -146,5 +147,7 @@ RFC-004 is split into independently reviewable chapters under [`docs/architectur
 ## Repository rule
 
 > If a capability is not documented in the current phase specification, it does not get implemented.
+
+This is the Golden Rule defined in [Document Control](docs/00-document-control.md#golden-rule).
 
 Every behavior-changing change must include its specification, implementation, tests and documentation in the same pull request.

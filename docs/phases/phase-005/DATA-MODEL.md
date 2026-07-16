@@ -20,4 +20,4 @@ owner: Lucky Jain
 | secret_references | Opaque reference; never secret value |
 | notifications | Delivery state for run events |
 
-Run states are `queued|waiting_approval|running|paused|succeeded|failed|cancelled|compensating|compensated`. Definitions and policies are immutable once active. All external actions carry stable idempotency keys and workspace scope.
+Run states are `queued|waiting_approval|running|paused|needs_review|succeeded|failed|cancelled|compensating|compensated`. `needs_review` holds a run when an external outcome cannot be classified as success or transient failure (see Execution Contract) and blocks automatic retry until a human resolves it. Definitions and policies are immutable once active. All external actions carry stable idempotency keys and workspace scope.
