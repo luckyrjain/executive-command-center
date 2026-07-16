@@ -5,7 +5,8 @@ import type { WorkspaceView } from './api/types'
 import WorkspaceNavigation from './navigation/WorkspaceNavigation'
 import RecommendationPanel from './RecommendationPanel'
 import SearchAuditPanel from './SearchAuditPanel'
-import WorkActionCenter from './WorkActionCenter'
+import CommitmentWorkspace from './features/commitments/CommitmentWorkspace'
+import TaskWorkspace from './features/tasks/TaskWorkspace'
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:8000'
 
@@ -195,7 +196,12 @@ export default function App() {
     <main id="workspace-main" className="app-shell">
       <WorkspaceNavigation currentView={currentView} onNavigate={setCurrentView} />
       <div id="workspace-panel" role="tabpanel" aria-labelledby={`workspace-tab-${currentView}`}>
-        <header className="topbar">
+        {currentView === 'work' ? (
+          <div className="work-grid">
+            <TaskWorkspace />
+            <CommitmentWorkspace />
+          </div>
+        ) : <><header className="topbar">
           <div>
             <p className="eyebrow">EXECUTIVE COMMAND CENTER</p>
             <h1>Today</h1>
@@ -230,9 +236,9 @@ export default function App() {
         ) : null}
 
         <MorningBrief />
-        <WorkActionCenter />
         <RecommendationPanel />
         <SearchAuditPanel />
+        </>}
       </div>
     </main>
   )
