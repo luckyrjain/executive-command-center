@@ -194,6 +194,19 @@ button:disabled { opacity: .6; cursor: wait; }
 .work-actions { display: flex; flex-wrap: wrap; gap: 8px; }
 .work-actions button { padding: 8px 13px; }
 
+.risk-factors { list-style: none; margin: 8px 0 0; padding: 0; display: flex; flex-wrap: wrap; gap: 6px; }
+.risk-factors li { border: 1px solid #e3e8ef; border-radius: 999px; padding: 4px 11px; font-size: 12px; color: #4f5b6d; }
+
+.recommendation-preview { margin-top: 14px; padding-top: 14px; border-top: 1px dashed #e7ebf0; display: grid; gap: 10px; }
+.evidence-preview { list-style: none; margin: 0; padding: 0; display: flex; flex-wrap: wrap; gap: 8px; }
+.evidence-preview li { border-radius: 999px; padding: 4px 11px; font-size: 12px; text-transform: capitalize; display: flex; gap: 6px; }
+.evidence-preview li span { font-weight: 700; }
+.evidence-preview .evidence-available { border: 1px solid #b7e0c4; background: #eefaf1; color: #1c6b3a; }
+.evidence-preview .evidence-missing { border: 1px solid #e3c8c8; background: #fdf1f1; color: #8a2c2c; }
+.risk-factor-preview p { margin: 0; color: #4f5b6d; font-size: 13px; }
+.risk-factor-preview ul { list-style: none; margin: 8px 0 0; padding: 0; display: flex; flex-wrap: wrap; gap: 6px; }
+.risk-factor-preview li { border: 1px solid #e3e8ef; border-radius: 999px; padding: 4px 11px; font-size: 12px; color: #4f5b6d; }
+
 .note-create-form,
 .note-editor { display: grid; gap: 14px; margin-top: 28px; }
 .note-create-form label,

@@ -148,20 +148,32 @@ it('adds mutation protection headers', async () => {
 - Modify: `frontend/src/RecommendationPanel.tsx`
 - Modify: `frontend/src/RecommendationPanel.test.ts`
 - Modify: `frontend/src/App.tsx`
+- Create: `frontend/src/MorningBrief.tsx`
 - Create: `frontend/src/MorningBrief.test.tsx`
+- Create: `backend/ecc/domains/knowledge/evidence.py`
+- Create: `tests/test_evidence_postgres.py`
+- Modify: `backend/ecc/main.py`
 
 **Interfaces:**
 - Produces risk create/edit/archive/restore and contracted state transitions available from the API.
-- Recommendation previews expose action, target version, confidence, factors, and evidence state before confirmation.
+- Recommendation previews expose action, target version, confidence, factors (risk targets only — see note), and evidence state before confirmation.
+- New `GET /api/v1/evidence?id=<uuid>&id=<uuid>...`: workspace-scoped, resolves each requested evidence id against `pkos_evidence` (joined to `pkos_nodes` for a label via `canonical_name`). Returns one item per requested id: `{id, status: "available"|"missing", source_type, label, captured_at}` (`source_type`/`label`/`captured_at` null when `status: "missing"`). No `permission_denied`/`deleted` status — not reachable from current schema (no soft-delete on `pkos_evidence`; a cross-workspace id is indistinguishable from a nonexistent one, matching the non-disclosure constraint, so both resolve to `"missing"`).
 
-- [ ] **Step 1: Write failing risk tests** for numeric bounds, required mitigation/trigger/review fields, optimistic editing, lifecycle actions, archive, and restore.
+**2026-07-16 scope note (user-approved amendment to the original plan text):**
+- "Factors" is not a field on `RecommendationResponse` (only `RiskResponse` and `/attention` items have it). Recommendation previews show target factors **only when `target_type == "risk"`**, fetched via the existing `GET /risks/{id}`. Task/commitment targets have no reliable single-entity factors source (only the list-based `/attention` endpoint, which may not contain the item) — show the target's core fields instead, no factors.
+- "Required mitigation/trigger/review fields" is a **frontend form requirement only**. The backend `RiskCreate`/`RiskPatch` models leave `mitigation`/`trigger`/`review_at` nullable and must stay that way (frozen contract) — the risk workspace's own form validation enforces non-empty values before submit.
+- The evidence-resolution endpoint above is new backend surface added specifically to back "evidence state" in the recommendation/confirmation preview, which had no prior data source.
+
+- [ ] **Step 1: Write failing risk tests** for numeric bounds, frontend-required mitigation/trigger/review fields, optimistic editing, lifecycle actions, archive, and restore.
 - [ ] **Step 2: Implement and wire the risk workspace; run focused green tests.**
-- [ ] **Step 3: Write failing recommendation tests** proving publication preview, confirmation preview, all evidence states, terminal-state action suppression, and conflict-safe refetch.
-- [ ] **Step 4: Implement the missing recommendation presentation and state rules.**
-- [ ] **Step 5: Write failing Morning Brief tests** for POST refresh, stale-to-fresh replacement, AI-disabled state, and recoverable refresh failure.
-- [ ] **Step 6: Extract `MorningBrief` for testability and implement the tested behavior.**
-- [ ] **Step 7: Run full frontend tests, typecheck, and production build.**
-- [ ] **Step 8: Commit:** `git commit -m "feat(frontend): complete risks recommendations and brief"`.
+- [ ] **Step 3: Write failing backend tests** for the evidence-resolution endpoint (available id, missing id, mixed batch, cross-workspace id resolves as `missing` not a distinct status, empty/absent query).
+- [ ] **Step 4: Implement `GET /api/v1/evidence` and register its router; run focused green tests plus Ruff/mypy/Snyk.**
+- [ ] **Step 5: Write failing recommendation tests** proving publication preview, confirmation preview, all reachable evidence states (`available`/`missing`), risk-target factors display, terminal-state action suppression, and conflict-safe refetch.
+- [ ] **Step 6: Implement the missing recommendation presentation and state rules**, calling the new evidence endpoint and (for risk targets) `GET /risks/{id}` for factors.
+- [ ] **Step 7: Write failing Morning Brief tests** for POST refresh, stale-to-fresh replacement, AI-disabled state, and recoverable refresh failure.
+- [ ] **Step 8: Extract `MorningBrief` out of `App.tsx` into its own file for testability and implement the tested behavior.**
+- [ ] **Step 9: Run full frontend tests, typecheck, and production build; run full backend tests, Ruff, mypy, and Snyk.**
+- [ ] **Step 10: Commit:** `git commit -m "feat(frontend): complete risks recommendations and brief"`.
 
 ### Task 6: Normative Playwright scenarios and accessibility
 

@@ -1,8 +1,9 @@
 import { useState } from 'react'
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { useQuery } from '@tanstack/react-query'
 
 import type { WorkspaceView } from './api/types'
 import WorkspaceNavigation from './navigation/WorkspaceNavigation'
+import MorningBrief from './MorningBrief'
 import RecommendationPanel from './RecommendationPanel'
 import SearchAuditPanel from './SearchAuditPanel'
 import CommitmentWorkspace from './features/commitments/CommitmentWorkspace'
@@ -10,6 +11,7 @@ import NoteWorkspace from './features/notes/NoteWorkspace'
 import { createNoteDraftRecoveryStore } from './features/notes/draftRecovery'
 import TaskWorkspace from './features/tasks/TaskWorkspace'
 import ScheduleWorkspace from './features/schedule/ScheduleWorkspace'
+import RiskWorkspace from './features/risks/RiskWorkspace'
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:8000'
 
@@ -40,21 +42,6 @@ type DashboardResponse = {
   sections: Record<string, DashboardItem[]>
 }
 
-type MorningBriefResponse = {
-  id: string
-  briefing_date: string
-  generation_version: number
-  sections: Record<string, DashboardItem[]>
-  source_versions: Record<string, number>
-  evidence_ids: string[]
-  generated_at: string
-  timezone: string
-  algorithm_version: string
-  ai_status: string
-  stale: boolean
-  stale_reason?: string | null
-}
-
 type ErrorEnvelope = {
   error?: { code?: string; message?: string }
 }
@@ -76,24 +63,6 @@ async function api<T>(path: string, init?: RequestInit): Promise<T> {
 
 function fetchDashboard(): Promise<DashboardResponse> {
   return api('/api/v1/dashboard/today')
-}
-
-function fetchMorningBrief(): Promise<MorningBriefResponse> {
-  return api('/api/v1/briefs/morning')
-}
-
-function refreshMorningBrief(): Promise<MorningBriefResponse> {
-  return api('/api/v1/briefs/morning', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Idempotency-Key': crypto.randomUUID(),
-      'X-CSRF-Token': document.cookie
-        .split('; ')
-        .find((value) => value.startsWith('ecc_csrf='))
-        ?.split('=')[1] ?? '',
-    },
-  })
 }
 
 function labelFor(item: DashboardItem): string {
@@ -142,48 +111,6 @@ function Section({ title, items, emptyMessage }: { title: string; items?: Dashbo
   )
 }
 
-function MorningBrief() {
-  const queryClient = useQueryClient()
-  const brief = useQuery({ queryKey: ['brief', 'morning'], queryFn: fetchMorningBrief, retry: 1 })
-  const refresh = useMutation({
-    mutationFn: refreshMorningBrief,
-    onSuccess: (data) => queryClient.setQueryData(['brief', 'morning'], data),
-  })
-
-  return (
-    <section className="brief-panel" aria-labelledby="morning-brief-title">
-      <div className="brief-heading">
-        <div>
-          <p className="eyebrow">PERSISTED DAILY BRIEF</p>
-          <h2 id="morning-brief-title">Morning Brief</h2>
-          <p>{brief.data ? `Generation ${brief.data.generation_version} · ${brief.data.ai_status.replaceAll('_', ' ')}` : 'A deterministic briefing of today’s attention.'}</p>
-        </div>
-        <button type="button" onClick={() => refresh.mutate()} disabled={refresh.isPending || brief.isLoading}>
-          {refresh.isPending ? 'Refreshing…' : 'Refresh brief'}
-        </button>
-      </div>
-
-      {brief.isLoading ? <div className="inline-status" role="status">Preparing your morning brief…</div> : null}
-      {brief.isError ? <div className="inline-status error-panel" role="alert">{brief.error.message}</div> : null}
-      {refresh.isError ? <div className="inline-status error-panel" role="alert">{refresh.error.message}</div> : null}
-      {brief.data?.stale ? (
-        <div className="inline-status degraded-panel" role="status">
-          This brief is stale{brief.data.stale_reason ? `: ${brief.data.stale_reason.replaceAll('_', ' ')}` : ''}. Refresh to regenerate it.
-        </div>
-      ) : null}
-
-      {brief.data ? (
-        <div className="brief-grid">
-          <Section title="Brief schedule" items={brief.data.sections.today_schedule} emptyMessage="No meetings in the brief." />
-          <Section title="Brief priorities" items={brief.data.sections.top_priorities} emptyMessage="No priorities in the brief." />
-          <Section title="Brief commitments" items={brief.data.sections.overdue_commitments} emptyMessage="No overdue commitments." />
-          <Section title="Brief risks" items={brief.data.sections.risks} emptyMessage="No open risks." />
-        </div>
-      ) : null}
-    </section>
-  )
-}
-
 export default function App() {
   const [currentView, setCurrentView] = useState<WorkspaceView>('today')
   const [noteDraftRecovery] = useState(() => createNoteDraftRecoveryStore({ namespace: crypto.randomUUID() }))
@@ -205,7 +132,12 @@ export default function App() {
             <TaskWorkspace />
             <CommitmentWorkspace />
           </div>
-        ) : currentView === 'notes' ? <NoteWorkspace recoveryStore={noteDraftRecovery} /> : currentView === 'schedule' ? <ScheduleWorkspace /> : <><header className="topbar">
+        ) : currentView === 'notes' ? <NoteWorkspace recoveryStore={noteDraftRecovery} />
+        : currentView === 'schedule' ? <ScheduleWorkspace />
+        : currentView === 'risks' ? <RiskWorkspace />
+        : currentView === 'recommendations' ? <RecommendationPanel />
+        : currentView === 'search-audit' ? <SearchAuditPanel />
+        : <><header className="topbar">
           <div>
             <p className="eyebrow">EXECUTIVE COMMAND CENTER</p>
             <h1>Today</h1>
@@ -240,8 +172,6 @@ export default function App() {
         ) : null}
 
         <MorningBrief />
-        <RecommendationPanel />
-        <SearchAuditPanel />
         </>}
       </div>
     </main>

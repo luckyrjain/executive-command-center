@@ -1,5 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
+import { apiRequest } from './api/client'
+
 const API_BASE = import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:8000'
 
 type RecommendationStatus =
@@ -34,6 +36,26 @@ export type Recommendation = {
 type RecommendationList = {
   items: Recommendation[]
   next_cursor?: string | null
+}
+
+type EvidenceItem = {
+  id: string
+  status: 'available' | 'missing'
+  source_type: string | null
+  label: string | null
+  captured_at: string | null
+}
+
+type EvidenceList = { items: EvidenceItem[] }
+
+type RiskFactor = { code: string; label: string; points: number; source_field?: string }
+
+/** Subset of RiskResponse used only to preview factors for risk-target recommendations. */
+type RiskPreview = {
+  id: string
+  score: number
+  factors: RiskFactor[]
+  explanation: string
 }
 
 type ErrorEnvelope = {
@@ -134,6 +156,62 @@ export function recommendationErrorMessage(error: Error): string {
   return error.message
 }
 
+export function evidenceQueryPath(evidenceIds: string[]): string {
+  const params = new URLSearchParams()
+  evidenceIds.forEach((id) => params.append('id', id))
+  return `/api/v1/evidence?${params}`
+}
+
+function EvidencePreview({ label, evidenceIds }: { label: string; evidenceIds: string[] }) {
+  const query = useQuery({
+    queryKey: ['evidence-preview', evidenceIds],
+    queryFn: () => apiRequest<EvidenceList>(evidenceQueryPath(evidenceIds)),
+    enabled: evidenceIds.length > 0,
+    retry: 1,
+  })
+
+  if (!evidenceIds.length) return null
+  if (query.isLoading) return <p role="status">Loading evidence…</p>
+  if (query.isError) return <p role="alert">{query.error.message}</p>
+
+  return (
+    <ul className="evidence-preview" aria-label={`Evidence for ${label}`}>
+      {(query.data?.items ?? []).map((item) => (
+        <li key={item.id} className={item.status === 'available' ? 'evidence-available' : 'evidence-missing'}>
+          <span>{item.status}</span>
+          {item.label ? <strong>{item.label}</strong> : null}
+        </li>
+      ))}
+    </ul>
+  )
+}
+
+/** Only risk targets carry a computed factors field (see RiskResponse); task/commitment targets
+ * have no reliable single-entity factors source, so this is not rendered for them. */
+function RiskFactorsPreview({ label, riskId }: { label: string; riskId: string }) {
+  const query = useQuery({
+    queryKey: ['risk-preview', riskId],
+    queryFn: () => apiRequest<RiskPreview>(`/api/v1/risks/${riskId}`),
+    retry: 1,
+  })
+
+  if (query.isLoading) return <p role="status">Loading risk factors…</p>
+  if (query.isError) return <p role="alert">{query.error.message}</p>
+  const risk = query.data
+  if (!risk) return null
+
+  return (
+    <div className="risk-factor-preview">
+      <p>Score {risk.score} · {risk.explanation}</p>
+      {risk.factors.length ? (
+        <ul aria-label={`Risk factors for ${label}`}>
+          {risk.factors.map((factor) => <li key={factor.code}>{factor.label} (+{factor.points})</li>)}
+        </ul>
+      ) : null}
+    </div>
+  )
+}
+
 export default function RecommendationPanel() {
   const queryClient = useQueryClient()
   const recommendations = useQuery({
@@ -197,6 +275,14 @@ export default function RecommendationPanel() {
                     <div><dt>Evidence</dt><dd>{item.evidence_ids.length} reference{item.evidence_ids.length === 1 ? '' : 's'}</dd></div>
                   </dl>
                   {item.execution_result ? <p className="execution-result">Execution recorded.</p> : null}
+                  {canPublish || canDecide ? (
+                    <div className="recommendation-preview">
+                      <EvidencePreview label={item.recommendation_type.replaceAll('_', ' ')} evidenceIds={item.evidence_ids} />
+                      {item.target_type === 'risk' && item.target_id ? (
+                        <RiskFactorsPreview label={item.recommendation_type.replaceAll('_', ' ')} riskId={item.target_id} />
+                      ) : null}
+                    </div>
+                  ) : null}
                 </div>
                 <div className="recommendation-actions" aria-label={`Actions for ${item.recommendation_type}`}>
                   {canPublish ? (
