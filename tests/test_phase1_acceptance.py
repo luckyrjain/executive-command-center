@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import importlib.util
 import json
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 CHECKER_PATH = Path("scripts/check_phase1_acceptance.py")
 spec = importlib.util.spec_from_file_location("phase1_acceptance_checker", CHECKER_PATH)
