@@ -48,7 +48,17 @@ Phase 1 does not include a production login screen. Create a development workspa
 uv run python scripts/bootstrap_dev.py
 ```
 
-Keep the printed session token private. The script prints two `document.cookie` commands that must be run in the browser console after the frontend opens.
+The bootstrap utility runs only when `ECC_ENV=development` and refuses non-local database hosts by default. Running it again reuses the existing local identity, revokes previous active sessions, and prints a fresh session and CSRF cookie pair.
+
+Keep the printed session token private. The script prints two `document.cookie` commands that must be run in the browser console after the frontend opens. These JavaScript-set cookies are intentionally limited to local development and are not a replacement for production `HttpOnly` session cookies.
+
+For an isolated remote development database only, explicitly set:
+
+```bash
+export ECC_BOOTSTRAP_ALLOW_REMOTE_DATABASE=1
+```
+
+Never enable this override for staging or production data.
 
 ## 4. Start the backend
 
@@ -92,8 +102,8 @@ Open `http://localhost:5173`, paste the two cookie commands from `bootstrap_dev.
 Backend:
 
 ```bash
-uv run ruff check backend tests
-uv run ruff format --check backend tests
+uv run ruff check backend tests scripts
+uv run ruff format --check backend tests scripts
 uv run mypy backend
 uv run pytest
 uv run pip-audit
@@ -140,9 +150,13 @@ uv run python scripts/bootstrap_dev.py
 
 Use a value with at least 32 characters and reload `.env` into the shell.
 
+### Bootstrap refuses the environment or database
+
+Confirm `ECC_ENV=development` and that `ECC_DATABASE_URL` points to `localhost`, `127.0.0.1`, or `::1`. Use the remote-development override only for an isolated non-production database.
+
 ### `401 Authentication required`
 
-Run `scripts/bootstrap_dev.py` again, set both cookies, and reload. Use `localhost` consistently in browser URLs.
+Run `scripts/bootstrap_dev.py` again, set both newly printed cookies, and reload. Use `localhost` consistently in browser URLs. Regeneration revokes the previous active session.
 
 ### `403 CSRF_TOKEN_REQUIRED` or `CSRF_TOKEN_INVALID`
 
@@ -164,6 +178,6 @@ Check `http://localhost:8000/health/ready`, confirm `VITE_API_BASE_URL`, and res
 ## Current limitations
 
 - Production registration and login are not implemented in Phase 1.
-- The bootstrap utility is development-only.
+- The bootstrap utility is development-only and deliberately refuses non-development environments.
 - External Gmail, Google Calendar, GitHub, and Jira connectors are deferred.
 - AI enrichment is optional and disabled by default; deterministic features remain available.
