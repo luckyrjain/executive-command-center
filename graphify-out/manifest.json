@@ -1,8 +1,8 @@
 {
   ".claude/settings.local.json": {
-    "mtime": 1784196599.969158,
-    "ast_hash": "4a60877c762e34b265db0401f2408e10",
-    "semantic_hash": "4a60877c762e34b265db0401f2408e10"
+    "mtime": 1784214346.9656572,
+    "ast_hash": "224346930ef671c160fd9bb06569ad96",
+    "semantic_hash": "224346930ef671c160fd9bb06569ad96"
   },
   "backend/ecc/__init__.py": {
     "mtime": 1784179605.8022003,
@@ -30,7 +30,7 @@
     "semantic_hash": "969ea17c08988b2cb7da7c597a866cf4"
   },
   "backend/ecc/dev_bootstrap.py": {
-    "mtime": 1784182306.195679,
+    "mtime": 1784208974.943076,
     "ast_hash": "74e6e447509e8a734cd745e151c16d28",
     "semantic_hash": "74e6e447509e8a734cd745e151c16d28"
   },
@@ -160,7 +160,7 @@
     "semantic_hash": "8fb5ee9b04db6e099661ad8970e8a3e3"
   },
   "backend/ecc/main.py": {
-    "mtime": 1784182306.1964493,
+    "mtime": 1784208974.9444196,
     "ast_hash": "f67ac0f277d6562d3fa1ba77c5666a4e",
     "semantic_hash": "f67ac0f277d6562d3fa1ba77c5666a4e"
   },
@@ -230,7 +230,7 @@
     "semantic_hash": "e7284e326645070c1af1a6cffa06d51c"
   },
   "config/phase1-acceptance.json": {
-    "mtime": 1784179605.8086889,
+    "mtime": 1784208974.9467647,
     "ast_hash": "4f8b1009794951b3d8b36585c5f1a5cd",
     "semantic_hash": "4f8b1009794951b3d8b36585c5f1a5cd"
   },
@@ -240,14 +240,14 @@
     "semantic_hash": "25d0fb2957cfda57e59bcd43e08a522d"
   },
   "frontend/package.json": {
-    "mtime": 1784179605.8177166,
-    "ast_hash": "b58c4b2cd7f9575edb4d62496a4a9934",
-    "semantic_hash": "b58c4b2cd7f9575edb4d62496a4a9934"
+    "mtime": 1784210189.6425576,
+    "ast_hash": "a64533980c357ed98ee5563cd79abcb5",
+    "semantic_hash": "a64533980c357ed98ee5563cd79abcb5"
   },
   "frontend/src/App.tsx": {
-    "mtime": 1784179605.8178735,
-    "ast_hash": "37869456cd5f7026087369f907492de5",
-    "semantic_hash": "37869456cd5f7026087369f907492de5"
+    "mtime": 1784214665.1723638,
+    "ast_hash": "30094ccb8a97a5670644e97082649aae",
+    "semantic_hash": "30094ccb8a97a5670644e97082649aae"
   },
   "frontend/src/RecommendationPanel.test.ts": {
     "mtime": 1784179605.8179522,
@@ -263,16 +263,6 @@
     "mtime": 1784179605.8181858,
     "ast_hash": "7d96c96adb3fa94ef1e1780f7cccaaca",
     "semantic_hash": "7d96c96adb3fa94ef1e1780f7cccaaca"
-  },
-  "frontend/src/WorkActionCenter.test.ts": {
-    "mtime": 1784179605.8182797,
-    "ast_hash": "dcee591afaa0c0e00abf8607c23a9006",
-    "semantic_hash": "dcee591afaa0c0e00abf8607c23a9006"
-  },
-  "frontend/src/WorkActionCenter.tsx": {
-    "mtime": 1784179605.8184137,
-    "ast_hash": "eaf0a2c3bd16fd04b3ec7874cacb26c6",
-    "semantic_hash": "eaf0a2c3bd16fd04b3ec7874cacb26c6"
   },
   "frontend/src/foundation.test.ts": {
     "mtime": 1784179605.8184972,
@@ -295,7 +285,7 @@
     "semantic_hash": "6774dc00ce6501abeaca72c87714097a"
   },
   "frontend/vite.config.ts": {
-    "mtime": 1784190422.6271844,
+    "mtime": 1784208974.9819453,
     "ast_hash": "b3a5c5ab95f2603a9bfa0a47bf103050",
     "semantic_hash": "b3a5c5ab95f2603a9bfa0a47bf103050"
   },
@@ -310,32 +300,32 @@
     "semantic_hash": "85b2723a7514e2e96a1c43879a7f56ab"
   },
   "scripts/__init__.py": {
-    "mtime": 1784179605.8198137,
+    "mtime": 1784208975.1413193,
     "ast_hash": "d8368584761cea66a0e899aaa3f8eb56",
     "semantic_hash": "d8368584761cea66a0e899aaa3f8eb56"
   },
   "scripts/backup.sh": {
-    "mtime": 1784179605.8203013,
+    "mtime": 1784208975.141684,
     "ast_hash": "706bfb602da2865c3f6fa50181aac056",
     "semantic_hash": "706bfb602da2865c3f6fa50181aac056"
   },
   "scripts/bootstrap_dev.py": {
-    "mtime": 1784182306.1977034,
+    "mtime": 1784208975.1431003,
     "ast_hash": "46c46abd6ee8c6483a94f33dd2e07941",
     "semantic_hash": "46c46abd6ee8c6483a94f33dd2e07941"
   },
   "scripts/check_phase1_acceptance.py": {
-    "mtime": 1784179605.8204103,
+    "mtime": 1784208975.1432612,
     "ast_hash": "4372612c16d57004e111599cd35f0fba",
     "semantic_hash": "4372612c16d57004e111599cd35f0fba"
   },
   "scripts/restore.sh": {
-    "mtime": 1784179605.8205025,
+    "mtime": 1784208975.1435256,
     "ast_hash": "c48dea0d2f957ff1779fc0fb92dba9e4",
     "semantic_hash": "c48dea0d2f957ff1779fc0fb92dba9e4"
   },
   "scripts/verify_restore.sh": {
-    "mtime": 1784179605.820593,
+    "mtime": 1784208975.1436503,
     "ast_hash": "5c4b8ecf581bfb2dd76852abf62a71e0",
     "semantic_hash": "5c4b8ecf581bfb2dd76852abf62a71e0"
   },
@@ -345,7 +335,7 @@
     "semantic_hash": "34190f09bfd0f067ef9750f396673c39"
   },
   "tests/test_bootstrap_dev.py": {
-    "mtime": 1784182306.1984267,
+    "mtime": 1784208975.1452746,
     "ast_hash": "1fd451ae46eff5319d01191e5a2678b2",
     "semantic_hash": "1fd451ae46eff5319d01191e5a2678b2"
   },
@@ -370,7 +360,7 @@
     "semantic_hash": "35a3d799b9fa9d3435c1a4c3f2ae11b6"
   },
   "tests/test_dev_bootstrap.py": {
-    "mtime": 1784182306.1989102,
+    "mtime": 1784208975.1461046,
     "ast_hash": "208c557c9430d80ddc99f8c9ed3fcde0",
     "semantic_hash": "208c557c9430d80ddc99f8c9ed3fcde0"
   },
@@ -390,7 +380,7 @@
     "semantic_hash": "f0fffe81dae8d5caef8eb252647d1938"
   },
   "tests/test_phase1_acceptance.py": {
-    "mtime": 1784179605.8216515,
+    "mtime": 1784208975.1464064,
     "ast_hash": "6c2f895f31f40765e43881d7544cffd6",
     "semantic_hash": "6c2f895f31f40765e43881d7544cffd6"
   },
@@ -445,17 +435,17 @@
     "semantic_hash": "06a9553efbac990119a28b653075c3b5"
   },
   ".github/workflows/phase1-acceptance.yml": {
-    "mtime": 1784179605.8013685,
+    "mtime": 1784208974.9393847,
     "ast_hash": "ccee2ebb86d7d2e9936eaac9ac8fdb9f",
     "semantic_hash": "ccee2ebb86d7d2e9936eaac9ac8fdb9f"
   },
   "README.md": {
-    "mtime": 1784196588.7251766,
+    "mtime": 1784208974.9415064,
     "ast_hash": "090bf349d3605edca6fd22fd2b8ff3ae",
     "semantic_hash": "090bf349d3605edca6fd22fd2b8ff3ae"
   },
   "docker-compose.yml": {
-    "mtime": 1784190422.6267939,
+    "mtime": 1784208974.9481926,
     "ast_hash": "986d7ec22992559c83a4c38d965e0ba5",
     "semantic_hash": "986d7ec22992559c83a4c38d965e0ba5"
   },
@@ -505,12 +495,12 @@
     "semantic_hash": "e426ee78034f5fe8532cfe42b4c76017"
   },
   "docs/ROADMAP.md": {
-    "mtime": 1784190716.6199856,
+    "mtime": 1784208974.948731,
     "ast_hash": "d43b93a979cf3530c191acbcbc7cb877",
     "semantic_hash": "d43b93a979cf3530c191acbcbc7cb877"
   },
   "docs/SETUP.md": {
-    "mtime": 1784182306.1968935,
+    "mtime": 1784208974.949695,
     "ast_hash": "eb63dab7f398bfbadf49d6e99371cc00",
     "semantic_hash": "eb63dab7f398bfbadf49d6e99371cc00"
   },
@@ -650,62 +640,62 @@
     "semantic_hash": "f5344e7fcb38a08bca6ce7a08843a7ca"
   },
   "docs/phases/PHASE-000-repository-foundation.md": {
-    "mtime": 1784190716.6204526,
+    "mtime": 1784208974.95053,
     "ast_hash": "5dc9d835215747cadc94b429fec25fd6",
     "semantic_hash": "5dc9d835215747cadc94b429fec25fd6"
   },
   "docs/phases/PHASE-001-executive-dashboard-mvp.md": {
-    "mtime": 1784190716.620896,
+    "mtime": 1784208974.9510274,
     "ast_hash": "4e88e04b262be94b0806c694f148877a",
     "semantic_hash": "4e88e04b262be94b0806c694f148877a"
   },
   "docs/phases/PHASE-002-knowledge-platform.md": {
-    "mtime": 1784190716.6210074,
+    "mtime": 1784208974.9512465,
     "ast_hash": "1aba7a103d5e3dad5d7a46e25b791b36",
     "semantic_hash": "1aba7a103d5e3dad5d7a46e25b791b36"
   },
   "docs/phases/PHASE-003-human-attention-engine.md": {
-    "mtime": 1784190716.6211064,
+    "mtime": 1784208974.951409,
     "ast_hash": "bcc4ecfb9a114657443b04d17ea53697",
     "semantic_hash": "bcc4ecfb9a114657443b04d17ea53697"
   },
   "docs/phases/PHASE-004-ai-runtime.md": {
-    "mtime": 1784190716.6212077,
+    "mtime": 1784208974.951518,
     "ast_hash": "e796cdce959fecf096bfbd30f4d86f1f",
     "semantic_hash": "e796cdce959fecf096bfbd30f4d86f1f"
   },
   "docs/phases/PHASE-005-automation.md": {
-    "mtime": 1784190716.6213095,
+    "mtime": 1784208974.9516203,
     "ast_hash": "e4f4f2aac6dd969bb35a7c75aa7755d6",
     "semantic_hash": "e4f4f2aac6dd969bb35a7c75aa7755d6"
   },
   "docs/phases/PHASE-006-engineering-workspace.md": {
-    "mtime": 1784190716.6214113,
+    "mtime": 1784208974.9517171,
     "ast_hash": "b25b684d6a412e6c993e29345847df4a",
     "semantic_hash": "b25b684d6a412e6c993e29345847df4a"
   },
   "docs/phases/PHASE-007-personal-intelligence.md": {
-    "mtime": 1784190716.6215074,
+    "mtime": 1784208974.951865,
     "ast_hash": "483fcd4a13caa8dd5d1b239420f6e088",
     "semantic_hash": "483fcd4a13caa8dd5d1b239420f6e088"
   },
   "docs/phases/PHASE-008-multi-user.md": {
-    "mtime": 1784190716.6216083,
+    "mtime": 1784208974.9525738,
     "ast_hash": "fcba2f6b8650e50e15974b38234f9c03",
     "semantic_hash": "fcba2f6b8650e50e15974b38234f9c03"
   },
   "docs/phases/PHASE-009-enterprise.md": {
-    "mtime": 1784190716.6217144,
+    "mtime": 1784208974.9526772,
     "ast_hash": "8e8abba0cb80c2780f07aa36fb931ce3",
     "semantic_hash": "8e8abba0cb80c2780f07aa36fb931ce3"
   },
   "docs/phases/PHASE-REVIEW.md": {
-    "mtime": 1784190716.621816,
+    "mtime": 1784208974.9527917,
     "ast_hash": "566bcee880a8fc44496d625396a39a07",
     "semantic_hash": "566bcee880a8fc44496d625396a39a07"
   },
   "docs/phases/README.md": {
-    "mtime": 1784190716.6219258,
+    "mtime": 1784208974.9531205,
     "ast_hash": "4501f134431e9718cc70aea655ea36e3",
     "semantic_hash": "4501f134431e9718cc70aea655ea36e3"
   },
@@ -730,12 +720,12 @@
     "semantic_hash": "d0151aa2d25e35e6f73c48cd3c32e93b"
   },
   "docs/phases/phase-001/FINAL-ACCEPTANCE.md": {
-    "mtime": 1784179605.8150027,
+    "mtime": 1784208974.9534118,
     "ast_hash": "1811768149527be58e81506802e7f76c",
     "semantic_hash": "1811768149527be58e81506802e7f76c"
   },
   "docs/phases/phase-001/IMPLEMENTATION-STATUS.md": {
-    "mtime": 1784190716.622057,
+    "mtime": 1784208974.9535537,
     "ast_hash": "464a533d97b1b5cec9be30911612e261",
     "semantic_hash": "464a533d97b1b5cec9be30911612e261"
   },
@@ -765,287 +755,287 @@
     "semantic_hash": "abc654de760564d8e5eac011535e010d"
   },
   "docs/phases/phase-002/API-SCHEMAS.md": {
-    "mtime": 1784190716.6222246,
+    "mtime": 1784208974.9539354,
     "ast_hash": "797388688ab71f2c796b406507e99c5f",
     "semantic_hash": "797388688ab71f2c796b406507e99c5f"
   },
   "docs/phases/phase-002/DATA-MODEL.md": {
-    "mtime": 1784190716.622329,
+    "mtime": 1784208974.9547386,
     "ast_hash": "a211719fbab808ad6e369150e14a54b9",
     "semantic_hash": "a211719fbab808ad6e369150e14a54b9"
   },
   "docs/phases/phase-002/ENTITY-RESOLUTION-CONTRACT.md": {
-    "mtime": 1784190716.6224415,
+    "mtime": 1784208974.9553685,
     "ast_hash": "9206bd914995952bf411352643d89301",
     "semantic_hash": "9206bd914995952bf411352643d89301"
   },
   "docs/phases/phase-002/IMPLEMENTATION-STATUS.md": {
-    "mtime": 1784190716.62256,
+    "mtime": 1784208974.9577506,
     "ast_hash": "111b496cc8367a7899abfaaeb4a24f68",
     "semantic_hash": "111b496cc8367a7899abfaaeb4a24f68"
   },
   "docs/phases/phase-002/RETRIEVAL-CONTRACT.md": {
-    "mtime": 1784190716.622762,
+    "mtime": 1784208974.9579394,
     "ast_hash": "17c050af5dbc0e9d91358842c73f7589",
     "semantic_hash": "17c050af5dbc0e9d91358842c73f7589"
   },
   "docs/phases/phase-002/TEST-PLAN.md": {
-    "mtime": 1784190716.6228883,
+    "mtime": 1784208974.9582608,
     "ast_hash": "c35c4ae7a3400a14a8d9c858f5af0b38",
     "semantic_hash": "c35c4ae7a3400a14a8d9c858f5af0b38"
   },
   "docs/phases/phase-002/UX-STATES.md": {
-    "mtime": 1784190716.622987,
+    "mtime": 1784208974.958495,
     "ast_hash": "743cb2561498741e8fef60c3536dc603",
     "semantic_hash": "743cb2561498741e8fef60c3536dc603"
   },
   "docs/phases/phase-003/API-SCHEMAS.md": {
-    "mtime": 1784190716.6231663,
+    "mtime": 1784208974.9588957,
     "ast_hash": "34cfc8d709b4c73071a5530c0ac5138e",
     "semantic_hash": "34cfc8d709b4c73071a5530c0ac5138e"
   },
   "docs/phases/phase-003/ATTENTION-MODEL.md": {
-    "mtime": 1784190716.6232803,
+    "mtime": 1784208974.959114,
     "ast_hash": "a7fbea52d674a536cdec9a1cedadd36e",
     "semantic_hash": "a7fbea52d674a536cdec9a1cedadd36e"
   },
   "docs/phases/phase-003/DATA-MODEL.md": {
-    "mtime": 1784190716.6233873,
+    "mtime": 1784208974.959301,
     "ast_hash": "f5d3e788461546d9dbd11450aa31b094",
     "semantic_hash": "f5d3e788461546d9dbd11450aa31b094"
   },
   "docs/phases/phase-003/IMPLEMENTATION-STATUS.md": {
-    "mtime": 1784190716.6234818,
+    "mtime": 1784208974.9596868,
     "ast_hash": "9d21b4adfb8d2818e518c56c3957726f",
     "semantic_hash": "9d21b4adfb8d2818e518c56c3957726f"
   },
   "docs/phases/phase-003/MEETING-PREP-CONTRACT.md": {
-    "mtime": 1784190716.6235733,
+    "mtime": 1784208974.959981,
     "ast_hash": "23654b2684513ab9a5d5664f5db333b4",
     "semantic_hash": "23654b2684513ab9a5d5664f5db333b4"
   },
   "docs/phases/phase-003/PLANNING-CONTRACT.md": {
-    "mtime": 1784190716.6236787,
+    "mtime": 1784208974.9600754,
     "ast_hash": "e715f9a7d1767ac653e5fa8f7af803ea",
     "semantic_hash": "e715f9a7d1767ac653e5fa8f7af803ea"
   },
   "docs/phases/phase-003/TEST-PLAN.md": {
-    "mtime": 1784190716.623782,
+    "mtime": 1784208974.9603865,
     "ast_hash": "bb65c0e42d4f3bd597344681b54dd384",
     "semantic_hash": "bb65c0e42d4f3bd597344681b54dd384"
   },
   "docs/phases/phase-003/UX-STATES.md": {
-    "mtime": 1784190716.6238806,
+    "mtime": 1784208974.9610593,
     "ast_hash": "07884b04f3743549c8e3634be138e172",
     "semantic_hash": "07884b04f3743549c8e3634be138e172"
   },
   "docs/phases/phase-004/API-SCHEMAS.md": {
-    "mtime": 1784190716.624034,
+    "mtime": 1784208974.9636655,
     "ast_hash": "d77950c5325c4b71b685c27c94e4aec2",
     "semantic_hash": "d77950c5325c4b71b685c27c94e4aec2"
   },
   "docs/phases/phase-004/DATA-MODEL.md": {
-    "mtime": 1784190716.624127,
+    "mtime": 1784208974.9642844,
     "ast_hash": "1c1e3dea2023aa80717c213d2d827f46",
     "semantic_hash": "1c1e3dea2023aa80717c213d2d827f46"
   },
   "docs/phases/phase-004/EVALUATION-CONTRACT.md": {
-    "mtime": 1784190716.6242208,
+    "mtime": 1784208974.9644325,
     "ast_hash": "139caadeed3fd0f9d6f6ff81f60660ac",
     "semantic_hash": "139caadeed3fd0f9d6f6ff81f60660ac"
   },
   "docs/phases/phase-004/IMPLEMENTATION-STATUS.md": {
-    "mtime": 1784190716.6243384,
+    "mtime": 1784208974.9657326,
     "ast_hash": "93d549362a7daa26d5901f6c64bfb2ec",
     "semantic_hash": "93d549362a7daa26d5901f6c64bfb2ec"
   },
   "docs/phases/phase-004/MODEL-ROUTING-CONTRACT.md": {
-    "mtime": 1784190716.6245008,
+    "mtime": 1784208974.9669092,
     "ast_hash": "a32184ca7b8a559219798cbb843cc1a4",
     "semantic_hash": "a32184ca7b8a559219798cbb843cc1a4"
   },
   "docs/phases/phase-004/TEST-PLAN.md": {
-    "mtime": 1784190716.6245766,
+    "mtime": 1784208974.9673367,
     "ast_hash": "909e105e7b1018b203992845700f90f8",
     "semantic_hash": "909e105e7b1018b203992845700f90f8"
   },
   "docs/phases/phase-004/UX-STATES.md": {
-    "mtime": 1784190716.6246557,
+    "mtime": 1784208974.9678857,
     "ast_hash": "92ffdde8112517d6c12e94da8e1510d2",
     "semantic_hash": "92ffdde8112517d6c12e94da8e1510d2"
   },
   "docs/phases/phase-005/API-SCHEMAS.md": {
-    "mtime": 1784190716.6248295,
+    "mtime": 1784208974.9681745,
     "ast_hash": "58cf069cae5dc04f4f5b11732b327132",
     "semantic_hash": "58cf069cae5dc04f4f5b11732b327132"
   },
   "docs/phases/phase-005/APPROVAL-POLICY.md": {
-    "mtime": 1784190716.6249301,
+    "mtime": 1784208974.968742,
     "ast_hash": "5a3889f01e9aff2d0f953b34b9d9a12f",
     "semantic_hash": "5a3889f01e9aff2d0f953b34b9d9a12f"
   },
   "docs/phases/phase-005/DATA-MODEL.md": {
-    "mtime": 1784196833.1194196,
+    "mtime": 1784208974.9693286,
     "ast_hash": "30d0dd54ff200c83af01eb323d901510",
     "semantic_hash": "30d0dd54ff200c83af01eb323d901510"
   },
   "docs/phases/phase-005/EXECUTION-CONTRACT.md": {
-    "mtime": 1784190716.625115,
+    "mtime": 1784208974.9694266,
     "ast_hash": "b8392c1d311c5ea215699824f4dd4b4a",
     "semantic_hash": "b8392c1d311c5ea215699824f4dd4b4a"
   },
   "docs/phases/phase-005/IMPLEMENTATION-STATUS.md": {
-    "mtime": 1784190716.6252115,
+    "mtime": 1784208974.9695184,
     "ast_hash": "83cb569818c36e746518562034508039",
     "semantic_hash": "83cb569818c36e746518562034508039"
   },
   "docs/phases/phase-005/TEST-PLAN.md": {
-    "mtime": 1784190716.6253057,
+    "mtime": 1784208974.9697092,
     "ast_hash": "1237004a1ce9fe820350ba65435031c8",
     "semantic_hash": "1237004a1ce9fe820350ba65435031c8"
   },
   "docs/phases/phase-005/UX-STATES.md": {
-    "mtime": 1784190716.6254072,
+    "mtime": 1784208974.9698403,
     "ast_hash": "56d2c6a30de6c367d084c3c8e70b6433",
     "semantic_hash": "56d2c6a30de6c367d084c3c8e70b6433"
   },
   "docs/phases/phase-006/API-SCHEMAS.md": {
-    "mtime": 1784190716.6255715,
+    "mtime": 1784208974.9701076,
     "ast_hash": "e9c6ca2f47c0803751d29811c8a1642b",
     "semantic_hash": "e9c6ca2f47c0803751d29811c8a1642b"
   },
   "docs/phases/phase-006/CONNECTOR-CONTRACT.md": {
-    "mtime": 1784190716.6257129,
+    "mtime": 1784208974.9702039,
     "ast_hash": "2381b084a8d8837301af33c5bbd47ed8",
     "semantic_hash": "2381b084a8d8837301af33c5bbd47ed8"
   },
   "docs/phases/phase-006/DATA-MODEL.md": {
-    "mtime": 1784190716.6258073,
+    "mtime": 1784208974.9713702,
     "ast_hash": "8d11cddd5273af8d120964dbe43531cf",
     "semantic_hash": "8d11cddd5273af8d120964dbe43531cf"
   },
   "docs/phases/phase-006/DELIVERY-INTELLIGENCE-CONTRACT.md": {
-    "mtime": 1784190716.6258976,
+    "mtime": 1784208974.9725344,
     "ast_hash": "94d2adeb0f7d0dc336d920d27b9833be",
     "semantic_hash": "94d2adeb0f7d0dc336d920d27b9833be"
   },
   "docs/phases/phase-006/IMPLEMENTATION-STATUS.md": {
-    "mtime": 1784190716.6259916,
+    "mtime": 1784208974.974099,
     "ast_hash": "f7b4ff68e2599ac0fe4fb2b6c1202007",
     "semantic_hash": "f7b4ff68e2599ac0fe4fb2b6c1202007"
   },
   "docs/phases/phase-006/TEST-PLAN.md": {
-    "mtime": 1784190716.6260874,
+    "mtime": 1784208974.9747493,
     "ast_hash": "552fd5dd4b9ca723e97a217905148405",
     "semantic_hash": "552fd5dd4b9ca723e97a217905148405"
   },
   "docs/phases/phase-006/UX-STATES.md": {
-    "mtime": 1784190716.6261842,
+    "mtime": 1784208974.9748538,
     "ast_hash": "aba97aea005e3e2d44ffc7ec51c01261",
     "semantic_hash": "aba97aea005e3e2d44ffc7ec51c01261"
   },
   "docs/phases/phase-007/API-SCHEMAS.md": {
-    "mtime": 1784190716.626323,
+    "mtime": 1784208974.9750414,
     "ast_hash": "814bfce3e4dbb0e1ce07de9151cd1682",
     "semantic_hash": "814bfce3e4dbb0e1ce07de9151cd1682"
   },
   "docs/phases/phase-007/DATA-MODEL.md": {
-    "mtime": 1784190716.6264129,
+    "mtime": 1784208974.975112,
     "ast_hash": "57397b801bd8ec9455c53e9fddf44422",
     "semantic_hash": "57397b801bd8ec9455c53e9fddf44422"
   },
   "docs/phases/phase-007/DOMAIN-PRIVACY-CONTRACT.md": {
-    "mtime": 1784190716.6265016,
+    "mtime": 1784208974.975387,
     "ast_hash": "56d149e1fc06bbe6435cb9e843de25f5",
     "semantic_hash": "56d149e1fc06bbe6435cb9e843de25f5"
   },
   "docs/phases/phase-007/IMPLEMENTATION-STATUS.md": {
-    "mtime": 1784190716.6265938,
+    "mtime": 1784208974.9756653,
     "ast_hash": "241f88b1b4b0378aefb03f4abf711611",
     "semantic_hash": "241f88b1b4b0378aefb03f4abf711611"
   },
   "docs/phases/phase-007/INSIGHT-CONTRACT.md": {
-    "mtime": 1784190716.626679,
+    "mtime": 1784208974.9759,
     "ast_hash": "9b4593f2c671ba07c84734f6d2361c64",
     "semantic_hash": "9b4593f2c671ba07c84734f6d2361c64"
   },
   "docs/phases/phase-007/TEST-PLAN.md": {
-    "mtime": 1784190716.6267686,
+    "mtime": 1784208974.9761746,
     "ast_hash": "c861d5ee9c4e8f6afd2e29a5351698be",
     "semantic_hash": "c861d5ee9c4e8f6afd2e29a5351698be"
   },
   "docs/phases/phase-007/UX-STATES.md": {
-    "mtime": 1784190716.626858,
+    "mtime": 1784208974.9773412,
     "ast_hash": "aadd70e905f51be7eefaba3fadadc1bc",
     "semantic_hash": "aadd70e905f51be7eefaba3fadadc1bc"
   },
   "docs/phases/phase-008/API-SCHEMAS.md": {
-    "mtime": 1784190716.6270142,
+    "mtime": 1784208974.9776657,
     "ast_hash": "b211c69daf9770af308c2944e13c86fc",
     "semantic_hash": "b211c69daf9770af308c2944e13c86fc"
   },
   "docs/phases/phase-008/DATA-MODEL.md": {
-    "mtime": 1784190716.6271136,
+    "mtime": 1784208974.9778621,
     "ast_hash": "477a2f269f0a2903a3a70f9f5a68ea6b",
     "semantic_hash": "477a2f269f0a2903a3a70f9f5a68ea6b"
   },
   "docs/phases/phase-008/DELEGATION-CONTRACT.md": {
-    "mtime": 1784190716.6272202,
+    "mtime": 1784208974.9788334,
     "ast_hash": "433176e8ffa7a85c61ddaf43f69c7e64",
     "semantic_hash": "433176e8ffa7a85c61ddaf43f69c7e64"
   },
   "docs/phases/phase-008/IMPLEMENTATION-STATUS.md": {
-    "mtime": 1784190716.6273096,
+    "mtime": 1784208974.9790773,
     "ast_hash": "78dcb1d8f21fa36a8615f0b5bd766793",
     "semantic_hash": "78dcb1d8f21fa36a8615f0b5bd766793"
   },
   "docs/phases/phase-008/PERMISSION-CONTRACT.md": {
-    "mtime": 1784190716.6274025,
+    "mtime": 1784208974.9792917,
     "ast_hash": "f57e6ea329e8f7c071f48fd6ae62f01c",
     "semantic_hash": "f57e6ea329e8f7c071f48fd6ae62f01c"
   },
   "docs/phases/phase-008/TEST-PLAN.md": {
-    "mtime": 1784190716.6275043,
+    "mtime": 1784208974.9794612,
     "ast_hash": "a67dc2dc1470d7c6608bdb3aec141f7a",
     "semantic_hash": "a67dc2dc1470d7c6608bdb3aec141f7a"
   },
   "docs/phases/phase-008/UX-STATES.md": {
-    "mtime": 1784190716.6276004,
+    "mtime": 1784208974.97957,
     "ast_hash": "98f2eb918c2aa5e83fe00fd9f308de19",
     "semantic_hash": "98f2eb918c2aa5e83fe00fd9f308de19"
   },
   "docs/phases/phase-009/API-SCHEMAS.md": {
-    "mtime": 1784190716.6277595,
+    "mtime": 1784208974.9797692,
     "ast_hash": "899fd9a8a3c1d7e6e9e3f5a6a396de9e",
     "semantic_hash": "899fd9a8a3c1d7e6e9e3f5a6a396de9e"
   },
   "docs/phases/phase-009/COMPLIANCE-CONTRACT.md": {
-    "mtime": 1784190716.6278467,
+    "mtime": 1784208974.980106,
     "ast_hash": "d5ef8d31853085562989466e3719db45",
     "semantic_hash": "d5ef8d31853085562989466e3719db45"
   },
   "docs/phases/phase-009/DATA-MODEL.md": {
-    "mtime": 1784190716.62794,
+    "mtime": 1784208974.9802244,
     "ast_hash": "a5adfc0f6466417734a96ddf9484e635",
     "semantic_hash": "a5adfc0f6466417734a96ddf9484e635"
   },
   "docs/phases/phase-009/IMPLEMENTATION-STATUS.md": {
-    "mtime": 1784190716.6280386,
+    "mtime": 1784208974.9803846,
     "ast_hash": "957c04d8712f4912e310b84adca51a13",
     "semantic_hash": "957c04d8712f4912e310b84adca51a13"
   },
   "docs/phases/phase-009/TENANCY-CONTRACT.md": {
-    "mtime": 1784190716.6281366,
+    "mtime": 1784208974.9806447,
     "ast_hash": "a00e1c85ef7cb5ce9eed5a88fe18af44",
     "semantic_hash": "a00e1c85ef7cb5ce9eed5a88fe18af44"
   },
   "docs/phases/phase-009/TEST-PLAN.md": {
-    "mtime": 1784190716.62824,
+    "mtime": 1784208974.9811454,
     "ast_hash": "1c928a47770b17d789f052da20b002df",
     "semantic_hash": "1c928a47770b17d789f052da20b002df"
   },
   "docs/phases/phase-009/UX-STATES.md": {
-    "mtime": 1784190716.6283364,
+    "mtime": 1784208974.9812376,
     "ast_hash": "63614f2fcfdedf58650e2ebeba15a0af",
     "semantic_hash": "63614f2fcfdedf58650e2ebeba15a0af"
   },
@@ -1100,7 +1090,7 @@
     "semantic_hash": "a0385809cf5028f729dae4aefe4ee4b8"
   },
   "pr18-bootstrap-report.txt": {
-    "mtime": 1784182306.1972382,
+    "mtime": 1784208975.1410785,
     "ast_hash": "f51d5d50447de3a8e95c43df475d2993",
     "semantic_hash": "f51d5d50447de3a8e95c43df475d2993"
   },
@@ -1108,5 +1098,90 @@
     "mtime": 1784179605.8195167,
     "ast_hash": "c9ac722ce4d8ad85ad8611d53c46a0ab",
     "semantic_hash": "c9ac722ce4d8ad85ad8611d53c46a0ab"
+  },
+  "frontend/src/api/client.test.ts": {
+    "mtime": 1784209846.312481,
+    "ast_hash": "78599d55d0e906e7d75d505d1231a47c",
+    "semantic_hash": "78599d55d0e906e7d75d505d1231a47c"
+  },
+  "frontend/src/api/client.ts": {
+    "mtime": 1784209744.1777563,
+    "ast_hash": "5ef1c5a50e577af8a819ac86fba55581",
+    "semantic_hash": "5ef1c5a50e577af8a819ac86fba55581"
+  },
+  "frontend/src/api/types.ts": {
+    "mtime": 1784209744.0398839,
+    "ast_hash": "491760f101205df9447803105105d1e8",
+    "semantic_hash": "491760f101205df9447803105105d1e8"
+  },
+  "frontend/src/features/commitments/CommitmentWorkspace.test.tsx": {
+    "mtime": 1784211572.5255404,
+    "ast_hash": "39cfa4a2ce9629c6312eb4c683fc9538",
+    "semantic_hash": "39cfa4a2ce9629c6312eb4c683fc9538"
+  },
+  "frontend/src/features/commitments/CommitmentWorkspace.tsx": {
+    "mtime": 1784211643.2188363,
+    "ast_hash": "9de21e7252c59dfbb42e7c778de2eaec",
+    "semantic_hash": "9de21e7252c59dfbb42e7c778de2eaec"
+  },
+  "frontend/src/features/notes/NoteWorkspace.test.tsx": {
+    "mtime": 1784214612.379211,
+    "ast_hash": "b74f998ed1c1f3fcd6eeadf358258fb0",
+    "semantic_hash": "b74f998ed1c1f3fcd6eeadf358258fb0"
+  },
+  "frontend/src/features/notes/NoteWorkspace.tsx": {
+    "mtime": 1784214665.0091681,
+    "ast_hash": "1a28f0f76b2ea9563ba2ff770d419473",
+    "semantic_hash": "1a28f0f76b2ea9563ba2ff770d419473"
+  },
+  "frontend/src/features/notes/autosave.test.ts": {
+    "mtime": 1784214062.4046643,
+    "ast_hash": "1190c7a2095267f1dc744ec897047b23",
+    "semantic_hash": "1190c7a2095267f1dc744ec897047b23"
+  },
+  "frontend/src/features/notes/autosave.ts": {
+    "mtime": 1784214116.56305,
+    "ast_hash": "fdda7e38d3aafec72e67c64c5277eb0e",
+    "semantic_hash": "fdda7e38d3aafec72e67c64c5277eb0e"
+  },
+  "frontend/src/features/notes/draftRecovery.test.ts": {
+    "mtime": 1784214493.6868734,
+    "ast_hash": "20141dd8d172fcf162d6eee89cb15986",
+    "semantic_hash": "20141dd8d172fcf162d6eee89cb15986"
+  },
+  "frontend/src/features/tasks/TaskWorkspace.test.tsx": {
+    "mtime": 1784211572.3936152,
+    "ast_hash": "60e946474760a6ba44fda9f44df5fc5a",
+    "semantic_hash": "60e946474760a6ba44fda9f44df5fc5a"
+  },
+  "frontend/src/features/tasks/TaskWorkspace.tsx": {
+    "mtime": 1784211643.0621638,
+    "ast_hash": "d9109215163ae2032f12ed8c24cf7c91",
+    "semantic_hash": "d9109215163ae2032f12ed8c24cf7c91"
+  },
+  "frontend/src/navigation/WorkspaceNavigation.test.tsx": {
+    "mtime": 1784210223.8541477,
+    "ast_hash": "c4d61a6482c315b761fe47cd03550c3f",
+    "semantic_hash": "c4d61a6482c315b761fe47cd03550c3f"
+  },
+  "frontend/src/navigation/WorkspaceNavigation.tsx": {
+    "mtime": 1784210239.7989798,
+    "ast_hash": "dbc0fe1943b45e3c4213e49b3e8e56d2",
+    "semantic_hash": "dbc0fe1943b45e3c4213e49b3e8e56d2"
+  },
+  "docs/runbooks/PHASE-1-RELEASE-GATE.md": {
+    "mtime": 1784208974.854848,
+    "ast_hash": "bea3b96e420006833dd42b6d1952ce11",
+    "semantic_hash": "bea3b96e420006833dd42b6d1952ce11"
+  },
+  "docs/superpowers/plans/2026-07-16-phase-1-completion.md": {
+    "mtime": 1784209491.9988103,
+    "ast_hash": "e08a364aa6e308200a0567d0d67297b1",
+    "semantic_hash": "e08a364aa6e308200a0567d0d67297b1"
+  },
+  "docs/superpowers/specs/2026-07-16-phase-1-completion-design.md": {
+    "mtime": 1784209222.790682,
+    "ast_hash": "5aa9bfaf8c1f5fbf00aa46c2e431c2c4",
+    "semantic_hash": "5aa9bfaf8c1f5fbf00aa46c2e431c2c4"
   }
 }
