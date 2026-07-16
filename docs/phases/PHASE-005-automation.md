@@ -2,9 +2,15 @@
 id: PHASE-005
 title: Automation
 status: Draft
-version: 0.1.0
+version: 0.2.0
 owner: Lucky Jain
-depends_on: [PHASE-004]
+depends_on:
+  - PHASE-004
+  - RFC-001
+  - RFC-003
+  - RFC-004
+  - RFC-005
+  - STD-001
 contracts:
   - phase-005/DATA-MODEL.md
   - phase-005/API-SCHEMAS.md
@@ -18,32 +24,88 @@ contracts:
 
 ## Objective
 
-Execute bounded, recoverable workflows on schedules or events only under explicit user-approved policies.
+Execute bounded, recoverable local workflows on manual, scheduled or domain-event triggers under explicit user-approved policies.
+
+## User value
+
+The user safely delegates repetitive ECC work, knows exactly what is authorized, previews consequences and can stop or recover execution.
 
 ## In scope
 
-Workflow definitions and versions; triggers and schedules; approval gates; durable execution; idempotency; retries; compensation; pause/cancel; secrets references; policy simulation; execution history; notifications; local background worker.
+Finite workflow/version schema; manual/event/schedule triggers; simulation; approval gates; durable local worker; idempotency; bounded retry; pause/cancel; explicit compensation; secret references; history/notifications; kill switches; connector-independent action adapter contract.
 
 ## Out of scope
 
-Unbounded autonomous agents, silent external side effects, self-created policies, financial/legal/medical decisions, credential discovery, cross-workspace workflows and multi-user delegation.
+Unbounded autonomous agents; silent side effects; self-created authority; production external connectors (Phase 6); financial/legal/medical decisions; credential discovery; cross-workspace workflows; multi-user delegation; unattended destructive/person-directed actions.
 
-## Requirements
+## Functional requirements
 
-- Every side effect belongs to an approved versioned workflow and policy.
-- Default is preview/recommend; approval scopes specify action, target, limits and expiry.
-- Execution is durable, idempotent and resumable after restart.
-- Human approval cannot be inferred from conversation or prior unrelated actions.
+- Every side effect belongs to a published workflow version and active policy.
+- Default mode is preview-only; authority is explicit, scoped, expiring and revocable.
 - High-impact actions require per-run confirmation.
-- Retries are bounded; compensation is explicit and never assumed.
-- Users can pause, cancel, inspect and revoke future authority.
-- Schedules use workspace timezone with defined DST and missed-run behavior.
-- Every step records redacted inputs, outcome, actor/policy and correlation.
+- Simulation shows steps, permissions, side effects, approval points and irreversibility.
+- Execution persists before/after side effects and resumes safely after restart.
+- Stable action digests/idempotency keys prevent duplicates.
+- Unknown external outcome moves to review, never blind retry.
+- Schedules define timezone, DST, misfire and concurrency behavior.
+- Pause/cancel/kill switches prevent future steps at safe checkpoints.
+- Compensation runs only when explicitly declared and authorized.
+
+## Non-functional requirements
+
+No duplicate effect under crash/retry fixtures. Revocation blocks the next not-yet-started side effect. Worker restarts recover durable state within 60 seconds locally. Queued run start p95 <5 seconds under acceptance load. Execution remains auditable without storing secrets.
+
+## Architecture impact
+
+Add workflow definition, policy, trigger, scheduler and durable-execution modules. Use PostgreSQL queues/leases in the modular monolith unless an ADR approves new infrastructure. Phase 4 provides bounded AI steps; Phase 6 later supplies production connector actions.
+
+## Data changes
+
+Add workflow definitions/versions, policies, triggers, runs/steps, approval requests, compensation state, secret references and notifications defined in `phase-005/DATA-MODEL.md`.
+
+## API changes
+
+Add workflow, simulation, policy/revocation, run control and approval endpoints in `phase-005/API-SCHEMAS.md`. Approval validates the exact action digest and current version.
+
+## Frontend changes
+
+Add workflow list/builder, simulation, authority/policy review, approval inbox, schedule controls, run history and recovery views. Exact targets and side effects appear before approval.
+
+## Security and privacy
+
+Least-privilege authority; secrets remain opaque references; step payloads are redacted; approvals cannot be inferred from chat or unrelated history. Replay, confused-deputy and payload-substitution protections are mandatory. Destructive, public, financial, legal, credential and person-directed actions require per-run approval.
+
+## Observability
+
+Measure queue age, schedule lag/misfire, run/step states, approval wait/expiry, retries, duplicate suppression, unknown outcomes, cancellation latency, compensation success and kill-switch state. Correlation spans trigger, approval, run and audit without logging secrets.
+
+## Test strategy
+
+Schema/property tests, simulation, DST/misfire, approval scope/expiry/revocation, crash recovery, idempotency, concurrency, timeout/retry, unknown outcome, cancellation, compensation, security, performance, accessibility and staged dogfood using local/fake adapters.
+
+## Acceptance criteria
+
+- Simulation never causes side effects.
+- Unauthorized, expired, changed or replayed approvals are rejected.
+- Crash/retry tests produce at most one effect.
+- Pause/cancel/revoke/kill switches stop before the next side effect.
+- Schedule/DST and recovery targets pass.
+- Unknown outcomes and partial compensation are visible and recoverable.
+- Browser acceptance covers the complete authority lifecycle.
 
 ## Exit criteria
 
-Approved contracts; durable worker recovery; approval and revocation tests; schedule/DST tests; connector sandbox tests; compensation; security review; browser acceptance; zero Critical/High/Medium findings; staged dogfood with no unauthorized side effects.
+- Contracts explicitly approved and threat model reviewed.
+- Local-action adapters and fake external adapter conformance pass.
+- Durable worker recovery and operational runbooks pass.
+- Staged dogfood advances from preview to bounded actions with zero unauthorized effects.
+- Zero open Critical, High or Medium findings.
+- Phase 6 can add connector actions without changing authority semantics.
 
-## Rollback
+## Rollback plan
 
-Global and workflow kill switches stop new runs. In-flight runs reach a safe checkpoint or cancel. Revoking a policy blocks future steps. Recovery procedures address partial external side effects.
+Global/workflow kill switches stop new runs. Revoke policies to block future steps. In-flight runs stop at safe checkpoints or enter review. Preserve run/audit history. Apply explicit compensation or manual recovery for partial effects.
+
+## Deferred backlog
+
+Production external connectors, multi-user delegation, distributed workflow engine, autonomous policy creation and unattended high-impact actions.
