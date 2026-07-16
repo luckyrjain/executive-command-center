@@ -45,7 +45,7 @@ pnpm install --frozen-lockfile
 pnpm --filter @ecc/frontend dev
 ```
 
-Open `http://localhost:5173`, paste the two cookie commands printed by `scripts/bootstrap_dev.py` into the browser developer console, and reload.
+Open the one-time URL printed by `scripts/bootstrap_dev.py`. The backend exchanges the code for an `HttpOnly` seven-day session cookie and redirects to `http://localhost:5173`.
 
 For prerequisites, Docker usage, testing, troubleshooting, reset instructions, and first-use guidance, read [Setup and Usage](docs/SETUP.md).
 
