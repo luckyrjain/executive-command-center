@@ -20,6 +20,7 @@ from ecc.domains.governance.recommendation_mutations import (
 from ecc.domains.governance.recommendation_queries import router as recommendation_queries_router
 from ecc.domains.governance.risk_mutations import router as risk_mutations_router
 from ecc.domains.governance.risks import router as risks_router
+from ecc.domains.knowledge.evidence import router as evidence_router
 from ecc.domains.knowledge.notes import router as notes_router
 from ecc.domains.planning.tasks import router as tasks_router
 from ecc.domains.platform.audit_queries import router as audit_queries_router
@@ -55,6 +56,7 @@ app.include_router(attention_router)
 app.include_router(recommendation_queries_router)
 app.include_router(recommendation_mutations_router)
 app.include_router(audit_queries_router)
+app.include_router(evidence_router)
 app.include_router(search_router)
 app.include_router(dashboard_briefs_router)
 app.middleware("http")(rejected_mutation_audit_middleware)
