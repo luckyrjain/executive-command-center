@@ -42,15 +42,15 @@ uv run alembic -c backend/alembic.ini upgrade head
 
 ## 3. Create a local authenticated session
 
-Phase 1 does not include a production login screen. Create a development workspace, user, session, and CSRF token with:
+Phase 1 does not include a production login screen. Create or reuse the development workspace and user with:
 
 ```bash
 uv run python scripts/bootstrap_dev.py
 ```
 
-The bootstrap utility runs only when `ECC_ENV=development` and refuses non-local database hosts by default. Running it again reuses the existing local identity, revokes previous active sessions, and prints a fresh session and CSRF cookie pair.
+The bootstrap utility runs only when `ECC_ENV=development` and refuses non-local database hosts by default. Running it again reuses the existing local identity, revokes previous active sessions, and prints a fresh one-time URL that expires after 15 minutes.
 
-Keep the printed session token private. The script prints two `document.cookie` commands that must be run in the browser console after the frontend opens. These JavaScript-set cookies are intentionally limited to local development and are not a replacement for production `HttpOnly` session cookies.
+Start the backend, then open the printed URL. The URL carries the one-time code in its fragment so it is not sent in HTTP access logs. The backend rotates the code into an opaque `HttpOnly`, `SameSite=Lax` session cookie with a seven-day absolute lifetime, sets the readable CSRF cookie, and redirects to the frontend.
 
 For an isolated remote development database only, explicitly set:
 
@@ -86,7 +86,7 @@ pnpm install --frozen-lockfile
 pnpm --filter @ecc/frontend dev
 ```
 
-Open `http://localhost:5173`, paste the two cookie commands from `bootstrap_dev.py` into the browser developer console, and reload.
+Open the one-time bootstrap URL printed by `scripts/bootstrap_dev.py`. After the secure cookie exchange, the backend redirects to `http://localhost:5173`.
 
 ## What is available
 
@@ -154,13 +154,17 @@ Use a value with at least 32 characters and reload `.env` into the shell.
 
 Confirm `ECC_ENV=development` and that `ECC_DATABASE_URL` points to `localhost`, `127.0.0.1`, or `::1`. Use the remote-development override only for an isolated non-production database.
 
+### Bootstrap code is invalid or expired
+
+Run `scripts/bootstrap_dev.py` again and open the newly printed URL within 15 minutes. Generating a new code revokes the previous active session.
+
 ### `401 Authentication required`
 
-Run `scripts/bootstrap_dev.py` again, set both newly printed cookies, and reload. Use `localhost` consistently in browser URLs. Regeneration revokes the previous active session.
+Run `scripts/bootstrap_dev.py` again and complete the one-time browser exchange. Use `localhost` consistently in browser URLs.
 
 ### `403 CSRF_TOKEN_REQUIRED` or `CSRF_TOKEN_INVALID`
 
-Set the newly printed `ecc_csrf` cookie. It is tied to the generated session and current session secret.
+Complete the bootstrap exchange again. The CSRF cookie is tied to the generated session and current session secret.
 
 ### Database connection failure
 
@@ -178,6 +182,6 @@ Check `http://localhost:8000/health/ready`, confirm `VITE_API_BASE_URL`, and res
 ## Current limitations
 
 - Production registration and login are not implemented in Phase 1.
-- The bootstrap utility is development-only and deliberately refuses non-development environments.
+- The bootstrap utility and `/dev/bootstrap` exchange are development-only.
 - External Gmail, Google Calendar, GitHub, and Jira connectors are deferred.
 - AI enrichment is optional and disabled by default; deterministic features remain available.
