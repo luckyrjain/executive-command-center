@@ -23,6 +23,13 @@ def test_database_url_rejects_unsupported_scheme(monkeypatch: pytest.MonkeyPatch
         bootstrap_dev._database_url()
 
 
+def test_bootstrap_rejects_missing_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("ECC_ENV", raising=False)
+
+    with pytest.raises(SystemExit, match="ECC_ENV=development"):
+        bootstrap_dev._validate_environment("postgresql://ecc:ecc@localhost:5432/ecc")
+
+
 def test_bootstrap_rejects_non_development_environment(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
