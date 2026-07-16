@@ -10,6 +10,7 @@ from sqlalchemy import text
 from ecc.audit import rejected_mutation_audit_middleware
 from ecc.config import get_settings
 from ecc.database import engine
+from ecc.dev_bootstrap import router as dev_bootstrap_router
 from ecc.domains.calendar.events import router as calendar_events_router
 from ecc.domains.communication.commitments import router as commitments_router
 from ecc.domains.governance.attention import router as attention_router
@@ -42,6 +43,7 @@ app.add_middleware(
         "Idempotency-Key",
     ],
 )
+app.include_router(dev_bootstrap_router)
 app.include_router(tasks_router)
 app.include_router(commitments_router)
 app.include_router(notes_router)
