@@ -40,6 +40,7 @@ jobs:
       RESTORE_DATABASE_URL: postgresql://ecc:ecc@localhost:5432/ecc_restore
       BACKUP_DIR: .local/backups
       SCHEMA_VERSION: phase1-ci
+      PG_CLIENT_IMAGE: postgres:18.0
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
