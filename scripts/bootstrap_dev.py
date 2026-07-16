@@ -1,4 +1,4 @@
-"""Create or rotate a local development workspace, user, and browser session."""
+"""Create or rotate a local development workspace, user, and bootstrap code."""
 
 from __future__ import annotations
 
@@ -6,8 +6,7 @@ import os
 import secrets
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
-from hmac import new
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 from uuid import UUID, uuid4
 
 import psycopg
@@ -99,9 +98,8 @@ def main() -> None:
     database_url = _database_url()
     _validate_environment(database_url)
 
-    session_token = secrets.token_urlsafe(32)
-    token_hash = sha256(session_token.encode()).hexdigest()
-    csrf_token = new(session_secret.encode(), session_token.encode(), "sha256").hexdigest()
+    bootstrap_code = secrets.token_urlsafe(32)
+    bootstrap_hash = sha256(bootstrap_code.encode()).hexdigest()
     now = datetime.now(UTC)
 
     with psycopg.connect(database_url) as connection:
@@ -133,22 +131,23 @@ def main() -> None:
                     uuid4(),
                     workspace_id,
                     user_id,
-                    token_hash,
-                    now + timedelta(days=30),
+                    bootstrap_hash,
+                    now + timedelta(minutes=15),
                     now,
                 ),
             )
         connection.commit()
 
+    bootstrap_url = (
+        "http://localhost:8000/dev/bootstrap#code="
+        f"{quote(bootstrap_code, safe='')}"
+    )
     print(f"Local development identity {action}; previous active sessions were revoked.\n")
     print(f"Workspace ID: {workspace_id}")
     print(f"User ID:      {user_id}")
-    print("\nOpen http://localhost:5173 and run these in the browser console:\n")
-    print(
-        f'document.cookie = "ecc_session={session_token}; Path=/; SameSite=Strict";'
-    )
-    print(f'document.cookie = "ecc_csrf={csrf_token}; Path=/; SameSite=Strict";')
-    print("\nThese JavaScript-set cookies are for local development only. Reload the page.")
+    print("\nStart the backend, then open this one-time URL within 15 minutes:\n")
+    print(bootstrap_url)
+    print("\nThe backend will exchange the code for an HttpOnly seven-day session cookie.")
 
 
 if __name__ == "__main__":
