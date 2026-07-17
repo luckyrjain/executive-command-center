@@ -50,6 +50,11 @@ export async function run({ page, baseURL }) {
   await page.getByRole('main').waitFor()
   await page.getByRole('navigation', { name: 'Workspace' }).waitFor()
 
+  // The persistent workspace tablist lives outside every other scenario's
+  // `include:` scan (it's a sibling of #workspace-panel/#search-panel, never
+  // inside them), so it otherwise has no automated a11y regression coverage.
+  await assertNoSeriousAccessibilityViolations(page, { include: 'nav[aria-label="Workspace"]' })
+
   // `.focus()` seeds initial focus into the tablist the way a user who has
   // just Tabbed in from the browser chrome would land on it; every
   // subsequent step below drives the UI with keyboard presses only.
