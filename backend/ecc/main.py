@@ -32,6 +32,7 @@ from ecc.http_security import (
     security_headers_middleware,
 )
 from ecc.logging import configure_logging
+from ecc.observability import render_metrics, request_observability_middleware
 from ecc.search import router as search_router
 
 configure_logging()
@@ -69,6 +70,22 @@ app.middleware("http")(rejected_mutation_audit_middleware)
 # reject an oversized body without ever buffering it. See http_security.py.
 app.add_middleware(MaxBodySizeMiddleware)
 app.middleware("http")(mutation_rate_limit_middleware)
+# Registered here -- after mutation_rate_limit_middleware, before
+# response_contract_middleware's own registration below -- so it ends up
+# wrapped *inward* of response_contract_middleware (registered earlier in
+# the file = wrapped more inward; see ecc.http_security's ordering comments
+# and ecc.observability's module docstring for the full derivation).
+# response_contract_middleware sets request.state.request_id/correlation_id
+# *before* calling call_next, i.e. before delegating to this middleware, so
+# by the time request_observability_middleware's own dispatch body runs,
+# those IDs are already set -- it reuses them rather than generating a
+# second, independent pair. Its own call_next in turn wraps
+# mutation_rate_limit_middleware, MaxBodySizeMiddleware,
+# rejected_mutation_audit_middleware, and the router itself, so the matched
+# route template and any authenticated workspace identifier (set deep
+# inside route handling) are available once that call_next returns too.
+# See tests/test_observability.py's real-app regression test for the proof.
+app.middleware("http")(request_observability_middleware)
 
 
 def _request_uuid(raw: str | None) -> str:
@@ -205,3 +222,12 @@ def ready() -> JSONResponse:
 @app.get("/version")
 def version() -> dict[str, str]:
     return {"service": "ecc-backend", "version": app.version}
+
+
+@app.get("/metrics")
+def metrics() -> Response:
+    # Internal Phase 1 operational endpoint (see ecc.observability): a
+    # hand-rolled Prometheus text exposition, no request/response body,
+    # cookie, CSRF, token, note, or evidence content -- counters/histograms
+    # with bounded labels only.
+    return Response(content=render_metrics(), media_type="text/plain; version=0.0.4")

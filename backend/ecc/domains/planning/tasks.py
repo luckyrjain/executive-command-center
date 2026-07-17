@@ -9,11 +9,17 @@ from uuid import UUID, uuid4
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from sqlalchemy import text
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from ecc.auth import AuthContext, AuthDep, CsrfDep
 from ecc.config import get_settings
 from ecc.database import get_session
+from ecc.observability import (
+    record_audit_outbox_failure,
+    record_idempotency_conflict,
+    record_lifecycle_event,
+)
 
 router = APIRouter(prefix="/api/v1/tasks", tags=["tasks"])
 
@@ -187,6 +193,7 @@ def _load_idempotent_response(
     if existing is None:
         return None
     if existing["request_hash"] != request_hash:
+        record_idempotency_conflict("tasks")
         raise HTTPException(status_code=409, detail="IDEMPOTENCY_CONFLICT")
     return TaskResponse.model_validate(existing["response_body"])
 
@@ -241,41 +248,46 @@ def _write_audit(
     authorization_result: str = "allowed",
     failure_code: str | None = None,
 ) -> None:
-    session.execute(
-        text(
-            """
-            INSERT INTO audit_events (
-                id, workspace_id, event_type, aggregate_type, aggregate_id,
-                aggregate_version, actor_id, request_id, correlation_id,
-                idempotency_key_hash, before, after, changed_fields,
-                authorization_result, source, failure_code, metadata, occurred_at
-            ) VALUES (
-                :id, :workspace_id, :event_type, 'task', :aggregate_id,
-                :aggregate_version, :actor_id, :request_id, :correlation_id,
-                :key_hash, CAST(:before AS jsonb), CAST(:after AS jsonb),
-                :changed_fields, :authorization_result, 'user', :failure_code,
-                '{}'::jsonb, :occurred_at
-            )
-            """
-        ),
-        {
-            "id": uuid4(),
-            "workspace_id": auth.workspace_id,
-            "event_type": event_type,
-            "aggregate_id": task_id,
-            "aggregate_version": aggregate_version,
-            "actor_id": auth.user_id,
-            "request_id": request_id,
-            "correlation_id": correlation_id,
-            "key_hash": sha256(idempotency_key.encode()).hexdigest(),
-            "before": dumps(before) if before is not None else None,
-            "after": dumps(after) if after is not None else None,
-            "changed_fields": changed_fields,
-            "authorization_result": authorization_result,
-            "failure_code": failure_code,
-            "occurred_at": now,
-        },
-    )
+    try:
+        session.execute(
+            text(
+                """
+                INSERT INTO audit_events (
+                    id, workspace_id, event_type, aggregate_type, aggregate_id,
+                    aggregate_version, actor_id, request_id, correlation_id,
+                    idempotency_key_hash, before, after, changed_fields,
+                    authorization_result, source, failure_code, metadata, occurred_at
+                ) VALUES (
+                    :id, :workspace_id, :event_type, 'task', :aggregate_id,
+                    :aggregate_version, :actor_id, :request_id, :correlation_id,
+                    :key_hash, CAST(:before AS jsonb), CAST(:after AS jsonb),
+                    :changed_fields, :authorization_result, 'user', :failure_code,
+                    '{}'::jsonb, :occurred_at
+                )
+                """
+            ),
+            {
+                "id": uuid4(),
+                "workspace_id": auth.workspace_id,
+                "event_type": event_type,
+                "aggregate_id": task_id,
+                "aggregate_version": aggregate_version,
+                "actor_id": auth.user_id,
+                "request_id": request_id,
+                "correlation_id": correlation_id,
+                "key_hash": sha256(idempotency_key.encode()).hexdigest(),
+                "before": dumps(before) if before is not None else None,
+                "after": dumps(after) if after is not None else None,
+                "changed_fields": changed_fields,
+                "authorization_result": authorization_result,
+                "failure_code": failure_code,
+                "occurred_at": now,
+            },
+        )
+    except SQLAlchemyError:
+        record_audit_outbox_failure("tasks")
+        raise
+    record_lifecycle_event("task", event_type, authorization_result)
 
 
 def _write_outbox(
@@ -293,27 +305,31 @@ def _write_outbox(
         "task_version": task_version,
         **payload,
     }
-    session.execute(
-        text(
-            """
-            INSERT INTO event_outbox (
-                event_id, workspace_id, event_type, event_version,
-                correlation_id, payload, occurred_at, attempt_count
-            ) VALUES (
-                :event_id, :workspace_id, :event_type, 1,
-                :correlation_id, CAST(:payload AS jsonb), :occurred_at, 0
-            )
-            """
-        ),
-        {
-            "event_id": uuid4(),
-            "workspace_id": auth.workspace_id,
-            "event_type": event_type,
-            "correlation_id": correlation_id,
-            "payload": dumps(event_payload),
-            "occurred_at": now,
-        },
-    )
+    try:
+        session.execute(
+            text(
+                """
+                INSERT INTO event_outbox (
+                    event_id, workspace_id, event_type, event_version,
+                    correlation_id, payload, occurred_at, attempt_count
+                ) VALUES (
+                    :event_id, :workspace_id, :event_type, 1,
+                    :correlation_id, CAST(:payload AS jsonb), :occurred_at, 0
+                )
+                """
+            ),
+            {
+                "event_id": uuid4(),
+                "workspace_id": auth.workspace_id,
+                "event_type": event_type,
+                "correlation_id": correlation_id,
+                "payload": dumps(event_payload),
+                "occurred_at": now,
+            },
+        )
+    except SQLAlchemyError:
+        record_audit_outbox_failure("tasks")
+        raise
 
 
 def _get_task_row(

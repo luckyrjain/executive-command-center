@@ -9,11 +9,17 @@ from uuid import UUID, uuid4
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from sqlalchemy import text
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from ecc.auth import AuthContext, AuthDep, CsrfDep
 from ecc.config import get_settings
 from ecc.database import get_session
+from ecc.observability import (
+    record_audit_outbox_failure,
+    record_idempotency_conflict,
+    record_lifecycle_event,
+)
 
 router = APIRouter(prefix="/api/v1/commitments", tags=["commitments"])
 
@@ -194,6 +200,7 @@ def _load_cached(
     if row is None:
         return None
     if row["request_hash"] != request_hash:
+        record_idempotency_conflict("commitments")
         raise HTTPException(status_code=409, detail="IDEMPOTENCY_CONFLICT")
     return CommitmentResponse.model_validate(row["response_body"])
 
@@ -246,38 +253,43 @@ def _write_audit(
     changed_fields: list[str],
     now: datetime,
 ) -> None:
-    session.execute(
-        text(
-            """
-            INSERT INTO audit_events (
-                id, workspace_id, event_type, aggregate_type, aggregate_id,
-                aggregate_version, actor_id, request_id, correlation_id,
-                idempotency_key_hash, before, after, changed_fields,
-                authorization_result, source, metadata, occurred_at
-            ) VALUES (
-                :id, :workspace_id, :event_type, 'commitment', :aggregate_id,
-                :aggregate_version, :actor_id, :request_id, :correlation_id,
-                :key_hash, CAST(:before AS jsonb), CAST(:after AS jsonb),
-                :changed_fields, 'allowed', 'user', '{}'::jsonb, :occurred_at
-            )
-            """
-        ),
-        {
-            "id": uuid4(),
-            "workspace_id": auth.workspace_id,
-            "event_type": event_type,
-            "aggregate_id": commitment_id,
-            "aggregate_version": aggregate_version,
-            "actor_id": auth.user_id,
-            "request_id": request_id,
-            "correlation_id": correlation_id,
-            "key_hash": sha256(idempotency_key.encode()).hexdigest(),
-            "before": dumps(before) if before is not None else None,
-            "after": dumps(after) if after is not None else None,
-            "changed_fields": changed_fields,
-            "occurred_at": now,
-        },
-    )
+    try:
+        session.execute(
+            text(
+                """
+                INSERT INTO audit_events (
+                    id, workspace_id, event_type, aggregate_type, aggregate_id,
+                    aggregate_version, actor_id, request_id, correlation_id,
+                    idempotency_key_hash, before, after, changed_fields,
+                    authorization_result, source, metadata, occurred_at
+                ) VALUES (
+                    :id, :workspace_id, :event_type, 'commitment', :aggregate_id,
+                    :aggregate_version, :actor_id, :request_id, :correlation_id,
+                    :key_hash, CAST(:before AS jsonb), CAST(:after AS jsonb),
+                    :changed_fields, 'allowed', 'user', '{}'::jsonb, :occurred_at
+                )
+                """
+            ),
+            {
+                "id": uuid4(),
+                "workspace_id": auth.workspace_id,
+                "event_type": event_type,
+                "aggregate_id": commitment_id,
+                "aggregate_version": aggregate_version,
+                "actor_id": auth.user_id,
+                "request_id": request_id,
+                "correlation_id": correlation_id,
+                "key_hash": sha256(idempotency_key.encode()).hexdigest(),
+                "before": dumps(before) if before is not None else None,
+                "after": dumps(after) if after is not None else None,
+                "changed_fields": changed_fields,
+                "occurred_at": now,
+            },
+        )
+    except SQLAlchemyError:
+        record_audit_outbox_failure("commitments")
+        raise
+    record_lifecycle_event("commitment", event_type, "allowed")
 
 
 def _write_outbox(
@@ -290,27 +302,33 @@ def _write_outbox(
     payload: dict[str, Any],
     now: datetime,
 ) -> None:
-    session.execute(
-        text(
-            """
-            INSERT INTO event_outbox (
-                event_id, workspace_id, event_type, event_version,
-                correlation_id, payload, occurred_at
-            ) VALUES (
-                :event_id, :workspace_id, :event_type, 1,
-                :correlation_id, CAST(:payload AS jsonb), :occurred_at
-            )
-            """
-        ),
-        {
-            "event_id": uuid4(),
-            "workspace_id": auth.workspace_id,
-            "event_type": event_type,
-            "correlation_id": correlation_id,
-            "payload": dumps({"commitment_id": str(commitment_id), "version": version, **payload}),
-            "occurred_at": now,
-        },
-    )
+    try:
+        session.execute(
+            text(
+                """
+                INSERT INTO event_outbox (
+                    event_id, workspace_id, event_type, event_version,
+                    correlation_id, payload, occurred_at
+                ) VALUES (
+                    :event_id, :workspace_id, :event_type, 1,
+                    :correlation_id, CAST(:payload AS jsonb), :occurred_at
+                )
+                """
+            ),
+            {
+                "event_id": uuid4(),
+                "workspace_id": auth.workspace_id,
+                "event_type": event_type,
+                "correlation_id": correlation_id,
+                "payload": dumps(
+                    {"commitment_id": str(commitment_id), "version": version, **payload}
+                ),
+                "occurred_at": now,
+            },
+        )
+    except SQLAlchemyError:
+        record_audit_outbox_failure("commitments")
+        raise
 
 
 def _get_row(

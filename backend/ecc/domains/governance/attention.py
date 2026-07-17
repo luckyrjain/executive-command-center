@@ -1,3 +1,4 @@
+import time as time_module
 from datetime import UTC, date, datetime, time, timedelta
 from json import dumps
 from typing import Annotated, Any, Literal
@@ -11,6 +12,7 @@ from sqlalchemy.orm import Session
 
 from ecc.auth import AuthContext, AuthDep, CsrfDep
 from ecc.database import get_session
+from ecc.observability import record_ranking
 
 router = APIRouter(prefix="/api/v1/attention", tags=["attention"])
 SessionDep = Annotated[Session, Depends(get_session)]
@@ -220,6 +222,7 @@ def _upsert(
 
 @router.post("/regenerate", response_model=AttentionList)
 def regenerate_attention(auth: AuthDep, session: SessionDep, _csrf: CsrfDep) -> AttentionList:
+    ranking_start = time_module.monotonic()
     now = datetime.now(UTC)
     with session.begin():
         today, day_end = _workspace_day(session, auth, now)
@@ -314,6 +317,10 @@ def regenerate_attention(auth: AuthDep, session: SessionDep, _csrf: CsrfDep) -> 
         for raw in risks:
             row = dict(raw)
             _upsert(session, auth, "risk", row, *_score_risk(row, now), now, expires_at)
+    record_ranking(
+        time_module.monotonic() - ranking_start,
+        len(tasks) + len(commitments) + len(risks),
+    )
     return list_attention(auth, session, 50)
 
 

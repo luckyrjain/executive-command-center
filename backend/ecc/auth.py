@@ -5,7 +5,7 @@ from hmac import compare_digest, new
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import Cookie, Depends, Header, HTTPException, status
+from fastapi import Cookie, Depends, Header, HTTPException, Request, status
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
@@ -25,6 +25,7 @@ class AuthContext:
 
 
 def require_auth_context(
+    request: Request,
     session: SessionDep,
     ecc_session: SessionCookie = None,
 ) -> AuthContext:
@@ -60,11 +61,17 @@ def require_auth_context(
             detail="Invalid session",
         )
 
-    return AuthContext(
+    context = AuthContext(
         workspace_id=row["workspace_id"],
         user_id=row["user_id"],
         timezone=row["timezone"],
     )
+    # Stashed for ecc.observability.request_observability_middleware's
+    # structured request log (the design doc's "workspace identifier when
+    # authenticated" field) -- a log field only, never a metric label (that
+    # would make label cardinality unbounded across workspaces).
+    request.state.workspace_id = context.workspace_id
+    return context
 
 
 def require_csrf(

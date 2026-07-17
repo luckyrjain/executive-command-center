@@ -9,11 +9,17 @@ from uuid import UUID, uuid4
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy import text
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from ecc.auth import AuthContext, AuthDep, CsrfDep
 from ecc.config import get_settings
 from ecc.database import get_session
+from ecc.observability import (
+    record_audit_outbox_failure,
+    record_idempotency_conflict,
+    record_lifecycle_event,
+)
 
 router = APIRouter(prefix="/api/v1/risks", tags=["risks"])
 
@@ -264,6 +270,7 @@ def _load_cached(
     if row is None:
         return None
     if row["request_hash"] != request_hash:
+        record_idempotency_conflict("risks")
         raise HTTPException(status_code=409, detail="IDEMPOTENCY_CONFLICT")
     return RiskResponse.model_validate(row["response_body"])
 
@@ -277,51 +284,56 @@ def _write_side_effects(
     now: datetime,
 ) -> None:
     request_id, correlation_id = _request_ids(request)
-    session.execute(
-        text(
-            """
-            INSERT INTO audit_events (
-                id, workspace_id, event_type, aggregate_type, aggregate_id,
-                aggregate_version, actor_id, request_id, correlation_id,
-                changed_fields, authorization_result, source, metadata, occurred_at
-            ) VALUES (
-                :id, :workspace_id, 'risk.created', 'risk', :aggregate_id,
-                :aggregate_version, :actor_id, :request_id, :correlation_id,
-                ARRAY['*'], 'allowed', 'user', '{}'::jsonb, :occurred_at
-            )
-            """
-        ),
-        {
-            "id": uuid4(),
-            "workspace_id": auth.workspace_id,
-            "aggregate_id": risk_id,
-            "aggregate_version": version,
-            "actor_id": auth.user_id,
-            "request_id": request_id,
-            "correlation_id": correlation_id,
-            "occurred_at": now,
-        },
-    )
-    session.execute(
-        text(
-            """
-            INSERT INTO event_outbox (
-                event_id, workspace_id, event_type, event_version,
-                correlation_id, payload, occurred_at, attempt_count
-            ) VALUES (
-                :event_id, :workspace_id, 'risk.created.v1', 1,
-                :correlation_id, CAST(:payload AS jsonb), :occurred_at, 0
-            )
-            """
-        ),
-        {
-            "event_id": uuid4(),
-            "workspace_id": auth.workspace_id,
-            "correlation_id": correlation_id,
-            "payload": dumps({"risk_id": str(risk_id), "version": version}),
-            "occurred_at": now,
-        },
-    )
+    try:
+        session.execute(
+            text(
+                """
+                INSERT INTO audit_events (
+                    id, workspace_id, event_type, aggregate_type, aggregate_id,
+                    aggregate_version, actor_id, request_id, correlation_id,
+                    changed_fields, authorization_result, source, metadata, occurred_at
+                ) VALUES (
+                    :id, :workspace_id, 'risk.created', 'risk', :aggregate_id,
+                    :aggregate_version, :actor_id, :request_id, :correlation_id,
+                    ARRAY['*'], 'allowed', 'user', '{}'::jsonb, :occurred_at
+                )
+                """
+            ),
+            {
+                "id": uuid4(),
+                "workspace_id": auth.workspace_id,
+                "aggregate_id": risk_id,
+                "aggregate_version": version,
+                "actor_id": auth.user_id,
+                "request_id": request_id,
+                "correlation_id": correlation_id,
+                "occurred_at": now,
+            },
+        )
+        session.execute(
+            text(
+                """
+                INSERT INTO event_outbox (
+                    event_id, workspace_id, event_type, event_version,
+                    correlation_id, payload, occurred_at, attempt_count
+                ) VALUES (
+                    :event_id, :workspace_id, 'risk.created.v1', 1,
+                    :correlation_id, CAST(:payload AS jsonb), :occurred_at, 0
+                )
+                """
+            ),
+            {
+                "event_id": uuid4(),
+                "workspace_id": auth.workspace_id,
+                "correlation_id": correlation_id,
+                "payload": dumps({"risk_id": str(risk_id), "version": version}),
+                "occurred_at": now,
+            },
+        )
+    except SQLAlchemyError:
+        record_audit_outbox_failure("risks")
+        raise
+    record_lifecycle_event("risk", "risk.created", "allowed")
 
 
 @router.post("", response_model=RiskResponse, status_code=status.HTTP_201_CREATED)
