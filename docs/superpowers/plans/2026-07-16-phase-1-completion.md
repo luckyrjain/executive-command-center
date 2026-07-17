@@ -216,18 +216,25 @@ it('adds mutation protection headers', async () => {
 - Modify: `backend/ecc/main.py`
 - Modify: `frontend/Dockerfile`
 - Create: `frontend/nginx.conf`
+- Modify: `docker-compose.yml`
 
 **Interfaces:**
 - Produces: `validate_production_settings(settings) -> None` raising a startup-safe configuration error.
 - Produces ASGI middleware for security headers, maximum request body, and bounded per-session route-class rate limits.
+
+**2026-07-17 grounding notes (from reading the current code before dispatch — not a scope change, just resolving what the plan text leaves implicit):**
+- `Settings.session_secret` (`backend/ecc/config.py`) defaults to `""` with `min_length=32`, but Pydantic does not validate field defaults by default — an unset secret silently passes `Settings()` construction. `validate_production_settings` must explicitly reject empty/placeholder/short secrets in production; the Pydantic field constraint alone does not catch this.
+- `Settings.environment` is a bare `str` with no enum/`Literal` validation today. "Missing environment classification" means rejecting empty/unrecognized values, not merely checking `!= "development"`.
+- The only cookie-issuing code in the app is `backend/ecc/dev_bootstrap.py:146-163` (`set_cookie(..., secure=False, ...)` on both `ecc_session` and `ecc_csrf`), and it is already gated by `_require_development()` (404s outside `environment == "development"`) at the endpoint level — but `backend/ecc/main.py:47` unconditionally registers `dev_bootstrap_router` regardless of environment (defense-in-depth gap: the router exists and its schema/paths are discoverable even in production, only actual invocation 404s). Treat "development bootstrap" and "insecure production cookies" as two faces of the same gap: at minimum, don't register the dev-bootstrap router when `environment` is not development; if that alone doesn't give `validate_production_settings` something concrete to check, that's fine — say so in the report rather than inventing an unused settings field.
+- `frontend/Dockerfile` currently runs `pnpm --filter @ecc/frontend dev` (the Vite dev server) unconditionally — it is a dev-only image, not a production build, and `docker-compose.yml`'s `frontend` service builds it with no `target` pinned. Converting it to a real production build (multi-stage: build static assets, then serve via nginx with the new `nginx.conf`) must not silently break local dev through `docker-compose up`. Use named build stages (e.g. `dev` and a final production stage) and add `target: dev` to the `frontend` service in `docker-compose.yml` so local dev keeps building the dev stage explicitly — this is why `docker-compose.yml` is now in this task's file list.
 
 - [ ] **Step 1: Write failing configuration tests** for placeholder/short secrets, permissive origins, insecure production cookies, development bootstrap, and missing environment classification.
 - [ ] **Step 2: Verify red** with `pytest tests/test_production_security.py -q`.
 - [ ] **Step 3: Implement production validation** while preserving explicit development defaults.
 - [ ] **Step 4: Write failing HTTP tests** for required headers, oversized `413`, mutation `429`, retry header, and unaffected health checks.
 - [ ] **Step 5: Implement minimal middleware** using monotonic time, bounded buckets, and route templates; do not store request bodies.
-- [ ] **Step 6: Add nginx headers and a container-level assertion** that production HTML responses contain the matching policy.
-- [ ] **Step 7: Run backend focused tests, Ruff, formatting, mypy, and container build.**
+- [ ] **Step 6: Add nginx headers and a container-level assertion** that production HTML responses contain the matching policy; add the dev/production Dockerfile stage split and pin `docker-compose.yml`'s frontend service to the dev stage.
+- [ ] **Step 7: Run backend focused tests, Ruff, formatting, mypy, and container build (both the pinned dev-stage build used by docker-compose and the new production stage).**
 - [ ] **Step 8: Commit:** `git commit -m "feat(security): harden Phase 1 production HTTP"`.
 
 ### Task 8: Structured observability and Phase 1 metrics

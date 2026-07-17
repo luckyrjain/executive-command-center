@@ -8,7 +8,7 @@ from fastapi.responses import JSONResponse
 from sqlalchemy import text
 
 from ecc.audit import rejected_mutation_audit_middleware
-from ecc.config import get_settings
+from ecc.config import get_settings, validate_production_settings
 from ecc.database import engine
 from ecc.dev_bootstrap import router as dev_bootstrap_router
 from ecc.domains.calendar.events import router as calendar_events_router
@@ -26,11 +26,17 @@ from ecc.domains.planning.tasks import router as tasks_router
 from ecc.domains.platform.audit_queries import router as audit_queries_router
 from ecc.domains.platform.dashboard_briefs import router as dashboard_briefs_router
 from ecc.domains.scheduling.meetings import router as meetings_router
+from ecc.http_security import (
+    MaxBodySizeMiddleware,
+    mutation_rate_limit_middleware,
+    security_headers_middleware,
+)
 from ecc.logging import configure_logging
 from ecc.search import router as search_router
 
 configure_logging()
 settings = get_settings()
+validate_production_settings(settings)
 app = FastAPI(title="Executive Command Center", version="0.2.0")
 app.add_middleware(
     CORSMiddleware,
@@ -44,7 +50,17 @@ app.add_middleware(
         "Idempotency-Key",
     ],
 )
-app.include_router(dev_bootstrap_router)
+# The dev-bootstrap router is only ever functional in development (each of
+# its routes calls _require_development() and 404s otherwise) -- but
+# registering it unconditionally still makes it discoverable outside
+# development: a malformed request to its POST route would 422 (Pydantic
+# body validation, which runs before the handler's own environment check)
+# instead of 404, leaking that the path exists. Not registering it at all
+# outside development closes that gap and is also the concrete fix behind
+# "insecure production cookies", since dev_bootstrap.py is the only
+# cookie-issuing code in the app. See tests/test_production_security.py.
+if settings.environment.casefold() == "development":
+    app.include_router(dev_bootstrap_router)
 app.include_router(tasks_router)
 app.include_router(commitments_router)
 app.include_router(notes_router)
@@ -60,6 +76,11 @@ app.include_router(evidence_router)
 app.include_router(search_router)
 app.include_router(dashboard_briefs_router)
 app.middleware("http")(rejected_mutation_audit_middleware)
+# Pure-ASGI body size guard: registered via add_middleware (not the
+# "http" dispatch helper) so it can intercept the raw receive() channel and
+# reject an oversized body without ever buffering it. See http_security.py.
+app.add_middleware(MaxBodySizeMiddleware)
+app.middleware("http")(mutation_rate_limit_middleware)
 
 
 def _request_uuid(raw: str | None) -> str:
@@ -143,6 +164,13 @@ async def response_contract_middleware(
         headers=headers,
         background=response.background,
     )
+
+
+# Registered last so it is the outermost middleware layer (Starlette wraps
+# most-recently-added first): every response -- including one produced by
+# any other middleware above, e.g. a 413/429 -- gets the baseline security
+# headers via response.headers.setdefault.
+app.middleware("http")(security_headers_middleware)
 
 
 @app.get("/health/live")
