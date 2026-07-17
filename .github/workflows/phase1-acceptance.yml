@@ -52,10 +52,32 @@ jobs:
       - run: uv sync --frozen --all-groups --python 3.14.6
       - run: uv run alembic -c backend/alembic.ini upgrade head
       - run: createdb -h localhost -U ecc ecc_restore
+      - name: Seed representative Phase 1 acceptance fixtures
+        run: uv run python scripts/seed_phase1_acceptance.py
       - name: Backup and verify clean restore
+        id: backup_restore
         run: |
+          drill_start=$(date +%s)
           archive=$(./scripts/backup.sh)
           ./scripts/verify_restore.sh "${archive}"
+          drill_end=$(date +%s)
+          echo "archive=${archive}" >> "${GITHUB_OUTPUT}"
+          echo "elapsed_seconds=$((drill_end - drill_start))" >> "${GITHUB_OUTPUT}"
+      - name: Generate Phase 1 recovery evidence report
+        run: |
+          uv run python scripts/phase1_evidence.py \
+            --source-url "postgresql://ecc:ecc@localhost:5432/ecc" \
+            --target-url "postgresql://ecc:ecc@localhost:5432/ecc_restore" \
+            --archive "${{ steps.backup_restore.outputs.archive }}" \
+            --elapsed-seconds "${{ steps.backup_restore.outputs.elapsed_seconds }}" \
+            --output-json .local/evidence/phase1-recovery.json \
+            --output-md .local/evidence/phase1-recovery.md
+      - name: Upload Phase 1 recovery evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: phase1-recovery-evidence
+          path: .local/evidence/
+          if-no-files-found: error
       - run: uv run pytest tests/test_phase1_acceptance.py
 
   accessibility-smoke:
