@@ -92,3 +92,60 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm --filter @ecc/frontend exec playwright install --with-deps chromium
       - run: pnpm --filter @ecc/frontend test:e2e
+
+  performance-acceptance:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18.0
+        env:
+          POSTGRES_DB: ecc
+          POSTGRES_USER: ecc
+          POSTGRES_PASSWORD: ecc
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U ecc -d ecc"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      ECC_SESSION_SECRET: ci-secret-value-that-is-at-least-32-characters
+      ECC_DATABASE_URL: postgresql+psycopg://ecc:ecc@localhost:5432/ecc
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: 3.14.6
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+        with:
+          version: 0.7.19
+      - run: uv sync --frozen --all-groups --python 3.14.6
+      - run: uv run alembic -c backend/alembic.ini upgrade head
+      - name: Run Phase 1 representative-scale performance gates
+        run: |
+          mkdir -p .local/evidence
+          uv run pytest -v \
+            tests/test_dashboard_performance_postgres.py \
+            tests/test_mutation_brief_performance_postgres.py \
+            tests/test_search_performance_postgres.py \
+            tests/test_risks_attention_postgres.py \
+            2>&1 | tee .local/evidence/phase1-performance.log
+      - name: Summarize Phase 1 performance evidence
+        if: always()
+        run: |
+          {
+            echo "## Phase 1 performance acceptance"
+            echo
+            echo "Representative-scale dataset: 10,000 tasks/commitments/risks/calendar events, 50,000 notes, 100,000 audit rows."
+            echo
+            echo '```'
+            grep -E "PASSED|FAILED|took|p95|exceeds" .local/evidence/phase1-performance.log || true
+            echo '```'
+          } >> "${GITHUB_STEP_SUMMARY}"
+      - name: Upload Phase 1 performance evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: phase1-performance-evidence
+          path: .local/evidence/
+          if-no-files-found: error
