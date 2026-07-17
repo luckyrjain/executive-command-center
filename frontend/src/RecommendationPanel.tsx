@@ -284,7 +284,7 @@ export default function RecommendationPanel() {
                     </div>
                   ) : null}
                 </div>
-                <div className="recommendation-actions" aria-label={`Actions for ${item.recommendation_type}`}>
+                <div className="recommendation-actions" role="group" aria-label={`Actions for ${item.recommendation_type}`}>
                   {canPublish ? (
                     <button type="button" onClick={() => mutation.mutate({ item, action: 'publish' })} disabled={busy}>Publish for confirmation</button>
                   ) : null}

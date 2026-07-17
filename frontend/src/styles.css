@@ -109,10 +109,10 @@ button:disabled { opacity: .6; cursor: wait; }
 }
 .item-list li:first-child { border-top: 0; padding-top: 4px; }
 .item-list strong { display: block; font-size: 14px; line-height: 1.45; }
-.item-list small { display: block; margin-top: 4px; color: #7b8493; text-transform: capitalize; }
+.item-list small { display: block; margin-top: 4px; color: #5a6472; text-transform: capitalize; }
 .item-meta { display: flex; align-items: center; gap: 8px; color: #596579; font-size: 12px; white-space: nowrap; }
 .item-meta span { border-radius: 999px; background: #eef1f5; padding: 4px 8px; font-weight: 800; }
-.empty-state { margin: 50px 0 0; color: #7b8493; text-align: center; }
+.empty-state { margin: 50px 0 0; color: #5a6472; text-align: center; }
 
 .brief-panel {
   margin-top: 36px;
@@ -174,7 +174,7 @@ button:disabled { opacity: .6; cursor: wait; }
 }
 .recommendation-copy dl { display: flex; flex-wrap: wrap; gap: 14px 28px; margin: 18px 0 0; }
 .recommendation-copy dl div { display: grid; gap: 3px; }
-.recommendation-copy dt { color: #7b8493; font-size: 11px; font-weight: 800; letter-spacing: .08em; text-transform: uppercase; }
+.recommendation-copy dt { color: #5a6472; font-size: 11px; font-weight: 800; letter-spacing: .08em; text-transform: uppercase; }
 .recommendation-copy dd { margin: 0; color: #293344; font-size: 13px; text-transform: capitalize; }
 .execution-result { margin-top: 14px !important; color: #28724f !important; font-weight: 700; }
 .recommendation-actions { display: flex; min-width: 190px; flex-direction: column; align-items: stretch; gap: 9px; }
@@ -249,7 +249,7 @@ button:disabled { opacity: .6; cursor: wait; }
 .result-copy h3 { margin: 10px 0 8px; font-size: 20px; }
 .result-copy p { margin: 0 0 8px; color: #4f5b6d; line-height: 1.55; }
 .result-copy small,
-.audit-list small { color: #7b8493; }
+.audit-list small { color: #5a6472; }
 .audit-list li { display: flex; justify-content: space-between; gap: 24px; }
 .audit-list strong,
 .audit-list span,
@@ -258,7 +258,7 @@ button:disabled { opacity: .6; cursor: wait; }
 .audit-meta { min-width: 220px; text-align: right; }
 .audit-meta time { display: block; color: #596579; font-size: 12px; }
 .audit-meta span { text-transform: capitalize; }
-.explore-empty { margin: 32px 0 0; color: #7b8493; text-align: center; }
+.explore-empty { margin: 32px 0 0; color: #5a6472; text-align: center; }
 
 @media (max-width: 800px) {
   .app-shell { padding-top: 28px; }

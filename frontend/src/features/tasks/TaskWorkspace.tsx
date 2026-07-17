@@ -145,7 +145,7 @@ export default function TaskWorkspace() {
           const terminal = ['completed', 'cancelled'].includes(task.status)
           return <li key={task.id}>
             <div><strong>{task.title}</strong><small>{task.status.replaceAll('_', ' ')} · {task.manual_priority}</small></div>
-            <div className="work-actions" aria-label={`Actions for ${task.title}`}>
+            <div className="work-actions" role="group" aria-label={`Actions for ${task.title}`}>
               {!archived && !terminal ? <><button type="button" disabled={actionMutation.isPending || editMutation.isPending} aria-label={`Edit ${task.title}`} onClick={() => setEdit({ task, ...taskDraft(task), latestVersion: task.version, conflict: false, reloadFailed: false })}>Edit</button><button type="button" disabled={actionMutation.isPending || editMutation.isPending} aria-label={`Complete ${task.title}`} onClick={() => actionMutation.mutate({ task, action: 'complete' })}>Complete</button><button type="button" disabled={actionMutation.isPending || editMutation.isPending} aria-label={`Cancel ${task.title}`} onClick={() => actionMutation.mutate({ task, action: 'cancel' })}>Cancel</button></> : null}
               {!archived ? <button type="button" disabled={actionMutation.isPending || editMutation.isPending} aria-label={`Archive ${task.title}`} onClick={() => actionMutation.mutate({ task, action: 'archive' })}>Archive</button> : <button type="button" disabled={actionMutation.isPending || editMutation.isPending} aria-label={`Restore ${task.title}`} onClick={() => actionMutation.mutate({ task, action: 'restore' })}>Restore</button>}
             </div>

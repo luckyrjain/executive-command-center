@@ -213,7 +213,7 @@ export default function RiskWorkspace() {
           <small>{value.status.replaceAll('_', ' ')} · P{value.probability}×I{value.impact} · score {value.score}{archived ? ' · archived' : ''}</small>
         </div>
         {value.factors.length ? <ul className="risk-factors" aria-label={`Factors for ${value.description}`}>{value.factors.map((factor) => <li key={factor.code}>{factor.label} (+{factor.points})</li>)}</ul> : null}
-        <div className="work-actions" aria-label={`Actions for ${value.description}`}>
+        <div className="work-actions" role="group" aria-label={`Actions for ${value.description}`}>
           {!archived ? <button type="button" disabled={pending} aria-label={`Edit ${value.description}`} onClick={() => { setFormError(null); setEdit({ risk: value, ...fromRisk(value), latestVersion: value.version, conflict: false, reloadFailed: false }) }}>Edit</button> : null}
           {!archived ? <button type="button" disabled={pending} aria-label={`Archive ${value.description}`} onClick={() => actionMutation.mutate({ risk: value, action: 'archive' })}>Archive</button> : <button type="button" disabled={pending} aria-label={`Restore ${value.description}`} onClick={() => actionMutation.mutate({ risk: value, action: 'restore' })}>Restore</button>}
         </div>

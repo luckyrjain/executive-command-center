@@ -215,7 +215,7 @@ export default function NoteWorkspace({ recoveryStore }: NoteWorkspaceProps) {
     {query.isError ? <div role="alert">{query.error.message}</div> : null}
     <ol className="work-list note-list">{visibleNotes.map((note) => {
       const title = displayTitle(note)
-      return <li key={note.id}><div><strong>{title}</strong><small>{note.note_type}{note.archived_at ? ' · archived' : ''}</small><p>{note.body}</p></div><div className="work-actions" aria-label={`Actions for ${title}`}>
+      return <li key={note.id}><div><strong>{title}</strong><small>{note.note_type}{note.archived_at ? ' · archived' : ''}</small><p>{note.body}</p></div><div className="work-actions" role="group" aria-label={`Actions for ${title}`}>
         {!note.archived_at ? <button type="button" aria-label={`Edit ${title}`} onClick={() => { void beginEditing(note) }}>Edit</button> : null}
         {!note.archived_at ? <button type="button" aria-label={`Archive ${title}`} disabled={actionMutation.isPending} onClick={() => actionMutation.mutate({ note, action: 'archive' })}>Archive</button> : <button type="button" aria-label={`Restore ${title}`} disabled={actionMutation.isPending} onClick={() => actionMutation.mutate({ note, action: 'restore' })}>Restore</button>}
       </div></li>
