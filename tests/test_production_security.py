@@ -617,6 +617,49 @@ def test_cors_headers_present_on_oversized_body_cross_origin_response() -> None:
     assert "origin" in response.headers.get("vary", "").lower()
 
 
+def test_cors_headers_present_on_real_app_oversized_body_cross_origin_response(
+    monkeypatch: pytest.MonkeyPatch,
+    restore_main_module: None,
+) -> None:
+    """Same regression as the two tests above, but against the *real*
+    ``ecc.main.app`` object -- not ``_build_test_app``'s hand-copied mirror --
+    so this test is a tripwire tied to main.py's actual middleware
+    registration order: if a future edit to main.py reintroduced
+    CORSMiddleware-first (without anyone touching this test file), this test
+    would fail even though the two tests above (which reconstruct the
+    ordering by hand) would keep passing unchanged.
+
+    Uses ``_reload_main`` (already used by the dev-bootstrap tests above) to
+    build the real app with production-classified settings, so this also
+    exercises the real, un-overridden ``MAX_REQUEST_BODY_BYTES`` (1 MiB) body
+    cap -- MaxBodySizeMiddleware's fast Content-Length path rejects the
+    request before routing/handlers ever run, so no DB/domain setup is
+    needed. A real 429 would require 41 rapid mutation requests against the
+    real 40-req/60s limiter (see RATE_LIMIT_MAX_REQUESTS in
+    http_security.py) sharing one session/IP key; that's impractical as a
+    fast, deterministic unit test, so only the 413 path is covered here. The
+    429 case remains covered by test_cors_headers_present_on_rate_limited_
+    cross_origin_response above, using a small max_requests for
+    determinism.
+    """
+    cross_origin = "https://app.example.com"  # matches _reload_main's ECC_CORS_ORIGINS
+    reloaded = _reload_main(monkeypatch, "production")
+    client = TestClient(reloaded.app)
+
+    oversized_body = b"x" * (MAX_REQUEST_BODY_BYTES + 1024)
+
+    response = client.post(
+        "/api/v1/tasks",
+        content=oversized_body,
+        headers={"Origin": cross_origin, "Content-Type": "application/octet-stream"},
+    )
+
+    assert response.status_code == 413
+    assert response.headers["access-control-allow-origin"] == cross_origin
+    assert response.headers["access-control-allow-credentials"] == "true"
+    assert "origin" in response.headers.get("vary", "").lower()
+
+
 def test_cors_headers_present_on_normal_response_with_cors_enabled() -> None:
     """Sanity check: enabling CORS in the test app doesn't break the plain
     (non-short-circuited) response path that the other tests in this file
