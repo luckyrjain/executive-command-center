@@ -107,17 +107,35 @@ async def request_observability_middleware(
     reaches Starlette's outer ``ServerErrorMiddleware`` (which still produces
     the same 500 response as today -- this only *observes* the failure, it
     is re-raised unchanged so response/status behavior is untouched).
+
+    That observation includes the *same* request-completion log line and
+    ``record_request`` metric call the success path below emits -- not just
+    ``record_database_failure`` -- using status ``500`` (the response
+    Starlette's ``ServerErrorMiddleware`` will actually send once this
+    re-raise reaches it), so a DB-failure-driven request still produces
+    exactly one structured log line and is still counted in
+    ``ecc_http_requests_total``/``ecc_http_request_duration_seconds``.
     """
     start = time.monotonic()
     try:
         response = await call_next(request)
     except SQLAlchemyError:
-        record_database_failure(_route_template(request))
+        route = _route_template(request)
+        record_database_failure(route)
+        duration_seconds = time.monotonic() - start
+        _record_and_log_request(request, route, duration_seconds, status_code=500)
         raise
 
     duration_seconds = time.monotonic() - start
     route = _route_template(request)
     status_code = response.status_code
+    _record_and_log_request(request, route, duration_seconds, status_code=status_code)
+    return response
+
+
+def _record_and_log_request(
+    request: Request, route: str, duration_seconds: float, *, status_code: int
+) -> None:
     method = request.method
     request_id = getattr(request.state, "request_id", None)
     correlation_id = getattr(request.state, "correlation_id", None)
@@ -137,7 +155,6 @@ async def request_observability_middleware(
             "workspace_id": str(workspace_id) if workspace_id else None,
         },
     )
-    return response
 
 
 # ---------------------------------------------------------------------------

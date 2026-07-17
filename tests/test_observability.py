@@ -29,6 +29,7 @@ from uuid import uuid4
 import pytest
 from fastapi import FastAPI, Request
 from fastapi.testclient import TestClient
+from sqlalchemy.exc import SQLAlchemyError
 
 from ecc.config import get_settings
 from ecc.database import engine
@@ -105,6 +106,10 @@ def _build_test_app() -> FastAPI:
     @app.post("/api/v1/echo")
     def echo(payload: dict, request: Request) -> dict:
         return {"received": payload}
+
+    @app.get("/api/v1/db-failure")
+    def db_failure(request: Request) -> dict:
+        raise SQLAlchemyError("simulated database failure")
 
     return app
 
@@ -250,6 +255,57 @@ def test_log_never_contains_request_body_cookies_or_csrf(
         assert _SECRET_BODY_MARKER not in rendered
         assert _SECRET_COOKIE_VALUE not in rendered
         assert _SECRET_CSRF_VALUE not in rendered
+
+
+# ---------------------------------------------------------------------------
+# Logging + Metrics: the ``except SQLAlchemyError`` branch must *also* emit
+# the request-completion log line and record_request metric before
+# re-raising -- not just record_database_failure -- so a DB-failure-driven
+# request is neither silently missing from the structured logs nor
+# undercounted in ecc_http_requests_total/ecc_http_request_duration_seconds.
+# ---------------------------------------------------------------------------
+
+
+def test_database_failure_path_emits_request_log_line(
+    capture_request_logs: _CaptureHandler,
+) -> None:
+    client = TestClient(_build_test_app())
+
+    with pytest.raises(SQLAlchemyError):
+        client.get("/api/v1/db-failure")
+
+    assert len(capture_request_logs.records) == 1
+    logged = capture_request_logs.records[0]
+    assert logged.getMessage() == "request_handled"
+    assert logged.route == "/api/v1/db-failure"  # type: ignore[attr-defined]
+    assert logged.http_method == "GET"  # type: ignore[attr-defined]
+    assert logged.status_code == 500  # type: ignore[attr-defined]
+    assert isinstance(logged.duration_ms, float)  # type: ignore[attr-defined]
+    assert logged.duration_ms >= 0  # type: ignore[attr-defined]
+    assert logged.request_id is not None  # type: ignore[attr-defined]
+
+
+def test_database_failure_path_increments_request_metric() -> None:
+    label_prefix = 'ecc_http_requests_total{route="/api/v1/db-failure",method="GET",status="500"}'
+    before_rendered = render_metrics()
+    before = 0
+    if label_prefix in before_rendered:
+        line = next(line for line in before_rendered.splitlines() if line.startswith(label_prefix))
+        before = int(float(line.split()[-1]))
+
+    client = TestClient(_build_test_app())
+    with pytest.raises(SQLAlchemyError):
+        client.get("/api/v1/db-failure")
+
+    rendered = render_metrics()
+    assert label_prefix in rendered
+    line = next(line for line in rendered.splitlines() if line.startswith(label_prefix))
+    after = int(float(line.split()[-1]))
+    assert after == before + 1
+
+    # The database-failure counter still fires too -- this fix is additive,
+    # not a replacement for record_database_failure.
+    assert 'ecc_database_failures_total{route="/api/v1/db-failure"}' in rendered
 
 
 # ---------------------------------------------------------------------------
