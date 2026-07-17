@@ -31,6 +31,7 @@ from types import ModuleType
 import httpx
 import pytest
 from fastapi import FastAPI, Response
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.testclient import TestClient
 
 from ecc.config import ConfigurationError, Settings, validate_production_settings
@@ -292,11 +293,34 @@ def test_dev_bootstrap_router_still_registered_in_development(
 # ---------------------------------------------------------------------------
 
 
-def _build_test_app(*, max_body_bytes: int = MAX_REQUEST_BODY_BYTES) -> FastAPI:
+def _build_test_app(
+    *,
+    max_body_bytes: int = MAX_REQUEST_BODY_BYTES,
+    include_cors: bool = False,
+    cors_origins: list[str] | None = None,
+) -> FastAPI:
     app = FastAPI()
     app.add_middleware(MaxBodySizeMiddleware, max_bytes=max_body_bytes)
     app.middleware("http")(mutation_rate_limit_middleware)
     app.middleware("http")(security_headers_middleware)
+    if include_cors:
+        # Registered *last* -- mirroring the corrected order in ecc.main --
+        # so CORSMiddleware is the outermost layer and wraps every response,
+        # including the ones MaxBodySizeMiddleware/mutation_rate_limit_middleware
+        # short-circuit before ever calling call_next()/self._app(). See the
+        # "CORS composition" tests below.
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=cors_origins or ["https://frontend.example.com"],
+            allow_credentials=True,
+            allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
+            allow_headers=[
+                "Content-Type",
+                "X-CSRF-Token",
+                "X-Correlation-ID",
+                "Idempotency-Key",
+            ],
+        )
 
     @app.post("/api/v1/widgets")
     def create_widget(payload: dict) -> dict:
@@ -522,6 +546,88 @@ def test_rate_limit_buckets_are_bounded_in_memory() -> None:
         limiter.check(f"key-{i}")
 
     assert len(limiter._buckets) <= 50
+
+
+# ---------------------------------------------------------------------------
+# CORS composition: short-circuited 413/429 responses must still carry CORS
+# headers for a real cross-origin browser client.
+#
+# ecc.main's actual deployment has the frontend on one origin and the
+# backend on another, with CORSMiddleware configured allow_credentials=True.
+# CORSMiddleware only annotates responses that pass through the `send`
+# channel it wraps. If it is registered as an *inner* layer (Starlette wraps
+# the most-recently-added middleware outermost -- see the ordering comments
+# in ecc.main), any middleware that short-circuits *before* calling
+# call_next()/self._app() -- as MaxBodySizeMiddleware's fast Content-Length
+# path and mutation_rate_limit_middleware's 429 branch both do -- produces a
+# response CORSMiddleware never gets a chance to see. A real browser then
+# reports an opaque network/CORS error instead of a readable 429/413 the
+# frontend could read `Retry-After` from and act on.
+#
+# `_build_test_app(include_cors=True)` registers CORSMiddleware *last*,
+# mirroring the corrected registration order in ecc.main (CORSMiddleware
+# added after every other middleware, so it ends up outermost). These tests
+# were confirmed to fail (no Access-Control-Allow-Origin header on the
+# 429/413 response) when CORSMiddleware was instead registered *first* --
+# reproducing ecc.main's pre-fix order -- and pass with it registered last.
+# ---------------------------------------------------------------------------
+
+_CROSS_ORIGIN = "https://frontend.example.com"
+
+
+def test_cors_headers_present_on_rate_limited_cross_origin_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ecc.http_security as http_security
+
+    limiter = http_security._MutationRateLimiter(window_seconds=60.0, max_requests=1)
+    monkeypatch.setattr(http_security, "_mutation_rate_limiter", limiter)
+
+    app = _build_test_app(include_cors=True, cors_origins=[_CROSS_ORIGIN])
+    client = TestClient(app)
+    client.cookies.set("ecc_session", "same-session-token")
+    origin_headers = {"Origin": _CROSS_ORIGIN}
+
+    first = client.post("/api/v1/widgets", json={}, headers=origin_headers)
+    second = client.post("/api/v1/widgets", json={}, headers=origin_headers)
+
+    assert first.status_code == 200
+    assert second.status_code == 429
+    assert int(second.headers["Retry-After"]) >= 1
+    # These are exactly what a real browser needs in order to read a
+    # cross-origin response's status/body at all, rather than surfacing an
+    # opaque CORS/network error to the frontend.
+    assert second.headers["access-control-allow-origin"] == _CROSS_ORIGIN
+    assert second.headers["access-control-allow-credentials"] == "true"
+    assert "origin" in second.headers.get("vary", "").lower()
+
+
+def test_cors_headers_present_on_oversized_body_cross_origin_response() -> None:
+    app = _build_test_app(max_body_bytes=16, include_cors=True, cors_origins=[_CROSS_ORIGIN])
+    client = TestClient(app)
+    origin_headers = {"Origin": _CROSS_ORIGIN}
+
+    response = client.post(
+        "/api/v1/widgets", json={"padding": "x" * 200}, headers=origin_headers
+    )
+
+    assert response.status_code == 413
+    assert response.headers["access-control-allow-origin"] == _CROSS_ORIGIN
+    assert response.headers["access-control-allow-credentials"] == "true"
+    assert "origin" in response.headers.get("vary", "").lower()
+
+
+def test_cors_headers_present_on_normal_response_with_cors_enabled() -> None:
+    """Sanity check: enabling CORS in the test app doesn't break the plain
+    (non-short-circuited) response path that the other tests in this file
+    exercise without CORS."""
+    app = _build_test_app(include_cors=True, cors_origins=[_CROSS_ORIGIN])
+    client = TestClient(app)
+
+    response = client.get("/api/v1/widgets", headers={"Origin": _CROSS_ORIGIN})
+
+    assert response.status_code == 200
+    assert response.headers["access-control-allow-origin"] == _CROSS_ORIGIN
 
 
 # ---------------------------------------------------------------------------

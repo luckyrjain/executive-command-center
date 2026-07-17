@@ -38,18 +38,6 @@ configure_logging()
 settings = get_settings()
 validate_production_settings(settings)
 app = FastAPI(title="Executive Command Center", version="0.2.0")
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=settings.cors_origin_list,
-    allow_credentials=True,
-    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
-    allow_headers=[
-        "Content-Type",
-        "X-CSRF-Token",
-        "X-Correlation-ID",
-        "Idempotency-Key",
-    ],
-)
 # The dev-bootstrap router is only ever functional in development (each of
 # its routes calls _require_development() and 404s otherwise) -- but
 # registering it unconditionally still makes it discoverable outside
@@ -166,11 +154,37 @@ async def response_contract_middleware(
     )
 
 
-# Registered last so it is the outermost middleware layer (Starlette wraps
-# most-recently-added first): every response -- including one produced by
-# any other middleware above, e.g. a 413/429 -- gets the baseline security
-# headers via response.headers.setdefault.
+# Registered before CORSMiddleware (below) so it is the second-outermost
+# middleware layer (Starlette wraps most-recently-added first): every
+# response -- including one produced by any other middleware above, e.g. a
+# 413/429 -- gets the baseline security headers via response.headers.setdefault.
 app.middleware("http")(security_headers_middleware)
+
+# Registered *last*, so CORSMiddleware ends up outermost of all -- wrapping
+# every response, including the ones the security middleware above
+# short-circuits before ever calling `call_next` (MaxBodySizeMiddleware's
+# fast-path 413, mutation_rate_limit_middleware's 429). Those responses are
+# built by writing directly to the ASGI `send` channel / returning a fresh
+# JSONResponse rather than going through `self._app`/`call_next`, so they
+# never reach an inner CORSMiddleware's wrapped `send` -- the browser would
+# see a response with no Access-Control-Allow-Origin/Vary headers and treat
+# it as an opaque network/CORS failure instead of a readable 413/429. With
+# CORSMiddleware outermost, it wraps `send` before delegating to the rest of
+# the stack, so it sees and annotates every response regardless of which
+# layer produced it. See tests/test_production_security.py's
+# `_build_test_app(include_cors=True)` cases for the regression test.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.cors_origin_list,
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
+    allow_headers=[
+        "Content-Type",
+        "X-CSRF-Token",
+        "X-Correlation-ID",
+        "Idempotency-Key",
+    ],
+)
 
 
 @app.get("/health/live")
