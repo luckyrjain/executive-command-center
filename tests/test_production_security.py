@@ -225,17 +225,31 @@ def _reload_main(monkeypatch: pytest.MonkeyPatch, environment: str | None) -> Mo
 
 @pytest.fixture
 def restore_main_module() -> Iterator[None]:
+    # Snapshot the actual pre-test environment (including "unset") so
+    # teardown can restore exactly what was there before -- not a hardcoded
+    # literal. In CI, ECC_SESSION_SECRET is a real environment variable set
+    # before pytest even starts (see .github/workflows/ci.yml), so
+    # overwriting it with tests/conftest.py's dev-default literal instead of
+    # restoring it would silently mutate the process env for every test that
+    # runs afterward.
+    restore_vars = ("ECC_ENV", "ECC_CORS_ORIGINS", "ECC_SESSION_SECRET")
+    prior_values = {name: os.environ.get(name) for name in restore_vars}
+
     yield
-    # Reload back to the sqlite/development defaults established by
-    # tests/conftest.py so later-imported test modules (already collected
-    # with `from ecc.main import app`, so unaffected either way, but future
-    # fixtures/tests running in-process still see a consistent default app).
+
+    # Reload back to whatever settings were actually in effect before this
+    # test ran, so later-imported test modules (already collected with
+    # `from ecc.main import app`, so unaffected either way, but future
+    # fixtures/tests running in-process still see a consistent app) observe
+    # the real prior state rather than a guessed default.
     import ecc.config as config_module
     import ecc.main as main_module
 
-    os.environ.pop("ECC_ENV", None)
-    os.environ.pop("ECC_CORS_ORIGINS", None)
-    os.environ["ECC_SESSION_SECRET"] = "test-secret-value-that-is-long-enough"
+    for name, value in prior_values.items():
+        if value is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = value
     config_module.get_settings.cache_clear()
     importlib.reload(main_module)
 
