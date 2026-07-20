@@ -264,6 +264,7 @@ def test_no_document_claims_completion_while_daily_use_gate_is_open() -> None:
 # produced genuine, independently-reviewed evidence for. Each must be
 # checked, not left unchecked -- this is the "don't underclaim" direction.
 RELEASE_GATE_ITEMS_WITH_EVIDENCE = (
+    "Backend Ruff, formatting, mypy, Alembic and PostgreSQL tests pass.",
     "Frontend typecheck, unit tests, production build and Chromium acceptance pass.",
     "All lifecycle mutations preserve optimistic version checks, idempotency, CSRF and "
     "workspace isolation.",
@@ -293,19 +294,23 @@ RELEASE_GATE_ITEMS_WITH_EVIDENCE = (
 )
 
 # Checklist items that genuinely cannot be proven live in this local
-# environment: Trivy's vulnerability-database scan results, `pnpm audit`'s
-# network-dependent findings, gitleaks and the SBOM scan only run for real
-# inside GitHub Actions (their YAML was syntax/logic-verified in Task 11,
-# never executed against live CVE data here -- see task-11-review.md), and
-# no live CI/CD pipeline exists yet to run post-deploy smoke checks
-# automatically. Also includes "Backend ... PostgreSQL tests pass.": Task 12
-# discovered a real, CI-config-reproducing test-isolation defect (see the
-# full-proof section of task-12-report.md) that makes the full `pytest`
-# suite fail under CI's actual configured ECC_SESSION_SECRET, so this claim
-# cannot be honestly checked off as of this update. These must stay
-# unchecked, not be silently checked off.
+# environment, or that reflect a real currently-failing gate: Trivy's
+# vulnerability-database scan results and `pnpm audit`'s network-dependent
+# findings were actually run live in Task 12 (network access was available,
+# contrary to task-11-review.md's assumption) and found real HIGH/CRITICAL
+# findings in frontend dependencies and both container base images -- a
+# genuine failing gate, not merely unverifiable; gitleaks and the SBOM step
+# were not independently re-run locally. No live CI/CD pipeline exists yet
+# to run post-deploy smoke checks automatically. These must stay unchecked,
+# not be silently checked off.
+#
+# ("Backend Ruff, formatting, mypy, Alembic and PostgreSQL tests pass." was
+# also in this list after Task 12 discovered a real, CI-config-reproducing
+# test-isolation defect in tests/test_production_security.py's
+# restore_main_module fixture -- fixed and independently re-reviewed in
+# commit 87e12b2 (see task-ci-secret-fix-report.md), so it moved back to
+# RELEASE_GATE_ITEMS_WITH_EVIDENCE above.)
 RELEASE_GATE_ITEMS_STILL_OPEN = (
-    "Backend Ruff, formatting, mypy, Alembic and PostgreSQL tests pass.",
     "Dependency, secret, container and SBOM scans pass.",
     "Post-deployment smoke checks are automated.",
 )
