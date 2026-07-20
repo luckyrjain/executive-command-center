@@ -621,9 +621,7 @@ def test_cors_headers_present_on_oversized_body_cross_origin_response() -> None:
     client = TestClient(app)
     origin_headers = {"Origin": _CROSS_ORIGIN}
 
-    response = client.post(
-        "/api/v1/widgets", json={"padding": "x" * 200}, headers=origin_headers
-    )
+    response = client.post("/api/v1/widgets", json={"padding": "x" * 200}, headers=origin_headers)
 
     assert response.status_code == 413
     assert response.headers["access-control-allow-origin"] == _CROSS_ORIGIN
