@@ -7,4 +7,4 @@ RUN uv sync --frozen --no-dev
 COPY --chown=ecc:ecc backend ./backend
 ENV PYTHONPATH=/app/backend
 USER ecc
-CMD ["uv", "run", "uvicorn", "ecc.main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["/app/.venv/bin/uvicorn", "ecc.main:app", "--host", "0.0.0.0", "--port", "8000"]
