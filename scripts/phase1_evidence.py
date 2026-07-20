@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import subprocess
 import sys
 from datetime import UTC, datetime
 from hashlib import sha256
@@ -51,6 +52,28 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import seed_phase1_acceptance as seed_fixtures  # noqa: E402
 
 DEFAULT_RTO_BUDGET_SECONDS = 600
+
+
+def _git_head_sha(root: Path = Path(".")) -> str | None:
+    """Return the current git HEAD commit SHA, or None if unavailable.
+
+    Recorded in the evidence report so the Phase 1 acceptance checker
+    (scripts/check_phase1_acceptance.py) can detect a stale recovery-drill
+    result -- one recorded against a commit other than the one currently
+    checked out -- rather than silently trusting an old artifact.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    sha = result.stdout.strip()
+    return sha or None
 
 
 def _pg_url(value: str) -> str:
@@ -235,6 +258,7 @@ def build_report(
         rto_budget_seconds=rto_budget_seconds,
     )
 
+    passed = all(item["passed"] for item in invariants)
     return {
         "generated_at": datetime.now(UTC).isoformat(),
         "elapsed_seconds": elapsed_seconds,
@@ -243,7 +267,13 @@ def build_report(
         "row_counts": {"source": source_counts, "target": target_counts},
         "checksums": {"source": source_checksums, "target": target_checksums},
         "invariants": invariants,
-        "passed": all(item["passed"] for item in invariants),
+        "passed": passed,
+        # Recorded-result fields consumed by
+        # scripts/check_phase1_acceptance.py's result-aware validation
+        # (result_evidence.backup_restore): a status string plus the
+        # commit this drill ran against.
+        "status": "passed" if passed else "failed",
+        "head_sha": _git_head_sha(),
     }
 
 
