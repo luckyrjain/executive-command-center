@@ -31,6 +31,12 @@ ENV VITE_API_BASE_URL=${VITE_API_BASE_URL}
 RUN pnpm --filter @ecc/frontend build
 
 FROM nginx:1.27-alpine AS production
+# The nginx:1.27-alpine tag already resolves to the newest published
+# 1.27.x-alpine build, but Alpine ships OS-package security fixes via its
+# apk repository ahead of new base-image tags/rebuilds. Pull those fixes in
+# explicitly so the image isn't stuck on stale libcrypto3/libssl3/libxml2/etc
+# versions between upstream base-image rebuilds.
+RUN apk update && apk upgrade --no-cache
 COPY frontend/nginx.conf /etc/nginx/conf.d/default.conf
 COPY --from=build /app/frontend/dist /usr/share/nginx/html
 EXPOSE 80
