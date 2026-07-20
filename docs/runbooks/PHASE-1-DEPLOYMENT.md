@@ -28,11 +28,12 @@ rather than starting and failing later (Task 7; `tests/test_production_security.
 
 ## Deploy
 
-Run from the repository root. `<REF>` is the git ref being deployed (a commit SHA or tag).
+Run from the repository root. Set `REF` to the git ref being deployed (a commit SHA or tag) before running the commands below.
 
 ```bash
+REF="<commit-sha-or-tag>"
 git fetch origin
-git checkout "<REF>"
+git checkout "${REF}"
 
 # 1. Build images at the deployed ref.
 docker build -f backend/Dockerfile -t "ecc-backend:${REF}" .
@@ -156,7 +157,7 @@ Phase 1 scope).
 
 **Recovery time objective (RTO):** 600 seconds (`config/phase1-acceptance.json`
 `backup_restore.rto_seconds`), measured end-to-end by
-`scripts/verify_restore.sh`'s `$SECONDS` check. Actually measured: 24
+`scripts/verify_restore.sh`'s `$SECONDS` check. Actually measured: 7
 seconds wall-clock for a full backup+restore+verify cycle against real
 PostgreSQL 18 in this environment on 2026-07-20 (see
 `.superpowers/sdd/task-12-report.md`'s full-proof section for the live
