@@ -32,7 +32,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy.exc import SQLAlchemyError
 
 from ecc.config import get_settings
-from ecc.database import engine
+from ecc.database import SessionFactory, engine
 from ecc.observability import (
     record_audit_outbox_failure,
     record_brief_stale,
@@ -340,6 +340,78 @@ def test_record_lifecycle_event_appears_in_metrics() -> None:
     assert 'event_type="meeting.created"' in rendered
 
 
+def test_queue_lifecycle_event_is_not_counted_until_session_commits() -> None:
+    """The domain layer calls queue_lifecycle_event() from inside the same
+    transaction as the rest of a mutation (audit write, outbox write,
+    idempotency-key storage). If a later statement in that transaction fails
+    and the session rolls back, the queued event must never reach
+    lifecycle_events_total -- otherwise the metric overcounts successes
+    relative to what actually persisted."""
+    from sqlalchemy import text
+
+    from ecc.observability import queue_lifecycle_event
+
+    session = SessionFactory()
+    try:
+        before = render_metrics()
+        # A real statement first, same as every production call site (the
+        # audit-row INSERT always precedes queue_lifecycle_event) -- this is
+        # what actually puts the session in a transaction for rollback() to
+        # roll back and fire after_rollback on.
+        session.execute(text("SELECT 1"))
+        queue_lifecycle_event(session, "task", "task.rollback_test", "allowed")
+        assert 'event_type="task.rollback_test"' not in render_metrics()
+
+        session.rollback()
+
+        after_rollback = render_metrics()
+        assert after_rollback == before
+        assert 'event_type="task.rollback_test"' not in after_rollback
+    finally:
+        session.close()
+
+
+def test_queue_lifecycle_event_does_not_leak_across_rollback_into_later_commit() -> None:
+    """session.info is not reset by SQLAlchemy on rollback -- without an
+    explicit after_rollback listener clearing the queue, a rolled-back
+    event would sit in session.info and get incorrectly flushed by a later,
+    unrelated commit on the same Session object."""
+    from sqlalchemy import text
+
+    from ecc.observability import queue_lifecycle_event
+
+    session = SessionFactory()
+    try:
+        session.execute(text("SELECT 1"))
+        queue_lifecycle_event(session, "task", "task.rollback_leak_test", "allowed")
+        session.rollback()
+
+        session.execute(text("SELECT 1"))
+        queue_lifecycle_event(session, "task", "task.unrelated_commit_test", "allowed")
+        session.commit()
+
+        rendered = render_metrics()
+        assert 'event_type="task.rollback_leak_test"' not in rendered
+        assert 'event_type="task.unrelated_commit_test"' in rendered
+    finally:
+        session.close()
+
+
+def test_queue_lifecycle_event_is_counted_after_session_commits() -> None:
+    from ecc.observability import queue_lifecycle_event
+
+    session = SessionFactory()
+    try:
+        queue_lifecycle_event(session, "task", "task.commit_test", "allowed")
+        assert 'event_type="task.commit_test"' not in render_metrics()
+
+        session.commit()
+
+        assert 'event_type="task.commit_test"' in render_metrics()
+    finally:
+        session.close()
+
+
 def test_record_search_appears_in_metrics() -> None:
     record_search(0.045, 7)
 
@@ -411,6 +483,29 @@ def test_metrics_endpoint_is_exposed_on_real_app() -> None:
 
     assert response.status_code == 200
     assert "ecc_http_requests_total" in response.text
+
+
+def test_metrics_endpoint_requires_token_when_configured(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When ECC_METRICS_TOKEN is set, /metrics must reject requests that
+    don't present it -- otherwise anyone can hit the endpoint at unlimited
+    rate (it's outside mutation_rate_limit_middleware's scope) and force a
+    live outbox-backlog DB query on every call."""
+    import ecc.main as main
+
+    monkeypatch.setattr(main.settings, "metrics_token", "s3cret-scrape-token")
+    client = TestClient(main.app)
+
+    unauthenticated = client.get("/metrics")
+    assert unauthenticated.status_code == 401
+
+    wrong_token = client.get("/metrics", headers={"Authorization": "Bearer wrong-token"})
+    assert wrong_token.status_code == 401
+
+    correct_token = client.get("/metrics", headers={"Authorization": "Bearer s3cret-scrape-token"})
+    assert correct_token.status_code == 200
+    assert "ecc_http_requests_total" in correct_token.text
 
 
 # ---------------------------------------------------------------------------

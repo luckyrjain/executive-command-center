@@ -25,8 +25,10 @@ Three independent pieces, each usable/testable on its own:
 3. ``_MutationRateLimiter`` / ``mutation_rate_limit_middleware`` -- a fixed
    window rate limiter for mutation-class routes only (see
    ``_is_mutation_route`` for the exact grouping and rationale), keyed by
-   session (falling back to client IP), backed by a bounded in-memory
-   bucket table so a long-running process cannot accumulate unbounded state.
+   client IP (refined by session cookie when present, but IP always
+   participates in the key since the cookie is unvalidated at this point in
+   the chain), backed by a bounded in-memory bucket table so a long-running
+   process cannot accumulate unbounded state.
 """
 
 from __future__ import annotations
@@ -184,6 +186,18 @@ _MUTATION_PATH_PREFIX = "/api/v1"
 RATE_LIMIT_WINDOW_SECONDS = 60.0
 RATE_LIMIT_MAX_REQUESTS = 40
 
+# A second, coarser ceiling keyed by client IP alone (never by the
+# unvalidated session cookie -- see _rate_limit_key). The per-session bucket
+# above lets several distinct legitimate sessions behind one shared IP
+# (office NAT, etc.) each get their own headroom, but that same design means
+# a client can mint a fresh, never-validated ecc_session cookie value on
+# every request to get a brand-new per-session bucket each time. This IP-only
+# ceiling bounds that: no matter how many cookie values one IP cycles
+# through, it cannot exceed RATE_LIMIT_MAX_REQUESTS_PER_IP mutation requests
+# per window. Set well above the per-session limit so it only engages against
+# genuine hammering/bypass attempts, not normal shared-IP traffic.
+RATE_LIMIT_MAX_REQUESTS_PER_IP = RATE_LIMIT_MAX_REQUESTS * 10
+
 # Bucket table cap: bounds worst-case memory for this rate limiter regardless
 # of how many distinct sessions/IPs a long-running process observes. Evicts
 # least-recently-used once the cap is reached.
@@ -242,14 +256,26 @@ class _MutationRateLimiter:
 
 
 _mutation_rate_limiter = _MutationRateLimiter()
+_mutation_ip_rate_limiter = _MutationRateLimiter(max_requests=RATE_LIMIT_MAX_REQUESTS_PER_IP)
 
 
-def _rate_limit_key(request: Request) -> str:
+def _client_host(request: Request) -> str:
+    client = request.client
+    return client.host if client else "unknown"
+
+
+def _rate_limit_key(request: Request, *, host: str) -> str:
+    # The session cookie has not been validated yet at this point in the
+    # middleware chain (auth happens later, in the route dependency), so on
+    # its own it cannot be trusted as a rate-limit key -- a client could mint
+    # a fresh, unvalidated cookie value on every request to get a new bucket
+    # each time. That bypass is closed by _mutation_ip_rate_limiter (an
+    # IP-only ceiling checked alongside this key in the middleware below),
+    # not by this function -- this key still differentiates real sessions
+    # sharing one IP so they don't throttle each other.
     session_token = request.cookies.get("ecc_session")
     if session_token:
-        return "session:" + sha256(session_token.encode("utf-8")).hexdigest()
-    client = request.client
-    host = client.host if client else "unknown"
+        return f"ip:{host}:session:" + sha256(session_token.encode("utf-8")).hexdigest()
     return f"ip:{host}"
 
 
@@ -266,7 +292,11 @@ async def mutation_rate_limit_middleware(
     if not _is_mutation_route(request):
         return await call_next(request)
 
-    retry_after = _mutation_rate_limiter.check(_rate_limit_key(request))
+    host = _client_host(request)
+    ip_retry_after = _mutation_ip_rate_limiter.check(f"ip:{host}")
+    key_retry_after = _mutation_rate_limiter.check(_rate_limit_key(request, host=host))
+    candidates = [r for r in (ip_retry_after, key_retry_after) if r is not None]
+    retry_after = max(candidates) if candidates else None
     if retry_after is None:
         return await call_next(request)
 

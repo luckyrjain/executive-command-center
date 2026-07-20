@@ -162,7 +162,22 @@ def check_result_evidence(
     if not isinstance(result, dict):
         return [f"result_evidence.{category}: recorded result must be a JSON object"]
 
-    current_head_sha = _current_head_sha(root) if spec.get("require_head_sha_match") else None
+    require_head_sha_match = bool(spec.get("require_head_sha_match"))
+    current_head_sha = _current_head_sha(root) if require_head_sha_match else None
+    if require_head_sha_match and current_head_sha is None:
+        # Fail closed: the spec explicitly asked for staleness verification,
+        # but git is unavailable (no .git checkout, git not installed, or
+        # the command failed) -- silently skipping the head_sha comparison
+        # here (current_head_sha=None) would let validate_recorded_result's
+        # `current_head_sha is not None and ...` guard no-op, letting an
+        # arbitrarily stale recorded-result artifact pass unnoticed. That is
+        # exactly the failure mode require_head_sha_match exists to catch.
+        return [
+            f"result_evidence.{category}: require_head_sha_match is set but the current "
+            f"git HEAD SHA could not be determined for {root.resolve()} "
+            "(not a git checkout, git unavailable, or the command failed) -- cannot verify "
+            "the recorded result isn't stale"
+        ]
     return validate_recorded_result(
         result,
         label=f"result_evidence.{category}",

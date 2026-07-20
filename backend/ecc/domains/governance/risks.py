@@ -16,9 +16,9 @@ from ecc.auth import AuthContext, AuthDep, CsrfDep
 from ecc.config import get_settings
 from ecc.database import get_session
 from ecc.observability import (
+    queue_lifecycle_event,
     record_audit_outbox_failure,
     record_idempotency_conflict,
-    record_lifecycle_event,
 )
 
 router = APIRouter(prefix="/api/v1/risks", tags=["risks"])
@@ -333,7 +333,7 @@ def _write_side_effects(
     except SQLAlchemyError:
         record_audit_outbox_failure("risks")
         raise
-    record_lifecycle_event("risk", "risk.created", "allowed")
+    queue_lifecycle_event(session, "risk", "risk.created", "allowed")
 
 
 @router.post("", response_model=RiskResponse, status_code=status.HTTP_201_CREATED)

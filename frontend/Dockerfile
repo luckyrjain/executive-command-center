@@ -7,10 +7,11 @@
 #                  the stage docker-compose.yml pins via `target: dev`, so
 #                  `docker compose up` is unaffected by anything below.
 #   build       -- compiles production static assets (tsc -b && vite build).
-#   production  -- nginx serving the built assets with frontend/nginx.conf's
-#                  security headers. Not wired into docker-compose.yml; built
-#                  and verified independently (see
-#                  tests/test_production_security.py's container assertion).
+#   production  -- nginx serving the built assets with
+#                  frontend/nginx.conf.template's security headers. Not wired
+#                  into docker-compose.yml; built and verified independently
+#                  (see tests/test_production_security.py's container
+#                  assertion).
 
 FROM node:22.17.0-alpine AS deps
 WORKDIR /app
@@ -37,7 +38,18 @@ FROM nginx:1.27-alpine AS production
 # explicitly so the image isn't stuck on stale libcrypto3/libssl3/libxml2/etc
 # versions between upstream base-image rebuilds.
 RUN apk update && apk upgrade --no-cache
-COPY frontend/nginx.conf /etc/nginx/conf.d/default.conf
+# Copied into /etc/nginx/templates/ (not conf.d/ directly) so the base
+# image's own docker-entrypoint.d/20-envsubst-on-templates.sh renders it into
+# /etc/nginx/conf.d/default.conf at container start, substituting
+# ${VITE_API_BASE_URL} into the CSP's connect-src -- see the template's own
+# header comment for why this must be a runtime value, not just baked in at
+# build time like the JS bundle's copy of the same variable.
+COPY frontend/nginx.conf.template /etc/nginx/templates/default.conf.template
 COPY --from=build /app/frontend/dist /usr/share/nginx/html
+# Default so the container still starts (with a same-origin-only CSP) if a
+# deployer forgets to pass -e VITE_API_BASE_URL at `docker run` time; the
+# actual production value must be supplied at run time to match whatever was
+# baked into the JS bundle via the build-stage ARG above.
+ENV VITE_API_BASE_URL=""
 EXPOSE 80
 CMD ["nginx", "-g", "daemon off;"]

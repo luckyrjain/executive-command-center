@@ -18,6 +18,7 @@ class Settings(BaseSettings):
         validation_alias="ECC_SESSION_SECRET",
     )
     cors_origins: str = Field(default="http://localhost:5173", validation_alias="ECC_CORS_ORIGINS")
+    metrics_token: str = Field(default="", validation_alias="ECC_METRICS_TOKEN")
 
     @property
     def cors_origin_list(self) -> list[str]:

@@ -1,9 +1,30 @@
 # Production static-asset server for the built frontend (see frontend/Dockerfile's
 # `production` stage). Mirrors the security header baseline applied to API
 # responses by backend/ecc/http_security.py, adapted for an HTML/JS/CSS origin:
-# a same-origin CSP (the built app only ever loads its own hashed JS/CSS bundles
-# and talks to the API via fetch/XHR, not third-party origins) rather than the
-# backend's `default-src 'none'`, which would break the app shell itself.
+# a same-origin CSP (the built app only ever loads its own hashed JS/CSS bundles)
+# rather than the backend's `default-src 'none'`, which would break the app
+# shell itself.
+#
+# This is a *.template file processed by the base nginx image's own
+# docker-entrypoint.d/20-envsubst-on-templates.sh at container start (nginx
+# only substitutes ${VAR} placeholders whose name is an actual process
+# environment variable, so unrelated nginx runtime variables like $uri below
+# are left untouched -- see nginx's docker-library docs for this mechanism).
+# `connect-src` needs the backend's real origin, not just 'self': the app is
+# commonly deployed with the frontend and backend on different origins (see
+# docs/runbooks/PHASE-1-DEPLOYMENT.md and the CORS allowlist in
+# backend/ecc/main.py, both of which assume a cross-origin browser->API
+# call), and a hardcoded `connect-src 'self'` would silently block every
+# fetch/XHR the app makes to that backend. `VITE_API_BASE_URL` is reused here
+# (the same variable Vite bakes into the JS bundle at build time) so a
+# deployer only has to set the backend origin once conceptually -- but it
+# must still be passed twice: as a `--build-arg` to `docker build` (bakes it
+# into the JS bundle) AND as a `-e`/`--env` to `docker run` (lets this
+# template pick it up at container start). If unset at runtime, this
+# resolves to `connect-src 'self' ;` -- a harmless no-op extra token, not a
+# broken header -- but the app will then be unable to reach a cross-origin
+# backend, same as before this template existed.
+#
 # nginx quirk this file works around: `add_header` in a location block does
 # NOT inherit from its parent `server`/`http` block once that location
 # defines any `add_header` of its own -- so every location below that sets
@@ -19,7 +40,7 @@ server {
     add_header X-Content-Type-Options "nosniff" always;
     add_header X-Frame-Options "DENY" always;
     add_header Referrer-Policy "no-referrer" always;
-    add_header Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'" always;
+    add_header Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' ${VITE_API_BASE_URL}; frame-ancestors 'none'; base-uri 'none'; form-action 'self'" always;
     add_header Strict-Transport-Security "max-age=63072000; includeSubDomains" always;
 
     location = /health {
@@ -44,7 +65,7 @@ server {
         add_header X-Content-Type-Options "nosniff" always;
         add_header X-Frame-Options "DENY" always;
         add_header Referrer-Policy "no-referrer" always;
-        add_header Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'" always;
+        add_header Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' ${VITE_API_BASE_URL}; frame-ancestors 'none'; base-uri 'none'; form-action 'self'" always;
         add_header Strict-Transport-Security "max-age=63072000; includeSubDomains" always;
     }
 
@@ -53,7 +74,7 @@ server {
         add_header X-Content-Type-Options "nosniff" always;
         add_header X-Frame-Options "DENY" always;
         add_header Referrer-Policy "no-referrer" always;
-        add_header Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'" always;
+        add_header Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' ${VITE_API_BASE_URL}; frame-ancestors 'none'; base-uri 'none'; form-action 'self'" always;
         add_header Strict-Transport-Security "max-age=63072000; includeSubDomains" always;
     }
 }

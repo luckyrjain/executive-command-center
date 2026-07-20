@@ -14,9 +14,9 @@ from ecc.auth import AuthContext, AuthDep, CsrfDep
 from ecc.database import get_session
 from ecc.domains.governance.risks import RiskResponse, RiskStatus, _project
 from ecc.observability import (
+    queue_lifecycle_event,
     record_audit_outbox_failure,
     record_idempotency_conflict,
-    record_lifecycle_event,
 )
 
 router = APIRouter(prefix="/api/v1/risks", tags=["risks"])
@@ -246,7 +246,7 @@ def _write_side_effects(
     except SQLAlchemyError:
         record_audit_outbox_failure("risks")
         raise
-    record_lifecycle_event("risk", event_type, "allowed")
+    queue_lifecycle_event(session, "risk", event_type, "allowed")
 
 
 @router.patch("/{risk_id}", response_model=RiskResponse)

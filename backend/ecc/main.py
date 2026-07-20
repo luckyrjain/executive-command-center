@@ -1,4 +1,5 @@
 from collections.abc import Awaitable, Callable
+from hmac import compare_digest
 from json import JSONDecodeError, loads
 from uuid import UUID, uuid4
 
@@ -225,9 +226,27 @@ def version() -> dict[str, str]:
 
 
 @app.get("/metrics")
-def metrics() -> Response:
+def metrics(request: Request) -> Response:
     # Internal Phase 1 operational endpoint (see ecc.observability): a
     # hand-rolled Prometheus text exposition, no request/response body,
     # cookie, CSRF, token, note, or evidence content -- counters/histograms
-    # with bounded labels only.
+    # with bounded labels only. Not covered by mutation_rate_limit_middleware
+    # (GET, and intentionally scrape-friendly), so it is protected instead by
+    # an optional shared-secret token: if ECC_METRICS_TOKEN is configured,
+    # every request must present it via `Authorization: Bearer <token>` or
+    # get a 401 -- both to stop unauthenticated internet-wide scraping and,
+    # since _outbox_backlog_count() below runs a live DB query per call
+    # (bounded further by render_metrics' own short-lived cache), to bound
+    # how cheaply that can be triggered. If ECC_METRICS_TOKEN is left unset,
+    # the endpoint stays open (today's behavior) -- see
+    # docs/runbooks/PHASE-1-DEPLOYMENT.md for why an operator must then
+    # firewall this route from the public internet themselves.
+    expected_token = settings.metrics_token
+    if expected_token:
+        authorization = request.headers.get("authorization", "")
+        provided_token = (
+            authorization.removeprefix("Bearer ") if authorization.startswith("Bearer ") else ""
+        )
+        if not provided_token or not compare_digest(provided_token, expected_token):
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
     return Response(content=render_metrics(), media_type="text/plain; version=0.0.4")

@@ -476,6 +476,45 @@ def test_mutation_rate_limit_keys_by_session_not_shared_globally(
     assert second.status_code == 200
 
 
+def test_mutation_rate_limit_not_bypassable_by_rotating_cookie(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A client cannot evade the limit by sending a fresh, unvalidated
+    session cookie value on every request -- the bucket key must always
+    incorporate client IP, since the cookie hasn't been authenticated at
+    this point in the middleware chain."""
+    import ecc.http_security as http_security
+
+    # Session bucket generous (isolates this test from the per-session
+    # ceiling); IP bucket tight -- this is the one that must catch the
+    # bypass since each forged cookie value gets its own session bucket.
+    monkeypatch.setattr(
+        http_security,
+        "_mutation_rate_limiter",
+        http_security._MutationRateLimiter(window_seconds=60.0, max_requests=100),
+    )
+    monkeypatch.setattr(
+        http_security,
+        "_mutation_ip_rate_limiter",
+        http_security._MutationRateLimiter(window_seconds=60.0, max_requests=2),
+    )
+    app = FastAPI()
+    app.middleware("http")(http_security.mutation_rate_limit_middleware)
+
+    @app.post("/api/v1/widgets")
+    def create_widget() -> dict:
+        return {"ok": True}
+
+    client = TestClient(app)
+
+    responses = []
+    for i in range(3):
+        client.cookies.set("ecc_session", f"forged-token-{i}")
+        responses.append(client.post("/api/v1/widgets"))
+
+    assert [r.status_code for r in responses] == [200, 200, 429]
+
+
 def test_read_routes_are_not_mutation_rate_limited(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -687,7 +726,7 @@ def test_cors_headers_present_on_normal_response_with_cors_enabled() -> None:
 
 # ---------------------------------------------------------------------------
 # Container-level assertion: the production frontend image actually serves
-# the nginx security header policy (frontend/nginx.conf), not merely that
+# the nginx security header policy (frontend/nginx.conf.template), not merely that
 # the config file contains the right text.
 #
 # This is opt-in (skipped unless ECC_RUN_CONTAINER_SECURITY_TEST=1), unlike
@@ -724,6 +763,89 @@ def _free_tcp_port() -> int:
     ),
 )
 def test_production_container_serves_security_headers() -> None:
+    image_tag = f"ecc-frontend-prod-test-{uuid.uuid4().hex[:12]}"
+    container_name = f"ecc-frontend-prod-check-{uuid.uuid4().hex[:12]}"
+    port = _free_tcp_port()
+    backend_origin = "https://api.example.test"
+
+    subprocess.run(
+        [
+            "docker",
+            "build",
+            "-f",
+            str(_REPO_ROOT / "frontend" / "Dockerfile"),
+            "--target",
+            "production",
+            "-t",
+            image_tag,
+            str(_REPO_ROOT),
+        ],
+        check=True,
+        capture_output=True,
+    )
+    try:
+        subprocess.run(
+            [
+                "docker",
+                "run",
+                "-d",
+                "--name",
+                container_name,
+                "-p",
+                f"127.0.0.1:{port}:80",
+                # Mirrors the deployment runbook: the CSP connect-src is
+                # rendered from this at container start (nginx.conf.template),
+                # independent of whatever VITE_API_BASE_URL the JS bundle was
+                # built with -- this test only exercises the run-time half.
+                "-e",
+                f"VITE_API_BASE_URL={backend_origin}",
+                image_tag,
+            ],
+            check=True,
+            capture_output=True,
+        )
+
+        response: httpx.Response | None = None
+        last_error: Exception | None = None
+        for _ in range(30):
+            try:
+                response = httpx.get(f"http://127.0.0.1:{port}/", timeout=1.0)
+                break
+            except httpx.TransportError as error:
+                last_error = error
+                time.sleep(0.5)
+        if response is None:
+            raise AssertionError(f"production container never became reachable: {last_error}")
+
+        assert response.status_code == 200
+        assert response.headers["x-content-type-options"] == "nosniff"
+        assert response.headers["x-frame-options"] == "DENY"
+        assert response.headers["referrer-policy"] == "no-referrer"
+        csp = response.headers["content-security-policy"]
+        assert "default-src 'self'" in csp
+        # The regression this guards: connect-src used to be hardcoded to
+        # 'self' only, which silently blocks the app's own API calls in the
+        # documented cross-origin deployment shape (see nginx.conf.template's
+        # header comment and docs/runbooks/PHASE-1-DEPLOYMENT.md).
+        assert f"connect-src 'self' {backend_origin}" in csp
+        assert "max-age=" in response.headers["strict-transport-security"]
+    finally:
+        subprocess.run(["docker", "rm", "-f", container_name], capture_output=True)
+        subprocess.run(["docker", "rmi", "-f", image_tag], capture_output=True)
+
+
+@pytest.mark.skipif(shutil.which("docker") is None, reason="docker CLI not available")
+@pytest.mark.skipif(
+    os.environ.get("ECC_RUN_CONTAINER_SECURITY_TEST") != "1",
+    reason=(
+        "opt-in container build/run test; set ECC_RUN_CONTAINER_SECURITY_TEST=1 "
+        "to exercise it (see comment above)"
+    ),
+)
+def test_production_container_csp_falls_back_safely_without_backend_origin() -> None:
+    """If a deployer forgets -e VITE_API_BASE_URL at `docker run` time, the
+    container must still start and serve a valid (if same-origin-only) CSP,
+    not a malformed header or a crashed nginx."""
     image_tag = f"ecc-frontend-prod-test-{uuid.uuid4().hex[:12]}"
     container_name = f"ecc-frontend-prod-check-{uuid.uuid4().hex[:12]}"
     port = _free_tcp_port()
@@ -772,11 +894,7 @@ def test_production_container_serves_security_headers() -> None:
             raise AssertionError(f"production container never became reachable: {last_error}")
 
         assert response.status_code == 200
-        assert response.headers["x-content-type-options"] == "nosniff"
-        assert response.headers["x-frame-options"] == "DENY"
-        assert response.headers["referrer-policy"] == "no-referrer"
-        assert "default-src 'self'" in response.headers["content-security-policy"]
-        assert "max-age=" in response.headers["strict-transport-security"]
+        assert "connect-src 'self'" in response.headers["content-security-policy"]
     finally:
         subprocess.run(["docker", "rm", "-f", container_name], capture_output=True)
         subprocess.run(["docker", "rmi", "-f", image_tag], capture_output=True)

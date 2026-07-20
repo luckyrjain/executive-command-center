@@ -102,6 +102,30 @@ def test_validate_flags_stale_recorded_result_when_wired_via_config(
     assert any("stale" in error.lower() for error in errors)
 
 
+def test_validate_fails_closed_when_head_sha_required_but_unresolvable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """require_head_sha_match must fail the check (not silently skip the
+    staleness comparison) when the current git HEAD SHA can't be determined
+    (no .git checkout, git unavailable, or the git command failed) --
+    otherwise an arbitrarily stale recorded-result artifact passes
+    unnoticed, which is exactly the failure mode this flag exists to catch.
+    """
+    monkeypatch.setattr(module, "_current_head_sha", lambda root: None)
+    document = _document()
+    document["result_evidence"] = {
+        "backup_restore": {
+            "artifact": "phase1-recovery.json",
+            "require_head_sha_match": True,
+        }
+    }
+    (tmp_path / "phase1-recovery.json").write_text(
+        json.dumps({"status": "passed", "head_sha": "some-sha"})
+    )
+    errors = validate(document, root=tmp_path)
+    assert any("could not be determined" in error for error in errors)
+
+
 # --- Documentation-assertion tests (Task 12) --------------------------------
 #
 # Task 12 is responsible for bringing five existing Phase 1 status documents

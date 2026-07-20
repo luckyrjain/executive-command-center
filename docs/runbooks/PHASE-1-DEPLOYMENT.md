@@ -19,7 +19,8 @@ local or otherwise. They are not placeholders.
 | `ECC_SESSION_SECRET` | yes | Session/CSRF signing secret. | Must be at least 32 characters, cryptographically random, and not one of the recognized development placeholder strings — `validate_production_settings` rejects both a too-short value and a known placeholder outside development. Rotation owner: see above. |
 | `ECC_CORS_ORIGINS` | yes | Comma-separated allowed browser origins. | Must be non-empty, must not contain a wildcard (`*`), and every origin must use `https://` outside development. |
 | `POSTGRES_DB` / `POSTGRES_USER` / `POSTGRES_PASSWORD` | yes (for the `postgres` container/service) | Database provisioning credentials. | Must not be the `ecc`/`ecc`/`ecc` development defaults in any shared or production environment. |
-| `VITE_API_BASE_URL` | yes (frontend build) | Backend origin the built frontend calls. | Must be the real backend origin reachable from the browser; baked into the static build at `docker build` time (`frontend/Dockerfile`'s `build` stage `ARG`/`ENV`). |
+| `ECC_METRICS_TOKEN` | recommended | Shared-secret token gating `GET /metrics`. | Optional, but strongly recommended in production: `/metrics` is a `GET` route and is intentionally outside `mutation_rate_limit_middleware`'s scope (it's meant to be scrape-friendly), and each scrape runs a live DB query. If unset, the endpoint stays open to anyone who can reach it -- **only acceptable if the port/route is firewalled off from the public internet** (e.g. restricted to an internal scrape network). If set, Prometheus/scrapers must send `Authorization: Bearer <token>`. |
+| `VITE_API_BASE_URL` | yes (frontend build AND frontend run) | Backend origin the built frontend calls. | Must be the real backend origin reachable from the browser. Needed at **two** points with the same value: baked into the static JS bundle at `docker build` time (`frontend/Dockerfile`'s `build` stage `ARG`/`ENV`), AND passed again at `docker run` time so `frontend/nginx.conf.template` can render it into the production container's `Content-Security-Policy` `connect-src` directive (via the base nginx image's `envsubst`-on-templates entrypoint). Omitting it at run time does not fail the container start, but the CSP falls back to `connect-src 'self'` only — the browser will block every API call to a non-same-origin backend. |
 
 All five backend variables are validated together by `validate_production_settings`,
 called unconditionally at import time in `backend/ecc/main.py` — the
@@ -56,8 +57,16 @@ docker run -d --name ecc-backend --restart unless-stopped \
 
 docker run -d --name ecc-frontend --restart unless-stopped \
   -p 80:80 \
+  -e VITE_API_BASE_URL="https://<production-backend-origin>" \
   "ecc-frontend:${REF}"
 ```
+
+`VITE_API_BASE_URL` must be passed here with the **same value** used in the
+`docker build --build-arg` step above -- the build-time value is baked into
+the JS bundle; this run-time value is rendered into the CSP `connect-src`
+directive by `frontend/nginx.conf.template` at container start. A mismatch
+(or omitting this flag) leaves the JS bundle calling a backend origin the
+CSP doesn't allow, and the browser silently blocks every request.
 
 `docker-compose.yml` remains the local-development entry point (`docker
 compose up -d postgres` plus `pnpm --filter @ecc/frontend dev` per

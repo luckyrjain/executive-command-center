@@ -15,11 +15,11 @@ from sqlalchemy.orm import Session
 from ecc.auth import AuthDep, CsrfDep
 from ecc.database import get_session
 from ecc.observability import (
+    queue_lifecycle_event,
     record_audit_outbox_failure,
     record_brief_generated,
     record_brief_stale,
     record_idempotency_conflict,
-    record_lifecycle_event,
 )
 
 router = APIRouter(prefix="/api/v1", tags=["dashboard", "briefs"])
@@ -566,7 +566,7 @@ def _generate(
     except SQLAlchemyError:
         record_audit_outbox_failure("briefs")
         raise
-    record_lifecycle_event("brief", "morning_brief.generated", "allowed")
+    queue_lifecycle_event(session, "brief", "morning_brief.generated", "allowed")
     record_brief_generated(time_module.monotonic() - generation_start)
     response = _response(dict(row), False, None)
     if commit:

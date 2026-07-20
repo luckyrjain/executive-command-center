@@ -57,8 +57,9 @@ from threading import Lock
 from typing import Final
 
 from fastapi import Request, Response
-from sqlalchemy import text
+from sqlalchemy import event, text
 from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.orm import Session
 
 from ecc.database import engine
 
@@ -373,6 +374,49 @@ def record_lifecycle_event(domain: str, event_type: str, result: str = "allowed"
     lifecycle_events_total.inc(domain, event_type, result)
 
 
+# ---------------------------------------------------------------------------
+# Lifecycle events: deferred until commit. Every domain mutation writes its
+# audit row and calls queue_lifecycle_event() *inside* the same transaction
+# as the rest of the mutation (outbox write, idempotency-key storage, etc).
+# If a later statement in that same transaction fails, the whole thing rolls
+# back -- but a direct record_lifecycle_event() call at audit-write time
+# would already have incremented lifecycle_events_total, silently counting a
+# mutation that never actually persisted. Queuing on session.info and
+# flushing from an `after_commit` event means the metric only ever reflects
+# committed state, regardless of which of the (several, near-identical)
+# domain call sites queued it, and regardless of whether that route commits
+# via `with session.begin():` or a manual `session.commit()` call.
+# ---------------------------------------------------------------------------
+
+
+def queue_lifecycle_event(
+    session: Session, domain: str, event_type: str, result: str = "allowed"
+) -> None:
+    session.info.setdefault("_pending_lifecycle_events", []).append((domain, event_type, result))
+
+
+@event.listens_for(Session, "after_commit")
+def _flush_lifecycle_events(session: Session) -> None:
+    pending = session.info.pop("_pending_lifecycle_events", None)
+    if not pending:
+        return
+    for domain, event_type, result in pending:
+        record_lifecycle_event(domain, event_type, result)
+
+
+@event.listens_for(Session, "after_rollback")
+def _discard_lifecycle_events_on_rollback(session: Session) -> None:
+    # session.info is a plain dict that outlives any one transaction (it is
+    # NOT reset by SQLAlchemy on rollback/commit), so without this a rolled
+    # back transaction's queued events would sit in session.info and get
+    # incorrectly flushed by a *later*, unrelated commit on the same Session
+    # object. Each request gets its own fresh Session today (see
+    # ecc.database.get_session), so that reuse doesn't currently happen in
+    # practice -- but nothing about queue_lifecycle_event's contract should
+    # depend on that.
+    session.info.pop("_pending_lifecycle_events", None)
+
+
 def record_search(duration_seconds: float, result_count: int) -> None:
     search_duration_seconds.observe(value=duration_seconds)
     search_results_total.observe(value=float(result_count))
@@ -415,16 +459,39 @@ def record_audit_outbox_failure(domain: str) -> None:
 # ---------------------------------------------------------------------------
 
 
+# Cache TTL for the backlog query below: bounds how often a live COUNT(*)
+# against event_outbox can be forced, independent of whatever auth gate (or
+# lack of one, see ECC_METRICS_TOKEN in ecc.main) sits in front of /metrics.
+# Short enough that a real scrape interval (typically 15-60s) always sees a
+# fresh value; long enough that even unthrottled/unauthenticated repeated
+# requests can't turn /metrics into a query-amplification vector.
+_OUTBOX_BACKLOG_CACHE_TTL_SECONDS = 5.0
+_outbox_backlog_cache: tuple[float, int | None] | None = None
+_outbox_backlog_cache_lock = Lock()
+
+
 def _outbox_backlog_count() -> int | None:
+    global _outbox_backlog_cache
+    now = time.monotonic()
+    with _outbox_backlog_cache_lock:
+        if _outbox_backlog_cache is not None:
+            cached_at, cached_value = _outbox_backlog_cache
+            if now - cached_at < _OUTBOX_BACKLOG_CACHE_TTL_SECONDS:
+                return cached_value
+
     try:
         with engine.connect() as connection:
             result = connection.execute(
                 text("SELECT count(*) FROM event_outbox WHERE published_at IS NULL")
             ).scalar_one()
-            return int(result)
+            value = int(result)
     except SQLAlchemyError:
         _observability_logger.warning("outbox_backlog_query_failed", exc_info=True)
-        return None
+        value = None
+
+    with _outbox_backlog_cache_lock:
+        _outbox_backlog_cache = (now, value)
+    return value
 
 
 def render_metrics() -> str:

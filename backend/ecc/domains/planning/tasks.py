@@ -16,9 +16,9 @@ from ecc.auth import AuthContext, AuthDep, CsrfDep
 from ecc.config import get_settings
 from ecc.database import get_session
 from ecc.observability import (
+    queue_lifecycle_event,
     record_audit_outbox_failure,
     record_idempotency_conflict,
-    record_lifecycle_event,
 )
 
 router = APIRouter(prefix="/api/v1/tasks", tags=["tasks"])
@@ -287,7 +287,7 @@ def _write_audit(
     except SQLAlchemyError:
         record_audit_outbox_failure("tasks")
         raise
-    record_lifecycle_event("task", event_type, authorization_result)
+    queue_lifecycle_event(session, "task", event_type, authorization_result)
 
 
 def _write_outbox(
