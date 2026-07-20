@@ -18,7 +18,8 @@ function response(body: unknown, status = 200) {
 
 function renderWorkspace() {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } })
-  return render(<QueryClientProvider client={client}><CommitmentWorkspace /></QueryClientProvider>)
+  const utils = render(<QueryClientProvider client={client}><CommitmentWorkspace /></QueryClientProvider>)
+  return { client, ...utils }
 }
 
 beforeEach(() => {
@@ -28,6 +29,26 @@ beforeEach(() => {
 afterEach(() => { cleanup(); vi.unstubAllGlobals() })
 
 describe('CommitmentWorkspace', () => {
+  it('invalidates the dashboard and morning brief caches on mutation success', async () => {
+    const fetch = vi.fn()
+      .mockImplementationOnce(() => response({ items: [], next_cursor: null }))
+      .mockImplementationOnce(() => response(commitment, 201))
+      .mockImplementationOnce(() => response({ items: [commitment], next_cursor: null }))
+    vi.stubGlobal('fetch', fetch)
+    const { client } = renderWorkspace()
+    const invalidateSpy = vi.spyOn(client, 'invalidateQueries')
+
+    fireEvent.change(screen.getByLabelText('Commitment summary'), { target: { value: 'Send the revised forecast' } })
+    fireEvent.change(screen.getByLabelText('Direction'), { target: { value: 'made_to_me' } })
+    fireEvent.change(screen.getByLabelText('Counterparty name'), { target: { value: 'Finance lead' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Create commitment' }))
+
+    await waitFor(() => expect(fetch).toHaveBeenCalledTimes(3))
+    const invalidatedKeys = invalidateSpy.mock.calls.map((call) => call[0]?.queryKey)
+    expect(invalidatedKeys).toContainEqual(['dashboard', 'today'])
+    expect(invalidatedKeys).toContainEqual(['brief', 'morning'])
+  })
+
   it('creates with direction and permitted counterparty but no owner fields', async () => {
     const fetch = vi.fn()
       .mockImplementationOnce(() => response({ items: [], next_cursor: null }))

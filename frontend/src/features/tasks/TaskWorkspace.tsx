@@ -78,7 +78,11 @@ export default function TaskWorkspace() {
     }
   }
 
-  const refresh = () => queryClient.invalidateQueries({ queryKey: ['tasks'] })
+  const refresh = () => {
+    void queryClient.invalidateQueries({ queryKey: ['tasks'] })
+    void queryClient.invalidateQueries({ queryKey: ['dashboard', 'today'] })
+    void queryClient.invalidateQueries({ queryKey: ['brief', 'morning'] })
+  }
   const createMutation = useMutation({
     mutationFn: (draft: TaskDraft) => apiRequest<Task>('/api/v1/tasks', {
       method: 'POST',

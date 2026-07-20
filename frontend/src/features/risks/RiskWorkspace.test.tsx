@@ -35,7 +35,8 @@ function response(body: unknown, status = 200) {
 
 function renderWorkspace() {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } })
-  return render(<QueryClientProvider client={client}><RiskWorkspace /></QueryClientProvider>)
+  const utils = render(<QueryClientProvider client={client}><RiskWorkspace /></QueryClientProvider>)
+  return { client, ...utils }
 }
 
 const validDraft: Draft = {
@@ -77,6 +78,27 @@ describe('validateDraft', () => {
 })
 
 describe('RiskWorkspace', () => {
+  it('invalidates the dashboard and morning brief caches on mutation success', async () => {
+    const fetch = vi.fn()
+      .mockImplementationOnce(() => response({ items: [], next_cursor: null }))
+      .mockImplementationOnce(() => response(risk, 201))
+      .mockImplementationOnce(() => response({ items: [risk], next_cursor: null }))
+    vi.stubGlobal('fetch', fetch)
+    const { client } = renderWorkspace()
+    const invalidateSpy = vi.spyOn(client, 'invalidateQueries')
+
+    fireEvent.change(screen.getByLabelText('Risk description'), { target: { value: 'Vendor renewal may lapse' } })
+    fireEvent.change(screen.getByLabelText('Mitigation'), { target: { value: 'Confirm renewal terms' } })
+    fireEvent.change(screen.getByLabelText('Trigger'), { target: { value: 'No signed contract' } })
+    fireEvent.change(screen.getByLabelText('Review at'), { target: { value: '2026-08-01T00:00' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Create risk' }))
+
+    await waitFor(() => expect(fetch).toHaveBeenCalledTimes(3))
+    const invalidatedKeys = invalidateSpy.mock.calls.map((call) => call[0]?.queryKey)
+    expect(invalidatedKeys).toContainEqual(['dashboard', 'today'])
+    expect(invalidatedKeys).toContainEqual(['brief', 'morning'])
+  })
+
   it('creates a risk with owner-derived fields absent from the request', async () => {
     const fetch = vi.fn()
       .mockImplementationOnce(() => response({ items: [], next_cursor: null }))

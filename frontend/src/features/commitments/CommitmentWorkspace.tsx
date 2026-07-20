@@ -50,7 +50,11 @@ export default function CommitmentWorkspace() {
       setEdit((value) => value?.commitment.id === id ? { ...value, latestVersion: 0, conflict: false, reloadFailed: true } : value)
     }
   }
-  const refresh = () => queryClient.invalidateQueries({ queryKey: ['commitments'] })
+  const refresh = () => {
+    void queryClient.invalidateQueries({ queryKey: ['commitments'] })
+    void queryClient.invalidateQueries({ queryKey: ['dashboard', 'today'] })
+    void queryClient.invalidateQueries({ queryKey: ['brief', 'morning'] })
+  }
 
   const createMutation = useMutation({
     mutationFn: (draft: Draft) => apiRequest<Commitment>('/api/v1/commitments', { method: 'POST', body: { summary: draft.summary.trim(), description: draft.description.trim() || null, direction: draft.direction, counterparty_name: draft.counterpartyName.trim() || null, importance: draft.importance, ...duePayload(draft), status: 'confirmed' } }),

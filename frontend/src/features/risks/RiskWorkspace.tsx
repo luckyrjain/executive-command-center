@@ -147,7 +147,11 @@ export default function RiskWorkspace() {
       setEdit((value) => value?.risk.id === id ? { ...value, latestVersion: 0, conflict: false, reloadFailed: true } : value)
     }
   }
-  const refresh = () => queryClient.invalidateQueries({ queryKey: ['risks'] })
+  const refresh = () => {
+    void queryClient.invalidateQueries({ queryKey: ['risks'] })
+    void queryClient.invalidateQueries({ queryKey: ['dashboard', 'today'] })
+    void queryClient.invalidateQueries({ queryKey: ['brief', 'morning'] })
+  }
 
   const createMutation = useMutation({
     mutationFn: (draft: Draft) => apiRequest<Risk>('/api/v1/risks', { method: 'POST', body: createBody(draft) }),

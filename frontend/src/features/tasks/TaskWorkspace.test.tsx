@@ -19,7 +19,8 @@ function response(body: unknown, status = 200) {
 
 function renderWorkspace() {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } })
-  return render(<QueryClientProvider client={client}><TaskWorkspace /></QueryClientProvider>)
+  const utils = render(<QueryClientProvider client={client}><TaskWorkspace /></QueryClientProvider>)
+  return { client, ...utils }
 }
 
 beforeEach(() => {
@@ -33,6 +34,24 @@ afterEach(() => {
 })
 
 describe('TaskWorkspace', () => {
+  it('invalidates the dashboard and morning brief caches on mutation success', async () => {
+    const fetch = vi.fn()
+      .mockImplementationOnce(() => response({ items: [], next_cursor: null }))
+      .mockImplementationOnce(() => response(task, 201))
+      .mockImplementationOnce(() => response({ items: [task], next_cursor: null }))
+    vi.stubGlobal('fetch', fetch)
+    const { client } = renderWorkspace()
+    const invalidateSpy = vi.spyOn(client, 'invalidateQueries')
+
+    fireEvent.change(screen.getByLabelText('Task title'), { target: { value: 'Prepare board pack' } })
+    fireEvent.submit(screen.getByRole('button', { name: 'Create task' }).closest('form')!)
+
+    await waitFor(() => expect(fetch).toHaveBeenCalledTimes(3))
+    const invalidatedKeys = invalidateSpy.mock.calls.map((call) => call[0]?.queryKey)
+    expect(invalidatedKeys).toContainEqual(['dashboard', 'today'])
+    expect(invalidatedKeys).toContainEqual(['brief', 'morning'])
+  })
+
   it('creates a task without owner fields and enforces one due precision', async () => {
     const fetch = vi.fn()
       .mockImplementationOnce(() => response({ items: [], next_cursor: null }))
