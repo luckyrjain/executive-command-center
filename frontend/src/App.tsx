@@ -12,6 +12,9 @@ import { createNoteDraftRecoveryStore } from './features/notes/draftRecovery'
 import TaskWorkspace from './features/tasks/TaskWorkspace'
 import ScheduleWorkspace from './features/schedule/ScheduleWorkspace'
 import RiskWorkspace from './features/risks/RiskWorkspace'
+import EntityExplorer from './features/knowledge/EntityExplorer'
+import ResolutionInbox from './features/knowledge/ResolutionInbox'
+import MergeReview from './features/knowledge/MergeReview'
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:8000'
 
@@ -135,6 +138,13 @@ export default function App() {
         ) : currentView === 'notes' ? <NoteWorkspace recoveryStore={noteDraftRecovery} />
         : currentView === 'schedule' ? <ScheduleWorkspace />
         : currentView === 'risks' ? <RiskWorkspace />
+        : currentView === 'knowledge' ? (
+          <div className="work-grid">
+            <EntityExplorer />
+            <ResolutionInbox />
+            <MergeReview />
+          </div>
+        )
         : currentView === 'recommendations' ? <RecommendationPanel />
         : currentView === 'search-audit' ? <SearchAuditPanel />
         : <><header className="topbar">

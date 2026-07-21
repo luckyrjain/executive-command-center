@@ -13,6 +13,7 @@ const WORKSPACES: ReadonlyArray<{ view: WorkspaceView; label: string }> = [
   { view: 'notes', label: 'Notes' },
   { view: 'schedule', label: 'Schedule' },
   { view: 'risks', label: 'Risks' },
+  { view: 'knowledge', label: 'Knowledge' },
   { view: 'recommendations', label: 'Recommendations' },
   { view: 'search-audit', label: 'Search & audit' },
 ]

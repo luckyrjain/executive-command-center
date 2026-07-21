@@ -134,6 +134,241 @@ function makeAudit({ corpus, pageSize = 20 }) {
   }
 }
 
+/**
+ * Phase 2 knowledge-platform endpoints. Kept as one dedicated dispatcher
+ * (rather than several `resourceHandler` calls) because merge/reverse/
+ * confirm/reject don't fit the generic {base}/:id/:action shape cleanly --
+ * `POST /entities/merge` in particular would otherwise be swallowed by the
+ * entities resourceHandler as `PATCH {base}/:id` with id="merge".
+ */
+function makeKnowledgeApi(overrides = {}) {
+  const entities = createCollection(overrides.entities ?? [])
+  const claims = [...(overrides.claims ?? [])]
+  const relationships = [...(overrides.relationships ?? [])]
+  const timelineEntries = [...(overrides.timelineEntries ?? [])]
+  const resolutionCandidates = createCollection(overrides.resolutionCandidates ?? [])
+  const entityOperations = []
+
+  function pushTimeline(entityId, eventType, summary) {
+    timelineEntries.push({
+      id: randomUUID(),
+      entity_id: entityId,
+      effective_at: nowIso(),
+      recorded_at: nowIso(),
+      event_type: eventType,
+      source_id: null,
+      summary,
+    })
+  }
+
+  const entitiesResource = resourceHandler({
+    base: '/api/v1/knowledge/entities',
+    collection: entities,
+    buildCreate: (body) => ({
+      entity_id: null,
+      kind: body.kind,
+      canonical_name: body.canonical_name,
+      summary: body.summary ?? null,
+      status: 'active',
+      confidence: 1,
+      created_at: nowIso(),
+      updated_at: nowIso(),
+    }),
+    buildPatch: (item, body) => ({
+      ...(body.canonical_name !== undefined ? { canonical_name: body.canonical_name } : {}),
+      ...('summary' in body ? { summary: body.summary } : {}),
+      updated_at: nowIso(),
+    }),
+    actions: { archive: archiveAction, restore: restoreAction },
+  })
+
+  function dispatch(pathname, method, body, queryString) {
+    if (!pathname.startsWith('/api/v1/knowledge')) return null
+
+    if (pathname === '/api/v1/knowledge/retrieve' && method === 'GET') {
+      const params = new URLSearchParams(queryString)
+      const needle = (params.get('q') ?? '').toLowerCase()
+      const kind = params.get('kind')
+      const items = entities
+        .list()
+        .filter((item) => item.status === 'active')
+        .filter((item) => !kind || item.kind === kind)
+        .filter((item) => !needle || item.canonical_name.toLowerCase().includes(needle))
+        .map((item) => ({
+          entity_type: item.kind,
+          entity_id: item.id,
+          title: item.canonical_name,
+          snippet: item.summary ?? '',
+          score: item.canonical_name.toLowerCase() === needle ? 0.95 : 0.5,
+          matching_mode: item.canonical_name.toLowerCase() === needle ? 'exact_name' : 'lexical',
+          factors: {},
+          evidence_state: 'unknown',
+          source_version: item.version,
+          stale: false,
+        }))
+      return {
+        status: 200,
+        body: { items, next_cursor: null, mode: 'lexical', degraded: false, degraded_reason: null },
+      }
+    }
+
+    if (pathname === '/api/v1/knowledge/entities/merge' && method === 'POST') {
+      const candidate = resolutionCandidates.find(body.candidate_id)
+      if (!candidate) return { status: 404, body: { error: { code: 'CANDIDATE_NOT_FOUND', message: 'Not found' } } }
+      if (candidate.status !== 'confirmed') {
+        return { status: 409, body: { error: { code: 'CANDIDATE_NOT_CONFIRMED', message: 'Not confirmed' } } }
+      }
+      const targetId = body.target_entity_id
+      const sourceId = targetId === candidate.left_entity_id ? candidate.right_entity_id : candidate.left_entity_id
+      const target = entities.find(targetId)
+      const source = entities.find(sourceId)
+      if (!target || !source) return { status: 404, body: { error: { code: 'ENTITY_NOT_FOUND', message: 'Not found' } } }
+      if (target.version !== body.expected_target_version || source.version !== body.expected_source_version) {
+        return { status: 409, body: { error: { code: 'VERSION_CONFLICT', message: 'Version conflict' } } }
+      }
+      source.status = 'redirected'
+      source.version += 1
+      const operation = {
+        id: randomUUID(),
+        operation_type: 'merge',
+        status: 'active',
+        source_entity_id: sourceId,
+        target_entity_id: targetId,
+        actor_id: 'fixture-user',
+        reason: body.reason,
+        reverses_operation_id: null,
+        created_at: nowIso(),
+      }
+      entityOperations.push(operation)
+      pushTimeline(targetId, 'entity_operation.merged', `merged ${sourceId} into ${targetId}`)
+      pushTimeline(sourceId, 'entity_operation.merged', `redirected to ${targetId}`)
+      return { status: 201, body: operation }
+    }
+
+    const reverseMatch = pathname.match(/^\/api\/v1\/knowledge\/entity-operations\/([^/]+)\/reverse$/)
+    if (reverseMatch && method === 'POST') {
+      const operation = entityOperations.find((candidate) => candidate.id === reverseMatch[1])
+      if (!operation) return { status: 404, body: { error: { code: 'OPERATION_NOT_FOUND', message: 'Not found' } } }
+      if (operation.status !== 'active') {
+        return { status: 409, body: { error: { code: 'OPERATION_ALREADY_REVERSED', message: 'Already reversed' } } }
+      }
+      operation.status = 'reversed'
+      const source = entities.find(operation.source_entity_id)
+      if (source) {
+        source.status = 'active'
+        source.version += 1
+      }
+      const reversal = {
+        id: randomUUID(),
+        operation_type: 'reverse',
+        status: 'active',
+        source_entity_id: operation.source_entity_id,
+        target_entity_id: operation.target_entity_id,
+        actor_id: 'fixture-user',
+        reason: body.reason,
+        reverses_operation_id: operation.id,
+        created_at: nowIso(),
+      }
+      entityOperations.push(reversal)
+      pushTimeline(operation.source_entity_id, 'entity_operation.reversed', `restored from redirect`)
+      return { status: 201, body: reversal }
+    }
+
+    if (pathname === '/api/v1/knowledge/resolution/candidates' && method === 'GET') {
+      const params = new URLSearchParams(queryString)
+      const status = params.get('status')
+      const items = resolutionCandidates.list().filter((item) => !status || item.status === status)
+      return { status: 200, body: { items, next_cursor: null } }
+    }
+    if (pathname === '/api/v1/knowledge/resolution/candidates' && method === 'POST') {
+      const item = resolutionCandidates.create({
+        left_entity_id: body.left_entity_id,
+        right_entity_id: body.right_entity_id,
+        score: 0.5,
+        factors: {},
+        resolver_version: 'fixture-v1',
+        status: 'open',
+        created_at: nowIso(),
+        resolved_at: null,
+        resolved_by: null,
+        reason: null,
+      })
+      return { status: 201, body: { deterministic: false, candidate: item } }
+    }
+    const decisionMatch = pathname.match(
+      /^\/api\/v1\/knowledge\/resolution\/candidates\/([^/]+)\/(confirm|reject)$/,
+    )
+    if (decisionMatch && method === 'POST') {
+      const [, id, decision] = decisionMatch
+      const candidate = resolutionCandidates.find(id)
+      if (!candidate) return { status: 404, body: { error: { code: 'CANDIDATE_NOT_FOUND', message: 'Not found' } } }
+      candidate.status = decision === 'confirm' ? 'confirmed' : 'rejected'
+      candidate.resolved_at = nowIso()
+      candidate.resolved_by = 'fixture-user'
+      candidate.reason = body.reason
+      return { status: 200, body: candidate }
+    }
+
+    const claimsMatch = pathname.match(/^\/api\/v1\/knowledge\/entities\/([^/]+)\/claims$/)
+    if (claimsMatch && method === 'GET') {
+      return { status: 200, body: { items: claims.filter((claim) => claim.subject_id === claimsMatch[1]) } }
+    }
+    if (claimsMatch && method === 'POST') {
+      const claim = {
+        id: randomUUID(),
+        subject_id: claimsMatch[1],
+        predicate: body.predicate,
+        value: body.value,
+        source_id: body.source_id,
+        confidence: body.confidence ?? 1,
+        valid_from: body.valid_from ?? null,
+        valid_to: body.valid_to ?? null,
+        superseded_by: null,
+        created_at: nowIso(),
+      }
+      claims.push(claim)
+      pushTimeline(claimsMatch[1], 'knowledge_entity.claim_recorded', `claim recorded: ${body.predicate}`)
+      return { status: 201, body: claim }
+    }
+
+    const relationshipsMatch = pathname.match(/^\/api\/v1\/knowledge\/entities\/([^/]+)\/relationships$/)
+    if (relationshipsMatch && method === 'GET') {
+      const entityId = relationshipsMatch[1]
+      const items = relationships.filter((rel) => rel.from_entity_id === entityId || rel.to_entity_id === entityId)
+      return { status: 200, body: { items } }
+    }
+    if (relationshipsMatch && method === 'POST') {
+      const fromId = relationshipsMatch[1]
+      const relationship = {
+        id: randomUUID(),
+        from_entity_id: fromId,
+        to_entity_id: body.to_entity_id,
+        relationship_type: body.relationship_type,
+        confidence: body.confidence ?? 1,
+        evidence_id: body.evidence_id ?? null,
+        valid_from: body.valid_from ?? null,
+        valid_to: body.valid_to ?? null,
+        status: 'active',
+      }
+      relationships.push(relationship)
+      pushTimeline(fromId, 'relationship.created', `${body.relationship_type} -> ${body.to_entity_id}`)
+      return { status: 201, body: relationship }
+    }
+
+    const timelineMatch = pathname.match(/^\/api\/v1\/knowledge\/entities\/([^/]+)\/timeline$/)
+    if (timelineMatch && method === 'GET') {
+      const items = timelineEntries
+        .filter((entry) => entry.entity_id === timelineMatch[1])
+        .sort((a, b) => b.effective_at.localeCompare(a.effective_at))
+      return { status: 200, body: { items, next_cursor: null } }
+    }
+
+    return entitiesResource(pathname, method, body, queryString)
+  }
+
+  return { dispatch, entities, claims, relationships, timelineEntries, resolutionCandidates, entityOperations }
+}
+
 const defaultDashboardSections = {
   today_schedule: [{ id: 'm1', title: 'Leadership review', starts_at: '2026-07-15T04:30:00Z' }],
   top_priorities: [{ entity_id: 't1', title: 'Approve hiring plan', score: 92, status: 'in_progress' }],
@@ -241,6 +476,13 @@ export async function createFixtureApi(page, overrides = {}) {
     degradedQueries: overrides.searchDegradedQueries ?? [],
   })
   const audit = makeAudit({ corpus: overrides.auditCorpus ?? defaultAuditCorpus, pageSize: overrides.auditPageSize })
+  const knowledge = makeKnowledgeApi({
+    entities: overrides.knowledgeEntities,
+    claims: overrides.knowledgeClaims,
+    relationships: overrides.knowledgeRelationships,
+    timelineEntries: overrides.knowledgeTimelineEntries,
+    resolutionCandidates: overrides.resolutionCandidates,
+  })
 
   // `route.fulfill()` synthesizes a response without touching the real
   // network, so `context.setOffline(true)` alone does NOT stop a mocked
@@ -381,6 +623,10 @@ export async function createFixtureApi(page, overrides = {}) {
       })
       return { status: 200, body: { items } }
     }
+    if (pathname.startsWith('/api/v1/knowledge')) {
+      const result = knowledge.dispatch(pathname, method, body, queryString)
+      if (result) return result
+    }
     for (const resource of resources) {
       const result = resource(pathname, method, body, queryString)
       if (result) return result
@@ -406,6 +652,7 @@ export async function createFixtureApi(page, overrides = {}) {
   return {
     requests,
     collections: { tasks, commitments, notes, calendarEvents, meetings, risks, recommendations },
+    knowledge,
     dashboard,
     brief,
     evidence,

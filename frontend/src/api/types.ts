@@ -4,6 +4,7 @@ export type WorkspaceView =
   | 'notes'
   | 'schedule'
   | 'risks'
+  | 'knowledge'
   | 'recommendations'
   | 'search-audit'
 
