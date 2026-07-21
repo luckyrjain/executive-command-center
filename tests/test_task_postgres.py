@@ -336,3 +336,51 @@ def test_concurrent_idempotent_create_returns_one_task(
             {"workspace_id": workspace_id, "title": "Concurrent idempotent task"},
         ).scalar_one()
     assert count == 1
+
+
+def test_concurrent_updates_with_same_expected_version_do_not_both_succeed(
+    task_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    """Regression/coverage test for optimistic concurrency: update_task's
+    `SELECT ... FOR UPDATE` (backend/ecc/domains/planning/tasks.py) must
+    serialize two genuinely concurrent PATCH requests racing on the same
+    row/expected_version, rather than both reading the pre-update version
+    and both applying their change (a lost update). Two distinct
+    idempotency keys are used so this exercises real concurrent writers,
+    not idempotency-key deduplication."""
+    client, workspace_id, _user_id, token = task_test_context
+
+    create = client.post(
+        "/api/v1/tasks",
+        headers=_headers(token, "create-race-task"),
+        json={"title": "Race target"},
+    )
+    assert create.status_code == 201
+    task_id = create.json()["id"]
+    assert create.json()["version"] == 1
+
+    def update_once(label: str) -> int:
+        worker = TestClient(app)
+        worker.cookies.set("ecc_session", token)
+        try:
+            response = worker.patch(
+                f"/api/v1/tasks/{task_id}",
+                headers=_headers(token, f"concurrent-update-{label}"),
+                json={"expected_version": 1, "title": f"Updated by {label}"},
+            )
+            return response.status_code
+        finally:
+            worker.close()
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(update_once, ["a", "b"]))
+
+    assert sorted(results) == [200, 409]
+
+    with engine.connect() as connection:
+        final = connection.execute(
+            text("SELECT version, title FROM tasks WHERE workspace_id = :w AND id = :id"),
+            {"w": workspace_id, "id": task_id},
+        ).one()
+    assert final.version == 2
+    assert final.title in {"Updated by a", "Updated by b"}

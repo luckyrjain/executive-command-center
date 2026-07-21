@@ -97,8 +97,16 @@ export default function ScheduleWorkspace() {
   const [editEvent, setEditEvent] = useState<EventEdit | null>(null)
   const [editMeeting, setEditMeeting] = useState<MeetingEdit | null>(null)
   const [formError, setFormError] = useState<string | null>(null)
-  const refreshEvents = () => client.invalidateQueries({ queryKey: ['calendar-events'] })
-  const refreshMeetings = () => client.invalidateQueries({ queryKey: ['meetings'] })
+  const refreshEvents = () => Promise.all([
+    client.invalidateQueries({ queryKey: ['calendar-events'] }),
+    client.invalidateQueries({ queryKey: ['dashboard', 'today'] }),
+    client.invalidateQueries({ queryKey: ['brief', 'morning'] }),
+  ])
+  const refreshMeetings = () => Promise.all([
+    client.invalidateQueries({ queryKey: ['meetings'] }),
+    client.invalidateQueries({ queryKey: ['dashboard', 'today'] }),
+    client.invalidateQueries({ queryKey: ['brief', 'morning'] }),
+  ])
 
   async function reloadEvent(id: string) {
     try {

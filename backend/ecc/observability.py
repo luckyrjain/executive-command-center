@@ -395,13 +395,29 @@ def queue_lifecycle_event(
     session.info.setdefault("_pending_lifecycle_events", []).append((domain, event_type, result))
 
 
+def queue_brief_generated(session: Session, duration_seconds: float) -> None:
+    """Defer a morning-brief generation-duration sample the same way
+    ``queue_lifecycle_event`` defers lifecycle-event counters: computed and
+    queued inside the generating transaction, but only ever flushed if that
+    transaction actually commits. ``dashboard_briefs._generate`` can be
+    called with its own ``session.commit()`` or wrapped by a caller that
+    commits later after further writes (idempotency-record persistence) --
+    either way, this must never record a duration sample for a brief that
+    ends up rolled back.
+    """
+    session.info.setdefault("_pending_brief_durations", []).append(duration_seconds)
+
+
 @event.listens_for(Session, "after_commit")
 def _flush_lifecycle_events(session: Session) -> None:
     pending = session.info.pop("_pending_lifecycle_events", None)
-    if not pending:
-        return
-    for domain, event_type, result in pending:
-        record_lifecycle_event(domain, event_type, result)
+    if pending:
+        for domain, event_type, result in pending:
+            record_lifecycle_event(domain, event_type, result)
+    pending_durations = session.info.pop("_pending_brief_durations", None)
+    if pending_durations:
+        for duration_seconds in pending_durations:
+            record_brief_generated(duration_seconds)
 
 
 @event.listens_for(Session, "after_rollback")
@@ -412,9 +428,10 @@ def _discard_lifecycle_events_on_rollback(session: Session) -> None:
     # incorrectly flushed by a *later*, unrelated commit on the same Session
     # object. Each request gets its own fresh Session today (see
     # ecc.database.get_session), so that reuse doesn't currently happen in
-    # practice -- but nothing about queue_lifecycle_event's contract should
-    # depend on that.
+    # practice -- but nothing about queue_lifecycle_event's/
+    # queue_brief_generated's contract should depend on that.
     session.info.pop("_pending_lifecycle_events", None)
+    session.info.pop("_pending_brief_durations", None)
 
 
 def record_search(duration_seconds: float, result_count: int) -> None:

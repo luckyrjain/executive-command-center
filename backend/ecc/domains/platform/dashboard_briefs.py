@@ -15,9 +15,9 @@ from sqlalchemy.orm import Session
 from ecc.auth import AuthDep, CsrfDep
 from ecc.database import get_session
 from ecc.observability import (
+    queue_brief_generated,
     queue_lifecycle_event,
     record_audit_outbox_failure,
-    record_brief_generated,
     record_brief_stale,
     record_idempotency_conflict,
 )
@@ -567,7 +567,7 @@ def _generate(
         record_audit_outbox_failure("briefs")
         raise
     queue_lifecycle_event(session, "brief", "morning_brief.generated", "allowed")
-    record_brief_generated(time_module.monotonic() - generation_start)
+    queue_brief_generated(session, time_module.monotonic() - generation_start)
     response = _response(dict(row), False, None)
     if commit:
         session.commit()

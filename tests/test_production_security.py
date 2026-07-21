@@ -30,7 +30,7 @@ from types import ModuleType
 
 import httpx
 import pytest
-from fastapi import FastAPI, Response
+from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.testclient import TestClient
 
@@ -599,6 +599,166 @@ def test_rate_limit_buckets_are_bounded_in_memory() -> None:
         limiter.check(f"key-{i}")
 
     assert len(limiter._buckets) <= 50
+
+
+def test_rate_limit_bucket_reset_is_not_immediately_evicted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression test: a bucket whose window just expired -- and which this
+    very call just made the most-recently-used -- must not still be sitting
+    at the eviction front from its original insertion position. Plain
+    ``dict``/``OrderedDict`` item assignment on an *existing* key does not
+    move it to the end on its own; only a brand-new key lands there
+    automatically."""
+    import ecc.http_security as http_security
+
+    fake_now = 1000.0
+
+    def fake_monotonic() -> float:
+        return fake_now
+
+    monkeypatch.setattr(http_security.time, "monotonic", fake_monotonic)
+    limiter = http_security._MutationRateLimiter(
+        window_seconds=10.0, max_requests=100, max_buckets=2
+    )
+
+    limiter.check("stale-but-active")  # inserted first -> oldest by position
+    limiter.check("other")
+
+    fake_now += 10.5  # "stale-but-active"'s window has now expired...
+    limiter.check("stale-but-active")  # ...but this call just reused it
+    limiter.check("newcomer")  # pushes the bucket table over max_buckets=2
+
+    assert "stale-but-active" in limiter._buckets
+    assert "other" not in limiter._buckets
+
+
+# ---------------------------------------------------------------------------
+# Client IP resolution: the raw ASGI socket peer by default, X-Forwarded-For
+# only when the deployment explicitly configures a trusted proxy hop count.
+# Exercises the fix for the rate limiter collapsing every real client behind
+# an unconfigured reverse proxy into one shared bucket.
+# ---------------------------------------------------------------------------
+
+
+def test_client_ip_from_forwarded_for_trusts_only_the_configured_hop_count() -> None:
+    import ecc.http_security as http_security
+
+    # One trusted proxy: the rightmost hop is what it appended -- the real
+    # client -- regardless of what an attacker prepended further left.
+    assert (
+        http_security._client_ip_from_forwarded_for("203.0.113.7", trusted_proxy_count=1)
+        == "203.0.113.7"
+    )
+    assert (
+        http_security._client_ip_from_forwarded_for(
+            "attacker-forged, 203.0.113.7", trusted_proxy_count=1
+        )
+        == "203.0.113.7"
+    )
+    # Two trusted proxies: the real client is two hops in from the right.
+    assert (
+        http_security._client_ip_from_forwarded_for(
+            "attacker-forged, 203.0.113.7, 10.0.0.5", trusted_proxy_count=2
+        )
+        == "203.0.113.7"
+    )
+
+
+def test_client_ip_from_forwarded_for_falls_back_when_header_has_too_few_hops() -> None:
+    import ecc.http_security as http_security
+
+    assert http_security._client_ip_from_forwarded_for("203.0.113.7", trusted_proxy_count=2) is None
+
+
+def _forwarded_request(*, forwarded_for: str, client_host: str) -> Request:
+    return Request(
+        {
+            "type": "http",
+            "headers": [(b"x-forwarded-for", forwarded_for.encode("utf-8"))],
+            "client": (client_host, 12345),
+            "method": "GET",
+            "path": "/",
+        }
+    )
+
+
+def test_client_host_ignores_forwarded_for_when_trusted_proxy_count_is_zero(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Default posture: an unconfigured deployment must never trust a
+    client-supplied X-Forwarded-For header, since that would let any client
+    spoof its rate-limit identity for free."""
+    import ecc.config as config_module
+    import ecc.http_security as http_security
+
+    monkeypatch.delenv("ECC_TRUSTED_PROXY_COUNT", raising=False)
+    config_module.get_settings.cache_clear()
+
+    request = _forwarded_request(forwarded_for="203.0.113.7", client_host="10.0.0.9")
+
+    assert http_security._client_host(request) == "10.0.0.9"
+
+
+def test_client_host_reads_forwarded_for_when_trusted_proxy_count_configured(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ecc.config as config_module
+    import ecc.http_security as http_security
+
+    monkeypatch.setenv("ECC_TRUSTED_PROXY_COUNT", "1")
+    config_module.get_settings.cache_clear()
+    try:
+        # The socket peer is the trusted reverse proxy's own address, not the
+        # real client -- exactly the value that otherwise collapses every
+        # client behind it into one shared rate-limit bucket.
+        request = _forwarded_request(forwarded_for="203.0.113.7", client_host="10.0.0.9")
+
+        assert http_security._client_host(request) == "203.0.113.7"
+    finally:
+        monkeypatch.delenv("ECC_TRUSTED_PROXY_COUNT", raising=False)
+        config_module.get_settings.cache_clear()
+
+
+def test_mutation_rate_limit_distinguishes_clients_behind_a_trusted_proxy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression test for the collapsed-bucket bug: with a trusted proxy
+    configured, two distinct real clients arriving through the same proxy
+    socket address must not share an IP rate-limit bucket."""
+    import ecc.config as config_module
+    import ecc.http_security as http_security
+
+    monkeypatch.setenv("ECC_TRUSTED_PROXY_COUNT", "1")
+    config_module.get_settings.cache_clear()
+    monkeypatch.setattr(
+        http_security,
+        "_mutation_rate_limiter",
+        http_security._MutationRateLimiter(window_seconds=60.0, max_requests=100),
+    )
+    monkeypatch.setattr(
+        http_security,
+        "_mutation_ip_rate_limiter",
+        http_security._MutationRateLimiter(window_seconds=60.0, max_requests=1),
+    )
+    app = FastAPI()
+    app.middleware("http")(http_security.mutation_rate_limit_middleware)
+
+    @app.post("/api/v1/widgets")
+    def create_widget() -> dict:
+        return {"ok": True}
+
+    try:
+        client = TestClient(app)  # every request shares one fixed socket peer
+
+        first = client.post("/api/v1/widgets", headers={"X-Forwarded-For": "203.0.113.7"})
+        second = client.post("/api/v1/widgets", headers={"X-Forwarded-For": "203.0.113.8"})
+
+        assert first.status_code == 200
+        assert second.status_code == 200
+    finally:
+        monkeypatch.delenv("ECC_TRUSTED_PROXY_COUNT", raising=False)
+        config_module.get_settings.cache_clear()
 
 
 # ---------------------------------------------------------------------------

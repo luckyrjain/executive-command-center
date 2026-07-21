@@ -4,6 +4,7 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { cleanup, render, screen, fireEvent, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
+import { ApiError } from './api/client'
 import RecommendationPanel, {
   actionPayload,
   actionSummary,
@@ -62,8 +63,7 @@ describe('recommendation presentation', () => {
   })
 
   it('turns version conflicts into a reload-safe message', () => {
-    const conflict = new Error('Conflict')
-    conflict.name = 'TARGET_VERSION_CONFLICT'
+    const conflict = new ApiError(409, 'TARGET_VERSION_CONFLICT', 'Conflict')
     expect(recommendationErrorMessage(conflict)).toContain('latest version has been reloaded')
     expect(recommendationErrorMessage(new Error('Network unavailable'))).toBe('Network unavailable')
   })
@@ -210,5 +210,61 @@ describe('recommendation preview (rendered)', () => {
     await screen.findByText('close risk')
     fireEvent.click(screen.getByRole('button', { name: 'Confirm and execute' }))
     await waitFor(() => expect(listCalls).toBeGreaterThanOrEqual(2))
+  })
+
+  it('invalidates the dashboard and morning brief caches after confirming a recommendation', async () => {
+    const pending = { ...riskRecommendation, evidence_ids: [] }
+    const confirmed = { ...pending, status: 'executed', execution_result: { applied: true } }
+    const fetch = fetchRouter([
+      {
+        test: (url, init) => url.includes('/api/v1/recommendations?') && isGet(init),
+        respond: () => jsonResponse({ items: [pending], next_cursor: null }),
+      },
+      {
+        test: (url, init) => url.includes('/confirm') && init?.method === 'POST',
+        respond: () => jsonResponse(confirmed),
+      },
+    ])
+    vi.stubGlobal('fetch', fetch)
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } })
+    render(<QueryClientProvider client={client}><RecommendationPanel /></QueryClientProvider>)
+
+    await screen.findByText('close risk')
+    const invalidateSpy = vi.spyOn(client, 'invalidateQueries')
+    fireEvent.click(screen.getByRole('button', { name: 'Confirm and execute' }))
+
+    await waitFor(() => expect(invalidateSpy).toHaveBeenCalled())
+    const invalidatedKeys = invalidateSpy.mock.calls.map((call) => call[0]?.queryKey)
+    expect(invalidatedKeys).toContainEqual(['recommendations', 'review'])
+    expect(invalidatedKeys).toContainEqual(['dashboard', 'today'])
+    expect(invalidatedKeys).toContainEqual(['brief', 'morning'])
+  })
+
+  it('does not invalidate the dashboard or morning brief caches for non-executing actions', async () => {
+    const pending = { ...riskRecommendation, evidence_ids: [] }
+    const rejected = { ...pending, status: 'rejected' }
+    const fetch = fetchRouter([
+      {
+        test: (url, init) => url.includes('/api/v1/recommendations?') && isGet(init),
+        respond: () => jsonResponse({ items: [pending], next_cursor: null }),
+      },
+      {
+        test: (url, init) => url.includes('/reject') && init?.method === 'POST',
+        respond: () => jsonResponse(rejected),
+      },
+    ])
+    vi.stubGlobal('fetch', fetch)
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } })
+    render(<QueryClientProvider client={client}><RecommendationPanel /></QueryClientProvider>)
+
+    await screen.findByText('close risk')
+    const invalidateSpy = vi.spyOn(client, 'invalidateQueries')
+    fireEvent.click(screen.getByRole('button', { name: 'Reject' }))
+
+    await waitFor(() => expect(invalidateSpy).toHaveBeenCalled())
+    const invalidatedKeys = invalidateSpy.mock.calls.map((call) => call[0]?.queryKey)
+    expect(invalidatedKeys).toContainEqual(['recommendations', 'review'])
+    expect(invalidatedKeys).not.toContainEqual(['dashboard', 'today'])
+    expect(invalidatedKeys).not.toContainEqual(['brief', 'morning'])
   })
 })

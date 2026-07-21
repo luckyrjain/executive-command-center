@@ -8,11 +8,12 @@ from zoneinfo import ZoneInfo
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, ConfigDict, field_validator
 from sqlalchemy import text
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from ecc.auth import AuthContext, AuthDep, CsrfDep
 from ecc.database import get_session
-from ecc.observability import record_ranking
+from ecc.observability import queue_lifecycle_event, record_audit_outbox_failure, record_ranking
 
 router = APIRouter(prefix="/api/v1/attention", tags=["attention"])
 SessionDep = Annotated[Session, Depends(get_session)]
@@ -501,37 +502,43 @@ def _mutate_attention(
         )
         request_id = UUID(request.state.request_id)
         correlation_id = UUID(request.state.correlation_id)
-        session.execute(
-            text("""
-                INSERT INTO audit_events (
-                    id, workspace_id, event_type, aggregate_type, aggregate_id,
-                    aggregate_version, actor_id, request_id, correlation_id,
-                    changed_fields, authorization_result, source, metadata, occurred_at
-                ) VALUES (
-                    :id, :workspace_id, :event_type, 'attention_item', :aggregate_id,
-                    :aggregate_version, :actor_id, :request_id, :correlation_id,
-                    :changed_fields, 'allowed', 'user', '{}'::jsonb, :occurred_at
-                )
-            """),
-            {
-                "id": uuid4(),
-                "workspace_id": auth.workspace_id,
-                "event_type": f"attention_item.{action}",
-                "aggregate_id": item_id,
-                "aggregate_version": row["source_entity_version"],
-                "actor_id": auth.user_id,
-                "request_id": request_id,
-                "correlation_id": correlation_id,
-                "changed_fields": (
-                    ["dismissed_at", "dismissed_entity_version"]
-                    if action == "dismiss"
-                    else ["deferred_until"]
-                    if action == "defer"
-                    else ["dismissed_at", "dismissed_entity_version", "deferred_until"]
-                ),
-                "occurred_at": now,
-            },
-        )
+        event_type = f"attention_item.{action}"
+        try:
+            session.execute(
+                text("""
+                    INSERT INTO audit_events (
+                        id, workspace_id, event_type, aggregate_type, aggregate_id,
+                        aggregate_version, actor_id, request_id, correlation_id,
+                        changed_fields, authorization_result, source, metadata, occurred_at
+                    ) VALUES (
+                        :id, :workspace_id, :event_type, 'attention_item', :aggregate_id,
+                        :aggregate_version, :actor_id, :request_id, :correlation_id,
+                        :changed_fields, 'allowed', 'user', '{}'::jsonb, :occurred_at
+                    )
+                """),
+                {
+                    "id": uuid4(),
+                    "workspace_id": auth.workspace_id,
+                    "event_type": event_type,
+                    "aggregate_id": item_id,
+                    "aggregate_version": row["source_entity_version"],
+                    "actor_id": auth.user_id,
+                    "request_id": request_id,
+                    "correlation_id": correlation_id,
+                    "changed_fields": (
+                        ["dismissed_at", "dismissed_entity_version"]
+                        if action == "dismiss"
+                        else ["deferred_until"]
+                        if action == "defer"
+                        else ["dismissed_at", "dismissed_entity_version", "deferred_until"]
+                    ),
+                    "occurred_at": now,
+                },
+            )
+        except SQLAlchemyError:
+            record_audit_outbox_failure("attention")
+            raise
+        queue_lifecycle_event(session, "attention_item", event_type, "allowed")
     return AttentionItem.model_validate(dict(updated))
 
 

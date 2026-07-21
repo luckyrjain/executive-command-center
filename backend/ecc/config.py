@@ -19,6 +19,18 @@ class Settings(BaseSettings):
     )
     cors_origins: str = Field(default="http://localhost:5173", validation_alias="ECC_CORS_ORIGINS")
     metrics_token: str = Field(default="", validation_alias="ECC_METRICS_TOKEN")
+    # Number of trusted reverse proxies/load balancers in front of this app
+    # (e.g. 1 for a single nginx/ALB hop). 0 (the default) means "not behind
+    # a proxy" -- ecc.http_security trusts only the raw ASGI socket peer,
+    # which is correct for local/dev/test but resolves to the proxy's own
+    # address in any real deployment, collapsing every distinct client into
+    # one shared mutation-rate-limit bucket. Set to the exact hop count from
+    # docs/runbooks/PHASE-1-DEPLOYMENT.md's topology so the limiter reads the
+    # real client IP from X-Forwarded-For instead. See
+    # ecc.http_security._client_ip_from_forwarded_for for why this must be an
+    # exact trusted count, not "trust X-Forwarded-For whenever present" --
+    # the header's client-supplied left-hand portion is never trustworthy.
+    trusted_proxy_count: int = Field(default=0, ge=0, validation_alias="ECC_TRUSTED_PROXY_COUNT")
 
     @property
     def cors_origin_list(self) -> list[str]:

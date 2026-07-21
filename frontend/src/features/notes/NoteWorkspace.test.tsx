@@ -59,6 +59,27 @@ describe('NoteWorkspace', () => {
     expect(String((fetch.mock.calls[1][1] as RequestInit).body)).not.toMatch(/owner|workspace|actor/)
   })
 
+  it('invalidates the dashboard and morning brief caches on note mutation success', async () => {
+    const created = { ...note, title: 'Decision log' }
+    const fetch = vi.fn()
+      .mockImplementationOnce(() => response({ items: [], next_cursor: null }))
+      .mockImplementationOnce(() => response(created, 201))
+      .mockImplementationOnce(() => response({ items: [created], next_cursor: null }))
+    vi.stubGlobal('fetch', fetch)
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } })
+    render(<QueryClientProvider client={client}><NoteWorkspace /></QueryClientProvider>)
+    const invalidateSpy = vi.spyOn(client, 'invalidateQueries')
+
+    fireEvent.change(screen.getByLabelText('Note title'), { target: { value: 'Decision log' } })
+    fireEvent.change(screen.getByLabelText('Note body'), { target: { value: 'Body' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Create note' }))
+
+    await waitFor(() => expect(fetch).toHaveBeenCalledTimes(3))
+    const invalidatedKeys = invalidateSpy.mock.calls.map((call) => call[0]?.queryKey)
+    expect(invalidatedKeys).toContainEqual(['dashboard', 'today'])
+    expect(invalidatedKeys).toContainEqual(['brief', 'morning'])
+  })
+
   it('searches the loaded notes locally and archives then restores a note', async () => {
     const second = { ...note, id: 'note-2', title: 'Hiring plan', body: 'Candidate pipeline' }
     const archived = { ...note, version: 5, archived_at: '2026-07-16T10:00:00Z' }

@@ -71,6 +71,51 @@ jobs:
           python-version: 3.14.6
       - run: docker build -f backend/Dockerfile -t ecc-backend:ci .
       - run: docker build -f frontend/Dockerfile -t ecc-frontend:ci .
+      - name: Smoke test backend container actually starts and serves
+        # Trivy below only proves the built image's filesystem is free of
+        # known-vulnerable packages; it never starts the container, so a
+        # broken CMD/entrypoint, missing runtime dependency, or bad file
+        # permission for the non-root user would build and scan clean and
+        # only surface once someone tries to actually deploy it. Runs before
+        # the (slower) vulnerability scans below so a container that can't
+        # even boot fails fast.
+        run: |
+          docker run -d --name ecc-backend-smoke -p 18000:8000 -e ECC_ENV=development ecc-backend:ci
+          live=0
+          for _ in $(seq 1 30); do
+            if curl -fsS http://localhost:18000/health/live >/dev/null 2>&1; then
+              live=1
+              break
+            fi
+            sleep 1
+          done
+          if [ "${live}" -ne 1 ]; then
+            echo "::error::backend container did not become healthy within 30s"
+            docker logs ecc-backend-smoke
+            docker rm -f ecc-backend-smoke
+            exit 1
+          fi
+          echo "backend container is live"
+          docker rm -f ecc-backend-smoke
+      - name: Smoke test frontend container actually starts and serves
+        run: |
+          docker run -d --name ecc-frontend-smoke -p 18080:80 ecc-frontend:ci
+          live=0
+          for _ in $(seq 1 30); do
+            if curl -fsS http://localhost:18080/ >/dev/null 2>&1; then
+              live=1
+              break
+            fi
+            sleep 1
+          done
+          if [ "${live}" -ne 1 ]; then
+            echo "::error::frontend container did not start serving within 30s"
+            docker logs ecc-frontend-smoke
+            docker rm -f ecc-frontend-smoke
+            exit 1
+          fi
+          echo "frontend container is serving"
+          docker rm -f ecc-frontend-smoke
       - name: Scan backend image for HIGH/CRITICAL vulnerabilities
         uses: aquasecurity/trivy-action@c07df6fec6fa692e6fd1200d50aaa1fdd66f03c8
         with:

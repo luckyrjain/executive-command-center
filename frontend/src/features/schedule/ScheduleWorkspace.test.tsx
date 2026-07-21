@@ -63,6 +63,50 @@ describe('ScheduleWorkspace', () => {
     })
   })
 
+  it('invalidates the dashboard and morning brief caches on event mutation success', async () => {
+    const fetch = initial(vi.fn(), [], [])
+      .mockImplementationOnce(() => response(event, 201))
+      .mockImplementationOnce(() => response({ items: [event], next_cursor: null }))
+    vi.stubGlobal('fetch', fetch)
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } })
+    render(<QueryClientProvider client={client}><ScheduleWorkspace /></QueryClientProvider>)
+    await screen.findByText('No calendar events.')
+    const invalidateSpy = vi.spyOn(client, 'invalidateQueries')
+
+    fireEvent.change(screen.getByLabelText('Event title'), { target: { value: 'Board review' } })
+    fireEvent.change(screen.getByLabelText('Event start'), { target: { value: '2026-07-20T10:00' } })
+    fireEvent.change(screen.getByLabelText('Event end'), { target: { value: '2026-07-20T11:00' } })
+    fireEvent.change(screen.getByLabelText('Event timezone'), { target: { value: 'Asia/Kolkata' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Create event' }))
+
+    await waitFor(() => expect(fetch).toHaveBeenCalledTimes(4))
+    const invalidatedKeys = invalidateSpy.mock.calls.map((call) => call[0]?.queryKey)
+    expect(invalidatedKeys).toContainEqual(['dashboard', 'today'])
+    expect(invalidatedKeys).toContainEqual(['brief', 'morning'])
+  })
+
+  it('invalidates the dashboard and morning brief caches on meeting mutation success', async () => {
+    const fetch = initial(vi.fn(), [], [])
+      .mockImplementationOnce(() => response(standaloneMeeting, 201))
+      .mockImplementationOnce(() => response({ items: [standaloneMeeting], next_cursor: null }))
+    vi.stubGlobal('fetch', fetch)
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } })
+    render(<QueryClientProvider client={client}><ScheduleWorkspace /></QueryClientProvider>)
+    await screen.findByText('No meetings.')
+    const invalidateSpy = vi.spyOn(client, 'invalidateQueries')
+
+    fireEvent.change(screen.getByLabelText('Meeting title'), { target: { value: 'Coaching session' } })
+    fireEvent.change(screen.getByLabelText('Meeting start'), { target: { value: '2026-07-20T10:00' } })
+    fireEvent.change(screen.getByLabelText('Meeting end'), { target: { value: '2026-07-20T11:00' } })
+    fireEvent.change(screen.getByLabelText('Meeting timezone'), { target: { value: 'Asia/Kolkata' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Create standalone meeting' }))
+
+    await waitFor(() => expect(fetch).toHaveBeenCalledTimes(4))
+    const invalidatedKeys = invalidateSpy.mock.calls.map((call) => call[0]?.queryKey)
+    expect(invalidatedKeys).toContainEqual(['dashboard', 'today'])
+    expect(invalidatedKeys).toContainEqual(['brief', 'morning'])
+  })
+
   it('archives and restores an event using the displayed versions', async () => {
     const archived = { ...event, archived_at: '2026-07-16T10:00:00Z', version: 5 }
     const restored = { ...event, version: 6 }

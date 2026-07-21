@@ -1,8 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
-import { apiRequest } from './api/client'
-
-const API_BASE = import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:8000'
+import { ApiError, apiRequest } from './api/client'
 
 type RecommendationStatus =
   | 'proposed'
@@ -58,41 +56,11 @@ type RiskPreview = {
   explanation: string
 }
 
-type ErrorEnvelope = {
-  error?: { code?: string; message?: string }
-}
-
 type ActionName = 'publish' | 'confirm' | 'reject' | 'defer' | 'pin'
 
 type ActionRequest = {
   item: Recommendation
   action: ActionName
-}
-
-function csrfToken(): string {
-  return (
-    document.cookie
-      .split('; ')
-      .find((value) => value.startsWith('ecc_csrf='))
-      ?.split('=')[1] ?? ''
-  )
-}
-
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const headers = new Headers(init?.headers)
-  headers.set('Accept', 'application/json')
-  const response = await fetch(`${API_BASE}${path}`, {
-    credentials: 'include',
-    ...init,
-    headers,
-  })
-  if (!response.ok) {
-    const payload = (await response.json().catch(() => ({}))) as ErrorEnvelope
-    const error = new Error(payload.error?.message ?? 'Recommendation action failed')
-    error.name = payload.error?.code ?? `HTTP_${response.status}`
-    throw error
-  }
-  return response.json()
 }
 
 function fetchRecommendations(): Promise<RecommendationList> {
@@ -102,7 +70,7 @@ function fetchRecommendations(): Promise<RecommendationList> {
   statuses.append('status', 'executed')
   statuses.append('status', 'failed')
   statuses.set('limit', '20')
-  return request(`/api/v1/recommendations?${statuses}`)
+  return apiRequest(`/api/v1/recommendations?${statuses}`)
 }
 
 export function actionPayload(item: Recommendation, action: ActionName): Record<string, unknown> {
@@ -128,14 +96,9 @@ export function actionPayload(item: Recommendation, action: ActionName): Record<
 }
 
 function mutateRecommendation({ item, action }: ActionRequest): Promise<Recommendation> {
-  return request(`/api/v1/recommendations/${item.id}/${action}`, {
+  return apiRequest(`/api/v1/recommendations/${item.id}/${action}`, {
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Idempotency-Key': crypto.randomUUID(),
-      'X-CSRF-Token': csrfToken(),
-    },
-    body: JSON.stringify(actionPayload(item, action)),
+    body: actionPayload(item, action),
   })
 }
 
@@ -150,7 +113,7 @@ export function confidenceLabel(confidence: number): string {
 }
 
 export function recommendationErrorMessage(error: Error): string {
-  if (error.name === 'VERSION_CONFLICT' || error.name === 'TARGET_VERSION_CONFLICT') {
+  if (error instanceof ApiError && (error.code === 'VERSION_CONFLICT' || error.code === 'TARGET_VERSION_CONFLICT')) {
     return 'This recommendation changed while you were reviewing it. The latest version has been reloaded.'
   }
   return error.message
@@ -222,9 +185,20 @@ export default function RecommendationPanel() {
   })
   const mutation = useMutation({
     mutationFn: mutateRecommendation,
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['recommendations', 'review'] }),
+    onSuccess: (_data, { action }) => {
+      void queryClient.invalidateQueries({ queryKey: ['recommendations', 'review'] })
+      // Confirming a recommendation executes its proposed action server-side
+      // (backend/ecc/domains/governance/recommendation_mutations.py's
+      // execute_target) -- e.g. completing a task or closing a risk -- so
+      // the dashboard and morning brief must also refresh, or they keep
+      // showing the pre-confirmation entity state.
+      if (action === 'confirm') {
+        void queryClient.invalidateQueries({ queryKey: ['dashboard', 'today'] })
+        void queryClient.invalidateQueries({ queryKey: ['brief', 'morning'] })
+      }
+    },
     onError: (error) => {
-      if (error.name === 'VERSION_CONFLICT' || error.name === 'TARGET_VERSION_CONFLICT') {
+      if (error instanceof ApiError && (error.code === 'VERSION_CONFLICT' || error.code === 'TARGET_VERSION_CONFLICT')) {
         void queryClient.invalidateQueries({ queryKey: ['recommendations', 'review'] })
       }
     },

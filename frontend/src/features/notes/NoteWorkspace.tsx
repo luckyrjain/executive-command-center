@@ -52,7 +52,11 @@ export default function NoteWorkspace({ recoveryStore }: NoteWorkspaceProps) {
   const mounted = useRef(true)
   const transition = useRef(0)
 
-  const refresh = () => queryClient.invalidateQueries({ queryKey: ['notes'] })
+  const refresh = () => Promise.all([
+    queryClient.invalidateQueries({ queryKey: ['notes'] }),
+    queryClient.invalidateQueries({ queryKey: ['dashboard', 'today'] }),
+    queryClient.invalidateQueries({ queryKey: ['brief', 'morning'] }),
+  ])
   const createMutation = useMutation({
     mutationFn: (draft: NoteDraft) => apiRequest<Note>('/api/v1/notes', {
       method: 'POST',

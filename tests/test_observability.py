@@ -23,6 +23,7 @@ Split into two independent surfaces, mirroring the module itself:
 from __future__ import annotations
 
 import logging
+import re
 from collections.abc import Iterator
 from uuid import uuid4
 
@@ -408,6 +409,59 @@ def test_queue_lifecycle_event_is_counted_after_session_commits() -> None:
         session.commit()
 
         assert 'event_type="task.commit_test"' in render_metrics()
+    finally:
+        session.close()
+
+
+def _brief_generation_observation_count(rendered: str) -> int:
+    # brief_generation_duration_seconds is an unlabeled, process-lifetime
+    # singleton histogram (like every instrument in this module), so its
+    # `_HELP`/`_TYPE` declaration lines are always present regardless of
+    # whether it has ever been observed -- only the `_count` line's value
+    # actually reflects observations, and only appears once observe() has
+    # been called at least once.
+    match = re.search(
+        r"^ecc_brief_generation_duration_seconds_count (\d+)$", rendered, re.MULTILINE
+    )
+    return int(match.group(1)) if match else 0
+
+
+def test_queue_brief_generated_is_not_counted_until_session_commits() -> None:
+    """Regression test: record_brief_generated() was previously called
+    directly at brief-generation time, before session.commit() -- so a
+    commit failure would still leave a duration sample recorded for a brief
+    that never persisted. queue_brief_generated() must defer the same way
+    queue_lifecycle_event() does."""
+    from sqlalchemy import text
+
+    from ecc.observability import queue_brief_generated
+
+    session = SessionFactory()
+    try:
+        before_count = _brief_generation_observation_count(render_metrics())
+        session.execute(text("SELECT 1"))
+        queue_brief_generated(session, 0.042)
+        assert _brief_generation_observation_count(render_metrics()) == before_count
+
+        session.rollback()
+
+        assert _brief_generation_observation_count(render_metrics()) == before_count
+    finally:
+        session.close()
+
+
+def test_queue_brief_generated_is_counted_after_session_commits() -> None:
+    from ecc.observability import queue_brief_generated
+
+    session = SessionFactory()
+    try:
+        before_count = _brief_generation_observation_count(render_metrics())
+        queue_brief_generated(session, 0.042)
+        assert _brief_generation_observation_count(render_metrics()) == before_count
+
+        session.commit()
+
+        assert _brief_generation_observation_count(render_metrics()) == before_count + 1
     finally:
         session.close()
 

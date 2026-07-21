@@ -28,7 +28,11 @@ Three independent pieces, each usable/testable on its own:
    client IP (refined by session cookie when present, but IP always
    participates in the key since the cookie is unvalidated at this point in
    the chain), backed by a bounded in-memory bucket table so a long-running
-   process cannot accumulate unbounded state.
+   process cannot accumulate unbounded state. "Client IP" is the raw ASGI
+   socket peer unless ``ECC_TRUSTED_PROXY_COUNT`` is set (see
+   ``_client_host`` / ``_client_ip_from_forwarded_for``), since behind an
+   unconfigured reverse proxy every client otherwise resolves to the same
+   proxy address and collapses into one shared bucket.
 """
 
 from __future__ import annotations
@@ -42,6 +46,8 @@ from math import ceil
 from fastapi import Request, Response
 from fastapi.responses import JSONResponse
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
+
+from ecc.config import get_settings
 
 # ---------------------------------------------------------------------------
 # Security headers
@@ -244,6 +250,15 @@ class _MutationRateLimiter:
         if bucket is None or now - bucket.window_start >= self._window_seconds:
             bucket = _RateLimitBucket(window_start=now)
             self._buckets[key] = bucket
+            # `dict.__setitem__` on an *existing* key leaves it at its old
+            # position rather than moving it to the end (only a brand-new
+            # key lands at the end automatically). Without this, a bucket
+            # whose window just expired -- and which this call just made the
+            # most-recently-used -- could still be sitting at the front of
+            # the OrderedDict from its original insertion and get evicted by
+            # the very next popitem(last=False) below, even for a `key` that
+            # is still actively in use.
+            self._buckets.move_to_end(key)
             if len(self._buckets) > self._max_buckets:
                 self._buckets.popitem(last=False)
         else:
@@ -259,9 +274,53 @@ _mutation_rate_limiter = _MutationRateLimiter()
 _mutation_ip_rate_limiter = _MutationRateLimiter(max_requests=RATE_LIMIT_MAX_REQUESTS_PER_IP)
 
 
+def _client_ip_from_forwarded_for(header_value: str, trusted_proxy_count: int) -> str | None:
+    """Resolve the real client IP from an ``X-Forwarded-For`` header value.
+
+    Only the rightmost ``trusted_proxy_count`` comma-separated hops were
+    appended by proxies we trust (each proxy appends the address it
+    received the request from; it never rewrites earlier entries). The
+    hop just to the left of those -- ``trusted_proxy_count`` entries in
+    from the right -- is the address our closest trusted proxy itself
+    received the request from, i.e. the real client. Everything further
+    left is unauthenticated and attacker-controllable (a client can send
+    an arbitrary ``X-Forwarded-For`` of its own), so it is never trusted.
+
+    Returns ``None`` -- signalling "fall back to the raw socket peer" --
+    if the header does not contain at least ``trusted_proxy_count`` hops,
+    since that means the configured trust count doesn't match what
+    actually arrived and guessing would be unsafe.
+    """
+    hops = [hop.strip() for hop in header_value.split(",") if hop.strip()]
+    if len(hops) < trusted_proxy_count:
+        return None
+    return hops[-trusted_proxy_count]
+
+
 def _client_host(request: Request) -> str:
+    """Resolve the request's client IP for rate-limit keying.
+
+    By default (``ECC_TRUSTED_PROXY_COUNT=0``) this trusts only the raw
+    ASGI socket peer -- correct for direct/dev/test connections, but wrong
+    behind a reverse proxy or load balancer, where every request arrives
+    from the proxy's own address and the mutation rate limiter collapses
+    every distinct real client into one shared bucket. When deployed
+    behind N trusted proxies (see docs/runbooks/PHASE-1-DEPLOYMENT.md),
+    set ``ECC_TRUSTED_PROXY_COUNT=N`` so this reads the real client IP from
+    ``X-Forwarded-For`` instead -- see
+    ``_client_ip_from_forwarded_for`` for why only a bounded, counted
+    number of trailing hops are ever trusted.
+    """
     client = request.client
-    return client.host if client else "unknown"
+    fallback = client.host if client else "unknown"
+    trusted_proxy_count = get_settings().trusted_proxy_count
+    if trusted_proxy_count <= 0:
+        return fallback
+    forwarded_for = request.headers.get("x-forwarded-for")
+    if not forwarded_for:
+        return fallback
+    resolved = _client_ip_from_forwarded_for(forwarded_for, trusted_proxy_count)
+    return resolved if resolved is not None else fallback
 
 
 def _rate_limit_key(request: Request, *, host: str) -> str:
