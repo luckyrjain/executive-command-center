@@ -13,6 +13,7 @@ from sqlalchemy.orm import Session
 from ecc.auth import AuthContext, AuthDep, CsrfDep
 from ecc.database import get_session
 from ecc.domains.knowledge.entities import EntityResponse, _project
+from ecc.domains.knowledge.retrieval import queue_retrieval_document
 from ecc.domains.knowledge.timeline import queue_timeline_entry
 from ecc.observability import (
     queue_lifecycle_event,
@@ -307,6 +308,16 @@ def update_entity(
             entity_id,
             "knowledge_entity.updated",
             f"updated: {', '.join(sorted(changed_fields))}",
+            now,
+        )
+        queue_retrieval_document(
+            session,
+            auth.workspace_id,
+            entity_id,
+            response.kind,
+            response.canonical_name,
+            response.summary,
+            response.version,
             now,
         )
         _store_cached(session, auth, idempotency_key, request_hash, response, now)
