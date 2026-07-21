@@ -1,8 +1,8 @@
 ---
 id: PHASE-002-DATA-MODEL
 title: Phase 2 Knowledge Platform Data Model
-status: Draft
-version: 0.1.0
+status: Approved for Implementation
+version: 0.2.0
 owner: Lucky Jain
 ---
 
@@ -12,20 +12,24 @@ owner: Lucky Jain
 
 PostgreSQL is authoritative. Every table carries `workspace_id`, timestamps and optimistic version where mutable. Composite foreign keys include `workspace_id`. Derived search, embedding and timeline projections are rebuildable.
 
+## Reconciliation with PKOS (ADR-0003 / PKOS-SCHEMA.md)
+
+Version 0.1.0 of this document proposed `knowledge_entities`, `relationships`, and `source_refs` as independently-named new tables. That would have forked a second entity/relationship store disconnected from `pkos_nodes`/`pkos_edges`/`pkos_evidence` — the tables Phase 0 already shipped and ADR-0003 (Accepted) already declared the canonical knowledge subsystem, and which `docs/domain/PKOS-SCHEMA.md`'s own mapping table already earmarked for exactly this phase ("aliases and merge records" / "embeddings and chunks" listed as "deferred until identity-resolution phase"). Resolved: extend the existing PKOS tables instead of forking. See `docs/superpowers/specs/2026-07-21-phase-2-knowledge-platform-design.md`'s Open decision 1 for the full analysis.
+
 ## Core records
 
-| Record | Purpose | Required fields |
-|---|---|---|
-| `knowledge_entities` | Canonical person, organization, project, topic, decision or document | id, workspace_id, kind, canonical_name, summary, status, version |
-| `entity_aliases` | Names and external identifiers | entity_id, alias_type, normalized_value, source_id, confidence |
-| `knowledge_claims` | Atomic attributable facts | subject_id, predicate, value_json, source_id, confidence, valid_from, valid_to |
-| `relationships` | Typed directed connection | from_entity_id, relationship_type, to_entity_id, source_id, confidence, valid interval |
-| `source_refs` | Provenance pointer and permission state | source_type, source_entity_id, locator, content_hash, evidence_state, observed_at |
-| `resolution_candidates` | Reviewable possible identity match | left_entity_id, right_entity_id, score, factors_json, status |
-| `entity_operations` | Merge/split lineage | operation_type, inputs_json, outputs_json, actor_id, reason |
-| `timeline_entries` | Rebuildable chronology projection | entity_id, effective_at, recorded_at, event_type, source_id, summary |
-| `retrieval_documents` | Normalized searchable projection | entity_type, entity_id, title, body, tsvector, source_version |
-| `embedding_projections` | Optional derived vectors | document_id, model_id, model_version, dimensions, vector, content_hash |
+| Record | Purpose | Required fields | Physical table |
+|---|---|---|---|
+| `knowledge_entities` | Canonical person, organization, project, topic, decision or document | id, workspace_id, kind, canonical_name, summary, status, version | `pkos_nodes`, extended with `entity_id`, `status`, `confidence`, `version` (`node_type`/`canonical_name`/`attributes` already exist and map to `kind`/`canonical_name`/free-form fields) |
+| `entity_aliases` | Names and external identifiers | entity_id, alias_type, normalized_value, source_id, confidence | new table, `entity_id` FK to `pkos_nodes` |
+| `knowledge_claims` | Atomic attributable facts | subject_id, predicate, value_json, source_id, confidence, valid_from, valid_to | new table, `subject_id` FK to `pkos_nodes` |
+| `relationships` | Typed directed connection | from_entity_id, relationship_type, to_entity_id, source_id, confidence, valid interval | `pkos_edges`, extended with `confidence`, `evidence_id`, `valid_from`, `valid_to`, `status` (`source_node_id`/`target_node_id`/`edge_type`/`attributes` already exist and map to `from_entity_id`/`to_entity_id`/`relationship_type`/free-form fields) |
+| `source_refs` | Provenance pointer and permission state | source_type, source_entity_id, locator, content_hash, evidence_state, observed_at | `pkos_evidence`, extended with `evidence_state`, `observed_at` |
+| `resolution_candidates` | Reviewable possible identity match | left_entity_id, right_entity_id, score, factors_json, status | new table, composite FKs to `pkos_nodes` |
+| `entity_operations` | Merge/split lineage | operation_type, inputs_json, outputs_json, actor_id, reason | new table |
+| `timeline_entries` | Rebuildable chronology projection | entity_id, effective_at, recorded_at, event_type, source_id, summary | new table, `entity_id` FK to `pkos_nodes` |
+| `retrieval_documents` | Normalized searchable projection | entity_type, entity_id, title, body, tsvector, source_version | new table, `entity_id` FK to `pkos_nodes` |
+| `embedding_projections` | Optional derived vectors | document_id, model_id, model_version, dimensions, vector, content_hash | new table — schema ships only when Slice 7 starts, gated on the design doc's Open decision 2 (RFC-005 amendment) |
 
 ## Invariants
 

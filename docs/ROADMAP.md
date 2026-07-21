@@ -4,7 +4,7 @@
 
 **Foundation:** Phase 0 baseline approved and implemented  
 **Current delivery:** [Phase 1 — Executive Dashboard MVP](phases/PHASE-001-executive-dashboard-mvp.md) — engineering delivery complete on `feature/phase-1-production-hardening` (Tasks 1-11 of `superpowers/plans/2026-07-16-phase-1-completion.md`, each independently reviewed with zero Critical or Important findings); Phase 1 exit remains open pending the seven-day daily-use validation gate and human change review — see [Phase 1 Implementation Status](phases/phase-001/IMPLEMENTATION-STATUS.md)  
-**Future specifications:** Phases 2–9 published as Draft / Planned
+**Future specifications:** Phase 2 Approved for Implementation and in progress (parallel to Phase 1's open exit gates); Phases 3–9 published as Draft / Planned
 
 The [canonical phase index](phases/README.md) lists every primary specification and supporting contract. The [Phase 0–9 documentation review](phases/PHASE-REVIEW.md) records completeness findings and approval gates.
 
@@ -26,7 +26,7 @@ Every phase must:
 ```text
 Phase 0 — Repository Foundation         [Implemented]
   -> Phase 1 — Executive Dashboard MVP [Engineering delivery complete; exit gates open]
-  -> Phase 2 — Knowledge Platform      [Draft]
+  -> Phase 2 — Knowledge Platform      [Approved for Implementation; in progress, parallel to open Phase 1 exit gates]
   -> Phase 3 — Human Attention Engine  [Draft]
   -> Phase 4 — AI Runtime              [Draft]
   -> Phase 5 — Automation              [Draft]
@@ -75,11 +75,12 @@ Daily-use validation record: [Phase 1 Daily-Use Validation Record](runbooks/PHAS
 
 ## Phase 2 — Knowledge Platform
 
-**Status:** Draft / Planned.
+**Status:** Approved for Implementation; contracts moved from Draft after resolving the PKOS-reconciliation decision in `docs/superpowers/specs/2026-07-21-phase-2-knowledge-platform-design.md` (extend the existing `pkos_nodes`/`pkos_edges`/`pkos_evidence` tables rather than fork independent ones). Implementation began by explicit repository-owner authorization to proceed in parallel with Phase 1's still-open exit gates (seven-day daily-use validation, human change review) — a deliberate exception to this document's own "implementation begins only after dependencies satisfy exit criteria" principle above, not a claim that Phase 1 has exited.
 
 Persistent entities, claims, relationships, entity resolution, reversible merge/split, timelines and lexical-first hybrid retrieval.
 
-Specification: [PHASE-002](phases/PHASE-002-knowledge-platform.md)
+Specification: [PHASE-002](phases/PHASE-002-knowledge-platform.md)  
+Implementation plan: [Phase 2 Knowledge Platform Implementation Plan](superpowers/plans/2026-07-21-phase-2-knowledge-platform.md)
 
 ## Phase 3 — Human Attention Engine
 

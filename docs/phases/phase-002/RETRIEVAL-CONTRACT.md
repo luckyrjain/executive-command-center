@@ -1,8 +1,8 @@
 ---
 id: PHASE-002-RETRIEVAL
 title: Hybrid Retrieval Contract
-status: Draft
-version: 0.1.0
+status: Approved for Implementation
+version: 0.2.0
 owner: Lucky Jain
 ---
 
