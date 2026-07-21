@@ -29,6 +29,10 @@ from ecc.domains.knowledge.entities_mutations import (
 )
 from ecc.domains.knowledge.evidence import router as evidence_router
 from ecc.domains.knowledge.notes import router as notes_router
+from ecc.domains.knowledge.relationships import router as knowledge_relationships_router
+from ecc.domains.knowledge.relationships_mutations import (
+    router as knowledge_relationships_mutations_router,
+)
 from ecc.domains.planning.tasks import router as tasks_router
 from ecc.domains.platform.audit_queries import router as audit_queries_router
 from ecc.domains.platform.dashboard_briefs import router as dashboard_briefs_router
@@ -72,6 +76,8 @@ app.include_router(evidence_router)
 app.include_router(knowledge_entities_router)
 app.include_router(knowledge_entities_mutations_router)
 app.include_router(knowledge_claims_router)
+app.include_router(knowledge_relationships_router)
+app.include_router(knowledge_relationships_mutations_router)
 app.include_router(identity_router)
 app.include_router(search_router)
 app.include_router(dashboard_briefs_router)

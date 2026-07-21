@@ -74,8 +74,10 @@ Added incrementally, one entry per delivery slice, alongside the code that emits
 | `knowledge_entity.archived.v1` | Knowledge Platform | entity_id, version |
 | `knowledge_entity.restored.v1` | Knowledge Platform | entity_id, version |
 | `knowledge_entity.claim_recorded.v1` | Knowledge Platform | entity_id, claim_id |
+| `relationship.created.v1` | Knowledge Platform | relationship_id |
+| `relationship.invalidated.v1` | Knowledge Platform | relationship_id |
 
-Remaining Phase 2 events (`relationship.created.v1`, `relationship.invalidated.v1`, `resolution_candidate.created.v1`, `resolution_candidate.confirmed.v1`, `resolution_candidate.rejected.v1`, `entity_operation.merged.v1`, `entity_operation.reversed.v1`) are added in the implementation plan's later slices, each alongside its own emitting code, not speculatively here.
+Remaining Phase 2 events (`resolution_candidate.created.v1`, `resolution_candidate.confirmed.v1`, `resolution_candidate.rejected.v1`, `entity_operation.merged.v1`, `entity_operation.reversed.v1`) are added in the implementation plan's later slices, each alongside its own emitting code, not speculatively here.
 
 ## Recommendation publication rule
 
