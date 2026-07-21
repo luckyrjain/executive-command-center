@@ -29,8 +29,11 @@
 - `backend/migrations/versions/0010_phase2_pkos_reconciliation.py`: add the Phase-1-deferred columns to `pkos_nodes`/`pkos_edges`/`pkos_evidence` (design doc's Open decision 1 recommendation).
 - `backend/migrations/versions/0011_phase2_knowledge_entities.py`: `entity_aliases`, `knowledge_claims`.
 - `backend/migrations/versions/0012_phase2_resolution.py`: `resolution_candidates`, `entity_operations`.
-- `backend/migrations/versions/0013_phase2_timeline_retrieval.py`: `timeline_entries`, `retrieval_documents`.
-- `backend/migrations/versions/0014_phase2_embeddings.py`: `embedding_projections` — created only when Slice 7 actually starts (schema-only migration ships with that slice's PR, not earlier, so an unused table doesn't sit ahead of its RFC approval).
+- `backend/migrations/versions/0013_phase2_timeline.py`: `timeline_entries`.
+- `backend/migrations/versions/0014_phase2_retrieval.py`: `retrieval_documents`.
+- `backend/migrations/versions/0015_phase2_embeddings.py`: `embedding_projections` — created only when Slice 7 actually starts (schema-only migration ships with that slice's PR, not earlier, so an unused table doesn't sit ahead of its RFC approval).
+
+Each migration is created and applied by exactly one task below, never reopened by a later one — an already-applied Alembic migration is never edited after the fact (standard Alembic hygiene: amending a migration another task's regression pass already ran against a real database breaks reproducibility for anyone who ran it first). Task 1's `0010` therefore adds the reconciliation columns to all three PKOS tables (`pkos_nodes`, `pkos_edges`, `pkos_evidence`) in one pass up front, even though Task 2 is what actually starts reading/writing the edge columns — not a second, later edit to `0010`.
 - `backend/ecc/domains/identity/__init__.py`, `person_organizations.py`: Person/Organization CRUD, queries + mutations split.
 - `backend/ecc/domains/knowledge/entities.py`, `entities_mutations.py`: `knowledge_entities` (extended `pkos_nodes`) queries/mutations, aliases.
 - `backend/ecc/domains/knowledge/claims.py`: claim record/supersede.
@@ -57,9 +60,9 @@
 ### Task 1: PKOS reconciliation migration and extended entity/relationship model
 
 **Files:**
-- Create: `backend/migrations/versions/0010_phase2_pkos_reconciliation.py`
+- Create: `backend/migrations/versions/0010_phase2_pkos_reconciliation.py` (adds the deferred columns to `pkos_nodes` AND `pkos_edges` AND `pkos_evidence` together — Task 2 and later tasks read/write the edge and evidence columns this creates, but never re-edit this migration file)
 - Create: `backend/ecc/domains/knowledge/entities.py`
-- Create: `backend/ecc/domains/knowledge/entities.test.py` equivalent — `tests/test_knowledge_entities_postgres.py`
+- Create: `tests/test_knowledge_entities_postgres.py`
 - Create: `backend/ecc/domains/knowledge/entities_mutations.py`
 - Create: `backend/migrations/versions/0011_phase2_knowledge_entities.py` (`entity_aliases`, `knowledge_claims`)
 - Create: `backend/ecc/domains/knowledge/claims.py`
@@ -75,9 +78,9 @@
 - Produces: `POST /api/v1/identity/people`, `POST /api/v1/identity/organizations` (thin wrappers that create a `pkos_nodes` row with `node_type='person'|'organization'` — Person/Organization are Identity-owned per `DOMAIN-MODEL.md` but physically the same extended `pkos_nodes` table Knowledge Platform entities use, since PKOS is the shared canonical store).
 - Emits: `knowledge_entity.created.v1`, `knowledge_entity.claim_recorded.v1`, `knowledge_entity.archived.v1`, `knowledge_entity.restored.v1`.
 
-- [ ] **Step 1: Write failing migration-shape tests** in `tests/test_knowledge_entities_postgres.py` asserting `pkos_nodes` gains `entity_id`, `status`, `confidence`, `version` with the constraints DATA-MODEL.md's invariants require (confidence in [0,1], status enum).
+- [ ] **Step 1: Write failing migration-shape tests** in `tests/test_knowledge_entities_postgres.py` asserting `pkos_nodes` gains `entity_id`, `status`, `confidence`, `version` and `pkos_edges` gains `confidence`, `evidence_id`, `valid_from`, `valid_to`, `status` (Task 2's columns, added here so `0010` is never reopened later) with the constraints DATA-MODEL.md's invariants require (confidence in [0,1], status enum).
 - [ ] **Step 2: Run red:** `uv run pytest tests/test_knowledge_entities_postgres.py`; expect column-not-found failures.
-- [ ] **Step 3: Write migration 0010** adding the columns via `op.add_column` with a server default backfilling existing seeded rows to `status='active'`, `version=1`, `confidence=1.0`.
+- [ ] **Step 3: Write migration 0010** adding the reconciliation columns to `pkos_nodes`, `pkos_edges`, and `pkos_evidence` together via `op.add_column`, with a server default backfilling existing seeded rows to `status='active'`, `version=1`, `confidence=1.0`.
 - [ ] **Step 4: Run `alembic upgrade head`** against local PostgreSQL; confirm `scripts/seed_phase1_acceptance.py`'s existing `pkos_nodes`/`pkos_edges` seed rows still round-trip (backup/restore evidence must not regress).
 - [ ] **Step 5: Write failing entity CRUD tests** covering create (kind + canonical_name required), list/filter by kind and status, patch (workspace/id/kind immutable, version-conflict on stale `If-Match`), archive/restore lifecycle, and cross-workspace 404.
 - [ ] **Step 6: Implement `entities.py`/`entities_mutations.py`** following the exact query/mutation router split `backend/ecc/domains/governance/risks.py`/`risk_mutations.py` already establishes.
@@ -91,8 +94,7 @@
 ### Task 2: Typed relationships and entity detail
 
 **Files:**
-- Modify: `backend/migrations/versions/0010_phase2_pkos_reconciliation.py` (extend to also add `pkos_edges` columns — same migration as Task 1's node columns, one reconciliation pass)
-- Create: `backend/ecc/domains/knowledge/relationships.py`, `relationships_mutations.py`
+- Create: `backend/ecc/domains/knowledge/relationships.py`, `relationships_mutations.py` (the `pkos_edges` columns this task reads/writes were already added by Task 1's `0010` migration — no migration file in this task)
 - Create: `tests/test_knowledge_relationships_postgres.py`
 - Modify: `backend/ecc/main.py`
 - Modify: `docs/domain/EVENT-CATALOG.md`
@@ -109,7 +111,7 @@
 ### Task 3: Timeline projection and deterministic rebuild
 
 **Files:**
-- Create: `backend/migrations/versions/0013_phase2_timeline_retrieval.py` (timeline half)
+- Create: `backend/migrations/versions/0013_phase2_timeline.py`
 - Create: `backend/ecc/domains/knowledge/timeline.py`
 - Create: `scripts/rebuild_knowledge_projections.py` (timeline half)
 - Create: `tests/test_knowledge_timeline_postgres.py`
@@ -127,7 +129,7 @@
 ### Task 4: Resolution candidates and human review
 
 **Files:**
-- Create: `backend/migrations/versions/0012_phase2_resolution.py` (resolution half)
+- Create: `backend/migrations/versions/0012_phase2_resolution.py` (both `resolution_candidates` and `entity_operations` — Task 5's merge/reverse work reads/writes `entity_operations` but needs no migration of its own, since this one already created it)
 - Create: `backend/ecc/domains/knowledge/resolution.py`
 - Create: `tests/test_knowledge_resolution_postgres.py`
 - Create: `tests/fixtures/phase2_resolution_dataset.py`
@@ -174,9 +176,9 @@
 ### Task 6: Lexical retrieval and explanations
 
 **Files:**
-- Create: `backend/migrations/versions/0013_phase2_timeline_retrieval.py` (retrieval half — same file as Task 3's timeline half, one migration)
+- Create: `backend/migrations/versions/0014_phase2_retrieval.py`
 - Create: `backend/ecc/domains/knowledge/retrieval.py`
-- Create: `scripts/rebuild_knowledge_projections.py` (retrieval half)
+- Modify: `scripts/rebuild_knowledge_projections.py` (add the retrieval half — Task 3 already created this file for the timeline half; unlike a migration, extending a plain script across tasks is normal)
 - Create: `tests/test_knowledge_retrieval_postgres.py`
 - Create: `tests/fixtures/phase2_retrieval_benchmark.py`
 - Create: `frontend/src/features/knowledge/EntityExplorer.tsx`, `EntityExplorer.test.tsx`
@@ -197,7 +199,7 @@
 
 ### Task 7: Optional embeddings and hybrid fusion — separately gated, not scheduled here
 
-**Not started by this plan.** Blocked on the design doc's Open decision 2: an RFC-005 amendment approving `pgvector` (or another local-first embedding store) with a benchmark run against Slices 1-6's real data and an ADR, per `RFC-005.md`'s explicit "Retrieval benchmark and ADR" activation requirement. When that approval lands, this task gets its own files (`backend/migrations/versions/0014_phase2_embeddings.py`, `backend/ecc/domains/knowledge/embeddings.py`) and TDD steps mirroring Task 6's shape, with the mandatory `degraded=true` fallback-to-lexical path tested first, before the happy path — per `RETRIEVAL-CONTRACT.md`'s degradation rule and `chapter-04-knowledge-platform.md`'s "if embeddings fail, graph traversal continues" principle.
+**Not started by this plan.** Blocked on the design doc's Open decision 2: an RFC-005 amendment approving `pgvector` (or another local-first embedding store) with a benchmark run against Slices 1-6's real data and an ADR, per `RFC-005.md`'s explicit "Retrieval benchmark and ADR" activation requirement. When that approval lands, this task gets its own files (`backend/migrations/versions/0015_phase2_embeddings.py`, `backend/ecc/domains/knowledge/embeddings.py`) and TDD steps mirroring Task 6's shape, with the mandatory `degraded=true` fallback-to-lexical path tested first, before the happy path — per `RETRIEVAL-CONTRACT.md`'s degradation rule and `chapter-04-knowledge-platform.md`'s "if embeddings fail, graph traversal continues" principle.
 
 ### Task 8: Executive knowledge UX polish and full browser acceptance
 
