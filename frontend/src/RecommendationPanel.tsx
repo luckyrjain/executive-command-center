@@ -1,6 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
-const API_BASE = import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:8000'
+import { ApiError, apiRequest } from './api/client'
 
 type RecommendationStatus =
   | 'proposed'
@@ -36,8 +36,24 @@ type RecommendationList = {
   next_cursor?: string | null
 }
 
-type ErrorEnvelope = {
-  error?: { code?: string; message?: string }
+type EvidenceItem = {
+  id: string
+  status: 'available' | 'missing'
+  source_type: string | null
+  label: string | null
+  captured_at: string | null
+}
+
+type EvidenceList = { items: EvidenceItem[] }
+
+type RiskFactor = { code: string; label: string; points: number; source_field?: string }
+
+/** Subset of RiskResponse used only to preview factors for risk-target recommendations. */
+type RiskPreview = {
+  id: string
+  score: number
+  factors: RiskFactor[]
+  explanation: string
 }
 
 type ActionName = 'publish' | 'confirm' | 'reject' | 'defer' | 'pin'
@@ -47,32 +63,6 @@ type ActionRequest = {
   action: ActionName
 }
 
-function csrfToken(): string {
-  return (
-    document.cookie
-      .split('; ')
-      .find((value) => value.startsWith('ecc_csrf='))
-      ?.split('=')[1] ?? ''
-  )
-}
-
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const headers = new Headers(init?.headers)
-  headers.set('Accept', 'application/json')
-  const response = await fetch(`${API_BASE}${path}`, {
-    credentials: 'include',
-    ...init,
-    headers,
-  })
-  if (!response.ok) {
-    const payload = (await response.json().catch(() => ({}))) as ErrorEnvelope
-    const error = new Error(payload.error?.message ?? 'Recommendation action failed')
-    error.name = payload.error?.code ?? `HTTP_${response.status}`
-    throw error
-  }
-  return response.json()
-}
-
 function fetchRecommendations(): Promise<RecommendationList> {
   const statuses = new URLSearchParams()
   statuses.append('status', 'proposed')
@@ -80,7 +70,7 @@ function fetchRecommendations(): Promise<RecommendationList> {
   statuses.append('status', 'executed')
   statuses.append('status', 'failed')
   statuses.set('limit', '20')
-  return request(`/api/v1/recommendations?${statuses}`)
+  return apiRequest(`/api/v1/recommendations?${statuses}`)
 }
 
 export function actionPayload(item: Recommendation, action: ActionName): Record<string, unknown> {
@@ -106,14 +96,9 @@ export function actionPayload(item: Recommendation, action: ActionName): Record<
 }
 
 function mutateRecommendation({ item, action }: ActionRequest): Promise<Recommendation> {
-  return request(`/api/v1/recommendations/${item.id}/${action}`, {
+  return apiRequest(`/api/v1/recommendations/${item.id}/${action}`, {
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Idempotency-Key': crypto.randomUUID(),
-      'X-CSRF-Token': csrfToken(),
-    },
-    body: JSON.stringify(actionPayload(item, action)),
+    body: actionPayload(item, action),
   })
 }
 
@@ -128,10 +113,66 @@ export function confidenceLabel(confidence: number): string {
 }
 
 export function recommendationErrorMessage(error: Error): string {
-  if (error.name === 'VERSION_CONFLICT' || error.name === 'TARGET_VERSION_CONFLICT') {
+  if (error instanceof ApiError && (error.code === 'VERSION_CONFLICT' || error.code === 'TARGET_VERSION_CONFLICT')) {
     return 'This recommendation changed while you were reviewing it. The latest version has been reloaded.'
   }
   return error.message
+}
+
+export function evidenceQueryPath(evidenceIds: string[]): string {
+  const params = new URLSearchParams()
+  evidenceIds.forEach((id) => params.append('id', id))
+  return `/api/v1/evidence?${params}`
+}
+
+function EvidencePreview({ label, evidenceIds }: { label: string; evidenceIds: string[] }) {
+  const query = useQuery({
+    queryKey: ['evidence-preview', evidenceIds],
+    queryFn: () => apiRequest<EvidenceList>(evidenceQueryPath(evidenceIds)),
+    enabled: evidenceIds.length > 0,
+    retry: 1,
+  })
+
+  if (!evidenceIds.length) return null
+  if (query.isLoading) return <p role="status">Loading evidence…</p>
+  if (query.isError) return <p role="alert">{query.error.message}</p>
+
+  return (
+    <ul className="evidence-preview" aria-label={`Evidence for ${label}`}>
+      {(query.data?.items ?? []).map((item) => (
+        <li key={item.id} className={item.status === 'available' ? 'evidence-available' : 'evidence-missing'}>
+          <span>{item.status}</span>
+          {item.label ? <strong>{item.label}</strong> : null}
+        </li>
+      ))}
+    </ul>
+  )
+}
+
+/** Only risk targets carry a computed factors field (see RiskResponse); task/commitment targets
+ * have no reliable single-entity factors source, so this is not rendered for them. */
+function RiskFactorsPreview({ label, riskId }: { label: string; riskId: string }) {
+  const query = useQuery({
+    queryKey: ['risk-preview', riskId],
+    queryFn: () => apiRequest<RiskPreview>(`/api/v1/risks/${riskId}`),
+    retry: 1,
+  })
+
+  if (query.isLoading) return <p role="status">Loading risk factors…</p>
+  if (query.isError) return <p role="alert">{query.error.message}</p>
+  const risk = query.data
+  if (!risk) return null
+
+  return (
+    <div className="risk-factor-preview">
+      <p>Score {risk.score} · {risk.explanation}</p>
+      {risk.factors.length ? (
+        <ul aria-label={`Risk factors for ${label}`}>
+          {risk.factors.map((factor) => <li key={factor.code}>{factor.label} (+{factor.points})</li>)}
+        </ul>
+      ) : null}
+    </div>
+  )
 }
 
 export default function RecommendationPanel() {
@@ -144,9 +185,22 @@ export default function RecommendationPanel() {
   })
   const mutation = useMutation({
     mutationFn: mutateRecommendation,
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['recommendations', 'review'] }),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ['recommendations', 'review'] })
+      // Every action (publish/confirm/reject/defer/pin) writes its own
+      // 'recommendation'-aggregate audit event
+      // (backend/ecc/domains/governance/recommendation_events.py's
+      // record_event, called by every branch of _transition as well as
+      // confirm), which the dashboard's recently_changed feed surfaces
+      // regardless of action -- not just confirm, which additionally
+      // executes the proposed action server-side against another entity
+      // (execute_target). So all five actions need the dashboard/brief
+      // caches invalidated, not just confirm.
+      void queryClient.invalidateQueries({ queryKey: ['dashboard', 'today'] })
+      void queryClient.invalidateQueries({ queryKey: ['brief', 'morning'] })
+    },
     onError: (error) => {
-      if (error.name === 'VERSION_CONFLICT' || error.name === 'TARGET_VERSION_CONFLICT') {
+      if (error instanceof ApiError && (error.code === 'VERSION_CONFLICT' || error.code === 'TARGET_VERSION_CONFLICT')) {
         void queryClient.invalidateQueries({ queryKey: ['recommendations', 'review'] })
       }
     },
@@ -197,8 +251,16 @@ export default function RecommendationPanel() {
                     <div><dt>Evidence</dt><dd>{item.evidence_ids.length} reference{item.evidence_ids.length === 1 ? '' : 's'}</dd></div>
                   </dl>
                   {item.execution_result ? <p className="execution-result">Execution recorded.</p> : null}
+                  {canPublish || canDecide ? (
+                    <div className="recommendation-preview">
+                      <EvidencePreview label={item.recommendation_type.replaceAll('_', ' ')} evidenceIds={item.evidence_ids} />
+                      {item.target_type === 'risk' && item.target_id ? (
+                        <RiskFactorsPreview label={item.recommendation_type.replaceAll('_', ' ')} riskId={item.target_id} />
+                      ) : null}
+                    </div>
+                  ) : null}
                 </div>
-                <div className="recommendation-actions" aria-label={`Actions for ${item.recommendation_type}`}>
+                <div className="recommendation-actions" role="group" aria-label={`Actions for ${item.recommendation_type}`}>
                   {canPublish ? (
                     <button type="button" onClick={() => mutation.mutate({ item, action: 'publish' })} disabled={busy}>Publish for confirmation</button>
                   ) : null}

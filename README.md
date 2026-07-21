@@ -7,7 +7,7 @@ Executive Command Center (ECC) is a specification-driven platform for helping ex
 ## Current status
 
 **Foundation specification:** Phase 0 baseline approved  
-**Implementation:** Phase 1 backend vertical slices implemented through Recommendations and confirmation execution  
+**Implementation:** Phase 1 engineering delivery is complete on `feature/phase-1-production-hardening` — backend domain slices, the executive frontend, and production hardening (security/config validation, structured observability, verified backup/restore, representative-scale performance gates, dependency/container/secret scanning) are all implemented and independently reviewed (`.superpowers/sdd/progress.md`). Phase 1 is not yet closed: it exits only after the seven-day daily-use validation (`docs/runbooks/PHASE-1-DAILY-USE.md`) and human change-review sign-off, both still open — see [Phase 1 Implementation Status](docs/phases/phase-001/IMPLEMENTATION-STATUS.md) and [Phase 1 Final Acceptance](docs/phases/phase-001/FINAL-ACCEPTANCE.md).  
 **Current delivery phase:** Phase 1 — Executive Dashboard MVP  
 **Published specifications:** Phases 0–9; Phases 2–9 remain Draft / Planned
 
@@ -79,10 +79,13 @@ Read the documents in this order:
 16. [Phase 0 Backup and Restore](docs/operations/PHASE-0-BACKUP-RESTORE.md)
 17. [PHASE-000 — Repository Foundation](docs/phases/PHASE-000-repository-foundation.md)
 18. [PHASE-001 — Executive Dashboard MVP](docs/phases/PHASE-001-executive-dashboard-mvp.md)
-19. [Phase Documentation Index](docs/phases/README.md)
-20. [Phase 0–9 Documentation Review](docs/phases/PHASE-REVIEW.md)
-21. [Roadmap](docs/ROADMAP.md)
-22. [Contributing](docs/CONTRIBUTING.md)
+19. [Phase 1 Production Release Gate](docs/runbooks/PHASE-1-RELEASE-GATE.md)
+20. [Phase 1 Deployment Runbook](docs/runbooks/PHASE-1-DEPLOYMENT.md)
+21. [Phase 1 Daily-Use Validation Record](docs/runbooks/PHASE-1-DAILY-USE.md)
+22. [Phase Documentation Index](docs/phases/README.md)
+23. [Phase 0–9 Documentation Review](docs/phases/PHASE-REVIEW.md)
+24. [Roadmap](docs/ROADMAP.md)
+25. [Contributing](docs/CONTRIBUTING.md)
 
 ## Architecture decisions
 

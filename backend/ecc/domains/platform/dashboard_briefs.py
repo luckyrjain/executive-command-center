@@ -1,3 +1,4 @@
+import time as time_module
 from datetime import UTC, date, datetime, time, timedelta
 from hashlib import sha256
 from json import dumps
@@ -8,10 +9,18 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
 from pydantic import BaseModel
 from sqlalchemy import text
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from ecc.auth import AuthDep, CsrfDep
 from ecc.database import get_session
+from ecc.observability import (
+    queue_brief_generated,
+    queue_lifecycle_event,
+    record_audit_outbox_failure,
+    record_brief_stale,
+    record_idempotency_conflict,
+)
 
 router = APIRouter(prefix="/api/v1", tags=["dashboard", "briefs"])
 SessionDep = Annotated[Session, Depends(get_session)]
@@ -315,17 +324,33 @@ def _build_sections(
         if len(risks) == 5:
             break
 
+    # Two-stage query: the inner DISTINCT ON collapses repeat edits of the
+    # same entity down to its single latest audit row *before* any LIMIT is
+    # applied, so one frequently-edited entity can no longer crowd every
+    # other entity out of the candidate window. The outer LIMIT is widened
+    # to 50 (vs. the 5 actually rendered) specifically because the Python
+    # loop below further discards any entity already surfaced in an earlier
+    # section (schedule/priorities/overdue/waiting/risks) -- a narrower
+    # LIMIT applied before that second filter could silently return zero
+    # "recently changed" entries on a busy workspace even when older, still
+    # genuinely-unshown changes exist just past the window.
     changed_rows = (
         session.execute(
             text(
                 """
                 SELECT id, event_type, aggregate_type, aggregate_id,
                        aggregate_version, changed_fields, occurred_at
-                FROM audit_events
-                WHERE workspace_id = :workspace_id
-                  AND occurred_at >= :since
+                FROM (
+                    SELECT DISTINCT ON (aggregate_type, aggregate_id)
+                           id, event_type, aggregate_type, aggregate_id,
+                           aggregate_version, changed_fields, occurred_at
+                    FROM audit_events
+                    WHERE workspace_id = :workspace_id
+                      AND occurred_at >= :since
+                    ORDER BY aggregate_type, aggregate_id, occurred_at DESC
+                ) latest_per_entity
                 ORDER BY occurred_at DESC, id DESC
-                LIMIT 20
+                LIMIT 50
                 """
             ),
             {"workspace_id": workspace_id, "since": now - timedelta(hours=24)},
@@ -428,6 +453,7 @@ def _generate(
     *,
     commit: bool = True,
 ) -> MorningBriefResponse:
+    generation_start = time_module.monotonic()
     now = datetime.now(UTC)
     session.execute(
         text("SELECT pg_advisory_xact_lock(hashtext(:key))"),
@@ -488,70 +514,76 @@ def _generate(
     )
     request_id = UUID(request.state.request_id)
     correlation_id = UUID(request.state.correlation_id)
-    session.execute(
-        text(
-            """
-            INSERT INTO audit_events (
-                id, workspace_id, event_type, aggregate_type,
-                aggregate_id, aggregate_version, actor_id,
-                request_id, correlation_id, before, after,
-                changed_fields, authorization_result, source,
-                metadata, occurred_at
-            ) VALUES (
-                :id, :w, 'morning_brief.generated', 'morning_brief',
-                :aggregate_id, :version, :actor, :request_id,
-                :correlation_id, NULL, CAST(:after AS jsonb),
-                :fields, 'allowed', 'user', '{}'::jsonb, :now
-            )
-            """
-        ),
-        {
-            "id": uuid4(),
-            "w": workspace_id,
-            "aggregate_id": brief_id,
-            "version": version,
-            "actor": user_id,
-            "request_id": request_id,
-            "correlation_id": correlation_id,
-            "after": dumps(
-                {
-                    "briefing_date": day.isoformat(),
-                    "generation_version": version,
-                }
+    try:
+        session.execute(
+            text(
+                """
+                INSERT INTO audit_events (
+                    id, workspace_id, event_type, aggregate_type,
+                    aggregate_id, aggregate_version, actor_id,
+                    request_id, correlation_id, before, after,
+                    changed_fields, authorization_result, source,
+                    metadata, occurred_at
+                ) VALUES (
+                    :id, :w, 'morning_brief.generated', 'morning_brief',
+                    :aggregate_id, :version, :actor, :request_id,
+                    :correlation_id, NULL, CAST(:after AS jsonb),
+                    :fields, 'allowed', 'user', '{}'::jsonb, :now
+                )
+                """
             ),
-            "fields": ["sections", "source_versions", "generated_at"],
-            "now": now,
-        },
-    )
-    session.execute(
-        text(
-            """
-            INSERT INTO event_outbox (
-                event_id, workspace_id, event_type, event_version,
-                correlation_id, causation_id, payload, occurred_at,
-                attempt_count
-            ) VALUES (
-                :event_id, :w, 'morning_brief.generated', 1,
-                :correlation_id, :causation_id,
-                CAST(:payload AS jsonb), :now, 0
-            )
-            """
-        ),
-        {
-            "event_id": uuid4(),
-            "w": workspace_id,
-            "correlation_id": correlation_id,
-            "causation_id": request_id,
-            "payload": dumps(
-                {
-                    "brief_id": str(brief_id),
-                    "briefing_date": day.isoformat(),
-                    "version": version,
-                }
+            {
+                "id": uuid4(),
+                "w": workspace_id,
+                "aggregate_id": brief_id,
+                "version": version,
+                "actor": user_id,
+                "request_id": request_id,
+                "correlation_id": correlation_id,
+                "after": dumps(
+                    {
+                        "briefing_date": day.isoformat(),
+                        "generation_version": version,
+                    }
+                ),
+                "fields": ["sections", "source_versions", "generated_at"],
+                "now": now,
+            },
+        )
+        session.execute(
+            text(
+                """
+                INSERT INTO event_outbox (
+                    event_id, workspace_id, event_type, event_version,
+                    correlation_id, causation_id, payload, occurred_at,
+                    attempt_count
+                ) VALUES (
+                    :event_id, :w, 'morning_brief.generated', 1,
+                    :correlation_id, :causation_id,
+                    CAST(:payload AS jsonb), :now, 0
+                )
+                """
             ),
-            "now": now,
-        },
-    )
+            {
+                "event_id": uuid4(),
+                "w": workspace_id,
+                "correlation_id": correlation_id,
+                "causation_id": request_id,
+                "payload": dumps(
+                    {
+                        "brief_id": str(brief_id),
+                        "briefing_date": day.isoformat(),
+                        "version": version,
+                    }
+                ),
+                "now": now,
+            },
+        )
+    except SQLAlchemyError:
+        record_audit_outbox_failure("briefs")
+        raise
+    queue_lifecycle_event(session, "brief", "morning_brief.generated", "allowed")
+    queue_brief_generated(session, time_module.monotonic() - generation_start)
     response = _response(dict(row), False, None)
     if commit:
         session.commit()
@@ -589,6 +621,21 @@ def get_morning_brief(
     day: DateQuery = None,
 ) -> MorningBriefResponse:
     target = _target_date(day, auth.timezone)
+    # Acquire the same per-(workspace,user,day) advisory lock _generate()
+    # takes, before the existence check below -- otherwise two concurrent
+    # GETs for a brief that doesn't exist yet can both see no row and both
+    # call _generate(), racing into two morning_briefs rows (generation
+    # versions 1 and 2, each with its own audit/outbox write) instead of
+    # one lazily-generated brief, since morning_briefs' uniqueness is per
+    # generation_version, not per (workspace,user,day) alone. Re-acquiring
+    # the identical key inside _generate() in the same session/transaction
+    # is a no-op; the lock is released at this request's commit/rollback,
+    # so a request that loses the race simply blocks until the winner
+    # commits, then sees the row the winner just created.
+    session.execute(
+        text("SELECT pg_advisory_xact_lock(hashtext(:key))"),
+        {"key": f"brief:{auth.workspace_id}:{auth.user_id}:{target.isoformat()}"},
+    )
     row = (
         session.execute(
             text(
@@ -621,6 +668,8 @@ def get_morning_brief(
         row["source_versions"],
     )
     session.rollback()
+    if stale and reason is not None:
+        record_brief_stale(reason)
     return _response(dict(row), stale, reason)
 
 
@@ -663,6 +712,7 @@ def refresh_morning_brief(
     if existing is not None:
         if existing["request_hash"] != request_hash:
             session.rollback()
+            record_idempotency_conflict("briefs")
             raise HTTPException(status_code=409, detail="IDEMPOTENCY_CONFLICT")
         session.rollback()
         return MorningBriefResponse.model_validate(existing["response_body"])

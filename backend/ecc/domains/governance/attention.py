@@ -1,3 +1,4 @@
+import time as time_module
 from datetime import UTC, date, datetime, time, timedelta
 from json import dumps
 from typing import Annotated, Any, Literal
@@ -7,10 +8,12 @@ from zoneinfo import ZoneInfo
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, ConfigDict, field_validator
 from sqlalchemy import text
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from ecc.auth import AuthContext, AuthDep, CsrfDep
 from ecc.database import get_session
+from ecc.observability import queue_lifecycle_event, record_audit_outbox_failure, record_ranking
 
 router = APIRouter(prefix="/api/v1/attention", tags=["attention"])
 SessionDep = Annotated[Session, Depends(get_session)]
@@ -161,29 +164,64 @@ def _score_risk(row: dict[str, Any], now: datetime) -> tuple[int, float, list[di
     return score, 1.0, factors
 
 
-def _upsert(
+def _upsert_batch(
     session: Session,
     auth: AuthContext,
     entity_type: EntityType,
-    row: dict[str, Any],
-    score: int,
-    confidence: float,
-    factors: list[dict[str, Any]],
+    rows: list[dict[str, Any]],
+    scored: list[tuple[int, float, list[dict[str, Any]]]],
     now: datetime,
     expires_at: datetime,
 ) -> None:
-    explanation = "; ".join(item["label"] for item in factors) or "No active priority factors"
+    """Upsert every ``rows``/``scored`` pair for one entity type in a single
+    statement.
+
+    Performance note: this used to be a Python ``for`` loop issuing one
+    ``INSERT ... ON CONFLICT`` round trip per entity (see git history for the
+    prior ``_upsert`` helper). At representative Phase 1 scale (10,000+
+    eligible entities per type) that loop alone took multiple seconds per
+    entity type -- measured directly at ~3s for 10,000 rows -- which blew
+    past both the design doc's "ranking of 10,000 eligible entities below
+    500 ms" budget and, combined across task/commitment/risk, the newly
+    configured 5-second statement timeout (`backend/ecc/database.py`).
+    Batching into one set-based statement per entity type (using
+    ``unnest`` over parallel arrays) preserves the exact same per-row
+    upsert/conflict semantics -- including the dismissed-state preservation
+    logic -- while cutting the round-trip count from one-per-entity to one
+    per entity type.
+    """
+    if not rows:
+        return
+    entity_ids = [row["id"] for row in rows]
+    versions = [row["version"] for row in rows]
+    scores = [score for score, _, _ in scored]
+    confidences = [confidence for _, confidence, _ in scored]
+    factors_json = [dumps(factors) for _, _, factors in scored]
+    explanations = [
+        "; ".join(item["label"] for item in factors) or "No active priority factors"
+        for _, _, factors in scored
+    ]
+    pinned = [bool(row["pinned"]) for row in rows]
+
     session.execute(
         text(
             """
             INSERT INTO attention_items (
                 id, workspace_id, entity_type, entity_id, source_entity_version,
                 score, confidence, factors, explanation, generated_at, expires_at, pinned
-            ) VALUES (
-                :id, :workspace_id, :entity_type, :entity_id, :version,
-                :score, :confidence, CAST(:factors AS jsonb), :explanation,
-                :generated_at, :expires_at, :pinned
             )
+            SELECT gen_random_uuid(), :workspace_id, :entity_type,
+                   t.entity_id, t.version, t.score, t.confidence,
+                   t.factors::jsonb, t.explanation, :generated_at, :expires_at, t.pinned
+            FROM unnest(
+                CAST(:entity_ids AS uuid[]),
+                CAST(:versions AS bigint[]),
+                CAST(:scores AS smallint[]),
+                CAST(:confidences AS numeric[]),
+                CAST(:factors AS text[]),
+                CAST(:explanations AS text[]),
+                CAST(:pinned AS boolean[])
+            ) AS t(entity_id, version, score, confidence, factors, explanation, pinned)
             ON CONFLICT (workspace_id, entity_type, entity_id) DO UPDATE SET
                 source_entity_version = EXCLUDED.source_entity_version,
                 score = EXCLUDED.score,
@@ -202,24 +240,24 @@ def _upsert(
             """
         ),
         {
-            "id": uuid4(),
             "workspace_id": auth.workspace_id,
             "entity_type": entity_type,
-            "entity_id": row["id"],
-            "version": row["version"],
-            "score": score,
-            "confidence": confidence,
-            "factors": dumps(factors),
-            "explanation": explanation,
+            "entity_ids": entity_ids,
+            "versions": versions,
+            "scores": scores,
+            "confidences": confidences,
+            "factors": factors_json,
+            "explanations": explanations,
+            "pinned": pinned,
             "generated_at": now,
             "expires_at": expires_at,
-            "pinned": row["pinned"],
         },
     )
 
 
 @router.post("/regenerate", response_model=AttentionList)
 def regenerate_attention(auth: AuthDep, session: SessionDep, _csrf: CsrfDep) -> AttentionList:
+    ranking_start = time_module.monotonic()
     now = datetime.now(UTC)
     with session.begin():
         today, day_end = _workspace_day(session, auth, now)
@@ -297,23 +335,40 @@ def regenerate_attention(auth: AuthDep, session: SessionDep, _csrf: CsrfDep) -> 
             ),
             {"workspace_id": auth.workspace_id},
         )
-        for raw in tasks:
-            row = dict(raw)
-            _upsert(session, auth, "task", row, *_score_task(row, today, now), now, expires_at)
-        for raw in commitments:
-            row = dict(raw)
-            _upsert(
-                session,
-                auth,
-                "commitment",
-                row,
-                *_score_commitment(row, today, now),
-                now,
-                expires_at,
-            )
-        for raw in risks:
-            row = dict(raw)
-            _upsert(session, auth, "risk", row, *_score_risk(row, now), now, expires_at)
+        task_rows = [dict(raw) for raw in tasks]
+        commitment_rows = [dict(raw) for raw in commitments]
+        risk_rows = [dict(raw) for raw in risks]
+        _upsert_batch(
+            session,
+            auth,
+            "task",
+            task_rows,
+            [_score_task(row, today, now) for row in task_rows],
+            now,
+            expires_at,
+        )
+        _upsert_batch(
+            session,
+            auth,
+            "commitment",
+            commitment_rows,
+            [_score_commitment(row, today, now) for row in commitment_rows],
+            now,
+            expires_at,
+        )
+        _upsert_batch(
+            session,
+            auth,
+            "risk",
+            risk_rows,
+            [_score_risk(row, now) for row in risk_rows],
+            now,
+            expires_at,
+        )
+    record_ranking(
+        time_module.monotonic() - ranking_start,
+        len(tasks) + len(commitments) + len(risks),
+    )
     return list_attention(auth, session, 50)
 
 
@@ -447,37 +502,43 @@ def _mutate_attention(
         )
         request_id = UUID(request.state.request_id)
         correlation_id = UUID(request.state.correlation_id)
-        session.execute(
-            text("""
-                INSERT INTO audit_events (
-                    id, workspace_id, event_type, aggregate_type, aggregate_id,
-                    aggregate_version, actor_id, request_id, correlation_id,
-                    changed_fields, authorization_result, source, metadata, occurred_at
-                ) VALUES (
-                    :id, :workspace_id, :event_type, 'attention_item', :aggregate_id,
-                    :aggregate_version, :actor_id, :request_id, :correlation_id,
-                    :changed_fields, 'allowed', 'user', '{}'::jsonb, :occurred_at
-                )
-            """),
-            {
-                "id": uuid4(),
-                "workspace_id": auth.workspace_id,
-                "event_type": f"attention_item.{action}",
-                "aggregate_id": item_id,
-                "aggregate_version": row["source_entity_version"],
-                "actor_id": auth.user_id,
-                "request_id": request_id,
-                "correlation_id": correlation_id,
-                "changed_fields": (
-                    ["dismissed_at", "dismissed_entity_version"]
-                    if action == "dismiss"
-                    else ["deferred_until"]
-                    if action == "defer"
-                    else ["dismissed_at", "dismissed_entity_version", "deferred_until"]
-                ),
-                "occurred_at": now,
-            },
-        )
+        event_type = f"attention_item.{action}"
+        try:
+            session.execute(
+                text("""
+                    INSERT INTO audit_events (
+                        id, workspace_id, event_type, aggregate_type, aggregate_id,
+                        aggregate_version, actor_id, request_id, correlation_id,
+                        changed_fields, authorization_result, source, metadata, occurred_at
+                    ) VALUES (
+                        :id, :workspace_id, :event_type, 'attention_item', :aggregate_id,
+                        :aggregate_version, :actor_id, :request_id, :correlation_id,
+                        :changed_fields, 'allowed', 'user', '{}'::jsonb, :occurred_at
+                    )
+                """),
+                {
+                    "id": uuid4(),
+                    "workspace_id": auth.workspace_id,
+                    "event_type": event_type,
+                    "aggregate_id": item_id,
+                    "aggregate_version": row["source_entity_version"],
+                    "actor_id": auth.user_id,
+                    "request_id": request_id,
+                    "correlation_id": correlation_id,
+                    "changed_fields": (
+                        ["dismissed_at", "dismissed_entity_version"]
+                        if action == "dismiss"
+                        else ["deferred_until"]
+                        if action == "defer"
+                        else ["dismissed_at", "dismissed_entity_version", "deferred_until"]
+                    ),
+                    "occurred_at": now,
+                },
+            )
+        except SQLAlchemyError:
+            record_audit_outbox_failure("attention")
+            raise
+        queue_lifecycle_event(session, "attention_item", event_type, "allowed")
     return AttentionItem.model_validate(dict(updated))
 
 

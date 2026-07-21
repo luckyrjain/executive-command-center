@@ -1,4 +1,5 @@
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, date, datetime, timedelta
 from hashlib import sha256
 from hmac import new
@@ -87,6 +88,7 @@ def dashboard_context() -> Iterator[tuple[TestClient, UUID, UUID, str]]:
                 "risks",
                 "commitments",
                 "tasks",
+                "notes",
                 "sessions",
                 "users",
             ):
@@ -396,3 +398,94 @@ def test_dashboard_review_regressions(
     assert stale.status_code == 200
     assert stale.json()["stale"] is True
     assert stale.json()["stale_reason"] == "source_version_changed"
+
+
+def test_recently_changed_is_not_crowded_out_by_one_entitys_repeat_edits(
+    dashboard_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    """Regression test: ``_build_sections``'s ``recently_changed`` query
+    used to apply its LIMIT before deduplicating by entity, so one entity
+    with many audit rows could crowd every other entity out of the
+    candidate window entirely. Uses notes specifically because they don't
+    feed any other dashboard section, isolating this bug from the
+    unrelated cross-section "already shown elsewhere" filtering."""
+    client, _workspace_id, _user_id, token = dashboard_context
+
+    older = client.post(
+        "/api/v1/notes",
+        headers=_headers(token),
+        json={"title": "Older note", "body": "Created first", "note_type": "general"},
+    )
+    assert older.status_code == 201
+    older_note_id = older.json()["id"]
+
+    busy = client.post(
+        "/api/v1/notes",
+        headers=_headers(token),
+        json={"title": "Busy note", "body": "v0", "note_type": "general"},
+    )
+    assert busy.status_code == 201
+    busy_note_id = busy.json()["id"]
+    version = busy.json()["version"]
+
+    # 20 edits to the same note produce 20 more audit_events rows, all more
+    # recent than the "older" note's single creation event -- enough to
+    # crowd it out of a naive `ORDER BY occurred_at DESC LIMIT 20` window
+    # entirely, which was the pre-fix query shape.
+    for i in range(20):
+        patched = client.patch(
+            f"/api/v1/notes/{busy_note_id}",
+            headers=_headers(token),
+            json={"expected_version": version, "body": f"v{i + 1}"},
+        )
+        assert patched.status_code == 200
+        version = patched.json()["version"]
+
+    dashboard = client.get("/api/v1/dashboard/today")
+    assert dashboard.status_code == 200
+    recently_changed = dashboard.json()["sections"].get("recently_changed", [])
+    changed_entity_ids = {item["entity_id"] for item in recently_changed}
+
+    assert older_note_id in changed_entity_ids
+    assert busy_note_id in changed_entity_ids
+    # The busy note must appear exactly once (its 21 audit rows collapse to
+    # its single latest edit), not once per edit.
+    assert sum(1 for item in recently_changed if item["entity_id"] == busy_note_id) == 1
+
+
+def test_concurrent_lazy_brief_generation_creates_exactly_one_brief(
+    dashboard_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    """Regression test: the lazy-generate GET had no lock around its
+    existence check, so concurrent requests for a brief that doesn't exist
+    yet could all call _generate() and race into duplicate rows."""
+    _client, workspace_id, user_id, token = dashboard_context
+
+    def get_brief_once() -> int:
+        worker = TestClient(app)
+        worker.cookies.set("ecc_session", token)
+        try:
+            return worker.get("/api/v1/briefs/morning").status_code
+        finally:
+            worker.close()
+
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        results = list(executor.map(lambda _: get_brief_once(), range(5)))
+
+    assert results == [200] * 5
+
+    with engine.connect() as connection:
+        brief_count = connection.execute(
+            text("SELECT count(*) FROM morning_briefs WHERE workspace_id=:w AND user_id=:u"),
+            {"w": workspace_id, "u": user_id},
+        ).scalar_one()
+        outbox_count = connection.execute(
+            text(
+                "SELECT count(*) FROM event_outbox "
+                "WHERE workspace_id=:w AND event_type='morning_brief.generated'"
+            ),
+            {"w": workspace_id},
+        ).scalar_one()
+
+    assert brief_count == 1
+    assert outbox_count == 1

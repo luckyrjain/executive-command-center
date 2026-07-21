@@ -55,6 +55,7 @@ jobs:
       - run: corepack enable
       - run: corepack prepare pnpm@10.12.4 --activate
       - run: pnpm install --frozen-lockfile
+      - run: pnpm audit --audit-level=high
       - run: pnpm --filter @ecc/frontend typecheck
       - run: pnpm --filter @ecc/frontend test -- --run
       - run: pnpm --filter @ecc/frontend build
@@ -65,8 +66,128 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: 3.14.6
       - run: docker build -f backend/Dockerfile -t ecc-backend:ci .
       - run: docker build -f frontend/Dockerfile -t ecc-frontend:ci .
+      - name: Smoke test backend container actually starts and serves
+        # Trivy below only proves the built image's filesystem is free of
+        # known-vulnerable packages; it never starts the container, so a
+        # broken CMD/entrypoint, missing runtime dependency, or bad file
+        # permission for the non-root user would build and scan clean and
+        # only surface once someone tries to actually deploy it. Runs before
+        # the (slower) vulnerability scans below so a container that can't
+        # even boot fails fast.
+        run: |
+          # ECC_SESSION_SECRET is required even in development: pydantic-settings
+          # validates a field's constraints (min_length=32 here) against its
+          # resolved value regardless of whether that value came from a source
+          # or the field's own default -- unlike plain pydantic BaseModel, it
+          # does not skip validation for unset/default fields. So Settings()
+          # fails at import time without this, before validate_production_settings's
+          # ECC_ENV=development early-return is ever reached. Every other real
+          # invocation path (docker-compose.yml, tests/conftest.py) already sets
+          # this; this smoke test is the first place that runs the container
+          # without it, which is what surfaced this.
+          docker run -d --name ecc-backend-smoke -p 18000:8000 \
+            -e ECC_ENV=development \
+            -e ECC_SESSION_SECRET=ci-smoke-test-secret-value-32-chars-min \
+            ecc-backend:ci
+          live=0
+          for _ in $(seq 1 30); do
+            if curl -fsS http://localhost:18000/health/live >/dev/null 2>&1; then
+              live=1
+              break
+            fi
+            sleep 1
+          done
+          if [ "${live}" -ne 1 ]; then
+            echo "::error::backend container did not become healthy within 30s"
+            docker logs ecc-backend-smoke
+            docker rm -f ecc-backend-smoke
+            exit 1
+          fi
+          echo "backend container is live"
+          docker rm -f ecc-backend-smoke
+      - name: Smoke test frontend container actually starts and serves
+        run: |
+          docker run -d --name ecc-frontend-smoke -p 18080:80 ecc-frontend:ci
+          live=0
+          for _ in $(seq 1 30); do
+            if curl -fsS http://localhost:18080/ >/dev/null 2>&1; then
+              live=1
+              break
+            fi
+            sleep 1
+          done
+          if [ "${live}" -ne 1 ]; then
+            echo "::error::frontend container did not start serving within 30s"
+            docker logs ecc-frontend-smoke
+            docker rm -f ecc-frontend-smoke
+            exit 1
+          fi
+          echo "frontend container is serving"
+          docker rm -f ecc-frontend-smoke
+      - name: Scan backend image for HIGH/CRITICAL vulnerabilities
+        uses: aquasecurity/trivy-action@c07df6fec6fa692e6fd1200d50aaa1fdd66f03c8
+        with:
+          scan-type: image
+          image-ref: ecc-backend:ci
+          severity: HIGH,CRITICAL
+          exit-code: "1"
+      - name: Scan frontend image for HIGH/CRITICAL vulnerabilities
+        uses: aquasecurity/trivy-action@c07df6fec6fa692e6fd1200d50aaa1fdd66f03c8
+        with:
+          scan-type: image
+          image-ref: ecc-frontend:ci
+          severity: HIGH,CRITICAL
+          exit-code: "1"
+      - name: Record Phase 1 container scan evidence
+        # Reached only if both Trivy scans above already passed (blocking,
+        # exit-code 1 on any HIGH/CRITICAL finding), so the finding counts
+        # recorded here are 0 by construction -- this step's job is to prove
+        # the scan actually ran, against which commit, and which image
+        # builds (by content digest) were scanned, not to recount findings
+        # Trivy already gated on. No registry push happens in this CI setup,
+        # so there is no registry digest to record; `docker inspect`'s
+        # locally-computed content-addressed image ID is the strongest
+        # digest available here and is what gets validated.
+        run: |
+          mkdir -p .local/evidence
+          backend_digest="$(docker inspect --format='{{.Id}}' ecc-backend:ci)"
+          frontend_digest="$(docker inspect --format='{{.Id}}' ecc-frontend:ci)"
+          head_sha="$(git rev-parse HEAD)"
+          python3 - "${backend_digest}" "${frontend_digest}" "${head_sha}" <<'PY'
+          import json
+          import sys
+          from datetime import UTC, datetime
+
+          backend_digest, frontend_digest, head_sha = sys.argv[1:4]
+          report = {
+              "generated_at": datetime.now(UTC).isoformat(),
+              "status": "passed",
+              "head_sha": head_sha,
+              "high_findings": 0,
+              "critical_findings": 0,
+              "image_digests": {
+                  "ecc-backend:ci": backend_digest,
+                  "ecc-frontend:ci": frontend_digest,
+              },
+          }
+          with open(".local/evidence/phase1-container-scan.json", "w") as fh:
+              json.dump(report, fh, indent=2, sort_keys=True)
+          PY
+      - name: Validate recorded container scan result
+        run: >
+          python3 scripts/check_phase1_acceptance.py
+          --check-result container_scan .local/evidence/phase1-container-scan.json
+      - name: Upload Phase 1 container scan evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: phase1-container-scan-evidence
+          path: .local/evidence/
+          if-no-files-found: error
 
   security:
     runs-on: ubuntu-latest
@@ -83,5 +204,5 @@ jobs:
         with:
           scan-type: fs
           scan-ref: .
-          severity: CRITICAL
+          severity: HIGH,CRITICAL
           exit-code: "1"

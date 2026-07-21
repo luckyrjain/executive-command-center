@@ -3,7 +3,7 @@
 ## Current status
 
 **Foundation:** Phase 0 baseline approved and implemented  
-**Current delivery:** [Phase 1 — Executive Dashboard MVP](phases/PHASE-001-executive-dashboard-mvp.md), implementation in progress  
+**Current delivery:** [Phase 1 — Executive Dashboard MVP](phases/PHASE-001-executive-dashboard-mvp.md) — engineering delivery complete on `feature/phase-1-production-hardening` (Tasks 1-11 of `superpowers/plans/2026-07-16-phase-1-completion.md`, each independently reviewed with zero Critical or Important findings); Phase 1 exit remains open pending the seven-day daily-use validation gate and human change review — see [Phase 1 Implementation Status](phases/phase-001/IMPLEMENTATION-STATUS.md)  
 **Future specifications:** Phases 2–9 published as Draft / Planned
 
 The [canonical phase index](phases/README.md) lists every primary specification and supporting contract. The [Phase 0–9 documentation review](phases/PHASE-REVIEW.md) records completeness findings and approval gates.
@@ -25,7 +25,7 @@ Every phase must:
 
 ```text
 Phase 0 — Repository Foundation         [Implemented]
-  -> Phase 1 — Executive Dashboard MVP [In progress]
+  -> Phase 1 — Executive Dashboard MVP [Engineering delivery complete; exit gates open]
   -> Phase 2 — Knowledge Platform      [Draft]
   -> Phase 3 — Human Attention Engine  [Draft]
   -> Phase 4 — AI Runtime              [Draft]
@@ -55,7 +55,7 @@ Specification: [PHASE-000](phases/PHASE-000-repository-foundation.md)
 
 ## Phase 1 — Executive Dashboard MVP
 
-**Status:** Approved for Implementation; delivery in progress.
+**Status:** Approved for Implementation; every capability below is delivered and independently reviewed on `feature/phase-1-production-hardening`. Phase 1 is not yet closed: it exits only after the seven-day daily-use validation (`docs/runbooks/PHASE-1-DAILY-USE.md`) and human change-review sign-off, both still open.
 
 Primary outcomes:
 
@@ -65,9 +65,13 @@ Primary outcomes:
 - immutable audit
 - explainable recommendations with durable human confirmation
 - executive frontend and browser acceptance
+- production hardening: security/config validation, structured observability, verified backup/restore, representative-scale performance gates, and dependency/container/secret scanning
 
 Specification: [PHASE-001](phases/PHASE-001-executive-dashboard-mvp.md)  
-Delivery status: [Phase 1 Implementation Status](phases/phase-001/IMPLEMENTATION-STATUS.md)
+Delivery status: [Phase 1 Implementation Status](phases/phase-001/IMPLEMENTATION-STATUS.md)  
+Release gate: [Phase 1 Production Release Gate](runbooks/PHASE-1-RELEASE-GATE.md)  
+Deployment runbook: [Phase 1 Deployment](runbooks/PHASE-1-DEPLOYMENT.md)  
+Daily-use validation record: [Phase 1 Daily-Use Validation Record](runbooks/PHASE-1-DAILY-USE.md)
 
 ## Phase 2 — Knowledge Platform
 

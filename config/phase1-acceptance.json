@@ -40,5 +40,21 @@
     "restore_verification": "scripts/verify_restore.sh",
     "acceptance_workflow": ".github/workflows/phase1-acceptance.yml",
     "standard_ci_workflow": ".github/workflows/ci.yml"
+  },
+  "result_evidence": {
+    "backup_restore": {
+      "artifact": ".local/evidence/phase1-recovery.json",
+      "require_head_sha_match": true
+    },
+    "performance": {
+      "artifact": ".local/evidence/phase1-performance.json",
+      "require_head_sha_match": true
+    },
+    "container_scan": {
+      "artifact": ".local/evidence/phase1-container-scan.json",
+      "require_head_sha_match": true,
+      "require_image_digest": true,
+      "max_high_findings": 0
+    }
   }
 }

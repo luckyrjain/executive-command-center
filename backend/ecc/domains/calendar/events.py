@@ -10,11 +10,17 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from sqlalchemy import text
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from ecc.auth import AuthContext, AuthDep, CsrfDep
 from ecc.config import get_settings
 from ecc.database import get_session
+from ecc.observability import (
+    queue_lifecycle_event,
+    record_audit_outbox_failure,
+    record_idempotency_conflict,
+)
 
 router = APIRouter(prefix="/api/v1/calendar/events", tags=["calendar-events"])
 
@@ -168,6 +174,7 @@ def _load_cached(
     if row is None:
         return None
     if row["request_hash"] != request_hash:
+        record_idempotency_conflict("calendar_events")
         raise HTTPException(status_code=409, detail="IDEMPOTENCY_CONFLICT")
     return CalendarEventResponse.model_validate(row["response_body"])
 
@@ -224,54 +231,59 @@ def _write_audit_and_outbox(
     now: datetime,
 ) -> None:
     request_id, correlation_id = _request_ids(request)
-    session.execute(
-        text(
-            """
-            INSERT INTO audit_events (
-                id, workspace_id, event_type, aggregate_type, aggregate_id,
-                aggregate_version, actor_id, request_id, correlation_id,
-                changed_fields, authorization_result, source, metadata, occurred_at
-            ) VALUES (
-                :id, :workspace_id, :event_type, 'calendar_event', :aggregate_id,
-                :aggregate_version, :actor_id, :request_id, :correlation_id,
-                :changed_fields, 'allowed', 'user', '{}'::jsonb, :occurred_at
-            )
-            """
-        ),
-        {
-            "id": uuid4(),
-            "workspace_id": auth.workspace_id,
-            "event_type": event_type,
-            "aggregate_id": event_id,
-            "aggregate_version": version,
-            "actor_id": auth.user_id,
-            "request_id": request_id,
-            "correlation_id": correlation_id,
-            "changed_fields": changed_fields,
-            "occurred_at": now,
-        },
-    )
-    session.execute(
-        text(
-            """
-            INSERT INTO event_outbox (
-                event_id, workspace_id, event_type, event_version,
-                correlation_id, payload, occurred_at, attempt_count
-            ) VALUES (
-                :event_id, :workspace_id, :event_type, 1,
-                :correlation_id, CAST(:payload AS jsonb), :occurred_at, 0
-            )
-            """
-        ),
-        {
-            "event_id": uuid4(),
-            "workspace_id": auth.workspace_id,
-            "event_type": f"{event_type}.v1",
-            "correlation_id": correlation_id,
-            "payload": dumps({"calendar_event_id": str(event_id), "version": version}),
-            "occurred_at": now,
-        },
-    )
+    try:
+        session.execute(
+            text(
+                """
+                INSERT INTO audit_events (
+                    id, workspace_id, event_type, aggregate_type, aggregate_id,
+                    aggregate_version, actor_id, request_id, correlation_id,
+                    changed_fields, authorization_result, source, metadata, occurred_at
+                ) VALUES (
+                    :id, :workspace_id, :event_type, 'calendar_event', :aggregate_id,
+                    :aggregate_version, :actor_id, :request_id, :correlation_id,
+                    :changed_fields, 'allowed', 'user', '{}'::jsonb, :occurred_at
+                )
+                """
+            ),
+            {
+                "id": uuid4(),
+                "workspace_id": auth.workspace_id,
+                "event_type": event_type,
+                "aggregate_id": event_id,
+                "aggregate_version": version,
+                "actor_id": auth.user_id,
+                "request_id": request_id,
+                "correlation_id": correlation_id,
+                "changed_fields": changed_fields,
+                "occurred_at": now,
+            },
+        )
+        session.execute(
+            text(
+                """
+                INSERT INTO event_outbox (
+                    event_id, workspace_id, event_type, event_version,
+                    correlation_id, payload, occurred_at, attempt_count
+                ) VALUES (
+                    :event_id, :workspace_id, :event_type, 1,
+                    :correlation_id, CAST(:payload AS jsonb), :occurred_at, 0
+                )
+                """
+            ),
+            {
+                "event_id": uuid4(),
+                "workspace_id": auth.workspace_id,
+                "event_type": f"{event_type}.v1",
+                "correlation_id": correlation_id,
+                "payload": dumps({"calendar_event_id": str(event_id), "version": version}),
+                "occurred_at": now,
+            },
+        )
+    except SQLAlchemyError:
+        record_audit_outbox_failure("calendar_events")
+        raise
+    queue_lifecycle_event(session, "calendar_event", event_type, "allowed")
 
 
 def _get_row(

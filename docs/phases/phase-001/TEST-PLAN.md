@@ -2,7 +2,7 @@
 id: PHASE-001-TEST-PLAN
 title: Phase 1 Test Plan
 status: Approved
-version: 1.0.2
+version: 1.0.3
 owner: Lucky Jain
 ---
 
@@ -20,7 +20,7 @@ Run against PostgreSQL 18. Prove migrations from Phase 0, downgrade or forward-f
 
 ### API contract tests
 
-Validate every API-SCHEMAS route, including task complete, cancel, archive and restore; commitment confirm, fulfil, cancel, archive and restore; note archive and restore; rejection of client owner fields; permitted counterparty references; linked Meeting timing restrictions; standalone Meeting API-to-storage field mapping; mutually exclusive due_date and due_at; recommendation publish only from proposed; confirmation only from pending_confirmation; non-execution from proposed, rejected, expired and superseded states; atomic rollback and failed-attempt recording; authentication; 404 non-disclosure; idempotency; version conflicts; cursors; archive filters; all four evidence states; calendar_event search; and feature capabilities.
+Validate every API-SCHEMAS route, including task complete, cancel, archive and restore; commitment confirm, fulfil, cancel, archive and restore; note archive and restore; rejection of client owner fields; permitted counterparty references; linked Meeting timing restrictions; standalone Meeting create/reschedule API-to-storage field mapping; complete timing-triple, offset-awareness, ordering and IANA timezone validation; mutually exclusive due_date and due_at; recommendation publish only from proposed; confirmation only from pending_confirmation; non-execution from proposed, rejected, expired and superseded states; atomic rollback and failed-attempt recording; authentication; 404 non-disclosure; idempotency; version conflicts; cursors; archive filters; all four evidence states; calendar_event search; and feature capabilities.
 
 Every successful lifecycle action is asserted to return `200` with the current entity representation.
 
@@ -33,7 +33,7 @@ Playwright scenarios:
 1. create, edit, complete, cancel, archive and restore a task;
 2. create, confirm, fulfil, cancel, archive and restore commitments;
 3. create, autosave, search, archive and restore a note;
-4. create a local CalendarEvent, linked Meeting and standalone Meeting, then reschedule through the authoritative record;
+4. create a local CalendarEvent, linked Meeting and standalone Meeting, reschedule the linked Meeting through its authoritative CalendarEvent, and reschedule the standalone Meeting directly;
 5. search and open a CalendarEvent result;
 6. view deterministic dashboard and morning brief with AI disabled;
 7. generate, publish and confirm a recommendation;

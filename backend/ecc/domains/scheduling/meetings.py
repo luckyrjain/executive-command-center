@@ -8,13 +8,20 @@ from uuid import UUID, uuid4
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from fastapi.exceptions import RequestValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 from sqlalchemy import text
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from ecc.auth import AuthContext, AuthDep, CsrfDep
 from ecc.config import get_settings
 from ecc.database import get_session
+from ecc.observability import (
+    queue_lifecycle_event,
+    record_audit_outbox_failure,
+    record_idempotency_conflict,
+)
 
 router = APIRouter(prefix="/api/v1/meetings", tags=["meetings"])
 
@@ -71,6 +78,10 @@ class MeetingPatch(BaseModel):
     agenda: str | None = None
     preparation: str | None = None
     notes_summary: str | None = None
+    # Timing remains raw until the locked row establishes linked vs standalone authority.
+    starts_at: Any = None
+    ends_at: Any = None
+    timezone: Any = None
 
     @model_validator(mode="after")
     def reject_null_required_fields(self) -> MeetingPatch:
@@ -78,6 +89,31 @@ class MeetingPatch(BaseModel):
             if field in self.model_fields_set and getattr(self, field) is None:
                 raise ValueError(f"{field} cannot be null")
         return self
+
+
+class _StandalonePatchTiming(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    starts_at: datetime
+    ends_at: datetime
+    timezone: str = Field(min_length=1, max_length=128)
+
+    @model_validator(mode="after")
+    def validate_timing(self) -> _StandalonePatchTiming:
+        _validate_aware(self.starts_at, "starts_at")
+        _validate_aware(self.ends_at, "ends_at")
+        _validate_timezone(self.timezone)
+        if self.ends_at <= self.starts_at:
+            raise ValueError("ends_at must be after starts_at")
+        return self
+
+
+def _validate_standalone_patch_timing(
+    payload: MeetingPatch,
+) -> _StandalonePatchTiming:
+    timing_fields = {"starts_at", "ends_at", "timezone"}
+    raw = payload.model_dump(include=timing_fields & payload.model_fields_set)
+    return _StandalonePatchTiming.model_validate(raw)
 
 
 class MeetingAction(BaseModel):
@@ -190,6 +226,7 @@ def _load_cached(
     if row is None:
         return None
     if row["request_hash"] != request_hash:
+        record_idempotency_conflict("meetings")
         raise HTTPException(status_code=409, detail="IDEMPOTENCY_CONFLICT")
     return MeetingResponse.model_validate(row["response_body"])
 
@@ -239,54 +276,59 @@ def _write_audit_and_outbox(
     now: datetime,
 ) -> None:
     request_id, correlation_id = _request_ids(request)
-    session.execute(
-        text(
-            """
-            INSERT INTO audit_events (
-                id, workspace_id, event_type, aggregate_type, aggregate_id,
-                aggregate_version, actor_id, request_id, correlation_id,
-                changed_fields, authorization_result, source, metadata, occurred_at
-            ) VALUES (
-                :id, :workspace_id, :event_type, 'meeting', :aggregate_id,
-                :aggregate_version, :actor_id, :request_id, :correlation_id,
-                :changed_fields, 'allowed', 'user', '{}'::jsonb, :occurred_at
-            )
-            """
-        ),
-        {
-            "id": uuid4(),
-            "workspace_id": auth.workspace_id,
-            "event_type": event_type,
-            "aggregate_id": meeting_id,
-            "aggregate_version": version,
-            "actor_id": auth.user_id,
-            "request_id": request_id,
-            "correlation_id": correlation_id,
-            "changed_fields": changed_fields,
-            "occurred_at": now,
-        },
-    )
-    session.execute(
-        text(
-            """
-            INSERT INTO event_outbox (
-                event_id, workspace_id, event_type, event_version,
-                correlation_id, payload, occurred_at, attempt_count
-            ) VALUES (
-                :event_id, :workspace_id, :event_type, 1,
-                :correlation_id, CAST(:payload AS jsonb), :occurred_at, 0
-            )
-            """
-        ),
-        {
-            "event_id": uuid4(),
-            "workspace_id": auth.workspace_id,
-            "event_type": f"{event_type}.v1",
-            "correlation_id": correlation_id,
-            "payload": dumps({"meeting_id": str(meeting_id), "version": version}),
-            "occurred_at": now,
-        },
-    )
+    try:
+        session.execute(
+            text(
+                """
+                INSERT INTO audit_events (
+                    id, workspace_id, event_type, aggregate_type, aggregate_id,
+                    aggregate_version, actor_id, request_id, correlation_id,
+                    changed_fields, authorization_result, source, metadata, occurred_at
+                ) VALUES (
+                    :id, :workspace_id, :event_type, 'meeting', :aggregate_id,
+                    :aggregate_version, :actor_id, :request_id, :correlation_id,
+                    :changed_fields, 'allowed', 'user', '{}'::jsonb, :occurred_at
+                )
+                """
+            ),
+            {
+                "id": uuid4(),
+                "workspace_id": auth.workspace_id,
+                "event_type": event_type,
+                "aggregate_id": meeting_id,
+                "aggregate_version": version,
+                "actor_id": auth.user_id,
+                "request_id": request_id,
+                "correlation_id": correlation_id,
+                "changed_fields": changed_fields,
+                "occurred_at": now,
+            },
+        )
+        session.execute(
+            text(
+                """
+                INSERT INTO event_outbox (
+                    event_id, workspace_id, event_type, event_version,
+                    correlation_id, payload, occurred_at, attempt_count
+                ) VALUES (
+                    :event_id, :workspace_id, :event_type, 1,
+                    :correlation_id, CAST(:payload AS jsonb), :occurred_at, 0
+                )
+                """
+            ),
+            {
+                "event_id": uuid4(),
+                "workspace_id": auth.workspace_id,
+                "event_type": f"{event_type}.v1",
+                "correlation_id": correlation_id,
+                "payload": dumps({"meeting_id": str(meeting_id), "version": version}),
+                "occurred_at": now,
+            },
+        )
+    except SQLAlchemyError:
+        record_audit_outbox_failure("meetings")
+        raise
+    queue_lifecycle_event(session, "meeting", event_type, "allowed")
 
 
 def _get_row(
@@ -468,10 +510,6 @@ def list_meetings(
         updated_at, meeting_id = _decode_cursor(cursor)
         clauses.append("(updated_at, id) < (:cursor_updated_at, :cursor_id)")
         params.update({"cursor_updated_at": updated_at, "cursor_id": meeting_id})
-    if cursor:
-        updated_at, meeting_id = _decode_cursor(cursor)
-        clauses.append("(updated_at, id) < (:cursor_updated_at, :cursor_id)")
-        params.update({"cursor_updated_at": updated_at, "cursor_id": meeting_id})
     rows = (
         session.execute(
             text(
@@ -526,19 +564,42 @@ def update_meeting(
             )
         if current["archived_at"] is not None:
             raise HTTPException(status_code=409, detail="MEETING_ARCHIVED")
+        timing_fields = {"starts_at", "ends_at", "timezone"}
+        fields = payload.model_fields_set - {"expected_version"}
+        if current["calendar_event_id"] is not None and fields & timing_fields:
+            raise HTTPException(
+                status_code=422,
+                detail="LINKED_MEETING_TIMING_READ_ONLY",
+            )
+        validated_timing = None
+        if fields & timing_fields:
+            try:
+                validated_timing = _validate_standalone_patch_timing(payload)
+            except ValidationError as exc:
+                raise RequestValidationError(exc.errors()) from exc
         if current["status"] in {"completed", "cancelled"} and payload.status not in {
             None,
             current["status"],
         }:
             raise HTTPException(status_code=409, detail="INVALID_MEETING_TRANSITION")
-        fields = payload.model_fields_set - {"expected_version"}
         if not fields:
             response = _project(session, auth, current)
             _store_cached(session, auth, idempotency_key, request_hash, response, 200, now)
             return response
-        assignments = [f"{field} = :{field}" for field in sorted(fields)]
-        assignments.extend(["updated_by = :actor_id", "updated_at = :now", "version = version + 1"])
-        values = payload.model_dump(include=fields)
+        mutable_fields = (
+            "title",
+            "status",
+            "agenda",
+            "preparation",
+            "notes_summary",
+            "starts_at",
+            "ends_at",
+            "timezone",
+        )
+        values = payload.model_dump()
+        if validated_timing is not None:
+            values.update(validated_timing.model_dump())
+        values.update({f"set_{field}": field in fields for field in mutable_fields})
         values.update(
             {
                 "workspace_id": auth.workspace_id,
@@ -552,7 +613,22 @@ def update_meeting(
                 text(
                     f"""
                     UPDATE meetings
-                    SET {", ".join(assignments)}
+                    SET title = CASE WHEN :set_title THEN :title ELSE title END,
+                        status = CASE WHEN :set_status THEN :status ELSE status END,
+                        agenda = CASE WHEN :set_agenda THEN :agenda ELSE agenda END,
+                        preparation = CASE
+                            WHEN :set_preparation THEN :preparation ELSE preparation END,
+                        notes_summary = CASE
+                            WHEN :set_notes_summary THEN :notes_summary ELSE notes_summary END,
+                        standalone_starts_at = CASE
+                            WHEN :set_starts_at THEN :starts_at ELSE standalone_starts_at END,
+                        standalone_ends_at = CASE
+                            WHEN :set_ends_at THEN :ends_at ELSE standalone_ends_at END,
+                        standalone_timezone = CASE
+                            WHEN :set_timezone THEN :timezone ELSE standalone_timezone END,
+                        updated_by = :actor_id,
+                        updated_at = :now,
+                        version = version + 1
                     WHERE workspace_id = :workspace_id AND id = :meeting_id
                     RETURNING {_MEETING_FIELDS}
                     """

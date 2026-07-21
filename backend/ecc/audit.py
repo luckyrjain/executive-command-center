@@ -8,6 +8,7 @@ from fastapi import Request, Response
 from sqlalchemy import text
 
 from ecc.database import engine
+from ecc.observability import record_audit_outbox_failure
 
 logger = logging.getLogger(__name__)
 _REJECTED_STATUSES = {403, 404, 409, 422}
@@ -106,5 +107,6 @@ async def rejected_mutation_audit_middleware(
         try:
             _record_rejected_task_mutation(request, response)
         except Exception:
+            record_audit_outbox_failure("rejected_mutation_audit")
             logger.exception("failed_to_record_rejected_task_mutation")
     return response

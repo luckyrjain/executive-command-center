@@ -1,3 +1,4 @@
+import time as time_module
 from base64 import urlsafe_b64decode, urlsafe_b64encode
 from datetime import datetime
 from hashlib import sha256
@@ -16,6 +17,7 @@ from sqlalchemy.orm import Session
 from ecc.auth import AuthDep
 from ecc.config import get_settings
 from ecc.database import get_session
+from ecc.observability import record_search
 
 router = APIRouter(prefix="/api/v1/search", tags=["search"])
 SessionDep = Annotated[Session, Depends(get_session)]
@@ -309,8 +311,10 @@ def search(
         "cursor_id": cursor_payload["id"] if cursor_payload else None,
         "fetch_limit": limit + 1,
     }
+    search_start = time_module.monotonic()
     rows = session.execute(sql, params).mappings().all()
     page = rows[:limit]
+    record_search(time_module.monotonic() - search_start, len(page))
 
     items: list[SearchResult] = []
     for row in page:

@@ -12,6 +12,7 @@ from sqlalchemy.orm import Session
 from ecc.auth import AuthContext
 from ecc.domains.governance.recommendation_events import record_event
 from ecc.domains.governance.recommendation_models import RecommendationResponse
+from ecc.observability import record_idempotency_conflict
 
 FIELDS = """
 id, recommendation_type, target_type, target_id, proposed_action, expected_version,
@@ -69,6 +70,7 @@ def load_cached(
         return None
     if row["request_hash"] != digest:
         session.rollback()
+        record_idempotency_conflict("recommendations")
         raise HTTPException(status_code=409, detail="IDEMPOTENCY_CONFLICT")
     session.rollback()
     return RecommendationResponse.model_validate(row["response_body"])

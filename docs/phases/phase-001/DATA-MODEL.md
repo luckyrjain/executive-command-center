@@ -2,7 +2,7 @@
 id: PHASE-001-DATA-MODEL
 title: Phase 1 Data Model
 status: Approved
-version: 1.0.1
+version: 1.0.2
 owner: Lucky Jain
 ---
 
@@ -46,7 +46,7 @@ Unique: `(workspace_id,external_source,external_id)` when external_id is non-nul
 
 ### meetings
 
-Fields: calendar_event_id nullable, title, standalone_starts_at nullable, standalone_ends_at nullable, standalone_timezone nullable, status `planned|in_progress|completed|cancelled`, agenda nullable, preparation nullable, notes_summary nullable. A CalendarEvent may have zero or one Meeting. Linked meetings derive timing exclusively from CalendarEvent. Standalone timing fields are required only when calendar_event_id is null. Linking adopts CalendarEvent timing while preserving Meeting identity.
+Fields: calendar_event_id nullable, title, standalone_starts_at nullable, standalone_ends_at nullable, standalone_timezone nullable, status `planned|in_progress|completed|cancelled`, agenda nullable, preparation nullable, notes_summary nullable. A CalendarEvent may have zero or one Meeting. Linked meetings derive timing exclusively from CalendarEvent and their standalone timing columns remain null. Standalone timing fields are required when calendar_event_id is null and may be updated atomically as a complete start/end/timezone triple. Linking adopts CalendarEvent timing while preserving Meeting identity.
 
 ### risks
 
