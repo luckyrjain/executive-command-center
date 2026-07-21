@@ -12,6 +12,16 @@ close PHASE-001: the seven-day daily-use validation
 (`docs/runbooks/PHASE-1-DAILY-USE.md`) and human change review remain open
 — see "Product validation outside the merge gate" below.
 
+> **Citation note:** this document and `docs/runbooks/PHASE-1-RELEASE-GATE.md`
+> cite `.superpowers/sdd/progress.md`, `task-*-review.md`, `task-12-report.md`,
+> and `task-ci-secret-fix-report.md` throughout as the backing evidence for
+> individual line items. That directory does not exist anywhere in this
+> repository (tracked or untracked) — only the unrelated `docs/superpowers/`
+> (plans/specs) does. Treat every such citation as an unverifiable dead
+> pointer: it does not mean the underlying claim is false, only that this
+> document's stated evidence for it cannot currently be inspected. Re-derive
+> or re-run the actual check before relying on a citation-only claim.
+
 ## Automated gates
 
 | Gate | Evidence | Budget |
@@ -22,7 +32,7 @@ close PHASE-001: the seven-day daily-use validation
 | Accessibility | ten named Playwright scenarios (`frontend/e2e/scenarios/`) plus `assertNoSeriousAccessibilityViolations`, orchestrated by `frontend/e2e/run.mjs` (Task 6) | WCAG 2.2 AA core flows, zero serious/critical axe violations |
 | Backup integrity | custom-format PostgreSQL archive and SHA-256 (Task 9) | checksum valid |
 | Restore integrity | clean PostgreSQL 18 restore with the full Task 9 invariant set (see below) | migration head, row counts, constraints and every invariant below match |
-| Security | HIGH+CRITICAL Trivy filesystem and container-image scanning, `pnpm audit --audit-level=high`, gitleaks secret scanning and SBOM generation in standard CI (Task 11); `pip-audit` in the backend CI job | zero HIGH or CRITICAL findings required; **not currently met** — Task 12 ran these scans live against real CVE data (network access and Docker are both available in this environment, contrary to `task-11-review.md`'s assumption) and found real, currently-failing findings: `pip-audit` is clean, but Trivy filesystem scan finds 6 HIGH findings in `react-router`, `pnpm audit` finds 19 findings (1 critical, 9 high), and Trivy image scans find 22 HIGH/CRITICAL findings in the backend image and 37 in the frontend image (mostly base-OS-image packages). See `.superpowers/sdd/task-12-report.md`'s Concerns section for full detail and exact commands. |
+| Security | HIGH+CRITICAL Trivy filesystem and container-image scanning, `pnpm audit --audit-level=high`, gitleaks secret scanning and SBOM generation in standard CI (Task 11); `pip-audit` in the backend CI job | zero HIGH or CRITICAL findings required; **status unverified as of this branch's current commit, not "not currently met" as previously recorded here.** An earlier scan against an older commit on this branch found real findings (`pip-audit` clean; Trivy filesystem HIGH findings in `react-router`; `pnpm audit` findings including `react-router`/`vite`; Trivy image findings in both base images, mostly OS-package). Since that scan ran, this branch has separately bumped `react-router` to `7.18.1` and `vite`/other frontend deps (commit `c4ca876`, above the `>=7.15.0` fix threshold the earlier scan itself cited for the `react-router` finding) and switched the backend base image from `python:3.14.6-slim` to `python:3.14.6-alpine` with an explicit `apk upgrade` step specifically to clear OS-package CVEs (commit `8ebb32d`). Neither change has been re-scanned, so the actual current HIGH/CRITICAL finding count is unknown — do not treat either the old failing numbers or an assumption that the bumps fully resolved it as current evidence. Re-run the `containers`/`security`/`frontend` CI jobs against this branch's current HEAD to get a real answer before treating this gate as open or closed. (The `.superpowers/sdd/task-12-report.md` this row previously cited for detail does not exist anywhere in this repository — there is no `.superpowers/` directory at all, tracked or untracked — so that citation was already dead regardless of the staleness above.) |
 | Review closure | specification and code review | Critical 0, High 0, Medium 0 |
 
 The normative machine-readable budgets and evidence paths are stored in `config/phase1-acceptance.json` and validated by `scripts/check_phase1_acceptance.py`, including result-aware validation of recorded backup/restore, performance, and container-scan artifacts (Task 11) — not just evidence-file existence.

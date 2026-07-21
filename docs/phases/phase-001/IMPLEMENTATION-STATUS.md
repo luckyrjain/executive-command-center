@@ -15,6 +15,12 @@ This document maps the approved Phase 1 contracts to delivered repository capabi
 
 Phase 1 backend and frontend capabilities are implemented across the core domain, deterministic intelligence, query, brief, recommendation, audit, executive frontend, and production-hardening surfaces (`docs/superpowers/plans/2026-07-16-phase-1-completion.md`, Tasks 1-11, all independently reviewed — `.superpowers/sdd/progress.md`). Every capability below, including the executive frontend and browser acceptance, is delivered. Phase 1 exit still requires the seven-day daily-use validation and human change review named in "Remaining Phase 1 exit work" below — this document does not claim Phase 1 itself is complete.
 
+> **Citation note:** `.superpowers/sdd/*.md` files cited throughout this
+> document do not exist anywhere in this repository (tracked or untracked).
+> Treat those citations as unverifiable dead pointers, not evidence that the
+> capability claims below are false — cross-check against the actual code
+> under `backend/ecc/domains/` and `frontend/src/` instead.
+
 ## Capability status
 
 | Capability | Status | Evidence in repository |

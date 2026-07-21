@@ -15,18 +15,25 @@ local or otherwise. They are not placeholders.
 | Variable | Required | Purpose | Production requirement |
 | --- | --- | --- | --- |
 | `ECC_ENV` | yes | Deployment classification (`development`, `staging`, `production`, ...). | Must be a recognized non-`development` value; `validate_production_settings` (`backend/ecc/config.py`) rejects an unrecognized or blank value outside development. |
-| `ECC_DATABASE_URL` | yes | SQLAlchemy/psycopg connection string, e.g. `postgresql+psycopg://ecc:ecc@127.0.0.1:5432/ecc`. | Must point at the real production PostgreSQL 18 instance; never the default local value. |
+| `ECC_DATABASE_URL` | yes | SQLAlchemy/psycopg connection string, e.g. `postgresql+psycopg://ecc:ecc@127.0.0.1:5432/ecc`. | Must point at the real production PostgreSQL 18 instance; never the default local value. **Not checked by `validate_production_settings`** (see note below the table) — an operator misconfiguration here fails only when a query actually runs, not at startup. |
 | `ECC_SESSION_SECRET` | yes | Session/CSRF signing secret. | Must be at least 32 characters, cryptographically random, and not one of the recognized development placeholder strings — `validate_production_settings` rejects both a too-short value and a known placeholder outside development. Rotation owner: see above. |
 | `ECC_CORS_ORIGINS` | yes | Comma-separated allowed browser origins. | Must be non-empty, must not contain a wildcard (`*`), and every origin must use `https://` outside development. |
-| `POSTGRES_DB` / `POSTGRES_USER` / `POSTGRES_PASSWORD` | yes (for the `postgres` container/service) | Database provisioning credentials. | Must not be the `ecc`/`ecc`/`ecc` development defaults in any shared or production environment. |
+| `POSTGRES_DB` / `POSTGRES_USER` / `POSTGRES_PASSWORD` | yes (for the `postgres` container/service) | Database provisioning credentials. | Must not be the `ecc`/`ecc`/`ecc` development defaults in any shared or production environment. **Not part of `Settings`/`validate_production_settings` at all** (see note below the table) — these are `docker-compose.yml`-only provisioning variables the backend process never reads directly; nothing in the application enforces this requirement. |
 | `ECC_METRICS_TOKEN` | recommended | Shared-secret token gating `GET /metrics`. | Optional, but strongly recommended in production: `/metrics` is a `GET` route and is intentionally outside `mutation_rate_limit_middleware`'s scope (it's meant to be scrape-friendly), and each scrape runs a live DB query. If unset, the endpoint stays open to anyone who can reach it -- **only acceptable if the port/route is firewalled off from the public internet** (e.g. restricted to an internal scrape network). If set, Prometheus/scrapers must send `Authorization: Bearer <token>`. |
 | `ECC_TRUSTED_PROXY_COUNT` | conditionally required | Number of trusted reverse proxies/load balancers in front of `ecc-backend`. | Defaults to `0` (trust only the raw socket peer), which is correct for the direct `docker run -p 8000:8000` exposure shown above. This app does not terminate TLS itself, so any deployment that actually satisfies `ECC_CORS_ORIGINS`'s `https://`-only requirement puts a TLS-terminating reverse proxy or load balancer in front of it -- at that point **this must be set to the exact hop count** (usually `1`), or `mutation_rate_limit_middleware`'s per-IP ceiling collapses every distinct client into one shared bucket (they all arrive from the proxy's address) instead of limiting individual clients. **Do not set this higher than the real hop count "to be safe"** -- an over-counted value lets a client pad `X-Forwarded-For` with its own fabricated hops and get treated as whatever IP it fabricates, bypassing the rate limit entirely. See `backend/ecc/http_security.py`'s `_client_host`. |
 | `VITE_API_BASE_URL` | yes (frontend build AND frontend run) | Backend origin the built frontend calls. | Must be the real backend origin reachable from the browser. Needed at **two** points with the same value: baked into the static JS bundle at `docker build` time (`frontend/Dockerfile`'s `build` stage `ARG`/`ENV`), AND passed again at `docker run` time so `frontend/nginx.conf.template` can render it into the production container's `Content-Security-Policy` `connect-src` directive (via the base nginx image's `envsubst`-on-templates entrypoint). Omitting it at run time does not fail the container start, but the CSP falls back to `connect-src 'self'` only — the browser will block every API call to a non-same-origin backend. |
 
-All five backend variables are validated together by `validate_production_settings`,
-called unconditionally at import time in `backend/ecc/main.py` — the
+`validate_production_settings` (`backend/ecc/config.py`), called
+unconditionally at import time in `backend/ecc/main.py`, actually validates
+only three fields: `ECC_ENV`, `ECC_SESSION_SECRET`, and `ECC_CORS_ORIGINS`
+(confirmed by reading the function directly — it never touches
+`database_url`, and `POSTGRES_DB`/`POSTGRES_USER`/`POSTGRES_PASSWORD` aren't
+even part of the `Settings` model it validates). For those three, the
 application refuses to start under an insecure production configuration
 rather than starting and failing later (Task 7; `tests/test_production_security.py`).
+The `ECC_DATABASE_URL` and `POSTGRES_*` "Production requirement" cells above
+are operational guidance only, not startup-enforced guarantees — a wrong
+value there fails at first query, not at boot.
 
 ## Deploy
 
