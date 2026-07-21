@@ -1,6 +1,13 @@
 import type { ApiErrorEnvelope, ApiRequestOptions } from './types'
 
-const API_BASE = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000'
+// `??`, not `||`: vite.config.ts defines this as `env.VITE_API_BASE_URL ?? ''`
+// (empty string, not undefined, when unset), so the frontend can make
+// relative same-origin requests when a deployer forgets to configure it,
+// matching frontend/nginx.conf.template's `connect-src 'self'` CSP
+// fallback. `||` would treat that empty string as falsy and silently
+// substitute the cross-origin localhost default instead, which the CSP
+// would then block every request against.
+const API_BASE = import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:8000'
 const SAFE_METHODS = new Set(['GET', 'HEAD', 'OPTIONS'])
 
 export class ApiError extends Error {
