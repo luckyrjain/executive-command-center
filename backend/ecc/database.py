@@ -30,6 +30,18 @@ if settings.database_url.startswith("postgresql"):
             cursor.execute(f"SET statement_timeout = {STATEMENT_TIMEOUT_MS}")
         finally:
             cursor.close()
+        # psycopg (like most DBAPI drivers) starts an implicit transaction on
+        # the first statement executed on a connection, so the SET above is
+        # not yet durable -- it is still inside that open transaction. The
+        # pool's reset-on-return behavior issues a ROLLBACK on every checkin
+        # (SQLAlchemy's default, since nothing here ever explicitly commits),
+        # which undoes an uncommitted plain `SET` exactly like it would any
+        # other uncommitted statement. Without this commit, the timeout reads
+        # back correctly the first time this physical connection is used but
+        # silently reverts to the server default (no timeout) the moment it
+        # is checked back into the pool and reused -- confirmed live via a
+        # second `engine.connect()` against the same pooled connection.
+        dbapi_connection.commit()  # type: ignore[attr-defined]
 
 
 def get_session() -> Generator[Session]:

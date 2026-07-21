@@ -16,14 +16,14 @@ from hashlib import sha256
 from pathlib import Path
 from types import ModuleType
 
+import psycopg
 import pytest
 
 from ecc.config import get_settings
 
 
-def _load_module() -> ModuleType:
-    path = Path("scripts/phase1_evidence.py")
-    spec = importlib.util.spec_from_file_location("phase1_evidence", path)
+def _load_module_from(path: Path, name: str) -> ModuleType:
+    spec = importlib.util.spec_from_file_location(name, path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
@@ -31,7 +31,7 @@ def _load_module() -> ModuleType:
     return module
 
 
-evidence_module = _load_module()
+evidence_module = _load_module_from(Path("scripts/phase1_evidence.py"), "phase1_evidence")
 
 
 def _passing_kwargs() -> dict:
@@ -278,6 +278,24 @@ def test_build_report_against_real_database_has_required_fields(tmp_path: Path) 
     pg_url = settings.database_url
     if pg_url.startswith("postgresql+psycopg://"):
         pg_url = pg_url.replace("postgresql+psycopg://", "postgresql://", 1)
+
+    # build_report's checksum invariants (representative_record_checksums_match,
+    # audit_events_append_only, pkos_mapped_columns_match) treat a table with
+    # no seeded rows as "empty" and deliberately fail rather than passing
+    # vacuously (see scripts/phase1_evidence.py's evaluate_invariants). This
+    # test compares the real database against itself, so it must seed the
+    # representative fixture rows itself rather than relying on some other
+    # test file having already done so earlier in the run -- test execution
+    # order across files is not guaranteed (e.g. this file sorts before
+    # test_seed_phase1_acceptance.py alphabetically, so that seeding would
+    # not have happened yet). seed() is idempotent (ON CONFLICT DO NOTHING),
+    # so this is safe even if seeding already ran.
+    seed_module = _load_module_from(
+        Path("scripts/seed_phase1_acceptance.py"), "seed_phase1_acceptance"
+    )
+    with psycopg.connect(pg_url) as seed_conn:
+        seed_module.seed(seed_conn)
+        seed_conn.commit()
 
     archive = tmp_path / "archive.dump"
     archive.write_bytes(b"fake archive contents for evidence field test")
