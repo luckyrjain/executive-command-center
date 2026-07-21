@@ -1,32 +1,32 @@
 ---
 id: PHASE-002-IMPLEMENTATION-STATUS
 title: Phase 2 Implementation Status
-status: Planned
-version: 0.2.0
+status: In progress
+version: 0.3.0
 owner: Lucky Jain
 updated: 2026-07-21
 ---
 
 # Phase 2 Implementation Status
 
-Phase 2 is planned and has not started. This status document is informational and does not override approved contracts.
+Phase 2 implementation has started on `feature/phase-2-knowledge-platform`. This status document is informational and does not override approved contracts.
 
 ## Planning artifacts
 
-A design and implementation plan now exist ahead of approval, so implementation can start immediately once the prerequisites below close: `docs/superpowers/specs/2026-07-21-phase-2-knowledge-platform-design.md` (approach, including a blocking open decision on reconciling `phase-002/DATA-MODEL.md` with the already-Accepted `docs/domain/PKOS-SCHEMA.md`/`ADR-0003`, and a separately-gated open decision on embedding/hybrid retrieval requiring an RFC-005 amendment) and `docs/superpowers/plans/2026-07-21-phase-2-knowledge-platform.md` (task-by-task implementation plan, eight slices). Neither document changes any contract's status or starts code.
+`docs/superpowers/specs/2026-07-21-phase-2-knowledge-platform-design.md` (approach) and `docs/superpowers/plans/2026-07-21-phase-2-knowledge-platform.md` (task-by-task implementation plan, eight slices).
 
 ## Prerequisites
 
-- Phase 1 exit gates complete.
-- Phase 2 contracts reviewed and moved from Draft to Approved for Implementation — see the design doc's Open decision 1 for the specific `DATA-MODEL.md` edit this requires first.
-- Any technology addition approved through RFC-005 and an ADR — see the design doc's Open decision 2 for embeddings/hybrid retrieval specifically.
-- Versioned retrieval and entity-resolution evaluation datasets established.
+- Phase 2 contracts reviewed and moved from Draft to Approved for Implementation — **done.** Open decision 1 (PKOS reconciliation) resolved: extend `pkos_nodes`/`pkos_edges`/`pkos_evidence` rather than fork independent tables; `phase-002/DATA-MODEL.md` and the other Phase 2 contracts updated accordingly.
+- Any technology addition approved through RFC-005 and an ADR — not yet needed; Slices 1-6 add no new technology. Still blocking for Slice 7 (embeddings) specifically, per the design doc's Open decision 2.
+- Versioned retrieval and entity-resolution evaluation datasets established — pending, scheduled in Slice 4/6 of the implementation plan.
+- **Phase 1 exit gates complete — still open** (seven-day daily-use validation, 0/7 recorded; human change-review sign-off not yet recorded). Phase 2 implementation is proceeding in parallel by explicit repository-owner authorization, not because this gate closed; see `docs/ROADMAP.md`'s Phase 2 status note.
 
 ## Planned delivery slices
 
 | Slice | Outcome | Status |
 |---|---|---|
-| 1 | Knowledge entities, aliases, claims and provenance | Not started |
+| 1 | Knowledge entities, aliases, claims and provenance | Backend implemented (commit `558bdb8`: migrations 0010-0011, `entities.py`/`entities_mutations.py`/`claims.py`/`identity/person_organizations.py`, 23 passing tests); frontend not started |
 | 2 | Typed relationships and entity detail | Not started |
 | 3 | Timeline projection and rebuild | Not started |
 | 4 | Resolution candidates and human review | Not started |

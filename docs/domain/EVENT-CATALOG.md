@@ -2,12 +2,13 @@
 id: EVENT-CATALOG
 title: Domain Event Catalog
 status: Accepted
-version: 1.1.2
+version: 1.2.0
 owner: Lucky Jain
 related:
   - ADR-0005
   - DOMAIN-MODEL
   - PHASE-001
+  - PHASE-002
 ---
 
 # Domain Event Catalog
@@ -61,6 +62,20 @@ Every event is immutable and uses the canonical Phase 0 envelope. Events are pas
 | `feedback.recorded.v1` | Executive Intelligence | feedback_id, recommendation_id, action |
 
 Existing foundation events remain valid.
+
+## Phase 2 catalog
+
+Added incrementally, one entry per delivery slice, alongside the code that emits it (`docs/superpowers/plans/2026-07-21-phase-2-knowledge-platform.md`). Producer is Knowledge Platform (Person/Organization creation goes through the same producer -- see that plan's Task 1 -- since Identity is the domain owner per `DOMAIN-MODEL.md` but the event describes the shared `pkos_nodes` aggregate, not a separate Identity-owned table).
+
+| Event | Producer | Required payload |
+|---|---|---|
+| `knowledge_entity.created.v1` | Knowledge Platform | entity_id, version |
+| `knowledge_entity.updated.v1` | Knowledge Platform | entity_id, version |
+| `knowledge_entity.archived.v1` | Knowledge Platform | entity_id, version |
+| `knowledge_entity.restored.v1` | Knowledge Platform | entity_id, version |
+| `knowledge_entity.claim_recorded.v1` | Knowledge Platform | entity_id, claim_id |
+
+Remaining Phase 2 events (`relationship.created.v1`, `relationship.invalidated.v1`, `resolution_candidate.created.v1`, `resolution_candidate.confirmed.v1`, `resolution_candidate.rejected.v1`, `entity_operation.merged.v1`, `entity_operation.reversed.v1`) are added in the implementation plan's later slices, each alongside its own emitting code, not speculatively here.
 
 ## Recommendation publication rule
 
