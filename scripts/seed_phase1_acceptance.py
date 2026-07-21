@@ -64,10 +64,11 @@ WORKSPACE_LABELS: tuple[str, ...] = ("alpha", "bravo")
 # Tables that carry a `workspace_id` column directly (every Phase 1 table
 # except `workspaces` itself, `event_inbox`, and `event_dead_letters`, plus
 # the Phase 2 tables added by backend/migrations/versions/0011_phase2_
-# knowledge_entities.py and 0012_phase2_timeline.py -- verify_restore.sh's
-# workspace-isolation check discovers workspace_id-bearing tables
-# generically, so any such table without seeded rows here fails that check
-# regardless of whether it's listed in ALL_PHASE1_TABLES's name).
+# knowledge_entities.py, 0012_phase2_timeline.py, and 0013_phase2_
+# resolution.py -- verify_restore.sh's workspace-isolation check discovers
+# workspace_id-bearing tables generically, so any such table without
+# seeded rows here fails that check regardless of whether it's listed in
+# ALL_PHASE1_TABLES's name).
 _WORKSPACE_ID_TABLES: tuple[str, ...] = (
     "users",
     "sessions",
@@ -90,6 +91,8 @@ _WORKSPACE_ID_TABLES: tuple[str, ...] = (
     "entity_aliases",
     "knowledge_claims",
     "timeline_entries",
+    "resolution_candidates",
+    "entity_operations",
 )
 # `workspaces` is scoped by its own `id`, not a `workspace_id` column.
 _WORKSPACE_TABLE = "workspaces"
@@ -120,6 +123,8 @@ def _fixture_ids(label: str) -> dict[str, UUID]:
         "entity_alias": seed_id(label, "entity_alias", "person"),
         "knowledge_claim": seed_id(label, "knowledge_claim", "person"),
         "timeline_entry": seed_id(label, "timeline_entry", "person"),
+        "resolution_candidate": seed_id(label, "resolution_candidate", "person_topic"),
+        "entity_operation": seed_id(label, "entity_operation", "merge"),
         "outbox_event": seed_id(label, "event_outbox", "marker"),
         "dead_letter": seed_id(label, "event_dead_letter", "marker"),
         "task_active": seed_id(label, "task", "active"),
@@ -337,6 +342,52 @@ def _seed_pkos(cur: psycopg.Cursor[Any], label: str, ids: Mapping[str, UUID]) ->
             "recorded_at": SEED_EPOCH,
             "source_id": ids["evidence"],
             "summary": f"seed timeline entry {label}",
+        },
+    )
+    cur.execute(
+        """
+        INSERT INTO resolution_candidates (
+            id, workspace_id, left_entity_id, right_entity_id, score,
+            factors_json, resolver_version, status, created_at
+        ) VALUES (
+            %(id)s, %(workspace_id)s, %(left_id)s, %(right_id)s, %(score)s,
+            %(factors_json)s, %(resolver_version)s, 'open', %(created_at)s
+        )
+        ON CONFLICT (id) DO NOTHING
+        """,
+        {
+            "id": ids["resolution_candidate"],
+            "workspace_id": ids["workspace"],
+            "left_id": ids["node_person"],
+            "right_id": ids["node_topic"],
+            "score": "0.1000",
+            "factors_json": (
+                '{"name_similarity": 0.0, "alias_overlap": 0.0, '
+                '"neighbor_overlap": 0.0, "temporal_compatibility": 1.0}'
+            ),
+            "resolver_version": "phase2-resolution-v1",
+            "created_at": SEED_EPOCH,
+        },
+    )
+    cur.execute(
+        """
+        INSERT INTO entity_operations (
+            id, workspace_id, operation_type, status, inputs_json, outputs_json,
+            actor_id, reason, created_at
+        ) VALUES (
+            %(id)s, %(workspace_id)s, 'merge', 'active', %(inputs_json)s,
+            %(outputs_json)s, %(actor_id)s, %(reason)s, %(created_at)s
+        )
+        ON CONFLICT (id) DO NOTHING
+        """,
+        {
+            "id": ids["entity_operation"],
+            "workspace_id": ids["workspace"],
+            "inputs_json": f'{{"seed": "{label}"}}',
+            "outputs_json": f'{{"seed": "{label}"}}',
+            "actor_id": ids["user"],
+            "reason": f"seed entity operation {label}",
+            "created_at": SEED_EPOCH,
         },
     )
 
