@@ -26,7 +26,7 @@ Phase 2 implementation has started on `feature/phase-2-knowledge-platform`. This
 
 | Slice | Outcome | Status |
 |---|---|---|
-| 1 | Knowledge entities, aliases, claims and provenance | Not started |
+| 1 | Knowledge entities, aliases, claims and provenance | Backend implemented (commit `558bdb8`: migrations 0010-0011, `entities.py`/`entities_mutations.py`/`claims.py`/`identity/person_organizations.py`, 23 passing tests); frontend not started |
 | 2 | Typed relationships and entity detail | Not started |
 | 3 | Timeline projection and rebuild | Not started |
 | 4 | Resolution candidates and human review | Not started |
