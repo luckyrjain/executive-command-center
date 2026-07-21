@@ -671,6 +671,22 @@ def test_client_ip_from_forwarded_for_falls_back_when_header_has_too_few_hops() 
     assert http_security._client_ip_from_forwarded_for("203.0.113.7", trusted_proxy_count=2) is None
 
 
+def test_client_ip_from_forwarded_for_rejects_zero_trusted_proxy_count() -> None:
+    """Defense-in-depth regression test: `list[-0]` is Python for `list[0]`
+    -- the leftmost, attacker-controlled hop -- so trusted_proxy_count=0
+    must never fall through to the `hops[-trusted_proxy_count]` indexing,
+    even though the sole caller (_client_host) already special-cases this
+    before calling in."""
+    import ecc.http_security as http_security
+
+    assert (
+        http_security._client_ip_from_forwarded_for(
+            "attacker-forged, 203.0.113.7", trusted_proxy_count=0
+        )
+        is None
+    )
+
+
 def _forwarded_request(*, forwarded_for: str, client_host: str) -> Request:
     return Request(
         {

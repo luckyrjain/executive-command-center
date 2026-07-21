@@ -100,22 +100,28 @@ async def request_observability_middleware(
     request. See the module docstring for why this is registered where it
     is in ``ecc.main`` relative to ``response_contract_middleware``.
 
-    "Database failures" are recorded here too: ``call_next`` wraps the full
-    downstream stack including the router/endpoint, and Starlette's
-    ``BaseHTTPMiddleware.call_next`` re-raises any exception the downstream
-    app raised (it runs it in a task and propagates the result), so a
-    ``SQLAlchemyError`` raised by domain code is visible here before it
-    reaches Starlette's outer ``ServerErrorMiddleware`` (which still produces
-    the same 500 response as today -- this only *observes* the failure, it
-    is re-raised unchanged so response/status behavior is untouched).
+    Any exception is observed here, not just database failures: ``call_next``
+    wraps the full downstream stack including the router/endpoint, and
+    Starlette's ``BaseHTTPMiddleware.call_next`` re-raises any exception the
+    downstream app raised (it runs it in a task and propagates the result),
+    so an exception raised by domain code is visible here before it reaches
+    Starlette's outer ``ServerErrorMiddleware`` (which still produces the
+    same 500 response as today -- this only *observes* the failure, it is
+    re-raised unchanged so response/status behavior is untouched). Without
+    this, a bug that isn't a ``SQLAlchemyError`` -- a ``TypeError``, a
+    serialization failure, anything -- would vanish from both the structured
+    request log and ``ecc_http_requests_total``/
+    ``ecc_http_request_duration_seconds`` entirely, silently undercounting
+    the exact class of failure this instrumentation exists to surface.
 
-    That observation includes the *same* request-completion log line and
-    ``record_request`` metric call the success path below emits -- not just
-    ``record_database_failure`` -- using status ``500`` (the response
-    Starlette's ``ServerErrorMiddleware`` will actually send once this
-    re-raise reaches it), so a DB-failure-driven request still produces
-    exactly one structured log line and is still counted in
-    ``ecc_http_requests_total``/``ecc_http_request_duration_seconds``.
+    ``SQLAlchemyError`` is still handled as its own case first, since only a
+    database failure also increments ``ecc_database_failures_total`` --
+    every exception (database or otherwise) gets the *same*
+    request-completion log line and ``record_request`` metric call the
+    success path below emits, using status ``500`` (the response Starlette's
+    ``ServerErrorMiddleware`` will actually send once the re-raise reaches
+    it), so a failed request still produces exactly one structured log line
+    and is still counted.
     """
     start = time.monotonic()
     try:
@@ -123,6 +129,11 @@ async def request_observability_middleware(
     except SQLAlchemyError:
         route = _route_template(request)
         record_database_failure(route)
+        duration_seconds = time.monotonic() - start
+        _record_and_log_request(request, route, duration_seconds, status_code=500)
+        raise
+    except Exception:
+        route = _route_template(request)
         duration_seconds = time.monotonic() - start
         _record_and_log_request(request, route, duration_seconds, status_code=500)
         raise
@@ -408,6 +419,20 @@ def queue_brief_generated(session: Session, duration_seconds: float) -> None:
     session.info.setdefault("_pending_brief_durations", []).append(duration_seconds)
 
 
+def queue_recommendation_transition(session: Session, event_type: str) -> None:
+    """Defer a recommendation-transition counter increment the same way
+    ``queue_lifecycle_event`` defers its own counter: queued inside the
+    mutating transaction, only flushed if that transaction actually
+    commits. ``recommendation_events.record_event`` writes the audit/outbox
+    rows for this same transition and calls ``queue_lifecycle_event``
+    immediately after -- calling ``record_recommendation_transition``
+    directly at that same point (as it used to) would increment
+    ``ecc_recommendation_transitions_total`` even if a later statement in
+    the same transaction (``save_cached``, the final commit) failed.
+    """
+    session.info.setdefault("_pending_recommendation_transitions", []).append(event_type)
+
+
 @event.listens_for(Session, "after_commit")
 def _flush_lifecycle_events(session: Session) -> None:
     pending = session.info.pop("_pending_lifecycle_events", None)
@@ -418,6 +443,10 @@ def _flush_lifecycle_events(session: Session) -> None:
     if pending_durations:
         for duration_seconds in pending_durations:
             record_brief_generated(duration_seconds)
+    pending_transitions = session.info.pop("_pending_recommendation_transitions", None)
+    if pending_transitions:
+        for event_type in pending_transitions:
+            record_recommendation_transition(event_type)
 
 
 @event.listens_for(Session, "after_rollback")
@@ -429,9 +458,11 @@ def _discard_lifecycle_events_on_rollback(session: Session) -> None:
     # object. Each request gets its own fresh Session today (see
     # ecc.database.get_session), so that reuse doesn't currently happen in
     # practice -- but nothing about queue_lifecycle_event's/
-    # queue_brief_generated's contract should depend on that.
+    # queue_brief_generated's/queue_recommendation_transition's contract
+    # should depend on that.
     session.info.pop("_pending_lifecycle_events", None)
     session.info.pop("_pending_brief_durations", None)
+    session.info.pop("_pending_recommendation_transitions", None)
 
 
 def record_search(duration_seconds: float, result_count: int) -> None:

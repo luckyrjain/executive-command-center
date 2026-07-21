@@ -324,17 +324,33 @@ def _build_sections(
         if len(risks) == 5:
             break
 
+    # Two-stage query: the inner DISTINCT ON collapses repeat edits of the
+    # same entity down to its single latest audit row *before* any LIMIT is
+    # applied, so one frequently-edited entity can no longer crowd every
+    # other entity out of the candidate window. The outer LIMIT is widened
+    # to 50 (vs. the 5 actually rendered) specifically because the Python
+    # loop below further discards any entity already surfaced in an earlier
+    # section (schedule/priorities/overdue/waiting/risks) -- a narrower
+    # LIMIT applied before that second filter could silently return zero
+    # "recently changed" entries on a busy workspace even when older, still
+    # genuinely-unshown changes exist just past the window.
     changed_rows = (
         session.execute(
             text(
                 """
                 SELECT id, event_type, aggregate_type, aggregate_id,
                        aggregate_version, changed_fields, occurred_at
-                FROM audit_events
-                WHERE workspace_id = :workspace_id
-                  AND occurred_at >= :since
+                FROM (
+                    SELECT DISTINCT ON (aggregate_type, aggregate_id)
+                           id, event_type, aggregate_type, aggregate_id,
+                           aggregate_version, changed_fields, occurred_at
+                    FROM audit_events
+                    WHERE workspace_id = :workspace_id
+                      AND occurred_at >= :since
+                    ORDER BY aggregate_type, aggregate_id, occurred_at DESC
+                ) latest_per_entity
                 ORDER BY occurred_at DESC, id DESC
-                LIMIT 20
+                LIMIT 50
                 """
             ),
             {"workspace_id": workspace_id, "since": now - timedelta(hours=24)},
@@ -605,6 +621,21 @@ def get_morning_brief(
     day: DateQuery = None,
 ) -> MorningBriefResponse:
     target = _target_date(day, auth.timezone)
+    # Acquire the same per-(workspace,user,day) advisory lock _generate()
+    # takes, before the existence check below -- otherwise two concurrent
+    # GETs for a brief that doesn't exist yet can both see no row and both
+    # call _generate(), racing into two morning_briefs rows (generation
+    # versions 1 and 2, each with its own audit/outbox write) instead of
+    # one lazily-generated brief, since morning_briefs' uniqueness is per
+    # generation_version, not per (workspace,user,day) alone. Re-acquiring
+    # the identical key inside _generate() in the same session/transaction
+    # is a no-op; the lock is released at this request's commit/rollback,
+    # so a request that loses the race simply blocks until the winner
+    # commits, then sees the row the winner just created.
+    session.execute(
+        text("SELECT pg_advisory_xact_lock(hashtext(:key))"),
+        {"key": f"brief:{auth.workspace_id}:{auth.user_id}:{target.isoformat()}"},
+    )
     row = (
         session.execute(
             text(

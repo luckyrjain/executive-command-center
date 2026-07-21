@@ -11,8 +11,8 @@ from sqlalchemy.orm import Session
 from ecc.auth import AuthContext
 from ecc.observability import (
     queue_lifecycle_event,
+    queue_recommendation_transition,
     record_audit_outbox_failure,
-    record_recommendation_transition,
 )
 
 
@@ -128,4 +128,4 @@ def record_event(
         record_audit_outbox_failure("recommendations")
         raise
     queue_lifecycle_event(session, "recommendation", event_name, "allowed")
-    record_recommendation_transition(event_name)
+    queue_recommendation_transition(session, event_name)

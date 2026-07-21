@@ -510,10 +510,6 @@ def list_meetings(
         updated_at, meeting_id = _decode_cursor(cursor)
         clauses.append("(updated_at, id) < (:cursor_updated_at, :cursor_id)")
         params.update({"cursor_updated_at": updated_at, "cursor_id": meeting_id})
-    if cursor:
-        updated_at, meeting_id = _decode_cursor(cursor)
-        clauses.append("(updated_at, id) < (:cursor_updated_at, :cursor_id)")
-        params.update({"cursor_updated_at": updated_at, "cursor_id": meeting_id})
     rows = (
         session.execute(
             text(

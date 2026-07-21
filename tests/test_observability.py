@@ -112,6 +112,10 @@ def _build_test_app() -> FastAPI:
     def db_failure(request: Request) -> dict:
         raise SQLAlchemyError("simulated database failure")
 
+    @app.get("/api/v1/generic-failure")
+    def generic_failure(request: Request) -> dict:
+        raise TypeError("simulated non-database bug")
+
     return app
 
 
@@ -310,6 +314,60 @@ def test_database_failure_path_increments_request_metric() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Logging + Metrics: a non-SQLAlchemyError exception (any ordinary bug) must
+# get the same request-completion log line and record_request metric as the
+# SQLAlchemyError path above -- not just database failures. Regression test
+# for the middleware previously catching only `except SQLAlchemyError`,
+# under which a plain TypeError/bug would vanish from both the structured
+# log and ecc_http_requests_total entirely.
+# ---------------------------------------------------------------------------
+
+
+def test_generic_exception_path_emits_request_log_line(
+    capture_request_logs: _CaptureHandler,
+) -> None:
+    client = TestClient(_build_test_app())
+
+    with pytest.raises(TypeError):
+        client.get("/api/v1/generic-failure")
+
+    assert len(capture_request_logs.records) == 1
+    logged = capture_request_logs.records[0]
+    assert logged.getMessage() == "request_handled"
+    assert logged.route == "/api/v1/generic-failure"  # type: ignore[attr-defined]
+    assert logged.http_method == "GET"  # type: ignore[attr-defined]
+    assert logged.status_code == 500  # type: ignore[attr-defined]
+    assert isinstance(logged.duration_ms, float)  # type: ignore[attr-defined]
+    assert logged.duration_ms >= 0  # type: ignore[attr-defined]
+    assert logged.request_id is not None  # type: ignore[attr-defined]
+
+
+def test_generic_exception_path_increments_request_metric() -> None:
+    label_prefix = (
+        'ecc_http_requests_total{route="/api/v1/generic-failure",method="GET",status="500"}'
+    )
+    before_rendered = render_metrics()
+    before = 0
+    if label_prefix in before_rendered:
+        line = next(line for line in before_rendered.splitlines() if line.startswith(label_prefix))
+        before = int(float(line.split()[-1]))
+
+    client = TestClient(_build_test_app())
+    with pytest.raises(TypeError):
+        client.get("/api/v1/generic-failure")
+
+    rendered = render_metrics()
+    assert label_prefix in rendered
+    line = next(line for line in rendered.splitlines() if line.startswith(label_prefix))
+    after = int(float(line.split()[-1]))
+    assert after == before + 1
+
+    # A non-database exception must NOT be misclassified as a database
+    # failure -- record_database_failure is specific to SQLAlchemyError.
+    assert 'ecc_database_failures_total{route="/api/v1/generic-failure"}' not in rendered
+
+
+# ---------------------------------------------------------------------------
 # Metrics: instrument-level tests against render_metrics().
 # ---------------------------------------------------------------------------
 
@@ -498,6 +556,47 @@ def test_record_recommendation_transition_appears_in_metrics() -> None:
     rendered = render_metrics()
 
     assert 'ecc_recommendation_transitions_total{event_type="recommendation.accepted"}' in rendered
+
+
+def test_queue_recommendation_transition_is_not_counted_until_session_commits() -> None:
+    """Regression test: record_recommendation_transition() used to be
+    called directly at audit-write time -- so a later failure in the same
+    transaction (e.g. save_cached, the final commit) would still leave the
+    transition counted. queue_recommendation_transition() must defer the
+    same way queue_lifecycle_event() does."""
+    from sqlalchemy import text
+
+    from ecc.observability import queue_recommendation_transition
+
+    session = SessionFactory()
+    try:
+        before = render_metrics()
+        session.execute(text("SELECT 1"))
+        queue_recommendation_transition(session, "recommendation.rollback_test")
+        assert 'event_type="recommendation.rollback_test"' not in render_metrics()
+
+        session.rollback()
+
+        after_rollback = render_metrics()
+        assert after_rollback == before
+        assert 'event_type="recommendation.rollback_test"' not in after_rollback
+    finally:
+        session.close()
+
+
+def test_queue_recommendation_transition_is_counted_after_session_commits() -> None:
+    from ecc.observability import queue_recommendation_transition
+
+    session = SessionFactory()
+    try:
+        queue_recommendation_transition(session, "recommendation.commit_test")
+        assert 'event_type="recommendation.commit_test"' not in render_metrics()
+
+        session.commit()
+
+        assert 'event_type="recommendation.commit_test"' in render_metrics()
+    finally:
+        session.close()
 
 
 def test_record_idempotency_conflict_appears_in_metrics() -> None:

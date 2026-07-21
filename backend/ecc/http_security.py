@@ -289,8 +289,15 @@ def _client_ip_from_forwarded_for(header_value: str, trusted_proxy_count: int) -
     Returns ``None`` -- signalling "fall back to the raw socket peer" --
     if the header does not contain at least ``trusted_proxy_count`` hops,
     since that means the configured trust count doesn't match what
-    actually arrived and guessing would be unsafe.
+    actually arrived and guessing would be unsafe. Also returns ``None``
+    for ``trusted_proxy_count <= 0``: the sole caller, ``_client_host``,
+    already special-cases that before ever reaching here, but ``hops[-0]``
+    is Python for ``hops[0]`` -- the leftmost, attacker-controlled hop --
+    so this is guarded here too rather than relying solely on the caller
+    to never pass 0.
     """
+    if trusted_proxy_count <= 0:
+        return None
     hops = [hop.strip() for hop in header_value.split(",") if hop.strip()]
     if len(hops) < trusted_proxy_count:
         return None
