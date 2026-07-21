@@ -80,7 +80,20 @@ jobs:
         # the (slower) vulnerability scans below so a container that can't
         # even boot fails fast.
         run: |
-          docker run -d --name ecc-backend-smoke -p 18000:8000 -e ECC_ENV=development ecc-backend:ci
+          # ECC_SESSION_SECRET is required even in development: pydantic-settings
+          # validates a field's constraints (min_length=32 here) against its
+          # resolved value regardless of whether that value came from a source
+          # or the field's own default -- unlike plain pydantic BaseModel, it
+          # does not skip validation for unset/default fields. So Settings()
+          # fails at import time without this, before validate_production_settings's
+          # ECC_ENV=development early-return is ever reached. Every other real
+          # invocation path (docker-compose.yml, tests/conftest.py) already sets
+          # this; this smoke test is the first place that runs the container
+          # without it, which is what surfaced this.
+          docker run -d --name ecc-backend-smoke -p 18000:8000 \
+            -e ECC_ENV=development \
+            -e ECC_SESSION_SECRET=ci-smoke-test-secret-value-32-chars-min \
+            ecc-backend:ci
           live=0
           for _ in $(seq 1 30); do
             if curl -fsS http://localhost:18000/health/live >/dev/null 2>&1; then

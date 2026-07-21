@@ -53,22 +53,18 @@ def _settings(**overrides: object) -> Settings:
     """Build a ``Settings`` instance for a given field state directly.
 
     Uses ``model_construct`` (bypasses field validators and the env/dotenv
-    sources entirely) rather than the normal constructor. Two reasons:
-
-    1. ``Settings`` fields use ``validation_alias`` (e.g. ``ECC_ENV``), so
-       calling ``Settings(environment=...)`` by field name silently falls
-       through to ambient env vars / the repo's real .env file instead of
-       raising or applying the override -- a test-only footgun this avoids.
-    2. Pydantic v2 validates *explicitly provided* values against field
-       constraints (unlike unset defaults), so a normal constructor call
-       cannot even reach the "short/placeholder secret slipped past
-       validation" scenario this module exists to guard against --
-       ``Settings(session_secret="short")`` would itself raise a
-       ``pydantic.ValidationError`` before ``validate_production_settings``
-       ever runs. ``model_construct`` reproduces the real-world gap: a
-       field value that arrived without going through validation at all
-       (today, that's the empty-string default; ``model_construct`` lets
-       these tests exercise the same code path for any value).
+    sources entirely) rather than the normal constructor: ``Settings``
+    fields use ``validation_alias`` (e.g. ``ECC_ENV``), so calling
+    ``Settings(environment=...)`` by field name silently falls through to
+    ambient env vars / the repo's real .env file instead of raising or
+    applying the override -- a test-only footgun this avoids. ``session_secret``
+    itself carries no pydantic-level length constraint (see ``config.py`` --
+    that check lives entirely in ``validate_production_settings``, on
+    purpose, so a short/empty value is never rejected before
+    ``validate_production_settings``'s ``ECC_ENV=development`` early-return
+    can apply), so ``model_construct`` isn't load-bearing for reaching this
+    module's short/placeholder-secret scenarios the way it once was --
+    it's kept for the alias reason above.
     """
     base: dict[str, object] = {
         "environment": "production",
@@ -179,6 +175,37 @@ def test_allows_todays_development_defaults() -> None:
     )
 
     validate_production_settings(settings)
+
+
+def test_settings_is_actually_constructible_in_development_with_no_session_secret(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression test for a real CI failure: pydantic-settings validates a
+    field's constraints against its *resolved* value regardless of whether
+    that came from a source or the field's own default (unlike plain
+    pydantic BaseModel, which skips validation for unset fields) -- so a
+    `min_length` constraint on session_secret made the real `Settings()`
+    constructor raise a ValidationError before validate_production_settings's
+    ECC_ENV=development early-return was ever reached, even though that
+    function's own docstring promises an empty secret is permitted in
+    development. This is exactly what CI's `containers` job hit: booting the
+    real image with ECC_ENV=development and no ECC_SESSION_SECRET failed at
+    import time, not at the intended validate_production_settings check.
+    Uses the real constructor (not model_construct) and clears every env var
+    Settings reads, so this only passes if the empty default is genuinely
+    unconstrained at the pydantic layer."""
+    import ecc.config as config_module
+
+    for var in ("ECC_ENV", "ECC_DATABASE_URL", "ECC_SESSION_SECRET", "ECC_CORS_ORIGINS"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("ECC_ENV", "development")
+    config_module.get_settings.cache_clear()
+    try:
+        settings = config_module.get_settings()
+        assert settings.session_secret == ""
+        validate_production_settings(settings)
+    finally:
+        config_module.get_settings.cache_clear()
 
 
 def test_allows_valid_production_settings() -> None:

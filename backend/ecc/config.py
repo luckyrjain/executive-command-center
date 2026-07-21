@@ -12,11 +12,21 @@ class Settings(BaseSettings):
         default="postgresql+psycopg://ecc:ecc@localhost:5432/ecc",
         validation_alias="ECC_DATABASE_URL",
     )
-    session_secret: str = Field(
-        default="",
-        min_length=32,
-        validation_alias="ECC_SESSION_SECRET",
-    )
+    # No `min_length` constraint here (deliberately, see below) -- the
+    # >=32-character requirement is enforced by validate_production_settings's
+    # _validate_session_secret, but only outside development. pydantic-settings
+    # validates a field's constraints against its *resolved* value regardless
+    # of whether that value came from a source or the field's own default
+    # (unlike plain pydantic BaseModel, it does not skip validation for
+    # unset/default fields) -- so a `min_length=32` constraint here would
+    # make Settings() itself raise before validate_production_settings's
+    # ECC_ENV=development early-return is ever reached, breaking the
+    # documented "permissive empty session secret in development" contract
+    # in every environment, not just production. This was live and confirmed
+    # in CI: the `containers` job's smoke test, which boots the real
+    # container with ECC_ENV=development, failed with exactly this
+    # ValidationError until this constraint was removed.
+    session_secret: str = Field(default="", validation_alias="ECC_SESSION_SECRET")
     cors_origins: str = Field(default="http://localhost:5173", validation_alias="ECC_CORS_ORIGINS")
     metrics_token: str = Field(default="", validation_alias="ECC_METRICS_TOKEN")
     # Number of trusted reverse proxies/load balancers in front of this app
@@ -72,7 +82,7 @@ _RECOGNIZED_ENVIRONMENTS = frozenset({"development", "staging", "production"})
 # Substrings that flag a session secret as a known/likely development
 # placeholder rather than a real generated secret. These are deliberately
 # drawn from this repo's own defaults (.env.example, docker-compose.yml) plus
-# generic markers, since `min_length=32` alone does not catch a
+# generic markers, since the length check alone does not catch a
 # long-but-still-placeholder value such as
 # "development-only-secret-change-before-real-data" (49 chars).
 _PLACEHOLDER_SECRET_MARKERS = (
