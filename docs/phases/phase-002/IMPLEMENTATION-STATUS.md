@@ -2,7 +2,7 @@
 id: PHASE-002-IMPLEMENTATION-STATUS
 title: Phase 2 Implementation Status
 status: In progress
-version: 0.4.0
+version: 0.5.0
 owner: Lucky Jain
 updated: 2026-07-21
 ---
@@ -29,7 +29,7 @@ Phase 2 implementation has started on `feature/phase-2-knowledge-platform`. This
 | 1 | Knowledge entities, aliases, claims and provenance | Backend implemented (commit `558bdb8`: migrations 0010-0011, `entities.py`/`entities_mutations.py`/`claims.py`/`identity/person_organizations.py`, 23 passing tests); frontend not started |
 | 2 | Typed relationships and entity detail | Backend implemented: `relationships.py`/`relationships_mutations.py` over extended `pkos_edges`, 4 passing tests; frontend not started |
 | 3 | Timeline projection and rebuild | Backend implemented: migration `0012_phase2_timeline.py`, `timeline.py` (`GET /entities/{id}/timeline` signed-cursor paginated, `queue_timeline_entry` direct-transaction writer wired into entities/claims/relationships mutation paths, `rebuild_timeline` deterministic regenerator sourced from `audit_events`), `scripts/rebuild_knowledge_projections.py` CLI, 5 passing tests; frontend not started |
-| 4 | Resolution candidates and human review | Not started |
+| 4 | Resolution candidates and human review | Backend implemented: migration `0013_phase2_resolution.py` (`resolution_candidates`, `entity_operations`), `resolution.py` (`score_candidate` pure scorer; deterministic match hierarchy levels 1-4 short-circuit before any candidate row is created; `POST/GET /resolution/candidates`, `POST /resolution/candidates/{id}/confirm\|reject`, idempotent), versioned labelled benchmark dataset (`tests/fixtures/phase2_resolution_dataset.py`, precision/recall/false-merge-rate/unresolved-rate thresholds), 24 passing tests; frontend (`ResolutionInbox.tsx`) deferred to Slice 8 alongside the other Phase 2 UI surfaces, matching Slices 1-3's backend-first sequencing |
 | 5 | Reversible merge/split lineage | Not started |
 | 6 | Lexical retrieval and explanations | Not started |
 | 7 | Optional embeddings and hybrid fusion | Not started |

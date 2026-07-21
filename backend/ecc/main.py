@@ -33,6 +33,7 @@ from ecc.domains.knowledge.relationships import router as knowledge_relationship
 from ecc.domains.knowledge.relationships_mutations import (
     router as knowledge_relationships_mutations_router,
 )
+from ecc.domains.knowledge.resolution import router as knowledge_resolution_router
 from ecc.domains.knowledge.timeline import router as knowledge_timeline_router
 from ecc.domains.planning.tasks import router as tasks_router
 from ecc.domains.platform.audit_queries import router as audit_queries_router
@@ -80,6 +81,7 @@ app.include_router(knowledge_claims_router)
 app.include_router(knowledge_relationships_router)
 app.include_router(knowledge_relationships_mutations_router)
 app.include_router(knowledge_timeline_router)
+app.include_router(knowledge_resolution_router)
 app.include_router(identity_router)
 app.include_router(search_router)
 app.include_router(dashboard_briefs_router)
