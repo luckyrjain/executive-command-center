@@ -2,7 +2,7 @@
 id: EVENT-CATALOG
 title: Domain Event Catalog
 status: Accepted
-version: 1.3.0
+version: 1.4.0
 owner: Lucky Jain
 related:
   - ADR-0005
@@ -79,8 +79,10 @@ Added incrementally, one entry per delivery slice, alongside the code that emits
 | `resolution_candidate.created.v1` | Knowledge Platform | candidate_id |
 | `resolution_candidate.confirmed.v1` | Knowledge Platform | candidate_id |
 | `resolution_candidate.rejected.v1` | Knowledge Platform | candidate_id |
+| `entity_operation.merged.v1` | Knowledge Platform | operation_id |
+| `entity_operation.reversed.v1` | Knowledge Platform | operation_id |
 
-Remaining Phase 2 events (`entity_operation.merged.v1`, `entity_operation.reversed.v1`) are added in the implementation plan's later slices, each alongside its own emitting code, not speculatively here.
+All Phase 2 catalog events are now implemented; no remaining speculative entries.
 
 ## Recommendation publication rule
 

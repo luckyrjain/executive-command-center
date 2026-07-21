@@ -27,6 +27,7 @@ from ecc.domains.knowledge.entities import router as knowledge_entities_router
 from ecc.domains.knowledge.entities_mutations import (
     router as knowledge_entities_mutations_router,
 )
+from ecc.domains.knowledge.entity_operations import router as knowledge_entity_operations_router
 from ecc.domains.knowledge.evidence import router as evidence_router
 from ecc.domains.knowledge.notes import router as notes_router
 from ecc.domains.knowledge.relationships import router as knowledge_relationships_router
@@ -82,6 +83,7 @@ app.include_router(knowledge_relationships_router)
 app.include_router(knowledge_relationships_mutations_router)
 app.include_router(knowledge_timeline_router)
 app.include_router(knowledge_resolution_router)
+app.include_router(knowledge_entity_operations_router)
 app.include_router(identity_router)
 app.include_router(search_router)
 app.include_router(dashboard_briefs_router)
