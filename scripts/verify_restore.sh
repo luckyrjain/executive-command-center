@@ -10,10 +10,26 @@ if [[ -z "${TARGET_DATABASE_URL}" ]]; then
   exit 2
 fi
 
-./scripts/restore.sh "${BACKUP}" "${TARGET_DATABASE_URL}"
-
 SOURCE_PG_URL="${SOURCE_DATABASE_URL/postgresql+psycopg:/postgresql:}"
 TARGET_PG_URL="${TARGET_DATABASE_URL/postgresql+psycopg:/postgresql:}"
+
+# scripts/restore.sh does a destructive `pg_restore --clean --if-exists`
+# against TARGET_DATABASE_URL. If a misconfiguration (e.g. a copy-paste
+# mistake wiring RESTORE_DATABASE_URL to the same value as
+# ECC_DATABASE_URL/DATABASE_URL) ever pointed it at the live source
+# database, this would drop-and-restore an old backup directly over
+# production -- and every check below would then trivially "pass" since
+# source and target would be the same database. Compared after the
+# postgresql+psycopg: -> postgresql: normalization above so a scheme
+# difference alone can't hide a real match.
+if [[ "${SOURCE_PG_URL}" == "${TARGET_PG_URL}" ]]; then
+  echo "RESTORE_DATABASE_URL must not equal the source database URL" \
+    "(ECC_DATABASE_URL/DATABASE_URL) -- refusing to run a destructive" \
+    "restore against what looks like the live database" >&2
+  exit 2
+fi
+
+./scripts/restore.sh "${BACKUP}" "${TARGET_DATABASE_URL}"
 
 source_revision=$(psql "${SOURCE_PG_URL}" -Atqc "SELECT version_num FROM alembic_version")
 target_revision=$(psql "${TARGET_PG_URL}" -Atqc "SELECT version_num FROM alembic_version")
@@ -72,6 +88,22 @@ printf '%s\n' "${target_checksums}" | grep -q "^audit_events	" || {
   echo "no audit_events checksum computed -- seed fixtures missing?" >&2
   exit 1
 }
+# fixture_row_checksums (scripts/seed_phase1_acceptance.py) emits the
+# literal value "empty" for a table whose seeded-workspace row count is
+# zero. Two databases both missing seed data would both show "empty" for
+# every table, satisfying the equality check above vacuously -- checking
+# equality alone cannot tell "checksums genuinely match" apart from
+# "neither database has the seed rows this check exists to verify."
+# Reject that case explicitly so a misconfigured seeding step (wrong
+# database, seeding step silently skipped, etc.) fails loudly here instead
+# of producing a false "restore verified" result.
+if printf '%s\n' "${target_checksums}" | grep -qP '\t(empty)$'; then
+  echo "checksum verification is vacuous: at least one seeded Phase 1 table has" \
+    "no rows (checksum 'empty') in the restored target -- seed fixtures are" \
+    "missing, not merely identical" >&2
+  printf '%s\n' "${target_checksums}" | grep -P '\t(empty)$' >&2
+  exit 1
+fi
 echo "representative record checksums match for every seeded Phase 1 table"
 echo "append-only audit protection verified: restored audit_events rows are checksum-identical to source"
 echo "PKOS mapped-column checksums verified (pkos_nodes, pkos_edges, pkos_evidence)"

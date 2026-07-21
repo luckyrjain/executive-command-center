@@ -90,6 +90,42 @@ def test_evaluate_invariants_flags_audit_events_checksum_mismatch() -> None:
     assert by_name["representative_record_checksums_match"]["passed"] is False
 
 
+def test_evaluate_invariants_flags_vacuous_checksums_when_both_sides_are_empty() -> None:
+    """Regression test: fixture_row_checksums emits 'empty' when a table has
+    no seeded rows. Two databases both missing seed data would both show
+    'empty' for every table -- source == target -- which must NOT be
+    treated as a passing checksum comparison, since it proves nothing about
+    whether the restore actually preserved data."""
+    kwargs = _passing_kwargs()
+    kwargs["source_checksums"]["tasks"] = "empty"
+    kwargs["target_checksums"]["tasks"] = "empty"
+    invariants = evidence_module.evaluate_invariants(**kwargs)
+    by_name = {item["name"]: item for item in invariants}
+    assert by_name["representative_record_checksums_match"]["passed"] is False
+    # audit_events/pkos checksums are still real, non-empty values in this
+    # scenario, so those two invariants are unaffected by the "tasks" gap.
+    assert by_name["audit_events_append_only"]["passed"] is True
+    assert by_name["pkos_mapped_columns_match"]["passed"] is True
+
+
+def test_evaluate_invariants_flags_vacuous_audit_events_checksum() -> None:
+    kwargs = _passing_kwargs()
+    kwargs["source_checksums"]["audit_events"] = "empty"
+    kwargs["target_checksums"]["audit_events"] = "empty"
+    invariants = evidence_module.evaluate_invariants(**kwargs)
+    by_name = {item["name"]: item for item in invariants}
+    assert by_name["audit_events_append_only"]["passed"] is False
+
+
+def test_evaluate_invariants_flags_vacuous_pkos_checksum() -> None:
+    kwargs = _passing_kwargs()
+    kwargs["source_checksums"]["pkos_nodes"] = "empty"
+    kwargs["target_checksums"]["pkos_nodes"] = "empty"
+    invariants = evidence_module.evaluate_invariants(**kwargs)
+    by_name = {item["name"]: item for item in invariants}
+    assert by_name["pkos_mapped_columns_match"]["passed"] is False
+
+
 def test_evaluate_invariants_flags_rto_budget_exceeded() -> None:
     kwargs = _passing_kwargs()
     kwargs["elapsed_seconds"] = 601

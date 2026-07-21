@@ -171,24 +171,46 @@ def evaluate_invariants(
         }
     )
 
+    # fixture_row_checksums (tests/phase1_dataset.py / seed_phase1_acceptance.py)
+    # emits the literal value "empty" for a table whose seeded-workspace row
+    # count is zero. Two databases both missing seed data would both show
+    # "empty" for every table, satisfying an equality check vacuously --
+    # equality alone can't distinguish "checksums genuinely match" from
+    # "neither database has the seed rows this invariant exists to verify."
+    # Every checksum invariant below therefore also requires the compared
+    # value not be this vacuous placeholder.
+    empty_checksum_tables = sorted(
+        table
+        for table in sorted(set(source_checksums) | set(target_checksums))
+        if source_checksums.get(table) == "empty" or target_checksums.get(table) == "empty"
+    )
+
     mismatched_checksums = sorted(
         table
         for table in sorted(set(source_checksums) | set(target_checksums))
         if source_checksums.get(table) != target_checksums.get(table)
     )
+    checksums_vacuous = not mismatched_checksums and bool(empty_checksum_tables)
     invariants.append(
         {
             "name": "representative_record_checksums_match",
-            "passed": not mismatched_checksums,
+            "passed": not mismatched_checksums and not checksums_vacuous,
             "detail": (
-                "all representative row checksums match"
-                if not mismatched_checksums
-                else f"mismatched tables: {mismatched_checksums}"
+                f"mismatched tables: {mismatched_checksums}"
+                if mismatched_checksums
+                else f"vacuous: no seed rows found for {empty_checksum_tables}"
+                if checksums_vacuous
+                else "all representative row checksums match"
             ),
         }
     )
 
-    audit_ok = source_checksums.get("audit_events") == target_checksums.get("audit_events")
+    audit_checksum = target_checksums.get("audit_events")
+    audit_ok = (
+        source_checksums.get("audit_events") == audit_checksum
+        and audit_checksum is not None
+        and audit_checksum != "empty"
+    )
     invariants.append(
         {
             "name": "audit_events_append_only",
@@ -197,12 +219,19 @@ def evaluate_invariants(
                 "restored audit_events rows are checksum-identical to source "
                 "(no DB trigger enforces append-only-ness; this full-row "
                 "checksum comparison is the documented substitute mechanism)"
+                if audit_ok
+                else "vacuous or mismatched: audit_events checksum is missing, "
+                "empty, or does not match source"
             ),
         }
     )
 
     pkos_tables = ("pkos_nodes", "pkos_edges", "pkos_evidence")
-    pkos_ok = all(source_checksums.get(t) == target_checksums.get(t) for t in pkos_tables)
+    pkos_ok = all(
+        source_checksums.get(t) == target_checksums.get(t)
+        and target_checksums.get(t) not in (None, "empty")
+        for t in pkos_tables
+    )
     invariants.append(
         {
             "name": "pkos_mapped_columns_match",
