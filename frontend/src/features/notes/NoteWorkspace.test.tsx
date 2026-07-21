@@ -129,6 +129,27 @@ describe('NoteWorkspace', () => {
     expect(screen.getByRole('status').textContent).toMatch(/saved/i)
   })
 
+  it('invalidates the dashboard and morning brief caches after an autosave', async () => {
+    vi.useFakeTimers()
+    const fetch = vi.fn()
+      .mockImplementationOnce(() => response({ items: [note], next_cursor: null }))
+      .mockImplementationOnce(() => response({ ...note, body: 'Edited body', version: 5 }))
+    vi.stubGlobal('fetch', fetch)
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } })
+    render(<QueryClientProvider client={client}><NoteWorkspace /></QueryClientProvider>)
+    await act(async () => { await vi.runAllTimersAsync() })
+    fireEvent.click(screen.getByRole('button', { name: 'Edit Board preparation' }))
+    const invalidateSpy = vi.spyOn(client, 'invalidateQueries')
+
+    fireEvent.change(screen.getByLabelText('Edit note body'), { target: { value: 'Edited body' } })
+    fireEvent.blur(screen.getByLabelText('Edit note body'))
+    await act(async () => { await vi.runAllTimersAsync() })
+
+    const invalidatedKeys = invalidateSpy.mock.calls.map((call) => call[0]?.queryKey)
+    expect(invalidatedKeys).toContainEqual(['dashboard', 'today'])
+    expect(invalidatedKeys).toContainEqual(['brief', 'morning'])
+  })
+
   it('preserves local text after network and conflict failures and retries a conflict with the latest version', async () => {
     const conflict = { error: { code: 'VERSION_CONFLICT', message: 'changed', details: { current_version: 5 } } }
     const current = { ...note, body: 'Other tab content', version: 5 }

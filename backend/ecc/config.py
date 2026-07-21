@@ -24,9 +24,14 @@ class Settings(BaseSettings):
     # a proxy" -- ecc.http_security trusts only the raw ASGI socket peer,
     # which is correct for local/dev/test but resolves to the proxy's own
     # address in any real deployment, collapsing every distinct client into
-    # one shared mutation-rate-limit bucket. Set to the exact hop count from
-    # docs/runbooks/PHASE-1-DEPLOYMENT.md's topology so the limiter reads the
-    # real client IP from X-Forwarded-For instead. See
+    # one shared mutation-rate-limit bucket. Set to the *exact* hop count
+    # from docs/runbooks/PHASE-1-DEPLOYMENT.md's topology -- too low leaves
+    # the collapsed-bucket problem partially unfixed, but too high is the
+    # dangerous direction: it lets a client pad X-Forwarded-For with its own
+    # fabricated leading hops until the header is long enough that the
+    # trusted-hop count selects one of those attacker-controlled values
+    # instead of the real proxy-appended one, letting it mint a fresh fake
+    # client IP per request and fully bypass the per-IP rate limit. See
     # ecc.http_security._client_ip_from_forwarded_for for why this must be an
     # exact trusted count, not "trust X-Forwarded-For whenever present" --
     # the header's client-supplied left-hand portion is never trustworthy.

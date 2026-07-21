@@ -126,6 +126,13 @@ export default function NoteWorkspace({ recoveryStore }: NoteWorkspaceProps) {
             method: 'PATCH', body: { expected_version: version, body: nextBody },
           })
           updateNoteCaches(saved)
+          // Note edits, not just create/archive/restore, produce a
+          // note.updated audit event that the dashboard's recently_changed
+          // feed surfaces -- autosave must invalidate it too, or that feed
+          // shows stale content until some other mutation happens to
+          // refresh it.
+          void queryClient.invalidateQueries({ queryKey: ['dashboard', 'today'] })
+          void queryClient.invalidateQueries({ queryKey: ['brief', 'morning'] })
           drafts.removePersisted(note.id, { text: nextBody, baseVersion: version })
           if (drafts.get(note.id)) drafts.rebase(note.id, saved.version)
           baseVersion.current = saved.version
