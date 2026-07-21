@@ -12,6 +12,7 @@ from sqlalchemy.orm import Session
 
 from ecc.auth import AuthContext, AuthDep, CsrfDep
 from ecc.database import get_session
+from ecc.domains.knowledge.retrieval import queue_retrieval_document
 from ecc.domains.knowledge.timeline import queue_timeline_entry
 from ecc.observability import (
     queue_lifecycle_event,
@@ -170,6 +171,25 @@ def _entity_version(session: Session, auth: AuthContext, entity_id: UUID) -> int
     return row[0] if row is not None else None
 
 
+def _entity_retrieval_fields(
+    session: Session, auth: AuthContext, entity_id: UUID
+) -> tuple[str, str, str | None, int] | None:
+    row = session.execute(
+        text(
+            """
+            SELECT node_type, canonical_name, attributes, version FROM pkos_nodes
+            WHERE workspace_id = :workspace_id AND id = :entity_id
+            """
+        ),
+        {"workspace_id": auth.workspace_id, "entity_id": entity_id},
+    ).one_or_none()
+    if row is None:
+        return None
+    node_type, canonical_name, attributes, version = row
+    summary = (attributes or {}).get("summary")
+    return node_type, canonical_name, summary, version
+
+
 def _write_side_effects(
     session: Session,
     auth: AuthContext,
@@ -317,6 +337,12 @@ def create_claim(
             now,
             source_id=payload.source_id,
         )
+        retrieval_fields = _entity_retrieval_fields(session, auth, entity_id)
+        if retrieval_fields is not None:
+            kind, canonical_name, summary, version = retrieval_fields
+            queue_retrieval_document(
+                session, auth.workspace_id, entity_id, kind, canonical_name, summary, version, now
+            )
         _store_cached(session, auth, idempotency_key, request_hash, response, now)
         return response
 
@@ -426,5 +452,11 @@ def supersede_claim(
             now,
             source_id=payload.source_id,
         )
+        retrieval_fields = _entity_retrieval_fields(session, auth, entity_id)
+        if retrieval_fields is not None:
+            kind, canonical_name, summary, version = retrieval_fields
+            queue_retrieval_document(
+                session, auth.workspace_id, entity_id, kind, canonical_name, summary, version, now
+            )
         _store_cached(session, auth, idempotency_key, request_hash, response, now)
         return response

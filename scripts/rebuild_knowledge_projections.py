@@ -2,17 +2,17 @@
 
 Rebuildable per docs/domain/PKOS-SCHEMA.md's "projections are rebuildable"
 rule and phase-002/DATA-MODEL.md's "Derived search, embedding and timeline
-projections are rebuildable" data-model rule: timeline_entries (and, once
-Task 6 lands, retrieval_documents) are derived from authoritative tables
-(currently audit_events) and can always be regenerated from scratch.
+projections are rebuildable" data-model rule: timeline_entries is derived
+from audit_events, retrieval_documents from pkos_nodes/knowledge_claims --
+both authoritative tables -- and can always be regenerated from scratch.
 
 CLI usage:
 
     uv run python scripts/rebuild_knowledge_projections.py
-        Rebuild timeline_entries for every workspace in ECC_DATABASE_URL.
+        Rebuild every projection for every workspace in ECC_DATABASE_URL.
 
     uv run python scripts/rebuild_knowledge_projections.py --workspace-id UUID
-        Rebuild timeline_entries for a single workspace.
+        Rebuild every projection for a single workspace.
 """
 
 from __future__ import annotations
@@ -23,6 +23,7 @@ from uuid import UUID
 from sqlalchemy import text
 
 from ecc.database import SessionFactory
+from ecc.domains.knowledge.retrieval import rebuild_retrieval_documents
 from ecc.domains.knowledge.timeline import rebuild_timeline
 
 
@@ -42,8 +43,15 @@ def main(argv: list[str] | None = None) -> int:
                 row[0] for row in session.execute(text("SELECT id FROM workspaces")).all()
             ]
         for workspace_id in workspace_ids:
-            report = rebuild_timeline(session, workspace_id)
-            print(f"{report.workspace_id}\ttimeline_entries\t{report.entries_written}")
+            timeline_report = rebuild_timeline(session, workspace_id)
+            print(
+                f"{timeline_report.workspace_id}\ttimeline_entries\t{timeline_report.entries_written}"
+            )
+            retrieval_report = rebuild_retrieval_documents(session, workspace_id)
+            print(
+                f"{retrieval_report.workspace_id}\tretrieval_documents\t"
+                f"{retrieval_report.documents_written}"
+            )
         session.commit()
     return 0
 

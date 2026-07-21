@@ -15,6 +15,7 @@ from sqlalchemy.orm import Session
 from ecc.auth import AuthContext, AuthDep, CsrfDep
 from ecc.config import get_settings
 from ecc.database import get_session
+from ecc.domains.knowledge.retrieval import queue_retrieval_document
 from ecc.domains.knowledge.timeline import queue_timeline_entry
 from ecc.observability import (
     queue_lifecycle_event,
@@ -290,6 +291,16 @@ def create_entity_core(
             entity_id,
             "knowledge_entity.created",
             f"{payload.kind} '{payload.canonical_name}' created",
+            now,
+        )
+        queue_retrieval_document(
+            session,
+            auth.workspace_id,
+            entity_id,
+            payload.kind,
+            payload.canonical_name,
+            payload.summary,
+            1,
             now,
         )
         session.execute(

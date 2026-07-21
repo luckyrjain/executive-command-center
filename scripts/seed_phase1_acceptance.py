@@ -64,11 +64,11 @@ WORKSPACE_LABELS: tuple[str, ...] = ("alpha", "bravo")
 # Tables that carry a `workspace_id` column directly (every Phase 1 table
 # except `workspaces` itself, `event_inbox`, and `event_dead_letters`, plus
 # the Phase 2 tables added by backend/migrations/versions/0011_phase2_
-# knowledge_entities.py, 0012_phase2_timeline.py, and 0013_phase2_
-# resolution.py -- verify_restore.sh's workspace-isolation check discovers
-# workspace_id-bearing tables generically, so any such table without
-# seeded rows here fails that check regardless of whether it's listed in
-# ALL_PHASE1_TABLES's name).
+# knowledge_entities.py, 0012_phase2_timeline.py, 0013_phase2_
+# resolution.py, and 0014_phase2_retrieval.py -- verify_restore.sh's
+# workspace-isolation check discovers workspace_id-bearing tables
+# generically, so any such table without seeded rows here fails that check
+# regardless of whether it's listed in ALL_PHASE1_TABLES's name).
 _WORKSPACE_ID_TABLES: tuple[str, ...] = (
     "users",
     "sessions",
@@ -93,6 +93,7 @@ _WORKSPACE_ID_TABLES: tuple[str, ...] = (
     "timeline_entries",
     "resolution_candidates",
     "entity_operations",
+    "retrieval_documents",
 )
 # `workspaces` is scoped by its own `id`, not a `workspace_id` column.
 _WORKSPACE_TABLE = "workspaces"
@@ -125,6 +126,7 @@ def _fixture_ids(label: str) -> dict[str, UUID]:
         "timeline_entry": seed_id(label, "timeline_entry", "person"),
         "resolution_candidate": seed_id(label, "resolution_candidate", "person_topic"),
         "entity_operation": seed_id(label, "entity_operation", "merge"),
+        "retrieval_document": seed_id(label, "retrieval_document", "person"),
         "outbox_event": seed_id(label, "event_outbox", "marker"),
         "dead_letter": seed_id(label, "event_dead_letter", "marker"),
         "task_active": seed_id(label, "task", "active"),
@@ -388,6 +390,26 @@ def _seed_pkos(cur: psycopg.Cursor[Any], label: str, ids: Mapping[str, UUID]) ->
             "actor_id": ids["user"],
             "reason": f"seed entity operation {label}",
             "created_at": SEED_EPOCH,
+        },
+    )
+    cur.execute(
+        """
+        INSERT INTO retrieval_documents (
+            id, workspace_id, entity_type, entity_id, title, body,
+            source_version, updated_at
+        ) VALUES (
+            %(id)s, %(workspace_id)s, 'person', %(entity_id)s, %(title)s, %(body)s,
+            1, %(updated_at)s
+        )
+        ON CONFLICT (id) DO NOTHING
+        """,
+        {
+            "id": ids["retrieval_document"],
+            "workspace_id": ids["workspace"],
+            "entity_id": ids["node_person"],
+            "title": f"Seed Person {label.capitalize()}",
+            "body": f"seed retrieval document {label}",
+            "updated_at": SEED_EPOCH,
         },
     )
 
