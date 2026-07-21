@@ -32,11 +32,15 @@ export async function run({ page, baseURL }) {
   await section.getByLabel('Note body').fill('Draft the offsite agenda for Friday')
   await section.getByLabel('Note type').selectOption('decision')
   await section.getByRole('button', { name: 'Create note' }).click()
-  await section.getByText('Offsite agenda').waitFor()
+  // { exact: true }: the note's body ("Draft the offsite agenda for
+  // Friday") also case-insensitively contains "Offsite agenda" as a
+  // substring, which would otherwise make this locator ambiguous between
+  // the title and the body paragraph.
+  await section.getByText('Offsite agenda', { exact: true }).waitFor()
 
   await section.getByLabel('Search notes').fill('offsite')
-  await section.getByText('Offsite agenda').waitFor()
-  assert.equal(await section.getByText('Board memo').count(), 0)
+  await section.getByText('Offsite agenda', { exact: true }).waitFor()
+  assert.equal(await section.getByText('Board memo', { exact: true }).count(), 0)
   await section.getByLabel('Search notes').fill('')
   await section.getByText('Board memo').waitFor()
 

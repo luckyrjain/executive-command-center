@@ -97,6 +97,17 @@ export async function run({ page, baseURL }) {
   await page.keyboard.press('Enter')
   await risksSection.getByText('Vendor concentration (reviewed)').waitFor()
 
+  // Archive then restore, still keyboard-only. Neither action has any
+  // other scenario coverage for risks (tasks.mjs covers archive/restore
+  // for tasks; nothing exercises it for risks).
+  await risksSection.getByRole('button', { name: 'Archive Vendor concentration (reviewed)' }).focus()
+  await page.keyboard.press('Enter')
+  const restoreButton = risksSection.getByRole('button', { name: 'Restore Vendor concentration (reviewed)' })
+  await restoreButton.waitFor()
+  await restoreButton.focus()
+  await page.keyboard.press('Enter')
+  await risksSection.getByRole('button', { name: 'Archive Vendor concentration (reviewed)' }).waitFor()
+
   // Continue keyboard navigation: risks(4) -> recommendations(5) -> search-audit(6).
   await page.getByRole('tab', { name: 'Risks' }).focus()
   await page.keyboard.press('ArrowRight')
