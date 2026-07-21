@@ -28,12 +28,12 @@
 
 - `backend/migrations/versions/0010_phase2_pkos_reconciliation.py`: add the Phase-1-deferred columns to `pkos_nodes`/`pkos_edges`/`pkos_evidence` (design doc's Open decision 1 recommendation).
 - `backend/migrations/versions/0011_phase2_knowledge_entities.py`: `entity_aliases`, `knowledge_claims`.
-- `backend/migrations/versions/0012_phase2_resolution.py`: `resolution_candidates`, `entity_operations`.
-- `backend/migrations/versions/0013_phase2_timeline.py`: `timeline_entries`.
+- `backend/migrations/versions/0012_phase2_timeline.py`: `timeline_entries`.
+- `backend/migrations/versions/0013_phase2_resolution.py`: `resolution_candidates`, `entity_operations`.
 - `backend/migrations/versions/0014_phase2_retrieval.py`: `retrieval_documents`.
 - `backend/migrations/versions/0015_phase2_embeddings.py`: `embedding_projections` — created only when Slice 7 actually starts (schema-only migration ships with that slice's PR, not earlier, so an unused table doesn't sit ahead of its RFC approval).
 
-Each migration is created and applied by exactly one task below, never reopened by a later one — an already-applied Alembic migration is never edited after the fact (standard Alembic hygiene: amending a migration another task's regression pass already ran against a real database breaks reproducibility for anyone who ran it first). Task 1's `0010` therefore adds the reconciliation columns to all three PKOS tables (`pkos_nodes`, `pkos_edges`, `pkos_evidence`) in one pass up front, even though Task 2 is what actually starts reading/writing the edge columns — not a second, later edit to `0010`.
+Each migration is created and applied by exactly one task below, never reopened by a later one — an already-applied Alembic migration is never edited after the fact (standard Alembic hygiene: amending a migration another task's regression pass already ran against a real database breaks reproducibility for anyone who ran it first). Task 1's `0010` therefore adds the reconciliation columns to all three PKOS tables (`pkos_nodes`, `pkos_edges`, `pkos_evidence`) in one pass up front, even though Task 2 is what actually starts reading/writing the edge columns — not a second, later edit to `0010`. Migration file numbers match actual implementation/chain order, not task numbers in this plan -- Task 3 (timeline) was implemented before Task 4 (resolution), so `timeline_entries` took the next open slot (`0012`) and `resolution_candidates`/`entity_operations` took `0013`, swapped from this document's original task-number-matched assignment.
 - `backend/ecc/domains/identity/__init__.py`, `person_organizations.py`: Person/Organization CRUD, queries + mutations split.
 - `backend/ecc/domains/knowledge/entities.py`, `entities_mutations.py`: `knowledge_entities` (extended `pkos_nodes`) queries/mutations, aliases.
 - `backend/ecc/domains/knowledge/claims.py`: claim record/supersede.
@@ -111,7 +111,7 @@ Each migration is created and applied by exactly one task below, never reopened 
 ### Task 3: Timeline projection and deterministic rebuild
 
 **Files:**
-- Create: `backend/migrations/versions/0013_phase2_timeline.py`
+- Create: `backend/migrations/versions/0012_phase2_timeline.py`
 - Create: `backend/ecc/domains/knowledge/timeline.py`
 - Create: `scripts/rebuild_knowledge_projections.py` (timeline half)
 - Create: `tests/test_knowledge_timeline_postgres.py`
@@ -129,7 +129,7 @@ Each migration is created and applied by exactly one task below, never reopened 
 ### Task 4: Resolution candidates and human review
 
 **Files:**
-- Create: `backend/migrations/versions/0012_phase2_resolution.py` (both `resolution_candidates` and `entity_operations` — Task 5's merge/reverse work reads/writes `entity_operations` but needs no migration of its own, since this one already created it)
+- Create: `backend/migrations/versions/0013_phase2_resolution.py` (both `resolution_candidates` and `entity_operations` — Task 5's merge/reverse work reads/writes `entity_operations` but needs no migration of its own, since this one already created it)
 - Create: `backend/ecc/domains/knowledge/resolution.py`
 - Create: `tests/test_knowledge_resolution_postgres.py`
 - Create: `tests/fixtures/phase2_resolution_dataset.py`
