@@ -185,17 +185,19 @@ export default function RecommendationPanel() {
   })
   const mutation = useMutation({
     mutationFn: mutateRecommendation,
-    onSuccess: (_data, { action }) => {
+    onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: ['recommendations', 'review'] })
-      // Confirming a recommendation executes its proposed action server-side
-      // (backend/ecc/domains/governance/recommendation_mutations.py's
-      // execute_target) -- e.g. completing a task or closing a risk -- so
-      // the dashboard and morning brief must also refresh, or they keep
-      // showing the pre-confirmation entity state.
-      if (action === 'confirm') {
-        void queryClient.invalidateQueries({ queryKey: ['dashboard', 'today'] })
-        void queryClient.invalidateQueries({ queryKey: ['brief', 'morning'] })
-      }
+      // Every action (publish/confirm/reject/defer/pin) writes its own
+      // 'recommendation'-aggregate audit event
+      // (backend/ecc/domains/governance/recommendation_events.py's
+      // record_event, called by every branch of _transition as well as
+      // confirm), which the dashboard's recently_changed feed surfaces
+      // regardless of action -- not just confirm, which additionally
+      // executes the proposed action server-side against another entity
+      // (execute_target). So all five actions need the dashboard/brief
+      // caches invalidated, not just confirm.
+      void queryClient.invalidateQueries({ queryKey: ['dashboard', 'today'] })
+      void queryClient.invalidateQueries({ queryKey: ['brief', 'morning'] })
     },
     onError: (error) => {
       if (error instanceof ApiError && (error.code === 'VERSION_CONFLICT' || error.code === 'TARGET_VERSION_CONFLICT')) {

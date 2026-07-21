@@ -240,7 +240,11 @@ describe('recommendation preview (rendered)', () => {
     expect(invalidatedKeys).toContainEqual(['brief', 'morning'])
   })
 
-  it('does not invalidate the dashboard or morning brief caches for non-executing actions', async () => {
+  it('invalidates the dashboard and morning brief caches for non-executing actions too', async () => {
+    // Every action -- not just confirm -- writes its own recommendation
+    // audit event (record_event, called by every branch of _transition),
+    // which the dashboard's recently_changed feed surfaces regardless of
+    // action.
     const pending = { ...riskRecommendation, evidence_ids: [] }
     const rejected = { ...pending, status: 'rejected' }
     const fetch = fetchRouter([
@@ -264,7 +268,7 @@ describe('recommendation preview (rendered)', () => {
     await waitFor(() => expect(invalidateSpy).toHaveBeenCalled())
     const invalidatedKeys = invalidateSpy.mock.calls.map((call) => call[0]?.queryKey)
     expect(invalidatedKeys).toContainEqual(['recommendations', 'review'])
-    expect(invalidatedKeys).not.toContainEqual(['dashboard', 'today'])
-    expect(invalidatedKeys).not.toContainEqual(['brief', 'morning'])
+    expect(invalidatedKeys).toContainEqual(['dashboard', 'today'])
+    expect(invalidatedKeys).toContainEqual(['brief', 'morning'])
   })
 })
