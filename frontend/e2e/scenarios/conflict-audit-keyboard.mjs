@@ -108,8 +108,9 @@ export async function run({ page, baseURL }) {
   await page.keyboard.press('Enter')
   await risksSection.getByRole('button', { name: 'Archive Vendor concentration (reviewed)' }).waitFor()
 
-  // Continue keyboard navigation: risks(4) -> recommendations(5) -> search-audit(6).
+  // Continue keyboard navigation: risks(4) -> knowledge(5) -> recommendations(6) -> search-audit(7).
   await page.getByRole('tab', { name: 'Risks' }).focus()
+  await page.keyboard.press('ArrowRight')
   await page.keyboard.press('ArrowRight')
   await page.keyboard.press('ArrowRight')
   assert.equal(await page.getByRole('tab', { name: 'Search & audit' }).getAttribute('aria-selected'), 'true')

@@ -11,6 +11,8 @@ import * as recommendationExecution from './scenarios/recommendation-execution.m
 import * as recommendationDecisions from './scenarios/recommendation-decisions.mjs'
 import * as recommendationTerminals from './scenarios/recommendation-terminals.mjs'
 import * as conflictAuditKeyboard from './scenarios/conflict-audit-keyboard.mjs'
+import * as knowledgeEntities from './scenarios/knowledge-entities.mjs'
+import * as knowledgeResolution from './scenarios/knowledge-resolution.mjs'
 
 const scenarios = [
   { name: 'tasks', module: tasks },
@@ -23,11 +25,19 @@ const scenarios = [
   { name: 'recommendation-decisions', module: recommendationDecisions },
   { name: 'recommendation-terminals', module: recommendationTerminals },
   { name: 'conflict-audit-keyboard', module: conflictAuditKeyboard },
+  { name: 'knowledge-entities', module: knowledgeEntities },
+  { name: 'knowledge-resolution', module: knowledgeResolution },
 ]
 
 async function main() {
   const server = await startPreviewServer()
-  const browser = await chromium.launch({ headless: true })
+  // PLAYWRIGHT_CHROMIUM_EXECUTABLE lets a sandboxed dev environment point at
+  // a pre-installed chromium binary that doesn't match the revision the
+  // pinned `playwright` package would otherwise try to download. Unset in
+  // CI, where `playwright install --with-deps chromium` already provisions
+  // the matching revision playwright expects.
+  const executablePath = process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE
+  const browser = await chromium.launch({ headless: true, ...(executablePath ? { executablePath } : {}) })
   const failures = []
 
   try {

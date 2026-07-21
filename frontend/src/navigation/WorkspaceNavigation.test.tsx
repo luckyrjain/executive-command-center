@@ -34,17 +34,18 @@ describe('WorkspaceNavigation', () => {
     expect(markup).toContain('Notes')
     expect(markup).toContain('Schedule')
     expect(markup).toContain('Risks')
+    expect(markup).toContain('Knowledge')
     expect(markup).toContain('Recommendations')
     expect(markup).toContain('Search &amp; audit')
     expect(markup.match(/aria-selected="true"/g)).toHaveLength(1)
   })
 
   it('moves focus with horizontal arrow keys and wraps at either end', () => {
-    expect(nextWorkspaceIndex(0, 'ArrowRight', 7)).toBe(1)
-    expect(nextWorkspaceIndex(6, 'ArrowRight', 7)).toBe(0)
-    expect(nextWorkspaceIndex(0, 'ArrowLeft', 7)).toBe(6)
-    expect(nextWorkspaceIndex(3, 'Home', 7)).toBe(0)
-    expect(nextWorkspaceIndex(3, 'End', 7)).toBe(6)
+    expect(nextWorkspaceIndex(0, 'ArrowRight', 8)).toBe(1)
+    expect(nextWorkspaceIndex(7, 'ArrowRight', 8)).toBe(0)
+    expect(nextWorkspaceIndex(0, 'ArrowLeft', 8)).toBe(7)
+    expect(nextWorkspaceIndex(3, 'Home', 8)).toBe(0)
+    expect(nextWorkspaceIndex(3, 'End', 8)).toBe(7)
 
     const focus = [vi.fn(), vi.fn()]
     const navigate = vi.fn()
@@ -65,16 +66,16 @@ describe('WorkspaceNavigation', () => {
     expect(tabs[0].tabIndex).toBe(-1)
 
     expect(fireEvent.keyDown(tabs[1], { key: 'End' })).toBe(false)
-    expect(document.activeElement).toBe(tabs[6])
-    expect(tabs[6].getAttribute('aria-selected')).toBe('true')
+    expect(document.activeElement).toBe(tabs[7])
+    expect(tabs[7].getAttribute('aria-selected')).toBe('true')
 
-    expect(fireEvent.keyDown(tabs[6], { key: 'Home' })).toBe(false)
+    expect(fireEvent.keyDown(tabs[7], { key: 'Home' })).toBe(false)
     expect(document.activeElement).toBe(tabs[0])
     expect(tabs[0].getAttribute('aria-selected')).toBe('true')
 
     expect(fireEvent.keyDown(tabs[0], { key: 'ArrowLeft' })).toBe(false)
-    expect(document.activeElement).toBe(tabs[6])
-    expect(tabs[6].tabIndex).toBe(0)
+    expect(document.activeElement).toBe(tabs[7])
+    expect(tabs[7].tabIndex).toBe(0)
     expect(tabs.filter((tab) => tab.getAttribute('aria-selected') === 'true')).toHaveLength(1)
   })
 
