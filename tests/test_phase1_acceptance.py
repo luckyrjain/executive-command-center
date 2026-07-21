@@ -315,29 +315,33 @@ RELEASE_GATE_ITEMS_WITH_EVIDENCE = (
     "Database migration rollback limitations are explicit.",
     "Environment variables and secret ownership are documented.",
     "Critical, High and Medium review findings are zero before merge.",
+    # Moved here from RELEASE_GATE_ITEMS_STILL_OPEN after PR #15 merged: the
+    # branch's final commit (c79afb3) was independently re-verified live via
+    # GitHub Actions CI (run IDs 29804619977/29804620011) rather than only
+    # reasoned about locally -- the security job (gitleaks, Syft SBOM, Trivy
+    # filesystem scan) and containers job (Trivy image scan of both built
+    # images) both completed with conclusion "success". Unlike every
+    # .superpowers/sdd/* citation, a GitHub Actions run ID on this repository
+    # is independently inspectable, not a dead pointer.
+    "Dependency, secret, container and SBOM scans pass.",
 )
 
 # Checklist items that genuinely cannot be proven live in this local
-# environment, or that reflect a real currently-failing gate: Trivy's
-# vulnerability-database scan results and `pnpm audit`'s network-dependent
-# findings were actually run live in Task 12 (network access was available,
-# contrary to task-11-review.md's assumption) and found real HIGH/CRITICAL
-# findings in frontend dependencies and both container base images -- a
-# genuine failing gate, not merely unverifiable; gitleaks and the SBOM step
-# were not independently re-run locally. No live CI/CD pipeline exists yet
-# to run post-deploy smoke checks automatically. These must stay unchecked,
-# not be silently checked off.
+# environment, or that reflect a real currently-open gap: no live CI/CD
+# pipeline exists yet to run post-deploy smoke checks automatically, because
+# Phase 1 has no hosted environment. This must stay unchecked, not be
+# silently checked off.
 #
 # ("Backend Ruff, formatting, mypy, Alembic and PostgreSQL tests pass." was
 # also in this list after Task 12 discovered a real, CI-config-reproducing
 # test-isolation defect in tests/test_production_security.py's
 # restore_main_module fixture -- fixed and independently re-reviewed in
 # commit 87e12b2 (see task-ci-secret-fix-report.md), so it moved back to
-# RELEASE_GATE_ITEMS_WITH_EVIDENCE above.)
-RELEASE_GATE_ITEMS_STILL_OPEN = (
-    "Dependency, secret, container and SBOM scans pass.",
-    "Post-deployment smoke checks are automated.",
-)
+# RELEASE_GATE_ITEMS_WITH_EVIDENCE above. "Dependency, secret, container and
+# SBOM scans pass." was here too, until PR #15's merge and its live CI
+# verification moved it to RELEASE_GATE_ITEMS_WITH_EVIDENCE as well -- see
+# the comment there.)
+RELEASE_GATE_ITEMS_STILL_OPEN = ("Post-deployment smoke checks are automated.",)
 
 
 def test_release_gate_checks_items_with_genuine_evidence() -> None:
