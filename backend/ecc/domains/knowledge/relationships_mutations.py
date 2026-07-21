@@ -18,6 +18,7 @@ from ecc.domains.knowledge.relationships import (
     _store_cached,
     _write_side_effects,
 )
+from ecc.domains.knowledge.timeline import queue_timeline_entry
 
 router = APIRouter(prefix="/api/v1/knowledge/relationships", tags=["knowledge-relationships"])
 SessionDep = Annotated[Session, Depends(get_session)]
@@ -108,6 +109,15 @@ def invalidate_relationship(
             relationship_id,
             source_version,
             now,
+        )
+        queue_timeline_entry(
+            session,
+            auth.workspace_id,
+            response.from_entity_id,
+            "relationship.invalidated",
+            f"{response.relationship_type} -> {response.to_entity_id} invalidated",
+            now,
+            source_id=response.evidence_id,
         )
         _store_cached(session, auth, idempotency_key, request_hash, response, now, 200)
         return response

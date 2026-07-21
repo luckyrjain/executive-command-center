@@ -72,6 +72,7 @@ def identity_test_context() -> Iterator[tuple[TestClient, UUID, UUID, str]]:
                 "event_outbox",
                 "audit_events",
                 "idempotency_records",
+                "timeline_entries",
                 "pkos_nodes",
                 "sessions",
                 "users",

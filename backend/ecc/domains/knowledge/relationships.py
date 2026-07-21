@@ -12,6 +12,7 @@ from sqlalchemy.orm import Session
 
 from ecc.auth import AuthContext, AuthDep, CsrfDep
 from ecc.database import get_session
+from ecc.domains.knowledge.timeline import queue_timeline_entry
 from ecc.observability import (
     queue_lifecycle_event,
     record_audit_outbox_failure,
@@ -365,6 +366,15 @@ def create_relationship(
         response = _project(dict(row))
         _write_side_effects(
             session, auth, request, "relationship.created", relationship_id, source_version, now
+        )
+        queue_timeline_entry(
+            session,
+            auth.workspace_id,
+            entity_id,
+            "relationship.created",
+            f"{payload.relationship_type} -> {payload.to_entity_id}",
+            now,
+            source_id=payload.evidence_id,
         )
         _store_cached(session, auth, idempotency_key, request_hash, response, now, 201)
         return response

@@ -15,6 +15,7 @@ from sqlalchemy.orm import Session
 from ecc.auth import AuthContext, AuthDep, CsrfDep
 from ecc.config import get_settings
 from ecc.database import get_session
+from ecc.domains.knowledge.timeline import queue_timeline_entry
 from ecc.observability import (
     queue_lifecycle_event,
     record_audit_outbox_failure,
@@ -283,6 +284,14 @@ def create_entity_core(
         )
         response = _project(dict(row))
         _write_side_effects(session, auth, request, entity_id, 1, now)
+        queue_timeline_entry(
+            session,
+            auth.workspace_id,
+            entity_id,
+            "knowledge_entity.created",
+            f"{payload.kind} '{payload.canonical_name}' created",
+            now,
+        )
         session.execute(
             text(
                 """

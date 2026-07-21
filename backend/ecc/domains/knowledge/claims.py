@@ -12,6 +12,7 @@ from sqlalchemy.orm import Session
 
 from ecc.auth import AuthContext, AuthDep, CsrfDep
 from ecc.database import get_session
+from ecc.domains.knowledge.timeline import queue_timeline_entry
 from ecc.observability import (
     queue_lifecycle_event,
     record_audit_outbox_failure,
@@ -307,6 +308,15 @@ def create_claim(
             response.id,
             now,
         )
+        queue_timeline_entry(
+            session,
+            auth.workspace_id,
+            entity_id,
+            "knowledge_entity.claim_recorded",
+            f"claim recorded: {payload.predicate}",
+            now,
+            source_id=payload.source_id,
+        )
         _store_cached(session, auth, idempotency_key, request_hash, response, now)
         return response
 
@@ -406,6 +416,15 @@ def supersede_claim(
             entity_version,
             response.id,
             now,
+        )
+        queue_timeline_entry(
+            session,
+            auth.workspace_id,
+            entity_id,
+            "knowledge_entity.claim_recorded",
+            f"claim superseded: {payload.predicate}",
+            now,
+            source_id=payload.source_id,
         )
         _store_cached(session, auth, idempotency_key, request_hash, response, now)
         return response

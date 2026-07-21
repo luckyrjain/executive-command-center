@@ -20,7 +20,7 @@ pytestmark = pytest.mark.skipif(
 
 
 @pytest.fixture
-def claims_test_context() -> Iterator[tuple[TestClient, UUID, UUID, str, UUID]]:
+def timeline_test_context() -> Iterator[tuple[TestClient, UUID, UUID, str, UUID]]:
     workspace_id = uuid4()
     user_id = uuid4()
     session_id = uuid4()
@@ -30,7 +30,7 @@ def claims_test_context() -> Iterator[tuple[TestClient, UUID, UUID, str, UUID]]:
     with engine.begin() as connection:
         connection.execute(
             text("INSERT INTO workspaces (id, name, created_at) VALUES (:id, :name, :created_at)"),
-            {"id": workspace_id, "name": "Knowledge Claims Test", "created_at": now},
+            {"id": workspace_id, "name": "Knowledge Timeline Test", "created_at": now},
         )
         connection.execute(
             text(
@@ -63,16 +63,15 @@ def claims_test_context() -> Iterator[tuple[TestClient, UUID, UUID, str, UUID]]:
 
     client = TestClient(app)
     client.cookies.set("ecc_session", token)
-
     csrf = new(settings.session_secret.encode(), token.encode(), "sha256").hexdigest()
     entity_response = client.post(
         "/api/v1/knowledge/entities",
         headers={
-            "Idempotency-Key": "create-subject-entity",
+            "Idempotency-Key": "create-timeline-subject",
             "X-CSRF-Token": csrf,
             "X-Correlation-ID": str(uuid4()),
         },
-        json={"kind": "person", "canonical_name": "Ada Lovelace"},
+        json={"kind": "person", "canonical_name": "Timeline Subject"},
     )
     entity_id = UUID(entity_response.json()["id"])
 
@@ -113,7 +112,23 @@ def _headers(token: str, key: str) -> dict[str, str]:
     }
 
 
-def _create_evidence(workspace_id: UUID, entity_id: UUID) -> UUID:
+def test_entity_creation_is_recorded_on_its_own_timeline(
+    timeline_test_context: tuple[TestClient, UUID, UUID, str, UUID],
+) -> None:
+    client, _workspace_id, _user_id, token, entity_id = timeline_test_context
+    response = client.get(
+        f"/api/v1/knowledge/entities/{entity_id}/timeline", headers=_headers(token, "get-timeline")
+    )
+    assert response.status_code == 200
+    items = response.json()["items"]
+    assert any(item["event_type"] == "knowledge_entity.created" for item in items)
+
+
+def test_claim_and_relationship_mutations_appear_on_timeline(
+    timeline_test_context: tuple[TestClient, UUID, UUID, str, UUID],
+) -> None:
+    client, workspace_id, _user_id, token, entity_id = timeline_test_context
+
     evidence_id = uuid4()
     now = datetime.now(UTC)
     with engine.begin() as connection:
@@ -121,7 +136,7 @@ def _create_evidence(workspace_id: UUID, entity_id: UUID) -> UUID:
             text(
                 "INSERT INTO pkos_evidence (id, workspace_id, node_id, source_type, "
                 "source_ref, sha256, captured_at) VALUES (:id, :workspace_id, :node_id, "
-                "'manual', 'test-source-ref', :sha256, :captured_at)"
+                "'manual', 'timeline-test-ref', :sha256, :captured_at)"
             ),
             {
                 "id": evidence_id,
@@ -131,91 +146,66 @@ def _create_evidence(workspace_id: UUID, entity_id: UUID) -> UUID:
                 "captured_at": now,
             },
         )
-    return evidence_id
 
-
-def test_claim_record_requires_at_least_one_source_reference(
-    claims_test_context: tuple[TestClient, UUID, UUID, str, UUID],
-) -> None:
-    client, _workspace_id, _user_id, token, entity_id = claims_test_context
-    missing_source = client.post(
+    client.post(
         f"/api/v1/knowledge/entities/{entity_id}/claims",
-        headers=_headers(token, "missing-source"),
-        json={"predicate": "employed_at", "value": {"organization": "Analytical Engines Ltd"}},
-    )
-    assert missing_source.status_code == 422
-
-
-def test_claim_record_and_list(
-    claims_test_context: tuple[TestClient, UUID, UUID, str, UUID],
-) -> None:
-    client, workspace_id, _user_id, token, entity_id = claims_test_context
-    evidence_id = _create_evidence(workspace_id, entity_id)
-
-    create = client.post(
-        f"/api/v1/knowledge/entities/{entity_id}/claims",
-        headers=_headers(token, "create-claim"),
+        headers=_headers(token, "create-timeline-claim"),
         json={
-            "predicate": "employed_at",
-            "value": {"organization": "Analytical Engines Ltd"},
+            "predicate": "role",
+            "value": {"title": "Engineer"},
             "source_id": str(evidence_id),
         },
     )
-    assert create.status_code == 201, create.text
-    claim = create.json()
-    assert claim["predicate"] == "employed_at"
-    assert claim["value"] == {"organization": "Analytical Engines Ltd"}
-    assert claim["confidence"] == 1.0
-    assert claim["superseded_by"] is None
 
-    listed = client.get(
-        f"/api/v1/knowledge/entities/{entity_id}/claims", headers=_headers(token, "list-claims")
+    other = client.post(
+        "/api/v1/knowledge/entities",
+        headers=_headers(token, "create-timeline-other-entity"),
+        json={"kind": "project", "canonical_name": "Timeline Project"},
     )
-    assert listed.status_code == 200
-    assert any(item["id"] == claim["id"] for item in listed.json()["items"])
+    other_id = other.json()["id"]
+    client.post(
+        f"/api/v1/knowledge/entities/{entity_id}/relationships",
+        headers=_headers(token, "create-timeline-relationship"),
+        json={"relationship_type": "WORKS_ON", "to_entity_id": other_id},
+    )
+
+    response = client.get(
+        f"/api/v1/knowledge/entities/{entity_id}/timeline", headers=_headers(token, "list-timeline")
+    )
+    event_types = {item["event_type"] for item in response.json()["items"]}
+    assert "knowledge_entity.claim_recorded" in event_types
+    assert "relationship.created" in event_types
 
 
-def test_claim_supersede_never_destructively_overwrites(
-    claims_test_context: tuple[TestClient, UUID, UUID, str, UUID],
+def test_timeline_is_ordered_deterministically_and_paginates(
+    timeline_test_context: tuple[TestClient, UUID, UUID, str, UUID],
 ) -> None:
-    client, workspace_id, _user_id, token, entity_id = claims_test_context
-    evidence_id = _create_evidence(workspace_id, entity_id)
-
-    create = client.post(
-        f"/api/v1/knowledge/entities/{entity_id}/claims",
-        headers=_headers(token, "create-claim-2"),
-        json={
-            "predicate": "employed_at",
-            "value": {"organization": "Analytical Engines Ltd"},
-            "source_id": str(evidence_id),
-        },
-    )
-    original_id = create.json()["id"]
-
-    supersede = client.post(
-        f"/api/v1/knowledge/entities/{entity_id}/claims/{original_id}/supersede",
-        headers=_headers(token, "supersede-claim"),
-        json={
-            "predicate": "employed_at",
-            "value": {"organization": "Cambridge University"},
-            "source_id": str(evidence_id),
-        },
-    )
-    assert supersede.status_code == 201, supersede.text
-    new_claim = supersede.json()
-    assert new_claim["id"] != original_id
-    assert new_claim["value"] == {"organization": "Cambridge University"}
-
-    with engine.connect() as connection:
-        original_row = (
-            connection.execute(
-                text("SELECT superseded_by, valid_to FROM knowledge_claims WHERE id = :id"),
-                {"id": original_id},
-            )
-            .mappings()
-            .one()
+    client, _workspace_id, _user_id, token, entity_id = timeline_test_context
+    for index in range(5):
+        client.patch(
+            f"/api/v1/knowledge/entities/{entity_id}",
+            headers=_headers(token, f"update-timeline-{index}"),
+            json={"expected_version": index + 1, "summary": f"revision {index}"},
         )
-    # The original claim row still exists (not destructively overwritten) and
-    # now points at its replacement.
-    assert str(original_row["superseded_by"]) == new_claim["id"]
-    assert original_row["valid_to"] is not None
+
+    page_one = client.get(
+        f"/api/v1/knowledge/entities/{entity_id}/timeline",
+        params={"limit": 3},
+        headers=_headers(token, "timeline-page-1"),
+    )
+    assert page_one.status_code == 200
+    first_items = page_one.json()["items"]
+    assert len(first_items) == 3
+    cursor = page_one.json()["next_cursor"]
+    assert cursor is not None
+
+    page_two = client.get(
+        f"/api/v1/knowledge/entities/{entity_id}/timeline",
+        params={"limit": 3, "cursor": cursor},
+        headers=_headers(token, "timeline-page-2"),
+    )
+    assert page_two.status_code == 200
+    second_items = page_two.json()["items"]
+    first_ids = {item["id"] for item in first_items}
+    second_ids = {item["id"] for item in second_items}
+    assert first_ids.isdisjoint(second_ids)

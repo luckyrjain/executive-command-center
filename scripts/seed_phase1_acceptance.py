@@ -64,10 +64,10 @@ WORKSPACE_LABELS: tuple[str, ...] = ("alpha", "bravo")
 # Tables that carry a `workspace_id` column directly (every Phase 1 table
 # except `workspaces` itself, `event_inbox`, and `event_dead_letters`, plus
 # the Phase 2 tables added by backend/migrations/versions/0011_phase2_
-# knowledge_entities.py -- verify_restore.sh's workspace-isolation check
-# discovers workspace_id-bearing tables generically, so any such table
-# without seeded rows here fails that check regardless of whether it's
-# listed in ALL_PHASE1_TABLES's name).
+# knowledge_entities.py and 0012_phase2_timeline.py -- verify_restore.sh's
+# workspace-isolation check discovers workspace_id-bearing tables
+# generically, so any such table without seeded rows here fails that check
+# regardless of whether it's listed in ALL_PHASE1_TABLES's name).
 _WORKSPACE_ID_TABLES: tuple[str, ...] = (
     "users",
     "sessions",
@@ -89,6 +89,7 @@ _WORKSPACE_ID_TABLES: tuple[str, ...] = (
     "recommendation_feedback",
     "entity_aliases",
     "knowledge_claims",
+    "timeline_entries",
 )
 # `workspaces` is scoped by its own `id`, not a `workspace_id` column.
 _WORKSPACE_TABLE = "workspaces"
@@ -118,6 +119,7 @@ def _fixture_ids(label: str) -> dict[str, UUID]:
         "evidence": seed_id(label, "pkos_evidence", "person"),
         "entity_alias": seed_id(label, "entity_alias", "person"),
         "knowledge_claim": seed_id(label, "knowledge_claim", "person"),
+        "timeline_entry": seed_id(label, "timeline_entry", "person"),
         "outbox_event": seed_id(label, "event_outbox", "marker"),
         "dead_letter": seed_id(label, "event_dead_letter", "marker"),
         "task_active": seed_id(label, "task", "active"),
@@ -314,6 +316,27 @@ def _seed_pkos(cur: psycopg.Cursor[Any], label: str, ids: Mapping[str, UUID]) ->
             "value_json": f'{{"seed": "{label}"}}',
             "source_id": ids["evidence"],
             "created_at": SEED_EPOCH,
+        },
+    )
+    cur.execute(
+        """
+        INSERT INTO timeline_entries (
+            id, workspace_id, entity_id, effective_at, recorded_at, event_type,
+            source_id, summary
+        ) VALUES (
+            %(id)s, %(workspace_id)s, %(entity_id)s, %(effective_at)s, %(recorded_at)s,
+            'knowledge_entity.created', %(source_id)s, %(summary)s
+        )
+        ON CONFLICT (id) DO NOTHING
+        """,
+        {
+            "id": ids["timeline_entry"],
+            "workspace_id": ids["workspace"],
+            "entity_id": ids["node_person"],
+            "effective_at": SEED_EPOCH,
+            "recorded_at": SEED_EPOCH,
+            "source_id": ids["evidence"],
+            "summary": f"seed timeline entry {label}",
         },
     )
 

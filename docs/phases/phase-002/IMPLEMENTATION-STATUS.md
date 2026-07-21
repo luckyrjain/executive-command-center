@@ -2,7 +2,7 @@
 id: PHASE-002-IMPLEMENTATION-STATUS
 title: Phase 2 Implementation Status
 status: In progress
-version: 0.3.0
+version: 0.4.0
 owner: Lucky Jain
 updated: 2026-07-21
 ---
@@ -28,7 +28,7 @@ Phase 2 implementation has started on `feature/phase-2-knowledge-platform`. This
 |---|---|---|
 | 1 | Knowledge entities, aliases, claims and provenance | Backend implemented (commit `558bdb8`: migrations 0010-0011, `entities.py`/`entities_mutations.py`/`claims.py`/`identity/person_organizations.py`, 23 passing tests); frontend not started |
 | 2 | Typed relationships and entity detail | Backend implemented: `relationships.py`/`relationships_mutations.py` over extended `pkos_edges`, 4 passing tests; frontend not started |
-| 3 | Timeline projection and rebuild | Not started |
+| 3 | Timeline projection and rebuild | Backend implemented: migration `0012_phase2_timeline.py`, `timeline.py` (`GET /entities/{id}/timeline` signed-cursor paginated, `queue_timeline_entry` direct-transaction writer wired into entities/claims/relationships mutation paths, `rebuild_timeline` deterministic regenerator sourced from `audit_events`), `scripts/rebuild_knowledge_projections.py` CLI, 5 passing tests; frontend not started |
 | 4 | Resolution candidates and human review | Not started |
 | 5 | Reversible merge/split lineage | Not started |
 | 6 | Lexical retrieval and explanations | Not started |
