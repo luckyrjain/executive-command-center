@@ -278,7 +278,10 @@ function makeKnowledgeApi(overrides = {}) {
     if (pathname === '/api/v1/knowledge/resolution/candidates' && method === 'GET') {
       const params = new URLSearchParams(queryString)
       const status = params.get('status')
-      const items = resolutionCandidates.list().filter((item) => !status || item.status === status)
+      const items = resolutionCandidates
+        .list()
+        .filter((item) => !status || item.status === status)
+        .filter((item) => !item.deferred_until || new Date(item.deferred_until).getTime() <= Date.now())
       return { status: 200, body: { items, next_cursor: null } }
     }
     if (pathname === '/api/v1/knowledge/resolution/candidates' && method === 'POST') {
@@ -293,6 +296,7 @@ function makeKnowledgeApi(overrides = {}) {
         resolved_at: null,
         resolved_by: null,
         reason: null,
+        deferred_until: null,
       })
       return { status: 201, body: { deterministic: false, candidate: item } }
     }
@@ -307,6 +311,21 @@ function makeKnowledgeApi(overrides = {}) {
       candidate.resolved_at = nowIso()
       candidate.resolved_by = 'fixture-user'
       candidate.reason = body.reason
+      return { status: 200, body: candidate }
+    }
+    const deferMatch = pathname.match(
+      /^\/api\/v1\/knowledge\/resolution\/candidates\/([^/]+)\/defer$/,
+    )
+    if (deferMatch && method === 'POST') {
+      const candidate = resolutionCandidates.find(deferMatch[1])
+      if (!candidate) return { status: 404, body: { error: { code: 'CANDIDATE_NOT_FOUND', message: 'Not found' } } }
+      if (candidate.status !== 'open') {
+        return { status: 409, body: { error: { code: 'CANDIDATE_NOT_OPEN', message: 'Not open' } } }
+      }
+      if (new Date(body.deferred_until).getTime() <= Date.now()) {
+        return { status: 422, body: { error: { code: 'DEFER_UNTIL_MUST_BE_FUTURE', message: 'Must be future' } } }
+      }
+      candidate.deferred_until = body.deferred_until
       return { status: 200, body: candidate }
     }
 

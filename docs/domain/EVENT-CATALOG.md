@@ -79,6 +79,7 @@ Added incrementally, one entry per delivery slice, alongside the code that emits
 | `resolution_candidate.created.v1` | Knowledge Platform | candidate_id |
 | `resolution_candidate.confirmed.v1` | Knowledge Platform | candidate_id |
 | `resolution_candidate.rejected.v1` | Knowledge Platform | candidate_id |
+| `resolution_candidate.deferred.v1` | Knowledge Platform | candidate_id |
 | `entity_operation.merged.v1` | Knowledge Platform | operation_id |
 | `entity_operation.reversed.v1` | Knowledge Platform | operation_id |
 

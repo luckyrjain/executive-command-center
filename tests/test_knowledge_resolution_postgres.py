@@ -324,3 +324,118 @@ def test_self_candidate_rejected(
         json={"left_entity_id": str(entity_id), "right_entity_id": str(entity_id)},
     )
     assert response.status_code == 422
+
+
+def _create_open_candidate(
+    client: TestClient, token: str, key_prefix: str, left_name: str, right_name: str
+) -> UUID:
+    left_id = _create_entity(client, token, f"{key_prefix}-left", "person", left_name)
+    right_id = _create_entity(client, token, f"{key_prefix}-right", "person", right_name)
+    created = client.post(
+        "/api/v1/knowledge/resolution/candidates",
+        headers=_headers(token, f"{key_prefix}-create"),
+        json={"left_entity_id": str(left_id), "right_entity_id": str(right_id)},
+    )
+    return UUID(created.json()["candidate"]["id"])
+
+
+def test_defer_hides_candidate_from_default_list_until_it_expires(
+    resolution_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    client, workspace_id, _user_id, token = resolution_test_context
+    candidate_id = _create_open_candidate(client, token, "defer", "Ada Lovelace", "Ada Lovelase")
+    deferred_until = (datetime.now(UTC) + timedelta(hours=1)).isoformat()
+
+    response = client.post(
+        f"/api/v1/knowledge/resolution/candidates/{candidate_id}/defer",
+        headers=_headers(token, "defer-once"),
+        json={"deferred_until": deferred_until},
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "open"
+    assert response.json()["deferred_until"] is not None
+
+    listed = client.get(
+        "/api/v1/knowledge/resolution/candidates", headers=_headers(token, "list-after-defer")
+    )
+    assert all(item["id"] != str(candidate_id) for item in listed.json()["items"])
+
+    # Once the deferral window has passed, the candidate is visible again --
+    # simulated directly (no HTTP endpoint sets deferred_until to the past,
+    # since the payload validator requires a future timestamp).
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "UPDATE resolution_candidates SET deferred_until = :past "
+                "WHERE workspace_id = :workspace_id AND id = :candidate_id"
+            ),
+            {
+                "past": datetime.now(UTC) - timedelta(minutes=1),
+                "workspace_id": workspace_id,
+                "candidate_id": candidate_id,
+            },
+        )
+    listed_after_expiry = client.get(
+        "/api/v1/knowledge/resolution/candidates", headers=_headers(token, "list-after-expiry")
+    )
+    assert any(item["id"] == str(candidate_id) for item in listed_after_expiry.json()["items"])
+
+
+def test_defer_is_idempotent(
+    resolution_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    client, _workspace_id, _user_id, token = resolution_test_context
+    candidate_id = _create_open_candidate(
+        client, token, "defer-idem", "Grace Hopper", "Grace Hoper"
+    )
+    deferred_until = (datetime.now(UTC) + timedelta(hours=1)).isoformat()
+
+    first = client.post(
+        f"/api/v1/knowledge/resolution/candidates/{candidate_id}/defer",
+        headers=_headers(token, "defer-idem-once"),
+        json={"deferred_until": deferred_until},
+    )
+    second = client.post(
+        f"/api/v1/knowledge/resolution/candidates/{candidate_id}/defer",
+        headers=_headers(token, "defer-idem-twice"),
+        json={"deferred_until": deferred_until},
+    )
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert first.json()["deferred_until"] == second.json()["deferred_until"]
+
+
+def test_defer_rejects_a_non_future_timestamp(
+    resolution_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    client, _workspace_id, _user_id, token = resolution_test_context
+    candidate_id = _create_open_candidate(client, token, "defer-past", "A Name", "A Nam")
+
+    response = client.post(
+        f"/api/v1/knowledge/resolution/candidates/{candidate_id}/defer",
+        headers=_headers(token, "defer-past-attempt"),
+        json={"deferred_until": (datetime.now(UTC) - timedelta(hours=1)).isoformat()},
+    )
+    assert response.status_code == 422
+
+
+def test_defer_a_decided_candidate_is_conflict(
+    resolution_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    client, _workspace_id, _user_id, token = resolution_test_context
+    candidate_id = _create_open_candidate(
+        client, token, "defer-decided", "Ada Lovelace", "Ada Lovelase"
+    )
+    client.post(
+        f"/api/v1/knowledge/resolution/candidates/{candidate_id}/confirm",
+        headers=_headers(token, "defer-decided-confirm"),
+        json={"reason": "verified"},
+    )
+
+    response = client.post(
+        f"/api/v1/knowledge/resolution/candidates/{candidate_id}/defer",
+        headers=_headers(token, "defer-decided-attempt"),
+        json={"deferred_until": (datetime.now(UTC) + timedelta(hours=1)).isoformat()},
+    )
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "CANDIDATE_NOT_OPEN"

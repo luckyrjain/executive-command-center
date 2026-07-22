@@ -8,7 +8,7 @@ from typing import Annotated, Any, Literal
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
@@ -174,7 +174,7 @@ IdempotencyHeader = Annotated[
 
 _CANDIDATE_FIELDS = """
 id, left_entity_id, right_entity_id, score, factors_json, resolver_version,
-status, created_at, resolved_at, resolved_by, reason
+status, created_at, resolved_at, resolved_by, reason, deferred_until
 """
 
 
@@ -197,6 +197,7 @@ class ResolutionCandidateResponse(BaseModel):
     resolved_at: datetime | None
     resolved_by: UUID | None
     reason: str | None
+    deferred_until: datetime | None
 
 
 class ResolutionCandidateListResponse(BaseModel):
@@ -224,6 +225,19 @@ class ResolutionDecision(BaseModel):
     reason: str = Field(min_length=1, max_length=2000)
 
 
+class ResolutionDefer(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    deferred_until: datetime
+
+    @field_validator("deferred_until")
+    @classmethod
+    def validate_deferred_until(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("deferred_until must include a timezone offset")
+        return value
+
+
 def _project(row: dict[str, Any]) -> ResolutionCandidateResponse:
     factors_raw = row["factors_json"]
     factors = loads(factors_raw) if isinstance(factors_raw, str) else dict(factors_raw)
@@ -239,6 +253,7 @@ def _project(row: dict[str, Any]) -> ResolutionCandidateResponse:
         resolved_at=row["resolved_at"],
         resolved_by=row["resolved_by"],
         reason=row["reason"],
+        deferred_until=row["deferred_until"],
     )
 
 
@@ -642,8 +657,20 @@ def list_candidates(
     cursor: str | None = None,
     limit: int = Query(default=50, ge=1, le=100),
 ) -> ResolutionCandidateListResponse:
-    clauses = ["workspace_id = :workspace_id"]
-    params: dict[str, Any] = {"workspace_id": auth.workspace_id, "limit": limit + 1}
+    # Deferred candidates are hidden from the default queue until their
+    # snooze expires, matching attention.py's identical deferred_until
+    # filter for attention_items -- defer postpones review, it never
+    # changes status, so this is the only place the postponement is
+    # actually enforced.
+    clauses = [
+        "workspace_id = :workspace_id",
+        "(deferred_until IS NULL OR deferred_until <= :now)",
+    ]
+    params: dict[str, Any] = {
+        "workspace_id": auth.workspace_id,
+        "limit": limit + 1,
+        "now": datetime.now(UTC),
+    }
     if status is not None:
         clauses.append("status = :status")
         params["status"] = status
@@ -798,3 +825,77 @@ def reject_candidate(
     return _decide_candidate(
         candidate_id, payload, request, auth, session, idempotency_key, "rejected"
     )
+
+
+@router.post("/candidates/{candidate_id}/defer", response_model=ResolutionCandidateResponse)
+def defer_candidate(
+    candidate_id: UUID,
+    payload: ResolutionDefer,
+    request: Request,
+    auth: AuthDep,
+    session: SessionDep,
+    _csrf: CsrfDep,
+    idempotency_key: IdempotencyHeader,
+) -> ResolutionCandidateResponse:
+    """UX-STATES.md names confirm/reject/defer as the three primary review
+    actions. Unlike confirm/reject, defer never decides the candidate --
+    status stays 'open', only deferred_until is set (mirrors attention.py's
+    identical defer semantics for attention_items: postpone review, don't
+    make a decision)."""
+    now = datetime.now(UTC)
+    if payload.deferred_until <= now:
+        raise HTTPException(status_code=422, detail="DEFER_UNTIL_MUST_BE_FUTURE")
+    request_hash = _request_hash(payload, f"defer:{candidate_id}")
+    with session.begin():
+        _lock_idempotency(session, auth, idempotency_key)
+        cached = _load_cached(session, auth, idempotency_key, request_hash)
+        if cached is not None:
+            return cached
+        current = (
+            session.execute(
+                text(
+                    f"""
+                    SELECT {_CANDIDATE_FIELDS}
+                    FROM resolution_candidates
+                    WHERE workspace_id = :workspace_id AND id = :candidate_id
+                    FOR UPDATE
+                    """
+                ),
+                {"workspace_id": auth.workspace_id, "candidate_id": candidate_id},
+            )
+            .mappings()
+            .one_or_none()
+        )
+        if current is None:
+            raise HTTPException(status_code=404, detail="CANDIDATE_NOT_FOUND")
+        if current["status"] != "open":
+            raise HTTPException(status_code=409, detail="CANDIDATE_NOT_OPEN")
+        if current["deferred_until"] == payload.deferred_until:
+            response = _project(dict(current))
+            _store_cached(session, auth, idempotency_key, request_hash, response, now, 200)
+            return response
+        row = (
+            session.execute(
+                text(
+                    f"""
+                    UPDATE resolution_candidates
+                    SET deferred_until = :deferred_until
+                    WHERE workspace_id = :workspace_id AND id = :candidate_id
+                    RETURNING {_CANDIDATE_FIELDS}
+                    """
+                ),
+                {
+                    "workspace_id": auth.workspace_id,
+                    "candidate_id": candidate_id,
+                    "deferred_until": payload.deferred_until,
+                },
+            )
+            .mappings()
+            .one()
+        )
+        response = _project(dict(row))
+        _write_side_effects(
+            session, auth, request, "resolution_candidate.deferred", candidate_id, now
+        )
+        _store_cached(session, auth, idempotency_key, request_hash, response, now, 200)
+        return response

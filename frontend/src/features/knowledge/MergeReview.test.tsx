@@ -18,6 +18,7 @@ const candidate = {
   resolved_at: '2026-07-02T00:00:00Z',
   resolved_by: 'user-1',
   reason: 'verified duplicate',
+  deferred_until: null,
 }
 
 const leftEntity = {

@@ -37,6 +37,21 @@ export default function ResolutionInbox() {
     },
   })
 
+  // UX-STATES.md names confirm/reject/defer as the three primary review
+  // actions -- defer postpones the decision (24h snooze) without confirming
+  // or rejecting, matching the identical pattern Phase 1's attention items
+  // already use for their own defer action.
+  const deferMutation = useMutation({
+    mutationFn: (candidate: ResolutionCandidate) =>
+      apiRequest<ResolutionCandidate>(`/api/v1/knowledge/resolution/candidates/${candidate.id}/defer`, {
+        method: 'POST',
+        body: { deferred_until: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString() },
+      }),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ['knowledge', 'resolution', 'candidates'] })
+    },
+  })
+
   function reasonFor(candidateId: string): string {
     return reasons[candidateId] ?? ''
   }
@@ -57,6 +72,9 @@ export default function ResolutionInbox() {
 
       {decisionMutation.error ? (
         <div role="alert" className="inline-status error-panel">{decisionMutation.error.message}</div>
+      ) : null}
+      {deferMutation.error ? (
+        <div role="alert" className="inline-status error-panel">{deferMutation.error.message}</div>
       ) : null}
       {query.isLoading ? <p role="status">Loading resolution candidates…</p> : null}
       {query.isError ? <div role="alert">{query.error.message}</div> : null}
@@ -94,6 +112,13 @@ export default function ResolutionInbox() {
                   }
                 >
                   Reject
+                </button>
+                <button
+                  type="button"
+                  disabled={deferMutation.isPending}
+                  onClick={() => deferMutation.mutate(candidate)}
+                >
+                  Defer
                 </button>
               </div>
             </li>

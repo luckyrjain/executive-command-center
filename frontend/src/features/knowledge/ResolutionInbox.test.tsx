@@ -18,6 +18,7 @@ const candidate = {
   resolved_at: null,
   resolved_by: null,
   reason: null,
+  deferred_until: null,
 }
 
 function jsonResponse(body: unknown, status = 200) {
@@ -76,5 +77,30 @@ describe('ResolutionInbox', () => {
     renderInbox()
 
     await screen.findByText('No resolution candidates awaiting review.')
+  })
+
+  it('defers a candidate with a future deferred_until, without requiring a reason', async () => {
+    const deferred = { ...candidate, deferred_until: '2026-07-03T00:00:00Z' }
+    const fetch = vi.fn()
+      .mockImplementationOnce(() => jsonResponse({ items: [candidate], next_cursor: null }))
+      .mockImplementationOnce(() => jsonResponse(deferred))
+      .mockImplementationOnce(() => jsonResponse({ items: [], next_cursor: null }))
+    vi.stubGlobal('fetch', fetch)
+    renderInbox()
+
+    await screen.findByText('entity-left', { exact: false })
+    fireEvent.click(screen.getByRole('button', { name: 'Defer' }))
+
+    const deferCall = await new Promise<[string, RequestInit]>((resolve) => {
+      const check = () => {
+        const call = fetch.mock.calls.find((c) => String(c[0]).includes('/defer'))
+        if (call) resolve(call as [string, RequestInit])
+        else setTimeout(check, 5)
+      }
+      check()
+    })
+    expect(deferCall[0]).toContain(`/resolution/candidates/${candidate.id}/defer`)
+    const body = JSON.parse(String(deferCall[1].body))
+    expect(new Date(body.deferred_until).getTime()).toBeGreaterThan(Date.now())
   })
 })

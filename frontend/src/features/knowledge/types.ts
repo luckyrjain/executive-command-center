@@ -96,6 +96,7 @@ export type ResolutionCandidate = {
   resolved_at: string | null
   resolved_by: string | null
   reason: string | null
+  deferred_until: string | null
 }
 
 export type ResolutionCandidateList = { items: ResolutionCandidate[]; next_cursor?: string | null }
