@@ -144,4 +144,29 @@ describe('MergeReview', () => {
     await screen.findByRole('button', { name: 'Retry: merge into Ada Lovelace' })
     expect(leftCallCount).toBeGreaterThan(1)
   })
+
+  it('shows a distinct error state when the candidates fetch fails, never the empty-state text', async () => {
+    // Regression test: the empty-state paragraph used to be gated on
+    // `!query.isLoading`, which is also true while a fetch has failed --
+    // so an error rendered the "No confirmed candidates..." text alongside
+    // the alert, exactly the bug EntityDetail.tsx already fixed for its
+    // own sections but this component missed.
+    // MergeReview's query passes retry: 1, so the mock must fail on every
+    // call (not just the first) or the retried attempt hangs. React
+    // Query's default backoff delays that retry by ~1s, so the assertion
+    // needs a longer-than-default findByRole timeout.
+    const fetch = vi.fn().mockImplementation(() =>
+      Promise.resolve(
+        new Response(JSON.stringify({ error: { code: 'CANDIDATES_UNAVAILABLE' } }), {
+          status: 500,
+          headers: { 'Content-Type': 'application/json' },
+        }),
+      ),
+    )
+    vi.stubGlobal('fetch', fetch)
+    renderMergeReview()
+
+    await screen.findByRole('alert', {}, { timeout: 3000 })
+    expect(screen.queryByText('No confirmed candidates awaiting merge.')).toBeNull()
+  })
 })

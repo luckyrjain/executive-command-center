@@ -659,6 +659,11 @@ def reverse_operation(
             ),
             {"workspace_id": auth.workspace_id, "source_id": source_id, "now": now},
         )
+        # The reactivated source's retrieval_documents/embedding rows still
+        # carry the source_version stamped when it was redirected out of
+        # search results -- without refreshing them, it reappears in
+        # listings with a stale:true flag despite being fully active again.
+        _refresh_projections(session, auth, source_id, now)
         session.execute(
             text(
                 "UPDATE entity_operations SET status = 'reversed', updated_at = :now, "
@@ -728,6 +733,19 @@ def split_operation(
     _csrf: CsrfDep,
     idempotency_key: IdempotencyHeader,
 ) -> EntityOperationResponse:
+    """Deliberately does not call _has_post_merge_dependent_activity the way
+    reverse_operation does. That check exists because a blind, total
+    reversal has no way to know which post-merge claim/relationship belongs
+    to which now-separate identity -- ambiguous attribution is exactly what
+    makes it unsafe. Split has no such ambiguity: the caller names every
+    claim/relationship to move back to the source explicitly (validated
+    against target ownership above), so a claim added to the target after
+    the merge is safe to move if and only if the caller says so. Blocking
+    split on the same post-merge-activity signal would make it fail in
+    precisely the scenario it exists to handle -- see
+    test_split_is_the_manual_path_when_reverse_would_be_unsafe, which
+    exercises reverse being rejected as UNSAFE_REVERSAL immediately before
+    split succeeds against the very same post-merge claim."""
     request_hash = _request_hash(payload, f"split:{operation_id}")
     now = datetime.now(UTC)
     with session.begin():
@@ -775,7 +793,15 @@ def split_operation(
 
         # Validate every reassignment target actually belongs to the target
         # entity before touching anything -- an all-or-nothing check, so a
-        # bad ID in the payload never leaves a partial reassignment.
+        # bad ID in the payload never leaves a partial reassignment. FOR
+        # UPDATE is defense-in-depth, not what actually prevents a race here:
+        # the target/source _lock_entity() calls above already serialize any
+        # two operations that could plausibly change a claim's subject_id or
+        # an edge's node references (split is the only code path that
+        # mutates subject_id, and merge's _rehome_edges is the only one that
+        # mutates edge node references -- both lock their target entity
+        # first, same as here). FOR UPDATE guards against a future mutator
+        # that reassigns ownership without locking the target the same way.
         if payload.reassign_claim_ids:
             found = session.execute(
                 text(
@@ -783,6 +809,7 @@ def split_operation(
                     SELECT id FROM knowledge_claims
                     WHERE workspace_id = :workspace_id AND subject_id = :target_id
                       AND id = ANY(:claim_ids)
+                    FOR UPDATE
                     """
                 ),
                 {
@@ -801,6 +828,7 @@ def split_operation(
                     WHERE workspace_id = :workspace_id
                       AND (source_node_id = :target_id OR target_node_id = :target_id)
                       AND id = ANY(:relationship_ids)
+                    FOR UPDATE
                     """
                 ),
                 {

@@ -508,3 +508,67 @@ def test_claim_record_rejects_valid_to_at_or_before_valid_from(
         },
     )
     assert response.status_code == 422, response.text
+
+
+def test_claim_record_rejects_archived_entity(
+    claims_test_context: tuple[TestClient, UUID, UUID, str, UUID],
+) -> None:
+    # relationships.py's create_relationship has the identical check for
+    # the same reason (an audit's re-review found claims.py never mirrored
+    # it, despite sharing DATA-MODEL.md's canonical-identity invariant).
+    client, workspace_id, _user_id, token, entity_id = claims_test_context
+    evidence_id = _create_evidence(workspace_id, entity_id)
+    archive = client.post(
+        f"/api/v1/knowledge/entities/{entity_id}/archive",
+        headers=_headers(token, "archive-before-claim"),
+        json={"expected_version": 1},
+    )
+    assert archive.status_code == 200, archive.text
+
+    response = client.post(
+        f"/api/v1/knowledge/entities/{entity_id}/claims",
+        headers=_headers(token, "claim-on-archived"),
+        json={
+            "predicate": "employed_at",
+            "value": {"organization": "Analytical Engines Ltd"},
+            "source_id": str(evidence_id),
+        },
+    )
+    assert response.status_code == 409, response.text
+    assert response.json()["error"]["code"] == "ENTITY_NOT_ACTIVE"
+
+
+def test_claim_supersede_rejects_archived_entity(
+    claims_test_context: tuple[TestClient, UUID, UUID, str, UUID],
+) -> None:
+    client, workspace_id, _user_id, token, entity_id = claims_test_context
+    evidence_id = _create_evidence(workspace_id, entity_id)
+    create = client.post(
+        f"/api/v1/knowledge/entities/{entity_id}/claims",
+        headers=_headers(token, "create-claim-before-archive"),
+        json={
+            "predicate": "employed_at",
+            "value": {"organization": "Analytical Engines Ltd"},
+            "source_id": str(evidence_id),
+        },
+    )
+    original_id = create.json()["id"]
+
+    archive = client.post(
+        f"/api/v1/knowledge/entities/{entity_id}/archive",
+        headers=_headers(token, "archive-before-supersede"),
+        json={"expected_version": 1},
+    )
+    assert archive.status_code == 200, archive.text
+
+    response = client.post(
+        f"/api/v1/knowledge/entities/{entity_id}/claims/{original_id}/supersede",
+        headers=_headers(token, "supersede-on-archived"),
+        json={
+            "predicate": "employed_at",
+            "value": {"organization": "Cambridge University"},
+            "source_id": str(evidence_id),
+        },
+    )
+    assert response.status_code == 409, response.text
+    assert response.json()["error"]["code"] == "ENTITY_NOT_ACTIVE"

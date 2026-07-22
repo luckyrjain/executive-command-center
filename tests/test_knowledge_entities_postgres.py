@@ -63,7 +63,11 @@ def test_pkos_evidence_has_phase2_reconciliation_columns() -> None:
                 )
             )
         }
-    assert {"evidence_state", "observed_at"} <= columns
+    assert {"evidence_state"} <= columns
+    # observed_at (migration 0010) was dropped by migration 0021: no code
+    # path ever wrote or read it, so its column existed but did nothing --
+    # see that migration's docstring.
+    assert "observed_at" not in columns
 
 
 def test_existing_seeded_pkos_rows_backfill_to_valid_defaults() -> None:
@@ -326,6 +330,63 @@ def test_entity_create_requires_kind_and_canonical_name(
     assert missing_kind.status_code == 422
 
 
+def test_entity_create_canonical_name_max_length_boundary(
+    knowledge_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    # EntityCreate.canonical_name is Field(min_length=1, max_length=500) --
+    # exercise both sides of that boundary rather than trusting the
+    # declared constraint alone.
+    client, _workspace_id, _user_id, token = knowledge_test_context
+    at_limit = client.post(
+        "/api/v1/knowledge/entities",
+        headers=_headers(token, "name-at-limit"),
+        json={"kind": "project", "canonical_name": "A" * 500},
+    )
+    assert at_limit.status_code == 201, at_limit.text
+    assert len(at_limit.json()["canonical_name"]) == 500
+
+    over_limit = client.post(
+        "/api/v1/knowledge/entities",
+        headers=_headers(token, "name-over-limit"),
+        json={"kind": "project", "canonical_name": "A" * 501},
+    )
+    assert over_limit.status_code == 422
+
+
+def test_entity_create_handles_sql_injection_shaped_canonical_name(
+    knowledge_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    # Every SQL statement in this domain module is parameterized (:name
+    # bind params, never string interpolation), so this proves that
+    # property holds end-to-end rather than assuming it from code review:
+    # a name shaped like a SQL injection attempt must be stored and
+    # returned verbatim, not executed, truncated or rejected, and must
+    # not corrupt any other row.
+    client, _workspace_id, _user_id, token = knowledge_test_context
+    malicious_name = "Robert'); DROP TABLE pkos_nodes; --"
+    create = client.post(
+        "/api/v1/knowledge/entities",
+        headers=_headers(token, "sql-injection-name"),
+        json={"kind": "project", "canonical_name": malicious_name},
+    )
+    assert create.status_code == 201, create.text
+    entity_id = create.json()["id"]
+    assert create.json()["canonical_name"] == malicious_name
+
+    fetched = client.get(
+        f"/api/v1/knowledge/entities/{entity_id}", headers=_headers(token, "sql-injection-get")
+    )
+    assert fetched.status_code == 200
+    assert fetched.json()["canonical_name"] == malicious_name
+
+    # The table this payload names is still intact.
+    with engine.connect() as connection:
+        still_exists = connection.execute(
+            text("SELECT to_regclass('pkos_nodes')")
+        ).scalar_one()
+    assert still_exists == "pkos_nodes"
+
+
 def test_entity_get_is_workspace_scoped_and_404s_across_workspaces(
     knowledge_test_context: tuple[TestClient, UUID, UUID, str],
 ) -> None:
@@ -344,6 +405,98 @@ def test_entity_get_is_workspace_scoped_and_404s_across_workspaces(
         f"/api/v1/knowledge/entities/{uuid4()}", headers=_headers(token, "get-missing")
     )
     assert missing.status_code == 404
+
+
+def _seed_foreign_workspace_entity() -> tuple[UUID, UUID]:
+    """A second, fully independent workspace with one active entity, for
+    proving PATCH/archive/restore/list never act on or expose a resource
+    that belongs to a different workspace."""
+    other_workspace_id = uuid4()
+    entity_id = uuid4()
+    now = datetime.now(UTC)
+    with engine.begin() as connection:
+        connection.execute(
+            text("INSERT INTO workspaces (id, name, created_at) VALUES (:id, :name, :created_at)"),
+            {"id": other_workspace_id, "name": "Foreign Workspace", "created_at": now},
+        )
+        connection.execute(
+            text(
+                "INSERT INTO pkos_nodes (id, workspace_id, node_type, canonical_name, "
+                "attributes, status, confidence, version, created_at, updated_at) VALUES "
+                "(:id, :workspace_id, 'person', 'Foreign Entity', '{}'::jsonb, 'active', "
+                "1.0, 1, :now, :now)"
+            ),
+            {"id": entity_id, "workspace_id": other_workspace_id, "now": now},
+        )
+    return other_workspace_id, entity_id
+
+
+def _teardown_foreign_workspace_entity(workspace_id: UUID) -> None:
+    with engine.begin() as connection:
+        connection.execute(
+            text("DELETE FROM pkos_nodes WHERE workspace_id = :workspace_id"),
+            {"workspace_id": workspace_id},
+        )
+        connection.execute(
+            text("DELETE FROM workspaces WHERE id = :workspace_id"), {"workspace_id": workspace_id}
+        )
+
+
+def test_entity_mutations_reject_a_foreign_workspace_entity(
+    knowledge_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    client, _workspace_id, _user_id, token = knowledge_test_context
+    other_workspace_id, foreign_entity_id = _seed_foreign_workspace_entity()
+    try:
+        patch = client.patch(
+            f"/api/v1/knowledge/entities/{foreign_entity_id}",
+            headers=_headers(token, "isolation-patch-foreign"),
+            json={"expected_version": 1, "summary": "attempted cross-workspace edit"},
+        )
+        assert patch.status_code == 404
+        assert patch.json()["error"]["code"] == "ENTITY_NOT_FOUND"
+
+        archive = client.post(
+            f"/api/v1/knowledge/entities/{foreign_entity_id}/archive",
+            headers=_headers(token, "isolation-archive-foreign"),
+            json={"expected_version": 1},
+        )
+        assert archive.status_code == 404
+        assert archive.json()["error"]["code"] == "ENTITY_NOT_FOUND"
+
+        restore = client.post(
+            f"/api/v1/knowledge/entities/{foreign_entity_id}/restore",
+            headers=_headers(token, "isolation-restore-foreign"),
+            json={"expected_version": 1},
+        )
+        assert restore.status_code == 404
+        assert restore.json()["error"]["code"] == "ENTITY_NOT_FOUND"
+
+        # The entity is untouched in its real (foreign) workspace.
+        with engine.connect() as connection:
+            row = connection.execute(
+                text("SELECT status, version FROM pkos_nodes WHERE id = :id"),
+                {"id": foreign_entity_id},
+            ).mappings().one()
+        assert row["status"] == "active"
+        assert row["version"] == 1
+    finally:
+        _teardown_foreign_workspace_entity(other_workspace_id)
+
+
+def test_entity_list_excludes_other_workspaces(
+    knowledge_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    client, _workspace_id, _user_id, token = knowledge_test_context
+    other_workspace_id, foreign_entity_id = _seed_foreign_workspace_entity()
+    try:
+        listed = client.get(
+            "/api/v1/knowledge/entities", headers=_headers(token, "isolation-list")
+        )
+        assert listed.status_code == 200
+        assert all(item["id"] != str(foreign_entity_id) for item in listed.json()["items"])
+    finally:
+        _teardown_foreign_workspace_entity(other_workspace_id)
 
 
 def _seed_alias(

@@ -258,6 +258,144 @@ def test_relationship_cross_workspace_404(
     assert response.status_code == 404
 
 
+def _seed_foreign_workspace_relationship() -> tuple[UUID, UUID, UUID]:
+    """A second, fully independent workspace with two nodes and an active
+    relationship between them, for proving create/invalidate/list never
+    act on or expose a resource that belongs to a different workspace."""
+    other_workspace_id = uuid4()
+    node_a, node_b = uuid4(), uuid4()
+    relationship_id = uuid4()
+    now = datetime.now(UTC)
+    with engine.begin() as connection:
+        connection.execute(
+            text("INSERT INTO workspaces (id, name, created_at) VALUES (:id, :name, :created_at)"),
+            {"id": other_workspace_id, "name": "Foreign Workspace", "created_at": now},
+        )
+        for node_id, name in ((node_a, "Foreign A"), (node_b, "Foreign B")):
+            connection.execute(
+                text(
+                    "INSERT INTO pkos_nodes (id, workspace_id, node_type, canonical_name, "
+                    "attributes, status, confidence, version, created_at, updated_at) VALUES "
+                    "(:id, :workspace_id, 'person', :name, '{}'::jsonb, 'active', 1.0, 1, :now, :now)"
+                ),
+                {"id": node_id, "workspace_id": other_workspace_id, "name": name, "now": now},
+            )
+        evidence_id = uuid4()
+        connection.execute(
+            text(
+                "INSERT INTO pkos_evidence (id, workspace_id, node_id, source_type, "
+                "source_ref, sha256, captured_at) VALUES (:id, :workspace_id, :node_id, "
+                "'manual', 'relationships-isolation-test-ref', :sha256, :captured_at)"
+            ),
+            {
+                "id": evidence_id,
+                "workspace_id": other_workspace_id,
+                "node_id": node_a,
+                "sha256": sha256(str(evidence_id).encode()).hexdigest(),
+                "captured_at": now,
+            },
+        )
+        connection.execute(
+            text(
+                """
+                INSERT INTO pkos_edges (
+                    id, workspace_id, source_node_id, target_node_id, edge_type,
+                    attributes, confidence, evidence_id, status
+                ) VALUES (
+                    :id, :workspace_id, :source, :target, 'WORKS_ON',
+                    '{}'::jsonb, 1.0, :evidence_id, 'active'
+                )
+                """
+            ),
+            {
+                "id": relationship_id,
+                "workspace_id": other_workspace_id,
+                "source": node_a,
+                "target": node_b,
+                "evidence_id": evidence_id,
+            },
+        )
+    return other_workspace_id, node_a, relationship_id
+
+
+def _teardown_foreign_workspace_relationship(workspace_id: UUID) -> None:
+    with engine.begin() as connection:
+        for table in ("pkos_edges", "pkos_evidence", "pkos_nodes"):
+            connection.execute(
+                text(f"DELETE FROM {table} WHERE workspace_id = :workspace_id"),  # noqa: S608
+                {"workspace_id": workspace_id},
+            )
+        connection.execute(
+            text("DELETE FROM workspaces WHERE id = :workspace_id"), {"workspace_id": workspace_id}
+        )
+
+
+def test_relationship_create_rejects_to_entity_from_another_workspace(
+    relationships_test_context: tuple[TestClient, UUID, UUID, str, UUID, UUID],
+) -> None:
+    client, workspace_id, _user_id, token, person_id, _project_id = relationships_test_context
+    other_workspace_id, foreign_node_id, _relationship_id = _seed_foreign_workspace_relationship()
+    try:
+        evidence_id = _create_evidence(workspace_id, person_id)
+        response = client.post(
+            f"/api/v1/knowledge/entities/{person_id}/relationships",
+            headers=_headers(token, "isolation-create-foreign-target"),
+            json={
+                "relationship_type": "WORKS_ON",
+                "to_entity_id": str(foreign_node_id),
+                "evidence_id": str(evidence_id),
+            },
+        )
+        assert response.status_code == 404
+        assert response.json()["error"]["code"] == "ENTITY_NOT_FOUND"
+    finally:
+        _teardown_foreign_workspace_relationship(other_workspace_id)
+
+
+def test_relationship_invalidate_rejects_a_foreign_workspace_relationship(
+    relationships_test_context: tuple[TestClient, UUID, UUID, str, UUID, UUID],
+) -> None:
+    client, _workspace_id, _user_id, token, _person_id, _project_id = relationships_test_context
+    other_workspace_id, _foreign_node_id, foreign_relationship_id = (
+        _seed_foreign_workspace_relationship()
+    )
+    try:
+        response = client.post(
+            f"/api/v1/knowledge/relationships/{foreign_relationship_id}/invalidate",
+            headers=_headers(token, "isolation-invalidate-foreign"),
+            json={},
+        )
+        assert response.status_code == 404
+        assert response.json()["error"]["code"] == "RELATIONSHIP_NOT_FOUND"
+
+        with engine.connect() as connection:
+            status = connection.execute(
+                text("SELECT status FROM pkos_edges WHERE id = :id"),
+                {"id": foreign_relationship_id},
+            ).scalar_one()
+        assert status == "active"
+    finally:
+        _teardown_foreign_workspace_relationship(other_workspace_id)
+
+
+def test_relationship_list_excludes_other_workspaces(
+    relationships_test_context: tuple[TestClient, UUID, UUID, str, UUID, UUID],
+) -> None:
+    client, _workspace_id, _user_id, token, _person_id, _project_id = relationships_test_context
+    other_workspace_id, foreign_node_id, foreign_relationship_id = (
+        _seed_foreign_workspace_relationship()
+    )
+    try:
+        response = client.get(
+            f"/api/v1/knowledge/entities/{foreign_node_id}/relationships",
+            headers=_headers(token, "isolation-list-foreign"),
+        )
+        assert response.status_code == 200
+        assert all(item["id"] != str(foreign_relationship_id) for item in response.json()["items"])
+    finally:
+        _teardown_foreign_workspace_relationship(other_workspace_id)
+
+
 def test_relationship_create_requires_evidence_id(
     relationships_test_context: tuple[TestClient, UUID, UUID, str, UUID, UUID],
 ) -> None:

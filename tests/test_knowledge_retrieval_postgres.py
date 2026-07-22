@@ -460,3 +460,30 @@ def test_exact_name_match_recognizes_a_different_unicode_encoding_of_the_same_na
     items = response.json()["items"]
     assert items[0]["entity_id"] == str(entity_id)
     assert items[0]["matching_mode"] == "exact_name"
+
+
+def test_exact_alias_match_recognizes_a_different_unicode_encoding_of_the_same_alias(
+    retrieval_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    # Adversarial regression test, same construction as the exact-name
+    # variant above but for entity_aliases.normalized_value -- the SQL-side
+    # exact_alias_match check used to compare the raw stored alias against
+    # the NFC-normalized query, so this exact scenario would silently miss
+    # even though the sibling normalized_title comparison already handled
+    # it correctly. decomposed_alias spells the accented letter as base "e"
+    # (U+0065) plus a combining acute accent (U+0301); precomposed_query
+    # uses the single precomposed e-acute codepoint (U+00E9).
+    decomposed_alias = "Jos" + "e\u0301" + " Rizal"
+    precomposed_query = "Jos" + "\u00e9" + " Rizal"
+    assert decomposed_alias != precomposed_query
+    assert decomposed_alias.casefold() != precomposed_query.casefold()
+
+    client, workspace_id, _user_id, token = retrieval_test_context
+    entity_id = _create_entity(client, token, "unicode-alias-entity", "person", "Rizal")
+    _create_alias(workspace_id, entity_id, decomposed_alias.casefold())
+
+    response = _retrieve(client, token, "unicode-alias-search", q=precomposed_query)
+    assert response.status_code == 200
+    items = response.json()["items"]
+    assert items[0]["entity_id"] == str(entity_id)
+    assert items[0]["matching_mode"] == "exact_alias"

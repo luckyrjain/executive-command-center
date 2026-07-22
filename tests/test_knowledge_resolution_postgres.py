@@ -1,3 +1,4 @@
+import time
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
@@ -403,6 +404,38 @@ def test_defer_is_idempotent(
     assert first.status_code == 200
     assert second.status_code == 200
     assert first.json()["deferred_until"] == second.json()["deferred_until"]
+
+
+def test_defer_idempotent_replay_after_deferred_until_has_passed(
+    resolution_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    client, _workspace_id, _user_id, token = resolution_test_context
+    candidate_id = _create_open_candidate(
+        client, token, "defer-replay", "Ada Lovelace", "Ada Lovelase"
+    )
+    deferred_until = (datetime.now(UTC) + timedelta(seconds=1)).isoformat()
+    headers = _headers(token, "defer-replay-key")
+
+    first = client.post(
+        f"/api/v1/knowledge/resolution/candidates/{candidate_id}/defer",
+        headers=headers,
+        json={"deferred_until": deferred_until},
+    )
+    assert first.status_code == 200, first.text
+
+    time.sleep(1.5)
+
+    # A replay with the same idempotency key/body must be served from the
+    # idempotency cache even though deferred_until is now in the past --
+    # the future-timestamp validation only guards the first attempt, not a
+    # cached replay of an already-accepted request.
+    second = client.post(
+        f"/api/v1/knowledge/resolution/candidates/{candidate_id}/defer",
+        headers=headers,
+        json={"deferred_until": deferred_until},
+    )
+    assert second.status_code == 200, second.text
+    assert second.json()["deferred_until"] == first.json()["deferred_until"]
 
 
 def test_defer_rejects_a_non_future_timestamp(

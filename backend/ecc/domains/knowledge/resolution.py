@@ -877,14 +877,14 @@ def defer_candidate(
     identical defer semantics for attention_items: postpone review, don't
     make a decision)."""
     now = datetime.now(UTC)
-    if payload.deferred_until <= now:
-        raise HTTPException(status_code=422, detail="DEFER_UNTIL_MUST_BE_FUTURE")
     request_hash = _request_hash(payload, f"defer:{candidate_id}")
     with session.begin():
         _lock_idempotency(session, auth, idempotency_key)
         cached = _load_cached(session, auth, idempotency_key, request_hash)
         if cached is not None:
             return cached
+        if payload.deferred_until <= now:
+            raise HTTPException(status_code=422, detail="DEFER_UNTIL_MUST_BE_FUTURE")
         current = (
             session.execute(
                 text(

@@ -257,7 +257,7 @@ _LEXICAL_CANDIDATES_CTE = """
                 SELECT 1 FROM entity_aliases a
                 WHERE a.workspace_id = d.workspace_id
                   AND a.entity_id = d.entity_id
-                  AND a.normalized_value = :query
+                  AND normalize(a.normalized_value, NFC) = :query
             ) AS exact_alias_match,
             (
                 SELECT e.evidence_state FROM pkos_evidence e

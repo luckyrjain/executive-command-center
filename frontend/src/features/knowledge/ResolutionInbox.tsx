@@ -124,7 +124,7 @@ export default function ResolutionInbox() {
             </li>
           ))}
         </ul>
-      ) : !query.isLoading ? (
+      ) : query.isSuccess ? (
         <p className="empty-state">No resolution candidates awaiting review.</p>
       ) : null}
     </section>

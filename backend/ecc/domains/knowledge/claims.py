@@ -185,6 +185,16 @@ def _entity_version(session: Session, auth: AuthContext, entity_id: UUID) -> int
     return row[0] if row is not None else None
 
 
+def _entity_status(session: Session, auth: AuthContext, entity_id: UUID) -> str | None:
+    row = session.execute(
+        text(
+            "SELECT status FROM pkos_nodes WHERE workspace_id = :workspace_id AND id = :entity_id"
+        ),
+        {"workspace_id": auth.workspace_id, "entity_id": entity_id},
+    ).one_or_none()
+    return row[0] if row is not None else None
+
+
 def _evidence_state(session: Session, auth: AuthContext, evidence_id: UUID) -> str | None:
     row = session.execute(
         text(
@@ -341,6 +351,15 @@ def create_claim(
         entity_version = _entity_version(session, auth, entity_id)
         if entity_version is None:
             raise HTTPException(status_code=404, detail="ENTITY_NOT_FOUND")
+        # relationships.py's create_relationship has the identical check for
+        # the same reason (DATA-MODEL.md's canonical-identity invariant: an
+        # archived entity is paused, not gone, but a redirected one has
+        # already been superseded by a merge target, so new activity should
+        # attach to the survivor instead) -- claims.py never mirrored it, a
+        # gap an audit's adversarial re-review caught.
+        entity_status = _entity_status(session, auth, entity_id)
+        if entity_status != "active":
+            raise HTTPException(status_code=409, detail="ENTITY_NOT_ACTIVE")
         # DATA-MODEL.md's "a claim ... has at least one source reference" is
         # enforced by the FK alone (source_id must reference a real evidence
         # row), but a reference to evidence that exists yet is no longer
@@ -454,6 +473,9 @@ def supersede_claim(
         entity_version = _entity_version(session, auth, entity_id)
         if entity_version is None:
             raise HTTPException(status_code=404, detail="ENTITY_NOT_FOUND")
+        entity_status = _entity_status(session, auth, entity_id)
+        if entity_status != "active":
+            raise HTTPException(status_code=409, detail="ENTITY_NOT_ACTIVE")
         evidence_state = _evidence_state(session, auth, payload.source_id)
         if evidence_state is None:
             raise HTTPException(status_code=404, detail="EVIDENCE_NOT_FOUND")

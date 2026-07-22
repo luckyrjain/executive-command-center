@@ -49,7 +49,10 @@ function claimValueText(claim: Claim): string {
 
 function evidenceLabel(status: EvidenceStatus | undefined): string {
   if (status === undefined) return 'checking…'
-  return status === 'available' ? 'available' : 'missing'
+  if (status === 'available') return 'available'
+  if (status === 'deleted') return 'deleted'
+  if (status === 'permission_denied') return 'permission denied'
+  return 'missing'
 }
 
 export default function EntityDetail({ entityId, onClose }: EntityDetailProps) {
@@ -273,7 +276,7 @@ export default function EntityDetail({ entityId, onClose }: EntityDetailProps) {
                         />
                       </label>
                       <label>
-                        Evidence ID
+                        Source ID
                         <input
                           aria-label={`Correction source ID for ${claim.id}`}
                           value={correctionDraft.sourceId}
@@ -336,7 +339,7 @@ export default function EntityDetail({ entityId, onClose }: EntityDetailProps) {
             />
           </label>
           <label>
-            Evidence ID
+            Source ID
             <input
               aria-label="Claim source ID"
               value={claimDraft.sourceId}

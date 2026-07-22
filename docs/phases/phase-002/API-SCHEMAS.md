@@ -2,7 +2,7 @@
 id: PHASE-002-API-SCHEMAS
 title: Phase 2 Knowledge Platform API
 status: Approved for Implementation
-version: 0.3.0
+version: 0.4.0
 owner: Lucky Jain
 ---
 
@@ -40,7 +40,7 @@ POST /identity/organizations
 
 ## Shared representations
 
-`KnowledgeEntity` includes id, kind, canonical_name, summary, status, aliases, version and timestamps. `EvidenceRef` includes source type, locator, evidence state, observed time and optional excerpt. `MatchExplanation` includes lexical, semantic, recency and authority factors without exposing sensitive internal features.
+`KnowledgeEntity` includes id, kind, canonical_name, summary, status, aliases, version and timestamps. `EvidenceRef` includes source type, locator, evidence state, observed time and optional excerpt. `MatchExplanation` includes the lexical (trigram, full-text) and, when hybrid mode is enabled, semantic factors that actually drove the ranking, without exposing sensitive internal features -- recency and authority are not scoring factors in the shipped implementation (see `RETRIEVAL-CONTRACT.md`'s ranking-order note).
 
 ## Mutation rules
 

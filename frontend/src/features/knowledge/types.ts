@@ -135,7 +135,7 @@ export type RetrievalResponse = {
   degraded_reason: string | null
 }
 
-export type EvidenceStatus = 'available' | 'missing'
+export type EvidenceStatus = 'available' | 'missing' | 'permission_denied' | 'deleted'
 
 export type EvidenceItem = {
   id: string

@@ -197,7 +197,7 @@ export default function MergeReview() {
             <MergeCandidateRow key={candidate.id} candidate={candidate} onMerged={recordMerge} />
           ))}
         </ul>
-      ) : !query.isLoading ? (
+      ) : query.isSuccess ? (
         <p className="empty-state">No confirmed candidates awaiting merge.</p>
       ) : null}
 

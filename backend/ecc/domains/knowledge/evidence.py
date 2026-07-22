@@ -28,7 +28,7 @@ IdempotencyHeader = Annotated[
     Header(alias="Idempotency-Key", min_length=1, max_length=255),
 ]
 
-EvidenceStatus = Literal["available", "missing"]
+EvidenceStatus = Literal["available", "missing", "permission_denied", "deleted"]
 
 # Redaction placeholder for a deleted evidence row's locator -- DATA-MODEL.md:
 # "Source deletion changes evidence to `deleted`... and retains only minimal
@@ -77,7 +77,8 @@ def resolve_evidence(
         session.execute(
             text(
                 """
-                SELECT e.id AS id, e.source_type AS source_type,
+                SELECT e.id AS id, e.evidence_state AS evidence_state,
+                       e.source_type AS source_type,
                        e.captured_at AS captured_at, n.canonical_name AS label
                 FROM pkos_evidence AS e
                 JOIN pkos_nodes AS n
@@ -97,6 +98,12 @@ def resolve_evidence(
     for evidence_id in requested:
         row = found.get(evidence_id)
         if row is None:
+            # Row genuinely doesn't exist, or belongs to a different
+            # workspace (the WHERE clause above already scopes to
+            # auth.workspace_id) -- both collapse to "missing" rather than
+            # leaking which case it is, matching this endpoint's existing,
+            # tested cross-workspace-resolves-as-missing-not-permission-
+            # denied convention.
             items.append(
                 EvidenceItem(
                     id=evidence_id,
@@ -107,10 +114,16 @@ def resolve_evidence(
                 )
             )
         else:
+            # The row's own evidence_state ('available', 'permission_denied'
+            # or 'deleted' -- see migration 0010's ck_pkos_evidence_state)
+            # is the real, current status. This used to be hardcoded to
+            # "available" for any existing row, so deleted evidence (see
+            # delete_evidence below) was indistinguishable from available
+            # evidence -- an audit's adversarial re-review caught this.
             items.append(
                 EvidenceItem(
                     id=evidence_id,
-                    status="available",
+                    status=row["evidence_state"],
                     source_type=row["source_type"],
                     label=row["label"],
                     captured_at=row["captured_at"],

@@ -79,6 +79,32 @@ describe('ResolutionInbox', () => {
     await screen.findByText('No resolution candidates awaiting review.')
   })
 
+  it('shows a distinct error state when the candidates fetch fails, never the empty-state text', async () => {
+    // Regression test: the empty-state paragraph used to be gated on
+    // `!query.isLoading`, which is also true while a fetch has failed --
+    // so an error rendered the "No resolution candidates..." text
+    // alongside the alert, exactly the bug EntityDetail.tsx already fixed
+    // for its own sections but this component missed.
+    // ResolutionInbox's query passes retry: 1, overriding the QueryClient's
+    // own retry: false default -- mockImplementation (not Once) so the
+    // retried attempt also fails, rather than hanging on an unconfigured
+    // mock call. React Query's default backoff delays that retry by ~1s,
+    // so the assertion needs a longer-than-default findByRole timeout.
+    const fetch = vi.fn().mockImplementation(() =>
+      Promise.resolve(
+        new Response(JSON.stringify({ error: { code: 'CANDIDATES_UNAVAILABLE' } }), {
+          status: 500,
+          headers: { 'Content-Type': 'application/json' },
+        }),
+      ),
+    )
+    vi.stubGlobal('fetch', fetch)
+    renderInbox()
+
+    await screen.findByRole('alert', {}, { timeout: 3000 })
+    expect(screen.queryByText('No resolution candidates awaiting review.')).toBeNull()
+  })
+
   it('defers a candidate with a future deferred_until, without requiring a reason', async () => {
     const deferred = { ...candidate, deferred_until: '2026-07-03T00:00:00Z' }
     const fetch = vi.fn()

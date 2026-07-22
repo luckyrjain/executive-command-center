@@ -472,6 +472,41 @@ def test_reversal_restores_source_to_active(
     assert merge_row["updated_at"] > merge_row["created_at"]
 
 
+def test_reversal_refreshes_source_retrieval_projection_so_it_is_not_stale(
+    entity_operations_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    # Regression test: reverse used to restore pkos_nodes.status/version to
+    # active without refreshing retrieval_documents, so the reactivated
+    # entity reappeared in search results with a false stale:true (its
+    # projection's source_version still reflected the version stamped
+    # before the merge redirected it out of search).
+    client, _workspace_id, _user_id, token = entity_operations_test_context
+    target_id = _create_entity(client, token, "rev-stale-target", "person", "Ada Lovelace")
+    source_id = _create_entity(client, token, "rev-stale-source", "person", "Ada Lovelase")
+    candidate_id = _create_confirmed_candidate(
+        client, token, "rev-stale-candidate", target_id, source_id
+    )
+    merged = _merge(client, token, "rev-stale-merge", candidate_id, target_id, 1, 1)
+    operation_id = merged.json()["id"]
+
+    reversed_response = client.post(
+        f"/api/v1/knowledge/entity-operations/{operation_id}/reverse",
+        headers=_headers(token, "rev-stale-reverse"),
+        json={"reason": "merged in error"},
+    )
+    assert reversed_response.status_code == 201, reversed_response.text
+
+    search = client.get(
+        "/api/v1/knowledge/retrieve",
+        headers=_headers(token, "rev-stale-search"),
+        params={"q": "Ada Lovelase"},
+    )
+    assert search.status_code == 200, search.text
+    matches = [item for item in search.json()["items"] if item["entity_id"] == str(source_id)]
+    assert matches, "reactivated source entity should be searchable again"
+    assert matches[0]["stale"] is False
+
+
 def test_reversal_rejected_when_target_has_post_merge_dependent_activity(
     entity_operations_test_context: tuple[TestClient, UUID, UUID, str],
 ) -> None:
@@ -655,6 +690,79 @@ def test_split_rejects_claim_not_belonging_to_target(
     )
     assert response.status_code == 422
     assert response.json()["error"]["code"] == "CLAIM_NOT_ON_TARGET"
+
+
+def test_concurrent_splits_reassigning_the_same_claim_do_not_both_succeed(
+    entity_operations_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    """Coverage for concurrent split calls that both name the same target
+    claim: two different merges (source_a and source_b, both redirected
+    into the same target) each get their own split operation, and both
+    name the SAME target claim in their reassign_claim_ids. The
+    target-entity lock both splits take before validating claim ownership
+    already serializes them (confirmed by hand: the ownership-validation
+    SELECT's FOR UPDATE is defense-in-depth, not what prevents this race --
+    see its comment), so exactly one must win with 201 and the other must
+    see the claim as no longer belonging to target and get 422, never both
+    succeeding or the loser silently reassigning zero rows while still
+    reporting success."""
+    client, workspace_id, _user_id, token = entity_operations_test_context
+    target_id = _create_entity(client, token, "split-race-target", "person", "Ada Lovelace")
+    source_a = _create_entity(client, token, "split-race-source-a", "person", "Ada L. A")
+    source_b = _create_entity(client, token, "split-race-source-b", "person", "Ada L. B")
+
+    candidate_a = _create_confirmed_candidate(
+        client, token, "split-race-candidate-a", target_id, source_a
+    )
+    merge_a = _merge(client, token, "split-race-merge-a", candidate_a, target_id, 1, 1)
+    operation_a = merge_a.json()["id"]
+
+    candidate_b = _create_confirmed_candidate(
+        client, token, "split-race-candidate-b", target_id, source_b
+    )
+    merge_b = _merge(client, token, "split-race-merge-b", candidate_b, target_id, 1, 1)
+    operation_b = merge_b.json()["id"]
+
+    evidence_id = _seed_evidence(workspace_id, target_id)
+    claim = client.post(
+        f"/api/v1/knowledge/entities/{target_id}/claims",
+        headers=_headers(token, "split-race-claim"),
+        json={
+            "predicate": "role",
+            "value": {"title": "Mathematician"},
+            "source_id": str(evidence_id),
+        },
+    )
+    claim_id = claim.json()["id"]
+
+    def split_once(label: str, operation_id: str) -> int:
+        worker = TestClient(app)
+        worker.cookies.set("ecc_session", token)
+        try:
+            response = worker.post(
+                f"/api/v1/knowledge/entity-operations/{operation_id}/split",
+                headers=_headers(token, f"split-race-attempt-{label}"),
+                json={"reason": "race", "reassign_claim_ids": [claim_id]},
+            )
+            return response.status_code
+        finally:
+            worker.close()
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(
+            executor.map(
+                lambda args: split_once(*args),
+                [("a", operation_a), ("b", operation_b)],
+            )
+        )
+
+    assert sorted(results) == [201, 422]
+
+    with engine.connect() as connection:
+        subject_id = connection.execute(
+            text("SELECT subject_id FROM knowledge_claims WHERE id = :id"), {"id": claim_id}
+        ).scalar_one()
+    assert str(subject_id) in (str(source_a), str(source_b))
 
 
 def test_split_requires_a_merge_operation(

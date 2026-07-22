@@ -307,6 +307,34 @@ def test_delete_evidence_marks_deleted_and_redacts_source_ref(
     assert "redacted" in row["source_ref"]
 
 
+def test_evidence_resolves_deleted_id_as_deleted_not_available(
+    evidence_test_context: tuple[TestClient, UUID, str],
+) -> None:
+    # Adversarial regression test: resolve_evidence used to hardcode
+    # status="available" for any row that existed, so evidence marked
+    # deleted (still a real row per ADR-0003's "never overwrite source
+    # evidence") was indistinguishable from genuinely available evidence --
+    # an audit's re-review caught this. GET /evidence must surface the
+    # row's own evidence_state, not just "does a row exist."
+    client, workspace_id, token = evidence_test_context
+    evidence_id = _insert_node_and_evidence(
+        workspace_id, "Board Deck", "document", datetime.now(UTC)
+    )
+    delete = client.post(
+        f"/api/v1/evidence/{evidence_id}/delete",
+        headers=_headers(token, "delete-for-resolve-check"),
+        json={"reason": "source revoked access"},
+    )
+    assert delete.status_code == 200, delete.text
+
+    response = client.get(f"/api/v1/evidence?id={evidence_id}")
+    assert response.status_code == 200
+    items = response.json()["items"]
+    assert len(items) == 1
+    assert items[0]["id"] == str(evidence_id)
+    assert items[0]["status"] == "deleted"
+
+
 def test_delete_evidence_is_idempotent(
     evidence_test_context: tuple[TestClient, UUID, str],
 ) -> None:
@@ -342,6 +370,55 @@ def test_delete_evidence_404_for_unknown_id(
     )
     assert response.status_code == 404
     assert response.json()["error"]["code"] == "EVIDENCE_NOT_FOUND"
+
+
+def test_delete_evidence_rejects_a_foreign_workspace_evidence_id(
+    evidence_test_context: tuple[TestClient, UUID, str],
+) -> None:
+    client, _workspace_id, token = evidence_test_context
+    other_workspace_id = uuid4()
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                """
+                INSERT INTO workspaces (id, name, timezone, created_at)
+                VALUES (:id, 'Foreign Workspace', 'UTC', :now)
+                """
+            ),
+            {"id": other_workspace_id, "now": datetime.now(UTC)},
+        )
+    try:
+        foreign_evidence_id = _insert_node_and_evidence(
+            other_workspace_id, "Foreign Contract", "document", datetime.now(UTC)
+        )
+        response = client.post(
+            f"/api/v1/evidence/{foreign_evidence_id}/delete",
+            headers=_headers(token, "isolation-delete-foreign"),
+            json={"reason": "attempt"},
+        )
+        assert response.status_code == 404
+        assert response.json()["error"]["code"] == "EVIDENCE_NOT_FOUND"
+
+        with engine.connect() as connection:
+            evidence_state = connection.execute(
+                text("SELECT evidence_state FROM pkos_evidence WHERE id = :id"),
+                {"id": foreign_evidence_id},
+            ).scalar_one()
+        assert evidence_state == "available"
+    finally:
+        with engine.begin() as connection:
+            connection.execute(
+                text("DELETE FROM pkos_evidence WHERE workspace_id = :w"),
+                {"w": other_workspace_id},
+            )
+            connection.execute(
+                text("DELETE FROM pkos_nodes WHERE workspace_id = :w"),
+                {"w": other_workspace_id},
+            )
+            connection.execute(
+                text("DELETE FROM workspaces WHERE id = :w"),
+                {"w": other_workspace_id},
+            )
 
 
 def test_delete_evidence_removes_derived_claim_content_from_retrieval(
