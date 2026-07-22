@@ -356,6 +356,28 @@ function makeKnowledgeApi(overrides = {}) {
       return { status: 201, body: claim }
     }
 
+    const supersedeMatch = pathname.match(/^\/api\/v1\/knowledge\/entities\/([^/]+)\/claims\/([^/]+)\/supersede$/)
+    if (supersedeMatch && method === 'POST') {
+      const [, entityId, claimId] = supersedeMatch
+      const original = claims.find((claim) => claim.id === claimId)
+      if (original) original.superseded_by = randomUUID()
+      const claim = {
+        id: original ? original.superseded_by : randomUUID(),
+        subject_id: entityId,
+        predicate: body.predicate,
+        value: body.value,
+        source_id: body.source_id,
+        confidence: body.confidence ?? 1,
+        valid_from: body.valid_from ?? null,
+        valid_to: body.valid_to ?? null,
+        superseded_by: null,
+        created_at: nowIso(),
+      }
+      claims.push(claim)
+      pushTimeline(entityId, 'knowledge_entity.claim_recorded', `claim corrected: ${body.predicate}`)
+      return { status: 201, body: claim }
+    }
+
     const relationshipsMatch = pathname.match(/^\/api\/v1\/knowledge\/entities\/([^/]+)\/relationships$/)
     if (relationshipsMatch && method === 'GET') {
       const entityId = relationshipsMatch[1]

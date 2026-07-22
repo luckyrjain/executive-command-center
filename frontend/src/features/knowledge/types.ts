@@ -135,3 +135,15 @@ export type RetrievalResponse = {
   degraded: boolean
   degraded_reason: string | null
 }
+
+export type EvidenceStatus = 'available' | 'missing'
+
+export type EvidenceItem = {
+  id: string
+  status: EvidenceStatus
+  source_type: string | null
+  label: string | null
+  captured_at: string | null
+}
+
+export type EvidenceListResponse = { items: EvidenceItem[] }

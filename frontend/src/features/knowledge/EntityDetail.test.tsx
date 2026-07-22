@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { cleanup, render, screen } from '@testing-library/react'
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import EntityDetail from './EntityDetail'
@@ -139,8 +139,141 @@ describe('EntityDetail', () => {
     renderDetail()
 
     await screen.findByText('nickname', { exact: false })
-    await screen.findByText('title', { exact: false })
+    await screen.findByText((_content, element) => element?.tagName === 'STRONG' && element.textContent === 'title')
     await screen.findByText('RELATES_TO → entity-2')
     await screen.findByText('Entity created', { exact: false })
+  })
+
+  it('resolves and renders evidence provenance for claims and relationships', async () => {
+    const fetch = routedFetch([
+      { method: 'GET', match: (p) => p === base(''), handle: () => jsonResponse(personEntity) },
+      { method: 'GET', match: (p) => p === base('/aliases'), handle: () => jsonResponse({ items: [] }) },
+      {
+        method: 'GET',
+        match: (p) => p === base('/claims'),
+        handle: () =>
+          jsonResponse({
+            items: [{ id: 'claim-1', subject_id: personEntity.id, predicate: 'title', value: { text: 'Mathematician' }, source_id: 'src-available', confidence: 0.9, superseded_by: null, valid_from: null, valid_to: null, created_at: '2026-01-01T00:00:00Z' }],
+          }),
+      },
+      {
+        method: 'GET',
+        match: (p) => p === base('/relationships'),
+        handle: () =>
+          jsonResponse({
+            items: [{ id: 'rel-1', from_entity_id: personEntity.id, to_entity_id: 'entity-2', relationship_type: 'RELATES_TO', status: 'active', confidence: 0.9, evidence_id: 'src-missing', valid_from: null, valid_to: null }],
+          }),
+      },
+      { method: 'GET', match: (p) => p === base('/timeline'), handle: () => jsonResponse({ items: [], next_cursor: null }) },
+      {
+        method: 'GET',
+        match: (p) => p === '/api/v1/evidence',
+        handle: () =>
+          jsonResponse({
+            items: [
+              { id: 'src-available', status: 'available', source_type: 'manual', label: null, captured_at: null },
+              { id: 'src-missing', status: 'missing', source_type: null, label: null, captured_at: null },
+            ],
+          }),
+      },
+    ])
+    vi.stubGlobal('fetch', fetch)
+    renderDetail()
+
+    await screen.findByText('(available)', { exact: false })
+    await screen.findByText('(missing)', { exact: false })
+    const evidenceCall = fetch.mock.calls.find(([input]) => String(input).startsWith('/api/v1/evidence'))
+    expect(evidenceCall).toBeTruthy()
+    expect(String(evidenceCall?.[0])).toContain('id=src-available')
+    expect(String(evidenceCall?.[0])).toContain('id=src-missing')
+  })
+
+  it('records a new claim via the claim form', async () => {
+    let claimsListCallCount = 0
+    const fetch = routedFetch([
+      { method: 'GET', match: (p) => p === base(''), handle: () => jsonResponse(personEntity) },
+      { method: 'GET', match: (p) => p === base('/aliases'), handle: () => jsonResponse({ items: [] }) },
+      {
+        method: 'GET',
+        match: (p) => p === base('/claims'),
+        handle: () => {
+          claimsListCallCount += 1
+          return jsonResponse({ items: [] })
+        },
+      },
+      { method: 'GET', match: (p) => p === base('/relationships'), handle: () => jsonResponse({ items: [] }) },
+      { method: 'GET', match: (p) => p === base('/timeline'), handle: () => jsonResponse({ items: [], next_cursor: null }) },
+      {
+        method: 'POST',
+        match: (p) => p === base('/claims'),
+        handle: () =>
+          jsonResponse(
+            { id: 'claim-new', subject_id: personEntity.id, predicate: 'employed_at', value: { text: 'Analytical Engines Ltd' }, source_id: 'src-1', confidence: 1, superseded_by: null, valid_from: null, valid_to: null, created_at: '2026-01-01T00:00:00Z' },
+            201,
+          ),
+      },
+    ])
+    vi.stubGlobal('fetch', fetch)
+    renderDetail()
+    await screen.findByText('No claims recorded for this entity.')
+
+    fireEvent.change(screen.getByLabelText('Claim predicate'), { target: { value: 'employed_at' } })
+    fireEvent.change(screen.getByLabelText('Claim value'), { target: { value: 'Analytical Engines Ltd' } })
+    fireEvent.change(screen.getByLabelText('Claim source ID'), { target: { value: 'src-1' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Record claim' }))
+
+    await waitFor(() => expect(claimsListCallCount).toBeGreaterThan(1))
+    const postCall = fetch.mock.calls.find(([, init]) => init?.method === 'POST')
+    expect(postCall).toBeTruthy()
+    const payload = JSON.parse(String(postCall?.[1]?.body))
+    expect(payload).toEqual({
+      predicate: 'employed_at',
+      value: { text: 'Analytical Engines Ltd' },
+      source_id: 'src-1',
+      confidence: 1,
+    })
+  })
+
+  it('corrects an existing claim via supersede', async () => {
+    const existingClaim = { id: 'claim-1', subject_id: personEntity.id, predicate: 'title', value: { text: 'Mathematician' }, source_id: 'src-1', confidence: 0.9, superseded_by: null, valid_from: null, valid_to: null, created_at: '2026-01-01T00:00:00Z' }
+    let supersedeCalled = false
+    const fetch = routedFetch([
+      { method: 'GET', match: (p) => p === base(''), handle: () => jsonResponse(personEntity) },
+      { method: 'GET', match: (p) => p === base('/aliases'), handle: () => jsonResponse({ items: [] }) },
+      { method: 'GET', match: (p) => p === base('/claims'), handle: () => jsonResponse({ items: [existingClaim] }) },
+      { method: 'GET', match: (p) => p === base('/relationships'), handle: () => jsonResponse({ items: [] }) },
+      { method: 'GET', match: (p) => p === base('/timeline'), handle: () => jsonResponse({ items: [], next_cursor: null }) },
+      {
+        method: 'POST',
+        match: (p) => p === base(`/claims/${existingClaim.id}/supersede`),
+        handle: () => {
+          supersedeCalled = true
+          return jsonResponse(
+            { ...existingClaim, id: 'claim-2', value: { text: 'Countess of Lovelace' } },
+            201,
+          )
+        },
+      },
+    ])
+    vi.stubGlobal('fetch', fetch)
+    renderDetail()
+
+    const correctButton = await screen.findByRole('button', { name: 'Correct “title”' })
+    fireEvent.click(correctButton)
+
+    const valueInput = await screen.findByLabelText(`Correction value for ${existingClaim.id}`)
+    fireEvent.change(valueInput, { target: { value: 'Countess of Lovelace' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Save correction' }))
+
+    await waitFor(() => expect(supersedeCalled).toBe(true))
+    const postCall = fetch.mock.calls.find(([input]) => String(input).includes('supersede'))
+    expect(postCall).toBeTruthy()
+    const payload = JSON.parse(String(postCall?.[1]?.body))
+    expect(payload).toEqual({
+      predicate: 'title',
+      value: { text: 'Countess of Lovelace' },
+      source_id: 'src-1',
+      confidence: 0.9,
+    })
   })
 })
