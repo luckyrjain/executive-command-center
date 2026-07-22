@@ -276,8 +276,7 @@ def test_reverse_with_200_rehomed_relationships_p95_under_budget(
     _merge_and_reverse_once(client, workspace_id, "warmup")
 
     samples = [
-        _merge_and_reverse_once(client, workspace_id, f"sample-{i}")
-        for i in range(REVERSE_COUNT)
+        _merge_and_reverse_once(client, workspace_id, f"sample-{i}") for i in range(REVERSE_COUNT)
     ]
 
     p95 = _p95(samples)
