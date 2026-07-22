@@ -487,6 +487,150 @@ def test_reversal_restores_source_to_active(
     assert merge_row["updated_at"] > merge_row["created_at"]
 
 
+def test_reversal_restores_rehomed_relationships_and_aliases_to_source(
+    entity_operations_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    # Regression test: reverse used to only flip pkos_nodes.status back to
+    # active, leaving every relationship/alias merge's _rehome_edges/
+    # _rehome_aliases had moved onto target permanently attached to target
+    # -- contradicting both this function's own docstring ("reverse can
+    # safely restore the source because nothing has changed since the
+    # merge") and DATA-MODEL.md's "reversal restores prior identities".
+    # Since nothing else happened (guaranteed by the UNSAFE_REVERSAL check
+    # already passing), everything the merge itself moved should move back.
+    client, workspace_id, _user_id, token = entity_operations_test_context
+    target_id = _create_entity(client, token, "rev-rel-target", "person", "Ada Lovelace")
+    source_id = _create_entity(client, token, "rev-rel-source", "person", "Ada Lovelase")
+    other_id = _create_entity(client, token, "rev-rel-other", "project", "Analytical Engine")
+    alias_id = _seed_alias(workspace_id, source_id, "the enchantress of numbers")
+
+    evidence_id = _seed_evidence(workspace_id, source_id)
+    relationship = client.post(
+        f"/api/v1/knowledge/entities/{source_id}/relationships",
+        headers=_headers(token, "rev-rel-create"),
+        json={
+            "relationship_type": "WORKS_ON",
+            "to_entity_id": str(other_id),
+            "evidence_id": str(evidence_id),
+        },
+    )
+    assert relationship.status_code == 201, relationship.text
+    relationship_id = relationship.json()["id"]
+
+    candidate_id = _create_confirmed_candidate(
+        client, token, "rev-rel-candidate", target_id, source_id
+    )
+    merged = _merge(client, token, "rev-rel-merge", candidate_id, target_id, 1, 1)
+    operation_id = merged.json()["id"]
+
+    # Rehomed onto target by the merge itself.
+    with engine.connect() as connection:
+        rehomed_edge = connection.execute(
+            text("SELECT source_node_id FROM pkos_edges WHERE id = :id"),
+            {"id": relationship_id},
+        ).scalar_one()
+        rehomed_alias_owner = connection.execute(
+            text("SELECT entity_id FROM entity_aliases WHERE id = :id"), {"id": alias_id}
+        ).scalar_one()
+    assert str(rehomed_edge) == str(target_id)
+    assert str(rehomed_alias_owner) == str(target_id)
+
+    reversed_response = client.post(
+        f"/api/v1/knowledge/entity-operations/{operation_id}/reverse",
+        headers=_headers(token, "rev-rel-reverse"),
+        json={"reason": "merged in error"},
+    )
+    assert reversed_response.status_code == 201, reversed_response.text
+
+    with engine.connect() as connection:
+        restored_edge = connection.execute(
+            text("SELECT source_node_id FROM pkos_edges WHERE id = :id"),
+            {"id": relationship_id},
+        ).scalar_one()
+        restored_alias_owner = connection.execute(
+            text("SELECT entity_id FROM entity_aliases WHERE id = :id"), {"id": alias_id}
+        ).scalar_one()
+    assert str(restored_edge) == str(source_id)
+    assert str(restored_alias_owner) == str(source_id)
+
+    source_relationships = client.get(
+        f"/api/v1/knowledge/entities/{source_id}/relationships",
+        headers=_headers(token, "rev-rel-check"),
+    )
+    assert any(item["id"] == relationship_id for item in source_relationships.json()["items"])
+
+
+def test_reversal_restores_an_invalidated_duplicate_edge_to_active(
+    entity_operations_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    # Companion to the above for the other _rehome_edges branch: an edge
+    # that duplicated one target already had was invalidated (status only,
+    # node references untouched) rather than rehomed. Reverse must flip its
+    # status back to active, restoring source's own copy of the
+    # relationship rather than leaving it permanently invalidated.
+    client, workspace_id, _user_id, token = entity_operations_test_context
+    target_id = _create_entity(client, token, "rev-dup-target", "person", "Ada Lovelace")
+    source_id = _create_entity(client, token, "rev-dup-source", "person", "Ada Lovelase")
+    other_id = _create_entity(client, token, "rev-dup-other", "project", "Analytical Engine")
+
+    target_evidence_id = _seed_evidence(workspace_id, target_id)
+    target_relationship = client.post(
+        f"/api/v1/knowledge/entities/{target_id}/relationships",
+        headers=_headers(token, "rev-dup-target-create"),
+        json={
+            "relationship_type": "WORKS_ON",
+            "to_entity_id": str(other_id),
+            "evidence_id": str(target_evidence_id),
+        },
+    )
+    assert target_relationship.status_code == 201, target_relationship.text
+
+    source_evidence_id = _seed_evidence(workspace_id, source_id)
+    source_relationship = client.post(
+        f"/api/v1/knowledge/entities/{source_id}/relationships",
+        headers=_headers(token, "rev-dup-source-create"),
+        json={
+            "relationship_type": "WORKS_ON",
+            "to_entity_id": str(other_id),
+            "evidence_id": str(source_evidence_id),
+        },
+    )
+    assert source_relationship.status_code == 201, source_relationship.text
+    duplicate_relationship_id = source_relationship.json()["id"]
+
+    candidate_id = _create_confirmed_candidate(
+        client, token, "rev-dup-candidate", target_id, source_id
+    )
+    merged = _merge(client, token, "rev-dup-merge", candidate_id, target_id, 1, 1)
+    operation_id = merged.json()["id"]
+
+    with engine.connect() as connection:
+        status_after_merge = connection.execute(
+            text("SELECT status FROM pkos_edges WHERE id = :id"),
+            {"id": duplicate_relationship_id},
+        ).scalar_one()
+    assert status_after_merge == "invalidated"
+
+    reversed_response = client.post(
+        f"/api/v1/knowledge/entity-operations/{operation_id}/reverse",
+        headers=_headers(token, "rev-dup-reverse"),
+        json={"reason": "merged in error"},
+    )
+    assert reversed_response.status_code == 201, reversed_response.text
+
+    with engine.connect() as connection:
+        status_after_reverse = (
+            connection.execute(
+                text("SELECT status, source_node_id FROM pkos_edges WHERE id = :id"),
+                {"id": duplicate_relationship_id},
+            )
+            .mappings()
+            .one()
+        )
+    assert status_after_reverse["status"] == "active"
+    assert str(status_after_reverse["source_node_id"]) == str(source_id)
+
+
 def test_reversal_refreshes_source_retrieval_projection_so_it_is_not_stale(
     entity_operations_test_context: tuple[TestClient, UUID, UUID, str],
 ) -> None:
@@ -550,6 +694,48 @@ def test_reversal_rejected_when_target_has_post_merge_dependent_activity(
         f"/api/v1/knowledge/entity-operations/{operation_id}/reverse",
         headers=_headers(token, "unsafe-reverse"),
         json={"reason": "attempt after dependent activity"},
+    )
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "UNSAFE_REVERSAL"
+
+
+def test_reversal_rejected_when_a_relationship_was_created_on_target_after_merge(
+    entity_operations_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    # Regression test: _has_post_merge_dependent_activity used to only check
+    # audit_events for aggregate_type='knowledge_entity', which claims and
+    # entity mutations write -- but relationships.py's create_relationship
+    # writes aggregate_type='relationship' with aggregate_id=<the
+    # relationship's own id>, not the target entity's id, so a relationship
+    # created against the target after the merge was invisible to the
+    # check and reverse would wrongly succeed despite the identical
+    # attribution ambiguity a post-merge claim already blocks.
+    client, workspace_id, _user_id, token = entity_operations_test_context
+    target_id = _create_entity(client, token, "unsafe-rel-target", "person", "Ada Lovelace")
+    source_id = _create_entity(client, token, "unsafe-rel-source", "person", "Ada Lovelase")
+    other_id = _create_entity(client, token, "unsafe-rel-other", "project", "Analytical Engine")
+    candidate_id = _create_confirmed_candidate(
+        client, token, "unsafe-rel-candidate", target_id, source_id
+    )
+    merged = _merge(client, token, "unsafe-rel-merge", candidate_id, target_id, 1, 1)
+    operation_id = merged.json()["id"]
+
+    evidence_id = _seed_evidence(workspace_id, target_id)
+    relationship = client.post(
+        f"/api/v1/knowledge/entities/{target_id}/relationships",
+        headers=_headers(token, "unsafe-rel-create"),
+        json={
+            "relationship_type": "WORKS_ON",
+            "to_entity_id": str(other_id),
+            "evidence_id": str(evidence_id),
+        },
+    )
+    assert relationship.status_code == 201, relationship.text
+
+    response = client.post(
+        f"/api/v1/knowledge/entity-operations/{operation_id}/reverse",
+        headers=_headers(token, "unsafe-rel-reverse"),
+        json={"reason": "attempt after dependent relationship activity"},
     )
     assert response.status_code == 422
     assert response.json()["error"]["code"] == "UNSAFE_REVERSAL"

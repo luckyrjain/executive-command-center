@@ -302,7 +302,7 @@ def _write_side_effects(
 
 def _rehome_aliases(
     session: Session, auth: AuthContext, source_id: UUID, target_id: UUID, now: datetime
-) -> int:
+) -> list[UUID]:
     """Move entity_aliases rows from source to target. entity_aliases carries
     a workspace-wide unique constraint on (alias_type, normalized_value)
     (migration 0011), so an alias the target already holds cannot also be
@@ -310,7 +310,13 @@ def _rehome_aliases(
     deterministically" is satisfied by simply leaving that specific alias
     row attached to the now-redirected source rather than failing the
     whole merge; the alias value itself is still discoverable (it already
-    resolves to target through its own row)."""
+    resolves to target through its own row).
+
+    Returns the rehomed alias ids so the caller can record them on the
+    merge operation -- reverse_operation needs this exact list to move
+    them back to source; there is no other way to distinguish "an alias
+    this merge rehomed onto target" from "an alias target already had"
+    after the fact."""
     rehomed = session.execute(
         text(
             """
@@ -334,18 +340,28 @@ def _rehome_aliases(
             "now": now,
         },
     )
-    return len(rehomed.all())
+    return [row[0] for row in rehomed.all()]
 
 
-def _rehome_edges(session: Session, auth: AuthContext, source_id: UUID, target_id: UUID) -> int:
+def _rehome_edges(
+    session: Session, auth: AuthContext, source_id: UUID, target_id: UUID
+) -> tuple[list[UUID], list[UUID]]:
     """Move active pkos_edges rows referencing source to reference target
     instead. An edge that would exactly duplicate an already-active
     target edge (same edge_type, same other-side node) after rehoming is
     invalidated instead of rehomed, per DATA-MODEL.md's "resolves
     duplicates deterministically" -- the target's original edge is kept,
     the source's redundant one is marked invalidated rather than deleted
-    (no authoritative record is ever destroyed)."""
-    rehomed = 0
+    (no authoritative record is ever destroyed).
+
+    Returns (rehomed_edge_ids, invalidated_edge_ids) so the caller can
+    record them on the merge operation -- reverse_operation needs this
+    exact split to restore correctly: a rehomed edge gets its node
+    reference moved back to source, an invalidated one just gets its
+    status flipped back to active (its node references were never
+    touched, so nothing to move)."""
+    rehomed_ids: list[UUID] = []
+    invalidated_ids: list[UUID] = []
     rows = session.execute(
         text(
             """
@@ -370,6 +386,7 @@ def _rehome_edges(session: Session, auth: AuthContext, source_id: UUID, target_i
                 ),
                 {"workspace_id": auth.workspace_id, "edge_id": edge_id},
             )
+            invalidated_ids.append(edge_id)
             continue
         duplicate = session.execute(
             text(
@@ -396,6 +413,7 @@ def _rehome_edges(session: Session, auth: AuthContext, source_id: UUID, target_i
                 ),
                 {"workspace_id": auth.workspace_id, "edge_id": edge_id},
             )
+            invalidated_ids.append(edge_id)
             continue
         session.execute(
             text(
@@ -412,8 +430,8 @@ def _rehome_edges(session: Session, auth: AuthContext, source_id: UUID, target_i
                 "new_target": new_target,
             },
         )
-        rehomed += 1
-    return rehomed
+        rehomed_ids.append(edge_id)
+    return rehomed_ids, invalidated_ids
 
 
 @router.post("/entities/merge", response_model=EntityOperationResponse, status_code=201)
@@ -495,8 +513,8 @@ def merge_entities(
             ),
             {"workspace_id": auth.workspace_id, "source_id": source_id, "now": now},
         )
-        rehomed_aliases = _rehome_aliases(session, auth, source_id, target_id, now)
-        rehomed_edges = _rehome_edges(session, auth, source_id, target_id)
+        rehomed_alias_ids = _rehome_aliases(session, auth, source_id, target_id, now)
+        rehomed_edge_ids, invalidated_edge_ids = _rehome_edges(session, auth, source_id, target_id)
 
         operation_id = uuid4()
         row = (
@@ -529,8 +547,15 @@ def merge_entities(
                         {
                             "source_entity_id": str(source_id),
                             "target_entity_id": str(target_id),
-                            "redirected_alias_count": rehomed_aliases,
-                            "redirected_edge_count": rehomed_edges,
+                            "redirected_alias_count": len(rehomed_alias_ids),
+                            "redirected_edge_count": len(rehomed_edge_ids),
+                            # Recorded so reverse_operation can restore exactly
+                            # what this merge moved, without guessing which of
+                            # target's current edges/aliases came from here --
+                            # see _rehome_edges/_rehome_aliases docstrings.
+                            "rehomed_alias_ids": [str(i) for i in rehomed_alias_ids],
+                            "rehomed_edge_ids": [str(i) for i in rehomed_edge_ids],
+                            "invalidated_edge_ids": [str(i) for i in invalidated_edge_ids],
                         }
                     ),
                     "actor_id": auth.user_id,
@@ -573,7 +598,14 @@ def _has_post_merge_dependent_activity(
     mutations recorded against the target both write audit_events with
     aggregate_type='knowledge_entity' and aggregate_id=target_id (see
     claims.py/entities_mutations.py's _write_side_effects), so any such
-    row occurring after the merge is exactly that signal."""
+    row occurring after the merge is exactly that signal.
+
+    Relationships are the identical ambiguity but need a second query:
+    relationships.py's _write_side_effects writes aggregate_type='relationship'
+    with aggregate_id=<the relationship's own id>, not the entity's id, so a
+    relationship created against the target after the merge is invisible to
+    the query above -- it has to join back through pkos_edges to find which
+    entity a given relationship event actually touched."""
     row = session.execute(
         text(
             """
@@ -589,7 +621,26 @@ def _has_post_merge_dependent_activity(
             "merge_created_at": merge_created_at,
         },
     ).one_or_none()
-    return row is not None
+    if row is not None:
+        return True
+    relationship_row = session.execute(
+        text(
+            """
+            SELECT 1 FROM audit_events ae
+            JOIN pkos_edges e ON e.workspace_id = ae.workspace_id AND e.id = ae.aggregate_id
+            WHERE ae.workspace_id = :workspace_id AND ae.aggregate_type = 'relationship'
+              AND ae.occurred_at > :merge_created_at
+              AND (e.source_node_id = :target_id OR e.target_node_id = :target_id)
+            LIMIT 1
+            """
+        ),
+        {
+            "workspace_id": auth.workspace_id,
+            "target_id": target_id,
+            "merge_created_at": merge_created_at,
+        },
+    ).one_or_none()
+    return relationship_row is not None
 
 
 @router.post(
@@ -664,6 +715,64 @@ def reverse_operation(
             ),
             {"workspace_id": auth.workspace_id, "source_id": source_id, "now": now},
         )
+
+        # Move back exactly what this merge rehomed onto target -- the
+        # recorded ids, not a fresh scan of target's current edges/aliases,
+        # since after the merge there's no way to tell "an edge this merge
+        # moved" apart from "an edge target always had" by inspection alone.
+        # Safe to do unconditionally here: the UNSAFE_REVERSAL check above
+        # already guarantees no relationship activity touched target since
+        # the merge, so restoring these can't collide with something new.
+        outputs = merge_op["outputs_json"] if isinstance(merge_op["outputs_json"], dict) else {}
+        rehomed_alias_ids = [UUID(i) for i in outputs.get("rehomed_alias_ids", [])]
+        rehomed_edge_ids = [UUID(i) for i in outputs.get("rehomed_edge_ids", [])]
+        invalidated_edge_ids = [UUID(i) for i in outputs.get("invalidated_edge_ids", [])]
+        if rehomed_alias_ids:
+            session.execute(
+                text(
+                    """
+                    UPDATE entity_aliases
+                    SET entity_id = :source_id, updated_at = :now, version = version + 1
+                    WHERE workspace_id = :workspace_id AND id = ANY(:alias_ids)
+                    """
+                ),
+                {
+                    "workspace_id": auth.workspace_id,
+                    "source_id": source_id,
+                    "alias_ids": rehomed_alias_ids,
+                    "now": now,
+                },
+            )
+        if rehomed_edge_ids:
+            session.execute(
+                text(
+                    """
+                    UPDATE pkos_edges
+                    SET source_node_id = CASE WHEN source_node_id = :target_id
+                            THEN :source_id ELSE source_node_id END,
+                        target_node_id = CASE WHEN target_node_id = :target_id
+                            THEN :source_id ELSE target_node_id END
+                    WHERE workspace_id = :workspace_id AND id = ANY(:edge_ids)
+                    """
+                ),
+                {
+                    "workspace_id": auth.workspace_id,
+                    "source_id": source_id,
+                    "target_id": target_id,
+                    "edge_ids": rehomed_edge_ids,
+                },
+            )
+        if invalidated_edge_ids:
+            session.execute(
+                text(
+                    """
+                    UPDATE pkos_edges SET status = 'active'
+                    WHERE workspace_id = :workspace_id AND id = ANY(:edge_ids)
+                    """
+                ),
+                {"workspace_id": auth.workspace_id, "edge_ids": invalidated_edge_ids},
+            )
+
         # The reactivated source's retrieval_documents/embedding rows still
         # carry the source_version stamped when it was redirected out of
         # search results -- without refreshing them, it reappears in

@@ -16,21 +16,23 @@ function factorSummary(candidate: ResolutionCandidate): string {
     .join(', ')
 }
 
-export default function ResolutionInbox() {
-  const queryClient = useQueryClient()
-  const [reasons, setReasons] = useState<Record<string, string>>({})
+type ResolutionCandidateRowProps = { candidate: ResolutionCandidate }
 
-  const query = useQuery({
-    queryKey: ['knowledge', 'resolution', 'candidates', 'open'],
-    queryFn: listOpenCandidates,
-    retry: 1,
-  })
+// Each row owns its own mutations (mirrors MergeReview.tsx's
+// MergeCandidateRow) rather than sharing one decisionMutation/deferMutation
+// across the whole list -- a shared mutation means one row's in-flight
+// request disables every other row's buttons, and one row's error renders
+// as an unattributed alert a reader has no way to tie back to which
+// candidate it came from.
+function ResolutionCandidateRow({ candidate }: ResolutionCandidateRowProps) {
+  const queryClient = useQueryClient()
+  const [reason, setReason] = useState('')
 
   const decisionMutation = useMutation({
-    mutationFn: ({ candidate, decision, reason }: { candidate: ResolutionCandidate; decision: Decision; reason: string }) =>
+    mutationFn: (decision: Decision) =>
       apiRequest<ResolutionCandidate>(`/api/v1/knowledge/resolution/candidates/${candidate.id}/${decision}`, {
         method: 'POST',
-        body: { reason },
+        body: { reason: reason.trim() },
       }),
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: ['knowledge', 'resolution', 'candidates'] })
@@ -42,7 +44,7 @@ export default function ResolutionInbox() {
   // or rejecting, matching the identical pattern Phase 1's attention items
   // already use for their own defer action.
   const deferMutation = useMutation({
-    mutationFn: (candidate: ResolutionCandidate) =>
+    mutationFn: () =>
       apiRequest<ResolutionCandidate>(`/api/v1/knowledge/resolution/candidates/${candidate.id}/defer`, {
         method: 'POST',
         body: { deferred_until: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString() },
@@ -52,13 +54,59 @@ export default function ResolutionInbox() {
     },
   })
 
-  function reasonFor(candidateId: string): string {
-    return reasons[candidateId] ?? ''
-  }
+  return (
+    <li>
+      <div>
+        <strong>{candidate.left_entity_id}</strong> ↔ <strong>{candidate.right_entity_id}</strong>
+        <small> · score {candidate.score.toFixed(2)} ({factorSummary(candidate)})</small>
+      </div>
+      {decisionMutation.error ? (
+        <div role="alert" className="inline-status error-panel">{decisionMutation.error.message}</div>
+      ) : null}
+      {deferMutation.error ? (
+        <div role="alert" className="inline-status error-panel">{deferMutation.error.message}</div>
+      ) : null}
+      <label>
+        {`Reason for ${candidate.id}`}
+        <input
+          aria-label={`Reason for ${candidate.id}`}
+          value={reason}
+          onChange={(event) => setReason(event.target.value)}
+        />
+      </label>
+      <div className="work-actions" role="group" aria-label={`Actions for candidate ${candidate.id}`}>
+        <button
+          type="button"
+          disabled={decisionMutation.isPending || !reason.trim()}
+          onClick={() => decisionMutation.mutate('confirm')}
+        >
+          Confirm match
+        </button>
+        <button
+          type="button"
+          disabled={decisionMutation.isPending || !reason.trim()}
+          onClick={() => decisionMutation.mutate('reject')}
+        >
+          Reject
+        </button>
+        <button
+          type="button"
+          disabled={deferMutation.isPending}
+          onClick={() => deferMutation.mutate()}
+        >
+          Defer
+        </button>
+      </div>
+    </li>
+  )
+}
 
-  function setReasonFor(candidateId: string, value: string) {
-    setReasons((current) => ({ ...current, [candidateId]: value }))
-  }
+export default function ResolutionInbox() {
+  const query = useQuery({
+    queryKey: ['knowledge', 'resolution', 'candidates', 'open'],
+    queryFn: listOpenCandidates,
+    retry: 1,
+  })
 
   return (
     <section className="work-panel knowledge-resolution-inbox" aria-labelledby="resolution-inbox-title">
@@ -70,58 +118,12 @@ export default function ResolutionInbox() {
         </div>
       </div>
 
-      {decisionMutation.error ? (
-        <div role="alert" className="inline-status error-panel">{decisionMutation.error.message}</div>
-      ) : null}
-      {deferMutation.error ? (
-        <div role="alert" className="inline-status error-panel">{deferMutation.error.message}</div>
-      ) : null}
       {query.isLoading ? <p role="status">Loading resolution candidates…</p> : null}
       {query.isError ? <div role="alert">{query.error.message}</div> : null}
       {query.data?.items.length ? (
         <ul className="work-list">
           {query.data.items.map((candidate) => (
-            <li key={candidate.id}>
-              <div>
-                <strong>{candidate.left_entity_id}</strong> ↔ <strong>{candidate.right_entity_id}</strong>
-                <small> · score {candidate.score.toFixed(2)} ({factorSummary(candidate)})</small>
-              </div>
-              <label>
-                {`Reason for ${candidate.id}`}
-                <input
-                  aria-label={`Reason for ${candidate.id}`}
-                  value={reasonFor(candidate.id)}
-                  onChange={(event) => setReasonFor(candidate.id, event.target.value)}
-                />
-              </label>
-              <div className="work-actions" role="group" aria-label={`Actions for candidate ${candidate.id}`}>
-                <button
-                  type="button"
-                  disabled={decisionMutation.isPending || !reasonFor(candidate.id).trim()}
-                  onClick={() =>
-                    decisionMutation.mutate({ candidate, decision: 'confirm', reason: reasonFor(candidate.id).trim() })
-                  }
-                >
-                  Confirm match
-                </button>
-                <button
-                  type="button"
-                  disabled={decisionMutation.isPending || !reasonFor(candidate.id).trim()}
-                  onClick={() =>
-                    decisionMutation.mutate({ candidate, decision: 'reject', reason: reasonFor(candidate.id).trim() })
-                  }
-                >
-                  Reject
-                </button>
-                <button
-                  type="button"
-                  disabled={deferMutation.isPending}
-                  onClick={() => deferMutation.mutate(candidate)}
-                >
-                  Defer
-                </button>
-              </div>
-            </li>
+            <ResolutionCandidateRow key={candidate.id} candidate={candidate} />
           ))}
         </ul>
       ) : query.isSuccess ? (
