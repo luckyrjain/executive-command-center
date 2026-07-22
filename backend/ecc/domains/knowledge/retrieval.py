@@ -75,10 +75,13 @@ def _build_body(session: Session, workspace_id: UUID, entity_id: UUID, summary: 
     claims = session.execute(
         text(
             """
-            SELECT predicate, value_json FROM knowledge_claims
-            WHERE workspace_id = :workspace_id AND subject_id = :entity_id
-              AND superseded_by IS NULL
-            ORDER BY created_at
+            SELECT c.predicate, c.value_json FROM knowledge_claims c
+            JOIN pkos_evidence ev
+              ON ev.workspace_id = c.workspace_id AND ev.id = c.source_id
+            WHERE c.workspace_id = :workspace_id AND c.subject_id = :entity_id
+              AND c.superseded_by IS NULL
+              AND ev.evidence_state = 'available'
+            ORDER BY c.created_at
             """
         ),
         {"workspace_id": workspace_id, "entity_id": entity_id},

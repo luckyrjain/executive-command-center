@@ -1,6 +1,7 @@
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
+from hmac import new
 from uuid import UUID, uuid4
 
 import pytest
@@ -80,7 +81,19 @@ def evidence_test_context() -> Iterator[tuple[TestClient, UUID, str]]:
     finally:
         client.close()
         with engine.begin() as connection:
-            for table in ("pkos_evidence", "pkos_nodes", "sessions", "users"):
+            for table in (
+                "event_outbox",
+                "audit_events",
+                "idempotency_records",
+                "embedding_projections",
+                "retrieval_documents",
+                "timeline_entries",
+                "knowledge_claims",
+                "pkos_evidence",
+                "pkos_nodes",
+                "sessions",
+                "users",
+            ):
                 connection.execute(
                     text(f"DELETE FROM {table} WHERE workspace_id = :workspace_id"),
                     {"workspace_id": workspace_id},
@@ -252,3 +265,143 @@ def test_evidence_with_no_ids_returns_empty_list(
     response = client.get("/api/v1/evidence")
     assert response.status_code == 200
     assert response.json()["items"] == []
+
+
+def _headers(token: str, key: str) -> dict[str, str]:
+    csrf = new(settings.session_secret.encode(), token.encode(), "sha256").hexdigest()
+    return {
+        "Idempotency-Key": key,
+        "X-CSRF-Token": csrf,
+        "X-Correlation-ID": str(uuid4()),
+    }
+
+
+def test_delete_evidence_marks_deleted_and_redacts_source_ref(
+    evidence_test_context: tuple[TestClient, UUID, str],
+) -> None:
+    client, workspace_id, token = evidence_test_context
+    evidence_id = _insert_node_and_evidence(
+        workspace_id, "Board Deck", "document", datetime.now(UTC)
+    )
+
+    response = client.post(
+        f"/api/v1/evidence/{evidence_id}/delete",
+        headers=_headers(token, "delete-once"),
+        json={"reason": "source revoked access"},
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["id"] == str(evidence_id)
+    assert response.json()["evidence_state"] == "deleted"
+
+    with engine.connect() as connection:
+        row = (
+            connection.execute(
+                text("SELECT evidence_state, source_ref FROM pkos_evidence WHERE id = :id"),
+                {"id": evidence_id},
+            )
+            .mappings()
+            .one()
+        )
+    assert row["evidence_state"] == "deleted"
+    assert row["source_ref"] != "ref"
+    assert "redacted" in row["source_ref"]
+
+
+def test_delete_evidence_is_idempotent(
+    evidence_test_context: tuple[TestClient, UUID, str],
+) -> None:
+    client, workspace_id, token = evidence_test_context
+    evidence_id = _insert_node_and_evidence(
+        workspace_id, "Board Deck", "document", datetime.now(UTC)
+    )
+
+    first = client.post(
+        f"/api/v1/evidence/{evidence_id}/delete",
+        headers=_headers(token, "delete-idem-1"),
+        json={"reason": "source revoked access"},
+    )
+    second = client.post(
+        f"/api/v1/evidence/{evidence_id}/delete",
+        headers=_headers(token, "delete-idem-2"),
+        json={"reason": "source revoked access"},
+    )
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert second.json()["id"] == first.json()["id"]
+    assert second.json()["evidence_state"] == first.json()["evidence_state"]
+
+
+def test_delete_evidence_404_for_unknown_id(
+    evidence_test_context: tuple[TestClient, UUID, str],
+) -> None:
+    client, _workspace_id, token = evidence_test_context
+    response = client.post(
+        f"/api/v1/evidence/{uuid4()}/delete",
+        headers=_headers(token, "delete-missing"),
+        json={"reason": "attempt"},
+    )
+    assert response.status_code == 404
+    assert response.json()["error"]["code"] == "EVIDENCE_NOT_FOUND"
+
+
+def test_delete_evidence_removes_derived_claim_content_from_retrieval(
+    evidence_test_context: tuple[TestClient, UUID, str],
+) -> None:
+    client, _workspace_id, token = evidence_test_context
+
+    create_entity = client.post(
+        "/api/v1/knowledge/entities",
+        headers=_headers(token, "create-entity"),
+        json={"kind": "person", "canonical_name": "Ada Lovelace"},
+    )
+    assert create_entity.status_code == 201, create_entity.text
+    entity_id = create_entity.json()["id"]
+
+    evidence_id = uuid4()
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO pkos_evidence (id, workspace_id, node_id, source_type, "
+                "source_ref, sha256, captured_at) VALUES (:id, :workspace_id, :node_id, "
+                "'manual', 'test-ref', :sha256, :captured_at)"
+            ),
+            {
+                "id": evidence_id,
+                "workspace_id": _workspace_id,
+                "node_id": entity_id,
+                "sha256": sha256(str(evidence_id).encode()).hexdigest(),
+                "captured_at": datetime.now(UTC),
+            },
+        )
+
+    claim = client.post(
+        f"/api/v1/knowledge/entities/{entity_id}/claims",
+        headers=_headers(token, "create-claim"),
+        json={
+            "predicate": "codename",
+            "value": {"text": "EnchantressOfNumbers"},
+            "source_id": str(evidence_id),
+        },
+    )
+    assert claim.status_code == 201, claim.text
+
+    before = client.get(
+        "/api/v1/knowledge/retrieve",
+        headers=_headers(token, "search-before"),
+        params={"q": "EnchantressOfNumbers"},
+    )
+    assert any(item["entity_id"] == entity_id for item in before.json()["items"])
+
+    delete = client.post(
+        f"/api/v1/evidence/{evidence_id}/delete",
+        headers=_headers(token, "delete-cascade"),
+        json={"reason": "source retracted"},
+    )
+    assert delete.status_code == 200, delete.text
+
+    after = client.get(
+        "/api/v1/knowledge/retrieve",
+        headers=_headers(token, "search-after"),
+        params={"q": "EnchantressOfNumbers"},
+    )
+    assert all(item["entity_id"] != entity_id for item in after.json()["items"])
