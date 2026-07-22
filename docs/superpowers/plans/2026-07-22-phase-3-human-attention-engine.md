@@ -27,13 +27,12 @@
 
 ## Planned file structure
 
-- `backend/migrations/versions/0016_phase3_attention_policy.py`: extend `attention_items` (`policy_version SMALLINT NOT NULL DEFAULT 1`, `override_reason TEXT NULL`); widen the `EntityType` literal in application code (no DB `CHECK` to change — verified `entity_type` is an unconstrained `String(32)`).
+- `backend/migrations/versions/0016_phase3_attention_policy.py`: extend `attention_items` (`policy_version SMALLINT NOT NULL DEFAULT 1`, `override_reason TEXT NULL`) and create `attention_feedback`; widen the `EntityType` literal in application code (no DB `CHECK` to change — verified `entity_type` is an unconstrained `String(32)`).
 - `backend/migrations/versions/0017_phase3_waiting.py`: `waiting_links`.
 - `backend/migrations/versions/0018_phase3_risk_reviews.py`: `risk_reviews`.
 - `backend/migrations/versions/0019_phase3_capacity_planning.py`: `capacity_profiles`, `planning_constraints`.
 - `backend/migrations/versions/0020_phase3_plans.py`: `plans`, `plan_blocks`.
 - `backend/migrations/versions/0021_phase3_meetings.py`: `meeting_participants` (design doc's Open decision 2 — new join table, `calendar_events` × Phase 2 `pkos_nodes`), `meeting_packs`.
-- `backend/migrations/versions/0022_phase3_feedback.py`: `attention_feedback`.
 
 Each migration is created and applied by exactly one task below, never reopened by a later one, matching Phase 2's established Alembic hygiene rule. Migration file numbers match actual implementation/chain order, not necessarily task numbers, if slice order shifts during execution — same allowance Phase 2's plan documented and used.
 
@@ -74,18 +73,22 @@ Each migration is created and applied by exactly one task below, never reopened 
 **Interfaces:**
 - Produces: `policy.py:get_active_policy(version) -> AttentionPolicy` (typed weights/caps dataclass).
 - Modifies: `attention.py`'s existing `_score_task`/`_score_commitment`/`_score_risk` to read weights from the active policy instead of inline literals.
-- Modifies: `POST /api/v1/attention/{id}/feedback` (new), `POST /api/v1/attention/{id}/dismiss|defer` (existing, gains optional `reason`).
+- Produces: `GET /api/v1/attention/{id}` (new — does not exist in Phase 1, confirmed by reading `attention.py`'s router; only list/regenerate/dismiss/defer/restore exist today).
+- Produces: `POST /api/v1/attention/{id}/feedback` (new — `attention_feedback` table, moved here from the ambiguous placement in this plan's first draft: it belongs with the core attention surface and has no dependency on Tasks 2-7).
+- Modifies: `POST /api/v1/attention/{id}/dismiss|defer` (existing, gains optional `reason`, persisted to the new `override_reason` column).
 
 - [ ] **Step 1: Write a failing regression-equivalence test** asserting policy-v1's `get_active_policy(1)` weights, applied through the refactored scorers, produce byte-identical scores/factors to the current pre-refactor `_score_task`/`_score_commitment`/`_score_risk` for `tests/fixtures/phase3_attention_scenarios.py`'s frozen representative dataset. This is the safety net for the whole refactor — it must exist and pass before any new factor is added.
 - [ ] **Step 2: Run red:** confirm the fixture's expected scores were captured from the pre-refactor code (golden values), not invented.
-- [ ] **Step 3: Write migration 0016** adding `policy_version SMALLINT NOT NULL DEFAULT 1` and `override_reason TEXT NULL` to `attention_items`; run `alembic upgrade head` and confirm `scripts/seed_phase1_acceptance.py`'s existing rows still round-trip.
+- [ ] **Step 3: Write migration 0016** adding `policy_version SMALLINT NOT NULL DEFAULT 1` and `override_reason TEXT NULL` to `attention_items`, plus the `attention_feedback` table (`target_type/id`, `label`, `reason`, `actor_id`, `policy_version` per `DATA-MODEL.md`) in the same migration — both belong to the core attention surface this task owns, so one migration file covers them instead of the first draft's orphaned `0022`. Run `alembic upgrade head` and confirm `scripts/seed_phase1_acceptance.py`'s existing rows still round-trip.
 - [ ] **Step 4: Implement `policy.py`** with policy-v1's weights matching Phase 1's exact current values (Task 0's accepted decision), then refactor `_score_task`/`_score_commitment`/`_score_risk` to consume it. Run Step 1's equivalence test green before proceeding.
 - [ ] **Step 5: Write failing tests for the new factors** — dependency/blocked-by, meeting proximity, user-set importance, bounded recency, bounded deferral penalty — added additively to policy-v1 per Task 0's decision.
 - [ ] **Step 6: Implement the new factors** in `policy.py` and wire into the scorers.
-- [ ] **Step 7: Write failing tests for `override_reason`** on dismiss/defer (optional field, stored, returned in `AttentionItem`) and the new `POST /{id}/feedback` endpoint (label + reason, writes `attention_feedback` — wait, this table is Task 8's migration; if feedback ships in Task 1 per `API-SCHEMAS.md`'s grouping, pull `attention_feedback`'s migration forward into this task's `0016` instead of Task 8's `0022`, or defer the feedback endpoint to Task 8. Resolve during implementation planning refinement, not blocking Task 0.)
-- [ ] **Step 8: Move `attention.py`** to `backend/ecc/domains/attention/`, update `main.py`'s router import, widen the `EntityType` literal to include `waiting_link`, `risk_review`, `meeting` (used starting Task 2/3/7; harmless to widen now).
-- [ ] **Step 9: Run full regression:** `uv run ruff check backend tests && uv run ruff format --check backend tests && uv run mypy backend && uv run alembic -c backend/alembic.ini upgrade head && uv run pytest`.
-- [ ] **Step 10: Commit:** `git commit -m "feat(attention): versioned policy over the extended attention_items"`.
+- [ ] **Step 7: Write failing tests for `override_reason`** on dismiss/defer (optional field, stored, returned in `AttentionItem`), `GET /{id}` (single-item fetch, workspace/cross-workspace 404), and `POST /{id}/feedback` (label + reason, writes `attention_feedback`, idempotent per `actor_id`+`target`+generation).
+- [ ] **Step 8: Implement `GET /{id}` and `POST /{id}/feedback`.**
+- [ ] **Step 9: Re-run and, if needed, extend the existing Phase 1 attention performance test** (`tests/test_risks_attention_postgres.py::test_ranking_10000_eligible_entities_under_budget`, currently asserting p95 <800ms for 10,000 task/commitment/risk rows) against the widened `EntityType` set from Step 10 below, confirming the policy refactor and new columns don't regress it. Called out explicitly because this exact test's CI behavior was measured as sensitive to unrelated changes to its runner/job (checkpoint I/O, dependency footprint) during the Task 7 PR (#33) — a scoring-pipeline change is a more direct risk to this budget than either of those were, so it needs its own explicit check here rather than an assumption it'll still pass.
+- [ ] **Step 10: Move `attention.py`** to `backend/ecc/domains/attention/`, update `main.py`'s router import, widen the `EntityType` literal to include `waiting_link`, `risk_review`, `meeting` (used starting Task 2/3/7; harmless to widen now).
+- [ ] **Step 11: Run full regression:** `uv run ruff check backend tests && uv run ruff format --check backend tests && uv run mypy backend && uv run alembic -c backend/alembic.ini upgrade head && uv run pytest`.
+- [ ] **Step 12: Commit:** `git commit -m "feat(attention): versioned policy over the extended attention_items"`.
 
 ### Task 2: Waiting direction and dependency lifecycle
 
@@ -97,14 +100,15 @@ Each migration is created and applied by exactly one task below, never reopened 
 - Modify: `docs/domain/EVENT-CATALOG.md` (`waiting_link.opened.v1`, `waiting_link.fulfilled.v1`, `waiting_link.cancelled.v1`)
 
 **Interfaces:**
-- Produces: `GET|POST /api/v1/waiting`, `PATCH /api/v1/waiting/{id}`, `POST /api/v1/waiting/{id}/fulfil|cancel`.
+- Produces: `GET|POST /api/v1/waiting` (signed-cursor paginated per `API-SCHEMAS.md:34`'s mandatory convention, matching `backend/ecc/search.py`'s/`tasks.py`'s per-module `_sign_cursor`/`_decode_cursor` pattern), `PATCH /api/v1/waiting/{id}`, `POST /api/v1/waiting/{id}/fulfil|cancel`.
 - Waiting items surface in the reconciled `attention_items` as `entity_type='waiting_link'`, scored by Task 1's `dependency` factor.
 
-- [ ] **Step 1: Write failing tests** for waiting-link creation (`subject_type/id`, `counterparty_entity_id` FK into Phase 2's `pkos_nodes`, `direction` enum), direction-change-creates-history (supersede, not overwrite — mirrors Phase 2's claim-supersede pattern), fulfil/cancel lifecycle, and cross-workspace 404.
-- [ ] **Step 2: Implement `waiting.py`.**
-- [ ] **Step 3: Wire waiting links into `attention.py`'s regenerate/list pipeline** as a fourth scored `entity_type`.
-- [ ] **Step 4: Write failing waiting-ageing test** (item open beyond a threshold surfaces a staleness factor, matching `ATTENTION-MODEL.md`'s evaluation requirements).
-- [ ] **Step 5: Run full regression and commit:** `git commit -m "feat(attention): waiting direction and dependency lifecycle"`.
+- [ ] **Step 1: Write failing tests** for waiting-link creation (`subject_type/id`, `counterparty_entity_id` FK into Phase 2's `pkos_nodes`, `direction` enum), direction-change-creates-history (supersede, not overwrite — mirrors Phase 2's claim-supersede pattern), fulfil/cancel lifecycle, signed-cursor pagination and tamper rejection, and cross-workspace 404.
+- [ ] **Step 2: Write a failing circular-dependency test**: a `blocked_by` chain that cycles back to its own subject (A blocked_by B, B blocked_by A) is rejected at creation with `invalid_waiting_direction` rather than accepted and left to loop forever in any downstream traversal — `TEST-PLAN.md`'s "Determinism and property tests" names circular dependencies explicitly as required coverage.
+- [ ] **Step 3: Implement `waiting.py`**, including the cycle check (a bounded graph walk over existing `blocked_by` links for the workspace before insert — cheap at Phase 3's target scale, matching Phase 2's resolution-neighborhood query pattern rather than a new graph library).
+- [ ] **Step 4: Wire waiting links into `attention.py`'s regenerate/list pipeline** as a fourth scored `entity_type`.
+- [ ] **Step 5: Write failing waiting-ageing test** (item open beyond a threshold surfaces a staleness factor, matching `ATTENTION-MODEL.md`'s evaluation requirements).
+- [ ] **Step 6: Run full regression and commit:** `git commit -m "feat(attention): waiting direction and dependency lifecycle"`.
 
 ### Task 3: Risk review queue and cadence
 
@@ -151,13 +155,14 @@ Each migration is created and applied by exactly one task below, never reopened 
 
 **Interfaces:**
 - Produces: `planning.py:propose_plan(...) -> PlanProposal` (pure function per the design doc's pure/impure split).
-- Produces: `GET|POST /api/v1/plans`, `GET /api/v1/plans/{id}`.
+- Produces: `GET|POST /api/v1/plans` (signed-cursor paginated list, matching Task 2's convention), `GET /api/v1/plans/{id}`.
 
 - [ ] **Step 1: Write failing scenario tests** for `PLANNING-CONTRACT.md`'s seven-step deterministic order: full calendars, no capacity, timezone/DST boundaries, overdue work, equal scores (stable tie-break), missing effort estimates (default bucket, lower confidence per the design doc's "no new effort field" decision), fixed meetings, stale sources.
 - [ ] **Step 2: Implement `propose_plan`** as a pure function over capacity/constraints/calendar/attention-ranking inputs.
-- [ ] **Step 3: Write failing conflict-transparency tests:** over-capacity, missed-deadline, and hard-constraint conflicts are always returned explicitly, never silently dropped.
+- [ ] **Step 3: Write failing conflict-transparency tests:** over-capacity (`capacity_exceeded`), missed-deadline, and hard-constraint (`constraint_conflict`) conflicts are always returned explicitly, never silently dropped, using the exact error codes `API-SCHEMAS.md`'s Errors section names.
 - [ ] **Step 4: Implement the `POST /plans` mutation** wrapping `propose_plan`, persisting `plans`/`plan_blocks` in `draft`/`proposed` status.
-- [ ] **Step 5: Run full regression and commit:** `git commit -m "feat(attention): deterministic plan proposals and conflict detection"`.
+- [ ] **Step 5: Write a failing performance test** asserting the <1 second p95 deterministic-daily-plan budget (`PHASE-003-human-attention-engine.md`'s Non-functional requirements) for a dense weekly plan against a representative dataset (`tests/fixtures/phase3_planning_scenarios.py`), following the same p95-measurement pattern as `tests/test_search_performance_postgres.py` — `TEST-PLAN.md`'s Performance section names this explicitly and the first draft of this plan omitted it.
+- [ ] **Step 6: Run full regression and commit:** `git commit -m "feat(attention): deterministic plan proposals and conflict detection"`.
 
 ### Task 6: Plan editing, acceptance and replan diff
 
@@ -191,12 +196,15 @@ Each migration is created and applied by exactly one task below, never reopened 
 
 - [ ] **Step 1: Write failing tests for `meeting_participants`**: linking a `calendar_events` row to Phase 2 `pkos_nodes` person entities with a role, workspace-scoped, cross-workspace 404.
 - [ ] **Step 2: Implement the participant linkage.**
-- [ ] **Step 3: Write failing pack-composition tests:** every required deterministic section present (objective/timing, participants, timeline, open commitments by direction, prior decisions, unresolved questions, active risks, evidence gaps), citations traceable to source IDs, permission-denied/deleted evidence shown only as an availability state, no uncited facts.
-- [ ] **Step 4: Implement `build_pack`** composing the existing domain queries and writing a `meeting_packs` snapshot with `source_versions`.
-- [ ] **Step 5: Write failing staleness tests:** a material change to a cited source marks the pack stale; refresh creates a new snapshot; prior snapshots remain available.
-- [ ] **Step 6: Implement staleness detection and refresh.**
-- [ ] **Step 7: Write failing prompt-injection fixture tests** confirming source content is never treated as instruction (contract's "Safety" section) — reuse Phase 1/2's existing prompt-injection test pattern if one exists; if not, this is the first one and should be named for reuse by Phase 4.
-- [ ] **Step 8: Run full regression and commit:** `git commit -m "feat(attention): evidence-backed meeting preparation"`.
+- [ ] **Step 3: Write failing pack-composition tests:** every required deterministic section present (objective/timing, participants, timeline, open commitments by direction, prior decisions, unresolved questions, active risks, evidence gaps), citations traceable to source IDs, permission-denied/deleted evidence shown only as an availability state (`evidence_unavailable`), no uncited facts.
+- [ ] **Step 4: Write a failing restricted-note-exclusion test:** a private/restricted note linked to a meeting's participants or timeline is excluded from the generated pack unless explicitly authorized for that surface — `TEST-PLAN.md`'s Security section names this explicitly and the first draft of this plan folded it into general evidence-permission handling without a dedicated test; this is a distinct, named requirement and gets a distinct test.
+- [ ] **Step 5: Write a failing `feature_disabled` test:** requesting optional AI enrichment while the feature flag is off (the default, per the design doc's Meeting preparation approach — Phase 4 doesn't exist yet to serve it) returns the deterministic pack plus the documented `feature_disabled` error code for the enrichment section specifically, never a failed request for the deterministic sections.
+- [ ] **Step 6: Implement `build_pack`** composing the existing domain queries and writing a `meeting_packs` snapshot with `source_versions`.
+- [ ] **Step 7: Write failing staleness tests:** a material change to a cited source marks the pack stale; refresh creates a new snapshot; prior snapshots remain available.
+- [ ] **Step 8: Implement staleness detection and refresh.**
+- [ ] **Step 9: Write failing prompt-injection fixture tests** confirming source content is never treated as instruction (contract's "Safety" section) — reuse Phase 1/2's existing prompt-injection test pattern if one exists; if not, this is the first one and should be named for reuse by Phase 4.
+- [ ] **Step 10: Write a failing performance test** asserting the <2 second p95 meeting-pack budget (excluding optional enrichment) against a large meeting history dataset (`tests/fixtures/phase3_meeting_scenarios.py`) — `TEST-PLAN.md`'s Performance section names this explicitly and the first draft of this plan omitted it.
+- [ ] **Step 11: Run full regression and commit:** `git commit -m "feat(attention): evidence-backed meeting preparation"`.
 
 ### Task 8: Executive attention UX, browser acceptance, and two-week dogfood
 
@@ -215,7 +223,7 @@ Each migration is created and applied by exactly one task below, never reopened 
 - [ ] **Step 1: Write failing navigation tests** for the new Attention surface entries, arrow-key focus, `<main>` targets — same pattern as Phase 1/2's navigation tasks.
 - [ ] **Step 2: Implement all five components**, wired to Tasks 1-7's endpoints, following `UX-STATES.md`'s required states (loading/empty/no-capacity/over-capacity/conflict/stale/degraded/offline/permission-denied/error/version-conflict) and accessibility rules (no red/green-only, no urgency animation, no shame language, WCAG 2.2 AA).
 - [ ] **Step 3: Implement `check_phase3_prohibited_signals.py`** and wire into CI, matching `PHASE-REVIEW.md`'s cross-phase "work not people" invariant as an automated, not just documented, gate.
-- [ ] **Step 4: Run the full Playwright suite** including all three new scenarios, keyboard-only pass included per `UX-STATES.md`.
+- [ ] **Step 4: Run the full Playwright suite** including all three new scenarios, each run twice: once with Phase 3's AI-enrichment flag on and once off (`TEST-PLAN.md`'s Browser acceptance section requires core flows working "in AI-disabled mode" explicitly, not just the deterministic-pack unit tests from Task 7), plus a keyboard-only pass per `UX-STATES.md`.
 - [ ] **Step 5: Run full backend + frontend regression**: ruff/format/mypy/alembic/pytest, typecheck/unit/build/e2e, `pnpm audit`, `pip-audit`.
 - [ ] **Step 6: Begin the two-week dogfood** using `docs/runbooks/PHASE-3-DOGFOOD.md`, logging top-five usefulness, missed critical items, false urgency, plan acceptance/churn, and meeting-pack corrections daily.
 - [ ] **Step 7: Update `docs/phases/phase-003/IMPLEMENTATION-STATUS.md`** with evidence links for each slice, matching Phase 1/2's citation format.
@@ -226,10 +234,11 @@ Each migration is created and applied by exactly one task below, never reopened 
 ## Completion checks
 
 - All migrations apply cleanly from a fresh Phase 2 database and are reversible (`alembic downgrade` tested for each).
-- Task 1's regression-equivalence test proves policy-v1 reproduces Phase 1's exact pre-refactor scores before any new factor is added — the single most important correctness gate in this plan, since it's the one place an unnoticed behavior change would silently alter what every existing user already sees ranked today.
+- Task 1's regression-equivalence test proves policy-v1 reproduces Phase 1's exact pre-refactor scores before any new factor is added, **and** Task 1 Step 9's re-run of the existing 10,000-item attention performance test confirms the widened `entity_type` set doesn't regress the p95<800ms budget — together the single most important correctness gate in this plan, since it's the one place an unnoticed behavior or performance change would silently alter what every existing user already sees ranked today.
 - `scripts/rebuild_attention_projections.py` reproduces `attention_items` scores deterministically from authoritative sources on a representative dataset.
-- Planning and meeting-prep benchmarks meet the thresholds Task 0 sets, with results attached to `phase-003/IMPLEMENTATION-STATUS.md`.
+- Attention (existing, re-validated), planning (<1s p95, Task 5 Step 5), and meeting-prep (<2s p95, Task 7 Step 10) performance budgets all have a dedicated benchmark test with results attached to `phase-003/IMPLEMENTATION-STATUS.md` — not left as an unverified non-functional requirement the way this plan's first draft left planning and meeting-prep.
 - Every new table's workspace isolation is covered by an adversarial cross-workspace test, matching Phase 1/2's isolation test convention.
+- Every `API-SCHEMAS.md` endpoint (including `GET /attention/{id}` and `POST /attention/{id}/feedback`, missing from this plan's first draft) and every named error code (`version_conflict`, `constraint_conflict`, `capacity_exceeded`, `invalid_waiting_direction`, `stale_plan`, `stale_meeting_pack`, `evidence_unavailable`, `feature_disabled`, `cursor_invalid`) has at least one test exercising it.
 - `check_phase3_prohibited_signals.py` passes in CI on every PR touching `backend/ecc/domains/attention/`.
 - Zero Critical, High, or Medium findings, matching every prior phase's exit bar.
 - Two-week dogfood (Task 8, Step 6) records against Task 0's accepted success thresholds before Phase 3 exit is claimed — this plan's completion is Task 8's code landing; Phase 3's *exit* is the dogfood result, and the two are not the same milestone (matching how Phase 1's engineering delivery completed before its own seven-day validation gate did).
