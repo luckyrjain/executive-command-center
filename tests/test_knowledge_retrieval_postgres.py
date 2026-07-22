@@ -74,6 +74,7 @@ def retrieval_test_context() -> Iterator[tuple[TestClient, UUID, UUID, str]]:
                 "event_outbox",
                 "audit_events",
                 "idempotency_records",
+                "embedding_projections",
                 "retrieval_documents",
                 "entity_operations",
                 "resolution_candidates",
@@ -247,9 +248,16 @@ def test_updated_time_range_filters_results(
     assert response.json()["items"] == []
 
 
-def test_hybrid_mode_falls_back_to_degraded_lexical(
+def test_hybrid_mode_falls_back_to_degraded_lexical_when_embeddings_disabled(
     retrieval_test_context: tuple[TestClient, UUID, UUID, str],
 ) -> None:
+    """Settings.embeddings_enabled defaults to False (see config.py), which
+    is exactly the state this whole test suite runs under -- so this test
+    needs no fixture/monkeypatch setup at all to exercise the degraded path.
+    Task 7's real hybrid behavior (embeddings enabled, real ranking, real
+    fallback-on-failure) is covered by test_knowledge_embeddings_postgres.py,
+    which deliberately tests that degraded path FIRST, before any happy-path
+    test, per the implementation plan's ordering requirement."""
     client, _workspace_id, _user_id, token = retrieval_test_context
     _create_entity(client, token, "hybrid-entity", "person", "Ada Lovelace")
 
@@ -258,7 +266,7 @@ def test_hybrid_mode_falls_back_to_degraded_lexical(
     body = response.json()
     assert body["mode"] == "lexical"
     assert body["degraded"] is True
-    assert body["degraded_reason"] == "hybrid_mode_unavailable"
+    assert body["degraded_reason"] == "embeddings_disabled"
 
 
 def test_signed_cursor_pagination_and_tamper_rejection(

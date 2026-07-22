@@ -1,6 +1,10 @@
 services:
   postgres:
-    image: postgres:18.0
+    # pgvector/pgvector:pg18 is the official pgvector-maintained image --
+    # postgres:18.0 plus the vector extension's shared library pre-built and
+    # installed, so `CREATE EXTENSION vector` (migration 0015) succeeds.
+    # Same PostgreSQL 18 core as the plain postgres:18.0 image Phase 1 used.
+    image: pgvector/pgvector:pg18
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-ecc}
       POSTGRES_USER: ${POSTGRES_USER:-ecc}

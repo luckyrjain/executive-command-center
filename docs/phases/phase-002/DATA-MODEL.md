@@ -2,7 +2,7 @@
 id: PHASE-002-DATA-MODEL
 title: Phase 2 Knowledge Platform Data Model
 status: Approved for Implementation
-version: 0.2.0
+version: 0.3.0
 owner: Lucky Jain
 ---
 
@@ -29,7 +29,7 @@ Version 0.1.0 of this document proposed `knowledge_entities`, `relationships`, a
 | `entity_operations` | Merge/split lineage | operation_type, inputs_json, outputs_json, actor_id, reason | new table |
 | `timeline_entries` | Rebuildable chronology projection | entity_id, effective_at, recorded_at, event_type, source_id, summary | new table, `entity_id` FK to `pkos_nodes` |
 | `retrieval_documents` | Normalized searchable projection | entity_type, entity_id, title, body, tsvector, source_version | new table, `entity_id` FK to `pkos_nodes` |
-| `embedding_projections` | Optional derived vectors | document_id, model_id, model_version, dimensions, vector, content_hash | new table — schema ships only when Slice 7 starts, gated on the design doc's Open decision 2 (RFC-005 amendment) |
+| `embedding_projections` | Optional derived vectors | document_id, model_id, model_version, dimensions, embedding, content_hash | migration `0015_phase2_embeddings.py`, `document_id` composite FK to `retrieval_documents`. Shipped: RFC-005 v1.2.0 amendment + ADR-0011 (Slice 7). `embedding` is the actual column name (`vector` is the pgvector type/extension name, kept distinct to avoid confusion); a `vector(384)` column via pgvector, HNSW-indexed with `vector_cosine_ops`. |
 
 ## Invariants
 

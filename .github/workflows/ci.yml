@@ -14,7 +14,9 @@ jobs:
     runs-on: ubuntu-latest
     services:
       postgres:
-        image: postgres:18.0
+        # pgvector/pgvector:pg18: postgres:18.0 plus the vector extension
+        # pre-built, needed for migration 0015's CREATE EXTENSION vector.
+        image: pgvector/pgvector:pg18
         env:
           POSTGRES_DB: ecc
           POSTGRES_USER: ecc

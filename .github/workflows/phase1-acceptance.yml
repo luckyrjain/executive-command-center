@@ -22,7 +22,14 @@ jobs:
     runs-on: ubuntu-latest
     services:
       postgres:
-        image: postgres:18.0
+        # pgvector/pgvector:pg18: postgres:18.0 plus the vector extension
+        # pre-built, needed for migration 0015's CREATE EXTENSION vector.
+        # PG_CLIENT_IMAGE below stays plain postgres:18.0 -- pg_dump/
+        # pg_restore are client binaries that don't need the extension's
+        # shared library themselves, only the server executing CREATE
+        # EXTENSION (this same container, for both the source and the
+        # ecc_restore target database) does.
+        image: pgvector/pgvector:pg18
         env:
           POSTGRES_DB: ecc
           POSTGRES_USER: ecc
@@ -101,7 +108,10 @@ jobs:
     runs-on: ubuntu-latest
     services:
       postgres:
-        image: postgres:18.0
+        # pgvector/pgvector:pg18 -- alembic upgrade head below applies
+        # migration 0015, which needs the vector extension even though this
+        # job's own tests don't touch embeddings.
+        image: pgvector/pgvector:pg18
         env:
           POSTGRES_DB: ecc
           POSTGRES_USER: ecc

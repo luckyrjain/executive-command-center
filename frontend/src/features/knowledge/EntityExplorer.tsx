@@ -26,7 +26,9 @@ export default function EntityExplorer() {
   const retrievalQuery = useQuery({
     queryKey: ['knowledge', 'retrieve', submittedQuery],
     queryFn: () =>
-      apiRequest<RetrievalResponse>(`/api/v1/knowledge/retrieve?q=${encodeURIComponent(submittedQuery)}`),
+      apiRequest<RetrievalResponse>(
+        `/api/v1/knowledge/retrieve?q=${encodeURIComponent(submittedQuery)}&mode=hybrid`,
+      ),
     enabled: submittedQuery.length > 0,
   })
 

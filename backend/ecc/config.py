@@ -46,6 +46,15 @@ class Settings(BaseSettings):
     # exact trusted count, not "trust X-Forwarded-For whenever present" --
     # the header's client-supplied left-hand portion is never trustworthy.
     trusted_proxy_count: int = Field(default=0, ge=0, validation_alias="ECC_TRUSTED_PROXY_COUNT")
+    # Off by default: loading the local sentence-transformers model costs a
+    # multi-second first-call delay and, before it's been cached to disk once,
+    # a Hugging Face Hub download -- unacceptable in the default/test
+    # environment where nothing needs semantic search. Mutation paths
+    # (queue_embedding) and hybrid retrieval both treat this as "feature not
+    # provisioned here" and degrade to lexical-only rather than erroring, per
+    # RETRIEVAL-CONTRACT.md's degradation rule -- this flag is the deliberate,
+    # explicit way to opt into paying that cost, not a workaround for it.
+    embeddings_enabled: bool = Field(default=False, validation_alias="ECC_EMBEDDINGS_ENABLED")
 
     @property
     def cors_origin_list(self) -> list[str]:

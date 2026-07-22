@@ -94,6 +94,7 @@ _WORKSPACE_ID_TABLES: tuple[str, ...] = (
     "resolution_candidates",
     "entity_operations",
     "retrieval_documents",
+    "embedding_projections",
 )
 # `workspaces` is scoped by its own `id`, not a `workspace_id` column.
 _WORKSPACE_TABLE = "workspaces"
@@ -127,6 +128,7 @@ def _fixture_ids(label: str) -> dict[str, UUID]:
         "resolution_candidate": seed_id(label, "resolution_candidate", "person_topic"),
         "entity_operation": seed_id(label, "entity_operation", "merge"),
         "retrieval_document": seed_id(label, "retrieval_document", "person"),
+        "embedding_projection": seed_id(label, "embedding_projection", "person"),
         "outbox_event": seed_id(label, "event_outbox", "marker"),
         "dead_letter": seed_id(label, "event_dead_letter", "marker"),
         "task_active": seed_id(label, "task", "active"),
@@ -410,6 +412,32 @@ def _seed_pkos(cur: psycopg.Cursor[Any], label: str, ids: Mapping[str, UUID]) ->
             "title": f"Seed Person {label.capitalize()}",
             "body": f"seed retrieval document {label}",
             "updated_at": SEED_EPOCH,
+        },
+    )
+    cur.execute(
+        """
+        INSERT INTO embedding_projections (
+            id, workspace_id, document_id, model_id, model_version,
+            dimensions, embedding, content_hash, created_at, updated_at
+        ) VALUES (
+            %(id)s, %(workspace_id)s, %(document_id)s, %(model_id)s, '1',
+            %(dimensions)s, CAST(%(embedding)s AS vector), %(content_hash)s,
+            %(created_at)s, %(created_at)s
+        )
+        ON CONFLICT (id) DO NOTHING
+        """,
+        {
+            "id": ids["embedding_projection"],
+            "workspace_id": ids["workspace"],
+            "document_id": ids["retrieval_document"],
+            "model_id": "sentence-transformers/all-MiniLM-L6-v2",
+            "dimensions": 384,
+            # A fixed, arbitrary unit-ish vector -- seed data only exercises
+            # storage/isolation, never real similarity ranking, so no need
+            # to run the actual model here.
+            "embedding": "[" + ",".join(["0.01"] * 384) + "]",
+            "content_hash": f"seed-{label}",
+            "created_at": SEED_EPOCH,
         },
     )
 
