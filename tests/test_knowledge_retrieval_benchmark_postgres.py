@@ -34,14 +34,97 @@ pytestmark = pytest.mark.skipif(
 
 # RETRIEVAL-CONTRACT.md's Evaluation section names precision@5/recall@10 as
 # release gates without prescribing exact numbers for a first activation --
-# this floor is deliberately not 1.0: MiniLM is a small, fast, CPU-friendly
+# these floors are deliberately not 1.0: MiniLM is a small, fast, CPU-friendly
 # model (the local-first tradeoff ADR-0011 accepts), not a large one, and
 # this dataset's queries are deliberately worded to share no literal words
 # with their target document, which is the hardest case for any embedding
-# model. A future ranking-formula or model change compares against this
-# recorded floor, per the contract's "ranking changes require before/after
-# benchmark results" rule.
+# model. hit@5/MRR/false-positive-rate@5 are not literal contract text but
+# are standard IR complements that make a floor-only pass/fail result
+# actionable: MRR shows how *high* a found document ranks (not just whether
+# it cleared the cutoff), and false-positive-rate@5 shows how much
+# irrelevant noise fills the slots a real result didn't. A future
+# ranking-formula or model change compares its printed numbers against
+# these recorded floors and this run's own printed output, per the
+# contract's "ranking changes require before/after benchmark results" rule
+# -- there is deliberately no separate baseline-snapshot file for a
+# benchmark this small; the floors below *are* the recorded baseline, and
+# raising one is how a real improvement gets locked in.
 MIN_HIT_AT_5_RATE = 0.7
+# precision@5 and recall@10's floors are derived, not independently chosen:
+# with 7 queries, hit@5 >= 0.7 requires at least 5 queries to hit (4/7 =
+# 0.571 fails), which puts a mathematical floor under precision@5
+# (>= 5/35 = 0.1429) and recall@10 (>= 5/7 = 0.714, since top-10 is a
+# superset of top-5). Both floors below sit just under that derived
+# minimum, so they can never fail on a run that already passes the
+# established hit@5 floor -- they tighten the gate without becoming a new,
+# separately-uncalibrated one.
+MIN_PRECISION_AT_5 = 0.14
+MIN_RECALL_AT_10 = 0.7
+# false-positive-rate@5's ceiling is derived the same way: the worst case
+# consistent with hit@5 >= 0.7 (exactly 5 of 7 queries hitting) is
+# (35 - 5) / 35 = 0.8571, so 0.86 can never fail a run that already passes
+# the hit@5 floor.
+MAX_FALSE_POSITIVE_RATE_AT_5 = 0.86
+# MRR has no floor: unlike the three metrics above, no value derived from
+# the hit@5 floor alone is tight enough to be meaningful (the worst case
+# consistent with hit@5 >= 0.7 is MRR >= 0.143, barely above zero) and this
+# benchmark has never been run against the real model to record an actual
+# achieved value to gate on -- see this module's docstring on why a
+# baseline-snapshot file isn't used here. Printed every run instead, so a
+# future change to the ranking formula has real before/after numbers to
+# compare, and a real floor can be set once a genuine baseline exists.
+_TOP_K = 10
+
+
+def _retrieval_metrics(
+    ranked_results: list[list[str]], expected_ids: list[str]
+) -> dict[str, float]:
+    """Pure metric computation over already-fetched, already-ranked top-_TOP_K
+    id lists -- kept separate from the HTTP/DB/model-dependent fetch so it is
+    unit-testable on synthetic data (see test_retrieval_metrics_computation
+    in test_resolution_scoring.py-style isolation) without needing the real
+    embedding model. Every query in this dataset has exactly one relevant
+    document (LabelledQuery.relevant_document_index is singular), so
+    precision@5/recall@10 reduce to hit-rate arithmetic rather than needing
+    a multi-relevant-document accumulator.
+    """
+    if not ranked_results:
+        return {
+            "hit_at_5": 0.0,
+            "precision_at_5": 0.0,
+            "recall_at_10": 0.0,
+            "mrr": 0.0,
+            "false_positive_rate_at_5": 0.0,
+        }
+    hits_at_5 = 0
+    hits_at_10 = 0
+    reciprocal_ranks: list[float] = []
+    top5_slots_filled = 0
+    top5_correct_slots = 0
+    for results, expected_id in zip(ranked_results, expected_ids, strict=True):
+        top5 = results[:5]
+        top5_slots_filled += len(top5)
+        if expected_id in top5:
+            hits_at_5 += 1
+            top5_correct_slots += 1
+        if expected_id in results[:10]:
+            hits_at_10 += 1
+        if expected_id in results:
+            reciprocal_ranks.append(1.0 / (results.index(expected_id) + 1))
+        else:
+            reciprocal_ranks.append(0.0)
+    count = len(ranked_results)
+    return {
+        "hit_at_5": hits_at_5 / count,
+        "precision_at_5": hits_at_5 / (count * 5),
+        "recall_at_10": hits_at_10 / count,
+        "mrr": sum(reciprocal_ranks) / count,
+        "false_positive_rate_at_5": (
+            (top5_slots_filled - top5_correct_slots) / top5_slots_filled
+            if top5_slots_filled
+            else 0.0
+        ),
+    }
 
 
 def _headers(token: str, key: str) -> dict[str, str]:
@@ -160,12 +243,13 @@ def test_hybrid_retrieval_semantic_recall_meets_benchmark_floor(
             assert response.status_code == 201, response.text
             document_ids.append(UUID(response.json()["id"]))
 
-        hits = 0
+        ranked_results: list[list[str]] = []
+        expected_ids: list[str] = []
         for query_index, labelled_query in enumerate(queries):
             response = client.get(
                 "/api/v1/knowledge/retrieve",
                 headers=_headers(token, f"benchmark-query-{query_index}"),
-                params={"q": labelled_query.query, "mode": "hybrid", "limit": 5},
+                params={"q": labelled_query.query, "mode": "hybrid", "limit": _TOP_K},
             )
             assert response.status_code == 200, response.text
             body = response.json()
@@ -173,16 +257,64 @@ def test_hybrid_retrieval_semantic_recall_meets_benchmark_floor(
             assert body["degraded"] is False, (
                 f"query {labelled_query.query!r} unexpectedly degraded: {reason}"
             )
-            top_5_ids = {item["entity_id"] for item in body["items"][:5]}
-            expected_id = str(document_ids[labelled_query.relevant_document_index])
-            if expected_id in top_5_ids:
-                hits += 1
+            ranked_results.append([item["entity_id"] for item in body["items"]])
+            expected_ids.append(str(document_ids[labelled_query.relevant_document_index]))
 
-        hit_at_5_rate = hits / len(queries)
-        assert hit_at_5_rate >= MIN_HIT_AT_5_RATE, (
-            f"hit@5 rate {hit_at_5_rate} below floor {MIN_HIT_AT_5_RATE} "
-            f"({hits}/{len(queries)} queries found their labelled document in the top 5)"
+        metrics = _retrieval_metrics(ranked_results, expected_ids)
+        print(
+            f"\n[retrieval benchmark] hit@5={metrics['hit_at_5']:.3f} "
+            f"precision@5={metrics['precision_at_5']:.3f} "
+            f"recall@10={metrics['recall_at_10']:.3f} mrr={metrics['mrr']:.3f} "
+            f"false_positive_rate@5={metrics['false_positive_rate_at_5']:.3f} "
+            f"over {len(queries)} queries"
+        )
+        assert metrics["hit_at_5"] >= MIN_HIT_AT_5_RATE, (
+            f"hit@5={metrics['hit_at_5']} below floor {MIN_HIT_AT_5_RATE}"
+        )
+        assert metrics["precision_at_5"] >= MIN_PRECISION_AT_5, (
+            f"precision@5={metrics['precision_at_5']} below floor {MIN_PRECISION_AT_5}"
+        )
+        assert metrics["recall_at_10"] >= MIN_RECALL_AT_10, (
+            f"recall@10={metrics['recall_at_10']} below floor {MIN_RECALL_AT_10}"
+        )
+        assert metrics["false_positive_rate_at_5"] <= MAX_FALSE_POSITIVE_RATE_AT_5, (
+            f"false_positive_rate@5={metrics['false_positive_rate_at_5']} above ceiling "
+            f"{MAX_FALSE_POSITIVE_RATE_AT_5}"
         )
     finally:
         get_settings.cache_clear()
         embeddings.set_provider_for_testing(None)
+
+
+def test_retrieval_metrics_computation_on_synthetic_ranked_lists() -> None:
+    """Unit-tests _retrieval_metrics's pure arithmetic against hand-computed
+    values on synthetic data, independent of the real embedding model (which
+    this environment may not have network access to load) -- so the metric
+    formulas themselves are verified even when
+    test_hybrid_retrieval_semantic_recall_meets_benchmark_floor above skips."""
+    ranked_results = [
+        ["a", "x", "x", "x", "x", "x", "x", "x", "x", "x"],  # found at rank 1
+        ["x", "x", "a", "x", "x", "x", "x", "x", "x", "x"],  # found at rank 3
+        ["x", "x", "x", "x", "x", "x", "a", "x", "x", "x"],  # found at rank 7 (outside top 5)
+        ["x", "x", "x", "x", "x", "x", "x", "x", "x", "x"],  # never found
+    ]
+    expected_ids = ["a", "a", "a", "a"]
+
+    metrics = _retrieval_metrics(ranked_results, expected_ids)
+
+    assert metrics["hit_at_5"] == 2 / 4
+    assert metrics["precision_at_5"] == 2 / 20
+    assert metrics["recall_at_10"] == 3 / 4
+    assert metrics["mrr"] == pytest.approx((1.0 + 1 / 3 + 1 / 7 + 0.0) / 4)
+    assert metrics["false_positive_rate_at_5"] == pytest.approx(18 / 20)
+
+
+def test_retrieval_metrics_computation_on_empty_input() -> None:
+    metrics = _retrieval_metrics([], [])
+    assert metrics == {
+        "hit_at_5": 0.0,
+        "precision_at_5": 0.0,
+        "recall_at_10": 0.0,
+        "mrr": 0.0,
+        "false_positive_rate_at_5": 0.0,
+    }

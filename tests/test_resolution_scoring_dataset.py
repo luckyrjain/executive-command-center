@@ -11,6 +11,18 @@ MIN_PRECISION = 0.9
 MIN_RECALL = 0.7
 MAX_FALSE_MERGE_RATE = 0.0
 MAX_UNRESOLVED_RATE = 0.35
+# Reviewer override rate: the fraction of the dataset where a human's
+# ground-truth decision would have to go against what the score alone
+# suggests (a false merge a reviewer must reject, or a real match the score
+# left below the auto-suggest threshold that a reviewer must confirm
+# anyway) -- ENTITY-RESOLUTION-CONTRACT.md's fifth named quality metric,
+# alongside precision/recall/false-merge-rate/unresolved-rate. It composes
+# the other two failure-mode rates into one number answering "how often
+# does a reviewer have to overrule the algorithm," so it's bounded by their
+# sum -- with MAX_FALSE_MERGE_RATE floored at 0.0, it equals
+# MAX_UNRESOLVED_RATE today, but the two ceilings are independent and would
+# no longer coincide if a future dataset ever tolerated nonzero false merges.
+MAX_REVIEWER_OVERRIDE_RATE = 0.35
 
 
 def test_dataset_version_is_pinned() -> None:
@@ -49,6 +61,7 @@ def test_scorer_meets_quality_thresholds_on_labelled_dataset() -> None:
     recall = true_positives / total_positives if total_positives else 1.0
     false_merge_rate = false_positives / total_negatives if total_negatives else 0.0
     unresolved_rate = false_negatives / total_positives if total_positives else 0.0
+    reviewer_override_rate = (false_positives + false_negatives) / len(dataset)
 
     assert false_merge_rate <= MAX_FALSE_MERGE_RATE, (
         f"false merges detected: {false_positives} negative pairs scored as high-confidence "
@@ -58,4 +71,9 @@ def test_scorer_meets_quality_thresholds_on_labelled_dataset() -> None:
     assert recall >= MIN_RECALL, f"recall={recall} below floor {MIN_RECALL}"
     assert unresolved_rate <= MAX_UNRESOLVED_RATE, (
         f"unresolved_rate={unresolved_rate} above ceiling {MAX_UNRESOLVED_RATE}"
+    )
+    assert reviewer_override_rate <= MAX_REVIEWER_OVERRIDE_RATE, (
+        f"reviewer_override_rate={reviewer_override_rate} above ceiling "
+        f"{MAX_REVIEWER_OVERRIDE_RATE} ({false_positives} false merges + {false_negatives} "
+        f"missed matches out of {len(dataset)} pairs)"
     )
