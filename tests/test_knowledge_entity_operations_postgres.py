@@ -262,16 +262,21 @@ def test_merge_rejects_stale_expected_version(
 def test_merge_deduplicates_active_edges_after_rehome(
     entity_operations_test_context: tuple[TestClient, UUID, UUID, str],
 ) -> None:
-    client, _workspace_id, _user_id, token = entity_operations_test_context
+    client, workspace_id, _user_id, token = entity_operations_test_context
     target_id = _create_entity(client, token, "dedup-target", "person", "Ada Lovelace")
     source_id = _create_entity(client, token, "dedup-source", "person", "Ada Lovelase")
     shared_id = _create_entity(client, token, "dedup-shared", "project", "Analytical Engine")
 
     for owner_id, key in ((target_id, "dedup-target-rel"), (source_id, "dedup-source-rel")):
+        evidence_id = _seed_evidence(workspace_id, owner_id)
         rel = client.post(
             f"/api/v1/knowledge/entities/{owner_id}/relationships",
             headers=_headers(token, key),
-            json={"relationship_type": "WORKS_ON", "to_entity_id": str(shared_id)},
+            json={
+                "relationship_type": "WORKS_ON",
+                "to_entity_id": str(shared_id),
+                "evidence_id": str(evidence_id),
+            },
         )
         assert rel.status_code == 201, rel.text
 

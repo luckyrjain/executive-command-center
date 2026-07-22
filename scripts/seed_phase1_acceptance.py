@@ -252,22 +252,10 @@ def _seed_pkos(cur: psycopg.Cursor[Any], label: str, ids: Mapping[str, UUID]) ->
                 "updated_at": SEED_EPOCH,
             },
         )
-    cur.execute(
-        """
-        INSERT INTO pkos_edges (
-            id, workspace_id, source_node_id, target_node_id, edge_type, attributes
-        ) VALUES (
-            %(id)s, %(workspace_id)s, %(source)s, %(target)s, 'related_to', '{}'::jsonb
-        )
-        ON CONFLICT (id) DO NOTHING
-        """,
-        {
-            "id": ids["edge"],
-            "workspace_id": ids["workspace"],
-            "source": ids["node_person"],
-            "target": ids["node_topic"],
-        },
-    )
+    # Evidence must exist before the edge below: pkos_edges.evidence_id is
+    # NOT NULL with a composite FK into pkos_evidence (migration 0016), and
+    # ids["evidence"] is already deterministic at this point (seed_id), so
+    # this insert only needs reordering ahead of the edge, not a new ID.
     cur.execute(
         """
         INSERT INTO pkos_evidence (
@@ -285,6 +273,25 @@ def _seed_pkos(cur: psycopg.Cursor[Any], label: str, ids: Mapping[str, UUID]) ->
             "source_ref": f"seed://{label}/evidence/person",
             "sha256": sha256(f"phase1-seed-evidence-{label}".encode()).hexdigest(),
             "captured_at": SEED_EPOCH,
+        },
+    )
+    cur.execute(
+        """
+        INSERT INTO pkos_edges (
+            id, workspace_id, source_node_id, target_node_id, edge_type,
+            attributes, evidence_id
+        ) VALUES (
+            %(id)s, %(workspace_id)s, %(source)s, %(target)s, 'related_to',
+            '{}'::jsonb, %(evidence_id)s
+        )
+        ON CONFLICT (id) DO NOTHING
+        """,
+        {
+            "id": ids["edge"],
+            "workspace_id": ids["workspace"],
+            "source": ids["node_person"],
+            "target": ids["node_topic"],
+            "evidence_id": ids["evidence"],
         },
     )
     cur.execute(

@@ -50,7 +50,7 @@ export type Relationship = {
   to_entity_id: string
   relationship_type: RelationshipType
   confidence: number
-  evidence_id: string | null
+  evidence_id: string
   valid_from: string | null
   valid_to: string | null
   status: 'active' | 'disputed' | 'invalidated'

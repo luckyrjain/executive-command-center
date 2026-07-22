@@ -166,7 +166,11 @@ def test_claim_and_relationship_mutations_appear_on_timeline(
     client.post(
         f"/api/v1/knowledge/entities/{entity_id}/relationships",
         headers=_headers(token, "create-timeline-relationship"),
-        json={"relationship_type": "WORKS_ON", "to_entity_id": other_id},
+        json={
+            "relationship_type": "WORKS_ON",
+            "to_entity_id": other_id,
+            "evidence_id": str(evidence_id),
+        },
     )
 
     response = client.get(

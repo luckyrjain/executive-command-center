@@ -72,8 +72,10 @@ export async function run({ page, baseURL }) {
   await detail.getByRole('heading', { name: 'Ada Lovelace', level: 2 }).waitFor()
   await detail.getByText('No relationships recorded for this entity.').waitFor()
 
+  const evidenceId = 'evidence-quarterly-budget'
   await detail.getByLabel('Relationship type').selectOption('WORKS_ON')
   await detail.getByLabel('Related entity ID').fill(seedProject.id)
+  await detail.getByLabel('Evidence ID').fill(evidenceId)
   await detail.getByRole('button', { name: 'Add relationship' }).click()
   const relationships = detail.locator(`section[aria-labelledby="relationships-heading-${seedEntity.id}"]`)
   await relationships.getByText(new RegExp(`WORKS_ON.*${seedProject.id}`)).waitFor()
@@ -86,6 +88,7 @@ export async function run({ page, baseURL }) {
   )
   assert.ok(relationshipRequest, 'expected a relationship create request')
   assert.equal(relationshipRequest.body.to_entity_id, seedProject.id)
+  assert.equal(relationshipRequest.body.evidence_id, evidenceId)
 
   await detail.getByRole('button', { name: 'Close detail' }).click()
   await detail.waitFor({ state: 'detached' })

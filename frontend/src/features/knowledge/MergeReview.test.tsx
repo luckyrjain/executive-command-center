@@ -110,4 +110,37 @@ describe('MergeReview', () => {
     await screen.findByText(`Merged ${rightEntity.id} into ${leftEntity.id}`)
     expect(screen.getByLabelText(`Reversal reason for ${mergeOperation.id}`)).toBeTruthy()
   })
+
+  it('on a version conflict, shows a dedicated message and refetches the latest entity versions', async () => {
+    let leftCallCount = 0
+    const fetch = routedFetch([
+      { method: 'GET', match: (path) => path === '/api/v1/knowledge/resolution/candidates', handle: () => jsonResponse({ items: [candidate], next_cursor: null }) },
+      {
+        method: 'GET',
+        match: (path) => path === `/api/v1/knowledge/entities/${leftEntity.id}`,
+        handle: () => {
+          leftCallCount += 1
+          // The entity changed (version bumped) by the time of refetch --
+          // simulating another user's concurrent edit.
+          return jsonResponse(leftCallCount > 1 ? { ...leftEntity, version: 4 } : leftEntity)
+        },
+      },
+      { method: 'GET', match: (path) => path === `/api/v1/knowledge/entities/${rightEntity.id}`, handle: () => jsonResponse(rightEntity) },
+      {
+        method: 'POST',
+        match: (path) => path === '/api/v1/knowledge/entities/merge',
+        handle: () => Promise.resolve(new Response(JSON.stringify({ error: { code: 'VERSION_CONFLICT', message: 'Version Conflict' } }), { status: 409, headers: { 'Content-Type': 'application/json' } })),
+      },
+    ])
+    vi.stubGlobal('fetch', fetch)
+    renderMergeReview()
+
+    await screen.findByText('Ada Lovelace')
+    fireEvent.change(screen.getByLabelText(`Merge reason for ${candidate.id}`), { target: { value: 'confirmed duplicate' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Merge into Ada Lovelace' }))
+
+    await screen.findByText('One of these entities changed since this page loaded. Refreshing the latest version below.')
+    await screen.findByRole('button', { name: 'Retry: merge into Ada Lovelace' })
+    expect(leftCallCount).toBeGreaterThan(1)
+  })
 })

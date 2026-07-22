@@ -1,8 +1,20 @@
 import { useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
-import { apiRequest } from '../../api/client'
+import { ApiError, apiRequest } from '../../api/client'
 import type { EntityOperation, KnowledgeEntity, ResolutionCandidate, ResolutionCandidateList } from './types'
+
+// Mirrors RiskWorkspace.tsx's errorMessage/VERSION_CONFLICT pattern: a
+// version conflict here means the entity changed (e.g. another user edited
+// or a concurrent merge redirected it) since this row's data was loaded --
+// not a generic failure, and not something retrying with the same stale
+// version can ever fix.
+function mergeErrorMessage(error: Error): string {
+  if (error instanceof ApiError && error.code === 'VERSION_CONFLICT') {
+    return 'One of these entities changed since this page loaded. Refreshing the latest version below.'
+  }
+  return error.message
+}
 
 function listConfirmedCandidates(): Promise<ResolutionCandidateList> {
   return apiRequest('/api/v1/knowledge/resolution/candidates?status=confirmed&limit=50')
@@ -51,10 +63,18 @@ function MergeCandidateRow({ candidate, onMerged }: MergeCandidateRowProps) {
       void queryClient.invalidateQueries({ queryKey: ['knowledge', 'resolution', 'candidates'] })
       onMerged(operation)
     },
+    onError: (error) => {
+      if (error instanceof ApiError && error.code === 'VERSION_CONFLICT') {
+        void left.refetch()
+        void right.refetch()
+      }
+    },
   })
 
   if (left.isLoading || right.isLoading) return <li>Loading entity details…</li>
   if (!left.data || !right.data) return null
+
+  const isVersionConflict = mergeMutation.error instanceof ApiError && mergeMutation.error.code === 'VERSION_CONFLICT'
 
   return (
     <li>
@@ -63,7 +83,7 @@ function MergeCandidateRow({ candidate, onMerged }: MergeCandidateRowProps) {
         <small> · confirmed match, score {candidate.score.toFixed(2)}</small>
       </div>
       {mergeMutation.error ? (
-        <div role="alert" className="inline-status error-panel">{mergeMutation.error.message}</div>
+        <div role="alert" className="inline-status error-panel">{mergeErrorMessage(mergeMutation.error)}</div>
       ) : null}
       <label>
         {`Merge reason for ${candidate.id}`}
@@ -76,17 +96,17 @@ function MergeCandidateRow({ candidate, onMerged }: MergeCandidateRowProps) {
       <div className="work-actions" role="group" aria-label={`Merge actions for ${candidate.id}`}>
         <button
           type="button"
-          disabled={mergeMutation.isPending || !reason.trim()}
+          disabled={mergeMutation.isPending || left.isFetching || right.isFetching || !reason.trim()}
           onClick={() => mergeMutation.mutate(left.data!.id)}
         >
-          Merge into {left.data.canonical_name}
+          {isVersionConflict ? `Retry: merge into ${left.data.canonical_name}` : `Merge into ${left.data.canonical_name}`}
         </button>
         <button
           type="button"
-          disabled={mergeMutation.isPending || !reason.trim()}
+          disabled={mergeMutation.isPending || left.isFetching || right.isFetching || !reason.trim()}
           onClick={() => mergeMutation.mutate(right.data!.id)}
         >
-          Merge into {right.data.canonical_name}
+          {isVersionConflict ? `Retry: merge into ${right.data.canonical_name}` : `Merge into ${right.data.canonical_name}`}
         </button>
       </div>
     </li>

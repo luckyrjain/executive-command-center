@@ -339,13 +339,19 @@ function makeKnowledgeApi(overrides = {}) {
     }
     if (relationshipsMatch && method === 'POST') {
       const fromId = relationshipsMatch[1]
+      // evidence_id is required (matching the real backend's DATA-MODEL.md
+      // "at least one source reference" invariant) -- unlike a real
+      // pydantic-validation 422, this mock returns the app's own error shape.
+      if (!body.evidence_id) {
+        return { status: 422, body: { error: { code: 'VALIDATION_ERROR', message: 'evidence_id is required' } } }
+      }
       const relationship = {
         id: randomUUID(),
         from_entity_id: fromId,
         to_entity_id: body.to_entity_id,
         relationship_type: body.relationship_type,
         confidence: body.confidence ?? 1,
-        evidence_id: body.evidence_id ?? null,
+        evidence_id: body.evidence_id,
         valid_from: body.valid_from ?? null,
         valid_to: body.valid_to ?? null,
         status: 'active',

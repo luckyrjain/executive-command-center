@@ -18,9 +18,13 @@ type EntityDetailProps = {
   onClose: () => void
 }
 
-type RelationshipDraft = { relationshipType: RelationshipType; toEntityId: string }
+type RelationshipDraft = { relationshipType: RelationshipType; toEntityId: string; evidenceId: string }
 
-const emptyRelationshipDraft: RelationshipDraft = { relationshipType: 'RELATES_TO', toEntityId: '' }
+const emptyRelationshipDraft: RelationshipDraft = {
+  relationshipType: 'RELATES_TO',
+  toEntityId: '',
+  evidenceId: '',
+}
 
 function formatClaimValue(claim: Claim): string {
   try {
@@ -55,7 +59,11 @@ export default function EntityDetail({ entityId, onClose }: EntityDetailProps) {
     mutationFn: (draft: RelationshipDraft) =>
       apiRequest<Relationship>(`/api/v1/knowledge/entities/${entityId}/relationships`, {
         method: 'POST',
-        body: { relationship_type: draft.relationshipType, to_entity_id: draft.toEntityId.trim() },
+        body: {
+          relationship_type: draft.relationshipType,
+          to_entity_id: draft.toEntityId.trim(),
+          evidence_id: draft.evidenceId.trim(),
+        },
       }),
     onSuccess: () => {
       setRelationshipDraft(emptyRelationshipDraft)
@@ -66,7 +74,9 @@ export default function EntityDetail({ entityId, onClose }: EntityDetailProps) {
 
   function submitRelationship(event: FormEvent) {
     event.preventDefault()
-    if (relationshipDraft.toEntityId.trim()) addRelationshipMutation.mutate(relationshipDraft)
+    if (relationshipDraft.toEntityId.trim() && relationshipDraft.evidenceId.trim()) {
+      addRelationshipMutation.mutate(relationshipDraft)
+    }
   }
 
   const entity = entityQuery.data
@@ -89,7 +99,9 @@ export default function EntityDetail({ entityId, onClose }: EntityDetailProps) {
       <section aria-labelledby={`claims-heading-${entityId}`}>
         <h3 id={`claims-heading-${entityId}`}>Claims</h3>
         {claimsQuery.isLoading ? <p role="status">Loading claims…</p> : null}
-        {claimsQuery.data?.items.length ? (
+        {claimsQuery.isError ? (
+          <div role="alert">{claimsQuery.error.message}</div>
+        ) : claimsQuery.data?.items.length ? (
           <ul>
             {claimsQuery.data.items.map((claim) => (
               <li key={claim.id}>
@@ -98,15 +110,17 @@ export default function EntityDetail({ entityId, onClose }: EntityDetailProps) {
               </li>
             ))}
           </ul>
-        ) : (
+        ) : claimsQuery.isSuccess ? (
           <p className="empty-state">No claims recorded for this entity.</p>
-        )}
+        ) : null}
       </section>
 
       <section aria-labelledby={`relationships-heading-${entityId}`}>
         <h3 id={`relationships-heading-${entityId}`}>Relationships</h3>
         {relationshipsQuery.isLoading ? <p role="status">Loading relationships…</p> : null}
-        {relationshipsQuery.data?.items.length ? (
+        {relationshipsQuery.isError ? (
+          <div role="alert">{relationshipsQuery.error.message}</div>
+        ) : relationshipsQuery.data?.items.length ? (
           <ul>
             {relationshipsQuery.data.items.map((relationship) => (
               <li key={relationship.id}>
@@ -117,9 +131,9 @@ export default function EntityDetail({ entityId, onClose }: EntityDetailProps) {
               </li>
             ))}
           </ul>
-        ) : (
+        ) : relationshipsQuery.isSuccess ? (
           <p className="empty-state">No relationships recorded for this entity.</p>
-        )}
+        ) : null}
         {addRelationshipMutation.error ? (
           <div role="alert" className="inline-status error-panel">{addRelationshipMutation.error.message}</div>
         ) : null}
@@ -147,6 +161,14 @@ export default function EntityDetail({ entityId, onClose }: EntityDetailProps) {
               onChange={(event) => setRelationshipDraft({ ...relationshipDraft, toEntityId: event.target.value })}
             />
           </label>
+          <label>
+            Evidence ID
+            <input
+              aria-label="Evidence ID"
+              value={relationshipDraft.evidenceId}
+              onChange={(event) => setRelationshipDraft({ ...relationshipDraft, evidenceId: event.target.value })}
+            />
+          </label>
           <button type="submit" disabled={addRelationshipMutation.isPending}>Add relationship</button>
         </form>
       </section>
@@ -154,7 +176,9 @@ export default function EntityDetail({ entityId, onClose }: EntityDetailProps) {
       <section aria-labelledby={`timeline-heading-${entityId}`}>
         <h3 id={`timeline-heading-${entityId}`}>Timeline</h3>
         {timelineQuery.isLoading ? <p role="status">Loading timeline…</p> : null}
-        {timelineQuery.data?.items.length ? (
+        {timelineQuery.isError ? (
+          <div role="alert">{timelineQuery.error.message}</div>
+        ) : timelineQuery.data?.items.length ? (
           <ol>
             {timelineQuery.data.items.map((entry) => (
               <li key={entry.id}>
@@ -162,9 +186,9 @@ export default function EntityDetail({ entityId, onClose }: EntityDetailProps) {
               </li>
             ))}
           </ol>
-        ) : (
+        ) : timelineQuery.isSuccess ? (
           <p className="empty-state">No timeline entries yet.</p>
-        )}
+        ) : null}
       </section>
     </section>
   )

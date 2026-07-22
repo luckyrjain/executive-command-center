@@ -66,7 +66,11 @@ class RelationshipCreate(BaseModel):
 
     relationship_type: RelationshipType
     to_entity_id: UUID
-    evidence_id: UUID | None = None
+    # Required, matching claims.py's identical rule: DATA-MODEL.md's invariant
+    # is "a claim or relationship has at least one source reference" -- claims
+    # already enforced this in the DB and API, relationships did not (a gap
+    # found by an audit of the shipped code against the contract).
+    evidence_id: UUID
     confidence: float = Field(default=1.0, ge=0, le=1)
     valid_from: datetime | None = None
     valid_to: datetime | None = None
@@ -88,7 +92,7 @@ class RelationshipResponse(BaseModel):
     to_entity_id: UUID
     relationship_type: RelationshipType
     confidence: float
-    evidence_id: UUID | None
+    evidence_id: UUID
     valid_from: datetime | None
     valid_to: datetime | None
     status: RelationshipStatus
@@ -324,16 +328,15 @@ def create_relationship(
         source_version = _entity_version(session, auth, entity_id)
         if source_version is None or not _entity_exists(session, auth, payload.to_entity_id):
             raise HTTPException(status_code=404, detail="ENTITY_NOT_FOUND")
-        if payload.evidence_id is not None:
-            evidence_row = session.execute(
-                text(
-                    "SELECT 1 FROM pkos_evidence"
-                    " WHERE workspace_id = :workspace_id AND id = :evidence_id"
-                ),
-                {"workspace_id": auth.workspace_id, "evidence_id": payload.evidence_id},
-            ).one_or_none()
-            if evidence_row is None:
-                raise HTTPException(status_code=404, detail="EVIDENCE_NOT_FOUND")
+        evidence_row = session.execute(
+            text(
+                "SELECT 1 FROM pkos_evidence"
+                " WHERE workspace_id = :workspace_id AND id = :evidence_id"
+            ),
+            {"workspace_id": auth.workspace_id, "evidence_id": payload.evidence_id},
+        ).one_or_none()
+        if evidence_row is None:
+            raise HTTPException(status_code=404, detail="EVIDENCE_NOT_FOUND")
         row = (
             session.execute(
                 text(

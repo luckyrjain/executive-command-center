@@ -33,9 +33,14 @@ SessionDep = Annotated[Session, Depends(get_session)]
 # match check is: entity_aliases has no separate "trusted identifier"
 # column beyond its free-form alias_type, so an exact alias match and an
 # exact canonical-name match are the two deterministic levels this schema
-# can express, both ranked above any lexical score.
-_SCORE_EXACT_ALIAS = 1.00
-_SCORE_EXACT_NAME = 0.95
+# can express, both ranked above any lexical score. Exact name must outrank
+# exact alias per the contract -- the CASE expressions and _matching_mode()
+# below check the name condition before the alias condition so a document
+# whose alias happens to equal its own canonical name is classified/scored
+# as the (higher) name match, not the alias match; simply swapping these two
+# constants without also reordering those checks would be insufficient.
+_SCORE_EXACT_NAME = 1.00
+_SCORE_EXACT_ALIAS = 0.95
 _SCORE_PREFIX_NAME = 0.85
 # Hybrid fusion (RETRIEVAL-CONTRACT.md's "versioned deterministic method",
 # version 1): a document lexical search already found gets a small boost
@@ -274,8 +279,8 @@ def _run_lexical_query(session: Session, params: dict[str, Any]) -> Sequence[Any
                 WITH {_LEXICAL_CANDIDATES_CTE}, ranked AS (
                     SELECT *,
                         CASE
-                            WHEN exact_alias_match THEN {_SCORE_EXACT_ALIAS}
                             WHEN normalized_title = :query THEN {_SCORE_EXACT_NAME}
+                            WHEN exact_alias_match THEN {_SCORE_EXACT_ALIAS}
                             WHEN normalized_title LIKE :query || '%' THEN {_SCORE_PREFIX_NAME}
                             ELSE greatest(
                                 least(trigram_score, 0.75),
@@ -370,8 +375,8 @@ def _run_hybrid_query(session: Session, params: dict[str, Any]) -> Sequence[Any]
                 ), ranked AS (
                     SELECT *,
                         CASE
-                            WHEN exact_alias_match THEN {_SCORE_EXACT_ALIAS}
                             WHEN normalized_title = :query THEN {_SCORE_EXACT_NAME}
+                            WHEN exact_alias_match THEN {_SCORE_EXACT_ALIAS}
                             WHEN normalized_title LIKE :query || '%' THEN {_SCORE_PREFIX_NAME}
                             WHEN trigram_score >= {_TRIGRAM_RELEVANCE_THRESHOLD}
                                 OR fulltext_score > 0 THEN least(
@@ -413,10 +418,10 @@ def _run_hybrid_query(session: Session, params: dict[str, Any]) -> Sequence[Any]
 
 def _matching_mode(row: Any, query: str, hybrid: bool) -> str:
     normalized_title = row["normalized_title"]
-    if row["exact_alias_match"]:
-        return "exact_alias"
     if normalized_title == query:
         return "exact_name"
+    if row["exact_alias_match"]:
+        return "exact_alias"
     if normalized_title.startswith(query):
         return "name_prefix"
     trigram_relevant = float(row["trigram_score"]) >= _TRIGRAM_RELEVANCE_THRESHOLD
