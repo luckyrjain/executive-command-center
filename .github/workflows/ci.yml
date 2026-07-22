@@ -39,6 +39,21 @@ jobs:
         with:
           version: 0.7.19
           enable-cache: true
+      - name: Raise Postgres checkpoint threshold for this CI run
+        # Default max_wal_size (1GB) is smaller than the aggregate WAL this
+        # suite now generates (several tests each insert/delete 10k+ rows),
+        # so Postgres logs "checkpoints are occurring too frequently" and
+        # runs back-to-back synchronous checkpoints that take 25-30s on this
+        # runner's disk -- long enough to blow through the deliberate 5s
+        # statement_timeout (backend/ecc/database.py's STATEMENT_TIMEOUT_MS)
+        # mid-checkpoint and cancel an unrelated in-flight query. Raising
+        # max_wal_size lets WAL accumulate further before a checkpoint is
+        # forced, matching Postgres's own log hint. Confirmed via 3
+        # consecutive reproductions of the same teardown-DELETE timeout
+        # before this fix; this is CI-only tuning, not an application change.
+        run: |
+          PGPASSWORD=ecc psql -h localhost -U ecc -d ecc -c "ALTER SYSTEM SET max_wal_size = '4GB';"
+          PGPASSWORD=ecc psql -h localhost -U ecc -d ecc -c "SELECT pg_reload_conf();"
       # No --extra embeddings here deliberately (see the embeddings-benchmark
       # job below): torch's install is large enough that running it in the
       # same job as the tight-budget Phase 1 performance tests caused real,
@@ -86,6 +101,11 @@ jobs:
         with:
           version: 0.7.19
           enable-cache: true
+      - name: Raise Postgres checkpoint threshold for this CI run
+        # See the identical step in the backend job above for why.
+        run: |
+          PGPASSWORD=ecc psql -h localhost -U ecc -d ecc -c "ALTER SYSTEM SET max_wal_size = '4GB';"
+          PGPASSWORD=ecc psql -h localhost -U ecc -d ecc -c "SELECT pg_reload_conf();"
       - run: uv sync --frozen --all-groups --extra embeddings --python 3.14.6
       - run: uv run alembic -c backend/alembic.ini upgrade head
       - run: >
