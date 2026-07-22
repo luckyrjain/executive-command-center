@@ -317,3 +317,76 @@ def test_relationship_create_rejects_evidence_from_another_workspace(
                 text("DELETE FROM workspaces WHERE id = :workspace_id"),
                 {"workspace_id": other_workspace_id},
             )
+
+
+def test_relationship_create_rejects_unavailable_evidence(
+    relationships_test_context: tuple[TestClient, UUID, UUID, str, UUID, UUID],
+) -> None:
+    client, workspace_id, _user_id, token, person_id, project_id = relationships_test_context
+    evidence_id = _create_evidence(workspace_id, person_id)
+    with engine.begin() as connection:
+        connection.execute(
+            text("UPDATE pkos_evidence SET evidence_state = 'deleted' WHERE id = :id"),
+            {"id": evidence_id},
+        )
+    response = client.post(
+        f"/api/v1/knowledge/entities/{person_id}/relationships",
+        headers=_headers(token, "unavailable-evidence"),
+        json={
+            "relationship_type": "WORKS_ON",
+            "to_entity_id": str(project_id),
+            "evidence_id": str(evidence_id),
+        },
+    )
+    assert response.status_code == 422, response.text
+    assert response.json()["error"]["code"] == "EVIDENCE_UNAVAILABLE"
+
+
+def test_relationship_create_rejects_archived_target_entity(
+    relationships_test_context: tuple[TestClient, UUID, UUID, str, UUID, UUID],
+) -> None:
+    client, workspace_id, _user_id, token, person_id, project_id = relationships_test_context
+    evidence_id = _create_evidence(workspace_id, person_id)
+    archive = client.post(
+        f"/api/v1/knowledge/entities/{project_id}/archive",
+        headers=_headers(token, "archive-target"),
+        json={"expected_version": 1},
+    )
+    assert archive.status_code == 200, archive.text
+
+    response = client.post(
+        f"/api/v1/knowledge/entities/{person_id}/relationships",
+        headers=_headers(token, "relate-to-archived"),
+        json={
+            "relationship_type": "WORKS_ON",
+            "to_entity_id": str(project_id),
+            "evidence_id": str(evidence_id),
+        },
+    )
+    assert response.status_code == 422, response.text
+    assert response.json()["error"]["code"] == "INVALID_RELATIONSHIP"
+
+
+def test_relationship_create_rejects_archived_source_entity(
+    relationships_test_context: tuple[TestClient, UUID, UUID, str, UUID, UUID],
+) -> None:
+    client, workspace_id, _user_id, token, person_id, project_id = relationships_test_context
+    evidence_id = _create_evidence(workspace_id, person_id)
+    archive = client.post(
+        f"/api/v1/knowledge/entities/{person_id}/archive",
+        headers=_headers(token, "archive-source"),
+        json={"expected_version": 1},
+    )
+    assert archive.status_code == 200, archive.text
+
+    response = client.post(
+        f"/api/v1/knowledge/entities/{person_id}/relationships",
+        headers=_headers(token, "relate-from-archived"),
+        json={
+            "relationship_type": "WORKS_ON",
+            "to_entity_id": str(project_id),
+            "evidence_id": str(evidence_id),
+        },
+    )
+    assert response.status_code == 422, response.text
+    assert response.json()["error"]["code"] == "INVALID_RELATIONSHIP"

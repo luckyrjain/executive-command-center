@@ -219,3 +219,78 @@ def test_claim_supersede_never_destructively_overwrites(
     # now points at its replacement.
     assert str(original_row["superseded_by"]) == new_claim["id"]
     assert original_row["valid_to"] is not None
+
+
+def test_claim_record_rejects_unknown_evidence(
+    claims_test_context: tuple[TestClient, UUID, UUID, str, UUID],
+) -> None:
+    client, _workspace_id, _user_id, token, entity_id = claims_test_context
+    response = client.post(
+        f"/api/v1/knowledge/entities/{entity_id}/claims",
+        headers=_headers(token, "unknown-evidence"),
+        json={
+            "predicate": "employed_at",
+            "value": {"organization": "Analytical Engines Ltd"},
+            "source_id": str(uuid4()),
+        },
+    )
+    assert response.status_code == 404, response.text
+    assert response.json()["error"]["code"] == "EVIDENCE_NOT_FOUND"
+
+
+def test_claim_record_rejects_unavailable_evidence(
+    claims_test_context: tuple[TestClient, UUID, UUID, str, UUID],
+) -> None:
+    client, workspace_id, _user_id, token, entity_id = claims_test_context
+    evidence_id = _create_evidence(workspace_id, entity_id)
+    with engine.begin() as connection:
+        connection.execute(
+            text("UPDATE pkos_evidence SET evidence_state = 'missing' WHERE id = :id"),
+            {"id": evidence_id},
+        )
+    response = client.post(
+        f"/api/v1/knowledge/entities/{entity_id}/claims",
+        headers=_headers(token, "unavailable-evidence"),
+        json={
+            "predicate": "employed_at",
+            "value": {"organization": "Analytical Engines Ltd"},
+            "source_id": str(evidence_id),
+        },
+    )
+    assert response.status_code == 422, response.text
+    assert response.json()["error"]["code"] == "EVIDENCE_UNAVAILABLE"
+
+
+def test_claim_supersede_rejects_unavailable_evidence(
+    claims_test_context: tuple[TestClient, UUID, UUID, str, UUID],
+) -> None:
+    client, workspace_id, _user_id, token, entity_id = claims_test_context
+    evidence_id = _create_evidence(workspace_id, entity_id)
+    create = client.post(
+        f"/api/v1/knowledge/entities/{entity_id}/claims",
+        headers=_headers(token, "create-claim-for-supersede"),
+        json={
+            "predicate": "employed_at",
+            "value": {"organization": "Analytical Engines Ltd"},
+            "source_id": str(evidence_id),
+        },
+    )
+    original_id = create.json()["id"]
+
+    with engine.begin() as connection:
+        connection.execute(
+            text("UPDATE pkos_evidence SET evidence_state = 'deleted' WHERE id = :id"),
+            {"id": evidence_id},
+        )
+
+    supersede = client.post(
+        f"/api/v1/knowledge/entities/{entity_id}/claims/{original_id}/supersede",
+        headers=_headers(token, "supersede-with-deleted-evidence"),
+        json={
+            "predicate": "employed_at",
+            "value": {"organization": "Cambridge University"},
+            "source_id": str(evidence_id),
+        },
+    )
+    assert supersede.status_code == 422, supersede.text
+    assert supersede.json()["error"]["code"] == "EVIDENCE_UNAVAILABLE"

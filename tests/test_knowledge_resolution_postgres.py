@@ -439,3 +439,41 @@ def test_defer_a_decided_candidate_is_conflict(
     )
     assert response.status_code == 409
     assert response.json()["error"]["code"] == "CANDIDATE_NOT_OPEN"
+
+
+def test_confirm_is_ambiguous_when_an_entity_was_archived_after_the_candidate_was_scored(
+    resolution_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    client, _workspace_id, _user_id, token = resolution_test_context
+    left_id = _create_entity(client, token, "ambiguous-left", "person", "Ada Lovelace")
+    right_id = _create_entity(client, token, "ambiguous-right", "person", "Ada Lovelase")
+    created = client.post(
+        "/api/v1/knowledge/resolution/candidates",
+        headers=_headers(token, "ambiguous-create"),
+        json={"left_entity_id": str(left_id), "right_entity_id": str(right_id)},
+    )
+    candidate_id = created.json()["candidate"]["id"]
+
+    archive = client.post(
+        f"/api/v1/knowledge/entities/{right_id}/archive",
+        headers=_headers(token, "ambiguous-archive"),
+        json={"expected_version": 1},
+    )
+    assert archive.status_code == 200, archive.text
+
+    response = client.post(
+        f"/api/v1/knowledge/resolution/candidates/{candidate_id}/confirm",
+        headers=_headers(token, "ambiguous-confirm"),
+        json={"reason": "same person, verified manually"},
+    )
+    assert response.status_code == 409, response.text
+    assert response.json()["error"]["code"] == "AMBIGUOUS_RESOLUTION"
+
+    # Rejecting the same candidate is unaffected -- it changes neither
+    # entity, so there is no ambiguity about what it decides.
+    reject = client.post(
+        f"/api/v1/knowledge/resolution/candidates/{candidate_id}/reject",
+        headers=_headers(token, "ambiguous-reject"),
+        json={"reason": "one side archived, no longer comparable"},
+    )
+    assert reject.status_code == 200, reject.text

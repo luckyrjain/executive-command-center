@@ -429,6 +429,16 @@ def _entity_row(session: Session, auth: AuthContext, entity_id: UUID) -> dict[st
     return dict(row) if row is not None else None
 
 
+def _entity_status(session: Session, auth: AuthContext, entity_id: UUID) -> str | None:
+    row = session.execute(
+        text(
+            "SELECT status FROM pkos_nodes WHERE workspace_id = :workspace_id AND id = :entity_id"
+        ),
+        {"workspace_id": auth.workspace_id, "entity_id": entity_id},
+    ).one_or_none()
+    return row[0] if row is not None else None
+
+
 def _candidate_entity(session: Session, auth: AuthContext, entity_id: UUID) -> CandidateEntity:
     node = _entity_row(session, auth, entity_id)
     if node is None:
@@ -766,6 +776,21 @@ def _decide_candidate(
             return response
         if current["status"] != "open":
             raise HTTPException(status_code=409, detail="CANDIDATE_NOT_OPEN")
+        # A confirm is a human decision that two identities are the same --
+        # but if either side has been redirected (merged away by an
+        # intervening operation) or archived since this candidate was
+        # scored, it is no longer clear which identity is actually being
+        # confirmed: the original entity, or whatever now stands in for it.
+        # Rejecting a still-open candidate carries no such ambiguity (it
+        # changes nothing about either entity), so this only guards confirm.
+        # Closes a gap an audit of the shipped code found: `ambiguous_
+        # resolution` was named in the contract's required error codes but
+        # never actually raised anywhere.
+        if new_status == "confirmed":
+            left_status = _entity_status(session, auth, current["left_entity_id"])
+            right_status = _entity_status(session, auth, current["right_entity_id"])
+            if left_status != "active" or right_status != "active":
+                raise HTTPException(status_code=409, detail="AMBIGUOUS_RESOLUTION")
         row = (
             session.execute(
                 text(

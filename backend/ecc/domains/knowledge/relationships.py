@@ -217,6 +217,16 @@ def _entity_exists(session: Session, auth: AuthContext, entity_id: UUID) -> bool
     return _entity_version(session, auth, entity_id) is not None
 
 
+def _entity_status(session: Session, auth: AuthContext, entity_id: UUID) -> str | None:
+    row = session.execute(
+        text(
+            "SELECT status FROM pkos_nodes WHERE workspace_id = :workspace_id AND id = :entity_id"
+        ),
+        {"workspace_id": auth.workspace_id, "entity_id": entity_id},
+    ).one_or_none()
+    return row[0] if row is not None else None
+
+
 def _source_entity_version(session: Session, auth: AuthContext, relationship_id: UUID) -> int:
     """`audit_events.aggregate_version` is NOT NULL, but relationships have no
     version of their own (DATA-MODEL.md lists one for knowledge_entities, not
@@ -326,17 +336,35 @@ def create_relationship(
         if cached is not None:
             return cached
         source_version = _entity_version(session, auth, entity_id)
-        if source_version is None or not _entity_exists(session, auth, payload.to_entity_id):
+        target_status = _entity_status(session, auth, payload.to_entity_id)
+        if source_version is None or target_status is None:
             raise HTTPException(status_code=404, detail="ENTITY_NOT_FOUND")
-        evidence_row = session.execute(
+        # DATA-MODEL.md's "typed directed connection" is meant to connect
+        # canonical, live identities -- an archived entity is paused, not
+        # gone, but a redirected one has already been superseded by a merge
+        # target (its whole purpose is that new activity attaches to the
+        # survivor instead). Allowing a fresh relationship to attach to
+        # either leaves the graph pointing at a non-canonical stand-in, which
+        # is exactly what `invalid_relationship` names in the contract's
+        # required error codes -- a gap an audit of the shipped code found
+        # was never actually checked.
+        source_status = _entity_status(session, auth, entity_id)
+        if source_status != "active" or target_status != "active":
+            raise HTTPException(status_code=422, detail="INVALID_RELATIONSHIP")
+        # See claims.py's identical check: evidence that exists but is no
+        # longer `available` (deleted, missing, permission_denied) cannot
+        # back a new relationship either.
+        evidence_state = session.execute(
             text(
-                "SELECT 1 FROM pkos_evidence"
+                "SELECT evidence_state FROM pkos_evidence"
                 " WHERE workspace_id = :workspace_id AND id = :evidence_id"
             ),
             {"workspace_id": auth.workspace_id, "evidence_id": payload.evidence_id},
-        ).one_or_none()
-        if evidence_row is None:
+        ).scalar_one_or_none()
+        if evidence_state is None:
             raise HTTPException(status_code=404, detail="EVIDENCE_NOT_FOUND")
+        if evidence_state != "available":
+            raise HTTPException(status_code=422, detail="EVIDENCE_UNAVAILABLE")
         row = (
             session.execute(
                 text(

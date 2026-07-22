@@ -172,6 +172,17 @@ def _entity_version(session: Session, auth: AuthContext, entity_id: UUID) -> int
     return row[0] if row is not None else None
 
 
+def _evidence_state(session: Session, auth: AuthContext, evidence_id: UUID) -> str | None:
+    row = session.execute(
+        text(
+            "SELECT evidence_state FROM pkos_evidence"
+            " WHERE workspace_id = :workspace_id AND id = :evidence_id"
+        ),
+        {"workspace_id": auth.workspace_id, "evidence_id": evidence_id},
+    ).one_or_none()
+    return row[0] if row is not None else None
+
+
 def _entity_retrieval_fields(
     session: Session, auth: AuthContext, entity_id: UUID
 ) -> tuple[str, str, str | None, int] | None:
@@ -317,6 +328,19 @@ def create_claim(
         entity_version = _entity_version(session, auth, entity_id)
         if entity_version is None:
             raise HTTPException(status_code=404, detail="ENTITY_NOT_FOUND")
+        # DATA-MODEL.md's "a claim ... has at least one source reference" is
+        # enforced by the FK alone (source_id must reference a real evidence
+        # row), but a reference to evidence that exists yet is no longer
+        # `available` (deleted, missing, permission_denied) is not a
+        # not-found -- it is a claim citing a source that can no longer back
+        # it, closing a gap an audit of the shipped code found: this endpoint
+        # never checked evidence_state at all before evidence-deletion (Task
+        # 22) made a non-`available` state reachable in practice.
+        evidence_state = _evidence_state(session, auth, payload.source_id)
+        if evidence_state is None:
+            raise HTTPException(status_code=404, detail="EVIDENCE_NOT_FOUND")
+        if evidence_state != "available":
+            raise HTTPException(status_code=422, detail="EVIDENCE_UNAVAILABLE")
         row = _insert_claim(session, auth, entity_id, payload, now)
         response = _project(row)
         _write_side_effects(
@@ -417,6 +441,11 @@ def supersede_claim(
         entity_version = _entity_version(session, auth, entity_id)
         if entity_version is None:
             raise HTTPException(status_code=404, detail="ENTITY_NOT_FOUND")
+        evidence_state = _evidence_state(session, auth, payload.source_id)
+        if evidence_state is None:
+            raise HTTPException(status_code=404, detail="EVIDENCE_NOT_FOUND")
+        if evidence_state != "available":
+            raise HTTPException(status_code=422, detail="EVIDENCE_UNAVAILABLE")
 
         new_row = _insert_claim(session, auth, entity_id, payload, now)
         session.execute(
