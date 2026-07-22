@@ -631,6 +631,77 @@ def test_reversal_restores_an_invalidated_duplicate_edge_to_active(
     assert str(status_after_reverse["source_node_id"]) == str(source_id)
 
 
+def test_reversal_rejected_when_a_rehomed_relationship_was_moved_by_a_later_merge(
+    entity_operations_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    # Regression test for a gap an independent second-round review found:
+    # target is still 'active' after absorbing source_1, so it can
+    # legitimately go on to become the SOURCE of a second, independent
+    # merge into some other entity -- which rehomes the relationship
+    # merge_1 already rehomed onto it a second time. merge_2's own
+    # _rehome_edges writes no audit trail (raw SQL, no audit_events row),
+    # so it's invisible to the UNSAFE_REVERSAL activity check. Without a
+    # precondition check right before restoring, reversing merge_1 would
+    # either silently leave the relationship on other_target (the CASE
+    # WHEN in the restore UPDATE matches nothing, since the row no longer
+    # points at target) or, for entity_aliases, unconditionally yank
+    # ownership back to source_1 out from under other_target. Either way
+    # merge_1's reverse must instead reject with UNSAFE_REVERSAL.
+    client, workspace_id, _user_id, token = entity_operations_test_context
+    target_id = _create_entity(client, token, "chain-target", "person", "Ada Lovelace")
+    source_1_id = _create_entity(client, token, "chain-source-1", "person", "Ada Lovelase")
+    other_id = _create_entity(client, token, "chain-other", "project", "Analytical Engine")
+
+    evidence_id = _seed_evidence(workspace_id, source_1_id)
+    relationship = client.post(
+        f"/api/v1/knowledge/entities/{source_1_id}/relationships",
+        headers=_headers(token, "chain-rel-create"),
+        json={
+            "relationship_type": "WORKS_ON",
+            "to_entity_id": str(other_id),
+            "evidence_id": str(evidence_id),
+        },
+    )
+    assert relationship.status_code == 201, relationship.text
+
+    candidate_1 = _create_confirmed_candidate(
+        client, token, "chain-candidate-1", target_id, source_1_id
+    )
+    merge_1 = _merge(client, token, "chain-merge-1", candidate_1, target_id, 1, 1)
+    assert merge_1.status_code == 201, merge_1.text
+    operation_1_id = merge_1.json()["id"]
+
+    # target (still active) now becomes the SOURCE of a second, unrelated
+    # merge -- perfectly legal, since nothing marks it as "involved in a
+    # pending reversal."
+    other_target_id = _create_entity(client, token, "chain-other-target", "person", "A. Lovelace")
+    candidate_2 = _create_confirmed_candidate(
+        client, token, "chain-candidate-2", other_target_id, target_id
+    )
+    # target's own version is untouched by merge_1 (only source_1's version
+    # bumps on redirect), so it's still 1 here.
+    merge_2 = _merge(client, token, "chain-merge-2", candidate_2, other_target_id, 1, 1)
+    assert merge_2.status_code == 201, merge_2.text
+
+    response = client.post(
+        f"/api/v1/knowledge/entity-operations/{operation_1_id}/reverse",
+        headers=_headers(token, "chain-reverse-1"),
+        json={"reason": "attempt after a later merge moved the relationship again"},
+    )
+    assert response.status_code == 422, response.text
+    assert response.json()["error"]["code"] == "UNSAFE_REVERSAL"
+
+    # Nothing was touched: the relationship still belongs to other_target
+    # (where merge_2 correctly rehomed it), not silently left behind or
+    # forced back onto source_1.
+    with engine.connect() as connection:
+        edge_owner = connection.execute(
+            text("SELECT source_node_id FROM pkos_edges WHERE id = :id"),
+            {"id": relationship.json()["id"]},
+        ).scalar_one()
+    assert str(edge_owner) == str(other_target_id)
+
+
 def test_reversal_refreshes_source_retrieval_projection_so_it_is_not_stale(
     entity_operations_test_context: tuple[TestClient, UUID, UUID, str],
 ) -> None:

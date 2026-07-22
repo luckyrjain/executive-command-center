@@ -643,6 +643,62 @@ def _has_post_merge_dependent_activity(
     return relationship_row is not None
 
 
+def _rehomed_state_still_matches(
+    session: Session,
+    auth: AuthContext,
+    target_id: UUID,
+    *,
+    rehomed_alias_ids: list[UUID],
+    rehomed_edge_ids: list[UUID],
+    invalidated_edge_ids: list[UUID],
+) -> bool:
+    """Verifies every row a merge recorded as rehomed/invalidated is still
+    exactly where the merge left it, immediately before reverse_operation
+    restores them. See the call site for why this can't be checked in
+    advance the way claim/relationship activity is."""
+    if rehomed_alias_ids:
+        rows = session.execute(
+            text(
+                "SELECT id, entity_id FROM entity_aliases "
+                "WHERE workspace_id = :workspace_id AND id = ANY(:ids)"
+            ),
+            {"workspace_id": auth.workspace_id, "ids": rehomed_alias_ids},
+        ).all()
+        found = {row[0]: row[1] for row in rows}
+        if len(found) != len(rehomed_alias_ids) or any(
+            entity_id != target_id for entity_id in found.values()
+        ):
+            return False
+    if rehomed_edge_ids:
+        rows = session.execute(
+            text(
+                "SELECT id, source_node_id, target_node_id FROM pkos_edges "
+                "WHERE workspace_id = :workspace_id AND id = ANY(:ids)"
+            ),
+            {"workspace_id": auth.workspace_id, "ids": rehomed_edge_ids},
+        ).all()
+        found_edges = {row[0]: (row[1], row[2]) for row in rows}
+        if len(found_edges) != len(rehomed_edge_ids) or any(
+            target_id not in (edge_source, edge_target)
+            for edge_source, edge_target in found_edges.values()
+        ):
+            return False
+    if invalidated_edge_ids:
+        rows = session.execute(
+            text(
+                "SELECT id, status FROM pkos_edges "
+                "WHERE workspace_id = :workspace_id AND id = ANY(:ids)"
+            ),
+            {"workspace_id": auth.workspace_id, "ids": invalidated_edge_ids},
+        ).all()
+        found_statuses = {row[0]: row[1] for row in rows}
+        if len(found_statuses) != len(invalidated_edge_ids) or any(
+            status != "invalidated" for status in found_statuses.values()
+        ):
+            return False
+    return True
+
+
 @router.post(
     "/entity-operations/{operation_id}/reverse",
     response_model=EntityOperationResponse,
@@ -720,13 +776,32 @@ def reverse_operation(
         # recorded ids, not a fresh scan of target's current edges/aliases,
         # since after the merge there's no way to tell "an edge this merge
         # moved" apart from "an edge target always had" by inspection alone.
-        # Safe to do unconditionally here: the UNSAFE_REVERSAL check above
-        # already guarantees no relationship activity touched target since
-        # the merge, so restoring these can't collide with something new.
+        # The UNSAFE_REVERSAL check above guards against new claim/relationship
+        # activity, but not against a *later, independent* operation moving
+        # one of these specific rows again -- e.g. target itself later
+        # becoming the source of a second merge (still 'active', so
+        # perfectly legal), or a split reassigning one of these rows
+        # elsewhere. Neither writes a signal the check above watches for
+        # (merge's own rehoming writes no audit trail at all, and a split's
+        # reassignment is driven by caller-chosen ids). Rather than trying
+        # to enumerate every way that could happen, verify directly, right
+        # before restoring, that every recorded row is still exactly where
+        # this merge left it -- and reject instead of silently no-op'ing
+        # (the CASE-based edge UPDATE below would otherwise match nothing
+        # for a row moved elsewhere) or overwriting whatever moved it there.
         outputs = merge_op["outputs_json"] if isinstance(merge_op["outputs_json"], dict) else {}
         rehomed_alias_ids = [UUID(i) for i in outputs.get("rehomed_alias_ids", [])]
         rehomed_edge_ids = [UUID(i) for i in outputs.get("rehomed_edge_ids", [])]
         invalidated_edge_ids = [UUID(i) for i in outputs.get("invalidated_edge_ids", [])]
+        if not _rehomed_state_still_matches(
+            session,
+            auth,
+            target_id,
+            rehomed_alias_ids=rehomed_alias_ids,
+            rehomed_edge_ids=rehomed_edge_ids,
+            invalidated_edge_ids=invalidated_edge_ids,
+        ):
+            raise HTTPException(status_code=422, detail="UNSAFE_REVERSAL")
         if rehomed_alias_ids:
             session.execute(
                 text(
