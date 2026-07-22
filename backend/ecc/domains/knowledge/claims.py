@@ -5,7 +5,7 @@ from typing import Annotated, Any
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
@@ -43,6 +43,19 @@ class ClaimCreate(BaseModel):
     confidence: float = Field(default=1.0, ge=0, le=1)
     valid_from: datetime | None = None
     valid_to: datetime | None = None
+
+    # Mirrors relationships.py's identical rule (added there when an audit
+    # of the shipped code found relationships enforcing this and claims not,
+    # despite both sharing the same valid_from/valid_to shape).
+    @model_validator(mode="after")
+    def validate_valid_interval(self) -> ClaimCreate:
+        if (
+            self.valid_from is not None
+            and self.valid_to is not None
+            and self.valid_to <= self.valid_from
+        ):
+            raise ValueError("valid_to must be after valid_from")
+        return self
 
 
 class ClaimResponse(BaseModel):

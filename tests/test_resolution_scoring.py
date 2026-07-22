@@ -39,6 +39,30 @@ def test_near_miss_typo_scores_high_but_not_maximum_name_similarity() -> None:
     assert 0.5 < result.factors.name_similarity < 1.0
 
 
+def test_different_unicode_encodings_of_the_same_name_score_maximum_similarity() -> None:
+    # Adversarial regression test, built from explicit \u escapes rather
+    # than typed accented literals (whose source-file bytes an editor could
+    # silently normalize and defeat the point of this test): both strings
+    # render as the identical visible name "Jos\u00e9 Rizal", but
+    # decomposed_name spells the accented letter as base "e" (U+0065) plus
+    # a combining acute accent (U+0301), while precomposed_name uses the
+    # single precomposed e-acute codepoint (U+00E9). Without NFC
+    # normalization before casefold(), _name_similarity would score these
+    # as merely trigram-similar (a near-miss), not an exact match -- the
+    # same gap test_exact_name_match_recognizes_a_different_unicode_
+    # encoding_of_the_same_name in test_knowledge_retrieval_postgres.py
+    # closes for retrieval's SQL-side matching.
+    decomposed_name = "Jos" + "e\u0301" + " Rizal"
+    precomposed_name = "Jos" + "\u00e9" + " Rizal"
+    assert decomposed_name != precomposed_name
+    assert decomposed_name.casefold() != precomposed_name.casefold()
+
+    left = _entity(canonical_name=decomposed_name)
+    right = _entity(canonical_name=precomposed_name)
+    result = score_candidate(left, right)
+    assert result.factors.name_similarity == 1.0
+
+
 def test_full_alias_overlap_scores_maximum() -> None:
     left = _entity(aliases=frozenset({"ada.lovelace@example.test", "countess of lovelace"}))
     right = _entity(aliases=frozenset({"ADA.LOVELACE@example.test", "Countess of Lovelace"}))

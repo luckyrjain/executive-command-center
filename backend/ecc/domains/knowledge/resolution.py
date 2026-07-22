@@ -5,6 +5,7 @@ from hashlib import sha256
 from hmac import compare_digest, new
 from json import dumps, loads
 from typing import Annotated, Any, Literal
+from unicodedata import normalize as unicode_normalize
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
@@ -79,7 +80,15 @@ class ScoreResult:
 
 
 def _normalize(value: str) -> str:
-    return " ".join(value.casefold().split())
+    # NFC first: casefold() alone does not unify two Unicode encodings of
+    # the same visible name -- e.g. an "e"+combining-acute-accent sequence
+    # vs. the single precomposed "e"-acute codepoint compare unequal under
+    # casefold() despite rendering identically, which would make an exact
+    # canonical-name match (this function's caller,
+    # _deterministic_alias_match) silently miss a genuine duplicate whose
+    # name arrived via a different input method/import source. An audit's
+    # adversarial test caught this gap.
+    return " ".join(unicode_normalize("NFC", value).casefold().split())
 
 
 def _trigrams(value: str) -> frozenset[str]:

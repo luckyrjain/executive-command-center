@@ -390,3 +390,81 @@ def test_relationship_create_rejects_archived_source_entity(
     )
     assert response.status_code == 422, response.text
     assert response.json()["error"]["code"] == "INVALID_RELATIONSHIP"
+
+
+def test_relationship_handles_a_three_node_cycle(
+    relationships_test_context: tuple[TestClient, UUID, UUID, str, UUID, UUID],
+) -> None:
+    # Adversarial regression test: only a *self* relationship is rejected
+    # (SELF_RELATIONSHIP_NOT_PERMITTED, see relationships.py) -- there is no
+    # cycle-detection across 3+ distinct entities, and there shouldn't be:
+    # real directed relationship types (DEPENDS_ON, MANAGES, WORKS_ON) can
+    # legitimately form a cycle (A depends on B, B depends on C, C depends
+    # on A is a real, if awkward, state of the world). This proves the
+    # system stores and serves such a cycle correctly rather than looping
+    # or corrupting state -- not that it should reject one.
+    client, workspace_id, _user_id, token, person_id, project_id = relationships_test_context
+    evidence_id = _create_evidence(workspace_id, person_id)
+
+    third = client.post(
+        "/api/v1/knowledge/entities",
+        headers=_headers(token, "cycle-create-third"),
+        json={"kind": "project", "canonical_name": "Third Node"},
+    )
+    assert third.status_code == 201, third.text
+    third_id = UUID(third.json()["id"])
+
+    edges = [
+        (person_id, project_id, "cycle-edge-1"),
+        (project_id, third_id, "cycle-edge-2"),
+        (third_id, person_id, "cycle-edge-3"),
+    ]
+    created_ids = []
+    for from_id, to_id, key in edges:
+        response = client.post(
+            f"/api/v1/knowledge/entities/{from_id}/relationships",
+            headers=_headers(token, key),
+            json={
+                "relationship_type": "DEPENDS_ON",
+                "to_entity_id": str(to_id),
+                "evidence_id": str(evidence_id),
+            },
+        )
+        assert response.status_code == 201, response.text
+        created_ids.append(response.json()["id"])
+
+    for entity_id in (person_id, project_id, third_id):
+        listed = client.get(
+            f"/api/v1/knowledge/entities/{entity_id}/relationships",
+            headers=_headers(token, f"cycle-list-{entity_id}"),
+        )
+        assert listed.status_code == 200
+        listed_ids = {item["id"] for item in listed.json()["items"]}
+        # Every node in a 3-cycle is both a source (one outgoing edge) and a
+        # target (one incoming edge) of the cycle, so exactly two of the
+        # three created edges must be visible from each entity.
+        assert len(listed_ids & set(created_ids)) == 2
+
+
+def test_relationship_create_rejects_valid_to_at_or_before_valid_from(
+    relationships_test_context: tuple[TestClient, UUID, UUID, str, UUID, UUID],
+) -> None:
+    # Adversarial regression test: RelationshipCreate.validate_valid_interval
+    # has been enforced since the evidence-required fix, but had zero test
+    # coverage until now.
+    client, workspace_id, _user_id, token, person_id, project_id = relationships_test_context
+    evidence_id = _create_evidence(workspace_id, person_id)
+    now = datetime.now(UTC)
+
+    response = client.post(
+        f"/api/v1/knowledge/entities/{person_id}/relationships",
+        headers=_headers(token, "invalid-interval"),
+        json={
+            "relationship_type": "WORKS_ON",
+            "to_entity_id": str(project_id),
+            "evidence_id": str(evidence_id),
+            "valid_from": now.isoformat(),
+            "valid_to": now.isoformat(),
+        },
+    )
+    assert response.status_code == 422, response.text

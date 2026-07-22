@@ -473,3 +473,30 @@ def test_claim_supersede_rejects_claim_from_another_workspace(
         assert response.json()["error"]["code"] == "CLAIM_NOT_FOUND"
     finally:
         _teardown_foreign_workspace(other_workspace_id)
+
+
+def test_claim_record_rejects_valid_to_at_or_before_valid_from(
+    claims_test_context: tuple[TestClient, UUID, UUID, str, UUID],
+) -> None:
+    # Adversarial regression test: relationships.py enforces this same rule
+    # on its own valid_from/valid_to pair (RelationshipCreate
+    # .validate_valid_interval); claims.py had no equivalent check at all
+    # despite sharing the identical field shape, until an audit's
+    # adversarial test caught the gap and ClaimCreate got the same
+    # validator.
+    client, workspace_id, _user_id, token, entity_id = claims_test_context
+    evidence_id = _create_evidence(workspace_id, entity_id)
+    now = datetime.now(UTC)
+
+    response = client.post(
+        f"/api/v1/knowledge/entities/{entity_id}/claims",
+        headers=_headers(token, "invalid-interval"),
+        json={
+            "predicate": "employed_at",
+            "value": {"organization": "Analytical Engines Ltd"},
+            "source_id": str(evidence_id),
+            "valid_from": now.isoformat(),
+            "valid_to": now.isoformat(),
+        },
+    )
+    assert response.status_code == 422, response.text

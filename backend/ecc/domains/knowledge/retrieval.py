@@ -7,6 +7,7 @@ from hmac import compare_digest, new
 from html import escape
 from json import dumps, loads
 from typing import Annotated, Any
+from unicodedata import normalize as unicode_normalize
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -198,7 +199,14 @@ class RetrievalResponse(BaseModel):
 
 
 def _normalize_query(value: str) -> str:
-    normalized = " ".join(value.casefold().split())
+    # NFC first: see resolution.py's _normalize for why casefold() alone
+    # would miss two Unicode encodings of the same visible query text (a
+    # precomposed accented character vs. the base character plus a
+    # combining accent). The SQL-side normalized_title/exact_alias_match
+    # comparisons this feeds also wrap the stored text in normalize(...,
+    # NFC) for the same reason -- both sides of the comparison need the
+    # same normal form or an exact match can silently miss.
+    normalized = " ".join(unicode_normalize("NFC", value).casefold().split())
     if not normalized:
         raise HTTPException(status_code=422, detail="RETRIEVAL_QUERY_REQUIRED")
     if len(normalized) > 500:
@@ -240,8 +248,8 @@ _LEXICAL_CANDIDATES_CTE = """
             d.entity_type, d.entity_id, d.title, d.body,
             d.source_version, d.updated_at,
             n.version AS live_version, n.status AS live_status,
-            lower(d.title) AS normalized_title,
-            similarity(lower(d.title), :query)::double precision AS trigram_score,
+            lower(normalize(d.title, NFC)) AS normalized_title,
+            similarity(lower(normalize(d.title, NFC)), :query)::double precision AS trigram_score,
             ts_rank_cd(
                 d.search_document, plainto_tsquery('simple', :query)
             )::double precision AS fulltext_score,
@@ -362,7 +370,7 @@ def _run_hybrid_query(session: Session, params: dict[str, Any]) -> Sequence[Any]
                         COALESCE(l.body, s.body) AS body,
                         COALESCE(l.source_version, s.source_version) AS source_version,
                         COALESCE(l.live_version, s.live_version) AS live_version,
-                        lower(COALESCE(l.title, s.title)) AS normalized_title,
+                        lower(normalize(COALESCE(l.title, s.title), NFC)) AS normalized_title,
                         COALESCE(l.trigram_score, 0) AS trigram_score,
                         COALESCE(l.fulltext_score, 0) AS fulltext_score,
                         COALESCE(l.exact_alias_match, false) AS exact_alias_match,

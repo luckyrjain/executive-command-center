@@ -432,3 +432,31 @@ def test_rebuild_retrieval_documents_reconstructs_after_manual_deletion(
     response = _retrieve(client, token, "rebuild-search", q="Ada Lovelace")
     assert response.status_code == 200
     assert any(item["entity_id"] == str(entity_id) for item in response.json()["items"])
+
+
+def test_exact_name_match_recognizes_a_different_unicode_encoding_of_the_same_name(
+    retrieval_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    # Adversarial regression test, built from explicit \u escapes rather
+    # than typed accented literals (whose source-file bytes an editor could
+    # silently normalize and defeat the point of this test): both strings
+    # render as the identical visible name "Jos\u00e9 Rizal", but
+    # decomposed_name spells the accented letter as base "e" (U+0065) plus
+    # a combining acute accent (U+0301), while precomposed_query uses the
+    # single precomposed e-acute codepoint (U+00E9). Without NFC
+    # normalization before casefold(), an exact canonical-name match would
+    # miss this -- a real risk whenever a name arrives via different input
+    # methods or import sources.
+    decomposed_name = "Jos" + "e\u0301" + " Rizal"
+    precomposed_query = "Jos" + "\u00e9" + " Rizal"
+    assert decomposed_name != precomposed_query
+    assert decomposed_name.casefold() != precomposed_query.casefold()
+
+    client, _workspace_id, _user_id, token = retrieval_test_context
+    entity_id = _create_entity(client, token, "unicode-entity", "person", decomposed_name)
+
+    response = _retrieve(client, token, "unicode-search", q=precomposed_query)
+    assert response.status_code == 200
+    items = response.json()["items"]
+    assert items[0]["entity_id"] == str(entity_id)
+    assert items[0]["matching_mode"] == "exact_name"

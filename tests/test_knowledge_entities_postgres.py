@@ -7,6 +7,7 @@ from uuid import UUID, uuid4
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import text
+from sqlalchemy.exc import IntegrityError
 
 from ecc.config import get_settings
 from ecc.database import engine
@@ -433,3 +434,33 @@ def test_entity_aliases_list_404s_for_unknown_or_cross_workspace_entity(
         f"/api/v1/knowledge/entities/{uuid4()}/aliases", headers=_headers(token, "list-missing")
     )
     assert response.status_code == 404
+
+
+def test_alias_collision_across_two_entities_is_rejected(
+    knowledge_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    # Adversarial regression test proving uq_entity_aliases_workspace_type_value
+    # (migration 0011) actually enforces the invariant
+    # _deterministic_alias_match's docstring (resolution.py) assumes: "an
+    # exact alias collision between two different entities cannot occur in
+    # the first place ... attaching an already-claimed alias to a second
+    # entity is rejected at write time." This exercises the constraint
+    # directly (there is no HTTP endpoint that writes entity_aliases -- see
+    # _seed_alias) rather than just trusting the docstring's claim.
+    client, workspace_id, _user_id, token = knowledge_test_context
+    first = client.post(
+        "/api/v1/knowledge/entities",
+        headers=_headers(token, "collision-create-first"),
+        json={"kind": "person", "canonical_name": "Ada Lovelace"},
+    )
+    second = client.post(
+        "/api/v1/knowledge/entities",
+        headers=_headers(token, "collision-create-second"),
+        json={"kind": "person", "canonical_name": "Grace Hopper"},
+    )
+    first_id = UUID(first.json()["id"])
+    second_id = UUID(second.json()["id"])
+
+    _seed_alias(workspace_id, first_id, "shared-alias", alias_type="nickname")
+    with pytest.raises(IntegrityError, match="uq_entity_aliases_workspace_type_value"):
+        _seed_alias(workspace_id, second_id, "shared-alias", alias_type="nickname")
