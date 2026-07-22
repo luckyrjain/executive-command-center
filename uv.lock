@@ -249,14 +249,18 @@ dependencies = [
     { name = "argon2-cffi" },
     { name = "fastapi" },
     { name = "httpx" },
-    { name = "pgvector" },
     { name = "psycopg", extra = ["binary"] },
     { name = "pydantic" },
     { name = "pydantic-settings" },
-    { name = "sentence-transformers" },
     { name = "sqlalchemy" },
     { name = "starlette" },
     { name = "uvicorn", extra = ["standard"] },
+]
+
+[package.optional-dependencies]
+embeddings = [
+    { name = "pgvector" },
+    { name = "sentence-transformers" },
 ]
 
 [package.dev-dependencies]

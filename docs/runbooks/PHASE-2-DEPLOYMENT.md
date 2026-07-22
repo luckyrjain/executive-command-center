@@ -58,6 +58,22 @@ assumes it.
   regenerate after a manual data fix) and for the backup/restore isolation
   checks in `scripts/verify_restore.sh`, not as a routine deployment step.
 
+## Optional: enabling embeddings and hybrid retrieval (Task 7)
+
+Off by default in every deployment, including the shipped production image. Two separate opt-ins, both required:
+
+1. **Build a custom backend image with the `embeddings` extra**, since `torch` (a `sentence-transformers` dependency) has no musl/Alpine wheels and `backend/Dockerfile`'s production image is deliberately Alpine (see ADR-0011):
+
+   ```bash
+   # Either switch the base image to a glibc distro (e.g. python:3.14.6-slim)
+   # for this custom build, or otherwise ensure a glibc runtime, then:
+   uv sync --frozen --extra embeddings
+   ```
+
+2. **Set `ECC_EMBEDDINGS_ENABLED=true`** on the running container (`Settings.embeddings_enabled`, `backend/ecc/config.py`) — without this, even a build that has the extra installed keeps `queue_embedding`/`GET /knowledge/retrieve?mode=hybrid` degrading to lexical-only, matching the default-off design at the runtime-config level.
+
+The first real request after enabling pays a multi-second model-load cost (and, until cached, a Hugging Face Hub download for `sentence-transformers/all-MiniLM-L6-v2`) — expected, not a fault.
+
 ## Deploy
 
 Follow `PHASE-1-DEPLOYMENT.md`'s "Deploy" section unchanged. The migration

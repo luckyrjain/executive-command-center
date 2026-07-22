@@ -39,7 +39,12 @@ jobs:
         with:
           version: 0.7.19
           enable-cache: true
-      - run: uv sync --frozen --all-groups --python 3.14.6
+      # --extra embeddings: not installed in the production image (see
+      # backend/Dockerfile, ADR-0011 -- torch has no musl/Alpine wheels), but
+      # this job runs on native Linux glibc and is the only place the real
+      # sentence-transformers model integration tests (RFC-005's required
+      # retrieval benchmark) can actually execute.
+      - run: uv sync --frozen --all-groups --extra embeddings --python 3.14.6
       - run: uv run ruff check backend tests
       - run: uv run ruff format --check backend tests
       - run: uv run mypy backend
