@@ -3,7 +3,6 @@ export type EntityStatus = 'active' | 'archived' | 'redirected'
 
 export type KnowledgeEntity = {
   id: string
-  entity_id: string | null
   kind: EntityKind
   canonical_name: string
   summary: string | null

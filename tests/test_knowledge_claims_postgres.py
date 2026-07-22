@@ -209,7 +209,10 @@ def test_claim_supersede_never_destructively_overwrites(
     with engine.connect() as connection:
         original_row = (
             connection.execute(
-                text("SELECT superseded_by, valid_to FROM knowledge_claims WHERE id = :id"),
+                text(
+                    "SELECT superseded_by, valid_to, version, updated_at, created_at "
+                    "FROM knowledge_claims WHERE id = :id"
+                ),
                 {"id": original_id},
             )
             .mappings()
@@ -219,6 +222,11 @@ def test_claim_supersede_never_destructively_overwrites(
     # now points at its replacement.
     assert str(original_row["superseded_by"]) == new_claim["id"]
     assert original_row["valid_to"] is not None
+    # Schema-hygiene regression test (migration 0019): supersede's UPDATE
+    # also bumps version/updated_at on the original row, not just the
+    # columns' existence.
+    assert original_row["version"] == 2
+    assert original_row["updated_at"] > original_row["created_at"]
 
 
 def test_claim_record_rejects_unknown_evidence(

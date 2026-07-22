@@ -293,10 +293,10 @@ def _insert_claim(
                 f"""
                 INSERT INTO knowledge_claims (
                     id, workspace_id, subject_id, predicate, value_json, source_id,
-                    confidence, valid_from, valid_to, created_at
+                    confidence, valid_from, valid_to, version, created_at, updated_at
                 ) VALUES (
                     :id, :workspace_id, :subject_id, :predicate, CAST(:value_json AS jsonb),
-                    :source_id, :confidence, :valid_from, :valid_to, :now
+                    :source_id, :confidence, :valid_from, :valid_to, 1, :now, :now
                 )
                 RETURNING {_CLAIM_FIELDS}
                 """
@@ -465,7 +465,8 @@ def supersede_claim(
             text(
                 """
                 UPDATE knowledge_claims
-                SET superseded_by = :new_id, valid_to = :now
+                SET superseded_by = :new_id, valid_to = :now, updated_at = :now,
+                    version = version + 1
                 WHERE workspace_id = :workspace_id AND id = :claim_id
                 """
             ),

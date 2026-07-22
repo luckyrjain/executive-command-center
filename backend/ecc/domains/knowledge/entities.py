@@ -35,7 +35,7 @@ IdempotencyHeader = Annotated[
 ]
 
 _ENTITY_FIELDS = """
-id, entity_id, node_type, canonical_name, attributes, status, confidence,
+id, node_type, canonical_name, attributes, status, confidence,
 version, created_at, updated_at
 """
 
@@ -50,7 +50,6 @@ class EntityCreate(BaseModel):
 
 class EntityResponse(BaseModel):
     id: UUID
-    entity_id: UUID | None
     kind: EntityKind
     canonical_name: str
     summary: str | None
@@ -104,7 +103,6 @@ def _project(row: dict[str, Any]) -> EntityResponse:
     attributes = row.get("attributes") or {}
     return EntityResponse(
         id=row["id"],
-        entity_id=row["entity_id"],
         kind=row["node_type"],
         canonical_name=row["canonical_name"],
         summary=attributes.get("summary"),

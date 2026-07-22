@@ -246,6 +246,41 @@ def test_merge_redirects_source_and_rehomes_aliases(
     assert any(item["normalized_value"] == "countess of lovelace" for item in rehomed_items)
 
 
+def test_merge_rehome_bumps_alias_version_and_updated_at(
+    entity_operations_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    # Schema-hygiene regression test: migration 0019 added updated_at/
+    # version to entity_aliases (mutated in place by merge's alias-rehome
+    # step) since DATA-MODEL.md's Rules section requires "optimistic
+    # version" on every mutable table. Proves _rehome_aliases actually
+    # maintains them, not just that the columns exist.
+    client, workspace_id, _user_id, token = entity_operations_test_context
+    target_id = _create_entity(client, token, "version-target", "person", "Ada Lovelace")
+    source_id = _create_entity(client, token, "version-source", "person", "Ada Lovelase")
+    alias_id = _seed_alias(workspace_id, source_id, "countess of lovelace v2")
+    candidate_id = _create_confirmed_candidate(
+        client, token, "version-merge-candidate", target_id, source_id
+    )
+
+    with engine.connect() as connection:
+        before = connection.execute(
+            text("SELECT version, updated_at, created_at FROM entity_aliases WHERE id = :id"),
+            {"id": alias_id},
+        ).mappings().one()
+    assert before["version"] == 1
+
+    response = _merge(client, token, "version-merge", candidate_id, target_id, 1, 1)
+    assert response.status_code == 201, response.text
+
+    with engine.connect() as connection:
+        after = connection.execute(
+            text("SELECT version, updated_at, created_at FROM entity_aliases WHERE id = :id"),
+            {"id": alias_id},
+        ).mappings().one()
+    assert after["version"] == 2
+    assert after["updated_at"] > after["created_at"]
+
+
 def test_merge_requires_confirmed_candidate(
     entity_operations_test_context: tuple[TestClient, UUID, UUID, str],
 ) -> None:
@@ -423,6 +458,18 @@ def test_reversal_restores_source_to_active(
         f"/api/v1/knowledge/entities/{source_id}", headers=_headers(token, "rev-check-source")
     )
     assert source_get.json()["status"] == "active"
+
+    # Schema-hygiene regression test (migration 0019): reverse marks the
+    # original merge row status='reversed' -- proves that mutation also
+    # bumps version/updated_at, not just the columns' existence.
+    with engine.connect() as connection:
+        merge_row = connection.execute(
+            text("SELECT version, updated_at, created_at, status FROM entity_operations WHERE id = :id"),
+            {"id": operation_id},
+        ).mappings().one()
+    assert merge_row["status"] == "reversed"
+    assert merge_row["version"] == 2
+    assert merge_row["updated_at"] > merge_row["created_at"]
 
 
 def test_reversal_rejected_when_target_has_post_merge_dependent_activity(

@@ -300,7 +300,9 @@ def _write_side_effects(
     queue_lifecycle_event(session, "entity_operation", event_type, "allowed")
 
 
-def _rehome_aliases(session: Session, auth: AuthContext, source_id: UUID, target_id: UUID) -> int:
+def _rehome_aliases(
+    session: Session, auth: AuthContext, source_id: UUID, target_id: UUID, now: datetime
+) -> int:
     """Move entity_aliases rows from source to target. entity_aliases carries
     a workspace-wide unique constraint on (alias_type, normalized_value)
     (migration 0011), so an alias the target already holds cannot also be
@@ -313,7 +315,7 @@ def _rehome_aliases(session: Session, auth: AuthContext, source_id: UUID, target
         text(
             """
             UPDATE entity_aliases AS a
-            SET entity_id = :target_id
+            SET entity_id = :target_id, updated_at = :now, version = a.version + 1
             WHERE a.workspace_id = :workspace_id AND a.entity_id = :source_id
               AND NOT EXISTS (
                   SELECT 1 FROM entity_aliases AS existing
@@ -325,7 +327,7 @@ def _rehome_aliases(session: Session, auth: AuthContext, source_id: UUID, target
             RETURNING a.id
             """
         ),
-        {"workspace_id": auth.workspace_id, "source_id": source_id, "target_id": target_id},
+        {"workspace_id": auth.workspace_id, "source_id": source_id, "target_id": target_id, "now": now},
     )
     return len(rehomed.all())
 
@@ -488,7 +490,7 @@ def merge_entities(
             ),
             {"workspace_id": auth.workspace_id, "source_id": source_id, "now": now},
         )
-        rehomed_aliases = _rehome_aliases(session, auth, source_id, target_id)
+        rehomed_aliases = _rehome_aliases(session, auth, source_id, target_id, now)
         rehomed_edges = _rehome_edges(session, auth, source_id, target_id)
 
         operation_id = uuid4()
@@ -498,10 +500,10 @@ def merge_entities(
                     f"""
                     INSERT INTO entity_operations (
                         id, workspace_id, operation_type, status, inputs_json,
-                        outputs_json, actor_id, reason, created_at
+                        outputs_json, actor_id, reason, version, created_at, updated_at
                     ) VALUES (
                         :id, :workspace_id, 'merge', 'active', CAST(:inputs_json AS jsonb),
-                        CAST(:outputs_json AS jsonb), :actor_id, :reason, :now
+                        CAST(:outputs_json AS jsonb), :actor_id, :reason, 1, :now, :now
                     )
                     RETURNING {_OPERATION_FIELDS}
                     """
@@ -659,10 +661,10 @@ def reverse_operation(
         )
         session.execute(
             text(
-                "UPDATE entity_operations SET status = 'reversed' "
-                "WHERE workspace_id = :workspace_id AND id = :operation_id"
+                "UPDATE entity_operations SET status = 'reversed', updated_at = :now, "
+                "version = version + 1 WHERE workspace_id = :workspace_id AND id = :operation_id"
             ),
-            {"workspace_id": auth.workspace_id, "operation_id": operation_id},
+            {"workspace_id": auth.workspace_id, "operation_id": operation_id, "now": now},
         )
 
         reverse_id = uuid4()
@@ -672,10 +674,12 @@ def reverse_operation(
                     f"""
                     INSERT INTO entity_operations (
                         id, workspace_id, operation_type, status, inputs_json,
-                        outputs_json, actor_id, reason, reverses_operation_id, created_at
+                        outputs_json, actor_id, reason, reverses_operation_id, version,
+                        created_at, updated_at
                     ) VALUES (
                         :id, :workspace_id, 'reverse', 'active', CAST(:inputs_json AS jsonb),
-                        CAST(:outputs_json AS jsonb), :actor_id, :reason, :reverses_id, :now
+                        CAST(:outputs_json AS jsonb), :actor_id, :reason, :reverses_id, 1,
+                        :now, :now
                     )
                     RETURNING {_OPERATION_FIELDS}
                     """
@@ -858,10 +862,10 @@ def split_operation(
 
         session.execute(
             text(
-                "UPDATE entity_operations SET status = 'reversed' "
-                "WHERE workspace_id = :workspace_id AND id = :operation_id"
+                "UPDATE entity_operations SET status = 'reversed', updated_at = :now, "
+                "version = version + 1 WHERE workspace_id = :workspace_id AND id = :operation_id"
             ),
-            {"workspace_id": auth.workspace_id, "operation_id": operation_id},
+            {"workspace_id": auth.workspace_id, "operation_id": operation_id, "now": now},
         )
 
         split_id = uuid4()
@@ -871,10 +875,12 @@ def split_operation(
                     f"""
                     INSERT INTO entity_operations (
                         id, workspace_id, operation_type, status, inputs_json,
-                        outputs_json, actor_id, reason, reverses_operation_id, created_at
+                        outputs_json, actor_id, reason, reverses_operation_id, version,
+                        created_at, updated_at
                     ) VALUES (
                         :id, :workspace_id, 'split', 'active', CAST(:inputs_json AS jsonb),
-                        CAST(:outputs_json AS jsonb), :actor_id, :reason, :reverses_id, :now
+                        CAST(:outputs_json AS jsonb), :actor_id, :reason, :reverses_id, 1,
+                        :now, :now
                     )
                     RETURNING {_OPERATION_FIELDS}
                     """

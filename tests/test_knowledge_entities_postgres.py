@@ -31,7 +31,11 @@ def test_pkos_nodes_has_phase2_reconciliation_columns() -> None:
                 )
             )
         }
-    assert {"entity_id", "status", "confidence", "version"} <= columns
+    assert {"status", "confidence", "version"} <= columns
+    # entity_id (migration 0010) was dropped by migration 0020: no code path
+    # ever wrote a non-NULL value to it, so its "mirror a domain aggregate"
+    # feature was never built -- see that migration's docstring.
+    assert "entity_id" not in columns
 
 
 def test_pkos_edges_has_phase2_reconciliation_columns() -> None:
