@@ -17,8 +17,8 @@ from hmac import new
 from uuid import UUID, uuid4
 
 import pytest
-from fixtures.phase2_retrieval_embedding_dataset import DATASET_VERSION, build_dataset
 from fastapi.testclient import TestClient
+from fixtures.phase2_retrieval_embedding_dataset import DATASET_VERSION, build_dataset
 from sqlalchemy import text
 
 from ecc.config import get_settings
