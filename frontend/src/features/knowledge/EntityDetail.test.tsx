@@ -57,9 +57,10 @@ beforeEach(() => {
 afterEach(() => { cleanup(); vi.unstubAllGlobals() })
 
 describe('EntityDetail', () => {
-  it('renders empty states when claims, relationships and timeline are genuinely empty', async () => {
+  it('renders empty states when aliases, claims, relationships and timeline are genuinely empty', async () => {
     const fetch = routedFetch([
       { method: 'GET', match: (p) => p === base(''), handle: () => jsonResponse(personEntity) },
+      { method: 'GET', match: (p) => p === base('/aliases'), handle: () => jsonResponse({ items: [] }) },
       { method: 'GET', match: (p) => p === base('/claims'), handle: () => jsonResponse({ items: [] }) },
       { method: 'GET', match: (p) => p === base('/relationships'), handle: () => jsonResponse({ items: [] }) },
       { method: 'GET', match: (p) => p === base('/timeline'), handle: () => jsonResponse({ items: [], next_cursor: null }) },
@@ -67,15 +68,17 @@ describe('EntityDetail', () => {
     vi.stubGlobal('fetch', fetch)
     renderDetail()
 
+    await screen.findByText('No aliases recorded for this entity.')
     await screen.findByText('No claims recorded for this entity.')
     await screen.findByText('No relationships recorded for this entity.')
     await screen.findByText('No timeline entries yet.')
     expect(screen.queryAllByRole('alert')).toHaveLength(0)
   })
 
-  it('shows a distinct error state for claims, relationships and timeline when their fetch fails, never the empty-state text', async () => {
+  it('shows a distinct error state for aliases, claims, relationships and timeline when their fetch fails, never the empty-state text', async () => {
     const fetch = routedFetch([
       { method: 'GET', match: (p) => p === base(''), handle: () => jsonResponse(personEntity) },
+      { method: 'GET', match: (p) => p === base('/aliases'), handle: () => errorResponse('ALIASES_UNAVAILABLE') },
       { method: 'GET', match: (p) => p === base('/claims'), handle: () => errorResponse('CLAIMS_UNAVAILABLE') },
       { method: 'GET', match: (p) => p === base('/relationships'), handle: () => errorResponse('RELATIONSHIPS_UNAVAILABLE') },
       { method: 'GET', match: (p) => p === base('/timeline'), handle: () => errorResponse('TIMELINE_UNAVAILABLE') },
@@ -85,18 +88,27 @@ describe('EntityDetail', () => {
 
     await screen.findByText('Ada Lovelace')
     const alerts = await screen.findAllByRole('alert')
-    expect(alerts).toHaveLength(3)
+    expect(alerts).toHaveLength(4)
 
     // The bug this regression-tests: a failed fetch must never render as if the
-    // list were genuinely empty -- these three strings must never appear.
+    // list were genuinely empty -- these strings must never appear.
+    expect(screen.queryByText('No aliases recorded for this entity.')).toBeNull()
     expect(screen.queryByText('No claims recorded for this entity.')).toBeNull()
     expect(screen.queryByText('No relationships recorded for this entity.')).toBeNull()
     expect(screen.queryByText('No timeline entries yet.')).toBeNull()
   })
 
-  it('renders claims, relationships and timeline content when present', async () => {
+  it('renders aliases, claims, relationships and timeline content when present', async () => {
     const fetch = routedFetch([
       { method: 'GET', match: (p) => p === base(''), handle: () => jsonResponse(personEntity) },
+      {
+        method: 'GET',
+        match: (p) => p === base('/aliases'),
+        handle: () =>
+          jsonResponse({
+            items: [{ id: 'alias-1', entity_id: personEntity.id, alias_type: 'nickname', normalized_value: 'ada', source_id: 'src-1', confidence: 0.9, created_at: '2026-01-01T00:00:00Z' }],
+          }),
+      },
       {
         method: 'GET',
         match: (p) => p === base('/claims'),
@@ -126,6 +138,7 @@ describe('EntityDetail', () => {
     vi.stubGlobal('fetch', fetch)
     renderDetail()
 
+    await screen.findByText('nickname', { exact: false })
     await screen.findByText('title', { exact: false })
     await screen.findByText('RELATES_TO → entity-2')
     await screen.findByText('Entity created', { exact: false })

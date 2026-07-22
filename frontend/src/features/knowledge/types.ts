@@ -16,6 +16,18 @@ export type KnowledgeEntity = {
 
 export type EntityList = { items: KnowledgeEntity[]; next_cursor?: string | null }
 
+export type EntityAlias = {
+  id: string
+  entity_id: string
+  alias_type: string
+  normalized_value: string
+  source_id: string
+  confidence: number
+  created_at: string
+}
+
+export type EntityAliasList = { items: EntityAlias[] }
+
 export type Claim = {
   id: string
   subject_id: string

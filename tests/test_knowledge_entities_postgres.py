@@ -339,3 +339,97 @@ def test_entity_get_is_workspace_scoped_and_404s_across_workspaces(
         f"/api/v1/knowledge/entities/{uuid4()}", headers=_headers(token, "get-missing")
     )
     assert missing.status_code == 404
+
+
+def _seed_alias(
+    workspace_id: UUID, entity_id: UUID, normalized_value: str, alias_type: str = "nickname"
+) -> UUID:
+    # No HTTP endpoint writes entity_aliases (API-SCHEMAS.md's proposed
+    # surface only lists a GET) -- aliases are created internally by
+    # resolution/merge flows, so tests seed them directly.
+    source_id = uuid4()
+    alias_id = uuid4()
+    now = datetime.now(UTC)
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO pkos_evidence (id, workspace_id, node_id, source_type, "
+                "source_ref, sha256, captured_at) VALUES (:id, :workspace_id, :node_id, "
+                "'manual', 'alias-test-ref', :sha256, :captured_at)"
+            ),
+            {
+                "id": source_id,
+                "workspace_id": workspace_id,
+                "node_id": entity_id,
+                "sha256": sha256(str(source_id).encode()).hexdigest(),
+                "captured_at": now,
+            },
+        )
+        connection.execute(
+            text(
+                "INSERT INTO entity_aliases (id, workspace_id, entity_id, alias_type, "
+                "normalized_value, source_id, created_at) VALUES (:id, :workspace_id, "
+                ":entity_id, :alias_type, :normalized_value, :source_id, :created_at)"
+            ),
+            {
+                "id": alias_id,
+                "workspace_id": workspace_id,
+                "entity_id": entity_id,
+                "alias_type": alias_type,
+                "normalized_value": normalized_value,
+                "source_id": source_id,
+                "created_at": now,
+            },
+        )
+    return alias_id
+
+
+def test_entity_aliases_list_returns_seeded_aliases_in_creation_order(
+    knowledge_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    client, workspace_id, _user_id, token = knowledge_test_context
+    create = client.post(
+        "/api/v1/knowledge/entities",
+        headers=_headers(token, "create-for-aliases"),
+        json={"kind": "person", "canonical_name": "Ada Lovelace"},
+    )
+    entity_id = UUID(create.json()["id"])
+    first_alias_id = _seed_alias(workspace_id, entity_id, "ada")
+    second_alias_id = _seed_alias(workspace_id, entity_id, "countess of lovelace")
+
+    response = client.get(
+        f"/api/v1/knowledge/entities/{entity_id}/aliases", headers=_headers(token, "list-aliases")
+    )
+    assert response.status_code == 200, response.text
+    items = response.json()["items"]
+    assert [item["id"] for item in items] == [str(first_alias_id), str(second_alias_id)]
+    assert items[0]["normalized_value"] == "ada"
+    assert items[0]["entity_id"] == str(entity_id)
+
+
+def test_entity_aliases_list_is_empty_for_an_entity_with_no_aliases(
+    knowledge_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    client, _workspace_id, _user_id, token = knowledge_test_context
+    create = client.post(
+        "/api/v1/knowledge/entities",
+        headers=_headers(token, "create-no-aliases"),
+        json={"kind": "person", "canonical_name": "Grace Hopper"},
+    )
+    entity_id = create.json()["id"]
+
+    response = client.get(
+        f"/api/v1/knowledge/entities/{entity_id}/aliases", headers=_headers(token, "list-empty")
+    )
+    assert response.status_code == 200
+    assert response.json()["items"] == []
+
+
+def test_entity_aliases_list_404s_for_unknown_or_cross_workspace_entity(
+    knowledge_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    client, _workspace_id, _user_id, token = knowledge_test_context
+    response = client.get(
+        f"/api/v1/knowledge/entities/{uuid4()}/aliases", headers=_headers(token, "list-missing")
+    )
+    assert response.status_code == 404

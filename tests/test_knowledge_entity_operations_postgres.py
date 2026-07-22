@@ -142,6 +142,29 @@ def _seed_evidence(workspace_id: UUID, node_id: UUID) -> UUID:
     return evidence_id
 
 
+def _seed_alias(workspace_id: UUID, entity_id: UUID, normalized_value: str) -> UUID:
+    source_id = _seed_evidence(workspace_id, entity_id)
+    alias_id = uuid4()
+    now = datetime.now(UTC)
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO entity_aliases (id, workspace_id, entity_id, alias_type, "
+                "normalized_value, source_id, created_at) VALUES (:id, :workspace_id, "
+                ":entity_id, 'nickname', :normalized_value, :source_id, :created_at)"
+            ),
+            {
+                "id": alias_id,
+                "workspace_id": workspace_id,
+                "entity_id": entity_id,
+                "normalized_value": normalized_value,
+                "source_id": source_id,
+                "created_at": now,
+            },
+        )
+    return alias_id
+
+
 def _create_confirmed_candidate(
     client: TestClient, token: str, key_prefix: str, left_id: UUID, right_id: UUID
 ) -> UUID:
@@ -186,9 +209,10 @@ def _merge(
 def test_merge_redirects_source_and_rehomes_aliases(
     entity_operations_test_context: tuple[TestClient, UUID, UUID, str],
 ) -> None:
-    client, _workspace_id, _user_id, token = entity_operations_test_context
+    client, workspace_id, _user_id, token = entity_operations_test_context
     target_id = _create_entity(client, token, "target", "person", "Ada Lovelace")
     source_id = _create_entity(client, token, "source", "person", "Ada Lovelase")
+    source_alias_id = _seed_alias(workspace_id, source_id, "countess of lovelace")
     candidate_id = _create_confirmed_candidate(client, token, "merge-basic", target_id, source_id)
 
     response = _merge(client, token, "merge-once", candidate_id, target_id, 1, 1)
@@ -208,6 +232,17 @@ def test_merge_redirects_source_and_rehomes_aliases(
         f"/api/v1/knowledge/entities/{target_id}", headers=_headers(token, "check-target")
     )
     assert target_get.json()["status"] == "active"
+
+    # The alias the source entity had before merge must now be reachable
+    # from the target (rehomed), not left orphaned on the redirected source.
+    target_aliases = client.get(
+        f"/api/v1/knowledge/entities/{target_id}/aliases", headers=_headers(token, "target-aliases")
+    )
+    assert target_aliases.status_code == 200
+    rehomed_items = target_aliases.json()["items"]
+    rehomed_ids = [item["id"] for item in rehomed_items]
+    assert str(source_alias_id) in rehomed_ids
+    assert any(item["normalized_value"] == "countess of lovelace" for item in rehomed_items)
 
 
 def test_merge_requires_confirmed_candidate(

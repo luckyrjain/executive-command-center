@@ -66,6 +66,20 @@ class EntityListResponse(BaseModel):
     next_cursor: str | None = None
 
 
+class EntityAliasResponse(BaseModel):
+    id: UUID
+    entity_id: UUID
+    alias_type: str
+    normalized_value: str
+    source_id: UUID
+    confidence: float
+    created_at: datetime
+
+
+class EntityAliasListResponse(BaseModel):
+    items: list[EntityAliasResponse]
+
+
 def _request_hash(payload: BaseModel, action: str) -> str:
     material = {"action": action, "payload": payload.model_dump(mode="json")}
     return sha256(dumps(material, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
@@ -396,3 +410,41 @@ def get_entity(entity_id: UUID, auth: AuthDep, session: SessionDep) -> EntityRes
     if row is None:
         raise HTTPException(status_code=404, detail="ENTITY_NOT_FOUND")
     return _project(row)
+
+
+@router.get("/{entity_id}/aliases", response_model=EntityAliasListResponse)
+def list_entity_aliases(
+    entity_id: UUID, auth: AuthDep, session: SessionDep
+) -> EntityAliasListResponse:
+    if _get_row(session, auth, entity_id) is None:
+        raise HTTPException(status_code=404, detail="ENTITY_NOT_FOUND")
+    rows = (
+        session.execute(
+            text(
+                """
+                SELECT id, entity_id, alias_type, normalized_value, source_id,
+                       confidence, created_at
+                FROM entity_aliases
+                WHERE workspace_id = :workspace_id AND entity_id = :entity_id
+                ORDER BY created_at, id
+                """
+            ),
+            {"workspace_id": auth.workspace_id, "entity_id": entity_id},
+        )
+        .mappings()
+        .all()
+    )
+    return EntityAliasListResponse(
+        items=[
+            EntityAliasResponse(
+                id=row["id"],
+                entity_id=row["entity_id"],
+                alias_type=row["alias_type"],
+                normalized_value=row["normalized_value"],
+                source_id=row["source_id"],
+                confidence=float(row["confidence"]),
+                created_at=row["created_at"],
+            )
+            for row in rows
+        ]
+    )

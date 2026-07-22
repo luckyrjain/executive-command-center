@@ -143,6 +143,7 @@ function makeAudit({ corpus, pageSize = 20 }) {
  */
 function makeKnowledgeApi(overrides = {}) {
   const entities = createCollection(overrides.entities ?? [])
+  const aliases = [...(overrides.aliases ?? [])]
   const claims = [...(overrides.claims ?? [])]
   const relationships = [...(overrides.relationships ?? [])]
   const timelineEntries = [...(overrides.timelineEntries ?? [])]
@@ -309,6 +310,11 @@ function makeKnowledgeApi(overrides = {}) {
       return { status: 200, body: candidate }
     }
 
+    const aliasesMatch = pathname.match(/^\/api\/v1\/knowledge\/entities\/([^/]+)\/aliases$/)
+    if (aliasesMatch && method === 'GET') {
+      return { status: 200, body: { items: aliases.filter((alias) => alias.entity_id === aliasesMatch[1]) } }
+    }
+
     const claimsMatch = pathname.match(/^\/api\/v1\/knowledge\/entities\/([^/]+)\/claims$/)
     if (claimsMatch && method === 'GET') {
       return { status: 200, body: { items: claims.filter((claim) => claim.subject_id === claimsMatch[1]) } }
@@ -372,7 +378,7 @@ function makeKnowledgeApi(overrides = {}) {
     return entitiesResource(pathname, method, body, queryString)
   }
 
-  return { dispatch, entities, claims, relationships, timelineEntries, resolutionCandidates, entityOperations }
+  return { dispatch, entities, aliases, claims, relationships, timelineEntries, resolutionCandidates, entityOperations }
 }
 
 const defaultDashboardSections = {
@@ -484,6 +490,7 @@ export async function createFixtureApi(page, overrides = {}) {
   const audit = makeAudit({ corpus: overrides.auditCorpus ?? defaultAuditCorpus, pageSize: overrides.auditPageSize })
   const knowledge = makeKnowledgeApi({
     entities: overrides.knowledgeEntities,
+    aliases: overrides.knowledgeAliases,
     claims: overrides.knowledgeClaims,
     relationships: overrides.knowledgeRelationships,
     timelineEntries: overrides.knowledgeTimelineEntries,

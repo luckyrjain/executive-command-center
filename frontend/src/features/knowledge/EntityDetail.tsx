@@ -6,6 +6,7 @@ import {
   RELATIONSHIP_TYPES,
   type Claim,
   type ClaimList,
+  type EntityAliasList,
   type KnowledgeEntity,
   type Relationship,
   type RelationshipList,
@@ -41,6 +42,10 @@ export default function EntityDetail({ entityId, onClose }: EntityDetailProps) {
   const entityQuery = useQuery({
     queryKey: ['knowledge', 'entity', entityId],
     queryFn: () => apiRequest<KnowledgeEntity>(`/api/v1/knowledge/entities/${entityId}`),
+  })
+  const aliasesQuery = useQuery({
+    queryKey: ['knowledge', 'entity', entityId, 'aliases'],
+    queryFn: () => apiRequest<EntityAliasList>(`/api/v1/knowledge/entities/${entityId}/aliases`),
   })
   const claimsQuery = useQuery({
     queryKey: ['knowledge', 'entity', entityId, 'claims'],
@@ -95,6 +100,24 @@ export default function EntityDetail({ entityId, onClose }: EntityDetailProps) {
       {entityQuery.isLoading ? <p role="status">Loading entity…</p> : null}
       {entityQuery.isError ? <div role="alert">{entityQuery.error.message}</div> : null}
       {entity?.summary ? <p>{entity.summary}</p> : null}
+
+      <section aria-labelledby={`aliases-heading-${entityId}`}>
+        <h3 id={`aliases-heading-${entityId}`}>Aliases</h3>
+        {aliasesQuery.isLoading ? <p role="status">Loading aliases…</p> : null}
+        {aliasesQuery.isError ? (
+          <div role="alert">{aliasesQuery.error.message}</div>
+        ) : aliasesQuery.data?.items.length ? (
+          <ul>
+            {aliasesQuery.data.items.map((alias) => (
+              <li key={alias.id}>
+                {alias.normalized_value} <small>· {alias.alias_type}</small>
+              </li>
+            ))}
+          </ul>
+        ) : aliasesQuery.isSuccess ? (
+          <p className="empty-state">No aliases recorded for this entity.</p>
+        ) : null}
+      </section>
 
       <section aria-labelledby={`claims-heading-${entityId}`}>
         <h3 id={`claims-heading-${entityId}`}>Claims</h3>
