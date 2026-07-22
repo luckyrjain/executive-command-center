@@ -3,8 +3,13 @@
 Rebuildable per docs/domain/PKOS-SCHEMA.md's "projections are rebuildable"
 rule and phase-002/DATA-MODEL.md's "Derived search, embedding and timeline
 projections are rebuildable" data-model rule: timeline_entries is derived
-from audit_events, retrieval_documents from pkos_nodes/knowledge_claims --
-both authoritative tables -- and can always be regenerated from scratch.
+from audit_events, retrieval_documents from pkos_nodes/knowledge_claims,
+and embedding_projections from retrieval_documents -- all ultimately
+authoritative tables -- and can always be regenerated from scratch.
+embedding_projections rebuilds as embedded=0 whenever
+Settings.embeddings_enabled is off or the model can't load, rather than
+failing (ecc.domains.knowledge.embeddings.queue_embedding's degrade-not-fail
+contract).
 
 CLI usage:
 
@@ -23,6 +28,7 @@ from uuid import UUID
 from sqlalchemy import text
 
 from ecc.database import SessionFactory
+from ecc.domains.knowledge.embeddings import rebuild_embeddings
 from ecc.domains.knowledge.retrieval import rebuild_retrieval_documents
 from ecc.domains.knowledge.timeline import rebuild_timeline
 
@@ -51,6 +57,11 @@ def main(argv: list[str] | None = None) -> int:
             print(
                 f"{retrieval_report.workspace_id}\tretrieval_documents\t"
                 f"{retrieval_report.documents_written}"
+            )
+            embedding_report = rebuild_embeddings(session, workspace_id)
+            print(
+                f"{embedding_report.workspace_id}\tembedding_projections\t"
+                f"embedded={embedding_report.embedded} skipped={embedding_report.skipped}"
             )
         session.commit()
     return 0

@@ -12,6 +12,7 @@ from sqlalchemy.orm import Session
 
 from ecc.auth import AuthContext, AuthDep, CsrfDep
 from ecc.database import get_session
+from ecc.domains.knowledge.embeddings import queue_embedding
 from ecc.domains.knowledge.entities import EntityResponse, _project
 from ecc.domains.knowledge.retrieval import queue_retrieval_document
 from ecc.domains.knowledge.timeline import queue_timeline_entry
@@ -320,6 +321,7 @@ def update_entity(
             response.version,
             now,
         )
+        queue_embedding(session, auth.workspace_id, entity_id, now)
         _store_cached(session, auth, idempotency_key, request_hash, response, now)
         return response
 

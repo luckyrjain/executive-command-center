@@ -14,7 +14,9 @@ jobs:
     runs-on: ubuntu-latest
     services:
       postgres:
-        image: postgres:18.0
+        # pgvector/pgvector:pg18: postgres:18.0 plus the vector extension
+        # pre-built, needed for migration 0015's CREATE EXTENSION vector.
+        image: pgvector/pgvector:pg18
         env:
           POSTGRES_DB: ecc
           POSTGRES_USER: ecc
@@ -37,6 +39,28 @@ jobs:
         with:
           version: 0.7.19
           enable-cache: true
+      - name: Raise Postgres checkpoint threshold for this CI run
+        # Default max_wal_size (1GB) is smaller than the aggregate WAL this
+        # suite now generates (several tests each insert/delete 10k+ rows),
+        # so Postgres logs "checkpoints are occurring too frequently" and
+        # runs back-to-back synchronous checkpoints that take 25-30s on this
+        # runner's disk -- long enough to blow through the deliberate 5s
+        # statement_timeout (backend/ecc/database.py's STATEMENT_TIMEOUT_MS)
+        # mid-checkpoint and cancel an unrelated in-flight query. Raising
+        # max_wal_size lets WAL accumulate further before a checkpoint is
+        # forced, matching Postgres's own log hint. Confirmed via 3
+        # consecutive reproductions of the same teardown-DELETE timeout
+        # before this fix; this is CI-only tuning, not an application change.
+        run: |
+          PGPASSWORD=ecc psql -h localhost -U ecc -d ecc -c "ALTER SYSTEM SET max_wal_size = '4GB';"
+          PGPASSWORD=ecc psql -h localhost -U ecc -d ecc -c "SELECT pg_reload_conf();"
+      # No --extra embeddings here deliberately (see the embeddings-benchmark
+      # job below): torch's install is large enough that running it in the
+      # same job as the tight-budget Phase 1 performance tests caused real,
+      # reproducible resource contention -- test_ranking_10000_eligible_
+      # entities_under_budget failed its 800ms p95 budget on 3 consecutive
+      # runs once --extra embeddings was added here, and passed cleanly
+      # again once it was split into its own job.
       - run: uv sync --frozen --all-groups --python 3.14.6
       - run: uv run ruff check backend tests
       - run: uv run ruff format --check backend tests
@@ -44,6 +68,50 @@ jobs:
       - run: uv run alembic -c backend/alembic.ini upgrade head
       - run: uv run pytest
       - run: uv run pip-audit
+
+  embeddings-benchmark:
+    # Isolated from `backend` above: installs the `embeddings` extra (torch,
+    # ~1-2GB) to run the real sentence-transformers model integration tests
+    # and RFC-005's required retrieval benchmark -- see this job's own
+    # comment on the `backend` job for why these can't share a runner with
+    # the tight-budget Phase 1 performance tests.
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg18
+        env:
+          POSTGRES_DB: ecc
+          POSTGRES_USER: ecc
+          POSTGRES_PASSWORD: ecc
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U ecc -d ecc"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      ECC_SESSION_SECRET: ci-secret-value-that-is-at-least-32-characters
+      ECC_DATABASE_URL: postgresql+psycopg://ecc:ecc@localhost:5432/ecc
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: 3.14.6
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+        with:
+          version: 0.7.19
+          enable-cache: true
+      - name: Raise Postgres checkpoint threshold for this CI run
+        # See the identical step in the backend job above for why.
+        run: |
+          PGPASSWORD=ecc psql -h localhost -U ecc -d ecc -c "ALTER SYSTEM SET max_wal_size = '4GB';"
+          PGPASSWORD=ecc psql -h localhost -U ecc -d ecc -c "SELECT pg_reload_conf();"
+      - run: uv sync --frozen --all-groups --extra embeddings --python 3.14.6
+      - run: uv run alembic -c backend/alembic.ini upgrade head
+      - run: >
+          uv run pytest -v
+          tests/test_knowledge_embeddings_postgres.py
+          tests/test_knowledge_retrieval_benchmark_postgres.py
 
   frontend:
     runs-on: ubuntu-latest

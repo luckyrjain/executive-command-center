@@ -77,7 +77,9 @@ Daily-use validation record: [Phase 1 Daily-Use Validation Record](runbooks/PHAS
 
 **Status:** Approved for Implementation; contracts moved from Draft after resolving the PKOS-reconciliation decision in `docs/superpowers/specs/2026-07-21-phase-2-knowledge-platform-design.md` (extend the existing `pkos_nodes`/`pkos_edges`/`pkos_evidence` tables rather than fork independent ones). Implementation began by explicit repository-owner authorization to proceed in parallel with Phase 1's still-open exit gates (seven-day daily-use validation, human change review) — a deliberate exception to this document's own "implementation begins only after dependencies satisfy exit criteria" principle above, not a claim that Phase 1 has exited.
 
-Persistent entities, claims, relationships, entity resolution, reversible merge/split, timelines and lexical-first hybrid retrieval.
+Tasks 1-6 and 8 (entities/claims/provenance, typed relationships, timeline, resolution, reversible merge/split, lexical retrieval, and the executive knowledge UX consuming all of it) are implemented. **Task 7 (optional embeddings and hybrid fusion), the design doc's Open decision 2, is now also authorized by the repository owner to proceed**, closing that decision's "repository owner decides embeddings are worth pursuing" precondition. This authorization covers starting the work, not the RFC-005/ADR gate itself — `RFC-005.md`'s "Retrieval benchmark and ADR" activation requirement for `pgvector` is satisfied separately, by RFC-005 v1.2.0's amendment and ADR-0011, both produced as part of this same authorization.
+
+Persistent entities, claims, relationships, entity resolution, reversible merge/split, timelines and lexical-first hybrid retrieval, now extended with optional local embeddings for semantic recall.
 
 Specification: [PHASE-002](phases/PHASE-002-knowledge-platform.md)  
 Implementation plan: [Phase 2 Knowledge Platform Implementation Plan](superpowers/plans/2026-07-21-phase-2-knowledge-platform.md)

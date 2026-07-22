@@ -1,4 +1,5 @@
 from base64 import urlsafe_b64decode, urlsafe_b64encode
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from hashlib import sha256
@@ -16,6 +17,12 @@ from sqlalchemy.orm import Session
 from ecc.auth import AuthDep
 from ecc.config import get_settings
 from ecc.database import get_session
+from ecc.domains.knowledge.embeddings import (
+    MODEL_ID,
+    EmbeddingUnavailable,
+    get_provider,
+    vector_literal,
+)
 
 router = APIRouter(prefix="/api/v1/knowledge", tags=["knowledge-retrieval"])
 SessionDep = Annotated[Session, Depends(get_session)]
@@ -30,6 +37,28 @@ SessionDep = Annotated[Session, Depends(get_session)]
 _SCORE_EXACT_ALIAS = 1.00
 _SCORE_EXACT_NAME = 0.95
 _SCORE_PREFIX_NAME = 0.85
+# Hybrid fusion (RETRIEVAL-CONTRACT.md's "versioned deterministic method",
+# version 1): a document lexical search already found gets a small boost
+# from semantic agreement, capped strictly below _SCORE_PREFIX_NAME so a
+# hybrid-boosted lexical relevance hit can never leapfrog a prefix match. A
+# document lexical search did NOT find is scored from semantic similarity
+# alone, scaled onto a band strictly below plain lexical relevance
+# (_SCORE_LEXICAL_CEILING) -- semantic-only recall extends what a query can
+# find, but per the contract's ranking order it never outranks a lexical hit.
+_SCORE_LEXICAL_CEILING = 0.75
+_SCORE_HYBRID_BONUS_CEILING = 0.84
+_SCORE_SEMANTIC_CEILING = 0.65
+_SEMANTIC_BONUS_WEIGHT = 0.05
+_SEMANTIC_MIN_SIMILARITY = 0.35
+_SEMANTIC_CANDIDATE_LIMIT = 100
+# pg_trgm's similarity() is continuous and rarely returns exactly 0 even for
+# unrelated strings (small positive noise from incidental shared trigrams),
+# unlike ts_rank_cd which is discrete token-overlap and genuinely 0 when
+# nothing matched -- so "does lexical relevance apply at all" must use this
+# same meaningful-relevance threshold the candidate WHERE clause already
+# uses, not a bare > 0 check, or trigram noise alone would misclassify a
+# pure-semantic match as hybrid.
+_TRIGRAM_RELEVANCE_THRESHOLD = 0.15
 
 
 def _build_body(session: Session, workspace_id: UUID, entity_id: UUID, summary: str | None) -> str:
@@ -197,80 +226,52 @@ def _decode_cursor(cursor: str) -> tuple[float, UUID]:
         raise HTTPException(status_code=400, detail="MALFORMED_CURSOR") from exc
 
 
-@router.get("/retrieve", response_model=RetrievalResponse)
-def retrieve(
-    auth: AuthDep,
-    session: SessionDep,
-    q: Annotated[str, Query(min_length=1, max_length=500)],
-    kind: str | None = None,
-    updated_from: datetime | None = None,
-    updated_to: datetime | None = None,
-    mode: str = "lexical",
-    cursor: str | None = None,
-    limit: int = Query(default=20, ge=1, le=100),
-) -> RetrievalResponse:
-    query = _normalize_query(q)
-    degraded = False
-    degraded_reason: str | None = None
-    if mode != "lexical":
-        # Slice 7 (embeddings) is separately gated and not implemented --
-        # RETRIEVAL-CONTRACT.md's degradation rule: never fail the
-        # request, fall back to lexical and say so.
-        degraded = True
-        degraded_reason = "hybrid_mode_unavailable"
-        mode = "lexical"
+_LEXICAL_CANDIDATES_CTE = """
+    candidates AS (
+        SELECT
+            d.entity_type, d.entity_id, d.title, d.body,
+            d.source_version, d.updated_at,
+            n.version AS live_version, n.status AS live_status,
+            lower(d.title) AS normalized_title,
+            similarity(lower(d.title), :query)::double precision AS trigram_score,
+            ts_rank_cd(
+                d.search_document, plainto_tsquery('simple', :query)
+            )::double precision AS fulltext_score,
+            EXISTS (
+                SELECT 1 FROM entity_aliases a
+                WHERE a.workspace_id = d.workspace_id
+                  AND a.entity_id = d.entity_id
+                  AND a.normalized_value = :query
+            ) AS exact_alias_match,
+            (
+                SELECT e.evidence_state FROM pkos_evidence e
+                WHERE e.workspace_id = d.workspace_id AND e.node_id = d.entity_id
+                ORDER BY e.captured_at DESC LIMIT 1
+            ) AS evidence_state
+        FROM retrieval_documents d
+        JOIN pkos_nodes n
+          ON n.workspace_id = d.workspace_id AND n.id = d.entity_id
+        WHERE d.workspace_id = :workspace_id
+          AND n.status = 'active'
+          AND (CAST(:kind AS text) IS NULL OR d.entity_type = :kind)
+          AND (
+              CAST(:updated_from AS timestamptz) IS NULL
+              OR d.updated_at >= CAST(:updated_from AS timestamptz)
+          )
+          AND (
+              CAST(:updated_to AS timestamptz) IS NULL
+              OR d.updated_at <= CAST(:updated_to AS timestamptz)
+          )
+    )
+"""
 
-    cursor_payload = _decode_cursor(cursor) if cursor else None
-    params: dict[str, Any] = {
-        "workspace_id": auth.workspace_id,
-        "query": query,
-        "kind": kind,
-        "updated_from": updated_from,
-        "updated_to": updated_to,
-        "cursor_score": cursor_payload[0] if cursor_payload else None,
-        "cursor_id": cursor_payload[1] if cursor_payload else None,
-        "fetch_limit": limit + 1,
-    }
-    rows = (
+
+def _run_lexical_query(session: Session, params: dict[str, Any]) -> Sequence[Any]:
+    return (
         session.execute(
             text(
                 f"""
-                WITH candidates AS (
-                    SELECT
-                        d.entity_type, d.entity_id, d.title, d.body,
-                        d.source_version, d.updated_at,
-                        n.version AS live_version, n.status AS live_status,
-                        lower(d.title) AS normalized_title,
-                        similarity(lower(d.title), :query)::double precision AS trigram_score,
-                        ts_rank_cd(
-                            d.search_document, plainto_tsquery('simple', :query)
-                        )::double precision AS fulltext_score,
-                        EXISTS (
-                            SELECT 1 FROM entity_aliases a
-                            WHERE a.workspace_id = d.workspace_id
-                              AND a.entity_id = d.entity_id
-                              AND a.normalized_value = :query
-                        ) AS exact_alias_match,
-                        (
-                            SELECT e.evidence_state FROM pkos_evidence e
-                            WHERE e.workspace_id = d.workspace_id AND e.node_id = d.entity_id
-                            ORDER BY e.captured_at DESC LIMIT 1
-                        ) AS evidence_state
-                    FROM retrieval_documents d
-                    JOIN pkos_nodes n
-                      ON n.workspace_id = d.workspace_id AND n.id = d.entity_id
-                    WHERE d.workspace_id = :workspace_id
-                      AND n.status = 'active'
-                      AND (CAST(:kind AS text) IS NULL OR d.entity_type = :kind)
-                      AND (
-                          CAST(:updated_from AS timestamptz) IS NULL
-                          OR d.updated_at >= CAST(:updated_from AS timestamptz)
-                      )
-                      AND (
-                          CAST(:updated_to AS timestamptz) IS NULL
-                          OR d.updated_at <= CAST(:updated_to AS timestamptz)
-                      )
-                ), ranked AS (
+                WITH {_LEXICAL_CANDIDATES_CTE}, ranked AS (
                     SELECT *,
                         CASE
                             WHEN exact_alias_match THEN {_SCORE_EXACT_ALIAS}
@@ -306,6 +307,136 @@ def retrieve(
         .mappings()
         .all()
     )
+
+
+def _run_hybrid_query(session: Session, params: dict[str, Any]) -> Sequence[Any]:
+    """Fuses lexical candidates with the nearest embedding_projections
+    neighbors of the query vector. See the module-level _SCORE_* constants
+    for the fusion formula (RETRIEVAL-CONTRACT.md's "versioned deterministic
+    method"): a document found lexically gets a small semantic bonus capped
+    below the next ranking band up; a document found only semantically is
+    scored from similarity alone, capped below plain lexical relevance."""
+    return (
+        session.execute(
+            text(
+                f"""
+                WITH {_LEXICAL_CANDIDATES_CTE}, semantic AS (
+                    SELECT
+                        d.entity_type, d.entity_id, d.title, d.body,
+                        d.source_version, d.updated_at,
+                        n.version AS live_version, n.status AS live_status,
+                        greatest(0, least(1, 1 - (e.embedding <=> CAST(:query_vector AS vector))))
+                            ::double precision AS semantic_similarity
+                    FROM embedding_projections e
+                    JOIN retrieval_documents d
+                      ON d.workspace_id = e.workspace_id AND d.id = e.document_id
+                    JOIN pkos_nodes n
+                      ON n.workspace_id = d.workspace_id AND n.id = d.entity_id
+                    WHERE e.workspace_id = :workspace_id
+                      AND e.model_id = :model_id
+                      AND n.status = 'active'
+                      AND (CAST(:kind AS text) IS NULL OR d.entity_type = :kind)
+                      AND (
+                          CAST(:updated_from AS timestamptz) IS NULL
+                          OR d.updated_at >= CAST(:updated_from AS timestamptz)
+                      )
+                      AND (
+                          CAST(:updated_to AS timestamptz) IS NULL
+                          OR d.updated_at <= CAST(:updated_to AS timestamptz)
+                      )
+                    ORDER BY e.embedding <=> CAST(:query_vector AS vector)
+                    LIMIT :semantic_candidate_limit
+                ), merged AS (
+                    SELECT
+                        COALESCE(l.entity_id, s.entity_id) AS entity_id,
+                        COALESCE(l.entity_type, s.entity_type) AS entity_type,
+                        COALESCE(l.title, s.title) AS title,
+                        COALESCE(l.body, s.body) AS body,
+                        COALESCE(l.source_version, s.source_version) AS source_version,
+                        COALESCE(l.live_version, s.live_version) AS live_version,
+                        lower(COALESCE(l.title, s.title)) AS normalized_title,
+                        COALESCE(l.trigram_score, 0) AS trigram_score,
+                        COALESCE(l.fulltext_score, 0) AS fulltext_score,
+                        COALESCE(l.exact_alias_match, false) AS exact_alias_match,
+                        COALESCE(s.semantic_similarity, 0) AS semantic_score,
+                        COALESCE(l.evidence_state, (
+                            SELECT e2.evidence_state FROM pkos_evidence e2
+                            WHERE e2.workspace_id = :workspace_id
+                              AND e2.node_id = COALESCE(l.entity_id, s.entity_id)
+                            ORDER BY e2.captured_at DESC LIMIT 1
+                        )) AS evidence_state
+                    FROM candidates l
+                    FULL OUTER JOIN semantic s ON s.entity_id = l.entity_id
+                ), ranked AS (
+                    SELECT *,
+                        CASE
+                            WHEN exact_alias_match THEN {_SCORE_EXACT_ALIAS}
+                            WHEN normalized_title = :query THEN {_SCORE_EXACT_NAME}
+                            WHEN normalized_title LIKE :query || '%' THEN {_SCORE_PREFIX_NAME}
+                            WHEN trigram_score >= {_TRIGRAM_RELEVANCE_THRESHOLD}
+                                OR fulltext_score > 0 THEN least(
+                                greatest(
+                                    least(trigram_score, {_SCORE_LEXICAL_CEILING}),
+                                    least(fulltext_score, 0.70)
+                                ) + {_SEMANTIC_BONUS_WEIGHT} * semantic_score,
+                                {_SCORE_HYBRID_BONUS_CEILING}
+                            )
+                            ELSE semantic_score * {_SCORE_SEMANTIC_CEILING}
+                        END AS score
+                    FROM merged
+                    WHERE exact_alias_match
+                       OR normalized_title = :query
+                       OR normalized_title LIKE :query || '%'
+                       OR trigram_score >= 0.15
+                       OR fulltext_score > 0
+                       OR semantic_score >= {_SEMANTIC_MIN_SIMILARITY}
+                )
+                SELECT * FROM ranked
+                WHERE (
+                    CAST(:cursor_score AS double precision) IS NULL
+                    OR score < CAST(:cursor_score AS double precision)
+                    OR (
+                        score = CAST(:cursor_score AS double precision)
+                        AND entity_id > CAST(:cursor_id AS uuid)
+                    )
+                )
+                ORDER BY score DESC, entity_id ASC
+                LIMIT :fetch_limit
+                """
+            ),
+            params,
+        )
+        .mappings()
+        .all()
+    )
+
+
+def _matching_mode(row: Any, query: str, hybrid: bool) -> str:
+    normalized_title = row["normalized_title"]
+    if row["exact_alias_match"]:
+        return "exact_alias"
+    if normalized_title == query:
+        return "exact_name"
+    if normalized_title.startswith(query):
+        return "name_prefix"
+    trigram_relevant = float(row["trigram_score"]) >= _TRIGRAM_RELEVANCE_THRESHOLD
+    fulltext_relevant = float(row["fulltext_score"]) > 0
+    if trigram_relevant or fulltext_relevant:
+        if hybrid and float(row.get("semantic_score", 0) or 0) > 0:
+            return "hybrid"
+        return "lexical"
+    return "semantic"
+
+
+def _build_response(
+    rows: Sequence[Any],
+    query: str,
+    mode: str,
+    limit: int,
+    hybrid: bool,
+    degraded: bool,
+    degraded_reason: str | None,
+) -> RetrievalResponse:
     page = rows[:limit]
     next_cursor = None
     if len(rows) > limit and page:
@@ -314,13 +445,13 @@ def retrieve(
 
     items: list[RetrievalResult] = []
     for row in page:
-        matching_mode = "lexical"
-        if row["exact_alias_match"]:
-            matching_mode = "exact_alias"
-        elif row["normalized_title"] == query:
-            matching_mode = "exact_name"
-        elif row["normalized_title"].startswith(query):
-            matching_mode = "name_prefix"
+        factors = {
+            "trigram": round(min(float(row["trigram_score"]), 0.75), 6),
+            "fulltext": round(min(float(row["fulltext_score"]), 0.70), 6),
+            "exact_alias": 1.0 if row["exact_alias_match"] else 0.0,
+        }
+        if hybrid:
+            factors["semantic"] = round(float(row.get("semantic_score", 0) or 0), 6)
         items.append(
             RetrievalResult(
                 entity_type=row["entity_type"],
@@ -328,12 +459,8 @@ def retrieve(
                 title=row["title"],
                 snippet=_snippet(row["body"], row["title"]),
                 score=round(min(max(float(row["score"]), 0.0), 1.0), 6),
-                matching_mode=matching_mode,
-                factors={
-                    "trigram": round(min(float(row["trigram_score"]), 0.75), 6),
-                    "fulltext": round(min(float(row["fulltext_score"]), 0.70), 6),
-                    "exact_alias": 1.0 if row["exact_alias_match"] else 0.0,
-                },
+                matching_mode=_matching_mode(row, query, hybrid),
+                factors=factors,
                 evidence_state=row["evidence_state"] or "unknown",
                 source_version=row["source_version"],
                 stale=row["source_version"] != row["live_version"],
@@ -346,3 +473,71 @@ def retrieve(
         degraded=degraded,
         degraded_reason=degraded_reason,
     )
+
+
+@router.get("/retrieve", response_model=RetrievalResponse)
+def retrieve(
+    auth: AuthDep,
+    session: SessionDep,
+    q: Annotated[str, Query(min_length=1, max_length=500)],
+    kind: str | None = None,
+    updated_from: datetime | None = None,
+    updated_to: datetime | None = None,
+    mode: str = "lexical",
+    cursor: str | None = None,
+    limit: int = Query(default=20, ge=1, le=100),
+) -> RetrievalResponse:
+    query = _normalize_query(q)
+    degraded = False
+    degraded_reason: str | None = None
+    query_vector: list[float] | None = None
+
+    if mode != "lexical":
+        # RETRIEVAL-CONTRACT.md's degradation rule: never fail the request --
+        # a disabled feature or a failed model load degrades to lexical-only
+        # with degraded=true rather than erroring. Catches Exception broadly
+        # (not just our own EmbeddingUnavailable) deliberately: the real
+        # provider wraps a third-party ML library that can fail in ways this
+        # module cannot enumerate (OOM, a corrupted model cache, a tokenizer
+        # error, ...) -- per chapter-04-knowledge-platform.md's "if
+        # embeddings fail, graph traversal continues" principle, any of
+        # those must degrade the same way a disabled feature does, not
+        # surface as a 500.
+        try:
+            provider = get_provider()
+            [query_vector] = provider.embed([query])
+        except EmbeddingUnavailable as exc:
+            degraded = True
+            degraded_reason = str(exc)
+            mode = "lexical"
+        except Exception:
+            degraded = True
+            degraded_reason = "embedding_generation_failed"
+            mode = "lexical"
+
+    cursor_payload = _decode_cursor(cursor) if cursor else None
+    params: dict[str, Any] = {
+        "workspace_id": auth.workspace_id,
+        "query": query,
+        "kind": kind,
+        "updated_from": updated_from,
+        "updated_to": updated_to,
+        "cursor_score": cursor_payload[0] if cursor_payload else None,
+        "cursor_id": cursor_payload[1] if cursor_payload else None,
+        "fetch_limit": limit + 1,
+    }
+
+    if query_vector is not None:
+        rows = _run_hybrid_query(
+            session,
+            {
+                **params,
+                "query_vector": vector_literal(query_vector),
+                "model_id": MODEL_ID,
+                "semantic_candidate_limit": _SEMANTIC_CANDIDATE_LIMIT,
+            },
+        )
+        return _build_response(rows, query, mode, limit, True, degraded, degraded_reason)
+
+    rows = _run_lexical_query(session, params)
+    return _build_response(rows, query, mode, limit, False, degraded, degraded_reason)

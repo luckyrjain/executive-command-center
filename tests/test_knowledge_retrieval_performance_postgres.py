@@ -145,6 +145,18 @@ def retrieval_performance_context() -> Iterator[tuple[TestClient, UUID]]:
     finally:
         client.close()
         with engine.begin() as connection:
+            # pkos_nodes is now referenced by more Phase 2 tables (pkos_edges,
+            # resolution_candidates, claims, ...) than when this fixture's
+            # teardown budget was last checked, and this workspace's 10,000
+            # pkos_nodes rows make the DELETE's FK-integrity re-checks slow
+            # enough on CI-runner hardware to exceed the connection's 5s
+            # statement_timeout (STATEMENT_TIMEOUT_MS in ecc/database.py) --
+            # an approved *application-request* SLA that was never meant to
+            # bound test cleanup. SET LOCAL scopes the relaxed budget to only
+            # this teardown transaction; every other connection through this
+            # engine (including the test's own request above) still enforces
+            # the real 5s budget.
+            connection.execute(text("SET LOCAL statement_timeout = '60s'"))
             for table in ("retrieval_documents", "pkos_nodes", "sessions", "users"):
                 connection.execute(
                     text(f"DELETE FROM {table} WHERE workspace_id = :workspace_id"),  # noqa: S608

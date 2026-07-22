@@ -8,12 +8,34 @@ dependencies = [
   "argon2-cffi==25.1.0",
   "fastapi==0.139.0",
   "httpx==0.28.1",
+  # Required (not the optional `embeddings` extra below): migration 0015
+  # imports pgvector.sqlalchemy.Vector for the embedding_projections column
+  # type, and alembic imports every migration file to build its revision
+  # graph -- `alembic upgrade head` would break on any environment that
+  # skipped this package, even one that never turns embeddings on. Safe to
+  # keep required: pgvector is pure-Python (no musl/Alpine wheel issue,
+  # unlike sentence-transformers/torch below) and tiny.
+  "pgvector==0.5.0",
   "pydantic==2.13.4",
   "pydantic-settings==2.14.2",
   "psycopg[binary]==3.3.4",
   "sqlalchemy==2.0.41",
   "starlette==1.3.1",
   "uvicorn[standard]==0.35.0",
+]
+
+[project.optional-dependencies]
+# Not installed by default (backend/Dockerfile's `uv sync --frozen --no-dev`
+# never requests this extra) -- sentence-transformers pulls in torch, which
+# publishes no musl/Alpine-compatible wheels at all, and the production
+# image is deliberately Alpine for a smaller, more hardened build. This
+# mirrors Settings.embeddings_enabled's own off-by-default design: a
+# deployment that wants Task 7's embeddings/hybrid retrieval builds a custom
+# image with `uv sync --extra embeddings`, matching CI's `backend` job
+# (native Linux glibc, not Alpine), which installs it to run the real-model
+# tests. See ADR-0011.
+embeddings = [
+  "sentence-transformers==5.6.0",
 ]
 
 [dependency-groups]
@@ -43,3 +65,8 @@ known-first-party = ["ecc"]
 python_version = "3.14"
 strict = true
 mypy_path = "backend"
+
+[[tool.mypy.overrides]]
+# sentence-transformers ships no type stubs / py.typed marker.
+module = "sentence_transformers.*"
+ignore_missing_imports = true
