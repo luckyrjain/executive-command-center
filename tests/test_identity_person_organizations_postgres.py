@@ -132,3 +132,109 @@ def test_person_create_rejects_kind_field_in_payload(
         json={"canonical_name": "Someone", "kind": "organization"},
     )
     assert response.status_code == 422
+
+
+def _seed_second_session() -> tuple[UUID, str]:
+    """A fully independent workspace + user + session, for proving an
+    identity-created entity is invisible to a *different* authenticated
+    session -- not just to an unauthenticated request."""
+    other_workspace_id = uuid4()
+    other_user_id = uuid4()
+    other_token = f"session-{uuid4()}"
+    now = datetime.now(UTC)
+    with engine.begin() as connection:
+        connection.execute(
+            text("INSERT INTO workspaces (id, name, created_at) VALUES (:id, :name, :created_at)"),
+            {"id": other_workspace_id, "name": "Second Identity Workspace", "created_at": now},
+        )
+        connection.execute(
+            text(
+                "INSERT INTO users (id, workspace_id, email, password_hash, created_at) "
+                "VALUES (:id, :workspace_id, :email, :password_hash, :created_at)"
+            ),
+            {
+                "id": other_user_id,
+                "workspace_id": other_workspace_id,
+                "email": f"{other_user_id}@example.test",
+                "password_hash": "test-password-hash",
+                "created_at": now,
+            },
+        )
+        connection.execute(
+            text(
+                "INSERT INTO sessions (id, workspace_id, user_id, token_hash, "
+                "expires_at, last_seen_at) VALUES (:id, :workspace_id, :user_id, "
+                ":token_hash, :expires_at, :last_seen_at)"
+            ),
+            {
+                "id": uuid4(),
+                "workspace_id": other_workspace_id,
+                "user_id": other_user_id,
+                "token_hash": sha256(other_token.encode()).hexdigest(),
+                "expires_at": now + timedelta(hours=1),
+                "last_seen_at": now,
+            },
+        )
+    return other_workspace_id, other_token
+
+
+def _teardown_second_session(workspace_id: UUID) -> None:
+    with engine.begin() as connection:
+        for table in ("pkos_nodes", "sessions", "users"):
+            connection.execute(
+                text(f"DELETE FROM {table} WHERE workspace_id = :workspace_id"),  # noqa: S608
+                {"workspace_id": workspace_id},
+            )
+        connection.execute(
+            text("DELETE FROM workspaces WHERE id = :workspace_id"), {"workspace_id": workspace_id}
+        )
+
+
+def test_person_created_via_identity_is_invisible_from_another_workspace(
+    identity_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    client, _workspace_id, _user_id, token = identity_test_context
+    created = client.post(
+        "/api/v1/identity/people",
+        headers=_headers(token, "isolation-create-person"),
+        json={"canonical_name": "Isolated Person"},
+    )
+    assert created.status_code == 201, created.text
+    person_id = created.json()["id"]
+
+    other_workspace_id, other_token = _seed_second_session()
+    try:
+        other_client = TestClient(app)
+        other_client.cookies.set("ecc_session", other_token)
+        response = other_client.get(
+            f"/api/v1/knowledge/entities/{person_id}",
+            headers=_headers(other_token, "isolation-read-foreign-person"),
+        )
+        assert response.status_code == 404, response.text
+    finally:
+        _teardown_second_session(other_workspace_id)
+
+
+def test_organization_created_via_identity_is_invisible_from_another_workspace(
+    identity_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    client, _workspace_id, _user_id, token = identity_test_context
+    created = client.post(
+        "/api/v1/identity/organizations",
+        headers=_headers(token, "isolation-create-org"),
+        json={"canonical_name": "Isolated Org"},
+    )
+    assert created.status_code == 201, created.text
+    org_id = created.json()["id"]
+
+    other_workspace_id, other_token = _seed_second_session()
+    try:
+        other_client = TestClient(app)
+        other_client.cookies.set("ecc_session", other_token)
+        response = other_client.get(
+            f"/api/v1/knowledge/entities/{org_id}",
+            headers=_headers(other_token, "isolation-read-foreign-org"),
+        )
+        assert response.status_code == 404, response.text
+    finally:
+        _teardown_second_session(other_workspace_id)

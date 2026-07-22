@@ -213,3 +213,58 @@ def test_timeline_is_ordered_deterministically_and_paginates(
     first_ids = {item["id"] for item in first_items}
     second_ids = {item["id"] for item in second_items}
     assert first_ids.isdisjoint(second_ids)
+
+
+def test_timeline_never_shows_another_workspaces_entries(
+    timeline_test_context: tuple[TestClient, UUID, UUID, str, UUID],
+) -> None:
+    client, _workspace_id, _user_id, token, _entity_id = timeline_test_context
+    other_workspace_id = uuid4()
+    other_node_id = uuid4()
+    now = datetime.now(UTC)
+    with engine.begin() as connection:
+        connection.execute(
+            text("INSERT INTO workspaces (id, name, created_at) VALUES (:id, :name, :created_at)"),
+            {"id": other_workspace_id, "name": "Foreign Workspace", "created_at": now},
+        )
+        connection.execute(
+            text(
+                "INSERT INTO pkos_nodes (id, workspace_id, node_type, canonical_name, "
+                "attributes, created_at, updated_at) VALUES (:id, :workspace_id, 'person', "
+                "'Foreign Timeline Subject', '{}'::jsonb, :now, :now)"
+            ),
+            {"id": other_node_id, "workspace_id": other_workspace_id, "now": now},
+        )
+        connection.execute(
+            text(
+                "INSERT INTO timeline_entries (id, workspace_id, entity_id, effective_at, "
+                "recorded_at, event_type, source_id, summary) VALUES (:id, :workspace_id, "
+                ":entity_id, :now, :now, 'knowledge_entity.created', NULL, 'foreign entry')"
+            ),
+            {"id": uuid4(), "workspace_id": other_workspace_id, "entity_id": other_node_id, "now": now},
+        )
+
+    try:
+        # A request for the *foreign* entity's timeline, made from this
+        # workspace's session, must never return the other workspace's row
+        # -- not even the row count -- matching claims.py's and
+        # relationships.py's identical cross-workspace-returns-empty
+        # convention for list endpoints (as opposed to single-resource
+        # lookups, which 404).
+        response = client.get(
+            f"/api/v1/knowledge/entities/{other_node_id}/timeline",
+            headers=_headers(token, "isolation-foreign-timeline"),
+        )
+        assert response.status_code == 200
+        assert response.json()["items"] == []
+    finally:
+        with engine.begin() as connection:
+            for table in ("timeline_entries", "pkos_nodes"):
+                connection.execute(
+                    text(f"DELETE FROM {table} WHERE workspace_id = :workspace_id"),  # noqa: S608
+                    {"workspace_id": other_workspace_id},
+                )
+            connection.execute(
+                text("DELETE FROM workspaces WHERE id = :workspace_id"),
+                {"workspace_id": other_workspace_id},
+            )

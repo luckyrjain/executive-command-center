@@ -3,6 +3,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from hmac import new
+from json import dumps
 from uuid import UUID, uuid4
 
 import pytest
@@ -660,3 +661,156 @@ def test_split_an_already_reversed_merge_is_conflict(
     )
     assert response.status_code == 409
     assert response.json()["error"]["code"] == "OPERATION_ALREADY_REVERSED"
+
+
+def _seed_foreign_workspace_merge_operation() -> tuple[UUID, UUID, UUID, UUID]:
+    """A second, fully independent workspace with a confirmed candidate and
+    a completed merge operation, for proving these mutation endpoints never
+    act on a resource that belongs to a different workspace."""
+    other_workspace_id = uuid4()
+    target_id, source_id = uuid4(), uuid4()
+    candidate_id = uuid4()
+    operation_id = uuid4()
+    now = datetime.now(UTC)
+    with engine.begin() as connection:
+        connection.execute(
+            text("INSERT INTO workspaces (id, name, created_at) VALUES (:id, :name, :created_at)"),
+            {"id": other_workspace_id, "name": "Foreign Workspace", "created_at": now},
+        )
+        for entity_id, name, status in (
+            (target_id, "Foreign Target", "active"),
+            (source_id, "Foreign Source", "redirected"),
+        ):
+            connection.execute(
+                text(
+                    "INSERT INTO pkos_nodes (id, workspace_id, node_type, canonical_name, "
+                    "attributes, status, confidence, version, created_at, updated_at) VALUES "
+                    "(:id, :workspace_id, 'person', :name, '{}'::jsonb, :status, 1.0, 1, :now, :now)"
+                ),
+                {
+                    "id": entity_id,
+                    "workspace_id": other_workspace_id,
+                    "name": name,
+                    "status": status,
+                    "now": now,
+                },
+            )
+        connection.execute(
+            text(
+                "INSERT INTO resolution_candidates (id, workspace_id, left_entity_id, "
+                "right_entity_id, score, factors_json, resolver_version, status, "
+                "resolved_at, resolved_by, reason, created_at) VALUES (:id, :workspace_id, "
+                ":target_id, :source_id, 0.95, '{}'::jsonb, 'test', 'confirmed', :now, "
+                ":resolved_by, 'merged', :now)"
+            ),
+            {
+                "id": candidate_id,
+                "workspace_id": other_workspace_id,
+                "target_id": target_id,
+                "source_id": source_id,
+                "resolved_by": uuid4(),
+                "now": now,
+            },
+        )
+        connection.execute(
+            text(
+                """
+                INSERT INTO entity_operations (
+                    id, workspace_id, operation_type, status, inputs_json,
+                    outputs_json, actor_id, reason, created_at
+                ) VALUES (
+                    :id, :workspace_id, 'merge', 'active', CAST(:inputs_json AS jsonb),
+                    '{}'::jsonb, :actor_id, 'foreign merge', :now
+                )
+                """
+            ),
+            {
+                "id": operation_id,
+                "workspace_id": other_workspace_id,
+                "inputs_json": dumps(
+                    {
+                        "candidate_id": str(candidate_id),
+                        "target_entity_id": str(target_id),
+                        "source_entity_id": str(source_id),
+                    }
+                ),
+                "actor_id": uuid4(),
+                "now": now,
+            },
+        )
+    return other_workspace_id, candidate_id, operation_id, target_id
+
+
+def _teardown_foreign_workspace(workspace_id: UUID) -> None:
+    with engine.begin() as connection:
+        for table in ("entity_operations", "resolution_candidates", "pkos_nodes"):
+            connection.execute(
+                text(f"DELETE FROM {table} WHERE workspace_id = :workspace_id"),  # noqa: S608
+                {"workspace_id": workspace_id},
+            )
+        connection.execute(
+            text("DELETE FROM workspaces WHERE id = :workspace_id"), {"workspace_id": workspace_id}
+        )
+
+
+def test_merge_rejects_candidate_from_another_workspace(
+    entity_operations_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    client, _workspace_id, _user_id, token = entity_operations_test_context
+    other_workspace_id, foreign_candidate_id, _operation_id, foreign_target_id = (
+        _seed_foreign_workspace_merge_operation()
+    )
+    try:
+        response = client.post(
+            "/api/v1/knowledge/entities/merge",
+            headers=_headers(token, "isolation-merge-foreign-candidate"),
+            json={
+                "candidate_id": str(foreign_candidate_id),
+                "target_entity_id": str(foreign_target_id),
+                "expected_target_version": 1,
+                "expected_source_version": 1,
+                "reason": "cross-workspace attempt",
+            },
+        )
+        assert response.status_code == 404, response.text
+        assert response.json()["error"]["code"] == "CANDIDATE_NOT_FOUND"
+    finally:
+        _teardown_foreign_workspace(other_workspace_id)
+
+
+def test_reverse_rejects_operation_from_another_workspace(
+    entity_operations_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    client, _workspace_id, _user_id, token = entity_operations_test_context
+    other_workspace_id, _candidate_id, foreign_operation_id, _target_id = (
+        _seed_foreign_workspace_merge_operation()
+    )
+    try:
+        response = client.post(
+            f"/api/v1/knowledge/entity-operations/{foreign_operation_id}/reverse",
+            headers=_headers(token, "isolation-reverse-foreign"),
+            json={"reason": "cross-workspace attempt"},
+        )
+        assert response.status_code == 404, response.text
+        assert response.json()["error"]["code"] == "OPERATION_NOT_FOUND"
+    finally:
+        _teardown_foreign_workspace(other_workspace_id)
+
+
+def test_split_rejects_operation_from_another_workspace(
+    entity_operations_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    client, _workspace_id, _user_id, token = entity_operations_test_context
+    other_workspace_id, _candidate_id, foreign_operation_id, _target_id = (
+        _seed_foreign_workspace_merge_operation()
+    )
+    try:
+        response = client.post(
+            f"/api/v1/knowledge/entity-operations/{foreign_operation_id}/split",
+            headers=_headers(token, "isolation-split-foreign"),
+            json={"reason": "cross-workspace attempt"},
+        )
+        assert response.status_code == 404, response.text
+        assert response.json()["error"]["code"] == "OPERATION_NOT_FOUND"
+    finally:
+        _teardown_foreign_workspace(other_workspace_id)

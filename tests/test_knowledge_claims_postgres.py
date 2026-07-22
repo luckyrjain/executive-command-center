@@ -294,3 +294,182 @@ def test_claim_supersede_rejects_unavailable_evidence(
     )
     assert supersede.status_code == 422, supersede.text
     assert supersede.json()["error"]["code"] == "EVIDENCE_UNAVAILABLE"
+
+
+def _seed_foreign_workspace_node_and_evidence() -> tuple[UUID, UUID, UUID]:
+    """A second, fully independent workspace + entity + evidence row, for
+    proving workspace isolation rather than just not-found handling for a
+    nonexistent id -- the two are different failure modes (a real id that
+    belongs to someone else vs. an id that belongs to no one)."""
+    other_workspace_id = uuid4()
+    other_node_id = uuid4()
+    other_evidence_id = uuid4()
+    now = datetime.now(UTC)
+    with engine.begin() as connection:
+        connection.execute(
+            text("INSERT INTO workspaces (id, name, created_at) VALUES (:id, :name, :created_at)"),
+            {"id": other_workspace_id, "name": "Foreign Workspace", "created_at": now},
+        )
+        connection.execute(
+            text(
+                "INSERT INTO pkos_nodes (id, workspace_id, node_type, canonical_name, "
+                "attributes, created_at, updated_at) VALUES (:id, :workspace_id, 'person', "
+                "'Foreign Node', '{}'::jsonb, :now, :now)"
+            ),
+            {"id": other_node_id, "workspace_id": other_workspace_id, "now": now},
+        )
+        connection.execute(
+            text(
+                "INSERT INTO pkos_evidence (id, workspace_id, node_id, source_type, "
+                "source_ref, sha256, captured_at) VALUES (:id, :workspace_id, :node_id, "
+                "'manual', 'foreign-ref', :sha256, :captured_at)"
+            ),
+            {
+                "id": other_evidence_id,
+                "workspace_id": other_workspace_id,
+                "node_id": other_node_id,
+                "sha256": sha256(str(other_evidence_id).encode()).hexdigest(),
+                "captured_at": now,
+            },
+        )
+    return other_workspace_id, other_node_id, other_evidence_id
+
+
+def _teardown_foreign_workspace(workspace_id: UUID) -> None:
+    with engine.begin() as connection:
+        for table in ("knowledge_claims", "pkos_evidence", "pkos_nodes"):
+            connection.execute(
+                text(f"DELETE FROM {table} WHERE workspace_id = :workspace_id"),  # noqa: S608
+                {"workspace_id": workspace_id},
+            )
+        connection.execute(
+            text("DELETE FROM workspaces WHERE id = :workspace_id"), {"workspace_id": workspace_id}
+        )
+
+
+def test_claim_list_never_shows_another_workspaces_claims(
+    claims_test_context: tuple[TestClient, UUID, UUID, str, UUID],
+) -> None:
+    client, workspace_id, _user_id, token, entity_id = claims_test_context
+    other_workspace_id, other_node_id, other_evidence_id = _seed_foreign_workspace_node_and_evidence()
+    try:
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    "INSERT INTO knowledge_claims (id, workspace_id, subject_id, predicate, "
+                    "value_json, source_id, confidence, created_at) VALUES (:id, :workspace_id, "
+                    ":subject_id, 'title', '{}'::jsonb, :source_id, 1.0, :now)"
+                ),
+                {
+                    "id": uuid4(),
+                    "workspace_id": other_workspace_id,
+                    "subject_id": other_node_id,
+                    "source_id": other_evidence_id,
+                    "now": datetime.now(UTC),
+                },
+            )
+
+        evidence_id = _create_evidence(workspace_id, entity_id)
+        client.post(
+            f"/api/v1/knowledge/entities/{entity_id}/claims",
+            headers=_headers(token, "isolation-own-claim"),
+            json={
+                "predicate": "employed_at",
+                "value": {"organization": "Analytical Engines Ltd"},
+                "source_id": str(evidence_id),
+            },
+        )
+
+        # A request for the *foreign* entity's claims, made from this
+        # workspace's session, must never return the other workspace's row
+        # -- not even the row count.
+        listed = client.get(
+            f"/api/v1/knowledge/entities/{other_node_id}/claims",
+            headers=_headers(token, "isolation-list-foreign"),
+        )
+        assert listed.status_code == 200
+        assert listed.json()["items"] == []
+    finally:
+        _teardown_foreign_workspace(other_workspace_id)
+
+
+def test_claim_create_rejects_entity_from_another_workspace(
+    claims_test_context: tuple[TestClient, UUID, UUID, str, UUID],
+) -> None:
+    client, workspace_id, _user_id, token, entity_id = claims_test_context
+    other_workspace_id, other_node_id, _other_evidence_id = _seed_foreign_workspace_node_and_evidence()
+    try:
+        evidence_id = _create_evidence(workspace_id, entity_id)
+        response = client.post(
+            f"/api/v1/knowledge/entities/{other_node_id}/claims",
+            headers=_headers(token, "isolation-create-foreign-entity"),
+            json={
+                "predicate": "employed_at",
+                "value": {"organization": "Analytical Engines Ltd"},
+                "source_id": str(evidence_id),
+            },
+        )
+        assert response.status_code == 404, response.text
+        assert response.json()["error"]["code"] == "ENTITY_NOT_FOUND"
+    finally:
+        _teardown_foreign_workspace(other_workspace_id)
+
+
+def test_claim_create_rejects_evidence_from_another_workspace(
+    claims_test_context: tuple[TestClient, UUID, UUID, str, UUID],
+) -> None:
+    client, _workspace_id, _user_id, token, entity_id = claims_test_context
+    other_workspace_id, _other_node_id, other_evidence_id = _seed_foreign_workspace_node_and_evidence()
+    try:
+        response = client.post(
+            f"/api/v1/knowledge/entities/{entity_id}/claims",
+            headers=_headers(token, "isolation-create-foreign-evidence"),
+            json={
+                "predicate": "employed_at",
+                "value": {"organization": "Analytical Engines Ltd"},
+                "source_id": str(other_evidence_id),
+            },
+        )
+        assert response.status_code == 404, response.text
+        assert response.json()["error"]["code"] == "EVIDENCE_NOT_FOUND"
+    finally:
+        _teardown_foreign_workspace(other_workspace_id)
+
+
+def test_claim_supersede_rejects_claim_from_another_workspace(
+    claims_test_context: tuple[TestClient, UUID, UUID, str, UUID],
+) -> None:
+    client, workspace_id, _user_id, token, entity_id = claims_test_context
+    other_workspace_id, other_node_id, other_evidence_id = _seed_foreign_workspace_node_and_evidence()
+    try:
+        foreign_claim_id = uuid4()
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    "INSERT INTO knowledge_claims (id, workspace_id, subject_id, predicate, "
+                    "value_json, source_id, confidence, created_at) VALUES (:id, :workspace_id, "
+                    ":subject_id, 'title', '{}'::jsonb, :source_id, 1.0, :now)"
+                ),
+                {
+                    "id": foreign_claim_id,
+                    "workspace_id": other_workspace_id,
+                    "subject_id": other_node_id,
+                    "source_id": other_evidence_id,
+                    "now": datetime.now(UTC),
+                },
+            )
+
+        evidence_id = _create_evidence(workspace_id, entity_id)
+        response = client.post(
+            f"/api/v1/knowledge/entities/{entity_id}/claims/{foreign_claim_id}/supersede",
+            headers=_headers(token, "isolation-supersede-foreign"),
+            json={
+                "predicate": "employed_at",
+                "value": {"organization": "Cambridge University"},
+                "source_id": str(evidence_id),
+            },
+        )
+        assert response.status_code == 404, response.text
+        assert response.json()["error"]["code"] == "CLAIM_NOT_FOUND"
+    finally:
+        _teardown_foreign_workspace(other_workspace_id)
