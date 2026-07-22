@@ -12,6 +12,8 @@ from sqlalchemy.orm import Session
 
 from ecc.auth import AuthContext, AuthDep, CsrfDep
 from ecc.database import get_session
+from ecc.domains.knowledge.embeddings import queue_embedding
+from ecc.domains.knowledge.retrieval import queue_retrieval_document
 from ecc.domains.knowledge.timeline import queue_timeline_entry
 from ecc.observability import (
     queue_lifecycle_event,
@@ -58,6 +60,22 @@ class EntityOperationReverseRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     reason: str = Field(min_length=1, max_length=2000)
+
+
+class EntityOperationSplitRequest(BaseModel):
+    """Split is the manual counterpart to reverse, used exactly when
+    reverse's automatic path is blocked (UNSAFE_REVERSAL, i.e. post-merge
+    dependent activity exists on the target). Reverse can safely restore
+    the source because nothing has changed since the merge; split cannot
+    automatically guess which post-merge claims/relationships on the target
+    actually belong to the restored source, so the caller states that
+    explicitly -- everything not listed here stays with the target."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    reason: str = Field(min_length=1, max_length=2000)
+    reassign_claim_ids: list[UUID] = Field(default_factory=list)
+    reassign_relationship_ids: list[UUID] = Field(default_factory=list)
 
 
 def _project(row: dict[str, Any]) -> EntityOperationResponse:
@@ -182,6 +200,42 @@ def _lock_entity(session: Session, auth: AuthContext, entity_id: UUID) -> dict[s
         .one_or_none()
     )
     return dict(row) if row is not None else None
+
+
+def _entity_retrieval_fields(
+    session: Session, auth: AuthContext, entity_id: UUID
+) -> tuple[str, str, str | None, int] | None:
+    row = session.execute(
+        text(
+            """
+            SELECT node_type, canonical_name, attributes, version FROM pkos_nodes
+            WHERE workspace_id = :workspace_id AND id = :entity_id
+            """
+        ),
+        {"workspace_id": auth.workspace_id, "entity_id": entity_id},
+    ).one_or_none()
+    if row is None:
+        return None
+    node_type, canonical_name, attributes, version = row
+    summary = (attributes or {}).get("summary")
+    return node_type, canonical_name, summary, version
+
+
+def _refresh_projections(
+    session: Session, auth: AuthContext, entity_id: UUID, now: datetime
+) -> None:
+    """DATA-MODEL.md's split invariant: "invalidate obsolete projections."
+    Split moves claims/relationships between entities via direct UPDATE
+    (not claims.py's/relationships.py's own mutation endpoints), so it must
+    explicitly refresh retrieval_documents/embeddings itself afterward,
+    exactly mirroring what those endpoints already do on every write."""
+    fields = _entity_retrieval_fields(session, auth, entity_id)
+    if fields is not None:
+        kind, canonical_name, summary, version = fields
+        queue_retrieval_document(
+            session, auth.workspace_id, entity_id, kind, canonical_name, summary, version, now
+        )
+        queue_embedding(session, auth.workspace_id, entity_id, now)
 
 
 def _write_side_effects(
@@ -652,5 +706,216 @@ def reverse_operation(
             f"restored from redirect to {target_id}",
             now,
         )
+        _store_cached(session, auth, idempotency_key, request_hash, response, now, 201)
+        return response
+
+
+@router.post(
+    "/entity-operations/{operation_id}/split",
+    response_model=EntityOperationResponse,
+    status_code=201,
+)
+def split_operation(
+    operation_id: UUID,
+    payload: EntityOperationSplitRequest,
+    request: Request,
+    auth: AuthDep,
+    session: SessionDep,
+    _csrf: CsrfDep,
+    idempotency_key: IdempotencyHeader,
+) -> EntityOperationResponse:
+    request_hash = _request_hash(payload, f"split:{operation_id}")
+    now = datetime.now(UTC)
+    with session.begin():
+        _lock_idempotency(session, auth, idempotency_key)
+        cached = _load_cached(session, auth, idempotency_key, request_hash)
+        if cached is not None:
+            return cached
+
+        merge_op = (
+            session.execute(
+                text(
+                    f"""
+                    SELECT {_OPERATION_FIELDS}
+                    FROM entity_operations
+                    WHERE workspace_id = :workspace_id AND id = :operation_id
+                    FOR UPDATE
+                    """
+                ),
+                {"workspace_id": auth.workspace_id, "operation_id": operation_id},
+            )
+            .mappings()
+            .one_or_none()
+        )
+        if merge_op is None:
+            raise HTTPException(status_code=404, detail="OPERATION_NOT_FOUND")
+        if merge_op["operation_type"] != "merge":
+            raise HTTPException(status_code=422, detail="NOT_A_MERGE_OPERATION")
+        if merge_op["status"] != "active":
+            raise HTTPException(status_code=409, detail="OPERATION_ALREADY_REVERSED")
+
+        inputs = merge_op["inputs_json"] if isinstance(merge_op["inputs_json"], dict) else {}
+        source_id = UUID(inputs["source_entity_id"])
+        target_id = UUID(inputs["target_entity_id"])
+
+        # Same fixed lock order as merge/reverse -- never deadlocks against
+        # a concurrent merge or reverse touching the same pair.
+        first_id, second_id = sorted((target_id, source_id), key=str)
+        locked = {first_id: _lock_entity(session, auth, first_id)}
+        locked[second_id] = _lock_entity(session, auth, second_id)
+        source = locked[source_id]
+        if source is None:
+            raise HTTPException(status_code=404, detail="ENTITY_NOT_FOUND")
+        if source["status"] != "redirected":
+            raise HTTPException(status_code=409, detail="SOURCE_NOT_REDIRECTED")
+
+        # Validate every reassignment target actually belongs to the target
+        # entity before touching anything -- an all-or-nothing check, so a
+        # bad ID in the payload never leaves a partial reassignment.
+        if payload.reassign_claim_ids:
+            found = session.execute(
+                text(
+                    """
+                    SELECT id FROM knowledge_claims
+                    WHERE workspace_id = :workspace_id AND subject_id = :target_id
+                      AND id = ANY(:claim_ids)
+                    """
+                ),
+                {
+                    "workspace_id": auth.workspace_id,
+                    "target_id": target_id,
+                    "claim_ids": payload.reassign_claim_ids,
+                },
+            ).all()
+            if len(found) != len(set(payload.reassign_claim_ids)):
+                raise HTTPException(status_code=422, detail="CLAIM_NOT_ON_TARGET")
+        if payload.reassign_relationship_ids:
+            found = session.execute(
+                text(
+                    """
+                    SELECT id FROM pkos_edges
+                    WHERE workspace_id = :workspace_id
+                      AND (source_node_id = :target_id OR target_node_id = :target_id)
+                      AND id = ANY(:relationship_ids)
+                    """
+                ),
+                {
+                    "workspace_id": auth.workspace_id,
+                    "target_id": target_id,
+                    "relationship_ids": payload.reassign_relationship_ids,
+                },
+            ).all()
+            if len(found) != len(set(payload.reassign_relationship_ids)):
+                raise HTTPException(status_code=422, detail="RELATIONSHIP_NOT_ON_TARGET")
+
+        session.execute(
+            text(
+                """
+                UPDATE pkos_nodes
+                SET status = 'active', updated_at = :now, version = version + 1
+                WHERE workspace_id = :workspace_id AND id = :source_id
+                """
+            ),
+            {"workspace_id": auth.workspace_id, "source_id": source_id, "now": now},
+        )
+        if payload.reassign_claim_ids:
+            session.execute(
+                text(
+                    """
+                    UPDATE knowledge_claims SET subject_id = :source_id
+                    WHERE workspace_id = :workspace_id AND subject_id = :target_id
+                      AND id = ANY(:claim_ids)
+                    """
+                ),
+                {
+                    "workspace_id": auth.workspace_id,
+                    "source_id": source_id,
+                    "target_id": target_id,
+                    "claim_ids": payload.reassign_claim_ids,
+                },
+            )
+        if payload.reassign_relationship_ids:
+            session.execute(
+                text(
+                    """
+                    UPDATE pkos_edges SET
+                        source_node_id = CASE WHEN source_node_id = :target_id
+                            THEN :source_id ELSE source_node_id END,
+                        target_node_id = CASE WHEN target_node_id = :target_id
+                            THEN :source_id ELSE target_node_id END
+                    WHERE workspace_id = :workspace_id
+                      AND (source_node_id = :target_id OR target_node_id = :target_id)
+                      AND id = ANY(:relationship_ids)
+                    """
+                ),
+                {
+                    "workspace_id": auth.workspace_id,
+                    "source_id": source_id,
+                    "target_id": target_id,
+                    "relationship_ids": payload.reassign_relationship_ids,
+                },
+            )
+
+        session.execute(
+            text(
+                "UPDATE entity_operations SET status = 'reversed' "
+                "WHERE workspace_id = :workspace_id AND id = :operation_id"
+            ),
+            {"workspace_id": auth.workspace_id, "operation_id": operation_id},
+        )
+
+        split_id = uuid4()
+        row = (
+            session.execute(
+                text(
+                    f"""
+                    INSERT INTO entity_operations (
+                        id, workspace_id, operation_type, status, inputs_json,
+                        outputs_json, actor_id, reason, reverses_operation_id, created_at
+                    ) VALUES (
+                        :id, :workspace_id, 'split', 'active', CAST(:inputs_json AS jsonb),
+                        CAST(:outputs_json AS jsonb), :actor_id, :reason, :reverses_id, :now
+                    )
+                    RETURNING {_OPERATION_FIELDS}
+                    """
+                ),
+                {
+                    "id": split_id,
+                    "workspace_id": auth.workspace_id,
+                    "inputs_json": dumps(
+                        {
+                            "operation_id": str(operation_id),
+                            "reassigned_claim_ids": [str(i) for i in payload.reassign_claim_ids],
+                            "reassigned_relationship_ids": [
+                                str(i) for i in payload.reassign_relationship_ids
+                            ],
+                        }
+                    ),
+                    "outputs_json": dumps(
+                        {"source_entity_id": str(source_id), "target_entity_id": str(target_id)}
+                    ),
+                    "actor_id": auth.user_id,
+                    "reason": payload.reason,
+                    "reverses_id": operation_id,
+                    "now": now,
+                },
+            )
+            .mappings()
+            .one()
+        )
+        response = _project(dict(row))
+        _write_side_effects(session, auth, request, "entity_operation.split", split_id, now)
+        queue_timeline_entry(
+            session,
+            auth.workspace_id,
+            source_id,
+            "entity_operation.split",
+            f"split from {target_id}",
+            now,
+        )
+        # Refresh both entities' projections: the target lost whatever was
+        # reassigned, the restored source gained it -- both are stale now.
+        _refresh_projections(session, auth, source_id, now)
+        _refresh_projections(session, auth, target_id, now)
         _store_cached(session, auth, idempotency_key, request_hash, response, now, 201)
         return response

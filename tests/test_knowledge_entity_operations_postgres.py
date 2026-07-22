@@ -483,3 +483,180 @@ def test_reverse_already_reversed_is_conflict(
     )
     assert second.status_code == 409
     assert second.json()["error"]["code"] == "OPERATION_ALREADY_REVERSED"
+
+
+def test_split_is_the_manual_path_when_reverse_would_be_unsafe(
+    entity_operations_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    client, workspace_id, _user_id, token = entity_operations_test_context
+    target_id = _create_entity(client, token, "split-target", "person", "Ada Lovelace")
+    source_id = _create_entity(client, token, "split-source", "person", "Ada Lovelase")
+    candidate_id = _create_confirmed_candidate(
+        client, token, "split-candidate", target_id, source_id
+    )
+    merged = _merge(client, token, "split-merge", candidate_id, target_id, 1, 1)
+    operation_id = merged.json()["id"]
+
+    # A claim recorded on the target after the merge -- exactly the
+    # condition that makes plain reverse unsafe (verified below).
+    evidence_id = _seed_evidence(workspace_id, target_id)
+    claim = client.post(
+        f"/api/v1/knowledge/entities/{target_id}/claims",
+        headers=_headers(token, "split-claim"),
+        json={
+            "predicate": "role",
+            "value": {"title": "Mathematician"},
+            "source_id": str(evidence_id),
+        },
+    )
+    claim_id = claim.json()["id"]
+
+    unsafe_reverse = client.post(
+        f"/api/v1/knowledge/entity-operations/{operation_id}/reverse",
+        headers=_headers(token, "split-confirm-unsafe"),
+        json={"reason": "attempt"},
+    )
+    assert unsafe_reverse.status_code == 422
+    assert unsafe_reverse.json()["error"]["code"] == "UNSAFE_REVERSAL"
+
+    split = client.post(
+        f"/api/v1/knowledge/entity-operations/{operation_id}/split",
+        headers=_headers(token, "split-once"),
+        json={"reason": "the post-merge claim belongs to the source", "reassign_claim_ids": [claim_id]},
+    )
+    assert split.status_code == 201, split.text
+    assert split.json()["operation_type"] == "split"
+    assert split.json()["reverses_operation_id"] == operation_id
+    assert split.json()["source_entity_id"] == str(source_id)
+    assert split.json()["target_entity_id"] == str(target_id)
+
+    source_get = client.get(
+        f"/api/v1/knowledge/entities/{source_id}", headers=_headers(token, "split-check-source")
+    )
+    assert source_get.json()["status"] == "active"
+
+    source_claims = client.get(
+        f"/api/v1/knowledge/entities/{source_id}/claims", headers=_headers(token, "split-source-claims")
+    )
+    assert any(item["id"] == claim_id for item in source_claims.json()["items"])
+
+    target_claims = client.get(
+        f"/api/v1/knowledge/entities/{target_id}/claims", headers=_headers(token, "split-target-claims")
+    )
+    assert all(item["id"] != claim_id for item in target_claims.json()["items"])
+
+
+def test_split_reassigns_relationships_too(
+    entity_operations_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    client, workspace_id, _user_id, token = entity_operations_test_context
+    target_id = _create_entity(client, token, "split-rel-target", "person", "Ada Lovelace")
+    source_id = _create_entity(client, token, "split-rel-source", "person", "Ada Lovelase")
+    other_id = _create_entity(client, token, "split-rel-other", "project", "Analytical Engine")
+    candidate_id = _create_confirmed_candidate(
+        client, token, "split-rel-candidate", target_id, source_id
+    )
+    merged = _merge(client, token, "split-rel-merge", candidate_id, target_id, 1, 1)
+    operation_id = merged.json()["id"]
+
+    evidence_id = _seed_evidence(workspace_id, target_id)
+    relationship = client.post(
+        f"/api/v1/knowledge/entities/{target_id}/relationships",
+        headers=_headers(token, "split-rel-create"),
+        json={
+            "relationship_type": "WORKS_ON",
+            "to_entity_id": str(other_id),
+            "evidence_id": str(evidence_id),
+        },
+    )
+    relationship_id = relationship.json()["id"]
+
+    split = client.post(
+        f"/api/v1/knowledge/entity-operations/{operation_id}/split",
+        headers=_headers(token, "split-rel-once"),
+        json={
+            "reason": "this relationship belongs to the source",
+            "reassign_relationship_ids": [relationship_id],
+        },
+    )
+    assert split.status_code == 201, split.text
+
+    source_relationships = client.get(
+        f"/api/v1/knowledge/entities/{source_id}/relationships",
+        headers=_headers(token, "split-rel-source-check"),
+    )
+    assert any(item["id"] == relationship_id for item in source_relationships.json()["items"])
+
+
+def test_split_rejects_claim_not_belonging_to_target(
+    entity_operations_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    client, _workspace_id, _user_id, token = entity_operations_test_context
+    target_id = _create_entity(client, token, "split-bad-target", "person", "Ada Lovelace")
+    source_id = _create_entity(client, token, "split-bad-source", "person", "Ada Lovelase")
+    candidate_id = _create_confirmed_candidate(
+        client, token, "split-bad-candidate", target_id, source_id
+    )
+    merged = _merge(client, token, "split-bad-merge", candidate_id, target_id, 1, 1)
+    operation_id = merged.json()["id"]
+
+    response = client.post(
+        f"/api/v1/knowledge/entity-operations/{operation_id}/split",
+        headers=_headers(token, "split-bad-attempt"),
+        json={"reason": "attempt", "reassign_claim_ids": [str(uuid4())]},
+    )
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "CLAIM_NOT_ON_TARGET"
+
+
+def test_split_requires_a_merge_operation(
+    entity_operations_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    client, _workspace_id, _user_id, token = entity_operations_test_context
+    target_id = _create_entity(client, token, "split-notmerge-target", "person", "Ada Lovelace")
+    source_id = _create_entity(client, token, "split-notmerge-source", "person", "Ada Lovelase")
+    candidate_id = _create_confirmed_candidate(
+        client, token, "split-notmerge-candidate", target_id, source_id
+    )
+    merged = _merge(client, token, "split-notmerge-merge", candidate_id, target_id, 1, 1)
+    operation_id = merged.json()["id"]
+    reversed_op = client.post(
+        f"/api/v1/knowledge/entity-operations/{operation_id}/reverse",
+        headers=_headers(token, "split-notmerge-reverse"),
+        json={"reason": "undo"},
+    )
+    reverse_operation_id = reversed_op.json()["id"]
+
+    response = client.post(
+        f"/api/v1/knowledge/entity-operations/{reverse_operation_id}/split",
+        headers=_headers(token, "split-notmerge-attempt"),
+        json={"reason": "attempt"},
+    )
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "NOT_A_MERGE_OPERATION"
+
+
+def test_split_an_already_reversed_merge_is_conflict(
+    entity_operations_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    client, _workspace_id, _user_id, token = entity_operations_test_context
+    target_id = _create_entity(client, token, "split-twice-target", "person", "Ada Lovelace")
+    source_id = _create_entity(client, token, "split-twice-source", "person", "Ada Lovelase")
+    candidate_id = _create_confirmed_candidate(
+        client, token, "split-twice-candidate", target_id, source_id
+    )
+    merged = _merge(client, token, "split-twice-merge", candidate_id, target_id, 1, 1)
+    operation_id = merged.json()["id"]
+    client.post(
+        f"/api/v1/knowledge/entity-operations/{operation_id}/reverse",
+        headers=_headers(token, "split-twice-reverse"),
+        json={"reason": "undo"},
+    )
+
+    response = client.post(
+        f"/api/v1/knowledge/entity-operations/{operation_id}/split",
+        headers=_headers(token, "split-twice-attempt"),
+        json={"reason": "attempt"},
+    )
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "OPERATION_ALREADY_REVERSED"
