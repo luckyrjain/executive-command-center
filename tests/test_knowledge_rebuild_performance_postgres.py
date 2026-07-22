@@ -1,6 +1,5 @@
 from collections.abc import Iterator
-from datetime import UTC, datetime, timedelta
-from hashlib import sha256
+from datetime import UTC, datetime
 from time import perf_counter
 from uuid import UUID, uuid4
 

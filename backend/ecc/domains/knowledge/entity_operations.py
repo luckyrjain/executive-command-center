@@ -327,7 +327,12 @@ def _rehome_aliases(
             RETURNING a.id
             """
         ),
-        {"workspace_id": auth.workspace_id, "source_id": source_id, "target_id": target_id, "now": now},
+        {
+            "workspace_id": auth.workspace_id,
+            "source_id": source_id,
+            "target_id": target_id,
+            "now": now,
+        },
     )
     return len(rehomed.all())
 

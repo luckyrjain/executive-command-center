@@ -114,7 +114,12 @@ def timeline_performance_context() -> Iterator[tuple[TestClient, UUID, UUID]]:
                 FROM generate_series(1, :count) AS series
                 """
             ),
-            {"workspace_id": workspace_id, "entity_id": entity_id, "now": now, "count": _ENTRY_COUNT},
+            {
+                "workspace_id": workspace_id,
+                "entity_id": entity_id,
+                "now": now,
+                "count": _ENTRY_COUNT,
+            },
         )
 
     with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as connection:

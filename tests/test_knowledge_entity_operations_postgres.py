@@ -263,20 +263,28 @@ def test_merge_rehome_bumps_alias_version_and_updated_at(
     )
 
     with engine.connect() as connection:
-        before = connection.execute(
-            text("SELECT version, updated_at, created_at FROM entity_aliases WHERE id = :id"),
-            {"id": alias_id},
-        ).mappings().one()
+        before = (
+            connection.execute(
+                text("SELECT version, updated_at, created_at FROM entity_aliases WHERE id = :id"),
+                {"id": alias_id},
+            )
+            .mappings()
+            .one()
+        )
     assert before["version"] == 1
 
     response = _merge(client, token, "version-merge", candidate_id, target_id, 1, 1)
     assert response.status_code == 201, response.text
 
     with engine.connect() as connection:
-        after = connection.execute(
-            text("SELECT version, updated_at, created_at FROM entity_aliases WHERE id = :id"),
-            {"id": alias_id},
-        ).mappings().one()
+        after = (
+            connection.execute(
+                text("SELECT version, updated_at, created_at FROM entity_aliases WHERE id = :id"),
+                {"id": alias_id},
+            )
+            .mappings()
+            .one()
+        )
     assert after["version"] == 2
     assert after["updated_at"] > after["created_at"]
 
@@ -463,10 +471,17 @@ def test_reversal_restores_source_to_active(
     # original merge row status='reversed' -- proves that mutation also
     # bumps version/updated_at, not just the columns' existence.
     with engine.connect() as connection:
-        merge_row = connection.execute(
-            text("SELECT version, updated_at, created_at, status FROM entity_operations WHERE id = :id"),
-            {"id": operation_id},
-        ).mappings().one()
+        merge_row = (
+            connection.execute(
+                text(
+                    "SELECT version, updated_at, created_at, status "
+                    "FROM entity_operations WHERE id = :id"
+                ),
+                {"id": operation_id},
+            )
+            .mappings()
+            .one()
+        )
     assert merge_row["status"] == "reversed"
     assert merge_row["version"] == 2
     assert merge_row["updated_at"] > merge_row["created_at"]
@@ -605,7 +620,10 @@ def test_split_is_the_manual_path_when_reverse_would_be_unsafe(
     split = client.post(
         f"/api/v1/knowledge/entity-operations/{operation_id}/split",
         headers=_headers(token, "split-once"),
-        json={"reason": "the post-merge claim belongs to the source", "reassign_claim_ids": [claim_id]},
+        json={
+            "reason": "the post-merge claim belongs to the source",
+            "reassign_claim_ids": [claim_id],
+        },
     )
     assert split.status_code == 201, split.text
     assert split.json()["operation_type"] == "split"
@@ -619,12 +637,14 @@ def test_split_is_the_manual_path_when_reverse_would_be_unsafe(
     assert source_get.json()["status"] == "active"
 
     source_claims = client.get(
-        f"/api/v1/knowledge/entities/{source_id}/claims", headers=_headers(token, "split-source-claims")
+        f"/api/v1/knowledge/entities/{source_id}/claims",
+        headers=_headers(token, "split-source-claims"),
     )
     assert any(item["id"] == claim_id for item in source_claims.json()["items"])
 
     target_claims = client.get(
-        f"/api/v1/knowledge/entities/{target_id}/claims", headers=_headers(token, "split-target-claims")
+        f"/api/v1/knowledge/entities/{target_id}/claims",
+        headers=_headers(token, "split-target-claims"),
     )
     assert all(item["id"] != claim_id for item in target_claims.json()["items"])
 
@@ -839,8 +859,9 @@ def _seed_foreign_workspace_merge_operation() -> tuple[UUID, UUID, UUID, UUID]:
             connection.execute(
                 text(
                     "INSERT INTO pkos_nodes (id, workspace_id, node_type, canonical_name, "
-                    "attributes, status, confidence, version, created_at, updated_at) VALUES "
-                    "(:id, :workspace_id, 'person', :name, '{}'::jsonb, :status, 1.0, 1, :now, :now)"
+                    "attributes, status, confidence, version, created_at, updated_at) "
+                    "VALUES (:id, :workspace_id, 'person', :name, '{}'::jsonb, :status, "
+                    "1.0, 1, :now, :now)"
                 ),
                 {
                     "id": entity_id,

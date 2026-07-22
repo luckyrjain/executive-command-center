@@ -33,8 +33,7 @@ def upgrade() -> None:
     orphaned_edges = (
         bind.execute(
             text(
-                "SELECT id, workspace_id, source_node_id FROM pkos_edges "
-                "WHERE evidence_id IS NULL"
+                "SELECT id, workspace_id, source_node_id FROM pkos_edges WHERE evidence_id IS NULL"
             )
         )
         .mappings()

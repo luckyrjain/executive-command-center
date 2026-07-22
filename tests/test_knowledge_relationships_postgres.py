@@ -275,8 +275,9 @@ def _seed_foreign_workspace_relationship() -> tuple[UUID, UUID, UUID]:
             connection.execute(
                 text(
                     "INSERT INTO pkos_nodes (id, workspace_id, node_type, canonical_name, "
-                    "attributes, status, confidence, version, created_at, updated_at) VALUES "
-                    "(:id, :workspace_id, 'person', :name, '{}'::jsonb, 'active', 1.0, 1, :now, :now)"
+                    "attributes, status, confidence, version, created_at, updated_at) "
+                    "VALUES (:id, :workspace_id, 'person', :name, '{}'::jsonb, 'active', "
+                    "1.0, 1, :now, :now)"
                 ),
                 {"id": node_id, "workspace_id": other_workspace_id, "name": name, "now": now},
             )

@@ -305,9 +305,7 @@ def _refresh_projections(
         queue_embedding(session, auth.workspace_id, entity_id, now)
 
 
-@router.post(
-    "/{evidence_id}/delete", response_model=EvidenceDeleteResponse, status_code=200
-)
+@router.post("/{evidence_id}/delete", response_model=EvidenceDeleteResponse, status_code=200)
 def delete_evidence(
     evidence_id: UUID,
     payload: EvidenceDeleteRequest,

@@ -35,4 +35,6 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    op.add_column("pkos_nodes", sa.Column("entity_id", postgresql.UUID(as_uuid=True), nullable=True))
+    op.add_column(
+        "pkos_nodes", sa.Column("entity_id", postgresql.UUID(as_uuid=True), nullable=True)
+    )

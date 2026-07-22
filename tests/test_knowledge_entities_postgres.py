@@ -381,9 +381,7 @@ def test_entity_create_handles_sql_injection_shaped_canonical_name(
 
     # The table this payload names is still intact.
     with engine.connect() as connection:
-        still_exists = connection.execute(
-            text("SELECT to_regclass('pkos_nodes')")
-        ).scalar_one()
+        still_exists = connection.execute(text("SELECT to_regclass('pkos_nodes')")).scalar_one()
     assert still_exists == "pkos_nodes"
 
 
@@ -474,10 +472,14 @@ def test_entity_mutations_reject_a_foreign_workspace_entity(
 
         # The entity is untouched in its real (foreign) workspace.
         with engine.connect() as connection:
-            row = connection.execute(
-                text("SELECT status, version FROM pkos_nodes WHERE id = :id"),
-                {"id": foreign_entity_id},
-            ).mappings().one()
+            row = (
+                connection.execute(
+                    text("SELECT status, version FROM pkos_nodes WHERE id = :id"),
+                    {"id": foreign_entity_id},
+                )
+                .mappings()
+                .one()
+            )
         assert row["status"] == "active"
         assert row["version"] == 1
     finally:
@@ -490,9 +492,7 @@ def test_entity_list_excludes_other_workspaces(
     client, _workspace_id, _user_id, token = knowledge_test_context
     other_workspace_id, foreign_entity_id = _seed_foreign_workspace_entity()
     try:
-        listed = client.get(
-            "/api/v1/knowledge/entities", headers=_headers(token, "isolation-list")
-        )
+        listed = client.get("/api/v1/knowledge/entities", headers=_headers(token, "isolation-list"))
         assert listed.status_code == 200
         assert all(item["id"] != str(foreign_entity_id) for item in listed.json()["items"])
     finally:

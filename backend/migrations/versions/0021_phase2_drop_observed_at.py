@@ -8,6 +8,7 @@ knowledge domain projects it either. Every row's observed_at has always
 been and will always be NULL; the same class of dead column migration
 0020 already dropped for pkos_nodes.entity_id.
 """
+
 import sqlalchemy as sa
 from alembic import op
 

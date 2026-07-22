@@ -241,7 +241,12 @@ def test_timeline_never_shows_another_workspaces_entries(
                 "recorded_at, event_type, source_id, summary) VALUES (:id, :workspace_id, "
                 ":entity_id, :now, :now, 'knowledge_entity.created', NULL, 'foreign entry')"
             ),
-            {"id": uuid4(), "workspace_id": other_workspace_id, "entity_id": other_node_id, "now": now},
+            {
+                "id": uuid4(),
+                "workspace_id": other_workspace_id,
+                "entity_id": other_node_id,
+                "now": now,
+            },
         )
 
     try:

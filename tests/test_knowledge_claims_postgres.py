@@ -359,7 +359,9 @@ def test_claim_list_never_shows_another_workspaces_claims(
     claims_test_context: tuple[TestClient, UUID, UUID, str, UUID],
 ) -> None:
     client, workspace_id, _user_id, token, entity_id = claims_test_context
-    other_workspace_id, other_node_id, other_evidence_id = _seed_foreign_workspace_node_and_evidence()
+    other_workspace_id, other_node_id, other_evidence_id = (
+        _seed_foreign_workspace_node_and_evidence()
+    )
     try:
         with engine.begin() as connection:
             connection.execute(
@@ -405,7 +407,9 @@ def test_claim_create_rejects_entity_from_another_workspace(
     claims_test_context: tuple[TestClient, UUID, UUID, str, UUID],
 ) -> None:
     client, workspace_id, _user_id, token, entity_id = claims_test_context
-    other_workspace_id, other_node_id, _other_evidence_id = _seed_foreign_workspace_node_and_evidence()
+    other_workspace_id, other_node_id, _other_evidence_id = (
+        _seed_foreign_workspace_node_and_evidence()
+    )
     try:
         evidence_id = _create_evidence(workspace_id, entity_id)
         response = client.post(
@@ -427,7 +431,9 @@ def test_claim_create_rejects_evidence_from_another_workspace(
     claims_test_context: tuple[TestClient, UUID, UUID, str, UUID],
 ) -> None:
     client, _workspace_id, _user_id, token, entity_id = claims_test_context
-    other_workspace_id, _other_node_id, other_evidence_id = _seed_foreign_workspace_node_and_evidence()
+    other_workspace_id, _other_node_id, other_evidence_id = (
+        _seed_foreign_workspace_node_and_evidence()
+    )
     try:
         response = client.post(
             f"/api/v1/knowledge/entities/{entity_id}/claims",
@@ -448,7 +454,9 @@ def test_claim_supersede_rejects_claim_from_another_workspace(
     claims_test_context: tuple[TestClient, UUID, UUID, str, UUID],
 ) -> None:
     client, workspace_id, _user_id, token, entity_id = claims_test_context
-    other_workspace_id, other_node_id, other_evidence_id = _seed_foreign_workspace_node_and_evidence()
+    other_workspace_id, other_node_id, other_evidence_id = (
+        _seed_foreign_workspace_node_and_evidence()
+    )
     try:
         foreign_claim_id = uuid4()
         with engine.begin() as connection:

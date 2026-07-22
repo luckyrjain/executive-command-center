@@ -15,9 +15,7 @@ depends_on = None
 
 
 def upgrade() -> None:
-    op.add_column(
-        "resolution_candidates", sa.Column("deferred_until", sa.DateTime(timezone=True))
-    )
+    op.add_column("resolution_candidates", sa.Column("deferred_until", sa.DateTime(timezone=True)))
 
 
 def downgrade() -> None:
