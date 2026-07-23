@@ -12,6 +12,8 @@ from ecc.audit import rejected_mutation_audit_middleware
 from ecc.config import get_settings, validate_production_settings
 from ecc.database import engine
 from ecc.dev_bootstrap import router as dev_bootstrap_router
+from ecc.domains.ai_runtime.registry import router as ai_models_router
+from ecc.domains.ai_runtime.router import api_router as ai_policies_router
 from ecc.domains.attention.attention import router as attention_router
 from ecc.domains.attention.capacity import router as capacity_router
 from ecc.domains.attention.meeting_prep import router as meeting_prep_router
@@ -106,6 +108,11 @@ app.include_router(knowledge_retrieval_router)
 app.include_router(identity_router)
 app.include_router(search_router)
 app.include_router(dashboard_briefs_router)
+# Phase 4 Task 1: read-only registry/policy surface only (GET /ai/models,
+# GET /ai/policies). Run/evaluation endpoints (POST /ai/runs, POST
+# /ai/policies/{id}/activate, etc.) are later tasks in the same plan.
+app.include_router(ai_models_router)
+app.include_router(ai_policies_router)
 app.middleware("http")(rejected_mutation_audit_middleware)
 # Pure-ASGI body size guard: registered via add_middleware (not the
 # "http" dispatch helper) so it can intercept the raw receive() channel and
