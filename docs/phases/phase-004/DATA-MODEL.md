@@ -1,7 +1,7 @@
 ---
 id: PHASE-004-DATA-MODEL
 title: Phase 4 AI Runtime Data Model
-status: Approved for Implementation
+status: Draft
 version: 0.2.0
 owner: Lucky Jain
 ---

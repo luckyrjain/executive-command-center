@@ -9,17 +9,17 @@ updated: 2026-07-23
 
 # Phase 4 Implementation Status
 
-Phase 4 design work is complete and contracts are Approved for Implementation; code implementation has not started. This document is informational and does not override normative contracts.
+Phase 4 design work is drafted; contracts remain Draft pending repository-owner review, and code implementation has not started. This document is informational and does not override normative contracts.
 
 ## Planning artifacts
 
-`docs/superpowers/specs/2026-07-23-phase-4-ai-runtime-design.md` (design doc, resolving Ollama activation, first model choice, routing algorithm, prompt/tool versioning, structured-output validation, bounded tool runtime, budgets, evaluation harness and data-class policy) and `docs/superpowers/plans/2026-07-23-phase-4-ai-runtime.md` (task-by-task implementation plan, six delivery tasks for this first activation slice). Neither document authorizes implementation by itself -- see Prerequisites below.
+`docs/superpowers/specs/2026-07-23-phase-4-ai-runtime-design.md` (design doc, proposing a resolution for Ollama activation, first model choice, routing algorithm, prompt/tool versioning, structured-output validation, bounded tool runtime, budgets, evaluation harness and data-class policy) and `docs/superpowers/plans/2026-07-23-phase-4-ai-runtime.md` (task-by-task implementation plan, six delivery tasks queued for this first activation slice). Neither document authorizes implementation by itself -- see Prerequisites below.
 
 ## Prerequisites
 
-- Phase 3 exit gates complete, or an explicit repository-owner parallel-start authorization matching Phase 2's and Phase 3's own precedent -- **granted 2026-07-23**, same exception Phase 2 and Phase 3 received; see `docs/ROADMAP.md`'s Phase 4 status note and `PHASE-004-ai-runtime.md`'s "Dependency exit posture" section.
-- Phase 4 contracts approved for implementation -- **done 2026-07-23.** The four approval gates named in `docs/phases/PHASE-REVIEW.md:135` (approved local/remote models and providers, data-class egress matrix, evaluation floors, trace retention) are resolved in `PHASE-004-ai-runtime.md`'s "Approved models, providers and evaluation floors" section and the six `phase-004/*.md` contracts, all moved to `Approved for Implementation` at version 0.2.0.
-- Ollama activated as a technology -- **done 2026-07-23.** `docs/RFC-005.md` v1.3.0 and `docs/adr/ADR-0012-ollama-local-inference.md`, satisfying RFC-005's pre-registered "AI-runtime phase specification and ADR review" gate.
+- Phase 3 exit gates complete, or an explicit repository-owner parallel-start authorization matching Phase 2's and Phase 3's own precedent -- **not yet granted.** Drafted for owner review in `docs/ROADMAP.md`'s Phase 4 status note and `PHASE-004-ai-runtime.md`'s "Dependency exit posture" section; unlike Phase 2's and Phase 3's exceptions, this one requires explicit sign-off before it can be treated as granted.
+- Phase 4 contracts approved for implementation -- **not yet done.** The four approval gates named in `docs/phases/PHASE-REVIEW.md:135` (approved local/remote models and providers, data-class egress matrix, evaluation floors, trace retention) have a proposed resolution in `PHASE-004-ai-runtime.md`'s "Approved models, providers and evaluation floors" section and the six `phase-004/*.md` contracts, all still at `Draft` pending repository-owner review.
+- Ollama activated as a technology -- **done 2026-07-23.** `docs/RFC-005.md` v1.3.0 and `docs/adr/ADR-0012-ollama-local-inference.md` satisfy RFC-005's pre-registered "AI-runtime phase specification and ADR review" gate (a documentation-review gate, narrower than and not equivalent to Phase 4 implementation authorization above).
 - Versioned evaluation dataset and promotion rubric established -- planned as `tests/fixtures/phase4_evaluation_attention_explain.py` (Task 5 of the implementation plan), not yet created.
 - Ethics/safety review of the tool-allowlist and prompt-injection mitigations -- planned as Task 4's dedicated adversarial test plus Task 6's security-scanning pass, not yet created.
 
@@ -27,7 +27,7 @@ Phase 4 design work is complete and contracts are Approved for Implementation; c
 
 | Task | Outcome | Status |
 |---|---|---|
-| 0 | Resolve open decisions and move contracts to Approved for Implementation | Done (this pass) |
+| 0 | Draft open decisions and propose contracts for Approved for Implementation | Design drafted; pending repository-owner review |
 | 1 | Model/provider registry and deterministic router | Not started |
 | 2 | Immutable prompt/tool versioning and structured-output validation | Not started |
 | 3 | Budgets, timeouts, cancellation and circuit breaker | Not started |

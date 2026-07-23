@@ -1,7 +1,7 @@
 ---
 id: PHASE-004-EVALUATION
 title: AI Evaluation Contract
-status: Approved for Implementation
+status: Draft
 version: 0.2.0
 owner: Lucky Jain
 ---

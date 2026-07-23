@@ -1,7 +1,7 @@
 ---
 id: PHASE-004
 title: AI Runtime
-status: Approved for Implementation
+status: Draft
 version: 0.3.0
 owner: Lucky Jain
 depends_on:
@@ -101,20 +101,20 @@ Adapter contracts; deterministic routing; budgets/timeouts/cancel; structured va
 - Zero open Critical, High or Medium findings.
 - Phase 5 receives a stable bounded invocation/tool contract.
 
-### Approved models, providers and evaluation floors (approved 2026-07-23)
+### Approved models, providers and evaluation floors (proposed 2026-07-23, pending repository-owner authorization)
 
-Resolving `docs/phases/PHASE-REVIEW.md:135`'s four named approval-gate items for this first activation, per `docs/superpowers/specs/2026-07-23-phase-4-ai-runtime-design.md` and `docs/adr/ADR-0012-ollama-local-inference.md`:
+Proposes a resolution to `docs/phases/PHASE-REVIEW.md:135`'s four named approval-gate items for this first activation, per `docs/superpowers/specs/2026-07-23-phase-4-ai-runtime-design.md` and `docs/adr/ADR-0012-ollama-local-inference.md`. This is a drafted recommendation, not yet an approved decision -- see "Dependency exit posture" below.
 
-- **Approved local/remote models and providers:** exactly one -- Ollama, `qwen2.5:1.5b-instruct-q4_K_M`, local only. No remote provider is approved in this activation.
-- **Data-class egress matrix:** four data classes (`public`, `internal`, `sensitive`, `restricted`), all local-only-eligible, zero remote-eligible.
-- **Evaluation floors:** `phase-004/EVALUATION-CONTRACT.md`'s table for `attention.explain_item` -- 100% schema validity, 100% grounding, 0 tolerated prohibited-fact occurrences, <20s p95 latency.
-- **Trace retention:** raw prompt/output retention off by default; redacted structured metadata retained; verbose trace retention is an explicit, time-bound, admin-only opt-in, never a default.
+- **Proposed local/remote models and providers:** exactly one -- Ollama, `qwen2.5:1.5b-instruct-q4_K_M`, local only. No remote provider is proposed for this activation.
+- **Proposed data-class egress matrix:** four data classes (`public`, `internal`, `sensitive`, `restricted`), all local-only-eligible, zero remote-eligible.
+- **Proposed evaluation floors:** `phase-004/EVALUATION-CONTRACT.md`'s table for `attention.explain_item` -- 100% schema validity, 100% grounding, 0 tolerated prohibited-fact occurrences, <20s p95 latency.
+- **Proposed trace retention:** raw prompt/output retention off by default; redacted structured metadata retained; verbose trace retention is an explicit, time-bound, admin-only opt-in, never a default.
 
-This resolution covers this first, deliberately narrow activation (one local model, no remote provider, two read-only tools, one evaluated task type). A later Phase 4 slice that adds a remote provider, a second model, or a mutating tool reopens the relevant part of this gate rather than inheriting it silently.
+This proposal covers only this first, deliberately narrow activation (one local model, no remote provider, two read-only tools, one evaluated task type). A later Phase 4 slice that adds a remote provider, a second model, or a mutating tool reopens the relevant part of this gate rather than inheriting it silently.
 
-## Dependency exit posture (approved 2026-07-23)
+## Dependency exit posture (proposed 2026-07-23, pending repository-owner authorization)
 
-Phase 4 design and contract-approval work proceeds now, in parallel with Phase 3's own still-open exit gate (the two-week dogfood window, `docs/runbooks/PHASE-3-DOGFOOD.md`, at 0/14 days recorded), under the same kind of parallel-start exception the repository owner granted Phase 2 and Phase 3 (`docs/ROADMAP.md`'s Phase 2 and Phase 3 status notes) -- not gated on Phase 3's dogfood closing first. This authorization covers proceeding with implementation of the first activation slice; it does not itself claim Phase 3 has exited, and Phase 4's own exit criteria above (including "zero open Critical, High or Medium findings" and the evaluation baseline) still apply in full.
+This document proposes that Phase 4 design and contract-approval work proceed in parallel with Phase 3's own still-open exit gate (the two-week dogfood window, `docs/runbooks/PHASE-3-DOGFOOD.md`, at 0/14 days recorded), under the same kind of parallel-start exception the repository owner explicitly granted Phase 2 and Phase 3 (`docs/ROADMAP.md`'s Phase 2 and Phase 3 status notes). Unlike Phase 2's and Phase 3's exceptions, this one has not yet been granted -- it requires the repository owner's explicit review and sign-off of this document's concrete decisions (model choice, routing rules, tool scope, budgets, evaluation floors, threat model) before this phase's status may move to Approved for Implementation and before any application code is written. It does not itself claim Phase 3 has exited, and Phase 4's own exit criteria above (including "zero open Critical, High or Medium findings" and the evaluation baseline) still apply in full once implementation begins.
 
 ## Rollback plan
 

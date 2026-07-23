@@ -1,7 +1,7 @@
 ---
 id: PHASE-004-MODEL-ROUTING
 title: Model Routing Contract
-status: Approved for Implementation
+status: Draft
 version: 0.2.0
 owner: Lucky Jain
 ---

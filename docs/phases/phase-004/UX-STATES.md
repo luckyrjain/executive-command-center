@@ -1,7 +1,7 @@
 ---
 id: PHASE-004-UX-STATES
 title: Phase 4 AI UX States
-status: Approved for Implementation
+status: Draft
 version: 0.2.0
 owner: Lucky Jain
 ---
