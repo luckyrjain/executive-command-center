@@ -12,6 +12,7 @@ from ecc.audit import rejected_mutation_audit_middleware
 from ecc.config import get_settings, validate_production_settings
 from ecc.database import engine
 from ecc.dev_bootstrap import router as dev_bootstrap_router
+from ecc.domains.ai_runtime.evaluation import router as ai_evaluations_router
 from ecc.domains.ai_runtime.prompts import router as ai_policy_activation_router
 from ecc.domains.ai_runtime.registry import router as ai_models_router
 from ecc.domains.ai_runtime.router import api_router as ai_policies_router
@@ -118,11 +119,14 @@ app.include_router(dashboard_briefs_router)
 # rather than a third router). Phase 4 Task 4 adds the run surface (POST
 # /ai/runs, GET /ai/runs/{id}, POST /ai/runs/{id}/cancel --
 # ecc.domains.ai_runtime.runtime, the bounded tool runtime and
-# orchestration loop). Evaluation endpoints remain a later task.
+# orchestration loop). Phase 4 Task 5 adds the evaluation surface (GET
+# /ai/evaluations, POST /ai/evaluations/runs, GET /ai/evaluations/runs/{id}
+# -- ecc.domains.ai_runtime.evaluation, the evaluation harness).
 app.include_router(ai_models_router)
 app.include_router(ai_policies_router)
 app.include_router(ai_policy_activation_router)
 app.include_router(ai_runs_router)
+app.include_router(ai_evaluations_router)
 app.middleware("http")(rejected_mutation_audit_middleware)
 # Pure-ASGI body size guard: registered via add_middleware (not the
 # "http" dispatch helper) so it can intercept the raw receive() channel and

@@ -358,6 +358,69 @@ def _store_idempotency(
     )
 
 
+# Task 5 addition: the exact set of gated prompt families -- design doc
+# Decision 9's promotion rule ("Promotion of prompt_versions/routing_
+# policies changes for this task always re-runs the full 20-example set
+# and requires the table above to pass in full before the new version can
+# become active") applies "specifically for the attention.explain_item
+# prompt" (Task 5's own scope), not to every prompt family this codebase
+# might ever register. `attention.explain_item.v1` is the family's stable
+# slug (Decision 3: the slug never changes across versions -- only the
+# integer `version` column does), the same literal migration
+# 0029_phase4_prompt_tool_versions.py seeds. `activate_tool_version`'s
+# path (kind == "tool") is never gated -- Task 5's scope is this one prompt
+# family only.
+_GATED_PROMPT_IDS = frozenset({"attention.explain_item.v1"})
+
+
+def _prompt_evaluation_floor_met(
+    session: Session, auth: AuthContext, *, prompt_id: str, version: int
+) -> bool:
+    """Design doc Decision 9 / `EVALUATION-CONTRACT.md`: before a gated
+    prompt version may become `active`, a `evaluation_runs` row for this
+    exact `(task_type, prompt_id, version)` triple, in the acting
+    administrator's own workspace, must already exist and must satisfy
+    `evaluation.check_promotion_floors`. Only ever called for names in
+    `_GATED_PROMPT_IDS` -- `activate_policy` below checks that first.
+
+    **Imported locally, not at module load time.** `evaluation.py` imports
+    `runtime.py` (to call `execute_run`), and `runtime.py` imports this
+    module (`from .prompts import get_active_prompt`) -- a module-level
+    `from .evaluation import ...` here would start importing `evaluation.py`
+    before this module finishes defining `get_active_prompt`, which
+    `runtime.py` (itself imported by `evaluation.py`) needs already defined.
+    Deferring the import to call time breaks that cycle safely: by the time
+    any HTTP request reaches `activate_policy`, every module in this
+    package has already finished importing (`ecc.main` imports all of
+    `prompts`/`registry`/`router`/`runtime`/`evaluation` at process start),
+    so the import below always succeeds and costs nothing beyond the first
+    call (Python caches the module).
+    """
+    from .evaluation import check_promotion_floors, get_latest_evaluation_run
+
+    task_type = _GATED_PROMPT_ID_TASK_TYPES.get(prompt_id)
+    if task_type is None:
+        return True  # not actually gated -- defensive, _GATED_PROMPT_IDS already filtered this.
+
+    latest = get_latest_evaluation_run(
+        session, auth, task_type=task_type, prompt_id=prompt_id, prompt_version=version
+    )
+    if latest is None:
+        return False
+    return check_promotion_floors(latest)
+
+
+# prompt_id -> task_type for every gated family (Task 5 scope: exactly
+# one). Not imported from `runtime.TASK_PORTS` to avoid the same
+# module-level circular import `_prompt_evaluation_floor_met`'s docstring
+# explains -- kept in sync by convention with `runtime.TASK_PORTS[
+# "attention.explain_item"].prompt_id`, mirroring this codebase's
+# established hash-duplication convention (`prompts.py`'s own `compute_
+# template_hash` docstring) for exactly this kind of "two modules, one
+# fact" situation.
+_GATED_PROMPT_ID_TASK_TYPES = {"attention.explain_item.v1": "attention.explain_item"}
+
+
 def _resolve_policy_kind(session: Session, name: str) -> Literal["prompt", "tool"] | None:
     """Which table `prompt_id_or_tool_name` names, checked against *any*
     status row (not just active) -- a caller activating a fresh `draft`
@@ -503,6 +566,24 @@ def activate_policy(
                 status_code=409,
                 detail={"code": "VERSION_CONFLICT", "current_active_version": current_version},
             )
+
+        if kind == "prompt" and prompt_id_or_tool_name in _GATED_PROMPT_IDS:
+            # Design doc Decision 9 / EVALUATION-CONTRACT.md: a gated
+            # prompt version may only become active if a passing
+            # evaluation_runs row already exists for this exact
+            # (prompt_id, version) pair -- activate_tool_version's path
+            # (kind == "tool") is never reached by this branch.
+            if not _prompt_evaluation_floor_met(
+                session, auth, prompt_id=prompt_id_or_tool_name, version=payload.version
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "EVALUATION_FLOORS_NOT_MET",
+                        "prompt_id": prompt_id_or_tool_name,
+                        "version": payload.version,
+                    },
+                )
 
         if kind == "tool":
             result = activate_tool_version(session, prompt_id_or_tool_name, payload.version)
