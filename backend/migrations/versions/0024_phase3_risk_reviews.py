@@ -44,8 +44,13 @@ def upgrade() -> None:
             name="ck_risk_reviews_outcome",
         ),
         sa.ForeignKeyConstraint(["workspace_id"], ["workspaces.id"], ondelete="CASCADE"),
+        # RESTRICT, not CASCADE: this table's own docstring says it is
+        # append-only review and escalation history -- deleting a risk must
+        # not silently delete that history out from under it (finding #14).
+        # A risk that still has review history must be archived, not
+        # hard-deleted, if that history is to be preserved.
         sa.ForeignKeyConstraint(
-            ["workspace_id", "risk_id"], ["risks.workspace_id", "risks.id"], ondelete="CASCADE"
+            ["workspace_id", "risk_id"], ["risks.workspace_id", "risks.id"], ondelete="RESTRICT"
         ),
         sa.ForeignKeyConstraint(
             ["workspace_id", "actor_id"], ["users.workspace_id", "users.id"], ondelete="RESTRICT"

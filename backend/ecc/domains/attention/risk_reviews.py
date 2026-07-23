@@ -145,7 +145,7 @@ def record_risk_review(
         risk = (
             session.execute(
                 text(
-                    "SELECT version, archived_at FROM risks "
+                    "SELECT version, archived_at, review_at FROM risks "
                     "WHERE workspace_id = :workspace_id AND id = :risk_id FOR UPDATE"
                 ),
                 {"workspace_id": auth.workspace_id, "risk_id": risk_id},
@@ -159,6 +159,22 @@ def record_risk_review(
             raise HTTPException(status_code=409, detail="RISK_ARCHIVED")
         if risk["version"] != payload.expected_version:
             raise HTTPException(status_code=409, detail="VERSION_CONFLICT")
+
+        # A review only changes the next-review cadence when it explicitly
+        # sets one, or when the outcome closes the risk out entirely (no
+        # further review is needed, so any existing schedule is cleared).
+        # Every other outcome (no_change/escalated/de_escalated/mitigated)
+        # recorded *without* an explicit next_review_at must leave the
+        # risk's existing review_at alone -- unconditionally nulling it
+        # here would silently cancel a previously scheduled review every
+        # time someone records an outcome that doesn't happen to set a new
+        # one (finding #2).
+        if payload.outcome == "closed":
+            next_review_at = None
+        elif payload.next_review_at is not None:
+            next_review_at = payload.next_review_at
+        else:
+            next_review_at = risk["review_at"]
 
         review_row = (
             session.execute(
@@ -203,7 +219,7 @@ def record_risk_review(
                 """
             ),
             {
-                "next_review_at": payload.next_review_at,
+                "next_review_at": next_review_at,
                 "actor_id": auth.user_id,
                 "now": now,
                 "workspace_id": auth.workspace_id,

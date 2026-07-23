@@ -147,6 +147,80 @@ def test_record_review_updates_risk_review_at_and_version_transactionally(
     assert review_count == 1
 
 
+def test_review_without_explicit_next_review_at_preserves_existing_cadence(
+    risk_review_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    """Finding #2: ``record_risk_review`` unconditionally set
+    ``risks.review_at`` to ``payload.next_review_at`` (``None`` when the
+    caller didn't set one), silently cancelling any existing scheduled
+    review every time an outcome was recorded without also setting a new
+    one. A review must only clear/reset the cadence when it explicitly
+    establishes a new one, or when the outcome closes the risk out
+    entirely -- every other outcome recorded without an explicit
+    ``next_review_at`` must leave the existing schedule alone.
+    """
+    client, _, _, token = risk_review_test_context
+    now = datetime.now(UTC)
+    existing_review_at = now + timedelta(days=14)
+    risk = _create_risk(client, token, "create-risk-preserve-cadence", review_at=existing_review_at)
+
+    review = client.post(
+        f"/api/v1/risks/{risk['id']}/review",
+        headers=_headers(token, "no-change-review-no-next"),
+        json={"expected_version": 1, "outcome": "no_change"},
+    )
+    assert review.status_code == 201, review.text
+
+    updated = client.get(f"/api/v1/risks/{risk['id']}")
+    assert updated.status_code == 200
+    assert datetime.fromisoformat(updated.json()["review_at"]) == existing_review_at
+
+
+def test_review_with_explicit_next_review_at_sets_new_cadence(
+    risk_review_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    client, _, _, token = risk_review_test_context
+    now = datetime.now(UTC)
+    risk = _create_risk(
+        client, token, "create-risk-new-cadence", review_at=now - timedelta(hours=1)
+    )
+
+    next_review = now + timedelta(days=30)
+    review = client.post(
+        f"/api/v1/risks/{risk['id']}/review",
+        headers=_headers(token, "mitigated-review-with-next"),
+        json={
+            "expected_version": 1,
+            "outcome": "mitigated",
+            "next_review_at": next_review.isoformat(),
+        },
+    )
+    assert review.status_code == 201, review.text
+
+    updated = client.get(f"/api/v1/risks/{risk['id']}")
+    assert datetime.fromisoformat(updated.json()["review_at"]) == next_review
+
+
+def test_review_outcome_closed_clears_review_at_even_without_explicit_next(
+    risk_review_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    client, _, _, token = risk_review_test_context
+    now = datetime.now(UTC)
+    risk = _create_risk(
+        client, token, "create-risk-close-clears", review_at=now + timedelta(days=5)
+    )
+
+    review = client.post(
+        f"/api/v1/risks/{risk['id']}/review",
+        headers=_headers(token, "close-clears-review-at"),
+        json={"expected_version": 1, "outcome": "closed"},
+    )
+    assert review.status_code == 201, review.text
+
+    updated = client.get(f"/api/v1/risks/{risk['id']}")
+    assert updated.json()["review_at"] is None
+
+
 def test_review_outcome_closed_also_closes_the_risk(
     risk_review_test_context: tuple[TestClient, UUID, UUID, str],
 ) -> None:
