@@ -68,6 +68,47 @@ class ReviewQueueList(BaseModel):
     items: list[ReviewQueueItem]
 
 
+def _evidence_state(session: Session, auth: AuthContext, evidence_id: UUID) -> str | None:
+    """Same lookup as ``claims.py``'s ``_evidence_state`` -- ``pkos_evidence``
+    scoped to the caller's workspace. Returns ``None`` when no such
+    evidence row exists in this workspace at all.
+    """
+    row = session.execute(
+        text(
+            "SELECT evidence_state FROM pkos_evidence"
+            " WHERE workspace_id = :workspace_id AND id = :evidence_id"
+        ),
+        {"workspace_id": auth.workspace_id, "evidence_id": evidence_id},
+    ).one_or_none()
+    return row[0] if row is not None else None
+
+
+def _validate_evidence_refs(session: Session, auth: AuthContext, evidence_refs: list[str]) -> None:
+    """API-SCHEMAS.md names ``evidence_unavailable`` as a required Phase 3
+    error code, but ``evidence_refs`` (migration 0024) was never validated
+    at all -- any string, including a reference to evidence that doesn't
+    exist or is no longer available, was accepted and persisted verbatim.
+
+    Migration 0024's own docstring documents ``evidence_refs`` as
+    deliberately free text -- "URLs, document names, evidence IDs quoted
+    as text" -- since risk reviews predate Phase 2's evidence model and
+    not every review cites Phase 2 evidence specifically. So only entries
+    that are themselves well-formed UUIDs are treated as a reference into
+    ``pkos_evidence`` and checked (mirroring ``claims.py``'s
+    ``_evidence_state`` check for the same ``EVIDENCE_UNAVAILABLE`` code);
+    a non-UUID ref (a URL, a document name) is free text by design and
+    passes through unchecked, exactly as migration 0024 intends.
+    """
+    for ref in evidence_refs:
+        try:
+            evidence_id = UUID(ref)
+        except ValueError:
+            continue
+        state = _evidence_state(session, auth, evidence_id)
+        if state is None or state != "available":
+            raise HTTPException(status_code=422, detail="EVIDENCE_UNAVAILABLE")
+
+
 def _lock_idempotency(session: Session, auth: AuthContext, key: str) -> None:
     lock_key = f"{auth.workspace_id}:{auth.user_id}:{key}"
     session.execute(
@@ -160,6 +201,8 @@ def record_risk_review(
             raise HTTPException(status_code=409, detail="RISK_ARCHIVED")
         if risk["version"] != payload.expected_version:
             raise HTTPException(status_code=409, detail="VERSION_CONFLICT")
+
+        _validate_evidence_refs(session, auth, payload.evidence_refs)
 
         # A review only changes the next-review cadence when it explicitly
         # sets one, or when the outcome closes the risk out entirely (no

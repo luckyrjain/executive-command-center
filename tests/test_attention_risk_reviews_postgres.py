@@ -76,6 +76,8 @@ def risk_review_test_context() -> Iterator[tuple[TestClient, UUID, UUID, str]]:
                 "idempotency_records",
                 "risk_reviews",
                 "risks",
+                "pkos_evidence",
+                "pkos_nodes",
                 "sessions",
                 "users",
             ):
@@ -95,6 +97,39 @@ def _headers(token: str, key: str | None = None) -> dict[str, str]:
     if key is not None:
         headers["Idempotency-Key"] = key
     return headers
+
+
+def _create_evidence(workspace_id: UUID) -> UUID:
+    """Seed a real, accessible `pkos_evidence` row (via a throwaway
+    `pkos_nodes` row, the FK's other half) for this workspace, matching
+    `test_knowledge_claims_postgres.py`'s `_create_evidence` pattern."""
+    node_id = uuid4()
+    evidence_id = uuid4()
+    now = datetime.now(UTC)
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO pkos_nodes (id, workspace_id, node_type, canonical_name, "
+                "attributes, created_at, updated_at) VALUES (:id, :workspace_id, 'person', "
+                "'Evidence Node', '{}'::jsonb, :now, :now)"
+            ),
+            {"id": node_id, "workspace_id": workspace_id, "now": now},
+        )
+        connection.execute(
+            text(
+                "INSERT INTO pkos_evidence (id, workspace_id, node_id, source_type, "
+                "source_ref, sha256, captured_at) VALUES (:id, :workspace_id, :node_id, "
+                "'manual', 'test-source-ref', :sha256, :captured_at)"
+            ),
+            {
+                "id": evidence_id,
+                "workspace_id": workspace_id,
+                "node_id": node_id,
+                "sha256": sha256(str(evidence_id).encode()).hexdigest(),
+                "captured_at": now,
+            },
+        )
+    return evidence_id
 
 
 def _create_risk(
@@ -145,6 +180,104 @@ def test_record_review_updates_risk_review_at_and_version_transactionally(
             {"workspace_id": workspace_id},
         ).scalar_one()
     assert review_count == 1
+
+
+# ---------------------------------------------------------------------------
+# Gap 5: EVIDENCE_UNAVAILABLE was documented (API-SCHEMAS.md) as a Phase 3
+# error code but never wired into risk_reviews.py's evidence_refs field.
+# Migration 0024 documents evidence_refs as deliberately free text (URLs,
+# doc names, or evidence IDs) -- so only UUID-shaped refs are checked
+# against pkos_evidence; non-UUID free text still passes through, matching
+# the existing (unmodified) test above that uses "doc://mitigation-plan".
+# ---------------------------------------------------------------------------
+
+
+def test_review_rejects_nonexistent_evidence_ref(
+    risk_review_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    client, _, _, token = risk_review_test_context
+    risk = _create_risk(client, token, "create-risk-bogus-evidence")
+
+    bogus_evidence_id = uuid4()
+    review = client.post(
+        f"/api/v1/risks/{risk['id']}/review",
+        headers=_headers(token, "bogus-evidence-review"),
+        json={
+            "expected_version": 1,
+            "outcome": "no_change",
+            "evidence_refs": [str(bogus_evidence_id)],
+        },
+    )
+    assert review.status_code == 422, review.text
+    assert review.json()["error"]["code"] == "EVIDENCE_UNAVAILABLE"
+
+
+def test_review_rejects_evidence_ref_that_is_not_available(
+    risk_review_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    client, workspace_id, _, token = risk_review_test_context
+    risk = _create_risk(client, token, "create-risk-unavailable-evidence")
+    evidence_id = _create_evidence(workspace_id)
+    with engine.begin() as connection:
+        connection.execute(
+            text("UPDATE pkos_evidence SET evidence_state = 'deleted' WHERE id = :id"),
+            {"id": evidence_id},
+        )
+
+    review = client.post(
+        f"/api/v1/risks/{risk['id']}/review",
+        headers=_headers(token, "unavailable-evidence-review"),
+        json={
+            "expected_version": 1,
+            "outcome": "no_change",
+            "evidence_refs": [str(evidence_id)],
+        },
+    )
+    assert review.status_code == 422, review.text
+    assert review.json()["error"]["code"] == "EVIDENCE_UNAVAILABLE"
+
+
+def test_review_accepts_real_accessible_evidence_ref(
+    risk_review_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    client, workspace_id, _, token = risk_review_test_context
+    risk = _create_risk(client, token, "create-risk-good-evidence")
+    evidence_id = _create_evidence(workspace_id)
+
+    review = client.post(
+        f"/api/v1/risks/{risk['id']}/review",
+        headers=_headers(token, "good-evidence-review"),
+        json={
+            "expected_version": 1,
+            "outcome": "no_change",
+            "evidence_refs": [str(evidence_id)],
+        },
+    )
+    assert review.status_code == 201, review.text
+    assert review.json()["evidence_refs"] == [str(evidence_id)]
+
+
+def test_review_free_text_evidence_ref_is_not_validated_as_a_uuid(
+    risk_review_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    """Migration 0024's documented design: a non-UUID ref (a URL, a
+    document name) is free text by intent, not a pkos_evidence reference,
+    so it must pass through unchecked even though it can never resolve to
+    a real evidence row."""
+    client, _, _, token = risk_review_test_context
+    risk = _create_risk(client, token, "create-risk-freetext-evidence")
+
+    review = client.post(
+        f"/api/v1/risks/{risk['id']}/review",
+        headers=_headers(token, "freetext-evidence-review"),
+        json={
+            "expected_version": 1,
+            "outcome": "no_change",
+            "evidence_refs": ["https://example.test/incident-report.pdf"],
+        },
+    )
+    assert review.status_code == 201, review.text
+    assert review.json()["evidence_refs"] == ["https://example.test/incident-report.pdf"]
 
 
 def test_review_without_explicit_next_review_at_preserves_existing_cadence(
