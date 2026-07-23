@@ -2,9 +2,9 @@
 id: PHASE-DOCUMENTATION-REVIEW
 title: Phase 0-9 Documentation Completeness Review
 status: Active
-version: 1.0.0
+version: 1.0.1
 owner: Lucky Jain
-updated: 2026-07-16
+updated: 2026-07-23
 ---
 
 # Phase 0–9 Documentation Completeness Review
@@ -101,6 +101,12 @@ Resolution: Phase 7 excludes diagnosis, treatment, regulated advice and transact
 Future phase specifications had qualitative exit summaries without explicit latency, propagation, determinism, recovery or integrity targets.
 
 Resolution: each phase now defines measurable non-functional and acceptance gates appropriate for Draft review. Final dataset sizes and operational SLOs must be frozen at approval.
+
+### F-07 — Phase 4 technology activation (Ollama)
+
+F-02 above deferred "Generative AI remains Phase 4" without resolving Ollama's own `RFC-005.md` activation gate ("AI-runtime phase specification and ADR review"), pre-registered since Phase 0.
+
+Resolution: satisfied 2026-07-23 by `docs/superpowers/specs/2026-07-23-phase-4-ai-runtime-design.md` (the AI-runtime phase specification's design pass) and `docs/adr/ADR-0012-ollama-local-inference.md`, activating Ollama and one local model (`qwen2.5:1.5b-instruct-q4_K_M`) via `docs/RFC-005.md` v1.3.0. No remote provider is activated by this resolution; see `PHASE-004-ai-runtime.md`'s "Approved models, providers and evaluation floors" section for the full scope of what this first activation covers.
 
 ## Cross-phase invariants
 

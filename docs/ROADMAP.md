@@ -4,7 +4,7 @@
 
 **Foundation:** Phase 0 baseline approved and implemented  
 **Current delivery:** [Phase 1 — Executive Dashboard MVP](phases/PHASE-001-executive-dashboard-mvp.md) — engineering delivery complete on `feature/phase-1-production-hardening` (Tasks 1-11 of `superpowers/plans/2026-07-16-phase-1-completion.md`, each independently reviewed with zero Critical or Important findings); Phase 1 exit remains open pending the seven-day daily-use validation gate and human change review — see [Phase 1 Implementation Status](phases/phase-001/IMPLEMENTATION-STATUS.md)  
-**Future specifications:** Phase 2 Approved for Implementation and in progress (parallel to Phase 1's open exit gates); Phase 3 Approved for Implementation and beginning (parallel-start exception granted, same as Phase 2's); Phases 4–9 published as Draft / Planned
+**Future specifications:** Phase 2 Approved for Implementation and in progress (parallel to Phase 1's open exit gates); Phase 3 Approved for Implementation and beginning (parallel-start exception granted, same as Phase 2's); Phase 4 contracts Approved for Implementation, design complete, implementation not yet started (parallel-start exception granted, same as Phase 2's and Phase 3's); Phases 5–9 published as Draft / Planned
 
 The [canonical phase index](phases/README.md) lists every primary specification and supporting contract. The [Phase 0–9 documentation review](phases/PHASE-REVIEW.md) records completeness findings and approval gates.
 
@@ -28,7 +28,7 @@ Phase 0 — Repository Foundation         [Implemented]
   -> Phase 1 — Executive Dashboard MVP [Engineering delivery complete; exit gates open]
   -> Phase 2 — Knowledge Platform      [Approved for Implementation; in progress, parallel to open Phase 1 exit gates]
   -> Phase 3 — Human Attention Engine  [Approved for Implementation; in progress, parallel-start exception granted]
-  -> Phase 4 — AI Runtime              [Draft]
+  -> Phase 4 — AI Runtime              [Approved for Implementation; design complete, implementation not started, parallel-start exception granted]
   -> Phase 5 — Automation              [Draft]
   -> Phase 6 — Engineering Workspace   [Draft]
   -> Phase 7 — Personal Intelligence   [Draft]
@@ -95,11 +95,14 @@ Implementation plan: [Phase 3 Human Attention Engine Implementation Plan](superp
 
 ## Phase 4 — AI Runtime
 
-**Status:** Draft / Planned.
+**Status:** Approved for Implementation; contracts moved from Draft after resolving Ollama activation and the first-activation design in `docs/superpowers/specs/2026-07-23-phase-4-ai-runtime-design.md` (local model: Ollama serving `qwen2.5:1.5b-instruct-q4_K_M`, no remote provider registered; deterministic routing algorithm; immutable prompt/tool versioning; Pydantic-based structured-output validation; two read-only first tools; concrete budget/timeout/circuit-breaker numbers; a 20-example first evaluation dataset for `attention.explain_item`). The four named approval gates (approved local/remote models and providers, data-class egress matrix, evaluation floors, trace retention) are resolved in `phase-004/EVALUATION-CONTRACT.md` and `PHASE-004-ai-runtime.md`'s "Approved models, providers and evaluation floors" section. Ollama's RFC-005 activation gate ("AI-runtime phase specification and ADR review") is satisfied by this design doc plus `docs/adr/ADR-0012-ollama-local-inference.md` and `docs/RFC-005.md` v1.3.0. Implementation begins by explicit repository-owner authorization to proceed in parallel with Phase 3's own open exit gate (the two-week dogfood window is still open) -- the same kind of exception Phase 2 and Phase 3 each received. This authorization covers design-and-contract approval and the start of implementation; it does not itself close Phase 3's dogfood gate.
 
-Local-first model routing, typed prompts/tools, structured output, budgets, safety, evaluation and deterministic degradation.
+Design work is complete; code implementation has not started -- see `phase-004/IMPLEMENTATION-STATUS.md`. This first activation is deliberately narrow: one local model, no remote provider, two read-only tools, one evaluated task type. Remote providers, additional models, mutating tools and further task types are explicitly deferred to later Phase 4 slices this design pass did not schedule.
 
-Specification: [PHASE-004](phases/PHASE-004-ai-runtime.md)
+Specification: [PHASE-004](phases/PHASE-004-ai-runtime.md)  
+Design doc: [Phase 4 AI Runtime Design](superpowers/specs/2026-07-23-phase-4-ai-runtime-design.md)  
+Implementation plan: [Phase 4 AI Runtime Implementation Plan](superpowers/plans/2026-07-23-phase-4-ai-runtime.md)  
+Technology activation: [RFC-005 v1.3.0](RFC-005.md), [ADR-0012](adr/ADR-0012-ollama-local-inference.md)
 
 ## Phase 5 — Automation
 
