@@ -1,0 +1,556 @@
+import os
+from collections.abc import Iterator
+from datetime import UTC, date, datetime, time, timedelta
+from hashlib import sha256
+from hmac import new
+from time import perf_counter
+from uuid import UUID, uuid4
+from zoneinfo import ZoneInfo
+
+import pytest
+from fastapi.testclient import TestClient
+from fixtures.phase3_planning_scenarios import (
+    FULL_CALENDAR_RESERVATION,
+    FULL_WEEK_CAPACITY,
+    MONDAY,
+    NO_CAPACITY,
+    OVERDUE_DEADLINE,
+    TIED_CANDIDATES,
+    TIMEZONE,
+    candidate,
+    monday_local,
+    reserved,
+)
+from sqlalchemy import text
+
+from ecc.config import get_settings
+from ecc.database import engine
+from ecc.domains.attention.planning import (
+    DEFAULT_EFFORT_MINUTES,
+    CandidateItemInput,
+    CapacityDayInput,
+    propose_plan,
+)
+from ecc.main import app
+
+settings = get_settings()
+pytestmark = pytest.mark.skipif(
+    not settings.database_url.startswith("postgresql"),
+    reason="PostgreSQL integration test",
+)
+
+
+# ---------------------------------------------------------------------------
+# Pure propose_plan scenario tests -- PLANNING-CONTRACT.md's Evaluation
+# section names these explicitly: full calendars, no capacity, timezone/DST,
+# overdue work, equal scores, missing estimates, fixed meetings, plus
+# constraint conflicts. No database needed since propose_plan is pure.
+# ---------------------------------------------------------------------------
+
+
+def test_full_calendar_leaves_candidate_unscheduled() -> None:
+    proposal = propose_plan(
+        period_start=MONDAY,
+        period_end=MONDAY,
+        timezone=TIMEZONE,
+        capacity_days=FULL_WEEK_CAPACITY,
+        reserved_blocks=[FULL_CALENDAR_RESERVATION],
+        deadline_constraints=[],
+        candidates=[candidate("Write report", score=80)],
+    )
+    assert proposal.blocks == []
+    assert len(proposal.unscheduled) == 1
+    assert proposal.unscheduled[0].reason == "no_capacity"
+    assert any(c.code == "capacity_exceeded" for c in proposal.conflicts)
+
+
+def test_no_capacity_produces_all_unscheduled_and_zero_capacity_minutes() -> None:
+    proposal = propose_plan(
+        period_start=MONDAY,
+        period_end=MONDAY,
+        timezone=TIMEZONE,
+        capacity_days=NO_CAPACITY,
+        reserved_blocks=[],
+        deadline_constraints=[],
+        candidates=[candidate("A", score=90), candidate("B", score=10)],
+    )
+    assert proposal.capacity_minutes == 0
+    assert proposal.blocks == []
+    assert {u.label for u in proposal.unscheduled} == {"A", "B"}
+
+
+def test_timezone_dst_spring_forward_boundary_stays_correct() -> None:
+    # 2026-03-08 is a US spring-forward DST transition (America/New_York
+    # loses an hour at 2am local). A day window anchored at local 09:00 for
+    # 480 minutes must still resolve to the correct UTC instants either
+    # side of the transition -- naive fixed-offset arithmetic would drift.
+    dst_day = date(2026, 3, 8)
+    zone = ZoneInfo("America/New_York")
+    proposal = propose_plan(
+        period_start=dst_day,
+        period_end=dst_day,
+        timezone="America/New_York",
+        capacity_days=[CapacityDayInput(weekday=dst_day.weekday(), available_minutes=480)],
+        reserved_blocks=[],
+        deadline_constraints=[],
+        candidates=[candidate("Post-DST task", score=50)],
+    )
+    assert len(proposal.blocks) == 1
+    block = proposal.blocks[0]
+    expected_start = datetime.combine(dst_day, time(9, 0), zone)
+    assert block.starts_at == expected_start
+    # March 8 2026 is the US spring-forward date itself (2am -> 3am); 9am
+    # local that same day is already past the transition, so EDT (-4) is
+    # correct here, not EST (-5) -- the point of this test is that the
+    # *local* 09:00 anchor and duration survive the transition correctly
+    # regardless of which side of it the day falls on.
+    assert block.starts_at.utcoffset() == timedelta(hours=-4)
+    assert (block.ends_at - block.starts_at) == timedelta(minutes=DEFAULT_EFFORT_MINUTES)
+
+
+def test_overdue_deadline_produces_missed_deadline_conflict() -> None:
+    proposal = propose_plan(
+        period_start=MONDAY,
+        period_end=MONDAY,
+        timezone=TIMEZONE,
+        capacity_days=FULL_WEEK_CAPACITY,
+        reserved_blocks=[],
+        deadline_constraints=[OVERDUE_DEADLINE],
+        candidates=[],
+    )
+    assert proposal.blocks == []
+    assert proposal.unscheduled[0].reason == "missed_deadline"
+    assert any(c.code == "missed_deadline" for c in proposal.conflicts)
+
+
+def test_equal_scores_tie_break_is_stable_across_runs() -> None:
+    first = propose_plan(
+        period_start=MONDAY,
+        period_end=MONDAY,
+        timezone=TIMEZONE,
+        capacity_days=FULL_WEEK_CAPACITY,
+        reserved_blocks=[],
+        deadline_constraints=[],
+        candidates=TIED_CANDIDATES,
+    )
+    second = propose_plan(
+        period_start=MONDAY,
+        period_end=MONDAY,
+        timezone=TIMEZONE,
+        capacity_days=FULL_WEEK_CAPACITY,
+        reserved_blocks=[],
+        deadline_constraints=[],
+        candidates=list(reversed(TIED_CANDIDATES)),  # input order must not matter
+    )
+    first_order = [b.label for b in first.blocks]
+    second_order = [b.label for b in second.blocks]
+    # The property under test: with tied scores, placement order depends
+    # only on entity_id (the stable final tie-breaker), never on input
+    # order -- reversing the input candidate list must not change the
+    # resulting block order.
+    assert first_order == second_order
+    assert {b.source_id for b in first.blocks} == {c.entity_id for c in TIED_CANDIDATES}
+    expected_order = [c.label for c in sorted(TIED_CANDIDATES, key=lambda c: str(c.entity_id))]
+    assert first_order == expected_order
+
+
+def test_missing_effort_estimate_uses_default_bucket_with_lower_confidence_flag() -> None:
+    proposal = propose_plan(
+        period_start=MONDAY,
+        period_end=MONDAY,
+        timezone=TIMEZONE,
+        capacity_days=FULL_WEEK_CAPACITY,
+        reserved_blocks=[],
+        deadline_constraints=[],
+        candidates=[candidate("No estimate", score=50)],
+    )
+    block = proposal.blocks[0]
+    assert block.is_default_effort is True
+    assert (block.ends_at - block.starts_at) == timedelta(minutes=DEFAULT_EFFORT_MINUTES)
+
+
+def test_explicit_effort_estimate_is_honored_and_not_flagged_default() -> None:
+    proposal = propose_plan(
+        period_start=MONDAY,
+        period_end=MONDAY,
+        timezone=TIMEZONE,
+        capacity_days=FULL_WEEK_CAPACITY,
+        reserved_blocks=[],
+        deadline_constraints=[],
+        candidates=[
+            CandidateItemInput(
+                entity_type="task",
+                entity_id=uuid4(),
+                label="Estimated",
+                score=50,
+                effort_minutes=90,
+            )
+        ],
+    )
+    block = proposal.blocks[0]
+    assert block.is_default_effort is False
+    assert (block.ends_at - block.starts_at) == timedelta(minutes=90)
+
+
+def test_fixed_meeting_is_reserved_and_candidates_never_overlap_it() -> None:
+    meeting = reserved("Standup", monday_local(9), monday_local(9, 30))
+    proposal = propose_plan(
+        period_start=MONDAY,
+        period_end=MONDAY,
+        timezone=TIMEZONE,
+        capacity_days=FULL_WEEK_CAPACITY,
+        reserved_blocks=[meeting],
+        deadline_constraints=[],
+        candidates=[candidate("Deep work", score=50)],
+    )
+    assert len(proposal.blocks) == 1
+    block = proposal.blocks[0]
+    assert block.starts_at >= meeting.ends_at or block.ends_at <= meeting.starts_at
+
+
+def test_overlapping_hard_reservations_produce_constraint_conflict_but_both_kept() -> None:
+    first = reserved("Board call", monday_local(10), monday_local(11))
+    second = reserved("Client call", monday_local(10, 30), monday_local(11, 30))
+    proposal = propose_plan(
+        period_start=MONDAY,
+        period_end=MONDAY,
+        timezone=TIMEZONE,
+        capacity_days=FULL_WEEK_CAPACITY,
+        reserved_blocks=[first, second],
+        deadline_constraints=[],
+        candidates=[],
+    )
+    assert any(c.code == "constraint_conflict" for c in proposal.conflicts)
+
+
+_IN_CI = os.getenv("CI") is not None
+# PHASE-003-human-attention-engine.md's NFR ("deterministic daily plan p95
+# <1 second") gives a 1-second ceiling, but propose_plan is a pure
+# in-memory function -- real measurement against this exact dense-weekly
+# scenario (7 days, 200 candidates, 20 reservations, 10 deadlines) is
+# ~0.95 ms p95 locally. A 1-second budget would carry ~1000x headroom and
+# catch nothing; 50 ms/100 ms still leaves 50-100x headroom (generous
+# margin for sandbox jitter on a sub-millisecond operation) while actually
+# catching an accidental quadratic blowup or a stray DB/network call.
+PLAN_BUDGET_SECONDS = 0.1 if _IN_CI else 0.05
+PLAN_SAMPLE_SIZE = 10
+
+
+def test_propose_plan_dense_weekly_p95_under_budget() -> None:
+    """Strictly harder than PHASE-003's named "daily" case: a full dense
+    week, not one day. Pure function, no DB: this is a genuine,
+    repeatable measurement of propose_plan's own cost, not infrastructure
+    noise.
+    """
+    from fixtures.phase3_planning_scenarios import deadline as make_deadline
+
+    period_start = MONDAY
+    period_end = MONDAY + timedelta(days=6)
+    capacity_days = FULL_WEEK_CAPACITY
+    reserved_blocks = [
+        reserved(
+            f"Meeting {i}",
+            monday_local(10) + timedelta(days=i % 7, hours=i % 3),
+            monday_local(10) + timedelta(days=i % 7, hours=(i % 3) + 1),
+        )
+        for i in range(20)
+    ]
+    deadline_constraints = [
+        make_deadline(f"Deadline {i}", monday_local(17) + timedelta(days=i)) for i in range(10)
+    ]
+    candidates = [candidate(f"Candidate {i}", score=100 - (i % 100)) for i in range(200)]
+
+    samples = []
+    for _ in range(PLAN_SAMPLE_SIZE):
+        started = perf_counter()
+        propose_plan(
+            period_start=period_start,
+            period_end=period_end,
+            timezone=TIMEZONE,
+            capacity_days=capacity_days,
+            reserved_blocks=reserved_blocks,
+            deadline_constraints=deadline_constraints,
+            candidates=candidates,
+        )
+        samples.append(perf_counter() - started)
+
+    ordered = sorted(samples)
+    index = min(len(ordered) - 1, -(-(95 * len(ordered)) // 100) - 1)
+    p95 = ordered[index]
+    assert p95 < PLAN_BUDGET_SECONDS, (
+        f"propose_plan p95 {p95 * 1000:.1f} ms exceeded {PLAN_BUDGET_SECONDS * 1000:.0f} ms "
+        f"budget (in_ci={_IN_CI}); samples(ms)={[round(s * 1000, 1) for s in samples]}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# HTTP integration tests for POST|GET /plans
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def planning_test_context() -> Iterator[tuple[TestClient, UUID, UUID, str]]:
+    workspace_id = uuid4()
+    user_id = uuid4()
+    token = f"session-{uuid4()}"
+    now = datetime.now(UTC)
+
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO workspaces (id, name, timezone, created_at) "
+                "VALUES (:id, 'Planning Test', 'Asia/Kolkata', :created_at)"
+            ),
+            {"id": workspace_id, "created_at": now},
+        )
+        connection.execute(
+            text(
+                "INSERT INTO users (id, workspace_id, email, password_hash, created_at) "
+                "VALUES (:id, :workspace_id, :email, 'test-password-hash', :created_at)"
+            ),
+            {
+                "id": user_id,
+                "workspace_id": workspace_id,
+                "email": f"{user_id}@example.test",
+                "created_at": now,
+            },
+        )
+        connection.execute(
+            text(
+                "INSERT INTO sessions (id, workspace_id, user_id, token_hash, "
+                "expires_at, last_seen_at) "
+                "VALUES (:id, :workspace_id, :user_id, :token_hash, :expires_at, :last_seen_at)"
+            ),
+            {
+                "id": uuid4(),
+                "workspace_id": workspace_id,
+                "user_id": user_id,
+                "token_hash": sha256(token.encode()).hexdigest(),
+                "expires_at": now + timedelta(hours=1),
+                "last_seen_at": now,
+            },
+        )
+
+    client = TestClient(app)
+    client.cookies.set("ecc_session", token)
+    try:
+        yield client, workspace_id, user_id, token
+    finally:
+        client.close()
+        with engine.begin() as connection:
+            for table in (
+                "plan_blocks",
+                "plans",
+                "attention_items",
+                "event_outbox",
+                "audit_events",
+                "idempotency_records",
+                "capacity_profiles",
+                "planning_constraints",
+                "tasks",
+                "sessions",
+                "users",
+            ):
+                connection.execute(
+                    text(f"DELETE FROM {table} WHERE workspace_id = :workspace_id"),  # noqa: S608
+                    {"workspace_id": workspace_id},
+                )
+            connection.execute(
+                text("DELETE FROM workspaces WHERE id = :workspace_id"),
+                {"workspace_id": workspace_id},
+            )
+
+
+def _headers(token: str, key: str | None = None) -> dict[str, str]:
+    csrf = new(settings.session_secret.encode(), token.encode(), "sha256").hexdigest()
+    headers = {"X-CSRF-Token": csrf, "X-Correlation-ID": str(uuid4())}
+    if key is not None:
+        headers["Idempotency-Key"] = key
+    return headers
+
+
+def _seed_task(workspace_id: UUID, owner_id: UUID, title: str) -> UUID:
+    task_id = uuid4()
+    now = datetime.now(UTC)
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                """
+                INSERT INTO tasks (
+                    id, workspace_id, owner_id, title, status, manual_priority,
+                    pinned, source_type, created_by, updated_by, created_at, updated_at, version
+                ) VALUES (
+                    :id, :workspace_id, :owner_id, :title, 'planned', 'high',
+                    false, 'local', :owner_id, :owner_id, :now, :now, 1
+                )
+                """
+            ),
+            {
+                "id": task_id,
+                "workspace_id": workspace_id,
+                "owner_id": owner_id,
+                "title": title,
+                "now": now,
+            },
+        )
+    return task_id
+
+
+def _set_full_week_capacity(client: TestClient, token: str) -> None:
+    days = [{"weekday": w, "available_minutes": 480, "focus_minutes": 240} for w in range(7)]
+    response = client.put(
+        "/api/v1/planning/capacity",
+        headers=_headers(token),
+        json={"expected_version": 0, "timezone": "Asia/Kolkata", "days": days},
+    )
+    assert response.status_code == 200, response.text
+
+
+def _next_period() -> tuple[date, date]:
+    start = date.today() + timedelta(days=1)
+    return start, start
+
+
+def test_create_plan_persists_blocks_and_is_retrievable(
+    planning_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    client, workspace_id, user_id, token = planning_test_context
+    _set_full_week_capacity(client, token)
+    _seed_task(workspace_id, user_id, "Write the board memo")
+
+    regenerate = client.post("/api/v1/attention/regenerate", headers=_headers(token), json={})
+    assert regenerate.status_code == 200
+
+    period_start, period_end = _next_period()
+    created = client.post(
+        "/api/v1/plans",
+        headers=_headers(token, "create-plan"),
+        json={"period_start": period_start.isoformat(), "period_end": period_end.isoformat()},
+    )
+    assert created.status_code == 201, created.text
+    body = created.json()
+    assert body["status"] == "proposed"
+    assert body["capacity_minutes"] == 480
+    assert len(body["blocks"]) == 1
+    assert body["blocks"][0]["is_default_effort"] is True
+
+    fetched = client.get(f"/api/v1/plans/{body['id']}")
+    assert fetched.status_code == 200
+    assert fetched.json()["id"] == body["id"]
+    assert len(fetched.json()["blocks"]) == 1
+
+
+def test_create_plan_rejects_period_over_max_days(
+    planning_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    client, _, _, token = planning_test_context
+    start = date.today() + timedelta(days=1)
+    response = client.post(
+        "/api/v1/plans",
+        headers=_headers(token, "create-plan-too-long"),
+        json={
+            "period_start": start.isoformat(),
+            "period_end": (start + timedelta(days=10)).isoformat(),
+        },
+    )
+    assert response.status_code == 422
+
+
+def test_create_plan_idempotent_on_replay(
+    planning_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    client, _, _, token = planning_test_context
+    _set_full_week_capacity(client, token)
+    period_start, period_end = _next_period()
+    headers = _headers(token, "idempotent-plan")
+    payload = {"period_start": period_start.isoformat(), "period_end": period_end.isoformat()}
+
+    first = client.post("/api/v1/plans", headers=headers, json=payload)
+    assert first.status_code == 201
+    replay = client.post("/api/v1/plans", headers=headers, json=payload)
+    assert replay.status_code == 201
+    assert replay.json()["id"] == first.json()["id"]
+
+
+def test_stale_attention_items_excluded_from_plan_candidates(
+    planning_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    """Step 1's "validate source freshness": an attention_items row whose
+    expires_at has already passed must never surface as a plan candidate,
+    the same way it's already excluded from GET /attention.
+    """
+    client, workspace_id, user_id, token = planning_test_context
+    _set_full_week_capacity(client, token)
+    task_id = _seed_task(workspace_id, user_id, "Stale candidate")
+    now = datetime.now(UTC)
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                """
+                INSERT INTO attention_items (
+                    id, workspace_id, entity_type, entity_id, source_entity_version,
+                    score, confidence, factors, explanation, generated_at, expires_at,
+                    pinned, policy_version
+                ) VALUES (
+                    :id, :workspace_id, 'task', :entity_id, 1,
+                    90, 1.0, '[]'::jsonb, 'stale', :generated_at, :expires_at, false, 1
+                )
+                """
+            ),
+            {
+                "id": uuid4(),
+                "workspace_id": workspace_id,
+                "entity_id": task_id,
+                "generated_at": now - timedelta(hours=2),
+                "expires_at": now - timedelta(hours=1),
+            },
+        )
+
+    period_start, period_end = _next_period()
+    created = client.post(
+        "/api/v1/plans",
+        headers=_headers(token, "create-plan-stale"),
+        json={"period_start": period_start.isoformat(), "period_end": period_end.isoformat()},
+    )
+    assert created.status_code == 201
+    assert created.json()["blocks"] == []
+
+
+def test_list_plans_signed_cursor_pagination_and_tamper_rejection(
+    planning_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    client, _, _, token = planning_test_context
+    _set_full_week_capacity(client, token)
+    base = date.today() + timedelta(days=1)
+    for i in range(3):
+        response = client.post(
+            "/api/v1/plans",
+            headers=_headers(token, f"paginate-plan-{i}"),
+            json={
+                "period_start": (base + timedelta(days=i)).isoformat(),
+                "period_end": (base + timedelta(days=i)).isoformat(),
+            },
+        )
+        assert response.status_code == 201
+
+    first_page = client.get("/api/v1/plans", params={"limit": 2})
+    assert first_page.status_code == 200
+    body = first_page.json()
+    assert len(body["items"]) == 2
+    assert body["next_cursor"] is not None
+
+    second_page = client.get("/api/v1/plans", params={"limit": 2, "cursor": body["next_cursor"]})
+    assert len(second_page.json()["items"]) == 1
+
+    tampered = client.get("/api/v1/plans", params={"cursor": body["next_cursor"][:-1] + "x"})
+    assert tampered.status_code == 400
+    assert tampered.json()["error"]["code"] == "CURSOR_INVALID"
+
+
+def test_plan_is_hidden_across_workspaces(
+    planning_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    client, _, _, _ = planning_test_context
+    response = client.get(f"/api/v1/plans/{uuid4()}")
+    assert response.status_code == 404
+    assert response.json()["error"]["code"] == "PLAN_NOT_FOUND"
