@@ -13,7 +13,7 @@ Phase 3 implementation has started on `feature/phase-3-attention-engine`. This d
 
 ## Planning artifacts
 
-`docs/superpowers/specs/2026-07-22-phase-3-human-attention-engine-design.md` (approach) and `docs/superpowers/plans/2026-07-22-phase-3-human-attention-engine.md` (task-by-task implementation plan, eight slices).
+`docs/superpowers/specs/2026-07-22-phase-3-human-attention-engine-design.md` (approach, including Open decision 1: reconcile the proposed `attention_items`/`attention_overrides` tables with the already-shipped Phase 1 `attention_items`/`attention.py` rather than fork them) and `docs/superpowers/plans/2026-07-22-phase-3-human-attention-engine.md` (task-by-task implementation plan, eight slices). Neither document authorizes implementation by itself — see Prerequisites below.
 
 ## Prerequisites
 
