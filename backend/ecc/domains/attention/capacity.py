@@ -59,15 +59,25 @@ class CapacityProfilePut(BaseModel):
         return self
 
 
-def _current_profile(session: Session, workspace_id: UUID, user_id: UUID) -> CapacityProfile:
+def _current_profile(
+    session: Session, workspace_id: UUID, user_id: UUID, *, for_update: bool = False
+) -> CapacityProfile:
+    # `for_update=True` locks the caller's existing rows (if any) for the
+    # rest of its transaction, closing a lost-update race: without it, two
+    # concurrent PUTs can both read the same version, both pass the
+    # version check, and the second write silently clobbers the first
+    # (finding #5). SELECT ... FOR UPDATE is a no-op (locks zero rows) the
+    # first time a user ever PUTs a profile, which is fine -- there is
+    # nothing to lose an update against yet.
+    lock_clause = " FOR UPDATE" if for_update else ""
     rows = (
         session.execute(
             text(
-                """
+                f"""
                 SELECT weekday, available_minutes, focus_minutes, timezone, version
                 FROM capacity_profiles
                 WHERE workspace_id = :workspace_id AND user_id = :user_id
-                ORDER BY weekday
+                ORDER BY weekday{lock_clause}
                 """
             ),
             {"workspace_id": workspace_id, "user_id": user_id},
@@ -113,7 +123,7 @@ def put_capacity_profile(
     """
     now = datetime.now(UTC)
     with session.begin():
-        current = _current_profile(session, auth.workspace_id, auth.user_id)
+        current = _current_profile(session, auth.workspace_id, auth.user_id, for_update=True)
         if current.version != payload.expected_version:
             raise HTTPException(
                 status_code=409,

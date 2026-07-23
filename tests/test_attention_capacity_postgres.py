@@ -79,6 +79,9 @@ def capacity_test_context() -> Iterator[tuple[TestClient, UUID, UUID, str]]:
             for table in (
                 "planning_constraints",
                 "capacity_profiles",
+                "event_outbox",
+                "audit_events",
+                "idempotency_records",
                 "sessions",
                 "users",
             ):
@@ -247,6 +250,79 @@ def test_planning_constraint_kinds_validate_hardness_and_priority(
         remaining = list_active_constraints(session, auth)
         assert preference.id not in {c.id for c in remaining}
         assert archive_constraint(session, auth, preference.id) is False
+
+
+# ---------------------------------------------------------------------------
+# Finding #10: planning_constraints.py had no route wired to it -- there was
+# no way for a user to actually create a hard constraint through the API.
+# ---------------------------------------------------------------------------
+
+
+def test_create_and_list_and_archive_constraint_via_http(
+    capacity_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    client, _, _, token = capacity_test_context
+    now = datetime.now(UTC)
+
+    created = client.post(
+        "/api/v1/planning/constraints",
+        headers={**_headers(token), "Idempotency-Key": "create-constraint"},
+        json={
+            "kind": "fixed_time",
+            "label": "Board meeting",
+            "starts_at": (now + timedelta(days=1)).isoformat(),
+            "ends_at": (now + timedelta(days=1, hours=1)).isoformat(),
+            "hardness": "hard",
+            "priority": 90,
+        },
+    )
+    assert created.status_code == 201, created.text
+    body = created.json()
+    assert body["kind"] == "fixed_time"
+    assert body["hardness"] == "hard"
+    assert body["archived_at"] is None
+
+    listed = client.get("/api/v1/planning/constraints")
+    assert listed.status_code == 200
+    assert [c["id"] for c in listed.json()["items"]] == [body["id"]]
+
+    archived = client.post(
+        f"/api/v1/planning/constraints/{body['id']}/archive", headers=_headers(token)
+    )
+    assert archived.status_code == 200
+    assert archived.json()["archived_at"] is not None
+
+    listed_after = client.get("/api/v1/planning/constraints")
+    assert listed_after.json()["items"] == []
+
+
+def test_create_constraint_idempotent_on_replay(
+    capacity_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    client, _, _, token = capacity_test_context
+    headers = {**_headers(token), "Idempotency-Key": "same-constraint-key"}
+    payload = {
+        "kind": "preference",
+        "label": "No meetings before 10am",
+        "hardness": "soft",
+        "priority": 10,
+    }
+    first = client.post("/api/v1/planning/constraints", headers=headers, json=payload)
+    assert first.status_code == 201
+    second = client.post("/api/v1/planning/constraints", headers=headers, json=payload)
+    assert second.status_code == 201
+    assert second.json()["id"] == first.json()["id"]
+
+
+def test_archive_constraint_rejects_unknown_id(
+    capacity_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    client, _, _, token = capacity_test_context
+    response = client.post(
+        f"/api/v1/planning/constraints/{uuid4()}/archive", headers=_headers(token)
+    )
+    assert response.status_code == 404
+    assert response.json()["error"]["code"] == "PLANNING_CONSTRAINT_NOT_FOUND"
 
 
 def test_fixed_time_constraint_requires_start_and_end() -> None:
