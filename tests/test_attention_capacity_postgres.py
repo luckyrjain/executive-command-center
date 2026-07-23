@@ -374,6 +374,46 @@ def test_create_and_list_and_archive_constraint_via_http(
     assert listed_after.json()["items"] == []
 
 
+def test_archive_constraint_is_idempotent(
+    capacity_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    """Gap 1: archiving an already-archived constraint must return 200 with
+    the current (already-archived) state, not 404 -- mirroring waiting.py's
+    ``_terminate`` idempotent-retry convention. Only a truly unknown id
+    (covered by test_archive_constraint_rejects_unknown_id) should 404."""
+    client, _, _, token = capacity_test_context
+    now = datetime.now(UTC)
+
+    created = client.post(
+        "/api/v1/planning/constraints",
+        headers={**_headers(token), "Idempotency-Key": "archive-twice-constraint"},
+        json={
+            "kind": "deadline",
+            "label": "File the report",
+            "ends_at": (now + timedelta(days=2)).isoformat(),
+            "hardness": "hard",
+            "priority": 50,
+        },
+    )
+    assert created.status_code == 201, created.text
+    constraint_id = created.json()["id"]
+
+    first_archive = client.post(
+        f"/api/v1/planning/constraints/{constraint_id}/archive", headers=_headers(token)
+    )
+    assert first_archive.status_code == 200
+    first_archived_at = first_archive.json()["archived_at"]
+    assert first_archived_at is not None
+
+    second_archive = client.post(
+        f"/api/v1/planning/constraints/{constraint_id}/archive", headers=_headers(token)
+    )
+    assert second_archive.status_code == 200, second_archive.text
+    body = second_archive.json()
+    assert body["id"] == constraint_id
+    assert body["archived_at"] == first_archived_at
+
+
 def test_create_constraint_idempotent_on_replay(
     capacity_test_context: tuple[TestClient, UUID, UUID, str],
 ) -> None:

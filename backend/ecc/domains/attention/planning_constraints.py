@@ -354,8 +354,34 @@ def archive_constraint_endpoint(
     session: SessionDep,
     _csrf: CsrfDep,
 ) -> PlanningConstraint:
+    """Idempotent, mirroring waiting.py's ``_terminate`` pattern: read the
+    current row first (without the ``archived_at IS NULL`` filter) so a
+    genuinely-missing row (404) can be told apart from a row that's already
+    archived (200, no-op) -- a retried archive call must not 404 just
+    because the first call already succeeded.
+    """
     now = datetime.now(UTC)
     with session.begin():
+        current = (
+            session.execute(
+                text(
+                    f"SELECT {_FIELDS} FROM planning_constraints "
+                    "WHERE workspace_id = :workspace_id AND user_id = :user_id "
+                    "AND id = :id FOR UPDATE"
+                ),
+                {
+                    "workspace_id": auth.workspace_id,
+                    "user_id": auth.user_id,
+                    "id": constraint_id,
+                },
+            )
+            .mappings()
+            .one_or_none()
+        )
+        if current is None:
+            raise HTTPException(status_code=404, detail="PLANNING_CONSTRAINT_NOT_FOUND")
+        if current["archived_at"] is not None:
+            return PlanningConstraint.model_validate(dict(current))
         if not archive_constraint(session, auth, constraint_id):
             raise HTTPException(status_code=404, detail="PLANNING_CONSTRAINT_NOT_FOUND")
         row = (
