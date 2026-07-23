@@ -97,6 +97,8 @@ Added incrementally, one entry per delivery slice, alongside the code that emits
 | `waiting_link.cancelled.v1` | Executive Intelligence | waiting_link_id, version |
 | `risk_review.recorded.v1` | Executive Intelligence | risk_id, review_id |
 | `plan.proposed.v1` | Executive Intelligence | plan_id |
+| `plan.accepted.v1` | Executive Intelligence | plan_id, version |
+| `plan.superseded.v1` | Executive Intelligence | plan_id, version |
 
 ## Recommendation publication rule
 

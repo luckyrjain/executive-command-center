@@ -18,6 +18,7 @@ configurable start time is deferred until a real user need for it appears,
 consistent with this codebase's "no speculative field" discipline.
 """
 
+
 from base64 import urlsafe_b64decode, urlsafe_b64encode
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta
@@ -29,7 +30,7 @@ from uuid import UUID, uuid4
 from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
-from pydantic import BaseModel, ConfigDict, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
@@ -340,7 +341,8 @@ _MAX_PERIOD_DAYS = 7
 
 _PLAN_FIELDS = """
     id, period_start, period_end, status, policy_version, capacity_minutes,
-    conflicts, unscheduled, superseded_by, accepted_at, created_at, updated_at, version
+    source_versions, conflicts, unscheduled, superseded_by, accepted_at,
+    created_at, updated_at, version
 """
 _BLOCK_FIELDS = """
     id, source_type, source_id, starts_at, ends_at, status, rationale, is_default_effort
@@ -358,6 +360,16 @@ class PlanBlockResponse(BaseModel):
     is_default_effort: bool
 
 
+DiffChange = Literal["added", "removed", "moved", "unchanged", "newly_conflicted"]
+
+
+class PlanDiffEntry(BaseModel):
+    source_type: BlockSourceType
+    source_id: UUID | None
+    label: str
+    change: DiffChange
+
+
 class Plan(BaseModel):
     id: UUID
     period_start: date
@@ -373,11 +385,35 @@ class Plan(BaseModel):
     updated_at: datetime
     version: int
     blocks: list[PlanBlockResponse]
+    diff: list[PlanDiffEntry] | None = None
 
 
 class PlanList(BaseModel):
     items: list[Plan]
     next_cursor: str | None = None
+
+
+class PlanAccept(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    expected_version: int = Field(ge=1)
+
+
+class BlockMove(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    expected_version: int = Field(ge=1)
+    starts_at: datetime
+    ends_at: datetime
+
+    @model_validator(mode="after")
+    def _validate_range(self) -> BlockMove:
+        if self.ends_at <= self.starts_at:
+            raise ValueError("ends_at must be after starts_at")
+        return self
+
+
+class BlockRemove(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    expected_version: int = Field(ge=1)
 
 
 class PlanCreate(BaseModel):
@@ -575,6 +611,78 @@ def _row_to_plan(session: Session, auth: AuthContext, row: dict[str, Any]) -> Pl
     )
 
 
+def _source_fingerprint(
+    candidates: list[CandidateItemInput],
+    reserved_blocks: list[ReservedBlockInput],
+    deadline_constraints: list[DeadlineConstraintInput],
+    capacity_days: list[CapacityDayInput],
+) -> dict[str, str]:
+    """A cheap, order-independent fingerprint of everything propose_plan
+    read, stored on the plan as ``source_versions`` so a later accept or
+    replan can detect "source changes mark a proposal stale"
+    (PLANNING-CONTRACT.md's Replanning section) without persisting full
+    copies of each input -- just a hash per input category.
+    """
+    candidate_sig = sorted(
+        f"{c.entity_type}:{c.entity_id}:{c.score}:{c.due_at}" for c in candidates
+    )
+    reservation_sig = sorted(
+        f"{r.source_type}:{r.source_id}:{r.starts_at}:{r.ends_at}" for r in reserved_blocks
+    )
+    deadline_sig = sorted(f"{d.source_id}:{d.due_at}:{d.priority}" for d in deadline_constraints)
+    capacity_sig = sorted(f"{c.weekday}:{c.available_minutes}" for c in capacity_days)
+    return {
+        "candidates": sha256("|".join(candidate_sig).encode()).hexdigest(),
+        "reservations": sha256("|".join(reservation_sig).encode()).hexdigest(),
+        "deadlines": sha256("|".join(deadline_sig).encode()).hexdigest(),
+        "capacity": sha256("|".join(capacity_sig).encode()).hexdigest(),
+    }
+
+
+@dataclass
+class _GeneratedProposal:
+    proposal: PlanProposal
+    fingerprint: dict[str, str]
+
+
+def _generate_proposal(
+    session: Session, auth: AuthContext, period_start: date, period_end: date, now: datetime
+) -> _GeneratedProposal:
+    zone = ZoneInfo(auth.timezone)
+    period_start_dt = datetime.combine(period_start, time.min, zone)
+    period_end_dt = datetime.combine(period_end + timedelta(days=1), time.min, zone)
+
+    capacity_days = _fetch_capacity_days(session, auth)
+    reserved_blocks = _fetch_reserved_blocks(session, auth, period_start_dt, period_end_dt)
+    deadline_constraints = _fetch_deadline_constraints(session, auth, period_end_dt)
+    candidates = _fetch_candidates(session, auth, now)
+
+    proposal = propose_plan(
+        period_start=period_start,
+        period_end=period_end,
+        timezone=auth.timezone,
+        capacity_days=capacity_days,
+        reserved_blocks=reserved_blocks,
+        deadline_constraints=deadline_constraints,
+        candidates=candidates,
+    )
+    fingerprint = _source_fingerprint(
+        candidates, reserved_blocks, deadline_constraints, capacity_days
+    )
+    return _GeneratedProposal(proposal=proposal, fingerprint=fingerprint)
+
+
+def _is_stale(session: Session, auth: AuthContext, plan_row: dict[str, Any]) -> bool:
+    stored = plan_row.get("source_versions") or {}
+    if not isinstance(stored, dict) or "candidates" not in stored:
+        return False  # older/placeholder snapshot shape: nothing to compare against.
+    now = datetime.now(UTC)
+    current = _generate_proposal(
+        session, auth, plan_row["period_start"], plan_row["period_end"], now
+    )
+    return current.fingerprint != stored
+
+
 @router.post("", response_model=Plan, status_code=status.HTTP_201_CREATED)
 def create_plan(
     payload: PlanCreate,
@@ -593,24 +701,8 @@ def create_plan(
         if cached is not None:
             return cached
 
-        zone = ZoneInfo(auth.timezone)
-        period_start_dt = datetime.combine(payload.period_start, time.min, zone)
-        period_end_dt = datetime.combine(payload.period_end + timedelta(days=1), time.min, zone)
-
-        capacity_days = _fetch_capacity_days(session, auth)
-        reserved_blocks = _fetch_reserved_blocks(session, auth, period_start_dt, period_end_dt)
-        deadline_constraints = _fetch_deadline_constraints(session, auth, period_end_dt)
-        candidates = _fetch_candidates(session, auth, now)
-
-        proposal = propose_plan(
-            period_start=payload.period_start,
-            period_end=payload.period_end,
-            timezone=auth.timezone,
-            capacity_days=capacity_days,
-            reserved_blocks=reserved_blocks,
-            deadline_constraints=deadline_constraints,
-            candidates=candidates,
-        )
+        generated = _generate_proposal(session, auth, payload.period_start, payload.period_end, now)
+        proposal = generated.proposal
 
         # Policy version is a plain snapshot for now (Task 1's policy v1);
         # a real join to the workspace's active policy version is a Task 1
@@ -638,7 +730,7 @@ def create_plan(
                     "period_start": payload.period_start,
                     "period_end": payload.period_end,
                     "capacity_minutes": proposal.capacity_minutes,
-                    "source_versions": dumps({"generated_at": now.isoformat()}),
+                    "source_versions": dumps(generated.fingerprint),
                     "conflicts": dumps(
                         [
                             {
@@ -865,3 +957,678 @@ def get_plan(plan_id: UUID, auth: AuthDep, session: SessionDep) -> Plan:
     if row is None:
         raise HTTPException(status_code=404, detail="PLAN_NOT_FOUND")
     return _row_to_plan(session, auth, dict(row))
+
+
+# --------------------------------------------------------------------------
+# Task 6: acceptance, manual retirement, replan diff, block editing.
+# plan_blocks carries no version of its own (see migration 0026's module
+# docstring) -- moving/removing a block bumps the *plan's* version in
+# place; replanning instead creates a brand-new plan row, superseding the
+# old one, mirroring waiting_links'/knowledge_claims' supersede pattern.
+# --------------------------------------------------------------------------
+
+
+def _write_plan_event(
+    session: Session,
+    auth: AuthContext,
+    request: Request,
+    event_type: str,
+    plan_id: UUID,
+    version: int,
+    now: datetime,
+    *,
+    emit_outbox: bool = True,
+) -> None:
+    """``emit_outbox=False`` for block move/remove: those are audit-only,
+    matching attention.py's dismiss/defer/restore precedent (audit_events
+    written, no event_outbox row, no catalog entry) -- Task 6's plan only
+    names ``plan.accepted.v1``/``plan.superseded.v1`` as new catalog
+    events, not a block-level one.
+    """
+    request_id, correlation_id = _request_ids(request)
+    try:
+        session.execute(
+            text(
+                """
+                INSERT INTO audit_events (
+                    id, workspace_id, event_type, aggregate_type, aggregate_id,
+                    aggregate_version, actor_id, request_id, correlation_id,
+                    changed_fields, authorization_result, source, metadata, occurred_at
+                ) VALUES (
+                    :id, :workspace_id, :event_type, 'plan', :aggregate_id,
+                    :aggregate_version, :actor_id, :request_id, :correlation_id,
+                    ARRAY['*'], 'allowed', 'user', '{}'::jsonb, :occurred_at
+                )
+                """
+            ),
+            {
+                "id": uuid4(),
+                "workspace_id": auth.workspace_id,
+                "event_type": event_type,
+                "aggregate_id": plan_id,
+                "aggregate_version": version,
+                "actor_id": auth.user_id,
+                "request_id": request_id,
+                "correlation_id": correlation_id,
+                "occurred_at": now,
+            },
+        )
+        if not emit_outbox:
+            queue_lifecycle_event(session, "plan", event_type, "allowed")
+            return
+        session.execute(
+            text(
+                """
+                INSERT INTO event_outbox (
+                    event_id, workspace_id, event_type, event_version,
+                    correlation_id, payload, occurred_at, attempt_count
+                ) VALUES (
+                    :event_id, :workspace_id, :event_type_v1, 1,
+                    :correlation_id, CAST(:payload AS jsonb), :occurred_at, 0
+                )
+                """
+            ),
+            {
+                "event_id": uuid4(),
+                "workspace_id": auth.workspace_id,
+                "event_type_v1": f"{event_type}.v1",
+                "correlation_id": correlation_id,
+                "payload": dumps({"plan_id": str(plan_id), "version": version}),
+                "occurred_at": now,
+            },
+        )
+    except SQLAlchemyError:
+        record_audit_outbox_failure("planning")
+        raise
+    queue_lifecycle_event(session, "plan", event_type, "allowed")
+
+
+def _get_plan_for_update(
+    session: Session, auth: AuthContext, plan_id: UUID
+) -> dict[str, Any] | None:
+    row = (
+        session.execute(
+            text(
+                f"SELECT {_PLAN_FIELDS} FROM plans "
+                "WHERE workspace_id = :workspace_id AND id = :plan_id FOR UPDATE"
+            ),
+            {"workspace_id": auth.workspace_id, "plan_id": plan_id},
+        )
+        .mappings()
+        .one_or_none()
+    )
+    return dict(row) if row is not None else None
+
+
+@router.post("/{plan_id}/accept", response_model=Plan)
+def accept_plan(
+    plan_id: UUID,
+    payload: PlanAccept,
+    request: Request,
+    auth: AuthDep,
+    session: SessionDep,
+    _csrf: CsrfDep,
+    idempotency_key: IdempotencyHeader,
+) -> Plan:
+    """Explicit, idempotent, audited human confirmation. Never writes an
+    external calendar (this codebase has no such integration to write to
+    in the first place -- acceptance only updates ECC's own planning
+    state, per PLANNING-CONTRACT.md's Proposal and acceptance section).
+    """
+    request_hash = _request_hash(payload, f"accept:{plan_id}")
+    now = datetime.now(UTC)
+    with session.begin():
+        _lock_idempotency(session, auth, idempotency_key)
+        cached = _load_cached(session, auth, idempotency_key, request_hash)
+        if cached is not None:
+            return cached
+
+        current = _get_plan_for_update(session, auth, plan_id)
+        if current is None:
+            raise HTTPException(status_code=404, detail="PLAN_NOT_FOUND")
+        if current["version"] != payload.expected_version:
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "VERSION_CONFLICT", "current_version": current["version"]},
+            )
+        if current["status"] != "proposed":
+            raise HTTPException(status_code=409, detail="PLAN_NOT_PROPOSED")
+        if _is_stale(session, auth, current):
+            raise HTTPException(status_code=409, detail="STALE_PLAN")
+
+        row = (
+            session.execute(
+                text(
+                    f"""
+                    UPDATE plans SET status = 'accepted', accepted_at = :now,
+                        updated_by = :actor_id, updated_at = :now, version = version + 1
+                    WHERE workspace_id = :workspace_id AND id = :plan_id
+                    RETURNING {_PLAN_FIELDS}
+                    """
+                ),
+                {
+                    "now": now,
+                    "actor_id": auth.user_id,
+                    "workspace_id": auth.workspace_id,
+                    "plan_id": plan_id,
+                },
+            )
+            .mappings()
+            .one()
+        )
+        session.execute(
+            text(
+                "UPDATE plan_blocks SET status = 'accepted', updated_at = :now "
+                "WHERE workspace_id = :workspace_id AND plan_id = :plan_id"
+            ),
+            {"now": now, "workspace_id": auth.workspace_id, "plan_id": plan_id},
+        )
+        response = _row_to_plan(session, auth, dict(row))
+        _write_plan_event(session, auth, request, "plan.accepted", plan_id, row["version"], now)
+        _store_idempotent_plan(session, auth, idempotency_key, request_hash, response, now)
+        return response
+
+
+@router.post("/{plan_id}/supersede", response_model=Plan)
+def supersede_plan(
+    plan_id: UUID,
+    payload: PlanAccept,
+    request: Request,
+    auth: AuthDep,
+    session: SessionDep,
+    _csrf: CsrfDep,
+    idempotency_key: IdempotencyHeader,
+) -> Plan:
+    """Manual retirement with no replacement (distinct from ``/propose``,
+    which supersedes *and* creates a new proposal in the same call)."""
+    request_hash = _request_hash(payload, f"supersede:{plan_id}")
+    now = datetime.now(UTC)
+    with session.begin():
+        _lock_idempotency(session, auth, idempotency_key)
+        cached = _load_cached(session, auth, idempotency_key, request_hash)
+        if cached is not None:
+            return cached
+
+        current = _get_plan_for_update(session, auth, plan_id)
+        if current is None:
+            raise HTTPException(status_code=404, detail="PLAN_NOT_FOUND")
+        if current["version"] != payload.expected_version:
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "VERSION_CONFLICT", "current_version": current["version"]},
+            )
+        if current["status"] not in ("proposed", "accepted"):
+            raise HTTPException(status_code=409, detail="PLAN_NOT_ACTIVE")
+
+        row = (
+            session.execute(
+                text(
+                    f"""
+                    UPDATE plans SET status = 'superseded',
+                        updated_by = :actor_id, updated_at = :now, version = version + 1
+                    WHERE workspace_id = :workspace_id AND id = :plan_id
+                    RETURNING {_PLAN_FIELDS}
+                    """
+                ),
+                {
+                    "now": now,
+                    "actor_id": auth.user_id,
+                    "workspace_id": auth.workspace_id,
+                    "plan_id": plan_id,
+                },
+            )
+            .mappings()
+            .one()
+        )
+        response = _row_to_plan(session, auth, dict(row))
+        _write_plan_event(session, auth, request, "plan.superseded", plan_id, row["version"], now)
+        _store_idempotent_plan(session, auth, idempotency_key, request_hash, response, now)
+        return response
+
+
+def _diff_blocks(
+    old_blocks: list[dict[str, Any]],
+    new_blocks: list[PlanBlockOutput],
+    new_unscheduled: list[UnscheduledOutput],
+) -> list[PlanDiffEntry]:
+    """Plain per-block-id comparison, no new dependency (per Task 6's plan:
+    "replan and the diff computation... no new dependency")."""
+
+    def key(source_type: str, source_id: UUID | None) -> tuple[str, str]:
+        return source_type, str(source_id)
+
+    old_by_key = {key(b["source_type"], b["source_id"]): b for b in old_blocks}
+    new_by_key = {key(b.source_type, b.source_id): b for b in new_blocks}
+    newly_conflicted_keys = {
+        key(u.source_type, u.source_id)
+        for u in new_unscheduled
+        if key(u.source_type, u.source_id) in old_by_key
+    }
+
+    entries: list[PlanDiffEntry] = []
+    for k, old_block in old_by_key.items():
+        if k in newly_conflicted_keys:
+            entries.append(
+                PlanDiffEntry(
+                    source_type=old_block["source_type"],
+                    source_id=old_block["source_id"],
+                    label=old_block.get("rationale", ""),
+                    change="newly_conflicted",
+                )
+            )
+        elif k not in new_by_key:
+            entries.append(
+                PlanDiffEntry(
+                    source_type=old_block["source_type"],
+                    source_id=old_block["source_id"],
+                    label=old_block.get("rationale", ""),
+                    change="removed",
+                )
+            )
+        else:
+            new_block = new_by_key[k]
+            moved = (
+                old_block["starts_at"] != new_block.starts_at
+                or old_block["ends_at"] != new_block.ends_at
+            )
+            entries.append(
+                PlanDiffEntry(
+                    source_type=new_block.source_type,
+                    source_id=new_block.source_id,
+                    label=new_block.label,
+                    change="moved" if moved else "unchanged",
+                )
+            )
+    for k, new_block in new_by_key.items():
+        if k not in old_by_key:
+            entries.append(
+                PlanDiffEntry(
+                    source_type=new_block.source_type,
+                    source_id=new_block.source_id,
+                    label=new_block.label,
+                    change="added",
+                )
+            )
+    return entries
+
+
+@router.post("/{plan_id}/propose", response_model=Plan, status_code=status.HTTP_201_CREATED)
+def replan(
+    plan_id: UUID,
+    payload: PlanAccept,
+    request: Request,
+    auth: AuthDep,
+    session: SessionDep,
+    _csrf: CsrfDep,
+    idempotency_key: IdempotencyHeader,
+) -> Plan:
+    """Replanning: source changes mark a proposal stale; this creates a
+    *new* proposal over the same period and supersedes the old one, never
+    silently rewriting it (PLANNING-CONTRACT.md's Replanning section) --
+    unlike block move/remove, which edit the same plan in place.
+    """
+    request_hash = _request_hash(payload, f"propose:{plan_id}")
+    now = datetime.now(UTC)
+    new_plan_id = uuid4()
+    with session.begin():
+        _lock_idempotency(session, auth, idempotency_key)
+        cached = _load_cached(session, auth, idempotency_key, request_hash)
+        if cached is not None:
+            return cached
+
+        old = _get_plan_for_update(session, auth, plan_id)
+        if old is None:
+            raise HTTPException(status_code=404, detail="PLAN_NOT_FOUND")
+        if old["version"] != payload.expected_version:
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "VERSION_CONFLICT", "current_version": old["version"]},
+            )
+        if old["status"] not in ("proposed", "accepted"):
+            raise HTTPException(status_code=409, detail="PLAN_NOT_ACTIVE")
+
+        old_blocks = (
+            session.execute(
+                text(
+                    f"SELECT {_BLOCK_FIELDS} FROM plan_blocks "
+                    "WHERE workspace_id = :workspace_id AND plan_id = :plan_id"
+                ),
+                {"workspace_id": auth.workspace_id, "plan_id": plan_id},
+            )
+            .mappings()
+            .all()
+        )
+
+        generated = _generate_proposal(session, auth, old["period_start"], old["period_end"], now)
+        proposal = generated.proposal
+
+        new_row = (
+            session.execute(
+                text(
+                    f"""
+                    INSERT INTO plans (
+                        id, workspace_id, user_id, period_start, period_end, status,
+                        policy_version, capacity_minutes, source_versions, conflicts,
+                        unscheduled, created_by, updated_by, created_at, updated_at, version
+                    ) VALUES (
+                        :id, :workspace_id, :user_id, :period_start, :period_end, 'proposed',
+                        1, :capacity_minutes, :source_versions, :conflicts,
+                        :unscheduled, :actor_id, :actor_id, :now, :now, 1
+                    )
+                    RETURNING {_PLAN_FIELDS}
+                    """
+                ),
+                {
+                    "id": new_plan_id,
+                    "workspace_id": auth.workspace_id,
+                    "user_id": auth.user_id,
+                    "period_start": old["period_start"],
+                    "period_end": old["period_end"],
+                    "capacity_minutes": proposal.capacity_minutes,
+                    "source_versions": dumps(generated.fingerprint),
+                    "conflicts": dumps(
+                        [
+                            {
+                                "code": c.code,
+                                "detail": c.detail,
+                                "source_type": c.source_type,
+                                "source_id": str(c.source_id) if c.source_id else None,
+                            }
+                            for c in proposal.conflicts
+                        ]
+                    ),
+                    "unscheduled": dumps(
+                        [
+                            {
+                                "source_type": u.source_type,
+                                "source_id": str(u.source_id) if u.source_id else None,
+                                "label": u.label,
+                                "reason": u.reason,
+                            }
+                            for u in proposal.unscheduled
+                        ]
+                    ),
+                    "actor_id": auth.user_id,
+                    "now": now,
+                },
+            )
+            .mappings()
+            .one()
+        )
+        if proposal.blocks:
+            session.execute(
+                text(
+                    """
+                    INSERT INTO plan_blocks (
+                        id, workspace_id, plan_id, source_type, source_id,
+                        starts_at, ends_at, status, rationale, is_default_effort,
+                        created_at, updated_at
+                    ) VALUES (
+                        :id, :workspace_id, :plan_id, :source_type, :source_id,
+                        :starts_at, :ends_at, 'proposed', :rationale, :is_default_effort,
+                        :now, :now
+                    )
+                    """
+                ),
+                [
+                    {
+                        "id": uuid4(),
+                        "workspace_id": auth.workspace_id,
+                        "plan_id": new_plan_id,
+                        "source_type": b.source_type,
+                        "source_id": b.source_id,
+                        "starts_at": b.starts_at,
+                        "ends_at": b.ends_at,
+                        "rationale": b.rationale,
+                        "is_default_effort": b.is_default_effort,
+                        "now": now,
+                    }
+                    for b in proposal.blocks
+                ],
+            )
+
+        session.execute(
+            text(
+                """
+                UPDATE plans SET status = 'superseded', superseded_by = :new_plan_id,
+                    updated_by = :actor_id, updated_at = :now, version = version + 1
+                WHERE workspace_id = :workspace_id AND id = :plan_id
+                """
+            ),
+            {
+                "new_plan_id": new_plan_id,
+                "actor_id": auth.user_id,
+                "now": now,
+                "workspace_id": auth.workspace_id,
+                "plan_id": plan_id,
+            },
+        )
+
+        diff = _diff_blocks([dict(b) for b in old_blocks], proposal.blocks, proposal.unscheduled)
+        response = _row_to_plan(session, auth, dict(new_row))
+        response = response.model_copy(update={"diff": diff})
+
+        _write_plan_event(session, auth, request, "plan.proposed", new_plan_id, 1, now)
+        _write_plan_event(
+            session, auth, request, "plan.superseded", plan_id, old["version"] + 1, now
+        )
+        _store_idempotent_plan(session, auth, idempotency_key, request_hash, response, now)
+        return response
+
+
+def _store_idempotent_plan(
+    session: Session, auth: AuthContext, key: str, request_hash: str, response: Plan, now: datetime
+) -> None:
+    session.execute(
+        text(
+            """
+            INSERT INTO idempotency_records (
+                workspace_id, actor_id, key, request_hash, response_status,
+                response_body, created_at, expires_at
+            ) VALUES (
+                :workspace_id, :actor_id, :key, :request_hash, 200,
+                CAST(:response_body AS jsonb), :created_at, :expires_at
+            )
+            """
+        ),
+        {
+            "workspace_id": auth.workspace_id,
+            "actor_id": auth.user_id,
+            "key": key,
+            "request_hash": request_hash,
+            "response_body": dumps(response.model_dump(mode="json")),
+            "created_at": now,
+            "expires_at": now + timedelta(days=365),
+        },
+    )
+
+
+def _blocks_overlap(
+    candidate_start: datetime, candidate_end: datetime, other: dict[str, Any]
+) -> bool:
+    return bool(candidate_start < other["ends_at"] and other["starts_at"] < candidate_end)
+
+
+@router.post("/{plan_id}/blocks/{block_id}/move", response_model=Plan)
+def move_block(
+    plan_id: UUID,
+    block_id: UUID,
+    payload: BlockMove,
+    request: Request,
+    auth: AuthDep,
+    session: SessionDep,
+    _csrf: CsrfDep,
+    idempotency_key: IdempotencyHeader,
+) -> Plan:
+    """Moving a block produces a new plan *version* (edits the same plan
+    row in place), not a new plan -- plan_blocks has no version of its
+    own, matching migration 0026's "the parent plan is the versioned
+    unit" design. Only a 'proposed' plan may be edited: "Accepted plans
+    are not silently rewritten" (PLANNING-CONTRACT.md).
+    """
+    request_hash = _request_hash(payload, f"move:{plan_id}:{block_id}")
+    now = datetime.now(UTC)
+    with session.begin():
+        _lock_idempotency(session, auth, idempotency_key)
+        cached = _load_cached(session, auth, idempotency_key, request_hash)
+        if cached is not None:
+            return cached
+
+        current = _get_plan_for_update(session, auth, plan_id)
+        if current is None:
+            raise HTTPException(status_code=404, detail="PLAN_NOT_FOUND")
+        if current["version"] != payload.expected_version:
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "VERSION_CONFLICT", "current_version": current["version"]},
+            )
+        if current["status"] != "proposed":
+            raise HTTPException(status_code=409, detail="PLAN_NOT_EDITABLE")
+
+        other_blocks = (
+            session.execute(
+                text(
+                    f"SELECT {_BLOCK_FIELDS} FROM plan_blocks "
+                    "WHERE workspace_id = :workspace_id AND plan_id = :plan_id AND id <> :block_id"
+                ),
+                {"workspace_id": auth.workspace_id, "plan_id": plan_id, "block_id": block_id},
+            )
+            .mappings()
+            .all()
+        )
+        if any(_blocks_overlap(payload.starts_at, payload.ends_at, dict(b)) for b in other_blocks):
+            raise HTTPException(status_code=422, detail="BLOCK_OVERLAP")
+
+        updated = session.execute(
+            text(
+                """
+                UPDATE plan_blocks SET starts_at = :starts_at, ends_at = :ends_at, updated_at = :now
+                WHERE workspace_id = :workspace_id AND plan_id = :plan_id AND id = :block_id
+                RETURNING id
+                """
+            ),
+            {
+                "starts_at": payload.starts_at,
+                "ends_at": payload.ends_at,
+                "now": now,
+                "workspace_id": auth.workspace_id,
+                "plan_id": plan_id,
+                "block_id": block_id,
+            },
+        ).one_or_none()
+        if updated is None:
+            raise HTTPException(status_code=404, detail="PLAN_BLOCK_NOT_FOUND")
+
+        row = (
+            session.execute(
+                text(
+                    f"""
+                    UPDATE plans
+                    SET updated_by = :actor_id, updated_at = :now, version = version + 1
+                    WHERE workspace_id = :workspace_id AND id = :plan_id
+                    RETURNING {_PLAN_FIELDS}
+                    """
+                ),
+                {
+                    "actor_id": auth.user_id,
+                    "now": now,
+                    "workspace_id": auth.workspace_id,
+                    "plan_id": plan_id,
+                },
+            )
+            .mappings()
+            .one()
+        )
+        response = _row_to_plan(session, auth, dict(row))
+        _write_plan_event(
+            session,
+            auth,
+            request,
+            "plan.block_moved",
+            plan_id,
+            row["version"],
+            now,
+            emit_outbox=False,
+        )
+        _store_idempotent_plan(session, auth, idempotency_key, request_hash, response, now)
+        return response
+
+
+@router.post("/{plan_id}/blocks/{block_id}/remove", response_model=Plan)
+def remove_block(
+    plan_id: UUID,
+    block_id: UUID,
+    payload: BlockRemove,
+    request: Request,
+    auth: AuthDep,
+    session: SessionDep,
+    _csrf: CsrfDep,
+    idempotency_key: IdempotencyHeader,
+) -> Plan:
+    """Removing a block, like moving one, edits the same plan row in place
+    and bumps its version -- only while the plan is still 'proposed'."""
+    request_hash = _request_hash(payload, f"remove:{plan_id}:{block_id}")
+    now = datetime.now(UTC)
+    with session.begin():
+        _lock_idempotency(session, auth, idempotency_key)
+        cached = _load_cached(session, auth, idempotency_key, request_hash)
+        if cached is not None:
+            return cached
+
+        current = _get_plan_for_update(session, auth, plan_id)
+        if current is None:
+            raise HTTPException(status_code=404, detail="PLAN_NOT_FOUND")
+        if current["version"] != payload.expected_version:
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "VERSION_CONFLICT", "current_version": current["version"]},
+            )
+        if current["status"] != "proposed":
+            raise HTTPException(status_code=409, detail="PLAN_NOT_EDITABLE")
+
+        deleted = session.execute(
+            text(
+                """
+                DELETE FROM plan_blocks
+                WHERE workspace_id = :workspace_id AND plan_id = :plan_id AND id = :block_id
+                RETURNING id
+                """
+            ),
+            {"workspace_id": auth.workspace_id, "plan_id": plan_id, "block_id": block_id},
+        ).one_or_none()
+        if deleted is None:
+            raise HTTPException(status_code=404, detail="PLAN_BLOCK_NOT_FOUND")
+
+        row = (
+            session.execute(
+                text(
+                    f"""
+                    UPDATE plans
+                    SET updated_by = :actor_id, updated_at = :now, version = version + 1
+                    WHERE workspace_id = :workspace_id AND id = :plan_id
+                    RETURNING {_PLAN_FIELDS}
+                    """
+                ),
+                {
+                    "actor_id": auth.user_id,
+                    "now": now,
+                    "workspace_id": auth.workspace_id,
+                    "plan_id": plan_id,
+                },
+            )
+            .mappings()
+            .one()
+        )
+        response = _row_to_plan(session, auth, dict(row))
+        _write_plan_event(
+            session,
+            auth,
+            request,
+            "plan.block_removed",
+            plan_id,
+            row["version"],
+            now,
+            emit_outbox=False,
+        )
+        _store_idempotent_plan(session, auth, idempotency_key, request_hash, response, now)
+        return response

@@ -369,7 +369,7 @@ def _headers(token: str, key: str | None = None) -> dict[str, str]:
     return headers
 
 
-def _seed_task(workspace_id: UUID, owner_id: UUID, title: str) -> UUID:
+def _seed_task(workspace_id: UUID, owner_id: UUID, title: str, *, priority: str = "high") -> UUID:
     task_id = uuid4()
     now = datetime.now(UTC)
     with engine.begin() as connection:
@@ -380,7 +380,7 @@ def _seed_task(workspace_id: UUID, owner_id: UUID, title: str) -> UUID:
                     id, workspace_id, owner_id, title, status, manual_priority,
                     pinned, source_type, created_by, updated_by, created_at, updated_at, version
                 ) VALUES (
-                    :id, :workspace_id, :owner_id, :title, 'planned', 'high',
+                    :id, :workspace_id, :owner_id, :title, 'planned', :priority,
                     false, 'local', :owner_id, :owner_id, :now, :now, 1
                 )
                 """
@@ -390,6 +390,7 @@ def _seed_task(workspace_id: UUID, owner_id: UUID, title: str) -> UUID:
                 "workspace_id": workspace_id,
                 "owner_id": owner_id,
                 "title": title,
+                "priority": priority,
                 "now": now,
             },
         )
@@ -554,3 +555,308 @@ def test_plan_is_hidden_across_workspaces(
     response = client.get(f"/api/v1/plans/{uuid4()}")
     assert response.status_code == 404
     assert response.json()["error"]["code"] == "PLAN_NOT_FOUND"
+
+
+# ---------------------------------------------------------------------------
+# Task 6: acceptance, manual retirement, replan diff, block editing.
+# ---------------------------------------------------------------------------
+
+
+def _create_plan_with_one_block(
+    client: TestClient, workspace_id: UUID, user_id: UUID, token: str
+) -> dict:
+    _set_full_week_capacity(client, token)
+    _seed_task(workspace_id, user_id, "Only candidate")
+    regenerate = client.post("/api/v1/attention/regenerate", headers=_headers(token), json={})
+    assert regenerate.status_code == 200
+    period_start, period_end = _next_period()
+    created = client.post(
+        "/api/v1/plans",
+        headers=_headers(token, "create-plan-for-task6"),
+        json={"period_start": period_start.isoformat(), "period_end": period_end.isoformat()},
+    )
+    assert created.status_code == 201, created.text
+    assert len(created.json()["blocks"]) == 1
+    return created.json()
+
+
+def test_accept_plan_transitions_status_and_is_idempotent_on_replay(
+    planning_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    client, workspace_id, user_id, token = planning_test_context
+    plan = _create_plan_with_one_block(client, workspace_id, user_id, token)
+    headers = _headers(token, "accept-plan")
+
+    accepted = client.post(
+        f"/api/v1/plans/{plan['id']}/accept",
+        headers=headers,
+        json={"expected_version": plan["version"]},
+    )
+    assert accepted.status_code == 200, accepted.text
+    body = accepted.json()
+    assert body["status"] == "accepted"
+    assert body["accepted_at"] is not None
+    assert all(b["status"] == "accepted" for b in body["blocks"])
+
+    replay = client.post(
+        f"/api/v1/plans/{plan['id']}/accept",
+        headers=headers,
+        json={"expected_version": plan["version"]},
+    )
+    assert replay.status_code == 200
+    replay_body = replay.json()
+    for key in ("id", "status", "version", "accepted_at", "blocks"):
+        assert replay_body[key] == body[key]
+
+
+def test_accept_plan_rejects_stale_version(
+    planning_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    client, workspace_id, user_id, token = planning_test_context
+    plan = _create_plan_with_one_block(client, workspace_id, user_id, token)
+
+    stale = client.post(
+        f"/api/v1/plans/{plan['id']}/accept",
+        headers=_headers(token, "accept-stale"),
+        json={"expected_version": 999},
+    )
+    assert stale.status_code == 409
+    assert stale.json()["error"]["code"] == "VERSION_CONFLICT"
+
+
+def test_accept_plan_rejects_when_not_proposed(
+    planning_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    client, workspace_id, user_id, token = planning_test_context
+    plan = _create_plan_with_one_block(client, workspace_id, user_id, token)
+
+    first = client.post(
+        f"/api/v1/plans/{plan['id']}/accept",
+        headers=_headers(token, "accept-first"),
+        json={"expected_version": plan["version"]},
+    )
+    assert first.status_code == 200
+
+    second = client.post(
+        f"/api/v1/plans/{plan['id']}/accept",
+        headers=_headers(token, "accept-second"),
+        json={"expected_version": first.json()["version"]},
+    )
+    assert second.status_code == 409
+    assert second.json()["error"]["code"] == "PLAN_NOT_PROPOSED"
+
+
+def test_accept_plan_rejects_stale_source(
+    planning_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    """PLANNING-CONTRACT.md's Replanning section: source changes mark a
+    proposal stale. Changing capacity after the plan was generated must
+    reject acceptance with stale_plan, prompting a replan first.
+    """
+    client, workspace_id, user_id, token = planning_test_context
+    plan = _create_plan_with_one_block(client, workspace_id, user_id, token)
+
+    changed = client.put(
+        "/api/v1/planning/capacity",
+        headers=_headers(token),
+        json={
+            "expected_version": 1,
+            "timezone": "Asia/Kolkata",
+            "days": [
+                {"weekday": w, "available_minutes": 600, "focus_minutes": 300} for w in range(7)
+            ],
+        },
+    )
+    assert changed.status_code == 200
+
+    stale = client.post(
+        f"/api/v1/plans/{plan['id']}/accept",
+        headers=_headers(token, "accept-stale-source"),
+        json={"expected_version": plan["version"]},
+    )
+    assert stale.status_code == 409
+    assert stale.json()["error"]["code"] == "STALE_PLAN"
+
+
+def test_move_block_produces_new_plan_version(
+    planning_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    client, workspace_id, user_id, token = planning_test_context
+    plan = _create_plan_with_one_block(client, workspace_id, user_id, token)
+    block = plan["blocks"][0]
+    new_start = datetime.fromisoformat(block["starts_at"]) + timedelta(hours=2)
+    new_end = datetime.fromisoformat(block["ends_at"]) + timedelta(hours=2)
+
+    moved = client.post(
+        f"/api/v1/plans/{plan['id']}/blocks/{block['id']}/move",
+        headers=_headers(token, "move-block"),
+        json={
+            "expected_version": plan["version"],
+            "starts_at": new_start.isoformat(),
+            "ends_at": new_end.isoformat(),
+        },
+    )
+    assert moved.status_code == 200, moved.text
+    body = moved.json()
+    assert body["version"] == plan["version"] + 1
+    assert body["id"] == plan["id"]  # same plan, new version -- not a new plan
+    assert datetime.fromisoformat(body["blocks"][0]["starts_at"]) == new_start
+
+
+def test_move_block_rejects_overlap_with_another_block_in_the_same_plan(
+    planning_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    client, workspace_id, user_id, token = planning_test_context
+    _set_full_week_capacity(client, token)
+    _seed_task(workspace_id, user_id, "First candidate")
+    _seed_task(workspace_id, user_id, "Second candidate")
+    regenerate = client.post("/api/v1/attention/regenerate", headers=_headers(token), json={})
+    assert regenerate.status_code == 200
+    period_start, period_end = _next_period()
+    created = client.post(
+        "/api/v1/plans",
+        headers=_headers(token, "create-plan-for-overlap"),
+        json={"period_start": period_start.isoformat(), "period_end": period_end.isoformat()},
+    )
+    assert created.status_code == 201, created.text
+    plan = created.json()
+    assert len(plan["blocks"]) == 2
+    first_block, second_block = plan["blocks"]
+    assert datetime.fromisoformat(first_block["starts_at"]) != datetime.fromisoformat(
+        second_block["starts_at"]
+    )
+
+    moved = client.post(
+        f"/api/v1/plans/{plan['id']}/blocks/{first_block['id']}/move",
+        headers=_headers(token, "move-block-overlap"),
+        json={
+            "expected_version": plan["version"],
+            "starts_at": second_block["starts_at"],
+            "ends_at": second_block["ends_at"],
+        },
+    )
+    assert moved.status_code == 422, moved.text
+    assert moved.json()["error"]["code"] == "BLOCK_OVERLAP"
+
+    unchanged = client.get(f"/api/v1/plans/{plan['id']}")
+    assert unchanged.status_code == 200
+    assert unchanged.json()["version"] == plan["version"]  # rejected move did not bump version
+
+
+def test_move_block_rejected_when_plan_not_proposed(
+    planning_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    client, workspace_id, user_id, token = planning_test_context
+    plan = _create_plan_with_one_block(client, workspace_id, user_id, token)
+    block = plan["blocks"][0]
+
+    accepted = client.post(
+        f"/api/v1/plans/{plan['id']}/accept",
+        headers=_headers(token, "accept-before-move"),
+        json={"expected_version": plan["version"]},
+    )
+    assert accepted.status_code == 200
+
+    moved = client.post(
+        f"/api/v1/plans/{plan['id']}/blocks/{block['id']}/move",
+        headers=_headers(token, "move-after-accept"),
+        json={
+            "expected_version": accepted.json()["version"],
+            "starts_at": block["starts_at"],
+            "ends_at": block["ends_at"],
+        },
+    )
+    assert moved.status_code == 409
+    assert moved.json()["error"]["code"] == "PLAN_NOT_EDITABLE"
+
+
+def test_remove_block_produces_new_plan_version(
+    planning_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    client, workspace_id, user_id, token = planning_test_context
+    plan = _create_plan_with_one_block(client, workspace_id, user_id, token)
+    block = plan["blocks"][0]
+
+    removed = client.post(
+        f"/api/v1/plans/{plan['id']}/blocks/{block['id']}/remove",
+        headers=_headers(token, "remove-block"),
+        json={"expected_version": plan["version"]},
+    )
+    assert removed.status_code == 200, removed.text
+    body = removed.json()
+    assert body["version"] == plan["version"] + 1
+    assert body["blocks"] == []
+
+
+def test_supersede_plan_manual_retirement(
+    planning_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    client, workspace_id, user_id, token = planning_test_context
+    plan = _create_plan_with_one_block(client, workspace_id, user_id, token)
+
+    superseded = client.post(
+        f"/api/v1/plans/{plan['id']}/supersede",
+        headers=_headers(token, "supersede-plan"),
+        json={"expected_version": plan["version"]},
+    )
+    assert superseded.status_code == 200
+    assert superseded.json()["status"] == "superseded"
+    assert superseded.json()["superseded_by"] is None  # manual retirement, no replacement
+
+
+def test_replan_creates_new_plan_with_diff_and_supersedes_old(
+    planning_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    """PLANNING-CONTRACT.md's Replanning section: replanning creates a new
+    proposal with a diff (added/removed/moved/unchanged/newly-conflicted)
+    against the prior version; the old plan is superseded, never silently
+    rewritten.
+    """
+    client, workspace_id, user_id, token = planning_test_context
+    plan = _create_plan_with_one_block(client, workspace_id, user_id, token)
+    original_block = plan["blocks"][0]
+
+    # Lower priority than the original ("high") candidate so it can never
+    # outrank or tie with it for the same slot -- the test asserts the
+    # original block is "unchanged", which only holds if it keeps its slot.
+    _seed_task(workspace_id, user_id, "New candidate for replan", priority="low")
+    regenerate = client.post("/api/v1/attention/regenerate", headers=_headers(token), json={})
+    assert regenerate.status_code == 200
+
+    replanned = client.post(
+        f"/api/v1/plans/{plan['id']}/propose",
+        headers=_headers(token, "replan"),
+        json={"expected_version": plan["version"]},
+    )
+    assert replanned.status_code == 201, replanned.text
+    new_plan = replanned.json()
+    assert new_plan["id"] != plan["id"]
+    assert new_plan["status"] == "proposed"
+    assert len(new_plan["blocks"]) == 2
+
+    diff = new_plan["diff"]
+    assert diff is not None
+    changes_by_source_id = {entry["source_id"]: entry["change"] for entry in diff}
+    assert changes_by_source_id[original_block["source_id"]] == "unchanged"
+    added = [entry for entry in diff if entry["change"] == "added"]
+    assert len(added) == 1
+
+    old = client.get(f"/api/v1/plans/{plan['id']}")
+    assert old.status_code == 200
+    assert old.json()["status"] == "superseded"
+    assert old.json()["superseded_by"] == new_plan["id"]
+
+
+def test_replan_rejects_stale_version(
+    planning_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    client, workspace_id, user_id, token = planning_test_context
+    plan = _create_plan_with_one_block(client, workspace_id, user_id, token)
+
+    stale = client.post(
+        f"/api/v1/plans/{plan['id']}/propose",
+        headers=_headers(token, "replan-stale"),
+        json={"expected_version": 999},
+    )
+    assert stale.status_code == 409
+    assert stale.json()["error"]["code"] == "VERSION_CONFLICT"
