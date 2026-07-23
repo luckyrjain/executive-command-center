@@ -65,6 +65,10 @@ jobs:
       - run: uv run ruff check backend tests
       - run: uv run ruff format --check backend tests
       - run: uv run mypy backend
+      # Static, stdlib-only, no DB dependency -- matches PHASE-REVIEW.md's
+      # cross-phase "work not people" invariant as an automated gate, not
+      # just documentation. See scripts/check_phase3_prohibited_signals.py.
+      - run: python scripts/check_phase3_prohibited_signals.py
       - run: uv run alembic -c backend/alembic.ini upgrade head
       - run: uv run pytest
       - run: uv run pip-audit

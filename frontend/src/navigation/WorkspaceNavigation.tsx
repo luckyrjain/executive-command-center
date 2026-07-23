@@ -9,9 +9,12 @@ type WorkspaceNavigationProps = {
 
 const WORKSPACES: ReadonlyArray<{ view: WorkspaceView; label: string }> = [
   { view: 'today', label: 'Today' },
+  { view: 'attention', label: 'Attention' },
   { view: 'work', label: 'Work' },
   { view: 'notes', label: 'Notes' },
   { view: 'schedule', label: 'Schedule' },
+  { view: 'planner', label: 'Planner' },
+  { view: 'meeting-prep', label: 'Meeting prep' },
   { view: 'risks', label: 'Risks' },
   { view: 'knowledge', label: 'Knowledge' },
   { view: 'recommendations', label: 'Recommendations' },

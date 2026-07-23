@@ -55,6 +55,14 @@ class Settings(BaseSettings):
     # RETRIEVAL-CONTRACT.md's degradation rule -- this flag is the deliberate,
     # explicit way to opt into paying that cost, not a workaround for it.
     embeddings_enabled: bool = Field(default=False, validation_alias="ECC_EMBEDDINGS_ENABLED")
+    # Off by default: MEETING-PREP-CONTRACT.md's "Optional enrichment" AI
+    # summarization has no Phase 4 (AI Runtime) to serve it yet -- the
+    # deterministic pack sections are unaffected either way, matching this
+    # repo's "deterministic core, AI optional and gated" pattern from every
+    # prior phase.
+    meeting_prep_ai_enrichment_enabled: bool = Field(
+        default=False, validation_alias="ECC_MEETING_PREP_AI_ENRICHMENT_ENABLED"
+    )
 
     @property
     def cors_origin_list(self) -> list[str]:

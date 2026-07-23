@@ -67,8 +67,9 @@ export async function run({ page, baseURL }) {
   const outline = await todayTab.evaluate((el) => getComputedStyle(el).outlineStyle)
   assert.notEqual(outline, 'none')
 
-  // Roving tabindex: today(0) -> work(1) -> notes(2) -> schedule(3) -> risks(4).
-  for (let step = 0; step < 4; step += 1) await page.keyboard.press('ArrowRight')
+  // Roving tabindex: today(0) -> attention(1) -> work(2) -> notes(3) ->
+  // schedule(4) -> planner(5) -> meeting-prep(6) -> risks(7).
+  for (let step = 0; step < 7; step += 1) await page.keyboard.press('ArrowRight')
   assert.equal(await page.evaluate(() => document.activeElement?.textContent), 'Risks')
   assert.equal(await page.getByRole('tab', { name: 'Risks' }).getAttribute('aria-selected'), 'true')
 

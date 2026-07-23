@@ -12,9 +12,15 @@ from ecc.audit import rejected_mutation_audit_middleware
 from ecc.config import get_settings, validate_production_settings
 from ecc.database import engine
 from ecc.dev_bootstrap import router as dev_bootstrap_router
+from ecc.domains.attention.attention import router as attention_router
+from ecc.domains.attention.capacity import router as capacity_router
+from ecc.domains.attention.meeting_prep import router as meeting_prep_router
+from ecc.domains.attention.planning import router as planning_router
+from ecc.domains.attention.planning_constraints import router as planning_constraints_router
+from ecc.domains.attention.risk_reviews import router as risk_reviews_router
+from ecc.domains.attention.waiting import router as waiting_router
 from ecc.domains.calendar.events import router as calendar_events_router
 from ecc.domains.communication.commitments import router as commitments_router
-from ecc.domains.governance.attention import router as attention_router
 from ecc.domains.governance.recommendation_mutations import (
     router as recommendation_mutations_router,
 )
@@ -70,9 +76,20 @@ app.include_router(commitments_router)
 app.include_router(notes_router)
 app.include_router(calendar_events_router)
 app.include_router(meetings_router)
+# risk_reviews_router's static /risks/review-queue must be registered before
+# risks_router's dynamic GET /risks/{risk_id} -- Starlette matches routes in
+# registration order across the whole app, so {risk_id} would otherwise
+# swallow "review-queue" as an (invalid-UUID) risk_id and 422 before this
+# router's route is ever tried.
+app.include_router(risk_reviews_router)
 app.include_router(risks_router)
 app.include_router(risk_mutations_router)
 app.include_router(attention_router)
+app.include_router(waiting_router)
+app.include_router(capacity_router)
+app.include_router(planning_constraints_router)
+app.include_router(planning_router)
+app.include_router(meeting_prep_router)
 app.include_router(recommendation_queries_router)
 app.include_router(recommendation_mutations_router)
 app.include_router(audit_queries_router)

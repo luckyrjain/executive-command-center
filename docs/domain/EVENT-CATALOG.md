@@ -86,6 +86,22 @@ Added incrementally, one entry per delivery slice, alongside the code that emits
 
 All Phase 2 catalog events are now implemented; no remaining speculative entries.
 
+## Phase 3 catalog
+
+Added incrementally, one entry per delivery slice, alongside the code that emits it (`docs/superpowers/plans/2026-07-22-phase-3-human-attention-engine.md`). `attention_item.created.v1`/`updated.v1` above are reused as-is for Task 1's extended `attention_items` -- not duplicated here.
+
+| Event | Producer | Required payload |
+|---|---|---|
+| `waiting_link.opened.v1` | Executive Intelligence | waiting_link_id, version |
+| `waiting_link.fulfilled.v1` | Executive Intelligence | waiting_link_id, version |
+| `waiting_link.cancelled.v1` | Executive Intelligence | waiting_link_id, version |
+| `risk_review.recorded.v1` | Executive Intelligence | risk_id, review_id |
+| `plan.proposed.v1` | Executive Intelligence | plan_id |
+| `plan.accepted.v1` | Executive Intelligence | plan_id, version |
+| `plan.superseded.v1` | Executive Intelligence | plan_id, version |
+| `meeting_pack.generated.v1` | Executive Intelligence | meeting_id |
+| `meeting_pack.refreshed.v1` | Executive Intelligence | meeting_id |
+
 ## Recommendation publication rule
 
 `recommendation.generated.v1` records creation in `proposed`. `recommendation.confirmation_requested.v1` is emitted only by `PublishRecommendation`, which transitions the aggregate from `proposed` to `pending_confirmation`. Confirmation and execution events cannot occur before that publication event.

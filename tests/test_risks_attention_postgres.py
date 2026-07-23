@@ -8,12 +8,21 @@ from uuid import UUID, uuid4
 
 import pytest
 from fastapi.testclient import TestClient
+from fixtures.phase3_attention_scenarios import (
+    COMMITMENT_SCENARIOS,
+    GOLDEN_SCORES,
+    RISK_SCENARIOS,
+    TASK_SCENARIOS,
+)
+from fixtures.phase3_attention_scenarios import NOW as SCENARIO_NOW
+from fixtures.phase3_attention_scenarios import TODAY as SCENARIO_TODAY
 from phase1_dataset import seed_phase1_dataset
 from sqlalchemy import text
 
 from ecc.config import get_settings
 from ecc.database import engine
-from ecc.domains.governance.attention import _score_commitment, _score_risk, _score_task
+from ecc.domains.attention.attention import _score_commitment, _score_risk, _score_task
+from ecc.domains.attention.policy import get_active_policy
 from ecc.main import app
 
 settings = get_settings()
@@ -89,6 +98,7 @@ def risk_test_context() -> Iterator[tuple[TestClient, UUID, UUID, str]]:
         client.close()
         with engine.begin() as connection:
             for table in (
+                "attention_feedback",
                 "attention_items",
                 "event_outbox",
                 "audit_events",
@@ -118,6 +128,70 @@ def _headers(token: str, key: str | None = None) -> dict[str, str]:
     if key is not None:
         headers["Idempotency-Key"] = key
     return headers
+
+
+def _other_workspace_client() -> tuple[TestClient, UUID]:
+    """A genuinely different, real workspace with its own real user and
+    session -- used to prove cross-workspace isolation, as opposed to a
+    bare ``uuid4()`` 404 probe against the fixture's own client, which
+    proves nothing about workspace scoping.
+    """
+    other_workspace_id = uuid4()
+    other_user_id = uuid4()
+    other_token = f"session-{uuid4()}"
+    now = datetime.now(UTC)
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO workspaces (id, name, timezone, created_at) "
+                "VALUES (:id, 'Other Workspace', 'UTC', :now)"
+            ),
+            {"id": other_workspace_id, "now": now},
+        )
+        connection.execute(
+            text(
+                "INSERT INTO users (id, workspace_id, email, password_hash, created_at) "
+                "VALUES (:id, :workspace_id, :email, 'hash', :now)"
+            ),
+            {
+                "id": other_user_id,
+                "workspace_id": other_workspace_id,
+                "email": f"{other_user_id}@example.test",
+                "now": now,
+            },
+        )
+        connection.execute(
+            text(
+                "INSERT INTO sessions (id, workspace_id, user_id, token_hash, "
+                "expires_at, last_seen_at) "
+                "VALUES (:id, :workspace_id, :user_id, :token_hash, :expires_at, :now)"
+            ),
+            {
+                "id": uuid4(),
+                "workspace_id": other_workspace_id,
+                "user_id": other_user_id,
+                "token_hash": sha256(other_token.encode()).hexdigest(),
+                "expires_at": now + timedelta(hours=1),
+                "now": now,
+            },
+        )
+    other_client = TestClient(app)
+    other_client.cookies.set("ecc_session", other_token)
+    return other_client, other_workspace_id
+
+
+def _cleanup_other_workspace(other_client: TestClient, other_workspace_id: UUID) -> None:
+    other_client.close()
+    with engine.begin() as connection:
+        for table in ("sessions", "users"):
+            connection.execute(
+                text(f"DELETE FROM {table} WHERE workspace_id = :workspace_id"),  # noqa: S608
+                {"workspace_id": other_workspace_id},
+            )
+        connection.execute(
+            text("DELETE FROM workspaces WHERE id = :workspace_id"),
+            {"workspace_id": other_workspace_id},
+        )
 
 
 def test_risk_lifecycle_and_attention_controls(
@@ -305,9 +379,31 @@ def test_risk_lifecycle_and_attention_controls(
 def test_risk_is_hidden_across_workspaces(
     risk_test_context: tuple[TestClient, UUID, UUID, str],
 ) -> None:
-    client, _, _, _ = risk_test_context
-    response = client.get(f"/api/v1/risks/{uuid4()}")
-    assert response.status_code == 404
+    """A different, real workspace's session must not be able to read a
+    risk that belongs to the fixture workspace -- not just a bare
+    ``uuid4()`` 404 probe against the fixture's own client, which proves
+    nothing about workspace scoping.
+    """
+    client, _, _, token = risk_test_context
+    created = client.post(
+        "/api/v1/risks",
+        headers=_headers(token, "create-risk-cross-workspace"),
+        json={
+            "description": "Cross-workspace isolation risk",
+            "probability": 3,
+            "impact": 3,
+        },
+    )
+    assert created.status_code == 201, created.text
+    risk_id = created.json()["id"]
+
+    other_client, other_workspace_id = _other_workspace_client()
+    try:
+        response = other_client.get(f"/api/v1/risks/{risk_id}")
+        assert response.status_code == 404
+        assert response.json()["error"]["code"] == "RISK_NOT_FOUND"
+    finally:
+        _cleanup_other_workspace(other_client, other_workspace_id)
 
 
 def test_closed_risk_cannot_reopen(
@@ -465,6 +561,7 @@ def ranking_performance_context() -> Iterator[tuple[TestClient, UUID, UUID, str]
         client.close()
         with engine.begin() as connection:
             for table in (
+                "attention_feedback",
                 "attention_items",
                 "event_outbox",
                 "audit_events",
@@ -571,7 +668,7 @@ def test_ranking_10000_eligible_entities_under_budget(
     "ranking of 10,000 eligible entities below 500 ms" is measured here by
     seeding the documented representative dataset and calling the actual
     ``POST /api/v1/attention/regenerate`` endpoint
-    (`backend/ecc/domains/governance/attention.py:223`) -- the endpoint that
+    (`backend/ecc/domains/attention/attention.py:471`) -- the endpoint that
     queries eligible tasks/commitments/risks from the database, scores every
     one of them, and returns the freshly ranked list -- through the real
     HTTP layer with real CSRF headers. This replaces relying solely on the
@@ -629,6 +726,7 @@ def test_ranking_10000_eligible_entities_under_budget(
 def test_priority_scoring_10000_entities_under_500ms() -> None:
     now = datetime.now(UTC)
     today = now.date()
+    policy = get_active_policy(1)
     task = {
         "manual_priority": "high",
         "due_date": today,
@@ -637,6 +735,7 @@ def test_priority_scoring_10000_entities_under_500ms() -> None:
         "blocked_on_person_id": None,
         "status": "planned",
         "updated_at": now - timedelta(days=8),
+        "created_at": now - timedelta(days=30),
     }
     commitment = {
         "importance": "high",
@@ -646,12 +745,14 @@ def test_priority_scoring_10000_entities_under_500ms() -> None:
         "pinned": False,
         "confidence": 0.9,
         "updated_at": now,
+        "created_at": now - timedelta(days=30),
     }
     risk = {
         "probability": 5,
         "impact": 4,
         "review_at": now + timedelta(hours=24),
         "pinned": False,
+        "created_at": now - timedelta(days=30),
     }
 
     started = perf_counter()
@@ -659,12 +760,312 @@ def test_priority_scoring_10000_entities_under_500ms() -> None:
     for index in range(10_000):
         selector = index % 3
         if selector == 0:
-            scores.append(_score_task(task, today, now)[0])
+            scores.append(_score_task(task, today, now, policy)[0])
         elif selector == 1:
-            scores.append(_score_commitment(commitment, today, now)[0])
+            scores.append(_score_commitment(commitment, today, now, policy)[0])
         else:
-            scores.append(_score_risk(risk, now)[0])
+            scores.append(_score_risk(risk, now, policy)[0])
     elapsed = perf_counter() - started
 
     assert len(scores) == 10_000
     assert elapsed < 0.5
+
+
+def test_policy_v1_reproduces_pre_phase3_scores_exactly() -> None:
+    """The safety net for Task 1's refactor: policy-v1, applied through the
+    refactored ``_score_task``/``_score_commitment``/``_score_risk``, must
+    reproduce the pre-refactor Phase 1 scores byte-for-byte for every
+    scenario in ``tests/fixtures/phase3_attention_scenarios.py`` -- captured
+    from the actual pre-refactor code (see that module's docstring), not
+    invented. Every scenario's ``created_at`` is 30 days old and none carry
+    a ``prior_deferred_until``, so Phase 3's new recently_created/
+    previously_deferred factors are inert here; this test only proves the
+    refactor itself changed nothing.
+    """
+    policy = get_active_policy(1)
+    for name, row in TASK_SCENARIOS.items():
+        score, confidence, _ = _score_task(row, SCENARIO_TODAY, SCENARIO_NOW, policy)
+        expected = GOLDEN_SCORES["tasks"][name]
+        assert score == expected["score"], f"{name}: score {score} != {expected['score']}"
+        assert confidence == expected["confidence"], name
+    for name, row in COMMITMENT_SCENARIOS.items():
+        score, confidence, _ = _score_commitment(row, SCENARIO_TODAY, SCENARIO_NOW, policy)
+        expected = GOLDEN_SCORES["commitments"][name]
+        assert score == expected["score"], f"{name}: score {score} != {expected['score']}"
+        assert confidence == expected["confidence"], name
+    for name, row in RISK_SCENARIOS.items():
+        score, confidence, _ = _score_risk(row, SCENARIO_NOW, policy)
+        expected = GOLDEN_SCORES["risks"][name]
+        assert score == expected["score"], f"{name}: score {score} != {expected['score']}"
+        assert confidence == expected["confidence"], name
+
+
+def test_bounded_recency_and_deferral_penalty_factors_are_additive_and_bounded() -> None:
+    """New in Phase 3, additive to policy v1 (ATTENTION-MODEL.md's
+    ``bounded_recency``/``bounded_deferral_penalty`` terms): a task created
+    within the last 24h scores exactly ``recently_created_points`` higher
+    than an otherwise-identical old task, and a task whose defer has
+    expired scores exactly ``previously_deferred_penalty`` lower -- both
+    single, fixed-magnitude applications (the "bounded" part), not a
+    scaling function that could grow unbounded.
+    """
+    policy = get_active_policy(1)
+    baseline = {
+        "manual_priority": "low",
+        "due_date": None,
+        "due_at": None,
+        "pinned": False,
+        "blocked_on_person_id": None,
+        "status": "planned",
+        "updated_at": SCENARIO_NOW,
+        "created_at": SCENARIO_NOW - timedelta(days=30),
+    }
+    baseline_score, _, baseline_factors = _score_task(
+        baseline, SCENARIO_TODAY, SCENARIO_NOW, policy
+    )
+    assert {f["code"] for f in baseline_factors} == {"manual_priority"}
+
+    recent = {**baseline, "created_at": SCENARIO_NOW - timedelta(hours=2)}
+    recent_score, _, recent_factors = _score_task(recent, SCENARIO_TODAY, SCENARIO_NOW, policy)
+    assert "recently_created" in {f["code"] for f in recent_factors}
+    assert recent_score == baseline_score + policy.recently_created_points
+
+    just_outside_window = {
+        **baseline,
+        "created_at": SCENARIO_NOW - timedelta(hours=policy.recently_created_window_hours + 1),
+    }
+    outside_score, _, outside_factors = _score_task(
+        just_outside_window, SCENARIO_TODAY, SCENARIO_NOW, policy
+    )
+    assert "recently_created" not in {f["code"] for f in outside_factors}
+    assert outside_score == baseline_score
+
+    deferred_expired = {**baseline, "prior_deferred_until": SCENARIO_NOW - timedelta(hours=1)}
+    deferred_score, _, deferred_factors = _score_task(
+        deferred_expired, SCENARIO_TODAY, SCENARIO_NOW, policy
+    )
+    assert "previously_deferred" in {f["code"] for f in deferred_factors}
+    assert deferred_score == baseline_score + policy.previously_deferred_penalty
+
+    deferred_future = {**baseline, "prior_deferred_until": SCENARIO_NOW + timedelta(hours=1)}
+    future_score, _, future_factors = _score_task(
+        deferred_future, SCENARIO_TODAY, SCENARIO_NOW, policy
+    )
+    assert "previously_deferred" not in {f["code"] for f in future_factors}
+    assert future_score == baseline_score
+
+
+def test_regenerate_applies_previously_deferred_penalty_after_defer_expires(
+    risk_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    client, workspace_id, user_id, token = risk_test_context
+    now = datetime.now(UTC)
+    task_id = uuid4()
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                """
+                INSERT INTO tasks (
+                    id, workspace_id, owner_id, title, status, manual_priority,
+                    pinned, source_type, created_by, updated_by,
+                    created_at, updated_at, version
+                ) VALUES (
+                    :id, :workspace_id, :owner_id, 'Deferred task', 'planned', 'low',
+                    false, 'local', :actor_id, :actor_id,
+                    :created_at, :updated_at, 1
+                )
+                """
+            ),
+            {
+                "id": task_id,
+                "workspace_id": workspace_id,
+                "owner_id": user_id,
+                "actor_id": user_id,
+                "created_at": now - timedelta(days=30),
+                "updated_at": now,
+            },
+        )
+
+    first = client.post("/api/v1/attention/regenerate", headers=_headers(token), json={})
+    assert first.status_code == 200
+    item = next(i for i in first.json()["items"] if i["entity_id"] == str(task_id))
+    assert "previously_deferred" not in {f["code"] for f in item["factors"]}
+    baseline_score = item["score"]
+
+    deferred_until = now + timedelta(hours=1)
+    defer = client.post(
+        f"/api/v1/attention/{item['id']}/defer",
+        headers=_headers(token),
+        json={"deferred_until": deferred_until.isoformat()},
+    )
+    assert defer.status_code == 200
+
+    # Simulate the defer having already expired (rather than sleeping in a
+    # test) by moving deferred_until into the past directly.
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "UPDATE attention_items SET deferred_until = :deferred_until "
+                "WHERE workspace_id = :workspace_id AND id = :item_id"
+            ),
+            {
+                "deferred_until": now - timedelta(minutes=1),
+                "workspace_id": workspace_id,
+                "item_id": item["id"],
+            },
+        )
+
+    second = client.post("/api/v1/attention/regenerate", headers=_headers(token), json={})
+    assert second.status_code == 200
+    updated_item = next(i for i in second.json()["items"] if i["entity_id"] == str(task_id))
+    assert "previously_deferred" in {f["code"] for f in updated_item["factors"]}
+    policy = get_active_policy(1)
+    assert updated_item["score"] == baseline_score + policy.previously_deferred_penalty
+
+
+def test_dismiss_and_defer_persist_override_reason(
+    risk_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    client, _, _, token = risk_test_context
+    now = datetime.now(UTC)
+    create = client.post(
+        "/api/v1/risks",
+        headers=_headers(token, "reason-risk"),
+        json={"description": "Needs a reason", "probability": 3, "impact": 3},
+    )
+    assert create.status_code == 201
+
+    regenerate = client.post("/api/v1/attention/regenerate", headers=_headers(token), json={})
+    item = next(i for i in regenerate.json()["items"] if i["entity_id"] == create.json()["id"])
+    assert item["override_reason"] is None
+    assert item["policy_version"] == 1
+
+    dismiss = client.post(
+        f"/api/v1/attention/{item['id']}/dismiss",
+        headers=_headers(token),
+        json={"reason": "Already handled offline"},
+    )
+    assert dismiss.status_code == 200
+    assert dismiss.json()["override_reason"] == "Already handled offline"
+
+    restore = client.post(
+        f"/api/v1/attention/{item['id']}/restore",
+        headers=_headers(token),
+        json={},
+    )
+    assert restore.status_code == 200
+    assert restore.json()["override_reason"] is None
+
+    defer = client.post(
+        f"/api/v1/attention/{item['id']}/defer",
+        headers=_headers(token),
+        json={
+            "deferred_until": (now + timedelta(hours=2)).isoformat(),
+            "reason": "Waiting on legal review",
+        },
+    )
+    assert defer.status_code == 200
+    assert defer.json()["override_reason"] == "Waiting on legal review"
+
+
+def test_get_attention_item_by_id(
+    risk_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    client, _, _, token = risk_test_context
+    create = client.post(
+        "/api/v1/risks",
+        headers=_headers(token, "get-by-id-risk"),
+        json={"description": "Fetch by id", "probability": 3, "impact": 3},
+    )
+    assert create.status_code == 201
+    regenerate = client.post("/api/v1/attention/regenerate", headers=_headers(token), json={})
+    item = next(i for i in regenerate.json()["items"] if i["entity_id"] == create.json()["id"])
+
+    fetched = client.get(f"/api/v1/attention/{item['id']}")
+    assert fetched.status_code == 200
+    assert fetched.json()["id"] == item["id"]
+
+    missing = client.get(f"/api/v1/attention/{uuid4()}")
+    assert missing.status_code == 404
+    assert missing.json()["error"]["code"] == "ATTENTION_ITEM_NOT_FOUND"
+
+
+def test_attention_item_is_hidden_across_workspaces(
+    risk_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    """A different, real workspace's session must not be able to read an
+    attention item that belongs to the fixture workspace -- not just a
+    bare ``uuid4()`` 404 probe against the fixture's own client, which
+    proves nothing about workspace scoping.
+    """
+    client, _, _, token = risk_test_context
+    create = client.post(
+        "/api/v1/risks",
+        headers=_headers(token, "cross-workspace-attention-risk"),
+        json={"description": "Cross-workspace attention item", "probability": 3, "impact": 3},
+    )
+    assert create.status_code == 201
+    regenerate = client.post("/api/v1/attention/regenerate", headers=_headers(token), json={})
+    assert regenerate.status_code == 200
+    item = next(i for i in regenerate.json()["items"] if i["entity_id"] == create.json()["id"])
+
+    other_client, other_workspace_id = _other_workspace_client()
+    try:
+        response = other_client.get(f"/api/v1/attention/{item['id']}")
+        assert response.status_code == 404
+        assert response.json()["error"]["code"] == "ATTENTION_ITEM_NOT_FOUND"
+    finally:
+        _cleanup_other_workspace(other_client, other_workspace_id)
+
+
+def test_attention_feedback_recorded_and_idempotent(
+    risk_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    client, _, _, token = risk_test_context
+    create = client.post(
+        "/api/v1/risks",
+        headers=_headers(token, "feedback-risk"),
+        json={"description": "Feedback target", "probability": 3, "impact": 3},
+    )
+    assert create.status_code == 201
+    regenerate = client.post("/api/v1/attention/regenerate", headers=_headers(token), json={})
+    item = next(i for i in regenerate.json()["items"] if i["entity_id"] == create.json()["id"])
+
+    feedback_headers = _headers(token, "feedback-once")
+    first = client.post(
+        f"/api/v1/attention/{item['id']}/feedback",
+        headers=feedback_headers,
+        json={"label": "useful"},
+    )
+    assert first.status_code == 201
+    body = first.json()
+    assert body["target_type"] == "attention_item"
+    assert body["target_id"] == item["id"]
+    assert body["label"] == "useful"
+    assert body["policy_version"] == 1
+
+    replay = client.post(
+        f"/api/v1/attention/{item['id']}/feedback",
+        headers=feedback_headers,
+        json={"label": "useful"},
+    )
+    assert replay.status_code == 201
+    assert replay.json()["id"] == body["id"]
+
+    conflicting = client.post(
+        f"/api/v1/attention/{item['id']}/feedback",
+        headers=feedback_headers,
+        json={"label": "not_useful"},
+    )
+    assert conflicting.status_code == 409
+    assert conflicting.json()["error"]["code"] == "IDEMPOTENCY_CONFLICT"
+    from ecc.observability import render_metrics
+
+    assert 'ecc_idempotency_conflicts_total{domain="attention"}' in render_metrics()
+
+    missing_target = client.post(
+        f"/api/v1/attention/{uuid4()}/feedback",
+        headers=_headers(token, "feedback-missing"),
+        json={"label": "useful"},
+    )
+    assert missing_target.status_code == 404

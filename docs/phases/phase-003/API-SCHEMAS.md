@@ -1,8 +1,8 @@
 ---
 id: PHASE-003-API-SCHEMAS
 title: Phase 3 Human Attention API
-status: Draft
-version: 0.1.0
+status: Approved for Implementation
+version: 0.2.0
 owner: Lucky Jain
 ---
 
@@ -13,7 +13,7 @@ owner: Lucky Jain
 ```text
 GET /attention
 GET /attention/{id}
-POST /attention/{id}/pin|dismiss|defer|restore
+POST /attention/{id}/dismiss|defer|restore
 POST /attention/{id}/feedback
 GET|POST /waiting
 PATCH /waiting/{id}
@@ -21,6 +21,8 @@ POST /waiting/{id}/fulfil|cancel
 GET /risks/review-queue
 POST /risks/{id}/review
 GET|PUT /planning/capacity
+GET|POST /planning/constraints
+POST /planning/constraints/{id}/archive
 GET|POST /plans
 GET /plans/{id}
 POST /plans/{id}/propose|accept|supersede
@@ -31,15 +33,23 @@ POST /meetings/{id}/prep/refresh
 
 ## Conventions
 
-Session-derived actor/workspace, UUIDs, ISO-8601 with workspace timezone, signed cursors, idempotency keys and optimistic concurrency are mandatory. Mutations return the current representation and write audit/outbox atomically.
+Session-derived actor/workspace, UUIDs, ISO-8601 with workspace timezone, signed cursors, idempotency keys and optimistic concurrency are mandatory. Mutations return the current representation and write audit/outbox atomically. `PUT /planning/capacity` in particular requires an `Idempotency-Key` header on every call -- omitting it fails request validation (422/400) rather than merely losing replay-safety, since a whole-week capacity overwrite has no other safe way to detect a retried request.
 
 ## Attention result
 
 Includes source reference, state, score, confidence, policy version, ordered factors, evidence, freshness, waiting direction, risk indicators and applicable user override. It must never expose a hidden person score.
 
+There is no dedicated `/pin` action (dropped per `DATA-MODEL.md`'s reconciliation with Phase 1's shipped `attention_items`): pin is read through from the source entity's own `pinned` column, so pinning happens via the source entity's existing `PATCH` (task/commitment/risk today, plus whatever new Phase 2/3 entity types this phase scores).
+
 ## Planning
 
 Plan creation identifies date/range, capacity profile version, optional fixed constraints and source snapshot. Proposal returns blocks, unscheduled items, conflicts, capacity summary and rationale. Accept requires the current plan version and is a durable human confirmation. It does not write to external calendars.
+
+`GET|POST /planning/constraints` manages the fixed constraints (e.g. `fixed_time` hard reservations, deadline priorities) that plan proposal reserves capacity around; each constraint carries the same version/optimistic-concurrency conventions as other Phase 3 entities. `POST /planning/constraints/{id}/archive` retires a constraint (idempotent on retry with the same expected version) rather than hard-deleting it, so proposals already referencing it stay explainable.
+
+## Risk review
+
+Each `ReviewQueueItem` returned by `GET /risks/review-queue` now includes a `version` field, required by `POST /risks/{id}/review`'s optimistic-concurrency check (`expected_version`).
 
 ## Meeting preparation
 

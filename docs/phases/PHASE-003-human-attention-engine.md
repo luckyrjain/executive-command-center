@@ -1,8 +1,8 @@
 ---
 id: PHASE-003
 title: Human Attention Engine
-status: Draft
-version: 0.2.0
+status: Approved for Implementation
+version: 0.3.0
 owner: Lucky Jain
 depends_on:
   - PHASE-002
@@ -61,7 +61,7 @@ Add attention projection, waiting/dependency, risk-review, planning and meeting-
 
 ## Data changes
 
-Add attention projections/overrides, waiting links, risk reviews, capacity profiles, constraints, plans/blocks, meeting packs and feedback defined in `phase-003/DATA-MODEL.md`.
+Extend Phase 1's shipped `attention_items` in place (`policy_version`, `override_reason`; no separate overrides table — `audit_events` already covers override history); add waiting links, risk reviews, capacity profiles, constraints, plans/blocks, meeting packs and feedback, all defined in `phase-003/DATA-MODEL.md`.
 
 ## API changes
 
@@ -96,10 +96,18 @@ Policy scenario tests, deterministic/property tests, prohibited-signal checks, w
 
 - Contracts explicitly approved before implementation.
 - All slices and migrations merged with benchmark evidence.
-- Two-week dogfood records top-five usefulness, critical misses, false urgency, plan acceptance/churn and meeting corrections.
+- Two-week dogfood (`docs/runbooks/PHASE-3-DOGFOOD.md`) records top-five usefulness, critical misses, false urgency, plan acceptance/churn and meeting corrections against the approved thresholds below.
 - No missed critical item or unsupported meeting fact remains unresolved.
 - Zero open Critical, High or Medium findings.
 - Phase 4 can consume stable context and proposal contracts.
+
+### Dogfood success thresholds (approved 2026-07-23)
+
+Zero missed critical items (per `phase-003/ATTENTION-MODEL.md`'s critical-item definition) across the two-week window; ≥80% top-five usefulness rating; plan acceptance rate ≥60% (below that, the planner is proposing infeasible plans); false-urgency rate <10%.
+
+## Dependency exit posture (approved 2026-07-23)
+
+Phase 3 implementation begins now, in parallel with Phase 1/2's own ongoing dogfood/validation windows, under the same kind of parallel-start exception the repository owner granted Phase 2 (`docs/ROADMAP.md`'s Phase 2 status note) — not gated on formally closing every Phase 1/2 exit gate first.
 
 ## Rollback plan
 

@@ -15,6 +15,11 @@ import RiskWorkspace from './features/risks/RiskWorkspace'
 import EntityExplorer from './features/knowledge/EntityExplorer'
 import ResolutionInbox from './features/knowledge/ResolutionInbox'
 import MergeReview from './features/knowledge/MergeReview'
+import AttentionQueue from './features/attention/AttentionQueue'
+import WaitingView from './features/attention/WaitingView'
+import RiskReviewQueue from './features/attention/RiskReviewQueue'
+import Planner from './features/attention/Planner'
+import MeetingPrep from './features/attention/MeetingPrep'
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:8000'
 
@@ -137,7 +142,20 @@ export default function App() {
           </div>
         ) : currentView === 'notes' ? <NoteWorkspace recoveryStore={noteDraftRecovery} />
         : currentView === 'schedule' ? <ScheduleWorkspace />
-        : currentView === 'risks' ? <RiskWorkspace />
+        : currentView === 'attention' ? (
+          <div className="work-grid">
+            <AttentionQueue />
+            <WaitingView />
+          </div>
+        )
+        : currentView === 'planner' ? <Planner />
+        : currentView === 'meeting-prep' ? <MeetingPrep />
+        : currentView === 'risks' ? (
+          <div className="work-grid">
+            <RiskWorkspace />
+            <RiskReviewQueue />
+          </div>
+        )
         : currentView === 'knowledge' ? (
           <div className="work-grid">
             <EntityExplorer />

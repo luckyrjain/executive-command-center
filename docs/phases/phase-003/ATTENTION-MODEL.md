@@ -1,8 +1,8 @@
 ---
 id: PHASE-003-ATTENTION-MODEL
 title: Human Attention Model
-status: Draft
-version: 0.1.0
+status: Approved for Implementation
+version: 0.2.0
 owner: Lucky Jain
 ---
 
@@ -29,7 +29,24 @@ score = clamp(0, 100,
 )
 ```
 
-Each component, cap and weight is stored in a versioned policy. Components use decimal arithmetic and entity ID is the final tie-breaker. Confidence is separate from priority and declines with missing, conflicting or stale evidence.
+Each component, cap and weight is stored in a versioned policy. `meeting` and `importance` are reserved terms in this formula, not yet contributing — see Policy v1 below for what is live today. Components use decimal arithmetic and entity ID is the final tie-breaker. Confidence is separate from priority and declines with missing, conflicting or stale evidence.
+
+## Policy v1 (approved 2026-07-23)
+
+Policy v1 is defined as Phase 1's exact current point values, carried forward byte-for-byte with zero ranking change on the day this phase ships, then extended additively with new factors (not a v2 bump — new terms join the same v1 config):
+
+- `urgency` (due timing): overdue `35`; due/reviewable within 48h `15`; due today `25` (tasks only, date-only due).
+- `commitment` (manual priority/importance): task manual_priority — critical `35`, high `25`, medium `15`, low `5`; commitment importance — critical `25`, high `18`, medium `10`, low `4`.
+- `risk`: impact (probability × impact) — `25` if ≥20, `15` if ≥12, `8` if ≥6, else `0`; review overdue `35`; review due within 48h `15`.
+- Pin: `+20` (uncapped item), score capped at `95` unpinned / `100` pinned (existing shipped cap behavior, unchanged).
+- Existing task-only factors carried forward unchanged: waiting-on-person `+8`, blocked `-12`, stale 7d `+4`, stale 14d `+8`.
+- New in Phase 3, additive to policy v1: `dependency` (blocked-by/waiting factors extending the existing waiting-on-person concept to `waiting_link` rows), `bounded_recency`, `bounded_deferral_penalty` — implemented and scenario-tested in Task 1 before shipping, with exact weights set during implementation and captured in `policy.py`'s versioned config (not restated here to avoid two sources of truth once code exists). `meeting` (meeting proximity) and a distinct `importance` (explicit user-set strategic importance, separate from task/commitment priority) were scoped in this design but **not implemented** — reserved for a future phase.
+
+Confidence values carry forward unchanged: task confidence `0.8` with a due date else `1.0`; commitment confidence from `row.confidence` (default `0.6`), capped at `0.8` when a due date exists; risk confidence fixed at `1.0`.
+
+## Critical-item definition (approved 2026-07-23)
+
+For the two-week dogfood's "no missed critical item" exit criterion, an item is **critical** if it is: overdue, due or reviewable within 48 hours, or blocking a dependent item. This reuses the existing `overdue`/`due_48h`/`review_due_soon`/`review_overdue` factor codes `attention.py` already computes — no new concept, just naming the existing high-weight factors as the critical set.
 
 ## Overrides
 

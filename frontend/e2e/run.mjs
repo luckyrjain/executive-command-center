@@ -14,6 +14,9 @@ import * as conflictAuditKeyboard from './scenarios/conflict-audit-keyboard.mjs'
 import * as knowledgeEntities from './scenarios/knowledge-entities.mjs'
 import * as knowledgeResolution from './scenarios/knowledge-resolution.mjs'
 import * as knowledgeKeyboard from './scenarios/knowledge-keyboard.mjs'
+import * as attentionQueue from './scenarios/attention-queue.mjs'
+import * as attentionPlanning from './scenarios/attention-planning.mjs'
+import * as attentionMeetingPrep from './scenarios/attention-meeting-prep.mjs'
 
 const scenarios = [
   { name: 'tasks', module: tasks },
@@ -29,6 +32,15 @@ const scenarios = [
   { name: 'knowledge-entities', module: knowledgeEntities },
   { name: 'knowledge-resolution', module: knowledgeResolution },
   { name: 'knowledge-keyboard', module: knowledgeKeyboard },
+  { name: 'attention-queue', module: attentionQueue },
+  { name: 'attention-planning', module: attentionPlanning },
+  // attention-meeting-prep reads process.env.MEETING_PREP_AI_ENRICHMENT at
+  // run time and branches its fixture accordingly -- run twice (this
+  // process is invoked once per desired flag state) so both the
+  // AI-enrichment-on and AI-disabled paths get real coverage, per
+  // TEST-PLAN.md's Browser acceptance section. See that scenario's
+  // docstring for why this is env-var-gated rather than a run.mjs param.
+  { name: `attention-meeting-prep (AI enrichment ${process.env.MEETING_PREP_AI_ENRICHMENT === '1' ? 'on' : 'off'})`, module: attentionMeetingPrep },
 ]
 
 async function main() {

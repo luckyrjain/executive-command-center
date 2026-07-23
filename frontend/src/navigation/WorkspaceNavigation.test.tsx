@@ -30,9 +30,12 @@ describe('WorkspaceNavigation', () => {
 
     expect(markup).toContain('aria-label="Workspace"')
     expect(markup).toContain('Today')
+    expect(markup).toContain('Attention')
     expect(markup).toContain('Work')
     expect(markup).toContain('Notes')
     expect(markup).toContain('Schedule')
+    expect(markup).toContain('Planner')
+    expect(markup).toContain('Meeting prep')
     expect(markup).toContain('Risks')
     expect(markup).toContain('Knowledge')
     expect(markup).toContain('Recommendations')
@@ -41,11 +44,11 @@ describe('WorkspaceNavigation', () => {
   })
 
   it('moves focus with horizontal arrow keys and wraps at either end', () => {
-    expect(nextWorkspaceIndex(0, 'ArrowRight', 8)).toBe(1)
-    expect(nextWorkspaceIndex(7, 'ArrowRight', 8)).toBe(0)
-    expect(nextWorkspaceIndex(0, 'ArrowLeft', 8)).toBe(7)
-    expect(nextWorkspaceIndex(3, 'Home', 8)).toBe(0)
-    expect(nextWorkspaceIndex(3, 'End', 8)).toBe(7)
+    expect(nextWorkspaceIndex(0, 'ArrowRight', 11)).toBe(1)
+    expect(nextWorkspaceIndex(10, 'ArrowRight', 11)).toBe(0)
+    expect(nextWorkspaceIndex(0, 'ArrowLeft', 11)).toBe(10)
+    expect(nextWorkspaceIndex(3, 'Home', 11)).toBe(0)
+    expect(nextWorkspaceIndex(3, 'End', 11)).toBe(10)
 
     const focus = [vi.fn(), vi.fn()]
     const navigate = vi.fn()
@@ -66,16 +69,16 @@ describe('WorkspaceNavigation', () => {
     expect(tabs[0].tabIndex).toBe(-1)
 
     expect(fireEvent.keyDown(tabs[1], { key: 'End' })).toBe(false)
-    expect(document.activeElement).toBe(tabs[7])
-    expect(tabs[7].getAttribute('aria-selected')).toBe('true')
+    expect(document.activeElement).toBe(tabs[10])
+    expect(tabs[10].getAttribute('aria-selected')).toBe('true')
 
-    expect(fireEvent.keyDown(tabs[7], { key: 'Home' })).toBe(false)
+    expect(fireEvent.keyDown(tabs[10], { key: 'Home' })).toBe(false)
     expect(document.activeElement).toBe(tabs[0])
     expect(tabs[0].getAttribute('aria-selected')).toBe('true')
 
     expect(fireEvent.keyDown(tabs[0], { key: 'ArrowLeft' })).toBe(false)
-    expect(document.activeElement).toBe(tabs[7])
-    expect(tabs[7].tabIndex).toBe(0)
+    expect(document.activeElement).toBe(tabs[10])
+    expect(tabs[10].tabIndex).toBe(0)
     expect(tabs.filter((tab) => tab.getAttribute('aria-selected') === 'true')).toHaveLength(1)
   })
 
