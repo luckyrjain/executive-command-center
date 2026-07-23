@@ -77,6 +77,15 @@ export default function Planner() {
   const refresh = () => {
     void queryClient.invalidateQueries({ queryKey: ['plans'] })
     void queryClient.invalidateQueries({ queryKey: ['dashboard', 'today'] })
+    void queryClient.invalidateQueries({ queryKey: ['brief', 'morning'] })
+  }
+
+  // A VERSION_CONFLICT means the cached plan (and its version) is stale --
+  // refetching here (rather than only on success) is what lets the next
+  // user action retry against the current version, instead of failing the
+  // same way again against data that's still stale in the query cache.
+  const onVersionConflict = (error: Error) => {
+    if (error instanceof ApiError && error.code === 'VERSION_CONFLICT') refresh()
   }
 
   const createMutation = useMutation({
@@ -86,10 +95,12 @@ export default function Planner() {
   const acceptMutation = useMutation({
     mutationFn: (plan: Plan) => apiRequest<Plan>(`/api/v1/plans/${plan.id}/accept`, { method: 'POST', body: { expected_version: plan.version } }),
     onSuccess: () => refresh(),
+    onError: onVersionConflict,
   })
   const supersedeMutation = useMutation({
     mutationFn: (plan: Plan) => apiRequest<Plan>(`/api/v1/plans/${plan.id}/supersede`, { method: 'POST', body: { expected_version: plan.version } }),
     onSuccess: () => refresh(),
+    onError: onVersionConflict,
   })
   // Replanning always presents the diff before acceptance (UX-STATES.md).
   // The replan call itself just proposes; a separate, explicit accept step
@@ -97,6 +108,7 @@ export default function Planner() {
   const replanMutation = useMutation({
     mutationFn: (plan: Plan) => apiRequest<Plan>(`/api/v1/plans/${plan.id}/propose`, { method: 'POST', body: { expected_version: plan.version } }),
     onSuccess: (newPlan) => { setPendingDiff(newPlan); refresh() },
+    onError: onVersionConflict,
   })
   // Block editing is keyboard-only (plain numeric/datetime inputs, no
   // drag-and-drop) -- UX-STATES.md requires DnD to have a full keyboard
@@ -108,6 +120,7 @@ export default function Planner() {
         body: { expected_version: plan.version, starts_at: new Date(startsAt).toISOString(), ends_at: new Date(endsAt).toISOString() },
       }),
     onSuccess: () => refresh(),
+    onError: onVersionConflict,
   })
   const removeBlockMutation = useMutation({
     mutationFn: ({ plan, block }: { plan: Plan; block: PlanBlock }) =>
@@ -116,6 +129,7 @@ export default function Planner() {
         body: { expected_version: plan.version },
       }),
     onSuccess: () => refresh(),
+    onError: onVersionConflict,
   })
   const pending = createMutation.isPending || acceptMutation.isPending || supersedeMutation.isPending
     || replanMutation.isPending || moveBlockMutation.isPending || removeBlockMutation.isPending

@@ -109,4 +109,39 @@ describe('Planner', () => {
     expect(body.expected_version).toBe(1)
     expect(new Date(body.starts_at).getUTCHours()).toBe(new Date('2026-07-24T11:00').getUTCHours())
   })
+
+  it('refetches plans after a VERSION_CONFLICT so the next retry uses fresh data', async () => {
+    const fetch = vi.fn()
+      .mockImplementationOnce(() => response({ items: [proposedPlan], next_cursor: null }))
+      .mockImplementationOnce(() => response({ error: { code: 'VERSION_CONFLICT', message: 'stale' } }, 409))
+      .mockImplementationOnce(() => response({ items: [{ ...proposedPlan, version: 2 }], next_cursor: null }))
+    vi.stubGlobal('fetch', fetch)
+    const { client } = renderPlanner()
+    const invalidateSpy = vi.spyOn(client, 'invalidateQueries')
+
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Accept plan 2026-07-24' })).toBeTruthy())
+    fireEvent.click(screen.getByRole('button', { name: 'Accept plan 2026-07-24' }))
+
+    await waitFor(() => expect(screen.getByRole('alert').textContent).toMatch(/This plan changed since it was loaded/))
+    await waitFor(() => expect(fetch).toHaveBeenCalledTimes(3))
+    const invalidatedKeys = invalidateSpy.mock.calls.map((call) => call[0]?.queryKey)
+    expect(invalidatedKeys).toContainEqual(['plans'])
+  })
+
+  it('invalidates the morning brief cache after a successful mutation', async () => {
+    const fetch = vi.fn()
+      .mockImplementationOnce(() => response({ items: [proposedPlan], next_cursor: null }))
+      .mockImplementationOnce(() => response({ ...proposedPlan, status: 'accepted' }))
+      .mockImplementationOnce(() => response({ items: [{ ...proposedPlan, status: 'accepted' }], next_cursor: null }))
+    vi.stubGlobal('fetch', fetch)
+    const { client } = renderPlanner()
+    const invalidateSpy = vi.spyOn(client, 'invalidateQueries')
+
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Accept plan 2026-07-24' })).toBeTruthy())
+    fireEvent.click(screen.getByRole('button', { name: 'Accept plan 2026-07-24' }))
+
+    await waitFor(() => expect(fetch).toHaveBeenCalledTimes(3))
+    const invalidatedKeys = invalidateSpy.mock.calls.map((call) => call[0]?.queryKey)
+    expect(invalidatedKeys).toContainEqual(['brief', 'morning'])
+  })
 })
