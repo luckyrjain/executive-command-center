@@ -1,7 +1,7 @@
 ---
 id: PHASE-004-TEST-PLAN
 title: Phase 4 Test Plan
-status: Draft
+status: Approved for Implementation
 version: 0.2.0
 owner: Lucky Jain
 ---

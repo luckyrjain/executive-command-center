@@ -30,10 +30,12 @@ Domains may reference another domain’s entity ID but may not directly mutate a
 | Knowledge Platform | Note, KnowledgeItem, Document, Decision, Relationship, Evidence |
 | Executive Intelligence | Risk, Brief, AttentionItem, Recommendation, RecommendationFeedback, UserFeedback |
 | Audit | AuditEvent |
-| AI Platform | PromptDefinition, ModelExecution, EvaluationResult, AgentRun |
+| AI Platform | ModelDefinition, RoutingPolicy, PromptVersion, ToolDefinition, AiRun, AiRunStep, EvaluationSet, EvaluationRun, GeneratedArtifact |
 | Integration Platform | ConnectorAccount, SyncCursor, SourceRecord |
 
 Backend package note (Phase 3, approved 2026-07-23): `AttentionItem` moves from `backend/ecc/domains/governance/attention.py` to a dedicated `backend/ecc/domains/attention/` package, which also owns Phase 3's new WaitingLink, RiskReview (history), CapacityProfile, PlanningConstraint, Plan/PlanBlock and MeetingPack records — all still conceptually within the Executive Intelligence domain above, just their own backend package since Phase 3 substantially extends and owns that surface. `Risk`'s CRUD stays in `governance/risks.py`; Phase 3 only adds the `risk_reviews` history table and a review endpoint reading/writing it.
+
+Backend package note (Phase 4, approved 2026-07-23): the AI Platform row's entities are the concrete `phase-004/DATA-MODEL.md` records (renamed from this document's earlier placeholder names -- `PromptDefinition`/`ModelExecution`/`EvaluationResult`/`AgentRun` -- to match what `docs/superpowers/specs/2026-07-23-phase-4-ai-runtime-design.md` actually specified), owned by a new `backend/ecc/domains/ai_runtime/` package. Domain modules never import a model-provider SDK directly (`ADR-0004`, `ADR-0007`, `ADR-0012`) or call a model outside the AI Runtime's Model Router; `attention/tools.py` and `knowledge/tools.py` add thin read-only tool-handler wrappers in their own existing packages, not new domain ownership.
 
 ## Core entities
 

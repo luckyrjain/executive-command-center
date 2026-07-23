@@ -1,7 +1,7 @@
 ---
 id: PHASE-004-API-SCHEMAS
 title: Phase 4 AI Runtime API
-status: Draft
+status: Approved for Implementation
 version: 0.2.0
 owner: Lucky Jain
 ---
