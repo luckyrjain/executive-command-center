@@ -634,6 +634,75 @@ def test_create_prep_composes_all_sections_from_existing_domains(
     assert body["status"] == "fresh"
 
 
+def test_notes_limit_applies_after_restricted_filter_not_before(
+    meeting_prep_test_context: tuple[TestClient, UUID, UUID, str, UUID],
+) -> None:
+    """Finding #8: ``_fetch_notes`` used to filter out restricted notes in
+    Python *after* the SQL ``LIMIT`` had already run, so a meeting with at
+    least as many restricted notes as the limit could return zero visible
+    notes even though a visible one existed. Seed more restricted notes
+    than the fetch limit, plus one visible note, and confirm the visible
+    one still surfaces.
+    """
+    client, workspace_id, user_id, token, meeting_id = meeting_prep_test_context
+    now = datetime.now(UTC)
+    with engine.begin() as connection:
+        # More restricted notes than meeting_prep.py's _MAX_NOTES (20) --
+        # under the old bug, LIMIT 20 could consume entirely restricted
+        # rows before the Python-side filter ever ran.
+        for i in range(25):
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO notes (
+                        id, workspace_id, owner_id, title, body, note_type, meeting_id,
+                        source_type, restricted, created_by, updated_by,
+                        created_at, updated_at, version
+                    ) VALUES (
+                        :id, :workspace_id, :owner_id, 'Restricted', 'Confidential', 'general',
+                        :meeting_id, 'local', true, :owner_id, :owner_id, :now, :now, 1
+                    )
+                    """
+                ),
+                {
+                    "id": uuid4(),
+                    "workspace_id": workspace_id,
+                    "owner_id": user_id,
+                    "meeting_id": meeting_id,
+                    "now": now - timedelta(minutes=25 - i),
+                },
+            )
+        connection.execute(
+            text(
+                """
+                INSERT INTO notes (
+                    id, workspace_id, owner_id, title, body, note_type, meeting_id,
+                    source_type, restricted, created_by, updated_by,
+                    created_at, updated_at, version
+                ) VALUES (
+                    :id, :workspace_id, :owner_id, 'Visible', 'Fine to share', 'general',
+                    :meeting_id, 'local', false, :owner_id, :owner_id, :now, :now, 1
+                )
+                """
+            ),
+            {
+                "id": uuid4(),
+                "workspace_id": workspace_id,
+                "owner_id": user_id,
+                "meeting_id": meeting_id,
+                "now": now,
+            },
+        )
+
+    created = client.post(
+        f"/api/v1/meetings/{meeting_id}/prep", headers=_headers(token, "create-notes-limit")
+    )
+    assert created.status_code == 201, created.text
+    notes = created.json()["notes"]
+    assert len(notes) == 1
+    assert notes[0]["body"] == "Fine to share"
+
+
 def test_create_prep_rejects_when_pack_already_exists(
     meeting_prep_test_context: tuple[TestClient, UUID, UUID, str, UUID],
 ) -> None:
@@ -644,6 +713,65 @@ def test_create_prep_rejects_when_pack_already_exists(
     second = client.post(f"/api/v1/meetings/{meeting_id}/prep", headers=_headers(token, "second"))
     assert second.status_code == 409
     assert second.json()["error"]["code"] == "MEETING_PACK_EXISTS"
+
+
+def test_create_prep_race_returns_409_not_500(
+    meeting_prep_test_context: tuple[TestClient, UUID, UUID, str, UUID],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Finding #7: two concurrent "generate pack" calls for the same
+    meeting could both pass the existence check and both attempt to
+    INSERT, either duplicating a row or 500ing on the resulting unhandled
+    IntegrityError. Force that exact race deterministically -- a pack
+    already exists, but the pre-insert existence check is monkeypatched to
+    report "none exists" anyway (simulating it having run just before the
+    concurrent request committed) -- so the INSERT itself must hit
+    ``uq_meeting_packs_active_per_meeting`` and the handler must translate
+    that into 409 MEETING_PACK_EXISTS, not an unhandled 500.
+    """
+    import ecc.domains.attention.meeting_prep as meeting_prep_module
+
+    client, _, _, token, meeting_id = meeting_prep_test_context
+    first = client.post(f"/api/v1/meetings/{meeting_id}/prep", headers=_headers(token, "first"))
+    assert first.status_code == 201
+
+    monkeypatch.setattr(meeting_prep_module, "_current_pack_row", lambda *a, **k: None)
+
+    raced = client.post(f"/api/v1/meetings/{meeting_id}/prep", headers=_headers(token, "raced"))
+    assert raced.status_code == 409, raced.text
+    assert raced.json()["error"]["code"] == "MEETING_PACK_EXISTS"
+
+
+def test_add_participant_race_returns_409_not_500(
+    meeting_prep_test_context: tuple[TestClient, UUID, UUID, str, UUID],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Same race, participant side (finding #7): two concurrent
+    add_participant calls for the same (meeting, entity) pair could both
+    pass the existence check and both INSERT, 500ing on the unhandled
+    unique-violation. Forced deterministically the same way as the pack
+    race above, via ``_participant_already_linked``.
+    """
+    import ecc.domains.attention.meeting_prep as meeting_prep_module
+
+    client, workspace_id, _, token, meeting_id = meeting_prep_test_context
+    entity_id = _seed_node(workspace_id, "person", "Jordan Lee")
+    first = client.post(
+        f"/api/v1/meetings/{meeting_id}/participants",
+        headers=_headers(token, "first-link"),
+        json={"entity_id": str(entity_id)},
+    )
+    assert first.status_code == 201
+
+    monkeypatch.setattr(meeting_prep_module, "_participant_already_linked", lambda *a, **k: False)
+
+    raced = client.post(
+        f"/api/v1/meetings/{meeting_id}/participants",
+        headers=_headers(token, "raced-link"),
+        json={"entity_id": str(entity_id)},
+    )
+    assert raced.status_code == 409, raced.text
+    assert raced.json()["error"]["code"] == "PARTICIPANT_ALREADY_LINKED"
 
 
 def test_create_prep_idempotent_on_replay(
@@ -780,6 +908,66 @@ def test_get_prep_marks_pack_stale_after_material_source_change(
     fetched = client.get(f"/api/v1/meetings/{meeting_id}/prep")
     assert fetched.status_code == 200
     assert fetched.json()["status"] == "stale"
+
+
+def test_get_prep_returns_originally_generated_content_until_refresh(
+    meeting_prep_test_context: tuple[TestClient, UUID, UUID, str, UUID],
+) -> None:
+    """Finding #6: a generated pack is meant to be a frozen, reproducible
+    snapshot -- GET must return exactly what was generated, even after the
+    underlying source changes and the pack is flagged 'stale', until an
+    explicit refresh. The old implementation re-derived live data on every
+    GET, so this would have silently shown the new decision immediately
+    instead of only after refresh.
+    """
+    client, workspace_id, user_id, token, meeting_id = meeting_prep_test_context
+    created = client.post(f"/api/v1/meetings/{meeting_id}/prep", headers=_headers(token, "create"))
+    assert created.status_code == 201
+    assert created.json()["decisions"] == []
+
+    now = datetime.now(UTC)
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                """
+                INSERT INTO notes (
+                    id, workspace_id, owner_id, title, body, note_type, meeting_id,
+                    source_type, restricted, created_by, updated_by, created_at, updated_at, version
+                ) VALUES (
+                    :id, :workspace_id, :owner_id, 'New decision', 'Decided later', 'decision',
+                    :meeting_id, 'local', false, :owner_id, :owner_id, :now, :now, 1
+                )
+                """
+            ),
+            {
+                "id": uuid4(),
+                "workspace_id": workspace_id,
+                "owner_id": user_id,
+                "meeting_id": meeting_id,
+                "now": now,
+            },
+        )
+
+    # The pack is now stale (material source change), but GET must still
+    # return the original, frozen content -- not the new decision.
+    fetched = client.get(f"/api/v1/meetings/{meeting_id}/prep")
+    assert fetched.status_code == 200
+    assert fetched.json()["status"] == "stale"
+    assert fetched.json()["decisions"] == []
+
+    # A second GET (now already marked 'stale' in the DB) must be equally
+    # frozen -- not just the first stale-detecting GET.
+    fetched_again = client.get(f"/api/v1/meetings/{meeting_id}/prep")
+    assert fetched_again.json()["decisions"] == []
+
+    # Only an explicit refresh picks up the new content.
+    refreshed = client.post(
+        f"/api/v1/meetings/{meeting_id}/prep/refresh", headers=_headers(token, "refresh")
+    )
+    assert refreshed.status_code == 201, refreshed.text
+    assert refreshed.json()["status"] == "fresh"
+    assert len(refreshed.json()["decisions"]) == 1
+    assert refreshed.json()["decisions"][0]["body"] == "Decided later"
 
 
 def test_create_prep_rejects_when_existing_pack_is_stale(

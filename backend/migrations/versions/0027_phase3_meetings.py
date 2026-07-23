@@ -20,6 +20,16 @@ condition marks the pack `stale` at read time. Refresh always creates a new
 row (never rewrites an existing snapshot in place) so prior packs remain
 available as history, mirroring `plans`'/`waiting_links`' supersede pattern.
 
+`meeting_packs.content` persists the fully-rendered pack body (participants,
+timeline, commitments, decisions, notes, risks, dependencies, evidence gaps)
+exactly as generated -- a real frozen snapshot per MEETING-PREP-CONTRACT.md,
+not re-derived from live tables on every GET (a subsequent GET returns this
+stored JSON verbatim; only `POST .../prep/refresh` re-derives and persists a
+new one). `uq_meeting_packs_active_per_meeting` enforces at most one
+fresh-or-stale pack per meeting at the database level, closing the
+duplicate-pack race a plain existence-check-then-insert can't close on its
+own under concurrent requests.
+
 Also adds `notes.restricted` (`BOOLEAN NOT NULL DEFAULT false`).
 `MEETING-PREP-CONTRACT.md`'s Safety section requires private/restricted
 notes to be excluded from a generated pack, and `TEST-PLAN.md` names this as
@@ -29,7 +39,6 @@ the minimal additive column to make that named, existing contract
 requirement satisfiable, matching how Task 1 added `attention_items.
 override_reason` directly rather than a new table.
 """
-
 
 import sqlalchemy as sa
 from alembic import op
@@ -102,6 +111,13 @@ def upgrade() -> None:
             nullable=False,
             server_default=sa.text("'{}'::jsonb"),
         ),
+        # The frozen, fully-rendered pack body -- see module docstring.
+        sa.Column(
+            "content",
+            postgresql.JSONB(),
+            nullable=False,
+            server_default=sa.text("'{}'::jsonb"),
+        ),
         sa.Column("created_by", uuid, nullable=False),
         sa.Column("updated_by", uuid, nullable=False),
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
@@ -129,9 +145,38 @@ def upgrade() -> None:
         "meeting_packs",
         ["workspace_id", "meeting_id", "generated_at"],
     )
+    # At most one active (fresh or stale) pack per meeting -- a database
+    # constraint, not just an application-level existence check, so two
+    # concurrent "generate pack" requests can't both pass the check and
+    # both insert (or leave a real duplicate uncaught).
+    op.create_index(
+        "uq_meeting_packs_active_per_meeting",
+        "meeting_packs",
+        ["workspace_id", "meeting_id"],
+        unique=True,
+        postgresql_where=sa.text("status IN ('fresh', 'stale')"),
+    )
+
+    # meeting_prep.py's _fetch_notes filters/orders by (workspace_id,
+    # meeting_id, created_at) and _fetch_commitments filters by
+    # (workspace_id, counterparty_person_id) -- both hot paths on every
+    # prep-pack generation/refresh, neither previously indexed.
+    op.create_index(
+        "ix_notes_workspace_meeting_created",
+        "notes",
+        ["workspace_id", "meeting_id", "created_at"],
+    )
+    op.create_index(
+        "ix_commitments_workspace_counterparty",
+        "commitments",
+        ["workspace_id", "counterparty_person_id"],
+    )
 
 
 def downgrade() -> None:
+    op.drop_index("ix_commitments_workspace_counterparty", table_name="commitments")
+    op.drop_index("ix_notes_workspace_meeting_created", table_name="notes")
+    op.drop_index("uq_meeting_packs_active_per_meeting", table_name="meeting_packs")
     op.drop_index("ix_meeting_packs_workspace_meeting_generated", table_name="meeting_packs")
     op.drop_table("meeting_packs")
     op.drop_index("ix_meeting_participants_workspace_meeting", table_name="meeting_participants")

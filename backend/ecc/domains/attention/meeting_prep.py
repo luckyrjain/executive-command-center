@@ -46,7 +46,7 @@ from uuid import UUID, uuid4
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import text
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from ecc.auth import AuthContext, AuthDep, CsrfDep
@@ -74,9 +74,11 @@ _MAX_TIMELINE_ENTRIES = 20
 _MAX_COMMITMENTS = 20
 _MAX_RISKS = 10
 _MAX_NOTES = 20
+_MAX_DEPENDENCIES = 20
+_MAX_EVIDENCE = 50
 
 _PACK_FIELDS = """
-    id, meeting_id, status, generated_at, stale_at, source_versions,
+    id, meeting_id, status, generated_at, stale_at, source_versions, content,
     created_at, updated_at, version
 """
 
@@ -218,17 +220,44 @@ def _source_fingerprint(
     notes: list[NoteRow],
     risks: list[RiskRow],
     dependencies: list[DependencyRow],
+    evidence: list[EvidenceRow],
 ) -> dict[str, str]:
+    """Hashed per input category, exactly like ``planning.py``'s
+    fingerprint. Every field that actually reaches the rendered pack
+    (``_pack_row_to_response``'s output) must be included here -- a field
+    that determines what's displayed but isn't hashed is a staleness gap:
+    the underlying source can change in a way a viewer would see, and
+    nothing marks the frozen snapshot ``stale`` for it (finding #6's
+    fingerprint half). This previously hashed only id/status/date-shaped
+    fields and omitted the actual display text (summary, entity_name,
+    description, note body/title, ...) and evidence entirely.
+    """
+
     def _hash(parts: list[str]) -> str:
         return sha256("|".join(sorted(parts)).encode()).hexdigest()
 
     return {
-        "participants": _hash([f"{p.id}:{p.role}" for p in participants]),
-        "timeline": _hash([f"{t.id}:{t.effective_at}" for t in timeline]),
-        "commitments": _hash([f"{c.id}:{c.status}:{c.due_at}" for c in commitments]),
-        "notes": _hash([f"{n.id}:{n.body}:{n.restricted}" for n in notes]),
-        "risks": _hash([f"{r.id}:{r.status}:{r.review_at}" for r in risks]),
-        "dependencies": _hash([f"{d.id}:{d.direction}:{d.expected_at}" for d in dependencies]),
+        "participants": _hash([f"{p.id}:{p.role}:{p.entity_name}" for p in participants]),
+        "timeline": _hash(
+            [f"{t.id}:{t.effective_at}:{t.event_type}:{t.summary}" for t in timeline]
+        ),
+        "commitments": _hash(
+            [
+                f"{c.id}:{c.status}:{c.due_at}:{c.direction}:{c.summary}:{c.counterparty_name}"
+                for c in commitments
+            ]
+        ),
+        "notes": _hash([f"{n.id}:{n.body}:{n.restricted}:{n.title}:{n.note_type}" for n in notes]),
+        "risks": _hash(
+            [
+                f"{r.id}:{r.status}:{r.review_at}:{r.description}:{r.probability}:{r.impact}"
+                for r in risks
+            ]
+        ),
+        "dependencies": _hash(
+            [f"{d.id}:{d.direction}:{d.expected_at}:{d.note}" for d in dependencies]
+        ),
+        "evidence": _hash([f"{e.id}:{e.source_type}:{e.evidence_state}" for e in evidence]),
     }
 
 
@@ -305,6 +334,29 @@ class EnrichmentOut(BaseModel):
     available: bool
     summary: str | None
     error_code: str | None
+
+
+class PackContentSnapshot(BaseModel):
+    """The frozen, fully-rendered pack body -- everything ``build_pack``
+    computed at generation time, persisted verbatim into
+    ``meeting_packs.content`` and returned as-is by every subsequent GET
+    (finding #6): a real snapshot, not a re-derivation of live data on
+    every read. Only ``POST .../prep/refresh`` produces a new one.
+    """
+
+    objective: str
+    starts_at: datetime
+    ends_at: datetime
+    timezone: str
+    participants: list[ParticipantResponse]
+    timeline: list[TimelineEntryOut]
+    commitments: list[CommitmentOut]
+    decisions: list[NoteOut]
+    open_questions: list[str]
+    notes: list[NoteOut]
+    risks: list[RiskOut]
+    dependencies: list[DependencyOut]
+    evidence_gaps: list[EvidenceGapOut]
 
 
 class MeetingPack(BaseModel):
@@ -579,6 +631,33 @@ def _fetch_participants(
     ]
 
 
+def _participant_already_linked(
+    session: Session, auth: AuthContext, meeting_id: UUID, entity_id: UUID
+) -> bool:
+    """The pre-insert existence check ``add_participant`` uses -- pulled
+    into its own function both for readability and so a test can
+    monkeypatch it to force the TOCTOU race finding #7 describes (this
+    check passing stale while a concurrent request already inserted the
+    same link), exercising the savepoint/``IntegrityError`` handling
+    around the INSERT rather than only the common non-concurrent case.
+    """
+    return (
+        session.execute(
+            text(
+                "SELECT 1 FROM meeting_participants "
+                "WHERE workspace_id = :workspace_id AND meeting_id = :meeting_id "
+                "AND entity_id = :entity_id"
+            ),
+            {
+                "workspace_id": auth.workspace_id,
+                "meeting_id": meeting_id,
+                "entity_id": entity_id,
+            },
+        ).scalar_one_or_none()
+        is not None
+    )
+
+
 def _fetch_timeline(
     session: Session, auth: AuthContext, entity_ids: list[UUID]
 ) -> list[TimelineRow]:
@@ -658,6 +737,14 @@ def _fetch_commitments(
 
 
 def _fetch_notes(session: Session, auth: AuthContext, meeting_id: UUID) -> list[NoteRow]:
+    # Restricted notes are excluded here, in the SQL WHERE clause, *before*
+    # LIMIT is applied -- not filtered out afterward in Python (build_pack's
+    # filter stays as a defense-in-depth belt-and-suspenders check, but
+    # must never be the *only* place this happens). Filtering post-fetch
+    # let LIMIT :limit count restricted rows against the cap, so a meeting
+    # with _MAX_NOTES-or-more restricted notes could return fewer than
+    # _MAX_NOTES visible notes even when more visible ones existed beyond
+    # the truncated window (finding #8).
     rows = (
         session.execute(
             text(
@@ -665,7 +752,7 @@ def _fetch_notes(session: Session, auth: AuthContext, meeting_id: UUID) -> list[
                 SELECT id, title, body, note_type, restricted, created_at
                 FROM notes
                 WHERE workspace_id = :workspace_id AND meeting_id = :meeting_id
-                  AND archived_at IS NULL
+                  AND archived_at IS NULL AND restricted = false
                 ORDER BY created_at DESC, id
                 LIMIT :limit
                 """
@@ -734,9 +821,14 @@ def _fetch_dependencies(
                   AND status = 'open'
                   AND counterparty_entity_id = ANY(:entity_ids)
                 ORDER BY expected_at NULLS LAST, id
+                LIMIT :limit
                 """
             ),
-            {"workspace_id": auth.workspace_id, "entity_ids": participant_entity_ids},
+            {
+                "workspace_id": auth.workspace_id,
+                "entity_ids": participant_entity_ids,
+                "limit": _MAX_DEPENDENCIES,
+            },
         )
         .mappings()
         .all()
@@ -759,9 +851,15 @@ def _fetch_evidence(session: Session, auth: AuthContext, node_ids: list[UUID]) -
                 SELECT id, source_type, evidence_state
                 FROM pkos_evidence
                 WHERE workspace_id = :workspace_id AND node_id = ANY(:node_ids)
+                ORDER BY id
+                LIMIT :limit
                 """
             ),
-            {"workspace_id": auth.workspace_id, "node_ids": node_ids},
+            {
+                "workspace_id": auth.workspace_id,
+                "node_ids": node_ids,
+                "limit": _MAX_EVIDENCE,
+            },
         )
         .mappings()
         .all()
@@ -799,19 +897,19 @@ def _generate_pack(
         meeting, participants, timeline, commitments, notes, risks, dependencies, evidence
     )
     fingerprint = _source_fingerprint(
-        participants, timeline, commitments, notes, risks, dependencies
+        participants, timeline, commitments, notes, risks, dependencies, evidence
     )
     return _GeneratedPack(content=content, fingerprint=fingerprint)
 
 
-def _pack_row_to_response(row: dict[str, Any], content: PackContent) -> MeetingPack:
-    return MeetingPack(
-        id=row["id"],
-        meeting_id=row["meeting_id"],
-        status=row["status"],
-        generated_at=row["generated_at"],
-        stale_at=row["stale_at"],
-        source_versions=dict(row["source_versions"]),
+def _content_to_snapshot(content: PackContent) -> PackContentSnapshot:
+    """Render a freshly-generated ``PackContent`` into the exact JSON-able
+    shape persisted as ``meeting_packs.content`` (finding #6). Called once,
+    at generation time (``create_prep``/``refresh_prep``) -- never at GET
+    time, which loads the already-persisted snapshot instead of calling
+    this again.
+    """
+    return PackContentSnapshot(
         objective=content.objective,
         starts_at=content.starts_at,
         ends_at=content.ends_at,
@@ -875,7 +973,24 @@ def _pack_row_to_response(row: dict[str, Any], content: PackContent) -> MeetingP
             EvidenceGapOut(id=e.id, source_type=e.source_type, evidence_state=e.evidence_state)
             for e in content.evidence_gaps
         ],
+    )
+
+
+def _pack_row_to_response(row: dict[str, Any], snapshot: PackContentSnapshot) -> MeetingPack:
+    """Merge a ``meeting_packs`` row's own columns with its persisted
+    content snapshot. ``snapshot`` always comes from ``row["content"]``
+    (the frozen body stored at generation time) -- never from a fresh
+    ``_generate_pack`` call, which would defeat the point of storing it.
+    """
+    return MeetingPack(
+        id=row["id"],
+        meeting_id=row["meeting_id"],
+        status=row["status"],
+        generated_at=row["generated_at"],
+        stale_at=row["stale_at"],
+        source_versions=dict(row["source_versions"]),
         enrichment=_enrichment_section(),
+        **snapshot.model_dump(),
     )
 
 
@@ -972,44 +1087,43 @@ def add_participant(
         if entity is None:
             raise HTTPException(status_code=404, detail="ENTITY_NOT_FOUND")
 
-        existing = session.execute(
-            text(
-                "SELECT 1 FROM meeting_participants "
-                "WHERE workspace_id = :workspace_id AND meeting_id = :meeting_id "
-                "AND entity_id = :entity_id"
-            ),
-            {
-                "workspace_id": auth.workspace_id,
-                "meeting_id": meeting_id,
-                "entity_id": payload.entity_id,
-            },
-        ).scalar_one_or_none()
-        if existing is not None:
+        if _participant_already_linked(session, auth, meeting_id, payload.entity_id):
             raise HTTPException(status_code=409, detail="PARTICIPANT_ALREADY_LINKED")
 
         participant_id = uuid4()
-        session.execute(
-            text(
-                """
-                INSERT INTO meeting_participants (
-                    id, workspace_id, meeting_id, entity_id, role,
-                    created_by, updated_by, created_at, updated_at, version
-                ) VALUES (
-                    :id, :workspace_id, :meeting_id, :entity_id, :role,
-                    :actor_id, :actor_id, :now, :now, 1
+        try:
+            # Nested transaction (SAVEPOINT): the existence check above
+            # closes the common case, but two concurrent requests can both
+            # pass it and both reach this INSERT -- migration 0027's
+            # uq_meeting_participants_link unique constraint is the real
+            # guard. Without the savepoint, catching the resulting
+            # IntegrityError here would still leave the outer transaction
+            # aborted for every statement after it (finding #7).
+            with session.begin_nested():
+                session.execute(
+                    text(
+                        """
+                        INSERT INTO meeting_participants (
+                            id, workspace_id, meeting_id, entity_id, role,
+                            created_by, updated_by, created_at, updated_at, version
+                        ) VALUES (
+                            :id, :workspace_id, :meeting_id, :entity_id, :role,
+                            :actor_id, :actor_id, :now, :now, 1
+                        )
+                        """
+                    ),
+                    {
+                        "id": participant_id,
+                        "workspace_id": auth.workspace_id,
+                        "meeting_id": meeting_id,
+                        "entity_id": payload.entity_id,
+                        "role": payload.role,
+                        "actor_id": auth.user_id,
+                        "now": now,
+                    },
                 )
-                """
-            ),
-            {
-                "id": participant_id,
-                "workspace_id": auth.workspace_id,
-                "meeting_id": meeting_id,
-                "entity_id": payload.entity_id,
-                "role": payload.role,
-                "actor_id": auth.user_id,
-                "now": now,
-            },
-        )
+        except IntegrityError as exc:
+            raise HTTPException(status_code=409, detail="PARTICIPANT_ALREADY_LINKED") from exc
         # Audit-only, no outbox/catalog event -- a minor sub-action, matching
         # attention_item.dismiss/defer/restore's established precedent.
         _write_event(
@@ -1086,34 +1200,52 @@ def create_prep(
             raise HTTPException(status_code=409, detail="MEETING_PACK_EXISTS")
 
         generated = _generate_pack(session, auth, meeting_id, meeting_row)
-        row = (
-            session.execute(
-                text(
-                    f"""
-                    INSERT INTO meeting_packs (
-                        id, workspace_id, meeting_id, status, generated_at, stale_at,
-                        source_versions, created_by, updated_by, created_at, updated_at, version
-                    ) VALUES (
-                        :id, :workspace_id, :meeting_id, 'fresh', :now, :stale_at,
-                        CAST(:source_versions AS jsonb), :actor_id, :actor_id, :now, :now, 1
+        snapshot = _content_to_snapshot(generated.content)
+        insert_params = {
+            "id": pack_id,
+            "workspace_id": auth.workspace_id,
+            "meeting_id": meeting_id,
+            "now": now,
+            "stale_at": now + _STALE_AFTER,
+            "source_versions": dumps(generated.fingerprint),
+            "content": dumps(snapshot.model_dump(mode="json")),
+            "actor_id": auth.user_id,
+        }
+        try:
+            # A nested transaction (SAVEPOINT): the existence check above
+            # closes the common case, but under true concurrency two
+            # requests can both pass it and both reach this INSERT --
+            # `uq_meeting_packs_active_per_meeting` (migration 0027) is
+            # the real guard, and the loser must get a clean 409 instead
+            # of an unhandled 500 (finding #7). A savepoint keeps that
+            # failure from dooming the whole outer transaction so the
+            # idempotency-record write below (a distinct concern) still
+            # succeeds.
+            with session.begin_nested():
+                row = (
+                    session.execute(
+                        text(
+                            f"""
+                            INSERT INTO meeting_packs (
+                                id, workspace_id, meeting_id, status, generated_at, stale_at,
+                                source_versions, content, created_by, updated_by,
+                                created_at, updated_at, version
+                            ) VALUES (
+                                :id, :workspace_id, :meeting_id, 'fresh', :now, :stale_at,
+                                CAST(:source_versions AS jsonb), CAST(:content AS jsonb),
+                                :actor_id, :actor_id, :now, :now, 1
+                            )
+                            RETURNING {_PACK_FIELDS}
+                            """
+                        ),
+                        insert_params,
                     )
-                    RETURNING {_PACK_FIELDS}
-                    """
-                ),
-                {
-                    "id": pack_id,
-                    "workspace_id": auth.workspace_id,
-                    "meeting_id": meeting_id,
-                    "now": now,
-                    "stale_at": now + _STALE_AFTER,
-                    "source_versions": dumps(generated.fingerprint),
-                    "actor_id": auth.user_id,
-                },
-            )
-            .mappings()
-            .one()
-        )
-        response = _pack_row_to_response(dict(row), generated.content)
+                    .mappings()
+                    .one()
+                )
+        except IntegrityError as exc:
+            raise HTTPException(status_code=409, detail="MEETING_PACK_EXISTS") from exc
+        response = _pack_row_to_response(dict(row), snapshot)
         _write_event(
             session,
             auth,
@@ -1141,7 +1273,11 @@ def get_prep(meeting_id: UUID, auth: AuthDep, session: SessionDep) -> MeetingPac
         if pack_row is None:
             raise HTTPException(status_code=404, detail="MEETING_PACK_NOT_FOUND")
         now = datetime.now(UTC)
-        generated = _generate_pack(session, auth, meeting_id, meeting_row)
+        # Staleness is only ever a *status* flip -- it never regenerates or
+        # overwrites the persisted `content` snapshot. A GET always returns
+        # the pack exactly as it was generated (finding #6): the caller
+        # sees `status: "stale"` as a signal to call .../prep/refresh, not
+        # silently-updated content.
         if pack_row["status"] == "fresh" and _is_stale(
             session, auth, meeting_id, pack_row, meeting_row, now
         ):
@@ -1166,7 +1302,8 @@ def get_prep(meeting_id: UUID, auth: AuthDep, session: SessionDep) -> MeetingPac
                 .one()
             )
             pack_row = dict(updated_row)
-        return _pack_row_to_response(pack_row, generated.content)
+        snapshot = PackContentSnapshot.model_validate(pack_row["content"])
+        return _pack_row_to_response(pack_row, snapshot)
 
 
 @router.post(
@@ -1197,34 +1334,11 @@ def refresh_prep(
         if old is None:
             raise HTTPException(status_code=404, detail="MEETING_PACK_NOT_FOUND")
 
-        generated = _generate_pack(session, auth, meeting_id, meeting_row)
-        row = (
-            session.execute(
-                text(
-                    f"""
-                    INSERT INTO meeting_packs (
-                        id, workspace_id, meeting_id, status, generated_at, stale_at,
-                        source_versions, created_by, updated_by, created_at, updated_at, version
-                    ) VALUES (
-                        :id, :workspace_id, :meeting_id, 'fresh', :now, :stale_at,
-                        CAST(:source_versions AS jsonb), :actor_id, :actor_id, :now, :now, 1
-                    )
-                    RETURNING {_PACK_FIELDS}
-                    """
-                ),
-                {
-                    "id": new_pack_id,
-                    "workspace_id": auth.workspace_id,
-                    "meeting_id": meeting_id,
-                    "now": now,
-                    "stale_at": now + _STALE_AFTER,
-                    "source_versions": dumps(generated.fingerprint),
-                    "actor_id": auth.user_id,
-                },
-            )
-            .mappings()
-            .one()
-        )
+        # Retire the old pack *before* inserting the new one:
+        # uq_meeting_packs_active_per_meeting (migration 0027) allows only
+        # one fresh-or-stale row per meeting at a time, checked immediately
+        # per-statement, so inserting the new 'fresh' row while the old one
+        # is still 'fresh'/'stale' would violate it.
         session.execute(
             text(
                 """
@@ -1240,7 +1354,40 @@ def refresh_prep(
                 "id": old["id"],
             },
         )
-        response = _pack_row_to_response(dict(row), generated.content)
+
+        generated = _generate_pack(session, auth, meeting_id, meeting_row)
+        snapshot = _content_to_snapshot(generated.content)
+        row = (
+            session.execute(
+                text(
+                    f"""
+                    INSERT INTO meeting_packs (
+                        id, workspace_id, meeting_id, status, generated_at, stale_at,
+                        source_versions, content, created_by, updated_by,
+                        created_at, updated_at, version
+                    ) VALUES (
+                        :id, :workspace_id, :meeting_id, 'fresh', :now, :stale_at,
+                        CAST(:source_versions AS jsonb), CAST(:content AS jsonb),
+                        :actor_id, :actor_id, :now, :now, 1
+                    )
+                    RETURNING {_PACK_FIELDS}
+                    """
+                ),
+                {
+                    "id": new_pack_id,
+                    "workspace_id": auth.workspace_id,
+                    "meeting_id": meeting_id,
+                    "now": now,
+                    "stale_at": now + _STALE_AFTER,
+                    "source_versions": dumps(generated.fingerprint),
+                    "content": dumps(snapshot.model_dump(mode="json")),
+                    "actor_id": auth.user_id,
+                },
+            )
+            .mappings()
+            .one()
+        )
+        response = _pack_row_to_response(dict(row), snapshot)
         _write_event(
             session,
             auth,
