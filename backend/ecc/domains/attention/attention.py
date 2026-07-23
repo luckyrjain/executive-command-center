@@ -284,6 +284,67 @@ def _score_risk(
     return score, policy.risk_confidence, factors
 
 
+_WAITING_DIRECTION_POINTS_FRACTION = {
+    "waiting_on_me": 1.0,
+    "blocked_by": 1.0,
+    "waiting_on_them": 1.0 / 3,
+    "delegated": 0.0,
+}
+
+
+def _score_waiting(
+    row: dict[str, Any], now: datetime, policy: AttentionPolicy
+) -> tuple[int, float, list[dict[str, Any]]]:
+    """New in Phase 3 Task 2: the fourth scored ``entity_type``, using the
+    policy's reserved ``dependency_weight_cap`` (declared but inert in
+    Task 1). ``waiting_on_me``/``blocked_by`` score at the full cap (my
+    action is needed, or my own work can't proceed either way);
+    ``waiting_on_them`` scores lower (visibility only, not blocking me);
+    ``delegated`` contributes nothing (no longer my action). No pin
+    concept for waiting links (not a column on ``waiting_links`` --
+    Open decision 1 only defined pin as read-through from a *source*
+    entity's own column, and a waiting link has no such column of its
+    own), so the cap is always the unpinned one.
+    """
+    factors: list[dict[str, Any]] = []
+    direction_points = round(
+        policy.dependency_weight_cap * _WAITING_DIRECTION_POINTS_FRACTION[row["direction"]]
+    )
+    if direction_points:
+        factors.append(
+            _factor(
+                "waiting_direction",
+                f"Waiting: {row['direction'].replace('_', ' ')}",
+                direction_points,
+                "direction",
+            )
+        )
+    expected_at = row["expected_at"]
+    if expected_at is not None:
+        delta = expected_at - now
+        if delta.total_seconds() < 0:
+            factors.append(
+                _factor(
+                    "overdue", "Expected timing passed", policy.due_overdue_points, "expected_at"
+                )
+            )
+        elif delta <= timedelta(hours=48):
+            factors.append(
+                _factor("due_48h", "Expected within 48 hours", policy.due_48h_points, "expected_at")
+            )
+    age = now - row["since_at"]
+    if age >= timedelta(days=14):
+        factors.append(
+            _factor("stale_14d", "Waiting for 14+ days", policy.stale_14d_points, "since_at")
+        )
+    elif age >= timedelta(days=7):
+        factors.append(
+            _factor("stale_7d", "Waiting for 7+ days", policy.stale_7d_points, "since_at")
+        )
+    score = min(policy.cap_unpinned, max(0, sum(item["points"] for item in factors)))
+    return score, 1.0, factors
+
+
 def _upsert_batch(
     session: Session,
     auth: AuthContext,
@@ -455,6 +516,18 @@ def regenerate_attention(auth: AuthDep, session: SessionDep, _csrf: CsrfDep) -> 
             .mappings()
             .all()
         )
+        waiting_links = (
+            session.execute(
+                text("""
+                SELECT id, version, direction, since_at, expected_at, updated_at, created_at
+                FROM waiting_links
+                WHERE workspace_id = :workspace_id AND status = 'open'
+            """),
+                {"workspace_id": auth.workspace_id},
+            )
+            .mappings()
+            .all()
+        )
         session.execute(
             text(
                 """
@@ -477,6 +550,11 @@ def regenerate_attention(auth: AuthDep, session: SessionDep, _csrf: CsrfDep) -> 
                         SELECT 1 FROM risks r
                         WHERE r.workspace_id = ai.workspace_id AND r.id = ai.entity_id
                           AND r.archived_at IS NULL AND r.status <> 'closed'
+                    ))
+                    OR (ai.entity_type = 'waiting_link' AND NOT EXISTS (
+                        SELECT 1 FROM waiting_links wl
+                        WHERE wl.workspace_id = ai.workspace_id AND wl.id = ai.entity_id
+                          AND wl.status = 'open'
                     ))
                   )
                 """
@@ -507,6 +585,13 @@ def regenerate_attention(auth: AuthDep, session: SessionDep, _csrf: CsrfDep) -> 
             {**dict(raw), "prior_deferred_until": prior_deferred_by_type["risk"].get(raw["id"])}
             for raw in risks
         ]
+        # waiting_links has no pinned column of its own (Open decision 1:
+        # pin is only ever read-through from a *source* entity's own
+        # column); _upsert_batch's INSERT still writes an ``attention_items
+        # .pinned`` value for every entity_type, so this stays permanently
+        # False here rather than making pinned optional across every
+        # scorer for one entity_type's sake.
+        waiting_rows = [{**dict(raw), "pinned": False} for raw in waiting_links]
         _upsert_batch(
             session,
             auth,
@@ -537,9 +622,19 @@ def regenerate_attention(auth: AuthDep, session: SessionDep, _csrf: CsrfDep) -> 
             expires_at,
             policy.version,
         )
+        _upsert_batch(
+            session,
+            auth,
+            "waiting_link",
+            waiting_rows,
+            [_score_waiting(row, now, policy) for row in waiting_rows],
+            now,
+            expires_at,
+            policy.version,
+        )
     record_ranking(
         time_module.monotonic() - ranking_start,
-        len(tasks) + len(commitments) + len(risks),
+        len(tasks) + len(commitments) + len(risks) + len(waiting_links),
     )
     return list_attention(auth, session, 50)
 
@@ -569,6 +664,8 @@ def list_attention(
                 AND c.workspace_id = ai.workspace_id AND c.id = ai.entity_id
             LEFT JOIN risks r ON ai.entity_type = 'risk'
                 AND r.workspace_id = ai.workspace_id AND r.id = ai.entity_id
+            LEFT JOIN waiting_links wl ON ai.entity_type = 'waiting_link'
+                AND wl.workspace_id = ai.workspace_id AND wl.id = ai.entity_id
             WHERE ai.workspace_id = :workspace_id
               AND ai.expires_at > :now
               AND (ai.dismissed_at IS NULL
@@ -580,7 +677,8 @@ def list_attention(
                 (t.due_date::timestamp + time '23:59:59') AT TIME ZONE w.timezone,
                 c.due_at,
                 (c.due_date::timestamp + time '23:59:59') AT TIME ZONE w.timezone,
-                r.review_at
+                r.review_at,
+                wl.expected_at
               ) ASC NULLS LAST,
               CASE
                 WHEN t.manual_priority = 'critical' THEN 4
@@ -589,7 +687,7 @@ def list_attention(
                 WHEN t.manual_priority = 'low' THEN 1
                 ELSE 0
               END DESC,
-              COALESCE(t.created_at, c.created_at, r.created_at) ASC,
+              COALESCE(t.created_at, c.created_at, r.created_at, wl.created_at) ASC,
               ai.entity_id ASC
             LIMIT :limit
         """),

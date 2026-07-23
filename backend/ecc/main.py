@@ -13,6 +13,7 @@ from ecc.config import get_settings, validate_production_settings
 from ecc.database import engine
 from ecc.dev_bootstrap import router as dev_bootstrap_router
 from ecc.domains.attention.attention import router as attention_router
+from ecc.domains.attention.waiting import router as waiting_router
 from ecc.domains.calendar.events import router as calendar_events_router
 from ecc.domains.communication.commitments import router as commitments_router
 from ecc.domains.governance.recommendation_mutations import (
@@ -73,6 +74,7 @@ app.include_router(meetings_router)
 app.include_router(risks_router)
 app.include_router(risk_mutations_router)
 app.include_router(attention_router)
+app.include_router(waiting_router)
 app.include_router(recommendation_queries_router)
 app.include_router(recommendation_mutations_router)
 app.include_router(audit_queries_router)
