@@ -234,6 +234,19 @@ def _would_create_cycle(
     """
     if direction != "blocked_by" or subject_type != "knowledge_entity":
         return False
+    # Serialize concurrent blocked_by graph mutations for this workspace so
+    # this read-then-decide check-then-write can't race with another
+    # transaction inserting a conflicting link in between (TOCTOU, finding
+    # #4): held for the rest of the caller's transaction (pg_advisory_xact_
+    # lock, same pattern as _lock_idempotency but a distinct hash salt so
+    # the two lock keyspaces never collide), so a second concurrent create/
+    # direction-change targeting the same workspace's blocked_by graph
+    # blocks here until this one commits, then re-reads the now-committed
+    # graph before deciding.
+    session.execute(
+        text("SELECT pg_advisory_xact_lock(hashtextextended(:lock_key, 1))"),
+        {"lock_key": f"{auth.workspace_id}:waiting_cycle"},
+    )
     frontier = {counterparty_entity_id}
     visited: set[UUID] = set()
     for _ in range(64):
@@ -556,7 +569,7 @@ def patch_waiting_link(
                         ) VALUES (
                             :id, :workspace_id, :subject_type, :subject_id,
                             :counterparty_entity_id, :direction, 'open',
-                            :note, :now, :expected_at, :actor_id, :actor_id,
+                            :note, :since_at, :expected_at, :actor_id, :actor_id,
                             :now, :now, 1
                         )
                         RETURNING {_FIELDS}
@@ -570,6 +583,14 @@ def patch_waiting_link(
                         "counterparty_entity_id": current["counterparty_entity_id"],
                         "direction": payload.direction,
                         "note": (payload.note if payload.note is not None else current["note"]),
+                        # Carry over the original since_at: a direction flip
+                        # (e.g. waiting_on_me -> waiting_on_them) supersedes
+                        # the row for history purposes, but the underlying
+                        # wait has existed continuously since since_at, not
+                        # since this edit -- resetting it to `now` would
+                        # understate how long the wait has actually been
+                        # open (finding #3).
+                        "since_at": current["since_at"],
                         "expected_at": (
                             payload.expected_at
                             if payload.expected_at is not None

@@ -211,6 +211,45 @@ def test_waiting_link_lifecycle_and_direction_history(
     assert replay.json()["status"] == "fulfilled"
 
 
+def test_direction_change_carries_over_original_since_at(
+    waiting_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    """Finding #3: a direction change (via PATCH) supersedes the row with a
+    brand-new one, but the underlying wait has existed since the original
+    ``since_at``, not since the moment of the edit -- the new row must
+    carry that original timestamp over, not reset it to `now`.
+    """
+    client, workspace_id, user_id, token = waiting_test_context
+    task_id = _seed_task(workspace_id, user_id)
+    counterparty = _seed_node(workspace_id, "person", "Counterparty Person")
+    original_since_at = datetime.now(UTC) - timedelta(days=10)
+
+    created = client.post(
+        "/api/v1/waiting",
+        headers=_headers(token, "create-waiting-since"),
+        json={
+            "subject_type": "task",
+            "subject_id": str(task_id),
+            "counterparty_entity_id": str(counterparty),
+            "direction": "waiting_on_them",
+            "since_at": original_since_at.isoformat(),
+        },
+    )
+    assert created.status_code == 201, created.text
+    link = created.json()
+    assert datetime.fromisoformat(link["since_at"]) == original_since_at
+
+    changed = client.patch(
+        f"/api/v1/waiting/{link['id']}",
+        headers=_headers(token, "patch-direction-since"),
+        json={"expected_version": 1, "direction": "blocked_by"},
+    )
+    assert changed.status_code == 200, changed.text
+    new_link = changed.json()
+    assert new_link["id"] != link["id"]
+    assert datetime.fromisoformat(new_link["since_at"]) == original_since_at
+
+
 def test_waiting_link_cancel_and_stale_version_conflict(
     waiting_test_context: tuple[TestClient, UUID, UUID, str],
 ) -> None:
