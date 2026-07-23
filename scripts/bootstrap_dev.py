@@ -138,10 +138,7 @@ def main() -> None:
             )
         connection.commit()
 
-    bootstrap_url = (
-        "http://localhost:8000/dev/bootstrap#code="
-        f"{quote(bootstrap_code, safe='')}"
-    )
+    bootstrap_url = f"http://localhost:8000/dev/bootstrap#code={quote(bootstrap_code, safe='')}"
     print(f"Local development identity {action}; previous active sessions were revoked.\n")
     print(f"Workspace ID: {workspace_id}")
     print(f"User ID:      {user_id}")
