@@ -214,6 +214,7 @@ def build_pack(
 
 
 def _source_fingerprint(
+    meeting: MeetingInput,
     participants: list[ParticipantRow],
     timeline: list[TimelineRow],
     commitments: list[CommitmentRow],
@@ -230,13 +231,25 @@ def _source_fingerprint(
     nothing marks the frozen snapshot ``stale`` for it (finding #6's
     fingerprint half). This previously hashed only id/status/date-shaped
     fields and omitted the actual display text (summary, entity_name,
-    description, note body/title, ...) and evidence entirely.
+    description, note body/title, ...) and evidence entirely. It also
+    previously omitted the meeting row itself: ``build_pack`` puts
+    ``objective`` (derived from ``meeting.agenda``/``meeting.title``),
+    ``starts_at``, ``ends_at`` and ``timezone`` straight into the
+    persisted/displayed pack content, so a reschedule or an agenda edit
+    with no other source changing would leave the pack silently wrong
+    without a ``meeting`` component here.
     """
 
     def _hash(parts: list[str]) -> str:
         return sha256("|".join(sorted(parts)).encode()).hexdigest()
 
     return {
+        "meeting": _hash(
+            [
+                f"{meeting.id}:{meeting.title}:{meeting.agenda}:"
+                f"{meeting.starts_at}:{meeting.ends_at}:{meeting.timezone}"
+            ]
+        ),
         "participants": _hash([f"{p.id}:{p.role}:{p.entity_name}" for p in participants]),
         "timeline": _hash(
             [f"{t.id}:{t.effective_at}:{t.event_type}:{t.summary}" for t in timeline]
@@ -897,7 +910,7 @@ def _generate_pack(
         meeting, participants, timeline, commitments, notes, risks, dependencies, evidence
     )
     fingerprint = _source_fingerprint(
-        participants, timeline, commitments, notes, risks, dependencies, evidence
+        meeting, participants, timeline, commitments, notes, risks, dependencies, evidence
     )
     return _GeneratedPack(content=content, fingerprint=fingerprint)
 

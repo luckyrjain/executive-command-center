@@ -910,6 +910,46 @@ def test_get_prep_marks_pack_stale_after_material_source_change(
     assert fetched.json()["status"] == "stale"
 
 
+def test_get_prep_marks_pack_stale_after_meeting_reschedule_or_agenda_edit(
+    meeting_prep_test_context: tuple[TestClient, UUID, UUID, str, UUID],
+) -> None:
+    """Gap 2: the staleness fingerprint previously hashed only
+    participants/timeline/commitments/notes/risks/dependencies/evidence and
+    never anything from the meeting row itself, even though ``build_pack``
+    puts ``objective`` (derived from ``meeting.agenda``/``meeting.title``),
+    ``starts_at``, ``ends_at`` and ``timezone`` directly into the
+    persisted/displayed pack content. A reschedule or an agenda edit --
+    with no other source changing -- must now flip the pack to stale.
+    """
+    client, _, _, token, meeting_id = meeting_prep_test_context
+    created = client.post(f"/api/v1/meetings/{meeting_id}/prep", headers=_headers(token, "create"))
+    assert created.status_code == 201, created.text
+    assert created.json()["status"] == "fresh"
+
+    new_starts_at = datetime.now(UTC) + timedelta(days=5)
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                """
+                UPDATE meetings
+                SET agenda = :agenda, standalone_starts_at = :starts_at,
+                    standalone_ends_at = :ends_at
+                WHERE id = :id
+                """
+            ),
+            {
+                "agenda": "Review Q4 numbers instead",
+                "starts_at": new_starts_at,
+                "ends_at": new_starts_at + timedelta(hours=1),
+                "id": meeting_id,
+            },
+        )
+
+    fetched = client.get(f"/api/v1/meetings/{meeting_id}/prep")
+    assert fetched.status_code == 200
+    assert fetched.json()["status"] == "stale"
+
+
 def test_get_prep_returns_originally_generated_content_until_refresh(
     meeting_prep_test_context: tuple[TestClient, UUID, UUID, str, UUID],
 ) -> None:
