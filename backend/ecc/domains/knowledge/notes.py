@@ -1,3 +1,4 @@
+
 from base64 import urlsafe_b64decode, urlsafe_b64encode
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
@@ -34,7 +35,7 @@ NoteTypeFilter = Annotated[list[NoteType] | None, Query(alias="note_type[]")]
 
 _SELECT_FIELDS = """
 id, owner_id, title, body, note_type, meeting_id, source_type, source_ref,
-created_at, updated_at, version, archived_at, pre_archive_status
+restricted, created_at, updated_at, version, archived_at, pre_archive_status
 """
 
 
@@ -47,6 +48,10 @@ class NoteCreate(BaseModel):
     meeting_id: UUID | None = None
     source_type: SourceType = "local"
     source_ref: str | None = Field(default=None, max_length=2000)
+    # MEETING-PREP-CONTRACT.md's Safety section: excluded from any generated
+    # meeting pack unless a future surface explicitly authorizes it -- see
+    # meeting_prep.py's pack composition.
+    restricted: bool = False
 
 
 class NotePatch(BaseModel):
@@ -59,10 +64,11 @@ class NotePatch(BaseModel):
     meeting_id: UUID | None = None
     source_type: SourceType | None = None
     source_ref: str | None = Field(default=None, max_length=2000)
+    restricted: bool | None = None
 
     @model_validator(mode="after")
     def reject_null_required_fields(self) -> NotePatch:
-        for field in ("body", "note_type", "source_type"):
+        for field in ("body", "note_type", "source_type", "restricted"):
             if field in self.model_fields_set and getattr(self, field) is None:
                 raise ValueError(f"{field} cannot be null")
         return self
@@ -87,6 +93,7 @@ class NoteResponse(BaseModel):
     meeting_id: UUID | None
     source_type: SourceType
     source_ref: str | None
+    restricted: bool
     created_at: datetime
     updated_at: datetime
     version: int
@@ -415,11 +422,11 @@ def create_note(
                     f"""
                     INSERT INTO notes (
                         id, workspace_id, owner_id, title, body, note_type,
-                        meeting_id, source_type, source_ref, created_by,
+                        meeting_id, source_type, source_ref, restricted, created_by,
                         updated_by, created_at, updated_at, version
                     ) VALUES (
                         :id, :workspace_id, :owner_id, :title, :body, :note_type,
-                        :meeting_id, :source_type, :source_ref, :actor_id,
+                        :meeting_id, :source_type, :source_ref, :restricted, :actor_id,
                         :actor_id, :now, :now, 1
                     ) RETURNING {_SELECT_FIELDS}
                     """

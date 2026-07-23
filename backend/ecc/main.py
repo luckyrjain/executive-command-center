@@ -1,3 +1,4 @@
+
 from collections.abc import Awaitable, Callable
 from hmac import compare_digest
 from json import JSONDecodeError, loads
@@ -14,6 +15,7 @@ from ecc.database import engine
 from ecc.dev_bootstrap import router as dev_bootstrap_router
 from ecc.domains.attention.attention import router as attention_router
 from ecc.domains.attention.capacity import router as capacity_router
+from ecc.domains.attention.meeting_prep import router as meeting_prep_router
 from ecc.domains.attention.planning import router as planning_router
 from ecc.domains.attention.risk_reviews import router as risk_reviews_router
 from ecc.domains.attention.waiting import router as waiting_router
@@ -86,6 +88,7 @@ app.include_router(attention_router)
 app.include_router(waiting_router)
 app.include_router(capacity_router)
 app.include_router(planning_router)
+app.include_router(meeting_prep_router)
 app.include_router(recommendation_queries_router)
 app.include_router(recommendation_mutations_router)
 app.include_router(audit_queries_router)

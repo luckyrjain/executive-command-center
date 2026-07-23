@@ -99,6 +99,8 @@ Added incrementally, one entry per delivery slice, alongside the code that emits
 | `plan.proposed.v1` | Executive Intelligence | plan_id |
 | `plan.accepted.v1` | Executive Intelligence | plan_id, version |
 | `plan.superseded.v1` | Executive Intelligence | plan_id, version |
+| `meeting_pack.generated.v1` | Executive Intelligence | meeting_id |
+| `meeting_pack.refreshed.v1` | Executive Intelligence | meeting_id |
 
 ## Recommendation publication rule
 
