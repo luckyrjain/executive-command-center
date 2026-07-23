@@ -35,7 +35,7 @@ IdempotencyHeader = Annotated[
 ]
 
 _ENTITY_FIELDS = """
-id, entity_id, node_type, canonical_name, attributes, status, confidence,
+id, node_type, canonical_name, attributes, status, confidence,
 version, created_at, updated_at
 """
 
@@ -50,7 +50,6 @@ class EntityCreate(BaseModel):
 
 class EntityResponse(BaseModel):
     id: UUID
-    entity_id: UUID | None
     kind: EntityKind
     canonical_name: str
     summary: str | None
@@ -64,6 +63,20 @@ class EntityResponse(BaseModel):
 class EntityListResponse(BaseModel):
     items: list[EntityResponse]
     next_cursor: str | None = None
+
+
+class EntityAliasResponse(BaseModel):
+    id: UUID
+    entity_id: UUID
+    alias_type: str
+    normalized_value: str
+    source_id: UUID
+    confidence: float
+    created_at: datetime
+
+
+class EntityAliasListResponse(BaseModel):
+    items: list[EntityAliasResponse]
 
 
 def _request_hash(payload: BaseModel, action: str) -> str:
@@ -90,7 +103,6 @@ def _project(row: dict[str, Any]) -> EntityResponse:
     attributes = row.get("attributes") or {}
     return EntityResponse(
         id=row["id"],
-        entity_id=row["entity_id"],
         kind=row["node_type"],
         canonical_name=row["canonical_name"],
         summary=attributes.get("summary"),
@@ -396,3 +408,41 @@ def get_entity(entity_id: UUID, auth: AuthDep, session: SessionDep) -> EntityRes
     if row is None:
         raise HTTPException(status_code=404, detail="ENTITY_NOT_FOUND")
     return _project(row)
+
+
+@router.get("/{entity_id}/aliases", response_model=EntityAliasListResponse)
+def list_entity_aliases(
+    entity_id: UUID, auth: AuthDep, session: SessionDep
+) -> EntityAliasListResponse:
+    if _get_row(session, auth, entity_id) is None:
+        raise HTTPException(status_code=404, detail="ENTITY_NOT_FOUND")
+    rows = (
+        session.execute(
+            text(
+                """
+                SELECT id, entity_id, alias_type, normalized_value, source_id,
+                       confidence, created_at
+                FROM entity_aliases
+                WHERE workspace_id = :workspace_id AND entity_id = :entity_id
+                ORDER BY created_at, id
+                """
+            ),
+            {"workspace_id": auth.workspace_id, "entity_id": entity_id},
+        )
+        .mappings()
+        .all()
+    )
+    return EntityAliasListResponse(
+        items=[
+            EntityAliasResponse(
+                id=row["id"],
+                entity_id=row["entity_id"],
+                alias_type=row["alias_type"],
+                normalized_value=row["normalized_value"],
+                source_id=row["source_id"],
+                confidence=float(row["confidence"]),
+                created_at=row["created_at"],
+            )
+            for row in rows
+        ]
+    )

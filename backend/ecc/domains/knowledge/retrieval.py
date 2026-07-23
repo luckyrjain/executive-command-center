@@ -7,6 +7,7 @@ from hmac import compare_digest, new
 from html import escape
 from json import dumps, loads
 from typing import Annotated, Any
+from unicodedata import normalize as unicode_normalize
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -33,9 +34,14 @@ SessionDep = Annotated[Session, Depends(get_session)]
 # match check is: entity_aliases has no separate "trusted identifier"
 # column beyond its free-form alias_type, so an exact alias match and an
 # exact canonical-name match are the two deterministic levels this schema
-# can express, both ranked above any lexical score.
-_SCORE_EXACT_ALIAS = 1.00
-_SCORE_EXACT_NAME = 0.95
+# can express, both ranked above any lexical score. Exact name must outrank
+# exact alias per the contract -- the CASE expressions and _matching_mode()
+# below check the name condition before the alias condition so a document
+# whose alias happens to equal its own canonical name is classified/scored
+# as the (higher) name match, not the alias match; simply swapping these two
+# constants without also reordering those checks would be insufficient.
+_SCORE_EXACT_NAME = 1.00
+_SCORE_EXACT_ALIAS = 0.95
 _SCORE_PREFIX_NAME = 0.85
 # Hybrid fusion (RETRIEVAL-CONTRACT.md's "versioned deterministic method",
 # version 1): a document lexical search already found gets a small boost
@@ -70,10 +76,13 @@ def _build_body(session: Session, workspace_id: UUID, entity_id: UUID, summary: 
     claims = session.execute(
         text(
             """
-            SELECT predicate, value_json FROM knowledge_claims
-            WHERE workspace_id = :workspace_id AND subject_id = :entity_id
-              AND superseded_by IS NULL
-            ORDER BY created_at
+            SELECT c.predicate, c.value_json FROM knowledge_claims c
+            JOIN pkos_evidence ev
+              ON ev.workspace_id = c.workspace_id AND ev.id = c.source_id
+            WHERE c.workspace_id = :workspace_id AND c.subject_id = :entity_id
+              AND c.superseded_by IS NULL
+              AND ev.evidence_state = 'available'
+            ORDER BY c.created_at
             """
         ),
         {"workspace_id": workspace_id, "entity_id": entity_id},
@@ -190,7 +199,14 @@ class RetrievalResponse(BaseModel):
 
 
 def _normalize_query(value: str) -> str:
-    normalized = " ".join(value.casefold().split())
+    # NFC first: see resolution.py's _normalize for why casefold() alone
+    # would miss two Unicode encodings of the same visible query text (a
+    # precomposed accented character vs. the base character plus a
+    # combining accent). The SQL-side normalized_title/exact_alias_match
+    # comparisons this feeds also wrap the stored text in normalize(...,
+    # NFC) for the same reason -- both sides of the comparison need the
+    # same normal form or an exact match can silently miss.
+    normalized = " ".join(unicode_normalize("NFC", value).casefold().split())
     if not normalized:
         raise HTTPException(status_code=422, detail="RETRIEVAL_QUERY_REQUIRED")
     if len(normalized) > 500:
@@ -232,8 +248,8 @@ _LEXICAL_CANDIDATES_CTE = """
             d.entity_type, d.entity_id, d.title, d.body,
             d.source_version, d.updated_at,
             n.version AS live_version, n.status AS live_status,
-            lower(d.title) AS normalized_title,
-            similarity(lower(d.title), :query)::double precision AS trigram_score,
+            lower(normalize(d.title, NFC)) AS normalized_title,
+            similarity(lower(normalize(d.title, NFC)), :query)::double precision AS trigram_score,
             ts_rank_cd(
                 d.search_document, plainto_tsquery('simple', :query)
             )::double precision AS fulltext_score,
@@ -241,7 +257,7 @@ _LEXICAL_CANDIDATES_CTE = """
                 SELECT 1 FROM entity_aliases a
                 WHERE a.workspace_id = d.workspace_id
                   AND a.entity_id = d.entity_id
-                  AND a.normalized_value = :query
+                  AND normalize(a.normalized_value, NFC) = :query
             ) AS exact_alias_match,
             (
                 SELECT e.evidence_state FROM pkos_evidence e
@@ -274,8 +290,8 @@ def _run_lexical_query(session: Session, params: dict[str, Any]) -> Sequence[Any
                 WITH {_LEXICAL_CANDIDATES_CTE}, ranked AS (
                     SELECT *,
                         CASE
-                            WHEN exact_alias_match THEN {_SCORE_EXACT_ALIAS}
                             WHEN normalized_title = :query THEN {_SCORE_EXACT_NAME}
+                            WHEN exact_alias_match THEN {_SCORE_EXACT_ALIAS}
                             WHEN normalized_title LIKE :query || '%' THEN {_SCORE_PREFIX_NAME}
                             ELSE greatest(
                                 least(trigram_score, 0.75),
@@ -354,7 +370,7 @@ def _run_hybrid_query(session: Session, params: dict[str, Any]) -> Sequence[Any]
                         COALESCE(l.body, s.body) AS body,
                         COALESCE(l.source_version, s.source_version) AS source_version,
                         COALESCE(l.live_version, s.live_version) AS live_version,
-                        lower(COALESCE(l.title, s.title)) AS normalized_title,
+                        lower(normalize(COALESCE(l.title, s.title), NFC)) AS normalized_title,
                         COALESCE(l.trigram_score, 0) AS trigram_score,
                         COALESCE(l.fulltext_score, 0) AS fulltext_score,
                         COALESCE(l.exact_alias_match, false) AS exact_alias_match,
@@ -370,8 +386,8 @@ def _run_hybrid_query(session: Session, params: dict[str, Any]) -> Sequence[Any]
                 ), ranked AS (
                     SELECT *,
                         CASE
-                            WHEN exact_alias_match THEN {_SCORE_EXACT_ALIAS}
                             WHEN normalized_title = :query THEN {_SCORE_EXACT_NAME}
+                            WHEN exact_alias_match THEN {_SCORE_EXACT_ALIAS}
                             WHEN normalized_title LIKE :query || '%' THEN {_SCORE_PREFIX_NAME}
                             WHEN trigram_score >= {_TRIGRAM_RELEVANCE_THRESHOLD}
                                 OR fulltext_score > 0 THEN least(
@@ -413,10 +429,10 @@ def _run_hybrid_query(session: Session, params: dict[str, Any]) -> Sequence[Any]
 
 def _matching_mode(row: Any, query: str, hybrid: bool) -> str:
     normalized_title = row["normalized_title"]
-    if row["exact_alias_match"]:
-        return "exact_alias"
     if normalized_title == query:
         return "exact_name"
+    if row["exact_alias_match"]:
+        return "exact_alias"
     if normalized_title.startswith(query):
         return "name_prefix"
     trigram_relevant = float(row["trigram_score"]) >= _TRIGRAM_RELEVANCE_THRESHOLD

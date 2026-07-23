@@ -1,3 +1,4 @@
+import time
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
@@ -324,3 +325,349 @@ def test_self_candidate_rejected(
         json={"left_entity_id": str(entity_id), "right_entity_id": str(entity_id)},
     )
     assert response.status_code == 422
+
+
+def _create_open_candidate(
+    client: TestClient, token: str, key_prefix: str, left_name: str, right_name: str
+) -> UUID:
+    left_id = _create_entity(client, token, f"{key_prefix}-left", "person", left_name)
+    right_id = _create_entity(client, token, f"{key_prefix}-right", "person", right_name)
+    created = client.post(
+        "/api/v1/knowledge/resolution/candidates",
+        headers=_headers(token, f"{key_prefix}-create"),
+        json={"left_entity_id": str(left_id), "right_entity_id": str(right_id)},
+    )
+    return UUID(created.json()["candidate"]["id"])
+
+
+def test_defer_hides_candidate_from_default_list_until_it_expires(
+    resolution_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    client, workspace_id, _user_id, token = resolution_test_context
+    candidate_id = _create_open_candidate(client, token, "defer", "Ada Lovelace", "Ada Lovelase")
+    deferred_until = (datetime.now(UTC) + timedelta(hours=1)).isoformat()
+
+    response = client.post(
+        f"/api/v1/knowledge/resolution/candidates/{candidate_id}/defer",
+        headers=_headers(token, "defer-once"),
+        json={"deferred_until": deferred_until},
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "open"
+    assert response.json()["deferred_until"] is not None
+
+    listed = client.get(
+        "/api/v1/knowledge/resolution/candidates", headers=_headers(token, "list-after-defer")
+    )
+    assert all(item["id"] != str(candidate_id) for item in listed.json()["items"])
+
+    # Once the deferral window has passed, the candidate is visible again --
+    # simulated directly (no HTTP endpoint sets deferred_until to the past,
+    # since the payload validator requires a future timestamp).
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "UPDATE resolution_candidates SET deferred_until = :past "
+                "WHERE workspace_id = :workspace_id AND id = :candidate_id"
+            ),
+            {
+                "past": datetime.now(UTC) - timedelta(minutes=1),
+                "workspace_id": workspace_id,
+                "candidate_id": candidate_id,
+            },
+        )
+    listed_after_expiry = client.get(
+        "/api/v1/knowledge/resolution/candidates", headers=_headers(token, "list-after-expiry")
+    )
+    assert any(item["id"] == str(candidate_id) for item in listed_after_expiry.json()["items"])
+
+
+def test_defer_is_idempotent(
+    resolution_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    client, _workspace_id, _user_id, token = resolution_test_context
+    candidate_id = _create_open_candidate(
+        client, token, "defer-idem", "Grace Hopper", "Grace Hoper"
+    )
+    deferred_until = (datetime.now(UTC) + timedelta(hours=1)).isoformat()
+
+    first = client.post(
+        f"/api/v1/knowledge/resolution/candidates/{candidate_id}/defer",
+        headers=_headers(token, "defer-idem-once"),
+        json={"deferred_until": deferred_until},
+    )
+    second = client.post(
+        f"/api/v1/knowledge/resolution/candidates/{candidate_id}/defer",
+        headers=_headers(token, "defer-idem-twice"),
+        json={"deferred_until": deferred_until},
+    )
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert first.json()["deferred_until"] == second.json()["deferred_until"]
+
+
+def test_defer_idempotent_replay_after_deferred_until_has_passed(
+    resolution_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    client, _workspace_id, _user_id, token = resolution_test_context
+    candidate_id = _create_open_candidate(
+        client, token, "defer-replay", "Ada Lovelace", "Ada Lovelase"
+    )
+    deferred_until = (datetime.now(UTC) + timedelta(seconds=1)).isoformat()
+    headers = _headers(token, "defer-replay-key")
+
+    first = client.post(
+        f"/api/v1/knowledge/resolution/candidates/{candidate_id}/defer",
+        headers=headers,
+        json={"deferred_until": deferred_until},
+    )
+    assert first.status_code == 200, first.text
+
+    time.sleep(1.5)
+
+    # A replay with the same idempotency key/body must be served from the
+    # idempotency cache even though deferred_until is now in the past --
+    # the future-timestamp validation only guards the first attempt, not a
+    # cached replay of an already-accepted request.
+    second = client.post(
+        f"/api/v1/knowledge/resolution/candidates/{candidate_id}/defer",
+        headers=headers,
+        json={"deferred_until": deferred_until},
+    )
+    assert second.status_code == 200, second.text
+    assert second.json()["deferred_until"] == first.json()["deferred_until"]
+
+
+def test_defer_rejects_a_non_future_timestamp(
+    resolution_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    client, _workspace_id, _user_id, token = resolution_test_context
+    candidate_id = _create_open_candidate(client, token, "defer-past", "A Name", "A Nam")
+
+    response = client.post(
+        f"/api/v1/knowledge/resolution/candidates/{candidate_id}/defer",
+        headers=_headers(token, "defer-past-attempt"),
+        json={"deferred_until": (datetime.now(UTC) - timedelta(hours=1)).isoformat()},
+    )
+    assert response.status_code == 422
+
+
+def test_defer_a_decided_candidate_is_conflict(
+    resolution_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    client, _workspace_id, _user_id, token = resolution_test_context
+    candidate_id = _create_open_candidate(
+        client, token, "defer-decided", "Ada Lovelace", "Ada Lovelase"
+    )
+    client.post(
+        f"/api/v1/knowledge/resolution/candidates/{candidate_id}/confirm",
+        headers=_headers(token, "defer-decided-confirm"),
+        json={"reason": "verified"},
+    )
+
+    response = client.post(
+        f"/api/v1/knowledge/resolution/candidates/{candidate_id}/defer",
+        headers=_headers(token, "defer-decided-attempt"),
+        json={"deferred_until": (datetime.now(UTC) + timedelta(hours=1)).isoformat()},
+    )
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "CANDIDATE_NOT_OPEN"
+
+
+def test_confirm_is_ambiguous_when_an_entity_was_archived_after_the_candidate_was_scored(
+    resolution_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    client, _workspace_id, _user_id, token = resolution_test_context
+    left_id = _create_entity(client, token, "ambiguous-left", "person", "Ada Lovelace")
+    right_id = _create_entity(client, token, "ambiguous-right", "person", "Ada Lovelase")
+    created = client.post(
+        "/api/v1/knowledge/resolution/candidates",
+        headers=_headers(token, "ambiguous-create"),
+        json={"left_entity_id": str(left_id), "right_entity_id": str(right_id)},
+    )
+    candidate_id = created.json()["candidate"]["id"]
+
+    archive = client.post(
+        f"/api/v1/knowledge/entities/{right_id}/archive",
+        headers=_headers(token, "ambiguous-archive"),
+        json={"expected_version": 1},
+    )
+    assert archive.status_code == 200, archive.text
+
+    response = client.post(
+        f"/api/v1/knowledge/resolution/candidates/{candidate_id}/confirm",
+        headers=_headers(token, "ambiguous-confirm"),
+        json={"reason": "same person, verified manually"},
+    )
+    assert response.status_code == 409, response.text
+    assert response.json()["error"]["code"] == "AMBIGUOUS_RESOLUTION"
+
+    # Rejecting the same candidate is unaffected -- it changes neither
+    # entity, so there is no ambiguity about what it decides.
+    reject = client.post(
+        f"/api/v1/knowledge/resolution/candidates/{candidate_id}/reject",
+        headers=_headers(token, "ambiguous-reject"),
+        json={"reason": "one side archived, no longer comparable"},
+    )
+    assert reject.status_code == 200, reject.text
+
+
+def _seed_foreign_workspace_entity() -> tuple[UUID, UUID]:
+    other_workspace_id = uuid4()
+    other_node_id = uuid4()
+    now = datetime.now(UTC)
+    with engine.begin() as connection:
+        connection.execute(
+            text("INSERT INTO workspaces (id, name, created_at) VALUES (:id, :name, :created_at)"),
+            {"id": other_workspace_id, "name": "Foreign Workspace", "created_at": now},
+        )
+        connection.execute(
+            text(
+                "INSERT INTO pkos_nodes (id, workspace_id, node_type, canonical_name, "
+                "attributes, created_at, updated_at) VALUES (:id, :workspace_id, 'person', "
+                "'Foreign Node', '{}'::jsonb, :now, :now)"
+            ),
+            {"id": other_node_id, "workspace_id": other_workspace_id, "now": now},
+        )
+    return other_workspace_id, other_node_id
+
+
+def _teardown_foreign_workspace(workspace_id: UUID) -> None:
+    with engine.begin() as connection:
+        for table in ("resolution_candidates", "pkos_nodes"):
+            connection.execute(
+                text(f"DELETE FROM {table} WHERE workspace_id = :workspace_id"),  # noqa: S608
+                {"workspace_id": workspace_id},
+            )
+        connection.execute(
+            text("DELETE FROM workspaces WHERE id = :workspace_id"), {"workspace_id": workspace_id}
+        )
+
+
+def test_candidate_create_rejects_entity_from_another_workspace(
+    resolution_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    client, _workspace_id, _user_id, token = resolution_test_context
+    other_workspace_id, other_node_id = _seed_foreign_workspace_entity()
+    try:
+        left_id = _create_entity(client, token, "isolation-create-left", "person", "Ada Lovelace")
+        response = client.post(
+            "/api/v1/knowledge/resolution/candidates",
+            headers=_headers(token, "isolation-create-candidate"),
+            json={"left_entity_id": str(left_id), "right_entity_id": str(other_node_id)},
+        )
+        assert response.status_code == 404, response.text
+        assert response.json()["error"]["code"] == "ENTITY_NOT_FOUND"
+    finally:
+        _teardown_foreign_workspace(other_workspace_id)
+
+
+def test_candidate_decide_rejects_candidate_from_another_workspace(
+    resolution_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    client, _workspace_id, _user_id, token = resolution_test_context
+    other_workspace_id, other_node_id = _seed_foreign_workspace_entity()
+    try:
+        other_node_id_2 = uuid4()
+        now = datetime.now(UTC)
+        foreign_candidate_id = uuid4()
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    "INSERT INTO pkos_nodes (id, workspace_id, node_type, canonical_name, "
+                    "attributes, created_at, updated_at) VALUES (:id, :workspace_id, 'person', "
+                    "'Foreign Node 2', '{}'::jsonb, :now, :now)"
+                ),
+                {"id": other_node_id_2, "workspace_id": other_workspace_id, "now": now},
+            )
+            connection.execute(
+                text(
+                    "INSERT INTO resolution_candidates (id, workspace_id, left_entity_id, "
+                    "right_entity_id, score, factors_json, resolver_version, status, "
+                    "created_at) VALUES (:id, :workspace_id, :left_id, :right_id, 0.9, "
+                    "'{}'::jsonb, 'test', 'open', :now)"
+                ),
+                {
+                    "id": foreign_candidate_id,
+                    "workspace_id": other_workspace_id,
+                    "left_id": other_node_id,
+                    "right_id": other_node_id_2,
+                    "now": now,
+                },
+            )
+
+        for action, key in (
+            ("confirm", "isolation-confirm-foreign"),
+            ("reject", "isolation-reject-foreign"),
+            ("defer", "isolation-defer-foreign"),
+        ):
+            payload = (
+                {"deferred_until": (now + timedelta(hours=1)).isoformat()}
+                if action == "defer"
+                else {"reason": "cross-workspace attempt"}
+            )
+            response = client.post(
+                f"/api/v1/knowledge/resolution/candidates/{foreign_candidate_id}/{action}",
+                headers=_headers(token, key),
+                json=payload,
+            )
+            assert response.status_code == 404, response.text
+            assert response.json()["error"]["code"] == "CANDIDATE_NOT_FOUND"
+    finally:
+        _teardown_foreign_workspace(other_workspace_id)
+
+
+def test_candidate_list_never_shows_another_workspaces_candidates(
+    resolution_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    client, _workspace_id, _user_id, token = resolution_test_context
+    other_workspace_id, other_node_id = _seed_foreign_workspace_entity()
+    try:
+        other_node_id_2 = uuid4()
+        now = datetime.now(UTC)
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    "INSERT INTO pkos_nodes (id, workspace_id, node_type, canonical_name, "
+                    "attributes, created_at, updated_at) VALUES (:id, :workspace_id, 'person', "
+                    "'Foreign Node 2', '{}'::jsonb, :now, :now)"
+                ),
+                {"id": other_node_id_2, "workspace_id": other_workspace_id, "now": now},
+            )
+            connection.execute(
+                text(
+                    "INSERT INTO resolution_candidates (id, workspace_id, left_entity_id, "
+                    "right_entity_id, score, factors_json, resolver_version, status, "
+                    "created_at) VALUES (:id, :workspace_id, :left_id, :right_id, 0.9, "
+                    "'{}'::jsonb, 'test', 'open', :now)"
+                ),
+                {
+                    "id": uuid4(),
+                    "workspace_id": other_workspace_id,
+                    "left_id": other_node_id,
+                    "right_id": other_node_id_2,
+                    "now": now,
+                },
+            )
+
+        left_id = _create_entity(client, token, "isolation-list-left", "person", "Grace Hopper")
+        right_id = _create_entity(client, token, "isolation-list-right", "person", "Grace Hoper")
+        client.post(
+            "/api/v1/knowledge/resolution/candidates",
+            headers=_headers(token, "isolation-list-create"),
+            json={"left_entity_id": str(left_id), "right_entity_id": str(right_id)},
+        )
+
+        listed = client.get(
+            "/api/v1/knowledge/resolution/candidates", headers=_headers(token, "isolation-list")
+        )
+        assert listed.status_code == 200
+        entity_ids = {
+            entity_id
+            for item in listed.json()["items"]
+            for entity_id in (item["left_entity_id"], item["right_entity_id"])
+        }
+        assert str(other_node_id) not in entity_ids
+        assert str(other_node_id_2) not in entity_ids
+    finally:
+        _teardown_foreign_workspace(other_workspace_id)

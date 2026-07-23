@@ -21,6 +21,12 @@ def upgrade() -> None:
         sa.Column("effective_at", sa.DateTime(timezone=True), nullable=False),
         sa.Column("recorded_at", sa.DateTime(timezone=True), nullable=False),
         sa.Column("event_type", sa.String(100), nullable=False),
+        # Nullable by design, not a gap: an audit revisited this and
+        # confirmed it should stay nullable. Not every timeline entry is
+        # evidence-backed -- entity-creation entries (timeline.py's
+        # queue_timeline_entry call in entities.py) genuinely have no
+        # source_id to cite, so requiring one here would force a fake
+        # placeholder rather than reflect reality.
         sa.Column("source_id", uuid),
         sa.Column("summary", sa.Text(), nullable=False),
         sa.ForeignKeyConstraint(

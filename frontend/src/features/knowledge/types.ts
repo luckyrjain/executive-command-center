@@ -3,7 +3,6 @@ export type EntityStatus = 'active' | 'archived' | 'redirected'
 
 export type KnowledgeEntity = {
   id: string
-  entity_id: string | null
   kind: EntityKind
   canonical_name: string
   summary: string | null
@@ -15,6 +14,18 @@ export type KnowledgeEntity = {
 }
 
 export type EntityList = { items: KnowledgeEntity[]; next_cursor?: string | null }
+
+export type EntityAlias = {
+  id: string
+  entity_id: string
+  alias_type: string
+  normalized_value: string
+  source_id: string
+  confidence: number
+  created_at: string
+}
+
+export type EntityAliasList = { items: EntityAlias[] }
 
 export type Claim = {
   id: string
@@ -50,7 +61,7 @@ export type Relationship = {
   to_entity_id: string
   relationship_type: RelationshipType
   confidence: number
-  evidence_id: string | null
+  evidence_id: string
   valid_from: string | null
   valid_to: string | null
   status: 'active' | 'disputed' | 'invalidated'
@@ -84,6 +95,7 @@ export type ResolutionCandidate = {
   resolved_at: string | null
   resolved_by: string | null
   reason: string | null
+  deferred_until: string | null
 }
 
 export type ResolutionCandidateList = { items: ResolutionCandidate[]; next_cursor?: string | null }
@@ -122,3 +134,15 @@ export type RetrievalResponse = {
   degraded: boolean
   degraded_reason: string | null
 }
+
+export type EvidenceStatus = 'available' | 'missing' | 'permission_denied' | 'deleted'
+
+export type EvidenceItem = {
+  id: string
+  status: EvidenceStatus
+  source_type: string | null
+  label: string | null
+  captured_at: string | null
+}
+
+export type EvidenceListResponse = { items: EvidenceItem[] }

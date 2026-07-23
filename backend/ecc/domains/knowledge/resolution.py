@@ -5,10 +5,11 @@ from hashlib import sha256
 from hmac import compare_digest, new
 from json import dumps, loads
 from typing import Annotated, Any, Literal
+from unicodedata import normalize as unicode_normalize
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
@@ -79,7 +80,15 @@ class ScoreResult:
 
 
 def _normalize(value: str) -> str:
-    return " ".join(value.casefold().split())
+    # NFC first: casefold() alone does not unify two Unicode encodings of
+    # the same visible name -- e.g. an "e"+combining-acute-accent sequence
+    # vs. the single precomposed "e"-acute codepoint compare unequal under
+    # casefold() despite rendering identically, which would make an exact
+    # canonical-name match (this function's caller,
+    # _deterministic_alias_match) silently miss a genuine duplicate whose
+    # name arrived via a different input method/import source. An audit's
+    # adversarial test caught this gap.
+    return " ".join(unicode_normalize("NFC", value).casefold().split())
 
 
 def _trigrams(value: str) -> frozenset[str]:
@@ -174,7 +183,7 @@ IdempotencyHeader = Annotated[
 
 _CANDIDATE_FIELDS = """
 id, left_entity_id, right_entity_id, score, factors_json, resolver_version,
-status, created_at, resolved_at, resolved_by, reason
+status, created_at, resolved_at, resolved_by, reason, deferred_until
 """
 
 
@@ -197,6 +206,7 @@ class ResolutionCandidateResponse(BaseModel):
     resolved_at: datetime | None
     resolved_by: UUID | None
     reason: str | None
+    deferred_until: datetime | None
 
 
 class ResolutionCandidateListResponse(BaseModel):
@@ -224,6 +234,19 @@ class ResolutionDecision(BaseModel):
     reason: str = Field(min_length=1, max_length=2000)
 
 
+class ResolutionDefer(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    deferred_until: datetime
+
+    @field_validator("deferred_until")
+    @classmethod
+    def validate_deferred_until(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("deferred_until must include a timezone offset")
+        return value
+
+
 def _project(row: dict[str, Any]) -> ResolutionCandidateResponse:
     factors_raw = row["factors_json"]
     factors = loads(factors_raw) if isinstance(factors_raw, str) else dict(factors_raw)
@@ -239,6 +262,7 @@ def _project(row: dict[str, Any]) -> ResolutionCandidateResponse:
         resolved_at=row["resolved_at"],
         resolved_by=row["resolved_by"],
         reason=row["reason"],
+        deferred_until=row["deferred_until"],
     )
 
 
@@ -412,6 +436,16 @@ def _entity_row(session: Session, auth: AuthContext, entity_id: UUID) -> dict[st
         .one_or_none()
     )
     return dict(row) if row is not None else None
+
+
+def _entity_status(session: Session, auth: AuthContext, entity_id: UUID) -> str | None:
+    row = session.execute(
+        text(
+            "SELECT status FROM pkos_nodes WHERE workspace_id = :workspace_id AND id = :entity_id"
+        ),
+        {"workspace_id": auth.workspace_id, "entity_id": entity_id},
+    ).one_or_none()
+    return row[0] if row is not None else None
 
 
 def _candidate_entity(session: Session, auth: AuthContext, entity_id: UUID) -> CandidateEntity:
@@ -642,8 +676,20 @@ def list_candidates(
     cursor: str | None = None,
     limit: int = Query(default=50, ge=1, le=100),
 ) -> ResolutionCandidateListResponse:
-    clauses = ["workspace_id = :workspace_id"]
-    params: dict[str, Any] = {"workspace_id": auth.workspace_id, "limit": limit + 1}
+    # Deferred candidates are hidden from the default queue until their
+    # snooze expires, matching attention.py's identical deferred_until
+    # filter for attention_items -- defer postpones review, it never
+    # changes status, so this is the only place the postponement is
+    # actually enforced.
+    clauses = [
+        "workspace_id = :workspace_id",
+        "(deferred_until IS NULL OR deferred_until <= :now)",
+    ]
+    params: dict[str, Any] = {
+        "workspace_id": auth.workspace_id,
+        "limit": limit + 1,
+        "now": datetime.now(UTC),
+    }
     if status is not None:
         clauses.append("status = :status")
         params["status"] = status
@@ -739,6 +785,21 @@ def _decide_candidate(
             return response
         if current["status"] != "open":
             raise HTTPException(status_code=409, detail="CANDIDATE_NOT_OPEN")
+        # A confirm is a human decision that two identities are the same --
+        # but if either side has been redirected (merged away by an
+        # intervening operation) or archived since this candidate was
+        # scored, it is no longer clear which identity is actually being
+        # confirmed: the original entity, or whatever now stands in for it.
+        # Rejecting a still-open candidate carries no such ambiguity (it
+        # changes nothing about either entity), so this only guards confirm.
+        # Closes a gap an audit of the shipped code found: `ambiguous_
+        # resolution` was named in the contract's required error codes but
+        # never actually raised anywhere.
+        if new_status == "confirmed":
+            left_status = _entity_status(session, auth, current["left_entity_id"])
+            right_status = _entity_status(session, auth, current["right_entity_id"])
+            if left_status != "active" or right_status != "active":
+                raise HTTPException(status_code=409, detail="AMBIGUOUS_RESOLUTION")
         row = (
             session.execute(
                 text(
@@ -798,3 +859,77 @@ def reject_candidate(
     return _decide_candidate(
         candidate_id, payload, request, auth, session, idempotency_key, "rejected"
     )
+
+
+@router.post("/candidates/{candidate_id}/defer", response_model=ResolutionCandidateResponse)
+def defer_candidate(
+    candidate_id: UUID,
+    payload: ResolutionDefer,
+    request: Request,
+    auth: AuthDep,
+    session: SessionDep,
+    _csrf: CsrfDep,
+    idempotency_key: IdempotencyHeader,
+) -> ResolutionCandidateResponse:
+    """UX-STATES.md names confirm/reject/defer as the three primary review
+    actions. Unlike confirm/reject, defer never decides the candidate --
+    status stays 'open', only deferred_until is set (mirrors attention.py's
+    identical defer semantics for attention_items: postpone review, don't
+    make a decision)."""
+    now = datetime.now(UTC)
+    request_hash = _request_hash(payload, f"defer:{candidate_id}")
+    with session.begin():
+        _lock_idempotency(session, auth, idempotency_key)
+        cached = _load_cached(session, auth, idempotency_key, request_hash)
+        if cached is not None:
+            return cached
+        if payload.deferred_until <= now:
+            raise HTTPException(status_code=422, detail="DEFER_UNTIL_MUST_BE_FUTURE")
+        current = (
+            session.execute(
+                text(
+                    f"""
+                    SELECT {_CANDIDATE_FIELDS}
+                    FROM resolution_candidates
+                    WHERE workspace_id = :workspace_id AND id = :candidate_id
+                    FOR UPDATE
+                    """
+                ),
+                {"workspace_id": auth.workspace_id, "candidate_id": candidate_id},
+            )
+            .mappings()
+            .one_or_none()
+        )
+        if current is None:
+            raise HTTPException(status_code=404, detail="CANDIDATE_NOT_FOUND")
+        if current["status"] != "open":
+            raise HTTPException(status_code=409, detail="CANDIDATE_NOT_OPEN")
+        if current["deferred_until"] == payload.deferred_until:
+            response = _project(dict(current))
+            _store_cached(session, auth, idempotency_key, request_hash, response, now, 200)
+            return response
+        row = (
+            session.execute(
+                text(
+                    f"""
+                    UPDATE resolution_candidates
+                    SET deferred_until = :deferred_until
+                    WHERE workspace_id = :workspace_id AND id = :candidate_id
+                    RETURNING {_CANDIDATE_FIELDS}
+                    """
+                ),
+                {
+                    "workspace_id": auth.workspace_id,
+                    "candidate_id": candidate_id,
+                    "deferred_until": payload.deferred_until,
+                },
+            )
+            .mappings()
+            .one()
+        )
+        response = _project(dict(row))
+        _write_side_effects(
+            session, auth, request, "resolution_candidate.deferred", candidate_id, now
+        )
+        _store_cached(session, auth, idempotency_key, request_hash, response, now, 200)
+        return response

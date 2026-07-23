@@ -3,6 +3,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from hmac import new
+from json import dumps
 from uuid import UUID, uuid4
 
 import pytest
@@ -142,6 +143,29 @@ def _seed_evidence(workspace_id: UUID, node_id: UUID) -> UUID:
     return evidence_id
 
 
+def _seed_alias(workspace_id: UUID, entity_id: UUID, normalized_value: str) -> UUID:
+    source_id = _seed_evidence(workspace_id, entity_id)
+    alias_id = uuid4()
+    now = datetime.now(UTC)
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO entity_aliases (id, workspace_id, entity_id, alias_type, "
+                "normalized_value, source_id, created_at) VALUES (:id, :workspace_id, "
+                ":entity_id, 'nickname', :normalized_value, :source_id, :created_at)"
+            ),
+            {
+                "id": alias_id,
+                "workspace_id": workspace_id,
+                "entity_id": entity_id,
+                "normalized_value": normalized_value,
+                "source_id": source_id,
+                "created_at": now,
+            },
+        )
+    return alias_id
+
+
 def _create_confirmed_candidate(
     client: TestClient, token: str, key_prefix: str, left_id: UUID, right_id: UUID
 ) -> UUID:
@@ -186,9 +210,10 @@ def _merge(
 def test_merge_redirects_source_and_rehomes_aliases(
     entity_operations_test_context: tuple[TestClient, UUID, UUID, str],
 ) -> None:
-    client, _workspace_id, _user_id, token = entity_operations_test_context
+    client, workspace_id, _user_id, token = entity_operations_test_context
     target_id = _create_entity(client, token, "target", "person", "Ada Lovelace")
     source_id = _create_entity(client, token, "source", "person", "Ada Lovelase")
+    source_alias_id = _seed_alias(workspace_id, source_id, "countess of lovelace")
     candidate_id = _create_confirmed_candidate(client, token, "merge-basic", target_id, source_id)
 
     response = _merge(client, token, "merge-once", candidate_id, target_id, 1, 1)
@@ -208,6 +233,60 @@ def test_merge_redirects_source_and_rehomes_aliases(
         f"/api/v1/knowledge/entities/{target_id}", headers=_headers(token, "check-target")
     )
     assert target_get.json()["status"] == "active"
+
+    # The alias the source entity had before merge must now be reachable
+    # from the target (rehomed), not left orphaned on the redirected source.
+    target_aliases = client.get(
+        f"/api/v1/knowledge/entities/{target_id}/aliases", headers=_headers(token, "target-aliases")
+    )
+    assert target_aliases.status_code == 200
+    rehomed_items = target_aliases.json()["items"]
+    rehomed_ids = [item["id"] for item in rehomed_items]
+    assert str(source_alias_id) in rehomed_ids
+    assert any(item["normalized_value"] == "countess of lovelace" for item in rehomed_items)
+
+
+def test_merge_rehome_bumps_alias_version_and_updated_at(
+    entity_operations_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    # Schema-hygiene regression test: migration 0019 added updated_at/
+    # version to entity_aliases (mutated in place by merge's alias-rehome
+    # step) since DATA-MODEL.md's Rules section requires "optimistic
+    # version" on every mutable table. Proves _rehome_aliases actually
+    # maintains them, not just that the columns exist.
+    client, workspace_id, _user_id, token = entity_operations_test_context
+    target_id = _create_entity(client, token, "version-target", "person", "Ada Lovelace")
+    source_id = _create_entity(client, token, "version-source", "person", "Ada Lovelase")
+    alias_id = _seed_alias(workspace_id, source_id, "countess of lovelace v2")
+    candidate_id = _create_confirmed_candidate(
+        client, token, "version-merge-candidate", target_id, source_id
+    )
+
+    with engine.connect() as connection:
+        before = (
+            connection.execute(
+                text("SELECT version, updated_at, created_at FROM entity_aliases WHERE id = :id"),
+                {"id": alias_id},
+            )
+            .mappings()
+            .one()
+        )
+    assert before["version"] == 1
+
+    response = _merge(client, token, "version-merge", candidate_id, target_id, 1, 1)
+    assert response.status_code == 201, response.text
+
+    with engine.connect() as connection:
+        after = (
+            connection.execute(
+                text("SELECT version, updated_at, created_at FROM entity_aliases WHERE id = :id"),
+                {"id": alias_id},
+            )
+            .mappings()
+            .one()
+        )
+    assert after["version"] == 2
+    assert after["updated_at"] > after["created_at"]
 
 
 def test_merge_requires_confirmed_candidate(
@@ -262,16 +341,21 @@ def test_merge_rejects_stale_expected_version(
 def test_merge_deduplicates_active_edges_after_rehome(
     entity_operations_test_context: tuple[TestClient, UUID, UUID, str],
 ) -> None:
-    client, _workspace_id, _user_id, token = entity_operations_test_context
+    client, workspace_id, _user_id, token = entity_operations_test_context
     target_id = _create_entity(client, token, "dedup-target", "person", "Ada Lovelace")
     source_id = _create_entity(client, token, "dedup-source", "person", "Ada Lovelase")
     shared_id = _create_entity(client, token, "dedup-shared", "project", "Analytical Engine")
 
     for owner_id, key in ((target_id, "dedup-target-rel"), (source_id, "dedup-source-rel")):
+        evidence_id = _seed_evidence(workspace_id, owner_id)
         rel = client.post(
             f"/api/v1/knowledge/entities/{owner_id}/relationships",
             headers=_headers(token, key),
-            json={"relationship_type": "WORKS_ON", "to_entity_id": str(shared_id)},
+            json={
+                "relationship_type": "WORKS_ON",
+                "to_entity_id": str(shared_id),
+                "evidence_id": str(evidence_id),
+            },
         )
         assert rel.status_code == 201, rel.text
 
@@ -383,6 +467,275 @@ def test_reversal_restores_source_to_active(
     )
     assert source_get.json()["status"] == "active"
 
+    # Schema-hygiene regression test (migration 0019): reverse marks the
+    # original merge row status='reversed' -- proves that mutation also
+    # bumps version/updated_at, not just the columns' existence.
+    with engine.connect() as connection:
+        merge_row = (
+            connection.execute(
+                text(
+                    "SELECT version, updated_at, created_at, status "
+                    "FROM entity_operations WHERE id = :id"
+                ),
+                {"id": operation_id},
+            )
+            .mappings()
+            .one()
+        )
+    assert merge_row["status"] == "reversed"
+    assert merge_row["version"] == 2
+    assert merge_row["updated_at"] > merge_row["created_at"]
+
+
+def test_reversal_restores_rehomed_relationships_and_aliases_to_source(
+    entity_operations_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    # Regression test: reverse used to only flip pkos_nodes.status back to
+    # active, leaving every relationship/alias merge's _rehome_edges/
+    # _rehome_aliases had moved onto target permanently attached to target
+    # -- contradicting both this function's own docstring ("reverse can
+    # safely restore the source because nothing has changed since the
+    # merge") and DATA-MODEL.md's "reversal restores prior identities".
+    # Since nothing else happened (guaranteed by the UNSAFE_REVERSAL check
+    # already passing), everything the merge itself moved should move back.
+    client, workspace_id, _user_id, token = entity_operations_test_context
+    target_id = _create_entity(client, token, "rev-rel-target", "person", "Ada Lovelace")
+    source_id = _create_entity(client, token, "rev-rel-source", "person", "Ada Lovelase")
+    other_id = _create_entity(client, token, "rev-rel-other", "project", "Analytical Engine")
+    alias_id = _seed_alias(workspace_id, source_id, "the enchantress of numbers")
+
+    evidence_id = _seed_evidence(workspace_id, source_id)
+    relationship = client.post(
+        f"/api/v1/knowledge/entities/{source_id}/relationships",
+        headers=_headers(token, "rev-rel-create"),
+        json={
+            "relationship_type": "WORKS_ON",
+            "to_entity_id": str(other_id),
+            "evidence_id": str(evidence_id),
+        },
+    )
+    assert relationship.status_code == 201, relationship.text
+    relationship_id = relationship.json()["id"]
+
+    candidate_id = _create_confirmed_candidate(
+        client, token, "rev-rel-candidate", target_id, source_id
+    )
+    merged = _merge(client, token, "rev-rel-merge", candidate_id, target_id, 1, 1)
+    operation_id = merged.json()["id"]
+
+    # Rehomed onto target by the merge itself.
+    with engine.connect() as connection:
+        rehomed_edge = connection.execute(
+            text("SELECT source_node_id FROM pkos_edges WHERE id = :id"),
+            {"id": relationship_id},
+        ).scalar_one()
+        rehomed_alias_owner = connection.execute(
+            text("SELECT entity_id FROM entity_aliases WHERE id = :id"), {"id": alias_id}
+        ).scalar_one()
+    assert str(rehomed_edge) == str(target_id)
+    assert str(rehomed_alias_owner) == str(target_id)
+
+    reversed_response = client.post(
+        f"/api/v1/knowledge/entity-operations/{operation_id}/reverse",
+        headers=_headers(token, "rev-rel-reverse"),
+        json={"reason": "merged in error"},
+    )
+    assert reversed_response.status_code == 201, reversed_response.text
+
+    with engine.connect() as connection:
+        restored_edge = connection.execute(
+            text("SELECT source_node_id FROM pkos_edges WHERE id = :id"),
+            {"id": relationship_id},
+        ).scalar_one()
+        restored_alias_owner = connection.execute(
+            text("SELECT entity_id FROM entity_aliases WHERE id = :id"), {"id": alias_id}
+        ).scalar_one()
+    assert str(restored_edge) == str(source_id)
+    assert str(restored_alias_owner) == str(source_id)
+
+    source_relationships = client.get(
+        f"/api/v1/knowledge/entities/{source_id}/relationships",
+        headers=_headers(token, "rev-rel-check"),
+    )
+    assert any(item["id"] == relationship_id for item in source_relationships.json()["items"])
+
+
+def test_reversal_restores_an_invalidated_duplicate_edge_to_active(
+    entity_operations_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    # Companion to the above for the other _rehome_edges branch: an edge
+    # that duplicated one target already had was invalidated (status only,
+    # node references untouched) rather than rehomed. Reverse must flip its
+    # status back to active, restoring source's own copy of the
+    # relationship rather than leaving it permanently invalidated.
+    client, workspace_id, _user_id, token = entity_operations_test_context
+    target_id = _create_entity(client, token, "rev-dup-target", "person", "Ada Lovelace")
+    source_id = _create_entity(client, token, "rev-dup-source", "person", "Ada Lovelase")
+    other_id = _create_entity(client, token, "rev-dup-other", "project", "Analytical Engine")
+
+    target_evidence_id = _seed_evidence(workspace_id, target_id)
+    target_relationship = client.post(
+        f"/api/v1/knowledge/entities/{target_id}/relationships",
+        headers=_headers(token, "rev-dup-target-create"),
+        json={
+            "relationship_type": "WORKS_ON",
+            "to_entity_id": str(other_id),
+            "evidence_id": str(target_evidence_id),
+        },
+    )
+    assert target_relationship.status_code == 201, target_relationship.text
+
+    source_evidence_id = _seed_evidence(workspace_id, source_id)
+    source_relationship = client.post(
+        f"/api/v1/knowledge/entities/{source_id}/relationships",
+        headers=_headers(token, "rev-dup-source-create"),
+        json={
+            "relationship_type": "WORKS_ON",
+            "to_entity_id": str(other_id),
+            "evidence_id": str(source_evidence_id),
+        },
+    )
+    assert source_relationship.status_code == 201, source_relationship.text
+    duplicate_relationship_id = source_relationship.json()["id"]
+
+    candidate_id = _create_confirmed_candidate(
+        client, token, "rev-dup-candidate", target_id, source_id
+    )
+    merged = _merge(client, token, "rev-dup-merge", candidate_id, target_id, 1, 1)
+    operation_id = merged.json()["id"]
+
+    with engine.connect() as connection:
+        status_after_merge = connection.execute(
+            text("SELECT status FROM pkos_edges WHERE id = :id"),
+            {"id": duplicate_relationship_id},
+        ).scalar_one()
+    assert status_after_merge == "invalidated"
+
+    reversed_response = client.post(
+        f"/api/v1/knowledge/entity-operations/{operation_id}/reverse",
+        headers=_headers(token, "rev-dup-reverse"),
+        json={"reason": "merged in error"},
+    )
+    assert reversed_response.status_code == 201, reversed_response.text
+
+    with engine.connect() as connection:
+        status_after_reverse = (
+            connection.execute(
+                text("SELECT status, source_node_id FROM pkos_edges WHERE id = :id"),
+                {"id": duplicate_relationship_id},
+            )
+            .mappings()
+            .one()
+        )
+    assert status_after_reverse["status"] == "active"
+    assert str(status_after_reverse["source_node_id"]) == str(source_id)
+
+
+def test_reversal_rejected_when_a_rehomed_relationship_was_moved_by_a_later_merge(
+    entity_operations_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    # Regression test for a gap an independent second-round review found:
+    # target is still 'active' after absorbing source_1, so it can
+    # legitimately go on to become the SOURCE of a second, independent
+    # merge into some other entity -- which rehomes the relationship
+    # merge_1 already rehomed onto it a second time. merge_2's own
+    # _rehome_edges writes no audit trail (raw SQL, no audit_events row),
+    # so it's invisible to the UNSAFE_REVERSAL activity check. Without a
+    # precondition check right before restoring, reversing merge_1 would
+    # either silently leave the relationship on other_target (the CASE
+    # WHEN in the restore UPDATE matches nothing, since the row no longer
+    # points at target) or, for entity_aliases, unconditionally yank
+    # ownership back to source_1 out from under other_target. Either way
+    # merge_1's reverse must instead reject with UNSAFE_REVERSAL.
+    client, workspace_id, _user_id, token = entity_operations_test_context
+    target_id = _create_entity(client, token, "chain-target", "person", "Ada Lovelace")
+    source_1_id = _create_entity(client, token, "chain-source-1", "person", "Ada Lovelase")
+    other_id = _create_entity(client, token, "chain-other", "project", "Analytical Engine")
+
+    evidence_id = _seed_evidence(workspace_id, source_1_id)
+    relationship = client.post(
+        f"/api/v1/knowledge/entities/{source_1_id}/relationships",
+        headers=_headers(token, "chain-rel-create"),
+        json={
+            "relationship_type": "WORKS_ON",
+            "to_entity_id": str(other_id),
+            "evidence_id": str(evidence_id),
+        },
+    )
+    assert relationship.status_code == 201, relationship.text
+
+    candidate_1 = _create_confirmed_candidate(
+        client, token, "chain-candidate-1", target_id, source_1_id
+    )
+    merge_1 = _merge(client, token, "chain-merge-1", candidate_1, target_id, 1, 1)
+    assert merge_1.status_code == 201, merge_1.text
+    operation_1_id = merge_1.json()["id"]
+
+    # target (still active) now becomes the SOURCE of a second, unrelated
+    # merge -- perfectly legal, since nothing marks it as "involved in a
+    # pending reversal."
+    other_target_id = _create_entity(client, token, "chain-other-target", "person", "A. Lovelace")
+    candidate_2 = _create_confirmed_candidate(
+        client, token, "chain-candidate-2", other_target_id, target_id
+    )
+    # target's own version is untouched by merge_1 (only source_1's version
+    # bumps on redirect), so it's still 1 here.
+    merge_2 = _merge(client, token, "chain-merge-2", candidate_2, other_target_id, 1, 1)
+    assert merge_2.status_code == 201, merge_2.text
+
+    response = client.post(
+        f"/api/v1/knowledge/entity-operations/{operation_1_id}/reverse",
+        headers=_headers(token, "chain-reverse-1"),
+        json={"reason": "attempt after a later merge moved the relationship again"},
+    )
+    assert response.status_code == 422, response.text
+    assert response.json()["error"]["code"] == "UNSAFE_REVERSAL"
+
+    # Nothing was touched: the relationship still belongs to other_target
+    # (where merge_2 correctly rehomed it), not silently left behind or
+    # forced back onto source_1.
+    with engine.connect() as connection:
+        edge_owner = connection.execute(
+            text("SELECT source_node_id FROM pkos_edges WHERE id = :id"),
+            {"id": relationship.json()["id"]},
+        ).scalar_one()
+    assert str(edge_owner) == str(other_target_id)
+
+
+def test_reversal_refreshes_source_retrieval_projection_so_it_is_not_stale(
+    entity_operations_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    # Regression test: reverse used to restore pkos_nodes.status/version to
+    # active without refreshing retrieval_documents, so the reactivated
+    # entity reappeared in search results with a false stale:true (its
+    # projection's source_version still reflected the version stamped
+    # before the merge redirected it out of search).
+    client, _workspace_id, _user_id, token = entity_operations_test_context
+    target_id = _create_entity(client, token, "rev-stale-target", "person", "Ada Lovelace")
+    source_id = _create_entity(client, token, "rev-stale-source", "person", "Ada Lovelase")
+    candidate_id = _create_confirmed_candidate(
+        client, token, "rev-stale-candidate", target_id, source_id
+    )
+    merged = _merge(client, token, "rev-stale-merge", candidate_id, target_id, 1, 1)
+    operation_id = merged.json()["id"]
+
+    reversed_response = client.post(
+        f"/api/v1/knowledge/entity-operations/{operation_id}/reverse",
+        headers=_headers(token, "rev-stale-reverse"),
+        json={"reason": "merged in error"},
+    )
+    assert reversed_response.status_code == 201, reversed_response.text
+
+    search = client.get(
+        "/api/v1/knowledge/retrieve",
+        headers=_headers(token, "rev-stale-search"),
+        params={"q": "Ada Lovelase"},
+    )
+    assert search.status_code == 200, search.text
+    matches = [item for item in search.json()["items"] if item["entity_id"] == str(source_id)]
+    assert matches, "reactivated source entity should be searchable again"
+    assert matches[0]["stale"] is False
+
 
 def test_reversal_rejected_when_target_has_post_merge_dependent_activity(
     entity_operations_test_context: tuple[TestClient, UUID, UUID, str],
@@ -417,6 +770,48 @@ def test_reversal_rejected_when_target_has_post_merge_dependent_activity(
     assert response.json()["error"]["code"] == "UNSAFE_REVERSAL"
 
 
+def test_reversal_rejected_when_a_relationship_was_created_on_target_after_merge(
+    entity_operations_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    # Regression test: _has_post_merge_dependent_activity used to only check
+    # audit_events for aggregate_type='knowledge_entity', which claims and
+    # entity mutations write -- but relationships.py's create_relationship
+    # writes aggregate_type='relationship' with aggregate_id=<the
+    # relationship's own id>, not the target entity's id, so a relationship
+    # created against the target after the merge was invisible to the
+    # check and reverse would wrongly succeed despite the identical
+    # attribution ambiguity a post-merge claim already blocks.
+    client, workspace_id, _user_id, token = entity_operations_test_context
+    target_id = _create_entity(client, token, "unsafe-rel-target", "person", "Ada Lovelace")
+    source_id = _create_entity(client, token, "unsafe-rel-source", "person", "Ada Lovelase")
+    other_id = _create_entity(client, token, "unsafe-rel-other", "project", "Analytical Engine")
+    candidate_id = _create_confirmed_candidate(
+        client, token, "unsafe-rel-candidate", target_id, source_id
+    )
+    merged = _merge(client, token, "unsafe-rel-merge", candidate_id, target_id, 1, 1)
+    operation_id = merged.json()["id"]
+
+    evidence_id = _seed_evidence(workspace_id, target_id)
+    relationship = client.post(
+        f"/api/v1/knowledge/entities/{target_id}/relationships",
+        headers=_headers(token, "unsafe-rel-create"),
+        json={
+            "relationship_type": "WORKS_ON",
+            "to_entity_id": str(other_id),
+            "evidence_id": str(evidence_id),
+        },
+    )
+    assert relationship.status_code == 201, relationship.text
+
+    response = client.post(
+        f"/api/v1/knowledge/entity-operations/{operation_id}/reverse",
+        headers=_headers(token, "unsafe-rel-reverse"),
+        json={"reason": "attempt after dependent relationship activity"},
+    )
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "UNSAFE_REVERSAL"
+
+
 def test_reverse_already_reversed_is_conflict(
     entity_operations_test_context: tuple[TestClient, UUID, UUID, str],
 ) -> None:
@@ -443,3 +838,412 @@ def test_reverse_already_reversed_is_conflict(
     )
     assert second.status_code == 409
     assert second.json()["error"]["code"] == "OPERATION_ALREADY_REVERSED"
+
+
+def test_split_is_the_manual_path_when_reverse_would_be_unsafe(
+    entity_operations_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    client, workspace_id, _user_id, token = entity_operations_test_context
+    target_id = _create_entity(client, token, "split-target", "person", "Ada Lovelace")
+    source_id = _create_entity(client, token, "split-source", "person", "Ada Lovelase")
+    candidate_id = _create_confirmed_candidate(
+        client, token, "split-candidate", target_id, source_id
+    )
+    merged = _merge(client, token, "split-merge", candidate_id, target_id, 1, 1)
+    operation_id = merged.json()["id"]
+
+    # A claim recorded on the target after the merge -- exactly the
+    # condition that makes plain reverse unsafe (verified below).
+    evidence_id = _seed_evidence(workspace_id, target_id)
+    claim = client.post(
+        f"/api/v1/knowledge/entities/{target_id}/claims",
+        headers=_headers(token, "split-claim"),
+        json={
+            "predicate": "role",
+            "value": {"title": "Mathematician"},
+            "source_id": str(evidence_id),
+        },
+    )
+    claim_id = claim.json()["id"]
+
+    unsafe_reverse = client.post(
+        f"/api/v1/knowledge/entity-operations/{operation_id}/reverse",
+        headers=_headers(token, "split-confirm-unsafe"),
+        json={"reason": "attempt"},
+    )
+    assert unsafe_reverse.status_code == 422
+    assert unsafe_reverse.json()["error"]["code"] == "UNSAFE_REVERSAL"
+
+    split = client.post(
+        f"/api/v1/knowledge/entity-operations/{operation_id}/split",
+        headers=_headers(token, "split-once"),
+        json={
+            "reason": "the post-merge claim belongs to the source",
+            "reassign_claim_ids": [claim_id],
+        },
+    )
+    assert split.status_code == 201, split.text
+    assert split.json()["operation_type"] == "split"
+    assert split.json()["reverses_operation_id"] == operation_id
+    assert split.json()["source_entity_id"] == str(source_id)
+    assert split.json()["target_entity_id"] == str(target_id)
+
+    source_get = client.get(
+        f"/api/v1/knowledge/entities/{source_id}", headers=_headers(token, "split-check-source")
+    )
+    assert source_get.json()["status"] == "active"
+
+    source_claims = client.get(
+        f"/api/v1/knowledge/entities/{source_id}/claims",
+        headers=_headers(token, "split-source-claims"),
+    )
+    assert any(item["id"] == claim_id for item in source_claims.json()["items"])
+
+    target_claims = client.get(
+        f"/api/v1/knowledge/entities/{target_id}/claims",
+        headers=_headers(token, "split-target-claims"),
+    )
+    assert all(item["id"] != claim_id for item in target_claims.json()["items"])
+
+
+def test_split_reassigns_relationships_too(
+    entity_operations_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    client, workspace_id, _user_id, token = entity_operations_test_context
+    target_id = _create_entity(client, token, "split-rel-target", "person", "Ada Lovelace")
+    source_id = _create_entity(client, token, "split-rel-source", "person", "Ada Lovelase")
+    other_id = _create_entity(client, token, "split-rel-other", "project", "Analytical Engine")
+    candidate_id = _create_confirmed_candidate(
+        client, token, "split-rel-candidate", target_id, source_id
+    )
+    merged = _merge(client, token, "split-rel-merge", candidate_id, target_id, 1, 1)
+    operation_id = merged.json()["id"]
+
+    evidence_id = _seed_evidence(workspace_id, target_id)
+    relationship = client.post(
+        f"/api/v1/knowledge/entities/{target_id}/relationships",
+        headers=_headers(token, "split-rel-create"),
+        json={
+            "relationship_type": "WORKS_ON",
+            "to_entity_id": str(other_id),
+            "evidence_id": str(evidence_id),
+        },
+    )
+    relationship_id = relationship.json()["id"]
+
+    split = client.post(
+        f"/api/v1/knowledge/entity-operations/{operation_id}/split",
+        headers=_headers(token, "split-rel-once"),
+        json={
+            "reason": "this relationship belongs to the source",
+            "reassign_relationship_ids": [relationship_id],
+        },
+    )
+    assert split.status_code == 201, split.text
+
+    source_relationships = client.get(
+        f"/api/v1/knowledge/entities/{source_id}/relationships",
+        headers=_headers(token, "split-rel-source-check"),
+    )
+    assert any(item["id"] == relationship_id for item in source_relationships.json()["items"])
+
+
+def test_split_rejects_claim_not_belonging_to_target(
+    entity_operations_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    client, _workspace_id, _user_id, token = entity_operations_test_context
+    target_id = _create_entity(client, token, "split-bad-target", "person", "Ada Lovelace")
+    source_id = _create_entity(client, token, "split-bad-source", "person", "Ada Lovelase")
+    candidate_id = _create_confirmed_candidate(
+        client, token, "split-bad-candidate", target_id, source_id
+    )
+    merged = _merge(client, token, "split-bad-merge", candidate_id, target_id, 1, 1)
+    operation_id = merged.json()["id"]
+
+    response = client.post(
+        f"/api/v1/knowledge/entity-operations/{operation_id}/split",
+        headers=_headers(token, "split-bad-attempt"),
+        json={"reason": "attempt", "reassign_claim_ids": [str(uuid4())]},
+    )
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "CLAIM_NOT_ON_TARGET"
+
+
+def test_concurrent_splits_reassigning_the_same_claim_do_not_both_succeed(
+    entity_operations_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    """Coverage for concurrent split calls that both name the same target
+    claim: two different merges (source_a and source_b, both redirected
+    into the same target) each get their own split operation, and both
+    name the SAME target claim in their reassign_claim_ids. The
+    target-entity lock both splits take before validating claim ownership
+    already serializes them (confirmed by hand: the ownership-validation
+    SELECT's FOR UPDATE is defense-in-depth, not what prevents this race --
+    see its comment), so exactly one must win with 201 and the other must
+    see the claim as no longer belonging to target and get 422, never both
+    succeeding or the loser silently reassigning zero rows while still
+    reporting success."""
+    client, workspace_id, _user_id, token = entity_operations_test_context
+    target_id = _create_entity(client, token, "split-race-target", "person", "Ada Lovelace")
+    source_a = _create_entity(client, token, "split-race-source-a", "person", "Ada L. A")
+    source_b = _create_entity(client, token, "split-race-source-b", "person", "Ada L. B")
+
+    candidate_a = _create_confirmed_candidate(
+        client, token, "split-race-candidate-a", target_id, source_a
+    )
+    merge_a = _merge(client, token, "split-race-merge-a", candidate_a, target_id, 1, 1)
+    operation_a = merge_a.json()["id"]
+
+    candidate_b = _create_confirmed_candidate(
+        client, token, "split-race-candidate-b", target_id, source_b
+    )
+    merge_b = _merge(client, token, "split-race-merge-b", candidate_b, target_id, 1, 1)
+    operation_b = merge_b.json()["id"]
+
+    evidence_id = _seed_evidence(workspace_id, target_id)
+    claim = client.post(
+        f"/api/v1/knowledge/entities/{target_id}/claims",
+        headers=_headers(token, "split-race-claim"),
+        json={
+            "predicate": "role",
+            "value": {"title": "Mathematician"},
+            "source_id": str(evidence_id),
+        },
+    )
+    claim_id = claim.json()["id"]
+
+    def split_once(label: str, operation_id: str) -> int:
+        worker = TestClient(app)
+        worker.cookies.set("ecc_session", token)
+        try:
+            response = worker.post(
+                f"/api/v1/knowledge/entity-operations/{operation_id}/split",
+                headers=_headers(token, f"split-race-attempt-{label}"),
+                json={"reason": "race", "reassign_claim_ids": [claim_id]},
+            )
+            return response.status_code
+        finally:
+            worker.close()
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(
+            executor.map(
+                lambda args: split_once(*args),
+                [("a", operation_a), ("b", operation_b)],
+            )
+        )
+
+    assert sorted(results) == [201, 422]
+
+    with engine.connect() as connection:
+        subject_id = connection.execute(
+            text("SELECT subject_id FROM knowledge_claims WHERE id = :id"), {"id": claim_id}
+        ).scalar_one()
+    assert str(subject_id) in (str(source_a), str(source_b))
+
+
+def test_split_requires_a_merge_operation(
+    entity_operations_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    client, _workspace_id, _user_id, token = entity_operations_test_context
+    target_id = _create_entity(client, token, "split-notmerge-target", "person", "Ada Lovelace")
+    source_id = _create_entity(client, token, "split-notmerge-source", "person", "Ada Lovelase")
+    candidate_id = _create_confirmed_candidate(
+        client, token, "split-notmerge-candidate", target_id, source_id
+    )
+    merged = _merge(client, token, "split-notmerge-merge", candidate_id, target_id, 1, 1)
+    operation_id = merged.json()["id"]
+    reversed_op = client.post(
+        f"/api/v1/knowledge/entity-operations/{operation_id}/reverse",
+        headers=_headers(token, "split-notmerge-reverse"),
+        json={"reason": "undo"},
+    )
+    reverse_operation_id = reversed_op.json()["id"]
+
+    response = client.post(
+        f"/api/v1/knowledge/entity-operations/{reverse_operation_id}/split",
+        headers=_headers(token, "split-notmerge-attempt"),
+        json={"reason": "attempt"},
+    )
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "NOT_A_MERGE_OPERATION"
+
+
+def test_split_an_already_reversed_merge_is_conflict(
+    entity_operations_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    client, _workspace_id, _user_id, token = entity_operations_test_context
+    target_id = _create_entity(client, token, "split-twice-target", "person", "Ada Lovelace")
+    source_id = _create_entity(client, token, "split-twice-source", "person", "Ada Lovelase")
+    candidate_id = _create_confirmed_candidate(
+        client, token, "split-twice-candidate", target_id, source_id
+    )
+    merged = _merge(client, token, "split-twice-merge", candidate_id, target_id, 1, 1)
+    operation_id = merged.json()["id"]
+    client.post(
+        f"/api/v1/knowledge/entity-operations/{operation_id}/reverse",
+        headers=_headers(token, "split-twice-reverse"),
+        json={"reason": "undo"},
+    )
+
+    response = client.post(
+        f"/api/v1/knowledge/entity-operations/{operation_id}/split",
+        headers=_headers(token, "split-twice-attempt"),
+        json={"reason": "attempt"},
+    )
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "OPERATION_ALREADY_REVERSED"
+
+
+def _seed_foreign_workspace_merge_operation() -> tuple[UUID, UUID, UUID, UUID]:
+    """A second, fully independent workspace with a confirmed candidate and
+    a completed merge operation, for proving these mutation endpoints never
+    act on a resource that belongs to a different workspace."""
+    other_workspace_id = uuid4()
+    target_id, source_id = uuid4(), uuid4()
+    candidate_id = uuid4()
+    operation_id = uuid4()
+    now = datetime.now(UTC)
+    with engine.begin() as connection:
+        connection.execute(
+            text("INSERT INTO workspaces (id, name, created_at) VALUES (:id, :name, :created_at)"),
+            {"id": other_workspace_id, "name": "Foreign Workspace", "created_at": now},
+        )
+        for entity_id, name, status in (
+            (target_id, "Foreign Target", "active"),
+            (source_id, "Foreign Source", "redirected"),
+        ):
+            connection.execute(
+                text(
+                    "INSERT INTO pkos_nodes (id, workspace_id, node_type, canonical_name, "
+                    "attributes, status, confidence, version, created_at, updated_at) "
+                    "VALUES (:id, :workspace_id, 'person', :name, '{}'::jsonb, :status, "
+                    "1.0, 1, :now, :now)"
+                ),
+                {
+                    "id": entity_id,
+                    "workspace_id": other_workspace_id,
+                    "name": name,
+                    "status": status,
+                    "now": now,
+                },
+            )
+        connection.execute(
+            text(
+                "INSERT INTO resolution_candidates (id, workspace_id, left_entity_id, "
+                "right_entity_id, score, factors_json, resolver_version, status, "
+                "resolved_at, resolved_by, reason, created_at) VALUES (:id, :workspace_id, "
+                ":target_id, :source_id, 0.95, '{}'::jsonb, 'test', 'confirmed', :now, "
+                ":resolved_by, 'merged', :now)"
+            ),
+            {
+                "id": candidate_id,
+                "workspace_id": other_workspace_id,
+                "target_id": target_id,
+                "source_id": source_id,
+                "resolved_by": uuid4(),
+                "now": now,
+            },
+        )
+        connection.execute(
+            text(
+                """
+                INSERT INTO entity_operations (
+                    id, workspace_id, operation_type, status, inputs_json,
+                    outputs_json, actor_id, reason, created_at
+                ) VALUES (
+                    :id, :workspace_id, 'merge', 'active', CAST(:inputs_json AS jsonb),
+                    '{}'::jsonb, :actor_id, 'foreign merge', :now
+                )
+                """
+            ),
+            {
+                "id": operation_id,
+                "workspace_id": other_workspace_id,
+                "inputs_json": dumps(
+                    {
+                        "candidate_id": str(candidate_id),
+                        "target_entity_id": str(target_id),
+                        "source_entity_id": str(source_id),
+                    }
+                ),
+                "actor_id": uuid4(),
+                "now": now,
+            },
+        )
+    return other_workspace_id, candidate_id, operation_id, target_id
+
+
+def _teardown_foreign_workspace(workspace_id: UUID) -> None:
+    with engine.begin() as connection:
+        for table in ("entity_operations", "resolution_candidates", "pkos_nodes"):
+            connection.execute(
+                text(f"DELETE FROM {table} WHERE workspace_id = :workspace_id"),  # noqa: S608
+                {"workspace_id": workspace_id},
+            )
+        connection.execute(
+            text("DELETE FROM workspaces WHERE id = :workspace_id"), {"workspace_id": workspace_id}
+        )
+
+
+def test_merge_rejects_candidate_from_another_workspace(
+    entity_operations_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    client, _workspace_id, _user_id, token = entity_operations_test_context
+    other_workspace_id, foreign_candidate_id, _operation_id, foreign_target_id = (
+        _seed_foreign_workspace_merge_operation()
+    )
+    try:
+        response = client.post(
+            "/api/v1/knowledge/entities/merge",
+            headers=_headers(token, "isolation-merge-foreign-candidate"),
+            json={
+                "candidate_id": str(foreign_candidate_id),
+                "target_entity_id": str(foreign_target_id),
+                "expected_target_version": 1,
+                "expected_source_version": 1,
+                "reason": "cross-workspace attempt",
+            },
+        )
+        assert response.status_code == 404, response.text
+        assert response.json()["error"]["code"] == "CANDIDATE_NOT_FOUND"
+    finally:
+        _teardown_foreign_workspace(other_workspace_id)
+
+
+def test_reverse_rejects_operation_from_another_workspace(
+    entity_operations_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    client, _workspace_id, _user_id, token = entity_operations_test_context
+    other_workspace_id, _candidate_id, foreign_operation_id, _target_id = (
+        _seed_foreign_workspace_merge_operation()
+    )
+    try:
+        response = client.post(
+            f"/api/v1/knowledge/entity-operations/{foreign_operation_id}/reverse",
+            headers=_headers(token, "isolation-reverse-foreign"),
+            json={"reason": "cross-workspace attempt"},
+        )
+        assert response.status_code == 404, response.text
+        assert response.json()["error"]["code"] == "OPERATION_NOT_FOUND"
+    finally:
+        _teardown_foreign_workspace(other_workspace_id)
+
+
+def test_split_rejects_operation_from_another_workspace(
+    entity_operations_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    client, _workspace_id, _user_id, token = entity_operations_test_context
+    other_workspace_id, _candidate_id, foreign_operation_id, _target_id = (
+        _seed_foreign_workspace_merge_operation()
+    )
+    try:
+        response = client.post(
+            f"/api/v1/knowledge/entity-operations/{foreign_operation_id}/split",
+            headers=_headers(token, "isolation-split-foreign"),
+            json={"reason": "cross-workspace attempt"},
+        )
+        assert response.status_code == 404, response.text
+        assert response.json()["error"]["code"] == "OPERATION_NOT_FOUND"
+    finally:
+        _teardown_foreign_workspace(other_workspace_id)

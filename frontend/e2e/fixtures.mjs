@@ -143,6 +143,7 @@ function makeAudit({ corpus, pageSize = 20 }) {
  */
 function makeKnowledgeApi(overrides = {}) {
   const entities = createCollection(overrides.entities ?? [])
+  const aliases = [...(overrides.aliases ?? [])]
   const claims = [...(overrides.claims ?? [])]
   const relationships = [...(overrides.relationships ?? [])]
   const timelineEntries = [...(overrides.timelineEntries ?? [])]
@@ -277,7 +278,10 @@ function makeKnowledgeApi(overrides = {}) {
     if (pathname === '/api/v1/knowledge/resolution/candidates' && method === 'GET') {
       const params = new URLSearchParams(queryString)
       const status = params.get('status')
-      const items = resolutionCandidates.list().filter((item) => !status || item.status === status)
+      const items = resolutionCandidates
+        .list()
+        .filter((item) => !status || item.status === status)
+        .filter((item) => !item.deferred_until || new Date(item.deferred_until).getTime() <= Date.now())
       return { status: 200, body: { items, next_cursor: null } }
     }
     if (pathname === '/api/v1/knowledge/resolution/candidates' && method === 'POST') {
@@ -292,6 +296,7 @@ function makeKnowledgeApi(overrides = {}) {
         resolved_at: null,
         resolved_by: null,
         reason: null,
+        deferred_until: null,
       })
       return { status: 201, body: { deterministic: false, candidate: item } }
     }
@@ -307,6 +312,26 @@ function makeKnowledgeApi(overrides = {}) {
       candidate.resolved_by = 'fixture-user'
       candidate.reason = body.reason
       return { status: 200, body: candidate }
+    }
+    const deferMatch = pathname.match(
+      /^\/api\/v1\/knowledge\/resolution\/candidates\/([^/]+)\/defer$/,
+    )
+    if (deferMatch && method === 'POST') {
+      const candidate = resolutionCandidates.find(deferMatch[1])
+      if (!candidate) return { status: 404, body: { error: { code: 'CANDIDATE_NOT_FOUND', message: 'Not found' } } }
+      if (candidate.status !== 'open') {
+        return { status: 409, body: { error: { code: 'CANDIDATE_NOT_OPEN', message: 'Not open' } } }
+      }
+      if (new Date(body.deferred_until).getTime() <= Date.now()) {
+        return { status: 422, body: { error: { code: 'DEFER_UNTIL_MUST_BE_FUTURE', message: 'Must be future' } } }
+      }
+      candidate.deferred_until = body.deferred_until
+      return { status: 200, body: candidate }
+    }
+
+    const aliasesMatch = pathname.match(/^\/api\/v1\/knowledge\/entities\/([^/]+)\/aliases$/)
+    if (aliasesMatch && method === 'GET') {
+      return { status: 200, body: { items: aliases.filter((alias) => alias.entity_id === aliasesMatch[1]) } }
     }
 
     const claimsMatch = pathname.match(/^\/api\/v1\/knowledge\/entities\/([^/]+)\/claims$/)
@@ -331,6 +356,28 @@ function makeKnowledgeApi(overrides = {}) {
       return { status: 201, body: claim }
     }
 
+    const supersedeMatch = pathname.match(/^\/api\/v1\/knowledge\/entities\/([^/]+)\/claims\/([^/]+)\/supersede$/)
+    if (supersedeMatch && method === 'POST') {
+      const [, entityId, claimId] = supersedeMatch
+      const original = claims.find((claim) => claim.id === claimId)
+      if (original) original.superseded_by = randomUUID()
+      const claim = {
+        id: original ? original.superseded_by : randomUUID(),
+        subject_id: entityId,
+        predicate: body.predicate,
+        value: body.value,
+        source_id: body.source_id,
+        confidence: body.confidence ?? 1,
+        valid_from: body.valid_from ?? null,
+        valid_to: body.valid_to ?? null,
+        superseded_by: null,
+        created_at: nowIso(),
+      }
+      claims.push(claim)
+      pushTimeline(entityId, 'knowledge_entity.claim_recorded', `claim corrected: ${body.predicate}`)
+      return { status: 201, body: claim }
+    }
+
     const relationshipsMatch = pathname.match(/^\/api\/v1\/knowledge\/entities\/([^/]+)\/relationships$/)
     if (relationshipsMatch && method === 'GET') {
       const entityId = relationshipsMatch[1]
@@ -339,13 +386,19 @@ function makeKnowledgeApi(overrides = {}) {
     }
     if (relationshipsMatch && method === 'POST') {
       const fromId = relationshipsMatch[1]
+      // evidence_id is required (matching the real backend's DATA-MODEL.md
+      // "at least one source reference" invariant) -- unlike a real
+      // pydantic-validation 422, this mock returns the app's own error shape.
+      if (!body.evidence_id) {
+        return { status: 422, body: { error: { code: 'VALIDATION_ERROR', message: 'evidence_id is required' } } }
+      }
       const relationship = {
         id: randomUUID(),
         from_entity_id: fromId,
         to_entity_id: body.to_entity_id,
         relationship_type: body.relationship_type,
         confidence: body.confidence ?? 1,
-        evidence_id: body.evidence_id ?? null,
+        evidence_id: body.evidence_id,
         valid_from: body.valid_from ?? null,
         valid_to: body.valid_to ?? null,
         status: 'active',
@@ -366,7 +419,7 @@ function makeKnowledgeApi(overrides = {}) {
     return entitiesResource(pathname, method, body, queryString)
   }
 
-  return { dispatch, entities, claims, relationships, timelineEntries, resolutionCandidates, entityOperations }
+  return { dispatch, entities, aliases, claims, relationships, timelineEntries, resolutionCandidates, entityOperations }
 }
 
 const defaultDashboardSections = {
@@ -478,6 +531,7 @@ export async function createFixtureApi(page, overrides = {}) {
   const audit = makeAudit({ corpus: overrides.auditCorpus ?? defaultAuditCorpus, pageSize: overrides.auditPageSize })
   const knowledge = makeKnowledgeApi({
     entities: overrides.knowledgeEntities,
+    aliases: overrides.knowledgeAliases,
     claims: overrides.knowledgeClaims,
     relationships: overrides.knowledgeRelationships,
     timelineEntries: overrides.knowledgeTimelineEntries,

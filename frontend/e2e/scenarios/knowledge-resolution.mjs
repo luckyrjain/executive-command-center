@@ -41,6 +41,7 @@ const seedCandidate = {
   resolved_at: null,
   resolved_by: null,
   reason: null,
+  deferred_until: null,
 }
 
 /**

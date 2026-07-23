@@ -209,7 +209,10 @@ def test_claim_supersede_never_destructively_overwrites(
     with engine.connect() as connection:
         original_row = (
             connection.execute(
-                text("SELECT superseded_by, valid_to FROM knowledge_claims WHERE id = :id"),
+                text(
+                    "SELECT superseded_by, valid_to, version, updated_at, created_at "
+                    "FROM knowledge_claims WHERE id = :id"
+                ),
                 {"id": original_id},
             )
             .mappings()
@@ -219,3 +222,361 @@ def test_claim_supersede_never_destructively_overwrites(
     # now points at its replacement.
     assert str(original_row["superseded_by"]) == new_claim["id"]
     assert original_row["valid_to"] is not None
+    # Schema-hygiene regression test (migration 0019): supersede's UPDATE
+    # also bumps version/updated_at on the original row, not just the
+    # columns' existence.
+    assert original_row["version"] == 2
+    assert original_row["updated_at"] > original_row["created_at"]
+
+
+def test_claim_record_rejects_unknown_evidence(
+    claims_test_context: tuple[TestClient, UUID, UUID, str, UUID],
+) -> None:
+    client, _workspace_id, _user_id, token, entity_id = claims_test_context
+    response = client.post(
+        f"/api/v1/knowledge/entities/{entity_id}/claims",
+        headers=_headers(token, "unknown-evidence"),
+        json={
+            "predicate": "employed_at",
+            "value": {"organization": "Analytical Engines Ltd"},
+            "source_id": str(uuid4()),
+        },
+    )
+    assert response.status_code == 404, response.text
+    assert response.json()["error"]["code"] == "EVIDENCE_NOT_FOUND"
+
+
+def test_claim_record_rejects_unavailable_evidence(
+    claims_test_context: tuple[TestClient, UUID, UUID, str, UUID],
+) -> None:
+    client, workspace_id, _user_id, token, entity_id = claims_test_context
+    evidence_id = _create_evidence(workspace_id, entity_id)
+    with engine.begin() as connection:
+        connection.execute(
+            text("UPDATE pkos_evidence SET evidence_state = 'missing' WHERE id = :id"),
+            {"id": evidence_id},
+        )
+    response = client.post(
+        f"/api/v1/knowledge/entities/{entity_id}/claims",
+        headers=_headers(token, "unavailable-evidence"),
+        json={
+            "predicate": "employed_at",
+            "value": {"organization": "Analytical Engines Ltd"},
+            "source_id": str(evidence_id),
+        },
+    )
+    assert response.status_code == 422, response.text
+    assert response.json()["error"]["code"] == "EVIDENCE_UNAVAILABLE"
+
+
+def test_claim_supersede_rejects_unavailable_evidence(
+    claims_test_context: tuple[TestClient, UUID, UUID, str, UUID],
+) -> None:
+    client, workspace_id, _user_id, token, entity_id = claims_test_context
+    evidence_id = _create_evidence(workspace_id, entity_id)
+    create = client.post(
+        f"/api/v1/knowledge/entities/{entity_id}/claims",
+        headers=_headers(token, "create-claim-for-supersede"),
+        json={
+            "predicate": "employed_at",
+            "value": {"organization": "Analytical Engines Ltd"},
+            "source_id": str(evidence_id),
+        },
+    )
+    original_id = create.json()["id"]
+
+    with engine.begin() as connection:
+        connection.execute(
+            text("UPDATE pkos_evidence SET evidence_state = 'deleted' WHERE id = :id"),
+            {"id": evidence_id},
+        )
+
+    supersede = client.post(
+        f"/api/v1/knowledge/entities/{entity_id}/claims/{original_id}/supersede",
+        headers=_headers(token, "supersede-with-deleted-evidence"),
+        json={
+            "predicate": "employed_at",
+            "value": {"organization": "Cambridge University"},
+            "source_id": str(evidence_id),
+        },
+    )
+    assert supersede.status_code == 422, supersede.text
+    assert supersede.json()["error"]["code"] == "EVIDENCE_UNAVAILABLE"
+
+
+def _seed_foreign_workspace_node_and_evidence() -> tuple[UUID, UUID, UUID]:
+    """A second, fully independent workspace + entity + evidence row, for
+    proving workspace isolation rather than just not-found handling for a
+    nonexistent id -- the two are different failure modes (a real id that
+    belongs to someone else vs. an id that belongs to no one)."""
+    other_workspace_id = uuid4()
+    other_node_id = uuid4()
+    other_evidence_id = uuid4()
+    now = datetime.now(UTC)
+    with engine.begin() as connection:
+        connection.execute(
+            text("INSERT INTO workspaces (id, name, created_at) VALUES (:id, :name, :created_at)"),
+            {"id": other_workspace_id, "name": "Foreign Workspace", "created_at": now},
+        )
+        connection.execute(
+            text(
+                "INSERT INTO pkos_nodes (id, workspace_id, node_type, canonical_name, "
+                "attributes, created_at, updated_at) VALUES (:id, :workspace_id, 'person', "
+                "'Foreign Node', '{}'::jsonb, :now, :now)"
+            ),
+            {"id": other_node_id, "workspace_id": other_workspace_id, "now": now},
+        )
+        connection.execute(
+            text(
+                "INSERT INTO pkos_evidence (id, workspace_id, node_id, source_type, "
+                "source_ref, sha256, captured_at) VALUES (:id, :workspace_id, :node_id, "
+                "'manual', 'foreign-ref', :sha256, :captured_at)"
+            ),
+            {
+                "id": other_evidence_id,
+                "workspace_id": other_workspace_id,
+                "node_id": other_node_id,
+                "sha256": sha256(str(other_evidence_id).encode()).hexdigest(),
+                "captured_at": now,
+            },
+        )
+    return other_workspace_id, other_node_id, other_evidence_id
+
+
+def _teardown_foreign_workspace(workspace_id: UUID) -> None:
+    with engine.begin() as connection:
+        for table in ("knowledge_claims", "pkos_evidence", "pkos_nodes"):
+            connection.execute(
+                text(f"DELETE FROM {table} WHERE workspace_id = :workspace_id"),  # noqa: S608
+                {"workspace_id": workspace_id},
+            )
+        connection.execute(
+            text("DELETE FROM workspaces WHERE id = :workspace_id"), {"workspace_id": workspace_id}
+        )
+
+
+def test_claim_list_never_shows_another_workspaces_claims(
+    claims_test_context: tuple[TestClient, UUID, UUID, str, UUID],
+) -> None:
+    client, workspace_id, _user_id, token, entity_id = claims_test_context
+    other_workspace_id, other_node_id, other_evidence_id = (
+        _seed_foreign_workspace_node_and_evidence()
+    )
+    try:
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    "INSERT INTO knowledge_claims (id, workspace_id, subject_id, predicate, "
+                    "value_json, source_id, confidence, created_at) VALUES (:id, :workspace_id, "
+                    ":subject_id, 'title', '{}'::jsonb, :source_id, 1.0, :now)"
+                ),
+                {
+                    "id": uuid4(),
+                    "workspace_id": other_workspace_id,
+                    "subject_id": other_node_id,
+                    "source_id": other_evidence_id,
+                    "now": datetime.now(UTC),
+                },
+            )
+
+        evidence_id = _create_evidence(workspace_id, entity_id)
+        client.post(
+            f"/api/v1/knowledge/entities/{entity_id}/claims",
+            headers=_headers(token, "isolation-own-claim"),
+            json={
+                "predicate": "employed_at",
+                "value": {"organization": "Analytical Engines Ltd"},
+                "source_id": str(evidence_id),
+            },
+        )
+
+        # A request for the *foreign* entity's claims, made from this
+        # workspace's session, must never return the other workspace's row
+        # -- not even the row count.
+        listed = client.get(
+            f"/api/v1/knowledge/entities/{other_node_id}/claims",
+            headers=_headers(token, "isolation-list-foreign"),
+        )
+        assert listed.status_code == 200
+        assert listed.json()["items"] == []
+    finally:
+        _teardown_foreign_workspace(other_workspace_id)
+
+
+def test_claim_create_rejects_entity_from_another_workspace(
+    claims_test_context: tuple[TestClient, UUID, UUID, str, UUID],
+) -> None:
+    client, workspace_id, _user_id, token, entity_id = claims_test_context
+    other_workspace_id, other_node_id, _other_evidence_id = (
+        _seed_foreign_workspace_node_and_evidence()
+    )
+    try:
+        evidence_id = _create_evidence(workspace_id, entity_id)
+        response = client.post(
+            f"/api/v1/knowledge/entities/{other_node_id}/claims",
+            headers=_headers(token, "isolation-create-foreign-entity"),
+            json={
+                "predicate": "employed_at",
+                "value": {"organization": "Analytical Engines Ltd"},
+                "source_id": str(evidence_id),
+            },
+        )
+        assert response.status_code == 404, response.text
+        assert response.json()["error"]["code"] == "ENTITY_NOT_FOUND"
+    finally:
+        _teardown_foreign_workspace(other_workspace_id)
+
+
+def test_claim_create_rejects_evidence_from_another_workspace(
+    claims_test_context: tuple[TestClient, UUID, UUID, str, UUID],
+) -> None:
+    client, _workspace_id, _user_id, token, entity_id = claims_test_context
+    other_workspace_id, _other_node_id, other_evidence_id = (
+        _seed_foreign_workspace_node_and_evidence()
+    )
+    try:
+        response = client.post(
+            f"/api/v1/knowledge/entities/{entity_id}/claims",
+            headers=_headers(token, "isolation-create-foreign-evidence"),
+            json={
+                "predicate": "employed_at",
+                "value": {"organization": "Analytical Engines Ltd"},
+                "source_id": str(other_evidence_id),
+            },
+        )
+        assert response.status_code == 404, response.text
+        assert response.json()["error"]["code"] == "EVIDENCE_NOT_FOUND"
+    finally:
+        _teardown_foreign_workspace(other_workspace_id)
+
+
+def test_claim_supersede_rejects_claim_from_another_workspace(
+    claims_test_context: tuple[TestClient, UUID, UUID, str, UUID],
+) -> None:
+    client, workspace_id, _user_id, token, entity_id = claims_test_context
+    other_workspace_id, other_node_id, other_evidence_id = (
+        _seed_foreign_workspace_node_and_evidence()
+    )
+    try:
+        foreign_claim_id = uuid4()
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    "INSERT INTO knowledge_claims (id, workspace_id, subject_id, predicate, "
+                    "value_json, source_id, confidence, created_at) VALUES (:id, :workspace_id, "
+                    ":subject_id, 'title', '{}'::jsonb, :source_id, 1.0, :now)"
+                ),
+                {
+                    "id": foreign_claim_id,
+                    "workspace_id": other_workspace_id,
+                    "subject_id": other_node_id,
+                    "source_id": other_evidence_id,
+                    "now": datetime.now(UTC),
+                },
+            )
+
+        evidence_id = _create_evidence(workspace_id, entity_id)
+        response = client.post(
+            f"/api/v1/knowledge/entities/{entity_id}/claims/{foreign_claim_id}/supersede",
+            headers=_headers(token, "isolation-supersede-foreign"),
+            json={
+                "predicate": "employed_at",
+                "value": {"organization": "Cambridge University"},
+                "source_id": str(evidence_id),
+            },
+        )
+        assert response.status_code == 404, response.text
+        assert response.json()["error"]["code"] == "CLAIM_NOT_FOUND"
+    finally:
+        _teardown_foreign_workspace(other_workspace_id)
+
+
+def test_claim_record_rejects_valid_to_at_or_before_valid_from(
+    claims_test_context: tuple[TestClient, UUID, UUID, str, UUID],
+) -> None:
+    # Adversarial regression test: relationships.py enforces this same rule
+    # on its own valid_from/valid_to pair (RelationshipCreate
+    # .validate_valid_interval); claims.py had no equivalent check at all
+    # despite sharing the identical field shape, until an audit's
+    # adversarial test caught the gap and ClaimCreate got the same
+    # validator.
+    client, workspace_id, _user_id, token, entity_id = claims_test_context
+    evidence_id = _create_evidence(workspace_id, entity_id)
+    now = datetime.now(UTC)
+
+    response = client.post(
+        f"/api/v1/knowledge/entities/{entity_id}/claims",
+        headers=_headers(token, "invalid-interval"),
+        json={
+            "predicate": "employed_at",
+            "value": {"organization": "Analytical Engines Ltd"},
+            "source_id": str(evidence_id),
+            "valid_from": now.isoformat(),
+            "valid_to": now.isoformat(),
+        },
+    )
+    assert response.status_code == 422, response.text
+
+
+def test_claim_record_rejects_archived_entity(
+    claims_test_context: tuple[TestClient, UUID, UUID, str, UUID],
+) -> None:
+    # relationships.py's create_relationship has the identical check for
+    # the same reason (an audit's re-review found claims.py never mirrored
+    # it, despite sharing DATA-MODEL.md's canonical-identity invariant).
+    client, workspace_id, _user_id, token, entity_id = claims_test_context
+    evidence_id = _create_evidence(workspace_id, entity_id)
+    archive = client.post(
+        f"/api/v1/knowledge/entities/{entity_id}/archive",
+        headers=_headers(token, "archive-before-claim"),
+        json={"expected_version": 1},
+    )
+    assert archive.status_code == 200, archive.text
+
+    response = client.post(
+        f"/api/v1/knowledge/entities/{entity_id}/claims",
+        headers=_headers(token, "claim-on-archived"),
+        json={
+            "predicate": "employed_at",
+            "value": {"organization": "Analytical Engines Ltd"},
+            "source_id": str(evidence_id),
+        },
+    )
+    assert response.status_code == 409, response.text
+    assert response.json()["error"]["code"] == "ENTITY_NOT_ACTIVE"
+
+
+def test_claim_supersede_rejects_archived_entity(
+    claims_test_context: tuple[TestClient, UUID, UUID, str, UUID],
+) -> None:
+    client, workspace_id, _user_id, token, entity_id = claims_test_context
+    evidence_id = _create_evidence(workspace_id, entity_id)
+    create = client.post(
+        f"/api/v1/knowledge/entities/{entity_id}/claims",
+        headers=_headers(token, "create-claim-before-archive"),
+        json={
+            "predicate": "employed_at",
+            "value": {"organization": "Analytical Engines Ltd"},
+            "source_id": str(evidence_id),
+        },
+    )
+    original_id = create.json()["id"]
+
+    archive = client.post(
+        f"/api/v1/knowledge/entities/{entity_id}/archive",
+        headers=_headers(token, "archive-before-supersede"),
+        json={"expected_version": 1},
+    )
+    assert archive.status_code == 200, archive.text
+
+    response = client.post(
+        f"/api/v1/knowledge/entities/{entity_id}/claims/{original_id}/supersede",
+        headers=_headers(token, "supersede-on-archived"),
+        json={
+            "predicate": "employed_at",
+            "value": {"organization": "Cambridge University"},
+            "source_id": str(evidence_id),
+        },
+    )
+    assert response.status_code == 409, response.text
+    assert response.json()["error"]["code"] == "ENTITY_NOT_ACTIVE"

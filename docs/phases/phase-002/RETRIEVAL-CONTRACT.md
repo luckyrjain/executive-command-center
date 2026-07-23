@@ -2,7 +2,7 @@
 id: PHASE-002-RETRIEVAL
 title: Hybrid Retrieval Contract
 status: Approved for Implementation
-version: 0.2.0
+version: 0.3.0
 owner: Lucky Jain
 ---
 
@@ -24,7 +24,9 @@ Lexical mode is mandatory and deterministic. Hybrid mode combines lexical and op
 
 ## Ranking
 
-Exact trusted identifier > exact canonical name > exact alias > lexical relevance > semantic relevance. Authority, recency and user-confirmed status may adjust scores within bounded versioned weights. Entity ID is the final tie-breaker.
+Exact canonical name > exact alias > lexical relevance (bounded above by a hybrid semantic-agreement bonus, still capped below the next tier up) > semantic-only relevance. Entity ID is the final tie-breaker.
+
+The schema has no separate "trusted identifier" column beyond an alias's free-form `alias_type`, so an exact-identifier tier above exact canonical name is not distinguishable from an exact alias match and is not implemented as a separate level. Authority, recency and user-confirmed status are not scoring factors in the shipped implementation -- nothing in `retrieval.py` reads a confirmation flag, a document age, or a source-authority weight into the ranking formula. A future iteration that wants these factors needs its own versioned scoring-formula change and benchmark re-run per the Evaluation section below, not a documentation-only claim.
 
 ## Result contract
 

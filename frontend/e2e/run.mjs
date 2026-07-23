@@ -13,6 +13,7 @@ import * as recommendationTerminals from './scenarios/recommendation-terminals.m
 import * as conflictAuditKeyboard from './scenarios/conflict-audit-keyboard.mjs'
 import * as knowledgeEntities from './scenarios/knowledge-entities.mjs'
 import * as knowledgeResolution from './scenarios/knowledge-resolution.mjs'
+import * as knowledgeKeyboard from './scenarios/knowledge-keyboard.mjs'
 
 const scenarios = [
   { name: 'tasks', module: tasks },
@@ -27,6 +28,7 @@ const scenarios = [
   { name: 'conflict-audit-keyboard', module: conflictAuditKeyboard },
   { name: 'knowledge-entities', module: knowledgeEntities },
   { name: 'knowledge-resolution', module: knowledgeResolution },
+  { name: 'knowledge-keyboard', module: knowledgeKeyboard },
 ]
 
 async function main() {

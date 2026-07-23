@@ -5,7 +5,7 @@ from typing import Annotated, Any
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
@@ -43,6 +43,19 @@ class ClaimCreate(BaseModel):
     confidence: float = Field(default=1.0, ge=0, le=1)
     valid_from: datetime | None = None
     valid_to: datetime | None = None
+
+    # Mirrors relationships.py's identical rule (added there when an audit
+    # of the shipped code found relationships enforcing this and claims not,
+    # despite both sharing the same valid_from/valid_to shape).
+    @model_validator(mode="after")
+    def validate_valid_interval(self) -> ClaimCreate:
+        if (
+            self.valid_from is not None
+            and self.valid_to is not None
+            and self.valid_to <= self.valid_from
+        ):
+            raise ValueError("valid_to must be after valid_from")
+        return self
 
 
 class ClaimResponse(BaseModel):
@@ -172,6 +185,27 @@ def _entity_version(session: Session, auth: AuthContext, entity_id: UUID) -> int
     return row[0] if row is not None else None
 
 
+def _entity_status(session: Session, auth: AuthContext, entity_id: UUID) -> str | None:
+    row = session.execute(
+        text(
+            "SELECT status FROM pkos_nodes WHERE workspace_id = :workspace_id AND id = :entity_id"
+        ),
+        {"workspace_id": auth.workspace_id, "entity_id": entity_id},
+    ).one_or_none()
+    return row[0] if row is not None else None
+
+
+def _evidence_state(session: Session, auth: AuthContext, evidence_id: UUID) -> str | None:
+    row = session.execute(
+        text(
+            "SELECT evidence_state FROM pkos_evidence"
+            " WHERE workspace_id = :workspace_id AND id = :evidence_id"
+        ),
+        {"workspace_id": auth.workspace_id, "evidence_id": evidence_id},
+    ).one_or_none()
+    return row[0] if row is not None else None
+
+
 def _entity_retrieval_fields(
     session: Session, auth: AuthContext, entity_id: UUID
 ) -> tuple[str, str, str | None, int] | None:
@@ -269,10 +303,10 @@ def _insert_claim(
                 f"""
                 INSERT INTO knowledge_claims (
                     id, workspace_id, subject_id, predicate, value_json, source_id,
-                    confidence, valid_from, valid_to, created_at
+                    confidence, valid_from, valid_to, version, created_at, updated_at
                 ) VALUES (
                     :id, :workspace_id, :subject_id, :predicate, CAST(:value_json AS jsonb),
-                    :source_id, :confidence, :valid_from, :valid_to, :now
+                    :source_id, :confidence, :valid_from, :valid_to, 1, :now, :now
                 )
                 RETURNING {_CLAIM_FIELDS}
                 """
@@ -317,6 +351,28 @@ def create_claim(
         entity_version = _entity_version(session, auth, entity_id)
         if entity_version is None:
             raise HTTPException(status_code=404, detail="ENTITY_NOT_FOUND")
+        # relationships.py's create_relationship has the identical check for
+        # the same reason (DATA-MODEL.md's canonical-identity invariant: an
+        # archived entity is paused, not gone, but a redirected one has
+        # already been superseded by a merge target, so new activity should
+        # attach to the survivor instead) -- claims.py never mirrored it, a
+        # gap an audit's adversarial re-review caught.
+        entity_status = _entity_status(session, auth, entity_id)
+        if entity_status != "active":
+            raise HTTPException(status_code=409, detail="ENTITY_NOT_ACTIVE")
+        # DATA-MODEL.md's "a claim ... has at least one source reference" is
+        # enforced by the FK alone (source_id must reference a real evidence
+        # row), but a reference to evidence that exists yet is no longer
+        # `available` (deleted, missing, permission_denied) is not a
+        # not-found -- it is a claim citing a source that can no longer back
+        # it, closing a gap an audit of the shipped code found: this endpoint
+        # never checked evidence_state at all before evidence-deletion (Task
+        # 22) made a non-`available` state reachable in practice.
+        evidence_state = _evidence_state(session, auth, payload.source_id)
+        if evidence_state is None:
+            raise HTTPException(status_code=404, detail="EVIDENCE_NOT_FOUND")
+        if evidence_state != "available":
+            raise HTTPException(status_code=422, detail="EVIDENCE_UNAVAILABLE")
         row = _insert_claim(session, auth, entity_id, payload, now)
         response = _project(row)
         _write_side_effects(
@@ -417,13 +473,22 @@ def supersede_claim(
         entity_version = _entity_version(session, auth, entity_id)
         if entity_version is None:
             raise HTTPException(status_code=404, detail="ENTITY_NOT_FOUND")
+        entity_status = _entity_status(session, auth, entity_id)
+        if entity_status != "active":
+            raise HTTPException(status_code=409, detail="ENTITY_NOT_ACTIVE")
+        evidence_state = _evidence_state(session, auth, payload.source_id)
+        if evidence_state is None:
+            raise HTTPException(status_code=404, detail="EVIDENCE_NOT_FOUND")
+        if evidence_state != "available":
+            raise HTTPException(status_code=422, detail="EVIDENCE_UNAVAILABLE")
 
         new_row = _insert_claim(session, auth, entity_id, payload, now)
         session.execute(
             text(
                 """
                 UPDATE knowledge_claims
-                SET superseded_by = :new_id, valid_to = :now
+                SET superseded_by = :new_id, valid_to = :now, updated_at = :now,
+                    version = version + 1
                 WHERE workspace_id = :workspace_id AND id = :claim_id
                 """
             ),

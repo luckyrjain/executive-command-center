@@ -44,8 +44,13 @@ function renderExplorer() {
 beforeEach(() => {
   document.cookie = 'ecc_csrf=knowledge-token; Secure; SameSite=Strict'
   vi.stubGlobal('crypto', { randomUUID: vi.fn(() => 'knowledge-request-id') })
+  window.history.replaceState(null, '', '/')
 })
-afterEach(() => { cleanup(); vi.unstubAllGlobals() })
+afterEach(() => {
+  cleanup()
+  vi.unstubAllGlobals()
+  window.history.replaceState(null, '', '/')
+})
 
 describe('EntityExplorer', () => {
   it('lists entities returned by GET /api/v1/knowledge/entities', async () => {
@@ -72,6 +77,7 @@ describe('EntityExplorer', () => {
       },
       { method: 'POST', match: (path) => path === '/api/v1/knowledge/entities', handle: () => jsonResponse(created, 201) },
       { method: 'GET', match: (path) => path === `/api/v1/knowledge/entities/${created.id}`, handle: () => jsonResponse(created) },
+      { method: 'GET', match: (path) => path === `/api/v1/knowledge/entities/${created.id}/aliases`, handle: () => jsonResponse({ items: [] }) },
       { method: 'GET', match: (path) => path === `/api/v1/knowledge/entities/${created.id}/claims`, handle: () => jsonResponse({ items: [] }) },
       { method: 'GET', match: (path) => path === `/api/v1/knowledge/entities/${created.id}/relationships`, handle: () => jsonResponse({ items: [] }) },
       { method: 'GET', match: (path) => path === `/api/v1/knowledge/entities/${created.id}/timeline`, handle: () => jsonResponse({ items: [], next_cursor: null }) },
@@ -107,6 +113,7 @@ describe('EntityExplorer', () => {
           }),
       },
       { method: 'GET', match: (path) => path === `/api/v1/knowledge/entities/${personEntity.id}`, handle: () => jsonResponse(personEntity) },
+      { method: 'GET', match: (path) => path === `/api/v1/knowledge/entities/${personEntity.id}/aliases`, handle: () => jsonResponse({ items: [] }) },
       { method: 'GET', match: (path) => path === `/api/v1/knowledge/entities/${personEntity.id}/claims`, handle: () => jsonResponse({ items: [] }) },
       { method: 'GET', match: (path) => path === `/api/v1/knowledge/entities/${personEntity.id}/relationships`, handle: () => jsonResponse({ items: [] }) },
       { method: 'GET', match: (path) => path === `/api/v1/knowledge/entities/${personEntity.id}/timeline`, handle: () => jsonResponse({ items: [], next_cursor: null }) },
@@ -121,5 +128,87 @@ describe('EntityExplorer', () => {
     fireEvent.click(resultButton)
 
     await waitFor(() => expect(screen.getByRole('heading', { name: 'Ada Lovelace', level: 2 })).toBeTruthy())
+  })
+
+  it('highlights the matched query terms within a search result', async () => {
+    const fetch = routedFetch([
+      { method: 'GET', match: (path) => path === '/api/v1/knowledge/entities', handle: () => jsonResponse({ items: [], next_cursor: null }) },
+      {
+        method: 'GET',
+        match: (path) => path === '/api/v1/knowledge/retrieve',
+        handle: () =>
+          jsonResponse({
+            items: [{
+              entity_type: 'person', entity_id: personEntity.id, title: 'Ada Lovelace',
+              snippet: 'Ada Lovelace is a mathematician', score: 0.95, matching_mode: 'exact_name',
+              factors: {}, evidence_state: 'available', source_version: 1, stale: false,
+            }],
+            next_cursor: null, mode: 'lexical', degraded: false, degraded_reason: null,
+          }),
+      },
+    ])
+    vi.stubGlobal('fetch', fetch)
+    renderExplorer()
+
+    fireEvent.change(screen.getByLabelText('Search entities'), { target: { value: 'Ada' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Search' }))
+
+    await waitFor(() => expect(document.querySelector('mark')).toBeTruthy())
+    const marks = document.querySelectorAll('mark')
+    expect(marks.length).toBeGreaterThan(0)
+    expect(Array.from(marks).some((mark) => mark.textContent === 'Ada')).toBe(true)
+  })
+
+  it('includes the kind filter in the retrieval request and clears it on demand', async () => {
+    const fetch = routedFetch([
+      { method: 'GET', match: (path) => path === '/api/v1/knowledge/entities', handle: () => jsonResponse({ items: [], next_cursor: null }) },
+      {
+        method: 'GET',
+        match: (path) => path === '/api/v1/knowledge/retrieve',
+        handle: () => jsonResponse({ items: [], next_cursor: null, mode: 'lexical', degraded: false, degraded_reason: null }),
+      },
+    ])
+    vi.stubGlobal('fetch', fetch)
+    renderExplorer()
+
+    fireEvent.change(screen.getByLabelText('Search entities'), { target: { value: 'Ada' } })
+    fireEvent.change(screen.getByLabelText('Filter by kind'), { target: { value: 'person' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Search' }))
+
+    await waitFor(() => {
+      const retrieveCall = fetch.mock.calls.find(([input]) => String(input).includes('/api/v1/knowledge/retrieve'))
+      expect(retrieveCall).toBeTruthy()
+      expect(String(retrieveCall?.[0])).toContain('kind=person')
+    })
+
+    fireEvent.click(screen.getByRole('button', { name: 'Clear filters' }))
+    expect((screen.getByLabelText('Filter by kind') as HTMLSelectElement).value).toBe('')
+  })
+
+  it('persists the search query and filters to the URL, and restores them on mount', async () => {
+    const fetch = routedFetch([
+      { method: 'GET', match: (path) => path === '/api/v1/knowledge/entities', handle: () => jsonResponse({ items: [], next_cursor: null }) },
+      {
+        method: 'GET',
+        match: (path) => path === '/api/v1/knowledge/retrieve',
+        handle: () => jsonResponse({ items: [], next_cursor: null, mode: 'lexical', degraded: false, degraded_reason: null }),
+      },
+    ])
+    vi.stubGlobal('fetch', fetch)
+    renderExplorer()
+
+    fireEvent.change(screen.getByLabelText('Search entities'), { target: { value: 'Ada' } })
+    fireEvent.change(screen.getByLabelText('Filter by kind'), { target: { value: 'person' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Search' }))
+
+    await waitFor(() => {
+      expect(window.location.search).toContain('q=Ada')
+      expect(window.location.search).toContain('kind=person')
+    })
+
+    cleanup()
+    const remounted = renderExplorer()
+    expect((remounted.getByLabelText('Search entities') as HTMLInputElement).value).toBe('Ada')
+    expect((remounted.getByLabelText('Filter by kind') as HTMLSelectElement).value).toBe('person')
   })
 })

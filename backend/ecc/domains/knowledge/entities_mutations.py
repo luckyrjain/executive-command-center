@@ -30,7 +30,7 @@ IdempotencyHeader = Annotated[
 ]
 
 _ENTITY_FIELDS = """
-id, entity_id, node_type, canonical_name, attributes, status, confidence,
+id, node_type, canonical_name, attributes, status, confidence,
 version, created_at, updated_at
 """
 

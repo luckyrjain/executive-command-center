@@ -158,6 +158,64 @@ def test_exact_name_match_ranks_above_lexical_relevance(
     assert items[0]["score"] > (items[1]["score"] if len(items) > 1 else 0)
 
 
+def _create_alias(workspace_id: UUID, entity_id: UUID, normalized_value: str) -> None:
+    # No HTTP endpoint writes entity_aliases yet, matching the pattern
+    # established for pkos_evidence in other knowledge-domain test files.
+    source_id = uuid4()
+    now = datetime.now(UTC)
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO pkos_evidence (id, workspace_id, node_id, source_type, "
+                "source_ref, sha256, captured_at) VALUES (:id, :workspace_id, :node_id, "
+                "'manual', 'alias-test-ref', :sha256, :captured_at)"
+            ),
+            {
+                "id": source_id,
+                "workspace_id": workspace_id,
+                "node_id": entity_id,
+                "sha256": sha256(str(source_id).encode()).hexdigest(),
+                "captured_at": now,
+            },
+        )
+        connection.execute(
+            text(
+                "INSERT INTO entity_aliases (id, workspace_id, entity_id, alias_type, "
+                "normalized_value, source_id, created_at) VALUES (:id, :workspace_id, "
+                ":entity_id, 'nickname', :normalized_value, :source_id, :created_at)"
+            ),
+            {
+                "id": uuid4(),
+                "workspace_id": workspace_id,
+                "entity_id": entity_id,
+                "normalized_value": normalized_value,
+                "source_id": source_id,
+                "created_at": now,
+            },
+        )
+
+
+def test_exact_name_match_ranks_above_exact_alias_match(
+    retrieval_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    # Regression test: RETRIEVAL-CONTRACT.md's ranking order is exact
+    # identifier > exact canonical name > exact alias > lexical > semantic.
+    # An earlier version of this scoring inverted name and alias.
+    client, workspace_id, _user_id, token = retrieval_test_context
+    name_match_id = _create_entity(client, token, "name-match", "person", "Ada Lovelace")
+    alias_match_id = _create_entity(client, token, "alias-match", "person", "Countess of Lovelace")
+    _create_alias(workspace_id, alias_match_id, "ada lovelace")
+
+    response = _retrieve(client, token, "search-name-vs-alias", q="Ada Lovelace")
+    assert response.status_code == 200, response.text
+    items = response.json()["items"]
+    by_id = {item["entity_id"]: item for item in items}
+    assert by_id[str(name_match_id)]["matching_mode"] == "exact_name"
+    assert by_id[str(alias_match_id)]["matching_mode"] == "exact_alias"
+    assert by_id[str(name_match_id)]["score"] > by_id[str(alias_match_id)]["score"]
+    assert items[0]["entity_id"] == str(name_match_id)
+
+
 def test_claim_content_becomes_searchable(
     retrieval_test_context: tuple[TestClient, UUID, UUID, str],
 ) -> None:
@@ -374,3 +432,58 @@ def test_rebuild_retrieval_documents_reconstructs_after_manual_deletion(
     response = _retrieve(client, token, "rebuild-search", q="Ada Lovelace")
     assert response.status_code == 200
     assert any(item["entity_id"] == str(entity_id) for item in response.json()["items"])
+
+
+def test_exact_name_match_recognizes_a_different_unicode_encoding_of_the_same_name(
+    retrieval_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    # Adversarial regression test, built from explicit \u escapes rather
+    # than typed accented literals (whose source-file bytes an editor could
+    # silently normalize and defeat the point of this test): both strings
+    # render as the identical visible name "Jos\u00e9 Rizal", but
+    # decomposed_name spells the accented letter as base "e" (U+0065) plus
+    # a combining acute accent (U+0301), while precomposed_query uses the
+    # single precomposed e-acute codepoint (U+00E9). Without NFC
+    # normalization before casefold(), an exact canonical-name match would
+    # miss this -- a real risk whenever a name arrives via different input
+    # methods or import sources.
+    decomposed_name = "Jos" + "e\u0301" + " Rizal"
+    precomposed_query = "Jos" + "\u00e9" + " Rizal"
+    assert decomposed_name != precomposed_query
+    assert decomposed_name.casefold() != precomposed_query.casefold()
+
+    client, _workspace_id, _user_id, token = retrieval_test_context
+    entity_id = _create_entity(client, token, "unicode-entity", "person", decomposed_name)
+
+    response = _retrieve(client, token, "unicode-search", q=precomposed_query)
+    assert response.status_code == 200
+    items = response.json()["items"]
+    assert items[0]["entity_id"] == str(entity_id)
+    assert items[0]["matching_mode"] == "exact_name"
+
+
+def test_exact_alias_match_recognizes_a_different_unicode_encoding_of_the_same_alias(
+    retrieval_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    # Adversarial regression test, same construction as the exact-name
+    # variant above but for entity_aliases.normalized_value -- the SQL-side
+    # exact_alias_match check used to compare the raw stored alias against
+    # the NFC-normalized query, so this exact scenario would silently miss
+    # even though the sibling normalized_title comparison already handled
+    # it correctly. decomposed_alias spells the accented letter as base "e"
+    # (U+0065) plus a combining acute accent (U+0301); precomposed_query
+    # uses the single precomposed e-acute codepoint (U+00E9).
+    decomposed_alias = "Jos" + "e\u0301" + " Rizal"
+    precomposed_query = "Jos" + "\u00e9" + " Rizal"
+    assert decomposed_alias != precomposed_query
+    assert decomposed_alias.casefold() != precomposed_query.casefold()
+
+    client, workspace_id, _user_id, token = retrieval_test_context
+    entity_id = _create_entity(client, token, "unicode-alias-entity", "person", "Rizal")
+    _create_alias(workspace_id, entity_id, decomposed_alias.casefold())
+
+    response = _retrieve(client, token, "unicode-alias-search", q=precomposed_query)
+    assert response.status_code == 200
+    items = response.json()["items"]
+    assert items[0]["entity_id"] == str(entity_id)
+    assert items[0]["matching_mode"] == "exact_alias"

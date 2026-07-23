@@ -11,6 +11,8 @@ from sqlalchemy import text
 
 from ecc.config import get_settings
 from ecc.database import engine
+from ecc.domains.knowledge import embeddings
+from ecc.domains.knowledge.embeddings import EMBEDDING_DIMENSIONS, MODEL_ID, MODEL_VERSION
 from ecc.main import app
 
 settings = get_settings()
@@ -19,14 +21,49 @@ pytestmark = pytest.mark.skipif(
     reason="PostgreSQL integration test",
 )
 
-# TEST-PLAN.md's non-functional requirement: lexical retrieval p95 under
-# 500 ms at acceptance dataset size, following the same local/CI budget
-# split as test_search_performance_postgres.py -- GitHub Actions sets `CI`
-# for every job, the standard platform-provided signal already used
-# elsewhere in this test suite.
+# PHASE-002-knowledge-platform.md's non-functional requirements: lexical
+# retrieval p95 under 500 ms locally / 800 ms in CI, hybrid retrieval p95
+# under 800 ms locally / 1280 ms in CI (same 1.6x local->CI multiplier this
+# suite already uses for test_search_performance_postgres.py and
+# test_risks_attention_postgres.py -- CI runners are shared/slower hardware,
+# not a different budget).
 _IN_CI = os.getenv("CI") is not None
 RETRIEVAL_BUDGET_SECONDS = 0.8 if _IN_CI else 0.5
+HYBRID_BUDGET_SECONDS = 1.28 if _IN_CI else 0.8
 _DOCUMENT_COUNT = 10_000
+SAMPLE_SIZE = 20
+
+
+def _p95(samples: list[float]) -> float:
+    """Nearest-rank 95th percentile: the smallest value at or above 95% of samples."""
+    ordered = sorted(samples)
+    index = min(len(ordered) - 1, -(-(95 * len(ordered)) // 100) - 1)
+    return ordered[index]
+
+
+class _FixedVectorProvider:
+    """Deterministic, near-zero-cost stand-in for the real sentence-
+    transformers model -- a hybrid-retrieval latency test measures the
+    pgvector HNSW query path at representative scale, not the real model's
+    own inference latency, which depends on hardware/model choice and is
+    explicitly outside RETRIEVAL-CONTRACT.md's degradation-guarded scope
+    (see retrieval.py's retrieve()). Same fake-provider convention as
+    test_knowledge_embeddings_postgres.py's FakeEmbeddingProvider."""
+
+    def __init__(self, vector: list[float]) -> None:
+        self._vector = vector
+
+    def embed(self, texts: list[str]) -> list[list[float]]:
+        return [self._vector for _ in texts]
+
+
+def _unit_vector(index: int) -> list[float]:
+    vector = [0.0] * EMBEDDING_DIMENSIONS
+    vector[index] = 1.0
+    return vector
+
+
+_BACKGROUND_VECTOR = _unit_vector(0)
 
 
 @pytest.fixture
@@ -37,6 +74,12 @@ def retrieval_performance_context() -> Iterator[tuple[TestClient, UUID]]:
     now = datetime.now(UTC)
 
     with engine.begin() as connection:
+        # Bulk-inserting 10,000 embedding_projections rows into an
+        # HNSW-indexed column (below) costs more than the connection's 5s
+        # application-request statement_timeout -- same relaxation as this
+        # fixture's own teardown block, scoped to just this setup
+        # transaction via SET LOCAL.
+        connection.execute(text("SET LOCAL statement_timeout = '60s'"))
         connection.execute(
             text("INSERT INTO workspaces (id, name, created_at) VALUES (:id, :name, :created_at)"),
             {"id": workspace_id, "name": "Retrieval Performance", "created_at": now},
@@ -137,6 +180,51 @@ def retrieval_performance_context() -> Iterator[tuple[TestClient, UUID]]:
             ),
             {"workspace_id": workspace_id, "entity_id": needle_id, "now": now},
         )
+        # Give every retrieval_documents row its own random embedding,
+        # generated SQL-side per row rather than one shared literal --
+        # 10,000 rows all sharing one exact vector puts pgvector's HNSW
+        # index into a degenerate all-tied-at-distance-zero search that is
+        # dramatically slower than real, diverse production embeddings ever
+        # are, which would make this fixture measure a pathological case
+        # instead of the representative one the budget is about.
+        connection.execute(
+            text(
+                """
+                INSERT INTO embedding_projections (
+                    id, workspace_id, document_id, model_id, model_version,
+                    dimensions, embedding, content_hash, created_at, updated_at
+                )
+                SELECT
+                    gen_random_uuid(), workspace_id, id, :model_id, :model_version,
+                    :dimensions,
+                    (SELECT ('[' || string_agg(random()::text, ',') || ']')::vector
+                     FROM generate_series(1, :dimensions)),
+                    'fixture', :now, :now
+                FROM retrieval_documents
+                WHERE workspace_id = :workspace_id
+                """
+            ),
+            {
+                "workspace_id": workspace_id,
+                "model_id": MODEL_ID,
+                "model_version": MODEL_VERSION,
+                "dimensions": EMBEDDING_DIMENSIONS,
+                "now": now,
+            },
+        )
+
+    # VACUUM cannot run inside a transaction block, so this always opens its
+    # own autocommit connection rather than reusing engine.begin() above.
+    # Without it, the planner has no fresh statistics for the just-built
+    # HNSW index and the just-bulk-inserted rows, and can pick a cold,
+    # dramatically slower plan for the first live query -- exactly the kind
+    # of one-off spike an untimed warm-up call is supposed to absorb, not
+    # something that should still be capable of blowing the 5s
+    # application-request statement_timeout on its own. Same reasoning as
+    # test_risks_attention_postgres.py's identical _vacuum_analyze step.
+    with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as connection:
+        connection.execute(text("VACUUM (ANALYZE) pkos_nodes, retrieval_documents"))
+        connection.execute(text("VACUUM (ANALYZE) embedding_projections"))
 
     client = TestClient(app)
     client.cookies.set("ecc_session", token)
@@ -157,7 +245,13 @@ def retrieval_performance_context() -> Iterator[tuple[TestClient, UUID]]:
             # engine (including the test's own request above) still enforces
             # the real 5s budget.
             connection.execute(text("SET LOCAL statement_timeout = '60s'"))
-            for table in ("retrieval_documents", "pkos_nodes", "sessions", "users"):
+            for table in (
+                "embedding_projections",
+                "retrieval_documents",
+                "pkos_nodes",
+                "sessions",
+                "users",
+            ):
                 connection.execute(
                     text(f"DELETE FROM {table} WHERE workspace_id = :workspace_id"),  # noqa: S608
                     {"workspace_id": workspace_id},
@@ -168,20 +262,66 @@ def retrieval_performance_context() -> Iterator[tuple[TestClient, UUID]]:
             )
 
 
-def test_retrieve_10000_document_local_and_ci_budget(
+def test_retrieve_10000_document_lexical_p95_under_budget(
     retrieval_performance_context: tuple[TestClient, UUID],
 ) -> None:
     client, _workspace_id = retrieval_performance_context
 
-    started = perf_counter()
-    response = client.get(
+    # One untimed correctness check, kept separate from the timed sample
+    # loop below so a cold connection-pool checkout or an unprimed query
+    # plan cache doesn't inflate the first timed sample.
+    warmup = client.get(
         "/api/v1/knowledge/retrieve", params={"q": "Needle Quarterly Contact", "limit": 20}
     )
-    elapsed_ms = (perf_counter() - started) * 1000
+    assert warmup.status_code == 200
+    assert warmup.json()["items"][0]["title"] == "Needle Quarterly Contact"
 
-    assert response.status_code == 200
-    assert response.json()["items"][0]["title"] == "Needle Quarterly Contact"
-    assert elapsed_ms < RETRIEVAL_BUDGET_SECONDS * 1000, (
-        f"retrieval took {elapsed_ms:.1f} ms "
-        f"(budget {RETRIEVAL_BUDGET_SECONDS * 1000:.0f} ms, in_ci={_IN_CI})"
+    samples: list[float] = []
+    for _ in range(SAMPLE_SIZE):
+        started = perf_counter()
+        response = client.get(
+            "/api/v1/knowledge/retrieve", params={"q": "Needle Quarterly Contact", "limit": 20}
+        )
+        samples.append(perf_counter() - started)
+        assert response.status_code == 200
+
+    p95 = _p95(samples)
+    assert p95 < RETRIEVAL_BUDGET_SECONDS, (
+        f"lexical retrieval p95 {p95 * 1000:.1f} ms exceeded "
+        f"{RETRIEVAL_BUDGET_SECONDS * 1000:.0f} ms budget (in_ci={_IN_CI}); samples(ms)="
+        f"{[round(s * 1000, 1) for s in samples]}"
     )
+
+
+def test_retrieve_10000_document_hybrid_p95_under_budget(
+    retrieval_performance_context: tuple[TestClient, UUID],
+) -> None:
+    client, _workspace_id = retrieval_performance_context
+    embeddings.set_provider_for_testing(_FixedVectorProvider(_BACKGROUND_VECTOR))
+    try:
+        warmup = client.get(
+            "/api/v1/knowledge/retrieve",
+            params={"q": "Needle Quarterly Contact", "limit": 20, "mode": "hybrid"},
+        )
+        assert warmup.status_code == 200
+        assert warmup.json()["degraded"] is False
+
+        samples: list[float] = []
+        for _ in range(SAMPLE_SIZE):
+            started = perf_counter()
+            response = client.get(
+                "/api/v1/knowledge/retrieve",
+                params={"q": "Needle Quarterly Contact", "limit": 20, "mode": "hybrid"},
+            )
+            samples.append(perf_counter() - started)
+            assert response.status_code == 200
+            assert response.json()["degraded"] is False
+
+        p95 = _p95(samples)
+        assert p95 < HYBRID_BUDGET_SECONDS, (
+            f"hybrid retrieval p95 {p95 * 1000:.1f} ms exceeded "
+            f"{HYBRID_BUDGET_SECONDS * 1000:.0f} ms budget (in_ci={_IN_CI}); samples(ms)="
+            f"{[round(s * 1000, 1) for s in samples]}"
+        )
+    finally:
+        embeddings.set_provider_for_testing(None)
