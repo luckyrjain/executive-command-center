@@ -31,7 +31,7 @@ Phase 3 implementation has started on `feature/phase-3-attention-engine`. This d
 | 3 | Risk review queue and cadence | Delivered (`feature/phase-3-attention-engine` commit `57c985c`) |
 | 4 | Capacity profiles and planning constraints | Delivered (`feature/phase-3-attention-engine` commit `3bbc517`) |
 | 5 | Deterministic plan proposals and conflicts | Delivered (`feature/phase-3-attention-engine` commit `0e31cd4`) |
-| 6 | Plan editing, acceptance and replan diff | Not started |
+| 6 | Plan editing, acceptance and replan diff | Delivered (`feature/phase-3-attention-engine` commit `3b4377a`) |
 | 7 | Evidence-backed meeting preparation | Not started |
 | 8 | Executive UX, browser acceptance and dogfood | Not started |
 
