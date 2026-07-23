@@ -62,6 +62,52 @@ def test_multi_word_term_requires_adjacent_whole_words() -> None:
     assert matches("origin_national") == []
 
 
+# --- Gap 4: single-unbroken-token substring matching (len >= 10) -----------
+#
+# Prefix-only matching on tokens closed the old false-positive problem but
+# opened a new false-negative: a prohibited term embedded anywhere in a
+# single, unseparated, no-camelCase-boundary token OTHER than as a prefix
+# was invisible. A length-based heuristic (>= 10 chars) is used to tell a
+# deliberately-concatenated multi-concept identifier apart from a short,
+# legitimately-named word that coincidentally contains a term as a
+# substring.
+
+
+def test_long_unbroken_token_catches_embedded_protected_characteristic() -> None:
+    # "targetgenderscore" (18 chars) has no separators/camelCase boundary
+    # at all, so prefix-only matching on its single token would never see
+    # "gender" sitting in the middle of it.
+    assert any("gender" in hit for hit in matches("targetgenderscore"))
+    assert any("ethnicity" in hit for hit in matches("flagethnicity"))
+    assert any("race" in hit for hit in matches("USERRACEID"))
+    assert any("age_bracket" in hit for hit in matches("agebracket"))
+
+
+def test_long_unbroken_token_catches_embedded_inferred_emotion() -> None:
+    assert any("mood" in hit for hit in matches("usermoodinferred"))
+
+
+def test_short_unbroken_token_keeps_prefix_only_matching() -> None:
+    # Below the length threshold, a coincidental substring must still not
+    # match -- this is the exact false-positive shape the prefix-only fix
+    # closed (`trace`=5, `workspace`=9, `embrace`=7 chars), and the new
+    # substring pass must not reopen it just because these are single,
+    # unseparated tokens.
+    assert matches("trace") == []
+    assert matches("workspace") == []
+    assert matches("embrace") == []
+
+
+def test_separated_token_does_not_get_substring_matched_even_if_long() -> None:
+    # The substring pass only applies to a token that never got split at
+    # all. A long identifier that *does* contain separators (so it isn't
+    # "a single token") stays on prefix-only matching for each of its
+    # constituent words -- unaffected by the new pass, no regression.
+    assert matches("trace_id") == []
+    assert matches("embrace_change") == []
+    assert matches("embrace_change_workspace_settings") == []
+
+
 # --- Reconstruction: BinOp concatenation and f-strings ----------------------
 
 

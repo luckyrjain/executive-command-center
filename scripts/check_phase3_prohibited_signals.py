@@ -158,14 +158,41 @@ def _token_sequence_matches(haystack: list[str], needle: list[str]) -> bool:
     return False
 
 
+# Second-pass threshold for the single-unbroken-token substring check
+# below. A normal, well-intentioned snake_case/camelCase identifier is
+# already caught by `_token_sequence_matches` above regardless of length
+# -- this secondary pass exists only for a single token that has NO
+# internal separators or camelCase boundaries at all (it didn't get split
+# by `_tokenize`), where prefix-only matching would otherwise let a
+# prohibited term hide anywhere but the start (e.g. "targetgenderscore").
+# 10 is a deliberate, bounded trade-off: legitimately-named short common
+# English words that coincidentally contain a banned term as a substring
+# (`trace`=5, `workspace`=9, `embrace`=7 chars) stay under it and keep
+# prefix-only matching (no false-positive regression), while a
+# deliberately-concatenated multi-concept identifier like
+# "targetgenderscore"(18), "flagethnicity"(13), "usermoodinferred"(16),
+# "USERRACEID"(10) or "agebracket"(10) reaches it.
+_SINGLE_TOKEN_SUBSTRING_MIN_LEN = 10
+
+
 def _matches(text: str) -> list[str]:
     if text.lower() in ALLOWLIST:
         return []
     tokens = _tokenize(text)
+    single_unbroken_token = (
+        tokens[0]
+        if len(tokens) == 1 and len(tokens[0]) >= _SINGLE_TOKEN_SUBSTRING_MIN_LEN
+        else None
+    )
     hits = []
     for category, terms in PROHIBITED_SIGNALS:
         for term in terms:
-            if _token_sequence_matches(tokens, _tokenize(term)):
+            term_tokens = _tokenize(term)
+            if _token_sequence_matches(tokens, term_tokens):
+                hits.append(f"{category} ({term!r})")
+            elif (
+                single_unbroken_token is not None and "".join(term_tokens) in single_unbroken_token
+            ):
                 hits.append(f"{category} ({term!r})")
     return hits
 
