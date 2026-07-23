@@ -774,6 +774,82 @@ def test_add_participant_race_returns_409_not_500(
     assert raced.json()["error"]["code"] == "PARTICIPANT_ALREADY_LINKED"
 
 
+def test_violated_constraint_extracts_psycopg_diag_constraint_name() -> None:
+    """Gap 3: ``_violated_constraint`` is the narrowing check that keeps
+    ``add_participant``/``create_prep`` from mislabeling an unrelated
+    ``IntegrityError`` (e.g. an FK violation) as the specific
+    duplicate-pack/participant conflict they defend against. Exercise it
+    directly against fake exception shapes so the extraction logic itself
+    is pinned down without needing to fabricate a real FK race.
+    """
+    import ecc.domains.attention.meeting_prep as meeting_prep_module
+
+    class _FakeDiag:
+        def __init__(self, name: str) -> None:
+            self.constraint_name = name
+
+    class _FakeOrig:
+        def __init__(self, name: str) -> None:
+            self.diag = _FakeDiag(name)
+
+    class _FakeIntegrityError(Exception):
+        def __init__(self, orig: object) -> None:
+            self.orig = orig
+
+    matching = _FakeIntegrityError(_FakeOrig("uq_meeting_participants_link"))
+    assert (
+        meeting_prep_module._violated_constraint(matching)  # noqa: SLF001
+        == "uq_meeting_participants_link"
+    )
+
+    unrelated = _FakeIntegrityError(_FakeOrig("meeting_participants_meeting_id_fkey"))
+    assert (
+        meeting_prep_module._violated_constraint(unrelated)  # noqa: SLF001
+        == "meeting_participants_meeting_id_fkey"
+    )
+
+    no_orig = _FakeIntegrityError(None)
+    assert meeting_prep_module._violated_constraint(no_orig) is None  # noqa: SLF001
+
+
+def test_add_participant_race_with_unrelated_constraint_is_not_mislabeled(
+    meeting_prep_test_context: tuple[TestClient, UUID, UUID, str, UUID],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Gap 3: force the real duplicate-link race (a genuine IntegrityError
+    from ``uq_meeting_participants_link``) but monkeypatch
+    ``_violated_constraint`` to report an unrelated constraint name, as if
+    a different IntegrityError had actually occurred. The handler must no
+    longer intercept it as PARTICIPANT_ALREADY_LINKED -- it must propagate
+    instead, proving the except clause is narrowed on the constraint name
+    and not just on ``IntegrityError`` as a type.
+    """
+    from sqlalchemy.exc import IntegrityError
+
+    import ecc.domains.attention.meeting_prep as meeting_prep_module
+
+    client, workspace_id, _, token, meeting_id = meeting_prep_test_context
+    entity_id = _seed_node(workspace_id, "person", "Casey Morgan")
+    first = client.post(
+        f"/api/v1/meetings/{meeting_id}/participants",
+        headers=_headers(token, "first-link-narrow"),
+        json={"entity_id": str(entity_id)},
+    )
+    assert first.status_code == 201
+
+    monkeypatch.setattr(meeting_prep_module, "_participant_already_linked", lambda *a, **k: False)
+    monkeypatch.setattr(
+        meeting_prep_module, "_violated_constraint", lambda exc: "some_unrelated_fk_constraint"
+    )
+
+    with pytest.raises(IntegrityError):
+        client.post(
+            f"/api/v1/meetings/{meeting_id}/participants",
+            headers=_headers(token, "raced-link-narrow"),
+            json={"entity_id": str(entity_id)},
+        )
+
+
 def test_create_prep_idempotent_on_replay(
     meeting_prep_test_context: tuple[TestClient, UUID, UUID, str, UUID],
 ) -> None:

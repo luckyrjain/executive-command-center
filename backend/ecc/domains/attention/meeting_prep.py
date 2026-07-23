@@ -401,6 +401,19 @@ class MeetingPack(BaseModel):
 # ---------------------------------------------------------------------------
 
 
+def _violated_constraint(exc: IntegrityError) -> str | None:
+    """Best-effort extraction of the specific DB constraint/index name a
+    psycopg ``IntegrityError`` violated (``exc.orig.diag.constraint_name``
+    for psycopg3), so the two savepoint-guarded races below can react only
+    to the exact unique index they're each defending against instead of
+    treating every ``IntegrityError`` -- including an unrelated FK
+    violation, e.g. a race with a deleted meeting -- as the specific
+    duplicate-pack/participant conflict they're not.
+    """
+    diag = getattr(getattr(exc, "orig", None), "diag", None)
+    return getattr(diag, "constraint_name", None) if diag is not None else None
+
+
 def _lock_idempotency(session: Session, auth: AuthContext, key: str) -> None:
     lock_key = f"{auth.workspace_id}:{auth.user_id}:{key}"
     session.execute(
@@ -1136,6 +1149,8 @@ def add_participant(
                     },
                 )
         except IntegrityError as exc:
+            if _violated_constraint(exc) != "uq_meeting_participants_link":
+                raise
             raise HTTPException(status_code=409, detail="PARTICIPANT_ALREADY_LINKED") from exc
         # Audit-only, no outbox/catalog event -- a minor sub-action, matching
         # attention_item.dismiss/defer/restore's established precedent.
@@ -1257,6 +1272,8 @@ def create_prep(
                     .one()
                 )
         except IntegrityError as exc:
+            if _violated_constraint(exc) != "uq_meeting_packs_active_per_meeting":
+                raise
             raise HTTPException(status_code=409, detail="MEETING_PACK_EXISTS") from exc
         response = _pack_row_to_response(dict(row), snapshot)
         _write_event(
