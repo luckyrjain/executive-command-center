@@ -14,7 +14,12 @@ from sqlalchemy.orm import Session
 
 from ecc.auth import AuthContext, AuthDep, CsrfDep
 from ecc.database import get_session
-from ecc.observability import queue_lifecycle_event, record_audit_outbox_failure, record_ranking
+from ecc.observability import (
+    queue_lifecycle_event,
+    record_audit_outbox_failure,
+    record_idempotency_conflict,
+    record_ranking,
+)
 
 from .policy import AttentionPolicy, get_active_policy
 
@@ -922,6 +927,7 @@ def _load_cached_feedback(
     if row is None:
         return None
     if row["request_hash"] != request_hash:
+        record_idempotency_conflict("attention")
         raise HTTPException(status_code=409, detail="IDEMPOTENCY_CONFLICT")
     return AttentionFeedback.model_validate(row["response_body"])
 

@@ -401,7 +401,7 @@ def _set_full_week_capacity(client: TestClient, token: str) -> None:
     days = [{"weekday": w, "available_minutes": 480, "focus_minutes": 240} for w in range(7)]
     response = client.put(
         "/api/v1/planning/capacity",
-        headers=_headers(token),
+        headers=_headers(token, "set-full-week-capacity"),
         json={"expected_version": 0, "timezone": "Asia/Kolkata", "days": days},
     )
     assert response.status_code == 200, response.text
@@ -471,6 +471,41 @@ def test_create_plan_idempotent_on_replay(
     replay = client.post("/api/v1/plans", headers=headers, json=payload)
     assert replay.status_code == 201
     assert replay.json()["id"] == first.json()["id"]
+
+
+def test_create_plan_conflicting_replay_returns_409_and_records_metric(
+    planning_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    """Reusing an Idempotency-Key with a materially different payload must
+    409 IDEMPOTENCY_CONFLICT, and must record the same
+    ``record_idempotency_conflict`` observability signal every other
+    idempotency-replay path in the codebase emits on this same conflict.
+    """
+    from ecc.observability import render_metrics
+
+    client, _, _, token = planning_test_context
+    _set_full_week_capacity(client, token)
+    period_start, period_end = _next_period()
+    headers = _headers(token, "conflicting-plan")
+
+    first = client.post(
+        "/api/v1/plans",
+        headers=headers,
+        json={"period_start": period_start.isoformat(), "period_end": period_end.isoformat()},
+    )
+    assert first.status_code == 201, first.text
+
+    conflicting = client.post(
+        "/api/v1/plans",
+        headers=headers,
+        json={
+            "period_start": period_start.isoformat(),
+            "period_end": (period_end + timedelta(days=1)).isoformat(),
+        },
+    )
+    assert conflicting.status_code == 409
+    assert conflicting.json()["error"]["code"] == "IDEMPOTENCY_CONFLICT"
+    assert 'ecc_idempotency_conflicts_total{domain="planning"}' in render_metrics()
 
 
 def test_stale_attention_items_excluded_from_plan_candidates(
@@ -817,7 +852,7 @@ def test_accept_plan_rejects_stale_source(
 
     changed = client.put(
         "/api/v1/planning/capacity",
-        headers=_headers(token),
+        headers=_headers(token, "change-capacity-stale-source"),
         json={
             "expected_version": 1,
             "timezone": "Asia/Kolkata",

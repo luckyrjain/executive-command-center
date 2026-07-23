@@ -287,6 +287,69 @@ def test_waiting_link_cancel_and_stale_version_conflict(
     assert cancelled.json()["status"] == "cancelled"
 
 
+def test_create_waiting_link_idempotent_on_replay(
+    waiting_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    client, workspace_id, user_id, token = waiting_test_context
+    task_id = _seed_task(workspace_id, user_id)
+    counterparty = _seed_node(workspace_id, "organization", "Vendor Org")
+    headers = _headers(token, "idempotent-create")
+    payload = {
+        "subject_type": "task",
+        "subject_id": str(task_id),
+        "counterparty_entity_id": str(counterparty),
+        "direction": "waiting_on_me",
+    }
+
+    first = client.post("/api/v1/waiting", headers=headers, json=payload)
+    assert first.status_code == 201
+    replay = client.post("/api/v1/waiting", headers=headers, json=payload)
+    assert replay.status_code == 201
+    assert replay.json()["id"] == first.json()["id"]
+
+
+def test_create_waiting_link_conflicting_replay_returns_409_and_records_metric(
+    waiting_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    """Reusing an Idempotency-Key with a materially different payload must
+    409 IDEMPOTENCY_CONFLICT, and must record the same
+    ``record_idempotency_conflict`` observability signal every other
+    idempotency-replay path in the codebase emits on this same conflict.
+    """
+    from ecc.observability import render_metrics
+
+    client, workspace_id, user_id, token = waiting_test_context
+    task_id = _seed_task(workspace_id, user_id)
+    counterparty = _seed_node(workspace_id, "organization", "Vendor Org")
+    headers = _headers(token, "conflicting-create")
+
+    first = client.post(
+        "/api/v1/waiting",
+        headers=headers,
+        json={
+            "subject_type": "task",
+            "subject_id": str(task_id),
+            "counterparty_entity_id": str(counterparty),
+            "direction": "waiting_on_me",
+        },
+    )
+    assert first.status_code == 201, first.text
+
+    conflicting = client.post(
+        "/api/v1/waiting",
+        headers=headers,
+        json={
+            "subject_type": "task",
+            "subject_id": str(task_id),
+            "counterparty_entity_id": str(counterparty),
+            "direction": "waiting_on_them",
+        },
+    )
+    assert conflicting.status_code == 409
+    assert conflicting.json()["error"]["code"] == "IDEMPOTENCY_CONFLICT"
+    assert 'ecc_idempotency_conflicts_total{domain="waiting"}' in render_metrics()
+
+
 def test_waiting_link_rejects_non_person_org_counterparty(
     waiting_test_context: tuple[TestClient, UUID, UUID, str],
 ) -> None:

@@ -12,7 +12,11 @@ from sqlalchemy.orm import Session
 
 from ecc.auth import AuthContext, AuthDep, CsrfDep
 from ecc.database import get_session
-from ecc.observability import queue_lifecycle_event, record_audit_outbox_failure
+from ecc.observability import (
+    queue_lifecycle_event,
+    record_audit_outbox_failure,
+    record_idempotency_conflict,
+)
 
 router = APIRouter(prefix="/api/v1/risks", tags=["risks"])
 SessionDep = Annotated[Session, Depends(get_session)]
@@ -154,6 +158,7 @@ def _load_cached(
     if row is None:
         return None
     if row["request_hash"] != request_hash:
+        record_idempotency_conflict("risk_reviews")
         raise HTTPException(status_code=409, detail="IDEMPOTENCY_CONFLICT")
     return RiskReview.model_validate(row["response_body"])
 

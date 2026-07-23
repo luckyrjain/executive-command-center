@@ -37,7 +37,11 @@ from sqlalchemy.orm import Session
 from ecc.auth import AuthContext, AuthDep, CsrfDep
 from ecc.config import get_settings
 from ecc.database import get_session
-from ecc.observability import queue_lifecycle_event, record_audit_outbox_failure
+from ecc.observability import (
+    queue_lifecycle_event,
+    record_audit_outbox_failure,
+    record_idempotency_conflict,
+)
 
 _WORKDAY_START = time(9, 0)
 DEFAULT_EFFORT_MINUTES = 30
@@ -472,6 +476,7 @@ def _load_cached(session: Session, auth: AuthContext, key: str, request_hash: st
     if row is None:
         return None
     if row["request_hash"] != request_hash:
+        record_idempotency_conflict("planning")
         raise HTTPException(status_code=409, detail="IDEMPOTENCY_CONFLICT")
     return Plan.model_validate(row["response_body"])
 

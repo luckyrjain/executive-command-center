@@ -409,6 +409,37 @@ def test_review_idempotent_on_replay(
     assert replay.json()["id"] == first.json()["id"]
 
 
+def test_review_conflicting_replay_returns_409_and_records_metric(
+    risk_review_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    """Reusing an Idempotency-Key with a materially different payload must
+    409 IDEMPOTENCY_CONFLICT, and must record the same
+    ``record_idempotency_conflict`` observability signal every other
+    idempotency-replay path in the codebase emits on this same conflict.
+    """
+    from ecc.observability import render_metrics
+
+    client, _, _, token = risk_review_test_context
+    risk = _create_risk(client, token, "create-risk-conflicting")
+    headers = _headers(token, "conflicting-review")
+
+    first = client.post(
+        f"/api/v1/risks/{risk['id']}/review",
+        headers=headers,
+        json={"expected_version": 1, "outcome": "no_change"},
+    )
+    assert first.status_code == 201, first.text
+
+    conflicting = client.post(
+        f"/api/v1/risks/{risk['id']}/review",
+        headers=headers,
+        json={"expected_version": 1, "outcome": "escalated"},
+    )
+    assert conflicting.status_code == 409
+    assert conflicting.json()["error"]["code"] == "IDEMPOTENCY_CONFLICT"
+    assert 'ecc_idempotency_conflicts_total{domain="risk_reviews"}' in render_metrics()
+
+
 def test_review_queue_ordered_by_cadence_urgency(
     risk_review_test_context: tuple[TestClient, UUID, UUID, str],
 ) -> None:
