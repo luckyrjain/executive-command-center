@@ -93,6 +93,33 @@ describe('MeetingPrep', () => {
     expect(screen.getByText('Review Q3 numbers')).toBeTruthy()
   })
 
+  it('renders the meeting time in the pack\'s own timezone, not the local runner timezone', async () => {
+    const localZone = Intl.DateTimeFormat().resolvedOptions().timeZone
+    const meetingZone = 'America/New_York'
+    // Guard against this test becoming vacuous if the runner's environment
+    // ever changes to already be in America/New_York.
+    expect(localZone).not.toBe(meetingZone)
+
+    const zonedPack: MeetingPack = { ...pack, timezone: meetingZone }
+    vi.stubGlobal('fetch', vi.fn(() => response(zonedPack)))
+    renderPrep()
+
+    fireEvent.change(screen.getByLabelText('Meeting ID'), { target: { value: 'meeting-1' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Load meeting prep' }))
+
+    await waitFor(() => expect(screen.getByText('Review Q3 numbers')).toBeTruthy())
+
+    // starts_at (2026-07-24T09:00:00Z) is 05:00 in America/New_York
+    // (EDT, UTC-4) in July -- manually computed independently of the
+    // component's own formatting helper.
+    const expectedStartHour = new Intl.DateTimeFormat('en-US', { hour: 'numeric', hour12: true, timeZone: meetingZone }).format(new Date(zonedPack.starts_at))
+    expect(expectedStartHour).toMatch(/^5\s?AM$/i)
+
+    const timingText = screen.getByText(/–.*America\/New_York/).textContent ?? ''
+    expect(timingText).toMatch(/5:00\s?AM/i)
+    expect(timingText).not.toMatch(/9:00\s?AM/i)
+  })
+
   it('shows a distinct not-found state guiding the operator to generate a pack', async () => {
     // The query passes retry: 1, overriding the QueryClient's own retry:
     // false default, and the mock fails on the retried attempt too --

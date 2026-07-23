@@ -43,6 +43,23 @@ const EVIDENCE_GAP_LABEL: Record<Exclude<MeetingPackEvidenceGap['evidence_state'
   deleted: 'Evidence source was removed',
 }
 
+/** Formats an ISO instant in the given IANA timezone so the displayed time
+ * actually matches the `(timezone)` label rendered next to it -- rather
+ * than `toLocaleString`/`toLocaleTimeString`'s default of the browser's
+ * local zone, which is only truthful when the viewer happens to be in the
+ * meeting's timezone. Falls back to local formatting (omitting the
+ * `timeZone` option) for an empty or invalid IANA name, instead of
+ * throwing a RangeError and crashing the pack. */
+function formatInTimeZone(iso: string, timeZone: string, options: Intl.DateTimeFormatOptions): string {
+  const instant = new Date(iso)
+  if (Number.isNaN(instant.getTime())) return ''
+  try {
+    return new Intl.DateTimeFormat(undefined, { ...options, timeZone: timeZone || undefined }).format(instant)
+  } catch {
+    return new Intl.DateTimeFormat(undefined, options).format(instant)
+  }
+}
+
 function errorMessage(error: Error): string {
   if (error instanceof ApiError && error.code === 'MEETING_NOT_FOUND') return 'No meeting was found with that ID.'
   if (error instanceof ApiError && error.code === 'MEETING_PACK_NOT_FOUND') return 'No preparation pack exists yet for this meeting. Generate one below.'
@@ -128,7 +145,12 @@ export default function MeetingPrep() {
           <section className="dashboard-card" aria-labelledby="prep-objective">
             <h2 id="prep-objective">Objective and timing</h2>
             <p>{pack.objective}</p>
-            <p>{new Date(pack.starts_at).toLocaleString()} – {new Date(pack.ends_at).toLocaleTimeString()} ({pack.timezone})</p>
+            <p>
+              {formatInTimeZone(pack.starts_at, pack.timezone, { dateStyle: 'medium', timeStyle: 'short' })}
+              {' – '}
+              {formatInTimeZone(pack.ends_at, pack.timezone, { timeStyle: 'short' })}
+              {' ('}{pack.timezone}{')'}
+            </p>
           </section>
 
           <section className="dashboard-card" aria-labelledby="prep-participants">
