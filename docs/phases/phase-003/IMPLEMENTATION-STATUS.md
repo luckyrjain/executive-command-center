@@ -33,8 +33,14 @@ Phase 3 implementation has started on `feature/phase-3-attention-engine`. This d
 | 5 | Deterministic plan proposals and conflicts | Delivered (`feature/phase-3-attention-engine` commit `0e31cd4`) |
 | 6 | Plan editing, acceptance and replan diff | Delivered (`feature/phase-3-attention-engine` commit `3b4377a`) |
 | 7 | Evidence-backed meeting preparation | Delivered (`feature/phase-3-attention-engine` commit `d2a0706`) |
-| 8 | Executive UX, browser acceptance and dogfood | Not started |
+| 8 | Executive UX, browser acceptance and dogfood | Code delivered (`feature/phase-3-attention-engine` commit `736b4ef`); two-week dogfood not started |
 
 ## Exit evidence
 
-Implementation PRs, policy benchmark, prohibited-signal review, isolation matrix, performance results, backup/restore evidence and two-week dogfood report will be linked here as produced.
+- Implementation: `feature/phase-3-attention-engine`, commits `5089423` (Slice 1) through `736b4ef` (Slice 8).
+- Prohibited-signal review: `scripts/check_phase3_prohibited_signals.py`, clean against `backend/ecc/domains/attention/` as of commit `736b4ef`, wired into `ci.yml`'s `backend` job on every PR.
+- Browser acceptance: `frontend/e2e/scenarios/attention-queue.mjs`, `attention-planning.mjs`, `attention-meeting-prep.mjs` (run twice — AI enrichment on and off) — all 16 Playwright scenarios (13 pre-existing + 3 new) pass locally as of commit `736b4ef`, including axe-core accessibility checks on every scenario and a keyboard-only pass (`conflict-audit-keyboard.mjs`, `knowledge-keyboard.mjs`).
+- Frontend regression: `pnpm typecheck`, `pnpm test -- --run` (136 tests, 21 files), `pnpm run build`, `pnpm audit --audit-level=high` (clean) all pass as of commit `736b4ef`.
+- Backend regression: `uv run ruff check/format`, `uv run mypy backend`, `uv run alembic upgrade head`, `uv run pytest`, `pip-audit` (clean) all pass as of the Task 7 commit `d2a0706` and remain unaffected by Task 8 (frontend/CI-only changes).
+- Performance results: attention ranking (existing, re-validated in Task 1), planning <1s p95 (Task 5), meeting-prep <2s p95 (Task 7) — see each task's own commit for the dedicated benchmark test.
+- Isolation matrix, backup/restore evidence and two-week dogfood report (`docs/runbooks/PHASE-3-DOGFOOD.md`) remain outstanding — the dogfood window is a real-usage gate that cannot be produced by code changes; see that document's Status line.
