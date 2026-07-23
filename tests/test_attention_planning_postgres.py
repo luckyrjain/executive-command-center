@@ -21,7 +21,7 @@ from fixtures.phase3_planning_scenarios import (
     monday_local,
     reserved,
 )
-from sqlalchemy import text
+from sqlalchemy import event, text
 
 from ecc.config import get_settings
 from ecc.database import engine
@@ -581,6 +581,102 @@ def test_list_plans_signed_cursor_pagination_and_tamper_rejection(
     tampered = client.get("/api/v1/plans", params={"cursor": body["next_cursor"][:-1] + "x"})
     assert tampered.status_code == 400
     assert tampered.json()["error"]["code"] == "CURSOR_INVALID"
+
+
+def test_list_plans_batches_block_fetch_across_page(
+    planning_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    """list_plans must not fire one plan_blocks query per plan in the page
+    (an N+1) -- fetching blocks for a whole page of plans must be O(1)
+    queries, not O(page size). Seeds ``plan_count`` plans each with their own
+    block and asserts both correctness (each plan's response carries exactly
+    its own seeded block, never another plan's) and that the total query
+    count for the list call stays bounded well under plan_count.
+    """
+    client, workspace_id, user_id, token = planning_test_context
+    base = date.today() + timedelta(days=1)
+    now = datetime.now(UTC)
+    plan_count = 12
+    expected_blocks: dict[UUID, list[UUID]] = {}
+
+    with engine.begin() as connection:
+        for i in range(plan_count):
+            plan_id = uuid4()
+            period = base + timedelta(days=i)
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO plans (
+                        id, workspace_id, user_id, period_start, period_end, status,
+                        policy_version, capacity_minutes, source_versions, conflicts,
+                        unscheduled, created_by, updated_by, created_at, updated_at, version
+                    ) VALUES (
+                        :id, :workspace_id, :user_id, :period, :period, 'proposed',
+                        1, 0, '{}'::jsonb, '[]'::jsonb, '[]'::jsonb,
+                        :user_id, :user_id, :created_at, :created_at, 1
+                    )
+                    """
+                ),
+                {
+                    "id": plan_id,
+                    "workspace_id": workspace_id,
+                    "user_id": user_id,
+                    "period": period,
+                    "created_at": now - timedelta(seconds=plan_count - i),
+                },
+            )
+            block_id = uuid4()
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO plan_blocks (
+                        id, workspace_id, plan_id, source_type, source_id, starts_at, ends_at,
+                        status, rationale, is_default_effort, created_at, updated_at
+                    ) VALUES (
+                        :id, :workspace_id, :plan_id, 'task', NULL, :starts_at, :ends_at,
+                        'proposed', :rationale, false, :now, :now
+                    )
+                    """
+                ),
+                {
+                    "id": block_id,
+                    "workspace_id": workspace_id,
+                    "plan_id": plan_id,
+                    "starts_at": datetime.combine(period, time(9, 0), UTC),
+                    "ends_at": datetime.combine(period, time(9, 30), UTC),
+                    "rationale": f"block for plan {i}",
+                    "now": now,
+                },
+            )
+            expected_blocks[plan_id] = [block_id]
+
+    query_count = 0
+
+    def _count(*args: object, **kwargs: object) -> None:
+        nonlocal query_count
+        query_count += 1
+
+    event.listen(engine, "before_cursor_execute", _count)
+    try:
+        response = client.get("/api/v1/plans", params={"limit": plan_count})
+    finally:
+        event.remove(engine, "before_cursor_execute", _count)
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert len(body["items"]) == plan_count
+
+    for item in body["items"]:
+        plan_id = UUID(item["id"])
+        assert [UUID(b["id"]) for b in item["blocks"]] == expected_blocks[plan_id]
+
+    # Regardless of how many plans are in the page, block-fetching must stay
+    # O(1): one query for the page of plans, one batched query for all their
+    # blocks (plus a small constant for auth/session lookups) -- never one
+    # query per plan, which is what would make this scale with plan_count.
+    assert query_count < plan_count, (
+        f"expected O(1) queries for list_plans, got {query_count} for {plan_count} plans"
+    )
 
 
 def test_plan_is_hidden_across_workspaces(

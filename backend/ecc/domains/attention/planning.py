@@ -19,6 +19,8 @@ consistent with this codebase's "no speculative field" discipline.
 """
 
 from base64 import urlsafe_b64decode, urlsafe_b64encode
+from collections import defaultdict
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta
 from hashlib import sha256
@@ -556,6 +558,23 @@ def _fetch_candidates(
     needed. Only entity_types that represent schedulable, doable work are
     candidates; risk/risk_review/meeting are attention-queue items but not
     something you block time to "do".
+
+    Deliberately unbounded (no LIMIT): unlike a "top N most relevant" read
+    such as meeting_prep.py's bounded fetches, propose_plan (Step 5/6 below)
+    must see every eligible candidate to place correctly -- pinned items in
+    particular are sorted to the front of scheduling in Python regardless of
+    score (see propose_plan's Step 5), not in this query's `ORDER BY score
+    DESC`, so a SQL-level LIMIT here could silently truncate away a
+    low-scored pinned item before propose_plan ever gets a chance to force
+    it in, which would be a silent correctness regression, not just a
+    performance one. Candidates that don't fit the period's capacity are
+    already reported as `unscheduled` by propose_plan itself, so the
+    unbounded fetch does not mean unbounded scheduling -- only unbounded
+    visibility into what *could* be scheduled. This is a known, deliberate
+    scale limitation (full-scan cost grows with a workspace's total eligible
+    item count) rather than an oversight; revisit only if/when real
+    workspaces are observed to have a candidate count large enough to make
+    this fetch itself the bottleneck.
     """
     rows = session.execute(
         text(
@@ -598,20 +617,33 @@ def _fetch_candidates(
     ]
 
 
-def _row_to_plan(session: Session, auth: AuthContext, row: dict[str, Any]) -> Plan:
-    block_rows = (
-        session.execute(
-            text(
-                f"SELECT {_BLOCK_FIELDS} FROM plan_blocks "
-                "WHERE workspace_id = :workspace_id AND plan_id = :plan_id ORDER BY starts_at"
-            ),
-            {"workspace_id": auth.workspace_id, "plan_id": row["id"]},
+def _row_to_plan(
+    session: Session,
+    auth: AuthContext,
+    row: dict[str, Any],
+    blocks: list[Mapping[str, Any]] | None = None,
+) -> Plan:
+    """Build a ``Plan`` from a plan row, formatting its blocks.
+
+    ``blocks`` lets callers that already fetched block rows (e.g. a batched
+    query across a whole page of plans) skip the per-plan query below. Single
+    -plan callers such as ``get_plan``/``accept_plan`` omit it and fall back
+    to the original per-plan lookup.
+    """
+    if blocks is None:
+        blocks = (
+            session.execute(
+                text(
+                    f"SELECT {_BLOCK_FIELDS} FROM plan_blocks "
+                    "WHERE workspace_id = :workspace_id AND plan_id = :plan_id ORDER BY starts_at"
+                ),
+                {"workspace_id": auth.workspace_id, "plan_id": row["id"]},
+            )
+            .mappings()
+            .all()
         )
-        .mappings()
-        .all()
-    )
     return Plan.model_validate(
-        {**row, "blocks": [PlanBlockResponse.model_validate(dict(b)) for b in block_rows]}
+        {**row, "blocks": [PlanBlockResponse.model_validate(dict(b)) for b in blocks]}
     )
 
 
@@ -937,7 +969,30 @@ def list_plans(
     )
     has_more = len(rows) > limit
     page = rows[:limit]
-    items = [_row_to_plan(session, auth, dict(row)) for row in page]
+
+    blocks_by_plan: dict[UUID, list[Mapping[str, Any]]] = defaultdict(list)
+    if page:
+        plan_ids = [row["id"] for row in page]
+        block_rows = (
+            session.execute(
+                text(
+                    f"SELECT plan_id, {_BLOCK_FIELDS} FROM plan_blocks "
+                    "WHERE workspace_id = :workspace_id AND plan_id = ANY(:plan_ids) "
+                    "ORDER BY starts_at"
+                ),
+                {"workspace_id": auth.workspace_id, "plan_ids": plan_ids},
+            )
+            .mappings()
+            .all()
+        )
+        for block_row in block_rows:
+            block = dict(block_row)
+            blocks_by_plan[block.pop("plan_id")].append(block)
+
+    items = [
+        _row_to_plan(session, auth, dict(row), blocks=blocks_by_plan.get(row["id"], []))
+        for row in page
+    ]
     next_cursor = None
     if has_more and page:
         last = page[-1]
