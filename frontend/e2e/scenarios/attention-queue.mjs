@@ -22,6 +22,25 @@ const item = {
   override_reason: null,
 }
 
+const deferredItem = {
+  id: 'attn-2',
+  entity_type: 'commitment',
+  entity_id: 'commitment-1',
+  source_entity_version: 1,
+  score: 40,
+  confidence: 0.7,
+  factors: [],
+  explanation: 'Follow up on vendor contract',
+  generated_at: '2026-07-19T00:00:00Z',
+  expires_at: '2026-07-26T00:00:00Z',
+  pinned: false,
+  dismissed_at: null,
+  dismissed_entity_version: null,
+  deferred_until: '2026-08-01T00:00:00Z',
+  policy_version: 1,
+  override_reason: 'Waiting for Q3 numbers',
+}
+
 const waitingLink = {
   id: 'wl-1',
   subject_type: 'task',
@@ -44,7 +63,7 @@ const waitingLink = {
  * restore, and a waiting item can be recorded as fulfilled.
  */
 export async function run({ page, baseURL }) {
-  const fixtures = await createFixtureApi(page, { attention: { attentionItems: [item], waitingLinks: [waitingLink] } })
+  const fixtures = await createFixtureApi(page, { attention: { attentionItems: [item, deferredItem], waitingLinks: [waitingLink] } })
 
   await page.goto(baseURL)
   await page.getByRole('tab', { name: 'Attention' }).click()
@@ -62,7 +81,7 @@ export async function run({ page, baseURL }) {
   // Score is present but secondary -- the plain-language reason is the
   // primary text (UX-STATES.md: "Scores are secondary to plain-language
   // rationale").
-  await section.getByLabel('Score (secondary to the reason above)').waitFor()
+  await needsAction.getByLabel('Score (secondary to the reason above)').waitFor()
 
   // Dismiss, then restore -- both reversible.
   await section.getByRole('button', { name: 'Dismiss Finish the board memo' }).click()
@@ -70,6 +89,19 @@ export async function run({ page, baseURL }) {
   await restoreButton.waitFor()
   await restoreButton.click()
   await needsAction.getByText('Finish the board memo').waitFor()
+
+  // A deferred-but-not-dismissed item still surfaces under "Dismissed or
+  // deferred (reversible)" with a working Restore button (finding 2's
+  // filter fix -- previously only dismissed_at items were rendered there,
+  // even though the section heading implies deferred items are covered
+  // too and the backend restore action already works for both).
+  const reversibleSection = section.locator('section[aria-labelledby="attention-overridden"]')
+  await reversibleSection.getByText('Follow up on vendor contract').waitFor()
+  await reversibleSection.getByText('Waiting for Q3 numbers').waitFor()
+  await reversibleSection.getByRole('button', { name: 'Restore Follow up on vendor contract' }).click()
+  const restoreRequest = fixtures.requests.find((request) => request.method === 'POST' && request.path === '/api/v1/attention/attn-2/restore')
+  assert.ok(restoreRequest, 'expected a restore request for the deferred item')
+  await needsAction.getByText('Follow up on vendor contract').waitFor()
 
   const waitingSection = page.locator('section[aria-labelledby="waiting-title"]')
   await waitingSection.getByText('Waiting on vendor signature').waitFor()

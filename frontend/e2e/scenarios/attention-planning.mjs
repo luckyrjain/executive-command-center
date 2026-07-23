@@ -68,4 +68,37 @@ export async function run({ page, baseURL }) {
 
   const acceptRequests = fixtures.requests.filter((request) => request.method === 'POST' && /\/api\/v1\/plans\/[^/]+\/accept$/.test(request.path))
   assert.ok(acceptRequests.length > 0, 'expected an accept request after reviewing the diff')
+
+  // Version-conflict recovery: propose a fresh plan, then simulate another
+  // actor changing it concurrently (bumping its version directly in the
+  // fixture, bypassing this client) before this stale client tries to
+  // accept it. The fixture's mutate() returns a real 409 VERSION_CONFLICT
+  // in that case, matching the real backend's optimistic-concurrency
+  // contract -- proving Planner.tsx's onError handler refetches ['plans']
+  // (finding 3) so the *next* action retries against current data instead
+  // of failing the same way forever.
+  await section.getByLabel('Period start').fill('2026-07-25')
+  await section.getByLabel('Period end').fill('2026-07-25')
+  await section.getByRole('button', { name: 'Propose plan' }).click()
+  await section.getByRole('button', { name: 'Accept plan 2026-07-25' }).waitFor()
+
+  const conflictPlan = fixtures.attention.collections.plans.list().find((plan) => plan.period_start === '2026-07-25')
+  assert.ok(conflictPlan, 'expected the freshly proposed plan to exist in the fixture')
+  const plansGetsBeforeConflict = fixtures.requests.filter((request) => request.method === 'GET' && request.path === '/api/v1/plans').length
+  conflictPlan.version += 1 // a concurrent change this client hasn't seen yet
+
+  await section.getByRole('button', { name: 'Accept plan 2026-07-25' }).click()
+  await section.getByText('This plan changed since it was loaded. Refresh and try again.').waitFor()
+
+  // The conflict must trigger an actual refetch of the plans list, not
+  // just show the error message and leave the stale version cached.
+  const refetchDeadline = Date.now() + 3000
+  while (fixtures.requests.filter((request) => request.method === 'GET' && request.path === '/api/v1/plans').length <= plansGetsBeforeConflict) {
+    if (Date.now() > refetchDeadline) throw new Error('Timed out waiting for a plans refetch after VERSION_CONFLICT')
+    await page.waitForTimeout(50)
+  }
+
+  // Retrying now succeeds, because the refetch picked up the current version.
+  await section.getByRole('button', { name: 'Accept plan 2026-07-25' }).click()
+  await section.getByText('2026-07-25 – 2026-07-25 · accepted').waitFor()
 }
