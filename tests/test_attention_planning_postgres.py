@@ -557,6 +557,104 @@ def test_plan_is_hidden_across_workspaces(
     assert response.json()["error"]["code"] == "PLAN_NOT_FOUND"
 
 
+def _add_second_user_in_same_workspace(workspace_id: UUID) -> tuple[UUID, str]:
+    """A second, real, logged-in user in the *same* workspace as the
+    fixture's primary user -- not a different workspace, and not a bare
+    ``uuid4()`` 404 probe. Used by the IDOR regression tests below (finding
+    #1): plans are per-(workspace, user) everywhere else, so another user
+    in the same workspace must be unable to read or mutate a plan that
+    isn't theirs, exactly as if it belonged to a different workspace.
+    """
+    other_user_id = uuid4()
+    other_token = f"session-{uuid4()}"
+    now = datetime.now(UTC)
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO users (id, workspace_id, email, password_hash, created_at) "
+                "VALUES (:id, :workspace_id, :email, 'test-password-hash', :created_at)"
+            ),
+            {
+                "id": other_user_id,
+                "workspace_id": workspace_id,
+                "email": f"{other_user_id}@example.test",
+                "created_at": now,
+            },
+        )
+        connection.execute(
+            text(
+                "INSERT INTO sessions (id, workspace_id, user_id, token_hash, "
+                "expires_at, last_seen_at) "
+                "VALUES (:id, :workspace_id, :user_id, :token_hash, :expires_at, :last_seen_at)"
+            ),
+            {
+                "id": uuid4(),
+                "workspace_id": workspace_id,
+                "user_id": other_user_id,
+                "token_hash": sha256(other_token.encode()).hexdigest(),
+                "expires_at": now + timedelta(hours=1),
+                "last_seen_at": now,
+            },
+        )
+    return other_user_id, other_token
+
+
+def test_get_plan_hidden_from_other_user_in_same_workspace(
+    planning_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    """Finding #1 (critical IDOR): ``get_plan`` filtered only by
+    ``workspace_id`` -- any authenticated user in the workspace could read
+    another user's plan by guessing/enumerating plan IDs. Fails before the
+    fix (200 with the other user's plan body), passes after (404).
+    """
+    client, workspace_id, user_id, token = planning_test_context
+    plan = _create_plan_with_one_block(client, workspace_id, user_id, token)
+
+    _other_user_id, other_token = _add_second_user_in_same_workspace(workspace_id)
+    other_client = TestClient(app)
+    other_client.cookies.set("ecc_session", other_token)
+    try:
+        response = other_client.get(f"/api/v1/plans/{plan['id']}")
+        assert response.status_code == 404
+        assert response.json()["error"]["code"] == "PLAN_NOT_FOUND"
+    finally:
+        other_client.close()
+
+
+def test_accept_plan_rejected_for_other_user_in_same_workspace(
+    planning_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    """Same finding #1, mutating side: ``_get_plan_for_update`` (used by
+    accept/supersede/replan/move_block/remove_block) had the identical gap
+    -- any user in the workspace could accept (or otherwise mutate)
+    another user's plan. Fails before the fix (200, plan accepted by the
+    wrong user), passes after (404, plan untouched).
+    """
+    client, workspace_id, user_id, token = planning_test_context
+    plan = _create_plan_with_one_block(client, workspace_id, user_id, token)
+
+    _other_user_id, other_token = _add_second_user_in_same_workspace(workspace_id)
+    other_client = TestClient(app)
+    other_client.cookies.set("ecc_session", other_token)
+    try:
+        response = other_client.post(
+            f"/api/v1/plans/{plan['id']}/accept",
+            headers=_headers(other_token, "cross-user-accept"),
+            json={"expected_version": plan["version"]},
+        )
+        assert response.status_code == 404
+        assert response.json()["error"]["code"] == "PLAN_NOT_FOUND"
+    finally:
+        other_client.close()
+
+    # The plan must be untouched -- still 'proposed' at its original
+    # version, visible to its real owner.
+    owned = client.get(f"/api/v1/plans/{plan['id']}")
+    assert owned.status_code == 200
+    assert owned.json()["status"] == "proposed"
+    assert owned.json()["version"] == plan["version"]
+
+
 # ---------------------------------------------------------------------------
 # Task 6: acceptance, manual retirement, replan diff, block editing.
 # ---------------------------------------------------------------------------
@@ -743,6 +841,80 @@ def test_move_block_rejects_overlap_with_another_block_in_the_same_plan(
     assert unchanged.json()["version"] == plan["version"]  # rejected move did not bump version
 
 
+def test_move_block_rejects_move_outside_period_bounds(
+    planning_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    """Finding #11: move_block previously let a block move to any time,
+    including outside the plan's own planned period.
+    """
+    client, workspace_id, user_id, token = planning_test_context
+    plan = _create_plan_with_one_block(client, workspace_id, user_id, token)
+    block = plan["blocks"][0]
+    # _next_period() is a single day -- three days later is well outside it.
+    new_start = datetime.fromisoformat(block["starts_at"]) + timedelta(days=3)
+    new_end = datetime.fromisoformat(block["ends_at"]) + timedelta(days=3)
+
+    moved = client.post(
+        f"/api/v1/plans/{plan['id']}/blocks/{block['id']}/move",
+        headers=_headers(token, "move-block-out-of-period"),
+        json={
+            "expected_version": plan["version"],
+            "starts_at": new_start.isoformat(),
+            "ends_at": new_end.isoformat(),
+        },
+    )
+    assert moved.status_code == 422, moved.text
+    assert moved.json()["error"]["code"] == "BLOCK_OUT_OF_PERIOD"
+
+    unchanged = client.get(f"/api/v1/plans/{plan['id']}")
+    assert unchanged.json()["version"] == plan["version"]
+
+
+def test_move_block_rejects_hard_constraint_conflict(
+    planning_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    """Finding #11: move_block previously didn't check hard calendar
+    reservations/planning constraints at all -- a block could be moved
+    directly onto one.
+    """
+    client, workspace_id, user_id, token = planning_test_context
+    plan = _create_plan_with_one_block(client, workspace_id, user_id, token)
+    block = plan["blocks"][0]
+
+    # A hard fixed_time constraint later the same day, clear of the
+    # original block's slot.
+    constraint_start = datetime.fromisoformat(block["starts_at"]) + timedelta(hours=3)
+    constraint_end = constraint_start + timedelta(minutes=30)
+    constraint = client.post(
+        "/api/v1/planning/constraints",
+        headers={**_headers(token), "Idempotency-Key": "move-block-hard-constraint"},
+        json={
+            "kind": "fixed_time",
+            "label": "Unmovable board call",
+            "starts_at": constraint_start.isoformat(),
+            "ends_at": constraint_end.isoformat(),
+            "hardness": "hard",
+            "priority": 90,
+        },
+    )
+    assert constraint.status_code == 201, constraint.text
+
+    moved = client.post(
+        f"/api/v1/plans/{plan['id']}/blocks/{block['id']}/move",
+        headers=_headers(token, "move-block-onto-constraint"),
+        json={
+            "expected_version": plan["version"],
+            "starts_at": constraint_start.isoformat(),
+            "ends_at": constraint_end.isoformat(),
+        },
+    )
+    assert moved.status_code == 409, moved.text
+    assert moved.json()["error"]["code"] == "CONSTRAINT_CONFLICT"
+
+    unchanged = client.get(f"/api/v1/plans/{plan['id']}")
+    assert unchanged.json()["version"] == plan["version"]
+
+
 def test_move_block_rejected_when_plan_not_proposed(
     planning_test_context: tuple[TestClient, UUID, UUID, str],
 ) -> None:
@@ -860,3 +1032,47 @@ def test_replan_rejects_stale_version(
     )
     assert stale.status_code == 409
     assert stale.json()["error"]["code"] == "VERSION_CONFLICT"
+
+
+def test_replan_idempotent_on_replay_and_records_201(
+    planning_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    """Finding #12: ``_store_idempotent_plan`` hardcoded
+    ``response_status=200`` for every caller, including ``replan``, whose
+    endpoint actually returns 201. The replayed HTTP response is always
+    correct either way (FastAPI applies the route's declared status code
+    regardless of what's stored), but the *stored* idempotency record must
+    reflect the real status for it to be a trustworthy audit record.
+    """
+    client, workspace_id, user_id, token = planning_test_context
+    plan = _create_plan_with_one_block(client, workspace_id, user_id, token)
+    headers = _headers(token, "replan-idempotent")
+
+    first = client.post(
+        f"/api/v1/plans/{plan['id']}/propose",
+        headers=headers,
+        json={"expected_version": plan["version"]},
+    )
+    assert first.status_code == 201, first.text
+
+    replay = client.post(
+        f"/api/v1/plans/{plan['id']}/propose",
+        headers=headers,
+        json={"expected_version": plan["version"]},
+    )
+    assert replay.status_code == 201
+    assert replay.json()["id"] == first.json()["id"]
+
+    stored_status = (
+        engine.connect()
+        .execute(
+            text(
+                "SELECT response_status FROM idempotency_records "
+                "WHERE workspace_id = :workspace_id AND actor_id = :actor_id "
+                "AND key = 'replan-idempotent'"
+            ),
+            {"workspace_id": workspace_id, "actor_id": user_id},
+        )
+        .scalar_one()
+    )
+    assert stored_status == 201

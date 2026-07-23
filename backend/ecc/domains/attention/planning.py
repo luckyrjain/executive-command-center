@@ -18,7 +18,6 @@ configurable start time is deferred until a real user need for it appears,
 consistent with this codebase's "no speculative field" discipline.
 """
 
-
 from base64 import urlsafe_b64decode, urlsafe_b64encode
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta
@@ -947,9 +946,9 @@ def get_plan(plan_id: UUID, auth: AuthDep, session: SessionDep) -> Plan:
         session.execute(
             text(
                 f"SELECT {_PLAN_FIELDS} FROM plans "
-                "WHERE workspace_id = :workspace_id AND id = :plan_id"
+                "WHERE workspace_id = :workspace_id AND user_id = :user_id AND id = :plan_id"
             ),
-            {"workspace_id": auth.workspace_id, "plan_id": plan_id},
+            {"workspace_id": auth.workspace_id, "user_id": auth.user_id, "plan_id": plan_id},
         )
         .mappings()
         .one_or_none()
@@ -1050,9 +1049,10 @@ def _get_plan_for_update(
         session.execute(
             text(
                 f"SELECT {_PLAN_FIELDS} FROM plans "
-                "WHERE workspace_id = :workspace_id AND id = :plan_id FOR UPDATE"
+                "WHERE workspace_id = :workspace_id AND user_id = :user_id AND id = :plan_id "
+                "FOR UPDATE"
             ),
-            {"workspace_id": auth.workspace_id, "plan_id": plan_id},
+            {"workspace_id": auth.workspace_id, "user_id": auth.user_id, "plan_id": plan_id},
         )
         .mappings()
         .one_or_none()
@@ -1412,12 +1412,20 @@ def replan(
         _write_plan_event(
             session, auth, request, "plan.superseded", plan_id, old["version"] + 1, now
         )
-        _store_idempotent_plan(session, auth, idempotency_key, request_hash, response, now)
+        _store_idempotent_plan(
+            session, auth, idempotency_key, request_hash, response, now, response_status=201
+        )
         return response
 
 
 def _store_idempotent_plan(
-    session: Session, auth: AuthContext, key: str, request_hash: str, response: Plan, now: datetime
+    session: Session,
+    auth: AuthContext,
+    key: str,
+    request_hash: str,
+    response: Plan,
+    now: datetime,
+    response_status: int = 200,
 ) -> None:
     session.execute(
         text(
@@ -1426,7 +1434,7 @@ def _store_idempotent_plan(
                 workspace_id, actor_id, key, request_hash, response_status,
                 response_body, created_at, expires_at
             ) VALUES (
-                :workspace_id, :actor_id, :key, :request_hash, 200,
+                :workspace_id, :actor_id, :key, :request_hash, :response_status,
                 CAST(:response_body AS jsonb), :created_at, :expires_at
             )
             """
@@ -1436,6 +1444,7 @@ def _store_idempotent_plan(
             "actor_id": auth.user_id,
             "key": key,
             "request_hash": request_hash,
+            "response_status": response_status,
             "response_body": dumps(response.model_dump(mode="json")),
             "created_at": now,
             "expires_at": now + timedelta(days=365),
@@ -1447,6 +1456,33 @@ def _blocks_overlap(
     candidate_start: datetime, candidate_end: datetime, other: dict[str, Any]
 ) -> bool:
     return bool(candidate_start < other["ends_at"] and other["starts_at"] < candidate_end)
+
+
+def _within_period(
+    starts_at: datetime, ends_at: datetime, period_start: date, period_end: date, timezone: str
+) -> bool:
+    """Same period-bounds arithmetic as ``_generate_proposal``'s
+    ``period_start_dt``/``period_end_dt`` -- a moved block must stay
+    inside the plan's own planned period (finding #11), not just avoid
+    overlapping other blocks.
+    """
+    zone = ZoneInfo(timezone)
+    period_start_dt = datetime.combine(period_start, time.min, zone)
+    period_end_dt = datetime.combine(period_end + timedelta(days=1), time.min, zone)
+    return period_start_dt <= starts_at and ends_at <= period_end_dt
+
+
+def _violated_hard_constraint(
+    starts_at: datetime, ends_at: datetime, reserved_blocks: list[ReservedBlockInput]
+) -> ReservedBlockInput | None:
+    """The first hard calendar reservation or hard fixed_time constraint
+    (``_fetch_reserved_blocks``'s combined set) that the candidate range
+    overlaps, or ``None`` if it's clear of all of them (finding #11).
+    """
+    for reservation in reserved_blocks:
+        if starts_at < reservation.ends_at and reservation.starts_at < ends_at:
+            return reservation
+    return None
 
 
 @router.post("/{plan_id}/blocks/{block_id}/move", response_model=Plan)
@@ -1484,6 +1520,32 @@ def move_block(
             )
         if current["status"] != "proposed":
             raise HTTPException(status_code=409, detail="PLAN_NOT_EDITABLE")
+
+        # A move must stay inside the plan's own planned period (finding
+        # #11) -- moving a block to any arbitrary time, including outside
+        # the days the plan actually covers, was previously unchecked.
+        if not _within_period(
+            payload.starts_at,
+            payload.ends_at,
+            current["period_start"],
+            current["period_end"],
+            auth.timezone,
+        ):
+            raise HTTPException(status_code=422, detail="BLOCK_OUT_OF_PERIOD")
+
+        # A move must also not land on a hard calendar reservation or hard
+        # fixed_time constraint -- the same reserved-blocks set
+        # propose_plan itself treats as unmovable (finding #11).
+        zone = ZoneInfo(auth.timezone)
+        period_start_dt = datetime.combine(current["period_start"], time.min, zone)
+        period_end_dt = datetime.combine(current["period_end"] + timedelta(days=1), time.min, zone)
+        reserved_blocks = _fetch_reserved_blocks(session, auth, period_start_dt, period_end_dt)
+        violated = _violated_hard_constraint(payload.starts_at, payload.ends_at, reserved_blocks)
+        if violated is not None:
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "CONSTRAINT_CONFLICT", "detail": f"overlaps {violated.label!r}"},
+            )
 
         other_blocks = (
             session.execute(
