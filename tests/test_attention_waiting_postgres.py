@@ -387,10 +387,80 @@ def test_waiting_link_list_signed_cursor_pagination_and_tamper_rejection(
 def test_waiting_link_is_hidden_across_workspaces(
     waiting_test_context: tuple[TestClient, UUID, UUID, str],
 ) -> None:
-    client, _, _, _ = waiting_test_context
-    response = client.get(f"/api/v1/waiting/{uuid4()}")
-    assert response.status_code == 404
-    assert response.json()["error"]["code"] == "WAITING_LINK_NOT_FOUND"
+    client, workspace_id, user_id, token = waiting_test_context
+    task_id = _seed_task(workspace_id, user_id)
+    counterparty = _seed_node(workspace_id, "person", "Cross-Workspace Counterparty")
+
+    created = client.post(
+        "/api/v1/waiting",
+        headers=_headers(token, "create-waiting-cross-workspace"),
+        json={
+            "subject_type": "task",
+            "subject_id": str(task_id),
+            "counterparty_entity_id": str(counterparty),
+            "direction": "waiting_on_them",
+        },
+    )
+    assert created.status_code == 201, created.text
+    link_id = created.json()["id"]
+
+    other_workspace_id = uuid4()
+    other_user_id = uuid4()
+    other_token = f"session-{uuid4()}"
+    now = datetime.now(UTC)
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO workspaces (id, name, timezone, created_at) "
+                "VALUES (:id, 'Other Workspace', 'UTC', :now)"
+            ),
+            {"id": other_workspace_id, "now": now},
+        )
+        connection.execute(
+            text(
+                "INSERT INTO users (id, workspace_id, email, password_hash, created_at) "
+                "VALUES (:id, :workspace_id, :email, 'hash', :now)"
+            ),
+            {
+                "id": other_user_id,
+                "workspace_id": other_workspace_id,
+                "email": f"{other_user_id}@example.test",
+                "now": now,
+            },
+        )
+        connection.execute(
+            text(
+                "INSERT INTO sessions (id, workspace_id, user_id, token_hash, "
+                "expires_at, last_seen_at) "
+                "VALUES (:id, :workspace_id, :user_id, :token_hash, :expires_at, :now)"
+            ),
+            {
+                "id": uuid4(),
+                "workspace_id": other_workspace_id,
+                "user_id": other_user_id,
+                "token_hash": sha256(other_token.encode()).hexdigest(),
+                "expires_at": now + timedelta(hours=1),
+                "now": now,
+            },
+        )
+    other_client = TestClient(app)
+    other_client.cookies.set("ecc_session", other_token)
+    try:
+        response = other_client.get(f"/api/v1/waiting/{link_id}")
+        assert response.status_code == 404
+        assert response.json()["error"]["code"] == "WAITING_LINK_NOT_FOUND"
+    finally:
+        other_client.close()
+        with engine.begin() as connection:
+            for table in ("sessions", "users"):
+                connection.execute(
+                    text(f"DELETE FROM {table} WHERE workspace_id = :workspace_id"),  # noqa: S608
+                    {"workspace_id": other_workspace_id},
+                )
+            connection.execute(
+                text("DELETE FROM workspaces WHERE id = :workspace_id"),
+                {"workspace_id": other_workspace_id},
+            )
 
 
 def test_waiting_link_surfaces_in_attention_queue_and_ages(

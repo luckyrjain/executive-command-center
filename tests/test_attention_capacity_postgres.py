@@ -197,6 +197,84 @@ def test_put_capacity_profile_rejects_unknown_timezone(
     assert response.status_code == 422
 
 
+def test_capacity_profile_hidden_across_workspaces(
+    capacity_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    """A different, real workspace's session must not see the fixture
+    workspace's capacity profile -- not just a bare ``uuid4()`` 404 probe
+    (capacity profiles are a singleton per workspace, fetched by
+    ``workspace_id`` alone, with no by-id GET), which would prove nothing
+    about workspace scoping.
+    """
+    client, _, _, token = capacity_test_context
+    created = client.put(
+        "/api/v1/planning/capacity",
+        headers=_headers(token),
+        json={"expected_version": 0, "timezone": "Asia/Kolkata", "days": _full_week()},
+    )
+    assert created.status_code == 200, created.text
+
+    other_workspace_id = uuid4()
+    other_user_id = uuid4()
+    other_token = f"session-{uuid4()}"
+    now = datetime.now(UTC)
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO workspaces (id, name, timezone, created_at) "
+                "VALUES (:id, 'Other Workspace', 'UTC', :now)"
+            ),
+            {"id": other_workspace_id, "now": now},
+        )
+        connection.execute(
+            text(
+                "INSERT INTO users (id, workspace_id, email, password_hash, created_at) "
+                "VALUES (:id, :workspace_id, :email, 'hash', :now)"
+            ),
+            {
+                "id": other_user_id,
+                "workspace_id": other_workspace_id,
+                "email": f"{other_user_id}@example.test",
+                "now": now,
+            },
+        )
+        connection.execute(
+            text(
+                "INSERT INTO sessions (id, workspace_id, user_id, token_hash, "
+                "expires_at, last_seen_at) "
+                "VALUES (:id, :workspace_id, :user_id, :token_hash, :expires_at, :now)"
+            ),
+            {
+                "id": uuid4(),
+                "workspace_id": other_workspace_id,
+                "user_id": other_user_id,
+                "token_hash": sha256(other_token.encode()).hexdigest(),
+                "expires_at": now + timedelta(hours=1),
+                "now": now,
+            },
+        )
+    other_client = TestClient(app)
+    other_client.cookies.set("ecc_session", other_token)
+    try:
+        other_fetched = other_client.get("/api/v1/planning/capacity")
+        assert other_fetched.status_code == 200
+        other_body = other_fetched.json()
+        assert other_body["version"] == 0
+        assert other_body["days"] == []
+    finally:
+        other_client.close()
+        with engine.begin() as connection:
+            for table in ("sessions", "users"):
+                connection.execute(
+                    text(f"DELETE FROM {table} WHERE workspace_id = :workspace_id"),  # noqa: S608
+                    {"workspace_id": other_workspace_id},
+                )
+            connection.execute(
+                text("DELETE FROM workspaces WHERE id = :workspace_id"),
+                {"workspace_id": other_workspace_id},
+            )
+
+
 def test_planning_constraint_kinds_validate_hardness_and_priority(
     capacity_test_context: tuple[TestClient, UUID, UUID, str],
 ) -> None:

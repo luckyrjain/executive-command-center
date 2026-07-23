@@ -551,10 +551,71 @@ def test_list_plans_signed_cursor_pagination_and_tamper_rejection(
 def test_plan_is_hidden_across_workspaces(
     planning_test_context: tuple[TestClient, UUID, UUID, str],
 ) -> None:
-    client, _, _, _ = planning_test_context
-    response = client.get(f"/api/v1/plans/{uuid4()}")
-    assert response.status_code == 404
-    assert response.json()["error"]["code"] == "PLAN_NOT_FOUND"
+    """A different, real workspace's session must not be able to read a
+    plan that belongs to the fixture workspace -- not just a bare
+    ``uuid4()`` 404 probe against the fixture's own client, which proves
+    nothing about workspace scoping.
+    """
+    client, workspace_id, user_id, token = planning_test_context
+    plan = _create_plan_with_one_block(client, workspace_id, user_id, token)
+
+    other_workspace_id = uuid4()
+    other_user_id = uuid4()
+    other_token = f"session-{uuid4()}"
+    now = datetime.now(UTC)
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO workspaces (id, name, timezone, created_at) "
+                "VALUES (:id, 'Other Workspace', 'UTC', :now)"
+            ),
+            {"id": other_workspace_id, "now": now},
+        )
+        connection.execute(
+            text(
+                "INSERT INTO users (id, workspace_id, email, password_hash, created_at) "
+                "VALUES (:id, :workspace_id, :email, 'hash', :now)"
+            ),
+            {
+                "id": other_user_id,
+                "workspace_id": other_workspace_id,
+                "email": f"{other_user_id}@example.test",
+                "now": now,
+            },
+        )
+        connection.execute(
+            text(
+                "INSERT INTO sessions (id, workspace_id, user_id, token_hash, "
+                "expires_at, last_seen_at) "
+                "VALUES (:id, :workspace_id, :user_id, :token_hash, :expires_at, :now)"
+            ),
+            {
+                "id": uuid4(),
+                "workspace_id": other_workspace_id,
+                "user_id": other_user_id,
+                "token_hash": sha256(other_token.encode()).hexdigest(),
+                "expires_at": now + timedelta(hours=1),
+                "now": now,
+            },
+        )
+    other_client = TestClient(app)
+    other_client.cookies.set("ecc_session", other_token)
+    try:
+        response = other_client.get(f"/api/v1/plans/{plan['id']}")
+        assert response.status_code == 404
+        assert response.json()["error"]["code"] == "PLAN_NOT_FOUND"
+    finally:
+        other_client.close()
+        with engine.begin() as connection:
+            for table in ("sessions", "users"):
+                connection.execute(
+                    text(f"DELETE FROM {table} WHERE workspace_id = :workspace_id"),  # noqa: S608
+                    {"workspace_id": other_workspace_id},
+                )
+            connection.execute(
+                text("DELETE FROM workspaces WHERE id = :workspace_id"),
+                {"workspace_id": other_workspace_id},
+            )
 
 
 def _add_second_user_in_same_workspace(workspace_id: UUID) -> tuple[UUID, str]:

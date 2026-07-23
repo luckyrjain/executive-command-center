@@ -130,6 +130,70 @@ def _headers(token: str, key: str | None = None) -> dict[str, str]:
     return headers
 
 
+def _other_workspace_client() -> tuple[TestClient, UUID]:
+    """A genuinely different, real workspace with its own real user and
+    session -- used to prove cross-workspace isolation, as opposed to a
+    bare ``uuid4()`` 404 probe against the fixture's own client, which
+    proves nothing about workspace scoping.
+    """
+    other_workspace_id = uuid4()
+    other_user_id = uuid4()
+    other_token = f"session-{uuid4()}"
+    now = datetime.now(UTC)
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO workspaces (id, name, timezone, created_at) "
+                "VALUES (:id, 'Other Workspace', 'UTC', :now)"
+            ),
+            {"id": other_workspace_id, "now": now},
+        )
+        connection.execute(
+            text(
+                "INSERT INTO users (id, workspace_id, email, password_hash, created_at) "
+                "VALUES (:id, :workspace_id, :email, 'hash', :now)"
+            ),
+            {
+                "id": other_user_id,
+                "workspace_id": other_workspace_id,
+                "email": f"{other_user_id}@example.test",
+                "now": now,
+            },
+        )
+        connection.execute(
+            text(
+                "INSERT INTO sessions (id, workspace_id, user_id, token_hash, "
+                "expires_at, last_seen_at) "
+                "VALUES (:id, :workspace_id, :user_id, :token_hash, :expires_at, :now)"
+            ),
+            {
+                "id": uuid4(),
+                "workspace_id": other_workspace_id,
+                "user_id": other_user_id,
+                "token_hash": sha256(other_token.encode()).hexdigest(),
+                "expires_at": now + timedelta(hours=1),
+                "now": now,
+            },
+        )
+    other_client = TestClient(app)
+    other_client.cookies.set("ecc_session", other_token)
+    return other_client, other_workspace_id
+
+
+def _cleanup_other_workspace(other_client: TestClient, other_workspace_id: UUID) -> None:
+    other_client.close()
+    with engine.begin() as connection:
+        for table in ("sessions", "users"):
+            connection.execute(
+                text(f"DELETE FROM {table} WHERE workspace_id = :workspace_id"),  # noqa: S608
+                {"workspace_id": other_workspace_id},
+            )
+        connection.execute(
+            text("DELETE FROM workspaces WHERE id = :workspace_id"),
+            {"workspace_id": other_workspace_id},
+        )
+
+
 def test_risk_lifecycle_and_attention_controls(
     risk_test_context: tuple[TestClient, UUID, UUID, str],
 ) -> None:
@@ -315,9 +379,31 @@ def test_risk_lifecycle_and_attention_controls(
 def test_risk_is_hidden_across_workspaces(
     risk_test_context: tuple[TestClient, UUID, UUID, str],
 ) -> None:
-    client, _, _, _ = risk_test_context
-    response = client.get(f"/api/v1/risks/{uuid4()}")
-    assert response.status_code == 404
+    """A different, real workspace's session must not be able to read a
+    risk that belongs to the fixture workspace -- not just a bare
+    ``uuid4()`` 404 probe against the fixture's own client, which proves
+    nothing about workspace scoping.
+    """
+    client, _, _, token = risk_test_context
+    created = client.post(
+        "/api/v1/risks",
+        headers=_headers(token, "create-risk-cross-workspace"),
+        json={
+            "description": "Cross-workspace isolation risk",
+            "probability": 3,
+            "impact": 3,
+        },
+    )
+    assert created.status_code == 201, created.text
+    risk_id = created.json()["id"]
+
+    other_client, other_workspace_id = _other_workspace_client()
+    try:
+        response = other_client.get(f"/api/v1/risks/{risk_id}")
+        assert response.status_code == 404
+        assert response.json()["error"]["code"] == "RISK_NOT_FOUND"
+    finally:
+        _cleanup_other_workspace(other_client, other_workspace_id)
 
 
 def test_closed_risk_cannot_reopen(
@@ -907,9 +993,29 @@ def test_get_attention_item_by_id(
 def test_attention_item_is_hidden_across_workspaces(
     risk_test_context: tuple[TestClient, UUID, UUID, str],
 ) -> None:
-    client, _, _, _ = risk_test_context
-    response = client.get(f"/api/v1/attention/{uuid4()}")
-    assert response.status_code == 404
+    """A different, real workspace's session must not be able to read an
+    attention item that belongs to the fixture workspace -- not just a
+    bare ``uuid4()`` 404 probe against the fixture's own client, which
+    proves nothing about workspace scoping.
+    """
+    client, _, _, token = risk_test_context
+    create = client.post(
+        "/api/v1/risks",
+        headers=_headers(token, "cross-workspace-attention-risk"),
+        json={"description": "Cross-workspace attention item", "probability": 3, "impact": 3},
+    )
+    assert create.status_code == 201
+    regenerate = client.post("/api/v1/attention/regenerate", headers=_headers(token), json={})
+    assert regenerate.status_code == 200
+    item = next(i for i in regenerate.json()["items"] if i["entity_id"] == create.json()["id"])
+
+    other_client, other_workspace_id = _other_workspace_client()
+    try:
+        response = other_client.get(f"/api/v1/attention/{item['id']}")
+        assert response.status_code == 404
+        assert response.json()["error"]["code"] == "ATTENTION_ITEM_NOT_FOUND"
+    finally:
+        _cleanup_other_workspace(other_client, other_workspace_id)
 
 
 def test_attention_feedback_recorded_and_idempotent(

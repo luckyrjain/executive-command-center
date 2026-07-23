@@ -313,3 +313,77 @@ def test_review_queue_excludes_closed_and_archived_risks(
 
     queue = client.get("/api/v1/risks/review-queue")
     assert all(item["risk_id"] != risk["id"] for item in queue.json()["items"])
+
+
+def test_review_queue_hidden_across_workspaces(
+    risk_review_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    """A different, real workspace's session must not see the fixture
+    workspace's review-queue entries -- not just a bare ``uuid4()`` 404
+    probe (there's no GET-by-id for a review; the queue is the primary
+    read here), which would prove nothing about workspace scoping.
+    """
+    client, _, _, token = risk_review_test_context
+    now = datetime.now(UTC)
+    risk = _create_risk(client, token, "cross-workspace-review", review_at=now - timedelta(hours=1))
+
+    own_queue = client.get("/api/v1/risks/review-queue")
+    assert own_queue.status_code == 200
+    assert any(item["risk_id"] == risk["id"] for item in own_queue.json()["items"])
+
+    other_workspace_id = uuid4()
+    other_user_id = uuid4()
+    other_token = f"session-{uuid4()}"
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO workspaces (id, name, timezone, created_at) "
+                "VALUES (:id, 'Other Workspace', 'UTC', :now)"
+            ),
+            {"id": other_workspace_id, "now": now},
+        )
+        connection.execute(
+            text(
+                "INSERT INTO users (id, workspace_id, email, password_hash, created_at) "
+                "VALUES (:id, :workspace_id, :email, 'hash', :now)"
+            ),
+            {
+                "id": other_user_id,
+                "workspace_id": other_workspace_id,
+                "email": f"{other_user_id}@example.test",
+                "now": now,
+            },
+        )
+        connection.execute(
+            text(
+                "INSERT INTO sessions (id, workspace_id, user_id, token_hash, "
+                "expires_at, last_seen_at) "
+                "VALUES (:id, :workspace_id, :user_id, :token_hash, :expires_at, :now)"
+            ),
+            {
+                "id": uuid4(),
+                "workspace_id": other_workspace_id,
+                "user_id": other_user_id,
+                "token_hash": sha256(other_token.encode()).hexdigest(),
+                "expires_at": now + timedelta(hours=1),
+                "now": now,
+            },
+        )
+    other_client = TestClient(app)
+    other_client.cookies.set("ecc_session", other_token)
+    try:
+        other_queue = other_client.get("/api/v1/risks/review-queue")
+        assert other_queue.status_code == 200
+        assert other_queue.json()["items"] == []
+    finally:
+        other_client.close()
+        with engine.begin() as connection:
+            for table in ("sessions", "users"):
+                connection.execute(
+                    text(f"DELETE FROM {table} WHERE workspace_id = :workspace_id"),  # noqa: S608
+                    {"workspace_id": other_workspace_id},
+                )
+            connection.execute(
+                text("DELETE FROM workspaces WHERE id = :workspace_id"),
+                {"workspace_id": other_workspace_id},
+            )
