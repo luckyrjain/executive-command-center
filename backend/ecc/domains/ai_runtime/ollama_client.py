@@ -19,6 +19,14 @@ read, and a wall-clock deadline checked between yielded chunks bounds the
 chunks that only cumulatively exceed the budget). Both surface as
 `OllamaCallTimeout`, never a raw `httpx` exception, so callers depend on one
 typed error regardless of which guard fired.
+
+`generate()` also accepts an optional `budgets.py:CancellationToken`
+(Task 3), checked at the exact same point, on the exact same per-chunk
+cadence, as the wall-clock deadline check above -- a cancellation raises
+`OllamaCallCancelled`, which unwinds through the same `finally: close()`
+cleanup the deadline/exhaustion paths already use, so no second
+stream-closing mechanism exists. Passing no token (the default) leaves
+every Task 1 caller of `generate()` unchanged.
 """
 
 import time
@@ -27,6 +35,8 @@ from dataclasses import dataclass
 
 import httpx
 import ollama
+
+from .budgets import CancellationToken
 
 DEFAULT_OLLAMA_HOST = "http://127.0.0.1:11434"
 
@@ -38,6 +48,16 @@ class OllamaCallTimeout(Exception):
     """Raised when a `generate()` call exceeds its per-model-call deadline
     (design doc Decision 5) -- either a single slow network read or the
     cumulative wall-clock time across many chunks.
+    """
+
+
+class OllamaCallCancelled(Exception):
+    """Raised when a `generate()` call's `CancellationToken` is cancelled
+    mid-stream (design doc Decision 5's "Cancellation" row, Task 3). A
+    caller that catches this transitions the run to `cancelled` --
+    never `completed`, and distinct from `OllamaCallTimeout`/
+    `OllamaCallFailed`, which are budget/provider-error outcomes, not an
+    operator/budget-triggered cancellation.
     """
 
 
@@ -107,16 +127,27 @@ class OllamaAdapter:
             raise OllamaCallFailed(str(exc)) from exc
         return [model.model for model in response.models if model.model is not None]
 
-    def generate(self, prompt: str, model_id: str, max_tokens: int) -> Iterator[Chunk]:
+    def generate(
+        self,
+        prompt: str,
+        model_id: str,
+        max_tokens: int,
+        *,
+        cancellation_token: CancellationToken | None = None,
+    ) -> Iterator[Chunk]:
         """Stream a `generate` call, yielding one `Chunk` per fragment.
 
         Raises `OllamaCallTimeout` if the call runs past its per-model-call
         deadline (checked before yielding each chunk, so a caller never
-        observes a chunk that arrived after the deadline), and
-        `OllamaCallFailed` on a transport/response error. Iterating to
-        exhaustion (the final `chunk.done`) or letting the generator be
-        garbage-collected/closed early both release the underlying HTTP
-        stream -- see the module docstring.
+        observes a chunk that arrived after the deadline), `OllamaCallFailed`
+        on a transport/response error, and -- when `cancellation_token` is
+        supplied and gets cancelled mid-stream -- `OllamaCallCancelled`,
+        checked at the same point and cadence as the deadline (Task 3).
+        Iterating to exhaustion (the final `chunk.done`), letting the
+        generator be garbage-collected/closed early, or either exception
+        path above all release the underlying HTTP stream -- see the
+        module docstring. `cancellation_token` defaults to `None`, so
+        every existing caller (Task 1) is unaffected.
         """
         deadline = self._clock() + self._timeout_seconds
         try:
@@ -137,6 +168,10 @@ class OllamaAdapter:
                     raise OllamaCallTimeout(
                         f"model call to {model_id!r} exceeded the "
                         f"{self._timeout_seconds}s per-model-call timeout"
+                    )
+                if cancellation_token is not None and cancellation_token.is_cancelled():
+                    raise OllamaCallCancelled(
+                        f"model call to {model_id!r} was cancelled ({cancellation_token.reason})"
                     )
                 try:
                     part = next(stream)
