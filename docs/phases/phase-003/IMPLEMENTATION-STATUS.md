@@ -1,24 +1,24 @@
 ---
 id: PHASE-003-IMPLEMENTATION-STATUS
 title: Phase 3 Implementation Status
-status: Planned
-version: 0.1.0
+status: In progress
+version: 0.2.0
 owner: Lucky Jain
-updated: 2026-07-16
+updated: 2026-07-23
 ---
 
 # Phase 3 Implementation Status
 
-Phase 3 is planned and has not started. This document is informational and does not override normative contracts.
+Phase 3 implementation has started on `feature/phase-3-attention-engine`. This document is informational and does not override normative contracts.
 
 ## Planning artifacts
 
-`docs/superpowers/specs/2026-07-22-phase-3-human-attention-engine-design.md` (approach, including Open decision 1: reconcile the proposed `attention_items`/`attention_overrides` tables with the already-shipped Phase 1 `attention_items`/`attention.py` rather than fork them) and `docs/superpowers/plans/2026-07-22-phase-3-human-attention-engine.md` (task-by-task implementation plan, eight slices). Neither document authorizes implementation by itself — see Prerequisites below.
+`docs/superpowers/specs/2026-07-22-phase-3-human-attention-engine-design.md` (approach) and `docs/superpowers/plans/2026-07-22-phase-3-human-attention-engine.md` (task-by-task implementation plan, eight slices).
 
 ## Prerequisites
 
-- Phase 1 and Phase 2 exit gates complete, or an explicit repository-owner parallel-start authorization matching Phase 2's precedent — **not yet granted.**
-- Phase 3 contracts approved for implementation — **not yet done.** Blocked on the design doc's Open decision 1 (`attention_items` reconciliation) and the three approval gates named in `docs/phases/PHASE-REVIEW.md:128` (attention policy weights/caps, critical-item definition, dogfood success thresholds), all requiring repository-owner sign-off (design doc proposes concrete starting answers for each — see Task 0 of the implementation plan).
+- Phase 1 and Phase 2 exit gates complete, or an explicit repository-owner parallel-start authorization matching Phase 2's precedent — **granted 2026-07-23**, same exception Phase 2 received; see `docs/ROADMAP.md`'s Phase 3 status note and `PHASE-003-human-attention-engine.md`'s "Dependency exit posture" section.
+- Phase 3 contracts approved for implementation — **done 2026-07-23.** Open decision 1 (`attention_items` reconciliation) resolved: extend Phase 1's shipped `attention_items` in place, no separate `attention_overrides` table; `phase-003/DATA-MODEL.md` and `API-SCHEMAS.md` updated accordingly. The three approval gates named in `docs/phases/PHASE-REVIEW.md:128` are resolved in `phase-003/ATTENTION-MODEL.md` (policy weights/caps, critical-item definition) and `PHASE-003-human-attention-engine.md` (dogfood success thresholds).
 - Versioned attention-policy scenarios and product-validation rubric established — planned as `tests/fixtures/phase3_attention_scenarios.py` (Task 1 of the implementation plan), not yet created.
 - Ethics review confirms excluded ranking signals and non-surveillance boundaries — planned as an automated CI gate (`scripts/check_phase3_prohibited_signals.py`, Task 8), not yet created.
 

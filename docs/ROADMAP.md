@@ -4,7 +4,7 @@
 
 **Foundation:** Phase 0 baseline approved and implemented  
 **Current delivery:** [Phase 1 — Executive Dashboard MVP](phases/PHASE-001-executive-dashboard-mvp.md) — engineering delivery complete on `feature/phase-1-production-hardening` (Tasks 1-11 of `superpowers/plans/2026-07-16-phase-1-completion.md`, each independently reviewed with zero Critical or Important findings); Phase 1 exit remains open pending the seven-day daily-use validation gate and human change review — see [Phase 1 Implementation Status](phases/phase-001/IMPLEMENTATION-STATUS.md)  
-**Future specifications:** Phase 2 Approved for Implementation and in progress (parallel to Phase 1's open exit gates); Phases 3–9 published as Draft / Planned
+**Future specifications:** Phase 2 Approved for Implementation and in progress (parallel to Phase 1's open exit gates); Phase 3 Approved for Implementation and beginning (parallel-start exception granted, same as Phase 2's); Phases 4–9 published as Draft / Planned
 
 The [canonical phase index](phases/README.md) lists every primary specification and supporting contract. The [Phase 0–9 documentation review](phases/PHASE-REVIEW.md) records completeness findings and approval gates.
 
@@ -27,7 +27,7 @@ Every phase must:
 Phase 0 — Repository Foundation         [Implemented]
   -> Phase 1 — Executive Dashboard MVP [Engineering delivery complete; exit gates open]
   -> Phase 2 — Knowledge Platform      [Approved for Implementation; in progress, parallel to open Phase 1 exit gates]
-  -> Phase 3 — Human Attention Engine  [Draft]
+  -> Phase 3 — Human Attention Engine  [Approved for Implementation; in progress, parallel-start exception granted]
   -> Phase 4 — AI Runtime              [Draft]
   -> Phase 5 — Automation              [Draft]
   -> Phase 6 — Engineering Workspace   [Draft]
@@ -86,11 +86,12 @@ Implementation plan: [Phase 2 Knowledge Platform Implementation Plan](superpower
 
 ## Phase 3 — Human Attention Engine
 
-**Status:** Draft / Planned.
+**Status:** Approved for Implementation; contracts moved from Draft after resolving the `attention_items`-reconciliation decision in `docs/superpowers/specs/2026-07-22-phase-3-human-attention-engine-design.md` (extend Phase 1's shipped `attention_items` table rather than fork a new one plus a separate `attention_overrides` table). The three named approval gates (attention policy weights/caps, critical-item definition, dogfood success thresholds) are resolved in `phase-003/ATTENTION-MODEL.md` and `PHASE-003-human-attention-engine.md`. Implementation begins by explicit repository-owner authorization to proceed in parallel with Phase 1/2's own open exit gates — the same kind of exception Phase 2 received.
 
 Explainable attention, waiting direction, risk review, capacity-aware planning and evidence-backed meeting preparation.
 
-Specification: [PHASE-003](phases/PHASE-003-human-attention-engine.md)
+Specification: [PHASE-003](phases/PHASE-003-human-attention-engine.md)  
+Implementation plan: [Phase 3 Human Attention Engine Implementation Plan](superpowers/plans/2026-07-22-phase-3-human-attention-engine.md)
 
 ## Phase 4 — AI Runtime
 

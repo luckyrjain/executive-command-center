@@ -1,8 +1,8 @@
 ---
 id: PHASE-003-API-SCHEMAS
 title: Phase 3 Human Attention API
-status: Draft
-version: 0.1.0
+status: Approved for Implementation
+version: 0.2.0
 owner: Lucky Jain
 ---
 
@@ -13,7 +13,7 @@ owner: Lucky Jain
 ```text
 GET /attention
 GET /attention/{id}
-POST /attention/{id}/pin|dismiss|defer|restore
+POST /attention/{id}/dismiss|defer|restore
 POST /attention/{id}/feedback
 GET|POST /waiting
 PATCH /waiting/{id}
@@ -36,6 +36,8 @@ Session-derived actor/workspace, UUIDs, ISO-8601 with workspace timezone, signed
 ## Attention result
 
 Includes source reference, state, score, confidence, policy version, ordered factors, evidence, freshness, waiting direction, risk indicators and applicable user override. It must never expose a hidden person score.
+
+There is no dedicated `/pin` action (dropped per `DATA-MODEL.md`'s reconciliation with Phase 1's shipped `attention_items`): pin is read through from the source entity's own `pinned` column, so pinning happens via the source entity's existing `PATCH` (task/commitment/risk today, plus whatever new Phase 2/3 entity types this phase scores).
 
 ## Planning
 

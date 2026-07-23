@@ -33,6 +33,8 @@ Domains may reference another domain’s entity ID but may not directly mutate a
 | AI Platform | PromptDefinition, ModelExecution, EvaluationResult, AgentRun |
 | Integration Platform | ConnectorAccount, SyncCursor, SourceRecord |
 
+Backend package note (Phase 3, approved 2026-07-23): `AttentionItem` moves from `backend/ecc/domains/governance/attention.py` to a dedicated `backend/ecc/domains/attention/` package, which also owns Phase 3's new WaitingLink, RiskReview (history), CapacityProfile, PlanningConstraint, Plan/PlanBlock and MeetingPack records — all still conceptually within the Executive Intelligence domain above, just their own backend package since Phase 3 substantially extends and owns that surface. `Risk`'s CRUD stays in `governance/risks.py`; Phase 3 only adds the `risk_reviews` history table and a review endpoint reading/writing it.
+
 ## Core entities
 
 ### Workspace
