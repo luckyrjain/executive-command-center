@@ -95,9 +95,12 @@ def capacity_test_context() -> Iterator[tuple[TestClient, UUID, UUID, str]]:
             )
 
 
-def _headers(token: str) -> dict[str, str]:
+def _headers(token: str, key: str | None = None) -> dict[str, str]:
     csrf = new(settings.session_secret.encode(), token.encode(), "sha256").hexdigest()
-    return {"X-CSRF-Token": csrf, "X-Correlation-ID": str(uuid4())}
+    headers = {"X-CSRF-Token": csrf, "X-Correlation-ID": str(uuid4())}
+    if key is not None:
+        headers["Idempotency-Key"] = key
+    return headers
 
 
 def _full_week(available: int = 480, focus: int = 240) -> list[dict]:
@@ -126,7 +129,7 @@ def test_put_capacity_profile_creates_and_updates_with_versioning(
 
     created = client.put(
         "/api/v1/planning/capacity",
-        headers=_headers(token),
+        headers=_headers(token, "put-create"),
         json={"expected_version": 0, "timezone": "Asia/Kolkata", "days": _full_week()},
     )
     assert created.status_code == 200, created.text
@@ -140,7 +143,7 @@ def test_put_capacity_profile_creates_and_updates_with_versioning(
 
     updated = client.put(
         "/api/v1/planning/capacity",
-        headers=_headers(token),
+        headers=_headers(token, "put-update"),
         json={
             "expected_version": 1,
             "timezone": "Asia/Kolkata",
@@ -153,11 +156,167 @@ def test_put_capacity_profile_creates_and_updates_with_versioning(
 
     stale = client.put(
         "/api/v1/planning/capacity",
-        headers=_headers(token),
+        headers=_headers(token, "put-stale"),
         json={"expected_version": 1, "timezone": "Asia/Kolkata", "days": _full_week()},
     )
     assert stale.status_code == 409
     assert stale.json()["error"]["code"] == "VERSION_CONFLICT"
+
+
+def test_put_capacity_profile_replays_response_on_same_idempotency_key(
+    capacity_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    """Regression for the confirmed failure scenario: a client PUTs with
+    ``expected_version=1``, the write succeeds and bumps the profile to
+    version 2, but the response is lost in transit. A byte-for-byte retry
+    (same ``Idempotency-Key``, same payload, still claiming
+    ``expected_version=1``) must replay the original response instead of
+    hitting a spurious ``VERSION_CONFLICT`` against its own already-applied
+    write -- the same ``Idempotency-Key`` + replay-cache pairing every other
+    ``expected_version``-guarded mutation in this domain uses (waiting-link
+    PATCH, risk review create, plan accept/supersede/propose/move/remove).
+    """
+    client, _, _, token = capacity_test_context
+
+    seed = client.put(
+        "/api/v1/planning/capacity",
+        headers=_headers(token, "seed-version"),
+        json={"expected_version": 0, "timezone": "Asia/Kolkata", "days": _full_week()},
+    )
+    assert seed.status_code == 200, seed.text
+
+    headers = _headers(token, "retry-same-key")
+    payload = {
+        "expected_version": 1,
+        "timezone": "Asia/Kolkata",
+        "days": _full_week(available=600, focus=300),
+    }
+    first = client.put("/api/v1/planning/capacity", headers=headers, json=payload)
+    assert first.status_code == 200, first.text
+    assert first.json()["version"] == 2
+
+    # Current state is now at version 2; a naive retry evaluating
+    # expected_version=1 against it would hit VERSION_CONFLICT without the
+    # idempotency-key replay cache short-circuiting before that check.
+    replay = client.put("/api/v1/planning/capacity", headers=headers, json=payload)
+    assert replay.status_code == 200, replay.text
+    assert replay.json()["version"] == first.json()["version"] == 2
+    assert replay.json()["days"] == first.json()["days"]
+    assert replay.json()["timezone"] == first.json()["timezone"]
+
+
+def test_put_capacity_profile_still_conflicts_on_genuine_stale_retry(
+    capacity_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    """A retry with a different Idempotency-Key (or no cached key at all)
+    against a genuinely stale ``expected_version`` must still 409 -- the
+    replay cache only short-circuits an *exact* retry, not every retry.
+    """
+    client, _, _, token = capacity_test_context
+
+    seed = client.put(
+        "/api/v1/planning/capacity",
+        headers=_headers(token, "genuine-conflict-seed"),
+        json={"expected_version": 0, "timezone": "Asia/Kolkata", "days": _full_week()},
+    )
+    assert seed.status_code == 200, seed.text
+
+    advance = client.put(
+        "/api/v1/planning/capacity",
+        headers=_headers(token, "genuine-conflict-advance"),
+        json={
+            "expected_version": 1,
+            "timezone": "Asia/Kolkata",
+            "days": _full_week(available=600, focus=300),
+        },
+    )
+    assert advance.status_code == 200, advance.text
+    assert advance.json()["version"] == 2
+
+    conflicting = client.put(
+        "/api/v1/planning/capacity",
+        headers=_headers(token, "genuine-conflict-retry"),
+        json={"expected_version": 1, "timezone": "Asia/Kolkata", "days": _full_week()},
+    )
+    assert conflicting.status_code == 409
+    assert conflicting.json()["error"]["code"] == "VERSION_CONFLICT"
+
+
+def test_put_capacity_profile_conflicting_payload_same_key_returns_idempotency_conflict(
+    capacity_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    """Reusing an Idempotency-Key with a materially different payload is not
+    a valid retry -- it must 409 IDEMPOTENCY_CONFLICT (not silently replay
+    the first response, and not silently apply the second write), and must
+    record the same ``record_idempotency_conflict`` observability signal
+    every other idempotency-replay path in the codebase emits.
+    """
+    from ecc.observability import render_metrics
+
+    client, _, _, token = capacity_test_context
+    headers = _headers(token, "conflicting-payload-key")
+
+    first = client.put(
+        "/api/v1/planning/capacity",
+        headers=headers,
+        json={"expected_version": 0, "timezone": "Asia/Kolkata", "days": _full_week()},
+    )
+    assert first.status_code == 200, first.text
+
+    conflicting = client.put(
+        "/api/v1/planning/capacity",
+        headers=headers,
+        json={"expected_version": 0, "timezone": "UTC", "days": _full_week()},
+    )
+    assert conflicting.status_code == 409
+    assert conflicting.json()["error"]["code"] == "IDEMPOTENCY_CONFLICT"
+    assert 'ecc_idempotency_conflicts_total{domain="capacity"}' in render_metrics()
+
+
+def test_put_capacity_profile_writes_audit_trail(
+    capacity_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    """Every other mutating endpoint in this domain writes an audit_events
+    row (and an event_outbox row) inside the same transaction as the
+    mutation (phase-003/API-SCHEMAS.md: "Mutations return the current
+    representation and write audit/outbox atomically"). PUT capacity must
+    too -- mirroring test_task_postgres.py's audit-trail assertion pattern.
+    """
+    client, workspace_id, user_id, token = capacity_test_context
+
+    response = client.put(
+        "/api/v1/planning/capacity",
+        headers=_headers(token, "audit-trail"),
+        json={"expected_version": 0, "timezone": "Asia/Kolkata", "days": _full_week()},
+    )
+    assert response.status_code == 200, response.text
+
+    with engine.connect() as connection:
+        audit_types = (
+            connection.execute(
+                text(
+                    """
+                    SELECT event_type FROM audit_events
+                    WHERE workspace_id = :workspace_id AND aggregate_id = :user_id
+                    ORDER BY occurred_at
+                    """
+                ),
+                {"workspace_id": workspace_id, "user_id": user_id},
+            )
+            .scalars()
+            .all()
+        )
+        outbox_types = (
+            connection.execute(
+                text("SELECT event_type FROM event_outbox WHERE workspace_id = :workspace_id"),
+                {"workspace_id": workspace_id},
+            )
+            .scalars()
+            .all()
+        )
+
+    assert "capacity_profile.updated" in audit_types
+    assert "capacity_profile.updated.v1" in outbox_types
 
 
 def test_put_capacity_profile_rejects_incomplete_week(
@@ -166,7 +325,7 @@ def test_put_capacity_profile_rejects_incomplete_week(
     client, _, _, token = capacity_test_context
     response = client.put(
         "/api/v1/planning/capacity",
-        headers=_headers(token),
+        headers=_headers(token, "incomplete-week"),
         json={"expected_version": 0, "timezone": "UTC", "days": _full_week()[:6]},
     )
     assert response.status_code == 422
@@ -179,7 +338,7 @@ def test_put_capacity_profile_rejects_focus_exceeding_available(
     days = _full_week(available=100, focus=200)
     response = client.put(
         "/api/v1/planning/capacity",
-        headers=_headers(token),
+        headers=_headers(token, "focus-exceeds-available"),
         json={"expected_version": 0, "timezone": "UTC", "days": days},
     )
     assert response.status_code == 422
@@ -191,7 +350,7 @@ def test_put_capacity_profile_rejects_unknown_timezone(
     client, _, _, token = capacity_test_context
     response = client.put(
         "/api/v1/planning/capacity",
-        headers=_headers(token),
+        headers=_headers(token, "unknown-timezone"),
         json={"expected_version": 0, "timezone": "Not/A_Zone", "days": _full_week()},
     )
     assert response.status_code == 422
@@ -209,7 +368,7 @@ def test_capacity_profile_hidden_across_workspaces(
     client, _, _, token = capacity_test_context
     created = client.put(
         "/api/v1/planning/capacity",
-        headers=_headers(token),
+        headers=_headers(token, "hidden-across-workspaces"),
         json={"expected_version": 0, "timezone": "Asia/Kolkata", "days": _full_week()},
     )
     assert created.status_code == 200, created.text
@@ -430,6 +589,46 @@ def test_create_constraint_idempotent_on_replay(
     second = client.post("/api/v1/planning/constraints", headers=headers, json=payload)
     assert second.status_code == 201
     assert second.json()["id"] == first.json()["id"]
+
+
+def test_create_constraint_conflicting_replay_returns_409_and_records_metric(
+    capacity_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    """Reusing an Idempotency-Key with a materially different payload must
+    409 IDEMPOTENCY_CONFLICT, and must record the same
+    ``record_idempotency_conflict`` observability signal every other
+    idempotency-replay path in the codebase emits on this same conflict.
+    """
+    from ecc.observability import render_metrics
+
+    client, _, _, token = capacity_test_context
+    headers = {**_headers(token), "Idempotency-Key": "conflicting-constraint-key"}
+
+    first = client.post(
+        "/api/v1/planning/constraints",
+        headers=headers,
+        json={
+            "kind": "preference",
+            "label": "No meetings before 10am",
+            "hardness": "soft",
+            "priority": 10,
+        },
+    )
+    assert first.status_code == 201, first.text
+
+    conflicting = client.post(
+        "/api/v1/planning/constraints",
+        headers=headers,
+        json={
+            "kind": "preference",
+            "label": "No meetings before 10am",
+            "hardness": "soft",
+            "priority": 20,
+        },
+    )
+    assert conflicting.status_code == 409
+    assert conflicting.json()["error"]["code"] == "IDEMPOTENCY_CONFLICT"
+    assert 'ecc_idempotency_conflicts_total{domain="planning_constraints"}' in render_metrics()
 
 
 def test_archive_constraint_rejects_unknown_id(

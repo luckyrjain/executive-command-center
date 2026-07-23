@@ -1058,6 +1058,10 @@ def test_attention_feedback_recorded_and_idempotent(
         json={"label": "not_useful"},
     )
     assert conflicting.status_code == 409
+    assert conflicting.json()["error"]["code"] == "IDEMPOTENCY_CONFLICT"
+    from ecc.observability import render_metrics
+
+    assert 'ecc_idempotency_conflicts_total{domain="attention"}' in render_metrics()
 
     missing_target = client.post(
         f"/api/v1/attention/{uuid4()}/feedback",
