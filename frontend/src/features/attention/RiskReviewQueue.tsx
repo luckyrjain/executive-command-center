@@ -12,6 +12,7 @@ export type ReviewQueueItem = {
   status: string
   review_at: string | null
   urgency: ReviewUrgency
+  version: number
 }
 
 type ReviewQueueList = { items: ReviewQueueItem[] }
@@ -55,6 +56,7 @@ export default function RiskReviewQueue() {
     void queryClient.invalidateQueries({ queryKey: ['risk-review-queue'] })
     void queryClient.invalidateQueries({ queryKey: ['risks'] })
     void queryClient.invalidateQueries({ queryKey: ['dashboard', 'today'] })
+    void queryClient.invalidateQueries({ queryKey: ['brief', 'morning'] })
   }
 
   const reviewMutation = useMutation({
@@ -107,7 +109,7 @@ export default function RiskReviewQueue() {
                 type="button"
                 disabled={pending}
                 aria-label={`Record review for ${item.description}`}
-                onClick={() => setReviewing({ item, draft: emptyDraft, version: 1 })}
+                onClick={() => setReviewing({ item, draft: emptyDraft, version: item.version })}
               >
                 Record review
               </button>
@@ -119,7 +121,6 @@ export default function RiskReviewQueue() {
       {reviewing ? (
         <form onSubmit={submit}>
           <h2>Record review: {reviewing.item.description}</h2>
-          <label>Expected version<input aria-label="Expected version" type="number" min={1} value={reviewing.version} onChange={(e) => setReviewing({ ...reviewing, version: Number(e.target.value) })} /></label>
           <label>Outcome
             <select aria-label="Review outcome" value={reviewing.draft.outcome} onChange={(e) => setReviewing({ ...reviewing, draft: { ...reviewing.draft, outcome: e.target.value as ReviewOutcome } })}>
               {OUTCOMES.map((outcome) => <option key={outcome} value={outcome}>{outcome.replaceAll('_', ' ')}</option>)}

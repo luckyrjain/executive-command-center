@@ -61,6 +61,7 @@ class ReviewQueueItem(BaseModel):
     status: str
     review_at: datetime | None
     urgency: Literal["overdue", "due_soon", "scheduled", "unscheduled"]
+    version: int
 
 
 class ReviewQueueList(BaseModel):
@@ -314,7 +315,7 @@ def list_review_queue(
         session.execute(
             text(
                 """
-                SELECT id, description, status, review_at
+                SELECT id, description, status, review_at, version
                 FROM risks
                 WHERE workspace_id = :workspace_id AND archived_at IS NULL
                   AND status <> 'closed' AND review_at IS NOT NULL
@@ -344,6 +345,7 @@ def list_review_queue(
                 status=row["status"],
                 review_at=review_at,
                 urgency=urgency,
+                version=row["version"],
             )
         )
     return ReviewQueueList(items=items)
