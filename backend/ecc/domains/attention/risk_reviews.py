@@ -1,0 +1,333 @@
+from datetime import UTC, datetime, timedelta
+from hashlib import sha256
+from json import dumps
+from typing import Annotated, Literal
+from uuid import UUID, uuid4
+
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+from sqlalchemy import text
+from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.orm import Session
+
+from ecc.auth import AuthContext, AuthDep, CsrfDep
+from ecc.database import get_session
+from ecc.observability import queue_lifecycle_event, record_audit_outbox_failure
+
+router = APIRouter(prefix="/api/v1/risks", tags=["risks"])
+SessionDep = Annotated[Session, Depends(get_session)]
+IdempotencyHeader = Annotated[
+    str,
+    Header(alias="Idempotency-Key", min_length=1, max_length=255),
+]
+
+ReviewOutcome = Literal["no_change", "escalated", "de_escalated", "mitigated", "closed"]
+
+_REVIEW_FIELDS = """
+    id, risk_id, outcome, notes, evidence_refs, reviewed_at, next_review_at, actor_id
+"""
+
+
+class RiskReview(BaseModel):
+    id: UUID
+    risk_id: UUID
+    outcome: ReviewOutcome
+    notes: str | None
+    evidence_refs: list[str]
+    reviewed_at: datetime
+    next_review_at: datetime | None
+    actor_id: UUID
+
+
+class RiskReviewCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    expected_version: int = Field(ge=1)
+    outcome: ReviewOutcome
+    notes: str | None = Field(default=None, max_length=5000)
+    evidence_refs: list[str] = Field(default_factory=list, max_length=50)
+    next_review_at: datetime | None = None
+
+    @field_validator("next_review_at")
+    @classmethod
+    def _require_tz(cls, value: datetime | None) -> datetime | None:
+        if value is not None and (value.tzinfo is None or value.utcoffset() is None):
+            raise ValueError("next_review_at must include a timezone offset")
+        return value
+
+
+class ReviewQueueItem(BaseModel):
+    risk_id: UUID
+    description: str
+    status: str
+    review_at: datetime | None
+    urgency: Literal["overdue", "due_soon", "scheduled", "unscheduled"]
+
+
+class ReviewQueueList(BaseModel):
+    items: list[ReviewQueueItem]
+
+
+def _lock_idempotency(session: Session, auth: AuthContext, key: str) -> None:
+    lock_key = f"{auth.workspace_id}:{auth.user_id}:{key}"
+    session.execute(
+        text("SELECT pg_advisory_xact_lock(hashtextextended(:lock_key, 0))"),
+        {"lock_key": lock_key},
+    )
+
+
+def _request_hash(payload: BaseModel, action: str) -> str:
+    material = {"action": action, "payload": payload.model_dump(mode="json")}
+    return sha256(dumps(material, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def _request_ids(request: Request) -> tuple[UUID, UUID]:
+    try:
+        return UUID(request.state.request_id), UUID(request.state.correlation_id)
+    except (AttributeError, TypeError, ValueError):
+        return uuid4(), uuid4()
+
+
+def _load_cached(
+    session: Session, auth: AuthContext, key: str, request_hash: str
+) -> RiskReview | None:
+    row = (
+        session.execute(
+            text(
+                """
+                SELECT request_hash, response_body FROM idempotency_records
+                WHERE workspace_id = :workspace_id AND actor_id = :actor_id
+                  AND key = :key AND expires_at > :now
+                """
+            ),
+            {
+                "workspace_id": auth.workspace_id,
+                "actor_id": auth.user_id,
+                "key": key,
+                "now": datetime.now(UTC),
+            },
+        )
+        .mappings()
+        .one_or_none()
+    )
+    if row is None:
+        return None
+    if row["request_hash"] != request_hash:
+        raise HTTPException(status_code=409, detail="IDEMPOTENCY_CONFLICT")
+    return RiskReview.model_validate(row["response_body"])
+
+
+@router.post("/{risk_id}/review", response_model=RiskReview, status_code=status.HTTP_201_CREATED)
+def record_risk_review(
+    risk_id: UUID,
+    payload: RiskReviewCreate,
+    request: Request,
+    auth: AuthDep,
+    session: SessionDep,
+    _csrf: CsrfDep,
+    idempotency_key: IdempotencyHeader,
+) -> RiskReview:
+    """Records a review and updates ``risks.review_at``/``version`` in the
+    same transaction as the ``risk_reviews`` insert -- a single dual-write,
+    matching every existing dual-write pattern in this codebase (e.g.
+    entity_operations.py's merge/reverse, claims.py's supersede).
+    ``risks.py``'s existing CRUD and its ``review_overdue``/
+    ``review_due_soon`` scoring factors (already live in
+    ``attention.py:_score_risk``) are unmodified by this endpoint.
+    """
+    request_hash = _request_hash(payload, f"review:{risk_id}")
+    now = datetime.now(UTC)
+    review_id = uuid4()
+    with session.begin():
+        _lock_idempotency(session, auth, idempotency_key)
+        cached = _load_cached(session, auth, idempotency_key, request_hash)
+        if cached is not None:
+            return cached
+        risk = (
+            session.execute(
+                text(
+                    "SELECT version, archived_at FROM risks "
+                    "WHERE workspace_id = :workspace_id AND id = :risk_id FOR UPDATE"
+                ),
+                {"workspace_id": auth.workspace_id, "risk_id": risk_id},
+            )
+            .mappings()
+            .one_or_none()
+        )
+        if risk is None:
+            raise HTTPException(status_code=404, detail="RISK_NOT_FOUND")
+        if risk["archived_at"] is not None:
+            raise HTTPException(status_code=409, detail="RISK_ARCHIVED")
+        if risk["version"] != payload.expected_version:
+            raise HTTPException(status_code=409, detail="VERSION_CONFLICT")
+
+        review_row = (
+            session.execute(
+                text(
+                    f"""
+                    INSERT INTO risk_reviews (
+                        id, workspace_id, risk_id, outcome, notes, evidence_refs,
+                        reviewed_at, next_review_at, actor_id
+                    ) VALUES (
+                        :id, :workspace_id, :risk_id, :outcome, :notes, :evidence_refs,
+                        :reviewed_at, :next_review_at, :actor_id
+                    )
+                    RETURNING {_REVIEW_FIELDS}
+                    """
+                ),
+                {
+                    "id": review_id,
+                    "workspace_id": auth.workspace_id,
+                    "risk_id": risk_id,
+                    "outcome": payload.outcome,
+                    "notes": payload.notes,
+                    "evidence_refs": payload.evidence_refs,
+                    "reviewed_at": now,
+                    "next_review_at": payload.next_review_at,
+                    "actor_id": auth.user_id,
+                },
+            )
+            .mappings()
+            .one()
+        )
+        new_status = "closed" if payload.outcome == "closed" else None
+        session.execute(
+            text(
+                """
+                UPDATE risks
+                SET review_at = :next_review_at, updated_by = :actor_id,
+                    updated_at = :now, version = version + 1
+                    """
+                + (", status = :new_status" if new_status else "")
+                + """
+                WHERE workspace_id = :workspace_id AND id = :risk_id
+                """
+            ),
+            {
+                "next_review_at": payload.next_review_at,
+                "actor_id": auth.user_id,
+                "now": now,
+                "workspace_id": auth.workspace_id,
+                "risk_id": risk_id,
+                **({"new_status": new_status} if new_status else {}),
+            },
+        )
+        response = RiskReview.model_validate(dict(review_row))
+        request_id, correlation_id = _request_ids(request)
+        try:
+            session.execute(
+                text(
+                    """
+                    INSERT INTO audit_events (
+                        id, workspace_id, event_type, aggregate_type, aggregate_id,
+                        aggregate_version, actor_id, request_id, correlation_id,
+                        changed_fields, authorization_result, source, metadata, occurred_at
+                    ) VALUES (
+                        :id, :workspace_id, 'risk_review.recorded', 'risk', :aggregate_id,
+                        :aggregate_version, :actor_id, :request_id, :correlation_id,
+                        ARRAY['review_at','version'], 'allowed', 'user', '{}'::jsonb, :occurred_at
+                    )
+                    """
+                ),
+                {
+                    "id": uuid4(),
+                    "workspace_id": auth.workspace_id,
+                    "aggregate_id": risk_id,
+                    "aggregate_version": risk["version"] + 1,
+                    "actor_id": auth.user_id,
+                    "request_id": request_id,
+                    "correlation_id": correlation_id,
+                    "occurred_at": now,
+                },
+            )
+            session.execute(
+                text(
+                    """
+                    INSERT INTO event_outbox (
+                        event_id, workspace_id, event_type, event_version,
+                        correlation_id, payload, occurred_at, attempt_count
+                    ) VALUES (
+                        :event_id, :workspace_id, 'risk_review.recorded.v1', 1,
+                        :correlation_id, CAST(:payload AS jsonb), :occurred_at, 0
+                    )
+                    """
+                ),
+                {
+                    "event_id": uuid4(),
+                    "workspace_id": auth.workspace_id,
+                    "correlation_id": correlation_id,
+                    "payload": dumps({"risk_id": str(risk_id), "review_id": str(review_id)}),
+                    "occurred_at": now,
+                },
+            )
+        except SQLAlchemyError:
+            record_audit_outbox_failure("risk_reviews")
+            raise
+        queue_lifecycle_event(session, "risk", "risk_review.recorded", "allowed")
+
+        session.execute(
+            text(
+                """
+                INSERT INTO idempotency_records (
+                    workspace_id, actor_id, key, request_hash, response_status,
+                    response_body, created_at, expires_at
+                ) VALUES (
+                    :workspace_id, :actor_id, :key, :request_hash, 201,
+                    CAST(:response_body AS jsonb), :created_at, :expires_at
+                )
+                """
+            ),
+            {
+                "workspace_id": auth.workspace_id,
+                "actor_id": auth.user_id,
+                "key": idempotency_key,
+                "request_hash": request_hash,
+                "response_body": dumps(response.model_dump(mode="json")),
+                "created_at": now,
+                "expires_at": now + timedelta(days=365),
+            },
+        )
+        return response
+
+
+@router.get("/review-queue", response_model=ReviewQueueList)
+def list_review_queue(
+    auth: AuthDep, session: SessionDep, limit: int = Query(default=50, ge=1, le=100)
+) -> ReviewQueueList:
+    now = datetime.now(UTC)
+    rows = (
+        session.execute(
+            text(
+                """
+                SELECT id, description, status, review_at
+                FROM risks
+                WHERE workspace_id = :workspace_id AND archived_at IS NULL
+                  AND status <> 'closed' AND review_at IS NOT NULL
+                ORDER BY review_at ASC
+                LIMIT :limit
+                """
+            ),
+            {"workspace_id": auth.workspace_id, "limit": limit},
+        )
+        .mappings()
+        .all()
+    )
+    items: list[ReviewQueueItem] = []
+    for row in rows:
+        review_at: datetime = row["review_at"]
+        delta = review_at - now
+        if delta.total_seconds() < 0:
+            urgency: Literal["overdue", "due_soon", "scheduled", "unscheduled"] = "overdue"
+        elif delta <= timedelta(hours=48):
+            urgency = "due_soon"
+        else:
+            urgency = "scheduled"
+        items.append(
+            ReviewQueueItem(
+                risk_id=row["id"],
+                description=row["description"],
+                status=row["status"],
+                review_at=review_at,
+                urgency=urgency,
+            )
+        )
+    return ReviewQueueList(items=items)
