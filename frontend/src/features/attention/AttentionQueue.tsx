@@ -170,7 +170,7 @@ export default function AttentionQueue() {
         <section className="dashboard-card" aria-labelledby="attention-overridden">
           <div className="section-heading"><h2 id="attention-overridden">Dismissed or deferred (reversible)</h2></div>
           <ol className="item-list">
-            {(query.data.items ?? []).filter((item) => item.dismissed_at).map((item) => (
+            {(query.data.items ?? []).filter((item) => item.dismissed_at || item.deferred_until).map((item) => (
               <li key={item.id}>
                 <div><strong>{item.explanation}</strong>{item.override_reason ? <small>{item.override_reason}</small> : null}</div>
                 <button type="button" disabled={pending} aria-label={`Restore ${item.explanation}`} onClick={() => actionMutation.mutate({ item, action: 'restore' })}>Restore</button>

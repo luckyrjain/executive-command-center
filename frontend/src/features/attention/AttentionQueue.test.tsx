@@ -118,4 +118,22 @@ describe('AttentionQueue', () => {
     await waitFor(() => expect(screen.getByText('Already resolved offline')).toBeTruthy())
     expect(screen.getByRole('button', { name: 'Restore Finish the board memo' })).toBeTruthy()
   })
+
+  it('offers a working restore action for deferred-but-not-dismissed items too', async () => {
+    const fetch = vi.fn()
+      .mockImplementationOnce(() => response({ items: [item({ deferred_until: '2026-08-01T00:00:00Z' })] }))
+      .mockImplementationOnce(() => response(item({})))
+      .mockImplementationOnce(() => response({ items: [item({})] }))
+    vi.stubGlobal('fetch', fetch)
+    renderQueue()
+
+    await waitFor(() => expect(screen.getByText('Dismissed or deferred (reversible)')).toBeTruthy())
+    const restoreButton = screen.getByRole('button', { name: 'Restore Finish the board memo' })
+    expect(restoreButton).toBeTruthy()
+
+    fireEvent.click(restoreButton)
+
+    await waitFor(() => expect(fetch).toHaveBeenCalledTimes(3))
+    expect(fetch.mock.calls[1][0]).toContain('/restore')
+  })
 })
