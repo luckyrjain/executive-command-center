@@ -135,6 +135,181 @@ function makeAudit({ corpus, pageSize = 20 }) {
 }
 
 /**
+ * Phase 3 attention-engine endpoints (attention queue, waiting, risk review
+ * queue, plans, meeting prep). Kept as one dedicated dispatcher, same
+ * rationale as makeKnowledgeApi below: none of these fit the generic
+ * {base}/:id/:action resourceHandler shape -- risks/review-queue is a
+ * static path that would otherwise be swallowed as risks/:id (mirroring
+ * the real backend's router-registration-order fix), meetings/:id/prep and
+ * .../prep/refresh nest under an existing resource's id, and plans has two
+ * distinct nested collections (plans and their blocks).
+ */
+function makeAttentionApi(overrides = {}) {
+  const attentionItems = createCollection(overrides.attentionItems ?? [])
+  const waitingLinks = createCollection(overrides.waitingLinks ?? [])
+  const risks = overrides.risksCollection
+  const reviewQueue = [...(overrides.reviewQueue ?? [])]
+  const plans = createCollection(overrides.plans ?? [])
+  const meetingPacks = new Map(Object.entries(overrides.meetingPacks ?? {}))
+  const meetingParticipants = new Map()
+  const aiEnrichmentEnabled = Boolean(overrides.aiEnrichmentEnabled)
+
+  function dispatch(pathname, method, body, queryString) {
+    if (pathname === '/api/v1/attention' && method === 'GET') {
+      return { status: 200, body: { items: attentionItems.list() } }
+    }
+    const attentionAction = pathname.match(/^\/api\/v1\/attention\/([^/]+)\/(dismiss|defer|restore)$/)
+    if (attentionAction && method === 'POST') {
+      const [, id, action] = attentionAction
+      const item = attentionItems.find(id)
+      if (!item) return { status: 404, body: { error: { code: 'NOT_FOUND', message: 'Not found' } } }
+      if (action === 'dismiss') Object.assign(item, { dismissed_at: nowIso(), override_reason: body.reason ?? null })
+      if (action === 'defer') Object.assign(item, { deferred_until: body.deferred_until, override_reason: body.reason ?? null })
+      if (action === 'restore') Object.assign(item, { dismissed_at: null, deferred_until: null, override_reason: null })
+      return { status: 200, body: item }
+    }
+
+    if (pathname === '/api/v1/waiting' && method === 'GET') {
+      return { status: 200, body: { items: waitingLinks.list(), next_cursor: null } }
+    }
+    if (pathname === '/api/v1/waiting' && method === 'POST') {
+      const item = waitingLinks.create({
+        ...body,
+        status: 'open',
+        since_at: body.since_at ?? nowIso(),
+        superseded_by: null,
+        created_at: nowIso(),
+        updated_at: nowIso(),
+      })
+      return { status: 201, body: item }
+    }
+    const waitingTerminal = pathname.match(/^\/api\/v1\/waiting\/([^/]+)\/(fulfil|cancel)$/)
+    if (waitingTerminal && method === 'POST') {
+      const [, id, action] = waitingTerminal
+      return waitingLinks.mutate(id, body.expected_version, () => ({ status: action === 'fulfil' ? 'fulfilled' : 'cancelled' }))
+    }
+
+    if (pathname === '/api/v1/risks/review-queue' && method === 'GET') {
+      return { status: 200, body: { items: reviewQueue } }
+    }
+    const riskReview = pathname.match(/^\/api\/v1\/risks\/([^/]+)\/review$/)
+    if (riskReview && method === 'POST' && risks) {
+      const [, id] = riskReview
+      const result = risks.mutate(id, body.expected_version, () => ({ status: body.outcome === 'closed' ? 'closed' : 'monitoring' }))
+      if (result.status === 200) {
+        const index = reviewQueue.findIndex((entry) => entry.risk_id === id)
+        if (index !== -1) reviewQueue.splice(index, 1)
+      }
+      return result
+    }
+
+    if (pathname === '/api/v1/plans' && method === 'GET') {
+      return { status: 200, body: { items: plans.list(), next_cursor: null } }
+    }
+    if (pathname === '/api/v1/plans' && method === 'POST') {
+      const item = plans.create({
+        period_start: body.period_start,
+        period_end: body.period_end,
+        status: 'proposed',
+        policy_version: 1,
+        capacity_minutes: overrides.planCapacityMinutes ?? 480,
+        conflicts: overrides.planConflicts ?? [],
+        unscheduled: overrides.planUnscheduled ?? [],
+        superseded_by: null,
+        accepted_at: null,
+        blocks: overrides.planBlocks ?? [],
+        diff: null,
+        created_at: nowIso(),
+        updated_at: nowIso(),
+      })
+      return { status: 201, body: item }
+    }
+    const planAction = pathname.match(/^\/api\/v1\/plans\/([^/]+)\/(accept|supersede|propose)$/)
+    if (planAction && method === 'POST') {
+      const [, id, action] = planAction
+      if (action === 'accept') return plans.mutate(id, body.expected_version, () => ({ status: 'accepted', accepted_at: nowIso() }))
+      if (action === 'supersede') return plans.mutate(id, body.expected_version, () => ({ status: 'superseded' }))
+      // propose (replan): mark the old plan superseded, create a new one
+      // carrying an explicit diff -- UX-STATES.md requires the diff be
+      // presented before any acceptance.
+      const old = plans.find(id)
+      if (!old) return { status: 404, body: { error: { code: 'NOT_FOUND', message: 'Not found' } } }
+      if (old.version !== body.expected_version) return { status: 409, body: conflictBody(old) }
+      const diff = overrides.replanDiff ?? []
+      const created = plans.create({
+        period_start: old.period_start,
+        period_end: old.period_end,
+        status: 'proposed',
+        policy_version: old.policy_version,
+        capacity_minutes: old.capacity_minutes,
+        conflicts: old.conflicts,
+        unscheduled: old.unscheduled,
+        superseded_by: null,
+        accepted_at: null,
+        blocks: overrides.replanBlocks ?? old.blocks,
+        diff,
+        created_at: nowIso(),
+        updated_at: nowIso(),
+      })
+      old.status = 'superseded'
+      old.superseded_by = created.id
+      old.version += 1
+      return { status: 201, body: created }
+    }
+    const blockAction = pathname.match(/^\/api\/v1\/plans\/([^/]+)\/blocks\/([^/]+)\/(move|remove)$/)
+    if (blockAction && method === 'POST') {
+      const [, planId, blockId, action] = blockAction
+      return plans.mutate(planId, body.expected_version, (plan) => ({
+        blocks: action === 'remove'
+          ? plan.blocks.filter((block) => block.id !== blockId)
+          : plan.blocks.map((block) => (block.id === blockId ? { ...block, starts_at: body.starts_at, ends_at: body.ends_at } : block)),
+      }))
+    }
+
+    const meetingPrep = pathname.match(/^\/api\/v1\/meetings\/([^/]+)\/prep$/)
+    if (meetingPrep) {
+      const [, meetingId] = meetingPrep
+      if (method === 'GET') {
+        const pack = meetingPacks.get(meetingId)
+        if (!pack) return { status: 404, body: { error: { code: 'MEETING_PACK_NOT_FOUND', message: 'No pack yet' } } }
+        return { status: 200, body: { ...pack, enrichment: aiEnrichmentEnabled ? pack.enrichment : { available: false, summary: null, error_code: 'feature_disabled' } } }
+      }
+      if (method === 'POST') {
+        if (meetingPacks.has(meetingId)) return { status: 409, body: { error: { code: 'MEETING_PACK_EXISTS', message: 'Pack already exists' } } }
+        const pack = overrides.buildMeetingPack ? overrides.buildMeetingPack(meetingId) : null
+        if (!pack) return { status: 404, body: { error: { code: 'MEETING_NOT_FOUND', message: 'Not found' } } }
+        meetingPacks.set(meetingId, pack)
+        return { status: 201, body: pack }
+      }
+    }
+    const meetingPrepRefresh = pathname.match(/^\/api\/v1\/meetings\/([^/]+)\/prep\/refresh$/)
+    if (meetingPrepRefresh && method === 'POST') {
+      const [, meetingId] = meetingPrepRefresh
+      const existing = meetingPacks.get(meetingId)
+      if (!existing) return { status: 404, body: { error: { code: 'MEETING_PACK_NOT_FOUND', message: 'No pack yet' } } }
+      const refreshed = { ...existing, id: randomUUID(), status: 'fresh', generated_at: nowIso() }
+      meetingPacks.set(meetingId, refreshed)
+      return { status: 201, body: refreshed }
+    }
+    const meetingParticipantsPath = pathname.match(/^\/api\/v1\/meetings\/([^/]+)\/participants$/)
+    if (meetingParticipantsPath) {
+      const [, meetingId] = meetingParticipantsPath
+      const list = meetingParticipants.get(meetingId) ?? []
+      if (method === 'GET') return { status: 200, body: { items: list } }
+      if (method === 'POST') {
+        const participant = { id: randomUUID(), entity_id: body.entity_id, entity_name: overrides.entityNames?.[body.entity_id] ?? 'Unknown', role: body.role ?? 'attendee' }
+        meetingParticipants.set(meetingId, [...list, participant])
+        return { status: 201, body: participant }
+      }
+    }
+
+    return null
+  }
+
+  return { dispatch, collections: { attentionItems, waitingLinks, plans }, meetingPacks }
+}
+
+/**
  * Phase 2 knowledge-platform endpoints. Kept as one dedicated dispatcher
  * (rather than several `resourceHandler` calls) because merge/reverse/
  * confirm/reject don't fit the generic {base}/:id/:action shape cleanly --
@@ -537,6 +712,7 @@ export async function createFixtureApi(page, overrides = {}) {
     timelineEntries: overrides.knowledgeTimelineEntries,
     resolutionCandidates: overrides.resolutionCandidates,
   })
+  const attention = makeAttentionApi({ ...overrides.attention, risksCollection: risks })
 
   // `route.fulfill()` synthesizes a response without touching the real
   // network, so `context.setOffline(true)` alone does NOT stop a mocked
@@ -681,6 +857,16 @@ export async function createFixtureApi(page, overrides = {}) {
       const result = knowledge.dispatch(pathname, method, body, queryString)
       if (result) return result
     }
+    // Checked before the generic `resources` loop: /api/v1/risks/review-queue
+    // is a static path that the generic risks resourceHandler below would
+    // otherwise swallow as GET {base}/:id (id="review-queue"), mirroring the
+    // real backend's router-registration-order fix for the same collision.
+    if (pathname.startsWith('/api/v1/attention') || pathname.startsWith('/api/v1/waiting')
+      || pathname === '/api/v1/risks/review-queue' || /^\/api\/v1\/risks\/[^/]+\/review$/.test(pathname)
+      || pathname.startsWith('/api/v1/plans') || /^\/api\/v1\/meetings\/[^/]+\/(prep|participants)/.test(pathname)) {
+      const result = attention.dispatch(pathname, method, body, queryString)
+      if (result) return result
+    }
     for (const resource of resources) {
       const result = resource(pathname, method, body, queryString)
       if (result) return result
@@ -707,6 +893,7 @@ export async function createFixtureApi(page, overrides = {}) {
     requests,
     collections: { tasks, commitments, notes, calendarEvents, meetings, risks, recommendations },
     knowledge,
+    attention,
     dashboard,
     brief,
     evidence,

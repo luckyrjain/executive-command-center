@@ -39,8 +39,9 @@ export async function run({ page, baseURL }) {
   await todayTab.focus()
   assert.equal(await page.evaluate(() => document.activeElement?.textContent), 'Today')
 
-  // Roving tabindex: today(0) -> work(1) -> notes(2) -> schedule(3) -> risks(4) -> knowledge(5).
-  for (let step = 0; step < 5; step += 1) await page.keyboard.press('ArrowRight')
+  // Roving tabindex: today(0) -> attention(1) -> work(2) -> notes(3) ->
+  // schedule(4) -> planner(5) -> meeting-prep(6) -> risks(7) -> knowledge(8).
+  for (let step = 0; step < 8; step += 1) await page.keyboard.press('ArrowRight')
   assert.equal(await page.evaluate(() => document.activeElement?.textContent), 'Knowledge')
   assert.equal(await page.getByRole('tab', { name: 'Knowledge' }).getAttribute('aria-selected'), 'true')
 
