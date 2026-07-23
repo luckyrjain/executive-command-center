@@ -252,28 +252,42 @@ def _would_create_cycle(
         text("SELECT pg_advisory_xact_lock(hashtextextended(:lock_key, 1))"),
         {"lock_key": f"{auth.workspace_id}:waiting_cycle"},
     )
-    frontier = {counterparty_entity_id}
-    visited: set[UUID] = set()
-    for _ in range(64):
-        if subject_id in frontier:
-            return True
-        frontier -= visited
-        if not frontier:
-            return False
-        visited |= frontier
-        rows = session.execute(
-            text(
-                """
-                SELECT counterparty_entity_id FROM waiting_links
-                WHERE workspace_id = :workspace_id AND direction = 'blocked_by'
-                  AND status = 'open' AND subject_type = 'knowledge_entity'
-                  AND subject_id = ANY(:frontier)
-                """
-            ),
-            {"workspace_id": auth.workspace_id, "frontier": list(frontier)},
-        ).all()
-        frontier = {row[0] for row in rows}
-    return False
+    # Single-round-trip equivalent of the old per-hop BFS loop: a recursive
+    # CTE walks the same subject_id -> counterparty_entity_id edges from
+    # counterparty_entity_id, capped at depth 63 (the old loop checked
+    # frontiers at depth 0..63 across its 64 iterations before giving up --
+    # see the range(64) history in git blame -- so this preserves that exact
+    # termination bound rather than searching indefinitely). The `path`
+    # array blocks re-descending into an already-visited node on the same
+    # path, which is what the old loop's `frontier -= visited` did to avoid
+    # cycling forever; since this function is precisely what keeps the
+    # blocked_by graph acyclic, that only ever matters defensively.
+    row = session.execute(
+        text(
+            """
+            WITH RECURSIVE reachable(node_id, depth, path) AS (
+                SELECT (:counterparty_entity_id)::uuid, 0, ARRAY[(:counterparty_entity_id)::uuid]
+                UNION ALL
+                SELECT wl.counterparty_entity_id, r.depth + 1, r.path || wl.counterparty_entity_id
+                FROM waiting_links wl
+                JOIN reachable r ON wl.subject_id = r.node_id
+                WHERE wl.workspace_id = :workspace_id
+                  AND wl.direction = 'blocked_by'
+                  AND wl.status = 'open'
+                  AND wl.subject_type = 'knowledge_entity'
+                  AND r.depth < 63
+                  AND NOT (wl.counterparty_entity_id = ANY(r.path))
+            )
+            SELECT 1 FROM reachable WHERE node_id = :subject_id LIMIT 1
+            """
+        ),
+        {
+            "workspace_id": auth.workspace_id,
+            "counterparty_entity_id": counterparty_entity_id,
+            "subject_id": subject_id,
+        },
+    ).one_or_none()
+    return row is not None
 
 
 @router.post("", response_model=WaitingLink, status_code=status.HTTP_201_CREATED)

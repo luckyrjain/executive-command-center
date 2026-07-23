@@ -6,7 +6,7 @@ from uuid import UUID, uuid4
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import text
+from sqlalchemy import event, text
 
 from ecc.config import get_settings
 from ecc.database import engine
@@ -407,6 +407,70 @@ def test_waiting_link_rejects_circular_blocked_by_chain(
     )
     assert second.status_code == 422, second.text
     assert second.json()["error"]["code"] == "INVALID_WAITING_DIRECTION"
+
+
+def test_waiting_link_rejects_deep_circular_blocked_by_chain(
+    waiting_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    """A blocked_by chain several hops deep -- not just the direct A<->B
+    case above -- must still be detected, and detected in a bounded number
+    of database round-trips rather than one query per hop in the chain
+    (the cycle-detection query was rewritten from a per-hop BFS loop to a
+    single recursive CTE).
+    """
+    client, workspace_id, _, token = waiting_test_context
+    chain_length = 8
+    nodes = [_seed_node(workspace_id, "person", f"Chain node {i}") for i in range(chain_length)]
+
+    # N1 blocked_by N0, N2 blocked_by N1, ..., N7 blocked_by N6 -- a chain
+    # deep enough that closing it back into a cycle previously required
+    # several sequential hop queries, not just one.
+    for i in range(1, chain_length):
+        response = client.post(
+            "/api/v1/waiting",
+            headers=_headers(token, f"deep-chain-{i}"),
+            json={
+                "subject_type": "knowledge_entity",
+                "subject_id": str(nodes[i]),
+                "counterparty_entity_id": str(nodes[i - 1]),
+                "direction": "blocked_by",
+            },
+        )
+        assert response.status_code == 201, response.text
+
+    # Closing the loop -- N0 blocked_by N7 -- would create an 8-hop cycle
+    # back to N0 and must be rejected.
+    query_count = 0
+
+    def _count(*args: object, **kwargs: object) -> None:
+        nonlocal query_count
+        query_count += 1
+
+    event.listen(engine, "before_cursor_execute", _count)
+    try:
+        closing = client.post(
+            "/api/v1/waiting",
+            headers=_headers(token, "deep-chain-close"),
+            json={
+                "subject_type": "knowledge_entity",
+                "subject_id": str(nodes[0]),
+                "counterparty_entity_id": str(nodes[chain_length - 1]),
+                "direction": "blocked_by",
+            },
+        )
+    finally:
+        event.remove(engine, "before_cursor_execute", _count)
+
+    assert closing.status_code == 422, closing.text
+    assert closing.json()["error"]["code"] == "INVALID_WAITING_DIRECTION"
+    # The old per-hop loop would have issued roughly one query per hop
+    # (chain_length - 1 of them) plus setup queries; the recursive-CTE
+    # rewrite does the whole graph traversal in a single round-trip, so
+    # total queries for this request must stay far below the chain depth.
+    assert query_count < chain_length, (
+        f"expected O(1) queries for cycle detection, got {query_count} for "
+        f"a {chain_length}-node chain"
+    )
 
 
 def test_waiting_link_list_signed_cursor_pagination_and_tamper_rejection(
