@@ -28,7 +28,7 @@ Phase 3 implementation has started on `feature/phase-3-attention-engine`. This d
 |---|---|---|
 | 1 | Attention projection and explainable policy | Delivered (`feature/phase-3-attention-engine` commit `5089423`) |
 | 2 | Waiting direction and dependency lifecycle | Delivered (`feature/phase-3-attention-engine` commit `666c787`) |
-| 3 | Risk review queue and cadence | Not started |
+| 3 | Risk review queue and cadence | Delivered (`feature/phase-3-attention-engine` commit `57c985c`) |
 | 4 | Capacity profiles and planning constraints | Not started |
 | 5 | Deterministic plan proposals and conflicts | Not started |
 | 6 | Plan editing, acceptance and replan diff | Not started |
