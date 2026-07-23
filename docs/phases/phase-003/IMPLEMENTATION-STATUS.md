@@ -19,14 +19,14 @@ Phase 3 implementation has started on `feature/phase-3-attention-engine`. This d
 
 - Phase 1 and Phase 2 exit gates complete, or an explicit repository-owner parallel-start authorization matching Phase 2's precedent — **granted 2026-07-23**, same exception Phase 2 received; see `docs/ROADMAP.md`'s Phase 3 status note and `PHASE-003-human-attention-engine.md`'s "Dependency exit posture" section.
 - Phase 3 contracts approved for implementation — **done 2026-07-23.** Open decision 1 (`attention_items` reconciliation) resolved: extend Phase 1's shipped `attention_items` in place, no separate `attention_overrides` table; `phase-003/DATA-MODEL.md` and `API-SCHEMAS.md` updated accordingly. The three approval gates named in `docs/phases/PHASE-REVIEW.md:128` are resolved in `phase-003/ATTENTION-MODEL.md` (policy weights/caps, critical-item definition) and `PHASE-003-human-attention-engine.md` (dogfood success thresholds).
-- Versioned attention-policy scenarios and product-validation rubric established — planned as `tests/fixtures/phase3_attention_scenarios.py` (Task 1 of the implementation plan), not yet created.
+- Versioned attention-policy scenarios and product-validation rubric established — **done.** `tests/fixtures/phase3_attention_scenarios.py`, checked in with Task 1.
 - Ethics review confirms excluded ranking signals and non-surveillance boundaries — planned as an automated CI gate (`scripts/check_phase3_prohibited_signals.py`, Task 8), not yet created.
 
 ## Planned delivery slices
 
 | Slice | Outcome | Status |
 |---|---|---|
-| 1 | Attention projection and explainable policy | Not started |
+| 1 | Attention projection and explainable policy | Delivered (`feature/phase-3-attention-engine` commit `5089423`) |
 | 2 | Waiting direction and dependency lifecycle | Not started |
 | 3 | Risk review queue and cadence | Not started |
 | 4 | Capacity profiles and planning constraints | Not started |
