@@ -27,7 +27,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from hashlib import sha256
 from json import dumps
-from typing import Literal
+from typing import Any, Literal
 from uuid import UUID
 
 from sqlalchemy import text
@@ -228,3 +228,47 @@ def activate_tool_version(
         .one()
     )
     return _row_to_tool(dict(final_row))
+
+
+# ---------------------------------------------------------------------------
+# Task 4 addition: the generic result shape every tool *handler* (`ecc.
+# domains.attention.tools:get_item_tool`, `ecc.domains.knowledge.tools:
+# get_entity_tool` -- the two `handler_ref` targets this module's tool
+# rows already point at) returns. This module owns tool *contract*
+# metadata (`ToolDefinition`, above); `ToolResult`/`ToolNotFound` are the
+# small, contract-agnostic execution-time result types both handlers and
+# `runtime.py`'s dispatch step (Task 4) share, so a handler has exactly one
+# place to import this shape from rather than each domain module inventing
+# its own. Deliberately not FastAPI-shaped (no `HTTPException`): a tool
+# handler is called from `runtime.py`'s orchestration loop, never directly
+# by a browser request, so "not found" is data the loop decides what to do
+# with (Decision 6's size-bounded, schema-validated tool result), not an
+# HTTP response.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class ToolResult:
+    """A tool handler's successful, not-yet-schema-validated return value.
+    `output` is a plain JSON-serializable dict shaped like the tool's
+    `output_schema` -- `runtime.py`'s dispatch step re-validates it against
+    that schema before treating it as trustworthy (Decision 6: "Every tool
+    result is schema-validated ... before ... re-inserted into the model's
+    context tagged as data").
+    """
+
+    output: dict[str, Any]
+
+
+@dataclass(frozen=True, slots=True)
+class ToolNotFound:
+    """The tool's target reference (an `attention_item_id`/`entity_id`)
+    does not resolve in the caller's own workspace -- either it genuinely
+    does not exist, or it belongs to a different workspace. Both cases
+    collapse to this one outcome, matching every existing Phase 1-3 read
+    endpoint's non-disclosing-404 convention (`entities.py:get_entity`,
+    `attention.py:get_attention_item`): a tool handler never reveals which
+    case occurred.
+    """
+
+    tool: str

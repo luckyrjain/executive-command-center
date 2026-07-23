@@ -15,6 +15,7 @@ from ecc.dev_bootstrap import router as dev_bootstrap_router
 from ecc.domains.ai_runtime.prompts import router as ai_policy_activation_router
 from ecc.domains.ai_runtime.registry import router as ai_models_router
 from ecc.domains.ai_runtime.router import api_router as ai_policies_router
+from ecc.domains.ai_runtime.runtime import router as ai_runs_router
 from ecc.domains.attention.attention import router as attention_router
 from ecc.domains.attention.capacity import router as capacity_router
 from ecc.domains.attention.meeting_prep import router as meeting_prep_router
@@ -114,11 +115,14 @@ app.include_router(dashboard_briefs_router)
 # endpoint over that same catalog, POST /ai/policies/{prompt_id_or_tool_
 # name}/activate (ecc.domains.ai_runtime.prompts -- it dispatches to both
 # prompt_versions and tool_definitions, so it lives with the prompt module
-# rather than a third router). Run/evaluation endpoints (POST /ai/runs,
-# etc.) remain later tasks in the same plan.
+# rather than a third router). Phase 4 Task 4 adds the run surface (POST
+# /ai/runs, GET /ai/runs/{id}, POST /ai/runs/{id}/cancel --
+# ecc.domains.ai_runtime.runtime, the bounded tool runtime and
+# orchestration loop). Evaluation endpoints remain a later task.
 app.include_router(ai_models_router)
 app.include_router(ai_policies_router)
 app.include_router(ai_policy_activation_router)
+app.include_router(ai_runs_router)
 app.middleware("http")(rejected_mutation_audit_middleware)
 # Pure-ASGI body size guard: registered via add_middleware (not the
 # "http" dispatch helper) so it can intercept the raw receive() channel and
