@@ -668,7 +668,7 @@ def test_ranking_10000_eligible_entities_under_budget(
     "ranking of 10,000 eligible entities below 500 ms" is measured here by
     seeding the documented representative dataset and calling the actual
     ``POST /api/v1/attention/regenerate`` endpoint
-    (`backend/ecc/domains/governance/attention.py:223`) -- the endpoint that
+    (`backend/ecc/domains/attention/attention.py:471`) -- the endpoint that
     queries eligible tasks/commitments/risks from the database, scores every
     one of them, and returns the freshly ranked list -- through the real
     HTTP layer with real CSRF headers. This replaces relying solely on the
