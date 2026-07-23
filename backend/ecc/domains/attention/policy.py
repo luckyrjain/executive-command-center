@@ -14,15 +14,28 @@ score against. Declaring them now, instead of inventing them ad hoc in a
 later task, keeps every entity_type's scorer reading from one shared config.
 """
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
+from types import MappingProxyType
 
 
 @dataclass(frozen=True)
 class AttentionPolicy:
+    """``@dataclass(frozen=True)`` only stops *rebinding* a field -- it does
+    nothing to stop mutating a mutable object a field points to. The two
+    dict-typed fields below are typed as ``Mapping`` and always constructed
+    wrapped in ``MappingProxyType`` (see ``POLICY_V1`` and
+    ``_frozen_points`` below) specifically so a caller can't do
+    ``policy.task_priority_points["low"] = 999`` in place, and so
+    ``dataclasses.replace(policy, ...)`` can't produce two "frozen"
+    instances that silently share (and can cross-mutate through) the same
+    underlying dict object (finding #13).
+    """
+
     version: int
 
-    task_priority_points: dict[str, int]
-    commitment_importance_points: dict[str, int]
+    task_priority_points: Mapping[str, int]
+    commitment_importance_points: Mapping[str, int]
 
     due_overdue_points: int
     due_48h_points: int
@@ -62,10 +75,21 @@ class AttentionPolicy:
     importance_weight_cap: int = field(default=20)
 
 
+def _frozen_points(points: dict[str, int]) -> Mapping[str, int]:
+    """Wrap a points table in a read-only view -- see ``AttentionPolicy``'s
+    docstring (finding #13). Use this (not a bare dict literal) at every
+    ``AttentionPolicy(...)``/``dataclasses.replace(...)`` call site that
+    sets one of these two fields, including any future policy version.
+    """
+    return MappingProxyType(dict(points))
+
+
 POLICY_V1 = AttentionPolicy(
     version=1,
-    task_priority_points={"critical": 35, "high": 25, "medium": 15, "low": 5},
-    commitment_importance_points={"critical": 25, "high": 18, "medium": 10, "low": 4},
+    task_priority_points=_frozen_points({"critical": 35, "high": 25, "medium": 15, "low": 5}),
+    commitment_importance_points=_frozen_points(
+        {"critical": 25, "high": 18, "medium": 10, "low": 4}
+    ),
     due_overdue_points=35,
     due_48h_points=15,
     due_today_points=25,
