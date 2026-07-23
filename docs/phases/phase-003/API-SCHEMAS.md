@@ -21,6 +21,8 @@ POST /waiting/{id}/fulfil|cancel
 GET /risks/review-queue
 POST /risks/{id}/review
 GET|PUT /planning/capacity
+GET|POST /planning/constraints
+POST /planning/constraints/{id}/archive
 GET|POST /plans
 GET /plans/{id}
 POST /plans/{id}/propose|accept|supersede
@@ -31,7 +33,7 @@ POST /meetings/{id}/prep/refresh
 
 ## Conventions
 
-Session-derived actor/workspace, UUIDs, ISO-8601 with workspace timezone, signed cursors, idempotency keys and optimistic concurrency are mandatory. Mutations return the current representation and write audit/outbox atomically.
+Session-derived actor/workspace, UUIDs, ISO-8601 with workspace timezone, signed cursors, idempotency keys and optimistic concurrency are mandatory. Mutations return the current representation and write audit/outbox atomically. `PUT /planning/capacity` in particular requires an `Idempotency-Key` header on every call -- omitting it fails request validation (422/400) rather than merely losing replay-safety, since a whole-week capacity overwrite has no other safe way to detect a retried request.
 
 ## Attention result
 
@@ -42,6 +44,12 @@ There is no dedicated `/pin` action (dropped per `DATA-MODEL.md`'s reconciliatio
 ## Planning
 
 Plan creation identifies date/range, capacity profile version, optional fixed constraints and source snapshot. Proposal returns blocks, unscheduled items, conflicts, capacity summary and rationale. Accept requires the current plan version and is a durable human confirmation. It does not write to external calendars.
+
+`GET|POST /planning/constraints` manages the fixed constraints (e.g. `fixed_time` hard reservations, deadline priorities) that plan proposal reserves capacity around; each constraint carries the same version/optimistic-concurrency conventions as other Phase 3 entities. `POST /planning/constraints/{id}/archive` retires a constraint (idempotent on retry with the same expected version) rather than hard-deleting it, so proposals already referencing it stay explainable.
+
+## Risk review
+
+Each `ReviewQueueItem` returned by `GET /risks/review-queue` now includes a `version` field, required by `POST /risks/{id}/review`'s optimistic-concurrency check (`expected_version`).
 
 ## Meeting preparation
 
