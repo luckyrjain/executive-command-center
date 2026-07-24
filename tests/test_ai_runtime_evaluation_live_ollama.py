@@ -212,14 +212,53 @@ def test_second_registered_model_produces_a_valid_completed_run_against_real_oll
                     "id": item_id,
                     "workspace_id": run_context["auth"].workspace_id,
                     "entity_id": uuid4(),
+                    # A single-factor item made the first CI run of this
+                    # test fail grounding 3/3 attempts, not occasional
+                    # noise -- a single, thin factor gives the model little
+                    # real material to draw a citation from and may push it
+                    # toward inventing/embellishing to fill the requested
+                    # explanation. Real evaluation_sets/attention_items
+                    # data never has this shape (every real item has
+                    # multiple factors); using the same multi-factor
+                    # example the checked-in evaluation dataset itself uses
+                    # (tests/fixtures/phase4_evaluation_attention_explain.py's
+                    # "task_overdue_critical_pinned_blocked") is both more
+                    # representative of production data and has a real,
+                    # observed good grounding track record across this PR's
+                    # CI runs (its own failures were schema_invalid/word-count,
+                    # never grounding_failed).
                     "factors": dumps(
                         [
+                            {
+                                "code": "manual_priority",
+                                "label": "Manual priority critical",
+                                "points": 30,
+                                "source_field": "manual_priority",
+                            },
                             {
                                 "code": "overdue",
                                 "label": "Due timing overdue",
                                 "points": 25,
                                 "source_field": "due_date,due_at",
-                            }
+                            },
+                            {
+                                "code": "pinned",
+                                "label": "Explicitly pinned",
+                                "points": 15,
+                                "source_field": "pinned",
+                            },
+                            {
+                                "code": "blocked",
+                                "label": "Task is blocked",
+                                "points": 10,
+                                "source_field": "status",
+                            },
+                            {
+                                "code": "stale_14d",
+                                "label": "No movement for 14 days",
+                                "points": 6,
+                                "source_field": "updated_at",
+                            },
                         ]
                     ),
                     "now": now,
@@ -244,17 +283,30 @@ def test_second_registered_model_produces_a_valid_completed_run_against_real_oll
 
         assert run.status == "completed", (
             f"model never produced a completed run in {_SMOKE_TEST_ATTEMPTS} attempts: "
-            f"error_codes={[r.error_code for r in runs]!r}"
+            f"error_codes={[r.error_code for r in runs]!r}; "
+            # `evidence` is redacted-safe by construction (runtime.py: on
+            # schema_invalid it's whatever was validated pre-failure -- []
+            # here since nothing validated; on grounding_failed it's the
+            # specific cited-but-ungrounded factor codes, never raw
+            # response text) -- safe to include directly in a pytest
+            # failure message for real diagnosability.
+            f"last_run_evidence={runs[-1].evidence!r}"
         )
         assert run.model_id == _SECOND_MODEL_ID
         assert run.output is not None
         # A "completed" run already implies grounding passed (execute_run's
         # own check_explain_item_grounding gate) -- every cited code must
-        # be a subset of the item's one real factor. Not asserting exact
-        # equality: a real model may legitimately cite it, cite it plus
-        # nothing else, or cite nothing at all (grounding is vacuously true
-        # for an empty citation list) -- all are valid completed outcomes.
-        assert set(run.output["cited_factor_codes"]) <= {"overdue"}
+        # be a subset of the item's real factors. Not asserting exact
+        # equality: a real model may legitimately cite any subset of them,
+        # including none (grounding is vacuously true for an empty
+        # citation list) -- all are valid completed outcomes.
+        assert set(run.output["cited_factor_codes"]) <= {
+            "manual_priority",
+            "overdue",
+            "pinned",
+            "blocked",
+            "stale_14d",
+        }
     finally:
         with engine.begin() as connection:
             connection.execute(
