@@ -437,6 +437,12 @@ def test_run_evaluation_permanently_schema_invalid_fails_only_that_floor(
         failure["key"] == invalid_key and failure["reason"] == "schema_invalid"
         for failure in run.failures
     )
+    # The redacted validation-error summary (field path + Pydantic error
+    # type only) is surfaced too -- otherwise diagnosing a real
+    # schema_invalid failure needs the raw response text, which this
+    # codebase never logs.
+    schema_failure = next(failure for failure in run.failures if failure["key"] == invalid_key)
+    assert schema_failure["detail"]
 
 
 # ---------------------------------------------------------------------------

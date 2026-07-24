@@ -288,6 +288,7 @@ class _ExampleScore:
     prohibited_matches: tuple[str, ...]
     error_code: str | None
     ai_run: AiRun
+    schema_invalid_detail: str | None = None
 
 
 def _classify_outcome(
@@ -300,6 +301,29 @@ def _classify_outcome(
     if run.error_code == "grounding_failed":
         return "grounding_failed"
     return "other_failure"
+
+
+def _fetch_schema_invalid_detail(session: Session, run: AiRun) -> str | None:
+    """The redacted validation-error summary (`validator.py`'s
+    `SchemaInvalid.detail` -- field path + Pydantic error type only, never
+    raw response text or a validated/rejected field value) lives on the
+    final `model_call` step's trace (`runtime.py`'s `_model_step`), not on
+    `AiRun` itself. Fetched only for `schema_invalid` outcomes, where it is
+    the only way to tell *why* an example failed without the raw response
+    text this codebase never logs.
+    """
+    row = session.execute(
+        text(
+            "SELECT trace FROM ai_run_steps WHERE run_id = :run_id AND kind = 'model_call' "
+            "ORDER BY sequence DESC LIMIT 1"
+        ),
+        {"run_id": run.id},
+    ).first()
+    if row is None:
+        return None
+    trace = row[0]
+    detail = trace.get("detail") if isinstance(trace, dict) else None
+    return detail if isinstance(detail, str) else None
 
 
 def _prohibited_matches(example: EvaluationExample, run: AiRun) -> tuple[str, ...]:
@@ -316,10 +340,11 @@ def _prohibited_matches(example: EvaluationExample, run: AiRun) -> tuple[str, ..
 
 
 def _score_example(
-    example: EvaluationExample, run: AiRun, *, latency_seconds: float
+    session: Session, example: EvaluationExample, run: AiRun, *, latency_seconds: float
 ) -> _ExampleScore:
     outcome = _classify_outcome(run)
     matches = _prohibited_matches(example, run) if outcome == "completed" else ()
+    detail = _fetch_schema_invalid_detail(session, run) if outcome == "schema_invalid" else None
     return _ExampleScore(
         key=example["key"],
         outcome=outcome,
@@ -327,6 +352,7 @@ def _score_example(
         prohibited_matches=matches,
         error_code=run.error_code,
         ai_run=run,
+        schema_invalid_detail=detail,
     )
 
 
@@ -351,6 +377,8 @@ def _aggregate(scores: list[_ExampleScore]) -> tuple[EvaluationMetrics, list[dic
                 # path) -- redacted by construction (factor codes only,
                 # never raw response text), safe to surface here.
                 failure["ungrounded_codes"] = score.ai_run.evidence
+            if score.outcome == "schema_invalid" and score.schema_invalid_detail:
+                failure["detail"] = score.schema_invalid_detail
             failures.append(failure)
         for phrase in score.prohibited_matches:
             failures.append({"key": score.key, "reason": "prohibited_fact", "phrase": phrase})
@@ -725,7 +753,7 @@ def run_evaluation(
             )
             latency_seconds = time.perf_counter() - call_started
 
-            score = _score_example(example, run, latency_seconds=latency_seconds)
+            score = _score_example(session, example, run, latency_seconds=latency_seconds)
             scores.append(score)
 
             if score.outcome == "completed":
