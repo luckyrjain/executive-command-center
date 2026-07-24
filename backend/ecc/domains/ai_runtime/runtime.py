@@ -35,6 +35,8 @@ being reachable from a hypothetical future multi-tool task.
 """
 
 import threading
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
@@ -50,7 +52,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from ecc.auth import AuthContext, AuthDep, CsrfDep
-from ecc.database import get_session
+from ecc.database import engine, get_session
 from ecc.observability import (
     queue_lifecycle_event,
     record_audit_outbox_failure,
@@ -1055,12 +1057,39 @@ def _request_hash(payload: BaseModel, action: str) -> str:
     return sha256(dumps(material, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
-def _lock_idempotency(session: Session, auth: AuthContext, key: str) -> None:
+@contextmanager
+def _held_idempotency_lock(auth: AuthContext, key: str) -> Iterator[None]:
+    """A session-scoped `pg_advisory_lock`, held on its own dedicated
+    connection for this context manager's entire duration -- unlike
+    `pg_advisory_xact_lock`, this is not released early by `execute_run`'s
+    own internal `session.commit()` calls partway through a run
+    (`_persist_terminal`'s docstring). `create_run` wraps its whole body
+    (cache check, existence check, `execute_run`, idempotency store) in
+    this lock specifically because that whole body -- not just the
+    initial cache lookup -- is the critical section: two concurrent
+    requests carrying the same Idempotency-Key must not both reach
+    `execute_run` and independently trigger a real model call. Every other
+    idempotency-key endpoint in this codebase (including this module's own
+    `activate_policy`-style callers elsewhere in the package) safely uses
+    the lighter transaction-scoped `pg_advisory_xact_lock` because their
+    entire critical section fits inside one `session.begin()` block with
+    no internal commit -- `execute_run` does not have that property (it is
+    also called directly, session-less-transaction-wise, from tests and
+    from `evaluation.py`'s per-example loop), so this endpoint cannot rely
+    on it either.
+    """
     lock_key = f"{auth.workspace_id}:{auth.user_id}:{key}"
-    session.execute(
-        text("SELECT pg_advisory_xact_lock(hashtextextended(:lock_key, 0))"),
-        {"lock_key": lock_key},
-    )
+    with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as connection:
+        connection.execute(
+            text("SELECT pg_advisory_lock(hashtextextended(:lock_key, 0))"), {"lock_key": lock_key}
+        )
+        try:
+            yield
+        finally:
+            connection.execute(
+                text("SELECT pg_advisory_unlock(hashtextextended(:lock_key, 0))"),
+                {"lock_key": lock_key},
+            )
 
 
 def _load_cached(
@@ -1145,37 +1174,44 @@ def create_run(
     convention (`knowledge/claims.py:create_claim`'s `_entity_version`
     check) -- rather than surfacing a nonexistent/cross-workspace id as a
     200 "failed run" body.
+
+    The entire body below runs inside `_held_idempotency_lock` (see its
+    own docstring): a concurrent duplicate request with the same
+    Idempotency-Key blocks until this one finishes and stores its
+    response, then finds it cached, rather than independently reaching
+    `execute_run` and triggering a second real model call.
     """
     request_hash = _request_hash(payload, "create_run")
     now = datetime.now(UTC)
-    with session.begin():
-        _lock_idempotency(session, auth, idempotency_key)
-        cached = _load_cached(session, auth, idempotency_key, request_hash)
-    if cached is not None:
-        return cached
+    with _held_idempotency_lock(auth, idempotency_key):
+        with session.begin():
+            cached = _load_cached(session, auth, idempotency_key, request_hash)
+        if cached is not None:
+            return cached
 
-    with session.begin():
-        exists = session.execute(
-            text(
-                "SELECT 1 FROM attention_items WHERE workspace_id = :workspace_id AND id = :item_id"
-            ),
-            {"workspace_id": auth.workspace_id, "item_id": payload.attention_item_id},
-        ).first()
-    if exists is None:
-        raise HTTPException(status_code=404, detail="ATTENTION_ITEM_NOT_FOUND")
+        with session.begin():
+            exists = session.execute(
+                text(
+                    "SELECT 1 FROM attention_items "
+                    "WHERE workspace_id = :workspace_id AND id = :item_id"
+                ),
+                {"workspace_id": auth.workspace_id, "item_id": payload.attention_item_id},
+            ).first()
+        if exists is None:
+            raise HTTPException(status_code=404, detail="ATTENTION_ITEM_NOT_FOUND")
 
-    run = execute_run(
-        payload.task,
-        payload.data_class,
-        {"attention_item_id": str(payload.attention_item_id)},
-        session=session,
-        auth=auth,
-        ollama_adapter=adapter,
-    )
-    response = _to_response(run)
-    with session.begin():
-        _store_idempotency(session, auth, idempotency_key, request_hash, response, now)
-    return response
+        run = execute_run(
+            payload.task,
+            payload.data_class,
+            {"attention_item_id": str(payload.attention_item_id)},
+            session=session,
+            auth=auth,
+            ollama_adapter=adapter,
+        )
+        response = _to_response(run)
+        with session.begin():
+            _store_idempotency(session, auth, idempotency_key, request_hash, response, now)
+        return response
 
 
 @router.get("/runs/{run_id}", response_model=AiRunResponse)

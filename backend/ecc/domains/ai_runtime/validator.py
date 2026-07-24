@@ -27,7 +27,7 @@ implements "one bounded repair retry ... allowed on `schema_invalid`
 specifically": exactly one re-attempt, no more, regardless of the second
 attempt's outcome. This module does not persist the attempt count anywhere
 -- `ai_run_steps` (where Decision 4 says a retry would be "recorded on the
-trace") is a Task 4 table (migration `0024_phase4_ai_runs.py`, not yet
+trace") is a Task 4 table (migration `0030_phase4_ai_runs.py`, not yet
 created as of Task 2). `RepairAttemptResult.attempts` is returned so Task
 4's orchestration loop (`runtime.py`) can wire it into a real `ai_run_steps`
 row once that table exists; Task 2 tests this counting/bounding logic in

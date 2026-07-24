@@ -719,6 +719,42 @@ def test_activate_gated_prompt_rejected_with_no_passing_evaluation(
     assert response.json()["error"]["code"] == "EVALUATION_FLOORS_NOT_MET"
 
 
+def test_activate_gated_prompt_rejected_when_evaluation_exists_but_failed(
+    run_context: dict, http_client: TestClient
+) -> None:
+    """An `evaluation_runs` row existing is not sufficient on its own --
+    the gate must also consult its actual `passed` verdict, not just its
+    presence. Without this test, a broken `_prompt_evaluation_floor_met`
+    that returns `True` for *any* existing row (silently dropping the
+    `check_promotion_floors` call) would pass both of this gate's other
+    two tests -- confirmed by an adversarial review of an earlier version
+    of this test suite, which found exactly that gap.
+    """
+    bad_key = EXAMPLES[3]["key"]
+    failing_adapter = _adapter_with_responses(*_flat_responses(bad_citation_key=bad_key))
+    app.dependency_overrides[get_ollama_adapter] = lambda: failing_adapter
+    try:
+        eval_response = http_client.post(
+            "/api/v1/ai/evaluations/runs",
+            json={"task_type": TASK_TYPE, "prompt_version": 1, "model_id": _SEEDED_MODEL_ID},
+            headers=_headers(run_context["token"], key="gate-fail-eval"),
+        )
+    finally:
+        app.dependency_overrides[get_ollama_adapter] = lambda: _adapter_with_responses(
+            *_flat_responses()
+        )
+    assert eval_response.status_code == 200
+    assert eval_response.json()["passed"] is False
+
+    activate_response = http_client.post(
+        f"/api/v1/ai/policies/{_SEEDED_PROMPT_ID}/activate",
+        json={"version": 1},
+        headers=_headers(run_context["token"], key="gate-fail-activate"),
+    )
+    assert activate_response.status_code == 409
+    assert activate_response.json()["error"]["code"] == "EVALUATION_FLOORS_NOT_MET"
+
+
 def test_activate_gated_prompt_allowed_once_evaluation_passes(
     run_context: dict, http_client: TestClient
 ) -> None:

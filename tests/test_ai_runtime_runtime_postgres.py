@@ -372,6 +372,18 @@ def test_execute_run_prompt_injection_in_factor_label_cannot_dispatch_out_of_sco
     records per the design doc's threat model), and the mocked model
     response simulates a model that *was* steered by it -- reusing Step 1's
     exact mechanism, not a synthetic isolated call.
+
+    Unlike `_adapter_with_responses` (used by every other test in this
+    file), this test captures the actual outbound HTTP request so it can
+    assert the injected label really did reach the rendered prompt, inside
+    `runtime.py:_render_factors_block`'s untrusted-data delimiters -- an
+    adversarial review of an earlier version of this test found that
+    without this capture, the test could not distinguish "the allowlist
+    stopped a real injection" from "a canned mock response was returned
+    regardless of what was ever sent," making it a duplicate of
+    `test_execute_run_rejects_out_of_scope_tool_request_and_never_dispatches_it`
+    in disguise. Capturing and asserting on the real request content closes
+    that gap.
     """
     injected_factors = [
         {"code": "overdue", "label": _INJECTED_LABEL, "points": 40, "source_field": "due_date"},
@@ -396,7 +408,28 @@ def test_execute_run_prompt_injection_in_factor_label_cannot_dispatch_out_of_sco
             }
         }
     )
-    adapter = _adapter_with_responses(compromised_response)
+    captured_requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured_requests.append(request)
+        body = (
+            json.dumps(
+                {
+                    "model": "m",
+                    "created_at": "now",
+                    "response": compromised_response,
+                    "done": True,
+                    "eval_count": 12,
+                    "prompt_eval_count": 40,
+                }
+            )
+            + "\n"
+        )
+        return httpx.Response(
+            200, content=body.encode(), headers={"content-type": "application/x-ndjson"}
+        )
+
+    adapter = OllamaAdapter(transport=httpx.MockTransport(handler))
 
     with SessionFactory() as session:
         run = execute_run(
@@ -411,6 +444,22 @@ def test_execute_run_prompt_injection_in_factor_label_cannot_dispatch_out_of_sco
     assert run.status == "failed"
     assert run.error_code == "tool_not_allowlisted"
     assert calls == [], "knowledge.get_entity must never be dispatched from an injected instruction"
+
+    # Proves the injected label genuinely reached the model, wrapped in the
+    # untrusted-data delimiters -- not just that a canned response was
+    # returned regardless of the real prompt content.
+    assert len(captured_requests) == 1
+    sent_prompt = json.loads(captured_requests[0].content)["prompt"]
+    assert _INJECTED_LABEL in sent_prompt
+    assert "BEGIN UNTRUSTED DATA" in sent_prompt
+    assert "END UNTRUSTED DATA" in sent_prompt
+    injection_index = sent_prompt.index(_INJECTED_LABEL)
+    begin_index = sent_prompt.index("BEGIN UNTRUSTED DATA")
+    end_index = sent_prompt.index("END UNTRUSTED DATA")
+    assert begin_index < injection_index < end_index, (
+        "the injected label must be inside the untrusted-data delimiters, "
+        "not free-standing text elsewhere in the prompt"
+    )
 
     row = _run_row(run.id)
     assert row["status"] == "failed"
