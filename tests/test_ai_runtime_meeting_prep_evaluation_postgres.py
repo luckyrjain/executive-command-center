@@ -31,7 +31,7 @@ from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from hmac import new
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import httpx
 import pytest
@@ -47,6 +47,9 @@ from ecc.domains.ai_runtime.evaluation import (
 )
 from ecc.domains.ai_runtime.evaluation import (
     _insert_synthetic_meeting as insert_synthetic_meeting,
+)
+from ecc.domains.ai_runtime.evaluation import (
+    _salted_synthetic_id as salted_synthetic_id,
 )
 from ecc.domains.ai_runtime.evaluation import (
     check_promotion_floors,
@@ -78,8 +81,17 @@ _SECTIONS = (
 )
 
 
-def _all_ids(example: dict) -> list[str]:
-    return [row["id"] for section in _SECTIONS for row in example[section]]
+def _all_ids(example: dict, workspace_id: UUID) -> list[str]:
+    """The real, workspace-salted ids `_insert_synthetic_meeting` actually
+    assigns -- not the raw fixture ids, which are only a pre-salt seed (see
+    `_salted_synthetic_id`'s docstring for why a bare fixture id would
+    collide across workspaces).
+    """
+    return [
+        str(salted_synthetic_id(workspace_id, row["id"]))
+        for section in _SECTIONS
+        for row in example[section]
+    ]
 
 
 @pytest.fixture(autouse=True)
@@ -169,13 +181,21 @@ def run_context() -> Iterator[dict]:
         )
 
 
-def _adapter_with_responses(*response_texts: str) -> OllamaAdapter:
+def _adapter_with_responses(
+    *response_texts: str, captured_prompts: list[str] | None = None
+) -> OllamaAdapter:
     """`test_ai_runtime_evaluation_postgres.py`'s identical helper -- see
-    that module's copy for the full rationale.
+    that module's copy for the full rationale. `captured_prompts`, when
+    given, records each call's actual rendered prompt text (in call order)
+    -- used by the risk-leak test below to prove no leaked risk's text
+    reaches a later example's real prompt, not just that the final example
+    count comes out right.
     """
     remaining = list(response_texts)
 
     def handler(request: httpx.Request) -> httpx.Response:
+        if captured_prompts is not None:
+            captured_prompts.append(json.loads(request.content)["prompt"])
         text_value = remaining.pop(0) if remaining else response_texts[-1]
         body = (
             json.dumps(
@@ -198,30 +218,44 @@ def _adapter_with_responses(*response_texts: str) -> OllamaAdapter:
 
 
 def _valid_response(
-    example: dict, *, extra_citation: str | None = None, prohibited: bool = False
+    example: dict,
+    workspace_id: UUID,
+    *,
+    extra_citation: str | None = None,
+    prohibited: bool = False,
 ) -> str:
     summary = example["reference_summary"]
     if prohibited and example["must_not_state"]:
         summary = f"{summary} Specifically, {example['must_not_state'][0]}."
-    cited = _all_ids(example)
+    cited = _all_ids(example, workspace_id)
     if extra_citation is not None:
         cited.append(extra_citation)
     return json.dumps({"summary_text": summary, "cited_evidence_ids": cited})
 
 
 def _flat_responses(
-    *, bad_citation_key: str | None = None, prohibited_key: str | None = None
+    workspace_id: UUID,
+    *,
+    bad_citation_key: str | None = None,
+    bad_citation_id: str | None = None,
+    prohibited_key: str | None = None,
 ) -> list[str]:
     """One flat, ordered response list spanning every example in
     `EXAMPLES`, matching `run_evaluation`'s call order (dataset order, one
     `.generate()` call per example -- none of these examples are
     deliberately schema-invalid, so no repair-retry consumption to account
     for, unlike `test_ai_runtime_evaluation_postgres.py`'s equivalent).
+
+    `bad_citation_id`, when given alongside `bad_citation_key`, is injected
+    verbatim as the extra ungrounded citation on that example, so a caller
+    can assert the exact value `_aggregate`'s `ungrounded_codes` surfaces
+    rather than only that grounding failed at all.
     """
     return [
         _valid_response(
             example,
-            extra_citation=str(uuid4()) if example["key"] == bad_citation_key else None,
+            workspace_id,
+            extra_citation=bad_citation_id if example["key"] == bad_citation_key else None,
             prohibited=example["key"] == prohibited_key,
         )
         for example in EXAMPLES
@@ -258,7 +292,7 @@ def test_seeded_evaluation_set_matches_the_checked_in_fixture() -> None:
 
 
 def test_run_evaluation_fully_grounded_run_passes_every_floor(run_context: dict) -> None:
-    adapter = _adapter_with_responses(*_flat_responses())
+    adapter = _adapter_with_responses(*_flat_responses(run_context["workspace_id"]))
     with SessionFactory() as session:
         run = run_evaluation(
             TASK_TYPE,
@@ -284,7 +318,12 @@ def test_run_evaluation_fully_grounded_run_passes_every_floor(run_context: dict)
 
 def test_run_evaluation_ungrounded_citation_fails_only_grounding_floor(run_context: dict) -> None:
     bad_key = EXAMPLES[2]["key"]
-    adapter = _adapter_with_responses(*_flat_responses(bad_citation_key=bad_key))
+    bad_citation_id = str(uuid4())
+    adapter = _adapter_with_responses(
+        *_flat_responses(
+            run_context["workspace_id"], bad_citation_key=bad_key, bad_citation_id=bad_citation_id
+        )
+    )
     with SessionFactory() as session:
         run = run_evaluation(
             TASK_TYPE,
@@ -299,15 +338,19 @@ def test_run_evaluation_ungrounded_citation_fails_only_grounding_floor(run_conte
     assert run.metrics.grounding_rate == pytest.approx(9 / 10)
     assert run.metrics.prohibited_fact_count == 0
     assert check_promotion_floors(run) is False
-    assert any(
-        failure["key"] == bad_key and failure["reason"] == "grounding_failed"
+    grounding_failure = next(
+        failure
         for failure in run.failures
+        if failure["key"] == bad_key and failure["reason"] == "grounding_failed"
     )
+    assert grounding_failure["ungrounded_codes"] == [bad_citation_id]
 
 
 def test_run_evaluation_prohibited_fact_fails_only_that_floor(run_context: dict) -> None:
     example_with_probe = next(example for example in EXAMPLES if example["must_not_state"])
-    adapter = _adapter_with_responses(*_flat_responses(prohibited_key=example_with_probe["key"]))
+    adapter = _adapter_with_responses(
+        *_flat_responses(run_context["workspace_id"], prohibited_key=example_with_probe["key"])
+    )
     with SessionFactory() as session:
         run = run_evaluation(
             TASK_TYPE,
@@ -331,7 +374,7 @@ def test_run_evaluation_prohibited_fact_fails_only_that_floor(run_context: dict)
 
 
 def test_run_evaluation_cleans_up_every_synthetic_table(run_context: dict) -> None:
-    adapter = _adapter_with_responses(*_flat_responses())
+    adapter = _adapter_with_responses(*_flat_responses(run_context["workspace_id"]))
     with SessionFactory() as session:
         run_evaluation(
             TASK_TYPE,
@@ -360,6 +403,53 @@ def test_run_evaluation_cleans_up_every_synthetic_table(run_context: dict) -> No
             assert count == 0, f"synthetic {table} rows must be cleaned up after the run"
 
 
+def test_run_evaluation_does_not_leak_risks_into_a_later_examples_prompt(
+    run_context: dict,
+) -> None:
+    """The test below this one (`test_synthetic_meeting_risks_do_not_leak_
+    into_a_later_examples_pack`) exercises `_insert_synthetic_meeting`/
+    `_delete_synthetic_meeting` directly, in the same order `run_evaluation`
+    uses them -- proving the helpers themselves are correct when sequenced
+    that way. It does not prove `run_evaluation`'s own loop (`evaluation.
+    py`) actually sequences them that way, rather than e.g. batching every
+    example's insert before any delete like `attention.explain_item`'s
+    path does. Grounding/failure counts can't distinguish this either --
+    `check_meeting_prep_grounding` only checks cited ids are valid, not
+    that every valid id was cited, so a leaked risk sitting unc-ited in a
+    later example's pack would not fail grounding.
+
+    This test instead captures the real prompt text `run_evaluation` sends
+    to the model for every example in one real end-to-end run, and asserts
+    a risk-bearing example's risk description text never appears in a
+    later example's prompt that declares no risks of its own -- the only
+    way that text could appear there is if the earlier example's synthetic
+    risk row were still present (not yet deleted) when the later example's
+    evidence pack was rendered into a prompt.
+    """
+    risk_index = next(i for i, example in enumerate(EXAMPLES) if example["risks"])
+    risk_text = EXAMPLES[risk_index]["risks"][0]["description"]
+    later_no_risk_index = next(
+        i for i in range(risk_index + 1, len(EXAMPLES)) if not EXAMPLES[i]["risks"]
+    )
+
+    captured_prompts: list[str] = []
+    adapter = _adapter_with_responses(
+        *_flat_responses(run_context["workspace_id"]), captured_prompts=captured_prompts
+    )
+    with SessionFactory() as session:
+        run_evaluation(
+            TASK_TYPE,
+            1,
+            _SEEDED_MODEL_ID,
+            session=session,
+            auth=run_context["auth"],
+            ollama_adapter=adapter,
+        )
+
+    assert len(captured_prompts) == len(EXAMPLES)
+    assert risk_text not in captured_prompts[later_no_risk_index]
+
+
 def test_synthetic_meeting_risks_do_not_leak_into_a_later_examples_pack(
     run_context: dict,
 ) -> None:
@@ -368,11 +458,14 @@ def test_synthetic_meeting_risks_do_not_leak_into_a_later_examples_pack(
     `risks` are workspace-wide, not meeting-scoped, so if example A's risks
     were still present when example B's pack is generated, B's `meeting.
     get_prep_pack` output would include a risk B's own fixture never
-    listed. Exercises the two helpers directly, in the same insert-then-
-    delete-before-the-next-insert sequence `run_evaluation`'s loop uses,
-    rather than only asserting the end state (Section 2's cleanup test) --
-    that end state alone can't distinguish "never leaked" from "leaked,
-    then correctly cleaned up eventually".
+    listed. Exercises the two helpers directly, proving *they* are correct
+    when sequenced insert-then-delete-before-the-next-insert, rather than
+    only asserting the end state (Section 2's cleanup test) -- that end
+    state alone can't distinguish "never leaked" from "leaked, then
+    correctly cleaned up eventually". This test alone does not prove
+    `run_evaluation`'s own loop actually calls the helpers in this order
+    for every example -- see `test_run_evaluation_does_not_leak_risks_
+    into_a_later_examples_prompt` immediately above for that.
     """
     auth = run_context["auth"]
     example_with_risk = next(example for example in EXAMPLES if example["risks"])
@@ -419,7 +512,7 @@ def http_client(run_context: dict) -> Iterator[TestClient]:
     different transport override `app.dependency_overrides[get_ollama_
     adapter]` themselves and restore it before this fixture tears down.
     """
-    adapter = _adapter_with_responses(*_flat_responses())
+    adapter = _adapter_with_responses(*_flat_responses(run_context["workspace_id"]))
     app.dependency_overrides[get_ollama_adapter] = lambda: adapter
     client = TestClient(app)
     client.cookies.set("ecc_session", run_context["token"])

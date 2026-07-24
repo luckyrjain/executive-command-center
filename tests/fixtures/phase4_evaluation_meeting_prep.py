@@ -537,3 +537,20 @@ assert _all_sections_covered == {
     "risks",
     "dependencies",
 }, "every pack section must appear populated in at least one example"
+for _example in EXAMPLES:
+    # `evaluation.py:_insert_synthetic_meeting` indexes into the per-
+    # example participant node list (`node_ids[0]` for `timeline`,
+    # `node_ids[commitment["counterparty_index"]]` for `commitments`/
+    # `dependencies`) with no bounds check -- a non-empty one of these
+    # sections paired with an empty `participants` list would raise
+    # `IndexError` at insertion time. Enforced here so a future example
+    # fails fast, at import time, with a clear message, not a cryptic
+    # `IndexError` deep in a synthetic-meeting insert.
+    if _example["participants"]:
+        continue
+    for _section in ("timeline", "commitments", "dependencies"):
+        assert not _example[_section], (
+            f"{_example['key']!r} has an empty participants section but a "
+            f"non-empty {_section!r} section -- {_section} rows index into "
+            "participant node ids at insertion time"
+        )

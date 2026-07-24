@@ -84,7 +84,7 @@ from hashlib import sha256
 from json import dumps
 from math import ceil
 from typing import Annotated, Any, Literal, TypedDict
-from uuid import UUID, uuid4
+from uuid import NAMESPACE_OID, UUID, uuid4, uuid5
 
 from fastapi import APIRouter, Depends, Header, HTTPException
 from pydantic import BaseModel, ConfigDict, Field
@@ -536,6 +536,27 @@ _SYNTHETIC_MEETING_DURATION = timedelta(hours=1)
 _MeetingPrepIds = tuple[UUID, list[UUID], list[UUID]]
 
 
+def _salted_synthetic_id(workspace_id: UUID, base_id: str) -> UUID:
+    """Deterministic per-(workspace, base_id) transform of a dataset-
+    declared row id.
+
+    The fixture/migration's own ids are a pure function of `(example key,
+    section, index)` with no workspace component -- necessarily, since the
+    migration seeds one global `evaluation_sets` row shared by every
+    workspace. Used bare as a real primary key (`meeting_participants.id`,
+    `timeline_entries.id`, `commitments.id`, `notes.id`, `risks.id`,
+    `waiting_links.id` -- all bare `id UUID PRIMARY KEY`, not composite
+    with `workspace_id`), two workspaces evaluating `meeting.prep_summary`
+    concurrently would collide on the same example's rows. Salting with
+    `workspace_id` keeps the id fully deterministic and reproducible for
+    a given `(workspace_id, base_id)` pair -- callers that need to know a
+    row's real id in advance (tests building mocked "fully grounded"
+    citations) compute the same salt -- while making cross-workspace
+    collisions as unlikely as any other independent UUID5 draw.
+    """
+    return uuid5(NAMESPACE_OID, f"{workspace_id}:{base_id}")
+
+
 def _insert_synthetic_meeting(
     session: Session, auth: AuthContext, example: dict[str, Any], *, now: datetime
 ) -> _MeetingPrepIds:
@@ -591,8 +612,10 @@ def _insert_synthetic_meeting(
         # participant helper. `node_id` (the `pkos_nodes` row, and the
         # `entity_id` foreign key `commitments`/`timeline_entries`/`waiting_
         # links` below join through) is a fresh, uncited id -- nothing in
-        # `meeting.get_prep_pack`'s output surfaces it.
-        participant_id = UUID(participant["id"])
+        # `meeting.get_prep_pack`'s output surfaces it. Salted with
+        # `workspace_id` (see `_salted_synthetic_id`) since this becomes a
+        # real, bare, non-workspace-composite primary key.
+        participant_id = _salted_synthetic_id(auth.workspace_id, participant["id"])
         node_id = uuid4()
         node_ids.append(node_id)
         session.execute(
@@ -649,7 +672,7 @@ def _insert_synthetic_meeting(
                 """
             ),
             {
-                "id": UUID(entry["id"]),
+                "id": _salted_synthetic_id(auth.workspace_id, entry["id"]),
                 "workspace_id": auth.workspace_id,
                 "entity_id": node_ids[0],
                 "effective_at": now - timedelta(hours=entry["effective_at_hours_ago"]),
@@ -680,7 +703,7 @@ def _insert_synthetic_meeting(
                 """
             ),
             {
-                "id": UUID(commitment["id"]),
+                "id": _salted_synthetic_id(auth.workspace_id, commitment["id"]),
                 "workspace_id": auth.workspace_id,
                 "owner_id": auth.user_id,
                 "summary": commitment["summary"],
@@ -708,7 +731,7 @@ def _insert_synthetic_meeting(
                     """
                 ),
                 {
-                    "id": UUID(note["id"]),
+                    "id": _salted_synthetic_id(auth.workspace_id, note["id"]),
                     "workspace_id": auth.workspace_id,
                     "owner_id": auth.user_id,
                     "title": note["title"],
@@ -721,7 +744,7 @@ def _insert_synthetic_meeting(
 
     risk_ids: list[UUID] = []
     for risk in example["risks"]:
-        risk_id = UUID(risk["id"])
+        risk_id = _salted_synthetic_id(auth.workspace_id, risk["id"])
         risk_ids.append(risk_id)
         review_at = (
             now + timedelta(days=risk["review_at_days"])
@@ -775,7 +798,7 @@ def _insert_synthetic_meeting(
                 """
             ),
             {
-                "id": UUID(dependency["id"]),
+                "id": _salted_synthetic_id(auth.workspace_id, dependency["id"]),
                 "workspace_id": auth.workspace_id,
                 "counterparty_id": counterparty_id,
                 "direction": dependency["direction"],
