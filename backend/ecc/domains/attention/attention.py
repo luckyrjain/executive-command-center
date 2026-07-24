@@ -371,11 +371,29 @@ def _upsert_batch(
     past both the design doc's "ranking of 10,000 eligible entities below
     500 ms" budget and, combined across task/commitment/risk, the newly
     configured 5-second statement timeout (`backend/ecc/database.py`).
-    Batching into one set-based statement per entity type (using
-    ``unnest`` over parallel arrays) preserves the exact same per-row
-    upsert/conflict semantics -- including the dismissed-state preservation
-    logic -- while cutting the round-trip count from one-per-entity to one
-    per entity type.
+    Batching into one set-based statement per entity type preserves the
+    exact same per-row upsert/conflict semantics -- including the
+    dismissed-state preservation logic -- while cutting the round-trip
+    count from one-per-entity to one per entity type.
+
+    The batch is sent as a single ``jsonb`` payload unpacked server-side
+    with ``jsonb_to_recordset``, not as several parallel ``unnest()``
+    arrays (see git history for that version). Root-caused via `cProfile`
+    against a 10,000-row batch: psycopg encodes a ``text[]`` array
+    parameter as one big array-literal string, which requires a
+    regex-based quote/backslash escape pass over *every element*
+    (`psycopg/types/array.py`'s ``dump_list``/``_dump_item``). With two
+    text[] arrays here (``factors`` as JSON-in-text and ``explanation``),
+    that was ~20,000 regex substitutions of pure Python CPU work on every
+    single ``regenerate`` call -- measured at ~150ms for one such array
+    alone, versus ~40ms to send the same content as one ``jsonb`` string
+    parameter (no per-element escaping, since it's a single bind
+    parameter, not a hand-built SQL array literal). That CPU-bound cost
+    (not Postgres-side I/O) scales with whatever else is contending for
+    the CPU at call time, which made it a plausible source of the
+    ``test_ranking_10000_eligible_entities_under_budget`` p95 spikes this
+    change targets, on top of being wasted latency on every real
+    ``regenerate`` request.
 
     ``override_reason`` is deliberately absent from the UPDATE SET list,
     matching ``deferred_until``'s existing behavior: both are user overrides
@@ -384,16 +402,22 @@ def _upsert_batch(
     """
     if not rows:
         return
-    entity_ids = [row["id"] for row in rows]
-    versions = [row["version"] for row in rows]
-    scores = [score for score, _, _ in scored]
-    confidences = [confidence for _, confidence, _ in scored]
-    factors_json = [dumps(factors) for _, _, factors in scored]
-    explanations = [
-        "; ".join(item["label"] for item in factors) or "No active priority factors"
-        for _, _, factors in scored
-    ]
-    pinned = [bool(row["pinned"]) for row in rows]
+    payload = dumps(
+        [
+            {
+                "entity_id": str(row["id"]),
+                "version": row["version"],
+                "score": score,
+                "confidence": confidence,
+                "factors": factors,
+                "explanation": (
+                    "; ".join(item["label"] for item in factors) or "No active priority factors"
+                ),
+                "pinned": bool(row["pinned"]),
+            }
+            for row, (score, confidence, factors) in zip(rows, scored, strict=True)
+        ]
+    )
 
     session.execute(
         text(
@@ -405,17 +429,12 @@ def _upsert_batch(
             )
             SELECT gen_random_uuid(), :workspace_id, :entity_type,
                    t.entity_id, t.version, t.score, t.confidence,
-                   t.factors::jsonb, t.explanation, :generated_at, :expires_at, t.pinned,
+                   t.factors, t.explanation, :generated_at, :expires_at, t.pinned,
                    :policy_version
-            FROM unnest(
-                CAST(:entity_ids AS uuid[]),
-                CAST(:versions AS bigint[]),
-                CAST(:scores AS smallint[]),
-                CAST(:confidences AS numeric[]),
-                CAST(:factors AS text[]),
-                CAST(:explanations AS text[]),
-                CAST(:pinned AS boolean[])
-            ) AS t(entity_id, version, score, confidence, factors, explanation, pinned)
+            FROM jsonb_to_recordset(CAST(:payload AS jsonb)) AS t(
+                entity_id uuid, version bigint, score smallint, confidence numeric,
+                factors jsonb, explanation text, pinned boolean
+            )
             ON CONFLICT (workspace_id, entity_type, entity_id) DO UPDATE SET
                 source_entity_version = EXCLUDED.source_entity_version,
                 score = EXCLUDED.score,
@@ -437,13 +456,7 @@ def _upsert_batch(
         {
             "workspace_id": auth.workspace_id,
             "entity_type": entity_type,
-            "entity_ids": entity_ids,
-            "versions": versions,
-            "scores": scores,
-            "confidences": confidences,
-            "factors": factors_json,
-            "explanations": explanations,
-            "pinned": pinned,
+            "payload": payload,
             "generated_at": now,
             "expires_at": expires_at,
             "policy_version": policy_version,
