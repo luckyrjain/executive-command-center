@@ -307,9 +307,19 @@ _UNTRUSTED_DATA_FOOTER = "--- END UNTRUSTED DATA ---"
 
 
 def _render_factors_block(factors: list[dict[str, Any]]) -> str:
+    # `factor_code=` is spelled out explicitly (not a bare leading token)
+    # and the workspace-record `source_field` is de-emphasized as
+    # parenthetical provenance -- a live-Ollama evaluation run
+    # (qwen2.5:1.5b) showed the model repeatedly citing a factor's
+    # `source_field` value (e.g. "created_at") instead of its `code`
+    # value (e.g. "recently_created") in `cited_factor_codes`, which reads
+    # as the model latching onto whichever token most resembles a data
+    # field name -- the previous "- {code}: {label} (source={source_field},
+    # points={points})" format put `code` and `source_field` on equal
+    # visual footing with no label distinguishing which one is citable.
     lines = [
-        f"- {factor['code']}: {factor['label']} "
-        f"(source={factor['source_field']}, points={factor['points']})"
+        f'- factor_code="{factor["code"]}" label="{factor["label"]}" points={factor["points"]} '
+        f"(from workspace field: {factor['source_field']})"
         for factor in factors
     ]
     body = "\n".join(lines) if lines else "(no factors)"
