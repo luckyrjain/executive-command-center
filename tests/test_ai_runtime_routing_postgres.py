@@ -432,7 +432,7 @@ def test_routing_policies_seeded_row() -> None:
     # every active model_definitions row, not this column -- see that
     # migration's own docstring), it does not add a second policy row or
     # bump version. Filtered by task_type (not a bare `FROM routing_
-    # policies`) since migration 0034_phase4_meeting_prep_enrichment
+    # policies`) since migration 0034_phase4_meeting_prep
     # added a second, independent task_type's own row -- see
     # test_meeting_prep_summary_routing_policy_seeded_row below.
     assert len(rows) == 1
@@ -451,7 +451,7 @@ def test_routing_policies_seeded_row() -> None:
 
 
 def test_meeting_prep_summary_routing_policy_seeded_row() -> None:
-    """Migration `0034_phase4_meeting_prep_enrichment.py` -- the second,
+    """Migration `0034_phase4_meeting_prep.py` -- the second,
     independent task_type's own `routing_policies` row (Phase 3's
     `meeting_prep.py` "Optional enrichment" wired on).
     """

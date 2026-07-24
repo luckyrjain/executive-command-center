@@ -1380,9 +1380,7 @@ def test_get_prep_returns_persisted_enrichment_not_recomputed(
     monkeypatch.setenv("ECC_MEETING_PREP_AI_ENRICHMENT_ENABLED", "true")
     get_settings.cache_clear()
     creation_adapter = _mocked_ollama_adapter(
-        json.dumps(
-            {"summary_text": "Original summary.", "cited_evidence_ids": [participant_id]}
-        )
+        json.dumps({"summary_text": "Original summary.", "cited_evidence_ids": [participant_id]})
     )
     app.dependency_overrides[get_ollama_adapter] = lambda: creation_adapter
     try:
@@ -1405,3 +1403,124 @@ def test_get_prep_returns_persisted_enrichment_not_recomputed(
 
     assert fetched.status_code == 200
     assert fetched.json()["enrichment"]["summary"] == "Original summary."
+
+
+def test_refresh_prep_enrichment_available_when_enabled_and_grounded(
+    meeting_prep_test_context: tuple[TestClient, UUID, UUID, str, UUID],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`create_prep`'s enrichment tests above only exercise `create_prep`
+    itself; `refresh_prep` has its own separate enrichment call site (and
+    its own documented FOR-UPDATE-lock-does-not-span-the-AI-call
+    behavior difference) that needs its own direct coverage rather than
+    relying on `create_prep`'s passing.
+    """
+    client, workspace_id, _user_id, token, meeting_id = meeting_prep_test_context
+    entity_id = _seed_node(workspace_id, "person", "Jordan Lee")
+    added = client.post(
+        f"/api/v1/meetings/{meeting_id}/participants",
+        headers=_headers(token, "refresh-enrichment-participant"),
+        json={"entity_id": str(entity_id)},
+    )
+    assert added.status_code == 201, added.text
+    participant_id = added.json()["id"]
+
+    created = client.post(
+        f"/api/v1/meetings/{meeting_id}/prep", headers=_headers(token, "refresh-enrichment-create")
+    )
+    assert created.status_code == 201, created.text
+    assert created.json()["enrichment"]["error_code"] == "feature_disabled"
+
+    monkeypatch.setenv("ECC_MEETING_PREP_AI_ENRICHMENT_ENABLED", "true")
+    get_settings.cache_clear()
+    adapter = _mocked_ollama_adapter(
+        json.dumps(
+            {
+                "summary_text": "Refreshed: Jordan Lee is attending.",
+                "cited_evidence_ids": [participant_id],
+            }
+        )
+    )
+    app.dependency_overrides[get_ollama_adapter] = lambda: adapter
+    try:
+        refreshed = client.post(
+            f"/api/v1/meetings/{meeting_id}/prep/refresh",
+            headers=_headers(token, "refresh-enrichment-refresh"),
+        )
+    finally:
+        app.dependency_overrides.pop(get_ollama_adapter, None)
+        get_settings.cache_clear()
+
+    assert refreshed.status_code == 201, refreshed.text
+    enrichment = refreshed.json()["enrichment"]
+    assert enrichment["available"] is True
+    assert enrichment["error_code"] is None
+    assert enrichment["summary"] == "Refreshed: Jordan Lee is attending."
+
+
+def test_create_prep_idempotent_replay_does_not_call_model_again(
+    meeting_prep_test_context: tuple[TestClient, UUID, UUID, str, UUID],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`create_prep`'s docstring claims `_held_idempotency_lock` plus the
+    idempotency-record cache keeps a same-key replay from reaching
+    `execute_run` a second time -- proven directly here (not merely
+    implied by the transaction restructuring passing other tests) by
+    pointing a second, replay-time mocked adapter at a transport that
+    raises if `.generate()` is ever called.
+    """
+    client, workspace_id, _user_id, token, meeting_id = meeting_prep_test_context
+    entity_id = _seed_node(workspace_id, "person", "Jordan Lee")
+    added = client.post(
+        f"/api/v1/meetings/{meeting_id}/participants",
+        headers=_headers(token, "replay-participant"),
+        json={"entity_id": str(entity_id)},
+    )
+    assert added.status_code == 201, added.text
+    participant_id = added.json()["id"]
+
+    monkeypatch.setenv("ECC_MEETING_PREP_AI_ENRICHMENT_ENABLED", "true")
+    get_settings.cache_clear()
+    call_count = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal call_count
+        call_count += 1
+        body = (
+            json.dumps(
+                {
+                    "model": "m",
+                    "created_at": "now",
+                    "response": json.dumps(
+                        {
+                            "summary_text": "Jordan Lee is attending.",
+                            "cited_evidence_ids": [participant_id],
+                        }
+                    ),
+                    "done": True,
+                    "eval_count": 12,
+                    "prompt_eval_count": 40,
+                }
+            )
+            + "\n"
+        )
+        return httpx.Response(
+            200, content=body.encode(), headers={"content-type": "application/x-ndjson"}
+        )
+
+    app.dependency_overrides[get_ollama_adapter] = lambda: OllamaAdapter(
+        transport=httpx.MockTransport(handler)
+    )
+    try:
+        headers = _headers(token, "replay-same-key")
+        first = client.post(f"/api/v1/meetings/{meeting_id}/prep", headers=headers)
+        assert first.status_code == 201, first.text
+        second = client.post(f"/api/v1/meetings/{meeting_id}/prep", headers=headers)
+    finally:
+        app.dependency_overrides.pop(get_ollama_adapter, None)
+        get_settings.cache_clear()
+
+    assert second.status_code == 201, second.text
+    assert second.json()["id"] == first.json()["id"]
+    assert second.json()["enrichment"] == first.json()["enrichment"]
+    assert call_count == 1, f"model was called {call_count} times, expected exactly 1"

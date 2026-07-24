@@ -62,9 +62,9 @@ from ecc.config import get_settings
 from ecc.database import get_session
 from ecc.domains.ai_runtime.ollama_client import OllamaAdapter
 from ecc.domains.ai_runtime.runtime import (
-    OllamaAdapterDep,
     _held_idempotency_lock,
     execute_run,
+    get_ollama_adapter,
 )
 from ecc.observability import (
     queue_lifecycle_event,
@@ -922,6 +922,32 @@ def _fetch_evidence(session: Session, auth: AuthContext, node_ids: list[UUID]) -
     ]
 
 
+def _resolve_ollama_adapter(request: Request) -> OllamaAdapter:
+    """Resolves the same provider `OllamaAdapterDep` (`Depends(get_
+    ollama_adapter)`) would -- including honoring `app.dependency_
+    overrides[get_ollama_adapter]`, exactly how tests inject a mocked
+    adapter -- but called explicitly, only from inside `create_prep`/
+    `refresh_prep`'s enrichment-enabled branch, instead of declared as an
+    eagerly-resolved route parameter.
+
+    This is deliberate, not a style preference: unlike `ai_runtime/
+    runtime.py:create_run` (where the adapter is unconditionally needed,
+    so declaring `adapter: OllamaAdapterDep` and letting FastAPI resolve
+    it upfront is correct), `create_prep`/`refresh_prep` only need a real
+    adapter when `meeting_prep_ai_enrichment_enabled` is on -- the
+    minority case. `get_ollama_adapter`'s default provider constructs a
+    fresh `OllamaAdapter`/`ollama.Client`/`httpx.Client` per call, which
+    is not free (this module's own p95 pack-generation budget test caught
+    it: constructing one unconditionally on every request, including the
+    far more common enrichment-disabled path where it is never used, was
+    a measurable, real per-request cost). Resolving it lazily here means
+    the disabled path -- `_compute_enrichment`'s own guaranteed no-op --
+    never pays for it at all.
+    """
+    override = request.app.dependency_overrides.get(get_ollama_adapter)
+    return override() if override is not None else get_ollama_adapter()
+
+
 def _compute_enrichment(
     session: Session,
     auth: AuthContext,
@@ -953,9 +979,11 @@ def _compute_enrichment(
     ``ollama_adapter`` mirrors ``execute_run``'s own optional parameter --
     ``None`` in production (`execute_run` falls back to a real
     ``OllamaAdapter()``), a test-supplied mocked transport in tests,
-    threaded from ``create_prep``/``refresh_prep``'s own ``OllamaAdapterDep``
-    exactly like ``ai_runtime/runtime.py:create_run`` already does for
-    ``POST /ai/runs``.
+    threaded from ``create_prep``/``refresh_prep``'s own
+    ``_resolve_ollama_adapter(request)`` call -- see that helper's
+    docstring for why it is resolved lazily there rather than declared as
+    an eagerly-resolved ``OllamaAdapterDep`` route parameter like
+    ``ai_runtime/runtime.py:create_run`` uses for ``POST /ai/runs``.
     """
     if not get_settings().meeting_prep_ai_enrichment_enabled:
         return EnrichmentOut(available=False, summary=None, error_code="feature_disabled")
@@ -1286,27 +1314,131 @@ def create_prep(
     session: SessionDep,
     _csrf: CsrfDep,
     idempotency_key: IdempotencyHeader,
-    adapter: OllamaAdapterDep,
 ) -> MeetingPack:
-    """`_held_idempotency_lock` (not the lighter, transaction-scoped
-    `_lock_idempotency` every other endpoint in this module uses) wraps
-    this whole body, matching `ai_runtime/runtime.py:create_run`'s exact
-    reasoning and precedent: `_compute_enrichment` calls `execute_run`,
-    which unconditionally commits partway through
+    """Two paths, chosen once up front by the enrichment flag -- not a
+    stylistic split, a measured one: the p95 pack-generation budget test
+    (`test_build_meeting_pack_p95_under_budget`) caught the fast path
+    below regressing to ~3x its budget when this endpoint unconditionally
+    paid for three separate committed transactions per call, including on
+    the far more common enrichment-disabled request.
+
+    When the flag is off, `_compute_enrichment` is a guaranteed no-op (it
+    returns `feature_disabled` immediately, before ever touching the
+    session or calling `execute_run`) -- so there is no reason to split
+    the transaction at all, and this path is exactly the pre-Phase-4
+    shape: one `session.begin()`, the lighter transaction-scoped
+    `_lock_idempotency` every other endpoint in this module uses.
+
+    When the flag is on, `_compute_enrichment` really does call
+    `execute_run`, which unconditionally commits partway through
     (`_persist_terminal`'s own docstring) -- calling it from inside a
     still-open `session.begin()` block closes that transaction out from
     under the caller (confirmed against a real Postgres instance while
     building this: `session.begin_nested()` afterward raised `Can't
-    operate on closed transaction`). So this body is split into several
-    short transactions with `_compute_enrichment` called bare between
-    them, exactly like `create_run`'s own three-phase shape, and the
-    *lock* -- not one shared transaction -- is what keeps two concurrent
-    requests carrying the same Idempotency-Key from both reaching
-    `execute_run` and each triggering a real model call.
+    operate on closed transaction`). So only this path pays for splitting
+    the body into several short transactions with `_compute_enrichment`
+    called bare between them, exactly like `ai_runtime/runtime.py:
+    create_run`'s own three-phase shape, with `_held_idempotency_lock`
+    (a session-scoped lock, not tied to any one transaction) as what
+    keeps two concurrent requests carrying the same Idempotency-Key from
+    both reaching `execute_run` and each triggering a real model call.
     """
     request_hash = _request_hash(f"create_prep:{meeting_id}")
     now = datetime.now(UTC)
     pack_id = uuid4()
+
+    def _insert_pack(generated: _GeneratedPack, enrichment: EnrichmentOut) -> MeetingPack:
+        snapshot = _content_to_snapshot(generated.content, enrichment)
+        insert_params = {
+            "id": pack_id,
+            "workspace_id": auth.workspace_id,
+            "meeting_id": meeting_id,
+            "now": now,
+            "stale_at": now + _STALE_AFTER,
+            "source_versions": dumps(generated.fingerprint),
+            "content": dumps(snapshot.model_dump(mode="json")),
+            "actor_id": auth.user_id,
+        }
+        try:
+            # A nested transaction (SAVEPOINT): the existence check above
+            # closes the common case, but under true concurrency two
+            # requests can both pass it and both reach this INSERT --
+            # `uq_meeting_packs_active_per_meeting` (migration 0027) is
+            # the real guard, and the loser must get a clean 409 instead
+            # of an unhandled 500 (finding #7). A savepoint keeps that
+            # failure from dooming the whole outer transaction so the
+            # idempotency-record write below (a distinct concern) still
+            # succeeds.
+            with session.begin_nested():
+                row = (
+                    session.execute(
+                        text(
+                            f"""
+                            INSERT INTO meeting_packs (
+                                id, workspace_id, meeting_id, status, generated_at, stale_at,
+                                source_versions, content, created_by, updated_by,
+                                created_at, updated_at, version
+                            ) VALUES (
+                                :id, :workspace_id, :meeting_id, 'fresh', :now, :stale_at,
+                                CAST(:source_versions AS jsonb), CAST(:content AS jsonb),
+                                :actor_id, :actor_id, :now, :now, 1
+                            )
+                            RETURNING {_PACK_FIELDS}
+                            """
+                        ),
+                        insert_params,
+                    )
+                    .mappings()
+                    .one()
+                )
+        except IntegrityError as exc:
+            if _violated_constraint(exc) != "uq_meeting_packs_active_per_meeting":
+                raise
+            raise HTTPException(status_code=409, detail="MEETING_PACK_EXISTS") from exc
+        response = _pack_row_to_response(dict(row), snapshot)
+        _write_event(
+            session,
+            auth,
+            request,
+            "meeting_pack.generated",
+            "meeting_pack",
+            meeting_id,
+            pack_id,
+            1,
+            now,
+        )
+        _store_cached(
+            session,
+            auth,
+            idempotency_key,
+            request_hash,
+            response.model_dump(mode="json"),
+            201,
+            now,
+        )
+        return response
+
+    if not get_settings().meeting_prep_ai_enrichment_enabled:
+        with session.begin():
+            _lock_idempotency(session, auth, idempotency_key)
+            cached = _load_cached(session, auth, idempotency_key, request_hash)
+            if cached is not None:
+                return MeetingPack.model_validate(cached)
+
+            meeting_row = _meeting_row(session, auth, meeting_id)
+            if meeting_row is None:
+                raise HTTPException(status_code=404, detail="MEETING_NOT_FOUND")
+
+            existing = _current_pack_row(session, auth, meeting_id)
+            if existing is not None:
+                if now >= existing["stale_at"]:
+                    raise HTTPException(status_code=409, detail="STALE_MEETING_PACK")
+                raise HTTPException(status_code=409, detail="MEETING_PACK_EXISTS")
+
+            generated = _generate_pack(session, auth, meeting_id, meeting_row)
+            enrichment = EnrichmentOut(available=False, summary=None, error_code="feature_disabled")
+            return _insert_pack(generated, enrichment)
+
     with _held_idempotency_lock(auth, idempotency_key):
         with session.begin():
             cached = _load_cached(session, auth, idempotency_key, request_hash)
@@ -1326,79 +1458,12 @@ def create_prep(
 
             generated = _generate_pack(session, auth, meeting_id, meeting_row)
 
-        enrichment = _compute_enrichment(session, auth, meeting_id, ollama_adapter=adapter)
+        enrichment = _compute_enrichment(
+            session, auth, meeting_id, ollama_adapter=_resolve_ollama_adapter(request)
+        )
 
         with session.begin():
-            snapshot = _content_to_snapshot(generated.content, enrichment)
-            insert_params = {
-                "id": pack_id,
-                "workspace_id": auth.workspace_id,
-                "meeting_id": meeting_id,
-                "now": now,
-                "stale_at": now + _STALE_AFTER,
-                "source_versions": dumps(generated.fingerprint),
-                "content": dumps(snapshot.model_dump(mode="json")),
-                "actor_id": auth.user_id,
-            }
-            try:
-                # A nested transaction (SAVEPOINT): the existence check
-                # above closes the common case, but under true
-                # concurrency two requests can both pass it and both
-                # reach this INSERT -- `uq_meeting_packs_active_per_
-                # meeting` (migration 0027) is the real guard, and the
-                # loser must get a clean 409 instead of an unhandled 500
-                # (finding #7). A savepoint keeps that failure from
-                # dooming the whole outer transaction so the
-                # idempotency-record write below (a distinct concern)
-                # still succeeds.
-                with session.begin_nested():
-                    row = (
-                        session.execute(
-                            text(
-                                f"""
-                                INSERT INTO meeting_packs (
-                                    id, workspace_id, meeting_id, status, generated_at, stale_at,
-                                    source_versions, content, created_by, updated_by,
-                                    created_at, updated_at, version
-                                ) VALUES (
-                                    :id, :workspace_id, :meeting_id, 'fresh', :now, :stale_at,
-                                    CAST(:source_versions AS jsonb), CAST(:content AS jsonb),
-                                    :actor_id, :actor_id, :now, :now, 1
-                                )
-                                RETURNING {_PACK_FIELDS}
-                                """
-                            ),
-                            insert_params,
-                        )
-                        .mappings()
-                        .one()
-                    )
-            except IntegrityError as exc:
-                if _violated_constraint(exc) != "uq_meeting_packs_active_per_meeting":
-                    raise
-                raise HTTPException(status_code=409, detail="MEETING_PACK_EXISTS") from exc
-            response = _pack_row_to_response(dict(row), snapshot)
-            _write_event(
-                session,
-                auth,
-                request,
-                "meeting_pack.generated",
-                "meeting_pack",
-                meeting_id,
-                pack_id,
-                1,
-                now,
-            )
-            _store_cached(
-                session,
-                auth,
-                idempotency_key,
-                request_hash,
-                response.model_dump(mode="json"),
-                201,
-                now,
-            )
-        return response
+            return _insert_pack(generated, enrichment)
 
 
 @router.get("/{meeting_id}/prep", response_model=MeetingPack)
@@ -1454,22 +1519,42 @@ def refresh_prep(
     session: SessionDep,
     _csrf: CsrfDep,
     idempotency_key: IdempotencyHeader,
-    adapter: OllamaAdapterDep,
 ) -> MeetingPack:
-    """`_held_idempotency_lock` -- see `create_prep`'s identical
-    docstring for why (`_compute_enrichment` calls `execute_run`, which
-    unconditionally commits partway through, so it cannot run inside a
-    still-open `session.begin()` block).
+    """Two paths, chosen once up front by the enrichment flag -- see
+    `create_prep`'s identical docstring for why this split exists at all
+    (a real, measured p95 regression from unconditionally paying for
+    three committed transactions per call, including on the far more
+    common enrichment-disabled request) and why the fast path below is
+    safe: `_compute_enrichment` is a guaranteed no-op when the flag is
+    off, so `execute_run` (whose internal commit is the only reason the
+    slow path below needs multiple transactions) is never called.
 
-    Splitting "retire the old row" and "insert the new one" across two
-    transactions (with `_compute_enrichment` called bare in between)
-    does trade away one property the original single-transaction version
-    had: `old`'s `FOR UPDATE` lock no longer stays held across the AI
-    call, so a second `refresh_prep` call landing in that exact gap sees
-    no active pack (the first call already retired the old one) and gets
-    `MEETING_PACK_NOT_FOUND` instead of transparently retrying against
-    whichever pack is current. A real, narrow-window behavior difference
-    versus before -- accepted deliberately here, matching `ai_runtime/
+    Slow path (flag on): retiring `old` and inserting the new row are
+    kept together in the *final* transaction (after `_compute_enrichment`
+    has already run), not split across the transaction that runs before
+    it. An earlier version of this restructuring retired `old` in the
+    pre-enrichment transaction; a real bug was found while reviewing that
+    shape: if `_compute_enrichment`/`execute_run` ever raised for a
+    reason other than the model call itself failing (`execute_run`'s own
+    terminal persist can re-raise a genuine `SQLAlchemyError` -- see
+    `ai_runtime/runtime.py:_persist_terminal`'s outbox-write path), the
+    already-committed retirement of `old` would survive while the new
+    row's `INSERT` never ran, leaving the meeting with zero active
+    packs. Retiring and inserting together here means either both
+    happen or neither does -- if anything above this point raises, `old`
+    is untouched.
+
+    This still trades away one property the original single-transaction
+    version had: `old`'s `FOR UPDATE` lock (taken below, before
+    `_compute_enrichment` runs) is released at that transaction's commit
+    and not held across the AI call, so a second `refresh_prep` call
+    landing in that exact gap can also pass the `old is not None` check
+    and reach this same final transaction. Guarded the same way
+    `create_prep`'s single-attempt-per-request `INSERT` already is: the
+    loser's `INSERT` (or its `UPDATE ... WHERE status IN (...)` matching
+    zero rows because the winner already retired `old`) is caught below
+    and turned into a clean `409 MEETING_PACK_EXISTS` rather than an
+    unhandled 500 or a second active pack, matching `ai_runtime/
     runtime.py:create_run`'s own established precedent for this same
     "must call execute_run, cannot hold one transaction across it" shape
     (that endpoint's own idempotency-replay path is what makes a
@@ -1478,6 +1563,111 @@ def refresh_prep(
     request_hash = _request_hash(f"refresh_prep:{meeting_id}")
     now = datetime.now(UTC)
     new_pack_id = uuid4()
+
+    def _retire_and_insert(
+        old_id: UUID, generated: _GeneratedPack, enrichment: EnrichmentOut
+    ) -> MeetingPack:
+        # Retire the old pack *before* inserting the new one, both in this
+        # one transaction: uq_meeting_packs_active_per_meeting (migration
+        # 0027) allows only one fresh-or-stale row per meeting at a time,
+        # checked immediately per-statement, so inserting the new 'fresh'
+        # row while the old one is still 'fresh'/'stale' would violate it.
+        session.execute(
+            text(
+                """
+                UPDATE meeting_packs
+                SET status = 'refreshed', updated_by = :actor_id, updated_at = :now
+                WHERE workspace_id = :workspace_id AND id = :id
+                    AND status IN ('fresh', 'stale')
+                """
+            ),
+            {
+                "actor_id": auth.user_id,
+                "now": now,
+                "workspace_id": auth.workspace_id,
+                "id": old_id,
+            },
+        )
+        snapshot = _content_to_snapshot(generated.content, enrichment)
+        row = (
+            session.execute(
+                text(
+                    f"""
+                    INSERT INTO meeting_packs (
+                        id, workspace_id, meeting_id, status, generated_at, stale_at,
+                        source_versions, content, created_by, updated_by,
+                        created_at, updated_at, version
+                    ) VALUES (
+                        :id, :workspace_id, :meeting_id, 'fresh', :now, :stale_at,
+                        CAST(:source_versions AS jsonb), CAST(:content AS jsonb),
+                        :actor_id, :actor_id, :now, :now, 1
+                    )
+                    RETURNING {_PACK_FIELDS}
+                    """
+                ),
+                {
+                    "id": new_pack_id,
+                    "workspace_id": auth.workspace_id,
+                    "meeting_id": meeting_id,
+                    "now": now,
+                    "stale_at": now + _STALE_AFTER,
+                    "source_versions": dumps(generated.fingerprint),
+                    "content": dumps(snapshot.model_dump(mode="json")),
+                    "actor_id": auth.user_id,
+                },
+            )
+            .mappings()
+            .one()
+        )
+        response = _pack_row_to_response(dict(row), snapshot)
+        _write_event(
+            session,
+            auth,
+            request,
+            "meeting_pack.refreshed",
+            "meeting_pack",
+            meeting_id,
+            new_pack_id,
+            1,
+            now,
+        )
+        _store_cached(
+            session,
+            auth,
+            idempotency_key,
+            request_hash,
+            response.model_dump(mode="json"),
+            201,
+            now,
+        )
+        return response
+
+    if not get_settings().meeting_prep_ai_enrichment_enabled:
+        try:
+            with session.begin():
+                _lock_idempotency(session, auth, idempotency_key)
+                cached = _load_cached(session, auth, idempotency_key, request_hash)
+                if cached is not None:
+                    return MeetingPack.model_validate(cached)
+
+                meeting_row = _meeting_row(session, auth, meeting_id)
+                if meeting_row is None:
+                    raise HTTPException(status_code=404, detail="MEETING_NOT_FOUND")
+
+                old = _current_pack_row(session, auth, meeting_id, for_update=True)
+                if old is None:
+                    raise HTTPException(status_code=404, detail="MEETING_PACK_NOT_FOUND")
+
+                generated = _generate_pack(session, auth, meeting_id, meeting_row)
+                enrichment = EnrichmentOut(
+                    available=False, summary=None, error_code="feature_disabled"
+                )
+                return _retire_and_insert(old["id"], generated, enrichment)
+        except IntegrityError as exc:
+            if _violated_constraint(exc) != "uq_meeting_packs_active_per_meeting":
+                raise
+            raise HTTPException(status_code=409, detail="MEETING_PACK_EXISTS") from exc
+
     with _held_idempotency_lock(auth, idempotency_key):
         with session.begin():
             cached = _load_cached(session, auth, idempotency_key, request_hash)
@@ -1493,81 +1683,16 @@ def refresh_prep(
             if old is None:
                 raise HTTPException(status_code=404, detail="MEETING_PACK_NOT_FOUND")
 
-            # Retire the old pack *before* inserting the new one:
-            # uq_meeting_packs_active_per_meeting (migration 0027) allows
-            # only one fresh-or-stale row per meeting at a time, checked
-            # immediately per-statement, so inserting the new 'fresh' row
-            # while the old one is still 'fresh'/'stale' would violate it.
-            session.execute(
-                text(
-                    """
-                    UPDATE meeting_packs
-                    SET status = 'refreshed', updated_by = :actor_id, updated_at = :now
-                    WHERE workspace_id = :workspace_id AND id = :id
-                    """
-                ),
-                {
-                    "actor_id": auth.user_id,
-                    "now": now,
-                    "workspace_id": auth.workspace_id,
-                    "id": old["id"],
-                },
-            )
             generated = _generate_pack(session, auth, meeting_id, meeting_row)
 
-        enrichment = _compute_enrichment(session, auth, meeting_id, ollama_adapter=adapter)
+        enrichment = _compute_enrichment(
+            session, auth, meeting_id, ollama_adapter=_resolve_ollama_adapter(request)
+        )
 
-        with session.begin():
-            snapshot = _content_to_snapshot(generated.content, enrichment)
-            row = (
-                session.execute(
-                    text(
-                        f"""
-                        INSERT INTO meeting_packs (
-                            id, workspace_id, meeting_id, status, generated_at, stale_at,
-                            source_versions, content, created_by, updated_by,
-                            created_at, updated_at, version
-                        ) VALUES (
-                            :id, :workspace_id, :meeting_id, 'fresh', :now, :stale_at,
-                            CAST(:source_versions AS jsonb), CAST(:content AS jsonb),
-                            :actor_id, :actor_id, :now, :now, 1
-                        )
-                        RETURNING {_PACK_FIELDS}
-                        """
-                    ),
-                    {
-                        "id": new_pack_id,
-                        "workspace_id": auth.workspace_id,
-                        "meeting_id": meeting_id,
-                        "now": now,
-                        "stale_at": now + _STALE_AFTER,
-                        "source_versions": dumps(generated.fingerprint),
-                        "content": dumps(snapshot.model_dump(mode="json")),
-                        "actor_id": auth.user_id,
-                    },
-                )
-                .mappings()
-                .one()
-            )
-            response = _pack_row_to_response(dict(row), snapshot)
-            _write_event(
-                session,
-                auth,
-                request,
-                "meeting_pack.refreshed",
-                "meeting_pack",
-                meeting_id,
-                new_pack_id,
-                1,
-                now,
-            )
-            _store_cached(
-                session,
-                auth,
-                idempotency_key,
-                request_hash,
-                response.model_dump(mode="json"),
-                201,
-                now,
-            )
-        return response
+        try:
+            with session.begin():
+                return _retire_and_insert(old["id"], generated, enrichment)
+        except IntegrityError as exc:
+            if _violated_constraint(exc) != "uq_meeting_packs_active_per_meeting":
+                raise
+            raise HTTPException(status_code=409, detail="MEETING_PACK_EXISTS") from exc

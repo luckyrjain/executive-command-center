@@ -466,7 +466,7 @@ def test_tool_definitions_seeded_rows() -> None:
 
 
 def test_meeting_prep_summary_prompt_seeded_row() -> None:
-    """Migration `0034_phase4_meeting_prep_enrichment.py` -- the second
+    """Migration `0034_phase4_meeting_prep.py` -- the second
     prompt family this activation registers (Phase 3's `meeting_prep.py`
     "Optional enrichment" wired on).
     """
