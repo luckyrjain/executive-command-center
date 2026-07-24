@@ -316,3 +316,134 @@ def test_second_registered_model_produces_a_valid_completed_run_against_real_oll
                 ),
                 {"model_id": _MODEL_ID},
             )
+
+
+def test_reflection_call_produces_a_valid_completed_run_against_real_ollama(
+    run_context: dict,
+) -> None:
+    """Reflection Engine (first slice, `runtime.py:_reflect_on_answer`,
+    gated by `routing_policies.constraints.reflection_enabled`, migration
+    `0033_phase4_reflection.py`, default `false`) is fail-open by
+    construction against a mocked transport (`tests/
+    test_ai_runtime_runtime_postgres.py`'s scenario matrix), but this is
+    the one test in this suite proving it is genuinely invokable
+    end-to-end against a real model -- a distinct property from "the
+    fail-open logic is correct," matching this file's own precedent for
+    `test_second_registered_model_produces_a_valid_completed_run_against_
+    real_ollama` above.
+
+    A smoke test, not a promotion-floor check: flips `reflection_enabled`
+    to `true` for this test's duration only (restored in `finally`,
+    keeping the default seeded value `false` for every other test in this
+    suite and for the real 20-example evaluation floor check above, per
+    `EVALUATION-CONTRACT.md`'s documented tradeoff not to run that check
+    with reflection enabled yet). Whatever the model's reflection call
+    decides (approve unchanged, or a revision that itself passes
+    validation/grounding, or any reflection-layer failure) the run must
+    still complete -- fail-open is the property under test here, not any
+    particular reflection outcome.
+    """
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "UPDATE routing_policies SET constraints = constraints || "
+                "'{\"reflection_enabled\": true}'::jsonb "
+                "WHERE task_type = :task_type AND status = 'active'"
+            ),
+            {"task_type": _TASK_TYPE},
+        )
+    try:
+        item_id = uuid4()
+        now = datetime.now(UTC)
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO attention_items (
+                        id, workspace_id, entity_type, entity_id, source_entity_version,
+                        score, confidence, factors, explanation, generated_at, expires_at,
+                        pinned, policy_version
+                    ) VALUES (
+                        :id, :workspace_id, 'task', :entity_id, 1, 62, 0.900,
+                        CAST(:factors AS jsonb), 'because reasons', :now, :expires_at, false, 1
+                    )
+                    """
+                ),
+                {
+                    "id": item_id,
+                    "workspace_id": run_context["auth"].workspace_id,
+                    "entity_id": uuid4(),
+                    # Same multi-factor set as this file's second-model
+                    # smoke test, for the same reason: a real, observed
+                    # good grounding track record, not a thin single-factor
+                    # item that gives the model too little material.
+                    "factors": dumps(
+                        [
+                            {
+                                "code": "manual_priority",
+                                "label": "Manual priority critical",
+                                "points": 30,
+                                "source_field": "manual_priority",
+                            },
+                            {
+                                "code": "overdue",
+                                "label": "Due timing overdue",
+                                "points": 25,
+                                "source_field": "due_date,due_at",
+                            },
+                            {
+                                "code": "pinned",
+                                "label": "Explicitly pinned",
+                                "points": 15,
+                                "source_field": "pinned",
+                            },
+                            {
+                                "code": "blocked",
+                                "label": "Task is blocked",
+                                "points": 10,
+                                "source_field": "status",
+                            },
+                            {
+                                "code": "stale_14d",
+                                "label": "No movement for 14 days",
+                                "points": 6,
+                                "source_field": "updated_at",
+                            },
+                        ]
+                    ),
+                    "now": now,
+                    "expires_at": now + timedelta(days=1),
+                },
+            )
+
+        runs = []
+        for _attempt in range(_SMOKE_TEST_ATTEMPTS):
+            with SessionFactory() as session:
+                run = execute_run(
+                    _TASK_TYPE,
+                    "sensitive",
+                    {"attention_item_id": str(item_id)},
+                    session=session,
+                    auth=run_context["auth"],
+                    ollama_adapter=OllamaAdapter(host=_OLLAMA_BASE_URL),
+                )
+            runs.append(run)
+            if run.status == "completed":
+                break
+
+        assert run.status == "completed", (
+            f"reflection-enabled run never completed in {_SMOKE_TEST_ATTEMPTS} attempts: "
+            f"error_codes={[r.error_code for r in runs]!r}; "
+            f"last_run_evidence={runs[-1].evidence!r}"
+        )
+        assert run.output is not None
+    finally:
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    "UPDATE routing_policies SET constraints = constraints || "
+                    "'{\"reflection_enabled\": false}'::jsonb "
+                    "WHERE task_type = :task_type AND status = 'active'"
+                ),
+                {"task_type": _TASK_TYPE},
+            )
