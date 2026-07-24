@@ -45,27 +45,34 @@ later slice's problem (this activation has no draft-prompt execution path
 at all, a real and openly documented limitation, not an oversight).
 
 **Ephemeral, workspace-scoped synthetic data, cleaned up after the run.**
-Each example needs a real `attention_items` row for `attention.get_item`
-(and therefore `attention.explain_item`) to read -- `run_evaluation` inserts
-one synthetic row per example into the *caller's own* workspace, runs it
-through `execute_run`, and deletes every synthetic row it created once the
-full dataset has been scored, so an evaluation run never leaves fabricated
-rows behind that could show up in that workspace's real Attention Queue.
-The `ai_runs`/`ai_run_steps` rows `execute_run` itself persists are *not*
-deleted -- they are genuine historical run records, retained for
+Each example needs a real domain row for `execute_run`'s Step 1 tool
+dispatch to read -- one `attention_items` row for `attention.get_item`
+(and therefore `attention.explain_item`), or one full synthetic meeting
+evidence bundle for `meeting.get_prep_pack` (and therefore `meeting.prep_
+summary`). `run_evaluation` inserts that source into the *caller's own*
+workspace, runs it through `execute_run`, and deletes it again, so an
+evaluation run never leaves fabricated rows behind that could show up in
+that workspace's real Attention Queue or meeting list. The two task types'
+synthetic sources are cleaned up on different schedules for a real reason,
+not stylistic inconsistency -- see `_insert_synthetic_meeting`'s docstring
+for why `meeting.prep_summary`'s cannot be batched like `attention.explain_
+item`'s. The `ai_runs`/`ai_run_steps` rows `execute_run` itself persists are
+*not* deleted -- they are genuine historical run records, retained for
 reproducibility exactly like any other run (`EVALUATION-CONTRACT.md`:
 "Evaluation results, environment and artifact hashes ... are retained for
 reproducibility").
 
 **`generated_artifacts`.** For every example that reaches `completed`,
 `run_evaluation` writes one `generated_artifacts` row deriving from that
-example's `ai_runs` row -- `source_versions` pins the synthetic item's
-`source_entity_version`, `evidence` is the run's cited factor codes,
-`output` is the validated `{explanation_text, cited_factor_codes}` payload.
-This is the first concrete producer of `generated_artifacts` rows in this
-activation (Task 4's `POST /ai/runs` does not write one); wiring the
-production run path to do the same is a later task's decision, not
-attempted here.
+example's `ai_runs` row -- `source_versions` identifies the synthetic
+source that produced it (the item id + `source_entity_version` for
+`attention.explain_item`, the meeting id for `meeting.prep_summary`),
+`evidence` is the run's cited ids, `output` is the validated response
+payload (`{explanation_text, cited_factor_codes}` or `{summary_text,
+cited_evidence_ids}`, task-type dependent). This is the first concrete
+producer of `generated_artifacts` rows in this activation (Task 4's `POST
+/ai/runs` does not write one); wiring the production run path to do the
+same is a later task's decision, not attempted here.
 """
 
 import time
@@ -77,7 +84,7 @@ from hashlib import sha256
 from json import dumps
 from math import ceil
 from typing import Annotated, Any, Literal, TypedDict
-from uuid import UUID, uuid4
+from uuid import NAMESPACE_OID, UUID, uuid4, uuid5
 
 from fastapi import APIRouter, Depends, Header, HTTPException
 from pydantic import BaseModel, ConfigDict, Field
@@ -117,10 +124,10 @@ _LATENCY_P95_CEILING_SECONDS = 20.0
 
 
 class EvaluationExample(TypedDict):
-    """One row of `evaluation_sets.examples` (design doc Decision 9) --
-    matches `tests/fixtures/phase4_evaluation_attention_explain.py`'s
-    `EXAMPLES` shape and migration `0031_phase4_evaluation.py`'s seeded
-    JSONB content exactly.
+    """One row of `evaluation_sets.examples` for `task_type='attention.
+    explain_item'` (design doc Decision 9) -- matches `tests/fixtures/
+    phase4_evaluation_attention_explain.py`'s `EXAMPLES` shape and migration
+    `0031_phase4_evaluation.py`'s seeded JSONB content exactly.
     """
 
     key: str
@@ -131,6 +138,43 @@ class EvaluationExample(TypedDict):
     must_cite: list[str]
     must_not_state: list[str]
     reference_explanation: str
+
+
+class MeetingPrepEvaluationExample(TypedDict):
+    """One row of `evaluation_sets.examples` for `task_type='meeting.prep_
+    summary'` -- matches `tests/fixtures/phase4_evaluation_meeting_prep.py`'s
+    `EXAMPLES` shape and migration `0035_phase4_meeting_prep_evaluation.py`'s
+    seeded JSONB content exactly. Structurally different from
+    `EvaluationExample` above (no single scalar item/factor list -- a
+    multi-section evidence bundle), the same reason `runtime.py`'s
+    `_PreparedRequest`/`_prepare_meeting_prep_request` are separate from
+    `attention.explain_item`'s equivalents rather than a shared shape forced
+    to fit both.
+    """
+
+    key: str
+    objective: str
+    participants: list[dict[str, Any]]
+    timeline: list[dict[str, Any]]
+    commitments: list[dict[str, Any]]
+    decisions: list[dict[str, Any]]
+    notes: list[dict[str, Any]]
+    risks: list[dict[str, Any]]
+    dependencies: list[dict[str, Any]]
+    must_cite: list[str]
+    must_not_state: list[str]
+    reference_summary: str
+
+
+# `evaluation_sets.examples` is untyped JSONB and this activation now stores
+# two structurally different example shapes in it (one per registered task
+# type) -- every function below that is genuinely task-type-agnostic
+# (`_score_example`/`_prohibited_matches`/`_aggregate`/`EvaluationSet.
+# examples` itself) accordingly types its `example` parameter as
+# `dict[str, Any]` rather than either specific TypedDict, and only ever
+# touches the two fields both shapes share (`key`, `must_not_state`). The
+# two TypedDicts above exist purely as construction/documentation aids for
+# each dataset's own fixture module and insertion helper.
 
 
 class EvaluationConfigError(Exception):
@@ -164,7 +208,7 @@ class EvaluationSet:
     version: int
     classification: Literal["labelled", "development"]
     example_count: int
-    examples: list[EvaluationExample]
+    examples: list[dict[str, Any]]
     status: Literal["active", "retired"]
 
 
@@ -326,24 +370,41 @@ def _fetch_schema_invalid_detail(session: Session, run: AiRun) -> str | None:
     return detail if isinstance(detail, str) else None
 
 
-def _prohibited_matches(example: EvaluationExample, run: AiRun) -> tuple[str, ...]:
+# Which field of a completed run's validated `output` holds the free-text
+# summary/explanation to scan for `must_not_state` phrases -- the one place
+# the two task types' output schemas genuinely differ in shape
+# (`ExplainItemOutput.explanation_text` vs `MeetingPrepSummary.summary_text`,
+# `validator.py`).
+_OUTPUT_TEXT_FIELD: dict[str, str] = {
+    "attention.explain_item": "explanation_text",
+    "meeting.prep_summary": "summary_text",
+}
+
+
+def _prohibited_matches(task_type: str, example: dict[str, Any], run: AiRun) -> tuple[str, ...]:
     """`must_not_state`'s hallucination probe (design doc Decision 9): a
-    completed run's `explanation_text` containing any of the example's
+    completed run's free-text output containing any of the example's
     forbidden phrases (case-insensitive substring match) is a prohibited-
     fact occurrence. Only meaningful for a `completed` run -- a run that
     never produced a validated `output` has nothing to check.
     """
     if run.output is None:
         return ()
-    explanation = str(run.output.get("explanation_text", "")).casefold()
-    return tuple(phrase for phrase in example["must_not_state"] if phrase.casefold() in explanation)
+    field = _OUTPUT_TEXT_FIELD[task_type]
+    text_value = str(run.output.get(field, "")).casefold()
+    return tuple(phrase for phrase in example["must_not_state"] if phrase.casefold() in text_value)
 
 
 def _score_example(
-    session: Session, example: EvaluationExample, run: AiRun, *, latency_seconds: float
+    session: Session,
+    task_type: str,
+    example: dict[str, Any],
+    run: AiRun,
+    *,
+    latency_seconds: float,
 ) -> _ExampleScore:
     outcome = _classify_outcome(run)
-    matches = _prohibited_matches(example, run) if outcome == "completed" else ()
+    matches = _prohibited_matches(task_type, example, run) if outcome == "completed" else ()
     detail = _fetch_schema_invalid_detail(session, run) if outcome == "schema_invalid" else None
     return _ExampleScore(
         key=example["key"],
@@ -402,7 +463,7 @@ _SYNTHETIC_SOURCE_ENTITY_VERSION = 1
 
 
 def _insert_synthetic_item(
-    session: Session, auth: AuthContext, example: EvaluationExample, *, now: datetime
+    session: Session, auth: AuthContext, example: dict[str, Any], *, now: datetime
 ) -> UUID:
     """Deliberately *not* wrapped in `with session.begin():` -- like
     `runtime.py:_persist_terminal`'s identical choice (see that function's
@@ -464,6 +525,365 @@ def _delete_synthetic_items(session: Session, auth: AuthContext, item_ids: list[
 
 
 # ---------------------------------------------------------------------------
+# Synthetic meetings (`task_type='meeting.prep_summary'`) -- ephemeral,
+# workspace-scoped, but cleaned up per-example rather than batched at the
+# end of the run (see `_insert_synthetic_meeting`'s docstring for why).
+# ---------------------------------------------------------------------------
+
+_SYNTHETIC_MEETING_STARTS_IN = timedelta(days=1)
+_SYNTHETIC_MEETING_DURATION = timedelta(hours=1)
+
+_MeetingPrepIds = tuple[UUID, list[UUID], list[UUID]]
+
+
+def _salted_synthetic_id(workspace_id: UUID, base_id: str) -> UUID:
+    """Deterministic per-(workspace, base_id) transform of a dataset-
+    declared row id.
+
+    The fixture/migration's own ids are a pure function of `(example key,
+    section, index)` with no workspace component -- necessarily, since the
+    migration seeds one global `evaluation_sets` row shared by every
+    workspace. Used bare as a real primary key (`meeting_participants.id`,
+    `timeline_entries.id`, `commitments.id`, `notes.id`, `risks.id`,
+    `waiting_links.id` -- all bare `id UUID PRIMARY KEY`, not composite
+    with `workspace_id`), two workspaces evaluating `meeting.prep_summary`
+    concurrently would collide on the same example's rows. Salting with
+    `workspace_id` keeps the id fully deterministic and reproducible for
+    a given `(workspace_id, base_id)` pair -- callers that need to know a
+    row's real id in advance (tests building mocked "fully grounded"
+    citations) compute the same salt -- while making cross-workspace
+    collisions as unlikely as any other independent UUID5 draw.
+    """
+    return uuid5(NAMESPACE_OID, f"{workspace_id}:{base_id}")
+
+
+def _insert_synthetic_meeting(
+    session: Session, auth: AuthContext, example: dict[str, Any], *, now: datetime
+) -> _MeetingPrepIds:
+    """Inserts one full synthetic meeting-prep evidence bundle -- a
+    `meetings` row plus every populated section (`pkos_nodes`/`meeting_
+    participants` for `participants`, `timeline_entries`, `commitments`,
+    `notes` for both `decisions` and `notes`, `risks`, `waiting_links` for
+    `dependencies`) -- for one `MeetingPrepEvaluationExample`, using exactly
+    the ids the fixture already assigned each row, so `must_cite`'s
+    symbolic references and `meeting.get_prep_pack`'s real output agree.
+
+    Returns `(meeting_id, participant_node_ids, risk_ids)`. Not context-
+    managed -- see `_insert_synthetic_item`'s identical rationale (this
+    session's transaction may already be autobegun by preceding reads).
+    """
+    meeting_id = uuid4()
+    session.execute(
+        text(
+            """
+            INSERT INTO meetings (
+                id, workspace_id, title, standalone_starts_at, standalone_ends_at,
+                standalone_timezone, status, agenda, created_by, updated_by,
+                created_at, updated_at, version
+            ) VALUES (
+                :id, :workspace_id, :title, :starts_at, :ends_at, 'UTC',
+                'planned', :agenda, :actor_id, :actor_id, :now, :now, 1
+            )
+            """
+        ),
+        {
+            "id": meeting_id,
+            "workspace_id": auth.workspace_id,
+            "title": f"evaluation fixture: {example['key']}",
+            "agenda": example["objective"],
+            "starts_at": now + _SYNTHETIC_MEETING_STARTS_IN,
+            "ends_at": now + _SYNTHETIC_MEETING_STARTS_IN + _SYNTHETIC_MEETING_DURATION,
+            "actor_id": auth.user_id,
+            "now": now,
+        },
+    )
+
+    node_ids: list[UUID] = []
+    for participant in example["participants"]:
+        # `meeting_prep.py:_fetch_participants` surfaces `mp.id` (the
+        # `meeting_participants` junction row's own id) as `ParticipantRow.
+        # id` -- the id `meeting.get_prep_pack`'s participants section
+        # actually returns, not `entity_id` (the `pkos_nodes` row this
+        # junction row links to, which is never surfaced directly). The
+        # fixture's `participant["id"]` is the citable id, so it must
+        # become `meeting_participants.id` here, not `pkos_nodes.id` -- a
+        # real bug this exact distinction already caused once before, in
+        # `tests/test_ai_runtime_runtime_postgres.py`'s own synthetic-
+        # participant helper. `node_id` (the `pkos_nodes` row, and the
+        # `entity_id` foreign key `commitments`/`timeline_entries`/`waiting_
+        # links` below join through) is a fresh, uncited id -- nothing in
+        # `meeting.get_prep_pack`'s output surfaces it. Salted with
+        # `workspace_id` (see `_salted_synthetic_id`) since this becomes a
+        # real, bare, non-workspace-composite primary key.
+        participant_id = _salted_synthetic_id(auth.workspace_id, participant["id"])
+        node_id = uuid4()
+        node_ids.append(node_id)
+        session.execute(
+            text(
+                """
+                INSERT INTO pkos_nodes (
+                    id, workspace_id, node_type, canonical_name, attributes,
+                    status, confidence, version, created_at, updated_at
+                ) VALUES (
+                    :id, :workspace_id, 'person', :name, '{}'::jsonb,
+                    'active', 1.00, 1, :now, :now
+                )
+                """
+            ),
+            {
+                "id": node_id,
+                "workspace_id": auth.workspace_id,
+                "name": participant["entity_name"],
+                "now": now,
+            },
+        )
+        session.execute(
+            text(
+                """
+                INSERT INTO meeting_participants (
+                    id, workspace_id, meeting_id, entity_id, role,
+                    created_by, updated_by, created_at, updated_at, version
+                ) VALUES (
+                    :id, :workspace_id, :meeting_id, :entity_id, :role,
+                    :actor_id, :actor_id, :now, :now, 1
+                )
+                """
+            ),
+            {
+                "id": participant_id,
+                "workspace_id": auth.workspace_id,
+                "meeting_id": meeting_id,
+                "entity_id": node_id,
+                "role": participant["role"],
+                "actor_id": auth.user_id,
+                "now": now,
+            },
+        )
+
+    for entry in example["timeline"]:
+        session.execute(
+            text(
+                """
+                INSERT INTO timeline_entries (
+                    id, workspace_id, entity_id, effective_at, recorded_at, event_type, summary
+                ) VALUES (
+                    :id, :workspace_id, :entity_id, :effective_at, :now, :event_type, :summary
+                )
+                """
+            ),
+            {
+                "id": _salted_synthetic_id(auth.workspace_id, entry["id"]),
+                "workspace_id": auth.workspace_id,
+                "entity_id": node_ids[0],
+                "effective_at": now - timedelta(hours=entry["effective_at_hours_ago"]),
+                "event_type": entry["event_type"],
+                "summary": entry["summary"],
+                "now": now,
+            },
+        )
+
+    for commitment in example["commitments"]:
+        due_at = (
+            now + timedelta(days=commitment["due_at_days"])
+            if commitment["due_at_days"] is not None
+            else None
+        )
+        session.execute(
+            text(
+                """
+                INSERT INTO commitments (
+                    id, workspace_id, owner_id, summary, direction, status,
+                    counterparty_person_id, due_at, importance, pinned,
+                    created_by, updated_by, created_at, updated_at, version
+                ) VALUES (
+                    :id, :workspace_id, :owner_id, :summary, :direction, :status,
+                    :counterparty_id, :due_at, 'medium', false,
+                    :owner_id, :owner_id, :now, :now, 1
+                )
+                """
+            ),
+            {
+                "id": _salted_synthetic_id(auth.workspace_id, commitment["id"]),
+                "workspace_id": auth.workspace_id,
+                "owner_id": auth.user_id,
+                "summary": commitment["summary"],
+                "direction": commitment["direction"],
+                "status": commitment["status"],
+                "counterparty_id": node_ids[commitment["counterparty_index"]],
+                "due_at": due_at,
+                "now": now,
+            },
+        )
+
+    for note_type, section in (("decision", "decisions"), ("general", "notes")):
+        for note in example[section]:
+            session.execute(
+                text(
+                    """
+                    INSERT INTO notes (
+                        id, workspace_id, owner_id, title, body, note_type, meeting_id,
+                        source_type, restricted, created_by, updated_by, created_at,
+                        updated_at, version
+                    ) VALUES (
+                        :id, :workspace_id, :owner_id, :title, :body, :note_type, :meeting_id,
+                        'local', false, :owner_id, :owner_id, :now, :now, 1
+                    )
+                    """
+                ),
+                {
+                    "id": _salted_synthetic_id(auth.workspace_id, note["id"]),
+                    "workspace_id": auth.workspace_id,
+                    "owner_id": auth.user_id,
+                    "title": note["title"],
+                    "body": note["body"],
+                    "note_type": note_type,
+                    "meeting_id": meeting_id,
+                    "now": now,
+                },
+            )
+
+    risk_ids: list[UUID] = []
+    for risk in example["risks"]:
+        risk_id = _salted_synthetic_id(auth.workspace_id, risk["id"])
+        risk_ids.append(risk_id)
+        review_at = (
+            now + timedelta(days=risk["review_at_days"])
+            if risk["review_at_days"] is not None
+            else None
+        )
+        session.execute(
+            text(
+                """
+                INSERT INTO risks (
+                    id, workspace_id, description, probability, impact, status, review_at,
+                    owner_id, created_by, updated_by, created_at, updated_at, version
+                ) VALUES (
+                    :id, :workspace_id, :description, :probability, :impact, :status, :review_at,
+                    :owner_id, :owner_id, :owner_id, :now, :now, 1
+                )
+                """
+            ),
+            {
+                "id": risk_id,
+                "workspace_id": auth.workspace_id,
+                "description": risk["description"],
+                "probability": risk["probability"],
+                "impact": risk["impact"],
+                "status": risk["status"],
+                "review_at": review_at,
+                "owner_id": auth.user_id,
+                "now": now,
+            },
+        )
+
+    for dependency in example["dependencies"]:
+        counterparty_id = node_ids[dependency["counterparty_index"]]
+        expected_at = (
+            now + timedelta(days=dependency["expected_at_days"])
+            if dependency["expected_at_days"] is not None
+            else None
+        )
+        session.execute(
+            text(
+                """
+                INSERT INTO waiting_links (
+                    id, workspace_id, subject_type, subject_id, counterparty_entity_id,
+                    direction, status, since_at, note, expected_at, created_by, updated_by,
+                    created_at, updated_at, version
+                ) VALUES (
+                    :id, :workspace_id, 'knowledge_entity', :counterparty_id, :counterparty_id,
+                    :direction, 'open', :now, :note, :expected_at,
+                    :owner_id, :owner_id, :now, :now, 1
+                )
+                """
+            ),
+            {
+                "id": _salted_synthetic_id(auth.workspace_id, dependency["id"]),
+                "workspace_id": auth.workspace_id,
+                "counterparty_id": counterparty_id,
+                "direction": dependency["direction"],
+                "note": dependency["note"],
+                "expected_at": expected_at,
+                "owner_id": auth.user_id,
+                "now": now,
+            },
+        )
+
+    session.commit()
+    return meeting_id, node_ids, risk_ids
+
+
+def _delete_synthetic_meeting(
+    session: Session,
+    auth: AuthContext,
+    meeting_id: UUID,
+    node_ids: list[UUID],
+    risk_ids: list[UUID],
+) -> None:
+    """Deletes everything `_insert_synthetic_meeting` created for one
+    example, immediately after that example is scored -- see that
+    function's docstring for why meeting.prep_summary's cleanup cannot
+    wait until the whole dataset has run like `_delete_synthetic_items`
+    does. Deletes every table that references `node_ids`/`meeting_id`
+    before the rows those ids identify, regardless of what FK `ondelete`
+    behavior may or may not already handle -- explicit, not relying on
+    cascade. Not context-managed -- see `_insert_synthetic_item`'s
+    identical rationale.
+    """
+    params = {"workspace_id": auth.workspace_id, "meeting_id": meeting_id, "node_ids": node_ids}
+    session.execute(
+        text(
+            "DELETE FROM meeting_participants "
+            "WHERE workspace_id = :workspace_id AND meeting_id = :meeting_id"
+        ),
+        params,
+    )
+    session.execute(
+        text("DELETE FROM notes WHERE workspace_id = :workspace_id AND meeting_id = :meeting_id"),
+        params,
+    )
+    if node_ids:
+        session.execute(
+            text(
+                "DELETE FROM timeline_entries "
+                "WHERE workspace_id = :workspace_id AND entity_id = ANY(:node_ids)"
+            ),
+            params,
+        )
+        session.execute(
+            text(
+                "DELETE FROM commitments "
+                "WHERE workspace_id = :workspace_id AND counterparty_person_id = ANY(:node_ids)"
+            ),
+            params,
+        )
+        session.execute(
+            text(
+                "DELETE FROM waiting_links "
+                "WHERE workspace_id = :workspace_id AND counterparty_entity_id = ANY(:node_ids)"
+            ),
+            params,
+        )
+    if risk_ids:
+        session.execute(
+            text("DELETE FROM risks WHERE workspace_id = :workspace_id AND id = ANY(:risk_ids)"),
+            {"workspace_id": auth.workspace_id, "risk_ids": risk_ids},
+        )
+    if node_ids:
+        session.execute(
+            text(
+                "DELETE FROM pkos_nodes WHERE workspace_id = :workspace_id AND id = ANY(:node_ids)"
+            ),
+            params,
+        )
+    session.execute(
+        text("DELETE FROM meetings WHERE workspace_id = :workspace_id AND id = :meeting_id"),
+        params,
+    )
+    session.commit()
+
+
+# ---------------------------------------------------------------------------
 # generated_artifacts -- module docstring's "first concrete producer".
 # ---------------------------------------------------------------------------
 
@@ -474,7 +894,7 @@ def _write_generated_artifact(
     *,
     run: AiRun,
     task_type: str,
-    attention_item_id: UUID,
+    source_versions: dict[str, Any],
     schema_version: str,
 ) -> None:
     session.execute(
@@ -495,12 +915,7 @@ def _write_generated_artifact(
             "workspace_id": auth.workspace_id,
             "ai_run_id": run.id,
             "task_type": task_type,
-            "source_versions": dumps(
-                {
-                    "attention_item_id": str(attention_item_id),
-                    "source_entity_version": _SYNTHETIC_SOURCE_ENTITY_VERSION,
-                }
-            ),
+            "source_versions": dumps(source_versions),
             "schema_version": schema_version,
             "output": dumps(run.output),
             "evidence": dumps(run.evidence),
@@ -739,56 +1154,95 @@ def run_evaluation(
     try:
         for example in evaluation_set.examples:
             now = datetime.now(UTC)
-            item_id = _insert_synthetic_item(session, auth, example, now=now)
-            synthetic_item_ids.append(item_id)
-
-            call_started = time.perf_counter()
-            run = execute_run(
-                task_type,
-                _EVALUATION_DATA_CLASS,
-                {"attention_item_id": str(item_id)},
-                session=session,
-                auth=auth,
-                ollama_adapter=ollama_adapter,
-            )
-            latency_seconds = time.perf_counter() - call_started
-
-            # `execute_run` always routes through the live `model_definitions`
-            # registry (runtime.py's own `route()` call) -- it has no
-            # parameter to pin a specific candidate. With a single
-            # registered model this was moot (only one possible outcome);
-            # with two or more, `route()` could legitimately pick a
-            # different candidate than the one this function's `model_id`
-            # parameter asserted was eligible, silently mis-attributing
-            # this evaluation's results to the wrong model (`EvaluationRun.
-            # model_id` below is stamped from the requested parameter, not
-            # from what actually ran). Matches this module's own "assertions,
-            # not overrides" contract (module docstring): fail loud, not a
-            # partial/degraded run scored against the wrong candidate.
-            # `run.model_id` is `None` on a run that never reached routing
-            # (e.g. `feature_disabled`) -- not a mismatch, already a
-            # legitimate `other_failure` outcome for `_score_example` below.
-            if run.model_id is not None and run.model_id != model_id:
-                raise EvaluationConfigError(
-                    "unexpected_model_routed",
-                    f"requested model_id {model_id!r} but the router selected "
-                    f"{run.model_id!r} instead -- refusing to score this evaluation "
-                    "run against the wrong model",
+            # `meeting.prep_summary`'s synthetic source cannot use `attention.
+            # explain_item`'s batched-insert/batched-cleanup-at-the-end shape
+            # (`_insert_synthetic_item`/`synthetic_item_ids`/`_delete_
+            # synthetic_items` below, kept verbatim and untouched by this
+            # branch): its `risks` section is workspace-wide, not meeting-
+            # scoped (`meeting_prep.py:_fetch_risks`'s own comment), so
+            # leaving one example's synthetic risks in place while later
+            # examples run would leak them into packs that never listed
+            # them. `_insert_synthetic_meeting`/`_delete_synthetic_meeting`
+            # insert and delete each example's entire bundle within this
+            # same iteration instead -- see their docstrings.
+            if task_type == "meeting.prep_summary":
+                meeting_id, node_ids, risk_ids = _insert_synthetic_meeting(
+                    session, auth, example, now=now
                 )
+                run_input: dict[str, Any] = {"meeting_id": str(meeting_id)}
+                source_versions: dict[str, Any] = {"meeting_id": str(meeting_id)}
+            else:
+                item_id = _insert_synthetic_item(session, auth, example, now=now)
+                synthetic_item_ids.append(item_id)
+                run_input = {"attention_item_id": str(item_id)}
+                source_versions = {
+                    "attention_item_id": str(item_id),
+                    "source_entity_version": _SYNTHETIC_SOURCE_ENTITY_VERSION,
+                }
 
-            score = _score_example(session, example, run, latency_seconds=latency_seconds)
-            scores.append(score)
-
-            if score.outcome == "completed":
-                _write_generated_artifact(
-                    session,
-                    auth,
-                    run=run,
-                    task_type=task_type,
-                    attention_item_id=item_id,
-                    schema_version=active_prompt.output_schema_ref,
+            try:
+                call_started = time.perf_counter()
+                run = execute_run(
+                    task_type,
+                    _EVALUATION_DATA_CLASS,
+                    run_input,
+                    session=session,
+                    auth=auth,
+                    ollama_adapter=ollama_adapter,
                 )
-                session.commit()
+                latency_seconds = time.perf_counter() - call_started
+
+                # `execute_run` always routes through the live `model_
+                # definitions` registry (runtime.py's own `route()` call) --
+                # it has no parameter to pin a specific candidate. With a
+                # single registered model this was moot (only one possible
+                # outcome); with two or more, `route()` could legitimately
+                # pick a different candidate than the one this function's
+                # `model_id` parameter asserted was eligible, silently mis-
+                # attributing this evaluation's results to the wrong model
+                # (`EvaluationRun.model_id` below is stamped from the
+                # requested parameter, not from what actually ran). Matches
+                # this module's own "assertions, not overrides" contract
+                # (module docstring): fail loud, not a partial/degraded run
+                # scored against the wrong candidate. `run.model_id` is
+                # `None` on a run that never reached routing (e.g. `feature_
+                # disabled`) -- not a mismatch, already a legitimate `other_
+                # failure` outcome for `_score_example` below.
+                if run.model_id is not None and run.model_id != model_id:
+                    raise EvaluationConfigError(
+                        "unexpected_model_routed",
+                        f"requested model_id {model_id!r} but the router selected "
+                        f"{run.model_id!r} instead -- refusing to score this evaluation "
+                        "run against the wrong model",
+                    )
+
+                score = _score_example(
+                    session, task_type, example, run, latency_seconds=latency_seconds
+                )
+                scores.append(score)
+
+                if score.outcome == "completed":
+                    _write_generated_artifact(
+                        session,
+                        auth,
+                        run=run,
+                        task_type=task_type,
+                        source_versions=source_versions,
+                        schema_version=active_prompt.output_schema_ref,
+                    )
+                    session.commit()
+            finally:
+                # `meeting.prep_summary`'s per-example cleanup, scoped to
+                # this one iteration -- see the comment above this branch's
+                # insert for why it cannot wait for the batched cleanup
+                # below. Runs even if the block above raised (e.g. the
+                # `unexpected_model_routed` guard), matching the outer
+                # `finally`'s own rollback-before-delete guard for the same
+                # reason.
+                if task_type == "meeting.prep_summary":
+                    if session.in_transaction():
+                        session.rollback()
+                    _delete_synthetic_meeting(session, auth, meeting_id, node_ids, risk_ids)
     finally:
         # Guard against a leftover open transaction from a mid-loop
         # exception (should not happen -- execute_run always returns an
@@ -845,7 +1299,7 @@ class EvaluationSetListResponse(BaseModel):
 
 class EvaluationRunCreateRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    task_type: Literal["attention.explain_item"]
+    task_type: Literal["attention.explain_item", "meeting.prep_summary"]
     prompt_version: int = Field(ge=1)
     model_id: str = Field(min_length=1, max_length=200)
 

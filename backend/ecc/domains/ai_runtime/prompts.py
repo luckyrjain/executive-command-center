@@ -365,13 +365,15 @@ def _store_idempotency(
 # and requires the table above to pass in full before the new version can
 # become active") applies "specifically for the attention.explain_item
 # prompt" (Task 5's own scope), not to every prompt family this codebase
-# might ever register. `attention.explain_item.v1` is the family's stable
-# slug (Decision 3: the slug never changes across versions -- only the
-# integer `version` column does), the same literal migration
-# 0029_phase4_prompt_tool_versions.py seeds. `activate_tool_version`'s
-# path (kind == "tool") is never gated -- Task 5's scope is this one prompt
-# family only.
-_GATED_PROMPT_IDS = frozenset({"attention.explain_item.v1"})
+# might ever register. `attention.explain_item.v1`/`meeting.prep_summary.v1`
+# are each family's stable slug (Decision 3: the slug never changes across
+# versions -- only the integer `version` column does), the same literals
+# migrations `0029_phase4_prompt_tool_versions.py`/`0034_phase4_meeting_
+# prep.py` seed. `activate_tool_version`'s path (kind == "tool") is never
+# gated -- this remains scoped to prompt families with an evaluation
+# dataset registered, not every prompt family this codebase might ever
+# register.
+_GATED_PROMPT_IDS = frozenset({"attention.explain_item.v1", "meeting.prep_summary.v1"})
 
 
 def _prompt_evaluation_floor_met(
@@ -411,15 +413,17 @@ def _prompt_evaluation_floor_met(
     return check_promotion_floors(latest)
 
 
-# prompt_id -> task_type for every gated family (Task 5 scope: exactly
-# one). Not imported from `runtime.TASK_PORTS` to avoid the same
-# module-level circular import `_prompt_evaluation_floor_met`'s docstring
-# explains -- kept in sync by convention with `runtime.TASK_PORTS[
-# "attention.explain_item"].prompt_id`, mirroring this codebase's
-# established hash-duplication convention (`prompts.py`'s own `compute_
-# template_hash` docstring) for exactly this kind of "two modules, one
-# fact" situation.
-_GATED_PROMPT_ID_TASK_TYPES = {"attention.explain_item.v1": "attention.explain_item"}
+# prompt_id -> task_type for every gated family. Not imported from
+# `runtime.TASK_PORTS` to avoid the same module-level circular import
+# `_prompt_evaluation_floor_met`'s docstring explains -- kept in sync by
+# convention with `runtime.TASK_PORTS[...].prompt_id` for each task type,
+# mirroring this codebase's established hash-duplication convention
+# (`prompts.py`'s own `compute_template_hash` docstring) for exactly this
+# kind of "two modules, one fact" situation.
+_GATED_PROMPT_ID_TASK_TYPES = {
+    "attention.explain_item.v1": "attention.explain_item",
+    "meeting.prep_summary.v1": "meeting.prep_summary",
+}
 
 
 def _resolve_policy_kind(session: Session, name: str) -> Literal["prompt", "tool"] | None:

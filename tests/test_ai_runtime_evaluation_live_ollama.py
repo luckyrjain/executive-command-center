@@ -46,6 +46,7 @@ _OLLAMA_BASE_URL = os.environ.get("ECC_OLLAMA_BASE_URL", "http://127.0.0.1:11434
 _MODEL_ID = "qwen2.5:1.5b-instruct-q4_K_M"
 _SECOND_MODEL_ID = "qwen2.5:3b-instruct-q4_K_M"
 _TASK_TYPE = "attention.explain_item"
+_MEETING_PREP_TASK_TYPE = "meeting.prep_summary"
 _SMOKE_TEST_ATTEMPTS = 3
 
 
@@ -111,6 +112,20 @@ def run_context() -> Iterator[dict]:
             "event_outbox",
             "audit_events",
             "attention_items",
+            # meeting.prep_summary's synthetic sources are already cleaned
+            # up per-example by run_evaluation itself (evaluation.py:
+            # _delete_synthetic_meeting) -- these are a defense-in-depth
+            # safety net for this fixture's teardown, matching why
+            # attention_items is listed above despite the same already
+            # being true of it.
+            "meeting_participants",
+            "timeline_entries",
+            "commitments",
+            "notes",
+            "risks",
+            "waiting_links",
+            "pkos_nodes",
+            "meetings",
             "users",
         ):
             connection.execute(
@@ -143,6 +158,35 @@ def test_attention_explain_item_passes_every_evaluation_floor_against_real_model
         )
 
     assert run.metrics.total_examples == 20
+    assert check_promotion_floors(run) is True, (
+        f"real-model evaluation floors not met: {run.metrics!r}; failures={run.failures!r}"
+    )
+
+
+def test_meeting_prep_summary_passes_every_evaluation_floor_against_real_model(
+    run_context: dict,
+) -> None:
+    """`meeting.prep_summary`'s equivalent of this file's `attention.
+    explain_item` floor check above -- the second task type's own real
+    acceptance check, against the same four `EVALUATION-CONTRACT.md`
+    floors and the same genuine `qwen2.5:1.5b-instruct-q4_K_M` output, not
+    a mocked transport. Uses the real 10-example `evaluation_sets` row
+    (`tests/fixtures/phase4_evaluation_meeting_prep.py`), inserting and
+    deleting a full synthetic meeting evidence bundle per example
+    (`evaluation.py:_insert_synthetic_meeting`/`_delete_synthetic_meeting`)
+    rather than attention.explain_item's single synthetic row.
+    """
+    with SessionFactory() as session:
+        run = run_evaluation(
+            _MEETING_PREP_TASK_TYPE,
+            1,
+            _MODEL_ID,
+            session=session,
+            auth=run_context["auth"],
+            ollama_adapter=OllamaAdapter(host=_OLLAMA_BASE_URL),
+        )
+
+    assert run.metrics.total_examples == 10
     assert check_promotion_floors(run) is True, (
         f"real-model evaluation floors not met: {run.metrics!r}; failures={run.failures!r}"
     )
