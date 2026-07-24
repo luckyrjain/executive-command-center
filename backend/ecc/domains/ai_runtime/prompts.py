@@ -40,7 +40,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from json import dumps
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
@@ -58,6 +58,7 @@ from ecc.observability import (
 )
 
 from .tools import (
+    ToolDefinition,
     ToolVersionNotFound,
     activate_tool_version,
     get_active_tool,
@@ -112,7 +113,7 @@ def compute_template_hash(*, template: str, input_schema_ref: str, output_schema
     return sha256(canonical.encode("utf-8")).hexdigest()
 
 
-def _row_to_prompt(row: dict) -> PromptVersion:
+def _row_to_prompt(row: dict[str, Any]) -> PromptVersion:
     return PromptVersion(
         id=row["id"],
         prompt_id=row["prompt_id"],
@@ -441,6 +442,7 @@ def _resolve_policy_kind(session: Session, name: str) -> Literal["prompt", "tool
 def _current_active_version(
     session: Session, kind: Literal["prompt", "tool"], name: str
 ) -> int | None:
+    active: PromptVersion | ToolDefinition | None
     if kind == "tool":
         active = get_active_tool(session, name)
     else:
@@ -585,6 +587,7 @@ def activate_policy(
                     },
                 )
 
+        result: PromptVersion | ToolDefinition | PromptVersionNotFound | ToolVersionNotFound
         if kind == "tool":
             result = activate_tool_version(session, prompt_id_or_tool_name, payload.version)
         else:

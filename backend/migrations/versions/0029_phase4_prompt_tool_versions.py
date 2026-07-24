@@ -78,6 +78,7 @@ safe to seed ahead of that module existing.
 
 import json
 from hashlib import sha256
+from typing import Any
 from uuid import uuid4
 
 import sqlalchemy as sa
@@ -90,7 +91,7 @@ branch_labels = None
 depends_on = None
 
 
-def _canonical_hash(material: dict) -> str:
+def _canonical_hash(material: dict[str, Any]) -> str:
     """Mirrors ``ecc.domains.ai_runtime.prompts.compute_template_hash``/
     ``tools.compute_definition_hash`` exactly: sha256 over canonical
     (UTF-8, sorted-object-keys, compact-separator) JSON bytes.

@@ -10,7 +10,7 @@ caller-supplied `model_id`/`provider` (`MODEL-ROUTING-CONTRACT.md`).
 """
 
 from dataclasses import dataclass
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 from uuid import UUID
 
 from fastapi import APIRouter, Depends
@@ -51,7 +51,7 @@ class ModelDefinition:
     status: ModelStatus
 
 
-def _row_to_model(row: dict) -> ModelDefinition:
+def _row_to_model(row: dict[str, Any]) -> ModelDefinition:
     return ModelDefinition(
         id=row["id"],
         provider=row["provider"],

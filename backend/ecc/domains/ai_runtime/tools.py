@@ -49,8 +49,8 @@ class ToolDefinition:
     name: str
     version: int
     scopes: tuple[str, ...]
-    input_schema: dict
-    output_schema: dict
+    input_schema: dict[str, Any]
+    output_schema: dict[str, Any]
     handler_ref: str
     definition_hash: str
     status: ToolStatus
@@ -70,8 +70,8 @@ class ToolVersionNotFound:
 
 def compute_definition_hash(
     *,
-    input_schema: dict,
-    output_schema: dict,
+    input_schema: dict[str, Any],
+    output_schema: dict[str, Any],
     scopes: Sequence[str],
     handler_ref: str,
 ) -> str:
@@ -92,7 +92,7 @@ def compute_definition_hash(
     return sha256(canonical.encode("utf-8")).hexdigest()
 
 
-def _row_to_tool(row: dict) -> ToolDefinition:
+def _row_to_tool(row: dict[str, Any]) -> ToolDefinition:
     return ToolDefinition(
         id=row["id"],
         name=row["name"],

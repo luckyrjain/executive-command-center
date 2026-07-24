@@ -290,13 +290,13 @@ class RoutingPolicy:
     id: UUID
     task_type: str
     version: int
-    candidates: list[dict]
-    constraints: dict
-    fallback: dict
+    candidates: list[dict[str, Any]]
+    constraints: dict[str, Any]
+    fallback: dict[str, Any]
     status: Literal["active", "retired"]
 
 
-def _row_to_policy(row: dict) -> RoutingPolicy:
+def _row_to_policy(row: dict[str, Any]) -> RoutingPolicy:
     return RoutingPolicy(
         id=row["id"],
         task_type=row["task_type"],

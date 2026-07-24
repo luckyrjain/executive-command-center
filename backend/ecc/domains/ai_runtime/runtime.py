@@ -42,7 +42,7 @@ from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from importlib import import_module
 from json import JSONDecodeError, dumps, loads
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Literal, cast
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, Header, HTTPException
@@ -899,7 +899,13 @@ def execute_run(
             prompt_version=prompt.version,
         )
 
-    validated: ExplainItemOutput = repair_result.outcome.value
+    # ValidatedOutput.value is typed BaseModel (validator.py's generic
+    # schema-agnostic shape) -- known concretely to be ExplainItemOutput
+    # here because port.output_schema (passed into
+    # validate_with_bounded_repair above) is TASK_PORTS["attention.
+    # explain_item"].output_schema, always ExplainItemOutput in this
+    # activation (only one TaskPort exists).
+    validated = cast(ExplainItemOutput, repair_result.outcome.value)
     grounding_failure = check_explain_item_grounding(validated, factor_codes)
     if grounding_failure is not None:
         return fail(

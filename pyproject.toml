@@ -8,6 +8,12 @@ dependencies = [
   "argon2-cffi==25.1.0",
   "fastapi==0.139.0",
   "httpx==0.28.1",
+  # Phase 4 AI Runtime (RFC-005 v1.3.0 amendment): the sole module that
+  # imports this is backend/ecc/domains/ai_runtime/ollama_client.py. A
+  # small pure-Python HTTP client wrapper around the local Ollama server's
+  # REST API -- no native build step, no musl/Alpine packaging concern
+  # (RFC-005.md's "Phase 4 activated technologies" table).
+  "ollama==0.6.2",
   # Required (not the optional `embeddings` extra below): migration 0015
   # imports pgvector.sqlalchemy.Vector for the embedding_projections column
   # type, and alembic imports every migration file to build its revision
