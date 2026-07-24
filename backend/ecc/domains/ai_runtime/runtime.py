@@ -409,12 +409,25 @@ def _tool_step(sequence: int, dispatch: _ToolDispatchOutcome) -> dict[str, Any]:
     return {"sequence": sequence, "kind": "tool_call", "status": status, "trace": detail}
 
 
-def _model_step(sequence: int, status: str, *, attempt: int, outcome: str) -> dict[str, Any]:
+def _model_step(
+    sequence: int, status: str, *, attempt: int, outcome: str, detail: str | None = None
+) -> dict[str, Any]:
+    trace: dict[str, Any] = {"attempt": attempt, "outcome": outcome}
+    if detail is not None:
+        # `detail` is `SchemaInvalid.detail` (validator.py): a redacted
+        # field-path + Pydantic error-type summary only, never raw
+        # response text or a validated/rejected field value -- exactly
+        # what DATA-MODEL.md's "Trace is redacted by default" already
+        # allows into `ai_run_steps.trace`. Previously computed and
+        # immediately discarded at every `SchemaInvalid` call site, which
+        # left no way to tell *why* a real evaluation failure occurred
+        # beyond the coarse `schema_invalid` bucket.
+        trace["detail"] = detail
     return {
         "sequence": sequence,
         "kind": "model_call",
         "status": status,
-        "trace": {"attempt": attempt, "outcome": outcome},
+        "trace": trace,
     }
 
 
@@ -884,6 +897,11 @@ def execute_run(
             outcome=(
                 "valid" if isinstance(repair_result.outcome, ValidatedOutput) else "schema_invalid"
             ),
+            detail=(
+                repair_result.outcome.detail
+                if isinstance(repair_result.outcome, SchemaInvalid)
+                else None
+            ),
         )
     )
 
@@ -917,6 +935,13 @@ def execute_run(
             provider=decision.provider,
             prompt_id=prompt.prompt_id,
             prompt_version=prompt.version,
+            # `evidence` is documented (API-SCHEMAS.md) as "the source
+            # item's cited factor codes" -- on a grounding failure these
+            # are still exactly that: the codes the model cited that are
+            # not in the item's real `factors` list. Previously dropped
+            # (defaulted to `[]`), leaving no way to tell which citation(s)
+            # were ungrounded without the raw response text.
+            evidence=list(grounding_failure.ungrounded_codes),
         )
 
     guard.complete()

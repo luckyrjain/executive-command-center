@@ -340,9 +340,18 @@ def _aggregate(scores: list[_ExampleScore]) -> tuple[EvaluationMetrics, list[dic
     failures: list[dict[str, Any]] = []
     for score in scores:
         if score.outcome != "completed":
-            failures.append(
-                {"key": score.key, "reason": score.outcome, "error_code": score.error_code}
-            )
+            failure: dict[str, Any] = {
+                "key": score.key,
+                "reason": score.outcome,
+                "error_code": score.error_code,
+            }
+            if score.outcome == "grounding_failed" and score.ai_run.evidence:
+                # `evidence` holds the specific cited-but-ungrounded factor
+                # codes on this outcome (runtime.py's grounding-failed
+                # path) -- redacted by construction (factor codes only,
+                # never raw response text), safe to surface here.
+                failure["ungrounded_codes"] = score.ai_run.evidence
+            failures.append(failure)
         for phrase in score.prohibited_matches:
             failures.append({"key": score.key, "reason": "prohibited_fact", "phrase": phrase})
 

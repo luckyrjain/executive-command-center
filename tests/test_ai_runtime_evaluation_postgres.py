@@ -388,6 +388,11 @@ def test_run_evaluation_ungrounded_citation_fails_only_grounding_floor(run_conte
         failure["key"] == bad_key and failure["reason"] == "grounding_failed"
         for failure in run.failures
     )
+    # The specific ungrounded code(s) are surfaced too, not just the coarse
+    # "grounding_failed" reason -- otherwise diagnosing which citation was
+    # bad requires the raw response text, which this codebase never logs.
+    grounding_failure = next(failure for failure in run.failures if failure["key"] == bad_key)
+    assert grounding_failure["ungrounded_codes"] == ["nonexistent_factor_code"]
 
 
 def test_run_evaluation_prohibited_fact_fails_only_that_floor(run_context: dict) -> None:

@@ -508,6 +508,18 @@ def test_execute_run_permanently_fails_after_bounded_repair_exhausted(run_contex
     assert run.error_code == "schema_invalid"
     assert run.attempts == 2
 
+    # The redacted validation-error summary (field path + Pydantic error
+    # type only -- see validator.py's SchemaInvalid docstring) is recorded
+    # on the final model_call step's trace, not silently discarded --
+    # otherwise a real schema_invalid failure (e.g. the live-Ollama
+    # evaluation floor check) is undiagnosable beyond the coarse error code.
+    steps = _step_rows(run.id)
+    final_model_step = steps[-1]
+    assert final_model_step["kind"] == "model_call"
+    assert final_model_step["trace"]["outcome"] == "schema_invalid"
+    assert "detail" in final_model_step["trace"]
+    assert final_model_step["trace"]["detail"]
+
 
 # ---------------------------------------------------------------------------
 # Grounding failure.
@@ -530,6 +542,10 @@ def test_execute_run_fails_on_ungrounded_citation(run_context: dict) -> None:
 
     assert run.status == "failed"
     assert run.error_code == "grounding_failed"
+    # The specific cited-but-ungrounded factor code(s) are recorded in
+    # `evidence` -- still "the source item's cited factor codes"
+    # (API-SCHEMAS.md), just the invalid ones, not silently dropped to [].
+    assert run.evidence == ["nonexistent_factor"]
 
 
 # ---------------------------------------------------------------------------
