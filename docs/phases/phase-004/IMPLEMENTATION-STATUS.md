@@ -1,8 +1,8 @@
 ---
 id: PHASE-004-IMPLEMENTATION-STATUS
 title: Phase 4 Implementation Status
-status: Implemented (Tasks 0-8 of the first activation slice)
-version: 0.4.0
+status: Implemented (Tasks 0-9 of the first activation slice)
+version: 0.5.0
 owner: Lucky Jain
 updated: 2026-07-24
 ---
@@ -35,7 +35,8 @@ Phase 4's design work and its six-task implementation plan (`docs/superpowers/pl
 | 5 | Evaluation harness and first dataset | Done -- `0d08726` |
 | 6 | Product surface, browser acceptance and security review | Done -- `98e7cc4` |
 | 7 | Second local model registration | Done -- `0071b24` |
-| 8 | Reflection Engine (first slice) on `attention.explain_item` | Done -- this commit |
+| 8 | Reflection Engine (first slice) on `attention.explain_item` | Done -- `101cec5` |
+| 9 | Wire Phase 3's `meeting_prep.py` "Optional enrichment" to `execute_run` | Done -- this commit |
 
 ### Task 1 evidence -- model/provider registry and router
 
@@ -120,6 +121,30 @@ The repository owner's re-raised deferred-scope item -- "Agent Runtime, multi-ag
 These test counts and the token-budget fix above reflect a post-open-PR review pass (4 parallel review agents: security, performance, adversarial test-verification, PR hygiene) -- security, performance, and PR-hygiene dimensions found no issues; the adversarial test-verification pass found two weak assertions (now strengthened, above) and six untested fail-open branches (now covered, above).
 
 **Docs.** `DATA-MODEL.md`, `MODEL-ROUTING-CONTRACT.md`, `API-SCHEMAS.md`, `EVALUATION-CONTRACT.md` updated for the new `constraints` key, `prompt_versions` row, `ai_run_steps` step shape, no-new-routing-decision clarification, and the deliberate reflection-disabled-during-floor-check tradeoff. No `AiRunResponse`/frontend change in this slice -- a `completed` run's `output` may transparently reflect a reflection-revised answer with no new response field; `ai_run_steps` (not exposed by any endpoint, matching every other step kind) carries the full detail for operators.
+
+### Task 9 evidence -- wire Phase 3's `meeting_prep.py` "Optional enrichment" to `execute_run`
+
+Phase 3's `meeting_prep.py` shipped with its AI-enrichment section feature-flagged off "until Phase 4 exists to serve it" (`config.py:meeting_prep_ai_enrichment_enabled`, default `False`; see the design doc's Decision 8 note that flipping this flag is a Phase-4-consuming change, not a redesign). This task performs that wiring, now that Phase 4 exists.
+
+**`execute_run` generalized to a second task type.** `TASK_PORTS` previously hardcoded a single-task-type shape inline inside `execute_run`. Refactored into a `_PREPARE_REQUEST: dict[str, Callable[...]]` dispatch table -- `_prepare_explain_item_request` (the pre-existing Step 1 tool-dispatch/render logic, extracted verbatim, zero behavior change) and a new `_prepare_meeting_prep_request` -- both returning a common `_PreparedRequest` (prompt id/version/text, repair instruction, grounding ids, and an optional `reflection_context` populated only for `attention.explain_item`, since `meeting.prep_summary` has no reflection capability in this activation). `attention.explain_item`'s full existing test suite (95 tests) passed unmodified after the refactor, confirming no regression from generalizing the orchestration loop.
+
+**New task type.** `TASK_PORTS["meeting.prep_summary"]`: `prompt_id="meeting.prep_summary.v1"`, `eligible_tools=("meeting.get_prep_pack",)`, `output_schema=MeetingPrepSummary`, `reflection_prompt_id=None`. `router.py:TASK_REQUIREMENTS["meeting.prep_summary"]`: `capability="summarization"`, `requires_structured_output=True`, `timeout_seconds=20.0`, `max_output_tokens=768`.
+
+**New tool.** `backend/ecc/domains/attention/meeting_prep_tools.py` (new): `get_prep_pack_tool`, wrapping `meeting_prep.py`'s existing `_meeting_row`/`_generate_pack` deterministic-pack functions and translating the one `HTTPException` case (`LINKED_CALENDAR_EVENT_MISSING`) to `ToolNotFound`, matching `attention.get_item`'s "tool handlers never raise `HTTPException`" discipline. Output covers all seven deterministic pack sections (participants, timeline, commitments, decisions, notes, risks, dependencies), deliberately omitting `evidence_gaps`/`open_questions` (not evidence to cite, they describe absence of evidence).
+
+**New schema and grounding check.** `validator.py`: `MeetingPrepSummary` (`summary_text` capped at 150 words, `cited_evidence_ids`, `extra="forbid"`) and `check_meeting_prep_grounding`, mirroring `ExplainItemOutput`/`check_explain_item_grounding`'s established pattern -- citations must be a subset of the ids actually present across the seven pack sections the tool call returned.
+
+**Migration.** `backend/migrations/versions/0034_phase4_meeting_prep_enrichment.py`: seeds the `meeting.get_prep_pack` tool contract, the `meeting.prep_summary.v1` prompt, and a `meeting.prep_summary` routing policy (`max_input_tokens=4096`, `max_output_tokens=768`, 20s per-model/5s per-tool/60s total budgets, same shape as `attention.explain_item`'s policy). Verified reversible (`upgrade` -> `downgrade -1` -> `upgrade` clean against a local Postgres instance).
+
+**`meeting_prep.py` wiring and a real frozen-snapshot gap closed.** `_compute_enrichment` (replacing the old always-`feature_disabled` `_enrichment_section`) calls `execute_run("meeting.prep_summary", "sensitive", {"meeting_id": ...}, ...)` when the flag is on, mapping a non-`completed` run to `EnrichmentOut(available=False, error_code=run.error_code)`. **Found and fixed while wiring this in:** `PackContentSnapshot` did not previously store enrichment at all -- `_pack_row_to_response` recomputed it fresh on every `GET`, violating this same file's own "frozen snapshot" contract (every other field is computed once at generation time and never re-derived). `enrichment` is now a real field on `PackContentSnapshot`, computed once in `create_prep`/`refresh_prep` and persisted with the rest of the snapshot; `GET` reads it back rather than recomputing, proven by `test_get_prep_returns_persisted_enrichment_not_recomputed` (a second GET-time mocked Ollama adapter that raises if `.generate()` is ever called again).
+
+**A real transaction bug found and fixed while wiring this in.** `execute_run`'s `_persist_terminal` unconditionally commits partway through its own execution (an existing, deliberate design -- see its docstring). Calling it from inside `create_prep`/`refresh_prep`'s single outer `with session.begin():` block closed a transaction those functions still believed was open, surfacing as `sqlalchemy.exc.InvalidRequestError: Can't operate on closed transaction`. `POST /ai/runs` (`runtime.py:create_run`) had already solved this exact problem: a session-scoped `_held_idempotency_lock` (`pg_advisory_lock` on a dedicated connection, not tied to any one transaction) wraps the whole request, with `execute_run` called bare between separate short transactions. Both `create_prep` and `refresh_prep` now follow that same precedent. Accepted tradeoff, documented in `refresh_prep`'s own docstring: the `FOR UPDATE` lock on the prior pack row no longer spans the AI call, so a genuinely concurrent second `refresh_prep` in that narrow window now returns `MEETING_PACK_NOT_FOUND` instead of transparently retrying -- the same tradeoff `create_run` already accepted.
+
+**Tests.** `tests/test_ai_runtime_validation_postgres.py`: 8 new tests for `MeetingPrepSummary`/`check_meeting_prep_grounding` (word-cap boundary, extra-field rejection, grounding pass/fail/empty-citations cases). `tests/test_ai_runtime_runtime_postgres.py`: 5 new tests exercising `execute_run("meeting.prep_summary", ...)` end-to-end against a mocked transport -- happy path persists `completed`, an ungrounded citation fails grounding, an unknown meeting id is not found, a schema-invalid first attempt repairs on the second, reflection never triggers for this task type. `tests/test_ai_runtime_routing_postgres.py`/`tests/test_ai_runtime_versioning_postgres.py`: seeded-row assertions updated from "exactly one row" to filtered/dict-keyed lookups (both task types now seed a `routing_policies` row), plus new seeded-row tests for the `meeting.prep_summary` prompt, tool, and policy. `tests/test_attention_meeting_prep_postgres.py`: 4 new HTTP-level tests -- enrichment feature-disabled by default (flag untouched), enrichment available and grounded when enabled, enrichment fails open on an ungrounded citation, and the frozen-snapshot proof above.
+
+**Full regression (this task).** Backend: `pytest tests/` -- 701 passed, 7 skipped, 2 failed + 3 errored on full-suite performance-budget tests (`test_build_meeting_pack_p95_under_budget`, `test_ranking_10000_eligible_entities_under_budget`, and three dashboard/retrieval performance tests) that all pass individually in isolation -- confirmed sandbox contention under full-suite load, not a regression from this task, matching the same pre-existing pattern already recorded under Task 6's evidence above. `ruff check`/`mypy` clean on every file this task touched.
+
+**Docs.** `MEETING-PREP-CONTRACT.md`'s existing "Optional enrichment" section already described this behavior generically and needed no change. `DATA-MODEL.md` updated: `routing_policies`/`prompt_versions`/`tool_definitions` rows now reflect two task types and three prompts/tools instead of one. `config.py`'s flag comment updated to reflect that Phase 4 now exists to serve it (the flag's default remains `False` -- this task wires the capability, it does not turn it on for anyone).
 
 ## Sandbox constraint (carried forward from the design pass)
 

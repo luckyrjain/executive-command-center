@@ -419,17 +419,22 @@ def test_routing_policies_seeded_row() -> None:
             connection.execute(
                 text(
                     "SELECT task_type, version, candidates, constraints, fallback, status "
-                    "FROM routing_policies"
-                )
+                    "FROM routing_policies WHERE task_type = :task_type"
+                ),
+                {"task_type": SEEDED_TASK_TYPE},
             )
             .mappings()
             .all()
         )
-    # Still exactly one policy row -- migration 0032 updates this row's
-    # candidates JSONB in place (documentation/audit accuracy; router.py's
-    # route() draws its candidate pool from every active model_definitions
-    # row, not this column -- see that migration's own docstring), it does
-    # not add a second policy row or bump version.
+    # Still exactly one policy row for attention.explain_item -- migration
+    # 0032 updates this row's candidates JSONB in place (documentation/
+    # audit accuracy; router.py's route() draws its candidate pool from
+    # every active model_definitions row, not this column -- see that
+    # migration's own docstring), it does not add a second policy row or
+    # bump version. Filtered by task_type (not a bare `FROM routing_
+    # policies`) since migration 0034_phase4_meeting_prep_enrichment
+    # added a second, independent task_type's own row -- see
+    # test_meeting_prep_summary_routing_policy_seeded_row below.
     assert len(rows) == 1
     record = rows[0]
     assert record["task_type"] == SEEDED_TASK_TYPE
@@ -441,6 +446,33 @@ def test_routing_policies_seeded_row() -> None:
     assert record["constraints"]["max_input_tokens"] == 3072
     assert record["constraints"]["max_output_tokens"] == 512
     assert record["constraints"]["per_model_call_timeout_seconds"] == 20
+    assert record["fallback"] == {}
+    assert record["status"] == "active"
+
+
+def test_meeting_prep_summary_routing_policy_seeded_row() -> None:
+    """Migration `0034_phase4_meeting_prep_enrichment.py` -- the second,
+    independent task_type's own `routing_policies` row (Phase 3's
+    `meeting_prep.py` "Optional enrichment" wired on).
+    """
+    with engine.connect() as connection:
+        record = (
+            connection.execute(
+                text(
+                    "SELECT task_type, version, candidates, constraints, fallback, status "
+                    "FROM routing_policies WHERE task_type = 'meeting.prep_summary'"
+                )
+            )
+            .mappings()
+            .one()
+        )
+    assert record["version"] == 1
+    assert record["candidates"] == [
+        {"provider": "ollama", "model_id": SEEDED_MODEL_ID},
+        {"provider": "ollama", "model_id": SECOND_SEEDED_MODEL_ID},
+    ]
+    assert record["constraints"]["max_input_tokens"] == 4096
+    assert record["constraints"]["max_output_tokens"] == 768
     assert record["fallback"] == {}
     assert record["status"] == "active"
 
@@ -474,10 +506,14 @@ def test_router_policy_functions_read_the_seeded_row() -> None:
     from ecc.database import SessionFactory
 
     with SessionFactory() as session:
+        # Two seeded policies as of migration 0034_phase4_meeting_prep_
+        # enrichment (attention.explain_item, meeting.prep_summary) --
+        # find the one this test is actually about rather than asserting
+        # a bare row count that a later, unrelated task type would break.
         policies = air.list_policies(session)
-        assert len(policies) == 1
-        assert policies[0].task_type == SEEDED_TASK_TYPE
-        assert len(policies[0].candidates) == 2
+        by_task_type = {policy.task_type: policy for policy in policies}
+        assert SEEDED_TASK_TYPE in by_task_type
+        assert len(by_task_type[SEEDED_TASK_TYPE].candidates) == 2
 
         policy = air.get_policy(session, SEEDED_TASK_TYPE)
         assert policy is not None
@@ -645,9 +681,12 @@ def test_get_ai_policies_returns_seeded_policy(
     response = client.get("/api/v1/ai/policies")
     assert response.status_code == 200
     body = response.json()
-    assert len(body["policies"]) == 1
-    policy = body["policies"][0]
-    assert policy["task_type"] == SEEDED_TASK_TYPE
+    # Two seeded policies as of migration 0034_phase4_meeting_prep_
+    # enrichment -- find the one this test is actually about (see test_
+    # router_policy_functions_read_the_seeded_row's identical reasoning).
+    by_task_type = {policy["task_type"]: policy for policy in body["policies"]}
+    assert SEEDED_TASK_TYPE in by_task_type
+    policy = by_task_type[SEEDED_TASK_TYPE]
     assert policy["version"] == 1
     assert policy["status"] == "active"
     assert policy["candidates"] == [

@@ -1,3 +1,4 @@
+import json
 import os
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
@@ -6,6 +7,7 @@ from hmac import new
 from time import perf_counter
 from uuid import UUID, uuid4
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 from fixtures.phase3_meeting_scenarios import seed_large_meeting_history
@@ -13,6 +15,8 @@ from sqlalchemy import text
 
 from ecc.config import get_settings
 from ecc.database import engine
+from ecc.domains.ai_runtime.ollama_client import OllamaAdapter
+from ecc.domains.ai_runtime.runtime import get_ollama_adapter
 from ecc.domains.attention.meeting_prep import (
     CommitmentRow,
     DependencyRow,
@@ -335,6 +339,7 @@ def meeting_prep_test_context() -> Iterator[tuple[TestClient, UUID, UUID, str, U
                 "event_outbox",
                 "audit_events",
                 "idempotency_records",
+                "ai_runs",
                 "sessions",
                 "users",
             ):
@@ -1211,3 +1216,192 @@ def test_build_meeting_pack_p95_under_budget(
         f"{_PACK_BUDGET_SECONDS * 1000:.0f} ms budget (in_ci={_IN_CI}); "
         f"samples(ms)={[round(s * 1000, 1) for s in samples]}"
     )
+
+
+# ---------------------------------------------------------------------------
+# AI enrichment (Phase 4-consuming wiring, MEETING-PREP-CONTRACT.md's
+# "Optional enrichment") -- gated on config.py:meeting_prep_ai_enrichment_
+# enabled (still default False), computed once at pack-generation time and
+# persisted into the frozen snapshot (never recomputed at GET time).
+# ---------------------------------------------------------------------------
+
+
+def _mocked_ollama_adapter(*response_texts: str) -> OllamaAdapter:
+    """`test_ai_runtime_runtime_postgres.py:_adapter_with_responses`'s
+    exact pattern (a real `OllamaAdapter` over `httpx.MockTransport`,
+    Task 1's own testing convention) -- kept as a local copy rather than
+    a cross-file import, matching every other Phase 4 test file's own
+    self-contained copy of this same helper.
+    """
+    remaining = list(response_texts)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        text_value = remaining.pop(0) if remaining else response_texts[-1]
+        body = (
+            json.dumps(
+                {
+                    "model": "m",
+                    "created_at": "now",
+                    "response": text_value,
+                    "done": True,
+                    "eval_count": 12,
+                    "prompt_eval_count": 40,
+                }
+            )
+            + "\n"
+        )
+        return httpx.Response(
+            200, content=body.encode(), headers={"content-type": "application/x-ndjson"}
+        )
+
+    return OllamaAdapter(transport=httpx.MockTransport(handler))
+
+
+def test_create_prep_enrichment_feature_disabled_by_default(
+    meeting_prep_test_context: tuple[TestClient, UUID, UUID, str, UUID],
+) -> None:
+    """`config.py:meeting_prep_ai_enrichment_enabled` defaults `False` in
+    the test environment (already true of every other test in this file
+    that never sets the env var) -- the deterministic pack still
+    generates in full; only `enrichment` reports the flag's off state.
+    """
+    client, _workspace_id, _user_id, token, meeting_id = meeting_prep_test_context
+    response = client.post(
+        f"/api/v1/meetings/{meeting_id}/prep", headers=_headers(token, "enrichment-disabled")
+    )
+    assert response.status_code == 201, response.text
+    enrichment = response.json()["enrichment"]
+    assert enrichment == {"available": False, "summary": None, "error_code": "feature_disabled"}
+
+
+def test_create_prep_enrichment_available_when_enabled_and_grounded(
+    meeting_prep_test_context: tuple[TestClient, UUID, UUID, str, UUID],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, workspace_id, _user_id, token, meeting_id = meeting_prep_test_context
+    entity_id = _seed_node(workspace_id, "person", "Jordan Lee")
+    added = client.post(
+        f"/api/v1/meetings/{meeting_id}/participants",
+        headers=_headers(token, "enrichment-participant"),
+        json={"entity_id": str(entity_id)},
+    )
+    assert added.status_code == 201, added.text
+    participant_id = added.json()["id"]
+
+    monkeypatch.setenv("ECC_MEETING_PREP_AI_ENRICHMENT_ENABLED", "true")
+    get_settings.cache_clear()
+    adapter = _mocked_ollama_adapter(
+        json.dumps(
+            {
+                "summary_text": "Jordan Lee is attending; review Q3 numbers.",
+                "cited_evidence_ids": [participant_id],
+            }
+        )
+    )
+    app.dependency_overrides[get_ollama_adapter] = lambda: adapter
+    try:
+        response = client.post(
+            f"/api/v1/meetings/{meeting_id}/prep", headers=_headers(token, "enrichment-enabled")
+        )
+    finally:
+        app.dependency_overrides.pop(get_ollama_adapter, None)
+        get_settings.cache_clear()
+
+    assert response.status_code == 201, response.text
+    enrichment = response.json()["enrichment"]
+    assert enrichment["available"] is True
+    assert enrichment["error_code"] is None
+    assert enrichment["summary"] == "Jordan Lee is attending; review Q3 numbers."
+
+
+def test_create_prep_enrichment_fails_open_on_ungrounded_citation(
+    meeting_prep_test_context: tuple[TestClient, UUID, UUID, str, UUID],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A reflection-layer-style failure in the AI call (here, a citation
+    to an id absent from the real pack) never blocks the deterministic
+    pack from generating -- `create_prep` still returns 201 with every
+    required section present, only `enrichment.available` is `False`.
+    """
+    client, workspace_id, _user_id, token, meeting_id = meeting_prep_test_context
+    entity_id = _seed_node(workspace_id, "person", "Jordan Lee")
+    added = client.post(
+        f"/api/v1/meetings/{meeting_id}/participants",
+        headers=_headers(token, "enrichment-fail-open-participant"),
+        json={"entity_id": str(entity_id)},
+    )
+    assert added.status_code == 201, added.text
+
+    monkeypatch.setenv("ECC_MEETING_PREP_AI_ENRICHMENT_ENABLED", "true")
+    get_settings.cache_clear()
+    adapter = _mocked_ollama_adapter(
+        json.dumps({"summary_text": "Fabricated.", "cited_evidence_ids": ["nonexistent-id"]})
+    )
+    app.dependency_overrides[get_ollama_adapter] = lambda: adapter
+    try:
+        response = client.post(
+            f"/api/v1/meetings/{meeting_id}/prep", headers=_headers(token, "enrichment-fail-open")
+        )
+    finally:
+        app.dependency_overrides.pop(get_ollama_adapter, None)
+        get_settings.cache_clear()
+
+    assert response.status_code == 201, response.text
+    body = response.json()
+    assert body["objective"] == "Review Q3 numbers"
+    assert len(body["participants"]) == 1
+    enrichment = body["enrichment"]
+    assert enrichment["available"] is False
+    assert enrichment["summary"] is None
+    assert enrichment["error_code"] == "grounding_failed"
+
+
+def test_get_prep_returns_persisted_enrichment_not_recomputed(
+    meeting_prep_test_context: tuple[TestClient, UUID, UUID, str, UUID],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`PackContentSnapshot.enrichment` is part of the frozen snapshot
+    (finding #6's discipline, now correctly applied to this field too) --
+    a later `GET .../prep`, even with the flag still on, must return the
+    exact summary generated at creation time, never a fresh model call.
+    Proven here by pointing the mocked adapter at a transport that would
+    raise if `.generate()` were ever called again after creation.
+    """
+    client, workspace_id, _user_id, token, meeting_id = meeting_prep_test_context
+    entity_id = _seed_node(workspace_id, "person", "Jordan Lee")
+    added = client.post(
+        f"/api/v1/meetings/{meeting_id}/participants",
+        headers=_headers(token, "enrichment-get-participant"),
+        json={"entity_id": str(entity_id)},
+    )
+    assert added.status_code == 201, added.text
+    participant_id = added.json()["id"]
+
+    monkeypatch.setenv("ECC_MEETING_PREP_AI_ENRICHMENT_ENABLED", "true")
+    get_settings.cache_clear()
+    creation_adapter = _mocked_ollama_adapter(
+        json.dumps(
+            {"summary_text": "Original summary.", "cited_evidence_ids": [participant_id]}
+        )
+    )
+    app.dependency_overrides[get_ollama_adapter] = lambda: creation_adapter
+    try:
+        created = client.post(
+            f"/api/v1/meetings/{meeting_id}/prep", headers=_headers(token, "enrichment-get-create")
+        )
+        assert created.status_code == 201, created.text
+        assert created.json()["enrichment"]["summary"] == "Original summary."
+
+        def _never_called(request: httpx.Request) -> httpx.Response:
+            raise AssertionError("GET .../prep must never call the model -- enrichment is frozen")
+
+        app.dependency_overrides[get_ollama_adapter] = lambda: OllamaAdapter(
+            transport=httpx.MockTransport(_never_called)
+        )
+        fetched = client.get(f"/api/v1/meetings/{meeting_id}/prep")
+    finally:
+        app.dependency_overrides.pop(get_ollama_adapter, None)
+        get_settings.cache_clear()
+
+    assert fetched.status_code == 200
+    assert fetched.json()["enrichment"]["summary"] == "Original summary."

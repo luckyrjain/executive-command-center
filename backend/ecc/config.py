@@ -56,7 +56,8 @@ class Settings(BaseSettings):
     # explicit way to opt into paying that cost, not a workaround for it.
     embeddings_enabled: bool = Field(default=False, validation_alias="ECC_EMBEDDINGS_ENABLED")
     # Off by default: MEETING-PREP-CONTRACT.md's "Optional enrichment" AI
-    # summarization has no Phase 4 (AI Runtime) to serve it yet -- the
+    # summarization is now wired to Phase 4 (AI Runtime)'s execute_run via
+    # the meeting.prep_summary task type, but stays opt-in -- the
     # deterministic pack sections are unaffected either way, matching this
     # repo's "deterministic core, AI optional and gated" pattern from every
     # prior phase.

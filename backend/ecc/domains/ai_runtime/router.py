@@ -61,15 +61,27 @@ class TaskRequirements:
     max_output_tokens: int
 
 
-# This activation registers exactly one task type (design doc Decision 9):
-# `attention.explain_item`. A second task type is a later slice's addition
-# to this table, not a schema change.
+# This activation originally registered exactly one task type (design doc
+# Decision 9): `attention.explain_item`. `meeting.prep_summary` (Phase 3's
+# `meeting_prep.py` "Optional enrichment", wired on now that Phase 4
+# exists to serve it) is the addition -- a table entry, not a schema
+# change, matching this comment's own original prediction.
 TASK_REQUIREMENTS: dict[str, TaskRequirements] = {
     "attention.explain_item": TaskRequirements(
         capability="explanation",
         requires_structured_output=True,
         timeout_seconds=20.0,
         max_output_tokens=512,
+    ),
+    "meeting.prep_summary": TaskRequirements(
+        capability="summarization",
+        requires_structured_output=True,
+        timeout_seconds=20.0,
+        # Higher than explain_item's 512: a meeting pack's evidence bundle
+        # is richer (up to seven sections instead of one item's factor
+        # list) and its 150-word summary cap (validator.py) is itself
+        # already more than double explain_item's 60-word cap.
+        max_output_tokens=768,
     ),
 }
 
