@@ -51,6 +51,7 @@ from ecc.domains.ai_runtime.budgets import (
     candidate_state_for,
     check_input_token_budget,
     check_output_token_budget,
+    reflection_enabled,
 )
 from ecc.domains.ai_runtime.ollama_client import (
     DEFAULT_PER_MODEL_CALL_TIMEOUT_SECONDS,
@@ -357,6 +358,53 @@ def test_run_budget_from_policy_falls_back_to_constraints_for_unregistered_task_
     budget = RunBudget.from_policy(synthetic_policy)
     assert budget.per_model_call_seconds == 20.0
     assert budget.max_output_tokens == 512
+
+
+# ---------------------------------------------------------------------------
+# reflection_enabled -- the Reflection Engine (first slice) gating switch,
+# read from the exact same routing_policies.constraints column RunBudget
+# already reads its five budget numbers from (migration
+# 0033_phase4_reflection.py, default false).
+# ---------------------------------------------------------------------------
+
+
+def _policy_with_constraints(constraints: dict) -> air.RoutingPolicy:
+    return air.RoutingPolicy(
+        id=uuid4(),
+        task_type="synthetic.task",
+        version=1,
+        candidates=[],
+        constraints=constraints,
+        fallback={},
+        status="active",
+    )
+
+
+def test_reflection_enabled_reads_the_seeded_routing_policy_row() -> None:
+    """Migration `0033_phase4_reflection.py` seeds `reflection_enabled:
+    false` on the real `attention.explain_item` policy row -- proving
+    this reads the live seeded value, not a hardcoded default only.
+    """
+    assert reflection_enabled(_seeded_policy()) is False
+
+
+def test_reflection_enabled_true_when_constraint_set_true() -> None:
+    policy = _policy_with_constraints({"reflection_enabled": True})
+    assert reflection_enabled(policy) is True
+
+
+def test_reflection_enabled_false_when_constraint_set_false() -> None:
+    policy = _policy_with_constraints({"reflection_enabled": False})
+    assert reflection_enabled(policy) is False
+
+
+def test_reflection_enabled_defaults_false_when_key_absent() -> None:
+    """A `routing_policies` row that predates migration
+    `0033_phase4_reflection.py` (or otherwise omits the key) must not
+    silently enable an unproven, un-configured reflection call.
+    """
+    policy = _policy_with_constraints({})
+    assert reflection_enabled(policy) is False
 
 
 # ---------------------------------------------------------------------------

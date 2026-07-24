@@ -253,3 +253,35 @@ def check_explain_item_grounding(
     if ungrounded:
         return GroundingFailure(ungrounded_codes=ungrounded)
     return None
+
+
+# ---------------------------------------------------------------------------
+# attention.explain_item.reflect -- first-slice Reflection Engine
+# (`docs/architecture/chapter-03-ai-runtime.md`'s Reflection Engine
+# section, narrowed to one bounded additional call on this one task type,
+# gated by `budgets.py:reflection_enabled`).
+# ---------------------------------------------------------------------------
+
+
+class ExplainItemReflection(BaseModel):
+    """The reflection call's output shape: the model reviews its own
+    already-validated, already-grounded `ExplainItemOutput` answer and
+    either approves it unchanged or proposes a revision. `extra="forbid"`
+    mirrors `ExplainItemOutput`'s strictness.
+
+    Deliberately no word-count (or any other) field validator here, unlike
+    `ExplainItemOutput._max_word_count` -- a proposed revision is never
+    accepted as-is. `runtime.py:execute_run` re-validates
+    `revised_explanation_text`/`revised_cited_factor_codes` by constructing
+    a fresh `ExplainItemOutput` from them and running it through
+    `validate_output` and `check_explain_item_grounding`, the exact same
+    checks the original answer had to pass -- so every schema rule
+    (including the 60-word cap) has exactly one owner, `ExplainItemOutput`,
+    not a second, independently-typed copy on this class.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    approved: bool
+    revised_explanation_text: str | None = None
+    revised_cited_factor_codes: list[str] | None = None

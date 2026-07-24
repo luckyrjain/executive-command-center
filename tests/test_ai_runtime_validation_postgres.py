@@ -33,6 +33,7 @@ from pydantic import BaseModel
 from ecc.config import get_settings
 from ecc.domains.ai_runtime.validator import (
     ExplainItemOutput,
+    ExplainItemReflection,
     GroundingFailure,
     RepairAttemptResult,
     SchemaInvalid,
@@ -347,3 +348,69 @@ def test_bounded_repair_reattempt_callback_never_called_more_than_once() -> None
 
     validate_with_bounded_repair(ExplainItemOutput, "{invalid", _reattempt)
     assert call_log == [0]
+
+
+# ---------------------------------------------------------------------------
+# ExplainItemReflection -- Reflection Engine (first slice) output shape.
+# ---------------------------------------------------------------------------
+
+
+def test_explain_item_reflection_approved_with_null_revision_fields() -> None:
+    raw = dumps(
+        {"approved": True, "revised_explanation_text": None, "revised_cited_factor_codes": None}
+    )
+    result = validate_output(ExplainItemReflection, raw)
+    assert isinstance(result, ValidatedOutput)
+    reflection = result.value
+    assert isinstance(reflection, ExplainItemReflection)
+    assert reflection.approved is True
+    assert reflection.revised_explanation_text is None
+    assert reflection.revised_cited_factor_codes is None
+
+
+def test_explain_item_reflection_defaults_revision_fields_to_none_when_omitted() -> None:
+    raw = dumps({"approved": True})
+    result = validate_output(ExplainItemReflection, raw)
+    assert isinstance(result, ValidatedOutput)
+    reflection = result.value
+    assert isinstance(reflection, ExplainItemReflection)
+    assert reflection.revised_explanation_text is None
+    assert reflection.revised_cited_factor_codes is None
+
+
+def test_explain_item_reflection_rejects_unexpected_extra_field() -> None:
+    raw = dumps({"approved": True, "unexpected_extra_field": "x"})
+    result = validate_output(ExplainItemReflection, raw)
+    assert isinstance(result, SchemaInvalid)
+
+
+def test_explain_item_reflection_requires_approved_field() -> None:
+    raw = dumps({"revised_explanation_text": None, "revised_cited_factor_codes": None})
+    result = validate_output(ExplainItemReflection, raw)
+    assert isinstance(result, SchemaInvalid)
+
+
+def test_explain_item_reflection_accepts_over_60_word_revision_unvalidated() -> None:
+    """Deliberately no word-count field validator on this class, unlike
+    `ExplainItemOutput._max_word_count` -- a proposed revision is never
+    accepted as-is; `runtime.py:_reflect_on_answer` re-validates it by
+    constructing a fresh `ExplainItemOutput` and running it through
+    `validate_output` again, so the 60-word rule has exactly one owner.
+    This test pins that division of responsibility: an over-long revision
+    validates fine *as an `ExplainItemReflection`* and is only ever
+    rejected at the second, `ExplainItemOutput` re-validation step.
+    """
+    long_text = " ".join(["word"] * 61)
+    raw = dumps(
+        {
+            "approved": False,
+            "revised_explanation_text": long_text,
+            "revised_cited_factor_codes": ["a"],
+        }
+    )
+    result = validate_output(ExplainItemReflection, raw)
+    assert isinstance(result, ValidatedOutput)
+
+    revision_payload = dumps({"explanation_text": long_text, "cited_factor_codes": ["a"]})
+    revision_result = validate_output(ExplainItemOutput, revision_payload)
+    assert isinstance(revision_result, SchemaInvalid)
