@@ -440,9 +440,12 @@ def test_run_evaluation_permanently_schema_invalid_fails_only_that_floor(
     # The redacted validation-error summary (field path + Pydantic error
     # type only) is surfaced too -- otherwise diagnosing a real
     # schema_invalid failure needs the raw response text, which this
-    # codebase never logs.
+    # codebase never logs. Exact match, not mere truthiness -- both
+    # responses for this example are deliberately non-JSON, so the real
+    # value is deterministic; a truthiness-only check would still pass a
+    # regression that substituted some other non-empty placeholder.
     schema_failure = next(failure for failure in run.failures if failure["key"] == invalid_key)
-    assert schema_failure["detail"]
+    assert schema_failure["detail"] == "<root>:json_invalid"
 
 
 # ---------------------------------------------------------------------------

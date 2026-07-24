@@ -517,8 +517,12 @@ def test_execute_run_permanently_fails_after_bounded_repair_exhausted(run_contex
     final_model_step = steps[-1]
     assert final_model_step["kind"] == "model_call"
     assert final_model_step["trace"]["outcome"] == "schema_invalid"
-    assert "detail" in final_model_step["trace"]
-    assert final_model_step["trace"]["detail"]
+    # Exact match, not mere truthiness -- "still not json either" is not
+    # valid JSON at all, so the real redacted summary is deterministic.
+    # A truthiness-only check would still pass a regression that
+    # accidentally substituted some other non-empty placeholder (e.g.
+    # `detail = outcome`) for the real validation-error summary.
+    assert final_model_step["trace"]["detail"] == "<root>:json_invalid"
 
 
 # ---------------------------------------------------------------------------

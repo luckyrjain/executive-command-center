@@ -52,7 +52,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from ecc.auth import AuthContext, AuthDep, CsrfDep
-from ecc.database import engine, get_session
+from ecc.database import get_session, lock_engine
 from ecc.observability import (
     queue_lifecycle_event,
     record_audit_outbox_failure,
@@ -1110,17 +1110,24 @@ def _held_idempotency_lock(auth: AuthContext, key: str) -> Iterator[None]:
     initial cache lookup -- is the critical section: two concurrent
     requests carrying the same Idempotency-Key must not both reach
     `execute_run` and independently trigger a real model call. Every other
-    idempotency-key endpoint in this codebase (including this module's own
-    `activate_policy`-style callers elsewhere in the package) safely uses
-    the lighter transaction-scoped `pg_advisory_xact_lock` because their
-    entire critical section fits inside one `session.begin()` block with
-    no internal commit -- `execute_run` does not have that property (it is
-    also called directly, session-less-transaction-wise, from tests and
-    from `evaluation.py`'s per-example loop), so this endpoint cannot rely
-    on it either.
+    idempotency-key endpoint in this codebase (including `prompts.py`'s own
+    `activate_policy`) safely uses the lighter transaction-scoped
+    `pg_advisory_xact_lock` because their entire critical section fits
+    inside one `session.begin()` block with no internal commit --
+    `execute_run` does not have that property (it is also called directly,
+    session-less-transaction-wise, from tests and from `evaluation.py`'s
+    per-example loop), so this endpoint cannot rely on it either.
+
+    Uses `ecc.database.lock_engine` (`NullPool`, no `statement_timeout`),
+    not the app's main `engine` -- this lock can be held for tens of
+    seconds to minutes (the synchronous model call), and the main engine's
+    shared, size-capped pool plus its 5-second `statement_timeout`
+    connect-listener are both sized/tuned for ordinary short queries, not
+    a lock-wait meant to block indefinitely until the first request
+    releases it. See `lock_engine`'s own docstring in `database.py`.
     """
     lock_key = f"{auth.workspace_id}:{auth.user_id}:{key}"
-    with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as connection:
+    with lock_engine.connect().execution_options(isolation_level="AUTOCOMMIT") as connection:
         connection.execute(
             text("SELECT pg_advisory_lock(hashtextextended(:lock_key, 0))"), {"lock_key": lock_key}
         )

@@ -101,7 +101,18 @@ class SchemaInvalid:
 def _summarize_validation_error(exc: ValidationError) -> str:
     parts = []
     for error in exc.errors(include_url=False):
-        loc = ".".join(str(segment) for segment in error["loc"]) or "<root>"
+        if error["type"] == "extra_forbidden":
+            # Unlike every other Pydantic error type, `extra_forbidden`'s
+            # `loc` is not a fixed, schema-known field path -- its final
+            # segment is the literal unexpected key name taken verbatim
+            # from the raw response (e.g. a model hallucinating an extra
+            # JSON field, or attacker-influenced content echoed into a
+            # key). Using it here would leak raw model-derived text into a
+            # value this class's own docstring (and every caller that
+            # persists/returns `detail`) treats as redaction-safe.
+            loc = "<extra_field>"
+        else:
+            loc = ".".join(str(segment) for segment in error["loc"]) or "<root>"
         parts.append(f"{loc}:{error['type']}")
     return "; ".join(parts) or "validation_failed"
 

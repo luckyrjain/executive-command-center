@@ -85,7 +85,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from ecc.auth import AuthContext, AuthDep, CsrfDep
-from ecc.database import engine, get_session
+from ecc.database import get_session, lock_engine
 from ecc.observability import record_idempotency_conflict
 
 from .ollama_client import OllamaAdapter
@@ -914,9 +914,16 @@ def _held_idempotency_lock(auth: AuthContext, key: str) -> Iterator[None]:
     `pg_advisory_xact_lock` would release long before the evaluation
     finishes, letting a concurrent duplicate request start its own
     20-example run before the first one's response is even stored.
+
+    Uses `ecc.database.lock_engine` (`NullPool`, no `statement_timeout`),
+    not the main `engine` -- see `runtime.py:_held_idempotency_lock`'s
+    identical rationale and `lock_engine`'s own docstring in
+    `database.py`. This endpoint's lock can be held for minutes (up to 20
+    sequential model calls), the longest-lived lock in this codebase, so
+    it is the case this matters most for.
     """
     lock_key = f"{auth.workspace_id}:{auth.user_id}:{key}"
-    with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as connection:
+    with lock_engine.connect().execution_options(isolation_level="AUTOCOMMIT") as connection:
         connection.execute(
             text("SELECT pg_advisory_lock(hashtextextended(:lock_key, 0))"), {"lock_key": lock_key}
         )
