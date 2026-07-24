@@ -424,23 +424,39 @@ def test_tool_definitions_partial_unique_index_rejects_second_active_row(
 
 
 def test_prompt_versions_seeded_row() -> None:
+    # Migration `0034_phase4_explain_prompt_v2` retired the original
+    # migration `0029` seed (version 1) and activated version 2 (the
+    # `overdue`-hallucination prompt fix) -- `WHERE status = 'active'`
+    # rather than a bare `WHERE prompt_id` keeps this a `.one()` regardless
+    # of how many retired versions accumulate for this family over time.
     with engine.connect() as connection:
         row = (
             connection.execute(
                 text(
                     "SELECT prompt_id, version, template_hash, input_schema_ref, "
-                    "output_schema_ref, status FROM prompt_versions WHERE prompt_id = :prompt_id"
+                    "output_schema_ref, status FROM prompt_versions "
+                    "WHERE prompt_id = :prompt_id AND status = 'active'"
                 ),
                 {"prompt_id": SEEDED_PROMPT_ID},
             )
             .mappings()
             .one()
         )
-    assert row["version"] == 1
+    assert row["version"] == 2
     assert row["status"] == "active"
     assert row["input_schema_ref"] == "attention.explain_item.input.v1"
     assert row["output_schema_ref"] == "attention.explain_item.output.v1"
     assert len(row["template_hash"]) == 64
+
+    with engine.connect() as connection:
+        retired_version = connection.execute(
+            text(
+                "SELECT version FROM prompt_versions "
+                "WHERE prompt_id = :prompt_id AND status = 'retired'"
+            ),
+            {"prompt_id": SEEDED_PROMPT_ID},
+        ).scalar_one()
+    assert retired_version == 1
 
 
 def test_tool_definitions_seeded_rows() -> None:
@@ -474,7 +490,7 @@ def test_get_active_prompt_reads_the_seeded_row() -> None:
     with SessionFactory() as session:
         active = ai_prompts.get_active_prompt(session, SEEDED_PROMPT_ID)
         assert active is not None
-        assert active.version == 1
+        assert active.version == 2
         assert active.status == "active"
         assert ai_prompts.get_active_prompt(session, "nonexistent.prompt") is None
 

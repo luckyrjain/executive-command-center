@@ -384,7 +384,7 @@ def test_execute_run_end_to_end_happy_path_persists_completed_run(run_context: d
     assert run.model_id == "qwen2.5:1.5b-instruct-q4_K_M"
     assert run.provider == "ollama"
     assert run.prompt_id == "attention.explain_item.v1"
-    assert run.prompt_version == 1
+    assert run.prompt_version == 2
     assert run.output is not None
     assert run.output["cited_factor_codes"] == ["overdue", "pinned"]
     assert run.attempts == 1
