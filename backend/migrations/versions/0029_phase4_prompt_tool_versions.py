@@ -107,12 +107,7 @@ _PROMPT_TEMPLATE = (
     "Explain, in 60 words or fewer, why this item deserves attention, "
     "grounded entirely in the factors listed below. Do not invent facts "
     "that are not present in the factors list. Every code you list in "
-    "cited_factor_codes must be one of the factor codes given here. A "
-    "factor's due-timing code tells you its exact urgency -- do not "
-    'substitute a different word for it: only say "overdue" if the code '
-    "is literally overdue; a code of due_48h means due soon, within the "
-    "next 48 hours, and is not yet overdue; a code of due_today means due "
-    "today, also not overdue.\n\n"
+    "cited_factor_codes must be one of the factor codes given here.\n\n"
     "Item type: {{ entity_type }}\n"
     "Score: {{ score }}\n"
     "Confidence: {{ confidence }}\n"
