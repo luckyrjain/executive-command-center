@@ -148,6 +148,22 @@ class OllamaAdapter:
         path above all release the underlying HTTP stream -- see the
         module docstring. `cancellation_token` defaults to `None`, so
         every existing caller (Task 1) is unaffected.
+
+        `temperature: 0` and a fixed `seed` make decoding greedy/
+        deterministic instead of Ollama's non-zero-temperature default --
+        required by the design doc's own non-functional requirement
+        ("Evaluation runs are reproducible from stored versions/hashes"),
+        which stochastic sampling violates outright: the same prompt could
+        legitimately produce a different response, and a different
+        schema-validity/grounding outcome, on every run. Greedy decoding is
+        also the standard mitigation for a small instruct model's structured-
+        output reliability (malformed JSON, over-length responses,
+        citing the wrong token) -- observed directly in this activation's
+        live-Ollama evaluation job (`ollama-evaluation` CI): schema_invalid
+        and grounding failures at non-zero temperature that a fixed,
+        zero-temperature decode should reduce, though this codebase's
+        sandboxed CI is the only place that claim can actually be checked
+        against the real model.
         """
         deadline = self._clock() + self._timeout_seconds
         try:
@@ -155,7 +171,7 @@ class OllamaAdapter:
                 model=model_id,
                 prompt=prompt,
                 stream=True,
-                options={"num_predict": max_tokens},
+                options={"num_predict": max_tokens, "temperature": 0, "seed": 0},
             )
         except ollama.ResponseError as exc:
             raise OllamaCallFailed(str(exc)) from exc
