@@ -73,6 +73,82 @@ def test_validate_output_malformed_json_returns_schema_invalid() -> None:
     assert result.reason == "schema_invalid"
 
 
+# ---------------------------------------------------------------------------
+# validate_output -- markdown code fence stripping. A real failure mode
+# confirmed against a live qwen2.5:1.5b-instruct-q4_K_M model (this PR's
+# ollama-evaluation CI job): 55% schema validity / 50% grounding against
+# the 100%/100% floors, entirely attributable to the model wrapping its
+# JSON response in a markdown code fence out of chat-formatting habit.
+# ---------------------------------------------------------------------------
+
+
+def _payload_json() -> str:
+    return dumps(
+        {
+            "explanation_text": "Ranked high because it is overdue and blocks a commitment.",
+            "cited_factor_codes": ["overdue", "blocks_commitment"],
+        }
+    )
+
+
+def test_validate_output_strips_json_language_tagged_fence() -> None:
+    raw = f"```json\n{_payload_json()}\n```"
+    result = validate_output(ExplainItemOutput, raw)
+    assert isinstance(result, ValidatedOutput)
+    assert result.value.cited_factor_codes == ["overdue", "blocks_commitment"]
+
+
+def test_validate_output_strips_untagged_fence() -> None:
+    raw = f"```\n{_payload_json()}\n```"
+    result = validate_output(ExplainItemOutput, raw)
+    assert isinstance(result, ValidatedOutput)
+
+
+def test_validate_output_strips_fence_with_surrounding_whitespace() -> None:
+    raw = f"\n\n  ```json\n{_payload_json()}\n```  \n\n"
+    result = validate_output(ExplainItemOutput, raw)
+    assert isinstance(result, ValidatedOutput)
+
+
+def test_validate_output_unfenced_json_still_works_unchanged() -> None:
+    """A response with no fence at all passes through untouched -- the
+    stripping is additive, never required, matching the existing
+    well-formed-JSON test's expectation exactly.
+    """
+    result = validate_output(ExplainItemOutput, _payload_json())
+    assert isinstance(result, ValidatedOutput)
+
+
+def test_validate_output_does_not_extract_json_from_surrounding_prose() -> None:
+    """Deliberately narrow: only a fence wrapping the *entire* response is
+    stripped. A response with leading prose and no fence markers is still
+    rejected -- this function does not attempt to hunt for a JSON
+    substring inside arbitrary text (a materially riskier heuristic this
+    module's docstring explicitly declines to implement).
+    """
+    raw = f"Here is the explanation: {_payload_json()}"
+    result = validate_output(ExplainItemOutput, raw)
+    assert isinstance(result, SchemaInvalid)
+
+
+def test_validate_output_unclosed_fence_is_not_stripped() -> None:
+    """A fence with no closing ``` is not a well-formed fence -- passed
+    through unchanged and correctly rejected, not silently mangled.
+    """
+    raw = f"```json\n{_payload_json()}"
+    result = validate_output(ExplainItemOutput, raw)
+    assert isinstance(result, SchemaInvalid)
+
+
+def test_validate_output_fenced_malformed_json_still_schema_invalid() -> None:
+    """Stripping the fence does not weaken validation of what's inside
+    it -- genuinely malformed content inside a fence is still rejected.
+    """
+    raw = "```json\n{not valid json\n```"
+    result = validate_output(ExplainItemOutput, raw)
+    assert isinstance(result, SchemaInvalid)
+
+
 def test_validate_output_missing_required_field_returns_schema_invalid() -> None:
     raw = dumps({"cited_factor_codes": ["overdue"]})  # explanation_text missing
     result = validate_output(ExplainItemOutput, raw)

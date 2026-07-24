@@ -34,6 +34,7 @@ row once that table exists; Task 2 tests this counting/bounding logic in
 isolation, against no database at all.
 """
 
+import re
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from typing import Literal
@@ -41,6 +42,33 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError, field_validator
 
 _MAX_EXPLANATION_WORDS = 60
+
+_MARKDOWN_FENCE_RE = re.compile(r"^```[a-zA-Z0-9_-]*\s*\n(?P<body>.*?)\n?```\s*$", re.DOTALL)
+
+
+def _strip_markdown_fence(raw_response: str) -> str:
+    """Small, instruct-tuned models (this activation's `qwen2.5:1.5b`
+    included) commonly wrap JSON output in a markdown code fence
+    (` ```json ... ``` ` or ` ``` ... ``` `) out of chat-formatting habit,
+    even when the prompt explicitly asks for raw JSON (Decision 4's
+    template: "Respond with JSON matching exactly: ..."). A strict JSON
+    parse rejects the fence markers outright, misreporting a
+    structurally-valid response as `schema_invalid` -- confirmed against a
+    real live model in this activation's evaluation harness (`PHASE-004`
+    live-Ollama CI job), not a hypothetical.
+
+    Narrowly strips only a well-formed leading/trailing triple-backtick
+    fence wrapping the *entire* response -- never touches the JSON content
+    itself, and deliberately does not attempt to extract a JSON substring
+    from surrounding prose (a materially riskier heuristic that could
+    silently accept a genuinely malformed response by grabbing a
+    JSON-looking fragment out of it). A response with no fence, or any
+    other unrecognized wrapping, passes through unchanged and is judged by
+    the strict parse exactly as before.
+    """
+    stripped = raw_response.strip()
+    match = _MARKDOWN_FENCE_RE.match(stripped)
+    return match.group("body").strip() if match else stripped
 
 
 @dataclass(frozen=True, slots=True)
@@ -97,9 +125,15 @@ def validate_output(
     the former), so there is exactly one failure path here, matching
     Decision 4's "A validation failure never reaches the domain layer" (no
     special-cased partial-success state exists).
+
+    `raw_response` is passed through `_strip_markdown_fence` first -- see
+    that function's docstring for why (a real, observed failure mode
+    against a live model, not speculative hardening).
     """
     try:
-        value = TypeAdapter(schema_ref).validate_json(raw_response, strict=True)
+        value = TypeAdapter(schema_ref).validate_json(
+            _strip_markdown_fence(raw_response), strict=True
+        )
     except ValidationError as exc:
         return SchemaInvalid(detail=_summarize_validation_error(exc))
     return ValidatedOutput(value=value)
