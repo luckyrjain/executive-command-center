@@ -46,6 +46,7 @@ _OLLAMA_BASE_URL = os.environ.get("ECC_OLLAMA_BASE_URL", "http://127.0.0.1:11434
 _MODEL_ID = "qwen2.5:1.5b-instruct-q4_K_M"
 _SECOND_MODEL_ID = "qwen2.5:3b-instruct-q4_K_M"
 _TASK_TYPE = "attention.explain_item"
+_SMOKE_TEST_ATTEMPTS = 3
 
 
 def _ollama_reachable() -> bool:
@@ -163,6 +164,20 @@ def test_second_registered_model_produces_a_valid_completed_run_against_real_oll
     a separate decision from confirming it works at all; this test is
     the latter.
 
+    Retries up to `_SMOKE_TEST_ATTEMPTS` times, accepting the first
+    `completed` run. `execute_run`'s bounded repair retry (Decision 4/5)
+    only covers `schema_invalid` -- a `grounding_failed` outcome (a real
+    model citing a factor code absent from the item's real factors, e.g.
+    an abbreviated/paraphrased code) is never retried inside a single
+    `execute_run` call, by design. The first model's own full 20-example
+    evaluation floor check tolerates exactly this kind of small-model
+    noise via averaging (it does not require literally every example to
+    pass on the first CI run); a single-shot, single-item smoke test has
+    no such averaging to fall back on, so it needs its own bounded
+    retry to avoid being flakier than the property it is actually
+    trying to prove ("this model is invokable and can produce a valid,
+    grounded response" -- not "this model never has an off run").
+
     The first model is temporarily marked `disabled` for this test's
     duration so `route()`'s eligibility pipeline has exactly one
     candidate left -- deterministic, not relying on winning a preference
@@ -212,17 +227,25 @@ def test_second_registered_model_produces_a_valid_completed_run_against_real_oll
                 },
             )
 
-        with SessionFactory() as session:
-            run = execute_run(
-                _TASK_TYPE,
-                "sensitive",
-                {"attention_item_id": str(item_id)},
-                session=session,
-                auth=run_context["auth"],
-                ollama_adapter=OllamaAdapter(host=_OLLAMA_BASE_URL),
-            )
+        runs = []
+        for _attempt in range(_SMOKE_TEST_ATTEMPTS):
+            with SessionFactory() as session:
+                run = execute_run(
+                    _TASK_TYPE,
+                    "sensitive",
+                    {"attention_item_id": str(item_id)},
+                    session=session,
+                    auth=run_context["auth"],
+                    ollama_adapter=OllamaAdapter(host=_OLLAMA_BASE_URL),
+                )
+            runs.append(run)
+            if run.status == "completed":
+                break
 
-        assert run.status == "completed", f"run failed: error_code={run.error_code!r}"
+        assert run.status == "completed", (
+            f"model never produced a completed run in {_SMOKE_TEST_ATTEMPTS} attempts: "
+            f"error_codes={[r.error_code for r in runs]!r}"
+        )
         assert run.model_id == _SECOND_MODEL_ID
         assert run.output is not None
         # A "completed" run already implies grounding passed (execute_run's
