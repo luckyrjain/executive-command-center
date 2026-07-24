@@ -20,7 +20,7 @@ consistent with this codebase's "no speculative field" discipline.
 
 from base64 import urlsafe_b64decode, urlsafe_b64encode
 from collections import defaultdict
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta
 from hashlib import sha256
@@ -621,7 +621,7 @@ def _row_to_plan(
     session: Session,
     auth: AuthContext,
     row: dict[str, Any],
-    blocks: list[Mapping[str, Any]] | None = None,
+    blocks: Sequence[Mapping[str, Any]] | None = None,
 ) -> Plan:
     """Build a ``Plan`` from a plan row, formatting its blocks.
 
@@ -631,8 +631,9 @@ def _row_to_plan(
     to the original per-plan lookup.
     """
     if blocks is None:
-        blocks = (
-            session.execute(
+        blocks = [
+            dict(b)
+            for b in session.execute(
                 text(
                     f"SELECT {_BLOCK_FIELDS} FROM plan_blocks "
                     "WHERE workspace_id = :workspace_id AND plan_id = :plan_id ORDER BY starts_at"
@@ -641,7 +642,7 @@ def _row_to_plan(
             )
             .mappings()
             .all()
-        )
+        ]
     return Plan.model_validate(
         {**row, "blocks": [PlanBlockResponse.model_validate(dict(b)) for b in blocks]}
     )
