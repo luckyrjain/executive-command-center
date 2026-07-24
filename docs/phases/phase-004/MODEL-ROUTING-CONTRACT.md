@@ -30,7 +30,9 @@ A candidate failing any step is excluded, not deprioritized:
 4. Lower observed p95 latency.
 5. Deterministic final tie-break: ascending `model_id` string comparison.
 
-In this first activation exactly one model is registered (`ollama` / `qwen2.5:1.5b-instruct-q4_K_M`, local, all four data classes eligible), so the preference stage is reachable only in the trivial single-candidate case; the ordering above is specified now so a second model does not require re-deriving it.
+The first activation registered exactly one model (`ollama` / `qwen2.5:1.5b-instruct-q4_K_M`, local, all four data classes eligible), so the preference stage was reachable only in the trivial single-candidate case -- the ordering above was specified then so a second model would not require re-deriving it. Migration `0032_phase4_second_model.py` has since registered a second candidate (`ollama` / `qwen2.5:3b-instruct-q4_K_M`, same deployment, same data classes and capabilities as the first, so eligibility filtering alone cannot decide `attention.explain_item` routing before this preference stage is reached with two live candidates -- exactly the case this ordering was written to cover). Both candidates start with no observed cost/latency history, so steps 3-4 above are ties until real usage data accumulates; step 5's ascending `model_id` comparison currently selects `qwen2.5:1.5b-instruct-q4_K_M` (`"1"` < `"3"`).
+
+`routing_policies.candidates` documents which models are intended for a task type but is not an enforced input to `route()` in this activation -- the eligibility/preference pipeline draws its candidate pool from every `active` `model_definitions` row, not filtered by this column. Both registered models are therefore real, live candidates for `attention.explain_item` regardless of whether this column lists them (it currently lists both, kept in sync for documentation/audit accuracy).
 
 ## Performance
 

@@ -53,6 +53,7 @@ pytestmark = pytest.mark.skipif(
 )
 
 SEEDED_MODEL_ID = "qwen2.5:1.5b-instruct-q4_K_M"
+SECOND_SEEDED_MODEL_ID = "qwen2.5:3b-instruct-q4_K_M"
 SEEDED_TASK_TYPE = "attention.explain_item"
 
 
@@ -378,26 +379,38 @@ def test_ineligible_candidates_excluded_before_preference_ordering() -> None:
 
 def test_model_definitions_seeded_row() -> None:
     with engine.connect() as connection:
-        row = (
+        rows = (
             connection.execute(
                 text(
                     "SELECT provider, model_id, deployment, data_classes, capabilities, "
                     "context_window_tokens, structured_output_supported, status "
-                    "FROM model_definitions"
+                    "FROM model_definitions ORDER BY model_id"
                 )
             )
             .mappings()
             .all()
         )
-    assert len(row) == 1
-    record = row[0]
-    assert record["provider"] == "ollama"
-    assert record["model_id"] == SEEDED_MODEL_ID
-    assert record["deployment"] == "local"
-    assert set(record["data_classes"]) == {"public", "internal", "sensitive", "restricted"}
-    assert set(record["capabilities"]) == {"extraction", "summarization", "explanation"}
-    assert record["structured_output_supported"] is True
-    assert record["status"] == "active"
+    # Migration 0028 seeded the first model; migration 0032 (this task's own
+    # follow-up, deferred at the time 0028 was written -- see that
+    # migration's module docstring) added a second, same task type, so both
+    # candidates are real, simultaneously-eligible options for router.py's
+    # preference stage to choose between, not just the trivial
+    # single-candidate case.
+    assert len(rows) == 2
+    by_model_id = {record["model_id"]: record for record in rows}
+    assert set(by_model_id) == {SEEDED_MODEL_ID, SECOND_SEEDED_MODEL_ID}
+    for record in rows:
+        assert record["provider"] == "ollama"
+        assert record["deployment"] == "local"
+        # Deliberately identical data_classes/capabilities across both rows
+        # (migration 0032's own docstring) -- if they differed, eligibility
+        # filtering alone would decide attention.explain_item routing
+        # before the preference/tie-break stage is ever reached with two
+        # live candidates.
+        assert set(record["data_classes"]) == {"public", "internal", "sensitive", "restricted"}
+        assert set(record["capabilities"]) == {"extraction", "summarization", "explanation"}
+        assert record["structured_output_supported"] is True
+        assert record["status"] == "active"
 
 
 def test_routing_policies_seeded_row() -> None:
@@ -412,11 +425,19 @@ def test_routing_policies_seeded_row() -> None:
             .mappings()
             .all()
         )
+    # Still exactly one policy row -- migration 0032 updates this row's
+    # candidates JSONB in place (documentation/audit accuracy; router.py's
+    # route() draws its candidate pool from every active model_definitions
+    # row, not this column -- see that migration's own docstring), it does
+    # not add a second policy row or bump version.
     assert len(rows) == 1
     record = rows[0]
     assert record["task_type"] == SEEDED_TASK_TYPE
     assert record["version"] == 1
-    assert record["candidates"] == [{"provider": "ollama", "model_id": SEEDED_MODEL_ID}]
+    assert record["candidates"] == [
+        {"provider": "ollama", "model_id": SEEDED_MODEL_ID},
+        {"provider": "ollama", "model_id": SECOND_SEEDED_MODEL_ID},
+    ]
     assert record["constraints"]["max_input_tokens"] == 3072
     assert record["constraints"]["max_output_tokens"] == 512
     assert record["constraints"]["per_model_call_timeout_seconds"] == 20
@@ -430,12 +451,21 @@ def test_registry_functions_read_the_seeded_row() -> None:
 
     with SessionFactory() as session:
         models = list_models(session)
-        assert len(models) == 1
-        assert models[0].model_id == SEEDED_MODEL_ID
+        assert len(models) == 2
+        assert {model.model_id for model in models} == {SEEDED_MODEL_ID, SECOND_SEEDED_MODEL_ID}
+        # list_models orders ascending by model_id -- matching the router's
+        # own preference-stage final tie-break (registry.py's docstring).
+        assert [model.model_id for model in models] == sorted(
+            [SEEDED_MODEL_ID, SECOND_SEEDED_MODEL_ID]
+        )
 
         found = get_model(session, SEEDED_MODEL_ID)
         assert found is not None
         assert found.provider == "ollama"
+
+        found_second = get_model(session, SECOND_SEEDED_MODEL_ID)
+        assert found_second is not None
+        assert found_second.provider == "ollama"
 
         assert get_model(session, "nonexistent-model") is None
 
@@ -447,12 +477,67 @@ def test_router_policy_functions_read_the_seeded_row() -> None:
         policies = air.list_policies(session)
         assert len(policies) == 1
         assert policies[0].task_type == SEEDED_TASK_TYPE
+        assert len(policies[0].candidates) == 2
 
         policy = air.get_policy(session, SEEDED_TASK_TYPE)
         assert policy is not None
         assert policy.version == 1
 
         assert air.get_policy(session, "unregistered.task") is None
+
+
+def test_refresh_cache_and_route_pick_correctly_among_two_real_seeded_models(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Every preference test elsewhere in this file exercises `_preference_
+    key`'s tie-break logic against synthetic in-memory `ModelDefinition`
+    fixtures -- proving the algorithm is correct, but never proving the
+    actual migration-seeded, multi-row `model_definitions` table round-trips
+    correctly through `refresh_cache` (the real production glue between the
+    database and `route()`'s module-level cache) into a real routing
+    decision. This test is that missing link: two real rows, read via a
+    real `refresh_cache(session)` call, routed via `route()`'s production
+    default path (no `candidates`/`candidate_states` override).
+
+    `monkeypatch` restores `router._cached_candidates`/`_cached_states` to
+    their pre-test values afterward -- `refresh_cache` mutates module-level
+    global state, and leaving a populated cache behind would leak into any
+    other test in this process that calls `route()` without an explicit
+    `candidates` override.
+    """
+    from ecc.database import SessionFactory
+
+    monkeypatch.setattr(air, "_cached_candidates", air._cached_candidates)
+    monkeypatch.setattr(air, "_cached_states", air._cached_states)
+
+    with SessionFactory() as session:
+        air.refresh_cache(session)
+
+    decision = air.route(SEEDED_TASK_TYPE, "sensitive", _ctx())
+    assert isinstance(decision, air.RoutingDecision)
+    # Both real candidates are brand-new (no observed cost/latency history,
+    # migration 0032's own docstring) -- identical on every preference step
+    # except the final ascending model_id string tie-break, which
+    # "qwen2.5:1.5b..." wins over "qwen2.5:3b..." ('1' < '3').
+    assert decision.model_id == SEEDED_MODEL_ID
+    assert decision.provider == "ollama"
+
+    # The losing candidate is confirmed present and eligible, not merely
+    # absent from the cache -- proves this was a real preference-stage
+    # tie-break between two eligible candidates, not eligibility filtering
+    # trivially leaving only one.
+    eligible_second = air.route(
+        SEEDED_TASK_TYPE,
+        "sensitive",
+        _ctx(),
+        candidates=[
+            candidate
+            for candidate in (air._cached_candidates or [])
+            if candidate.model_id == SECOND_SEEDED_MODEL_ID
+        ],
+    )
+    assert isinstance(eligible_second, air.RoutingDecision)
+    assert eligible_second.model_id == SECOND_SEEDED_MODEL_ID
 
 
 # ---------------------------------------------------------------------------
@@ -531,13 +616,14 @@ def test_get_ai_models_returns_seeded_model(
     response = client.get("/api/v1/ai/models")
     assert response.status_code == 200
     body = response.json()
-    assert len(body["models"]) == 1
-    model = body["models"][0]
-    assert model["provider"] == "ollama"
-    assert model["model_id"] == SEEDED_MODEL_ID
-    assert model["deployment"] == "local"
-    assert set(model["data_classes"]) == {"public", "internal", "sensitive", "restricted"}
-    assert set(model["capabilities"]) == {"extraction", "summarization", "explanation"}
+    assert len(body["models"]) == 2
+    models_by_id = {model["model_id"]: model for model in body["models"]}
+    assert set(models_by_id) == {SEEDED_MODEL_ID, SECOND_SEEDED_MODEL_ID}
+    for model in body["models"]:
+        assert model["provider"] == "ollama"
+        assert model["deployment"] == "local"
+        assert set(model["data_classes"]) == {"public", "internal", "sensitive", "restricted"}
+        assert set(model["capabilities"]) == {"extraction", "summarization", "explanation"}
     # No caller-supplied model_id/provider is ever accepted by this
     # endpoint (`MODEL-ROUTING-CONTRACT.md`) -- it is a bare GET with no
     # request body/query parameters selecting a model at all.
@@ -564,7 +650,10 @@ def test_get_ai_policies_returns_seeded_policy(
     assert policy["task_type"] == SEEDED_TASK_TYPE
     assert policy["version"] == 1
     assert policy["status"] == "active"
-    assert policy["candidates"] == [{"provider": "ollama", "model_id": SEEDED_MODEL_ID}]
+    assert policy["candidates"] == [
+        {"provider": "ollama", "model_id": SEEDED_MODEL_ID},
+        {"provider": "ollama", "model_id": SECOND_SEEDED_MODEL_ID},
+    ]
 
 
 def test_get_ai_policies_requires_authentication(

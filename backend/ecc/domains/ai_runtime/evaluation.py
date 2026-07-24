@@ -753,6 +753,29 @@ def run_evaluation(
             )
             latency_seconds = time.perf_counter() - call_started
 
+            # `execute_run` always routes through the live `model_definitions`
+            # registry (runtime.py's own `route()` call) -- it has no
+            # parameter to pin a specific candidate. With a single
+            # registered model this was moot (only one possible outcome);
+            # with two or more, `route()` could legitimately pick a
+            # different candidate than the one this function's `model_id`
+            # parameter asserted was eligible, silently mis-attributing
+            # this evaluation's results to the wrong model (`EvaluationRun.
+            # model_id` below is stamped from the requested parameter, not
+            # from what actually ran). Matches this module's own "assertions,
+            # not overrides" contract (module docstring): fail loud, not a
+            # partial/degraded run scored against the wrong candidate.
+            # `run.model_id` is `None` on a run that never reached routing
+            # (e.g. `feature_disabled`) -- not a mismatch, already a
+            # legitimate `other_failure` outcome for `_score_example` below.
+            if run.model_id is not None and run.model_id != model_id:
+                raise EvaluationConfigError(
+                    "unexpected_model_routed",
+                    f"requested model_id {model_id!r} but the router selected "
+                    f"{run.model_id!r} instead -- refusing to score this evaluation "
+                    "run against the wrong model",
+                )
+
             score = _score_example(session, example, run, latency_seconds=latency_seconds)
             scores.append(score)
 

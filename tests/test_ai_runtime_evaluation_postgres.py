@@ -68,6 +68,7 @@ pytestmark = pytest.mark.skipif(
 )
 
 _SEEDED_MODEL_ID = "qwen2.5:1.5b-instruct-q4_K_M"
+_SECOND_SEEDED_MODEL_ID = "qwen2.5:3b-instruct-q4_K_M"
 _SEEDED_PROMPT_ID = "attention.explain_item.v1"
 
 
@@ -493,6 +494,35 @@ def test_run_evaluation_unregistered_model_raises_config_error(run_context: dict
                 ollama_adapter=_adapter_with_responses("{}"),
             )
     assert exc_info.value.code == "model_not_registered"
+
+
+def test_run_evaluation_requested_model_not_actually_routed_raises_config_error(
+    run_context: dict,
+) -> None:
+    """`execute_run` always routes through the live `model_definitions`
+    registry (no parameter to pin a specific candidate) -- with two real
+    registered models (migration 0032), requesting an evaluation for
+    `_SECOND_SEEDED_MODEL_ID` does not guarantee that model is the one
+    `route()` actually picks. Both candidates start with identical,
+    zero-history `CandidateState` in a fresh test database, so the
+    router's deterministic ascending-model_id tie-break always selects
+    `_SEEDED_MODEL_ID` first -- meaning this evaluation request is
+    guaranteed to hit the real mismatch this task's fix exists to catch,
+    not a contrived/mocked one. Matches the module's own "assertions, not
+    overrides" contract: fail loud, never silently score a run against the
+    wrong model.
+    """
+    with SessionFactory() as session:
+        with pytest.raises(EvaluationConfigError) as exc_info:
+            run_evaluation(
+                TASK_TYPE,
+                1,
+                _SECOND_SEEDED_MODEL_ID,
+                session=session,
+                auth=run_context["auth"],
+                ollama_adapter=_adapter_with_responses(*_flat_responses()),
+            )
+    assert exc_info.value.code == "unexpected_model_routed"
 
 
 def test_run_evaluation_no_active_dataset_raises_config_error(run_context: dict) -> None:

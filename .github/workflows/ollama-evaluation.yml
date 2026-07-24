@@ -99,19 +99,30 @@ jobs:
           fi
 
       - name: Pull qwen2.5:1.5b-instruct-q4_K_M
-        # design doc Decision 1's exact model tag -- the only model
+        # design doc Decision 1's exact model tag -- the first model
         # model_definitions registers in this activation (migration
         # 0028_phase4_model_registry.py).
         run: docker exec ollama ollama pull qwen2.5:1.5b-instruct-q4_K_M
+
+      - name: Pull qwen2.5:3b-instruct-q4_K_M
+        # The second registered model (migration
+        # 0032_phase4_second_model.py) -- needed for tests/test_ai_runtime_
+        # evaluation_live_ollama.py's smoke test to prove it is genuinely
+        # invokable against a real Ollama server, not just present in the
+        # registry.
+        run: docker exec ollama ollama pull qwen2.5:3b-instruct-q4_K_M
 
       - name: Run the live-Ollama evaluation floor check
         # tests/test_ai_runtime_evaluation_live_ollama.py -- runs the real
         # 20-example dataset (tests/fixtures/
         # phase4_evaluation_attention_explain.py) through
-        # ecc.domains.ai_runtime.evaluation.run_evaluation against the real
-        # model above and asserts check_promotion_floors(run) is True,
+        # ecc.domains.ai_runtime.evaluation.run_evaluation against the
+        # first model and asserts check_promotion_floors(run) is True,
         # i.e. EVALUATION-CONTRACT.md's four floors actually pass against
-        # genuine model output, not a mock.
+        # genuine model output, not a mock. Also runs a single-item smoke
+        # test against the second model, proving it can be invoked
+        # end to end for real -- not a full 20-example floor check, which
+        # is a separate promotion decision from "this model works at all".
         run: uv run pytest -v tests/test_ai_runtime_evaluation_live_ollama.py
 
       - name: Stop the Ollama server container
