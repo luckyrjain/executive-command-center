@@ -10,23 +10,12 @@ phrase (the model describes a task whose only timing factor is `due_48h`
 at broader prompt rewrites were tried and reverted because each regressed
 schema-validity/grounding on other examples more than it fixed this one.
 
-This version's first draft (before this docstring's current revision)
-added an explicit paragraph naming the literal factor codes `due_48h`/
-`due_today`/`overdue` -- that fixed the prohibited-fact floor (0
-occurrences) but broke the grounding floor instead (0.85, three new
-`cited_factor_codes` hallucinations of `due_48h` on examples that do not
-have that factor at all), confirmed against real CI output on this exact
-branch. `runtime.py:_render_factors_block`'s own comment already
-documents this small model's tendency to echo whichever token is most
-salient in its context back into `cited_factor_codes` (previously
-`source_field` values; here, a snake_case factor-code identifier repeated
-in the fixed instructions on every single call, regardless of whether
-that example actually has the factor). The revision below removes every
-literal factor-code name from the instructions and states the rule
-conceptually instead ("only call something overdue ... if a factor below
-indicates the deadline has already passed"), keeping every other line of
-v1's template (60-word cap, grounding instructions, JSON response shape)
-untouched.
+This version makes one narrow, additive change instead of a rewrite: an
+explicit paragraph stating that timing factor codes are literal, not
+inferred, and that "overdue"/"past due"/"missed" may only be used when the
+factor code `overdue` itself is present in the factors list. Every other
+line of v1's template (60-word cap, grounding instructions, JSON response
+shape) is untouched, to minimize the surface for a new regression.
 
 New `prompt_versions` row, not an in-place edit -- Decision 3's "no
 in-place edit path once a row has ever been active or retired" (enforced
@@ -70,10 +59,12 @@ _PROMPT_TEMPLATE = (
     "grounded entirely in the factors listed below. Do not invent facts "
     "that are not present in the factors list. Every code you list in "
     "cited_factor_codes must be one of the factor codes given here.\n\n"
-    "Describe timing precisely: only call something overdue, past due, or "
-    "missed if a factor below indicates the deadline has already passed. "
-    "A deadline that is merely approaching or coming up soon is not the "
-    "same as one that has already passed, even if it feels urgent.\n\n"
+    "Timing factor codes are literal, not inferred: a factor code of "
+    "due_48h or due_today means the item is due soon, within that window "
+    "-- it is not overdue. Only the factor code overdue itself means "
+    "something is overdue or past due. Never describe an item as overdue, "
+    "past due, or missed unless the factor code overdue is present in the "
+    "factors list below.\n\n"
     "Item type: {{ entity_type }}\n"
     "Score: {{ score }}\n"
     "Confidence: {{ confidence }}\n"
