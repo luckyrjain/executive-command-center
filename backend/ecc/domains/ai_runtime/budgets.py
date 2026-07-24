@@ -267,6 +267,26 @@ class RunBudget:
         )
 
 
+def reflection_enabled(policy: RoutingPolicy) -> bool:
+    """Whether the first-slice Reflection Engine (an additional, bounded,
+    fail-open model call `runtime.py:execute_run` makes after grounding
+    passes) is turned on for this task type's active `routing_policies`
+    row. Reads `policy.constraints["reflection_enabled"]` -- the exact same
+    JSONB column `RunBudget.from_policy` already reads its five budget
+    numbers from, so there is exactly one policy-configuration mechanism,
+    not a second one introduced for this flag. Not folded into `RunBudget`
+    itself: this is an on/off switch, not one of Decision 5's five budget
+    numbers, and conflating the two would blur `RunBudget`'s otherwise
+    single-purpose shape.
+
+    Defaults `False` when the key is absent (migration
+    `0033_phase4_reflection.py` seeds it explicitly, but this default keeps
+    the function safe against any future `routing_policies` row that
+    predates that migration or omits the key).
+    """
+    return bool(policy.constraints.get("reflection_enabled", False))
+
+
 def check_input_token_budget(context_estimate: ContextEstimate, budget: RunBudget) -> None:
     """Reject a prompt **before** the model call is attempted if its
     pre-call estimate already exceeds `budget.max_input_tokens` (Decision

@@ -80,6 +80,38 @@ def _reset_breakers() -> Iterator[None]:
 
 
 @pytest.fixture
+def reflection_enabled_policy() -> Iterator[None]:
+    """Flips `routing_policies.constraints.reflection_enabled` to `true`
+    for `attention.explain_item`'s active policy row, for the duration of
+    one test. `routing_policies` is global, not workspace-scoped (unlike
+    every other fixture's `run_context`-cleanup precedent) -- migration
+    `0033_phase4_reflection.py` seeds the key `false`, so this fixture
+    restores that exact seeded default afterward rather than deleting the
+    key, keeping this test file's own mutation of global state fully
+    self-contained.
+    """
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "UPDATE routing_policies SET constraints = constraints || "
+                "'{\"reflection_enabled\": true}'::jsonb, updated_at = now() "
+                "WHERE task_type = 'attention.explain_item' AND status = 'active'"
+            )
+        )
+    try:
+        yield
+    finally:
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    "UPDATE routing_policies SET constraints = constraints || "
+                    "'{\"reflection_enabled\": false}'::jsonb, updated_at = now() "
+                    "WHERE task_type = 'attention.explain_item' AND status = 'active'"
+                )
+            )
+
+
+@pytest.fixture
 def run_context() -> Iterator[dict]:
     workspace_id = uuid4()
     user_id = uuid4()
@@ -585,6 +617,297 @@ def test_execute_run_unknown_attention_item_is_not_found(run_context: dict) -> N
 
     assert run.status == "failed"
     assert run.error_code == "not_found"
+
+
+# ---------------------------------------------------------------------------
+# Reflection Engine (first slice): one additional, optional, fail-open
+# model call after grounding passes, gated by `routing_policies.
+# constraints.reflection_enabled` (migration 0033_phase4_reflection.py,
+# default false). Every scenario below either keeps the original,
+# already-validated-and-grounded answer unchanged, or replaces it with a
+# revision that itself independently passes the exact same validation/
+# grounding checks the original did -- never turns a completed run into a
+# failed one.
+# ---------------------------------------------------------------------------
+
+
+def _reflection_response(
+    *, approved: bool, revised_text: str | None = None, revised_codes: list[str] | None = None
+) -> str:
+    return json.dumps(
+        {
+            "approved": approved,
+            "revised_explanation_text": revised_text,
+            "revised_cited_factor_codes": revised_codes,
+        }
+    )
+
+
+def test_execute_run_reflection_disabled_by_default_skips_reflection_call(
+    run_context: dict,
+) -> None:
+    item_id = _insert_attention_item(run_context["workspace_id"], factors=_DEFAULT_FACTORS)
+    # Only one response queued -- if reflection were (incorrectly) invoked
+    # despite the default-off policy, the mock transport would just repeat
+    # this same response for a second call, so this alone would not catch
+    # a regression; the step-count/kind assertions below are what actually
+    # prove no second model call happened.
+    adapter = _adapter_with_responses(_valid_output(["overdue", "pinned"]))
+
+    with SessionFactory() as session:
+        run = execute_run(
+            "attention.explain_item",
+            "sensitive",
+            {"attention_item_id": str(item_id)},
+            session=session,
+            auth=run_context["auth"],
+            ollama_adapter=adapter,
+        )
+
+    assert run.status == "completed"
+    steps = _step_rows(run.id)
+    assert [s["kind"] for s in steps] == ["tool_call", "model_call"]
+
+
+def test_execute_run_reflection_approved_keeps_original_output(
+    run_context: dict, reflection_enabled_policy: None
+) -> None:
+    item_id = _insert_attention_item(run_context["workspace_id"], factors=_DEFAULT_FACTORS)
+    adapter = _adapter_with_responses(
+        _valid_output(["overdue", "pinned"]),
+        _reflection_response(approved=True),
+    )
+
+    with SessionFactory() as session:
+        run = execute_run(
+            "attention.explain_item",
+            "sensitive",
+            {"attention_item_id": str(item_id)},
+            session=session,
+            auth=run_context["auth"],
+            ollama_adapter=adapter,
+        )
+
+    assert run.status == "completed"
+    assert set(run.evidence) == {"overdue", "pinned"}
+    assert run.output is not None
+    assert run.output["cited_factor_codes"] == ["overdue", "pinned"]
+
+    steps = _step_rows(run.id)
+    assert [s["kind"] for s in steps] == ["tool_call", "model_call", "model_call"]
+    assert steps[2]["status"] == "succeeded"
+    assert steps[2]["trace"]["outcome"] == "approved"
+
+
+def test_execute_run_reflection_revises_valid_grounded_answer_replaces_output(
+    run_context: dict, reflection_enabled_policy: None
+) -> None:
+    item_id = _insert_attention_item(run_context["workspace_id"], factors=_DEFAULT_FACTORS)
+    adapter = _adapter_with_responses(
+        _valid_output(["overdue", "pinned"]),
+        _reflection_response(
+            approved=False,
+            revised_text="This task is significantly overdue, which is why it needs attention.",
+            revised_codes=["overdue"],
+        ),
+    )
+
+    with SessionFactory() as session:
+        run = execute_run(
+            "attention.explain_item",
+            "sensitive",
+            {"attention_item_id": str(item_id)},
+            session=session,
+            auth=run_context["auth"],
+            ollama_adapter=adapter,
+        )
+
+    assert run.status == "completed"
+    assert run.evidence == ["overdue"]
+    assert run.output is not None
+    assert run.output["cited_factor_codes"] == ["overdue"]
+    assert "significantly overdue" in run.output["explanation_text"]
+
+    steps = _step_rows(run.id)
+    assert steps[2]["status"] == "succeeded"
+    assert steps[2]["trace"]["outcome"] == "revised"
+
+
+def test_execute_run_reflection_revision_fails_grounding_is_discarded(
+    run_context: dict, reflection_enabled_policy: None
+) -> None:
+    item_id = _insert_attention_item(run_context["workspace_id"], factors=_DEFAULT_FACTORS)
+    adapter = _adapter_with_responses(
+        _valid_output(["overdue", "pinned"]),
+        _reflection_response(
+            approved=False,
+            revised_text="This task cites a factor that does not exist on the item.",
+            revised_codes=["nonexistent_factor"],
+        ),
+    )
+
+    with SessionFactory() as session:
+        run = execute_run(
+            "attention.explain_item",
+            "sensitive",
+            {"attention_item_id": str(item_id)},
+            session=session,
+            auth=run_context["auth"],
+            ollama_adapter=adapter,
+        )
+
+    # The run still completes with the ORIGINAL answer -- a reflection-
+    # layer failure (here, a proposed revision that fails the same
+    # grounding check the original had to pass) never turns a completed
+    # run into a failed/degraded one.
+    assert run.status == "completed"
+    assert set(run.evidence) == {"overdue", "pinned"}
+    assert run.output is not None
+    assert run.output["cited_factor_codes"] == ["overdue", "pinned"]
+
+    steps = _step_rows(run.id)
+    assert steps[2]["status"] == "failed"
+    assert steps[2]["trace"]["outcome"] == "revision_ungrounded"
+    # No ungrounded factor codes (arbitrary model-generated text) leak into
+    # the persisted trace -- validator.py's redaction-safety discipline
+    # applied to a discarded revision, not only to SchemaInvalid.detail.
+    assert "detail" not in steps[2]["trace"]
+
+
+def test_execute_run_reflection_schema_invalid_response_skipped_no_repair_attempted(
+    run_context: dict, reflection_enabled_policy: None
+) -> None:
+    """`validate_with_bounded_repair`'s one-retry mechanism is specific to
+    the *primary* answer -- a reflection response is validated with the
+    plain `validate_output`, never repaired. Only two responses are queued
+    (primary, then a malformed reflection response); if reflection were
+    (incorrectly) repair-retried, a third call would consume the mock
+    transport's repeated-last-response fallback and this test's step-count
+    assertion below would catch it.
+    """
+    item_id = _insert_attention_item(run_context["workspace_id"], factors=_DEFAULT_FACTORS)
+    adapter = _adapter_with_responses(
+        _valid_output(["overdue", "pinned"]),
+        "not valid json for the reflection response",
+    )
+
+    with SessionFactory() as session:
+        run = execute_run(
+            "attention.explain_item",
+            "sensitive",
+            {"attention_item_id": str(item_id)},
+            session=session,
+            auth=run_context["auth"],
+            ollama_adapter=adapter,
+        )
+
+    assert run.status == "completed"
+    assert set(run.evidence) == {"overdue", "pinned"}
+
+    steps = _step_rows(run.id)
+    assert [s["kind"] for s in steps] == ["tool_call", "model_call", "model_call"]
+    assert steps[2]["status"] == "failed"
+    assert steps[2]["trace"]["outcome"] == "schema_invalid"
+
+
+def test_execute_run_reflection_tool_call_shaped_response_rejected_not_dispatched(
+    run_context: dict, reflection_enabled_policy: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A reflection response is a second surface an injected instruction
+    could target -- reusing Step 1/5's exact allowlist mechanism, but even
+    stricter: reflection has no `eligible_tools` of its own at all, so a
+    tool-call-shaped reflection response is rejected outright, never
+    dispatched anywhere.
+    """
+    item_id = _insert_attention_item(run_context["workspace_id"], factors=_DEFAULT_FACTORS)
+
+    calls: list[UUID] = []
+    original = knowledge_tools.get_entity_tool
+
+    def spy(session, auth, entity_id):  # noqa: ANN001
+        calls.append(entity_id)
+        return original(session, auth, entity_id)
+
+    monkeypatch.setattr(knowledge_tools, "get_entity_tool", spy)
+
+    malicious_reflection_response = json.dumps(
+        {"tool_call": {"name": "knowledge.get_entity", "arguments": {"entity_id": str(uuid4())}}}
+    )
+    adapter = _adapter_with_responses(
+        _valid_output(["overdue", "pinned"]), malicious_reflection_response
+    )
+
+    with SessionFactory() as session:
+        run = execute_run(
+            "attention.explain_item",
+            "sensitive",
+            {"attention_item_id": str(item_id)},
+            session=session,
+            auth=run_context["auth"],
+            ollama_adapter=adapter,
+        )
+
+    assert run.status == "completed"
+    assert calls == []
+    assert set(run.evidence) == {"overdue", "pinned"}
+
+    steps = _step_rows(run.id)
+    assert steps[2]["status"] == "rejected"
+    assert steps[2]["trace"]["outcome"] == "tool_call_shaped"
+
+
+def test_execute_run_reflection_provider_error_is_skipped_run_still_completes(
+    run_context: dict, reflection_enabled_policy: None
+) -> None:
+    """A reflection-layer `OllamaCallFailed` (here: Ollama returns an error
+    status on the *second* call) must not degrade or fail an otherwise-
+    completed run -- fail-open, distinct from a primary-call provider
+    error, which does fail the run (existing circuit-breaker/provider_error
+    coverage elsewhere in this file).
+    """
+    item_id = _insert_attention_item(run_context["workspace_id"], factors=_DEFAULT_FACTORS)
+    call_count = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            body = (
+                json.dumps(
+                    {
+                        "model": "m",
+                        "created_at": "now",
+                        "response": _valid_output(["overdue", "pinned"]),
+                        "done": True,
+                        "eval_count": 12,
+                        "prompt_eval_count": 40,
+                    }
+                )
+                + "\n"
+            )
+            return httpx.Response(
+                200, content=body.encode(), headers={"content-type": "application/x-ndjson"}
+            )
+        return httpx.Response(500, json={"error": "reflection call failed"})
+
+    adapter = OllamaAdapter(transport=httpx.MockTransport(handler))
+
+    with SessionFactory() as session:
+        run = execute_run(
+            "attention.explain_item",
+            "sensitive",
+            {"attention_item_id": str(item_id)},
+            session=session,
+            auth=run_context["auth"],
+            ollama_adapter=adapter,
+        )
+
+    assert run.status == "completed"
+    assert set(run.evidence) == {"overdue", "pinned"}
+
+    steps = _step_rows(run.id)
+    assert steps[2]["status"] == "failed"
+    assert steps[2]["trace"]["outcome"] == "provider_error"
 
 
 # ---------------------------------------------------------------------------
