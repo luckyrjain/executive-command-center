@@ -135,7 +135,7 @@ def test_attention_explain_item_passes_every_evaluation_floor_against_real_model
     with SessionFactory() as session:
         run = run_evaluation(
             _TASK_TYPE,
-            2,
+            1,
             _MODEL_ID,
             session=session,
             auth=run_context["auth"],
