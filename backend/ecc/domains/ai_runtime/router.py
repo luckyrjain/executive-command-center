@@ -77,11 +77,23 @@ TASK_REQUIREMENTS: dict[str, TaskRequirements] = {
         capability="summarization",
         requires_structured_output=True,
         timeout_seconds=20.0,
-        # Higher than explain_item's 512: a meeting pack's evidence bundle
-        # is richer (up to seven sections instead of one item's factor
-        # list) and its 150-word summary cap (validator.py) is itself
-        # already more than double explain_item's 60-word cap.
-        max_output_tokens=768,
+        # Deliberately *below* explain_item's 512, not above it, despite
+        # this task's larger 150-word cap (vs. explain_item's 60) -- 768
+        # was tried first on the same reasoning the comment this replaces
+        # gave, and measurably caused live-Ollama timeouts (`ollama-
+        # evaluation` CI): `num_predict` is passed straight through to
+        # Ollama as the hard generation ceiling, and this model's
+        # demonstrated throughput on CI hardware (attention.explain_item's
+        # own p95 of ~14s generating at most ~150 tokens toward a 512
+        # ceiling that's never actually hit) means any call that doesn't
+        # stop early runs for a long time per token generated. A larger
+        # ceiling only widens how far a non-converging generation can run
+        # before the 20s per-model-call timeout cuts it off -- exactly
+        # what happened here (3 of 10 evaluation examples timed out
+        # outright). 400 tokens comfortably covers 150 words plus the JSON
+        # wrapper and a handful of cited_evidence_ids while staying below
+        # explain_item's own proven-safe ceiling.
+        max_output_tokens=400,
     ),
 }
 

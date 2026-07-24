@@ -472,7 +472,7 @@ def test_meeting_prep_summary_routing_policy_seeded_row() -> None:
         {"provider": "ollama", "model_id": SECOND_SEEDED_MODEL_ID},
     ]
     assert record["constraints"]["max_input_tokens"] == 4096
-    assert record["constraints"]["max_output_tokens"] == 768
+    assert record["constraints"]["max_output_tokens"] == 400
     assert record["fallback"] == {}
     assert record["status"] == "active"
 
