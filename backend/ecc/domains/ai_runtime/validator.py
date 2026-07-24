@@ -285,3 +285,67 @@ class ExplainItemReflection(BaseModel):
     approved: bool
     revised_explanation_text: str | None = None
     revised_cited_factor_codes: list[str] | None = None
+
+
+# ---------------------------------------------------------------------------
+# meeting.prep_summary -- Phase 4-consuming wiring of Phase 3's
+# `meeting_prep.py` "Optional enrichment" (`MEETING-PREP-CONTRACT.md`),
+# feature-flagged off until now via `config.py:meeting_prep_ai_enrichment_
+# enabled`. Second task type this activation registers, structurally
+# different from `attention.explain_item`: no single scalar "item", a
+# multi-section evidence bundle (participants/timeline/commitments/
+# decisions/notes/risks/dependencies) already fetched deterministically by
+# `meeting_prep.py:_generate_pack` before the AI ever sees it.
+# ---------------------------------------------------------------------------
+
+_MAX_SUMMARY_WORDS = 150
+
+
+class MeetingPrepSummary(BaseModel):
+    """`{summary_text, cited_evidence_ids}` -- mirrors `ExplainItemOutput`'s
+    shape exactly (one bounded text field, one citation list), just with a
+    higher word cap: a meeting pack's evidence bundle is richer than one
+    attention item's factor list, so a useful summary needs more room.
+    `extra="forbid"` and the word-count field validator both mirror
+    `ExplainItemOutput` for the same reasons stated there.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    summary_text: str = Field(min_length=1)
+    cited_evidence_ids: list[str] = Field(default_factory=list)
+
+    @field_validator("summary_text")
+    @classmethod
+    def _max_word_count(cls, value: str) -> str:
+        word_count = len(value.split())
+        if word_count > _MAX_SUMMARY_WORDS:
+            raise ValueError(f"summary_text exceeds {_MAX_SUMMARY_WORDS} words (got {word_count})")
+        return value
+
+
+def check_meeting_prep_grounding(
+    output: MeetingPrepSummary, evidence_ids: Iterable[str]
+) -> GroundingFailure | None:
+    """`check_explain_item_grounding`'s exact pattern, for `meeting.
+    prep_summary`'s citation list instead of `cited_factor_codes` --
+    reuses `GroundingFailure` unchanged (`ungrounded_codes` is already
+    generic over "some cited identifier", not `attention.explain_item`-
+    specific despite that function's docstring; only this call site's
+    meaning of "identifier" differs: a participant/timeline/commitment/
+    decision/note/risk/dependency row id here, a factor code there).
+
+    `evidence_ids` is every id actually present in the pack content the
+    model was shown -- supplied by the caller (`runtime.py`), never
+    re-derived here, matching `check_explain_item_grounding`'s same
+    no-database-access discipline. Deliberately excludes `evidence_gaps`
+    ids (`meeting_prep.py:build_pack`): a gap represents the *absence* of
+    available evidence, not a citable fact, so a summary citing a gap's id
+    as if it supported a claim is exactly the kind of ungrounded citation
+    this check exists to catch, not a legitimate one to allow.
+    """
+    valid_ids = set(evidence_ids)
+    ungrounded = tuple(id_ for id_ in output.cited_evidence_ids if id_ not in valid_ids)
+    if ungrounded:
+        return GroundingFailure(ungrounded_codes=ungrounded)
+    return None

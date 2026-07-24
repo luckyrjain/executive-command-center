@@ -35,10 +35,12 @@ from ecc.domains.ai_runtime.validator import (
     ExplainItemOutput,
     ExplainItemReflection,
     GroundingFailure,
+    MeetingPrepSummary,
     RepairAttemptResult,
     SchemaInvalid,
     ValidatedOutput,
     check_explain_item_grounding,
+    check_meeting_prep_grounding,
     validate_output,
     validate_with_bounded_repair,
 )
@@ -414,3 +416,71 @@ def test_explain_item_reflection_accepts_over_60_word_revision_unvalidated() -> 
     revision_payload = dumps({"explanation_text": long_text, "cited_factor_codes": ["a"]})
     revision_result = validate_output(ExplainItemOutput, revision_payload)
     assert isinstance(revision_result, SchemaInvalid)
+
+
+# ---------------------------------------------------------------------------
+# MeetingPrepSummary / check_meeting_prep_grounding -- meeting.prep_summary
+# (Phase 3's meeting_prep.py "Optional enrichment" wired on). Mirrors
+# ExplainItemOutput/check_explain_item_grounding's exact pattern above,
+# just a higher word cap (150 vs 60) and a citation field named
+# cited_evidence_ids instead of cited_factor_codes.
+# ---------------------------------------------------------------------------
+
+
+def test_meeting_prep_summary_valid_response_parses() -> None:
+    raw = dumps({"summary_text": "Concise summary.", "cited_evidence_ids": ["p1", "c2"]})
+    result = validate_output(MeetingPrepSummary, raw)
+    assert isinstance(result, ValidatedOutput)
+    summary = result.value
+    assert isinstance(summary, MeetingPrepSummary)
+    assert summary.summary_text == "Concise summary."
+    assert summary.cited_evidence_ids == ["p1", "c2"]
+
+
+def test_meeting_prep_summary_defaults_cited_ids_to_empty_list_when_omitted() -> None:
+    raw = dumps({"summary_text": "No citations needed."})
+    result = validate_output(MeetingPrepSummary, raw)
+    assert isinstance(result, ValidatedOutput)
+    assert isinstance(result.value, MeetingPrepSummary)
+    assert result.value.cited_evidence_ids == []
+
+
+def test_meeting_prep_summary_over_150_words_returns_schema_invalid() -> None:
+    raw = dumps({"summary_text": " ".join(["word"] * 151), "cited_evidence_ids": []})
+    result = validate_output(MeetingPrepSummary, raw)
+    assert isinstance(result, SchemaInvalid)
+
+
+def test_meeting_prep_summary_exactly_150_words_is_valid() -> None:
+    raw = dumps({"summary_text": " ".join(["word"] * 150), "cited_evidence_ids": []})
+    result = validate_output(MeetingPrepSummary, raw)
+    assert isinstance(result, ValidatedOutput)
+
+
+def test_meeting_prep_summary_rejects_unexpected_extra_field() -> None:
+    raw = dumps({"summary_text": "ok", "cited_evidence_ids": [], "extra": "nope"})
+    result = validate_output(MeetingPrepSummary, raw)
+    assert isinstance(result, SchemaInvalid)
+
+
+def test_meeting_prep_summary_requires_summary_text_field() -> None:
+    raw = dumps({"cited_evidence_ids": []})
+    result = validate_output(MeetingPrepSummary, raw)
+    assert isinstance(result, SchemaInvalid)
+
+
+def test_meeting_prep_grounding_passes_when_every_citation_is_real() -> None:
+    output = MeetingPrepSummary(summary_text="ok", cited_evidence_ids=["p1", "c2"])
+    assert check_meeting_prep_grounding(output, ["p1", "c2", "r3"]) is None
+
+
+def test_meeting_prep_grounding_fails_on_a_citation_absent_from_real_ids() -> None:
+    output = MeetingPrepSummary(summary_text="ok", cited_evidence_ids=["p1", "nonexistent"])
+    failure = check_meeting_prep_grounding(output, ["p1", "c2"])
+    assert isinstance(failure, GroundingFailure)
+    assert failure.ungrounded_codes == ("nonexistent",)
+
+
+def test_meeting_prep_grounding_empty_citations_always_grounded() -> None:
+    output = MeetingPrepSummary(summary_text="ok", cited_evidence_ids=[])
+    assert check_meeting_prep_grounding(output, []) is None

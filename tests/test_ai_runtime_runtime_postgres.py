@@ -178,6 +178,13 @@ def run_context() -> Iterator[dict]:
             "audit_events",
             "idempotency_records",
             "attention_items",
+            # meeting.prep_summary's own required-input tables (Phase
+            # 4-consuming wiring of meeting_prep.py's "Optional
+            # enrichment") -- deleted here too so a test that exercises
+            # that task type doesn't need its own separate fixture.
+            "meeting_participants",
+            "meetings",
+            "pkos_nodes",
             "sessions",
             "users",
         ):
@@ -218,6 +225,85 @@ def _insert_attention_item(workspace_id: UUID, *, factors: list[dict]) -> UUID:
             },
         )
     return item_id
+
+
+def _insert_meeting_with_participant(workspace_id: UUID, user_id: UUID) -> tuple[UUID, UUID]:
+    """`meeting.prep_summary`'s own required input: a meeting with at
+    least one participant (a `pkos_nodes` row linked via `meeting_
+    participants`), the minimum `meeting_prep.py:_generate_pack` needs to
+    produce a non-empty pack. Returns `(meeting_id, participant_id)` --
+    the latter is `meeting_participants.id` (the junction row's own id,
+    matching `ParticipantRow.id`/`meeting_prep_tools.py:get_prep_pack_
+    tool`'s `"id"` field for a participant -- not the linked `pkos_nodes`
+    entity id), the one real, citable id a mocked response can name.
+    """
+    meeting_id = uuid4()
+    node_id = uuid4()
+    participant_id = uuid4()
+    now = datetime.now(UTC)
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                """
+                INSERT INTO meetings (
+                    id, workspace_id, title, standalone_starts_at, standalone_ends_at,
+                    standalone_timezone, status, agenda, created_by, updated_by,
+                    created_at, updated_at, version
+                ) VALUES (
+                    :id, :workspace_id, 'Quarterly review', :starts_at, :ends_at, 'UTC',
+                    'planned', 'Review Q3 numbers', :user_id, :user_id, :now, :now, 1
+                )
+                """
+            ),
+            {
+                "id": meeting_id,
+                "workspace_id": workspace_id,
+                "starts_at": now + timedelta(days=1),
+                "ends_at": now + timedelta(days=1, hours=1),
+                "user_id": user_id,
+                "now": now,
+            },
+        )
+        connection.execute(
+            text(
+                """
+                INSERT INTO pkos_nodes (
+                    id, workspace_id, node_type, canonical_name, attributes,
+                    status, confidence, version, created_at, updated_at
+                ) VALUES (
+                    :id, :workspace_id, 'person', 'Jordan Lee', '{}'::jsonb,
+                    'active', 1.00, 1, :now, :now
+                )
+                """
+            ),
+            {"id": node_id, "workspace_id": workspace_id, "now": now},
+        )
+        connection.execute(
+            text(
+                """
+                INSERT INTO meeting_participants (
+                    id, workspace_id, meeting_id, entity_id, role,
+                    created_by, updated_by, created_at, updated_at, version
+                ) VALUES (
+                    :id, :workspace_id, :meeting_id, :entity_id, 'attendee',
+                    :user_id, :user_id, :now, :now, 1
+                )
+                """
+            ),
+            {
+                "id": participant_id,
+                "workspace_id": workspace_id,
+                "meeting_id": meeting_id,
+                "entity_id": node_id,
+                "user_id": user_id,
+                "now": now,
+            },
+        )
+    return meeting_id, participant_id
+
+
+def _meeting_prep_response(*, summary_text: str, cited_ids: list[str]) -> str:
+    return json.dumps({"summary_text": summary_text, "cited_evidence_ids": cited_ids})
 
 
 _DEFAULT_FACTORS = [
@@ -1331,3 +1417,156 @@ def test_post_ai_runs_idempotent_replay_returns_identical_response(
             {"workspace_id": run_context["workspace_id"]},
         ).scalar_one()
     assert count == 1
+
+
+# ---------------------------------------------------------------------------
+# meeting.prep_summary -- Phase 4-consuming wiring of Phase 3's meeting_
+# prep.py "Optional enrichment". Structurally different from attention.
+# explain_item (`meeting.get_prep_pack` instead of `attention.get_item`, a
+# multi-section evidence bundle instead of one item's factor list, `cited_
+# evidence_ids` instead of `cited_factor_codes`) -- these tests exercise
+# execute_run's task-type dispatch machinery for real, not just attention.
+# explain_item's own path a second time.
+# ---------------------------------------------------------------------------
+
+
+def test_execute_run_meeting_prep_summary_happy_path_persists_completed_run(
+    run_context: dict,
+) -> None:
+    meeting_id, participant_id = _insert_meeting_with_participant(
+        run_context["workspace_id"], run_context["user_id"]
+    )
+    adapter = _adapter_with_responses(
+        _meeting_prep_response(
+            summary_text="Jordan Lee is attending; review Q3 numbers.",
+            cited_ids=[str(participant_id)],
+        )
+    )
+
+    with SessionFactory() as session:
+        run = execute_run(
+            "meeting.prep_summary",
+            "sensitive",
+            {"meeting_id": str(meeting_id)},
+            session=session,
+            auth=run_context["auth"],
+            ollama_adapter=adapter,
+        )
+
+    assert run.status == "completed"
+    assert run.error_code is None
+    assert run.prompt_id == "meeting.prep_summary.v1"
+    assert run.prompt_version == 1
+    assert run.evidence == [str(participant_id)]
+    assert run.output is not None
+    assert run.output["cited_evidence_ids"] == [str(participant_id)]
+    assert run.output["summary_text"] == "Jordan Lee is attending; review Q3 numbers."
+
+    steps = _step_rows(run.id)
+    assert [s["kind"] for s in steps] == ["tool_call", "model_call"]
+    assert steps[0]["trace"]["tool_name"] == "meeting.get_prep_pack"
+
+
+def test_execute_run_meeting_prep_summary_ungrounded_citation_fails_grounding(
+    run_context: dict,
+) -> None:
+    meeting_id, _participant_id = _insert_meeting_with_participant(
+        run_context["workspace_id"], run_context["user_id"]
+    )
+    adapter = _adapter_with_responses(
+        _meeting_prep_response(summary_text="Fabricated.", cited_ids=["nonexistent-id"])
+    )
+
+    with SessionFactory() as session:
+        run = execute_run(
+            "meeting.prep_summary",
+            "sensitive",
+            {"meeting_id": str(meeting_id)},
+            session=session,
+            auth=run_context["auth"],
+            ollama_adapter=adapter,
+        )
+
+    assert run.status == "failed"
+    assert run.error_code == "grounding_failed"
+    assert run.evidence == ["nonexistent-id"]
+
+
+def test_execute_run_meeting_prep_summary_unknown_meeting_is_not_found(
+    run_context: dict,
+) -> None:
+    adapter = _adapter_with_responses("{}")
+
+    with SessionFactory() as session:
+        run = execute_run(
+            "meeting.prep_summary",
+            "sensitive",
+            {"meeting_id": str(uuid4())},
+            session=session,
+            auth=run_context["auth"],
+            ollama_adapter=adapter,
+        )
+
+    assert run.status == "failed"
+    assert run.error_code == "not_found"
+
+
+def test_execute_run_meeting_prep_summary_repairs_on_second_attempt(run_context: dict) -> None:
+    meeting_id, participant_id = _insert_meeting_with_participant(
+        run_context["workspace_id"], run_context["user_id"]
+    )
+    adapter = _adapter_with_responses(
+        "not valid json",
+        _meeting_prep_response(summary_text="Repaired summary.", cited_ids=[str(participant_id)]),
+    )
+
+    with SessionFactory() as session:
+        run = execute_run(
+            "meeting.prep_summary",
+            "sensitive",
+            {"meeting_id": str(meeting_id)},
+            session=session,
+            auth=run_context["auth"],
+            ollama_adapter=adapter,
+        )
+
+    assert run.status == "completed"
+    assert run.attempts == 2
+    assert run.output is not None
+    assert run.output["summary_text"] == "Repaired summary."
+
+    steps = _step_rows(run.id)
+    assert [s["kind"] for s in steps] == ["tool_call", "model_call"]
+    assert steps[1]["trace"]["attempt"] == 2
+
+
+def test_execute_run_meeting_prep_summary_never_triggers_reflection(
+    run_context: dict,
+) -> None:
+    """`TASK_PORTS["meeting.prep_summary"].reflection_prompt_id` is `None`
+    -- the Reflection Engine (first slice) has no capability registered
+    for this task type at all, regardless of any policy flag. Only two
+    steps (tool_call, model_call) even with a fully valid, grounded first
+    response -- a third (reflection) `model_call` step would mean this
+    invariant broke.
+    """
+    meeting_id, participant_id = _insert_meeting_with_participant(
+        run_context["workspace_id"], run_context["user_id"]
+    )
+    adapter = _adapter_with_responses(
+        _meeting_prep_response(summary_text="ok", cited_ids=[str(participant_id)])
+    )
+
+    with SessionFactory() as session:
+        run = execute_run(
+            "meeting.prep_summary",
+            "sensitive",
+            {"meeting_id": str(meeting_id)},
+            session=session,
+            auth=run_context["auth"],
+            ollama_adapter=adapter,
+        )
+
+    assert run.status == "completed"
+    steps = _step_rows(run.id)
+    assert [s["kind"] for s in steps] == ["tool_call", "model_call"]

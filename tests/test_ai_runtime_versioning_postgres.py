@@ -465,6 +465,48 @@ def test_tool_definitions_seeded_rows() -> None:
     assert list(rows[1]["scopes"]) == ["read:knowledge"]
 
 
+def test_meeting_prep_summary_prompt_seeded_row() -> None:
+    """Migration `0034_phase4_meeting_prep.py` -- the second
+    prompt family this activation registers (Phase 3's `meeting_prep.py`
+    "Optional enrichment" wired on).
+    """
+    with engine.connect() as connection:
+        row = (
+            connection.execute(
+                text(
+                    "SELECT version, template_hash, input_schema_ref, output_schema_ref, status "
+                    "FROM prompt_versions WHERE prompt_id = 'meeting.prep_summary.v1'"
+                )
+            )
+            .mappings()
+            .one()
+        )
+    assert row["version"] == 1
+    assert row["status"] == "active"
+    assert row["input_schema_ref"] == "meeting.prep_summary.input.v1"
+    assert row["output_schema_ref"] == "meeting.prep_summary.output.v1"
+    assert len(row["template_hash"]) == 64
+
+
+def test_meeting_get_prep_pack_tool_seeded_row() -> None:
+    with engine.connect() as connection:
+        row = (
+            connection.execute(
+                text(
+                    "SELECT version, scopes, status, definition_hash, handler_ref "
+                    "FROM tool_definitions WHERE name = 'meeting.get_prep_pack'"
+                )
+            )
+            .mappings()
+            .one()
+        )
+    assert row["version"] == 1
+    assert row["status"] == "active"
+    assert list(row["scopes"]) == ["read:meetings"]
+    assert row["handler_ref"] == "ecc.domains.attention.meeting_prep_tools:get_prep_pack_tool"
+    assert len(row["definition_hash"]) == 64
+
+
 # ---------------------------------------------------------------------------
 # prompts.py / tools.py functions.
 # ---------------------------------------------------------------------------
