@@ -652,6 +652,134 @@ def test_execute_run_permanently_fails_after_bounded_repair_exhausted(run_contex
     assert final_model_step["trace"]["detail"] == "<root>:json_invalid"
 
 
+def _first_ok_then_failing_adapter(failure_response: httpx.Response) -> OllamaAdapter:
+    """First `.generate()` call returns a schema-invalid 200 (triggering
+    the bounded repair retry); every call after that returns
+    `failure_response` -- for exercising a transport-level failure on the
+    *retry* itself, distinct from every other test in this file's fixtures
+    that only ever fail (or only ever succeed) on the very first call.
+    """
+    call_count = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            body = (
+                json.dumps(
+                    {
+                        "model": "m",
+                        "created_at": "now",
+                        "response": "not json at all",
+                        "done": True,
+                        "eval_count": 12,
+                        "prompt_eval_count": 40,
+                    }
+                )
+                + "\n"
+            )
+            return httpx.Response(
+                200, content=body.encode(), headers={"content-type": "application/x-ndjson"}
+            )
+        return failure_response
+
+    return OllamaAdapter(transport=httpx.MockTransport(handler))
+
+
+def test_execute_run_repair_retry_provider_error_fails_run_gracefully(
+    run_context: dict,
+) -> None:
+    """A transport-level failure on the *repair retry itself* (as opposed
+    to the well-covered case of the retry's response being schema-invalid
+    again) must degrade `execute_run` to a clean `failed` `AiRun`, not
+    escape uncaught -- `execute_run`'s own contract, restated at every
+    other failure branch in this function, is that it always returns an
+    `AiRun`. Before this fix, `reattempt()`'s `call_model()` call had no
+    exception handling of its own and `validate_with_bounded_repair` does
+    not add any (see its docstring), so this exact scenario raised
+    `OllamaCallFailed` straight out of `execute_run` uncaught.
+    """
+    item_id = _insert_attention_item(run_context["workspace_id"], factors=_DEFAULT_FACTORS)
+    adapter = _first_ok_then_failing_adapter(httpx.Response(500, json={"error": "boom"}))
+
+    with SessionFactory() as session:
+        run = execute_run(
+            "attention.explain_item",
+            "sensitive",
+            {"attention_item_id": str(item_id)},
+            session=session,
+            auth=run_context["auth"],
+            ollama_adapter=adapter,
+        )
+
+    assert run.status == "failed"
+    assert run.error_code == "provider_error"
+    assert run.attempts == 1
+
+    steps = _step_rows(run.id)
+    final_step = steps[-1]
+    assert final_step["kind"] == "model_call"
+    assert final_step["status"] == "failed"
+    assert final_step["trace"]["attempt"] == 2
+    assert final_step["trace"]["outcome"] == "provider_error"
+
+
+def test_execute_run_repair_retry_timeout_fails_run_gracefully(run_context: dict) -> None:
+    """Same failure class as the provider-error test above, but the retry
+    times out instead of erroring -- a distinct `error_code` branch in the
+    fix, and the realistic failure mode given `meeting.prep_summary`'s
+    largest examples already time out on their *first* attempt against the
+    real model (documented in `EVALUATION-CONTRACT.md`'s Sandbox
+    constraint section), making a timeout on a *retry* plausible, not a
+    contrived edge case.
+    """
+    item_id = _insert_attention_item(run_context["workspace_id"], factors=_DEFAULT_FACTORS)
+    call_count = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            body = (
+                json.dumps(
+                    {
+                        "model": "m",
+                        "created_at": "now",
+                        "response": "not json at all",
+                        "done": True,
+                        "eval_count": 12,
+                        "prompt_eval_count": 40,
+                    }
+                )
+                + "\n"
+            )
+            return httpx.Response(
+                200, content=body.encode(), headers={"content-type": "application/x-ndjson"}
+            )
+        raise httpx.TimeoutException("boom")
+
+    adapter = OllamaAdapter(transport=httpx.MockTransport(handler))
+
+    with SessionFactory() as session:
+        run = execute_run(
+            "attention.explain_item",
+            "sensitive",
+            {"attention_item_id": str(item_id)},
+            session=session,
+            auth=run_context["auth"],
+            ollama_adapter=adapter,
+        )
+
+    assert run.status == "failed"
+    assert run.error_code == "timeout"
+    assert run.attempts == 1
+
+    steps = _step_rows(run.id)
+    final_step = steps[-1]
+    assert final_step["trace"]["attempt"] == 2
+    assert final_step["trace"]["outcome"] == "timeout"
+
+
 # ---------------------------------------------------------------------------
 # Grounding failure.
 # ---------------------------------------------------------------------------
