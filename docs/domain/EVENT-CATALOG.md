@@ -102,6 +102,18 @@ Added incrementally, one entry per delivery slice, alongside the code that emits
 | `meeting_pack.generated.v1` | Executive Intelligence | meeting_id |
 | `meeting_pack.refreshed.v1` | Executive Intelligence | meeting_id |
 
+## Phase 4 catalog
+
+Added incrementally, one entry per delivery slice, alongside the code that emits it (`docs/superpowers/plans/2026-07-23-phase-4-ai-runtime.md`). Producer is AI Runtime. `ai_prompt.activated`/`ai_tool.activated` (Task 2, `ecc.domains.ai_runtime.prompts`) are administrative-catalog audit events, not domain events describing a workspace aggregate, and are intentionally not listed in this table -- they follow `AUDIT-CONTRACT.md`'s audit-event convention, not this catalog's envelope.
+
+| Event | Producer | Required payload |
+|---|---|---|
+| `ai_run.completed.v1` | AI Runtime | run_id, task_type, model_id, prompt_version |
+| `ai_run.failed.v1` | AI Runtime | run_id, task_type, model_id, prompt_version, error_code |
+| `ai_run.cancelled.v1` | AI Runtime | run_id, task_type, model_id, prompt_version |
+
+`ai_run.failed.v1` also covers a run that finished `degraded` (design doc Decision 5: a total-wall-clock/output-token budget overrun) -- `DATA-MODEL.md` names three run-outcome events, not four, and the payload's `error_code` (`budget_exceeded`, `schema_invalid`, `tool_not_allowlisted`, `timeout`, `circuit_open`, `feature_disabled`, `remote_not_configured`, or an activation-specific extension) is what a consumer inspects to distinguish a hard failure from a degraded-but-terminated run. `ai_run_steps`' own per-step trace (never emitted as a domain event, matching `DATA-MODEL.md`'s redacted-trace convention) is where the finer-grained model-call/tool-call detail lives.
+
 ## Recommendation publication rule
 
 `recommendation.generated.v1` records creation in `proposed`. `recommendation.confirmation_requested.v1` is emitted only by `PublishRecommendation`, which transitions the aggregate from `proposed` to `pending_confirmation`. Confirmation and execution events cannot occur before that publication event.

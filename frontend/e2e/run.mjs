@@ -17,6 +17,7 @@ import * as knowledgeKeyboard from './scenarios/knowledge-keyboard.mjs'
 import * as attentionQueue from './scenarios/attention-queue.mjs'
 import * as attentionPlanning from './scenarios/attention-planning.mjs'
 import * as attentionMeetingPrep from './scenarios/attention-meeting-prep.mjs'
+import * as attentionExplanation from './scenarios/attention-explanation.mjs'
 
 const scenarios = [
   { name: 'tasks', module: tasks },
@@ -41,6 +42,13 @@ const scenarios = [
   // TEST-PLAN.md's Browser acceptance section. See that scenario's
   // docstring for why this is env-var-gated rather than a run.mjs param.
   { name: `attention-meeting-prep (AI enrichment ${process.env.MEETING_PREP_AI_ENRICHMENT === '1' ? 'on' : 'off'})`, module: attentionMeetingPrep },
+  // attention-explanation reads process.env.AI_EXPLANATIONS_ENABLED at run
+  // time and branches its fixture/frontend-runtime-override accordingly --
+  // run twice for the same reason as attention-meeting-prep above (Task 6,
+  // Step 3 requires proving the AI-disabled case leaves the existing
+  // Attention Queue behaviorally unaffected, not just that the enabled case
+  // works). See that scenario's docstring for why this is env-var-gated.
+  { name: `attention-explanation (AI runtime ${process.env.AI_EXPLANATIONS_ENABLED === '0' ? 'off' : 'on'})`, module: attentionExplanation },
 ]
 
 async function main() {

@@ -2,12 +2,32 @@ from collections.abc import Generator
 
 from sqlalchemy import create_engine, event
 from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.pool import NullPool
 
 from ecc.config import get_settings
 
 settings = get_settings()
 engine = create_engine(settings.database_url, pool_pre_ping=True)
 SessionFactory = sessionmaker(bind=engine, expire_on_commit=False)
+
+# A separate, unpooled engine for session-scoped advisory locks
+# (ecc.domains.ai_runtime.runtime/evaluation's `_held_idempotency_lock`).
+# Those locks are held for a request's *entire* critical section, which can
+# span multiple synchronous outbound model calls lasting tens of seconds to
+# minutes -- drawing that connection from the app's shared, size-capped
+# `engine` pool (default pool_size=5 + max_overflow=10 = 15 total,
+# app-wide) would let a handful of concurrent long-running AI-runtime
+# requests exhaust the pool and starve every unrelated endpoint. NullPool
+# opens a fresh physical connection per checkout and closes it (rather than
+# returning it to a pool) on release, so each lock-holder draws on
+# Postgres's own connection ceiling instead of this app's much smaller
+# self-imposed one, and deliberately does NOT get `engine`'s
+# `_set_statement_timeout` listener below -- `pg_advisory_lock` is meant to
+# block indefinitely until the first request releases it (that is the
+# whole point of the lock), and the connect-listener's 5-second budget
+# (approved for ordinary query latency, not lock-wait time) would otherwise
+# cancel the wait itself under real contention.
+lock_engine = create_engine(settings.database_url, poolclass=NullPool)
 
 # Approved Phase 1 acceptance budget (see
 # docs/superpowers/specs/2026-07-16-phase-1-completion-design.md:178 and

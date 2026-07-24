@@ -597,6 +597,50 @@ function makeKnowledgeApi(overrides = {}) {
   return { dispatch, entities, aliases, claims, relationships, timelineEntries, resolutionCandidates, entityOperations }
 }
 
+/**
+ * Phase 4 AI Runtime surface (`POST /api/v1/ai/runs`, `GET /api/v1/ai/
+ * runs/{id}`, `POST /api/v1/ai/runs/{id}/cancel`) -- just enough of
+ * `phase-004/API-SCHEMAS.md`'s `AiRunResponse` shape for
+ * `attention-explanation.mjs` to exercise `AttentionExplanation.tsx`
+ * against a mocked backend, matching this file's existing "no live
+ * backend, no live model" convention. `overrides.buildRun(body)` lets a
+ * scenario decide the response for a given request body (e.g. a specific
+ * `attention_item_id`); returning `null` yields the same
+ * `ATTENTION_ITEM_NOT_FOUND` 404 shape `runtime.py:create_run` returns for
+ * an item that doesn't resolve in the caller's workspace.
+ */
+function makeAiRuntimeApi(overrides = {}) {
+  const runs = new Map()
+  const buildRun = overrides.buildRun ?? (() => null)
+
+  function dispatch(pathname, method, body) {
+    if (pathname === '/api/v1/ai/runs' && method === 'POST') {
+      const run = buildRun(body)
+      if (!run) return { status: 404, body: { error: { code: 'ATTENTION_ITEM_NOT_FOUND', message: 'Not found' } } }
+      runs.set(run.id, run)
+      return { status: 200, body: run }
+    }
+    const getMatch = pathname.match(/^\/api\/v1\/ai\/runs\/([^/]+)$/)
+    if (getMatch && method === 'GET') {
+      const run = runs.get(getMatch[1])
+      if (!run) return { status: 404, body: { error: { code: 'AI_RUN_NOT_FOUND', message: 'Not found' } } }
+      return { status: 200, body: run }
+    }
+    const cancelMatch = pathname.match(/^\/api\/v1\/ai\/runs\/([^/]+)\/cancel$/)
+    if (cancelMatch && method === 'POST') {
+      const run = runs.get(cancelMatch[1])
+      if (!run) return { status: 404, body: { error: { code: 'AI_RUN_NOT_FOUND', message: 'Not found' } } }
+      if (run.status !== 'running') return { status: 409, body: { error: { code: 'AI_RUN_ALREADY_TERMINAL', message: 'Already terminal' } } }
+      const cancelled = { ...run, status: 'cancelled', completed_at: nowIso() }
+      runs.set(cancelMatch[1], cancelled)
+      return { status: 200, body: cancelled }
+    }
+    return null
+  }
+
+  return { dispatch, runs }
+}
+
 const defaultDashboardSections = {
   today_schedule: [{ id: 'm1', title: 'Leadership review', starts_at: '2026-07-15T04:30:00Z' }],
   top_priorities: [{ entity_id: 't1', title: 'Approve hiring plan', score: 92, status: 'in_progress' }],
@@ -713,6 +757,7 @@ export async function createFixtureApi(page, overrides = {}) {
     resolutionCandidates: overrides.resolutionCandidates,
   })
   const attention = makeAttentionApi({ ...overrides.attention, risksCollection: risks })
+  const aiRuntime = makeAiRuntimeApi(overrides.aiRuntime)
 
   // `route.fulfill()` synthesizes a response without touching the real
   // network, so `context.setOffline(true)` alone does NOT stop a mocked
@@ -867,6 +912,10 @@ export async function createFixtureApi(page, overrides = {}) {
       const result = attention.dispatch(pathname, method, body, queryString)
       if (result) return result
     }
+    if (pathname.startsWith('/api/v1/ai/runs')) {
+      const result = aiRuntime.dispatch(pathname, method, body)
+      if (result) return result
+    }
     for (const resource of resources) {
       const result = resource(pathname, method, body, queryString)
       if (result) return result
@@ -894,6 +943,7 @@ export async function createFixtureApi(page, overrides = {}) {
     collections: { tasks, commitments, notes, calendarEvents, meetings, risks, recommendations },
     knowledge,
     attention,
+    aiRuntime,
     dashboard,
     brief,
     evidence,

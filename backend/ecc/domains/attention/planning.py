@@ -632,8 +632,8 @@ def _row_to_plan(
     """
     if blocks is None:
         blocks = [
-            dict(b)
-            for b in session.execute(
+            dict(mapping)
+            for mapping in session.execute(
                 text(
                     f"SELECT {_BLOCK_FIELDS} FROM plan_blocks "
                     "WHERE workspace_id = :workspace_id AND plan_id = :plan_id ORDER BY starts_at"

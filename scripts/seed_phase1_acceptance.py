@@ -65,19 +65,29 @@ WORKSPACE_LABELS: tuple[str, ...] = ("alpha", "bravo")
 # except `workspaces` itself, `event_inbox`, and `event_dead_letters`, plus
 # the Phase 2 tables added by backend/migrations/versions/0011_phase2_
 # knowledge_entities.py, 0012_phase2_timeline.py, 0013_phase2_
-# resolution.py, and 0014_phase2_retrieval.py, plus the Phase 3 tables added
-# by 0022_phase3_attention_policy.py, 0023_phase3_waiting.py, 0024_phase3_
+# resolution.py, and 0014_phase2_retrieval.py; the Phase 3 tables added by
+# 0022_phase3_attention_policy.py, 0023_phase3_waiting.py, 0024_phase3_
 # risk_reviews.py, 0025_phase3_capacity_planning.py, 0026_phase3_plans.py,
-# and 0027_phase3_meetings.py -- verify_restore.sh's workspace-isolation
-# check discovers workspace_id-bearing tables generically, so any such
-# table without seeded rows here fails that check regardless of whether
-# it's listed in ALL_PHASE1_TABLES's name. This list itself is NOT
-# discovered generically and must be kept in sync by hand whenever a new
-# workspace_id-bearing table is added -- Phase 3 added nine such tables
-# (attention_feedback, waiting_links, risk_reviews, capacity_profiles,
-# planning_constraints, plans, plan_blocks, meeting_participants,
-# meeting_packs) without updating this list, which is what made the
-# backup-restore drill's workspace-isolation check fail).
+# and 0027_phase3_meetings.py; and the Phase 4 tables added by this branch's
+# own 0030_phase4_ai_runs.py and 0031_phase4_evaluation.py -- verify_restore.
+# sh's workspace-isolation check discovers workspace_id-bearing tables
+# generically, so any such table without seeded rows here fails that check
+# regardless of whether it's listed in ALL_PHASE1_TABLES's name.
+#
+# The Phase 3 tables above were never added here when Phase 3 shipped --
+# a pre-existing gap, not something this pass introduced -- and went
+# undetected because nothing had exercised scripts/verify_restore.sh's
+# generic workspace-scoped-table discovery against a Phase-3-and-later
+# schema until this branch's own CI run surfaced it (workspace isolation
+# check failed for ai_run_steps, the first Phase 4 table alphabetically;
+# fixing only the Phase 4 tables would have then failed on the first Phase 3
+# table alphabetically instead, e.g. attention_feedback or capacity_
+# profiles). This pass closes both gaps together since both block the same
+# CI job. `model_definitions`, `routing_policies`, `prompt_versions`,
+# `tool_definitions`, and `evaluation_sets` (migrations 0028/0029/0031) are
+# deliberately absent from this tuple: per those migrations' own docstrings
+# they are global platform catalog tables with no `workspace_id` column at
+# all, seeded once by the migration itself, not per-workspace fixture data.
 _WORKSPACE_ID_TABLES: tuple[str, ...] = (
     "users",
     "sessions",
@@ -104,15 +114,21 @@ _WORKSPACE_ID_TABLES: tuple[str, ...] = (
     "entity_operations",
     "retrieval_documents",
     "embedding_projections",
-    "attention_feedback",
+    # Phase 3 (migrations 0022-0027) -- pre-existing gap, closed here.
     "waiting_links",
     "risk_reviews",
     "capacity_profiles",
     "planning_constraints",
     "plans",
     "plan_blocks",
+    "attention_feedback",
     "meeting_participants",
     "meeting_packs",
+    # Phase 4 (migrations 0030-0031) -- this branch's own new tables.
+    "ai_runs",
+    "ai_run_steps",
+    "evaluation_runs",
+    "generated_artifacts",
 )
 # `workspaces` is scoped by its own `id`, not a `workspace_id` column.
 _WORKSPACE_TABLE = "workspaces"
@@ -171,15 +187,19 @@ def _fixture_ids(label: str) -> dict[str, UUID]:
         "correlation_marker": seed_id(label, "correlation", "marker"),
         "request_created": seed_id(label, "request", "task_active", "created"),
         "request_archived": seed_id(label, "request", "task_archived", "archived"),
-        "attention_feedback": seed_id(label, "attention_feedback", "useful"),
-        "waiting_link": seed_id(label, "waiting_link", "task_active"),
+        "waiting_link": seed_id(label, "waiting_link", "task_active", "person"),
         "risk_review": seed_id(label, "risk_review", "risk_active"),
         "capacity_profile": seed_id(label, "capacity_profile", "monday"),
-        "planning_constraint": seed_id(label, "planning_constraint", "task_active"),
-        "plan": seed_id(label, "plan", "week"),
+        "planning_constraint": seed_id(label, "planning_constraint", "preference"),
+        "plan": seed_id(label, "plan", "week1"),
         "plan_block": seed_id(label, "plan_block", "task_active"),
-        "meeting_participant": seed_id(label, "meeting_participant", "node_person"),
-        "meeting_pack": seed_id(label, "meeting_pack", "meeting_linked"),
+        "attention_feedback": seed_id(label, "attention_feedback", "useful"),
+        "meeting_participant": seed_id(label, "meeting_participant", "person"),
+        "meeting_pack": seed_id(label, "meeting_pack", "fresh"),
+        "ai_run": seed_id(label, "ai_run", "explain_item"),
+        "ai_run_step": seed_id(label, "ai_run_step", "model_call"),
+        "evaluation_run": seed_id(label, "evaluation_run", "attention_explain_item"),
+        "generated_artifact": seed_id(label, "generated_artifact", "explain_item"),
     }
 
 
@@ -954,223 +974,6 @@ def _seed_attention_and_briefs(
             "now": SEED_EPOCH,
         },
     )
-    cur.execute(
-        """
-        INSERT INTO attention_feedback (
-            id, workspace_id, target_type, target_id, label, reason, actor_id,
-            policy_version, created_at
-        ) VALUES (
-            %(id)s, %(workspace_id)s, 'attention_item', %(target_id)s, 'useful',
-            %(reason)s, %(actor_id)s, 1, %(created_at)s
-        )
-        ON CONFLICT (id) DO NOTHING
-        """,
-        {
-            "id": ids["attention_feedback"],
-            "workspace_id": ids["workspace"],
-            "target_id": ids["attention_item"],
-            "reason": "Deterministic phase1 acceptance seed fixture feedback.",
-            "actor_id": ids["user"],
-            "created_at": SEED_EPOCH,
-        },
-    )
-
-
-def _seed_waiting_links(cur: psycopg.Cursor[Any], label: str, ids: Mapping[str, UUID]) -> None:
-    cur.execute(
-        """
-        INSERT INTO waiting_links (
-            id, workspace_id, subject_type, subject_id, counterparty_entity_id,
-            direction, status, note, since_at, expected_at, superseded_by,
-            created_by, updated_by, created_at, updated_at, version
-        ) VALUES (
-            %(id)s, %(workspace_id)s, 'task', %(subject_id)s, %(counterparty)s,
-            'waiting_on_them', 'open', %(note)s, %(since_at)s, %(expected_at)s, NULL,
-            %(actor)s, %(actor)s, %(now)s, %(now)s, 1
-        )
-        ON CONFLICT (id) DO NOTHING
-        """,
-        {
-            "id": ids["waiting_link"],
-            "workspace_id": ids["workspace"],
-            "subject_id": ids["task_active"],
-            "counterparty": ids["node_person"],
-            "note": "Deterministic phase1 acceptance seed fixture waiting link.",
-            "since_at": SEED_EPOCH,
-            "expected_at": SEED_EPOCH + timedelta(days=7),
-            "actor": ids["user"],
-            "now": SEED_EPOCH,
-        },
-    )
-
-
-def _seed_risk_reviews(cur: psycopg.Cursor[Any], label: str, ids: Mapping[str, UUID]) -> None:
-    cur.execute(
-        """
-        INSERT INTO risk_reviews (
-            id, workspace_id, risk_id, outcome, notes, evidence_refs, reviewed_at,
-            next_review_at, actor_id
-        ) VALUES (
-            %(id)s, %(workspace_id)s, %(risk_id)s, 'no_change', %(notes)s,
-            ARRAY[%(evidence_ref)s]::text[], %(reviewed_at)s, %(next_review_at)s, %(actor)s
-        )
-        ON CONFLICT (id) DO NOTHING
-        """,
-        {
-            "id": ids["risk_review"],
-            "workspace_id": ids["workspace"],
-            "risk_id": ids["risk_active"],
-            "notes": "Deterministic phase1 acceptance seed fixture risk review.",
-            "evidence_ref": f"seed://{label}/risk-review/evidence",
-            "reviewed_at": SEED_EPOCH,
-            "next_review_at": SEED_EPOCH + timedelta(days=30),
-            "actor": ids["user"],
-        },
-    )
-
-
-def _seed_capacity_and_constraints(
-    cur: psycopg.Cursor[Any], label: str, ids: Mapping[str, UUID]
-) -> None:
-    cur.execute(
-        """
-        INSERT INTO capacity_profiles (
-            id, workspace_id, user_id, weekday, available_minutes, focus_minutes,
-            timezone, version, created_at, updated_at
-        ) VALUES (
-            %(id)s, %(workspace_id)s, %(user_id)s, 0, 480, 240, %(timezone)s, 1,
-            %(now)s, %(now)s
-        )
-        ON CONFLICT (id) DO NOTHING
-        """,
-        {
-            "id": ids["capacity_profile"],
-            "workspace_id": ids["workspace"],
-            "user_id": ids["user"],
-            "timezone": _tz(label),
-            "now": SEED_EPOCH,
-        },
-    )
-    cur.execute(
-        """
-        INSERT INTO planning_constraints (
-            id, workspace_id, user_id, kind, source_type, source_id, label,
-            starts_at, ends_at, hardness, priority, created_at, updated_at,
-            version, archived_at
-        ) VALUES (
-            %(id)s, %(workspace_id)s, %(user_id)s, 'deadline', 'task', %(source_id)s,
-            %(label)s, NULL, %(ends_at)s, 'hard', 1, %(now)s, %(now)s, 1, NULL
-        )
-        ON CONFLICT (id) DO NOTHING
-        """,
-        {
-            "id": ids["planning_constraint"],
-            "workspace_id": ids["workspace"],
-            "user_id": ids["user"],
-            "source_id": ids["task_active"],
-            "label": f"{SEED_MARKER} planning constraint {label}",
-            "ends_at": SEED_EPOCH + timedelta(days=2),
-            "now": SEED_EPOCH,
-        },
-    )
-
-
-def _seed_plans(cur: psycopg.Cursor[Any], label: str, ids: Mapping[str, UUID]) -> None:
-    cur.execute(
-        """
-        INSERT INTO plans (
-            id, workspace_id, user_id, period_start, period_end, status,
-            policy_version, capacity_minutes, source_versions, conflicts,
-            unscheduled, superseded_by, accepted_at, created_by, updated_by,
-            created_at, updated_at, version
-        ) VALUES (
-            %(id)s, %(workspace_id)s, %(user_id)s, %(period_start)s, %(period_end)s,
-            'proposed', 1, 480, '{}'::jsonb, '[]'::jsonb, '[]'::jsonb, NULL, NULL,
-            %(actor)s, %(actor)s, %(now)s, %(now)s, 1
-        )
-        ON CONFLICT (id) DO NOTHING
-        """,
-        {
-            "id": ids["plan"],
-            "workspace_id": ids["workspace"],
-            "user_id": ids["user"],
-            "period_start": SEED_EPOCH.date(),
-            "period_end": SEED_EPOCH.date() + timedelta(days=6),
-            "actor": ids["user"],
-            "now": SEED_EPOCH,
-        },
-    )
-    cur.execute(
-        """
-        INSERT INTO plan_blocks (
-            id, workspace_id, plan_id, source_type, source_id, starts_at, ends_at,
-            status, rationale, is_default_effort, created_at, updated_at
-        ) VALUES (
-            %(id)s, %(workspace_id)s, %(plan_id)s, 'task', %(source_id)s,
-            %(starts_at)s, %(ends_at)s, 'proposed', %(rationale)s, FALSE,
-            %(now)s, %(now)s
-        )
-        ON CONFLICT (id) DO NOTHING
-        """,
-        {
-            "id": ids["plan_block"],
-            "workspace_id": ids["workspace"],
-            "plan_id": ids["plan"],
-            "source_id": ids["task_active"],
-            "starts_at": SEED_EPOCH + timedelta(hours=9),
-            "ends_at": SEED_EPOCH + timedelta(hours=10),
-            "rationale": "Deterministic phase1 acceptance seed fixture plan block.",
-            "now": SEED_EPOCH,
-        },
-    )
-
-
-def _seed_meeting_participants_and_packs(
-    cur: psycopg.Cursor[Any], label: str, ids: Mapping[str, UUID]
-) -> None:
-    cur.execute(
-        """
-        INSERT INTO meeting_participants (
-            id, workspace_id, meeting_id, entity_id, role, created_by, updated_by,
-            created_at, updated_at, version
-        ) VALUES (
-            %(id)s, %(workspace_id)s, %(meeting_id)s, %(entity_id)s, 'attendee',
-            %(actor)s, %(actor)s, %(now)s, %(now)s, 1
-        )
-        ON CONFLICT (id) DO NOTHING
-        """,
-        {
-            "id": ids["meeting_participant"],
-            "workspace_id": ids["workspace"],
-            "meeting_id": ids["meeting_linked"],
-            "entity_id": ids["node_person"],
-            "actor": ids["user"],
-            "now": SEED_EPOCH,
-        },
-    )
-    cur.execute(
-        """
-        INSERT INTO meeting_packs (
-            id, workspace_id, meeting_id, status, generated_at, stale_at,
-            source_versions, content, created_by, updated_by, created_at,
-            updated_at, version
-        ) VALUES (
-            %(id)s, %(workspace_id)s, %(meeting_id)s, 'fresh', %(generated_at)s,
-            %(stale_at)s, '{}'::jsonb, '{}'::jsonb, %(actor)s, %(actor)s,
-            %(now)s, %(now)s, 1
-        )
-        ON CONFLICT (id) DO NOTHING
-        """,
-        {
-            "id": ids["meeting_pack"],
-            "workspace_id": ids["workspace"],
-            "meeting_id": ids["meeting_linked"],
-            "generated_at": SEED_EPOCH,
-            "stale_at": SEED_EPOCH + timedelta(days=1),
-            "actor": ids["user"],
-            "now": SEED_EPOCH,
-        },
-    )
 
 
 def _seed_recommendations(cur: psycopg.Cursor[Any], label: str, ids: Mapping[str, UUID]) -> None:
@@ -1277,6 +1080,385 @@ def _seed_idempotency(cur: psycopg.Cursor[Any], label: str, ids: Mapping[str, UU
     )
 
 
+def _seed_waiting_links(cur: psycopg.Cursor[Any], label: str, ids: Mapping[str, UUID]) -> None:
+    # counterparty_entity_id has a composite (workspace_id, entity) FK into
+    # pkos_nodes (migration 0023); node_person is already seeded by
+    # _seed_pkos, which runs before this function in seed()'s call order.
+    cur.execute(
+        """
+        INSERT INTO waiting_links (
+            id, workspace_id, subject_type, subject_id, counterparty_entity_id,
+            direction, status, note, since_at, expected_at, superseded_by,
+            created_by, updated_by, created_at, updated_at, version
+        ) VALUES (
+            %(id)s, %(workspace_id)s, 'task', %(subject_id)s, %(counterparty)s,
+            'waiting_on_me', 'open', %(note)s, %(since_at)s, %(expected_at)s, NULL,
+            %(actor)s, %(actor)s, %(now)s, %(now)s, 1
+        )
+        ON CONFLICT (id) DO NOTHING
+        """,
+        {
+            "id": ids["waiting_link"],
+            "workspace_id": ids["workspace"],
+            "subject_id": ids["task_active"],
+            "counterparty": ids["node_person"],
+            "note": "Deterministic phase1 acceptance seed fixture waiting link.",
+            "since_at": SEED_EPOCH,
+            "expected_at": SEED_EPOCH + timedelta(days=5),
+            "actor": ids["user"],
+            "now": SEED_EPOCH,
+        },
+    )
+
+
+def _seed_risk_reviews(cur: psycopg.Cursor[Any], label: str, ids: Mapping[str, UUID]) -> None:
+    # risk_id has a composite (workspace_id, risk) RESTRICT FK into risks
+    # (migration 0024); risk_active is already seeded by _seed_risks, which
+    # runs before this function in seed()'s call order.
+    cur.execute(
+        """
+        INSERT INTO risk_reviews (
+            id, workspace_id, risk_id, outcome, notes, evidence_refs,
+            reviewed_at, next_review_at, actor_id
+        ) VALUES (
+            %(id)s, %(workspace_id)s, %(risk_id)s, 'no_change', %(notes)s,
+            %(evidence_refs)s, %(reviewed_at)s, %(next_review_at)s, %(actor_id)s
+        )
+        ON CONFLICT (id) DO NOTHING
+        """,
+        {
+            "id": ids["risk_review"],
+            "workspace_id": ids["workspace"],
+            "risk_id": ids["risk_active"],
+            "notes": "Deterministic phase1 acceptance seed fixture risk review.",
+            "evidence_refs": [f"seed://{label}/risk-review/evidence"],
+            "reviewed_at": SEED_EPOCH,
+            "next_review_at": SEED_EPOCH + timedelta(days=30),
+            "actor_id": ids["user"],
+        },
+    )
+
+
+def _seed_capacity_and_planning_constraints(
+    cur: psycopg.Cursor[Any], label: str, ids: Mapping[str, UUID]
+) -> None:
+    cur.execute(
+        """
+        INSERT INTO capacity_profiles (
+            id, workspace_id, user_id, weekday, available_minutes, focus_minutes,
+            timezone, version, created_at, updated_at
+        ) VALUES (
+            %(id)s, %(workspace_id)s, %(user_id)s, 0, 480, 240,
+            %(timezone)s, 1, %(now)s, %(now)s
+        )
+        ON CONFLICT (id) DO NOTHING
+        """,
+        {
+            "id": ids["capacity_profile"],
+            "workspace_id": ids["workspace"],
+            "user_id": ids["user"],
+            "timezone": _tz(label),
+            "now": SEED_EPOCH,
+        },
+    )
+    cur.execute(
+        """
+        INSERT INTO planning_constraints (
+            id, workspace_id, user_id, kind, source_type, source_id, label,
+            starts_at, ends_at, hardness, priority, created_at, updated_at,
+            version, archived_at
+        ) VALUES (
+            %(id)s, %(workspace_id)s, %(user_id)s, 'preference', NULL, NULL,
+            %(label)s, NULL, NULL, 'soft', 0, %(now)s, %(now)s, 1, NULL
+        )
+        ON CONFLICT (id) DO NOTHING
+        """,
+        {
+            "id": ids["planning_constraint"],
+            "workspace_id": ids["workspace"],
+            "user_id": ids["user"],
+            "label": f"Deterministic phase1 acceptance seed fixture constraint {label}.",
+            "now": SEED_EPOCH,
+        },
+    )
+
+
+def _seed_plans_and_blocks(cur: psycopg.Cursor[Any], label: str, ids: Mapping[str, UUID]) -> None:
+    cur.execute(
+        """
+        INSERT INTO plans (
+            id, workspace_id, user_id, period_start, period_end, status,
+            policy_version, capacity_minutes, source_versions, conflicts,
+            unscheduled, superseded_by, accepted_at, created_by, updated_by,
+            created_at, updated_at, version
+        ) VALUES (
+            %(id)s, %(workspace_id)s, %(user_id)s, %(period_start)s, %(period_end)s,
+            'accepted', 1, 2400, '{}', '[]', '[]', NULL, %(accepted_at)s,
+            %(actor)s, %(actor)s, %(now)s, %(now)s, 1
+        )
+        ON CONFLICT (id) DO NOTHING
+        """,
+        {
+            "id": ids["plan"],
+            "workspace_id": ids["workspace"],
+            "user_id": ids["user"],
+            "period_start": SEED_EPOCH.date(),
+            "period_end": (SEED_EPOCH + timedelta(days=6)).date(),
+            "accepted_at": SEED_EPOCH,
+            "actor": ids["user"],
+            "now": SEED_EPOCH,
+        },
+    )
+    # plan_id has a composite (workspace_id, plan) CASCADE FK into plans
+    # (migration 0026), inserted immediately above.
+    cur.execute(
+        """
+        INSERT INTO plan_blocks (
+            id, workspace_id, plan_id, source_type, source_id, starts_at,
+            ends_at, status, rationale, is_default_effort, created_at, updated_at
+        ) VALUES (
+            %(id)s, %(workspace_id)s, %(plan_id)s, 'task', %(source_id)s,
+            %(starts_at)s, %(ends_at)s, 'accepted', %(rationale)s, FALSE,
+            %(now)s, %(now)s
+        )
+        ON CONFLICT (id) DO NOTHING
+        """,
+        {
+            "id": ids["plan_block"],
+            "workspace_id": ids["workspace"],
+            "plan_id": ids["plan"],
+            "source_id": ids["task_active"],
+            "starts_at": SEED_EPOCH + timedelta(days=1, hours=9),
+            "ends_at": SEED_EPOCH + timedelta(days=1, hours=10),
+            "rationale": "Deterministic phase1 acceptance seed fixture plan block.",
+            "now": SEED_EPOCH,
+        },
+    )
+
+
+def _seed_attention_feedback(cur: psycopg.Cursor[Any], label: str, ids: Mapping[str, UUID]) -> None:
+    # target_id is a free-standing uuid column with no FK constraint
+    # (migration 0022), but points at the attention_item already seeded by
+    # _seed_attention_and_briefs for realism, matching this file's existing
+    # convention of pointing seed FKs at other real seeded rows even where
+    # the database itself would not require it.
+    cur.execute(
+        """
+        INSERT INTO attention_feedback (
+            id, workspace_id, target_type, target_id, label, reason, actor_id,
+            policy_version, created_at
+        ) VALUES (
+            %(id)s, %(workspace_id)s, 'attention_item', %(target_id)s, 'useful',
+            %(reason)s, %(actor_id)s, 1, %(created_at)s
+        )
+        ON CONFLICT (id) DO NOTHING
+        """,
+        {
+            "id": ids["attention_feedback"],
+            "workspace_id": ids["workspace"],
+            "target_id": ids["attention_item"],
+            "reason": "Deterministic phase1 acceptance seed fixture attention feedback.",
+            "actor_id": ids["user"],
+            "created_at": SEED_EPOCH,
+        },
+    )
+
+
+def _seed_meeting_participants_and_packs(
+    cur: psycopg.Cursor[Any], label: str, ids: Mapping[str, UUID]
+) -> None:
+    # meeting_id has a composite (workspace_id, meeting) RESTRICT FK into
+    # meetings (migration 0027); meeting_linked is already seeded by
+    # _seed_calendar_and_meetings, which runs before this function in
+    # seed()'s call order. entity_id has the same shape into pkos_nodes.
+    cur.execute(
+        """
+        INSERT INTO meeting_participants (
+            id, workspace_id, meeting_id, entity_id, role, created_by, updated_by,
+            created_at, updated_at, version
+        ) VALUES (
+            %(id)s, %(workspace_id)s, %(meeting_id)s, %(entity_id)s, 'attendee',
+            %(actor)s, %(actor)s, %(now)s, %(now)s, 1
+        )
+        ON CONFLICT (id) DO NOTHING
+        """,
+        {
+            "id": ids["meeting_participant"],
+            "workspace_id": ids["workspace"],
+            "meeting_id": ids["meeting_linked"],
+            "entity_id": ids["node_person"],
+            "actor": ids["user"],
+            "now": SEED_EPOCH,
+        },
+    )
+    cur.execute(
+        """
+        INSERT INTO meeting_packs (
+            id, workspace_id, meeting_id, status, generated_at, stale_at,
+            source_versions, content, created_by, updated_by, created_at,
+            updated_at, version
+        ) VALUES (
+            %(id)s, %(workspace_id)s, %(meeting_id)s, 'fresh', %(generated_at)s,
+            %(stale_at)s, '{}', %(content)s, %(actor)s, %(actor)s, %(now)s,
+            %(now)s, 1
+        )
+        ON CONFLICT (id) DO NOTHING
+        """,
+        {
+            "id": ids["meeting_pack"],
+            "workspace_id": ids["workspace"],
+            "meeting_id": ids["meeting_linked"],
+            "generated_at": SEED_EPOCH,
+            "stale_at": SEED_EPOCH + timedelta(days=1),
+            "content": (
+                '{"participants": [], "timeline": [], "commitments": [], '
+                '"decisions": [], "notes": [], "risks": [], "dependencies": [], '
+                '"evidence_gaps": []}'
+            ),
+            "actor": ids["user"],
+            "now": SEED_EPOCH,
+        },
+    )
+
+
+def _seed_ai_runs_and_steps(cur: psycopg.Cursor[Any], label: str, ids: Mapping[str, UUID]) -> None:
+    cur.execute(
+        """
+        INSERT INTO ai_runs (
+            id, workspace_id, actor_id, task_type, data_class, status,
+            policy_version, model_id, provider, prompt_id, prompt_version,
+            input_ref, output, evidence, error_code, prompt_tokens,
+            output_tokens, cost, attempts, started_at, completed_at,
+            created_at, updated_at
+        ) VALUES (
+            %(id)s, %(workspace_id)s, %(actor_id)s, 'attention.explain_item',
+            'internal', 'completed', 1, %(model_id)s, 'ollama',
+            'attention.explain_item.v1', 1, %(input_ref)s, %(output)s,
+            %(evidence)s, NULL, 120, 40, 0.0000, 1, %(started_at)s,
+            %(completed_at)s, %(now)s, %(now)s
+        )
+        ON CONFLICT (id) DO NOTHING
+        """,
+        {
+            "id": ids["ai_run"],
+            "workspace_id": ids["workspace"],
+            "actor_id": ids["user"],
+            "model_id": "qwen2.5:1.5b-instruct-q4_K_M",
+            "input_ref": f'{{"attention_item_id": "{ids["attention_item"]}"}}',
+            "output": (
+                '{"explanation_text": "Deterministic phase1 acceptance seed fixture '
+                'explanation.", "cited_factor_codes": ["manual_priority"]}'
+            ),
+            "evidence": '["manual_priority"]',
+            "started_at": SEED_EPOCH,
+            "completed_at": SEED_EPOCH + timedelta(seconds=5),
+            "now": SEED_EPOCH,
+        },
+    )
+    # run_id has a composite (workspace_id, run) CASCADE FK into ai_runs
+    # (migration 0030), inserted immediately above.
+    cur.execute(
+        """
+        INSERT INTO ai_run_steps (
+            id, workspace_id, run_id, sequence, kind, status, trace, created_at
+        ) VALUES (
+            %(id)s, %(workspace_id)s, %(run_id)s, 1, 'model_call', 'succeeded',
+            %(trace)s, %(created_at)s
+        )
+        ON CONFLICT (id) DO NOTHING
+        """,
+        {
+            "id": ids["ai_run_step"],
+            "workspace_id": ids["workspace"],
+            "run_id": ids["ai_run"],
+            "trace": ('{"model_id": "qwen2.5:1.5b-instruct-q4_K_M", "duration_ms": 850}'),
+            "created_at": SEED_EPOCH,
+        },
+    )
+
+
+def _seed_evaluation_run(cur: psycopg.Cursor[Any], label: str, ids: Mapping[str, UUID]) -> None:
+    # evaluation_set_id is a plain (non-composite) FK into the single global
+    # evaluation_sets row migration 0031 seeds for task_type
+    # 'attention.explain_item' -- that row's id is generated with uuid4() at
+    # migration time, not derivable via seed_id(), so it is looked up here
+    # rather than hardcoded. Both workspaces reference the same global row.
+    cur.execute(
+        "SELECT id, version FROM evaluation_sets WHERE task_type = %s AND status = 'active'",
+        ("attention.explain_item",),
+    )
+    row = cur.fetchone()
+    if row is None:
+        raise RuntimeError(
+            "no active evaluation_sets row for task_type='attention.explain_item' -- "
+            "expected migration 0031_phase4_evaluation.py to have seeded exactly one"
+        )
+    evaluation_set_id, dataset_version = row
+
+    cur.execute(
+        """
+        INSERT INTO evaluation_runs (
+            id, workspace_id, actor_id, task_type, evaluation_set_id,
+            dataset_version, prompt_id, prompt_version, model_id, provider,
+            total_examples, schema_validity_rate, grounding_rate,
+            prohibited_fact_count, latency_p95_seconds, passed, failures,
+            status, started_at, completed_at, created_at
+        ) VALUES (
+            %(id)s, %(workspace_id)s, %(actor_id)s, 'attention.explain_item',
+            %(evaluation_set_id)s, %(dataset_version)s, 'attention.explain_item.v1',
+            1, %(model_id)s, 'ollama', 20, 1.0000, 1.0000, 0, 1.250, TRUE, '[]',
+            'completed', %(started_at)s, %(completed_at)s, %(created_at)s
+        )
+        ON CONFLICT (id) DO NOTHING
+        """,
+        {
+            "id": ids["evaluation_run"],
+            "workspace_id": ids["workspace"],
+            "actor_id": ids["user"],
+            "evaluation_set_id": evaluation_set_id,
+            "dataset_version": dataset_version,
+            "model_id": "qwen2.5:1.5b-instruct-q4_K_M",
+            "started_at": SEED_EPOCH,
+            "completed_at": SEED_EPOCH + timedelta(minutes=2),
+            "created_at": SEED_EPOCH,
+        },
+    )
+
+
+def _seed_generated_artifact(cur: psycopg.Cursor[Any], label: str, ids: Mapping[str, UUID]) -> None:
+    # ai_run_id has a composite (workspace_id, ai_run) CASCADE FK into
+    # ai_runs (migration 0031); ai_run is already seeded by
+    # _seed_ai_runs_and_steps, which runs before this function in seed()'s
+    # call order.
+    cur.execute(
+        """
+        INSERT INTO generated_artifacts (
+            id, workspace_id, ai_run_id, task_type, source_versions,
+            schema_version, output, evidence, status, created_at
+        ) VALUES (
+            %(id)s, %(workspace_id)s, %(ai_run_id)s, 'attention.explain_item',
+            %(source_versions)s, 'attention.explain_item.output.v1', %(output)s,
+            %(evidence)s, 'proposed', %(created_at)s
+        )
+        ON CONFLICT (id) DO NOTHING
+        """,
+        {
+            "id": ids["generated_artifact"],
+            "workspace_id": ids["workspace"],
+            "ai_run_id": ids["ai_run"],
+            "source_versions": (
+                f'{{"attention_item_id": "{ids["attention_item"]}", "source_entity_version": 1}}'
+            ),
+            "output": (
+                '{"explanation_text": "Deterministic phase1 acceptance seed fixture '
+                'explanation.", "cited_factor_codes": ["manual_priority"]}'
+            ),
+            "evidence": '["manual_priority"]',
+            "created_at": SEED_EPOCH,
+        },
+    )
+
+
 def seed(conn: psycopg.Connection[Any]) -> None:
     """Insert deterministic Phase 1 fixtures into every table for both workspaces.
 
@@ -1296,13 +1478,28 @@ def seed(conn: psycopg.Connection[Any]) -> None:
             _seed_calendar_and_meetings(cur, label, ids)
             _seed_risks(cur, label, ids)
             _seed_attention_and_briefs(cur, label, ids)
-            _seed_waiting_links(cur, label, ids)
-            _seed_risk_reviews(cur, label, ids)
-            _seed_capacity_and_constraints(cur, label, ids)
-            _seed_plans(cur, label, ids)
-            _seed_meeting_participants_and_packs(cur, label, ids)
             _seed_recommendations(cur, label, ids)
             _seed_idempotency(cur, label, ids)
+            # Phase 3 (migrations 0022-0027) -- each depends only on rows
+            # already seeded above: waiting_links on pkos_nodes/tasks,
+            # risk_reviews on risks, capacity/planning on users,
+            # plan_blocks on plans (seeded immediately before it),
+            # attention_feedback on attention_items, meeting_participants/
+            # meeting_packs on meetings/pkos_nodes.
+            _seed_waiting_links(cur, label, ids)
+            _seed_risk_reviews(cur, label, ids)
+            _seed_capacity_and_planning_constraints(cur, label, ids)
+            _seed_plans_and_blocks(cur, label, ids)
+            _seed_attention_feedback(cur, label, ids)
+            _seed_meeting_participants_and_packs(cur, label, ids)
+            # Phase 4 (migrations 0030-0031) -- ai_run_steps/generated_
+            # artifacts depend on ai_runs (seeded immediately before them);
+            # evaluation_runs depends on users plus the global evaluation_
+            # sets row migration 0031 seeds directly (looked up by query,
+            # not seeded here).
+            _seed_ai_runs_and_steps(cur, label, ids)
+            _seed_evaluation_run(cur, label, ids)
+            _seed_generated_artifact(cur, label, ids)
 
 
 def fixture_row_checksums(conn: psycopg.Connection[Any]) -> dict[str, str]:
