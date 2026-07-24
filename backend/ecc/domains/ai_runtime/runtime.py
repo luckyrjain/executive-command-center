@@ -738,6 +738,7 @@ def _reflect_on_answer(
     validated: ExplainItemOutput,
     call_model: Callable[[str], tuple[str, int | None, int | None]],
     steps: list[dict[str, Any]],
+    budget: RunBudget,
 ) -> ExplainItemOutput:
     """Runs *after* `validated` has already independently passed schema
     validation and grounding -- it is already a safe, complete answer on
@@ -754,7 +755,13 @@ def _reflect_on_answer(
     Reuses the caller's `call_model` closure verbatim, so this call
     inherits `RunGuard`'s total-wall-clock budget check
     (`guard.check_total_budget`, invoked at the top of that closure)
-    automatically -- no new budget mechanism.
+    automatically -- no new budget mechanism. `budget` is passed through
+    separately (not re-derived) so this function can also apply
+    `check_output_token_budget`'s application-level fallback safety net to
+    the reflection call's own `eval_count`, exactly like the primary call
+    does (runtime.py's `execute_run`) -- otherwise a model that ignores
+    `num_predict` on the reflection call specifically would have gone
+    unchecked, a defense-in-depth gap the primary call doesn't have.
 
     Deliberately does not touch `_breaker_for(...)`'s circuit breaker for
     this model: that breaker is shared with the primary "explain" call at
@@ -779,7 +786,9 @@ def _reflect_on_answer(
     )
 
     try:
-        reflection_raw, _eval_count, _prompt_eval_count = call_model(reflection_prompt_text)
+        reflection_raw, reflection_eval_count, _prompt_eval_count = call_model(
+            reflection_prompt_text
+        )
     except OllamaCallTimeout:
         steps.append(_model_step(sequence, "failed", attempt=1, outcome="timeout"))
         return validated
@@ -791,6 +800,12 @@ def _reflect_on_answer(
         return validated
     except RunBudgetExceeded:
         steps.append(_model_step(sequence, "failed", attempt=1, outcome="budget_exceeded"))
+        return validated
+
+    try:
+        check_output_token_budget(eval_count=reflection_eval_count, budget=budget)
+    except RunBudgetExceeded:
+        steps.append(_model_step(sequence, "failed", attempt=1, outcome="output_budget_exceeded"))
         return validated
 
     if _try_parse_tool_call_request(reflection_raw) is not None:
@@ -1162,6 +1177,7 @@ def execute_run(
             validated=validated,
             call_model=call_model,
             steps=steps,
+            budget=budget,
         )
 
     guard.complete()

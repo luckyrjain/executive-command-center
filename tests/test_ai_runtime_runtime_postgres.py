@@ -49,13 +49,22 @@ from sqlalchemy import text
 from ecc.auth import AuthContext
 from ecc.config import get_settings
 from ecc.database import SessionFactory, engine
-from ecc.domains.ai_runtime.ollama_client import OllamaAdapter
+from ecc.domains.ai_runtime.budgets import RunBudget, RunBudgetExceeded
+from ecc.domains.ai_runtime.ollama_client import (
+    OllamaAdapter,
+    OllamaCallCancelled,
+    OllamaCallTimeout,
+)
+from ecc.domains.ai_runtime.router import get_policy as get_routing_policy
 from ecc.domains.ai_runtime.runtime import (
+    TASK_PORTS,
     AiRun,
+    _reflect_on_answer,
     execute_run,
     get_ollama_adapter,
     reset_circuit_breakers,
 )
+from ecc.domains.ai_runtime.validator import ExplainItemOutput
 from ecc.domains.knowledge import tools as knowledge_tools
 from ecc.main import app
 
@@ -764,6 +773,13 @@ def test_execute_run_reflection_revision_fails_grounding_is_discarded(
     assert set(run.evidence) == {"overdue", "pinned"}
     assert run.output is not None
     assert run.output["cited_factor_codes"] == ["overdue", "pinned"]
+    # Asserting cited_factor_codes alone would also pass a buggy partial
+    # discard (e.g. keeping the original codes but leaking the rejected
+    # revision's explanation_text) -- pin the full original answer.
+    assert (
+        run.output["explanation_text"]
+        == "This task is overdue and manually pinned, so it needs attention now."
+    )
 
     steps = _step_rows(run.id)
     assert steps[2]["status"] == "failed"
@@ -779,17 +795,41 @@ def test_execute_run_reflection_schema_invalid_response_skipped_no_repair_attemp
 ) -> None:
     """`validate_with_bounded_repair`'s one-retry mechanism is specific to
     the *primary* answer -- a reflection response is validated with the
-    plain `validate_output`, never repaired. Only two responses are queued
-    (primary, then a malformed reflection response); if reflection were
-    (incorrectly) repair-retried, a third call would consume the mock
-    transport's repeated-last-response fallback and this test's step-count
-    assertion below would catch it.
+    plain `validate_output`, never repaired. Counts actual outbound HTTP
+    requests (not just the step-kind list, which a silent extra call
+    folded into the same step would not change) to prove exactly two
+    model calls happen: the primary call and one reflection call, no
+    repair-retry of the reflection response.
     """
     item_id = _insert_attention_item(run_context["workspace_id"], factors=_DEFAULT_FACTORS)
-    adapter = _adapter_with_responses(
-        _valid_output(["overdue", "pinned"]),
-        "not valid json for the reflection response",
-    )
+    call_count = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal call_count
+        call_count += 1
+        text_value = (
+            _valid_output(["overdue", "pinned"])
+            if call_count == 1
+            else "not valid json for the reflection response"
+        )
+        body = (
+            json.dumps(
+                {
+                    "model": "m",
+                    "created_at": "now",
+                    "response": text_value,
+                    "done": True,
+                    "eval_count": 12,
+                    "prompt_eval_count": 40,
+                }
+            )
+            + "\n"
+        )
+        return httpx.Response(
+            200, content=body.encode(), headers={"content-type": "application/x-ndjson"}
+        )
+
+    adapter = OllamaAdapter(transport=httpx.MockTransport(handler))
 
     with SessionFactory() as session:
         run = execute_run(
@@ -803,6 +843,10 @@ def test_execute_run_reflection_schema_invalid_response_skipped_no_repair_attemp
 
     assert run.status == "completed"
     assert set(run.evidence) == {"overdue", "pinned"}
+    assert call_count == 2, (
+        f"expected exactly 2 model calls (primary + one reflection attempt, no "
+        f"reflection repair-retry), got {call_count}"
+    )
 
     steps = _step_rows(run.id)
     assert [s["kind"] for s in steps] == ["tool_call", "model_call", "model_call"]
@@ -908,6 +952,172 @@ def test_execute_run_reflection_provider_error_is_skipped_run_still_completes(
     steps = _step_rows(run.id)
     assert steps[2]["status"] == "failed"
     assert steps[2]["trace"]["outcome"] == "provider_error"
+
+
+# ---------------------------------------------------------------------------
+# _reflect_on_answer, exercised directly -- covers failure modes that are
+# impractical to force through a real (or even mocked-HTTP) timing/budget
+# race via the full execute_run orchestration path: reflection-layer
+# timeout, cancellation, total-wall-clock budget exhaustion, and the
+# output-token-budget fallback check. Also covers two revision-shape
+# branches (an over-length revision that fails the ExplainItemOutput
+# re-validation step; the revised_cited_factor_codes=None reuse-original
+# fallback) not otherwise exercised. Reuses the real seeded
+# attention.explain_item.reflect.v1 prompt row and RunBudget -- only the
+# `call_model` closure is a test stub, so the DB-touching parts of
+# _reflect_on_answer (get_active_prompt) are exercised for real.
+# ---------------------------------------------------------------------------
+
+
+def _reflection_budget() -> RunBudget:
+    with SessionFactory() as session:
+        policy = get_routing_policy(session, "attention.explain_item")
+    assert policy is not None
+    return RunBudget.from_policy(policy)
+
+
+def _reflect_args(call_model) -> dict:  # noqa: ANN001
+    return {
+        "port": TASK_PORTS["attention.explain_item"],
+        "item": {"entity_type": "task", "score": 62, "confidence": 0.9},
+        "factors_block": "irrelevant to these tests",
+        "factor_codes": ["overdue", "pinned"],
+        "validated": ExplainItemOutput(
+            explanation_text="This task is overdue and manually pinned, so it needs attention now.",
+            cited_factor_codes=["overdue", "pinned"],
+        ),
+        "call_model": call_model,
+        "steps": [],
+        "budget": _reflection_budget(),
+    }
+
+
+def test_reflect_on_answer_timeout_is_skipped_original_kept() -> None:
+    def call_model(prompt_text: str) -> tuple[str, int | None, int | None]:
+        raise OllamaCallTimeout("boom")
+
+    args = _reflect_args(call_model)
+    with SessionFactory() as session:
+        result = _reflect_on_answer(session, **args)
+
+    assert result is args["validated"]
+    assert args["steps"][0]["trace"]["outcome"] == "timeout"
+
+
+def test_reflect_on_answer_cancelled_is_skipped_original_kept() -> None:
+    def call_model(prompt_text: str) -> tuple[str, int | None, int | None]:
+        raise OllamaCallCancelled("boom")
+
+    args = _reflect_args(call_model)
+    with SessionFactory() as session:
+        result = _reflect_on_answer(session, **args)
+
+    assert result is args["validated"]
+    assert args["steps"][0]["status"] == "cancelled"
+    assert args["steps"][0]["trace"]["outcome"] == "cancelled"
+
+
+def test_reflect_on_answer_total_budget_exceeded_is_skipped_original_kept() -> None:
+    def call_model(prompt_text: str) -> tuple[str, int | None, int | None]:
+        raise RunBudgetExceeded("boom", status="degraded")
+
+    args = _reflect_args(call_model)
+    with SessionFactory() as session:
+        result = _reflect_on_answer(session, **args)
+
+    assert result is args["validated"]
+    assert args["steps"][0]["trace"]["outcome"] == "budget_exceeded"
+
+
+def test_reflect_on_answer_output_token_budget_exceeded_is_skipped_original_kept() -> None:
+    """A defense-in-depth check found missing during PR review: the
+    reflection call's own `eval_count` was never checked against
+    `budget.max_output_tokens` the way the primary call's is
+    (`execute_run`'s own `check_output_token_budget` call) -- a model that
+    ignores `num_predict` on the reflection call specifically would have
+    gone unchecked. Fixed by threading `budget` into `_reflect_on_answer`
+    and re-running the same check on its `eval_count`.
+    """
+    over_budget_eval_count = _reflection_budget().max_output_tokens + 1
+
+    def call_model(prompt_text: str) -> tuple[str, int | None, int | None]:
+        return _reflection_response(approved=True), over_budget_eval_count, 40
+
+    args = _reflect_args(call_model)
+    with SessionFactory() as session:
+        result = _reflect_on_answer(session, **args)
+
+    assert result is args["validated"]
+    assert args["steps"][0]["trace"]["outcome"] == "output_budget_exceeded"
+
+
+def test_reflect_on_answer_revision_over_word_limit_fails_output_revalidation() -> None:
+    """`ExplainItemReflection` itself has no word-count validator (see
+    `tests/test_ai_runtime_validation_postgres.py::
+    test_explain_item_reflection_accepts_over_60_word_revision_unvalidated`)
+    -- this is the runtime-level half of that same contract: an over-60-word
+    revision is only ever caught here, at the ExplainItemOutput
+    re-validation step, and the original answer is kept.
+    """
+    long_text = " ".join(["word"] * 61)
+
+    def call_model(prompt_text: str) -> tuple[str, int | None, int | None]:
+        return (
+            _reflection_response(approved=False, revised_text=long_text, revised_codes=["overdue"]),
+            12,
+            40,
+        )
+
+    args = _reflect_args(call_model)
+    with SessionFactory() as session:
+        result = _reflect_on_answer(session, **args)
+
+    assert result is args["validated"]
+    assert args["steps"][0]["trace"]["outcome"] == "revision_schema_invalid"
+    assert "detail" in args["steps"][0]["trace"]
+
+
+def test_reflect_on_answer_revision_omits_codes_reuses_original_codes() -> None:
+    """`revised_cited_factor_codes=None` (the model revises the wording
+    but doesn't propose new citations) falls back to the original
+    answer's own `cited_factor_codes`, not an empty list."""
+
+    def call_model(prompt_text: str) -> tuple[str, int | None, int | None]:
+        return (
+            _reflection_response(
+                approved=False,
+                revised_text="This is significantly overdue and remains pinned for attention.",
+                revised_codes=None,
+            ),
+            12,
+            40,
+        )
+
+    args = _reflect_args(call_model)
+    with SessionFactory() as session:
+        result = _reflect_on_answer(session, **args)
+
+    assert result is not args["validated"]
+    assert result.cited_factor_codes == ["overdue", "pinned"]
+    assert args["steps"][0]["trace"]["outcome"] == "revised"
+
+
+def test_reflect_on_answer_disapproved_with_no_revision_text_keeps_original() -> None:
+    """`approved=False` with `revised_explanation_text=None` (the model
+    declines to approve but also declines to actually propose a revision)
+    is documented, current behavior: bucketed with the "approved" outcome
+    since there is nothing to revise to -- pinned here so a future change
+    to this fallback is a deliberate decision, not an accidental one."""
+
+    def call_model(prompt_text: str) -> tuple[str, int | None, int | None]:
+        return _reflection_response(approved=False), 12, 40
+
+    args = _reflect_args(call_model)
+    with SessionFactory() as session:
+        result = _reflect_on_answer(session, **args)
+
+    assert result is args["validated"]
+    assert args["steps"][0]["trace"]["outcome"] == "approved"
 
 
 # ---------------------------------------------------------------------------
