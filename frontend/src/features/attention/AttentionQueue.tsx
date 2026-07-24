@@ -2,6 +2,39 @@ import { useMemo, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
 import { ApiError, apiRequest } from '../../api/client'
+import AttentionExplanation from './AttentionExplanation'
+
+declare global {
+  interface Window {
+    // Runtime override for `frontend/e2e/scenarios/attention-explanation.mjs`
+    // (see the constant below) -- never set outside a test harness.
+    __ECC_AI_EXPLANATIONS_ENABLED__?: boolean
+  }
+}
+
+/** `phase-004/UX-STATES.md` Task 6, Step 3: the existing Attention Queue
+ * must be "pixel-for-pixel/behaviorally unaffected" when AI explanations
+ * are globally off -- achieved here by not mounting `AttentionExplanation`
+ * at all in that case, rather than mounting it and asking it to render
+ * nothing (which would still add DOM nodes/effects a pixel-diff could
+ * catch). Defaults to enabled: this is a deliberately optional, discardable,
+ * clearly labelled affordance (never replacing the deterministic factor
+ * list above it), not a feature that needs an explicit opt-in per real
+ * deployment -- `VITE_AI_EXPLANATIONS_ENABLED=0` is the real, build-time
+ * deployment killswitch.
+ *
+ * `window.__ECC_AI_EXPLANATIONS_ENABLED__` is a *runtime* override checked
+ * first, purely so `attention-explanation.mjs` can exercise both the
+ * enabled and disabled product states against the single production build
+ * `frontend/e2e/run.mjs` already produces once for every scenario
+ * (`page.addInitScript` sets it before the bundle evaluates) -- a Vite
+ * `import.meta.env.VITE_*` value is inlined at build time and cannot be
+ * flipped per-scenario without a second full build, which no other
+ * scenario in this suite requires either. */
+const AI_EXPLANATIONS_ENABLED =
+  typeof window !== 'undefined' && typeof window.__ECC_AI_EXPLANATIONS_ENABLED__ === 'boolean'
+    ? window.__ECC_AI_EXPLANATIONS_ENABLED__
+    : import.meta.env.VITE_AI_EXPLANATIONS_ENABLED !== '0'
 
 export type AttentionFactor = { code: string; label: string; points: number; source_field?: string }
 
@@ -152,6 +185,7 @@ export default function AttentionQueue() {
                         ))}
                       </ul>
                     ) : null}
+                    {AI_EXPLANATIONS_ENABLED ? <AttentionExplanation item={item} /> : null}
                     <div className="work-actions" role="group" aria-label={`Actions for ${item.explanation}`}>
                       <button type="button" disabled={pending} aria-label={`Defer ${item.explanation}`} onClick={() => actionMutation.mutate({ item, action: 'defer' })}>Defer</button>
                       <button type="button" disabled={pending} aria-label={`Dismiss ${item.explanation}`} onClick={() => actionMutation.mutate({ item, action: 'dismiss' })}>Dismiss</button>

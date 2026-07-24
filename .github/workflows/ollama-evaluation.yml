@@ -1,0 +1,119 @@
+name: ollama-evaluation
+
+# Phase 4 AI Runtime Task 5 Step 6 (docs/superpowers/plans/2026-07-23-phase-
+# 4-ai-runtime.md; design doc's Test strategy section; ADR-0012's Risks).
+# Provisions a real Ollama server, pulls qwen2.5:1.5b-instruct-q4_K_M, and
+# runs tests/test_ai_runtime_evaluation_live_ollama.py -- the one test in
+# this repository's ai_runtime suite that exercises genuine model output
+# against EVALUATION-CONTRACT.md's four promotion floors, rather than a
+# mocked HTTP transport.
+#
+# Isolated into its own workflow file (not a job inside ci.yml), mirroring
+# ci.yml's embeddings-benchmark job's own isolation rationale: provisioning
+# a real model server and pulling a multi-hundred-MB model is slow and
+# resource-heavy enough that sharing a runner with the tight-budget Phase 1
+# performance tests risks the same resource-contention failure that
+# comment documents for the analogous torch/sentence-transformers case.
+#
+# UNVERIFIED BY CONSTRUCTION: this workflow could not be executed or tested
+# in the sandbox that authored it -- that sandbox has no outbound network
+# access to ollama.com (confirmed via the design doc's Test strategy
+# section / ADR-0012's Risks: `curl https://ollama.com` returns a 403 from
+# the environment's egress proxy) and cannot pull the ollama/ollama image or
+# the model tag below. Its YAML has been written to match this repository's
+# existing CI conventions as closely as possible (see ci.yml), but its
+# first real pass/fail evidence must come from an actual GitHub Actions run
+# of this file, not from any claim made while authoring it.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  ollama-evaluation:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg18
+        env:
+          POSTGRES_DB: ecc
+          POSTGRES_USER: ecc
+          POSTGRES_PASSWORD: ecc
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U ecc -d ecc"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      ECC_SESSION_SECRET: ci-secret-value-that-is-at-least-32-characters
+      ECC_DATABASE_URL: postgresql+psycopg://ecc:ecc@localhost:5432/ecc
+      ECC_OLLAMA_BASE_URL: http://127.0.0.1:11434
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: 3.14.6
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+        with:
+          version: 0.7.19
+          enable-cache: true
+      - run: uv sync --frozen --all-groups --python 3.14.6
+      - run: uv run alembic -c backend/alembic.ini upgrade head
+
+      - name: Start the official Ollama server container
+        # Pinned by tag, not digest. RFC-005 v1.3.0's amendment and this
+        # plan's own instructions require pinning the official ollama/ollama
+        # image by digest where a real, current digest can be verified --
+        # this development sandbox has no outbound network access to
+        # ollama.com or Docker Hub (see this file's header comment) and
+        # therefore cannot resolve or verify a real digest for this tag
+        # without fabricating one, which would be worse than an honest tag
+        # pin. Replace `ollama/ollama:0.6.8` below with
+        # `ollama/ollama@sha256:<verified digest>` once a maintainer with
+        # real registry access resolves and records the actual current
+        # digest for a released ollama/ollama version -- do not paste in an
+        # invented-looking digest to make this comment go away.
+        run: docker run -d --name ollama -p 11434:11434 ollama/ollama:0.6.8
+
+      - name: Wait for the Ollama server to become ready
+        run: |
+          ready=0
+          for _ in $(seq 1 60); do
+            if curl -fsS "${ECC_OLLAMA_BASE_URL}/" >/dev/null 2>&1; then
+              ready=1
+              break
+            fi
+            sleep 2
+          done
+          if [ "${ready}" -ne 1 ]; then
+            echo "::error::ollama server did not become ready within 120s"
+            docker logs ollama
+            exit 1
+          fi
+
+      - name: Pull qwen2.5:1.5b-instruct-q4_K_M
+        # design doc Decision 1's exact model tag -- the only model
+        # model_definitions registers in this activation (migration
+        # 0028_phase4_model_registry.py).
+        run: docker exec ollama ollama pull qwen2.5:1.5b-instruct-q4_K_M
+
+      - name: Run the live-Ollama evaluation floor check
+        # tests/test_ai_runtime_evaluation_live_ollama.py -- runs the real
+        # 20-example dataset (tests/fixtures/
+        # phase4_evaluation_attention_explain.py) through
+        # ecc.domains.ai_runtime.evaluation.run_evaluation against the real
+        # model above and asserts check_promotion_floors(run) is True,
+        # i.e. EVALUATION-CONTRACT.md's four floors actually pass against
+        # genuine model output, not a mock.
+        run: uv run pytest -v tests/test_ai_runtime_evaluation_live_ollama.py
+
+      - name: Stop the Ollama server container
+        if: always()
+        run: docker rm -f ollama || true

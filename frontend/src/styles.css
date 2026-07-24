@@ -197,6 +197,18 @@ button:disabled { opacity: .6; cursor: wait; }
 .risk-factors { list-style: none; margin: 8px 0 0; padding: 0; display: flex; flex-wrap: wrap; gap: 6px; }
 .risk-factors li { border: 1px solid #e3e8ef; border-radius: 999px; padding: 4px 11px; font-size: 12px; color: #4f5b6d; }
 
+/* AI-generated content is visually distinct from the deterministic factor
+ * list above it (PHASE-004-ai-runtime.md's frontend-changes requirement) --
+ * a dashed border and a tinted background, never the same solid-card
+ * treatment `.dashboard-card`/`.item-list` use for deterministic content. */
+.ai-explanation { margin-top: 12px; padding: 14px 16px; border: 1px dashed #b9c3e0; border-radius: 14px; background: #f5f7ff; display: grid; gap: 8px; }
+.ai-explanation-badge { margin: 0; font-size: 11px; font-weight: 800; letter-spacing: .04em; text-transform: uppercase; color: #4a5a9c; }
+.ai-explanation p { margin: 0; }
+.ai-explanation ul { margin: 0; padding-left: 18px; }
+.ai-explanation small { color: #5a6472; }
+.ai-explanation-progress { height: 8px; border-radius: 999px; background: #e2e7f5; overflow: hidden; }
+.ai-explanation-progress-fill { height: 100%; background: #4a5a9c; transition: width .2s linear; }
+
 .recommendation-preview { margin-top: 14px; padding-top: 14px; border-top: 1px dashed #e7ebf0; display: grid; gap: 10px; }
 .evidence-preview { list-style: none; margin: 0; padding: 0; display: flex; flex-wrap: wrap; gap: 8px; }
 .evidence-preview li { border-radius: 999px; padding: 4px 11px; font-size: 12px; text-transform: capitalize; display: flex; gap: 6px; }

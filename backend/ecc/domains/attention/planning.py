@@ -631,8 +631,9 @@ def _row_to_plan(
     to the original per-plan lookup.
     """
     if blocks is None:
-        blocks = (
-            session.execute(
+        blocks = [
+            dict(mapping)
+            for mapping in session.execute(
                 text(
                     f"SELECT {_BLOCK_FIELDS} FROM plan_blocks "
                     "WHERE workspace_id = :workspace_id AND plan_id = :plan_id ORDER BY starts_at"
@@ -641,7 +642,7 @@ def _row_to_plan(
             )
             .mappings()
             .all()
-        )
+        ]
     return Plan.model_validate(
         {**row, "blocks": [PlanBlockResponse.model_validate(dict(b)) for b in blocks]}
     )
