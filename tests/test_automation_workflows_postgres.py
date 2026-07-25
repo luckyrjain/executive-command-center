@@ -1,0 +1,893 @@
+"""Phase 5 Automation Task 1: workflow schema (design doc Decision 2).
+
+Covers, per the task's own scope ("workflow schema, policy model and
+triggers -- the data layer only"):
+
+1. The database-level immutability trigger (`trg_workflow_versions_
+   immutability`, migration `0038_phase5_workflow_schema.py`) -- exercised
+   with **direct SQL** `UPDATE` statements, bypassing `workflows.py`
+   entirely, mirroring `test_ai_runtime_versioning_postgres.py`'s own
+   structure for the identical Phase 4 property.
+2. The partial unique index enforcing exactly one `active` version per
+   `(workspace_id, workflow_id)`.
+3. `workflows.py`'s hashing/graph-validation/CRUD/activation functions.
+4. `GET|POST /api/v1/automations/workflows`, `GET .../{id}`,
+   `POST .../{id}/publish|disable`.
+5. Cross-workspace isolation.
+"""
+
+from collections.abc import Iterator
+from datetime import UTC, datetime, timedelta
+from hashlib import sha256
+from hmac import new
+from json import dumps
+from typing import Any
+from uuid import UUID, uuid4
+
+import pytest
+from fastapi.testclient import TestClient
+from sqlalchemy import text
+from sqlalchemy.exc import IntegrityError, ProgrammingError
+
+from ecc.config import get_settings
+from ecc.database import SessionFactory, engine
+from ecc.domains.automation import workflows as automation_workflows
+from ecc.main import app
+
+settings = get_settings()
+pytestmark = pytest.mark.skipif(
+    not settings.database_url.startswith("postgresql"),
+    reason="PostgreSQL integration test",
+)
+
+
+def _valid_graph() -> dict[str, Any]:
+    return {
+        "steps": [
+            {
+                "step_id": "s1",
+                "step_type": "action",
+                "action_ref": "local.create_note",
+                "input_mapping": {"title": "$trigger.title"},
+                "on_success": "s2",
+                "on_failure": "failed",
+            },
+            {
+                "step_id": "s2",
+                "step_type": "approval_gate",
+                "input_mapping": {},
+                "on_success": "succeeded",
+                "on_failure": "failed",
+            },
+        ]
+    }
+
+
+# ---------------------------------------------------------------------------
+# Shared workspace/user/session fixture.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def workflow_test_context() -> Iterator[tuple[TestClient, UUID, UUID, str]]:
+    workspace_id = uuid4()
+    user_id = uuid4()
+    token = f"session-{uuid4()}"
+    now = datetime.now(UTC)
+
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO workspaces (id, name, timezone, created_at) "
+                "VALUES (:id, 'Automation Workflow Test', 'Asia/Kolkata', :now)"
+            ),
+            {"id": workspace_id, "now": now},
+        )
+        connection.execute(
+            text(
+                "INSERT INTO users (id, workspace_id, email, password_hash, created_at) "
+                "VALUES (:id, :workspace_id, :email, 'test-password-hash', :now)"
+            ),
+            {
+                "id": user_id,
+                "workspace_id": workspace_id,
+                "email": f"{user_id}@example.test",
+                "now": now,
+            },
+        )
+        connection.execute(
+            text(
+                "INSERT INTO sessions (id, workspace_id, user_id, token_hash, "
+                "expires_at, last_seen_at) "
+                "VALUES (:id, :workspace_id, :user_id, :token_hash, :expires_at, :now)"
+            ),
+            {
+                "id": uuid4(),
+                "workspace_id": workspace_id,
+                "user_id": user_id,
+                "token_hash": sha256(token.encode()).hexdigest(),
+                "expires_at": now + timedelta(hours=1),
+                "now": now,
+            },
+        )
+
+    client = TestClient(app)
+    client.cookies.set("ecc_session", token)
+    try:
+        yield client, workspace_id, user_id, token
+    finally:
+        client.close()
+        _cleanup_workspace(workspace_id)
+
+
+def _cleanup_workspace(workspace_id: UUID) -> None:
+    with engine.begin() as connection:
+        for table in (
+            "triggers",
+            "automation_policies",
+            "workflow_versions",
+            "workflow_definitions",
+            "event_outbox",
+            "audit_events",
+            "idempotency_records",
+            "sessions",
+            "users",
+        ):
+            connection.execute(
+                text(f"DELETE FROM {table} WHERE workspace_id = :workspace_id"),  # noqa: S608
+                {"workspace_id": workspace_id},
+            )
+        connection.execute(
+            text("DELETE FROM workspaces WHERE id = :workspace_id"), {"workspace_id": workspace_id}
+        )
+
+
+def _headers(token: str, key: str | None = None) -> dict[str, str]:
+    csrf = new(settings.session_secret.encode(), token.encode(), "sha256").hexdigest()
+    headers = {"X-CSRF-Token": csrf, "X-Correlation-ID": str(uuid4())}
+    if key is not None:
+        headers["Idempotency-Key"] = key
+    return headers
+
+
+def _insert_workflow_family(workspace_id: UUID, user_id: UUID, workflow_id: str) -> None:
+    now = datetime.now(UTC)
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO workflow_definitions (id, workspace_id, workflow_id, created_by, "
+                "created_at, updated_at) VALUES (:id, :workspace_id, :workflow_id, :created_by, "
+                ":now, :now)"
+            ),
+            {
+                "id": uuid4(),
+                "workspace_id": workspace_id,
+                "workflow_id": workflow_id,
+                "created_by": user_id,
+                "now": now,
+            },
+        )
+
+
+def _insert_version_row(
+    workspace_id: UUID,
+    user_id: UUID,
+    workflow_id: str,
+    *,
+    version: int,
+    status: str,
+    graph: dict[str, Any] | None = None,
+) -> UUID:
+    graph = graph if graph is not None else _valid_graph()
+    row_id = uuid4()
+    now = datetime.now(UTC)
+    definition_hash = automation_workflows.compute_definition_hash(
+        graph=graph, trigger_refs=[], policy_ref=None
+    )
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                """
+                INSERT INTO workflow_versions (
+                    id, workspace_id, workflow_id, version, graph, trigger_refs, policy_ref,
+                    definition_hash, status, created_by, updated_by, created_at, updated_at
+                ) VALUES (
+                    :id, :workspace_id, :workflow_id, :version, CAST(:graph AS jsonb),
+                    '[]'::jsonb, NULL, :definition_hash, :status, :created_by, :created_by,
+                    :now, :now
+                )
+                """
+            ),
+            {
+                "id": row_id,
+                "workspace_id": workspace_id,
+                "workflow_id": workflow_id,
+                "version": version,
+                "graph": dumps(graph),
+                "definition_hash": definition_hash,
+                "status": status,
+                "created_by": user_id,
+                "now": now,
+            },
+        )
+    return row_id
+
+
+# ---------------------------------------------------------------------------
+# 1. Immutability trigger -- direct SQL only.
+# ---------------------------------------------------------------------------
+
+
+def test_draft_row_graph_is_freely_editable(
+    workflow_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    _client, workspace_id, user_id, _token = workflow_test_context
+    workflow_id = f"test.draft-editable.{uuid4().hex}"
+    _insert_workflow_family(workspace_id, user_id, workflow_id)
+    _insert_version_row(workspace_id, user_id, workflow_id, version=1, status="draft")
+
+    new_graph = {
+        "steps": [{"step_id": "only", "step_type": "condition", "on_success": "succeeded"}]
+    }
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "UPDATE workflow_versions SET graph = CAST(:graph AS jsonb) "
+                "WHERE workspace_id = :workspace_id AND workflow_id = :workflow_id"
+            ),
+            {"graph": dumps(new_graph), "workspace_id": workspace_id, "workflow_id": workflow_id},
+        )
+        row = (
+            connection.execute(
+                text(
+                    "SELECT graph FROM workflow_versions WHERE workspace_id = :workspace_id "
+                    "AND workflow_id = :workflow_id"
+                ),
+                {"workspace_id": workspace_id, "workflow_id": workflow_id},
+            )
+            .mappings()
+            .one()
+        )
+    assert row["graph"]["steps"][0]["step_id"] == "only"
+
+
+def test_active_row_graph_update_rejected_by_trigger(
+    workflow_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    _client, workspace_id, user_id, _token = workflow_test_context
+    workflow_id = f"test.active-immutable.{uuid4().hex}"
+    _insert_workflow_family(workspace_id, user_id, workflow_id)
+    _insert_version_row(workspace_id, user_id, workflow_id, version=1, status="active")
+
+    with pytest.raises(ProgrammingError) as excinfo:
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    "UPDATE workflow_versions SET graph = '{\"steps\":[]}'::jsonb "
+                    "WHERE workspace_id = :workspace_id AND workflow_id = :workflow_id"
+                ),
+                {"workspace_id": workspace_id, "workflow_id": workflow_id},
+            )
+    assert "immutable" in str(excinfo.value).lower()
+
+
+@pytest.mark.parametrize(
+    "column,sql_value",
+    [
+        ("trigger_refs", "'[\"manual\"]'::jsonb"),
+        ("policy_ref", "gen_random_uuid()"),
+        ("definition_hash", "'" + "0" * 64 + "'"),
+    ],
+)
+def test_retired_row_every_hashed_column_rejected(
+    workflow_test_context: tuple[TestClient, UUID, UUID, str], column: str, sql_value: str
+) -> None:
+    _client, workspace_id, user_id, _token = workflow_test_context
+    workflow_id = f"test.retired-immutable.{uuid4().hex}"
+    _insert_workflow_family(workspace_id, user_id, workflow_id)
+    _insert_version_row(workspace_id, user_id, workflow_id, version=1, status="retired")
+
+    with pytest.raises(ProgrammingError):
+        with engine.begin() as connection:
+            connection.execute(
+                text(  # noqa: S608
+                    f"UPDATE workflow_versions SET {column} = {sql_value} "
+                    "WHERE workspace_id = :workspace_id AND workflow_id = :workflow_id"
+                ),
+                {"workspace_id": workspace_id, "workflow_id": workflow_id},
+            )
+
+
+def test_status_and_updated_at_remain_editable_post_activation(
+    workflow_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    _client, workspace_id, user_id, _token = workflow_test_context
+    workflow_id = f"test.status-editable.{uuid4().hex}"
+    _insert_workflow_family(workspace_id, user_id, workflow_id)
+    _insert_version_row(workspace_id, user_id, workflow_id, version=1, status="active")
+
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "UPDATE workflow_versions SET status = 'retired', updated_at = now() "
+                "WHERE workspace_id = :workspace_id AND workflow_id = :workflow_id"
+            ),
+            {"workspace_id": workspace_id, "workflow_id": workflow_id},
+        )
+        status_value = connection.execute(
+            text(
+                "SELECT status FROM workflow_versions WHERE workspace_id = :workspace_id "
+                "AND workflow_id = :workflow_id"
+            ),
+            {"workspace_id": workspace_id, "workflow_id": workflow_id},
+        ).scalar_one()
+    assert status_value == "retired"
+
+
+def test_partial_unique_index_rejects_second_active_row(
+    workflow_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    _client, workspace_id, user_id, _token = workflow_test_context
+    workflow_id = f"test.dup-active.{uuid4().hex}"
+    _insert_workflow_family(workspace_id, user_id, workflow_id)
+    _insert_version_row(workspace_id, user_id, workflow_id, version=1, status="active")
+
+    with pytest.raises(IntegrityError):
+        _insert_version_row(workspace_id, user_id, workflow_id, version=2, status="active")
+
+
+# ---------------------------------------------------------------------------
+# 3. workflows.py functions.
+# ---------------------------------------------------------------------------
+
+
+def test_compute_definition_hash_is_deterministic_and_sensitive_to_every_input() -> None:
+    graph = _valid_graph()
+    h1 = automation_workflows.compute_definition_hash(
+        graph=graph, trigger_refs=["manual"], policy_ref=None
+    )
+    h2 = automation_workflows.compute_definition_hash(
+        graph=graph, trigger_refs=["manual"], policy_ref=None
+    )
+    assert h1 == h2
+    assert len(h1) == 64
+
+    other_graph = automation_workflows.compute_definition_hash(
+        graph={"steps": []}, trigger_refs=["manual"], policy_ref=None
+    )
+    assert other_graph != h1
+
+    other_triggers = automation_workflows.compute_definition_hash(
+        graph=graph, trigger_refs=["event"], policy_ref=None
+    )
+    assert other_triggers != h1
+
+    ref = uuid4()
+    other_policy = automation_workflows.compute_definition_hash(
+        graph=graph, trigger_refs=["manual"], policy_ref=ref
+    )
+    assert other_policy != h1
+
+
+def test_validate_graph_shape_accepts_a_well_formed_graph() -> None:
+    assert automation_workflows.validate_graph_shape(_valid_graph()) == []
+
+
+def test_validate_graph_shape_rejects_duplicate_step_ids() -> None:
+    graph = {
+        "steps": [
+            {"step_id": "s1", "step_type": "condition", "on_success": "succeeded"},
+            {"step_id": "s1", "step_type": "condition", "on_success": "succeeded"},
+        ]
+    }
+    violations = automation_workflows.validate_graph_shape(graph)
+    assert any("duplicate" in v for v in violations)
+
+
+def test_validate_graph_shape_rejects_unknown_edge_target() -> None:
+    graph = {"steps": [{"step_id": "s1", "step_type": "condition", "on_success": "nonexistent"}]}
+    violations = automation_workflows.validate_graph_shape(graph)
+    assert any("unknown step" in v for v in violations)
+
+
+def test_validate_graph_shape_rejects_backward_reference() -> None:
+    graph = {
+        "steps": [
+            {"step_id": "s1", "step_type": "condition", "on_success": "s2"},
+            {"step_id": "s2", "step_type": "condition", "on_success": "s1"},
+        ]
+    }
+    violations = automation_workflows.validate_graph_shape(graph)
+    assert any("not strictly later" in v for v in violations)
+
+
+def test_validate_graph_shape_requires_action_ref_for_action_steps() -> None:
+    graph = {"steps": [{"step_id": "s1", "step_type": "action", "on_success": "succeeded"}]}
+    violations = automation_workflows.validate_graph_shape(graph)
+    assert any("action_ref required" in v for v in violations)
+
+
+def test_create_workflow_draft_creates_family_and_first_version(
+    workflow_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    _client, workspace_id, user_id, _token = workflow_test_context
+    workflow_id = f"test.create-draft.{uuid4().hex}"
+
+    with SessionFactory() as session:
+        with session.begin():
+            created = automation_workflows.create_workflow_draft(
+                session,
+                workspace_id,
+                user_id,
+                workflow_id=workflow_id,
+                graph=_valid_graph(),
+                trigger_refs=["manual"],
+                policy_ref=None,
+            )
+        assert created.version == 1
+        assert created.status == "draft"
+        assert created.workflow_id == workflow_id
+
+
+def test_create_workflow_draft_second_call_increments_version(
+    workflow_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    _client, workspace_id, user_id, _token = workflow_test_context
+    workflow_id = f"test.increment.{uuid4().hex}"
+
+    with SessionFactory() as session:
+        with session.begin():
+            automation_workflows.create_workflow_draft(
+                session,
+                workspace_id,
+                user_id,
+                workflow_id=workflow_id,
+                graph=_valid_graph(),
+                trigger_refs=[],
+                policy_ref=None,
+            )
+    with SessionFactory() as session:
+        with session.begin():
+            second = automation_workflows.create_workflow_draft(
+                session,
+                workspace_id,
+                user_id,
+                workflow_id=workflow_id,
+                graph=_valid_graph(),
+                trigger_refs=[],
+                policy_ref=None,
+            )
+        assert second.version == 2
+
+
+def test_activate_workflow_version_retires_outgoing_and_activates_incoming(
+    workflow_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    _client, workspace_id, user_id, _token = workflow_test_context
+    workflow_id = f"test.activate.{uuid4().hex}"
+    _insert_workflow_family(workspace_id, user_id, workflow_id)
+    v1_id = _insert_version_row(workspace_id, user_id, workflow_id, version=1, status="active")
+    v2_id = _insert_version_row(workspace_id, user_id, workflow_id, version=2, status="draft")
+
+    with SessionFactory() as session:
+        with session.begin():
+            result = automation_workflows.activate_workflow_version(session, workspace_id, v2_id)
+        assert isinstance(result, automation_workflows.WorkflowVersion)
+        assert result.status == "active"
+
+    with engine.connect() as connection:
+        v1_status = connection.execute(
+            text("SELECT status FROM workflow_versions WHERE id = :id"), {"id": v1_id}
+        ).scalar_one()
+        v2_status = connection.execute(
+            text("SELECT status FROM workflow_versions WHERE id = :id"), {"id": v2_id}
+        ).scalar_one()
+    assert v1_status == "retired"
+    assert v2_status == "active"
+
+
+def test_activate_workflow_version_reactivating_already_active_is_a_noop(
+    workflow_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    _client, workspace_id, user_id, _token = workflow_test_context
+    workflow_id = f"test.reactivate-noop.{uuid4().hex}"
+    _insert_workflow_family(workspace_id, user_id, workflow_id)
+    v1_id = _insert_version_row(workspace_id, user_id, workflow_id, version=1, status="active")
+
+    with SessionFactory() as session:
+        with session.begin():
+            result = automation_workflows.activate_workflow_version(session, workspace_id, v1_id)
+        assert isinstance(result, automation_workflows.WorkflowVersion)
+        assert result.status == "active"
+
+
+def test_activate_workflow_version_retired_target_returns_not_draft(
+    workflow_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    _client, workspace_id, user_id, _token = workflow_test_context
+    workflow_id = f"test.retired-target.{uuid4().hex}"
+    _insert_workflow_family(workspace_id, user_id, workflow_id)
+    v1_id = _insert_version_row(workspace_id, user_id, workflow_id, version=1, status="retired")
+
+    with SessionFactory() as session:
+        with session.begin():
+            result = automation_workflows.activate_workflow_version(session, workspace_id, v1_id)
+        assert isinstance(result, automation_workflows.WorkflowVersionNotDraft)
+
+
+def test_activate_workflow_version_unknown_id_returns_not_found(
+    workflow_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    _client, workspace_id, _user_id, _token = workflow_test_context
+    with SessionFactory() as session:
+        with session.begin():
+            result = automation_workflows.activate_workflow_version(session, workspace_id, uuid4())
+        assert isinstance(result, automation_workflows.WorkflowVersionNotFound)
+
+
+def test_disable_workflow_version_retires_active(
+    workflow_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    _client, workspace_id, user_id, _token = workflow_test_context
+    workflow_id = f"test.disable.{uuid4().hex}"
+    _insert_workflow_family(workspace_id, user_id, workflow_id)
+    v1_id = _insert_version_row(workspace_id, user_id, workflow_id, version=1, status="active")
+
+    with SessionFactory() as session:
+        with session.begin():
+            result = automation_workflows.disable_workflow_version(session, workspace_id, v1_id)
+        assert isinstance(result, automation_workflows.WorkflowVersion)
+        assert result.status == "retired"
+
+
+def test_disable_workflow_version_non_active_returns_not_active(
+    workflow_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    _client, workspace_id, user_id, _token = workflow_test_context
+    workflow_id = f"test.disable-not-active.{uuid4().hex}"
+    _insert_workflow_family(workspace_id, user_id, workflow_id)
+    v1_id = _insert_version_row(workspace_id, user_id, workflow_id, version=1, status="draft")
+
+    with SessionFactory() as session:
+        with session.begin():
+            result = automation_workflows.disable_workflow_version(session, workspace_id, v1_id)
+        assert isinstance(result, automation_workflows.WorkflowVersionNotActive)
+
+
+# ---------------------------------------------------------------------------
+# 4. HTTP endpoints.
+# ---------------------------------------------------------------------------
+
+
+def test_create_workflow_via_endpoint(
+    workflow_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    client, _workspace_id, _user_id, token = workflow_test_context
+    workflow_id = f"test.http-create.{uuid4().hex}"
+
+    response = client.post(
+        "/api/v1/automations/workflows",
+        json={"workflow_id": workflow_id, "graph": _valid_graph(), "trigger_refs": ["manual"]},
+        headers=_headers(token, key="create-1"),
+    )
+    assert response.status_code == 201, response.text
+    body = response.json()
+    assert body["workflow_id"] == workflow_id
+    assert body["version"] == 1
+    assert body["status"] == "draft"
+    assert len(body["definition_hash"]) == 64
+
+
+def test_create_workflow_second_call_appends_version_two(
+    workflow_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    client, _workspace_id, _user_id, token = workflow_test_context
+    workflow_id = f"test.http-append.{uuid4().hex}"
+    payload = {"workflow_id": workflow_id, "graph": _valid_graph(), "trigger_refs": []}
+
+    first = client.post(
+        "/api/v1/automations/workflows", json=payload, headers=_headers(token, key="append-1")
+    )
+    second = client.post(
+        "/api/v1/automations/workflows", json=payload, headers=_headers(token, key="append-2")
+    )
+    assert first.status_code == 201
+    assert second.status_code == 201
+    assert first.json()["version"] == 1
+    assert second.json()["version"] == 2
+
+
+def test_create_workflow_malformed_graph_is_schema_invalid(
+    workflow_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    client, _workspace_id, _user_id, token = workflow_test_context
+    graph = {
+        "steps": [
+            {"step_id": "s1", "step_type": "condition", "on_success": "s1"},
+        ]
+    }
+    response = client.post(
+        "/api/v1/automations/workflows",
+        json={
+            "workflow_id": f"test.http-invalid.{uuid4().hex}",
+            "graph": graph,
+            "trigger_refs": [],
+        },
+        headers=_headers(token, key="invalid-1"),
+    )
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "SCHEMA_INVALID"
+
+
+def test_get_workflow_via_endpoint(
+    workflow_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    client, _workspace_id, _user_id, token = workflow_test_context
+    workflow_id = f"test.http-get.{uuid4().hex}"
+    created = client.post(
+        "/api/v1/automations/workflows",
+        json={"workflow_id": workflow_id, "graph": _valid_graph(), "trigger_refs": []},
+        headers=_headers(token, key="get-create"),
+    ).json()
+
+    response = client.get(f"/api/v1/automations/workflows/{created['id']}")
+    assert response.status_code == 200
+    assert response.json()["workflow_id"] == workflow_id
+
+
+def test_get_unknown_workflow_is_404(
+    workflow_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    client, _workspace_id, _user_id, _token = workflow_test_context
+    response = client.get(f"/api/v1/automations/workflows/{uuid4()}")
+    assert response.status_code == 404
+    assert response.json()["error"]["code"] == "WORKFLOW_NOT_FOUND"
+
+
+def test_list_workflows_via_endpoint(
+    workflow_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    client, _workspace_id, _user_id, token = workflow_test_context
+    workflow_id = f"test.http-list.{uuid4().hex}"
+    client.post(
+        "/api/v1/automations/workflows",
+        json={"workflow_id": workflow_id, "graph": _valid_graph(), "trigger_refs": []},
+        headers=_headers(token, key="list-create"),
+    )
+    response = client.get("/api/v1/automations/workflows")
+    assert response.status_code == 200
+    summaries = {w["workflow_id"]: w for w in response.json()["workflows"]}
+    assert workflow_id in summaries
+    assert summaries[workflow_id]["latest_version"] == 1
+    assert summaries[workflow_id]["active_version"] is None
+
+
+def test_publish_workflow_via_endpoint(
+    workflow_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    client, _workspace_id, _user_id, token = workflow_test_context
+    workflow_id = f"test.http-publish.{uuid4().hex}"
+    created = client.post(
+        "/api/v1/automations/workflows",
+        json={"workflow_id": workflow_id, "graph": _valid_graph(), "trigger_refs": []},
+        headers=_headers(token, key="publish-create"),
+    ).json()
+
+    response = client.post(
+        f"/api/v1/automations/workflows/{created['id']}/publish",
+        headers=_headers(token, key="publish-1"),
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "active"
+
+
+def test_publish_unknown_workflow_is_404(
+    workflow_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    client, _workspace_id, _user_id, token = workflow_test_context
+    response = client.post(
+        f"/api/v1/automations/workflows/{uuid4()}/publish",
+        headers=_headers(token, key="publish-404"),
+    )
+    assert response.status_code == 404
+    assert response.json()["error"]["code"] == "WORKFLOW_NOT_FOUND"
+
+
+def test_publish_retired_version_is_conflict(
+    workflow_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    client, workspace_id, user_id, token = workflow_test_context
+    workflow_id = f"test.http-publish-retired.{uuid4().hex}"
+    _insert_workflow_family(workspace_id, user_id, workflow_id)
+    retired_id = _insert_version_row(
+        workspace_id, user_id, workflow_id, version=1, status="retired"
+    )
+
+    response = client.post(
+        f"/api/v1/automations/workflows/{retired_id}/publish",
+        headers=_headers(token, key="publish-retired"),
+    )
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "WORKFLOW_VERSION_NOT_DRAFT"
+
+
+def test_disable_active_workflow_via_endpoint(
+    workflow_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    client, _workspace_id, _user_id, token = workflow_test_context
+    workflow_id = f"test.http-disable.{uuid4().hex}"
+    created = client.post(
+        "/api/v1/automations/workflows",
+        json={"workflow_id": workflow_id, "graph": _valid_graph(), "trigger_refs": []},
+        headers=_headers(token, key="disable-create"),
+    ).json()
+    client.post(
+        f"/api/v1/automations/workflows/{created['id']}/publish",
+        headers=_headers(token, key="disable-publish"),
+    )
+
+    response = client.post(
+        f"/api/v1/automations/workflows/{created['id']}/disable",
+        headers=_headers(token, key="disable-1"),
+    )
+    assert response.status_code == 200
+    assert response.json()["status"] == "retired"
+
+
+def test_disable_draft_workflow_is_workflow_not_active(
+    workflow_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    client, _workspace_id, _user_id, token = workflow_test_context
+    workflow_id = f"test.http-disable-draft.{uuid4().hex}"
+    created = client.post(
+        "/api/v1/automations/workflows",
+        json={"workflow_id": workflow_id, "graph": _valid_graph(), "trigger_refs": []},
+        headers=_headers(token, key="disable-draft-create"),
+    ).json()
+
+    response = client.post(
+        f"/api/v1/automations/workflows/{created['id']}/disable",
+        headers=_headers(token, key="disable-draft-1"),
+    )
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "WORKFLOW_NOT_ACTIVE"
+
+
+def test_create_workflow_requires_csrf(
+    workflow_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    client, _workspace_id, _user_id, _token = workflow_test_context
+    response = client.post(
+        "/api/v1/automations/workflows",
+        json={
+            "workflow_id": f"test.no-csrf.{uuid4().hex}",
+            "graph": _valid_graph(),
+            "trigger_refs": [],
+        },
+        headers={"Idempotency-Key": "no-csrf"},
+    )
+    assert response.status_code == 403
+
+
+def test_create_workflow_requires_authentication(
+    workflow_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    client, _workspace_id, _user_id, token = workflow_test_context
+    client.cookies.clear()
+    response = client.post(
+        "/api/v1/automations/workflows",
+        json={
+            "workflow_id": f"test.no-auth.{uuid4().hex}",
+            "graph": _valid_graph(),
+            "trigger_refs": [],
+        },
+        headers=_headers(token, key="no-auth"),
+    )
+    assert response.status_code == 401
+
+
+def test_create_workflow_idempotency_replay_returns_identical_response(
+    workflow_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    client, _workspace_id, _user_id, token = workflow_test_context
+    workflow_id = f"test.http-idempotent.{uuid4().hex}"
+    payload = {"workflow_id": workflow_id, "graph": _valid_graph(), "trigger_refs": []}
+    headers = _headers(token, key="replay-key")
+
+    first = client.post("/api/v1/automations/workflows", json=payload, headers=headers)
+    second = client.post("/api/v1/automations/workflows", json=payload, headers=headers)
+    assert first.status_code == 201
+    assert second.status_code == 201
+    ignored = {"request_id", "correlation_id"}
+    first_body = {k: v for k, v in first.json().items() if k not in ignored}
+    second_body = {k: v for k, v in second.json().items() if k not in ignored}
+    assert first_body == second_body
+
+
+def test_workflow_is_hidden_across_workspaces(
+    workflow_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    client, _workspace_id, _user_id, token = workflow_test_context
+    workflow_id = f"test.cross-workspace.{uuid4().hex}"
+    created = client.post(
+        "/api/v1/automations/workflows",
+        json={"workflow_id": workflow_id, "graph": _valid_graph(), "trigger_refs": []},
+        headers=_headers(token, key="cross-create"),
+    ).json()
+
+    other_workspace_id = uuid4()
+    other_user_id = uuid4()
+    other_token = f"session-{uuid4()}"
+    now = datetime.now(UTC)
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO workspaces (id, name, timezone, created_at) "
+                "VALUES (:id, 'Other Workspace', 'UTC', :now)"
+            ),
+            {"id": other_workspace_id, "now": now},
+        )
+        connection.execute(
+            text(
+                "INSERT INTO users (id, workspace_id, email, password_hash, created_at) "
+                "VALUES (:id, :workspace_id, :email, 'hash', :now)"
+            ),
+            {
+                "id": other_user_id,
+                "workspace_id": other_workspace_id,
+                "email": f"{other_user_id}@example.test",
+                "now": now,
+            },
+        )
+        connection.execute(
+            text(
+                "INSERT INTO sessions (id, workspace_id, user_id, token_hash, "
+                "expires_at, last_seen_at) "
+                "VALUES (:id, :workspace_id, :user_id, :token_hash, :expires_at, :now)"
+            ),
+            {
+                "id": uuid4(),
+                "workspace_id": other_workspace_id,
+                "user_id": other_user_id,
+                "token_hash": sha256(other_token.encode()).hexdigest(),
+                "expires_at": now + timedelta(hours=1),
+                "now": now,
+            },
+        )
+    other_client = TestClient(app)
+    other_client.cookies.set("ecc_session", other_token)
+    try:
+        get_response = other_client.get(f"/api/v1/automations/workflows/{created['id']}")
+        assert get_response.status_code == 404
+        assert get_response.json()["error"]["code"] == "WORKFLOW_NOT_FOUND"
+
+        list_response = other_client.get("/api/v1/automations/workflows")
+        assert list_response.status_code == 200
+        assert all(w["workflow_id"] != workflow_id for w in list_response.json()["workflows"])
+
+        publish_response = other_client.post(
+            f"/api/v1/automations/workflows/{created['id']}/publish",
+            headers=_headers(other_token, key="cross-publish"),
+        )
+        assert publish_response.status_code == 404
+    finally:
+        other_client.close()
+        _cleanup_workspace(other_workspace_id)
+
+
+def test_create_workflow_rejects_nonexistent_policy_ref(
+    workflow_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    client, _workspace_id, _user_id, token = workflow_test_context
+    response = client.post(
+        "/api/v1/automations/workflows",
+        json={
+            "workflow_id": f"test.bad-policy-ref.{uuid4().hex}",
+            "graph": _valid_graph(),
+            "trigger_refs": [],
+            "policy_ref": str(uuid4()),
+        },
+        headers=_headers(token, key="bad-policy-ref"),
+    )
+    assert response.status_code == 404
+    assert response.json()["error"]["code"] == "POLICY_NOT_FOUND"
