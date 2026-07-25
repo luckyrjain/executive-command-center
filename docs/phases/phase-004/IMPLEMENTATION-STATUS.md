@@ -285,6 +285,8 @@ Task 11's original audit named a documentation-accuracy gap as its last, lowest-
 
 **Not changed.** `IMPLEMENTATION-STATUS.md`'s own Task 14 evidence section above is left as the historical record of what was known and done at that time (it correctly said "not yet re-verified"); the new confirming-CI-outcome content lives here in Task 17 rather than retroactively rewriting Task 14's already-shipped text.
 
+**Reviewed and corrected before merge.** An independent review agent found one real, minor inconsistency in this PR's first version: `PHASE-004-ai-runtime.md` and this file both got their frontmatter `version` bumped for their substantive content changes, but `EVALUATION-CONTRACT.md`'s stayed at `0.2.0` despite its own substantive addition (the "Re-verified against a live model, twice" paragraph with new p95-latency/schema-validity figures). Fixed by bumping it to `0.3.0` to match the same pattern. The review found no other issues -- confirmed the pre-PR "exactly one model"/"one evaluated task type" claims were genuinely stale, cross-checked every Task-number reference in the new text against this file's own Delivery tasks table, and verified the cited PR #51/#53 evaluation figures are internally consistent with this file's pre-existing text.
+
 **Full regression.** No code changed by this task; `tests/` suite unaffected. `ruff check`/`format`/`mypy backend` -- n/a (no Python files touched).
 
 ## Sandbox constraint (carried forward from the design pass)
