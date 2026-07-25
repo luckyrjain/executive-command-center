@@ -28,8 +28,8 @@ Phase 0 — Repository Foundation         [Implemented]
   -> Phase 1 — Executive Dashboard MVP [Engineering delivery complete; exit gates open]
   -> Phase 2 — Knowledge Platform      [Approved for Implementation; in progress, parallel to open Phase 1 exit gates]
   -> Phase 3 — Human Attention Engine  [Approved for Implementation; in progress, parallel-start exception granted]
-  -> Phase 4 — AI Runtime              [Approved for Implementation; beginning, parallel-start exception granted]
-  -> Phase 5 — Automation              [Draft]
+  -> Phase 4 — AI Runtime              [Engineering delivery complete; exit gates open, known limitations accepted]
+  -> Phase 5 — Automation              [Draft; design work authorized in parallel, exception granted]
   -> Phase 6 — Engineering Workspace   [Draft]
   -> Phase 7 — Personal Intelligence   [Draft]
   -> Phase 8 — Multi-user Workspaces   [Draft]
@@ -97,7 +97,9 @@ Implementation plan: [Phase 3 Human Attention Engine Implementation Plan](superp
 
 **Status:** Approved for Implementation; contracts moved from Draft after the repository owner reviewed and accepted `docs/superpowers/specs/2026-07-23-phase-4-ai-runtime-design.md`'s proposed resolution for the first activation (local model: Ollama serving `qwen2.5:1.5b-instruct-q4_K_M`, no remote provider registered; deterministic routing algorithm; immutable prompt/tool versioning; Pydantic-based structured-output validation; two read-only first tools; concrete budget/timeout/circuit-breaker numbers; a 20-example first evaluation dataset for `attention.explain_item`) and the four named approval gates (approved local/remote models and providers, data-class egress matrix, evaluation floors, trace retention), resolved in `PHASE-004-ai-runtime.md`'s "Approved models, providers and evaluation floors" section. Ollama's RFC-005 technology-activation gate ("AI-runtime phase specification and ADR review") is satisfied by this design doc plus `docs/adr/ADR-0012-ollama-local-inference.md` and `docs/RFC-005.md` v1.3.0. Implementation begins by explicit repository-owner authorization to proceed in parallel with Phase 3's own open exit gate (the two-week dogfood window is still open) -- the same kind of exception Phase 2 and Phase 3 each received. This authorization does not itself close Phase 3's dogfood gate.
 
-Implementation has landed through Task 17 of the first activation slice (post-launch audit fixes, including a documentation-freshness pass) -- see `phase-004/IMPLEMENTATION-STATUS.md`. The originally scoped first activation was deliberately narrow: one local model, no remote provider, two read-only tools, one evaluated task type. Two parts of that scope have since been explicitly reopened and repository-owner-approved within this same activation, not silently inherited: a second local model and a second evaluated task type, `meeting.prep_summary` (`PHASE-004-ai-runtime.md`'s "Approved models, providers and evaluation floors" section has the current detail). A remote provider and any mutating tool remain explicitly deferred to a later Phase 4 slice this design pass did not schedule.
+Implementation has landed through Task 19 of the first activation slice (post-launch audit fixes and closure) -- see `phase-004/IMPLEMENTATION-STATUS.md`. The originally scoped first activation was deliberately narrow: one local model, no remote provider, two read-only tools, one evaluated task type. Two parts of that scope have since been explicitly reopened and repository-owner-approved within this same activation, not silently inherited: a second local model and a second evaluated task type, `meeting.prep_summary` (`PHASE-004-ai-runtime.md`'s "Approved models, providers and evaluation floors" section has the current detail). A remote provider and any mutating tool remain explicitly deferred to a later Phase 4 slice this design pass did not schedule.
+
+Phase 4's own exit gate remains open, by repository-owner acceptance rather than by oversight: two evaluation-floor misses (`attention.explain_item`'s stable `prohibited_fact` count, `meeting.prep_summary`'s p95 latency) are documented, evidence-backed known limitations of this activation's small local model, not pursued further as of 2026-07-25, and no promotion decision has been made for either task type (`PHASE-004-ai-runtime.md`'s "Phase 4 exit status and Phase 5 parallel-start" section has the full detail). The repository owner's own independent full-repo re-verification, also named in Phase 4's exit criteria, has not yet been performed.
 
 Specification: [PHASE-004](phases/PHASE-004-ai-runtime.md)  
 Design doc: [Phase 4 AI Runtime Design](superpowers/specs/2026-07-23-phase-4-ai-runtime-design.md)  
@@ -106,7 +108,7 @@ Technology activation: [RFC-005 v1.3.0](RFC-005.md), [ADR-0012](adr/ADR-0012-oll
 
 ## Phase 5 — Automation
 
-**Status:** Draft / Planned.
+**Status:** Draft / Planned. Design work authorized to begin in parallel with Phase 4's own still-open exit gate -- the same kind of parallel-start exception Phases 2, 3 and 4 each already received (`PHASE-004-ai-runtime.md`'s "Phase 4 exit status and Phase 5 parallel-start" section, granted 2026-07-25). This authorizes Phase 5's own design doc, RFC amendments, ADRs and contracts to proceed (matching Phase 4's own Task 0 precedent before any implementation began); it does not itself move any Phase 5 contract to Approved for Implementation -- that follows the same review-and-acceptance process every prior phase's contracts went through, per this document's own Delivery principles above ("avoid implementation outside the approved phase").
 
 Versioned workflows, simulation, explicit approval, durable execution, schedules, cancellation, compensation and kill switches.
 
