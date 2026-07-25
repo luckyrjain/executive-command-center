@@ -2,7 +2,7 @@
 id: PHASE-004
 title: AI Runtime
 status: Approved for Implementation
-version: 0.4.0
+version: 0.5.0
 owner: Lucky Jain
 depends_on:
   - PHASE-003
@@ -115,6 +115,12 @@ This resolution originally covered only a first, deliberately narrow activation 
 ## Dependency exit posture (approved 2026-07-23)
 
 Phase 4 implementation proceeds in parallel with Phase 3's own still-open exit gate (the two-week dogfood window, `docs/runbooks/PHASE-3-DOGFOOD.md`, at 0/14 days recorded), under the same kind of parallel-start exception the repository owner explicitly granted Phase 2 and Phase 3 (`docs/ROADMAP.md`'s Phase 2 and Phase 3 status notes) -- granted for Phase 4 by the repository owner's explicit review and acceptance of this document's concrete decisions (model choice, routing rules, tool scope, budgets, evaluation floors, threat model), recorded in `docs/ROADMAP.md`'s Phase 4 status note. This does not itself claim Phase 3 has exited, and Phase 4's own exit criteria above (including "zero open Critical, High or Medium findings" and the evaluation baseline) still apply in full as implementation proceeds.
+
+### Phase 4 exit status and Phase 5 parallel-start (2026-07-25)
+
+Phase 4's own exit criteria above remain not fully met: the evaluation baseline names two floors still missed against a live model -- `attention.explain_item`'s `prohibited_fact_count` (1, floor requires 0) and `meeting.prep_summary`'s p95 latency (31.28s, floor requires <25s) -- both documented, evidence-backed known limitations of this activation's single small local model (`phase-004/IMPLEMENTATION-STATUS.md`'s "What remains before Phase 4 itself can exit" section has the full detail and fix history). The repository owner reviewed both and accepted them as known limitations rather than directing further speculative fix attempts; no promotion decision has been made for either task type, and none is made by this acceptance. The independent full-repo re-verification this document's exit criteria also names remains the repository owner's own separate task, not completed by this closure.
+
+Notwithstanding that open gate, the repository owner authorized Phase 5 to begin its own design work in parallel -- the same kind of parallel-start exception this section already grants Phase 4 relative to Phase 3's open dogfood gate above, and Phase 2/3 each received relative to their own predecessors (`docs/ROADMAP.md`'s Phase 5 status note). This authorizes Phase 5 *design* work (its own design doc, RFC amendments, ADRs and contracts -- matching this phase's own Task 0 precedent before any implementation began) to proceed while Phase 4's exit gate stays open; it does not move any Phase 5 contract to Approved for Implementation, and does not exempt Phase 4 from eventually meeting its own exit criteria in full.
 
 ## Rollback plan
 
