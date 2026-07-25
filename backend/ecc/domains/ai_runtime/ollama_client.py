@@ -59,14 +59,30 @@ DEFAULT_PER_MODEL_CALL_TIMEOUT_SECONDS = 20.0
 # network read against a genuinely hung connection. Deliberately *not*
 # `DEFAULT_PER_MODEL_CALL_TIMEOUT_SECONDS` or any one task's declared
 # timeout: this client is constructed once and shared across every task
-# type (`runtime.py:get_ollama_adapter`'s single FastAPI-DI instance), so a
-# fixed value here must be generous enough to never itself become the
-# limiting factor for any task's real per-call deadline -- the manual
-# wall-clock loop in `generate()` below is what actually enforces that,
-# per-call. Set to Decision 5's total per-run wall-clock budget: no single
-# per-model-call timeout should ever legitimately need to exceed the
-# entire run's own budget.
-_HTTPX_TRANSPORT_TIMEOUT_SECONDS = 60.0
+# type (`runtime.py:get_ollama_adapter`'s single FastAPI-DI instance), and
+# the `ollama` package's `Client.generate()` has a closed keyword-argument
+# signature with no per-request timeout override -- confirmed by reading
+# its source -- so this value cannot vary per call the way the manual
+# wall-clock deadline below can. It must stay a fixed ceiling comfortably
+# above every currently-registered task's own declared timeout (`router.py:
+# TASK_REQUIREMENTS` -- 20s/25s today) so a longer-than-`DEFAULT_PER_MODEL_
+# CALL_TIMEOUT_SECONDS` per-call override (`meeting.prep_summary`'s 25s)
+# is never silently cut short here first.
+#
+# This is a real, accepted trade-off, not a free backstop: for the common
+# case (many small streamed chunks), the manual deadline loop below is what
+# actually enforces each task's declared timeout, checked between every
+# chunk. But that loop cannot preempt a single `next(stream)` call already
+# in flight -- if the *very first* read hangs (a genuinely dead connection,
+# the scenario this constant exists to catch at all), this fixed value is
+# the only thing bounding that hang, for every task type uniformly. Kept
+# deliberately close to the largest registered timeout (not Decision 5's
+# full 60s total-run budget, which would let one hung single-chunk read
+# silently consume half the entire run's wall-clock allowance) -- if a
+# future task type registers a timeout close to this constant, raise this
+# constant too; `test_ai_runtime_budgets_postgres.py` asserts the margin
+# holds so this can't silently drift out of sync.
+_HTTPX_TRANSPORT_TIMEOUT_SECONDS = 30.0
 
 
 class OllamaCallTimeout(Exception):

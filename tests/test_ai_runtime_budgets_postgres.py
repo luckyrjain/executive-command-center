@@ -54,6 +54,7 @@ from ecc.domains.ai_runtime.budgets import (
     reflection_enabled,
 )
 from ecc.domains.ai_runtime.ollama_client import (
+    _HTTPX_TRANSPORT_TIMEOUT_SECONDS,
     DEFAULT_PER_MODEL_CALL_TIMEOUT_SECONDS,
     Chunk,
     OllamaAdapter,
@@ -768,3 +769,25 @@ def test_run_budget_meeting_prep_summary_per_model_call_seconds_diverges_from_de
     budget = RunBudget.from_policy(policy)
     assert budget.per_model_call_seconds == 25.0
     assert budget.per_model_call_seconds != DEFAULT_PER_MODEL_CALL_TIMEOUT_SECONDS
+
+
+def test_httpx_transport_timeout_stays_ahead_of_every_registered_task_timeout() -> None:
+    """`_HTTPX_TRANSPORT_TIMEOUT_SECONDS` is a single fixed value shared
+    across every task type (the `ollama` package's `Client.generate()` has
+    no per-request timeout override, confirmed by reading its source --
+    `ollama_client.py`'s own updated comment on this constant) -- it must
+    stay comfortably ahead of the largest currently-registered per-task
+    timeout, or a legitimate, longer-than-default `generate(timeout_
+    seconds=...)` override (`meeting.prep_summary`'s 25s) would be
+    silently cut short by this constant first. This is a guard rail: if a
+    future task type's own declared timeout creeps close to (or past)
+    this constant, this test fails loudly instead of that gap being
+    reintroduced silently the way it was found during Phase C's audit.
+    """
+    largest_registered_timeout = max(
+        requirements.timeout_seconds for requirements in air.TASK_REQUIREMENTS.values()
+    )
+    assert _HTTPX_TRANSPORT_TIMEOUT_SECONDS > largest_registered_timeout
+    # A real margin, not just barely ahead -- catches the constant being
+    # bumped by only a token amount alongside a task timeout increase.
+    assert _HTTPX_TRANSPORT_TIMEOUT_SECONDS - largest_registered_timeout >= 5.0
