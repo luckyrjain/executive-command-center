@@ -76,7 +76,30 @@ TASK_REQUIREMENTS: dict[str, TaskRequirements] = {
     "meeting.prep_summary": TaskRequirements(
         capability="summarization",
         requires_structured_output=True,
-        timeout_seconds=20.0,
+        # Deliberately *above* explain_item's 20s, not equal to it, despite
+        # Decision 5's budget table listing one shared "20s per-model-call"
+        # number: this task's full seven-section evidence-bundle prompt is
+        # substantially larger than explain_item's single-item explanation,
+        # and its three heaviest evaluation examples (`rich_all_sections`,
+        # `participants_and_commitments_heavy`, `timeline_heavy`) measured
+        # at 20.07-20.2s against real Ollama -- a genuine, repeatable
+        # near-miss (`EVALUATION-CONTRACT.md`'s "Sandbox constraint"
+        # section), not one-off noise, driven by this small model's decode
+        # throughput on this task's larger prompts, not a bug in prompt
+        # rendering or the timeout mechanism itself. 25s gives real margin
+        # over the observed ~20.1-20.2s (not just clearing it by hundreds
+        # of milliseconds) while a schema-repair retry (this task's own
+        # prompt strictly larger again) still fits twice within the 60s
+        # total per-run wall-clock budget alongside routing/tool-dispatch/
+        # validation overhead. Genuinely enforced per task type via
+        # `ollama_client.py:OllamaAdapter.generate`'s `timeout_seconds`
+        # override (`runtime.py:execute_run` passes `budget.per_model_
+        # call_seconds` here) -- previously this field was read into
+        # `RunBudget.per_model_call_seconds` but never actually reached
+        # the real per-call deadline, which was silently always the
+        # adapter's own fixed constructor default regardless of task type
+        # (see that module's own updated docstring).
+        timeout_seconds=25.0,
         # Deliberately *below* explain_item's 512, not above it, despite
         # this task's larger 150-word cap (vs. explain_item's 60) -- 768
         # was tried first on the same reasoning the comment this replaces

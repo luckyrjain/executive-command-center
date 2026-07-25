@@ -1379,7 +1379,11 @@ def execute_run(
         eval_count: int | None = None
         prompt_eval_count: int | None = None
         for chunk in adapter.generate(
-            prompt_text, decision.model_id, budget.max_output_tokens, cancellation_token=token
+            prompt_text,
+            decision.model_id,
+            budget.max_output_tokens,
+            cancellation_token=token,
+            timeout_seconds=budget.per_model_call_seconds,
         ):
             parts.append(chunk.text)
             if chunk.done:
