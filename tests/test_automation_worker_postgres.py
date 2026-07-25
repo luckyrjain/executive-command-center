@@ -32,6 +32,7 @@ from __future__ import annotations
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from hashlib import sha256
 from typing import Any
 from uuid import UUID, uuid4
@@ -42,6 +43,8 @@ from sqlalchemy import text
 
 from ecc.config import get_settings
 from ecc.database import SessionFactory, engine
+from ecc.domains.automation import approvals as automation_approvals
+from ecc.domains.automation import policy as automation_policy
 from ecc.domains.automation import worker as automation_worker
 from ecc.domains.automation import workflows as automation_workflows
 from ecc.domains.automation.adapters import (
@@ -117,6 +120,32 @@ class FailingAdapter:
     def execute(self, action_input: EchoInput) -> EchoOutput:  # noqa: D102
         self.execute_calls += 1
         raise RuntimeError("adapter always fails")
+
+
+class HighImpactAdapter:
+    """`person-directed` (Decision 5) -- always requires per-run approval
+    regardless of `approval_mode` (Task 3's gate). Counts `execute()`
+    calls exactly like `EchoAdapter`, so a test can assert it stays `0`
+    while a run sits in `waiting_approval`.
+    """
+
+    adapter_id = "test.high-impact"
+    input_schema = EchoInput
+    output_schema = EchoOutput
+    reversible = False
+    high_impact_categories: frozenset[str] = frozenset({"person-directed"})
+
+    def __init__(self) -> None:
+        self.execute_calls = 0
+        self.simulate_calls = 0
+
+    def simulate(self, action_input: EchoInput) -> EchoOutput:  # noqa: D102
+        self.simulate_calls += 1
+        return EchoOutput(value=action_input.value)
+
+    def execute(self, action_input: EchoInput) -> EchoOutput:  # noqa: D102
+        self.execute_calls += 1
+        return EchoOutput(value=action_input.value)
 
 
 class DigestVisibilityProbeAdapter:
@@ -258,6 +287,7 @@ def worker_test_context() -> Iterator[tuple[UUID, UUID]]:
 def _cleanup_workspace(workspace_id: UUID) -> None:
     with engine.begin() as connection:
         for table in (
+            "approval_requests",
             "workflow_run_steps",
             "workflow_runs",
             "triggers",
@@ -279,9 +309,85 @@ def _cleanup_workspace(workspace_id: UUID) -> None:
         )
 
 
+def _create_policy(
+    workspace_id: UUID,
+    user_id: UUID,
+    workflow_id: str,
+    *,
+    approval_mode: automation_policy.ApprovalMode = "bounded_recurring",
+    count_limit: int = 1000,
+) -> automation_policy.AutomationPolicy:
+    """Task 3's own test helper. `create_policy` requires `workflow_id` to
+    already name a real `workflow_definitions` row (`policy.py`'s own FK),
+    so this is always called *after* `automation_workflows.create_workflow_
+    draft` has created that row for the same `workflow_id` -- `_publish_
+    workflow` below sequences the two calls accordingly.
+    """
+    with SessionFactory() as session, session.begin():
+        return automation_policy.create_policy(
+            session,
+            workspace_id,
+            user_id,
+            workflow_id=workflow_id,
+            action_types=[],
+            data_classes=[],
+            value_limit=Decimal("1000000"),
+            count_limit=count_limit,
+            rate_limit=None,
+            schedule=None,
+            approval_mode=approval_mode,
+        )
+
+
 def _publish_workflow(
-    workspace_id: UUID, user_id: UUID, workflow_id: str, graph: dict[str, Any]
+    workspace_id: UUID,
+    user_id: UUID,
+    workflow_id: str,
+    graph: dict[str, Any],
+    *,
+    approval_mode: automation_policy.ApprovalMode = "bounded_recurring",
+    count_limit: int = 1000,
 ) -> automation_workflows.WorkflowVersion:
+    """Task 3 extends this in place (this task's own instruction): every
+    run in this test module now resolves against a real, *usable*
+    `automation_policies` row -- Task 3's dispatch gate fail-closes on a
+    run with no usable policy at all (`worker.py`'s own module docstring,
+    "Task 3's approval/policy gate" section), which would otherwise
+    silently break every one of Task 2's own pre-existing tests below
+    (none of which are testing approval/policy semantics themselves). A
+    `bounded_recurring` policy with a generous default `count_limit`
+    reproduces Task 2's original "everything just dispatches" behavior
+    exactly, since every fake adapter in this module declares
+    `high_impact_categories = frozenset()` (`bounded`, module docstring).
+    Tests that specifically exercise the approval gate or policy-
+    revocation/expiry blocking pass `approval_mode`/`count_limit`
+    explicitly, or revoke/expire the returned workflow's policy directly
+    via `automation_policy.revoke_policy`/a direct `UPDATE`.
+    """
+    # A throwaway version=1 draft exists solely to create the
+    # workflow_definitions family row automation_policies' own FK
+    # requires (policy.py's `workflow_id` FK) -- never activated,
+    # immediately superseded by the real, policy-bound draft below.
+    # create_workflow_draft's own "insert a new version" path (Decision 2:
+    # "editing a workflow always inserts a new row") makes this safe:
+    # nothing about the eventual active version's own content depends on
+    # this throwaway row, and no test in this module asserts a specific
+    # `workflow_version` number for `_publish_workflow`'s own return value
+    # (`active.version`, read back from whatever `activate_workflow_
+    # version` actually activated).
+    with SessionFactory() as session, session.begin():
+        automation_workflows.create_workflow_draft(
+            session,
+            workspace_id,
+            user_id,
+            workflow_id=workflow_id,
+            graph=graph,
+            trigger_refs=[],
+            policy_ref=None,
+        )
+    policy_row = _create_policy(
+        workspace_id, user_id, workflow_id, approval_mode=approval_mode, count_limit=count_limit
+    )
     with SessionFactory() as session, session.begin():
         draft = automation_workflows.create_workflow_draft(
             session,
@@ -290,7 +396,7 @@ def _publish_workflow(
             workflow_id=workflow_id,
             graph=graph,
             trigger_refs=[],
-            policy_ref=None,
+            policy_ref=policy_row.id,
         )
         activated = automation_workflows.activate_workflow_version(session, workspace_id, draft.id)
     assert isinstance(activated, automation_workflows.WorkflowVersion)
@@ -700,6 +806,7 @@ def test_unknown_outcome_surfaces_without_retry(worker_test_context: tuple[UUID,
         finished = automation_worker.process_claimed_run(session, run, registry, "worker-a")
     assert finished.status == "needs_review"
     assert echo.execute_calls == 0
+    assert finished.finished_at is None
 
 
 # ---------------------------------------------------------------------------
@@ -1084,3 +1191,530 @@ def test_adapter_registry_rejects_unknown_high_impact_category() -> None:
 def test_adapter_registry_get_returns_none_for_unknown_id() -> None:
     registry = AdapterRegistry()
     assert registry.get("nope") is None
+
+
+# ---------------------------------------------------------------------------
+# 15. Task 3: the approval/policy dispatch gate wired into run_step.
+# ---------------------------------------------------------------------------
+
+
+def test_high_impact_step_pauses_run_without_ever_calling_execute(
+    worker_test_context: tuple[UUID, UUID],
+) -> None:
+    """The required minimum this task's own instructions name first: a
+    high-impact-category step is never dispatched without an approved,
+    digest-matching request -- `execute_calls` stays `0`.
+    """
+    workspace_id, user_id = worker_test_context
+    workflow_id = f"test.high-impact-pause.{uuid4().hex}"
+    graph = _chained_graph(_action_step("s1", "test.high-impact"))
+    _publish_workflow(workspace_id, user_id, workflow_id, graph)
+    with SessionFactory() as session, session.begin():
+        automation_worker.enqueue_run(session, workspace_id, user_id, workflow_id=workflow_id)
+
+    adapter = HighImpactAdapter()
+    registry = _make_registry(adapter)
+    with SessionFactory() as session:
+        claimed = automation_worker.claim_next_run(session, "worker-a")
+    assert claimed is not None
+
+    with SessionFactory() as session:
+        finished = automation_worker.process_claimed_run(session, claimed, registry, "worker-a")
+    assert finished.status == "waiting_approval"
+    assert finished.current_step_index == 0
+    assert adapter.execute_calls == 0
+    # `waiting_approval` is not terminal (excluded from
+    # `_TERMINAL_RUN_STATUSES`) -- `finished_at` must stay unset while
+    # paused, or a later resume back to 'queued' would leave a stale,
+    # misleading timestamp on a run that is still actively in flight
+    # (`_pause_run`, as distinct from `_finish_run`).
+    assert finished.finished_at is None
+
+    # No workflow_run_steps row is written while paused -- the whole point
+    # of gating *before* the 'dispatched' INSERT (worker.py's own module
+    # docstring): a paused step must never look like Task 2's own
+    # crash-in-the-gap 'unknown' case to a later run_step call.
+    with SessionFactory() as session, session.begin():
+        steps = automation_worker.list_run_steps(session, workspace_id, claimed.id)
+    assert steps == []
+
+    with SessionFactory() as session, session.begin():
+        pending = automation_approvals.get_pending_approval(session, workspace_id, claimed.id, 0)
+    assert pending is not None
+    assert pending.status == "pending"
+    assert pending.high_impact_categories == ("person-directed",)
+
+
+def test_approving_correct_digest_resumes_run_and_dispatches_exactly_once(
+    worker_test_context: tuple[UUID, UUID],
+) -> None:
+    """The full path this task's own instructions require: request
+    created, approved with the correct digest, run resumes and the step
+    actually executes exactly once.
+    """
+    workspace_id, user_id = worker_test_context
+    workflow_id = f"test.high-impact-resume.{uuid4().hex}"
+    graph = _chained_graph(_action_step("s1", "test.high-impact", input_mapping={"value": "x"}))
+    _publish_workflow(workspace_id, user_id, workflow_id, graph)
+    with SessionFactory() as session, session.begin():
+        automation_worker.enqueue_run(session, workspace_id, user_id, workflow_id=workflow_id)
+
+    adapter = HighImpactAdapter()
+    registry = _make_registry(adapter)
+    with SessionFactory() as session:
+        claimed = automation_worker.claim_next_run(session, "worker-a")
+    assert claimed is not None
+    with SessionFactory() as session:
+        paused = automation_worker.process_claimed_run(session, claimed, registry, "worker-a")
+    assert paused.status == "waiting_approval"
+    assert adapter.execute_calls == 0
+    assert paused.finished_at is None
+
+    with SessionFactory() as session, session.begin():
+        pending = automation_approvals.get_pending_approval(session, workspace_id, claimed.id, 0)
+        assert pending is not None
+        decided = automation_approvals.decide_approval(
+            session,
+            workspace_id,
+            user_id,
+            pending.id,
+            "approved",
+            current_action_digest=pending.action_digest,
+        )
+    assert isinstance(decided, automation_approvals.ApprovalRequest)
+    assert decided.status == "approved"
+
+    # decide_approval's own internal _advance_run_after_decision already
+    # flipped the run back to 'queued' -- the next claim/process cycle
+    # picks it up exactly like any other queued run (worker.py's own
+    # "Resuming a waiting_approval run" module-docstring note), no
+    # separate resume-specific call required.
+    with SessionFactory() as session, session.begin():
+        resumed = automation_worker.get_run(session, workspace_id, claimed.id)
+    assert resumed is not None
+    assert resumed.status == "queued"
+    assert resumed.current_step_index == 0
+    # Regression check: an approved run flipped back to 'queued' must not
+    # carry a stale `finished_at` from its earlier pause -- a 'queued'
+    # (still actively progressing) run showing a non-null `finished_at`
+    # would be a real, observable inconsistency (see `_pause_run`'s
+    # docstring in worker.py for the full reasoning).
+    assert resumed.finished_at is None
+
+    with SessionFactory() as session:
+        reclaimed = automation_worker.claim_next_run(session, "worker-b")
+    assert reclaimed is not None
+    with SessionFactory() as session:
+        finished = automation_worker.process_claimed_run(session, reclaimed, registry, "worker-b")
+    assert finished.status == "succeeded"
+    assert adapter.execute_calls == 1
+    assert finished.finished_at is not None
+
+    with SessionFactory() as session, session.begin():
+        steps = automation_worker.list_run_steps(session, workspace_id, claimed.id)
+    assert len(steps) == 1
+    assert steps[0].status == "succeeded"
+
+
+def test_bounded_step_dispatches_without_any_approval_under_usable_policy(
+    worker_test_context: tuple[UUID, UUID],
+) -> None:
+    """A `bounded` (non-high-impact) step under a usable `bounded_recurring`
+    policy dispatches without needing any approval at all.
+    """
+    workspace_id, user_id = worker_test_context
+    workflow_id = f"test.bounded-no-approval.{uuid4().hex}"
+    graph = _chained_graph(_action_step("s1", "test.echo"))
+    _publish_workflow(workspace_id, user_id, workflow_id, graph, approval_mode="bounded_recurring")
+    with SessionFactory() as session, session.begin():
+        automation_worker.enqueue_run(session, workspace_id, user_id, workflow_id=workflow_id)
+
+    adapter = EchoAdapter()
+    registry = _make_registry(adapter)
+    with SessionFactory() as session:
+        claimed = automation_worker.claim_next_run(session, "worker-a")
+    assert claimed is not None
+    with SessionFactory() as session:
+        finished = automation_worker.process_claimed_run(session, claimed, registry, "worker-a")
+    assert finished.status == "succeeded"
+    assert adapter.execute_calls == 1
+
+    with SessionFactory() as session, session.begin():
+        approvals = automation_approvals.list_approvals(session, workspace_id)
+    assert approvals == []
+
+
+def test_count_limit_exceeded_requires_approval_for_otherwise_bounded_step(
+    worker_test_context: tuple[UUID, UUID],
+) -> None:
+    """`policy-limit-exceeding` (Decision 5): a `bounded_recurring` policy
+    whose `count_limit` this run's own already-dispatched action-step
+    count has reached still gates the *next* step, even though the
+    adapter itself declares no high-impact category.
+    """
+    workspace_id, user_id = worker_test_context
+    workflow_id = f"test.count-limit.{uuid4().hex}"
+    graph = _chained_graph(
+        _action_step("s1", "test.echo", input_mapping={"value": "first"}),
+        _action_step("s2", "test.echo", input_mapping={"value": "second"}),
+    )
+    _publish_workflow(
+        workspace_id, user_id, workflow_id, graph, approval_mode="bounded_recurring", count_limit=1
+    )
+    with SessionFactory() as session, session.begin():
+        automation_worker.enqueue_run(session, workspace_id, user_id, workflow_id=workflow_id)
+
+    adapter = EchoAdapter()
+    registry = _make_registry(adapter)
+    with SessionFactory() as session:
+        claimed = automation_worker.claim_next_run(session, "worker-a")
+    assert claimed is not None
+    with SessionFactory() as session:
+        finished = automation_worker.process_claimed_run(session, claimed, registry, "worker-a")
+    # s1 dispatches (count_so_far=0 < count_limit=1); s2 would bring the
+    # count to 2 > 1, so it requires approval instead of dispatching.
+    assert finished.status == "waiting_approval"
+    assert finished.current_step_index == 1
+    assert adapter.execute_calls == 1
+
+
+@pytest.mark.parametrize("approval_mode", ["preview_only", "per_run"])
+def test_preview_only_and_per_run_modes_require_approval_for_bounded_step(
+    worker_test_context: tuple[UUID, UUID], approval_mode: automation_policy.ApprovalMode
+) -> None:
+    """Neither `preview_only` nor `per_run` lets a `bounded` step dispatch
+    unattended -- this task's own judgment call (`approvals.py`'s module
+    docstring: "preview_only is treated identically to per_run here").
+    """
+    workspace_id, user_id = worker_test_context
+    workflow_id = f"test.mode-gate.{approval_mode}.{uuid4().hex}"
+    graph = _chained_graph(_action_step("s1", "test.echo"))
+    _publish_workflow(workspace_id, user_id, workflow_id, graph, approval_mode=approval_mode)
+    with SessionFactory() as session, session.begin():
+        automation_worker.enqueue_run(session, workspace_id, user_id, workflow_id=workflow_id)
+
+    adapter = EchoAdapter()
+    registry = _make_registry(adapter)
+    with SessionFactory() as session:
+        claimed = automation_worker.claim_next_run(session, "worker-a")
+    assert claimed is not None
+    with SessionFactory() as session:
+        finished = automation_worker.process_claimed_run(session, claimed, registry, "worker-a")
+    assert finished.status == "waiting_approval"
+    assert adapter.execute_calls == 0
+
+
+def test_no_policy_blocks_dispatch_as_needs_review(worker_test_context: tuple[UUID, UUID]) -> None:
+    """Fail-closed: a run whose workflow was published with no policy at
+    all (`policy_ref=None`) never dispatches its first step -- "no policy
+    means no authority," this task's own instruction.
+    """
+    workspace_id, user_id = worker_test_context
+    workflow_id = f"test.no-policy.{uuid4().hex}"
+    graph = _chained_graph(_action_step("s1", "test.echo"))
+    with SessionFactory() as session, session.begin():
+        draft = automation_workflows.create_workflow_draft(
+            session,
+            workspace_id,
+            user_id,
+            workflow_id=workflow_id,
+            graph=graph,
+            trigger_refs=[],
+            policy_ref=None,
+        )
+        automation_workflows.activate_workflow_version(session, workspace_id, draft.id)
+    with SessionFactory() as session, session.begin():
+        queued = automation_worker.enqueue_run(
+            session, workspace_id, user_id, workflow_id=workflow_id
+        )
+    assert isinstance(queued, automation_worker.WorkflowRun)
+    assert queued.policy_id is None
+
+    adapter = EchoAdapter()
+    registry = _make_registry(adapter)
+    with SessionFactory() as session:
+        claimed = automation_worker.claim_next_run(session, "worker-a")
+    assert claimed is not None
+    with SessionFactory() as session:
+        finished = automation_worker.process_claimed_run(session, claimed, registry, "worker-a")
+    assert finished.status == "needs_review"
+    assert adapter.execute_calls == 0
+    # `needs_review` is not terminal either (`_TERMINAL_RUN_STATUSES`
+    # excludes it alongside `waiting_approval`) -- same `_pause_run`
+    # reasoning applies.
+    assert finished.finished_at is None
+    with SessionFactory() as session, session.begin():
+        steps = automation_worker.list_run_steps(session, workspace_id, claimed.id)
+    assert steps == []
+
+
+def test_revoked_policy_blocks_the_next_not_yet_started_step(
+    worker_test_context: tuple[UUID, UUID],
+) -> None:
+    workspace_id, user_id = worker_test_context
+    workflow_id = f"test.revoked-policy.{uuid4().hex}"
+    graph = _chained_graph(_action_step("s1", "test.echo"))
+    active = _publish_workflow(workspace_id, user_id, workflow_id, graph)
+    assert active.policy_ref is not None
+    with SessionFactory() as session, session.begin():
+        revoked = automation_policy.revoke_policy(session, workspace_id, user_id, active.policy_ref)
+    assert isinstance(revoked, automation_policy.AutomationPolicy)
+
+    with SessionFactory() as session, session.begin():
+        automation_worker.enqueue_run(session, workspace_id, user_id, workflow_id=workflow_id)
+
+    adapter = EchoAdapter()
+    registry = _make_registry(adapter)
+    with SessionFactory() as session:
+        claimed = automation_worker.claim_next_run(session, "worker-a")
+    assert claimed is not None
+    with SessionFactory() as session:
+        finished = automation_worker.process_claimed_run(session, claimed, registry, "worker-a")
+    assert finished.status == "needs_review"
+    assert adapter.execute_calls == 0
+
+
+def test_expired_policy_blocks_the_next_not_yet_started_step(
+    worker_test_context: tuple[UUID, UUID],
+) -> None:
+    workspace_id, user_id = worker_test_context
+    workflow_id = f"test.expired-policy.{uuid4().hex}"
+    graph = _chained_graph(_action_step("s1", "test.echo"))
+    active = _publish_workflow(workspace_id, user_id, workflow_id, graph)
+    assert active.policy_ref is not None
+    with engine.begin() as connection:
+        connection.execute(
+            text("UPDATE automation_policies SET expires_at = :past WHERE id = :id"),
+            {"past": datetime.now(UTC) - timedelta(seconds=1), "id": active.policy_ref},
+        )
+
+    with SessionFactory() as session, session.begin():
+        automation_worker.enqueue_run(session, workspace_id, user_id, workflow_id=workflow_id)
+
+    adapter = EchoAdapter()
+    registry = _make_registry(adapter)
+    with SessionFactory() as session:
+        claimed = automation_worker.claim_next_run(session, "worker-a")
+    assert claimed is not None
+    with SessionFactory() as session:
+        finished = automation_worker.process_claimed_run(session, claimed, registry, "worker-a")
+    assert finished.status == "needs_review"
+    assert adapter.execute_calls == 0
+
+
+def test_revoking_policy_mid_run_blocks_the_next_step_but_not_the_one_already_succeeded(
+    worker_test_context: tuple[UUID, UUID],
+) -> None:
+    """Decision 6 verbatim: revocation blocks the *next not-yet-started*
+    step; a step that already succeeded before revocation stays succeeded.
+    """
+    workspace_id, user_id = worker_test_context
+    workflow_id = f"test.revoked-mid-run.{uuid4().hex}"
+    graph = _chained_graph(
+        _action_step("s1", "test.echo", input_mapping={"value": "first"}),
+        _action_step("s2", "test.echo", input_mapping={"value": "second"}),
+    )
+    active = _publish_workflow(workspace_id, user_id, workflow_id, graph)
+    assert active.policy_ref is not None
+    with SessionFactory() as session, session.begin():
+        queued = automation_worker.enqueue_run(
+            session, workspace_id, user_id, workflow_id=workflow_id
+        )
+    assert isinstance(queued, automation_worker.WorkflowRun)
+
+    adapter = EchoAdapter()
+    registry = _make_registry(adapter)
+    # Dispatch only s1 directly (run_step, not process_claimed_run), then
+    # revoke the policy before s2 is ever attempted.
+    with SessionFactory() as session:
+        claimed = automation_worker.claim_next_run(session, "worker-a")
+    assert claimed is not None
+    with SessionFactory() as session:
+        outcome = automation_worker.run_step(session, claimed, 0, registry)
+    assert isinstance(outcome, automation_worker.StepOutcome)
+    assert outcome.status == "succeeded"
+
+    with SessionFactory() as session, session.begin():
+        revoked = automation_policy.revoke_policy(session, workspace_id, user_id, active.policy_ref)
+    assert isinstance(revoked, automation_policy.AutomationPolicy)
+
+    with SessionFactory() as session:
+        run = automation_worker.get_run(session, workspace_id, claimed.id)
+        assert run is not None
+        finished = automation_worker.process_claimed_run(session, run, registry, "worker-a")
+    assert finished.status == "needs_review"
+    assert adapter.execute_calls == 1  # only s1 -- s2 never dispatched
+
+    with SessionFactory() as session, session.begin():
+        steps = automation_worker.list_run_steps(session, workspace_id, claimed.id)
+    assert len(steps) == 1
+    assert steps[0].status == "succeeded"
+
+
+def test_rejected_approval_fails_the_run_without_dispatching(
+    worker_test_context: tuple[UUID, UUID],
+) -> None:
+    workspace_id, user_id = worker_test_context
+    workflow_id = f"test.rejected.{uuid4().hex}"
+    graph = _chained_graph(_action_step("s1", "test.high-impact"))
+    _publish_workflow(workspace_id, user_id, workflow_id, graph)
+    with SessionFactory() as session, session.begin():
+        automation_worker.enqueue_run(session, workspace_id, user_id, workflow_id=workflow_id)
+
+    adapter = HighImpactAdapter()
+    registry = _make_registry(adapter)
+    with SessionFactory() as session:
+        claimed = automation_worker.claim_next_run(session, "worker-a")
+    assert claimed is not None
+    with SessionFactory() as session:
+        paused = automation_worker.process_claimed_run(session, claimed, registry, "worker-a")
+    assert paused.status == "waiting_approval"
+
+    with SessionFactory() as session, session.begin():
+        pending = automation_approvals.get_pending_approval(session, workspace_id, claimed.id, 0)
+        assert pending is not None
+        decided = automation_approvals.decide_approval(
+            session, workspace_id, user_id, pending.id, "rejected", current_action_digest=None
+        )
+    assert isinstance(decided, automation_approvals.ApprovalRequest)
+    assert decided.status == "rejected"
+
+    with SessionFactory() as session, session.begin():
+        run = automation_worker.get_run(session, workspace_id, claimed.id)
+    assert run is not None
+    assert run.status == "failed"
+    assert adapter.execute_calls == 0
+
+
+def test_approving_with_mismatched_digest_is_rejected_and_never_dispatches(
+    worker_test_context: tuple[UUID, UUID],
+) -> None:
+    workspace_id, user_id = worker_test_context
+    workflow_id = f"test.digest-mismatch.{uuid4().hex}"
+    graph = _chained_graph(_action_step("s1", "test.high-impact"))
+    _publish_workflow(workspace_id, user_id, workflow_id, graph)
+    with SessionFactory() as session, session.begin():
+        automation_worker.enqueue_run(session, workspace_id, user_id, workflow_id=workflow_id)
+
+    adapter = HighImpactAdapter()
+    registry = _make_registry(adapter)
+    with SessionFactory() as session:
+        claimed = automation_worker.claim_next_run(session, "worker-a")
+    assert claimed is not None
+    with SessionFactory() as session:
+        automation_worker.process_claimed_run(session, claimed, registry, "worker-a")
+
+    with SessionFactory() as session, session.begin():
+        pending = automation_approvals.get_pending_approval(session, workspace_id, claimed.id, 0)
+        assert pending is not None
+        decided = automation_approvals.decide_approval(
+            session,
+            workspace_id,
+            user_id,
+            pending.id,
+            "approved",
+            current_action_digest="0" * 64,
+        )
+    assert isinstance(decided, automation_approvals.ApprovalDigestMismatch)
+    assert decided.expected_digest == pending.action_digest
+
+    with SessionFactory() as session, session.begin():
+        run = automation_worker.get_run(session, workspace_id, claimed.id)
+        still_pending = automation_approvals.get_pending_approval(
+            session, workspace_id, claimed.id, 0
+        )
+    assert run is not None
+    assert run.status == "waiting_approval"  # never resumed
+    assert still_pending is not None  # the request itself is still open
+    assert adapter.execute_calls == 0
+
+
+def test_an_expired_approval_request_cannot_be_approved(
+    worker_test_context: tuple[UUID, UUID],
+) -> None:
+    workspace_id, user_id = worker_test_context
+    workflow_id = f"test.approval-expired.{uuid4().hex}"
+    graph = _chained_graph(_action_step("s1", "test.high-impact"))
+    _publish_workflow(workspace_id, user_id, workflow_id, graph)
+    with SessionFactory() as session, session.begin():
+        automation_worker.enqueue_run(session, workspace_id, user_id, workflow_id=workflow_id)
+
+    adapter = HighImpactAdapter()
+    registry = _make_registry(adapter)
+    with SessionFactory() as session:
+        claimed = automation_worker.claim_next_run(session, "worker-a")
+    assert claimed is not None
+    with SessionFactory() as session:
+        automation_worker.process_claimed_run(session, claimed, registry, "worker-a")
+
+    with SessionFactory() as session, session.begin():
+        pending = automation_approvals.get_pending_approval(session, workspace_id, claimed.id, 0)
+    assert pending is not None
+    with engine.begin() as connection:
+        connection.execute(
+            text("UPDATE approval_requests SET expires_at = :past WHERE id = :id"),
+            {"past": datetime.now(UTC) - timedelta(seconds=1), "id": pending.id},
+        )
+
+    with SessionFactory() as session, session.begin():
+        decided = automation_approvals.decide_approval(
+            session,
+            workspace_id,
+            user_id,
+            pending.id,
+            "approved",
+            current_action_digest=pending.action_digest,
+        )
+    assert isinstance(decided, automation_approvals.ApprovalExpired)
+    assert adapter.execute_calls == 0
+
+
+def test_workspace_isolation_for_approval_requests(
+    worker_test_context: tuple[UUID, UUID],
+) -> None:
+    workspace_a, user_a = worker_test_context
+    workflow_id = f"test.approval-isolation.{uuid4().hex}"
+    graph = _chained_graph(_action_step("s1", "test.high-impact"))
+    _publish_workflow(workspace_a, user_a, workflow_id, graph)
+    with SessionFactory() as session, session.begin():
+        automation_worker.enqueue_run(session, workspace_a, user_a, workflow_id=workflow_id)
+
+    registry = _make_registry(HighImpactAdapter())
+    with SessionFactory() as session:
+        claimed = automation_worker.claim_next_run(session, "worker-a")
+    assert claimed is not None
+    with SessionFactory() as session:
+        automation_worker.process_claimed_run(session, claimed, registry, "worker-a")
+    with SessionFactory() as session, session.begin():
+        pending = automation_approvals.get_pending_approval(session, workspace_a, claimed.id, 0)
+    assert pending is not None
+
+    workspace_b = uuid4()
+    now = datetime.now(UTC)
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO workspaces (id, name, timezone, created_at) "
+                "VALUES (:id, 'Approval Isolation Peer', 'Asia/Kolkata', :now)"
+            ),
+            {"id": workspace_b, "now": now},
+        )
+    try:
+        with SessionFactory() as session, session.begin():
+            assert automation_approvals.get_approval(session, workspace_b, pending.id) is None
+            assert automation_approvals.list_approvals(session, workspace_b) == []
+            wrong_workspace_decision = automation_approvals.decide_approval(
+                session,
+                workspace_b,
+                user_a,
+                pending.id,
+                "approved",
+                current_action_digest=pending.action_digest,
+            )
+        assert isinstance(wrong_workspace_decision, automation_approvals.ApprovalNotFound)
+
+        with SessionFactory() as session, session.begin():
+            assert automation_approvals.get_approval(session, workspace_a, pending.id) is not None
+    finally:
+        with engine.begin() as connection:
+            connection.execute(text("DELETE FROM workspaces WHERE id = :id"), {"id": workspace_b})
