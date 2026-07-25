@@ -34,7 +34,9 @@ metrics:
 """
 
 import json
+import threading
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from hmac import new
@@ -653,6 +655,125 @@ def test_post_evaluations_runs_idempotency_store_failure_still_returns_the_compl
     get_response = http_client.get(f"/api/v1/ai/evaluations/runs/{body['id']}")
     assert get_response.status_code == 200
     assert get_response.json()["id"] == body["id"]
+
+
+def test_post_evaluations_runs_conflicting_payload_same_key_returns_idempotency_conflict(
+    run_context: dict, http_client: TestClient
+) -> None:
+    """`runtime.py:create_run`'s identical fix and test cover the same
+    pattern for `POST /ai/runs` -- this is the `ai_runtime` write
+    endpoint's other half. Reusing an Idempotency-Key with a materially
+    different payload must 409 IDEMPOTENCY_CONFLICT, never silently
+    replay the first response or silently execute the second, different
+    request.
+    """
+    from ecc.observability import render_metrics
+
+    headers = _headers(run_context["token"], key="conflicting-eval-payload-key")
+
+    first = http_client.post(
+        "/api/v1/ai/evaluations/runs",
+        json={"task_type": TASK_TYPE, "prompt_version": 1, "model_id": _SEEDED_MODEL_ID},
+        headers=headers,
+    )
+    assert first.status_code == 200, first.text
+
+    conflicting = http_client.post(
+        "/api/v1/ai/evaluations/runs",
+        json={"task_type": TASK_TYPE, "prompt_version": 1, "model_id": _SECOND_SEEDED_MODEL_ID},
+        headers=headers,
+    )
+    assert conflicting.status_code == 409
+    assert conflicting.json()["error"]["code"] == "IDEMPOTENCY_CONFLICT"
+    assert 'ecc_idempotency_conflicts_total{domain="ai_runtime"}' in render_metrics()
+
+
+def test_post_evaluations_runs_concurrent_same_idempotency_key_only_evaluates_once(
+    run_context: dict,
+) -> None:
+    """`test_ai_runtime_runtime_postgres.py`'s identical `/ai/runs` test
+    covers the same `_held_idempotency_lock` guarantee for this endpoint's
+    sibling: two genuinely concurrent OS threads POSTing `/ai/evaluations/
+    runs` with the *same* Idempotency-Key must not both reach `run_
+    evaluation` and independently re-run the full labelled set. Distinct
+    from `test_run_evaluation_concurrent_same_workspace_runs_do_not_
+    collide` (`test_ai_runtime_meeting_prep_evaluation_postgres.py`),
+    which uses *different* keys to prove no shared key coordinates them at
+    all, calling `run_evaluation` directly below the HTTP/idempotency
+    layer -- this test proves the lock itself genuinely serializes two
+    real concurrent requests sharing one key.
+    """
+    call_count = 0
+    call_lock = threading.Lock()
+    responses = _flat_responses()
+
+    def counting_handler(request: httpx.Request) -> httpx.Response:
+        nonlocal call_count
+        with call_lock:
+            index = call_count
+            call_count += 1
+        text_value = responses[index] if index < len(responses) else responses[-1]
+        body = (
+            json.dumps(
+                {
+                    "model": "m",
+                    "created_at": "now",
+                    "response": text_value,
+                    "done": True,
+                    "eval_count": 12,
+                    "prompt_eval_count": 40,
+                }
+            )
+            + "\n"
+        )
+        return httpx.Response(
+            200, content=body.encode(), headers={"content-type": "application/x-ndjson"}
+        )
+
+    adapter = OllamaAdapter(transport=httpx.MockTransport(counting_handler))
+    app.dependency_overrides[get_ollama_adapter] = lambda: adapter
+
+    def post_once(_: int) -> tuple[int, dict]:
+        worker = TestClient(app)
+        worker.cookies.set("ecc_session", run_context["token"])
+        try:
+            response = worker.post(
+                "/api/v1/ai/evaluations/runs",
+                json={"task_type": TASK_TYPE, "prompt_version": 1, "model_id": _SEEDED_MODEL_ID},
+                headers=_headers(run_context["token"], key="concurrent-same-eval-key"),
+            )
+            return response.status_code, response.json()
+        finally:
+            worker.close()
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            results = list(executor.map(post_once, range(2)))
+    finally:
+        app.dependency_overrides.pop(get_ollama_adapter, None)
+
+    assert [status for status, _body in results] == [200, 200]
+    run_ids = {body["id"] for _status, body in results}
+    assert len(run_ids) == 1, "both concurrent requests must get back the same evaluation run"
+    assert call_count == len(responses), (
+        f"expected exactly one full {len(responses)}-example evaluation, "
+        f"not one per concurrent request"
+    )
+
+    (run_id,) = run_ids
+    with SessionFactory() as session:
+        run_row_count = session.execute(
+            text("SELECT count(*) FROM evaluation_runs WHERE id = :id"), {"id": run_id}
+        ).scalar_one()
+        idempotency_row_count = session.execute(
+            text(
+                "SELECT count(*) FROM idempotency_records "
+                "WHERE workspace_id = :workspace_id AND key = 'concurrent-same-eval-key'"
+            ),
+            {"workspace_id": run_context["workspace_id"]},
+        ).scalar_one()
+    assert run_row_count == 1
+    assert idempotency_row_count == 1
 
 
 def test_post_evaluations_runs_unknown_model_is_422(
