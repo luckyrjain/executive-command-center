@@ -77,7 +77,7 @@ same is a later task's decision, not attempted here.
 
 import time
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
@@ -89,11 +89,12 @@ from uuid import NAMESPACE_OID, UUID, uuid4, uuid5
 from fastapi import APIRouter, Depends, Header, HTTPException
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import text
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from ecc.auth import AuthContext, AuthDep, CsrfDep
 from ecc.database import get_session, lock_engine
-from ecc.observability import record_idempotency_conflict
+from ecc.observability import record_database_failure, record_idempotency_conflict
 
 from .ollama_client import OllamaAdapter
 from .prompts import get_active_prompt
@@ -1107,6 +1108,37 @@ def get_latest_evaluation_run(
 # ---------------------------------------------------------------------------
 
 
+@contextmanager
+def _synthetic_meeting_serialization_lock(workspace_id: UUID) -> Iterator[None]:
+    """Serializes `meeting.prep_summary` evaluation runs within one
+    workspace -- `_salted_synthetic_id`'s ids are deterministic per
+    `(workspace_id, base_id)` (see its own docstring: needed so tests can
+    predict them ahead of building mocked "fully grounded" citations), so
+    two overlapping `meeting.prep_summary` evaluation runs in the *same*
+    workspace (different `Idempotency-Key`s -- `_held_idempotency_lock`
+    only serializes requests sharing the same key) would otherwise race
+    to `INSERT` the same real primary key and surface as an unhandled
+    `IntegrityError`. `attention.explain_item`'s synthetic items use
+    random `uuid4()` ids and have no such collision risk, so this lock is
+    `meeting.prep_summary`-only -- see `_insert_synthetic_meeting`'s call
+    site in `run_evaluation` below. Same `lock_engine`/`pg_advisory_lock`
+    pattern as `_held_idempotency_lock`, held on its own dedicated
+    connection for this context manager's entire duration.
+    """
+    lock_key = f"{workspace_id}:meeting.prep_summary:synthetic-eval-data"
+    with lock_engine.connect().execution_options(isolation_level="AUTOCOMMIT") as connection:
+        connection.execute(
+            text("SELECT pg_advisory_lock(hashtextextended(:lock_key, 0))"), {"lock_key": lock_key}
+        )
+        try:
+            yield
+        finally:
+            connection.execute(
+                text("SELECT pg_advisory_unlock(hashtextextended(:lock_key, 0))"),
+                {"lock_key": lock_key},
+            )
+
+
 def run_evaluation(
     task_type: str,
     prompt_version: int,
@@ -1151,108 +1183,119 @@ def run_evaluation(
     scores: list[_ExampleScore] = []
     synthetic_item_ids: list[UUID] = []
 
-    try:
-        for example in evaluation_set.examples:
-            now = datetime.now(UTC)
-            # `meeting.prep_summary`'s synthetic source cannot use `attention.
-            # explain_item`'s batched-insert/batched-cleanup-at-the-end shape
-            # (`_insert_synthetic_item`/`synthetic_item_ids`/`_delete_
-            # synthetic_items` below, kept verbatim and untouched by this
-            # branch): its `risks` section is workspace-wide, not meeting-
-            # scoped (`meeting_prep.py:_fetch_risks`'s own comment), so
-            # leaving one example's synthetic risks in place while later
-            # examples run would leak them into packs that never listed
-            # them. `_insert_synthetic_meeting`/`_delete_synthetic_meeting`
-            # insert and delete each example's entire bundle within this
-            # same iteration instead -- see their docstrings.
-            if task_type == "meeting.prep_summary":
-                meeting_id, node_ids, risk_ids = _insert_synthetic_meeting(
-                    session, auth, example, now=now
-                )
-                run_input: dict[str, Any] = {"meeting_id": str(meeting_id)}
-                source_versions: dict[str, Any] = {"meeting_id": str(meeting_id)}
-            else:
-                item_id = _insert_synthetic_item(session, auth, example, now=now)
-                synthetic_item_ids.append(item_id)
-                run_input = {"attention_item_id": str(item_id)}
-                source_versions = {
-                    "attention_item_id": str(item_id),
-                    "source_entity_version": _SYNTHETIC_SOURCE_ENTITY_VERSION,
-                }
-
-            try:
-                call_started = time.perf_counter()
-                run = execute_run(
-                    task_type,
-                    _EVALUATION_DATA_CLASS,
-                    run_input,
-                    session=session,
-                    auth=auth,
-                    ollama_adapter=ollama_adapter,
-                )
-                latency_seconds = time.perf_counter() - call_started
-
-                # `execute_run` always routes through the live `model_
-                # definitions` registry (runtime.py's own `route()` call) --
-                # it has no parameter to pin a specific candidate. With a
-                # single registered model this was moot (only one possible
-                # outcome); with two or more, `route()` could legitimately
-                # pick a different candidate than the one this function's
-                # `model_id` parameter asserted was eligible, silently mis-
-                # attributing this evaluation's results to the wrong model
-                # (`EvaluationRun.model_id` below is stamped from the
-                # requested parameter, not from what actually ran). Matches
-                # this module's own "assertions, not overrides" contract
-                # (module docstring): fail loud, not a partial/degraded run
-                # scored against the wrong candidate. `run.model_id` is
-                # `None` on a run that never reached routing (e.g. `feature_
-                # disabled`) -- not a mismatch, already a legitimate `other_
-                # failure` outcome for `_score_example` below.
-                if run.model_id is not None and run.model_id != model_id:
-                    raise EvaluationConfigError(
-                        "unexpected_model_routed",
-                        f"requested model_id {model_id!r} but the router selected "
-                        f"{run.model_id!r} instead -- refusing to score this evaluation "
-                        "run against the wrong model",
-                    )
-
-                score = _score_example(
-                    session, task_type, example, run, latency_seconds=latency_seconds
-                )
-                scores.append(score)
-
-                if score.outcome == "completed":
-                    _write_generated_artifact(
-                        session,
-                        auth,
-                        run=run,
-                        task_type=task_type,
-                        source_versions=source_versions,
-                        schema_version=active_prompt.output_schema_ref,
-                    )
-                    session.commit()
-            finally:
-                # `meeting.prep_summary`'s per-example cleanup, scoped to
-                # this one iteration -- see the comment above this branch's
-                # insert for why it cannot wait for the batched cleanup
-                # below. Runs even if the block above raised (e.g. the
-                # `unexpected_model_routed` guard), matching the outer
-                # `finally`'s own rollback-before-delete guard for the same
-                # reason.
+    # Only `meeting.prep_summary` needs the serialization lock -- see
+    # `_synthetic_meeting_serialization_lock`'s own docstring for why
+    # `attention.explain_item`'s random-uuid4 synthetic items have no
+    # such collision risk and don't pay for it.
+    serialization_lock = (
+        _synthetic_meeting_serialization_lock(auth.workspace_id)
+        if task_type == "meeting.prep_summary"
+        else nullcontext()
+    )
+    with serialization_lock:
+        try:
+            for example in evaluation_set.examples:
+                now = datetime.now(UTC)
+                # `meeting.prep_summary`'s synthetic source cannot use
+                # `attention.explain_item`'s batched-insert/batched-
+                # cleanup-at-the-end shape (`_insert_synthetic_item`/
+                # `synthetic_item_ids`/`_delete_synthetic_items` below,
+                # kept verbatim and untouched by this branch): its `risks`
+                # section is workspace-wide, not meeting-scoped (`meeting_
+                # prep.py:_fetch_risks`'s own comment), so leaving one
+                # example's synthetic risks in place while later examples
+                # run would leak them into packs that never listed them.
+                # `_insert_synthetic_meeting`/`_delete_synthetic_meeting`
+                # insert and delete each example's entire bundle within
+                # this same iteration instead -- see their docstrings.
                 if task_type == "meeting.prep_summary":
-                    if session.in_transaction():
-                        session.rollback()
-                    _delete_synthetic_meeting(session, auth, meeting_id, node_ids, risk_ids)
-    finally:
-        # Guard against a leftover open transaction from a mid-loop
-        # exception (should not happen -- execute_run always returns an
-        # AiRun rather than raising -- but this keeps the cleanup delete
-        # below safe regardless): SQLAlchemy's Session only tolerates one
-        # active transaction at a time, and `_delete_synthetic_items` opens
-        # its own via `session.begin()`.
-        if session.in_transaction():
-            session.rollback()
-        _delete_synthetic_items(session, auth, synthetic_item_ids)
+                    meeting_id, node_ids, risk_ids = _insert_synthetic_meeting(
+                        session, auth, example, now=now
+                    )
+                    run_input: dict[str, Any] = {"meeting_id": str(meeting_id)}
+                    source_versions: dict[str, Any] = {"meeting_id": str(meeting_id)}
+                else:
+                    item_id = _insert_synthetic_item(session, auth, example, now=now)
+                    synthetic_item_ids.append(item_id)
+                    run_input = {"attention_item_id": str(item_id)}
+                    source_versions = {
+                        "attention_item_id": str(item_id),
+                        "source_entity_version": _SYNTHETIC_SOURCE_ENTITY_VERSION,
+                    }
+
+                try:
+                    call_started = time.perf_counter()
+                    run = execute_run(
+                        task_type,
+                        _EVALUATION_DATA_CLASS,
+                        run_input,
+                        session=session,
+                        auth=auth,
+                        ollama_adapter=ollama_adapter,
+                    )
+                    latency_seconds = time.perf_counter() - call_started
+
+                    # `execute_run` always routes through the live `model_
+                    # definitions` registry (runtime.py's own `route()` call) --
+                    # it has no parameter to pin a specific candidate. With a
+                    # single registered model this was moot (only one possible
+                    # outcome); with two or more, `route()` could legitimately
+                    # pick a different candidate than the one this function's
+                    # `model_id` parameter asserted was eligible, silently mis-
+                    # attributing this evaluation's results to the wrong model
+                    # (`EvaluationRun.model_id` below is stamped from the
+                    # requested parameter, not from what actually ran). Matches
+                    # this module's own "assertions, not overrides" contract
+                    # (module docstring): fail loud, not a partial/degraded run
+                    # scored against the wrong candidate. `run.model_id` is
+                    # `None` on a run that never reached routing (e.g. `feature_
+                    # disabled`) -- not a mismatch, already a legitimate `other_
+                    # failure` outcome for `_score_example` below.
+                    if run.model_id is not None and run.model_id != model_id:
+                        raise EvaluationConfigError(
+                            "unexpected_model_routed",
+                            f"requested model_id {model_id!r} but the router selected "
+                            f"{run.model_id!r} instead -- refusing to score this evaluation "
+                            "run against the wrong model",
+                        )
+
+                    score = _score_example(
+                        session, task_type, example, run, latency_seconds=latency_seconds
+                    )
+                    scores.append(score)
+
+                    if score.outcome == "completed":
+                        _write_generated_artifact(
+                            session,
+                            auth,
+                            run=run,
+                            task_type=task_type,
+                            source_versions=source_versions,
+                            schema_version=active_prompt.output_schema_ref,
+                        )
+                        session.commit()
+                finally:
+                    # `meeting.prep_summary`'s per-example cleanup, scoped to
+                    # this one iteration -- see the comment above this branch's
+                    # insert for why it cannot wait for the batched cleanup
+                    # below. Runs even if the block above raised (e.g. the
+                    # `unexpected_model_routed` guard), matching the outer
+                    # `finally`'s own rollback-before-delete guard for the same
+                    # reason.
+                    if task_type == "meeting.prep_summary":
+                        if session.in_transaction():
+                            session.rollback()
+                        _delete_synthetic_meeting(session, auth, meeting_id, node_ids, risk_ids)
+        finally:
+            # Guard against a leftover open transaction from a mid-loop
+            # exception (should not happen -- execute_run always returns an
+            # AiRun rather than raising -- but this keeps the cleanup delete
+            # below safe regardless): SQLAlchemy's Session only tolerates one
+            # active transaction at a time, and `_delete_synthetic_items` opens
+            # its own via `session.begin()`.
+            if session.in_transaction():
+                session.rollback()
+            _delete_synthetic_items(session, auth, synthetic_item_ids)
 
     completed_at = datetime.now(UTC)
     metrics, failures = _aggregate(scores)
@@ -1518,8 +1561,22 @@ def create_evaluation_run(
             ) from exc
 
         response = _to_response(run)
-        with session.begin():
-            _store_idempotency(session, auth, idempotency_key, request_hash, response, now)
+        try:
+            with session.begin():
+                _store_idempotency(session, auth, idempotency_key, request_hash, response, now)
+        except SQLAlchemyError:
+            # `run` above is already persisted (`_persist_evaluation_run`,
+            # inside `run_evaluation`) -- losing only the idempotency
+            # bookkeeping record must not turn an already-completed
+            # evaluation run into an apparent failure for the caller.
+            # Residual risk, not fully closed: a same-key retry after this
+            # failure won't find a cached response and will re-invoke
+            # `run_evaluation`, a second full labelled-set run -- but that
+            # requires this exact statement to fail specifically (a DB
+            # blip, not a concurrent request; `_held_idempotency_lock`
+            # above already fully serializes those), the same narrower
+            # window `runtime.py:create_run`'s identical fix accepts.
+            record_database_failure("/api/v1/ai/evaluations/runs")
         return response
 
 

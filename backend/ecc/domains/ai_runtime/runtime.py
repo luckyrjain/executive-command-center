@@ -56,6 +56,7 @@ from ecc.database import get_session, lock_engine
 from ecc.observability import (
     queue_lifecycle_event,
     record_audit_outbox_failure,
+    record_database_failure,
     record_idempotency_conflict,
 )
 
@@ -1918,8 +1919,23 @@ def create_run(
             ollama_adapter=adapter,
         )
         response = _to_response(run)
-        with session.begin():
-            _store_idempotency(session, auth, idempotency_key, request_hash, response, now)
+        try:
+            with session.begin():
+                _store_idempotency(session, auth, idempotency_key, request_hash, response, now)
+        except SQLAlchemyError:
+            # `run` above is already committed (`execute_run`'s own
+            # internal commit, `_persist_terminal`) -- losing only the
+            # idempotency bookkeeping record must not turn an already-
+            # successful run into an apparent failure for the caller, who
+            # already paid for the real model call this response reflects.
+            # Residual risk, not fully closed: a same-key retry after this
+            # failure won't find a cached response and will re-invoke
+            # `execute_run`, a second real model call -- but that requires
+            # this exact statement to fail specifically (a DB blip, not a
+            # concurrent request; `_held_idempotency_lock` above already
+            # fully serializes those), a narrower window than discarding
+            # a response the caller already has.
+            record_database_failure("/api/v1/ai/runs")
         return response
 
 

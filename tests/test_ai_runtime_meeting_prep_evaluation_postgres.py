@@ -28,6 +28,7 @@ Covers:
 
 import json
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from hmac import new
@@ -43,6 +44,12 @@ from ecc.auth import AuthContext
 from ecc.config import get_settings
 from ecc.database import SessionFactory, engine
 from ecc.domains.ai_runtime.evaluation import (
+    EvaluationRun,
+    check_promotion_floors,
+    get_evaluation_run,
+    run_evaluation,
+)
+from ecc.domains.ai_runtime.evaluation import (
     _delete_synthetic_meeting as delete_synthetic_meeting,
 )
 from ecc.domains.ai_runtime.evaluation import (
@@ -50,11 +57,6 @@ from ecc.domains.ai_runtime.evaluation import (
 )
 from ecc.domains.ai_runtime.evaluation import (
     _salted_synthetic_id as salted_synthetic_id,
-)
-from ecc.domains.ai_runtime.evaluation import (
-    check_promotion_floors,
-    get_evaluation_run,
-    run_evaluation,
 )
 from ecc.domains.ai_runtime.ollama_client import OllamaAdapter
 from ecc.domains.ai_runtime.runtime import get_ollama_adapter, reset_circuit_breakers
@@ -490,6 +492,62 @@ def test_synthetic_meeting_risks_do_not_leak_into_a_later_examples_pack(
             assert risk_ids_in_pack == set()
         finally:
             delete_synthetic_meeting(session, auth, meeting_b, nodes_b, risks_b)
+
+
+def test_run_evaluation_concurrent_same_workspace_runs_do_not_collide(
+    run_context: dict,
+) -> None:
+    """Two `meeting.prep_summary` evaluation runs in the *same* workspace,
+    submitted with genuine start-time overlap (different threads, no
+    shared `Idempotency-Key` -- `_held_idempotency_lock` at the HTTP layer
+    only serializes requests sharing the same key, and this test calls
+    `run_evaluation` directly, below that layer entirely) must not race to
+    `INSERT` the same salted synthetic-meeting primary key. Before
+    `_synthetic_meeting_serialization_lock`, running these two calls with
+    genuine concurrency raised an unhandled `IntegrityError` on whichever
+    call's `_insert_synthetic_meeting` lost the race, mid-run, for exactly
+    this reason: `_salted_synthetic_id` is deterministic per `(workspace_id,
+    base_id)`, with no per-run component, so two concurrent runs in one
+    workspace compute identical ids for the same fixture example.
+    """
+    auth = run_context["auth"]
+
+    def run_once() -> EvaluationRun:
+        adapter = _adapter_with_responses(*_flat_responses(run_context["workspace_id"]))
+        with SessionFactory() as session:
+            return run_evaluation(
+                TASK_TYPE,
+                1,
+                _SEEDED_MODEL_ID,
+                session=session,
+                auth=auth,
+                ollama_adapter=adapter,
+            )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [executor.submit(run_once) for _ in range(2)]
+        results = [future.result() for future in futures]
+
+    for run in results:
+        assert run.metrics.total_examples == 10
+        assert check_promotion_floors(run) is True
+
+    with engine.connect() as connection:
+        for table in (
+            "meetings",
+            "pkos_nodes",
+            "meeting_participants",
+            "timeline_entries",
+            "commitments",
+            "notes",
+            "risks",
+            "waiting_links",
+        ):
+            count = connection.execute(
+                text(f"SELECT count(*) FROM {table} WHERE workspace_id = :workspace_id"),  # noqa: S608
+                {"workspace_id": run_context["workspace_id"]},
+            ).scalar_one()
+            assert count == 0, f"synthetic {table} rows must be cleaned up after both runs"
 
 
 # ---------------------------------------------------------------------------
