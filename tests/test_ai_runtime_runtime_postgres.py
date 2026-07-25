@@ -2273,17 +2273,17 @@ def test_execute_run_meeting_prep_summary_happy_path_persists_completed_run(
     assert steps[0]["trace"]["tool_name"] == "meeting.get_prep_pack"
 
 
-def test_execute_run_meeting_prep_summary_passes_its_own_25s_timeout_to_the_adapter(
+def test_execute_run_meeting_prep_summary_passes_its_own_32s_timeout_to_the_adapter(
     run_context: dict,
 ) -> None:
     """`meeting.prep_summary`'s own declared per-model-call timeout
-    (25.0s, `router.py:TASK_REQUIREMENTS`, Phase C fix -- raised from the
-    20s it previously shared with `attention.explain_item` after its
-    three heaviest evaluation examples measured 20.07-20.2s against real
-    Ollama, `EVALUATION-CONTRACT.md`'s "Sandbox constraint" section)
+    (32.0s, `router.py:TASK_REQUIREMENTS`, Phase G fix -- raised again
+    from Phase C's 25.0s after real CI still missed the floor at that
+    value: `rich_all_sections` measured p95 25.09s/25.30s across two live
+    runs, `EVALUATION-CONTRACT.md`'s "Sandbox constraint" section)
     genuinely reaches the adapter's real per-call deadline via
     `execute_run`, not just `budgets.py:RunBudget.per_model_call_seconds`
-    (a value that, before this fix, was computed correctly but never
+    (a value that, before Phase C's fix, was computed correctly but never
     actually consumed anywhere -- the real production adapter, `runtime.
     py:get_ollama_adapter`'s single shared FastAPI-DI instance, always
     used its own fixed constructor default regardless of task type).
@@ -2310,7 +2310,7 @@ def test_execute_run_meeting_prep_summary_passes_its_own_25s_timeout_to_the_adap
         )
 
     assert run.status == "completed"
-    assert spy.observed_timeout_seconds == [25.0]
+    assert spy.observed_timeout_seconds == [32.0]
 
 
 def test_execute_run_attention_explain_item_still_passes_its_own_20s_timeout(

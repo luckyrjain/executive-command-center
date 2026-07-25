@@ -86,20 +86,40 @@ TASK_REQUIREMENTS: dict[str, TaskRequirements] = {
         # near-miss (`EVALUATION-CONTRACT.md`'s "Sandbox constraint"
         # section), not one-off noise, driven by this small model's decode
         # throughput on this task's larger prompts, not a bug in prompt
-        # rendering or the timeout mechanism itself. 25s gives real margin
-        # over the observed ~20.1-20.2s (not just clearing it by hundreds
-        # of milliseconds) while a schema-repair retry (this task's own
-        # prompt strictly larger again) still fits twice within the 60s
-        # total per-run wall-clock budget alongside routing/tool-dispatch/
-        # validation overhead. Genuinely enforced per task type via
+        # rendering or the timeout mechanism itself. Originally raised to
+        # 25s (Phase 4 post-launch audit, phase C) for real margin over the
+        # observed ~20.1-20.2s. **That margin did not hold in real CI**:
+        # two subsequent live-model runs (PR #51, PR #53) both still missed
+        # the floor on `rich_all_sections` specifically, at p95 25.09s and
+        # 25.30s -- essentially consuming the entire 25s budget rather than
+        # comfortably clearing it, most likely because the first fix's
+        # margin was sized against CI-runner-variance-affected samples that
+        # happened to land near the low end of this small model's real
+        # decode-time distribution on this task's heaviest prompt. Raised
+        # again (Phase 4 post-launch audit, phase G) to 32s -- a real ~6.7s
+        # margin over the worst *post-fix* observation (25.30s), not the
+        # original pre-fix near-miss, so this margin is sized against the
+        # failure this fix is actually trying to clear. A schema-repair
+        # retry still fits twice within the total per-run wall-clock budget
+        # (raised to 75s in lockstep, migration
+        # `0037_phase4_meeting_timeout2.py`) alongside routing/tool-
+        # dispatch/validation overhead -- preserving the same "two full-
+        # length calls plus slack" invariant the original 25s/60s pairing
+        # established, just at the new numbers. Genuinely enforced per
+        # task type via
         # `ollama_client.py:OllamaAdapter.generate`'s `timeout_seconds`
         # override (`runtime.py:execute_run` passes `budget.per_model_
         # call_seconds` here) -- previously this field was read into
         # `RunBudget.per_model_call_seconds` but never actually reached
         # the real per-call deadline, which was silently always the
         # adapter's own fixed constructor default regardless of task type
-        # (see that module's own updated docstring).
-        timeout_seconds=25.0,
+        # (see that module's own updated docstring). Also required raising
+        # `ollama_client.py:_HTTPX_TRANSPORT_TIMEOUT_SECONDS` (30.0 -> 37.0)
+        # in lockstep -- the guard-rail test the first raise added exists
+        # for exactly this: catching a per-task timeout that has crept past
+        # the transport-level backstop, which would otherwise fire first
+        # and silently cap real latency below the intended value.
+        timeout_seconds=32.0,
         # Deliberately *below* explain_item's 512, not above it, despite
         # this task's larger 150-word cap (vs. explain_item's 60) -- 768
         # was tried first on the same reasoning the comment this replaces

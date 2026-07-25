@@ -118,10 +118,32 @@ __all__ = [
 _EVALUATION_DATA_CLASS = "sensitive"
 
 # EVALUATION-CONTRACT.md's four promotion floors (design doc Decision 9).
+# Three are shared across every task type; the fourth (latency) is not --
+# `EVALUATION-CONTRACT.md`'s own floor table has always listed a distinct
+# ceiling per task type ("<20s (attention.explain_item), <25s (meeting.
+# prep_summary)"), matching each task's own declared per-model-call timeout
+# minus real margin (Decision 5's per-task budgets, `router.py:TASK_
+# REQUIREMENTS`) -- but `check_promotion_floors` below held a single flat
+# 20.0s ceiling for every task type until this fix (Phase 4 post-launch
+# audit, phase G), silently applying `attention.explain_item`'s own tighter
+# number to `meeting.prep_summary` too and making its documented 25s floor
+# entirely unreachable regardless of how the per-model-call timeout was
+# tuned. Deliberately kept as its own dict here, not derived from
+# `TASK_REQUIREMENTS[task_type].timeout_seconds` directly: the promotion
+# floor is a production-quality bar (typical latency must stay comfortably
+# fast), the per-model-call timeout is a reliability backstop (don't hang
+# forever) -- raising the timeout for safety margin should never silently
+# widen what counts as promotable-quality latency. An unregistered task
+# type falls back to the strictest defined ceiling (fail-safe, matching
+# this module's "assertions, not overrides" contract) rather than silently
+# admitting an unbounded latency.
 _SCHEMA_VALIDITY_FLOOR = 1.0
 _GROUNDING_FLOOR = 1.0
 _PROHIBITED_FACT_FLOOR = 0
-_LATENCY_P95_CEILING_SECONDS = 20.0
+_LATENCY_P95_CEILING_SECONDS_BY_TASK_TYPE: dict[str, float] = {
+    "attention.explain_item": 20.0,
+    "meeting.prep_summary": 25.0,
+}
 
 
 class EvaluationExample(TypedDict):
@@ -294,19 +316,25 @@ class EvaluationRun:
 def check_promotion_floors(evaluation_run: EvaluationRun) -> bool:
     """`EVALUATION-CONTRACT.md`'s four floors, all required simultaneously
     (design doc Decision 9's table): 100% schema validity, 100% grounding,
-    zero prohibited-fact occurrences, p95 latency strictly under 20s. A
-    pure function over already-computed metrics -- no database access, no
-    knowledge of *how* `evaluation_run` was produced, so `prompts.py`'s
-    promotion gate and this module's own persistence path both call the
-    exact same logic rather than two independently-maintained copies of
-    "did it pass".
+    zero prohibited-fact occurrences, p95 latency strictly under the
+    evaluated task type's own declared ceiling (20s for `attention.
+    explain_item`, 25s for `meeting.prep_summary` -- distinct numbers, not
+    one shared value; see `_LATENCY_P95_CEILING_SECONDS_BY_TASK_TYPE`'s own
+    comment). A pure function over already-computed metrics -- no database
+    access, no knowledge of *how* `evaluation_run` was produced, so
+    `prompts.py`'s promotion gate and this module's own persistence path
+    both call the exact same logic rather than two independently-maintained
+    copies of "did it pass".
     """
     metrics = evaluation_run.metrics
+    latency_ceiling = _LATENCY_P95_CEILING_SECONDS_BY_TASK_TYPE.get(
+        evaluation_run.task_type, min(_LATENCY_P95_CEILING_SECONDS_BY_TASK_TYPE.values())
+    )
     return (
         metrics.schema_validity_rate >= _SCHEMA_VALIDITY_FLOOR
         and metrics.grounding_rate >= _GROUNDING_FLOOR
         and metrics.prohibited_fact_count <= _PROHIBITED_FACT_FLOOR
-        and metrics.latency_p95_seconds < _LATENCY_P95_CEILING_SECONDS
+        and metrics.latency_p95_seconds < latency_ceiling
     )
 
 
