@@ -216,6 +216,18 @@ def test_validate_output_explanation_over_60_words_returns_schema_invalid() -> N
     assert isinstance(result, SchemaInvalid)
 
 
+def test_validate_output_explanation_exactly_60_words_is_valid() -> None:
+    """The boundary itself -- mirrors `MeetingPrepSummary`'s own exactly-
+    at-the-cap positive test (`test_meeting_prep_summary_exactly_150_
+    words_is_valid` below), which `explanation_text` was missing: the
+    over-60 test above only proves the cap rejects one word too many, not
+    that exactly 60 is still accepted rather than off-by-one rejected.
+    """
+    raw = dumps({"explanation_text": " ".join(["word"] * 60), "cited_factor_codes": ["a"]})
+    result = validate_output(ExplainItemOutput, raw)
+    assert isinstance(result, ValidatedOutput)
+
+
 def test_validate_output_explanation_single_pathological_word_still_bounded() -> None:
     """The 60-word cap above splits on whitespace, so a single "word" with
     no whitespace at all (a huge base64 blob, a repeated-character run)

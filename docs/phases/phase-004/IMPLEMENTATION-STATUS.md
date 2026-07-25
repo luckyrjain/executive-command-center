@@ -1,8 +1,8 @@
 ---
 id: PHASE-004-IMPLEMENTATION-STATUS
 title: Phase 4 Implementation Status
-status: Implemented (Tasks 0-15 of the first activation slice)
-version: 0.11.0
+status: Implemented (Tasks 0-16 of the first activation slice)
+version: 0.12.0
 owner: Lucky Jain
 updated: 2026-07-25
 ---
@@ -42,7 +42,8 @@ Phase 4's design work and its six-task implementation plan (`docs/superpowers/pl
 | 12 | Post-launch audit fixes, phase A: synthetic-eval-id concurrency + idempotency-store fail-open | Done -- `25f858d` |
 | 13 | Post-launch audit fixes, phase B: repair-prompt budget re-check, reflection trace step, output char caps | Done -- `0834e57` |
 | 14 | Post-launch audit fixes, phase C: meeting.prep_summary's per-model-call timeout raised 20s -> 25s, genuinely wired | Done -- `36a3d43` |
-| 15 | Post-launch audit fixes, phase D: safety-critical test coverage gaps | Done -- this commit |
+| 15 | Post-launch audit fixes, phase D: safety-critical test coverage gaps | Done -- `1be8302` |
+| 16 | Post-launch audit fixes, phase E: minor test coverage additions | Done -- this commit |
 
 ### Task 1 evidence -- model/provider registry and router
 
@@ -256,6 +257,20 @@ Continuing the phased pickup of Task 11's audit findings. Phase D: the five safe
 **Tests.** Ten new tests total: four in the "primary model-call failure paths" gap, one circuit-breaker gap, one prompt-injection gap, two idempotency-conflict gaps (one per endpoint), two concurrent-idempotency gaps (one per endpoint) -- `tests/test_ai_runtime_runtime_postgres.py` (8 new: gaps 1-3 plus the `/ai/runs` half of gaps 4-5) and `tests/test_ai_runtime_evaluation_postgres.py` (2 new: the `/ai/evaluations/runs` half of gaps 4-5).
 
 **Full regression.** `tests/test_ai_runtime_runtime_postgres.py` (51 passed, was 43) + `tests/test_ai_runtime_evaluation_postgres.py` (31 passed, was 29). Cross-suite (budgets + runtime + evaluation + meeting-prep-evaluation + routing + versioning + validation + attention-meeting-prep): 281 passed. Full `tests/` suite (excluding the two live-Ollama files): 742 passed, 4 skipped, 1 deselected (same pre-existing `test_ranking_10000_eligible_entities_under_budget` gap, unrelated -- this task's diff is test-file-only, no production code touched) plus one transient, unrelated `VACUUM ANALYZE` statement-timeout error in `test_knowledge_retrieval_performance_postgres.py` (a different domain entirely, confirmed to pass cleanly on its own in isolation immediately after -- sandbox contention, not a regression). `ruff check`/`format`/`mypy backend` clean.
+
+### Task 16 evidence -- post-launch audit fixes, phase E (minor test coverage additions)
+
+Continuing the phased pickup of Task 11's audit findings. Phase E: the three remaining "minor" test-coverage items -- narrower than Phase D's safety-critical gaps, but each closes a real, previously-unverified edge case. No production code changed.
+
+**Gap 1 -- no exact-60-word positive-boundary test for `ExplainItemOutput.explanation_text`.** The 60-word cap had a rejection test (`test_validate_output_explanation_over_60_words_returns_schema_invalid`, 61 words) but no acceptance test proving the boundary itself is not off-by-one -- unlike its sibling `MeetingPrepSummary.summary_text` (150-word cap), which already had both `test_meeting_prep_summary_over_150_words_returns_schema_invalid` and `test_meeting_prep_summary_exactly_150_words_is_valid`. `test_validate_output_explanation_exactly_60_words_is_valid` (`test_ai_runtime_validation_postgres.py`) closes the asymmetry.
+
+**Gap 2 -- the `other_failure` bucket in evaluation scoring, never exercised through `run_evaluation`'s real code path.** `evaluation.py:_classify_outcome`'s fourth, catch-all outcome (`timeout`/`provider_error`/`circuit_open`/`budget_exceeded` -- any non-validation `execute_run` failure) had no dedicated test, unlike the other three outcomes (`schema_invalid`, `grounding_failed`, `prohibited_fact`), each of which already had one. This is the exact failure mode `meeting.prep_summary`'s heaviest live-model examples hit in real CI (`EVALUATION-CONTRACT.md`'s "Sandbox constraint" section) -- a real, previously-observed-in-production shape, not a hypothetical. `test_run_evaluation_provider_error_on_one_example_lands_in_other_failure` (`test_ai_runtime_evaluation_postgres.py`) simulates a single HTTP 500 on one example's model call (every other example still succeeding via the real `_flat_responses()` fixture), asserting the failing example lands in `run.failures` with `reason: "other_failure"` and `error_code: "provider_error"`, and that both `schema_validity_rate` and `grounding_rate` drop to 19/20 -- `_aggregate`'s own counting rule, since an `other_failure` example is neither `"completed"` nor `"grounding_failed"` and so drops out of both rates' numerators.
+
+**Gap 3 -- live-Ollama determinism/reproducibility never codified as an in-test assertion.** `ollama_client.py:generate()` sets `temperature=0` and a fixed `seed=0` specifically for reproducibility (design doc's own non-functional requirement), and `EVALUATION-CONTRACT.md`'s "Sandbox constraint" section describes this as observed -- but only informally, across *separate* CI job runs over time ("three CI runs, byte-for-byte identical"), never as a single in-test comparison. `test_execute_run_output_is_byte_for_byte_reproducible_across_two_calls` (`tests/test_ai_runtime_evaluation_live_ollama.py`) calls `execute_run` twice against the identical attention item/prompt (the same second-model-disabled precedent as the existing smoke test, so both calls are guaranteed to route to the same candidate) and asserts the two validated `run.output` dicts are equal. Each call gets its own bounded 3-attempt retry for real small-model noise (the same reasoning the existing second-model smoke test already established) -- this does not weaken the property under test, since `temperature=0`/`seed=0` determinism means every attempt against the identical prompt is itself a deterministic function of that prompt, so whichever attempt succeeds on either side, the two final outputs must still match if determinism genuinely holds. Not yet run against a real Ollama server (this sandbox has none, same constraint as every other test in this file) -- collects and skips cleanly (5 tests now, up from 4, all still skip in this sandbox); the next real `ollama-evaluation` CI run is what actually exercises it.
+
+**Tests.** Three new tests total, one per gap: `tests/test_ai_runtime_validation_postgres.py` (+1), `tests/test_ai_runtime_evaluation_postgres.py` (+1), `tests/test_ai_runtime_evaluation_live_ollama.py` (+1, untested in this sandbox -- see Gap 3 above).
+
+**Full regression.** `tests/test_ai_runtime_validation_postgres.py` + `tests/test_ai_runtime_evaluation_postgres.py` -- 74 passed (was 72). Full `tests/` suite (excluding the two live-Ollama files): 745 passed, 4 skipped, 1 deselected (same pre-existing unrelated perf gap). `tests/test_ai_runtime_evaluation_live_ollama.py` alone: 5 skipped (was 4), confirming the new test collects without error even though it cannot execute here. `ruff check`/`format`/`mypy backend` clean.
 
 ## Sandbox constraint (carried forward from the design pass)
 
