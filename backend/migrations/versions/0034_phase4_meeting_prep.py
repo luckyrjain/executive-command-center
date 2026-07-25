@@ -206,13 +206,7 @@ _PROMPT_TEMPLATE = (
     "information. Every ID you list in cited_evidence_ids must be one of "
     "the IDs given here.\n\n"
     "Meeting: {{ objective }}\n\n"
-    "Participants:\n{{ participants }}\n\n"
-    "Recent timeline:\n{{ timeline }}\n\n"
-    "Open commitments:\n{{ commitments }}\n\n"
-    "Prior decisions:\n{{ decisions }}\n\n"
-    "Other notes:\n{{ notes }}\n\n"
-    "Active risks:\n{{ risks }}\n\n"
-    "Open dependencies:\n{{ dependencies }}\n\n"
+    "{{ evidence_sections }}"
     'Respond with JSON matching exactly: {"summary_text": string, '
     '"cited_evidence_ids": [string, ...]}'
 )
@@ -330,7 +324,13 @@ def upgrade() -> None:
             ],
             constraints={
                 "max_input_tokens": 4096,
-                "max_output_tokens": 768,
+                # Kept in sync with router.py's TASK_REQUIREMENTS["meeting.
+                # prep_summary"].max_output_tokens by convention -- that
+                # value wins at runtime (budgets.py:RunBudget.from_policy),
+                # but this row should still reflect it rather than a stale
+                # number, per this migration's own docstring on avoiding
+                # exactly that kind of divergence.
+                "max_output_tokens": 400,
                 "per_model_call_timeout_seconds": 20,
                 "per_tool_call_timeout_seconds": 5,
                 "total_run_budget_seconds": 60,
