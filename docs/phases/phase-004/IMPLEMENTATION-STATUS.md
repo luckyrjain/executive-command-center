@@ -1,8 +1,8 @@
 ---
 id: PHASE-004-IMPLEMENTATION-STATUS
 title: Phase 4 Implementation Status
-status: Implemented (Tasks 0-16 of the first activation slice)
-version: 0.12.0
+status: Implemented (Tasks 0-17 of the first activation slice)
+version: 0.13.0
 owner: Lucky Jain
 updated: 2026-07-25
 ---
@@ -43,7 +43,8 @@ Phase 4's design work and its six-task implementation plan (`docs/superpowers/pl
 | 13 | Post-launch audit fixes, phase B: repair-prompt budget re-check, reflection trace step, output char caps | Done -- `0834e57` |
 | 14 | Post-launch audit fixes, phase C: meeting.prep_summary's per-model-call timeout raised 20s -> 25s, genuinely wired | Done -- `36a3d43` |
 | 15 | Post-launch audit fixes, phase D: safety-critical test coverage gaps | Done -- `1be8302` |
-| 16 | Post-launch audit fixes, phase E: minor test coverage additions | Done -- this commit |
+| 16 | Post-launch audit fixes, phase E: minor test coverage additions | Done -- `b75f730` |
+| 17 | Post-launch audit fixes, phase F: refresh stale docs (`PHASE-004-ai-runtime.md`, `ROADMAP.md`, `EVALUATION-CONTRACT.md`) | Done -- this commit |
 
 ### Task 1 evidence -- model/provider registry and router
 
@@ -271,6 +272,20 @@ Continuing the phased pickup of Task 11's audit findings. Phase E: the three rem
 **Tests.** Three new tests total, one per gap: `tests/test_ai_runtime_validation_postgres.py` (+1), `tests/test_ai_runtime_evaluation_postgres.py` (+1), `tests/test_ai_runtime_evaluation_live_ollama.py` (+1, untested in this sandbox -- see Gap 3 above).
 
 **Full regression.** `tests/test_ai_runtime_validation_postgres.py` + `tests/test_ai_runtime_evaluation_postgres.py` -- 74 passed (was 72). Full `tests/` suite (excluding the two live-Ollama files): 745 passed, 4 skipped, 1 deselected (same pre-existing unrelated perf gap). `tests/test_ai_runtime_evaluation_live_ollama.py` alone: 5 skipped (was 4), confirming the new test collects without error even though it cannot execute here. `ruff check`/`format`/`mypy backend` clean.
+
+### Task 17 evidence -- post-launch audit fixes, phase F (refresh stale umbrella docs)
+
+Task 11's original audit named a documentation-accuracy gap as its last, lowest-severity item: `PHASE-004-ai-runtime.md`'s own "Approved models, providers and evaluation floors" section still read as the day-one, single-model/single-task-type activation, even though Tasks 7-16 had since added a second model, a second evaluated task type with its own floors, and a Decision-5 timeout change to one of them -- none of that was reflected in the umbrella spec. No production code changed.
+
+**`PHASE-004-ai-runtime.md`.** The "Approved models, providers and evaluation floors" section's three factual claims were stale: "exactly one" model (Task 7 registered a second, `qwen2.5:3b-instruct-q4_K_M`, repository owner's explicit model choice), the evaluation-floors bullet describing only `attention.explain_item`'s floor (Task 10 added `meeting.prep_summary`'s own floors; Task 14 raised its latency floor 20s -> 25s), and the closing paragraph's "one evaluated task type" framing the second model/task type as still-future "later Phase 4 slices" when both had already landed and been owner-approved within this same activation. All three corrected in place; version bumped 0.3.0 -> 0.4.0.
+
+**`docs/ROADMAP.md`.** The Phase 4 status note carried the identical stale "one local model ... one evaluated task type ... deferred to later Phase 4 slices" claim in near-duplicate language, and still read "Implementation is beginning" despite Tasks 0-16 all being Done. Updated to match `PHASE-004-ai-runtime.md`'s corrected framing rather than leaving the same inaccuracy in two places.
+
+**`EVALUATION-CONTRACT.md`.** Task 14's own text explicitly flagged itself as provisional: "Not yet re-verified against a live model in CI ... the next real `ollama-evaluation` run ... is the confirming signal this fix actually clears the latency floor." That confirming signal has since arrived, twice (PR #51's own CI run and PR #53's) -- and both show the fix did **not** clear the floor: `rich_all_sections` still times out (p95 25.09s and 25.30s across the two runs, essentially at the new 25s budget rather than comfortably under it), and `sparse_pack` newly showed an intermittent `schema_invalid` failure not seen at the old 20s budget. Schema validity/grounding improved (0.7 -> 0.8-0.9) but still miss the required 1.0 floor. Recorded honestly rather than left as an open promise the doc could no longer keep or silently marked resolved -- matching this file's and `EVALUATION-CONTRACT.md`'s own repeated standard of treating an unverified or now-falsified claim as unresolved, not passing by assumption. No promotion decision has been made for `meeting.prep_summary`; a further timeout increase or the `sparse_pack` schema-validity miss specifically is left as a follow-up, not speculatively pursued here.
+
+**Not changed.** `IMPLEMENTATION-STATUS.md`'s own Task 14 evidence section above is left as the historical record of what was known and done at that time (it correctly said "not yet re-verified"); the new confirming-CI-outcome content lives here in Task 17 rather than retroactively rewriting Task 14's already-shipped text.
+
+**Full regression.** No code changed by this task; `tests/` suite unaffected. `ruff check`/`format`/`mypy backend` -- n/a (no Python files touched).
 
 ## Sandbox constraint (carried forward from the design pass)
 
