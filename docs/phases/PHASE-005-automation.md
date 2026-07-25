@@ -1,8 +1,8 @@
 ---
 id: PHASE-005
 title: Automation
-status: Draft
-version: 0.2.0
+status: Approved for Implementation
+version: 0.3.0
 owner: Lucky Jain
 depends_on:
   - PHASE-004
@@ -109,3 +109,18 @@ Global/workflow kill switches stop new runs. Revoke policies to block future ste
 ## Deferred backlog
 
 Production external connectors, multi-user delegation, distributed workflow engine, autonomous policy creation and unattended high-impact actions.
+
+### Approved decisions (approved 2026-07-25)
+
+Resolves `docs/phases/PHASE-REVIEW.md:136`'s four named approval-gate items for this first activation, per `docs/superpowers/specs/2026-07-25-phase-5-automation-design.md` and `docs/adr/ADR-0013-durable-workflow-execution.md`, proposed by that design pass and recorded here as the phase's own approved resolution:
+
+- **PostgreSQL worker/lease design:** a lease-based worker inside the existing modular monolith, not Temporal (`RFC-005.md`'s pre-registered gate is evaluated and explicitly not activated this round, `ADR-0013`) -- 2-second poll interval, 30-second lease duration renewed by a 10-second heartbeat, `sha256` `action_digest`-gated idempotent dispatch persisted before every side effect. Recovery is the same lease-expiry reclaim path a worker restart uses, comfortably inside the phase's own 60-second recovery target (`docs/runbooks/PHASE-5-RECOVERY.md`).
+- **High-impact action taxonomy:** a closed, fail-closed seven-category enumeration (`destructive`, `financial`, `legal`, `credential`, `person-directed`, `public`, `policy-limit-exceeding`) -- an adapter that cannot classify itself defaults to requiring per-run approval, never to `bounded`.
+- **Approval expiry/rate limits:** 90-day policy expiry (7-day renewal prompt), 24-hour per-run approval-request expiry, 10 runs/workflow/hour policy default; monetary value and action-count limits have no system-wide default and are required, non-nullable per-policy fields instead.
+- **Recovery runbook:** `docs/runbooks/PHASE-5-RECOVERY.md` -- what the 60-second worker-restart-recovery target means operationally, and what an operator does (and does not need to do) on a worker crash.
+
+This resolution registers no production external connector in this first activation (`docs/phases/phase-005/DATA-MODEL.md`'s action adapters are local or explicitly fake, matching `docs/phases/PHASE-REVIEW.md`'s F-03 resolution) -- Phase 6 implements the same connector-independent action-adapter contract (design doc Decision 8) against real GitHub/GitLab/Jira systems without renegotiating approval, simulation, idempotency or compensation semantics.
+
+## Dependency exit posture (approved 2026-07-25)
+
+Phase 5 design work and contract approval proceed in parallel with Phase 4's own still-open exit gate (two evaluation-floor misses accepted as documented known limitations, and the repository owner's own independent full-repo re-verification, both still open per `docs/phases/PHASE-004-ai-runtime.md`'s "Phase 4 exit status and Phase 5 parallel-start" section) -- the same kind of parallel-start exception Phase 2, Phase 3 and Phase 4 each already received, recorded in `docs/ROADMAP.md`'s Phase 5 status note. This does not itself claim Phase 4 has exited, and Phase 5's own exit criteria above still apply in full as implementation proceeds. Implementation (Task 1 onward) begins once the repository owner has reviewed this document's "Approved decisions" section above.

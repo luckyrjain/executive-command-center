@@ -4,7 +4,7 @@
 
 **Foundation:** Phase 0 baseline approved and implemented  
 **Current delivery:** [Phase 1 — Executive Dashboard MVP](phases/PHASE-001-executive-dashboard-mvp.md) — engineering delivery complete on `feature/phase-1-production-hardening` (Tasks 1-11 of `superpowers/plans/2026-07-16-phase-1-completion.md`, each independently reviewed with zero Critical or Important findings); Phase 1 exit remains open pending the seven-day daily-use validation gate and human change review — see [Phase 1 Implementation Status](phases/phase-001/IMPLEMENTATION-STATUS.md)  
-**Future specifications:** Phase 2 Approved for Implementation and in progress (parallel to Phase 1's open exit gates); Phase 3 Approved for Implementation and beginning (parallel-start exception granted, same as Phase 2's); Phase 4 Approved for Implementation and beginning (parallel-start exception granted, same as Phase 2's and Phase 3's); Phases 5–9 published as Draft / Planned
+**Future specifications:** Phase 2 Approved for Implementation and in progress (parallel to Phase 1's open exit gates); Phase 3 Approved for Implementation and beginning (parallel-start exception granted, same as Phase 2's); Phase 4 engineering delivery complete, exit gates open (known-limitation floor misses accepted, parallel-start exception granted, same as Phase 2's and Phase 3's); Phase 5 Approved for Implementation, Task 0 design pass complete and awaiting repository-owner review before implementation begins (parallel-start exception granted, same as Phase 2/3/4's); Phases 6–9 published as Draft / Planned
 
 The [canonical phase index](phases/README.md) lists every primary specification and supporting contract. The [Phase 0–9 documentation review](phases/PHASE-REVIEW.md) records completeness findings and approval gates.
 
@@ -29,7 +29,7 @@ Phase 0 — Repository Foundation         [Implemented]
   -> Phase 2 — Knowledge Platform      [Approved for Implementation; in progress, parallel to open Phase 1 exit gates]
   -> Phase 3 — Human Attention Engine  [Approved for Implementation; in progress, parallel-start exception granted]
   -> Phase 4 — AI Runtime              [Engineering delivery complete; exit gates open, known limitations accepted]
-  -> Phase 5 — Automation              [Draft; design work authorized in parallel, exception granted]
+  -> Phase 5 — Automation              [Approved for Implementation; Task 0 design pass complete, awaiting owner review before Task 1]
   -> Phase 6 — Engineering Workspace   [Draft]
   -> Phase 7 — Personal Intelligence   [Draft]
   -> Phase 8 — Multi-user Workspaces   [Draft]
@@ -108,11 +108,14 @@ Technology activation: [RFC-005 v1.3.0](RFC-005.md), [ADR-0012](adr/ADR-0012-oll
 
 ## Phase 5 — Automation
 
-**Status:** Draft / Planned. Design work authorized to begin in parallel with Phase 4's own still-open exit gate -- the same kind of parallel-start exception Phases 2, 3 and 4 each already received (`PHASE-004-ai-runtime.md`'s "Phase 4 exit status and Phase 5 parallel-start" section, granted 2026-07-25). This authorizes Phase 5's own design doc, RFC amendments, ADRs and contracts to proceed (matching Phase 4's own Task 0 precedent before any implementation began); it does not itself move any Phase 5 contract to Approved for Implementation -- that follows the same review-and-acceptance process every prior phase's contracts went through, per this document's own Delivery principles above ("avoid implementation outside the approved phase").
+**Status:** Approved for Implementation; contracts moved from Draft after resolving `docs/phases/PHASE-REVIEW.md:136`'s four named approval-gate items (PostgreSQL worker/lease design, high-impact action taxonomy, approval expiry/rate limits, recovery runbook) in `docs/superpowers/specs/2026-07-25-phase-5-automation-design.md`, per its own "Approved decision gates" section, resolved in `PHASE-005-automation.md`'s "Approved decisions" section. `RFC-005.md`'s pre-registered Temporal activation gate ("Durable workflows | Automation phase and ADR") is evaluated and explicitly declined for this first activation -- `docs/adr/ADR-0013-durable-workflow-execution.md` records a PostgreSQL-backed lease worker instead, so `RFC-005.md` itself is not amended (Temporal's row is unchanged, still un-activated). Design work began by explicit repository-owner authorization to proceed in parallel with Phase 4's own open exit gate (`PHASE-004-ai-runtime.md`'s "Phase 4 exit status and Phase 5 parallel-start" section) -- the same kind of exception Phase 2, Phase 3 and Phase 4 each received; this authorization does not itself close Phase 4's exit gate. Implementation (Task 1 onward) begins once the repository owner has reviewed this design pass's proposed resolutions.
 
 Versioned workflows, simulation, explicit approval, durable execution, schedules, cancellation, compensation and kill switches.
 
-Specification: [PHASE-005](phases/PHASE-005-automation.md)
+Specification: [PHASE-005](phases/PHASE-005-automation.md)  
+Design doc: [Phase 5 Automation Design](superpowers/specs/2026-07-25-phase-5-automation-design.md)  
+Technology decision: [ADR-0013](adr/ADR-0013-durable-workflow-execution.md)  
+Recovery runbook: [Phase 5 Durable Worker Recovery](runbooks/PHASE-5-RECOVERY.md)
 
 ## Phase 6 — Engineering Workspace
 

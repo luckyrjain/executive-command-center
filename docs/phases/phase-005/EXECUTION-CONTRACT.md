@@ -1,13 +1,25 @@
 ---
 id: PHASE-005-EXECUTION
 title: Durable Execution Contract
-status: Draft
-version: 0.1.0
+status: Approved for Implementation
+version: 0.2.0
 owner: Lucky Jain
 ---
 
 # Durable Execution Contract
 
-Workflow graphs are finite and versioned. The worker persists state before and after each side effect. A stable action digest and idempotency key prevent duplicate execution. Restart resumes from the last durable checkpoint.
+Workflow graphs are finite, acyclic and versioned (`docs/superpowers/specs/2026-07-25-phase-5-automation-design.md` Decision 2) -- no loops, no parallel fan-out in this first activation (Decision 10). The worker persists state before and after each side effect: a step's `action_digest` (`sha256` over `{workflow_id, workflow_version, step_id, resolved_input}`) is written before the corresponding action adapter's `execute()` is invoked, and the step's terminal outcome is written immediately after (Decision 3). A stable action digest and idempotency key prevent duplicate execution -- a step already recorded `succeeded` or `in_progress` under a given digest is never re-dispatched by any worker that subsequently claims the run.
 
-Retries use bounded exponential backoff only for classified transient failures. Unknown external outcomes move to `needs_review`; they are not blindly retried. Parallel branches have explicit join semantics. Cancellation stops before the next side effect. Compensation executes only declared, approved steps and records partial recovery.
+## Lease and recovery
+
+Durable execution is implemented as a PostgreSQL-backed lease/claim worker (`docs/adr/ADR-0013-durable-workflow-execution.md`), not a distributed workflow engine, for this first activation. A `workflow_runs` row is claimed via a single-statement compare-and-swap `UPDATE ... WHERE status='queued' OR (status='leased' AND leased_until < now()) RETURNING *`. Lease duration is 30 seconds, renewed by a heartbeat every 10 seconds while a step is actively executing; a lease that goes 30 seconds without a heartbeat is presumed abandoned (worker crash) and is reclaimable by any live worker's next poll (2-second interval). **Restart resumes from the last durable checkpoint** -- this is the same lease-expiry reclaim path that handles a single worker crashing mid-step, not a separate recovery code path (`docs/runbooks/PHASE-5-RECOVERY.md`).
+
+## Retries, unknown outcomes, cancellation, compensation
+
+Retries use bounded exponential backoff only for classified transient failures (connection error, timeout) -- never for a step whose side effect may have already partially occurred. **Unknown external outcomes move to `needs_review` (run) / `unknown` (step); they are not blindly retried.** A crash between digest-persisted and adapter-confirmed-complete is exactly this case: ambiguous, surfaced for human resolution, never guessed at automatically (`docs/runbooks/PHASE-5-RECOVERY.md`'s "What an operator does" section).
+
+Parallel branches and their join semantics are explicitly out of scope for this activation (design doc Decision 10) -- every workflow graph is strictly sequential, so there is no join to specify.
+
+Cancellation stops before the next side effect: a not-yet-dispatched step is guaranteed never to dispatch once cancellation is recorded; a step already dispatched to its adapter completes (or reaches `unknown`) rather than being force-interrupted, since interrupt-mid-`execute()` cannot be guaranteed for an arbitrary adapter.
+
+Compensation executes only declared, authorized steps and records partial recovery: a `compensate_ref` runs only when the workflow's own graph marks a step as requiring compensation on a specific failure path (never automatic or inferred), dispatches through the identical lease/claim/idempotency mechanics as any other step, and is recorded as its own `step_type='compensation'` row distinct from the step it compensates. A compensation that itself fails surfaces the run as `compensation_failed` for human review rather than retrying indefinitely.

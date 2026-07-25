@@ -1,0 +1,39 @@
+# Phase 5 Durable Worker Recovery Runbook
+
+**Status:** design-time procedure, written as part of Phase 5's Task 0 design pass (`docs/superpowers/specs/2026-07-25-phase-5-automation-design.md`, `docs/adr/ADR-0013-durable-workflow-execution.md`). No Phase 5 code exists yet — this document defines what recovery means operationally *before* implementation, so Task 1 builds to a specified target rather than inventing recovery behavior after the fact. It will be updated with real evidence (actual recovery timings, actual incident walkthroughs) once implemented, the same way `docs/runbooks/PHASE-1-DAILY-USE.md` and `PHASE-1-RELEASE-GATE.md` record real evidence for Phase 1.
+
+**Scope:** what "worker restarts recover durable state within 60 seconds locally" (`PHASE-005-automation.md`'s own non-functional requirement) means in practice, and what an operator (the repository owner, running ECC locally) does — and explicitly does not need to do — when the automation worker process crashes or restarts.
+
+## What recovery means
+
+Every `workflow_runs` row a worker is actively executing is claimed via a **lease** (`docs/superpowers/specs/2026-07-25-phase-5-automation-design.md` Decision 3): `status='leased'`, `leased_by=<worker id>`, `leased_until=<now + 30s>`, renewed every 10 seconds by a heartbeat while the current step is genuinely still executing. A worker that crashes simply stops renewing its leases. There is no separate "detect the crash and trigger recovery" step — **recovery is the same lease-expiry reclaim logic every worker already runs on every poll cycle**, not a distinct disaster-recovery code path that could itself have its own bugs or go untested.
+
+Concretely, after a crash:
+
+1. The crashed worker's leases stop being renewed. Within 30 seconds (the lease duration), each affected `workflow_runs` row's `leased_until` passes.
+2. Any live worker's next poll cycle (every 2 seconds) picks up rows matching `status = 'leased' AND leased_until < now()` — the identical query used for normal `queued`-row claiming, just a different `WHERE` branch of the same statement.
+3. The claiming worker resumes the run from its last durably persisted checkpoint: `current_step_index` plus whichever `workflow_run_steps` rows already have a persisted `action_digest`. A step whose digest was persisted but whose adapter never confirmed completion is not blindly retried — it is marked `unknown` and the run moves to human review (design doc Decision 3), exactly the same outcome an `unknown` external result produces in normal operation, not a recovery-specific behavior.
+
+**Recovery-time budget:** 30s (lease timeout) + 2s (poll interval) + a small constant for the claim query and step resumption itself comfortably clears the 60-second target. This is a property of the lease numbers chosen in Decision 3, not a separately-tuned recovery parameter — there is nothing to configure differently for "recovery mode" versus normal operation.
+
+## What an operator does on a worker crash (local ECC deployment)
+
+**If ECC's process supervisor (`docker compose`) restarts the worker automatically** (the expected case — the worker runs as a service in the same Compose stack as `backend`, restarted on failure the same way `backend` itself already is): nothing. The restarted worker process begins polling immediately; any runs it or a sibling worker previously held leases on are reclaimed via the mechanism above within the 60-second budget. No manual intervention, no manual query, no manual "resume" action.
+
+**If the operator needs to manually confirm recovery happened** (e.g. after an unusual crash, or before trusting the system unattended): query `workflow_runs` for any row with `status = 'leased' AND leased_until < now() - interval '90 seconds'` (a 90-second, not 30-second, threshold deliberately gives margin over the reclaim budget before treating a stuck lease as a genuine anomaly rather than a false alarm from checking too early). A non-empty result after that margin indicates every worker in the deployment is down, not merely one — the fix is to bring at least one worker process back up, not to manually intervene in the lease table.
+
+**If a run's step outcome is genuinely `unknown`** after recovery (the crash landed between digest-persisted and adapter-confirmed): this is not a worker-availability problem and is not fixed by restarting anything. It surfaces in the approval/run-history UI (`UX-STATES.md`) as requiring human review — the operator inspects the target system (whatever the adapter's `execute()` was acting on) to determine whether the side effect actually happened, then explicitly resolves the run (mark the step's true outcome, or trigger its compensation if one is declared, design doc Decision 9). This is intentionally a human decision, not an automated guess — automating "did the side effect happen" for an arbitrary adapter is exactly the blind-retry risk `PHASE-005-automation.md`'s own functional requirement exists to prevent.
+
+## What recovery does not require
+
+- **No manual database surgery.** The reclaim query is a normal part of the worker's own poll loop; an operator never needs to hand-write an `UPDATE` to un-stick a lease under normal crash-recovery conditions (only the diagnostic read query above, and only to confirm, never to force a claim).
+- **No workflow re-authorization.** A recovered run continues under the exact policy version and approval state it already had — recovery never re-prompts for an approval that was already granted, and never silently grants one that wasn't.
+- **No data loss for a properly-persisted step.** Any step whose `action_digest` was persisted before the crash retains that record regardless of whether the crash happened before or after the underlying side effect — the `unknown`-outcome path above exists precisely so ambiguity is surfaced, not silently resolved either direction.
+
+## Kill switches and their recovery interaction
+
+A global or per-workflow kill switch (`PHASE-005-automation.md`'s Rollback plan) sets a flag the worker's claim query itself checks — a killed workflow's rows are never claimed, reclaimed, or resumed regardless of lease state, including across a crash/restart cycle. Re-enabling a previously-killed workflow does not automatically resume its paused runs; per the phase's own rollback plan, in-flight runs under a kill switch "stop at safe checkpoints or enter review," which the operator explicitly resolves the same way an `unknown` outcome is resolved above, not implicitly on re-enable.
+
+## Backup/restore interaction
+
+`workflow_runs`/`workflow_run_steps`/`workflow_versions`/`policies` are ordinary PostgreSQL tables within the same database Phase 0's backup/restore procedure already covers (`docs/runbooks/PHASE-1-DEPLOYMENT.md`'s backup/restore section) — Phase 5 introduces no new stateful service and therefore no new backup/restore procedure, only new tables inside the existing one. A restore to a backup taken mid-run leaves that run's rows in whatever state the backup captured (typically `leased` with a `leased_until` that has since passed) — the same lease-expiry reclaim path above resumes it identically to a live crash, with the same `unknown`-outcome-requires-review caveat, since a restore is, from the worker's perspective, indistinguishable from "time passed and this lease expired."
