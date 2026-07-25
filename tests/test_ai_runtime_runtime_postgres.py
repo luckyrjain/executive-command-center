@@ -812,9 +812,7 @@ def test_execute_run_repair_prompt_exceeding_input_budget_fails_gracefully(
                 "repair prompt exceeds max_input_tokens budget", status="failed"
             )
 
-    monkeypatch.setattr(
-        runtime_module, "check_input_token_budget", fake_check_input_token_budget
-    )
+    monkeypatch.setattr(runtime_module, "check_input_token_budget", fake_check_input_token_budget)
 
     with SessionFactory() as session:
         run = execute_run(
