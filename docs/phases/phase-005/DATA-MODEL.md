@@ -1,23 +1,33 @@
 ---
 id: PHASE-005-DATA-MODEL
 title: Phase 5 Automation Data Model
-status: Draft
-version: 0.1.0
+status: Approved for Implementation
+version: 0.2.0
 owner: Lucky Jain
 ---
 
 # Phase 5 Data Model
 
-| Record | Purpose |
-|---|---|
-| workflow_definitions / workflow_versions | Immutable typed workflow graph |
-| automation_policies | Approved scope, limits, expiry and revocation |
-| triggers | Event, manual or schedule configuration |
-| workflow_runs | Durable run state and correlation |
-| workflow_steps | Attempt, idempotency key, status and redacted result |
-| approval_requests | Requested action, impact, expiry and decision |
-| compensation_steps | Explicit recovery action/state |
-| secret_references | Opaque reference; never secret value |
-| notifications | Delivery state for run events |
+Concrete shape for this first activation, resolved by `docs/superpowers/specs/2026-07-25-phase-5-automation-design.md` (Decisions 1-10) and `docs/adr/ADR-0013-durable-workflow-execution.md`. Every table is workspace scoped, matching every existing Phase 1-4 migration.
 
-Run states are `queued|waiting_approval|running|paused|needs_review|succeeded|failed|cancelled|compensating|compensated`. `needs_review` holds a run when an external outcome cannot be classified as success or transient failure (see Execution Contract) and blocks automatic retry until a human resolves it. Definitions and policies are immutable once active. All external actions carry stable idempotency keys and workspace scope.
+| Record | Purpose | Key fields | Resolved for this activation |
+|---|---|---|---|
+| `workflow_definitions` / `workflow_versions` | Immutable typed workflow graph | `workflow_id`, `version`, `graph`, `definition_hash`, `status` | `definition_hash` is `sha256` over `{graph, trigger_refs, policy_ref}`, reusing Phase 4's `prompt_versions` immutability mechanism exactly: a PostgreSQL trigger rejects `UPDATE` of `graph`/`definition_hash` once `status <> 'draft'`; exactly one `active` version per `workflow_id` via a partial unique index (design doc Decision 2). `graph` is a finite, acyclic, strictly sequential ordered list of steps (`step_id`, `step_type` in `action\|approval_gate\|condition\|compensation`, `action_ref`, `input_mapping`, `on_success`, `on_failure`) -- no loops, no parallel fan-out in this activation (Decision 10). |
+| `automation_policies` | Approved scope, limits, expiry and revocation | `workflow_id`, `action_types`, `data_classes`, `value_limit`, `count_limit`, `rate_limit`, `schedule`, `approval_mode`, `expires_at`, `revoked_at` | `approval_mode` in `preview_only\|per_run\|bounded_recurring` (existing skeleton, retained). `value_limit`/`count_limit` are required, non-nullable -- no system-wide default (design doc Decision 6); a policy author must set both explicitly. `expires_at` defaults to 90 days from creation/last renewal; `revoked_at` set immediately on revocation and checked before every not-yet-started step's dispatch (Decision 6). |
+| `triggers` | Event, manual or schedule configuration | `workflow_id`, `trigger_type`, `event_type_filter`, `schedule_expression`, `timezone`, `skip_missed` | `trigger_type` in `manual\|event\|schedule` (Decision 7). `timezone` is a required IANA zone name for `schedule` triggers -- never inferred from server-local time. `skip_missed` (bool, default `false`) governs misfire behavior: `false` fires at most once on recovery after a missed window (catch-up-once), `true` skips entirely. `event_type_filter` matches against the existing durable event-bus contract (`ADR-0005`) -- Phase 5 subscribes as a consumer, no new pub/sub mechanism. |
+| `workflow_runs` | Durable run state, lease and correlation | `id`, `workflow_id`, `workflow_version`, `policy_id`, `trigger_ref`, `status`, `current_step_index`, `leased_by`, `leased_until`, `lease_heartbeat_at`, `queued_at`, `started_at`, `finished_at` | Lease/claim mechanism per design doc Decision 3: single-statement compare-and-swap `UPDATE ... WHERE status='queued' OR (status='leased' AND leased_until < now()) RETURNING *`. 2s poll interval, 30s lease duration, 10s heartbeat while a step actively executes. `status` values below. |
+| `workflow_run_steps` | Attempt, idempotency key, status and redacted result | `run_id`, `step_index`, `step_type`, `status`, `action_digest`, `input` (redacted), `output` (redacted), `started_at`, `finished_at`, `error_class` | `action_digest` is `sha256` over `{workflow_id, workflow_version, step_id, resolved_input}`, persisted **before** the adapter's `execute()` is called (Decision 3) -- the mechanical enforcement of `EXECUTION-CONTRACT.md`'s "the worker persists state before and after each side effect." A step recorded `succeeded`/`in_progress` with a given digest is never re-dispatched under that same digest. `step_type='compensation'` rows are distinct rows from the step they compensate (Decision 9), never folded into the original step's record. |
+| `approval_requests` | Requested action, impact, expiry and decision | `run_id`, `step_index`, `action_digest`, `high_impact_categories`, `requested_at`, `expires_at`, `decided_at`, `decision`, `decided_by` | Bound to the exact `action_digest` it approves (Decision 3/Threat model) -- a changed digest invalidates any prior approval for that step. `expires_at` defaults to 24 hours from `requested_at`; unresponded requests auto-expire to `expired`, never implicitly approved. |
+| `compensation_steps` | Explicit recovery action/state | `run_id`, `compensates_step_index`, `action_digest`, `status` | Only created when a workflow's own `graph` explicitly declares a `compensate_ref` for a step on the failing path (Decision 9) -- never automatic. Dispatched through the identical lease/claim/idempotency mechanics as any other step; a compensation that itself fails surfaces the run as `compensation_failed`, not an indefinite auto-retry. |
+| `secret_references` | Opaque reference; never secret value | `reference_id`, `provider`, `scope` | Resolved only at the moment of adapter `execute()`; never rendered into `workflow_run_steps.input`/`output` (Threat model: secret leakage). |
+| `notifications` | Delivery state for run events | `run_id`, `event_type`, `delivered_at`, `channel` | Existing skeleton, retained unchanged -- notification delivery itself is not a Phase 5 approval-gate item. |
+
+## Run and step states (resolved)
+
+`workflow_runs.status`: `queued \| leased \| running \| waiting_approval \| paused \| needs_review \| succeeded \| failed \| cancelled \| compensating \| compensated \| compensation_failed \| expired \| rate_limited`. `needs_review` holds a run when an external outcome cannot be classified as success or transient failure (an `unknown` step outcome, design doc Decision 3) and blocks automatic progression until a human resolves it -- the same terminal-until-human-action state a recovered-but-ambiguous step produces (`docs/runbooks/PHASE-5-RECOVERY.md`).
+
+`workflow_run_steps.status`: `pending \| dispatched \| succeeded \| failed \| unknown \| skipped`. `unknown` is the recovery-ambiguity outcome above, distinct from `failed` -- a `failed` step's side effect definitely did not (fully) happen; an `unknown` step's side effect may or may not have happened and requires human confirmation before the run can proceed.
+
+## Immutability, idempotency and versioning (resolved)
+
+Workflow definitions are immutable after activation, enforced by a database trigger (not only application code), identical in mechanism to Phase 4's `prompt_versions`/`tool_definitions` trigger. Every `action_digest` is computed and persisted before the corresponding side effect executes, never after (design doc Decision 3) -- the mechanism that makes "at most one effect under crash/retry" (the phase's own non-functional requirement) a property of the schema, not merely of careful application code. Secrets are never stored as values anywhere in this data model, only as opaque `secret_references` rows resolved at the point of use.

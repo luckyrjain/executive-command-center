@@ -17,11 +17,11 @@ This is the canonical index for phase-wise product, architecture, API, data, UX,
 | Phase | Name | Specification | Delivery status |
 |---:|---|---|---|
 | 0 | Repository Foundation | Approved baseline | Implemented |
-| 1 | Executive Dashboard MVP | Approved for implementation | In progress |
-| 2 | Knowledge Platform | Draft | Not started |
-| 3 | Human Attention Engine | Draft | Not started |
-| 4 | AI Runtime | Draft | Not started |
-| 5 | Automation | Draft | Not started |
+| 1 | Executive Dashboard MVP | Approved for implementation | Engineering delivery complete; exit gates open |
+| 2 | Knowledge Platform | Approved for implementation | In progress |
+| 3 | Human Attention Engine | Approved for implementation | In progress |
+| 4 | AI Runtime | Approved for implementation | Engineering delivery complete; exit gates open, known limitations accepted |
+| 5 | Automation | Approved for implementation | Task 0 design pass complete; implementation not started |
 | 6 | Engineering Workspace | Draft | Not started |
 | 7 | Personal Intelligence | Draft | Not started |
 | 8 | Multi-user Workspaces | Draft | Not started |
