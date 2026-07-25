@@ -806,6 +806,7 @@ def test_unknown_outcome_surfaces_without_retry(worker_test_context: tuple[UUID,
         finished = automation_worker.process_claimed_run(session, run, registry, "worker-a")
     assert finished.status == "needs_review"
     assert echo.execute_calls == 0
+    assert finished.finished_at is None
 
 
 # ---------------------------------------------------------------------------
@@ -1222,6 +1223,12 @@ def test_high_impact_step_pauses_run_without_ever_calling_execute(
     assert finished.status == "waiting_approval"
     assert finished.current_step_index == 0
     assert adapter.execute_calls == 0
+    # `waiting_approval` is not terminal (excluded from
+    # `_TERMINAL_RUN_STATUSES`) -- `finished_at` must stay unset while
+    # paused, or a later resume back to 'queued' would leave a stale,
+    # misleading timestamp on a run that is still actively in flight
+    # (`_pause_run`, as distinct from `_finish_run`).
+    assert finished.finished_at is None
 
     # No workflow_run_steps row is written while paused -- the whole point
     # of gating *before* the 'dispatched' INSERT (worker.py's own module
@@ -1261,6 +1268,7 @@ def test_approving_correct_digest_resumes_run_and_dispatches_exactly_once(
         paused = automation_worker.process_claimed_run(session, claimed, registry, "worker-a")
     assert paused.status == "waiting_approval"
     assert adapter.execute_calls == 0
+    assert paused.finished_at is None
 
     with SessionFactory() as session, session.begin():
         pending = automation_approvals.get_pending_approval(session, workspace_id, claimed.id, 0)
@@ -1286,6 +1294,12 @@ def test_approving_correct_digest_resumes_run_and_dispatches_exactly_once(
     assert resumed is not None
     assert resumed.status == "queued"
     assert resumed.current_step_index == 0
+    # Regression check: an approved run flipped back to 'queued' must not
+    # carry a stale `finished_at` from its earlier pause -- a 'queued'
+    # (still actively progressing) run showing a non-null `finished_at`
+    # would be a real, observable inconsistency (see `_pause_run`'s
+    # docstring in worker.py for the full reasoning).
+    assert resumed.finished_at is None
 
     with SessionFactory() as session:
         reclaimed = automation_worker.claim_next_run(session, "worker-b")
@@ -1294,6 +1308,7 @@ def test_approving_correct_digest_resumes_run_and_dispatches_exactly_once(
         finished = automation_worker.process_claimed_run(session, reclaimed, registry, "worker-b")
     assert finished.status == "succeeded"
     assert adapter.execute_calls == 1
+    assert finished.finished_at is not None
 
     with SessionFactory() as session, session.begin():
         steps = automation_worker.list_run_steps(session, workspace_id, claimed.id)
@@ -1424,6 +1439,10 @@ def test_no_policy_blocks_dispatch_as_needs_review(worker_test_context: tuple[UU
         finished = automation_worker.process_claimed_run(session, claimed, registry, "worker-a")
     assert finished.status == "needs_review"
     assert adapter.execute_calls == 0
+    # `needs_review` is not terminal either (`_TERMINAL_RUN_STATUSES`
+    # excludes it alongside `waiting_approval`) -- same `_pause_run`
+    # reasoning applies.
+    assert finished.finished_at is None
     with SessionFactory() as session, session.begin():
         steps = automation_worker.list_run_steps(session, workspace_id, claimed.id)
     assert steps == []

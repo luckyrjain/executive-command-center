@@ -709,10 +709,46 @@ def _mark_running(session: Session, run: WorkflowRun) -> WorkflowRun:
 
 
 def _finish_run(session: Session, run: WorkflowRun, status: RunStatus) -> WorkflowRun:
+    """Reserved for genuinely terminal states (`_TERMINAL_RUN_STATUSES`) --
+    stamps `finished_at`. Never call this for `waiting_approval` or
+    `needs_review`: both are excluded from `_TERMINAL_RUN_STATUSES`
+    precisely because they are resumable (approval decided; an operator
+    resolves the ambiguity), and `waiting_approval` in particular has a
+    real, reachable resume path (`approvals._advance_run_after_decision`
+    flips it straight back to `'queued'`) that does not clear a stale
+    `finished_at` -- stamping it here would leave a `'queued'` (i.e.
+    still-active) run showing a non-null `finished_at` from the moment it
+    merely paused, until it next reaches a real terminal state. Use
+    `_pause_run` for those two instead.
+    """
     now = datetime.now(UTC)
     session.execute(
         text(
             "UPDATE workflow_runs SET status = :status, finished_at = :now, updated_at = :now, "
+            "leased_by = NULL, leased_until = NULL WHERE id = :id"
+        ),
+        {"status": status, "now": now, "id": run.id},
+    )
+    session.commit()
+    result = get_run(session, run.workspace_id, run.id)
+    assert result is not None
+    return result
+
+
+def _pause_run(session: Session, run: WorkflowRun, status: RunStatus) -> WorkflowRun:
+    """For `waiting_approval`/`needs_review` -- releases the lease (this
+    worker is done with the run for now) exactly like `_finish_run`, but
+    deliberately never touches `finished_at`: neither state is terminal
+    (`_TERMINAL_RUN_STATUSES` excludes both), and `waiting_approval` has a
+    real resume path back to `'queued'` (`approvals._advance_run_after_
+    decision`) that a stale `finished_at` would otherwise leave behind on
+    an actively-progressing run -- see `_finish_run`'s own docstring for
+    the full reasoning.
+    """
+    now = datetime.now(UTC)
+    session.execute(
+        text(
+            "UPDATE workflow_runs SET status = :status, updated_at = :now, "
             "leased_by = NULL, leased_until = NULL WHERE id = :id"
         ),
         {"status": status, "now": now, "id": run.id},
@@ -1095,16 +1131,16 @@ def process_claimed_run(
             # UPDATE immediately above) -- the run pauses exactly where it
             # is, never rewound; resuming re-enters this same step_index
             # (module docstring's "Resuming a waiting_approval run" note).
-            return _finish_run(session, run, "waiting_approval")
+            return _pause_run(session, run, "waiting_approval")
         if isinstance(outcome, StepBlockedByPolicy):
-            return _finish_run(session, run, "needs_review")
+            return _pause_run(session, run, "needs_review")
         if outcome.status == "succeeded":
             step_index += 1
             continue
         if outcome.status == "failed":
             return _finish_run(session, run, "failed")
         if outcome.status == "unknown":
-            return _finish_run(session, run, "needs_review")
+            return _pause_run(session, run, "needs_review")
         # 'skipped' -- never produced by run_step in this task's scope;
         # handled here only so a future step type that legitimately skips
         # itself advances cleanly rather than looping forever.
