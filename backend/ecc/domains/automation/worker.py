@@ -280,6 +280,31 @@ re-pause the run instantly -- an unresumable run that looks superficially
 resumed (`status='queued'` momentarily) but can never actually make
 progress again. `cancel_run` has no analogous concern: cancellation is
 one-way, so `cancel_requested_at` never needs clearing.
+
+**Task 5: `WorkspaceScopeMismatch`, a small defense-in-depth addition found
+during this task's own self-review, not part of Tasks 2-4's original
+shape.** Task 5 ("Connector action adapters and sandbox tests") registers
+this activation's first adapter with a real database side effect (`local.
+create_note`) and reviewed, as its own explicit instruction required,
+exactly where `run_step`'s `action_input.workspace_id` field (for any
+adapter whose `input_schema` happens to declare one) actually comes from.
+The answer: `_resolve_step`'s `resolved_input` is a step's static `input_
+mapping`, authored into the run's own pinned, immutable `workflow_versions.
+graph` by an already workspace-scoped human at `workflows.create_workflow_
+draft` time -- there is no live templating/substitution step in this
+codebase yet (`_resolve_step` returns the graph step's `input_mapping`
+verbatim; see `local_adapters.py`'s own module docstring for the full
+trace). That makes `action_input.workspace_id` only as trustworthy as
+workflow-authoring authorization already is -- not a new confused-deputy
+hole this task introduces, but also not mechanically enforced anywhere
+before this addition. `run_step` now compares any validated `action_input.
+workspace_id` against `run.workspace_id` immediately after `input_schema.
+model_validate(...)` and before `execute()` is ever called, raising
+`WorkspaceScopeMismatch` (caught by the same broad `except Exception`
+already wrapping the `execute()` call) on a mismatch -- generic (keys off
+an attribute name, not a specific adapter), and inert for any adapter whose
+`input_schema` carries no `workspace_id` field at all (every one of Task
+2-4's own test fakes, and `fake.external_action`).
 """
 
 from dataclasses import dataclass
@@ -489,6 +514,25 @@ class WorkflowRunNotPaused:
     """
 
     status: RunStatus
+
+
+class WorkspaceScopeMismatch(ValueError):
+    """Raised by `run_step` (Task 5's own self-review addition -- see
+    `local_adapters.py`'s module docstring for the full confused-deputy
+    discussion this closes) when a validated `action_input` declares a
+    `workspace_id` field that does not match the dispatching `run`'s own
+    `workspace_id`. `ActionAdapter.execute(action_input)` is given no
+    `run`/`workspace_id`/session of its own (module docstring's
+    commit-placement section), so an adapter whose `input_schema` happens
+    to carry a `workspace_id` field has no independent way to verify it
+    itself; `run_step` is the one place that already holds both values and
+    can cheaply compare them before ever calling `execute()`. Caught by
+    `run_step`'s existing broad `except Exception` around the `execute()`
+    call, so this surfaces as an ordinary classified step failure
+    (`error_class = 'WorkspaceScopeMismatch'`), not an unhandled crash.
+    Inert (never raised) for any adapter whose `input_schema` carries no
+    `workspace_id` field at all.
+    """
 
 
 class UnsupportedStepType(ValueError):
@@ -1133,6 +1177,17 @@ def run_step(
 
     try:
         action_input = adapter.input_schema.model_validate(resolved_input)
+        # Defense-in-depth confused-deputy backstop (Task 5's own
+        # self-review addition) -- see WorkspaceScopeMismatch's own
+        # docstring immediately above for why this check, and not a
+        # different mechanism, is the right place for it.
+        input_workspace_id = getattr(action_input, "workspace_id", None)
+        if input_workspace_id is not None and input_workspace_id != run.workspace_id:
+            raise WorkspaceScopeMismatch(
+                f"step '{step['step_id']}' (index {step_index}) resolved input names "
+                f"workspace_id={input_workspace_id}, which does not match run {run.id}'s "
+                f"own workspace_id={run.workspace_id}"
+            )
         output_model = adapter.execute(action_input)
         output_dict = output_model.model_dump(mode="json")
     except Exception as exc:  # noqa: BLE001 -- an adapter may raise any error class

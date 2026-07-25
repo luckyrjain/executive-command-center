@@ -2,19 +2,21 @@
 (`docs/superpowers/specs/2026-07-25-phase-5-automation-design.md` Decision
 8, resolving `docs/phases/PHASE-REVIEW.md`'s F-03).
 
-**This module registers zero real product adapters.** It defines the
-contract shape every future adapter (this activation's own `local.
-create_note`/`local.send_test_notification`/`fake.external_action`, a
-later task's own registration commit; Phase 6's production GitHub/GitLab/
-Jira connectors) must implement, and the small in-process registry
-`ecc.domains.automation.worker` resolves a workflow step's `action_ref`
-against. Registering a real adapter here is explicitly out of this task's
-scope ("Connector action adapters and sandbox tests" is a later task,
-`docs/phases/phase-005/IMPLEMENTATION-STATUS.md`'s per-slice status
-table); this task's own tests define whatever minimal fake adapter(s) they
-need directly in the test module, not here, matching how Task 1's own
-tests constructed workspace/user fixtures directly rather than through a
-product registration flow where none yet existed.
+**This module (Task 2) defines the contract shape**; `local_adapters.py`
+(Task 5, "Connector action adapters and sandbox tests") implements the
+three local/fake adapters this activation registers -- `local.create_note`,
+`local.send_test_notification`, `fake.external_action` -- and this module's
+own bottom section performs the actual `registry.register(...)` calls, so
+the shared production `registry` instance below is no longer empty as of
+Task 5. Every future adapter (this activation's own three; Phase 6's
+production GitHub/GitLab/Jira connectors) must satisfy the `ActionAdapter`
+Protocol below, and the small in-process registry `ecc.domains.automation.
+worker` resolves a workflow step's `action_ref` against is exactly this
+module's `registry`. Task 2's own tests (`tests/test_automation_worker_
+postgres.py`) still define their own minimal fake adapters directly in that
+test module rather than importing the three real ones here, matching how
+Task 1's own tests constructed workspace/user fixtures directly rather than
+through a product registration flow -- unchanged by this task.
 
 **Contract shape (design doc Decision 8, verbatim).** An adapter declares:
 `adapter_id` (str), `input_schema`/`output_schema` (both Pydantic models --
@@ -49,6 +51,12 @@ author contract obligation the runtime cannot mechanically prove").
 from typing import Any, Protocol, runtime_checkable
 
 from pydantic import BaseModel
+
+from .local_adapters import (
+    FakeExternalActionAdapter,
+    LocalCreateNoteAdapter,
+    LocalSendTestNotificationAdapter,
+)
 
 # design doc Decision 5 / `docs/phases/phase-005/APPROVAL-POLICY.md`'s
 # closed, seven-category high-impact action taxonomy. `policy-limit-
@@ -181,10 +189,22 @@ def call_compensate(adapter: ActionAdapter, action_input: BaseModel) -> BaseMode
     return result
 
 
-# Shared production registry -- empty by design (module docstring). A
-# later task ("Connector action adapters and sandbox tests") registers
-# `local.create_note`/`local.send_test_notification`/`fake.external_action`
-# into this exact instance; this task's own tests build their own private
-# `AdapterRegistry()` instances instead of mutating this one, so test runs
-# never depend on import order or leak fakes into a shared global.
+# Shared production registry. Task 2 left this empty by design (module
+# docstring, historical); Task 5 ("Connector action adapters and sandbox
+# tests") registers this activation's three local/fake adapters into this
+# exact instance, at import time, below -- the one place the design doc's
+# own text ("a later task registers ... into this exact instance") points
+# to. Every other test module in this package (Task 2-4's own worker/
+# policy/approvals/scheduler/runs tests) still builds its own private
+# `AdapterRegistry()` instances for their own test-only fakes instead of
+# mutating this one, so those test runs never depend on import order or
+# leak fakes into a shared global -- unchanged by this task. `tests/
+# test_automation_adapters_postgres.py` (Task 5, new) is the one test
+# module that deliberately dispatches through this exact shared `registry`
+# instance, proving the three real, now-registered adapters resolve and
+# execute through the actual worker dispatch path, not a private test
+# double standing in for them.
 registry = AdapterRegistry()
+registry.register(LocalCreateNoteAdapter())
+registry.register(LocalSendTestNotificationAdapter())
+registry.register(FakeExternalActionAdapter())
