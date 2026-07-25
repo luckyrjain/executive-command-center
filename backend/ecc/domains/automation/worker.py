@@ -1,0 +1,962 @@
+"""The durable local worker: enqueue, poll/lease/claim, per-step dispatch
+and heartbeat, cancellation, and crash recovery
+(`docs/superpowers/specs/2026-07-25-phase-5-automation-design.md`
+Decision 3, `docs/adr/ADR-0013-durable-workflow-execution.md`,
+`docs/phases/phase-005/EXECUTION-CONTRACT.md`,
+`docs/runbooks/PHASE-5-RECOVERY.md`).
+
+**No HTTP surface in this module**, matching `triggers.py`'s precedent
+exactly: `docs/phases/phase-005/API-SCHEMAS.md`'s `/runs`/`/approvals`
+endpoints need this module's worker to exist first, but are more
+meaningfully built once Task 3's approval-gate logic and a later task's
+real adapters exist too -- this module is an internally-invokable
+component (a function/class other code, and this task's own tests, call
+directly), not a router.
+
+**Claim mechanic -- Decision 3's SQL, generalized by one documented
+step.** Decision 3's own compare-and-swap `UPDATE` literally reads:
+
+    UPDATE workflow_runs
+    SET status = 'leased', leased_by = $worker_id,
+        leased_until = now() + interval '30 seconds',
+        lease_heartbeat_at = now()
+    WHERE id = $run_id
+      AND (status = 'queued' OR (status = 'leased' AND leased_until < now()))
+    RETURNING *;
+
+Two things worth being explicit about, since this task's own instructions
+ask for a flagged finding rather than a silent deviation wherever reality
+and the design-time document diverge:
+
+1. **The `WHERE id = $run_id` predicate implies a candidate is already
+   chosen before this statement runs.** `claim_next_run` below makes that
+   explicit: a plain, unlocked `SELECT id ... ORDER BY queued_at LIMIT 1`
+   picks one candidate, then the exact compare-and-swap `UPDATE` above
+   (parameterized by that `id`) is the sole atomic claim -- no `SELECT
+   ... FOR UPDATE` precedes it (this task's own instruction: that would be
+   a different, arguably worse locking strategy than the one-statement
+   compare-and-swap Decision 3 actually specifies). Two workers racing the
+   same candidate simply both attempt the same targeted `UPDATE`; exactly
+   one affects a row, the other's `UPDATE` matches zero rows and that
+   worker polls again -- "no error path, this is the expected steady-state
+   outcome under concurrent workers" (Decision 3, verbatim).
+2. **The expired-lease branch here checks `status IN ('leased',
+   'running')`, not `status = 'leased'` alone.** `DATA-MODEL.md`'s own
+   run-state vocabulary requires a distinct `running` state (reached while
+   a run is actively dispatching steps, as opposed to `leased`: claimed
+   but not yet past its first step) -- this task's own instructions list
+   `running` among the states this worker "needs to legitimately reach".
+   Decision 3's literal SQL, restricted to `status = 'leased'`, would never
+   reclaim a run that crashed *after* transitioning to `running` -- silently
+   violating `docs/runbooks/PHASE-5-RECOVERY.md`'s own central claim that
+   "recovery is the same lease-expiry reclaim logic every worker already
+   runs on every poll cycle, not a distinct disaster-recovery code path"
+   for exactly the crash timing that matters most (mid-run, not merely
+   post-claim-pre-start). Both `leased` and `running` are lease-bearing
+   states (both carry `leased_by`/`leased_until`/`lease_heartbeat_at`,
+   both are renewed by the identical `renew_lease` heartbeat call below) --
+   so this implementation's reclaim predicate is `status IN ('leased',
+   'running') AND leased_until < now()`, a one-word-wider, disclosed
+   generalization of Decision 3's own SQL, not a second code path. See
+   `docs/runbooks/PHASE-5-RECOVERY.md`'s own updated text (this task's
+   commit) and this PR's evidence section for the same note.
+
+**Idempotency (Decision 3, made concrete).** `run_step` computes
+`action_digest = sha256({workflow_id, workflow_version, step_id,
+resolved_input})` and `INSERT`s the `workflow_run_steps` row -- `status =
+'dispatched'`, digest set -- in a statement that is durably `commit()`-ed
+(not merely `flush()`-ed -- see the commit-placement note below) to the
+database **before** the resolved adapter's `execute()` is called. A row
+already `succeeded` under this exact `(run_id, step_index)` key is never
+re-dispatched (`execute()` is not called a second time); a row still
+`dispatched` when a worker next examines it (digest persisted, no outcome
+ever recorded -- the crash-between-persist-and-confirm case) is marked
+`unknown` and the run moves to `needs_review`, never blindly retried.
+
+**Every durability-critical write in this module commits immediately, on
+a bare session -- not `flush()`, and not left to an enclosing `with
+session.begin():` block.** This mirrors `ecc.domains.ai_runtime.runtime.
+_persist_terminal`'s own documented reasoning exactly: a `flush()` sends
+statements to the server but is rolled back along with everything else in
+an open transaction if the process dies before that transaction's own
+`COMMIT` -- which would silently defeat Decision 3's entire guarantee
+("computed once and persisted to `workflow_run_steps.action_digest`
+**before** the adapter's `execute()` is called", design doc verbatim)
+for the one crash timing that guarantee exists to cover. Calling `session.
+commit()` from inside a caller's `with session.begin():` block raises
+`InvalidRequestError` (confirmed directly against this codebase's own
+`Session`/`SessionFactory` wiring while reviewing this task -- SQLAlchemy
+2.0's context-manager form holds a reference to the specific transaction
+it started and cannot complete against one an inner call already ended),
+so every function in this module that needs a real, crash-surviving
+commit -- `claim_next_run`, `renew_lease`, `run_step`, and the internal
+`_mark_running`/`_finish_run` helpers `process_claimed_run` calls -- must
+be invoked against a **bare** `session` (`with SessionFactory() as
+session:`, no `.begin()`), exactly like every `execute_run` call site in
+`tests/test_ai_runtime_runtime_postgres.py`. `enqueue_run` and
+`cancel_run` are the exception: neither has a risky external call to
+protect against, so both remain ordinary caller-committed mutations
+(`with session.begin():` is correct for them, matching every Task 1
+endpoint's own convention).
+
+**Heartbeat shape (a documented choice, not the only possible one).**
+`renew_lease` is a plain, independently callable, independently testable
+function (`renew_lease(session, workspace_id, run_id, worker_id)`) --
+`process_claimed_run` calls it once per step, immediately before that
+step's `run_step` dispatch, which is the "called between steps at
+minimum" shape this task's own instructions explicitly allow. This
+activation's own adapters (this task's tests' fakes; later tasks' local/
+fake adapters) are fast in-process calls with no real long-running I/O, so
+a single per-step renewal comfortably keeps `leased_until` ahead of the
+10-second heartbeat cadence Decision 3 specifies without needing a
+background thread mid-`execute()`. A later task whose adapters are
+genuinely slow (a Phase-4 AI-runtime step budgeted up to 75s, an external
+connector call) can wrap a single slow `execute()` call in a background
+timer that calls this exact same `renew_lease` function every 10 seconds
+while that one call is in flight -- the mechanism does not change, only
+the calling shape around one specific slow step would need to.
+
+**Cancellation.** `cancel_run` sets `cancel_requested_at` (immediately,
+for a run still `queued`, also flips straight to `cancelled` -- there is
+no in-flight step to protect). For a claimed run, `process_claimed_run`
+checks `cancel_requested_at` immediately before dispatching each
+not-yet-dispatched step and, if set, stops there (`status = 'cancelled'`)
+without calling `run_step` for that step at all -- a step already
+mid-`run_step` (already committed its `dispatched` row and called
+`execute()`) is never interrupted, matching `EXECUTION-CONTRACT.md`
+verbatim ("a step already dispatched to its adapter completes ... rather
+than being force-interrupted").
+"""
+
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from hashlib import sha256
+from json import dumps
+from typing import Any, Literal
+from uuid import UUID, uuid4
+
+from sqlalchemy import text
+from sqlalchemy.orm import Session
+
+from .adapters import AdapterRegistry
+from .workflows import get_active_workflow_version, get_workflow_version
+
+RunStatus = Literal[
+    "queued",
+    "leased",
+    "running",
+    "waiting_approval",
+    "paused",
+    "needs_review",
+    "succeeded",
+    "failed",
+    "cancelled",
+    "compensating",
+    "compensated",
+    "compensation_failed",
+    "expired",
+    "rate_limited",
+]
+StepStatus = Literal["pending", "dispatched", "succeeded", "failed", "unknown", "skipped"]
+
+# Decision 3's concrete numbers -- referenced by docstrings/tests, and
+# interpolated into the lease SQL below so there is exactly one place
+# these three numbers live (never a second hardcoded literal that could
+# silently drift from this module's own constants).
+POLL_INTERVAL_SECONDS = 2
+LEASE_DURATION_SECONDS = 30
+HEARTBEAT_INTERVAL_SECONDS = 10
+
+_TERMINAL_RUN_STATUSES = frozenset(
+    {
+        "succeeded",
+        "failed",
+        "cancelled",
+        "compensated",
+        "compensation_failed",
+        "expired",
+        "rate_limited",
+    }
+)
+
+# See module docstring point 2: the reclaim predicate's expired-lease
+# branch spans both lease-bearing states, not `leased` alone.
+_CLAIMABLE_PREDICATE = (
+    "(status = 'queued' OR (status IN ('leased', 'running') AND leased_until < now()))"
+)
+
+_RUN_FIELDS = """
+    id, workspace_id, workflow_id, workflow_version, policy_id, trigger_ref,
+    status, current_step_index, leased_by, leased_until, lease_heartbeat_at,
+    cancel_requested_at, queued_at, started_at, finished_at, created_by,
+    created_at, updated_at
+"""
+
+_STEP_FIELDS = """
+    id, workspace_id, run_id, step_index, step_type, status, action_digest,
+    input, output, started_at, finished_at, error_class, created_at, updated_at
+"""
+
+# Redaction markers (design doc Decision 8's Threat model section /
+# `DATA-MODEL.md`'s "step payloads are redacted" requirement): any dict key
+# whose name contains one of these (case-insensitive) has its value
+# replaced before either `workflow_run_steps.input` or `.output` is ever
+# written. This is a real, load-bearing transform on stored bytes, not a
+# comment -- `_redact_payload` runs on every step INSERT/UPDATE in this
+# module, and this task's own tests assert a marked key never reaches the
+# database unredacted.
+_REDACTION_MARKERS = ("secret", "password", "token", "credential", "api_key", "authorization")
+
+_REDACTED_VALUE = "[REDACTED]"
+
+# The natural key `run_step` addresses a `workflow_run_steps` row by,
+# reused verbatim across its INSERT-once/UPDATE-on-outcome statements.
+_STEP_ROW_WHERE = (
+    "WHERE workspace_id = :workspace_id AND run_id = :run_id AND step_index = :step_index"
+)
+
+
+# ---------------------------------------------------------------------------
+# Result / value types
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class WorkflowRun:
+    id: UUID
+    workspace_id: UUID
+    workflow_id: str
+    workflow_version: int
+    policy_id: UUID | None
+    trigger_ref: str | None
+    status: RunStatus
+    current_step_index: int
+    leased_by: str | None
+    leased_until: datetime | None
+    lease_heartbeat_at: datetime | None
+    cancel_requested_at: datetime | None
+    queued_at: datetime
+    started_at: datetime | None
+    finished_at: datetime | None
+    created_by: UUID
+    created_at: datetime
+    updated_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class WorkflowRunStep:
+    id: UUID
+    workspace_id: UUID
+    run_id: UUID
+    step_index: int
+    step_type: str
+    status: StepStatus
+    action_digest: str | None
+    input: dict[str, Any]
+    output: dict[str, Any] | None
+    started_at: datetime | None
+    finished_at: datetime | None
+    error_class: str | None
+    created_at: datetime
+    updated_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class StepOutcome:
+    step_index: int
+    status: StepStatus
+    output: dict[str, Any] | None
+    error_class: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class WorkflowNotActive:
+    """`enqueue_run` was asked to run a `workflow_id` with no `active`
+    `workflow_versions` row -- the mechanical source of `API-SCHEMAS.md`'s
+    `WORKFLOW_NOT_ACTIVE` error code, matching Task 1's existing error-code
+    convention (`workflows.py:WorkflowVersionNotActive`) exactly.
+    """
+
+    workflow_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class WorkflowRunNotFound:
+    """No `workflow_runs` row matches the given lookup key in this
+    workspace -- mirrors every other `*NotFound` dataclass in this
+    package (`workflows.py:WorkflowVersionNotFound`,
+    `policy.py:PolicyNotFound`).
+    """
+
+
+class UnsupportedStepType(ValueError):
+    """`run_step` was asked to dispatch a step whose `step_type` is not
+    `action`. Handling `approval_gate` (Task 3's approval-gate logic) and
+    `condition` (never listed in this task's own scope) is deliberately
+    out of this task's scope -- raised, not silently skipped or silently
+    treated as an action, so a graph that reaches an unsupported step type
+    fails loudly during this task's own tests rather than producing a
+    misleading outcome. Every graph this task's own tests construct uses
+    `action` steps only, so this is never hit by this task's own test
+    suite; it exists as a guard against a future caller accidentally
+    routing an unsupported step type through this task's dispatch path
+    before the task that actually implements it lands.
+    """
+
+
+# ---------------------------------------------------------------------------
+# Redaction
+# ---------------------------------------------------------------------------
+
+
+def _redact_payload(value: Any) -> Any:
+    """Recursively replaces the value of any dict key matching a
+    `_REDACTION_MARKERS` substring (case-insensitive) with
+    `_REDACTED_VALUE`. Applied to both `input` and `output` before either
+    is ever written to `workflow_run_steps` -- the mechanical enforcement
+    of "step payloads are redacted" (`DATA-MODEL.md`), not merely a
+    documented intention. Non-dict/list values pass through unchanged.
+    """
+    if isinstance(value, dict):
+        redacted: dict[str, Any] = {}
+        for key, inner in value.items():
+            if any(marker in key.lower() for marker in _REDACTION_MARKERS):
+                redacted[key] = _REDACTED_VALUE
+            else:
+                redacted[key] = _redact_payload(inner)
+        return redacted
+    if isinstance(value, list):
+        return [_redact_payload(item) for item in value]
+    return value
+
+
+# ---------------------------------------------------------------------------
+# Row <-> dataclass mapping
+# ---------------------------------------------------------------------------
+
+
+def _row_to_run(row: dict[str, Any]) -> WorkflowRun:
+    return WorkflowRun(
+        id=row["id"],
+        workspace_id=row["workspace_id"],
+        workflow_id=row["workflow_id"],
+        workflow_version=row["workflow_version"],
+        policy_id=row["policy_id"],
+        trigger_ref=row["trigger_ref"],
+        status=row["status"],
+        current_step_index=row["current_step_index"],
+        leased_by=row["leased_by"],
+        leased_until=row["leased_until"],
+        lease_heartbeat_at=row["lease_heartbeat_at"],
+        cancel_requested_at=row["cancel_requested_at"],
+        queued_at=row["queued_at"],
+        started_at=row["started_at"],
+        finished_at=row["finished_at"],
+        created_by=row["created_by"],
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+    )
+
+
+def _row_to_step(row: dict[str, Any]) -> WorkflowRunStep:
+    return WorkflowRunStep(
+        id=row["id"],
+        workspace_id=row["workspace_id"],
+        run_id=row["run_id"],
+        step_index=row["step_index"],
+        step_type=row["step_type"],
+        status=row["status"],
+        action_digest=row["action_digest"],
+        input=row["input"],
+        output=row["output"],
+        started_at=row["started_at"],
+        finished_at=row["finished_at"],
+        error_class=row["error_class"],
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+    )
+
+
+# ---------------------------------------------------------------------------
+# Reads
+# ---------------------------------------------------------------------------
+
+
+def get_run(session: Session, workspace_id: UUID, run_id: UUID) -> WorkflowRun | None:
+    row = (
+        session.execute(
+            text(
+                f"SELECT {_RUN_FIELDS} FROM workflow_runs "
+                "WHERE workspace_id = :workspace_id AND id = :id"
+            ),
+            {"workspace_id": workspace_id, "id": run_id},
+        )
+        .mappings()
+        .one_or_none()
+    )
+    return _row_to_run(dict(row)) if row is not None else None
+
+
+def list_run_steps(session: Session, workspace_id: UUID, run_id: UUID) -> list[WorkflowRunStep]:
+    rows = (
+        session.execute(
+            text(
+                f"SELECT {_STEP_FIELDS} FROM workflow_run_steps "
+                "WHERE workspace_id = :workspace_id AND run_id = :run_id ORDER BY step_index ASC"
+            ),
+            {"workspace_id": workspace_id, "run_id": run_id},
+        )
+        .mappings()
+        .all()
+    )
+    return [_row_to_step(dict(row)) for row in rows]
+
+
+# ---------------------------------------------------------------------------
+# Enqueue
+# ---------------------------------------------------------------------------
+
+
+def enqueue_run(
+    session: Session,
+    workspace_id: UUID,
+    actor_id: UUID,
+    *,
+    workflow_id: str,
+    trigger_ref: str | None = None,
+) -> WorkflowRun | WorkflowNotActive:
+    """Creates a `queued` `workflow_runs` row pinned to `workflow_id`'s
+    current `active` `workflow_versions` row -- reuses `workflows.
+    get_active_workflow_version` (Task 1) rather than re-querying for an
+    active version here, matching this task's own instruction. Rejects a
+    workflow with no active version (`WorkflowNotActive`, Task 1's
+    `WORKFLOW_NOT_ACTIVE`-shaped error-code convention) before any row is
+    written.
+    """
+    active = get_active_workflow_version(session, workspace_id, workflow_id)
+    if active is None:
+        return WorkflowNotActive(workflow_id=workflow_id)
+
+    now = datetime.now(UTC)
+    run_id = uuid4()
+    session.execute(
+        text(
+            """
+            INSERT INTO workflow_runs (
+                id, workspace_id, workflow_id, workflow_version, policy_id,
+                trigger_ref, status, current_step_index, queued_at,
+                created_by, created_at, updated_at
+            ) VALUES (
+                :id, :workspace_id, :workflow_id, :workflow_version, :policy_id,
+                :trigger_ref, 'queued', 0, :now, :created_by, :now, :now
+            )
+            """
+        ),
+        {
+            "id": run_id,
+            "workspace_id": workspace_id,
+            "workflow_id": workflow_id,
+            "workflow_version": active.version,
+            "policy_id": active.policy_ref,
+            "trigger_ref": trigger_ref,
+            "created_by": actor_id,
+            "now": now,
+        },
+    )
+    result = get_run(session, workspace_id, run_id)
+    assert result is not None  # just inserted, in the same transaction
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Claim / lease / heartbeat
+# ---------------------------------------------------------------------------
+
+
+def claim_next_run(session: Session, worker_id: str) -> WorkflowRun | None:
+    """Design doc Decision 3's compare-and-swap claim, generalized per this
+    module's docstring point 2. A plain, unlocked `SELECT` (no `FOR
+    UPDATE` -- this task's own instruction) identifies one candidate row
+    (`ORDER BY queued_at ASC`, oldest first); the single-statement
+    `UPDATE ... WHERE id = :id AND <the identical predicate> RETURNING *`
+    is the sole atomic claim. Returns `None` when there is nothing
+    claimable, or when this worker lost the race for the one candidate it
+    picked (the caller's next poll cycle, 2 seconds later per
+    `POLL_INTERVAL_SECONDS`, tries again) -- both are the ordinary,
+    expected steady state under concurrent workers, never an error.
+    """
+    candidate_id = session.execute(
+        text(
+            f"SELECT id FROM workflow_runs WHERE {_CLAIMABLE_PREDICATE} "
+            "ORDER BY queued_at ASC LIMIT 1"
+        )
+    ).scalar()
+    if candidate_id is None:
+        return None
+
+    row = (
+        session.execute(
+            text(
+                f"""
+                UPDATE workflow_runs
+                SET status = 'leased', leased_by = :worker_id,
+                    leased_until = now() + interval '{LEASE_DURATION_SECONDS} seconds',
+                    lease_heartbeat_at = now(), updated_at = now()
+                WHERE id = :id AND {_CLAIMABLE_PREDICATE}
+                RETURNING {_RUN_FIELDS}
+                """
+            ),
+            {"worker_id": worker_id, "id": candidate_id},
+        )
+        .mappings()
+        .one_or_none()
+    )
+    if row is None:
+        return None
+    # Durable before returning: a lease this worker believes it holds must
+    # survive a crash on the very next line, or a subsequent claim attempt
+    # would see this run still 'queued' and let a second worker dispatch it
+    # from scratch -- see module docstring's commit-placement note.
+    session.commit()
+    return _row_to_run(dict(row))
+
+
+def renew_lease(
+    session: Session, workspace_id: UUID, run_id: UUID, worker_id: str
+) -> WorkflowRun | None:
+    """The heartbeat (Decision 3: renewed every 10 seconds while a step is
+    actively executing) -- an independently callable, independently
+    testable function, not folded invisibly into `process_claimed_run`
+    (this task's own instruction). Only renews a lease this exact
+    `worker_id` currently holds on a still-lease-bearing run (`status IN
+    ('leased', 'running')`) -- a worker that has already lost its lease
+    (reclaimed by another worker after a missed heartbeat) gets `None`
+    back and must stop dispatching further steps for this run, never
+    silently keep going under a lease it no longer holds.
+    """
+    row = (
+        session.execute(
+            text(
+                f"""
+                UPDATE workflow_runs
+                SET leased_until = now() + interval '{LEASE_DURATION_SECONDS} seconds',
+                    lease_heartbeat_at = now(), updated_at = now()
+                WHERE workspace_id = :workspace_id AND id = :id AND leased_by = :worker_id
+                  AND status IN ('leased', 'running')
+                RETURNING {_RUN_FIELDS}
+                """
+            ),
+            {"workspace_id": workspace_id, "id": run_id, "worker_id": worker_id},
+        )
+        .mappings()
+        .one_or_none()
+    )
+    if row is None:
+        return None
+    # Durable immediately: a heartbeat that isn't committed is, from a
+    # recovering worker's perspective, a heartbeat that never happened --
+    # module docstring's commit-placement note.
+    session.commit()
+    return _row_to_run(dict(row))
+
+
+def _mark_running(session: Session, run: WorkflowRun) -> WorkflowRun:
+    now = datetime.now(UTC)
+    session.execute(
+        text(
+            "UPDATE workflow_runs SET status = 'running', "
+            "started_at = COALESCE(started_at, :now), updated_at = :now "
+            "WHERE id = :id AND status = 'leased'"
+        ),
+        {"now": now, "id": run.id},
+    )
+    # Durable before the first step is dispatched -- module docstring's
+    # commit-placement note; matches every other write in this function's
+    # call chain.
+    session.commit()
+    result = get_run(session, run.workspace_id, run.id)
+    assert result is not None
+    return result
+
+
+def _finish_run(session: Session, run: WorkflowRun, status: RunStatus) -> WorkflowRun:
+    now = datetime.now(UTC)
+    session.execute(
+        text(
+            "UPDATE workflow_runs SET status = :status, finished_at = :now, updated_at = :now, "
+            "leased_by = NULL, leased_until = NULL WHERE id = :id"
+        ),
+        {"status": status, "now": now, "id": run.id},
+    )
+    session.commit()
+    result = get_run(session, run.workspace_id, run.id)
+    assert result is not None
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Step dispatch -- idempotency-gated, digest-before-execute (Decision 3)
+# ---------------------------------------------------------------------------
+
+
+def compute_action_digest(
+    *, workflow_id: str, workflow_version: int, step_id: str, resolved_input: dict[str, Any]
+) -> str:
+    """`sha256` over `{workflow_id, workflow_version, step_id,
+    resolved_input}` (Decision 3, Threat model: "the digest covers the
+    step's *resolved input*"), canonical (UTF-8, sorted-object-keys,
+    compact-separator) JSON bytes -- identical hashing convention to
+    `workflows.compute_definition_hash`.
+    """
+    material = {
+        "workflow_id": workflow_id,
+        "workflow_version": workflow_version,
+        "step_id": step_id,
+        "resolved_input": resolved_input,
+    }
+    canonical = dumps(material, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _resolve_step(session: Session, run: WorkflowRun, step_index: int) -> dict[str, Any]:
+    """Reads `step_index` out of the run's pinned `workflow_versions.graph`
+    -- reuses `workflows.get_workflow_version` (Task 1) rather than
+    re-querying `workflow_versions` directly, matching this task's own
+    instruction to reuse Task 1's lookups rather than duplicate them.
+    """
+    version = get_workflow_version(session, run.workspace_id, run.workflow_id, run.workflow_version)
+    if version is None:
+        # A run can only ever be created against a version that existed at
+        # enqueue time (enqueue_run's own FK-backed insert), and workflow
+        # versions are immutable/never deleted -- reaching this branch
+        # would indicate a real data-integrity bug, not a recoverable
+        # runtime condition.
+        raise RuntimeError(
+            f"workflow_runs row {run.id} pins workflow_version "
+            f"{run.workflow_id}@{run.workflow_version}, which no longer exists"
+        )
+    steps: list[dict[str, Any]] = version.graph.get("steps", [])
+    return steps[step_index]
+
+
+def run_step(
+    session: Session, run: WorkflowRun, step_index: int, adapter_registry: AdapterRegistry
+) -> StepOutcome:
+    """Dispatches (or resumes) exactly one step. At-most-one-effect
+    (Decision 3): a `workflow_run_steps` row already `succeeded` under
+    this `(run_id, step_index)` key is returned as-is, `execute()` is
+    never called a second time. A row still `dispatched` (the digest was
+    persisted before a prior attempt but no outcome was ever recorded --
+    the crash-in-the-gap case) is marked `unknown` here and returned as
+    such, again without calling `execute()` -- this is the mechanical
+    surface of "unknown external outcome moves to review, never blind
+    retry" (`EXECUTION-CONTRACT.md`).
+
+    Only `step_type == "action"` is dispatched; anything else raises
+    `UnsupportedStepType` (module docstring / class docstring: out of this
+    task's scope).
+    """
+    step = _resolve_step(session, run, step_index)
+    if step.get("step_type") != "action":
+        raise UnsupportedStepType(
+            f"run_step only dispatches step_type='action' in this task's scope; "
+            f"step '{step.get('step_id')}' (index {step_index}) is "
+            f"'{step.get('step_type')}'"
+        )
+
+    resolved_input: dict[str, Any] = step.get("input_mapping", {})
+    digest = compute_action_digest(
+        workflow_id=run.workflow_id,
+        workflow_version=run.workflow_version,
+        step_id=step["step_id"],
+        resolved_input=resolved_input,
+    )
+
+    existing = (
+        session.execute(
+            text(
+                f"SELECT {_STEP_FIELDS} FROM workflow_run_steps "
+                "WHERE workspace_id = :workspace_id AND run_id = :run_id "
+                "AND step_index = :step_index FOR UPDATE"
+            ),
+            {"workspace_id": run.workspace_id, "run_id": run.id, "step_index": step_index},
+        )
+        .mappings()
+        .one_or_none()
+    )
+
+    if existing is not None:
+        if existing["status"] == "succeeded":
+            return StepOutcome(step_index, "succeeded", existing["output"], None)
+        if existing["status"] in ("failed", "unknown"):
+            return StepOutcome(
+                step_index, existing["status"], existing["output"], existing["error_class"]
+            )
+        if existing["status"] == "dispatched":
+            now = datetime.now(UTC)
+            session.execute(
+                text(
+                    "UPDATE workflow_run_steps SET status = 'unknown', finished_at = :now, "
+                    "updated_at = :now WHERE id = :id"
+                ),
+                {"now": now, "id": existing["id"]},
+            )
+            session.commit()
+            return StepOutcome(step_index, "unknown", None, None)
+        # 'pending'/'skipped' rows are never written by this module; if one
+        # is ever seen (a future task's own write path), treat it as not
+        # yet dispatched and fall through to a fresh dispatch below.
+
+    else:
+        now = datetime.now(UTC)
+        session.execute(
+            text(
+                """
+                INSERT INTO workflow_run_steps (
+                    id, workspace_id, run_id, step_index, step_type, status,
+                    action_digest, input, started_at, created_at, updated_at
+                ) VALUES (
+                    :id, :workspace_id, :run_id, :step_index, :step_type, 'dispatched',
+                    :digest, CAST(:input AS jsonb), :now, :now, :now
+                )
+                """
+            ),
+            {
+                "id": uuid4(),
+                "workspace_id": run.workspace_id,
+                "run_id": run.id,
+                "step_index": step_index,
+                "step_type": step["step_type"],
+                "digest": digest,
+                "input": dumps(_redact_payload(resolved_input)),
+                "now": now,
+            },
+        )
+        # Decision 3's core guarantee: the digest is durably committed to
+        # the database *before* execute() is ever called -- a real COMMIT,
+        # not merely `flush()` (module docstring's commit-placement note:
+        # a flush alone is rolled back with the rest of an open transaction
+        # if the process dies before that transaction's own COMMIT, which
+        # would silently defeat this exact guarantee for the one crash
+        # timing it exists to cover). A crash on the very next line leaves
+        # exactly this row -- status='dispatched', a real, committed,
+        # durable digest, no outcome -- for a later claim attempt's
+        # `existing["status"] == "dispatched"` branch above to catch.
+        session.commit()
+
+    adapter = adapter_registry.get(step["action_ref"])
+    if adapter is None:
+        now = datetime.now(UTC)
+        session.execute(
+            text(
+                "UPDATE workflow_run_steps SET status = 'failed', "
+                "error_class = 'AdapterNotRegistered', finished_at = :now, updated_at = :now "
+                f"{_STEP_ROW_WHERE}"
+            ),
+            {
+                "now": now,
+                "workspace_id": run.workspace_id,
+                "run_id": run.id,
+                "step_index": step_index,
+            },
+        )
+        session.commit()
+        return StepOutcome(step_index, "failed", None, "AdapterNotRegistered")
+
+    try:
+        action_input = adapter.input_schema.model_validate(resolved_input)
+        output_model = adapter.execute(action_input)
+        output_dict = output_model.model_dump(mode="json")
+    except Exception as exc:  # noqa: BLE001 -- an adapter may raise any error class
+        now = datetime.now(UTC)
+        session.execute(
+            text(
+                "UPDATE workflow_run_steps SET status = 'failed', error_class = :error_class, "
+                f"finished_at = :now, updated_at = :now {_STEP_ROW_WHERE}"
+            ),
+            {
+                "error_class": type(exc).__name__,
+                "now": now,
+                "workspace_id": run.workspace_id,
+                "run_id": run.id,
+                "step_index": step_index,
+            },
+        )
+        session.commit()
+        return StepOutcome(step_index, "failed", None, type(exc).__name__)
+
+    now = datetime.now(UTC)
+    session.execute(
+        text(
+            "UPDATE workflow_run_steps SET status = 'succeeded', "
+            "output = CAST(:output AS jsonb), finished_at = :now, updated_at = :now "
+            f"{_STEP_ROW_WHERE}"
+        ),
+        {
+            "output": dumps(_redact_payload(output_dict)),
+            "now": now,
+            "workspace_id": run.workspace_id,
+            "run_id": run.id,
+            "step_index": step_index,
+        },
+    )
+    # Durable after the side effect too (Decision 3: "persists state
+    # before and after each side effect") -- without this, a crash right
+    # after a real (non-idempotent) adapter's execute() succeeded would
+    # roll back the only record that it did, and a recovering worker would
+    # see the digest-committed-but-no-outcome 'dispatched' state above and
+    # correctly (but unnecessarily) surface it as needs_review rather than
+    # knowing the effect already completed cleanly.
+    session.commit()
+    return StepOutcome(step_index, "succeeded", output_dict, None)
+
+
+# ---------------------------------------------------------------------------
+# The claimed-run driving loop
+# ---------------------------------------------------------------------------
+
+
+def process_claimed_run(
+    session: Session, run: WorkflowRun, adapter_registry: AdapterRegistry, worker_id: str
+) -> WorkflowRun:
+    """Runs a freshly-claimed (or reclaimed) run's steps sequentially from
+    `current_step_index` to a terminal state -- Decision 3's concurrency
+    model ("steps execute strictly sequentially ... never more than one
+    in-flight step per run"). Renews the lease (`renew_lease`, the
+    heartbeat) immediately before each step's dispatch; if the lease was
+    lost (this worker's own heartbeat lost the race to a reclaim -- should
+    not happen under this task's own numbers, since 30s lease vastly
+    exceeds one in-process fake adapter call, but handled defensively
+    regardless), this worker stops advancing the run immediately rather
+    than dispatching further steps under a lease it no longer holds.
+
+    Checks `cancel_requested_at` before each not-yet-dispatched step and
+    stops there (module docstring's Cancellation section) without
+    dispatching that step at all.
+    """
+    run = _mark_running(session, run)
+    version = get_workflow_version(session, run.workspace_id, run.workflow_id, run.workflow_version)
+    assert version is not None
+    steps: list[dict[str, Any]] = version.graph.get("steps", [])
+
+    step_index = run.current_step_index
+    while step_index < len(steps):
+        renewed = renew_lease(session, run.workspace_id, run.id, worker_id)
+        if renewed is None:
+            current = get_run(session, run.workspace_id, run.id)
+            assert current is not None
+            return current
+        run = renewed
+
+        if run.cancel_requested_at is not None:
+            return _finish_run(session, run, "cancelled")
+
+        session.execute(
+            text(
+                "UPDATE workflow_runs SET current_step_index = :step_index, updated_at = now() "
+                "WHERE id = :id"
+            ),
+            {"step_index": step_index, "id": run.id},
+        )
+
+        outcome = run_step(session, run, step_index, adapter_registry)
+        if outcome.status == "succeeded":
+            step_index += 1
+            continue
+        if outcome.status == "failed":
+            return _finish_run(session, run, "failed")
+        if outcome.status == "unknown":
+            return _finish_run(session, run, "needs_review")
+        # 'skipped' -- never produced by run_step in this task's scope;
+        # handled here only so a future step type that legitimately skips
+        # itself advances cleanly rather than looping forever.
+        step_index += 1
+
+    session.execute(
+        text(
+            "UPDATE workflow_runs SET current_step_index = :step_index, updated_at = now() "
+            "WHERE id = :id"
+        ),
+        {"step_index": len(steps), "id": run.id},
+    )
+    return _finish_run(session, run, "succeeded")
+
+
+def run_worker_once(
+    session: Session, worker_id: str, adapter_registry: AdapterRegistry
+) -> WorkflowRun | None:
+    """One full poll-cycle iteration: `claim_next_run` then, if a run was
+    claimed, `process_claimed_run` to completion. Returns `None` when
+    nothing was claimable this cycle (the ordinary steady state, matching
+    `claim_next_run`'s own contract) -- callers that want a real polling
+    loop call this repeatedly on `POLL_INTERVAL_SECONDS`; no such loop
+    exists in this task's own scope (no process entrypoint is added here,
+    matching how this module has no HTTP surface either) -- this task's
+    own tests call `run_worker_once` (or `claim_next_run`/
+    `process_claimed_run` directly) to exercise exactly one iteration at a
+    time, deterministically.
+    """
+    run = claim_next_run(session, worker_id)
+    if run is None:
+        return None
+    return process_claimed_run(session, run, adapter_registry, worker_id)
+
+
+# ---------------------------------------------------------------------------
+# Cancellation
+# ---------------------------------------------------------------------------
+
+
+def cancel_run(
+    session: Session, workspace_id: UUID, run_id: UUID
+) -> WorkflowRun | WorkflowRunNotFound:
+    """Sets `cancel_requested_at` (idempotent -- a second call never moves
+    an already-recorded timestamp). A `queued` run (never claimed, no
+    in-flight step to protect at all) is cancelled immediately. A claimed
+    run's own `process_claimed_run` loop observes the flag before its next
+    not-yet-dispatched step and stops there -- this function itself never
+    touches `status` for anything already claimed, matching
+    `EXECUTION-CONTRACT.md`'s "stops before the next side effect" (a step
+    already dispatched to its adapter is never interrupted by this call).
+    A run already in a terminal state is returned unchanged (cancelling a
+    finished run is a no-op, not an error).
+    """
+    row = (
+        session.execute(
+            text(
+                "SELECT status FROM workflow_runs WHERE workspace_id = :workspace_id AND id = :id "
+                "FOR UPDATE"
+            ),
+            {"workspace_id": workspace_id, "id": run_id},
+        )
+        .mappings()
+        .one_or_none()
+    )
+    if row is None:
+        return WorkflowRunNotFound()
+
+    if row["status"] in _TERMINAL_RUN_STATUSES:
+        result = get_run(session, workspace_id, run_id)
+        assert result is not None
+        return result
+
+    now = datetime.now(UTC)
+    session.execute(
+        text(
+            "UPDATE workflow_runs SET cancel_requested_at = COALESCE(cancel_requested_at, :now), "
+            "updated_at = :now WHERE id = :id"
+        ),
+        {"now": now, "id": run_id},
+    )
+    if row["status"] == "queued":
+        session.execute(
+            text(
+                "UPDATE workflow_runs SET status = 'cancelled', finished_at = :now, "
+                "updated_at = :now WHERE id = :id"
+            ),
+            {"now": now, "id": run_id},
+        )
+
+    result = get_run(session, workspace_id, run_id)
+    assert result is not None
+    return result

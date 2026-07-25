@@ -139,6 +139,12 @@ _WORKSPACE_ID_TABLES: tuple[str, ...] = (
     "workflow_versions",
     "automation_policies",
     "triggers",
+    # Phase 5 Task 2 (migration 0039) -- workflow_runs/workflow_run_steps,
+    # also workspace-scoped; seeded (not merely migrated) here from day one
+    # for the identical reason the four Task 1 tables above are, closing
+    # this exact gap before it repeats a third time.
+    "workflow_runs",
+    "workflow_run_steps",
 )
 # `workspaces` is scoped by its own `id`, not a `workspace_id` column.
 _WORKSPACE_TABLE = "workspaces"
@@ -213,6 +219,8 @@ def _fixture_ids(label: str) -> dict[str, UUID]:
         "workflow_version": seed_id(label, "workflow_version", "acceptance"),
         "automation_policy": seed_id(label, "automation_policy", "acceptance"),
         "trigger": seed_id(label, "trigger", "acceptance"),
+        "workflow_run": seed_id(label, "workflow_run", "acceptance"),
+        "workflow_run_step": seed_id(label, "workflow_run_step", "acceptance"),
     }
 
 
@@ -1476,13 +1484,25 @@ _AUTOMATION_WORKFLOW_ID = "phase1-seed.automation.acceptance"
 
 
 def _seed_automation(cur: psycopg.Cursor[Any], label: str, ids: Mapping[str, UUID]) -> None:
-    """Phase 5 (migration 0038) -- workflow_definitions/workflow_versions/
-    automation_policies/triggers, all workspace-scoped (unlike Phase 4's
+    """Phase 5 (migrations 0038-0039) -- workflow_definitions/workflow_
+    versions/automation_policies/triggers (Task 1), plus workflow_runs/
+    workflow_run_steps (Task 2), all workspace-scoped (unlike Phase 4's
     global catalog tables). ``workflow_definitions`` is the family identity
     row every other table here FK's against; it must be inserted first.
     ``workflow_versions.policy_ref`` carries no FK constraint (migration
     0038's own docstring), so referencing ``ids["automation_policy"]`` here
     is safe regardless of insert order relative to the policy row itself.
+    ``workflow_runs`` pins ``workflow_version = 1`` via a real composite FK
+    (migration 0039) -- the seeded version row above must exist first, but
+    its ``status`` does not need to be ``active`` for that FK to hold, so
+    this seeds one ``succeeded`` run against the still-``draft`` version
+    seeded above rather than also seeding a second, ``active`` version
+    solely for this run to reference. This function is Task 1's own
+    ``_seed_automation`` extended in place (Task 2's own instruction),
+    following the exact ``workflow_runs``/``workflow_run_steps`` naturally-
+    follows-``workflow_definitions``/``workflow_versions`` sequencing
+    Task 1's fix commit established, not a new, duplicate ``_seed_*``
+    function.
     """
     graph = (
         '{"steps": [{"step_id": "notify", "step_type": "action", '
@@ -1579,6 +1599,68 @@ def _seed_automation(cur: psycopg.Cursor[Any], label: str, ids: Mapping[str, UUI
             "workspace_id": ids["workspace"],
             "workflow_id": _AUTOMATION_WORKFLOW_ID,
             "actor": ids["user"],
+            "now": SEED_EPOCH,
+        },
+    )
+
+    # Phase 5 Task 2 (migration 0039) -- workflow_runs/workflow_run_steps.
+    # A single completed run pinned to the ``workflow_versions`` row seeded
+    # above (version 1 -- the FK only requires the row to exist, not to be
+    # ``active``, so pointing at the still-``draft`` seed version is valid
+    # and avoids seeding a second, ``active`` version just for this run to
+    # reference). ``action_digest`` is computed inline with the same
+    # ``sha256``-over-canonical-material shape ``worker.compute_action_
+    # digest`` uses at runtime, not by importing that function -- mirrors
+    # how ``definition_hash`` above is computed inline rather than via
+    # ``ecc.domains.automation.workflows.compute_definition_hash``.
+    step_input = '{"note": "phase1 acceptance seed fixture -- no secret material"}'
+    step_output = '{"result": "ok"}'
+    action_digest = sha256(
+        (_AUTOMATION_WORKFLOW_ID + "1" + "notify" + step_input).encode("utf-8")
+    ).hexdigest()
+    cur.execute(
+        """
+        INSERT INTO workflow_runs (
+            id, workspace_id, workflow_id, workflow_version, policy_id,
+            trigger_ref, status, current_step_index, leased_by, leased_until,
+            lease_heartbeat_at, cancel_requested_at, queued_at, started_at,
+            finished_at, created_by, created_at, updated_at
+        ) VALUES (
+            %(id)s, %(workspace_id)s, %(workflow_id)s, 1, %(policy_ref)s,
+            'manual:phase1-seed', 'succeeded', 1, NULL, NULL, NULL, NULL,
+            %(now)s, %(now)s, %(now)s, %(actor)s, %(now)s, %(now)s
+        )
+        ON CONFLICT (id) DO NOTHING
+        """,
+        {
+            "id": ids["workflow_run"],
+            "workspace_id": ids["workspace"],
+            "workflow_id": _AUTOMATION_WORKFLOW_ID,
+            "policy_ref": ids["automation_policy"],
+            "actor": ids["user"],
+            "now": SEED_EPOCH,
+        },
+    )
+    cur.execute(
+        """
+        INSERT INTO workflow_run_steps (
+            id, workspace_id, run_id, step_index, step_type, status,
+            action_digest, input, output, started_at, finished_at,
+            error_class, created_at, updated_at
+        ) VALUES (
+            %(id)s, %(workspace_id)s, %(run_id)s, 0, 'action', 'succeeded',
+            %(action_digest)s, %(input)s, %(output)s, %(now)s, %(now)s,
+            NULL, %(now)s, %(now)s
+        )
+        ON CONFLICT (id) DO NOTHING
+        """,
+        {
+            "id": ids["workflow_run_step"],
+            "workspace_id": ids["workspace"],
+            "run_id": ids["workflow_run"],
+            "action_digest": action_digest,
+            "input": step_input,
+            "output": step_output,
             "now": SEED_EPOCH,
         },
     )
