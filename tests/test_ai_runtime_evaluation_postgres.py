@@ -93,11 +93,11 @@ def _metrics(**overrides: object) -> EvaluationMetrics:
     return EvaluationMetrics(**base)  # type: ignore[arg-type]
 
 
-def _run(metrics: EvaluationMetrics) -> EvaluationRun:
+def _run(metrics: EvaluationMetrics, *, task_type: str = TASK_TYPE) -> EvaluationRun:
     now = datetime.now(UTC)
     return EvaluationRun(
         id=uuid4(),
-        task_type=TASK_TYPE,
+        task_type=task_type,
         prompt_id=_SEEDED_PROMPT_ID,
         prompt_version=1,
         model_id=_SEEDED_MODEL_ID,
@@ -134,6 +134,50 @@ def test_check_promotion_floors_fails_on_latency_at_or_above_ceiling() -> None:
 
 def test_check_promotion_floors_passes_at_latency_just_under_ceiling() -> None:
     assert check_promotion_floors(_run(_metrics(latency_p95_seconds=19.999))) is True
+
+
+def test_check_promotion_floors_latency_ceiling_is_task_type_specific() -> None:
+    """`meeting.prep_summary`'s own declared floor is 25s
+    (`EVALUATION-CONTRACT.md`'s table), not `attention.explain_item`'s
+    tighter 20s -- Phase 4 post-launch audit, phase G, fixing a real bug
+    where `check_promotion_floors` held a single flat 20.0s ceiling
+    regardless of `evaluation_run.task_type`, silently making meeting.
+    prep_summary's documented 25s floor unreachable. A latency between the
+    two ceilings (22.0s) must pass for `meeting.prep_summary` and fail for
+    `attention.explain_item` -- proving the ceiling genuinely varies by
+    task type, not just that both happen to reject some shared value.
+    """
+    metrics = _metrics(latency_p95_seconds=22.0)
+    assert check_promotion_floors(_run(metrics, task_type="meeting.prep_summary")) is True
+    assert check_promotion_floors(_run(metrics, task_type="attention.explain_item")) is False
+
+
+def test_check_promotion_floors_meeting_prep_summary_fails_at_or_above_its_own_ceiling() -> None:
+    assert (
+        check_promotion_floors(
+            _run(_metrics(latency_p95_seconds=25.0), task_type="meeting.prep_summary")
+        )
+        is False
+    )
+    assert (
+        check_promotion_floors(
+            _run(_metrics(latency_p95_seconds=24.999), task_type="meeting.prep_summary")
+        )
+        is True
+    )
+
+
+def test_check_promotion_floors_unregistered_task_type_falls_back_to_strictest_ceiling() -> None:
+    """An evaluation run for a task type not in the ceiling table (should
+    not happen against real registered task types, but this is a pure
+    function with no guarantee its caller only ever passes one of the two
+    known types) fails safe -- held to the strictest defined ceiling
+    (20.0s) rather than silently admitting unbounded latency.
+    """
+    assert (
+        check_promotion_floors(_run(_metrics(latency_p95_seconds=22.0), task_type="unknown.task"))
+        is False
+    )
 
 
 # ---------------------------------------------------------------------------

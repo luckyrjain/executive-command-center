@@ -65,9 +65,9 @@ DEFAULT_PER_MODEL_CALL_TIMEOUT_SECONDS = 20.0
 # its source -- so this value cannot vary per call the way the manual
 # wall-clock deadline below can. It must stay a fixed ceiling comfortably
 # above every currently-registered task's own declared timeout (`router.py:
-# TASK_REQUIREMENTS` -- 20s/25s today) so a longer-than-`DEFAULT_PER_MODEL_
-# CALL_TIMEOUT_SECONDS` per-call override (`meeting.prep_summary`'s 25s)
-# is never silently cut short here first.
+# TASK_REQUIREMENTS` -- 20s/32s today) so a longer-than-`DEFAULT_PER_MODEL_
+# CALL_TIMEOUT_SECONDS` per-call override (`meeting.prep_summary`'s 32s) is
+# never silently cut short here first.
 #
 # This is a real, accepted trade-off, not a free backstop: for the common
 # case (many small streamed chunks), the manual deadline loop below is what
@@ -77,12 +77,17 @@ DEFAULT_PER_MODEL_CALL_TIMEOUT_SECONDS = 20.0
 # the scenario this constant exists to catch at all), this fixed value is
 # the only thing bounding that hang, for every task type uniformly. Kept
 # deliberately close to the largest registered timeout (not Decision 5's
-# full 60s total-run budget, which would let one hung single-chunk read
-# silently consume half the entire run's wall-clock allowance) -- if a
-# future task type registers a timeout close to this constant, raise this
+# total-run budget, which would let one hung single-chunk read silently
+# consume a large fraction of the entire run's wall-clock allowance) -- if
+# a future task type registers a timeout close to this constant, raise this
 # constant too; `test_ai_runtime_budgets_postgres.py` asserts the margin
-# holds so this can't silently drift out of sync.
-_HTTPX_TRANSPORT_TIMEOUT_SECONDS = 30.0
+# holds so this can't silently drift out of sync. Raised 30.0 -> 37.0 in
+# lockstep with `meeting.prep_summary`'s own 25s -> 32s raise (Phase 4
+# post-launch audit, phase G) -- the audit's own review-caught lesson from
+# the original 20s -> 25s raise: this constant must move whenever the
+# largest per-task timeout does, or it silently becomes the thing that
+# actually fires first.
+_HTTPX_TRANSPORT_TIMEOUT_SECONDS = 37.0
 
 
 class OllamaCallTimeout(Exception):
