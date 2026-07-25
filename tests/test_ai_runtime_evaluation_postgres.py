@@ -420,6 +420,71 @@ def test_run_evaluation_prohibited_fact_fails_only_that_floor(run_context: dict)
     assert any(failure["reason"] == "prohibited_fact" for failure in run.failures)
 
 
+def test_run_evaluation_provider_error_on_one_example_lands_in_other_failure(
+    run_context: dict,
+) -> None:
+    """`_classify_outcome`'s (`evaluation.py`) fourth, catch-all bucket --
+    a real coverage gap found during Phase 4 audit: the other three
+    outcomes (`schema_invalid`, `grounding_failed`, `prohibited_fact`,
+    tested above and below) all have a dedicated test, but nothing drove
+    an example into `other_failure` through `run_evaluation`'s real code
+    path. This is the bucket every non-validation `execute_run` failure
+    falls into -- `timeout`/`provider_error`/`circuit_open`/`budget_
+    exceeded` -- exactly the failure mode `meeting.prep_summary`'s
+    heaviest live-model examples hit in real CI (`EVALUATION-CONTRACT.md`'s
+    "Sandbox constraint" section). Simulated here with a single HTTP 500
+    on one specific example's model call, every other example still
+    succeeding.
+    """
+    failing_index = 5
+    failing_key = EXAMPLES[failing_index]["key"]
+    responses = _flat_responses()
+    call_index = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal call_index
+        index = call_index
+        call_index += 1
+        if index == failing_index:
+            return httpx.Response(500, json={"error": "boom"})
+        body = (
+            json.dumps(
+                {
+                    "model": "m",
+                    "created_at": "now",
+                    "response": responses[index],
+                    "done": True,
+                    "eval_count": 12,
+                    "prompt_eval_count": 40,
+                }
+            )
+            + "\n"
+        )
+        return httpx.Response(
+            200, content=body.encode(), headers={"content-type": "application/x-ndjson"}
+        )
+
+    adapter = OllamaAdapter(transport=httpx.MockTransport(handler))
+    with SessionFactory() as session:
+        run = run_evaluation(
+            TASK_TYPE,
+            1,
+            _SEEDED_MODEL_ID,
+            session=session,
+            auth=run_context["auth"],
+            ollama_adapter=adapter,
+        )
+
+    # The failing example is neither `completed` nor `grounding_failed`,
+    # so it drops out of both rates -- `_aggregate`'s own counting rule.
+    assert run.metrics.schema_validity_rate == pytest.approx(19 / 20)
+    assert run.metrics.grounding_rate == pytest.approx(19 / 20)
+    assert check_promotion_floors(run) is False
+    failure = next(f for f in run.failures if f["key"] == failing_key)
+    assert failure["reason"] == "other_failure"
+    assert failure["error_code"] == "provider_error"
+
+
 def test_run_evaluation_permanently_schema_invalid_fails_only_that_floor(
     run_context: dict,
 ) -> None:

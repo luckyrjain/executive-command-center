@@ -491,3 +491,171 @@ def test_reflection_call_produces_a_valid_completed_run_against_real_ollama(
                 ),
                 {"task_type": _TASK_TYPE},
             )
+
+
+def test_execute_run_output_is_reproducible_across_two_calls(
+    run_context: dict,
+) -> None:
+    """`ollama_client.py:generate()` sets `temperature=0` and a fixed
+    `seed=0` specifically for reproducibility -- the design doc's own
+    non-functional requirement ("Evaluation runs are reproducible from
+    stored versions/hashes"). `EVALUATION-CONTRACT.md`'s "Sandbox
+    constraint" section only ever describes this as an informal
+    observation across *separate* CI job runs over time ("three CI runs,
+    byte-for-byte identical") -- this test is the missing in-test
+    codification of that same claim: two `execute_run` calls against the
+    identical item/prompt, within one test, must produce the identical
+    validated output.
+
+    Compares `run.output` (the parsed, validated dict `execute_run`
+    returns), not the raw pre-JSON-parse response text -- `execute_run`
+    exposes no such raw-text field, so this proves the two calls are
+    value-identical/field-for-field reproducible, a narrower but still
+    meaningful property than literal byte-for-byte identity of the raw
+    model response (which this test cannot observe either way).
+
+    The second registered model is temporarily marked `disabled` (same
+    precedent as `test_second_registered_model_produces_a_valid_
+    completed_run_against_real_ollama` above, restored in `finally`) so
+    both calls are guaranteed to route to the same candidate -- otherwise
+    a routing decision that happened to differ between the two calls
+    (e.g. a preference tie-break shifting after the first call updates
+    observed candidate state) would make this test meaningless: it must
+    compare one model's output against itself, not two different models'
+    outputs.
+
+    Each call gets its own bounded `_SMOKE_TEST_ATTEMPTS` retry (same
+    reasoning as the second-model smoke test above: a `grounding_failed`
+    outcome from real small-model noise is never retried inside a single
+    `execute_run` call) -- this does not weaken the property under test:
+    `temperature=0`/`seed=0` determinism means every attempt against the
+    identical prompt is itself a deterministic function of that prompt,
+    so whichever attempt succeeds on either side, the two final validated
+    outputs must still match if determinism genuinely holds.
+    """
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "UPDATE model_definitions SET status = 'disabled' "
+                "WHERE provider = 'ollama' AND model_id = :model_id"
+            ),
+            {"model_id": _SECOND_MODEL_ID},
+        )
+    try:
+        item_id = uuid4()
+        now = datetime.now(UTC)
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO attention_items (
+                        id, workspace_id, entity_type, entity_id, source_entity_version,
+                        score, confidence, factors, explanation, generated_at, expires_at,
+                        pinned, policy_version
+                    ) VALUES (
+                        :id, :workspace_id, 'task', :entity_id, 1, 62, 0.900,
+                        CAST(:factors AS jsonb), 'because reasons', :now, :expires_at, false, 1
+                    )
+                    """
+                ),
+                {
+                    "id": item_id,
+                    "workspace_id": run_context["auth"].workspace_id,
+                    "entity_id": uuid4(),
+                    # The same real, multi-factor, known-good-grounding
+                    # example the second-model smoke test above already
+                    # uses (see that test's own comment on why a single-
+                    # factor item is a bad choice here).
+                    "factors": dumps(
+                        [
+                            {
+                                "code": "manual_priority",
+                                "label": "Manual priority critical",
+                                "points": 30,
+                                "source_field": "manual_priority",
+                            },
+                            {
+                                "code": "overdue",
+                                "label": "Due timing overdue",
+                                "points": 25,
+                                "source_field": "due_date,due_at",
+                            },
+                            {
+                                "code": "pinned",
+                                "label": "Explicitly pinned",
+                                "points": 15,
+                                "source_field": "pinned",
+                            },
+                            {
+                                "code": "blocked",
+                                "label": "Task is blocked",
+                                "points": 10,
+                                "source_field": "status",
+                            },
+                            {
+                                "code": "stale_14d",
+                                "label": "No movement for 14 days",
+                                "points": 6,
+                                "source_field": "updated_at",
+                            },
+                        ]
+                    ),
+                    "now": now,
+                    "expires_at": now + timedelta(days=1),
+                },
+            )
+
+        runs_first = []
+        for _attempt in range(_SMOKE_TEST_ATTEMPTS):
+            with SessionFactory() as session:
+                run = execute_run(
+                    _TASK_TYPE,
+                    "sensitive",
+                    {"attention_item_id": str(item_id)},
+                    session=session,
+                    auth=run_context["auth"],
+                    ollama_adapter=OllamaAdapter(host=_OLLAMA_BASE_URL),
+                )
+            runs_first.append(run)
+            if run.status == "completed":
+                break
+        assert run.status == "completed", (
+            f"first call never completed in {_SMOKE_TEST_ATTEMPTS} attempts: "
+            f"error_codes={[r.error_code for r in runs_first]!r}"
+        )
+        first_output = run.output
+
+        runs_second = []
+        for _attempt in range(_SMOKE_TEST_ATTEMPTS):
+            with SessionFactory() as session:
+                run = execute_run(
+                    _TASK_TYPE,
+                    "sensitive",
+                    {"attention_item_id": str(item_id)},
+                    session=session,
+                    auth=run_context["auth"],
+                    ollama_adapter=OllamaAdapter(host=_OLLAMA_BASE_URL),
+                )
+            runs_second.append(run)
+            if run.status == "completed":
+                break
+        assert run.status == "completed", (
+            f"second call never completed in {_SMOKE_TEST_ATTEMPTS} attempts: "
+            f"error_codes={[r.error_code for r in runs_second]!r}"
+        )
+        second_output = run.output
+
+        assert first_output == second_output, (
+            "temperature=0/seed=0 should make two calls against the identical "
+            f"prompt produce the identical validated output: first={first_output!r}, "
+            f"second={second_output!r}"
+        )
+    finally:
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    "UPDATE model_definitions SET status = 'active' "
+                    "WHERE provider = 'ollama' AND model_id = :model_id"
+                ),
+                {"model_id": _SECOND_MODEL_ID},
+            )
