@@ -1473,7 +1473,70 @@ def execute_run(
         raw2, _eval2, _prompt_eval2 = call_model(repair_prompt)
         return raw2
 
-    repair_result = validate_with_bounded_repair(port.output_schema, raw_response, reattempt)
+    # `reattempt` calls `call_model` again, so it can raise every exception
+    # the primary call above can -- `validate_with_bounded_repair` has no
+    # opinion on how the second raw response is produced and does not
+    # catch these itself (validator.py's own docstring). Handled here with
+    # the same fail() outcomes as the primary call's identical exceptions,
+    # `attempts=1` (only the first, schema_invalid response was actually
+    # obtained) and its own `_model_step` entry -- so a retry-side failure
+    # degrades cleanly instead of escaping `execute_run` uncaught, exactly
+    # as every other failure mode in this function already does.
+    try:
+        repair_result = validate_with_bounded_repair(port.output_schema, raw_response, reattempt)
+    except OllamaCallTimeout:
+        breaker.record_failure()
+        steps.append(_model_step(len(steps) + 1, "failed", attempt=2, outcome="timeout"))
+        return fail(
+            "timeout",
+            steps=steps,
+            attempts=1,
+            policy_version=policy.version,
+            model_id=decision.model_id,
+            provider=decision.provider,
+            prompt_id=prepared.prompt_id,
+            prompt_version=prepared.prompt_version,
+        )
+    except OllamaCallCancelled:
+        steps.append(_model_step(len(steps) + 1, "failed", attempt=2, outcome="cancelled"))
+        return fail(
+            None,
+            status="cancelled",
+            steps=steps,
+            attempts=1,
+            policy_version=policy.version,
+            model_id=decision.model_id,
+            provider=decision.provider,
+            prompt_id=prepared.prompt_id,
+            prompt_version=prepared.prompt_version,
+        )
+    except OllamaCallFailed:
+        breaker.record_failure()
+        error_code = "circuit_open" if breaker.state == "open" else "provider_error"
+        steps.append(_model_step(len(steps) + 1, "failed", attempt=2, outcome=error_code))
+        return fail(
+            error_code,
+            steps=steps,
+            attempts=1,
+            policy_version=policy.version,
+            model_id=decision.model_id,
+            provider=decision.provider,
+            prompt_id=prepared.prompt_id,
+            prompt_version=prepared.prompt_version,
+        )
+    except RunBudgetExceeded:
+        steps.append(_model_step(len(steps) + 1, "failed", attempt=2, outcome="budget_exceeded"))
+        return fail(
+            "budget_exceeded",
+            status="degraded",
+            steps=steps,
+            attempts=1,
+            policy_version=policy.version,
+            model_id=decision.model_id,
+            provider=decision.provider,
+            prompt_id=prepared.prompt_id,
+            prompt_version=prepared.prompt_version,
+        )
     steps.append(
         _model_step(
             len(steps) + 1,

@@ -1,8 +1,8 @@
 ---
 id: PHASE-004-IMPLEMENTATION-STATUS
 title: Phase 4 Implementation Status
-status: Implemented (Tasks 0-10 of the first activation slice)
-version: 0.6.0
+status: Implemented (Tasks 0-11 of the first activation slice)
+version: 0.7.0
 owner: Lucky Jain
 updated: 2026-07-24
 ---
@@ -20,8 +20,8 @@ Phase 4's design work and its six-task implementation plan (`docs/superpowers/pl
 - Phase 3 exit gates complete, or an explicit repository-owner parallel-start authorization matching Phase 2's and Phase 3's own precedent -- **granted 2026-07-23**, same exception Phase 2 and Phase 3 received; see `docs/ROADMAP.md`'s Phase 4 status note and `PHASE-004-ai-runtime.md`'s "Dependency exit posture" section.
 - Phase 4 contracts approved for implementation -- **done 2026-07-23.** The four approval gates named in `docs/phases/PHASE-REVIEW.md:135` (approved local/remote models and providers, data-class egress matrix, evaluation floors, trace retention) are resolved in `PHASE-004-ai-runtime.md`'s "Approved models, providers and evaluation floors" section and the six `phase-004/*.md` contracts, all moved to `Approved for Implementation` at version 0.2.0.
 - Ollama activated as a technology -- **done 2026-07-23.** `docs/RFC-005.md` v1.3.0 and `docs/adr/ADR-0012-ollama-local-inference.md`, satisfying RFC-005's pre-registered "AI-runtime phase specification and ADR review" gate.
-- Versioned evaluation dataset and promotion rubric established -- planned as `tests/fixtures/phase4_evaluation_attention_explain.py` (Task 5 of the implementation plan), not yet created.
-- Ethics/safety review of the tool-allowlist and prompt-injection mitigations -- planned as Task 4's dedicated adversarial test plus Task 6's security-scanning pass, not yet created.
+- Versioned evaluation dataset and promotion rubric established -- **done.** `tests/fixtures/phase4_evaluation_attention_explain.py` (Task 5, commit `0d08726`) and `tests/fixtures/phase4_evaluation_meeting_prep.py` (Task 10, commit `9530466`).
+- Ethics/safety review of the tool-allowlist and prompt-injection mitigations -- **done.** Task 4's dedicated adversarial test (`tests/test_ai_runtime_runtime_postgres.py::test_execute_run_prompt_injection_in_factor_label_cannot_dispatch_out_of_scope_tool`) and Task 6's security-scanning pass, both documented in this file's Task 4/Task 6 evidence sections below.
 
 ## Delivery tasks
 
@@ -37,7 +37,8 @@ Phase 4's design work and its six-task implementation plan (`docs/superpowers/pl
 | 7 | Second local model registration | Done -- `0071b24` |
 | 8 | Reflection Engine (first slice) on `attention.explain_item` | Done -- `101cec5` |
 | 9 | Wire Phase 3's `meeting_prep.py` "Optional enrichment" to `execute_run` | Done -- `PR #43` |
-| 10 | Second evaluated task type: `meeting.prep_summary` evaluation dataset and promotion floors | Done -- this commit |
+| 10 | Second evaluated task type: `meeting.prep_summary` evaluation dataset and promotion floors | Done -- `9530466` |
+| 11 | Post-launch audit fixes: `execute_run`'s repair-retry exception handling | Done -- this commit |
 
 ### Task 1 evidence -- model/provider registry and router
 
@@ -177,6 +178,18 @@ Task 9 wired `meeting.prep_summary` into `execute_run`, but `run_evaluation`/`ch
 **Full regression.** `pytest` across `test_ai_runtime_evaluation_postgres.py`, the new meeting-prep-evaluation file, `test_ai_runtime_versioning_postgres.py`, `test_ai_runtime_routing_postgres.py`, `test_ai_runtime_runtime_postgres.py`, `test_ai_runtime_validation_postgres.py`, `test_attention_meeting_prep_postgres.py` -- 217 passed (post-review), zero regressions. `ruff check`/`format`/`mypy backend` clean on every file this task touched.
 
 **Docs.** `EVALUATION-CONTRACT.md`: new "Second task and dataset" section, dataset-size sentence updated to both datasets, promotion/reproducibility and sandbox-constraint sections updated to cover both task types. `DATA-MODEL.md`: `evaluation_sets`/`generated_artifacts` rows updated to describe two task types instead of one.
+
+### Task 11 evidence -- post-launch audit fixes
+
+A repository-owner-requested full audit of Phase 4 (five parallel passes: contract-doc drift, security/isolation, correctness/robustness, test-coverage gaps, known-issues verification) found one real, high-severity correctness bug and confirmed the rest of the system's prior review cycles held up under a fresh adversarial re-check.
+
+**The bug.** `execute_run`'s bounded schema-repair retry (`runtime.py`'s `reattempt()`, called from inside `validate_with_bounded_repair`) calls `call_model` a second time with no exception handling of its own -- unlike the identical primary call a few lines above, which is fully wrapped for `OllamaCallTimeout`/`OllamaCallCancelled`/`OllamaCallFailed`/`RunBudgetExceeded`. `validate_with_bounded_repair` (`validator.py`) does not add any handling either -- by design, it has no opinion on how the second raw response is produced. The result: any of those four exceptions occurring specifically on the *retry* (as opposed to the well-tested case of the retry's response itself being schema-invalid again) propagated straight out of `execute_run` uncaught, contradicting its own documented contract ("always returns an `AiRun` rather than raising", a contract `evaluation.py`'s `run_evaluation` explicitly assumed holds via its own comment) and its use inside `meeting_prep.py`'s `_compute_enrichment`, whose fail-open docstring this bug silently violated. Not a contrived edge case: `meeting.prep_summary`'s three largest examples already time out on their *first* attempt against the real model (Task 10's live-CI evidence above), making a timeout on a schema-repair *retry* -- whose prompt is strictly larger than the first attempt's -- a realistic sequence.
+
+**The fix.** Wrapped the `validate_with_bounded_repair(...)` call site in `runtime.py` with the same four `except` branches as the primary call, mapping to the same `fail(...)` outcomes (`timeout`/`cancelled`/`provider_error`-or-`circuit_open`/`budget_exceeded`), `attempts=1` (only the first, schema-invalid response was actually obtained), and its own `_model_step` trace entry -- so a retry-side failure now degrades cleanly instead of escaping uncaught, matching every other failure branch in this function.
+
+**Tests.** `tests/test_ai_runtime_runtime_postgres.py`: 2 new tests -- `test_execute_run_repair_retry_provider_error_fails_run_gracefully` (a transport-level 500 on the retry) and `test_execute_run_repair_retry_timeout_fails_run_gracefully` (the retry exceeds the per-model-call deadline), both asserting a clean `failed` `AiRun` with the correct `error_code`, `attempts == 1`, and a `_model_step` trace entry recording `attempt=2`. Full cross-suite regression (`test_ai_runtime_runtime_postgres.py` + `test_ai_runtime_evaluation_postgres.py` + the meeting-prep-evaluation file + `test_ai_runtime_versioning_postgres.py` + `test_ai_runtime_routing_postgres.py` + `test_ai_runtime_validation_postgres.py` + `test_ai_runtime_budgets_postgres.py` + `test_attention_meeting_prep_postgres.py`) -- 259 passed, zero regressions. `ruff check`/`format`/`mypy backend` clean.
+
+**Everything else the audit found, not fixed in this task (see the repository owner's own triage):** a residual gap in Task 10's own workspace-salting fix (closes cross-workspace synthetic-id collisions in `evaluation.py` but not same-workspace concurrent evaluation runs with different Idempotency-Keys -- still an unhandled `IntegrityError`, not a data leak); an idempotency-record commit split from the run's own commit in `create_run`/`create_evaluation_run` (a failure between the two lets a same-key retry double-fire a real model call -- `meeting_prep.py`'s `create_prep`/`refresh_prep` already avoid this by committing both in one transaction); the repair prompt is never re-checked against `max_input_tokens` (only the first prompt is); one `_reflect_on_answer` exit path skips its trace step (observability-only); output schemas cap word count but not raw character length; the circuit breaker's `runtime.py` wiring and the primary model call's failure paths are unit-tested in isolation but never exercised end-to-end through `execute_run`; `meeting.prep_summary` has no adversarial prompt-injection test despite a larger injection surface than `attention.explain_item`, which has one; the idempotency-conflict (409, reused key + different payload) path is untested for every write endpoint; idempotency concurrency is only tested sequentially, never with real concurrent requests; and three concrete, now-fixed doc-drift items (a stale "this commit" placeholder in this table, an outdated Prerequisites section still saying things "not yet created" that shipped tasks ago, and `TEST-PLAN.md` claiming an automated exfiltration "fitness-function" check that was never built -- only a one-time manual read was done).
 
 ## Sandbox constraint (carried forward from the design pass)
 
