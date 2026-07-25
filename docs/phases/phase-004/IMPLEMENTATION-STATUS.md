@@ -1,8 +1,8 @@
 ---
 id: PHASE-004-IMPLEMENTATION-STATUS
 title: Phase 4 Implementation Status
-status: Implemented (Tasks 0-11 of the first activation slice)
-version: 0.7.0
+status: Implemented (Tasks 0-12 of the first activation slice)
+version: 0.8.0
 owner: Lucky Jain
 updated: 2026-07-24
 ---
@@ -38,7 +38,8 @@ Phase 4's design work and its six-task implementation plan (`docs/superpowers/pl
 | 8 | Reflection Engine (first slice) on `attention.explain_item` | Done -- `101cec5` |
 | 9 | Wire Phase 3's `meeting_prep.py` "Optional enrichment" to `execute_run` | Done -- `PR #43` |
 | 10 | Second evaluated task type: `meeting.prep_summary` evaluation dataset and promotion floors | Done -- `9530466` |
-| 11 | Post-launch audit fixes: `execute_run`'s repair-retry exception handling | Done -- this commit |
+| 11 | Post-launch audit fixes: `execute_run`'s repair-retry exception handling | Done -- `b21718e` |
+| 12 | Post-launch audit fixes, phase A: synthetic-eval-id concurrency + idempotency-store fail-open | Done -- this commit |
 
 ### Task 1 evidence -- model/provider registry and router
 
@@ -190,6 +191,20 @@ A repository-owner-requested full audit of Phase 4 (five parallel passes: contra
 **Tests.** `tests/test_ai_runtime_runtime_postgres.py`: 2 new tests -- `test_execute_run_repair_retry_provider_error_fails_run_gracefully` (a transport-level 500 on the retry) and `test_execute_run_repair_retry_timeout_fails_run_gracefully` (the retry exceeds the per-model-call deadline), both asserting a clean `failed` `AiRun` with the correct `error_code`, `attempts == 1`, and a `_model_step` trace entry recording `attempt=2`. Full cross-suite regression (`test_ai_runtime_runtime_postgres.py` + `test_ai_runtime_evaluation_postgres.py` + the meeting-prep-evaluation file + `test_ai_runtime_versioning_postgres.py` + `test_ai_runtime_routing_postgres.py` + `test_ai_runtime_validation_postgres.py` + `test_ai_runtime_budgets_postgres.py` + `test_attention_meeting_prep_postgres.py`) -- 259 passed, zero regressions. `ruff check`/`format`/`mypy backend` clean.
 
 **Everything else the audit found, not fixed in this task (see the repository owner's own triage):** a residual gap in Task 10's own workspace-salting fix (closes cross-workspace synthetic-id collisions in `evaluation.py` but not same-workspace concurrent evaluation runs with different Idempotency-Keys -- still an unhandled `IntegrityError`, not a data leak); an idempotency-record commit split from the run's own commit in `create_run`/`create_evaluation_run` (a failure between the two lets a same-key retry double-fire a real model call -- `meeting_prep.py`'s `create_prep`/`refresh_prep` already avoid this by committing both in one transaction); the repair prompt is never re-checked against `max_input_tokens` (only the first prompt is); one `_reflect_on_answer` exit path skips its trace step (observability-only); output schemas cap word count but not raw character length; the circuit breaker's `runtime.py` wiring and the primary model call's failure paths are unit-tested in isolation but never exercised end-to-end through `execute_run`; `meeting.prep_summary` has no adversarial prompt-injection test despite a larger injection surface than `attention.explain_item`, which has one; the idempotency-conflict (409, reused key + different payload) path is untested for every write endpoint; idempotency concurrency is only tested sequentially, never with real concurrent requests; and three concrete, now-fixed doc-drift items (a stale "this commit" placeholder in this table, an outdated Prerequisites section still saying things "not yet created" that shipped tasks ago, and `TEST-PLAN.md` claiming an automated exfiltration "fitness-function" check that was never built -- only a one-time manual read was done).
+
+### Task 12 evidence -- post-launch audit fixes, phase A (concurrency + idempotency fail-open)
+
+Repository owner asked to pick up the audit's remaining findings in a phased approach. Phase A: the two items flagged as real correctness/robustness gaps (as opposed to test-coverage gaps or minor polish).
+
+**Fix 1 -- same-workspace concurrent evaluation-run id collision.** Task 10's workspace-salting fix (`_salted_synthetic_id`) closes cross-workspace collisions on `meeting.prep_summary`'s synthetic-meeting row ids, but two overlapping evaluation runs *within the same workspace* (different `Idempotency-Key`s -- `_held_idempotency_lock` only serializes requests sharing the same key) still compute identical salted ids for the same fixture example and race to `INSERT` the same real primary key, surfacing as an unhandled `IntegrityError`. Fixed with a new `_synthetic_meeting_serialization_lock(workspace_id)` -- the same `lock_engine`/`pg_advisory_lock` pattern as `_held_idempotency_lock`, keyed on `f"{workspace_id}:meeting.prep_summary:synthetic-eval-data"` -- wrapping `run_evaluation`'s whole per-example loop when (and only when) `task_type == "meeting.prep_summary"`. `attention.explain_item`'s synthetic items use random `uuid4()` ids with no collision risk and pay nothing for this (`contextlib.nullcontext()` in that branch).
+
+Verified the fix is load-bearing, not just present: temporarily disabled the lock and re-ran the new concurrency test, confirming it reproduces the exact `IntegrityError` (`duplicate key value violates unique constraint`) the fix closes, then restored the fix and confirmed the test passes.
+
+**Fix 2 -- idempotency-record write failure discards an already-successful run.** `create_run`/`create_evaluation_run` call `execute_run`/`run_evaluation` (which internally commits the real `ai_runs`/`evaluation_runs` row) and only afterward, in a separate transaction, store the idempotency bookkeeping record. If that second write fails (a transient DB error, not a concurrent request -- `_held_idempotency_lock` already fully serializes those), the caller previously got an unhandled 500 even though their run had genuinely completed and persisted -- the response they already paid a real model call for was discarded. Fixed by wrapping the idempotency-store call in `try`/`except SQLAlchemyError`, returning the already-built response and recording `record_database_failure` instead of propagating. This does not fully close the residual "a same-key retry after this exact failure re-invokes the model" risk (that requires a genuine two-phase-commit-style redesign, judged disproportionate to the actual likelihood -- the failure window is a DB blip landing in one specific few-millisecond gap, not routine concurrency) -- but it strictly improves the common case: the caller now gets their real, already-completed result back instead of losing it to an unrelated bookkeeping failure.
+
+**Tests.** `tests/test_ai_runtime_meeting_prep_evaluation_postgres.py`: `test_run_evaluation_concurrent_same_workspace_runs_do_not_collide` -- two genuinely concurrent `run_evaluation` calls (real threads, `ThreadPoolExecutor`, no shared Idempotency-Key) in the same workspace, both must complete and pass every floor, with zero leftover synthetic rows after. `tests/test_ai_runtime_runtime_postgres.py`: `test_post_ai_runs_idempotency_store_failure_still_returns_the_completed_run` -- monkeypatches `_store_idempotency` to raise `SQLAlchemyError`, asserts `POST /ai/runs` still returns 200 with the completed run (not a 500), and the run is independently fetchable by id. `tests/test_ai_runtime_evaluation_postgres.py`: the identical pattern for `POST /ai/evaluations/runs`.
+
+**Full regression.** `test_ai_runtime_runtime_postgres.py` + `test_ai_runtime_evaluation_postgres.py` + the meeting-prep-evaluation file + `test_ai_runtime_versioning_postgres.py` + `test_ai_runtime_routing_postgres.py` + `test_ai_runtime_validation_postgres.py` + `test_ai_runtime_budgets_postgres.py` + `test_attention_meeting_prep_postgres.py` -- 260 passed, zero regressions. `ruff check`/`format`/`mypy backend` clean.
 
 ## Sandbox constraint (carried forward from the design pass)
 

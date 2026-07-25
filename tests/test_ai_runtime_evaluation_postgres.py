@@ -45,10 +45,12 @@ import pytest
 from fastapi.testclient import TestClient
 from fixtures.phase4_evaluation_attention_explain import DATASET_VERSION, EXAMPLES, TASK_TYPE
 from sqlalchemy import text
+from sqlalchemy.exc import SQLAlchemyError
 
 from ecc.auth import AuthContext
 from ecc.config import get_settings
 from ecc.database import SessionFactory, engine
+from ecc.domains.ai_runtime import evaluation as evaluation_module
 from ecc.domains.ai_runtime.evaluation import (
     EvaluationConfigError,
     EvaluationMetrics,
@@ -614,6 +616,39 @@ def test_post_evaluations_runs_happy_path(run_context: dict, http_client: TestCl
     assert body["metrics"]["schema_validity_rate"] == 1.0
     assert body["metrics"]["grounding_rate"] == 1.0
     assert body["metrics"]["prohibited_fact_count"] == 0
+
+    get_response = http_client.get(f"/api/v1/ai/evaluations/runs/{body['id']}")
+    assert get_response.status_code == 200
+    assert get_response.json()["id"] == body["id"]
+
+
+def test_post_evaluations_runs_idempotency_store_failure_still_returns_the_completed_run(
+    run_context: dict, http_client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`run_evaluation` above `_store_idempotency`'s call site already
+    persisted the real `evaluation_runs` row (`_persist_evaluation_run`,
+    inside `run_evaluation`) by the time `_store_idempotency` runs -- a
+    failure writing only the idempotency bookkeeping record must not
+    discard the response the caller already successfully obtained. Before
+    this fix, this scenario surfaced as an unhandled 500 even though the
+    full labelled-set evaluation had genuinely completed and persisted --
+    `runtime.py:create_run`'s identical fix and test cover the same
+    pattern for `POST /ai/runs`.
+    """
+
+    def _failing_store(*args: object, **kwargs: object) -> None:
+        raise SQLAlchemyError("simulated idempotency-record write failure")
+
+    monkeypatch.setattr(evaluation_module, "_store_idempotency", _failing_store)
+
+    response = http_client.post(
+        "/api/v1/ai/evaluations/runs",
+        json={"task_type": TASK_TYPE, "prompt_version": 1, "model_id": _SEEDED_MODEL_ID},
+        headers=_headers(run_context["token"], key="eval-run-idempotency-store-fails"),
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["passed"] is True
 
     get_response = http_client.get(f"/api/v1/ai/evaluations/runs/{body['id']}")
     assert get_response.status_code == 200

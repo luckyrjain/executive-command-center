@@ -45,10 +45,12 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import text
+from sqlalchemy.exc import SQLAlchemyError
 
 from ecc.auth import AuthContext
 from ecc.config import get_settings
 from ecc.database import SessionFactory, engine
+from ecc.domains.ai_runtime import runtime as runtime_module
 from ecc.domains.ai_runtime.budgets import RunBudget, RunBudgetExceeded
 from ecc.domains.ai_runtime.ollama_client import (
     OllamaAdapter,
@@ -1374,6 +1376,42 @@ def test_post_ai_runs_happy_path(run_context: dict, http_client: TestClient) -> 
     assert set(body["evidence"]) == {"overdue", "pinned"}
     assert body["usage"]["cost"] == 0.0
 
+    get_response = http_client.get(f"/api/v1/ai/runs/{body['id']}")
+    assert get_response.status_code == 200
+    assert get_response.json()["id"] == body["id"]
+
+
+def test_post_ai_runs_idempotency_store_failure_still_returns_the_completed_run(
+    run_context: dict, http_client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`execute_run` above `_store_idempotency`'s call site already
+    committed the real `ai_runs` row (`_persist_terminal`'s own internal
+    commit) by the time `_store_idempotency` runs -- a failure writing
+    only the idempotency bookkeeping record must not discard the response
+    the caller already successfully obtained. Before this fix, this
+    scenario surfaced as an unhandled 500 even though the run itself had
+    genuinely completed and persisted.
+    """
+    item_id = _insert_attention_item(run_context["workspace_id"], factors=_DEFAULT_FACTORS)
+
+    def _failing_store(*args: object, **kwargs: object) -> None:
+        raise SQLAlchemyError("simulated idempotency-record write failure")
+
+    monkeypatch.setattr(runtime_module, "_store_idempotency", _failing_store)
+
+    response = http_client.post(
+        "/api/v1/ai/runs",
+        json={"task": "attention.explain_item", "attention_item_id": str(item_id)},
+        headers=_headers(run_context["token"], key="run-idempotency-store-fails"),
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["status"] == "completed"
+    assert set(body["evidence"]) == {"overdue", "pinned"}
+
+    # The run itself is genuinely persisted -- a GET by id (not the
+    # idempotency-replay path) finds it regardless of the bookkeeping
+    # failure above.
     get_response = http_client.get(f"/api/v1/ai/runs/{body['id']}")
     assert get_response.status_code == 200
     assert get_response.json()["id"] == body["id"]
