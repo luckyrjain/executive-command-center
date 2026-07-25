@@ -1718,3 +1718,369 @@ def test_workspace_isolation_for_approval_requests(
     finally:
         with engine.begin() as connection:
             connection.execute(text("DELETE FROM workspaces WHERE id = :id"), {"id": workspace_b})
+
+
+# ---------------------------------------------------------------------------
+# 16. Task 4: user-initiated pause_run/resume_run.
+# ---------------------------------------------------------------------------
+
+
+def test_pause_queued_run_is_immediate(worker_test_context: tuple[UUID, UUID]) -> None:
+    workspace_id, user_id = worker_test_context
+    workflow_id = f"test.pause-queued.{uuid4().hex}"
+    graph = _chained_graph(_action_step("s1", "test.echo"))
+    _publish_workflow(workspace_id, user_id, workflow_id, graph)
+    with SessionFactory() as session, session.begin():
+        queued = automation_worker.enqueue_run(
+            session, workspace_id, user_id, workflow_id=workflow_id
+        )
+    assert isinstance(queued, automation_worker.WorkflowRun)
+
+    with SessionFactory() as session, session.begin():
+        paused = automation_worker.pause_run(session, workspace_id, queued.id)
+    assert isinstance(paused, automation_worker.WorkflowRun)
+    assert paused.status == "paused"
+    assert paused.pause_requested_at is not None
+    assert paused.finished_at is None  # 'paused' is not terminal
+
+
+def test_pause_blocks_next_not_yet_dispatched_step_but_not_in_flight_one(
+    worker_test_context: tuple[UUID, UUID],
+) -> None:
+    """Mirrors `test_cancel_blocks_next_not_yet_dispatched_step_but_not_
+    in_flight_one` exactly, but the run ends `'paused'`, not `'cancelled'`,
+    and `finished_at` stays `None` -- the one property that distinguishes
+    pause from cancel (module docstring's own "Task 4" section).
+    """
+    workspace_id, user_id = worker_test_context
+    workflow_id = f"test.pause-mid-run.{uuid4().hex}"
+    graph = _chained_graph(
+        _action_step("s1", "test.echo"),
+        _action_step("s2", "test.echo"),
+    )
+    _publish_workflow(workspace_id, user_id, workflow_id, graph)
+    echo = EchoAdapter()
+    registry = _make_registry(echo)
+
+    with SessionFactory() as session, session.begin():
+        queued = automation_worker.enqueue_run(
+            session, workspace_id, user_id, workflow_id=workflow_id
+        )
+    assert isinstance(queued, automation_worker.WorkflowRun)
+    with SessionFactory() as session:
+        claimed = automation_worker.claim_next_run(session, "worker-a")
+        assert claimed is not None
+        outcome = automation_worker.run_step(session, claimed, 0, registry)
+        assert outcome.status == "succeeded"
+    assert echo.execute_calls == 1
+
+    with SessionFactory() as session, session.begin():
+        paused = automation_worker.pause_run(session, workspace_id, queued.id)
+    assert isinstance(paused, automation_worker.WorkflowRun)
+    assert paused.status not in ("paused",)  # not queued -- not immediate
+    assert paused.pause_requested_at is not None
+
+    with SessionFactory() as session, session.begin():
+        run = automation_worker.get_run(session, workspace_id, queued.id)
+        assert run is not None
+        session.execute(
+            text(
+                "UPDATE workflow_runs SET status = 'leased', current_step_index = 1 WHERE id = :id"
+            ),
+            {"id": run.id},
+        )
+    with SessionFactory() as session:
+        run = automation_worker.get_run(session, workspace_id, queued.id)
+        assert run is not None
+        finished = automation_worker.process_claimed_run(session, run, registry, "worker-a")
+
+    assert finished.status == "paused"
+    assert finished.finished_at is None  # never stamped for a non-terminal pause
+    assert echo.execute_calls == 1  # step 2 was never dispatched
+    with SessionFactory() as session, session.begin():
+        steps = automation_worker.list_run_steps(session, workspace_id, queued.id)
+    assert [s.status for s in steps] == ["succeeded"]  # only step 1 has a row at all
+
+
+def test_resume_paused_run_flips_to_queued_and_completes_normally(
+    worker_test_context: tuple[UUID, UUID],
+) -> None:
+    workspace_id, user_id = worker_test_context
+    workflow_id = f"test.resume.{uuid4().hex}"
+    graph = _chained_graph(_action_step("s1", "test.echo"))
+    _publish_workflow(workspace_id, user_id, workflow_id, graph)
+    echo = EchoAdapter()
+    registry = _make_registry(echo)
+
+    with SessionFactory() as session, session.begin():
+        queued = automation_worker.enqueue_run(
+            session, workspace_id, user_id, workflow_id=workflow_id
+        )
+    assert isinstance(queued, automation_worker.WorkflowRun)
+    with SessionFactory() as session, session.begin():
+        paused = automation_worker.pause_run(session, workspace_id, queued.id)
+    assert isinstance(paused, automation_worker.WorkflowRun)
+    assert paused.status == "paused"
+
+    with SessionFactory() as session, session.begin():
+        resumed = automation_worker.resume_run(session, workspace_id, queued.id)
+    assert isinstance(resumed, automation_worker.WorkflowRun)
+    assert resumed.status == "queued"
+    assert resumed.pause_requested_at is None  # cleared -- see worker.py's own note
+    assert resumed.finished_at is None
+
+    # Regression check for the exact bug this task's own review was asked
+    # to design around upfront: if resume_run failed to clear
+    # pause_requested_at, this claim/process would immediately re-pause
+    # the run instead of completing it.
+    with SessionFactory() as session:
+        claimed = automation_worker.claim_next_run(session, "worker-a")
+        assert claimed is not None
+        finished = automation_worker.process_claimed_run(session, claimed, registry, "worker-a")
+    assert finished.status == "succeeded"
+    assert echo.execute_calls == 1
+    assert finished.finished_at is not None
+
+
+def test_resume_non_paused_run_returns_not_paused(
+    worker_test_context: tuple[UUID, UUID],
+) -> None:
+    workspace_id, user_id = worker_test_context
+    workflow_id = f"test.resume-not-paused.{uuid4().hex}"
+    graph = _chained_graph(_action_step("s1", "test.echo"))
+    _publish_workflow(workspace_id, user_id, workflow_id, graph)
+    with SessionFactory() as session, session.begin():
+        queued = automation_worker.enqueue_run(
+            session, workspace_id, user_id, workflow_id=workflow_id
+        )
+    assert isinstance(queued, automation_worker.WorkflowRun)
+
+    with SessionFactory() as session, session.begin():
+        result = automation_worker.resume_run(session, workspace_id, queued.id)
+    assert isinstance(result, automation_worker.WorkflowRunNotPaused)
+    assert result.status == "queued"
+
+
+def test_pause_unknown_run_returns_not_found(worker_test_context: tuple[UUID, UUID]) -> None:
+    workspace_id, _user_id = worker_test_context
+    with SessionFactory() as session, session.begin():
+        result = automation_worker.pause_run(session, workspace_id, uuid4())
+    assert isinstance(result, automation_worker.WorkflowRunNotFound)
+
+
+def test_resume_unknown_run_returns_not_found(worker_test_context: tuple[UUID, UUID]) -> None:
+    workspace_id, _user_id = worker_test_context
+    with SessionFactory() as session, session.begin():
+        result = automation_worker.resume_run(session, workspace_id, uuid4())
+    assert isinstance(result, automation_worker.WorkflowRunNotFound)
+
+
+def test_pause_already_finished_run_is_a_noop(worker_test_context: tuple[UUID, UUID]) -> None:
+    workspace_id, user_id = worker_test_context
+    workflow_id = f"test.pause-finished.{uuid4().hex}"
+    graph = _chained_graph(_action_step("s1", "test.echo"))
+    _publish_workflow(workspace_id, user_id, workflow_id, graph)
+    echo = EchoAdapter()
+    registry = _make_registry(echo)
+    with SessionFactory() as session, session.begin():
+        queued = automation_worker.enqueue_run(
+            session, workspace_id, user_id, workflow_id=workflow_id
+        )
+    assert isinstance(queued, automation_worker.WorkflowRun)
+    with SessionFactory() as session:
+        claimed = automation_worker.claim_next_run(session, "worker-a")
+        assert claimed is not None
+        finished = automation_worker.process_claimed_run(session, claimed, registry, "worker-a")
+    assert finished.status == "succeeded"
+
+    with SessionFactory() as session, session.begin():
+        result = automation_worker.pause_run(session, workspace_id, queued.id)
+    assert isinstance(result, automation_worker.WorkflowRun)
+    assert result.status == "succeeded"  # unchanged, not overwritten to 'paused'
+    assert result.pause_requested_at is None
+
+
+def test_cancel_an_already_paused_run_becomes_cancelled_not_stuck(
+    worker_test_context: tuple[UUID, UUID],
+) -> None:
+    """Regression test for a real bug found during this task's own
+    self-review (`worker.cancel_run`'s own docstring has the full
+    reasoning): `'paused'` is deliberately excluded from `_CLAIMABLE_
+    PREDICATE`, so a `'paused'` run is never revisited by `process_
+    claimed_run` on its own. Before the fix, cancelling an already-
+    `'paused'` run only set `cancel_requested_at` without changing
+    `status` (mirroring every other non-`'queued'` branch), leaving the
+    run permanently stuck in `'paused'` -- a flag nothing would ever
+    consult. This proves the fix directly: `status` becomes `'cancelled'`
+    immediately, exactly like cancelling a never-claimed `'queued'` run.
+    """
+    workspace_id, user_id = worker_test_context
+    workflow_id = f"test.cancel-already-paused.{uuid4().hex}"
+    graph = _chained_graph(_action_step("s1", "test.echo"))
+    _publish_workflow(workspace_id, user_id, workflow_id, graph)
+    with SessionFactory() as session, session.begin():
+        queued = automation_worker.enqueue_run(
+            session, workspace_id, user_id, workflow_id=workflow_id
+        )
+    assert isinstance(queued, automation_worker.WorkflowRun)
+
+    with SessionFactory() as session, session.begin():
+        paused = automation_worker.pause_run(session, workspace_id, queued.id)
+    assert isinstance(paused, automation_worker.WorkflowRun)
+    assert paused.status == "paused"
+
+    with SessionFactory() as session, session.begin():
+        cancelled = automation_worker.cancel_run(session, workspace_id, queued.id)
+    assert isinstance(cancelled, automation_worker.WorkflowRun)
+    assert cancelled.status == "cancelled"  # not stuck in 'paused'
+    assert cancelled.finished_at is not None
+
+    # Confirms it is genuinely terminal, not merely relabeled: a later
+    # resume_run attempt correctly reports it is no longer 'paused'.
+    with SessionFactory() as session, session.begin():
+        resume_attempt = automation_worker.resume_run(session, workspace_id, queued.id)
+    assert isinstance(resume_attempt, automation_worker.WorkflowRunNotPaused)
+    assert resume_attempt.status == "cancelled"
+
+
+def test_cancel_takes_priority_over_a_pending_pause_request(
+    worker_test_context: tuple[UUID, UUID],
+) -> None:
+    """When both flags happen to be set on a claimed run, `process_claimed_
+    run` checks `cancel_requested_at` first (worker.py's own module
+    docstring: "cancellation is the strictly stronger, more final request
+    of the two") -- the run ends `'cancelled'`, not `'paused'`.
+    """
+    workspace_id, user_id = worker_test_context
+    workflow_id = f"test.cancel-over-pause.{uuid4().hex}"
+    graph = _chained_graph(
+        _action_step("s1", "test.echo"),
+        _action_step("s2", "test.echo"),
+    )
+    _publish_workflow(workspace_id, user_id, workflow_id, graph)
+    echo = EchoAdapter()
+    registry = _make_registry(echo)
+
+    with SessionFactory() as session, session.begin():
+        queued = automation_worker.enqueue_run(
+            session, workspace_id, user_id, workflow_id=workflow_id
+        )
+    assert isinstance(queued, automation_worker.WorkflowRun)
+    with SessionFactory() as session:
+        claimed = automation_worker.claim_next_run(session, "worker-a")
+        assert claimed is not None
+        outcome = automation_worker.run_step(session, claimed, 0, registry)
+        assert outcome.status == "succeeded"
+
+    with SessionFactory() as session, session.begin():
+        automation_worker.pause_run(session, workspace_id, queued.id)
+        automation_worker.cancel_run(session, workspace_id, queued.id)
+
+    with SessionFactory() as session, session.begin():
+        run = automation_worker.get_run(session, workspace_id, queued.id)
+        assert run is not None
+        session.execute(
+            text(
+                "UPDATE workflow_runs SET status = 'leased', current_step_index = 1 WHERE id = :id"
+            ),
+            {"id": run.id},
+        )
+    with SessionFactory() as session:
+        run = automation_worker.get_run(session, workspace_id, queued.id)
+        assert run is not None
+        finished = automation_worker.process_claimed_run(session, run, registry, "worker-a")
+
+    assert finished.status == "cancelled"
+    assert finished.finished_at is not None
+
+
+def test_pausing_a_waiting_approval_run_takes_effect_on_the_approval_resume(
+    worker_test_context: tuple[UUID, UUID],
+) -> None:
+    """Cross-feature interaction between Task 3's approval gate and this
+    task's user-initiated pause, not covered by either task's own test
+    suite in isolation -- worth proving directly rather than assumed
+    correct by inspection. Pausing a run that is currently sitting in
+    `'waiting_approval'` sets `pause_requested_at` but leaves `status`
+    unchanged (identical to pausing any other non-`'queued'`,
+    non-immediately-claimable state -- `pause_run`'s own documented
+    "claimed run's own process_claimed_run loop observes the flag" shape;
+    a `'waiting_approval'` run simply is not being actively polled by
+    anything until a human decides it). The pending pause request is not
+    lost: `decide_approval`'s `'approved'` branch flips the run straight
+    back to `'queued'` exactly as it would with no pending pause (Task 3's
+    own resume mechanic, unaware of and unaffected by pause), and the very
+    next claim/poll cycle's `process_claimed_run` call observes `pause_
+    requested_at` at the top of its loop -- *before* dispatching the
+    now-approved step -- and re-pauses the run instead of ever calling
+    `execute()`. The pause request "wins," taking effect at the next
+    available checkpoint, exactly the same way a pause requested against
+    an actively-dispatching run takes effect at its own next checkpoint.
+    """
+    workspace_id, user_id = worker_test_context
+    workflow_id = f"test.pause-waiting-approval.{uuid4().hex}"
+    graph = _chained_graph(_action_step("s1", "test.high-impact"))
+    _publish_workflow(workspace_id, user_id, workflow_id, graph)
+    with SessionFactory() as session, session.begin():
+        automation_worker.enqueue_run(session, workspace_id, user_id, workflow_id=workflow_id)
+
+    adapter = HighImpactAdapter()
+    registry = _make_registry(adapter)
+    with SessionFactory() as session:
+        claimed = automation_worker.claim_next_run(session, "worker-a")
+    assert claimed is not None
+    with SessionFactory() as session:
+        paused_for_approval = automation_worker.process_claimed_run(
+            session, claimed, registry, "worker-a"
+        )
+    assert paused_for_approval.status == "waiting_approval"
+
+    with SessionFactory() as session, session.begin():
+        pause_result = automation_worker.pause_run(session, workspace_id, claimed.id)
+    assert isinstance(pause_result, automation_worker.WorkflowRun)
+    assert pause_result.status == "waiting_approval"  # unchanged -- not immediately claimable
+    assert pause_result.pause_requested_at is not None
+
+    with SessionFactory() as session, session.begin():
+        pending = automation_approvals.get_pending_approval(session, workspace_id, claimed.id, 0)
+        assert pending is not None
+        decided = automation_approvals.decide_approval(
+            session,
+            workspace_id,
+            user_id,
+            pending.id,
+            "approved",
+            current_action_digest=pending.action_digest,
+        )
+    assert isinstance(decided, automation_approvals.ApprovalRequest)
+
+    with SessionFactory() as session, session.begin():
+        resumed_to_queued = automation_worker.get_run(session, workspace_id, claimed.id)
+    assert resumed_to_queued is not None
+    assert resumed_to_queued.status == "queued"  # decide_approval's own resume, unaware of pause
+
+    with SessionFactory() as session:
+        reclaimed = automation_worker.claim_next_run(session, "worker-b")
+    assert reclaimed is not None
+    with SessionFactory() as session:
+        final = automation_worker.process_claimed_run(session, reclaimed, registry, "worker-b")
+    assert final.status == "paused"  # the pending pause request took effect here
+    assert adapter.execute_calls == 0  # never dispatched -- paused before the step ran
+    assert final.finished_at is None
+
+    # Confirms it is genuinely resumable, not accidentally re-blocked by a
+    # leftover approval-gate artifact: an ordinary resume_run + reclaim now
+    # completes normally.
+    with SessionFactory() as session, session.begin():
+        resumed = automation_worker.resume_run(session, workspace_id, claimed.id)
+    assert isinstance(resumed, automation_worker.WorkflowRun)
+    assert resumed.status == "queued"
+    with SessionFactory() as session:
+        reclaimed_again = automation_worker.claim_next_run(session, "worker-c")
+    assert reclaimed_again is not None
+    with SessionFactory() as session:
+        completed = automation_worker.process_claimed_run(
+            session, reclaimed_again, registry, "worker-c"
+        )
+    assert completed.status == "succeeded"
+    assert adapter.execute_calls == 1

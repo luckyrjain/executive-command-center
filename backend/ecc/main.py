@@ -26,6 +26,7 @@ from ecc.domains.attention.risk_reviews import router as risk_reviews_router
 from ecc.domains.attention.waiting import router as waiting_router
 from ecc.domains.automation.approvals import router as automation_approvals_router
 from ecc.domains.automation.policy import router as automation_policies_router
+from ecc.domains.automation.runs import router as automation_runs_router
 from ecc.domains.automation.workflows import router as automation_workflows_router
 from ecc.domains.calendar.events import router as calendar_events_router
 from ecc.domains.communication.commitments import router as commitments_router
@@ -138,8 +139,8 @@ app.include_router(ai_evaluations_router)
 # policy owns GET|POST /automations/policies and POST /automations/
 # policies/{id}/revoke. ecc.domains.automation.triggers has no router of
 # its own in this task (no trigger endpoint is in Task 1's API scope,
-# API-SCHEMAS.md). No /simulate or /runs endpoint exists yet -- those need
-# a later task's real adapters/scheduler wiring.
+# API-SCHEMAS.md). No /simulate endpoint exists yet -- that needs a later
+# task's real adapters. /runs is added by Task 4, below.
 app.include_router(automation_workflows_router)
 app.include_router(automation_policies_router)
 # Phase 5 Task 3: the approval inbox (docs/phases/phase-005/API-SCHEMAS.md)
@@ -148,6 +149,15 @@ app.include_router(automation_policies_router)
 # dispatch-gate logic ecc.domains.automation.worker.run_step wires in
 # directly (no HTTP surface of its own for that half).
 app.include_router(automation_approvals_router)
+# Phase 5 Task 4: schedule-trigger evaluation (ecc.domains.automation.
+# scheduler, no HTTP surface of its own -- run via scripts/run_automation_
+# worker.py, not this app) plus the run-management HTTP surface --
+# GET|POST /automations/runs, GET /automations/runs/{id}, POST
+# /automations/runs/{id}/pause|resume|cancel (ecc.domains.automation.runs).
+# Event-trigger firing and a notifications delivery system are explicitly
+# not part of this task -- see runs.py/scheduler.py's own module
+# docstrings for the full scoping reasoning.
+app.include_router(automation_runs_router)
 app.middleware("http")(rejected_mutation_audit_middleware)
 # Pure-ASGI body size guard: registered via add_middleware (not the
 # "http" dispatch helper) so it can intercept the raw receive() channel and
