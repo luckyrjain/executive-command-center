@@ -2,7 +2,7 @@
 id: PHASE-004
 title: AI Runtime
 status: Approved for Implementation
-version: 0.3.0
+version: 0.4.0
 owner: Lucky Jain
 depends_on:
   - PHASE-003
@@ -105,12 +105,12 @@ Adapter contracts; deterministic routing; budgets/timeouts/cancel; structured va
 
 Resolves `docs/phases/PHASE-REVIEW.md:135`'s four named approval-gate items for this first activation, per `docs/superpowers/specs/2026-07-23-phase-4-ai-runtime-design.md` and `docs/adr/ADR-0012-ollama-local-inference.md`, accepted by the repository owner as proposed:
 
-- **Approved local/remote models and providers:** exactly one -- Ollama, `qwen2.5:1.5b-instruct-q4_K_M`, local only. No remote provider is approved in this activation.
+- **Approved local/remote models and providers:** two Ollama local models -- `qwen2.5:1.5b-instruct-q4_K_M` (this first activation's original approval) and `qwen2.5:3b-instruct-q4_K_M` (added by explicit repository-owner decision, `phase-004/IMPLEMENTATION-STATUS.md` Task 7 -- same license family and deployment shape as the first, no new data-class or egress exposure). No remote provider is approved in this activation.
 - **Data-class egress matrix:** four data classes (`public`, `internal`, `sensitive`, `restricted`), all local-only-eligible, zero remote-eligible.
-- **Evaluation floors:** `phase-004/EVALUATION-CONTRACT.md`'s table for `attention.explain_item` -- 100% schema validity, 100% grounding, 0 tolerated prohibited-fact occurrences, <20s p95 latency.
+- **Evaluation floors:** `phase-004/EVALUATION-CONTRACT.md`'s table, now covering two evaluated task types -- 100% schema validity, 100% grounding and 0 tolerated prohibited-fact occurrences for both, with p95 latency <20s for `attention.explain_item` and <25s for `meeting.prep_summary` (raised from the originally-approved 20s by an explicit repository-owner-approved Decision 5 budget change, `IMPLEMENTATION-STATUS.md` Task 14, after `meeting.prep_summary`'s heaviest real evaluation examples repeatedly missed the shared 20s budget). Neither task type has yet cleared every floor against a live model -- see `EVALUATION-CONTRACT.md`'s "Sandbox constraint" section for current real-model status; no promotion decision has been made for either.
 - **Trace retention:** raw prompt/output retention off by default; redacted structured metadata retained; verbose trace retention is an explicit, time-bound, admin-only opt-in, never a default.
 
-This resolution covers only this first, deliberately narrow activation (one local model, no remote provider, two read-only tools, one evaluated task type). A later Phase 4 slice that adds a remote provider, a second model, or a mutating tool reopens the relevant part of this gate rather than inheriting it silently.
+This resolution originally covered only a first, deliberately narrow activation (one local model, no remote provider, two read-only tools, one evaluated task type). Two parts of that narrow scope have since been explicitly reopened and re-approved by the repository owner within this same activation, not silently inherited: a second local model (`IMPLEMENTATION-STATUS.md` Task 7) and a second evaluated task type, `meeting.prep_summary` (Tasks 9-10, with its own promotion floors above). A later Phase 4 slice that adds a remote provider or a mutating tool still reopens the relevant part of this gate rather than inheriting it silently.
 
 ## Dependency exit posture (approved 2026-07-23)
 
