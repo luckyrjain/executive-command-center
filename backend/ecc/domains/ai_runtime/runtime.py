@@ -1935,7 +1935,7 @@ def create_run(
             # concurrent request; `_held_idempotency_lock` above already
             # fully serializes those), a narrower window than discarding
             # a response the caller already has.
-            record_database_failure("POST /ai/runs")
+            record_database_failure("/api/v1/ai/runs")
         return response
 
 

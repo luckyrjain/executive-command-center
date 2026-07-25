@@ -1576,7 +1576,7 @@ def create_evaluation_run(
             # blip, not a concurrent request; `_held_idempotency_lock`
             # above already fully serializes those), the same narrower
             # window `runtime.py:create_run`'s identical fix accepts.
-            record_database_failure("POST /ai/evaluations/runs")
+            record_database_failure("/api/v1/ai/evaluations/runs")
         return response
 
 
