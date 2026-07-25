@@ -43,6 +43,19 @@ from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError,
 
 _MAX_EXPLANATION_WORDS = 60
 
+# Defense-in-depth character ceiling, independent of the word-count check
+# above: `_max_word_count` splits on whitespace, so a single pathological
+# "word" with no whitespace at all (e.g. a huge base64 blob or a repeated-
+# character run) would satisfy a <=60-word count while still being
+# unbounded in raw size. `Field(max_length=...)` on `explanation_text`
+# closes that gap the same way the codebase already bounds other
+# model-controlled/user-controlled text fields (e.g. `notes.py`'s
+# `body: str = Field(min_length=1, max_length=100000)`,
+# `risks.py`'s `description: str = Field(min_length=1, max_length=5000)`).
+# Sized generously above any legitimate 60-word answer, not as a normal-
+# usage limit.
+_MAX_EXPLANATION_CHARS = 2000
+
 _MARKDOWN_FENCE_RE = re.compile(r"^```[a-zA-Z0-9_-]*\s*\n(?P<body>.*?)\n?```\s*$", re.DOTALL)
 
 
@@ -203,7 +216,7 @@ class ExplainItemOutput(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    explanation_text: str = Field(min_length=1)
+    explanation_text: str = Field(min_length=1, max_length=_MAX_EXPLANATION_CHARS)
     cited_factor_codes: list[str] = Field(default_factory=list)
 
     @field_validator("explanation_text")
@@ -300,6 +313,10 @@ class ExplainItemReflection(BaseModel):
 
 _MAX_SUMMARY_WORDS = 150
 
+# Same defense-in-depth rationale as `_MAX_EXPLANATION_CHARS` above, scaled
+# to this field's higher word cap.
+_MAX_SUMMARY_CHARS = 5000
+
 
 class MeetingPrepSummary(BaseModel):
     """`{summary_text, cited_evidence_ids}` -- mirrors `ExplainItemOutput`'s
@@ -312,7 +329,7 @@ class MeetingPrepSummary(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    summary_text: str = Field(min_length=1)
+    summary_text: str = Field(min_length=1, max_length=_MAX_SUMMARY_CHARS)
     cited_evidence_ids: list[str] = Field(default_factory=list)
 
     @field_validator("summary_text")

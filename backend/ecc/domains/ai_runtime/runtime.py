@@ -907,6 +907,14 @@ def _reflect_on_answer(
     sequence = len(steps) + 1
     prompt = get_active_prompt(session, cast(str, port.reflection_prompt_id))
     if prompt is None:
+        # `port.reflection_prompt_id is not None and reflection_enabled(policy)`
+        # (this function's only call site) already means reflection is
+        # nominally turned on for this task type -- reaching here means the
+        # specific prompt row is missing or inactive (never seeded, or
+        # deactivated after the fact), a distinct, diagnosable condition
+        # from every other skip path below, all of which record a step.
+        # `attempt=0`: no model call was attempted.
+        steps.append(_model_step(sequence, "skipped", attempt=0, outcome="prompt_unavailable"))
         return validated
 
     reflection_prompt_text = _render_reflection_prompt(
@@ -1471,6 +1479,21 @@ def execute_run(
 
     def reattempt() -> str:
         repair_prompt = f"{rendered_prompt}\n\n{prepared.repair_instruction}"
+        # The original `rendered_prompt` was checked against
+        # `budget.max_input_tokens` above (`check_input_token_budget` at
+        # this function's top), but `repair_prompt` is strictly longer --
+        # a prompt that started near the budget ceiling could push over it
+        # once `prepared.repair_instruction` is appended, and that larger
+        # prompt was never itself re-checked before being sent. Re-running
+        # the same check here raises the same `RunBudgetExceeded` the
+        # `except RunBudgetExceeded` clause below already handles for
+        # every other repair-call failure mode, so this needs no new
+        # exception handling of its own.
+        repair_estimate = ContextEstimate(
+            estimated_prompt_tokens=_estimate_tokens(repair_prompt),
+            declared_max_output_tokens=task_requirements.max_output_tokens,
+        )
+        check_input_token_budget(repair_estimate, budget)
         raw2, _eval2, _prompt_eval2 = call_model(repair_prompt)
         return raw2
 

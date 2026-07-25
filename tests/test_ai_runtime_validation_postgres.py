@@ -216,6 +216,20 @@ def test_validate_output_explanation_over_60_words_returns_schema_invalid() -> N
     assert isinstance(result, SchemaInvalid)
 
 
+def test_validate_output_explanation_single_pathological_word_still_bounded() -> None:
+    """The 60-word cap above splits on whitespace, so a single "word" with
+    no whitespace at all (a huge base64 blob, a repeated-character run)
+    would satisfy a <=60-word count while still being unbounded in raw
+    size -- `Field(max_length=...)` on `explanation_text` is the
+    independent, defense-in-depth check that catches exactly this shape.
+    """
+    pathological_word = "x" * 5000  # one "word" by whitespace-splitting, well past max_length
+    raw = dumps({"explanation_text": pathological_word, "cited_factor_codes": ["a"]})
+    result = validate_output(ExplainItemOutput, raw)
+    assert isinstance(result, SchemaInvalid)
+    assert "explanation_text" in result.detail
+
+
 def test_validate_output_generic_over_arbitrary_pydantic_model() -> None:
     """`validate_output` has no special-cased knowledge of `ExplainItemOutput`
     -- it works identically against an unrelated model, matching the design
@@ -455,6 +469,17 @@ def test_meeting_prep_summary_exactly_150_words_is_valid() -> None:
     raw = dumps({"summary_text": " ".join(["word"] * 150), "cited_evidence_ids": []})
     result = validate_output(MeetingPrepSummary, raw)
     assert isinstance(result, ValidatedOutput)
+
+
+def test_meeting_prep_summary_single_pathological_word_still_bounded() -> None:
+    """Same defense-in-depth gap as
+    `test_validate_output_explanation_single_pathological_word_still_bounded`,
+    for `summary_text`'s higher word cap."""
+    pathological_word = "x" * 10000
+    raw = dumps({"summary_text": pathological_word, "cited_evidence_ids": []})
+    result = validate_output(MeetingPrepSummary, raw)
+    assert isinstance(result, SchemaInvalid)
+    assert "summary_text" in result.detail
 
 
 def test_meeting_prep_summary_rejects_unexpected_extra_field() -> None:
