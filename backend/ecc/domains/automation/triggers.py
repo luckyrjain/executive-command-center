@@ -10,25 +10,38 @@ trigger endpoint; the design doc's own scheduler/event-subscriber (Decision
 with no HTTP surface of its own, whose functions exist for a later task
 (and, here, this task's own tests) to call directly.
 
-Every function is workspace-scoped the same way `workflows.py`/`policy.py`
-are -- no function accepts anything that could substitute for the caller's
-own `workspace_id`.
+Every *workspace-scoped* function here is workspace-scoped the same way
+`workflows.py`/`policy.py` are -- no such function accepts anything that
+could substitute for the caller's own `workspace_id`. **One exception,
+added by Task 4:** `list_schedule_triggers` is deliberately *not*
+workspace-scoped -- it is the scheduler tick's own read (`ecc.domains.
+automation.scheduler.run_scheduler_once`), an internal background-worker
+loop, not a per-request HTTP handler acting on behalf of one caller's
+session. This mirrors `worker.claim_next_run`'s identical, already-
+established precedent: a worker polls across every workspace's claimable
+rows, not one workspace at a time, because there is no "caller" to scope
+to in a background loop. `mark_trigger_fired` (also Task 4) *is*
+workspace-scoped, like every mutating function in this package, since it
+still writes a specific row this task's own caller (the scheduler,
+resolving `workspace_id` from the very row `list_schedule_triggers` just
+read, never from external input) must not be able to target cross-
+workspace by accident.
 """
 
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any, Literal
+from typing import Any, Literal, cast
 from uuid import UUID, uuid4
 
-from sqlalchemy import text
+from sqlalchemy import CursorResult, text
 from sqlalchemy.orm import Session
 
 TriggerType = Literal["manual", "event", "schedule"]
 
 _TRIGGER_FIELDS = """
     id, workspace_id, workflow_id, trigger_type, event_type_filter,
-    schedule_expression, timezone, skip_missed, created_by, updated_by,
-    created_at, updated_at
+    schedule_expression, timezone, skip_missed, last_fired_at, created_by,
+    updated_by, created_at, updated_at
 """
 
 
@@ -42,6 +55,7 @@ class Trigger:
     schedule_expression: str | None
     timezone: str | None
     skip_missed: bool
+    last_fired_at: datetime | None
     created_by: UUID
     updated_by: UUID
     created_at: datetime
@@ -58,6 +72,7 @@ def _row_to_trigger(row: dict[str, Any]) -> Trigger:
         schedule_expression=row["schedule_expression"],
         timezone=row["timezone"],
         skip_missed=row["skip_missed"],
+        last_fired_at=row["last_fired_at"],
         created_by=row["created_by"],
         updated_by=row["updated_by"],
         created_at=row["created_at"],
@@ -169,3 +184,92 @@ def create_trigger(
     result = get_trigger(session, workspace_id, trigger_id)
     assert result is not None
     return result
+
+
+# ---------------------------------------------------------------------------
+# Task 4: the scheduler tick's own reads/writes (module docstring's
+# "one exception" note).
+# ---------------------------------------------------------------------------
+
+
+def list_schedule_triggers(session: Session) -> list[Trigger]:
+    """Every `trigger_type = 'schedule'` row, across every workspace --
+    deliberately unscoped (module docstring). `ecc.domains.automation.
+    scheduler.run_scheduler_once` is the only caller; it evaluates each
+    returned row's own `schedule_expression`/`timezone`/`skip_missed`/
+    `last_fired_at` independently, so there is no meaningful "one
+    workspace at a time" shape to this read the way an HTTP list endpoint
+    would need. `event`/`manual` triggers are never returned here -- the
+    mechanical enforcement of this task's own explicit non-scope (event
+    triggers are not auto-fired by this activation, `scheduler.py`'s
+    module docstring).
+    """
+    rows = (
+        session.execute(
+            text(
+                f"SELECT {_TRIGGER_FIELDS} FROM triggers "
+                "WHERE trigger_type = 'schedule' ORDER BY created_at ASC"
+            )
+        )
+        .mappings()
+        .all()
+    )
+    return [_row_to_trigger(dict(row)) for row in rows]
+
+
+def mark_trigger_fired(
+    session: Session,
+    workspace_id: UUID,
+    trigger_id: UUID,
+    fired_at: datetime,
+    *,
+    expected_last_fired_at: datetime | None,
+) -> bool:
+    """Sets `last_fired_at`, the catch-up-once anchor `scheduler.py`'s own
+    misfire logic reads on the next tick. Workspace-scoped like every
+    mutating function in this package (module docstring) -- the caller
+    (`scheduler.run_scheduler_once`) always resolves `workspace_id` from
+    the same `Trigger` row `list_schedule_triggers` just read, never from
+    external input. No commit here -- caller-committed, exactly like
+    `create_trigger` above; `scheduler.py`'s own module docstring explains
+    why its call site commits this together with the `workflow_runs`
+    INSERT it fires alongside, in one atomic transaction.
+
+    **Compare-and-swap, not an unconditional write** -- `WHERE ... AND
+    last_fired_at IS NOT DISTINCT FROM :expected_last_fired_at` (`IS NOT
+    DISTINCT FROM` rather than `=` so a still-`NULL` anchor, a trigger's
+    own pre-first-fire state, compares correctly instead of every `NULL =
+    NULL` silently evaluating to unknown/false in ordinary SQL). This is
+    the exact `UPDATE ... WHERE <the state this caller read> RETURNING
+    ...` compare-and-swap idiom `worker.claim_next_run` already
+    establishes for the identical "two independent processes acting on
+    the same row without a `SELECT ... FOR UPDATE` lock" shape -- two
+    concurrent scheduler ticks (e.g. two `scripts/run_automation_worker.py`
+    replicas) racing the same trigger must not both fire it. Returns
+    `True` if this call's own view of `last_fired_at` was still current at
+    write time (this caller won the race, or there was no race at all --
+    the ordinary case); `False` if another writer already advanced the
+    anchor first (this caller lost the race and must not also enqueue a
+    run). `scheduler.run_scheduler_once` checks this return value *before*
+    calling `worker.enqueue_run`, not after -- see that function's own
+    docstring.
+    """
+    result = session.execute(
+        text(
+            "UPDATE triggers SET last_fired_at = :fired_at, updated_at = :fired_at "
+            "WHERE workspace_id = :workspace_id AND id = :id "
+            "AND last_fired_at IS NOT DISTINCT FROM :expected_last_fired_at"
+        ),
+        {
+            "fired_at": fired_at,
+            "workspace_id": workspace_id,
+            "id": trigger_id,
+            "expected_last_fired_at": expected_last_fired_at,
+        },
+    )
+    # session.execute() against a text() UPDATE always returns a real
+    # CursorResult at runtime (it has a real rowcount from the DBAPI
+    # cursor) -- mypy's stubs type Session.execute()'s return as the
+    # broader Result[Any] regardless of statement kind, so this narrows
+    # explicitly rather than silencing the check.
+    return cast("CursorResult[Any]", result).rowcount > 0

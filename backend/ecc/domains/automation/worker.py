@@ -223,6 +223,63 @@ because the moment a human approval-decides is already a natural,
 explicit trigger to requeue -- no polling-based reclaim is needed for a
 state change that only ever happens as a direct consequence of a
 synchronous, already-transactional HTTP decision.
+
+**Task 4: user-initiated `pause_run`/`resume_run` -- public functions,
+deliberately not to be confused with the private `_pause_run` helper
+above.** `_pause_run` (added by Task 3, kept unchanged by this task) is
+`process_claimed_run`'s own internal state-transition helper for a
+*different* purpose entirely: releasing a run's lease when it pauses
+itself mid-dispatch onto `waiting_approval` or `needs_review`. `pause_run`/
+`resume_run` below are the **public**, user-initiated feature
+`API-SCHEMAS.md` names (`POST /automations/runs/{id}/pause|resume`,
+"`pause`/`resume` behave identically [to cancel] for suspension/
+continuation without terminating the run") -- a human explicitly asking
+"stop making progress on this run for now, but don't cancel it." Python's
+leading-underscore convention already disambiguates the two at the
+call-site level (`_pause_run` is a module-private implementation detail;
+`pause_run` is this module's public API), but the naming is close enough
+on a skim that this is called out explicitly here, once, for a future
+reader: **do not add a call from `pause_run` to `_pause_run` or vice
+versa** -- they serve unrelated triggers (a human's explicit request vs.
+an automatic mid-dispatch pause) even though their underlying SQL shape
+(release the lease, do not touch `finished_at`) happens to be identical.
+
+**Mechanically, `pause_run` is architecturally almost identical to
+`cancel_run`**, reusing the exact same shape deliberately (module's own
+instruction: "reuse as much of that existing mechanic as makes sense
+rather than inventing a parallel one") with one difference that matters:
+`cancel_run` sets `cancel_requested_at` (a one-way flag -- a cancelled run
+never un-cancels, matching `_TERMINAL_RUN_STATUSES` including
+`'cancelled'`); `pause_run` sets the new `pause_requested_at` column
+(migration `0041_phase5_scheduler_and_pause.py`) instead of overloading
+`cancel_requested_at`, specifically *because* `'paused'` is not terminal
+and needs its own, independently-resumable flag a human can clear again.
+Both flags are checked by `process_claimed_run` at the identical point in
+its loop (immediately before dispatching each not-yet-dispatched step,
+after that step's lease has been freshly renewed) and both stop the run
+there without calling `run_step` for that step at all -- a step already
+mid-`run_step` (already committed its `'dispatched'` row and called
+`execute()`) is never interrupted by either, matching
+`EXECUTION-CONTRACT.md` verbatim for both cancellation *and* pause
+(`API-SCHEMAS.md`: "behave identically ... for suspension/continuation").
+`cancel_requested_at` is checked first when both happen to be set (an
+operator who cancels a paused run should get a terminal outcome, not a
+run stuck forever in `'paused'` because a stale pause flag never gets
+reconsidered) -- cancellation is the strictly stronger, more final
+request of the two.
+
+**`resume_run` clears `pause_requested_at` back to `NULL`.** This is the
+one genuinely easy-to-get-wrong detail worth spelling out explicitly
+(discovered and designed around during this task's own self-review,
+before it could become a real bug the way Task 2/3's own reviews each
+found one): if `resume_run` only flipped `status` back to `'queued'`
+without also clearing the flag, the very next `process_claimed_run` call
+for this run would immediately observe `pause_requested_at` still set (the
+check runs at the *top* of the loop, before any step dispatches) and
+re-pause the run instantly -- an unresumable run that looks superficially
+resumed (`status='queued'` momentarily) but can never actually make
+progress again. `cancel_run` has no analogous concern: cancellation is
+one-way, so `cancel_requested_at` never needs clearing.
 """
 
 from dataclasses import dataclass
@@ -292,8 +349,8 @@ _CLAIMABLE_PREDICATE = (
 _RUN_FIELDS = """
     id, workspace_id, workflow_id, workflow_version, policy_id, trigger_ref,
     status, current_step_index, leased_by, leased_until, lease_heartbeat_at,
-    cancel_requested_at, queued_at, started_at, finished_at, created_by,
-    created_at, updated_at
+    cancel_requested_at, pause_requested_at, queued_at, started_at, finished_at,
+    created_by, created_at, updated_at
 """
 
 _STEP_FIELDS = """
@@ -339,6 +396,7 @@ class WorkflowRun:
     leased_until: datetime | None
     lease_heartbeat_at: datetime | None
     cancel_requested_at: datetime | None
+    pause_requested_at: datetime | None
     queued_at: datetime
     started_at: datetime | None
     finished_at: datetime | None
@@ -418,6 +476,21 @@ class WorkflowRunNotFound:
     """
 
 
+@dataclass(frozen=True, slots=True)
+class WorkflowRunNotPaused:
+    """`resume_run` (Task 4) was asked to resume a run that is not
+    currently `'paused'` -- mirrors `approvals.ApprovalAlreadyDecided`'s
+    precedent of surfacing a specific, informative non-actionable state
+    rather than silently no-op-ing (resuming an already-`'succeeded'` run,
+    for instance, is meaningfully different from resuming a run that was
+    never paused in the first place, but this dataclass does not need to
+    distinguish those further -- `status` alone is enough for a caller to
+    decide what to show).
+    """
+
+    status: RunStatus
+
+
 class UnsupportedStepType(ValueError):
     """`run_step` was asked to dispatch a step whose `step_type` is not
     `action`. Handling `approval_gate` (Task 3's approval-gate logic) and
@@ -478,6 +551,7 @@ def _row_to_run(row: dict[str, Any]) -> WorkflowRun:
         leased_until=row["leased_until"],
         lease_heartbeat_at=row["lease_heartbeat_at"],
         cancel_requested_at=row["cancel_requested_at"],
+        pause_requested_at=row["pause_requested_at"],
         queued_at=row["queued_at"],
         started_at=row["started_at"],
         finished_at=row["finished_at"],
@@ -524,6 +598,34 @@ def get_run(session: Session, workspace_id: UUID, run_id: UUID) -> WorkflowRun |
         .one_or_none()
     )
     return _row_to_run(dict(row)) if row is not None else None
+
+
+def list_runs(
+    session: Session, workspace_id: UUID, *, status_filter: RunStatus | None = None
+) -> list[WorkflowRun]:
+    """Workspace-scoped run listing (Task 4's `GET /automations/runs`) --
+    added alongside `pause_run`/`resume_run` rather than in `runs.py`
+    itself, matching this package's established convention that reads
+    against a table live in that table's own owning module
+    (`approvals.list_approvals`, `policy.list_policies`), with the router
+    module itself staying a thin HTTP-shape layer.
+    """
+    clause = "AND status = :status_filter" if status_filter is not None else ""
+    params: dict[str, Any] = {"workspace_id": workspace_id}
+    if status_filter is not None:
+        params["status_filter"] = status_filter
+    rows = (
+        session.execute(
+            text(
+                f"SELECT {_RUN_FIELDS} FROM workflow_runs "
+                f"WHERE workspace_id = :workspace_id {clause} ORDER BY queued_at DESC"
+            ),
+            params,
+        )
+        .mappings()
+        .all()
+    )
+    return [_row_to_run(dict(row)) for row in rows]
 
 
 def list_run_steps(session: Session, workspace_id: UUID, run_id: UUID) -> list[WorkflowRunStep]:
@@ -1116,6 +1218,16 @@ def process_claimed_run(
 
         if run.cancel_requested_at is not None:
             return _finish_run(session, run, "cancelled")
+        if run.pause_requested_at is not None:
+            # Task 4 -- the user-initiated pause flag, checked at the
+            # identical point in the loop as cancel_requested_at (module
+            # docstring's "Task 4: user-initiated pause_run/resume_run"
+            # section). Reuses _pause_run (Task 3's helper) purely because
+            # its SQL shape -- release the lease, never touch finished_at
+            # -- happens to be exactly what a non-terminal pause needs too;
+            # this is not the same pause as Task 3's own waiting_approval/
+            # needs_review transitions, only the same underlying mechanic.
+            return _pause_run(session, run, "paused")
 
         session.execute(
             text(
@@ -1194,6 +1306,25 @@ def cancel_run(
     already dispatched to its adapter is never interrupted by this call).
     A run already in a terminal state is returned unchanged (cancelling a
     finished run is a no-op, not an error).
+
+    **A `'paused'` run (Task 4) is also cancelled immediately, exactly
+    like `'queued'` -- a real bug found and fixed during this task's own
+    self-review, not part of the original Task 2 shape.** `'paused'` is
+    deliberately excluded from `_CLAIMABLE_PREDICATE` (a paused run must
+    never be silently reclaimed and resumed by a poll cycle -- only an
+    explicit `resume_run` call may do that), which means a `'paused'` run
+    is *never* revisited by `process_claimed_run` on its own. Before this
+    fix, cancelling a `'paused'` run only set `cancel_requested_at` and
+    left `status` unchanged (mirroring every other non-`'queued'` branch)
+    -- since nothing ever calls `process_claimed_run` for a `'paused'` run
+    again without an intervening `resume_run`, the run would sit forever
+    in `'paused'` with a cancellation flag no code path ever consults, a
+    permanently stuck state, not a genuinely cancelled one. This is safe
+    to fix the same way `'queued'` already is: by the time a run reaches
+    `'paused'`, `_pause_run` has already released its lease
+    (`leased_by`/`leased_until` are both `NULL`), so there is no in-flight
+    step to protect -- cancelling it has exactly the same safety
+    properties as cancelling a never-claimed `'queued'` run.
     """
     row = (
         session.execute(
@@ -1222,7 +1353,9 @@ def cancel_run(
         ),
         {"now": now, "id": run_id},
     )
-    if row["status"] == "queued":
+    if row["status"] in ("queued", "paused"):
+        # 'paused' included alongside 'queued' -- module docstring's own
+        # "real bug found and fixed" note above has the full reasoning.
         session.execute(
             text(
                 "UPDATE workflow_runs SET status = 'cancelled', finished_at = :now, "
@@ -1231,6 +1364,122 @@ def cancel_run(
             {"now": now, "id": run_id},
         )
 
+    result = get_run(session, workspace_id, run_id)
+    assert result is not None
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Task 4: user-initiated pause/resume (module docstring's own section has
+# the full reasoning for why these are distinct from Task 3's private
+# _pause_run helper despite the similar name and near-identical mechanic).
+# ---------------------------------------------------------------------------
+
+
+def pause_run(
+    session: Session, workspace_id: UUID, run_id: UUID
+) -> WorkflowRun | WorkflowRunNotFound:
+    """Sets `pause_requested_at` (idempotent -- a second call never moves
+    an already-recorded timestamp, identical to `cancel_run`'s own
+    `COALESCE` precedent). A `queued` run (no in-flight step to protect)
+    pauses immediately, exactly like `cancel_run`'s identical `queued`
+    fast path. A claimed (`leased`/`running`) run's own `process_claimed_
+    run` loop observes the flag before its next not-yet-dispatched step
+    and stops there -- this function itself never touches `status` for
+    anything already claimed, matching `cancel_run`'s own division of
+    responsibility exactly. A run already in a terminal state
+    (`_TERMINAL_RUN_STATUSES`) is returned unchanged (pausing a finished
+    run is a no-op, not an error, matching `cancel_run`'s identical
+    precedent for the same case). A run already `'paused'` is also
+    returned unchanged -- idempotent, not an error.
+    """
+    row = (
+        session.execute(
+            text(
+                "SELECT status FROM workflow_runs WHERE workspace_id = :workspace_id AND id = :id "
+                "FOR UPDATE"
+            ),
+            {"workspace_id": workspace_id, "id": run_id},
+        )
+        .mappings()
+        .one_or_none()
+    )
+    if row is None:
+        return WorkflowRunNotFound()
+
+    if row["status"] in _TERMINAL_RUN_STATUSES or row["status"] == "paused":
+        result = get_run(session, workspace_id, run_id)
+        assert result is not None
+        return result
+
+    now = datetime.now(UTC)
+    session.execute(
+        text(
+            "UPDATE workflow_runs SET pause_requested_at = COALESCE(pause_requested_at, :now), "
+            "updated_at = :now WHERE id = :id"
+        ),
+        {"now": now, "id": run_id},
+    )
+    if row["status"] == "queued":
+        # No in-flight step to protect -- identical reasoning to
+        # cancel_run's own 'queued' fast path. Does not touch finished_at
+        # ('paused' is not terminal, _TERMINAL_RUN_STATUSES excludes it) --
+        # the one point this diverges from cancel_run's otherwise-identical
+        # 'queued' branch, since a paused run must remain resumable.
+        session.execute(
+            text("UPDATE workflow_runs SET status = 'paused', updated_at = :now WHERE id = :id"),
+            {"now": now, "id": run_id},
+        )
+
+    result = get_run(session, workspace_id, run_id)
+    assert result is not None
+    return result
+
+
+def resume_run(
+    session: Session, workspace_id: UUID, run_id: UUID
+) -> WorkflowRun | WorkflowRunNotFound | WorkflowRunNotPaused:
+    """Flips a `'paused'` run back to `'queued'` -- `claim_next_run`'s
+    ordinary `_CLAIMABLE_PREDICATE` already matches `'queued'`, so the
+    very next poll cycle (any worker's) claims it exactly as it would any
+    other queued run and `process_claimed_run` resumes at the unchanged
+    `current_step_index`, mirroring `approvals._advance_run_after_
+    decision`'s identical "flip straight back to queued, reuse the
+    existing claim/poll machinery, no separate resume-specific reclaim
+    path" precedent for `waiting_approval` exactly.
+
+    **Clears `pause_requested_at` back to `NULL`** -- module docstring's
+    own "resume_run clears pause_requested_at" section explains why this
+    is required, not optional: leaving it set would make the very next
+    `process_claimed_run` call re-pause the run instantly, before any
+    step could dispatch, since that check runs at the top of the loop
+    before `run_step` is ever called for the next step.
+    """
+    row = (
+        session.execute(
+            text(
+                "SELECT status FROM workflow_runs WHERE workspace_id = :workspace_id AND id = :id "
+                "FOR UPDATE"
+            ),
+            {"workspace_id": workspace_id, "id": run_id},
+        )
+        .mappings()
+        .one_or_none()
+    )
+    if row is None:
+        return WorkflowRunNotFound()
+    if row["status"] != "paused":
+        return WorkflowRunNotPaused(status=row["status"])
+
+    now = datetime.now(UTC)
+    session.execute(
+        text(
+            "UPDATE workflow_runs SET status = 'queued', queued_at = :now, "
+            "pause_requested_at = NULL, leased_by = NULL, leased_until = NULL, "
+            "updated_at = :now WHERE id = :id"
+        ),
+        {"now": now, "id": run_id},
+    )
     result = get_run(session, workspace_id, run_id)
     assert result is not None
     return result
