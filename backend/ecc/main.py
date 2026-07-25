@@ -24,6 +24,8 @@ from ecc.domains.attention.planning import router as planning_router
 from ecc.domains.attention.planning_constraints import router as planning_constraints_router
 from ecc.domains.attention.risk_reviews import router as risk_reviews_router
 from ecc.domains.attention.waiting import router as waiting_router
+from ecc.domains.automation.policy import router as automation_policies_router
+from ecc.domains.automation.workflows import router as automation_workflows_router
 from ecc.domains.calendar.events import router as calendar_events_router
 from ecc.domains.communication.commitments import router as commitments_router
 from ecc.domains.governance.recommendation_mutations import (
@@ -127,6 +129,18 @@ app.include_router(ai_policies_router)
 app.include_router(ai_policy_activation_router)
 app.include_router(ai_runs_router)
 app.include_router(ai_evaluations_router)
+# Phase 5 Task 1: workflow schema, policy model and triggers -- the data
+# layer only (docs/superpowers/specs/2026-07-25-phase-5-automation-design.md,
+# docs/phases/phase-005/DATA-MODEL.md). ecc.domains.automation.workflows
+# owns GET|POST /automations/workflows, GET /automations/workflows/{id} and
+# POST /automations/workflows/{id}/publish|disable. ecc.domains.automation.
+# policy owns GET|POST /automations/policies and POST /automations/
+# policies/{id}/revoke. ecc.domains.automation.triggers has no router of
+# its own in this task (no trigger endpoint is in Task 1's API scope,
+# API-SCHEMAS.md). No /simulate, /runs or /approvals endpoint exists yet --
+# those need the durable worker/adapter machinery a later task builds.
+app.include_router(automation_workflows_router)
+app.include_router(automation_policies_router)
 app.middleware("http")(rejected_mutation_audit_middleware)
 # Pure-ASGI body size guard: registered via add_middleware (not the
 # "http" dispatch helper) so it can intercept the raw receive() channel and

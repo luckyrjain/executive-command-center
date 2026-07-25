@@ -129,6 +129,16 @@ _WORKSPACE_ID_TABLES: tuple[str, ...] = (
     "ai_run_steps",
     "evaluation_runs",
     "generated_artifacts",
+    # Phase 5 (migration 0038) -- workspace-scoped, unlike Phase 4's global
+    # prompt_versions/tool_definitions/model_definitions/routing_policies/
+    # evaluation_sets (see 0038_phase5_workflow_schema.py's own docstring);
+    # discovered generically by verify_restore.sh's workspace-isolation
+    # check the same way the Phase 3/4 tables above were, so seeding them
+    # here from day one avoids repeating that gap for a fifth time.
+    "workflow_definitions",
+    "workflow_versions",
+    "automation_policies",
+    "triggers",
 )
 # `workspaces` is scoped by its own `id`, not a `workspace_id` column.
 _WORKSPACE_TABLE = "workspaces"
@@ -200,6 +210,9 @@ def _fixture_ids(label: str) -> dict[str, UUID]:
         "ai_run_step": seed_id(label, "ai_run_step", "model_call"),
         "evaluation_run": seed_id(label, "evaluation_run", "attention_explain_item"),
         "generated_artifact": seed_id(label, "generated_artifact", "explain_item"),
+        "workflow_version": seed_id(label, "workflow_version", "acceptance"),
+        "automation_policy": seed_id(label, "automation_policy", "acceptance"),
+        "trigger": seed_id(label, "trigger", "acceptance"),
     }
 
 
@@ -1459,6 +1472,118 @@ def _seed_generated_artifact(cur: psycopg.Cursor[Any], label: str, ids: Mapping[
     )
 
 
+_AUTOMATION_WORKFLOW_ID = "phase1-seed.automation.acceptance"
+
+
+def _seed_automation(cur: psycopg.Cursor[Any], label: str, ids: Mapping[str, UUID]) -> None:
+    """Phase 5 (migration 0038) -- workflow_definitions/workflow_versions/
+    automation_policies/triggers, all workspace-scoped (unlike Phase 4's
+    global catalog tables). ``workflow_definitions`` is the family identity
+    row every other table here FK's against; it must be inserted first.
+    ``workflow_versions.policy_ref`` carries no FK constraint (migration
+    0038's own docstring), so referencing ``ids["automation_policy"]`` here
+    is safe regardless of insert order relative to the policy row itself.
+    """
+    graph = (
+        '{"steps": [{"step_id": "notify", "step_type": "action", '
+        '"action_ref": "local.send_test_notification", "input_mapping": {}, '
+        '"on_success": "succeeded", "on_failure": "failed"}]}'
+    )
+    trigger_refs = "[]"
+    definition_hash = sha256(
+        (graph + trigger_refs + str(ids["automation_policy"])).encode("utf-8")
+    ).hexdigest()
+
+    cur.execute(
+        """
+        INSERT INTO workflow_definitions (
+            id, workspace_id, workflow_id, created_by, created_at, updated_at
+        ) VALUES (
+            %(id)s, %(workspace_id)s, %(workflow_id)s, %(actor)s, %(now)s, %(now)s
+        )
+        ON CONFLICT (id) DO NOTHING
+        """,
+        {
+            "id": seed_id(label, "workflow_definition", "acceptance"),
+            "workspace_id": ids["workspace"],
+            "workflow_id": _AUTOMATION_WORKFLOW_ID,
+            "actor": ids["user"],
+            "now": SEED_EPOCH,
+        },
+    )
+    cur.execute(
+        """
+        INSERT INTO workflow_versions (
+            id, workspace_id, workflow_id, version, graph, trigger_refs,
+            policy_ref, definition_hash, status, created_by, updated_by,
+            created_at, updated_at
+        ) VALUES (
+            %(id)s, %(workspace_id)s, %(workflow_id)s, 1, %(graph)s, %(trigger_refs)s,
+            %(policy_ref)s, %(definition_hash)s, 'draft', %(actor)s, %(actor)s,
+            %(now)s, %(now)s
+        )
+        ON CONFLICT (id) DO NOTHING
+        """,
+        {
+            "id": ids["workflow_version"],
+            "workspace_id": ids["workspace"],
+            "workflow_id": _AUTOMATION_WORKFLOW_ID,
+            "graph": graph,
+            "trigger_refs": trigger_refs,
+            "policy_ref": ids["automation_policy"],
+            "definition_hash": definition_hash,
+            "actor": ids["user"],
+            "now": SEED_EPOCH,
+        },
+    )
+    cur.execute(
+        """
+        INSERT INTO automation_policies (
+            id, workspace_id, workflow_id, action_types, data_classes,
+            value_limit, count_limit, rate_limit, schedule, approval_mode,
+            expires_at, revoked_at, version, created_by, updated_by,
+            created_at, updated_at
+        ) VALUES (
+            %(id)s, %(workspace_id)s, %(workflow_id)s, %(action_types)s, %(data_classes)s,
+            0, 1, %(rate_limit)s, NULL, 'preview_only', %(expires_at)s, NULL, 1,
+            %(actor)s, %(actor)s, %(now)s, %(now)s
+        )
+        ON CONFLICT (id) DO NOTHING
+        """,
+        {
+            "id": ids["automation_policy"],
+            "workspace_id": ids["workspace"],
+            "workflow_id": _AUTOMATION_WORKFLOW_ID,
+            "action_types": ["bounded"],
+            "data_classes": ["internal"],
+            "rate_limit": '{"runs_per_workflow_per_hour": 10}',
+            "expires_at": SEED_EPOCH + timedelta(days=90),
+            "actor": ids["user"],
+            "now": SEED_EPOCH,
+        },
+    )
+    cur.execute(
+        """
+        INSERT INTO triggers (
+            id, workspace_id, workflow_id, trigger_type, event_type_filter,
+            schedule_expression, timezone, skip_missed, created_by, updated_by,
+            created_at, updated_at
+        ) VALUES (
+            %(id)s, %(workspace_id)s, %(workflow_id)s, 'manual', NULL, NULL, NULL,
+            FALSE, %(actor)s, %(actor)s, %(now)s, %(now)s
+        )
+        ON CONFLICT (id) DO NOTHING
+        """,
+        {
+            "id": ids["trigger"],
+            "workspace_id": ids["workspace"],
+            "workflow_id": _AUTOMATION_WORKFLOW_ID,
+            "actor": ids["user"],
+            "now": SEED_EPOCH,
+        },
+    )
+
+
 def seed(conn: psycopg.Connection[Any]) -> None:
     """Insert deterministic Phase 1 fixtures into every table for both workspaces.
 
@@ -1500,6 +1625,10 @@ def seed(conn: psycopg.Connection[Any]) -> None:
             _seed_ai_runs_and_steps(cur, label, ids)
             _seed_evaluation_run(cur, label, ids)
             _seed_generated_artifact(cur, label, ids)
+            # Phase 5 (migration 0038) -- workflow_versions/automation_
+            # policies/triggers all reference workflow_definitions, seeded
+            # first inside _seed_automation itself.
+            _seed_automation(cur, label, ids)
 
 
 def fixture_row_checksums(conn: psycopg.Connection[Any]) -> dict[str, str]:

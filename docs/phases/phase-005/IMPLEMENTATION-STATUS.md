@@ -1,19 +1,20 @@
 ---
 id: PHASE-005-IMPLEMENTATION-STATUS
 title: Phase 5 Implementation Status
-status: Task 0 (design pass) complete; implementation not started
-version: 0.2.0
+status: Task 0 (design pass) and Task 1 (workflow schema, policy model, triggers) complete
+version: 0.3.0
 owner: Lucky Jain
 updated: 2026-07-25
 ---
 
 # Phase 5 Implementation Status
 
-Task 0 (design doc, ADR, contracts, recovery runbook) is complete, per the same parallel-start exception every prior phase received (`docs/phases/PHASE-004-ai-runtime.md`'s "Phase 4 exit status and Phase 5 parallel-start" section) -- design work does not wait for Phase 4's own exit gate to close. Implementation (Task 1 onward) has not started; it begins once the repository owner has reviewed this pass's proposed resolutions (`PHASE-005-automation.md`'s "Approved decisions" section).
+Task 0 (design doc, ADR, contracts, recovery runbook) is complete, per the same parallel-start exception every prior phase received (`docs/phases/PHASE-004-ai-runtime.md`'s "Phase 4 exit status and Phase 5 parallel-start" section) -- design work does not wait for Phase 4's own exit gate to close. Task 1 (the data layer this design work specified: `workflow_definitions`/`workflow_versions`, `automation_policies`, `triggers`) is also complete. No durable worker, scheduler, action-adapter registry, run/approval surface or `/simulate` endpoint exists yet -- those are later tasks that depend on this data layer existing first.
 
 | Task | Description | Status |
 |---|---|---|
 | 0 | Design doc, ADR (durable-execution technology), contracts moved to Approved for Implementation, recovery runbook | Done -- this commit |
+| 1 | Workflow schema, policy model and triggers (data layer only) | Done -- this commit |
 
 ## Task 0 evidence -- design doc, ADR, contracts, recovery runbook
 
@@ -29,13 +30,33 @@ Task 0 (design doc, ADR, contracts, recovery runbook) is complete, per the same 
 
 **No code, migration or worker implementation ships as part of this pass** -- documentation only, matching the design doc's own stated completion boundary. Task 1 (the first real implementation slice) is deliberately not started in this same pass, the same sequencing Phase 4's own Task 0 used (design doc and ADR first, contracts moved to Approved, implementation plan and Task 1 begin only after repository-owner review).
 
+### Task 1 evidence -- workflow schema, policy model and triggers (data layer only, this commit)
+
+**Migration.** `backend/migrations/versions/0038_phase5_workflow_schema.py` -- the true next-in-chain after `0037_phase4_meeting_timeout2.py`, per this codebase's own documented migration-numbering convention (migration `0029`'s own docstring precedent). Creates four tables, all workspace-scoped (a deliberate divergence from Phase 4's global `prompt_versions`/`tool_definitions`, matching every Phase 1-3 domain table's convention instead -- see the migration's own module docstring for the full reasoning):
+
+- `workflow_definitions` -- the workflow-family identity row (`id`, `workspace_id`, `workflow_id`, `created_by`, timestamps), `UNIQUE(workspace_id, workflow_id)`. A second table beyond the single-table shape Phase 4's `prompt_versions` used, added specifically so `automation_policies`/`triggers` have a stable FK target for "which workflow family" independent of any one version row's lifecycle.
+- `workflow_versions` -- `workflow_id`, `version`, `graph` (JSONB), `trigger_refs` (JSONB), `policy_ref` (nullable UUID, no FK -- see migration docstring), `definition_hash` (`sha256` over `{graph, trigger_refs, policy_ref}`), `status` (`draft|active|retired`). `trg_workflow_versions_immutability` (`BEFORE UPDATE`) rejects any change to `graph`/`trigger_refs`/`policy_ref`/`definition_hash` once `status <> 'draft'`, mirroring migration `0029`'s `trg_prompt_versions_immutability` exactly in style. `uq_workflow_versions_active_per_workflow` (partial unique index, `WHERE status = 'active'`) enforces exactly one active version per `(workspace_id, workflow_id)`.
+- `automation_policies` -- `workflow_id`, `action_types`/`data_classes` (`ARRAY(TEXT)`), `value_limit`/`count_limit` (both `NOT NULL`, no `server_default` -- `APPROVAL-POLICY.md`'s resolved decision that a policy author must set both explicitly), `rate_limit` (JSONB, defaults to `{"runs_per_workflow_per_hour": 10}` -- the one limit this doc *does* give a system-wide default), `schedule`, `approval_mode` (`preview_only|per_run|bounded_recurring`), `expires_at` (computed in application code as `created_at + 90 days`, never a DB default), `revoked_at`, `version` (optimistic-concurrency column, Phase 3's established idiom).
+- `triggers` -- `workflow_id`, `trigger_type` (`manual|event|schedule`), `event_type_filter`, `schedule_expression`, `timezone`, `skip_missed`. Two `CHECK` constraints enforce design doc Decision 7's "a schedule trigger always names its own timezone explicitly" and "an event trigger always names its filter" at the database layer, not only in application code.
+
+Verified against a live PostgreSQL 16 instance: `alembic upgrade head` applies cleanly, `alembic downgrade -1` then `alembic upgrade head` again reproduces an identical schema (migration is cleanly reversible).
+
+**Application code.** `backend/ecc/domains/automation/` (new package): `workflows.py` (`compute_definition_hash`, `validate_graph_shape`, `create_workflow_draft`, `activate_workflow_version`, `disable_workflow_version`, read helpers, and the HTTP router), `policy.py` (`create_policy`, `revoke_policy`, `policy_status`/`is_policy_usable` -- the expiry-check helper -- and the HTTP router), `triggers.py` (`create_trigger`/`get_trigger`/`list_triggers`, no `APIRouter` of its own -- `API-SCHEMAS.md` names no trigger endpoint in this task's scope, mirroring `ai_runtime.tools`'s router-less shape exactly). `activate_workflow_version`/`disable_workflow_version` only ever write `status`/`updated_at`, so neither function can structurally collide with the immutability trigger; `publish`'s endpoint additionally catches `IntegrityError` around the activation call and converts it to a clean `WORKFLOW_VERSION_ACTIVE_CONFLICT` 409 rather than propagating a raw Postgres exception, per this task's own instruction. Wired into `backend/ecc/main.py` alongside the existing Phase 1-4 routers.
+
+**API surface (Task 1 scope only).** `GET|POST /api/v1/automations/workflows`, `GET /api/v1/automations/workflows/{id}`, `POST /api/v1/automations/workflows/{id}/publish|disable`, `GET|POST /api/v1/automations/policies`, `POST /api/v1/automations/policies/{id}/revoke`. No `/simulate`, `/runs` or `/approvals` endpoint -- those need the durable worker/action-adapter machinery a later task builds; none was stubbed (no dead code). Every mutating endpoint requires `AuthDep`/`CsrfDep` plus an `Idempotency-Key`; every endpoint resolves `workspace_id` server-side from the caller's session, never from a request body or path parameter (confused-deputy protection, matching Phase 4's own precedent the design doc's Threat model section cites). Required error codes from `API-SCHEMAS.md` all exercised within this task's real endpoints: `SCHEMA_INVALID` (`POST /workflows`, a structurally invalid graph -- duplicate `step_id`s, an edge referencing an unknown or non-forward step, a missing `action_ref` on an `action`/`compensation` step), `WORKFLOW_NOT_ACTIVE` (`POST /workflows/{id}/disable` against a non-active version), `POLICY_EXPIRED`/`POLICY_REVOKED` (`POST /policies/{id}/revoke` against an already-expired or already-revoked policy).
+
+**Tests.** `tests/test_automation_workflows_postgres.py` (37 tests), `tests/test_automation_policy_postgres.py` (21 tests), `tests/test_automation_triggers_postgres.py` (8 tests) -- 66 tests in total (`test_retired_row_every_hashed_column_rejected` is parametrized x3, `trigger_refs`/`policy_ref`/`definition_hash`). Covers, per this task's own required minimum: the DB-level immutability trigger rejecting a post-activation content edit via **direct SQL**, bypassing `workflows.py` entirely (mirroring `test_ai_runtime_versioning_postgres.py`'s identical structure for Phase 4's analogous property); the partial unique index rejecting a second `active` row via direct `INSERT`; draft creation and version increment (`create_workflow_draft`); activation both via the application path (`activate_workflow_version`, exactly-one-active enforced by locking) and the endpoint (`publish`); cross-workspace isolation for workflows, policies and triggers (a resource from workspace A is a 404, never a 403 or a visible-but-empty row, from workspace B -- `GET`, `list`, `publish`, `revoke` all independently verified); policy expiry/revocation state transitions (`policy_status`, `revoke_policy`'s four possible outcomes); the DB-level `NOT NULL` backstop on `value_limit`/`count_limit` (direct `INSERT` omitting either fails with `IntegrityError`) and the HTTP-layer equivalent (`POST /policies` omitting either is `422`); the `triggers` table's two `CHECK` constraints (a `schedule` trigger without `schedule_expression`/`timezone`, or an `event` trigger without `event_type_filter`, both rejected with `IntegrityError`).
+
+**Judgment calls a reviewer should double-check.** (1) `workflow_definitions` as a second table, diverging from Phase 4's single-table `prompt_versions` shape -- justified in the migration's own docstring by `automation_policies`/`triggers` needing a stable FK target `workflow_versions` alone cannot provide. (2) `workflow_versions.policy_ref` carries no FK constraint (an opaque UUID, validated at the application layer against the caller's own workspace) -- avoids an artificial table-creation-order constraint; a workflow can be drafted before or after its intended policy. (3) `POST /automations/workflows` serves both "create a new workflow" and "add a new version to an existing one" through one endpoint, since `API-SCHEMAS.md`'s Task-1-scoped surface names no separate "add version" route. (4) `publish`/`disable` address a specific `workflow_versions` row by its own UUID (not by `(workflow_id, version)`), matching how Phase 4's `GET /ai/runs/{id}` addresses a single run. (5) `POST /policies/{id}/revoke` rejects (rather than silently no-ops) revoking an already-revoked or already-expired policy, on the reasoning that both are terminal states a second `revoke` call cannot meaningfully act on further, and the required `POLICY_REVOKED`/`POLICY_EXPIRED` error codes need a real call site to be exercised within this task's scope.
+
 | Slice | Status |
 |---|---|
 | Task 0: design doc, ADR, contracts, recovery runbook | Done |
-| Workflow schema, simulator and policy model | Not started |
+| Task 1: workflow schema and policy model (data layer only) | Done |
+| Task 1: workflow/policy simulator | Not started -- depends on the durable worker/action-adapter machinery (Task 2+) |
 | Durable local worker and recovery | Not started |
 | Approval inbox and revocation | Not started |
-| Schedules, triggers and notifications | Not started |
+| Schedules, triggers and notifications (worker/scheduler wiring; the `triggers` table itself is Task 1's, done) | Not started |
 | Connector action adapters and sandbox tests | Not started |
 | Compensation, observability and kill switches | Not started |
 | Browser acceptance and staged dogfood | Not started |
