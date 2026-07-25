@@ -493,7 +493,7 @@ def test_reflection_call_produces_a_valid_completed_run_against_real_ollama(
             )
 
 
-def test_execute_run_output_is_byte_for_byte_reproducible_across_two_calls(
+def test_execute_run_output_is_reproducible_across_two_calls(
     run_context: dict,
 ) -> None:
     """`ollama_client.py:generate()` sets `temperature=0` and a fixed
@@ -504,8 +504,15 @@ def test_execute_run_output_is_byte_for_byte_reproducible_across_two_calls(
     observation across *separate* CI job runs over time ("three CI runs,
     byte-for-byte identical") -- this test is the missing in-test
     codification of that same claim: two `execute_run` calls against the
-    identical item/prompt, within one test, must produce byte-for-byte
-    identical validated output.
+    identical item/prompt, within one test, must produce the identical
+    validated output.
+
+    Compares `run.output` (the parsed, validated dict `execute_run`
+    returns), not the raw pre-JSON-parse response text -- `execute_run`
+    exposes no such raw-text field, so this proves the two calls are
+    value-identical/field-for-field reproducible, a narrower but still
+    meaningful property than literal byte-for-byte identity of the raw
+    model response (which this test cannot observe either way).
 
     The second registered model is temporarily marked `disabled` (same
     precedent as `test_second_registered_model_produces_a_valid_
@@ -640,7 +647,7 @@ def test_execute_run_output_is_byte_for_byte_reproducible_across_two_calls(
 
         assert first_output == second_output, (
             "temperature=0/seed=0 should make two calls against the identical "
-            f"prompt byte-for-byte reproducible: first={first_output!r}, "
+            f"prompt produce the identical validated output: first={first_output!r}, "
             f"second={second_output!r}"
         )
     finally:
