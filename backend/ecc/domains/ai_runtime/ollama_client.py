@@ -12,13 +12,18 @@ generation instead of waiting on a non-preemptible blocking call to return
 below, closing the underlying Ollama HTTP stream -- the mechanism Task 3
 threads a `CancellationToken` into, not reimplemented here.
 
-Enforces the design doc's 20s per-model-call timeout two ways: the
-underlying `httpx` client's own request timeout bounds any single network
-read, and a wall-clock deadline checked between yielded chunks bounds the
-*whole* call even if no single read is individually slow (many small
-chunks that only cumulatively exceed the budget). Both surface as
-`OllamaCallTimeout`, never a raw `httpx` exception, so callers depend on one
-typed error regardless of which guard fired.
+Enforces a per-model-call timeout two ways: the underlying `httpx` client's
+own request timeout bounds any single network read (a fixed, generous
+backstop against a hung connection, `_HTTPX_TRANSPORT_TIMEOUT_SECONDS`, not
+tied to any one task's budget), and a wall-clock deadline checked between
+yielded chunks bounds the *whole* call even if no single read is
+individually slow (many small chunks that only cumulatively exceed the
+budget) -- this second guard is the one that actually enforces design doc
+Decision 5's per-task timeout number, via `generate()`'s `timeout_seconds`
+parameter (`runtime.py`'s `execute_run` passes `budget.per_model_call_
+seconds`, which varies by task type -- see `router.py:TASK_REQUIREMENTS`).
+Both surface as `OllamaCallTimeout`, never a raw `httpx` exception, so
+callers depend on one typed error regardless of which guard fired.
 
 `generate()` also accepts an optional `budgets.py:CancellationToken`
 (Task 3), checked at the exact same point, on the exact same per-chunk
@@ -40,8 +45,28 @@ from .budgets import CancellationToken
 
 DEFAULT_OLLAMA_HOST = "http://127.0.0.1:11434"
 
-# design doc Decision 5's budget table: "Per-model-call timeout | 20s".
+# design doc Decision 5's budget table default: "Per-model-call timeout |
+# 20s" -- `attention.explain_item`'s own declared timeout
+# (`router.py:TASK_REQUIREMENTS`) and `generate()`'s fallback when no
+# per-call `timeout_seconds` override is given. Individual task types can
+# declare a different value (`meeting.prep_summary`'s own, larger prompts
+# need more decode time -- see that entry's own comment) and get it
+# genuinely enforced via `generate(timeout_seconds=...)`, not just this
+# constant.
 DEFAULT_PER_MODEL_CALL_TIMEOUT_SECONDS = 20.0
+
+# The underlying `httpx` client's own request-timeout, bounding a single
+# network read against a genuinely hung connection. Deliberately *not*
+# `DEFAULT_PER_MODEL_CALL_TIMEOUT_SECONDS` or any one task's declared
+# timeout: this client is constructed once and shared across every task
+# type (`runtime.py:get_ollama_adapter`'s single FastAPI-DI instance), so a
+# fixed value here must be generous enough to never itself become the
+# limiting factor for any task's real per-call deadline -- the manual
+# wall-clock loop in `generate()` below is what actually enforces that,
+# per-call. Set to Decision 5's total per-run wall-clock budget: no single
+# per-model-call timeout should ever legitimately need to exceed the
+# entire run's own budget.
+_HTTPX_TRANSPORT_TIMEOUT_SECONDS = 60.0
 
 
 class OllamaCallTimeout(Exception):
@@ -112,7 +137,7 @@ class OllamaAdapter:
     ) -> None:
         self._timeout_seconds = timeout_seconds
         self._clock = clock
-        client_kwargs: dict[str, object] = {"timeout": timeout_seconds}
+        client_kwargs: dict[str, object] = {"timeout": _HTTPX_TRANSPORT_TIMEOUT_SECONDS}
         if transport is not None:
             client_kwargs["transport"] = transport
         self._client = ollama.Client(host=host, **client_kwargs)
@@ -134,6 +159,7 @@ class OllamaAdapter:
         max_tokens: int,
         *,
         cancellation_token: CancellationToken | None = None,
+        timeout_seconds: float | None = None,
     ) -> Iterator[Chunk]:
         """Stream a `generate` call, yielding one `Chunk` per fragment.
 
@@ -148,6 +174,16 @@ class OllamaAdapter:
         path above all release the underlying HTTP stream -- see the
         module docstring. `cancellation_token` defaults to `None`, so
         every existing caller (Task 1) is unaffected.
+
+        `timeout_seconds` overrides this instance's own `_timeout_seconds`
+        (set at construction, `DEFAULT_PER_MODEL_CALL_TIMEOUT_SECONDS` by
+        default) for this call only -- `runtime.py:execute_run` passes
+        `budget.per_model_call_seconds` here, so a single shared adapter
+        instance (this codebase's actual production wiring: one FastAPI-DI
+        instance, `get_ollama_adapter`, reused across every task type)
+        still enforces each task's own declared timeout rather than one
+        fixed value for all of them. `None` (the default) keeps every
+        pre-existing caller that doesn't pass it unaffected.
 
         `temperature: 0` and a fixed `seed` make decoding greedy/
         deterministic instead of Ollama's non-zero-temperature default --
@@ -165,7 +201,10 @@ class OllamaAdapter:
         sandboxed CI is the only place that claim can actually be checked
         against the real model.
         """
-        deadline = self._clock() + self._timeout_seconds
+        effective_timeout_seconds = (
+            timeout_seconds if timeout_seconds is not None else self._timeout_seconds
+        )
+        deadline = self._clock() + effective_timeout_seconds
         try:
             stream = self._client.generate(
                 model=model_id,
@@ -183,7 +222,7 @@ class OllamaAdapter:
                 if self._clock() >= deadline:
                     raise OllamaCallTimeout(
                         f"model call to {model_id!r} exceeded the "
-                        f"{self._timeout_seconds}s per-model-call timeout"
+                        f"{effective_timeout_seconds}s per-model-call timeout"
                     )
                 if cancellation_token is not None and cancellation_token.is_cancelled():
                     raise OllamaCallCancelled(
@@ -196,7 +235,7 @@ class OllamaAdapter:
                 except httpx.TimeoutException as exc:
                     raise OllamaCallTimeout(
                         f"model call to {model_id!r} timed out waiting for a response "
-                        f"chunk (per-model-call timeout {self._timeout_seconds}s)"
+                        f"chunk (per-model-call timeout {effective_timeout_seconds}s)"
                     ) from exc
                 except ollama.ResponseError as exc:
                     raise OllamaCallFailed(str(exc)) from exc

@@ -349,6 +349,29 @@ def _adapter_with_responses(*response_texts: str) -> OllamaAdapter:
     return OllamaAdapter(transport=httpx.MockTransport(handler))
 
 
+class _TimeoutSpyAdapter:
+    """Wraps a real `OllamaAdapter`, recording every `timeout_seconds`
+    kwarg passed to `generate()` before delegating -- proves `execute_run`
+    genuinely threads `budget.per_model_call_seconds` through to the real
+    call. `test_ai_runtime_budgets_postgres.py` separately proves the
+    override mechanism itself works in isolation inside `generate()`; this
+    is the other half -- that `execute_run` actually supplies it, not just
+    that it *could*. A real gap found during Phase C audit: this value was
+    computed correctly per task type but never reached the real per-call
+    deadline before this fix, which was silently always the shared
+    adapter instance's own fixed constructor default regardless of task
+    type (`ollama_client.py`'s own updated module docstring).
+    """
+
+    def __init__(self, inner: OllamaAdapter) -> None:
+        self._inner = inner
+        self.observed_timeout_seconds: list[float | None] = []
+
+    def generate(self, *args, **kwargs):  # noqa: ANN002, ANN003, ANN201
+        self.observed_timeout_seconds.append(kwargs.get("timeout_seconds"))
+        return self._inner.generate(*args, **kwargs)
+
+
 def _valid_output(cited: list[str] | None = None) -> str:
     return json.dumps(
         {
@@ -1723,6 +1746,72 @@ def test_execute_run_meeting_prep_summary_happy_path_persists_completed_run(
     steps = _step_rows(run.id)
     assert [s["kind"] for s in steps] == ["tool_call", "model_call"]
     assert steps[0]["trace"]["tool_name"] == "meeting.get_prep_pack"
+
+
+def test_execute_run_meeting_prep_summary_passes_its_own_25s_timeout_to_the_adapter(
+    run_context: dict,
+) -> None:
+    """`meeting.prep_summary`'s own declared per-model-call timeout
+    (25.0s, `router.py:TASK_REQUIREMENTS`, Phase C fix -- raised from the
+    20s it previously shared with `attention.explain_item` after its
+    three heaviest evaluation examples measured 20.07-20.2s against real
+    Ollama, `EVALUATION-CONTRACT.md`'s "Sandbox constraint" section)
+    genuinely reaches the adapter's real per-call deadline via
+    `execute_run`, not just `budgets.py:RunBudget.per_model_call_seconds`
+    (a value that, before this fix, was computed correctly but never
+    actually consumed anywhere -- the real production adapter, `runtime.
+    py:get_ollama_adapter`'s single shared FastAPI-DI instance, always
+    used its own fixed constructor default regardless of task type).
+    """
+    meeting_id, participant_id = _insert_meeting_with_participant(
+        run_context["workspace_id"], run_context["user_id"]
+    )
+    inner = _adapter_with_responses(
+        _meeting_prep_response(
+            summary_text="Jordan Lee is attending; review Q3 numbers.",
+            cited_ids=[str(participant_id)],
+        )
+    )
+    spy = _TimeoutSpyAdapter(inner)
+
+    with SessionFactory() as session:
+        run = execute_run(
+            "meeting.prep_summary",
+            "sensitive",
+            {"meeting_id": str(meeting_id)},
+            session=session,
+            auth=run_context["auth"],
+            ollama_adapter=spy,  # type: ignore[arg-type]
+        )
+
+    assert run.status == "completed"
+    assert spy.observed_timeout_seconds == [25.0]
+
+
+def test_execute_run_attention_explain_item_still_passes_its_own_20s_timeout(
+    run_context: dict,
+) -> None:
+    """Sibling proof for `attention.explain_item`'s own, unchanged 20.0s
+    timeout -- confirms the wiring is genuinely per-task (`router.py:
+    TASK_REQUIREMENTS`), not hardcoded to `meeting.prep_summary`'s new
+    25.0s value specifically.
+    """
+    item_id = _insert_attention_item(run_context["workspace_id"], factors=_DEFAULT_FACTORS)
+    inner = _adapter_with_responses(_valid_output(["overdue"]))
+    spy = _TimeoutSpyAdapter(inner)
+
+    with SessionFactory() as session:
+        run = execute_run(
+            "attention.explain_item",
+            "sensitive",
+            {"attention_item_id": str(item_id)},
+            session=session,
+            auth=run_context["auth"],
+            ollama_adapter=spy,  # type: ignore[arg-type]
+        )
+
+    assert run.status == "completed"
+    assert spy.observed_timeout_seconds == [20.0]
 
 
 def test_execute_run_meeting_prep_summary_ungrounded_citation_fails_grounding(

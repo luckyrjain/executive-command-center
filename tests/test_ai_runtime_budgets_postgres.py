@@ -58,6 +58,7 @@ from ecc.domains.ai_runtime.ollama_client import (
     Chunk,
     OllamaAdapter,
     OllamaCallCancelled,
+    OllamaCallTimeout,
 )
 from ecc.domains.ai_runtime.registry import ModelDefinition
 
@@ -677,3 +678,93 @@ def test_run_never_transitions_to_completed_after_cancellation() -> None:
     # cleanup path racing the cancellation) must never overwrite it.
     guard.complete()
     assert guard.status == "cancelled"
+
+
+# ---------------------------------------------------------------------------
+# generate()'s per-call `timeout_seconds` override -- Phase 4 post-launch
+# audit, phase C. A real gap: `RunBudget.per_model_call_seconds` was
+# computed correctly per task type but never actually reached `OllamaAdapter.
+# generate()`'s real per-call deadline, which was silently always this
+# instance's own fixed constructor default regardless of task type (this
+# codebase's actual production wiring is one shared `OllamaAdapter`
+# instance, `runtime.py:get_ollama_adapter`'s FastAPI-DI singleton, reused
+# across every task type). These three tests exercise the override
+# mechanism itself, in isolation; `test_ai_runtime_runtime_postgres.py`
+# separately proves `execute_run` actually supplies it.
+# ---------------------------------------------------------------------------
+
+
+def test_generate_timeout_seconds_override_replaces_the_instance_default() -> None:
+    """Advancing the fake clock past the constructor's own 20s default,
+    but not past a 30s per-call override, must not raise -- proving the
+    override (not the constructor default) is what's actually enforced.
+    """
+    clock = _FakeClock()
+    adapter = OllamaAdapter(
+        transport=httpx.MockTransport(_many_chunk_handler), timeout_seconds=20.0, clock=clock
+    )
+
+    received: list[Chunk] = []
+    for index, chunk in enumerate(adapter.generate("hi", "m", 100, timeout_seconds=30.0)):
+        received.append(chunk)
+        if index == 0:
+            clock.advance(25.0)
+
+    assert len(received) == 51
+    assert received[-1].done is True
+
+
+def test_generate_timeout_seconds_override_is_itself_enforced() -> None:
+    """The override isn't "disable the deadline check" -- advancing past
+    the override's own value still raises `OllamaCallTimeout`.
+    """
+    clock = _FakeClock()
+    adapter = OllamaAdapter(
+        transport=httpx.MockTransport(_many_chunk_handler), timeout_seconds=20.0, clock=clock
+    )
+
+    received: list[Chunk] = []
+    with pytest.raises(OllamaCallTimeout) as exc_info:
+        for index, chunk in enumerate(adapter.generate("hi", "m", 100, timeout_seconds=30.0)):
+            received.append(chunk)
+            if index == 0:
+                clock.advance(31.0)
+
+    assert len(received) == 1
+    assert "30.0s per-model-call timeout" in str(exc_info.value)
+
+
+def test_generate_without_override_still_uses_the_instance_default_deadline() -> None:
+    """No `timeout_seconds` passed -- every pre-existing caller keeps
+    exactly its old behavior, falling back to the constructor default.
+    """
+    clock = _FakeClock()
+    adapter = OllamaAdapter(
+        transport=httpx.MockTransport(_many_chunk_handler), timeout_seconds=20.0, clock=clock
+    )
+
+    received: list[Chunk] = []
+    with pytest.raises(OllamaCallTimeout) as exc_info:
+        for index, chunk in enumerate(adapter.generate("hi", "m", 100)):
+            received.append(chunk)
+            if index == 0:
+                clock.advance(21.0)
+
+    assert len(received) == 1
+    assert "20.0s per-model-call timeout" in str(exc_info.value)
+
+
+def test_run_budget_meeting_prep_summary_per_model_call_seconds_diverges_from_default() -> None:
+    """`meeting.prep_summary`'s own declared timeout (25.0s, `router.py:
+    TASK_REQUIREMENTS`, phase C fix) is deliberately *not* equal to
+    `ollama_client.py`'s default constant -- confirming the two task
+    types now genuinely diverge, unlike `test_run_budget_per_model_call_
+    seconds_matches_ollama_adapter_default_timeout` above (which is still
+    correct for `attention.explain_item` specifically).
+    """
+    with SessionFactory() as session:
+        policy = air.get_policy(session, "meeting.prep_summary")
+    assert policy is not None
+    budget = RunBudget.from_policy(policy)
+    assert budget.per_model_call_seconds == 25.0
+    assert budget.per_model_call_seconds != DEFAULT_PER_MODEL_CALL_TIMEOUT_SECONDS
