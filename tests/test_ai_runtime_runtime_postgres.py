@@ -782,6 +782,69 @@ def test_execute_run_repair_retry_timeout_fails_run_gracefully(run_context: dict
     assert final_step["trace"]["outcome"] == "timeout"
 
 
+def test_execute_run_repair_prompt_exceeding_input_budget_fails_gracefully(
+    run_context: dict, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The repair prompt (`rendered_prompt + "\\n\\n" + repair_instruction`)
+    is strictly longer than the original prompt, which was already checked
+    against `budget.max_input_tokens` before the primary model call. A gap
+    found during audit: that larger repair prompt was never itself
+    re-checked before being sent -- a prompt that started near the budget
+    ceiling could silently exceed it once the repair instruction is
+    appended. Isolates exactly the new re-check `reattempt()` now performs
+    by letting the first (original-prompt) `check_input_token_budget` call
+    through unconditionally and only rejecting the second (repair-prompt)
+    call -- the real per-call token counts aren't the point here, only that
+    the repair path is re-checked at all and degrades cleanly when it
+    fails, the same way every other repair-retry failure mode in this file
+    already does.
+    """
+    item_id = _insert_attention_item(run_context["workspace_id"], factors=_DEFAULT_FACTORS)
+    adapter = _adapter_with_responses("not json at all", _valid_output(["overdue"]))
+
+    call_count = 0
+
+    def fake_check_input_token_budget(context_estimate: object, budget: object) -> None:
+        nonlocal call_count
+        call_count += 1
+        if call_count >= 2:
+            raise RunBudgetExceeded(
+                "repair prompt exceeds max_input_tokens budget", status="failed"
+            )
+
+    monkeypatch.setattr(
+        runtime_module, "check_input_token_budget", fake_check_input_token_budget
+    )
+
+    with SessionFactory() as session:
+        run = execute_run(
+            "attention.explain_item",
+            "sensitive",
+            {"attention_item_id": str(item_id)},
+            session=session,
+            auth=run_context["auth"],
+            ollama_adapter=adapter,
+        )
+
+    assert call_count == 2, "the repair prompt must be re-checked against max_input_tokens"
+    # `degraded`, not `failed`: this raises `RunBudgetExceeded` from inside
+    # `reattempt()`, caught by the same `except RunBudgetExceeded` clause
+    # every other repair-retry failure mode already goes through (line
+    # ~1528), which always degrades rather than fails -- unlike the
+    # *original* prompt's budget check, which fails outright because
+    # nothing has run yet (`check_input_token_budget`'s own docstring).
+    assert run.status == "degraded"
+    assert run.error_code == "budget_exceeded"
+    assert run.attempts == 1
+
+    steps = _step_rows(run.id)
+    final_step = steps[-1]
+    assert final_step["kind"] == "model_call"
+    assert final_step["status"] == "failed"
+    assert final_step["trace"]["attempt"] == 2
+    assert final_step["trace"]["outcome"] == "budget_exceeded"
+
+
 # ---------------------------------------------------------------------------
 # Grounding failure.
 # ---------------------------------------------------------------------------
@@ -1206,6 +1269,37 @@ def _reflect_args(call_model) -> dict:  # noqa: ANN001
         "steps": [],
         "budget": _reflection_budget(),
     }
+
+
+def test_reflect_on_answer_no_active_prompt_records_trace_step(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """This function's only call site (`execute_run`) already gates on
+    `port.reflection_prompt_id is not None and reflection_enabled(policy)`
+    before calling in, so reaching the `prompt is None` branch here means
+    reflection is nominally on for this task type but the specific prompt
+    row is missing or inactive (never seeded, or deactivated after the
+    fact) -- a distinct, diagnosable condition from every other skip path
+    in this function, all of which already record a `steps` entry. Before
+    this fix, this branch returned `validated` with no trace step at all,
+    silently blending an "the prompt row is gone" condition into an
+    ordinary no-op with no way to tell the two apart from the trace.
+    """
+
+    def call_model(prompt_text: str) -> tuple[str, int | None, int | None]:
+        raise AssertionError("no active reflection prompt means the model must never be called")
+
+    args = _reflect_args(call_model)
+    monkeypatch.setattr(runtime_module, "get_active_prompt", lambda session, prompt_id: None)
+    with SessionFactory() as session:
+        result = runtime_module._reflect_on_answer(session, **args)
+
+    assert result is args["validated"]
+    assert len(args["steps"]) == 1
+    assert args["steps"][0]["kind"] == "model_call"
+    assert args["steps"][0]["status"] == "skipped"
+    assert args["steps"][0]["trace"]["attempt"] == 0
+    assert args["steps"][0]["trace"]["outcome"] == "prompt_unavailable"
 
 
 def test_reflect_on_answer_timeout_is_skipped_original_kept() -> None:

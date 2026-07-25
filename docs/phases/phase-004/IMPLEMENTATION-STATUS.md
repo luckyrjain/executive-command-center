@@ -1,10 +1,10 @@
 ---
 id: PHASE-004-IMPLEMENTATION-STATUS
 title: Phase 4 Implementation Status
-status: Implemented (Tasks 0-12 of the first activation slice)
-version: 0.8.0
+status: Implemented (Tasks 0-13 of the first activation slice)
+version: 0.9.0
 owner: Lucky Jain
-updated: 2026-07-24
+updated: 2026-07-25
 ---
 
 # Phase 4 Implementation Status
@@ -39,7 +39,8 @@ Phase 4's design work and its six-task implementation plan (`docs/superpowers/pl
 | 9 | Wire Phase 3's `meeting_prep.py` "Optional enrichment" to `execute_run` | Done -- `PR #43` |
 | 10 | Second evaluated task type: `meeting.prep_summary` evaluation dataset and promotion floors | Done -- `9530466` |
 | 11 | Post-launch audit fixes: `execute_run`'s repair-retry exception handling | Done -- `b21718e` |
-| 12 | Post-launch audit fixes, phase A: synthetic-eval-id concurrency + idempotency-store fail-open | Done -- this commit |
+| 12 | Post-launch audit fixes, phase A: synthetic-eval-id concurrency + idempotency-store fail-open | Done -- `25f858d` |
+| 13 | Post-launch audit fixes, phase B: repair-prompt budget re-check, reflection trace step, output char caps | Done -- this commit |
 
 ### Task 1 evidence -- model/provider registry and router
 
@@ -205,6 +206,20 @@ Verified the fix is load-bearing, not just present: temporarily disabled the loc
 **Tests.** `tests/test_ai_runtime_meeting_prep_evaluation_postgres.py`: `test_run_evaluation_concurrent_same_workspace_runs_do_not_collide` -- two genuinely concurrent `run_evaluation` calls (real threads, `ThreadPoolExecutor`, no shared Idempotency-Key) in the same workspace, both must complete and pass every floor, with zero leftover synthetic rows after. `tests/test_ai_runtime_runtime_postgres.py`: `test_post_ai_runs_idempotency_store_failure_still_returns_the_completed_run` -- monkeypatches `_store_idempotency` to raise `SQLAlchemyError`, asserts `POST /ai/runs` still returns 200 with the completed run (not a 500), and the run is independently fetchable by id. `tests/test_ai_runtime_evaluation_postgres.py`: the identical pattern for `POST /ai/evaluations/runs`.
 
 **Full regression.** `test_ai_runtime_runtime_postgres.py` + `test_ai_runtime_evaluation_postgres.py` + the meeting-prep-evaluation file + `test_ai_runtime_versioning_postgres.py` + `test_ai_runtime_routing_postgres.py` + `test_ai_runtime_validation_postgres.py` + `test_ai_runtime_budgets_postgres.py` + `test_attention_meeting_prep_postgres.py` -- 260 passed, zero regressions. `ruff check`/`format`/`mypy backend` clean.
+
+### Task 13 evidence -- post-launch audit fixes, phase B (repair-prompt budget re-check, reflection trace step, output char caps)
+
+Continuing the repository owner's phased pickup of Task 11's audit findings. Phase B: the three items flagged as small robustness gaps (as opposed to Phase A's two correctness/concurrency bugs, or the test-coverage-only and doc-drift-only items still pending in later phases).
+
+**Fix 1 -- repair prompt never re-checked against `max_input_tokens`.** `execute_run`'s original `rendered_prompt` is checked against `budget.max_input_tokens` before the primary model call (`check_input_token_budget`), but the bounded schema-repair retry's prompt (`reattempt()`'s `repair_prompt = rendered_prompt + "\n\n" + prepared.repair_instruction`) is strictly longer and was never itself re-checked -- a prompt that started near the budget ceiling could silently exceed it once the repair instruction is appended. Fixed by re-running `check_input_token_budget` against a fresh `ContextEstimate` for `repair_prompt` at the top of `reattempt()`. This needed no new exception handling: `check_input_token_budget` raises the same `RunBudgetExceeded` the surrounding `except RunBudgetExceeded` clause already catches for every other repair-retry failure mode, degrading the run to `degraded`/`budget_exceeded` exactly like a retry-side timeout or provider error already does.
+
+**Fix 2 -- `_reflect_on_answer`'s "no active reflection prompt" exit skips its trace step.** This function's only call site already gates on `port.reflection_prompt_id is not None and reflection_enabled(policy)` before calling in, so its own `prompt is None` branch (reached when the specific `prompt_versions` row is missing or inactive -- never seeded, or deactivated after the fact) is a distinct, diagnosable condition from every other skip path in the function, all of which record a `steps` entry. Before this fix it silently returned `validated` with no trace step, indistinguishable from an ordinary no-reflection-configured run. Fixed by recording `_model_step(sequence, "skipped", attempt=0, outcome="prompt_unavailable")` before returning.
+
+**Fix 3 -- output schemas cap word count but not raw character length.** `ExplainItemOutput.explanation_text`'s and `MeetingPrepSummary.summary_text`'s word-count field validators split on whitespace, so a single pathological "word" with no whitespace at all (a huge base64 blob, a repeated-character run) satisfies a <=60/<=150-word count while remaining unbounded in raw size. Fixed with `Field(max_length=...)` on both fields (`_MAX_EXPLANATION_CHARS = 2000`, `_MAX_SUMMARY_CHARS = 5000` -- generously above any legitimate word-capped answer, matching the codebase's existing convention for bounding text fields, e.g. `notes.py`'s `body: str = Field(min_length=1, max_length=100000)`), an independent, defense-in-depth ceiling alongside the existing word-count check, not a replacement for it.
+
+**Tests.** `tests/test_ai_runtime_runtime_postgres.py`: `test_execute_run_repair_prompt_exceeding_input_budget_fails_gracefully` (spies on `check_input_token_budget` to let the original prompt's check through and reject only the repair prompt's, asserting a clean `degraded`/`budget_exceeded` `AiRun` with a `_model_step` trace entry recording `attempt=2`) and `test_reflect_on_answer_no_active_prompt_records_trace_step` (monkeypatches `get_active_prompt` to return `None`, asserts a `skipped`/`prompt_unavailable` trace step is recorded and the model is never called). `tests/test_ai_runtime_validation_postgres.py`: `test_validate_output_explanation_single_pathological_word_still_bounded` and `test_meeting_prep_summary_single_pathological_word_still_bounded`, each a single whitespace-free string past the new `max_length` cap.
+
+**Full regression.** `tests/test_ai_runtime_validation_postgres.py` + `tests/test_ai_runtime_runtime_postgres.py` -- 82 passed. Full `tests/` suite (excluding the two live-Ollama files, which require a real Ollama server): 726 passed, 4 skipped, one pre-existing unrelated failure deselected (`test_risks_attention_postgres.py::test_ranking_10000_eligible_entities_under_budget` -- the same Phase 1 performance gate documented as sandbox-load-dependent in Task 6's evidence above, reproduced again here in isolation across two independent runs at a consistent ~550-820ms cluster against the 500ms budget; this task's diff touches only `ai_runtime/runtime.py` and `ai_runtime/validator.py`, nowhere near the risks/attention ranking code path). `ruff check`/`mypy backend` clean.
 
 ## Sandbox constraint (carried forward from the design pass)
 
