@@ -126,6 +126,103 @@ mid-`run_step` (already committed its `dispatched` row and called
 `execute()`) is never interrupted, matching `EXECUTION-CONTRACT.md`
 verbatim ("a step already dispatched to its adapter completes ... rather
 than being force-interrupted").
+
+**Task 3's approval/policy gate -- inserted between "no existing
+`workflow_run_steps` row for this step" and "`INSERT` the `dispatched`
+row," never after.** `run_step`'s digest is computed in memory first
+(unchanged from Task 2); the `SELECT ... FOR UPDATE` existing-row check
+runs next (also unchanged -- it is what tells this call whether a prior
+attempt already dispatched, succeeded, failed, or left an ambiguous
+`unknown`-shaped gap for *this exact step*). Only once that check confirms
+there is **no row at all yet** does `_evaluate_dispatch_gate` run: it
+resolves the run's policy (`policy.get_policy` via `run.policy_id`;
+`policy.is_policy_usable`), and, if the policy is usable, evaluates
+`approvals.evaluate_approval_requirement` against the resolved adapter. A
+step this gate does not clear returns `StepBlockedByPolicy` or
+`StepAwaitingApproval` -- a `workflow_run_steps` row is deliberately never
+written for either outcome. This ordering is the one genuinely
+load-bearing design choice in this task's own wiring, worth stating
+explicitly rather than leaving implicit: writing the `'dispatched'` row
+*before* evaluating the gate (the naive reading of "after computing digest
+... before calling `execute()`") would leave a step paused for approval
+looking identical, to any later `run_step` call examining
+`workflow_run_steps`, to Task 2's own crash-in-the-gap case (`'dispatched'`
+status, a real digest, no recorded outcome) -- which Task 2's own existing
+branch immediately and unconditionally marks `unknown`/`needs_review` on
+sight, with no way to tell "still legitimately waiting for a human" apart
+from "the process that wrote this row is dead." Evaluating the gate
+*before* that row exists at all sidesteps the ambiguity entirely: a step
+paused for approval or blocked by policy leaves **no** `workflow_run_steps`
+row, so a later `run_step` call for the same `step_index` (a resumed poll
+cycle, or an explicit approval decision requeuing the run -- `approvals.
+_advance_run_after_decision`) falls through the same "no existing row"
+branch and simply re-evaluates the gate from scratch, which is exactly the
+resume behavior this task needs (see `process_claimed_run`'s own note
+below) with no separate "resume" code path required inside `run_step`
+itself.
+
+`_evaluate_dispatch_gate`'s two blocking outcomes:
+
+1. **No usable policy (`StepBlockedByPolicy`).** `run.policy_id is None`,
+   or it names a row `policy.get_policy` cannot find, or `policy.
+   is_policy_usable` reports `False` (revoked or expired) -- all three
+   block the step, fail-closed ("no policy means no authority," this
+   task's own instruction: an unset `policy_id` is not an implicit
+   all-bounded default). `process_claimed_run` maps this to `run.status =
+   'needs_review'` -- reusing the existing terminal-until-human-action
+   state Task 2 already built for the crash-ambiguous `unknown` case
+   (`docs/runbooks/PHASE-5-RECOVERY.md`'s own precedent), rather than
+   inventing a fifth run status: an unusable policy is exactly the kind of
+   thing a human, not an automatic retry, must resolve (renew or
+   re-authorize the policy, or cancel the run), which is precisely what
+   `needs_review` already means. No new `workflow_runs` column records
+   *which* of the three sub-reasons applied -- `run.policy_id` plus the
+   named `automation_policies` row's own `revoked_at`/`expires_at` fields
+   are already sufficient for an operator or a future UI to determine why,
+   without this task adding a column purely to restate what those two
+   fields already say.
+2. **Approval required, no `approved` row for this exact digest yet
+   (`StepAwaitingApproval`).** `approvals.evaluate_approval_requirement`
+   said yes; `approvals.get_approved_request` (keyed by the live,
+   freshly-computed `digest` -- never a previously-cached value) found
+   nothing. `_evaluate_dispatch_gate` then looks for an already-`pending`
+   request for this step (`approvals.get_pending_approval`) and reuses it,
+   or creates a fresh one (`approvals.create_approval_request`) bound to
+   this exact digest, then durably commits that write immediately
+   (`session.commit()`, on a bare session -- this module's own
+   commit-placement discipline applies identically here: a crash between
+   creating the request and committing it must never leave a request that
+   silently vanishes, which would otherwise strand the run in
+   `waiting_approval` with nothing in the approval inbox for a human to
+   act on). `process_claimed_run` maps this to `run.status =
+   'waiting_approval'`.
+
+**Resuming a `waiting_approval` run reuses the existing claim/poll
+machinery -- there is no separate reclaim predicate or resume-specific
+dispatch path.** `approvals.decide_approval`'s own `_advance_run_after_
+decision` helper (called for every decision, HTTP or direct) flips an
+`approved` run's `status` straight back to `'queued'` (clearing its stale
+lease fields) the moment a human approves -- `claim_next_run`'s ordinary
+`_CLAIMABLE_PREDICATE` already matches `'queued'`, so the very next poll
+cycle (any worker's) claims it exactly as it would any other queued run,
+`process_claimed_run` resumes at `run.current_step_index` (never rewound
+to `0` -- unchanged from Task 2's own crash-recovery checkpoint, since
+`waiting_approval` never advances `current_step_index` past the step it
+paused on), and `run_step`'s gate re-evaluates for that same step,
+finds the now-`approved` row matching the live digest via `get_approved_
+request`, and proceeds to dispatch. A `rejected` decision instead flips
+the run straight to `'failed'` (a human declined -- there is nothing left
+to resume, matching how an adapter's own raised exception also produces
+`failed`, not `needs_review`, for a definitively-classified outcome). This
+was a genuine design choice this task's own instructions flagged as
+"architecturally significant" -- the alternative (a distinct `claim_next_
+run`-adjacent reclaim predicate specifically for `waiting_approval` rows)
+was rejected because `waiting_approval` is not a lease-bearing state (it
+carries no `leased_until` a poll cycle could compare against `now()`) and
+because the moment a human approval-decides is already a natural,
+explicit trigger to requeue -- no polling-based reclaim is needed for a
+state change that only ever happens as a direct consequence of a
+synchronous, already-transactional HTTP decision.
 """
 
 from dataclasses import dataclass
@@ -138,7 +235,14 @@ from uuid import UUID, uuid4
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+from . import policy as policy_module
 from .adapters import AdapterRegistry
+from .approvals import (
+    create_approval_request,
+    evaluate_approval_requirement,
+    get_approved_request,
+    get_pending_approval,
+)
 from .workflows import get_active_workflow_version, get_workflow_version
 
 RunStatus = Literal[
@@ -267,6 +371,31 @@ class StepOutcome:
     status: StepStatus
     output: dict[str, Any] | None
     error_class: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class StepAwaitingApproval:
+    """`run_step` did not dispatch `step_index` -- a fresh, digest-bound
+    human approval is required and none exists yet for this exact digest
+    (module docstring's "Task 3's approval/policy gate" section). No
+    `workflow_run_steps` row is written for this outcome; `approval_id`
+    names the `pending` (or already-`pending`, reused) `approval_requests`
+    row a human resolves via `approvals.decide_approval`.
+    """
+
+    step_index: int
+    approval_id: UUID
+
+
+@dataclass(frozen=True, slots=True)
+class StepBlockedByPolicy:
+    """`run_step` did not dispatch `step_index` -- the run's policy is
+    unusable (module docstring: unset, not found, revoked, or expired). No
+    `workflow_run_steps` row is written for this outcome either.
+    """
+
+    step_index: int
+    reason: Literal["no_policy", "policy_revoked", "policy_expired"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -639,9 +768,93 @@ def _resolve_step(session: Session, run: WorkflowRun, step_index: int) -> dict[s
     return steps[step_index]
 
 
+def _count_dispatched_action_steps(session: Session, workspace_id: UUID, run_id: UUID) -> int:
+    """How many `workflow_run_steps` rows (any status) this run has
+    already written -- every row this module ever inserts is for an
+    `action` step (module docstring / `UnsupportedStepType`), so this is
+    exactly "how many action steps has this run already attempted," the
+    count `policy-limit-exceeding` (`approvals.evaluate_approval_
+    requirement`) needs. Counts rows for the step currently being gated
+    too if one somehow already existed (it never does here -- this is only
+    ever called from the `else:` branch below, which is only reached when
+    no row exists yet for this exact `step_index`), so it is exactly the
+    count of *prior* steps, never off-by-one against the step under
+    evaluation.
+    """
+    result = session.execute(
+        text(
+            "SELECT COUNT(*) FROM workflow_run_steps "
+            "WHERE workspace_id = :workspace_id AND run_id = :run_id"
+        ),
+        {"workspace_id": workspace_id, "run_id": run_id},
+    ).scalar()
+    return int(result or 0)
+
+
+def _evaluate_dispatch_gate(
+    session: Session,
+    run: WorkflowRun,
+    step_index: int,
+    digest: str,
+    step: dict[str, Any],
+    adapter_registry: AdapterRegistry,
+) -> StepBlockedByPolicy | StepAwaitingApproval | None:
+    """Task 3's gate (module docstring's own section has the full
+    reasoning) -- only ever called from `run_step`'s `else:` branch, i.e.
+    only when no `workflow_run_steps` row exists yet for this step at all.
+    Returns `None` when the step is cleared to dispatch immediately:
+    either the policy is usable and no approval is required, or an
+    `approved` request already matches this exact, freshly-computed
+    `digest`.
+    """
+    if run.policy_id is None:
+        return StepBlockedByPolicy(step_index, "no_policy")
+    policy_row = policy_module.get_policy(session, run.workspace_id, run.policy_id)
+    if policy_row is None:
+        return StepBlockedByPolicy(step_index, "no_policy")
+    if not policy_module.is_policy_usable(policy_row):
+        lifecycle = policy_module.policy_status(policy_row)
+        reason: Literal["policy_revoked", "policy_expired"] = (
+            "policy_revoked" if lifecycle == "revoked" else "policy_expired"
+        )
+        return StepBlockedByPolicy(step_index, reason)
+
+    adapter = adapter_registry.get(step["action_ref"])
+    if adapter is None:
+        # Not a policy/approval concern -- the existing "AdapterNotRegistered"
+        # branch further down handles an unregistered action_ref; clear
+        # this gate and let dispatch proceed to that branch unchanged from
+        # Task 2.
+        return None
+
+    action_step_count_so_far = _count_dispatched_action_steps(session, run.workspace_id, run.id)
+    if not evaluate_approval_requirement(
+        adapter, policy_row, action_step_count_so_far=action_step_count_so_far
+    ):
+        return None
+
+    approved = get_approved_request(session, run.workspace_id, run.id, step_index, digest)
+    if approved is not None:
+        return None
+
+    pending = get_pending_approval(session, run.workspace_id, run.id, step_index)
+    if pending is not None:
+        return StepAwaitingApproval(step_index, pending.id)
+
+    created = create_approval_request(
+        session, run.workspace_id, run.id, step_index, digest, adapter.high_impact_categories
+    )
+    # Durable immediately -- module docstring's "Task 3's approval/policy
+    # gate" section: a crash here must never strand the run in
+    # waiting_approval with no corresponding approval_requests row for a
+    # human to act on.
+    session.commit()
+    return StepAwaitingApproval(step_index, created.id)
+
+
 def run_step(
     session: Session, run: WorkflowRun, step_index: int, adapter_registry: AdapterRegistry
-) -> StepOutcome:
+) -> StepOutcome | StepAwaitingApproval | StepBlockedByPolicy:
     """Dispatches (or resumes) exactly one step. At-most-one-effect
     (Decision 3): a `workflow_run_steps` row already `succeeded` under
     this `(run_id, step_index)` key is returned as-is, `execute()` is
@@ -655,6 +868,14 @@ def run_step(
     Only `step_type == "action"` is dispatched; anything else raises
     `UnsupportedStepType` (module docstring / class docstring: out of this
     task's scope).
+
+    **Task 3.** When no `workflow_run_steps` row exists yet for this step,
+    `_evaluate_dispatch_gate` runs before any row is written -- an unusable
+    policy or a not-yet-approved high-impact/policy-limit-exceeding step
+    returns `StepBlockedByPolicy`/`StepAwaitingApproval` instead of a
+    `StepOutcome`, and no row is written at all (module docstring's own
+    "Task 3's approval/policy gate" section has the full reasoning for why
+    this ordering, not "write `dispatched` first," is required).
     """
     step = _resolve_step(session, run, step_index)
     if step.get("step_type") != "action":
@@ -708,6 +929,15 @@ def run_step(
         # yet dispatched and fall through to a fresh dispatch below.
 
     else:
+        # Task 3's gate -- must run before any workflow_run_steps row for
+        # this step exists at all (module docstring / run_step's own
+        # docstring: writing 'dispatched' first would make an
+        # approval-paused step indistinguishable from Task 2's own
+        # crash-in-the-gap 'unknown' case on any later re-examination).
+        gate = _evaluate_dispatch_gate(session, run, step_index, digest, step, adapter_registry)
+        if gate is not None:
+            return gate
+
         now = datetime.now(UTC)
         session.execute(
             text(
@@ -860,6 +1090,14 @@ def process_claimed_run(
         )
 
         outcome = run_step(session, run, step_index, adapter_registry)
+        if isinstance(outcome, StepAwaitingApproval):
+            # current_step_index is already persisted as step_index (the
+            # UPDATE immediately above) -- the run pauses exactly where it
+            # is, never rewound; resuming re-enters this same step_index
+            # (module docstring's "Resuming a waiting_approval run" note).
+            return _finish_run(session, run, "waiting_approval")
+        if isinstance(outcome, StepBlockedByPolicy):
+            return _finish_run(session, run, "needs_review")
         if outcome.status == "succeeded":
             step_index += 1
             continue

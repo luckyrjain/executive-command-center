@@ -24,6 +24,7 @@ from ecc.domains.attention.planning import router as planning_router
 from ecc.domains.attention.planning_constraints import router as planning_constraints_router
 from ecc.domains.attention.risk_reviews import router as risk_reviews_router
 from ecc.domains.attention.waiting import router as waiting_router
+from ecc.domains.automation.approvals import router as automation_approvals_router
 from ecc.domains.automation.policy import router as automation_policies_router
 from ecc.domains.automation.workflows import router as automation_workflows_router
 from ecc.domains.calendar.events import router as calendar_events_router
@@ -137,10 +138,16 @@ app.include_router(ai_evaluations_router)
 # policy owns GET|POST /automations/policies and POST /automations/
 # policies/{id}/revoke. ecc.domains.automation.triggers has no router of
 # its own in this task (no trigger endpoint is in Task 1's API scope,
-# API-SCHEMAS.md). No /simulate, /runs or /approvals endpoint exists yet --
-# those need the durable worker/adapter machinery a later task builds.
+# API-SCHEMAS.md). No /simulate or /runs endpoint exists yet -- those need
+# a later task's real adapters/scheduler wiring.
 app.include_router(automation_workflows_router)
 app.include_router(automation_policies_router)
+# Phase 5 Task 3: the approval inbox (docs/phases/phase-005/API-SCHEMAS.md)
+# -- GET /automations/approvals, POST /automations/approvals/{id}/
+# approve|reject. ecc.domains.automation.approvals also owns the
+# dispatch-gate logic ecc.domains.automation.worker.run_step wires in
+# directly (no HTTP surface of its own for that half).
+app.include_router(automation_approvals_router)
 app.middleware("http")(rejected_mutation_audit_middleware)
 # Pure-ASGI body size guard: registered via add_middleware (not the
 # "http" dispatch helper) so it can intercept the raw receive() channel and

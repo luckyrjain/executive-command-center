@@ -145,6 +145,10 @@ _WORKSPACE_ID_TABLES: tuple[str, ...] = (
     # this exact gap before it repeats a third time.
     "workflow_runs",
     "workflow_run_steps",
+    # Phase 5 Task 3 (migration 0040) -- approval_requests, also
+    # workspace-scoped; seeded here from day one for the same reason,
+    # closing this exact gap before it repeats a fourth time.
+    "approval_requests",
 )
 # `workspaces` is scoped by its own `id`, not a `workspace_id` column.
 _WORKSPACE_TABLE = "workspaces"
@@ -221,6 +225,7 @@ def _fixture_ids(label: str) -> dict[str, UUID]:
         "trigger": seed_id(label, "trigger", "acceptance"),
         "workflow_run": seed_id(label, "workflow_run", "acceptance"),
         "workflow_run_step": seed_id(label, "workflow_run_step", "acceptance"),
+        "approval_request": seed_id(label, "approval_request", "acceptance"),
     }
 
 
@@ -1484,25 +1489,33 @@ _AUTOMATION_WORKFLOW_ID = "phase1-seed.automation.acceptance"
 
 
 def _seed_automation(cur: psycopg.Cursor[Any], label: str, ids: Mapping[str, UUID]) -> None:
-    """Phase 5 (migrations 0038-0039) -- workflow_definitions/workflow_
-    versions/automation_policies/triggers (Task 1), plus workflow_runs/
-    workflow_run_steps (Task 2), all workspace-scoped (unlike Phase 4's
-    global catalog tables). ``workflow_definitions`` is the family identity
-    row every other table here FK's against; it must be inserted first.
-    ``workflow_versions.policy_ref`` carries no FK constraint (migration
-    0038's own docstring), so referencing ``ids["automation_policy"]`` here
-    is safe regardless of insert order relative to the policy row itself.
-    ``workflow_runs`` pins ``workflow_version = 1`` via a real composite FK
-    (migration 0039) -- the seeded version row above must exist first, but
-    its ``status`` does not need to be ``active`` for that FK to hold, so
-    this seeds one ``succeeded`` run against the still-``draft`` version
-    seeded above rather than also seeding a second, ``active`` version
-    solely for this run to reference. This function is Task 1's own
-    ``_seed_automation`` extended in place (Task 2's own instruction),
-    following the exact ``workflow_runs``/``workflow_run_steps`` naturally-
-    follows-``workflow_definitions``/``workflow_versions`` sequencing
-    Task 1's fix commit established, not a new, duplicate ``_seed_*``
-    function.
+    """Phase 5 (migrations 0038-0040) -- workflow_definitions/workflow_
+    versions/automation_policies/triggers (Task 1), workflow_runs/
+    workflow_run_steps (Task 2), plus approval_requests (Task 3), all
+    workspace-scoped (unlike Phase 4's global catalog tables).
+    ``workflow_definitions`` is the family identity row every other table
+    here FK's against; it must be inserted first. ``workflow_versions.
+    policy_ref`` carries no FK constraint (migration 0038's own docstring),
+    so referencing ``ids["automation_policy"]`` here is safe regardless of
+    insert order relative to the policy row itself. ``workflow_runs`` pins
+    ``workflow_version = 1`` via a real composite FK (migration 0039) --
+    the seeded version row above must exist first, but its ``status`` does
+    not need to be ``active`` for that FK to hold, so this seeds one
+    ``succeeded`` run against the still-``draft`` version seeded above
+    rather than also seeding a second, ``active`` version solely for this
+    run to reference. ``approval_requests`` composite-FK's ``(workspace_id,
+    run_id)`` to ``workflow_runs`` (migration 0040) -- the seeded run above
+    must exist first; this seeds one ``approved`` (fully decided, not
+    ``pending``) request bound to the exact same ``action_digest`` the
+    seeded ``workflow_run_steps`` row above carries, representing a
+    step that genuinely required and received approval before it
+    dispatched -- a more representative fixture than a still-``pending``
+    row that would look like a permanently-stuck seed. This function is
+    Task 1's own ``_seed_automation`` extended in place (Task 2 and now
+    Task 3's own instruction), following the exact ``workflow_runs``/
+    ``workflow_run_steps``/``approval_requests`` naturally-follows-
+    ``workflow_definitions``/``workflow_versions`` sequencing Task 1's fix
+    commit established, not a new, duplicate ``_seed_*`` function.
     """
     graph = (
         '{"steps": [{"step_id": "notify", "step_type": "action", '
@@ -1661,6 +1674,40 @@ def _seed_automation(cur: psycopg.Cursor[Any], label: str, ids: Mapping[str, UUI
             "action_digest": action_digest,
             "input": step_input,
             "output": step_output,
+            "now": SEED_EPOCH,
+        },
+    )
+
+    # Phase 5 Task 3 (migration 0040) -- approval_requests. Bound to the
+    # exact same action_digest as the workflow_run_steps row above (the
+    # "approval is bound to the exact digest it approved" property,
+    # DATA-MODEL.md) -- represents a high-impact step that genuinely
+    # required and received approval before its adapter's execute() ran.
+    # 'approved', not 'pending': decided_at/decision/decided_by are all
+    # NOT NULL together (ck_approval_requests_decided_matches_decision,
+    # migration 0040), the more representative fixture for a step that
+    # already ran to 'succeeded'.
+    cur.execute(
+        """
+        INSERT INTO approval_requests (
+            id, workspace_id, run_id, step_index, action_digest,
+            high_impact_categories, status, requested_at, expires_at,
+            decided_at, decision, decided_by, created_at, updated_at
+        ) VALUES (
+            %(id)s, %(workspace_id)s, %(run_id)s, 0, %(action_digest)s,
+            %(high_impact_categories)s, 'approved', %(now)s, %(expires_at)s,
+            %(now)s, 'approved', %(actor)s, %(now)s, %(now)s
+        )
+        ON CONFLICT (id) DO NOTHING
+        """,
+        {
+            "id": ids["approval_request"],
+            "workspace_id": ids["workspace"],
+            "run_id": ids["workflow_run"],
+            "action_digest": action_digest,
+            "high_impact_categories": ["person-directed"],
+            "expires_at": SEED_EPOCH + timedelta(hours=24),
+            "actor": ids["user"],
             "now": SEED_EPOCH,
         },
     )
