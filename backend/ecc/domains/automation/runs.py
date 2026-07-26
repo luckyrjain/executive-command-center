@@ -55,10 +55,12 @@ not surfaced by this router directly -- they are properties of a run's own
 step-dispatch outcome (`needs_review`/`waiting_approval`, already fully
 handled inside `worker.run_step`/`approvals.py`) visible through this
 router's own `GET` responses rather than raised as HTTP errors by a `POST`
-here. `kill_switch_active` belongs to a later task's own kill-switch
-machinery ("Compensation, observability and kill switches" in `docs/
-phases/phase-005/IMPLEMENTATION-STATUS.md`'s per-slice status table) --
-not built here.
+here. `kill_switch_active` (`KILL_SWITCH_ACTIVE`, 409) is now handled here
+too (Task 6, "Compensation, observability and kill switches") -- `worker.
+enqueue_run` rejects a killed workflow (`WorkflowKilled`) before creating
+any `workflow_runs` row at all; this endpoint simply maps that outcome to
+the required error code, the same shape `workflow_not_active` already
+uses.
 """
 
 from __future__ import annotations
@@ -402,6 +404,16 @@ def create_run_endpoint(
             raise HTTPException(
                 status_code=409,
                 detail={"code": "WORKFLOW_NOT_ACTIVE", "workflow_id": result.workflow_id},
+            )
+        if isinstance(result, worker_module.WorkflowKilled):
+            # Task 6: API-SCHEMAS.md's kill_switch_active error code, for
+            # this call site -- `enqueue_run` is the single choke point
+            # both this endpoint and the scheduler's own fire path go
+            # through (worker.py's own "Task 6: kill switches" docstring
+            # section).
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "KILL_SWITCH_ACTIVE", "workflow_id": result.workflow_id},
             )
 
         response = _to_response(result)

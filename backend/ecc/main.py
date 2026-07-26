@@ -25,6 +25,7 @@ from ecc.domains.attention.planning_constraints import router as planning_constr
 from ecc.domains.attention.risk_reviews import router as risk_reviews_router
 from ecc.domains.attention.waiting import router as waiting_router
 from ecc.domains.automation.approvals import router as automation_approvals_router
+from ecc.domains.automation.kill_switches import router as automation_kill_switches_router
 from ecc.domains.automation.policy import router as automation_policies_router
 from ecc.domains.automation.runs import router as automation_runs_router
 from ecc.domains.automation.workflows import router as automation_workflows_router
@@ -158,6 +159,12 @@ app.include_router(automation_approvals_router)
 # not part of this task -- see runs.py/scheduler.py's own module
 # docstrings for the full scoping reasoning.
 app.include_router(automation_runs_router)
+# Phase 5 Task 6: global/per-workflow kill switches (ecc.domains.automation.
+# kill_switches) -- POST /automations/workflows/{workflow_id}/kill_switch,
+# POST /automations/kill_switch. A disclosed, minimal addition to
+# API-SCHEMAS.md's endpoint list (neither route existed there before this
+# task); see that module's own docstring for the full reasoning.
+app.include_router(automation_kill_switches_router)
 app.middleware("http")(rejected_mutation_audit_middleware)
 # Pure-ASGI body size guard: registered via add_middleware (not the
 # "http" dispatch helper) so it can intercept the raw receive() channel and

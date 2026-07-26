@@ -149,6 +149,12 @@ _WORKSPACE_ID_TABLES: tuple[str, ...] = (
     # workspace-scoped; seeded here from day one for the same reason,
     # closing this exact gap before it repeats a fourth time.
     "approval_requests",
+    # Phase 5 Task 6 (migration 0042) -- compensation_steps/
+    # automation_kill_switches, also workspace-scoped; seeded here from
+    # day one for the same reason, closing this exact gap before it
+    # repeats a fifth time.
+    "compensation_steps",
+    "automation_kill_switches",
 )
 # `workspaces` is scoped by its own `id`, not a `workspace_id` column.
 _WORKSPACE_TABLE = "workspaces"
@@ -226,6 +232,8 @@ def _fixture_ids(label: str) -> dict[str, UUID]:
         "workflow_run": seed_id(label, "workflow_run", "acceptance"),
         "workflow_run_step": seed_id(label, "workflow_run_step", "acceptance"),
         "approval_request": seed_id(label, "approval_request", "acceptance"),
+        "compensation_step": seed_id(label, "compensation_step", "acceptance"),
+        "kill_switch": seed_id(label, "kill_switch", "acceptance"),
     }
 
 
@@ -1709,6 +1717,58 @@ def _seed_automation(cur: psycopg.Cursor[Any], label: str, ids: Mapping[str, UUI
             "expires_at": SEED_EPOCH + timedelta(hours=24),
             "actor": ids["user"],
             "now": SEED_EPOCH,
+        },
+    )
+
+    # Phase 5 Task 6 (migration 0042) -- compensation_steps/automation_
+    # kill_switches. ``compensation_steps`` represents one already-recorded
+    # compensation for the seeded run's own step 0 (``compensates_step_
+    # index=0``), bound to the same ``action_digest`` computed above,
+    # ``status='succeeded'`` -- a representative "compensation already ran
+    # and completed" fixture rather than a still-``pending`` row.
+    # ``automation_kill_switches`` seeds one *deactivated* global switch
+    # (``workflow_id IS NULL``, ``active=false``) -- a genuine historical
+    # audit-trail row (the append-only-ish shape migration 0042 documents)
+    # that does not leave an active kill switch in seeded data able to
+    # affect any other acceptance check that might separately enqueue or
+    # claim a run against these fixtures.
+    cur.execute(
+        """
+        INSERT INTO compensation_steps (
+            id, workspace_id, run_id, compensates_step_index, action_digest,
+            status, started_at, finished_at, error_class, created_at, updated_at
+        ) VALUES (
+            %(id)s, %(workspace_id)s, %(run_id)s, 0, %(action_digest)s,
+            'succeeded', %(now)s, %(now)s, NULL, %(now)s, %(now)s
+        )
+        ON CONFLICT (id) DO NOTHING
+        """,
+        {
+            "id": ids["compensation_step"],
+            "workspace_id": ids["workspace"],
+            "run_id": ids["workflow_run"],
+            "action_digest": action_digest,
+            "now": SEED_EPOCH,
+        },
+    )
+    cur.execute(
+        """
+        INSERT INTO automation_kill_switches (
+            id, workspace_id, workflow_id, active, reason, activated_by,
+            activated_at, deactivated_by, deactivated_at, created_at, updated_at
+        ) VALUES (
+            %(id)s, %(workspace_id)s, NULL, FALSE, %(reason)s, %(actor)s,
+            %(now)s, %(actor)s, %(deactivated_at)s, %(now)s, %(deactivated_at)s
+        )
+        ON CONFLICT (id) DO NOTHING
+        """,
+        {
+            "id": ids["kill_switch"],
+            "workspace_id": ids["workspace"],
+            "reason": "phase1 acceptance seed fixture -- deactivated historical switch",
+            "actor": ids["user"],
+            "now": SEED_EPOCH,
+            "deactivated_at": SEED_EPOCH + timedelta(hours=1),
         },
     )
 

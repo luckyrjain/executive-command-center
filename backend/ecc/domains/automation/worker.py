@@ -305,10 +305,155 @@ already wrapping the `execute()` call) on a mismatch -- generic (keys off
 an attribute name, not a specific adapter), and inert for any adapter whose
 `input_schema` carries no `workspace_id` field at all (every one of Task
 2-4's own test fakes, and `fake.external_action`).
+
+**Task 6: bounded retry (`docs/phases/phase-005/EXECUTION-CONTRACT.md`'s
+"Retries use bounded exponential backoff only for classified transient
+failures ... never for a step whose side effect may have already partially
+occurred").** No such mechanism existed before this task -- `run_step`'s
+`except Exception` block caught literally anything and immediately marked
+the step `'failed'`, with no distinction between "definitely no side
+effect, safe to retry" and "ambiguous." An adapter now opts in explicitly,
+per attempt, by raising `adapters.TransientAdapterError` instead of an
+ordinary exception (`adapters.py`'s own docstring has the full contract);
+every other exception keeps today's exact unconditional-`'failed'`
+behavior -- `run_step` never guesses retry-safety for an unclassified
+error. `MAX_RETRY_ATTEMPTS = 3`, backoff `2 ** attempt_count` seconds (2s,
+4s, 8s for attempts 1/2/3) -- see those constants below. On a
+`TransientAdapterError` with `attempt_count < MAX_RETRY_ATTEMPTS`,
+`run_step` itself (not `process_claimed_run`) durably commits
+`workflow_run_steps.status = 'retrying'`/`attempt_count += 1` and releases
+the run's own lease back to `'queued'` with `next_attempt_at = now() +
+backoff` -- the identical lease-release shape `_pause_run` already uses,
+except the retry gate lives on `workflow_runs.next_attempt_at`, not a new
+run-level status (`DATA-MODEL.md`'s run-state vocabulary gets no new
+`'retrying'` value; `UX-STATES.md`'s required "retrying" UI state is
+realized by an ordinary `'queued'` run whose *current step's own row*
+shows `status='retrying'`). `_CLAIMABLE_PREDICATE` is widened so a
+retry-pending run is not reclaimed before `next_attempt_at` elapses. Once
+exhausted (`attempt_count >= MAX_RETRY_ATTEMPTS` at the moment of yet
+another `TransientAdapterError`), `run_step` falls through to the ordinary,
+unconditional `'failed'` path unchanged -- bounded, never indefinite. A
+`'retrying'`-status existing row (a reclaimed, now-due run resuming the
+exact step it paused on) is handled in `run_step`'s existing-row branch by
+falling through to a fresh dispatch attempt that `UPDATE`s the same row
+(never a second `INSERT`), reusing its existing `attempt_count`.
+
+**Task 6: compensation dispatch (`docs/superpowers/specs/
+2026-07-25-phase-5-automation-design.md` Decision 9).** `workflows.
+GraphStepModel` gained `compensate_ref` this same task (a real, disclosed
+gap between two already-merged tasks' own assumptions -- see that module's
+own docstring) -- this module is what actually dispatches it. Two changes
+to `process_claimed_run`'s main loop were required first, not merely
+additive: (1) the main per-step walk now skips forward over any step whose
+`step_type != "action"` without ever calling `run_step` for it and without
+writing a `workflow_run_steps` row -- previously, a `step_type=
+'compensation'` (or, by the same latent gap, `'approval_gate'`/
+`'condition'`) step sitting inline in the flat `steps` list would, if ever
+linearly reached, be passed to `run_step`, which raises `UnsupportedStepType`
+unhandled, crashing the whole claimed-run dispatch; a `step_type=
+'compensation'` step is now reachable *only* through the dedicated
+compensation-dispatch path below, never through this linear walk. (2) When
+a step's outcome is `'failed'`, the loop no longer unconditionally calls
+`_finish_run(..., "failed")` -- it first looks at the graph's own
+already-`succeeded` action steps with index `< step_index` (the step that
+just failed is never itself compensated -- only earlier, completed steps
+that declared a `compensate_ref`) and collects any with one set,
+**descending** by original step index (`_qualifying_compensations`,
+standard saga rollback order: undo the most recently completed effect
+first). No qualifying step: unchanged behavior, `_finish_run(..., "failed")`.
+One or more: `_mark_compensating` flips `run.status` to `'compensating'`
+via a direct `UPDATE` that deliberately does **not** release the lease
+(this is an automatic continuation of the same dispatch, not a human-wait
+state the way `waiting_approval`/`needs_review` are), then `_run_
+compensation_sequence` dispatches each qualifying compensation step in
+turn, renewing the lease before each (`renew_lease`, same heartbeat
+function every other dispatch uses) -- continuing to attempt every
+qualifying compensation even after one fails, so partial compensation is
+visible (`PHASE-005-automation.md`'s own acceptance criterion), never
+stopping early. `_dispatch_compensation_step` computes its own
+`action_digest` from the *compensation* step's own `step_id`/`input_
+mapping` (never the original step's -- this identifies *this compensation
+dispatch attempt*, distinct from the original step it is undoing), writes
+its own `workflow_run_steps` row (`step_type='compensation'`, at the
+compensation step's own `step_index` in the graph -- a distinct row from
+the step it compensates per `DATA-MODEL.md`) plus its own `compensation_
+steps` ledger row (`compensates_step_index` = the *original* step's
+index), and dispatches through whichever of two shapes applies (a genuine
+judgment call, resolved and documented -- see that function's own
+docstring for the full reasoning, not left ambiguous): if the *original*
+step's own registered adapter declares `compensate()` (`adapters.
+compensable`), that adapter's `compensate()` is called with the
+*original* step's own resolved input (matching `FakeExternalActionAdapter.
+compensate`'s actual documented signature -- "the same `action_input`
+`execute()` was originally called with, not the prior `execute()` call's
+output"); otherwise, if the *compensation* step's own `action_ref` names a
+distinct registered adapter, that adapter's ordinary `execute()` is called
+with the compensation step's own resolved input, exactly like any action
+step. Once every qualifying compensation has been attempted: all
+succeeded -> `_finish_run(..., "compensated")`; any failed/unknown ->
+`_finish_run(..., "compensation_failed")`. `process_claimed_run`'s own
+cancel/pause/kill-switch checks are deliberately not re-consulted anywhere
+inside this sequence -- once compensation starts, it runs to its own
+completion, matching this module's existing "an already-dispatched step is
+never force-interrupted" philosophy, generalized to a whole compensation
+sequence rather than one step.
+
+**Task 6: a disclosed, real scope boundary -- compensation dispatch is not
+crash-resumable.** `_CLAIMABLE_PREDICATE` is deliberately *not* widened to
+reclaim `status = 'compensating'` rows the way it already is for `'leased'`/
+`'running'` (module docstring point 2, above) -- doing so correctly would
+require rebuilding `_qualifying_compensations`' own list idempotently on
+resume (which it already can, by construction: the list is always
+recomputed live from `run.current_step_index` plus which `workflow_run_
+steps` rows are actually `'succeeded'`, so a second call is naturally
+idempotent) *and* auditing `_dispatch_compensation_step`'s own crash-safety
+the same rigor `run_step` itself received in Task 2's review. This task's
+own required test list does not name a crash-mid-compensation case, and
+building + proving that property correctly is a genuinely separate unit of
+work from the compensation-dispatch mechanics themselves -- deliberately
+left out of this task's scope rather than half-built and half-tested. **The
+concrete consequence a reviewer should know:** a worker crash while
+`status = 'compensating'` leaves that run permanently stuck (its lease
+eventually expires, but no reclaim predicate ever picks it up again) until
+an operator manually intervenes -- the same 90-second manual-confirmation
+diagnostic query `docs/runbooks/PHASE-5-RECOVERY.md` already documents for
+the `'leased'`/`'running'` case would need to additionally check `status =
+'compensating'` to catch this today, which that runbook's own text does
+not yet say. Flagged here, in this task's own PR evidence, and as a
+concrete next step for a later task, not silently left implicit.
+
+**Task 6: kill switches (`docs/runbooks/PHASE-5-RECOVERY.md`'s "Kill
+switches and their recovery interaction" section).** `_CLAIMABLE_PREDICATE`
+gained two correlated `NOT EXISTS` subqueries against `automation_kill_
+switches` (global: `workflow_id IS NULL AND active`; per-workflow:
+`workflow_id = workflow_runs.workflow_id AND active`; both scoped to
+`workspace_id = workflow_runs.workspace_id`) -- a killed workflow's rows
+are "never claimed, reclaimed, or resumed regardless of lease state,
+including across a crash/restart cycle" (runbook, verbatim), satisfied
+mechanically by this predicate being the *same* one statement every claim
+and reclaim already goes through, not a second check bolted on elsewhere.
+`process_claimed_run`'s per-step loop checks `kill_switches.
+is_workflow_killed` at the identical point its `cancel_requested_at`/
+`pause_requested_at` checks already run (before dispatching each
+not-yet-dispatched step) -- a kill switch discovered mid-run stops the run
+via `_pause_run(session, run, "needs_review")`, reusing the existing
+terminal-until-human-action state (this module's own "unusable policy"
+precedent, Task 3) rather than inventing a new run status; per the runbook,
+re-enabling the kill switch later does **not** implicitly resume this run
+-- `needs_review` is not in `_CLAIMABLE_PREDICATE`'s claimable set
+regardless of kill-switch state, so there is no code path that could
+auto-resume it either way. `enqueue_run` checks `kill_switches.
+is_workflow_killed` before creating any `workflow_runs` row at all and
+rejects with `WorkflowKilled` if killed -- "Global/workflow kill switches
+stop new runs" (`PHASE-005-automation.md`'s Rollback plan, verbatim), not
+only a claim-time gate that would otherwise let `queued` rows silently pile
+up forever behind an active switch; `scheduler.run_scheduler_once`'s fire
+path and `runs.py`'s `POST /automations/runs` both call this same
+`enqueue_run`, so neither needs its own separate kill-switch check.
 """
 
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from json import dumps
 from typing import Any, Literal
@@ -317,8 +462,22 @@ from uuid import UUID, uuid4
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+from ecc.observability import (
+    queue_cancellation_latency,
+    queue_run_state_transition,
+    record_cancellation_latency,
+    record_compensation_outcome,
+    record_duplicate_dispatch_suppressed,
+    record_run_queue_age,
+    record_run_state_transition,
+    record_step_outcome,
+    record_step_retry,
+    record_unknown_outcome,
+)
+
+from . import kill_switches
 from . import policy as policy_module
-from .adapters import AdapterRegistry
+from .adapters import AdapterRegistry, TransientAdapterError, call_compensate, compensable
 from .approvals import (
     create_approval_request,
     evaluate_approval_requirement,
@@ -343,7 +502,9 @@ RunStatus = Literal[
     "expired",
     "rate_limited",
 ]
-StepStatus = Literal["pending", "dispatched", "succeeded", "failed", "unknown", "skipped"]
+StepStatus = Literal[
+    "pending", "dispatched", "succeeded", "failed", "unknown", "skipped", "retrying"
+]
 
 # Decision 3's concrete numbers -- referenced by docstrings/tests, and
 # interpolated into the lease SQL below so there is exactly one place
@@ -352,6 +513,17 @@ StepStatus = Literal["pending", "dispatched", "succeeded", "failed", "unknown", 
 POLL_INTERVAL_SECONDS = 2
 LEASE_DURATION_SECONDS = 30
 HEARTBEAT_INTERVAL_SECONDS = 10
+
+# Task 6's bounded-retry numbers (`EXECUTION-CONTRACT.md`: "bounded
+# exponential backoff only for classified transient failures"). A step may
+# be automatically re-dispatched up to `MAX_RETRY_ATTEMPTS` times after a
+# `TransientAdapterError`; backoff for the Nth retry is `RETRY_BACKOFF_
+# BASE_SECONDS ** N` seconds -- 2s, 4s, 8s for attempts 1/2/3 with the
+# current numbers. Referenced by this module's own docstring/tests, same
+# "exactly one place these numbers live" discipline as the three constants
+# above.
+MAX_RETRY_ATTEMPTS = 3
+RETRY_BACKOFF_BASE_SECONDS = 2
 
 _TERMINAL_RUN_STATUSES = frozenset(
     {
@@ -366,21 +538,47 @@ _TERMINAL_RUN_STATUSES = frozenset(
 )
 
 # See module docstring point 2: the reclaim predicate's expired-lease
-# branch spans both lease-bearing states, not `leased` alone.
+# branch spans both lease-bearing states, not `leased` alone. Task 6 adds
+# two more conjuncts: `next_attempt_at` gates a retry-pending run until its
+# backoff elapses (module docstring's "Task 6: bounded retry" section),
+# and the two correlated `NOT EXISTS` subqueries against `automation_kill_
+# switches` are the mechanical enforcement of `docs/runbooks/
+# PHASE-5-RECOVERY.md`'s "a killed workflow's rows are never claimed,
+# reclaimed, or resumed regardless of lease state" (module docstring's
+# "Task 6: kill switches" section) -- both scoped to `workspace_id =
+# workflow_runs.workspace_id`, the first for a global switch (`workflow_id
+# IS NULL`), the second for a switch naming this exact `workflow_id`.
 _CLAIMABLE_PREDICATE = (
-    "(status = 'queued' OR (status IN ('leased', 'running') AND leased_until < now()))"
+    "(status = 'queued' OR (status IN ('leased', 'running') AND leased_until < now())) "
+    "AND (next_attempt_at IS NULL OR next_attempt_at <= now()) "
+    "AND NOT EXISTS ("
+    "  SELECT 1 FROM automation_kill_switches aks_global"
+    "  WHERE aks_global.workspace_id = workflow_runs.workspace_id"
+    "    AND aks_global.workflow_id IS NULL AND aks_global.active"
+    ") "
+    "AND NOT EXISTS ("
+    "  SELECT 1 FROM automation_kill_switches aks_workflow"
+    "  WHERE aks_workflow.workspace_id = workflow_runs.workspace_id"
+    "    AND aks_workflow.workflow_id = workflow_runs.workflow_id AND aks_workflow.active"
+    ")"
 )
 
 _RUN_FIELDS = """
     id, workspace_id, workflow_id, workflow_version, policy_id, trigger_ref,
     status, current_step_index, leased_by, leased_until, lease_heartbeat_at,
-    cancel_requested_at, pause_requested_at, queued_at, started_at, finished_at,
-    created_by, created_at, updated_at
+    cancel_requested_at, pause_requested_at, next_attempt_at, queued_at,
+    started_at, finished_at, created_by, created_at, updated_at
 """
 
 _STEP_FIELDS = """
     id, workspace_id, run_id, step_index, step_type, status, action_digest,
-    input, output, started_at, finished_at, error_class, created_at, updated_at
+    attempt_count, input, output, started_at, finished_at, error_class,
+    created_at, updated_at
+"""
+
+_COMPENSATION_STEP_FIELDS = """
+    id, workspace_id, run_id, compensates_step_index, action_digest, status,
+    started_at, finished_at, error_class, created_at, updated_at
 """
 
 # Redaction markers (design doc Decision 8's Threat model section /
@@ -422,6 +620,7 @@ class WorkflowRun:
     lease_heartbeat_at: datetime | None
     cancel_requested_at: datetime | None
     pause_requested_at: datetime | None
+    next_attempt_at: datetime | None
     queued_at: datetime
     started_at: datetime | None
     finished_at: datetime | None
@@ -439,8 +638,33 @@ class WorkflowRunStep:
     step_type: str
     status: StepStatus
     action_digest: str | None
+    attempt_count: int
     input: dict[str, Any]
     output: dict[str, Any] | None
+    started_at: datetime | None
+    finished_at: datetime | None
+    error_class: str | None
+    created_at: datetime
+    updated_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class CompensationStep:
+    """The explicit compensation ledger row `DATA-MODEL.md` names
+    (`compensation_steps`, Decision 9) -- a distinct table from `workflow_
+    run_steps`'s own `step_type='compensation'` rows (module docstring's
+    "Task 6: compensation dispatch" section explains the division: this
+    table records the *relationship* -- which earlier step, by index, this
+    compensation undoes -- while `workflow_run_steps` records the
+    compensation step's own dispatch).
+    """
+
+    id: UUID
+    workspace_id: UUID
+    run_id: UUID
+    compensates_step_index: int
+    action_digest: str | None
+    status: str
     started_at: datetime | None
     finished_at: datetime | None
     error_class: str | None
@@ -487,6 +711,20 @@ class WorkflowNotActive:
     `workflow_versions` row -- the mechanical source of `API-SCHEMAS.md`'s
     `WORKFLOW_NOT_ACTIVE` error code, matching Task 1's existing error-code
     convention (`workflows.py:WorkflowVersionNotActive`) exactly.
+    """
+
+    workflow_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class WorkflowKilled:
+    """`enqueue_run` was asked to start a run against a workflow a global
+    or per-workflow kill switch currently blocks (Task 6, `docs/runbooks/
+    PHASE-5-RECOVERY.md`'s "Kill switches" section / `PHASE-005-automation.
+    md`'s Rollback plan: "Global/workflow kill switches stop new runs") --
+    the mechanical source of `API-SCHEMAS.md`'s `kill_switch_active` error
+    code for this call site (`runs.py`'s `POST /automations/runs` maps this
+    to `409`).
     """
 
     workflow_id: str
@@ -596,6 +834,7 @@ def _row_to_run(row: dict[str, Any]) -> WorkflowRun:
         lease_heartbeat_at=row["lease_heartbeat_at"],
         cancel_requested_at=row["cancel_requested_at"],
         pause_requested_at=row["pause_requested_at"],
+        next_attempt_at=row["next_attempt_at"],
         queued_at=row["queued_at"],
         started_at=row["started_at"],
         finished_at=row["finished_at"],
@@ -614,8 +853,25 @@ def _row_to_step(row: dict[str, Any]) -> WorkflowRunStep:
         step_type=row["step_type"],
         status=row["status"],
         action_digest=row["action_digest"],
+        attempt_count=row["attempt_count"],
         input=row["input"],
         output=row["output"],
+        started_at=row["started_at"],
+        finished_at=row["finished_at"],
+        error_class=row["error_class"],
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+    )
+
+
+def _row_to_compensation_step(row: dict[str, Any]) -> CompensationStep:
+    return CompensationStep(
+        id=row["id"],
+        workspace_id=row["workspace_id"],
+        run_id=row["run_id"],
+        compensates_step_index=row["compensates_step_index"],
+        action_digest=row["action_digest"],
+        status=row["status"],
         started_at=row["started_at"],
         finished_at=row["finished_at"],
         error_class=row["error_class"],
@@ -687,6 +943,28 @@ def list_run_steps(session: Session, workspace_id: UUID, run_id: UUID) -> list[W
     return [_row_to_step(dict(row)) for row in rows]
 
 
+def list_compensation_steps(
+    session: Session, workspace_id: UUID, run_id: UUID
+) -> list[CompensationStep]:
+    """The compensation ledger for one run, `compensates_step_index`
+    ascending -- Task 6's addition, mirroring `list_run_steps`'s own shape
+    exactly for the sibling table.
+    """
+    rows = (
+        session.execute(
+            text(
+                f"SELECT {_COMPENSATION_STEP_FIELDS} FROM compensation_steps "
+                "WHERE workspace_id = :workspace_id AND run_id = :run_id "
+                "ORDER BY compensates_step_index ASC"
+            ),
+            {"workspace_id": workspace_id, "run_id": run_id},
+        )
+        .mappings()
+        .all()
+    )
+    return [_row_to_compensation_step(dict(row)) for row in rows]
+
+
 # ---------------------------------------------------------------------------
 # Enqueue
 # ---------------------------------------------------------------------------
@@ -699,7 +977,7 @@ def enqueue_run(
     *,
     workflow_id: str,
     trigger_ref: str | None = None,
-) -> WorkflowRun | WorkflowNotActive:
+) -> WorkflowRun | WorkflowNotActive | WorkflowKilled:
     """Creates a `queued` `workflow_runs` row pinned to `workflow_id`'s
     current `active` `workflow_versions` row -- reuses `workflows.
     get_active_workflow_version` (Task 1) rather than re-querying for an
@@ -707,10 +985,21 @@ def enqueue_run(
     workflow with no active version (`WorkflowNotActive`, Task 1's
     `WORKFLOW_NOT_ACTIVE`-shaped error-code convention) before any row is
     written.
+
+    **Task 6.** Also rejects (`WorkflowKilled`) if `kill_switches.
+    is_workflow_killed` reports a global or per-workflow kill switch
+    currently active for this workspace/workflow -- checked before any row
+    is written, the same "reject before writing" shape as the `WorkflowNot
+    Active` check immediately above. This is the single choke point both
+    `scheduler.run_scheduler_once`'s fire path and `runs.py`'s `POST
+    /automations/runs` go through, so neither needs its own separate
+    kill-switch check (module docstring's "Task 6: kill switches" section).
     """
     active = get_active_workflow_version(session, workspace_id, workflow_id)
     if active is None:
         return WorkflowNotActive(workflow_id=workflow_id)
+    if kill_switches.is_workflow_killed(session, workspace_id, workflow_id):
+        return WorkflowKilled(workflow_id=workflow_id)
 
     now = datetime.now(UTC)
     run_id = uuid4()
@@ -793,6 +1082,13 @@ def claim_next_run(session: Session, worker_id: str) -> WorkflowRun | None:
     # would see this run still 'queued' and let a second worker dispatch it
     # from scratch -- see module docstring's commit-placement note.
     session.commit()
+    # Task 6 observability: queue age (PHASE-005-automation.md's
+    # Observability line, "queue age"). `queued_at` is never reset by a
+    # reclaim (only a genuinely fresh `enqueue_run`/`resume_run` sets it),
+    # so this also captures a reclaimed run's total time-to-claim across
+    # its original queueing, not merely time since the most recent lease
+    # expired -- the more useful end-to-end signal.
+    record_run_queue_age((datetime.now(UTC) - row["queued_at"]).total_seconds())
     return _row_to_run(dict(row))
 
 
@@ -804,10 +1100,17 @@ def renew_lease(
     testable function, not folded invisibly into `process_claimed_run`
     (this task's own instruction). Only renews a lease this exact
     `worker_id` currently holds on a still-lease-bearing run (`status IN
-    ('leased', 'running')`) -- a worker that has already lost its lease
-    (reclaimed by another worker after a missed heartbeat) gets `None`
-    back and must stop dispatching further steps for this run, never
-    silently keep going under a lease it no longer holds.
+    ('leased', 'running', 'compensating')` -- Task 6 widens this by one
+    more lease-bearing state, mirroring `claim_next_run`'s own `leased`/
+    `running` generalization: `_mark_compensating` deliberately keeps the
+    lease rather than releasing it, since compensation is an automatic
+    continuation of the same claimed dispatch, not a human-wait state; `_
+    run_compensation_sequence` renews this same heartbeat before each
+    compensation step it dispatches, exactly like the main loop does for
+    ordinary steps) -- a worker that has already lost its lease (reclaimed
+    by another worker after a missed heartbeat) gets `None` back and must
+    stop dispatching further steps for this run, never silently keep going
+    under a lease it no longer holds.
     """
     row = (
         session.execute(
@@ -817,7 +1120,7 @@ def renew_lease(
                 SET leased_until = now() + interval '{LEASE_DURATION_SECONDS} seconds',
                     lease_heartbeat_at = now(), updated_at = now()
                 WHERE workspace_id = :workspace_id AND id = :id AND leased_by = :worker_id
-                  AND status IN ('leased', 'running')
+                  AND status IN ('leased', 'running', 'compensating')
                 RETURNING {_RUN_FIELDS}
                 """
             ),
@@ -876,6 +1179,7 @@ def _finish_run(session: Session, run: WorkflowRun, status: RunStatus) -> Workfl
         {"status": status, "now": now, "id": run.id},
     )
     session.commit()
+    record_run_state_transition(status)
     result = get_run(session, run.workspace_id, run.id)
     assert result is not None
     return result
@@ -900,6 +1204,28 @@ def _pause_run(session: Session, run: WorkflowRun, status: RunStatus) -> Workflo
         {"status": status, "now": now, "id": run.id},
     )
     session.commit()
+    record_run_state_transition(status)
+    result = get_run(session, run.workspace_id, run.id)
+    assert result is not None
+    return result
+
+
+def _mark_compensating(session: Session, run: WorkflowRun) -> WorkflowRun:
+    """Task 6: transitions a run whose most recent step failed (with at
+    least one qualifying compensation to attempt) to `'compensating'` --
+    module docstring's "Task 6: compensation dispatch" section. Deliberately
+    does **not** release the lease (`leased_by`/`leased_until` untouched,
+    unlike `_finish_run`/`_pause_run`): this is an automatic continuation
+    of the same claimed run's own dispatch, not a state a different worker
+    should be able to pick up mid-sequence.
+    """
+    now = datetime.now(UTC)
+    session.execute(
+        text("UPDATE workflow_runs SET status = 'compensating', updated_at = :now WHERE id = :id"),
+        {"now": now, "id": run.id},
+    )
+    session.commit()
+    record_run_state_transition("compensating")
     result = get_run(session, run.workspace_id, run.id)
     assert result is not None
     return result
@@ -927,6 +1253,37 @@ def compute_action_digest(
     }
     canonical = dumps(material, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
     return sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _retry_backoff_seconds(attempt_count: int) -> int:
+    """Task 6's bounded-exponential-backoff schedule: `RETRY_BACKOFF_BASE_
+    SECONDS ** attempt_count` -- 2s/4s/8s for `attempt_count` 1/2/3 with
+    this module's current constants. `attempt_count` here is the *new*
+    (post-increment) attempt number a `TransientAdapterError` is about to
+    schedule, never the pre-increment value.
+    """
+    # mypy's stub for `int.__pow__` returns `Any` (it must accommodate a
+    # negative-exponent overload that can produce a float) -- both operands
+    # are plain non-negative ints in every call this module makes, so the
+    # real runtime type is always int; narrowed explicitly rather than
+    # silencing the check.
+    return int(RETRY_BACKOFF_BASE_SECONDS**attempt_count)
+
+
+def _enforce_workspace_scope(action_input: Any, run: WorkflowRun, step: dict[str, Any]) -> None:
+    """Task 5's defense-in-depth confused-deputy backstop (`WorkspaceScope
+    Mismatch`'s own docstring has the full reasoning), extracted into a
+    shared helper this task reuses verbatim for compensation dispatch
+    (`_dispatch_compensation_step`) -- the identical trust question applies
+    equally to a compensation action's own resolved input.
+    """
+    input_workspace_id = getattr(action_input, "workspace_id", None)
+    if input_workspace_id is not None and input_workspace_id != run.workspace_id:
+        raise WorkspaceScopeMismatch(
+            f"step '{step.get('step_id')}' resolved input names "
+            f"workspace_id={input_workspace_id}, which does not match run {run.id}'s "
+            f"own workspace_id={run.workspace_id}"
+        )
 
 
 def _resolve_step(session: Session, run: WorkflowRun, step_index: int) -> dict[str, Any]:
@@ -1049,7 +1406,11 @@ def run_step(
 
     Only `step_type == "action"` is dispatched; anything else raises
     `UnsupportedStepType` (module docstring / class docstring: out of this
-    task's scope).
+    task's scope). `process_claimed_run`'s own main loop never reaches this
+    function with a non-`action` step (Task 6's own fix, module docstring's
+    "Task 6: compensation dispatch" section) -- this remains a defensive
+    guard against a future caller routing an unsupported step type through
+    this path directly.
 
     **Task 3.** When no `workflow_run_steps` row exists yet for this step,
     `_evaluate_dispatch_gate` runs before any row is written -- an unusable
@@ -1058,6 +1419,18 @@ def run_step(
     `StepOutcome`, and no row is written at all (module docstring's own
     "Task 3's approval/policy gate" section has the full reasoning for why
     this ordering, not "write `dispatched` first," is required).
+
+    **Task 6.** A `'retrying'`-status existing row (a reclaimed, now-due
+    run resuming the exact step a prior `TransientAdapterError` paused it
+    on) falls through to a fresh dispatch attempt below exactly like the
+    `'pending'`/`'skipped'` case always has -- the row is `UPDATE`d, never
+    re-`INSERT`ed, and its `attempt_count` carries forward. If that
+    dispatch attempt raises `TransientAdapterError` again and `attempt_
+    count < MAX_RETRY_ATTEMPTS`, `run_step` itself durably commits another
+    `'retrying'` transition and releases the run's lease back to `'queued'`
+    (module docstring's "Task 6: bounded retry" section) -- once exhausted,
+    it falls through to the ordinary, unconditional `'failed'` path below,
+    unchanged from Task 2.
     """
     step = _resolve_step(session, run, step_index)
     if step.get("step_type") != "action":
@@ -1088,8 +1461,16 @@ def run_step(
         .one_or_none()
     )
 
+    # Task 6: `attempt_count` carries forward across a retry-resume; a
+    # fresh dispatch (no existing row, or a first-ever attempt) starts at 0.
+    attempt_count = existing["attempt_count"] if existing is not None else 0
+
     if existing is not None:
         if existing["status"] == "succeeded":
+            # Task 6 observability: at-most-one-effect's own steady-state
+            # signal -- a step already succeeded under this digest is
+            # returned as-is, execute() is never called again.
+            record_duplicate_dispatch_suppressed()
             return StepOutcome(step_index, "succeeded", existing["output"], None)
         if existing["status"] in ("failed", "unknown"):
             return StepOutcome(
@@ -1105,10 +1486,16 @@ def run_step(
                 {"now": now, "id": existing["id"]},
             )
             session.commit()
+            record_step_outcome("unknown")
+            record_unknown_outcome()
             return StepOutcome(step_index, "unknown", None, None)
-        # 'pending'/'skipped' rows are never written by this module; if one
-        # is ever seen (a future task's own write path), treat it as not
-        # yet dispatched and fall through to a fresh dispatch below.
+        # 'pending'/'skipped'/'retrying' rows fall through to a fresh
+        # dispatch attempt below -- 'pending'/'skipped' are never written by
+        # this module (Task 2's own original comment); 'retrying' (Task 6)
+        # is written by this same function on a prior TransientAdapterError
+        # and is deliberately treated identically: not yet dispatched *this*
+        # attempt, so re-dispatch below, reusing (never re-INSERTing) this
+        # row.
 
     else:
         # Task 3's gate -- must run before any workflow_run_steps row for
@@ -1173,23 +1560,87 @@ def run_step(
             },
         )
         session.commit()
+        record_step_outcome("failed")
         return StepOutcome(step_index, "failed", None, "AdapterNotRegistered")
 
     try:
         action_input = adapter.input_schema.model_validate(resolved_input)
         # Defense-in-depth confused-deputy backstop (Task 5's own
-        # self-review addition) -- see WorkspaceScopeMismatch's own
-        # docstring immediately above for why this check, and not a
-        # different mechanism, is the right place for it.
-        input_workspace_id = getattr(action_input, "workspace_id", None)
-        if input_workspace_id is not None and input_workspace_id != run.workspace_id:
-            raise WorkspaceScopeMismatch(
-                f"step '{step['step_id']}' (index {step_index}) resolved input names "
-                f"workspace_id={input_workspace_id}, which does not match run {run.id}'s "
-                f"own workspace_id={run.workspace_id}"
-            )
+        # self-review addition, extracted into _enforce_workspace_scope by
+        # Task 6 so compensation dispatch can reuse it verbatim) -- see
+        # WorkspaceScopeMismatch's own docstring immediately above for why
+        # this check, and not a different mechanism, is the right place
+        # for it.
+        _enforce_workspace_scope(action_input, run, step)
         output_model = adapter.execute(action_input)
         output_dict = output_model.model_dump(mode="json")
+    except TransientAdapterError as exc:
+        # Task 6: bounded retry (module docstring's own section). Only
+        # this specific, adapter-asserted exception class is ever treated
+        # as retry-safe -- every other exception (the `except Exception`
+        # branch below) keeps Task 2's original unconditional-'failed'
+        # behavior.
+        if attempt_count < MAX_RETRY_ATTEMPTS:
+            new_attempt_count = attempt_count + 1
+            backoff_seconds = _retry_backoff_seconds(new_attempt_count)
+            now = datetime.now(UTC)
+            next_attempt_at = now + timedelta(seconds=backoff_seconds)
+            session.execute(
+                text(
+                    "UPDATE workflow_run_steps SET status = 'retrying', "
+                    "attempt_count = :attempt_count, error_class = :error_class, "
+                    f"updated_at = :now {_STEP_ROW_WHERE}"
+                ),
+                {
+                    "attempt_count": new_attempt_count,
+                    "error_class": type(exc).__name__,
+                    "now": now,
+                    "workspace_id": run.workspace_id,
+                    "run_id": run.id,
+                    "step_index": step_index,
+                },
+            )
+            # Release the lease back to 'queued', resumable at this exact
+            # step_index (current_step_index is already persisted as
+            # step_index by process_claimed_run's own loop before calling
+            # run_step) -- the identical lease-release shape _pause_run
+            # uses, except this is a direct UPDATE here (run_step's own
+            # commit-placement discipline, not a call to _pause_run, since
+            # _pause_run has no next_attempt_at parameter and this is not
+            # one of its two named states).
+            session.execute(
+                text(
+                    "UPDATE workflow_runs SET status = 'queued', "
+                    "next_attempt_at = :next_attempt_at, "
+                    "leased_by = NULL, leased_until = NULL, updated_at = :now WHERE id = :id"
+                ),
+                {"next_attempt_at": next_attempt_at, "now": now, "id": run.id},
+            )
+            session.commit()
+            record_step_outcome("retrying")
+            record_step_retry(new_attempt_count)
+            return StepOutcome(step_index, "retrying", None, type(exc).__name__)
+
+        # Exhausted -- bounded, never indefinite (EXECUTION-CONTRACT.md).
+        # Falls through to the identical unconditional-'failed' write the
+        # general `except Exception` branch below performs.
+        now = datetime.now(UTC)
+        session.execute(
+            text(
+                "UPDATE workflow_run_steps SET status = 'failed', error_class = :error_class, "
+                f"finished_at = :now, updated_at = :now {_STEP_ROW_WHERE}"
+            ),
+            {
+                "error_class": type(exc).__name__,
+                "now": now,
+                "workspace_id": run.workspace_id,
+                "run_id": run.id,
+                "step_index": step_index,
+            },
+        )
+        session.commit()
+        record_step_outcome("failed")
+        return StepOutcome(step_index, "failed", None, type(exc).__name__)
     except Exception as exc:  # noqa: BLE001 -- an adapter may raise any error class
         now = datetime.now(UTC)
         session.execute(
@@ -1206,6 +1657,7 @@ def run_step(
             },
         )
         session.commit()
+        record_step_outcome("failed")
         return StepOutcome(step_index, "failed", None, type(exc).__name__)
 
     now = datetime.now(UTC)
@@ -1231,7 +1683,368 @@ def run_step(
     # correctly (but unnecessarily) surface it as needs_review rather than
     # knowing the effect already completed cleanly.
     session.commit()
+    record_step_outcome("succeeded")
     return StepOutcome(step_index, "succeeded", output_dict, None)
+
+
+# ---------------------------------------------------------------------------
+# Task 6: compensation dispatch (Decision 9). Module docstring's "Task 6:
+# compensation dispatch" section has the full design reasoning.
+# ---------------------------------------------------------------------------
+
+
+def _index_by_step_id(steps: list[dict[str, Any]]) -> dict[str, int]:
+    return {step["step_id"]: index for index, step in enumerate(steps)}
+
+
+def _qualifying_compensations(
+    session: Session, run: WorkflowRun, steps: list[dict[str, Any]], boundary: int
+) -> list[tuple[int, dict[str, Any], int, dict[str, Any]]]:
+    """The graph's own already-`succeeded` `action` steps with index `<
+    boundary` (the step that just failed, never itself compensated) that
+    declare a `compensate_ref`, returned as `(original_index, original_step,
+    compensation_index, compensation_step)` tuples in **descending**
+    `original_index` order -- standard saga rollback order, undoing the
+    most recently completed effect first (module docstring). Walking `range
+    (boundary - 1, -1, -1)` directly produces this order without a separate
+    reverse step.
+    """
+    index_by_id = _index_by_step_id(steps)
+    qualifying: list[tuple[int, dict[str, Any], int, dict[str, Any]]] = []
+    for original_index in range(boundary - 1, -1, -1):
+        original_step = steps[original_index]
+        if original_step.get("step_type") != "action":
+            continue
+        compensate_ref = original_step.get("compensate_ref")
+        if not compensate_ref:
+            continue
+        succeeded = session.execute(
+            text(
+                "SELECT 1 FROM workflow_run_steps WHERE workspace_id = :workspace_id "
+                "AND run_id = :run_id AND step_index = :step_index AND status = 'succeeded'"
+            ),
+            {
+                "workspace_id": run.workspace_id,
+                "run_id": run.id,
+                "step_index": original_index,
+            },
+        ).first()
+        if succeeded is None:
+            # Declared but never actually dispatched/succeeded (e.g. the
+            # workflow failed before reaching it) -- nothing to undo.
+            continue
+        compensation_index = index_by_id.get(compensate_ref)
+        if compensation_index is None:
+            # validate_graph_shape (workflows.py) already rejects a
+            # compensate_ref that does not resolve at publish time -- this
+            # branch should be unreachable against any workflow that
+            # actually published, kept as a defensive skip rather than a
+            # crash for a hand-constructed graph that bypassed validation.
+            continue
+        qualifying.append(
+            (original_index, original_step, compensation_index, steps[compensation_index])
+        )
+    return qualifying
+
+
+def _dispatch_compensation_step(
+    session: Session,
+    run: WorkflowRun,
+    original_index: int,
+    original_step: dict[str, Any],
+    compensation_index: int,
+    compensation_step: dict[str, Any],
+    adapter_registry: AdapterRegistry,
+) -> StepOutcome:
+    """Dispatches one compensation step, idempotency-gated identically in
+    spirit to `run_step` (existing-row short-circuit, digest committed
+    before any adapter call, outcome committed immediately after) --
+    module docstring's "Task 6: compensation dispatch" section has the
+    full design, including the two-shapes judgment call this function
+    resolves below.
+
+    The `action_digest` this writes (both to `workflow_run_steps` and to
+    the `compensation_steps` ledger row) is computed from the
+    *compensation* step's own `step_id`/`input_mapping` -- it identifies
+    *this compensation dispatch attempt*, distinct from the original step
+    it is undoing, never the original step's own digest.
+    """
+    resolved_comp_input: dict[str, Any] = compensation_step.get("input_mapping", {})
+    digest = compute_action_digest(
+        workflow_id=run.workflow_id,
+        workflow_version=run.workflow_version,
+        step_id=compensation_step["step_id"],
+        resolved_input=resolved_comp_input,
+    )
+
+    existing = (
+        session.execute(
+            text(
+                f"SELECT {_STEP_FIELDS} FROM workflow_run_steps "
+                "WHERE workspace_id = :workspace_id AND run_id = :run_id "
+                "AND step_index = :step_index FOR UPDATE"
+            ),
+            {
+                "workspace_id": run.workspace_id,
+                "run_id": run.id,
+                "step_index": compensation_index,
+            },
+        )
+        .mappings()
+        .one_or_none()
+    )
+
+    if existing is not None:
+        if existing["status"] == "succeeded":
+            return StepOutcome(compensation_index, "succeeded", existing["output"], None)
+        if existing["status"] in ("failed", "unknown"):
+            return StepOutcome(
+                compensation_index, existing["status"], existing["output"], existing["error_class"]
+            )
+        if existing["status"] == "dispatched":
+            now = datetime.now(UTC)
+            session.execute(
+                text(
+                    "UPDATE workflow_run_steps SET status = 'unknown', finished_at = :now, "
+                    "updated_at = :now WHERE id = :id"
+                ),
+                {"now": now, "id": existing["id"]},
+            )
+            session.execute(
+                text(
+                    "UPDATE compensation_steps SET status = 'unknown', finished_at = :now, "
+                    "updated_at = :now WHERE workspace_id = :workspace_id AND run_id = :run_id "
+                    "AND compensates_step_index = :original_index"
+                ),
+                {
+                    "now": now,
+                    "workspace_id": run.workspace_id,
+                    "run_id": run.id,
+                    "original_index": original_index,
+                },
+            )
+            session.commit()
+            record_step_outcome("unknown")
+            record_unknown_outcome()
+            record_compensation_outcome("unknown")
+            return StepOutcome(compensation_index, "unknown", None, None)
+        # 'pending'/'skipped'/'retrying' -- never written for a compensation
+        # step by this function; fall through defensively, mirroring
+        # run_step's own identical fallback.
+    else:
+        now = datetime.now(UTC)
+        session.execute(
+            text(
+                """
+                INSERT INTO workflow_run_steps (
+                    id, workspace_id, run_id, step_index, step_type, status,
+                    action_digest, input, started_at, created_at, updated_at
+                ) VALUES (
+                    :id, :workspace_id, :run_id, :step_index, 'compensation', 'dispatched',
+                    :digest, CAST(:input AS jsonb), :now, :now, :now
+                )
+                """
+            ),
+            {
+                "id": uuid4(),
+                "workspace_id": run.workspace_id,
+                "run_id": run.id,
+                "step_index": compensation_index,
+                "digest": digest,
+                "input": dumps(_redact_payload(resolved_comp_input)),
+                "now": now,
+            },
+        )
+        session.execute(
+            text(
+                """
+                INSERT INTO compensation_steps (
+                    id, workspace_id, run_id, compensates_step_index, action_digest, status,
+                    started_at, created_at, updated_at
+                ) VALUES (
+                    :id, :workspace_id, :run_id, :compensates_step_index, :digest, 'dispatched',
+                    :now, :now, :now
+                )
+                """
+            ),
+            {
+                "id": uuid4(),
+                "workspace_id": run.workspace_id,
+                "run_id": run.id,
+                "compensates_step_index": original_index,
+                "digest": digest,
+                "now": now,
+            },
+        )
+        # Identical digest-before-execute durability discipline as
+        # run_step's own INSERT -- module docstring's "no new crash-unsafe
+        # path" requirement.
+        session.commit()
+
+    # The two-shapes judgment call (module docstring): prefer the
+    # *original* step's own registered adapter's compensate(), called with
+    # the *original* step's own resolved input (matches
+    # FakeExternalActionAdapter.compensate's actual documented signature);
+    # fall back to the *compensation* step's own action_ref naming a
+    # distinct registered adapter, dispatched via that adapter's ordinary
+    # execute() with the compensation step's own resolved input.
+    original_adapter = adapter_registry.get(original_step.get("action_ref", ""))
+    compensation_adapter = adapter_registry.get(compensation_step.get("action_ref", ""))
+
+    if original_adapter is None and compensation_adapter is None:
+        now = datetime.now(UTC)
+        session.execute(
+            text(
+                "UPDATE workflow_run_steps SET status = 'failed', "
+                "error_class = 'AdapterNotRegistered', finished_at = :now, updated_at = :now "
+                f"{_STEP_ROW_WHERE}"
+            ),
+            {
+                "now": now,
+                "workspace_id": run.workspace_id,
+                "run_id": run.id,
+                "step_index": compensation_index,
+            },
+        )
+        session.execute(
+            text(
+                "UPDATE compensation_steps SET status = 'failed', "
+                "error_class = 'AdapterNotRegistered', finished_at = :now, updated_at = :now "
+                "WHERE workspace_id = :workspace_id AND run_id = :run_id "
+                "AND compensates_step_index = :original_index"
+            ),
+            {
+                "now": now,
+                "workspace_id": run.workspace_id,
+                "run_id": run.id,
+                "original_index": original_index,
+            },
+        )
+        session.commit()
+        record_step_outcome("failed")
+        record_compensation_outcome("failed")
+        return StepOutcome(compensation_index, "failed", None, "AdapterNotRegistered")
+
+    try:
+        if original_adapter is not None and compensable(original_adapter):
+            original_resolved_input: dict[str, Any] = original_step.get("input_mapping", {})
+            action_input = original_adapter.input_schema.model_validate(original_resolved_input)
+            _enforce_workspace_scope(action_input, run, original_step)
+            output_model = call_compensate(original_adapter, action_input)
+        else:
+            assert compensation_adapter is not None
+            action_input = compensation_adapter.input_schema.model_validate(resolved_comp_input)
+            _enforce_workspace_scope(action_input, run, compensation_step)
+            output_model = compensation_adapter.execute(action_input)
+        output_dict = output_model.model_dump(mode="json")
+    except Exception as exc:  # noqa: BLE001 -- an adapter may raise any error class
+        now = datetime.now(UTC)
+        session.execute(
+            text(
+                "UPDATE workflow_run_steps SET status = 'failed', error_class = :error_class, "
+                "finished_at = :now, updated_at = :now "
+                f"{_STEP_ROW_WHERE}"
+            ),
+            {
+                "error_class": type(exc).__name__,
+                "now": now,
+                "workspace_id": run.workspace_id,
+                "run_id": run.id,
+                "step_index": compensation_index,
+            },
+        )
+        session.execute(
+            text(
+                "UPDATE compensation_steps SET status = 'failed', error_class = :error_class, "
+                "finished_at = :now, updated_at = :now WHERE workspace_id = :workspace_id "
+                "AND run_id = :run_id AND compensates_step_index = :original_index"
+            ),
+            {
+                "error_class": type(exc).__name__,
+                "now": now,
+                "workspace_id": run.workspace_id,
+                "run_id": run.id,
+                "original_index": original_index,
+            },
+        )
+        session.commit()
+        record_step_outcome("failed")
+        record_compensation_outcome("failed")
+        return StepOutcome(compensation_index, "failed", None, type(exc).__name__)
+
+    now = datetime.now(UTC)
+    session.execute(
+        text(
+            "UPDATE workflow_run_steps SET status = 'succeeded', "
+            "output = CAST(:output AS jsonb), finished_at = :now, updated_at = :now "
+            f"{_STEP_ROW_WHERE}"
+        ),
+        {
+            "output": dumps(_redact_payload(output_dict)),
+            "now": now,
+            "workspace_id": run.workspace_id,
+            "run_id": run.id,
+            "step_index": compensation_index,
+        },
+    )
+    session.execute(
+        text(
+            "UPDATE compensation_steps SET status = 'succeeded', finished_at = :now, "
+            "updated_at = :now WHERE workspace_id = :workspace_id AND run_id = :run_id "
+            "AND compensates_step_index = :original_index"
+        ),
+        {
+            "now": now,
+            "workspace_id": run.workspace_id,
+            "run_id": run.id,
+            "original_index": original_index,
+        },
+    )
+    session.commit()
+    record_step_outcome("succeeded")
+    record_compensation_outcome("succeeded")
+    return StepOutcome(compensation_index, "succeeded", output_dict, None)
+
+
+def _run_compensation_sequence(
+    session: Session,
+    run: WorkflowRun,
+    adapter_registry: AdapterRegistry,
+    worker_id: str,
+    steps: list[dict[str, Any]],
+    qualifying: list[tuple[int, dict[str, Any], int, dict[str, Any]]],
+) -> WorkflowRun:
+    """Dispatches every qualifying compensation in order, renewing the
+    lease before each -- continues attempting every one even after an
+    earlier one fails (module docstring: "so partial compensation is
+    visible"), never stopping early. `cancel_requested_at`/`pause_
+    requested_at`/kill-switch are deliberately never re-checked here --
+    module docstring's "once compensation starts, it runs to its own
+    completion" note.
+    """
+    all_succeeded = True
+    for original_index, original_step, compensation_index, compensation_step in qualifying:
+        renewed = renew_lease(session, run.workspace_id, run.id, worker_id)
+        if renewed is None:
+            current = get_run(session, run.workspace_id, run.id)
+            assert current is not None
+            return current
+        run = renewed
+
+        outcome = _dispatch_compensation_step(
+            session,
+            run,
+            original_index,
+            original_step,
+            compensation_index,
+            compensation_step,
+            adapter_registry,
+        )
+        if outcome.status != "succeeded":
+            all_succeeded = False
+
+    final_status: RunStatus = "compensated" if all_succeeded else "compensation_failed"
+    return _finish_run(session, run, final_status)
 
 
 # ---------------------------------------------------------------------------
@@ -1253,9 +2066,18 @@ def process_claimed_run(
     regardless), this worker stops advancing the run immediately rather
     than dispatching further steps under a lease it no longer holds.
 
-    Checks `cancel_requested_at` before each not-yet-dispatched step and
-    stops there (module docstring's Cancellation section) without
+    Checks `cancel_requested_at`/`pause_requested_at`/a kill switch
+    (Task 6) before each not-yet-dispatched step and stops there (module
+    docstring's Cancellation / "Task 6: kill switches" sections) without
     dispatching that step at all.
+
+    **Task 6.** Never calls `run_step` for a step whose `step_type !=
+    "action"` -- the main walk skips forward over such a step without
+    writing any `workflow_run_steps` row for it (module docstring's "Task
+    6: compensation dispatch" section, point 1). A `'failed'` outcome no
+    longer unconditionally finishes the run: it first checks for qualifying
+    compensations and, if any exist, dispatches them via `_run_
+    compensation_sequence` instead (module docstring, point 2).
     """
     run = _mark_running(session, run)
     version = get_workflow_version(session, run.workspace_id, run.workflow_id, run.workflow_version)
@@ -1264,6 +2086,18 @@ def process_claimed_run(
 
     step_index = run.current_step_index
     while step_index < len(steps):
+        step = steps[step_index]
+        if step.get("step_type") != "action":
+            # Task 6 fix: a step_type='compensation' (or, by the same
+            # latent gap, 'approval_gate'/'condition') step must never be
+            # passed to run_step by this linear walk -- run_step raises
+            # UnsupportedStepType for any non-'action' step_type, which
+            # would otherwise crash the whole claimed-run dispatch
+            # unhandled. A compensation step is reachable only through the
+            # dedicated compensation-dispatch path below.
+            step_index += 1
+            continue
+
         renewed = renew_lease(session, run.workspace_id, run.id, worker_id)
         if renewed is None:
             current = get_run(session, run.workspace_id, run.id)
@@ -1272,6 +2106,8 @@ def process_claimed_run(
         run = renewed
 
         if run.cancel_requested_at is not None:
+            cancellation_latency = (datetime.now(UTC) - run.cancel_requested_at).total_seconds()
+            record_cancellation_latency(cancellation_latency)
             return _finish_run(session, run, "cancelled")
         if run.pause_requested_at is not None:
             # Task 4 -- the user-initiated pause flag, checked at the
@@ -1283,6 +2119,9 @@ def process_claimed_run(
             # this is not the same pause as Task 3's own waiting_approval/
             # needs_review transitions, only the same underlying mechanic.
             return _pause_run(session, run, "paused")
+        if kill_switches.is_workflow_killed(session, run.workspace_id, run.workflow_id):
+            # Task 6 -- module docstring's "Task 6: kill switches" section.
+            return _pause_run(session, run, "needs_review")
 
         session.execute(
             text(
@@ -1304,8 +2143,23 @@ def process_claimed_run(
         if outcome.status == "succeeded":
             step_index += 1
             continue
+        if outcome.status == "retrying":
+            # Task 6: run_step itself already released the lease and set
+            # run.status='queued'/next_attempt_at (module docstring's "Task
+            # 6: bounded retry" section) -- nothing further to do here
+            # except stop advancing this run.
+            current = get_run(session, run.workspace_id, run.id)
+            assert current is not None
+            return current
         if outcome.status == "failed":
-            return _finish_run(session, run, "failed")
+            # Task 6: compensation dispatch, module docstring point 2.
+            qualifying = _qualifying_compensations(session, run, steps, step_index)
+            if not qualifying:
+                return _finish_run(session, run, "failed")
+            run = _mark_compensating(session, run)
+            return _run_compensation_sequence(
+                session, run, adapter_registry, worker_id, steps, qualifying
+            )
         if outcome.status == "unknown":
             return _pause_run(session, run, "needs_review")
         # 'skipped' -- never produced by run_step in this task's scope;
@@ -1418,6 +2272,14 @@ def cancel_run(
             ),
             {"now": now, "id": run_id},
         )
+        # Task 6 observability: this fast path sets cancel_requested_at and
+        # reaches 'cancelled' in the same call, so latency is ~0 -- still
+        # recorded for a complete signal. cancel_run is caller-committed
+        # (module docstring: "no risky external call to protect against"),
+        # so these are deferred until the enclosing transaction actually
+        # commits, not recorded directly.
+        queue_run_state_transition(session, "cancelled")
+        queue_cancellation_latency(session, 0.0)
 
     result = get_run(session, workspace_id, run_id)
     assert result is not None

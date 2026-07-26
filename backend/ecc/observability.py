@@ -346,6 +346,93 @@ audit_outbox_failures_total = _Counter(
     ("domain",),
 )
 
+# ---------------------------------------------------------------------------
+# Phase 5 Automation Task 6 -- the observability signals `docs/phases/
+# phase-005/PHASE-005-automation.md`'s own Observability line names
+# verbatim: "queue age, schedule lag/misfire, run/step states, approval
+# wait/expiry, retries, duplicate suppression, unknown outcomes,
+# cancellation latency, compensation success and kill-switch state."
+#
+# Every instrument here follows this module's own established `_Counter`/
+# `_Histogram` + module-level instrument + `record_*` function pattern
+# (this task's own instruction: reuse the existing primitives, do not
+# invent a new one without a concrete, stated reason). No new primitive
+# class was needed anywhere below -- a "how many kill switches are
+# currently active" *gauge*-shaped question is expressed instead as a
+# `_Counter` of activate/deactivate *events* labeled `scope`/`action`
+# (`kill_switch_events_total`), matching this module's own existing
+# event-counting idiom (`recommendation_transitions_total`) rather than
+# adding a `_Gauge` class for one signal -- current active-switch *count*
+# is a point-in-time property of the `automation_kill_switches` table
+# itself, not a per-mutation event, and is cheaply derivable by a direct
+# `SELECT count(*) ... WHERE active` if an operator ever needs the live
+# figure, the same reasoning this module's own `_outbox_backlog_count`
+# already uses for an analogous "count of current DB state," rather than
+# duplicating that as a second maintained counter.
+#
+# Every label used below is drawn from a small, fixed, code-defined set
+# (`status`, `scope`, `action`, `to_status`, `decision`) -- never a raw run
+# ID, workflow ID, or payload value, matching this module's own "no PII/
+# secret in a label" discipline restated in the module docstring above.
+# ---------------------------------------------------------------------------
+
+run_queue_age_seconds = _Histogram(
+    "ecc_automation_run_queue_age_seconds",
+    "Seconds a workflow_runs row waited between queued_at and being claimed.",
+)
+schedule_lag_seconds = _Histogram(
+    "ecc_automation_schedule_lag_seconds",
+    "Seconds between a schedule trigger's due occurrence and the tick that "
+    "actually fired (or skipped) it.",
+)
+run_state_transitions_total = _Counter(
+    "ecc_automation_run_state_transitions_total",
+    "workflow_runs terminal/pause-state transitions, by resulting status.",
+    ("to_status",),
+)
+step_outcomes_total = _Counter(
+    "ecc_automation_step_outcomes_total",
+    "workflow_run_steps outcome writes, by resulting status.",
+    ("status",),
+)
+approval_wait_seconds = _Histogram(
+    "ecc_automation_approval_wait_seconds",
+    "Seconds between an approval_requests row's requested_at and its decided_at, by decision.",
+    ("decision",),
+)
+approval_expired_total = _Counter(
+    "ecc_automation_approval_expired_total",
+    "approval_requests rows observed past their expires_at window unresolved.",
+)
+step_retries_total = _Counter(
+    "ecc_automation_step_retries_total",
+    "workflow_run_steps transitions to status='retrying' after a "
+    "TransientAdapterError, by attempt number.",
+    ("attempt",),
+)
+duplicate_dispatch_suppressed_total = _Counter(
+    "ecc_automation_duplicate_dispatch_suppressed_total",
+    "run_step calls for a step already 'succeeded' under its digest -- execute() not called again.",
+)
+unknown_outcomes_total = _Counter(
+    "ecc_automation_unknown_outcomes_total",
+    "workflow_run_steps rows surfaced as status='unknown' (crash-in-the-gap).",
+)
+cancellation_latency_seconds = _Histogram(
+    "ecc_automation_cancellation_latency_seconds",
+    "Seconds between cancel_requested_at and a run actually reaching status='cancelled'.",
+)
+compensation_outcomes_total = _Counter(
+    "ecc_automation_compensation_outcomes_total",
+    "compensation_steps dispatch outcomes, by resulting status.",
+    ("status",),
+)
+kill_switch_events_total = _Counter(
+    "ecc_automation_kill_switch_events_total",
+    "Kill switch activate/deactivate events, by scope and action.",
+    ("scope", "action"),
+)
+
 _COUNTERS: Final[tuple[_Counter, ...]] = (
     http_requests_total,
     database_failures_total,
@@ -354,6 +441,14 @@ _COUNTERS: Final[tuple[_Counter, ...]] = (
     recommendation_transitions_total,
     idempotency_conflicts_total,
     audit_outbox_failures_total,
+    run_state_transitions_total,
+    step_outcomes_total,
+    approval_expired_total,
+    step_retries_total,
+    duplicate_dispatch_suppressed_total,
+    unknown_outcomes_total,
+    compensation_outcomes_total,
+    kill_switch_events_total,
 )
 _HISTOGRAMS: Final[tuple[_Histogram, ...]] = (
     http_request_duration_seconds,
@@ -362,6 +457,10 @@ _HISTOGRAMS: Final[tuple[_Histogram, ...]] = (
     ranking_duration_seconds,
     ranking_input_total,
     brief_generation_duration_seconds,
+    run_queue_age_seconds,
+    schedule_lag_seconds,
+    approval_wait_seconds,
+    cancellation_latency_seconds,
 )
 
 
@@ -447,6 +546,18 @@ def _flush_lifecycle_events(session: Session) -> None:
     if pending_transitions:
         for event_type in pending_transitions:
             record_recommendation_transition(event_type)
+    pending_kill_switch_events = session.info.pop("_pending_kill_switch_events", None)
+    if pending_kill_switch_events:
+        for scope, action in pending_kill_switch_events:
+            record_kill_switch_event(scope, action)
+    pending_run_state_transitions = session.info.pop("_pending_run_state_transitions", None)
+    if pending_run_state_transitions:
+        for to_status in pending_run_state_transitions:
+            record_run_state_transition(to_status)
+    pending_cancellation_latencies = session.info.pop("_pending_cancellation_latencies", None)
+    if pending_cancellation_latencies:
+        for duration_seconds in pending_cancellation_latencies:
+            record_cancellation_latency(duration_seconds)
 
 
 @event.listens_for(Session, "after_rollback")
@@ -463,6 +574,9 @@ def _discard_lifecycle_events_on_rollback(session: Session) -> None:
     session.info.pop("_pending_lifecycle_events", None)
     session.info.pop("_pending_brief_durations", None)
     session.info.pop("_pending_recommendation_transitions", None)
+    session.info.pop("_pending_kill_switch_events", None)
+    session.info.pop("_pending_run_state_transitions", None)
+    session.info.pop("_pending_cancellation_latencies", None)
 
 
 def record_search(duration_seconds: float, result_count: int) -> None:
@@ -493,6 +607,101 @@ def record_idempotency_conflict(domain: str) -> None:
 
 def record_audit_outbox_failure(domain: str) -> None:
     audit_outbox_failures_total.inc(domain)
+
+
+# ---------------------------------------------------------------------------
+# Phase 5 Automation Task 6's own record_* helpers. Called directly (not
+# via the queue_*/after_commit deferral mechanism above) from `ecc.domains.
+# automation.worker` -- every write site in that module already commits
+# immediately on a bare session (that module's own "commit-placement"
+# discipline, `worker.py`'s module docstring), so by the time any of these
+# is called the write it describes is already durable; the deferral
+# mechanism above exists specifically to protect `with session.begin():`
+# HTTP-endpoint-shaped callers (`workflows.py`/`policy.py`/`approvals.py`)
+# where a *later* statement in the same transaction could still roll
+# everything back. `ecc.domains.automation.kill_switches`'s HTTP endpoints
+# are exactly that shape, so `queue_kill_switch_event` (below) is used
+# there instead of calling `record_kill_switch_event` directly.
+# ---------------------------------------------------------------------------
+
+
+def record_run_queue_age(duration_seconds: float) -> None:
+    run_queue_age_seconds.observe(value=duration_seconds)
+
+
+def record_schedule_lag(duration_seconds: float) -> None:
+    schedule_lag_seconds.observe(value=duration_seconds)
+
+
+def record_run_state_transition(to_status: str) -> None:
+    run_state_transitions_total.inc(to_status)
+
+
+def record_step_outcome(status_label: str) -> None:
+    step_outcomes_total.inc(status_label)
+
+
+def record_approval_wait(decision: str, duration_seconds: float) -> None:
+    approval_wait_seconds.observe(decision, value=duration_seconds)
+
+
+def record_approval_expired() -> None:
+    approval_expired_total.inc()
+
+
+def record_step_retry(attempt: int) -> None:
+    step_retries_total.inc(str(attempt))
+
+
+def record_duplicate_dispatch_suppressed() -> None:
+    duplicate_dispatch_suppressed_total.inc()
+
+
+def record_unknown_outcome() -> None:
+    unknown_outcomes_total.inc()
+
+
+def record_cancellation_latency(duration_seconds: float) -> None:
+    cancellation_latency_seconds.observe(value=duration_seconds)
+
+
+def record_compensation_outcome(status_label: str) -> None:
+    compensation_outcomes_total.inc(status_label)
+
+
+def record_kill_switch_event(scope: str, action: str) -> None:
+    kill_switch_events_total.inc(scope, action)
+
+
+def queue_kill_switch_event(session: Session, scope: str, action: str) -> None:
+    """Defers a kill-switch activate/deactivate counter increment until
+    the enclosing transaction actually commits -- `queue_lifecycle_event`'s
+    own identical reasoning applies here verbatim (`ecc.domains.automation.
+    kill_switches`'s endpoints run inside a `with session.begin():` block;
+    a later statement failing must not leave this counter incremented for
+    a mutation that never persisted).
+    """
+    session.info.setdefault("_pending_kill_switch_events", []).append((scope, action))
+
+
+def queue_run_state_transition(session: Session, to_status: str) -> None:
+    """Defers a `run_state_transitions_total` increment until commit --
+    used by `ecc.domains.automation.worker.cancel_run`'s immediate `queued`/
+    `paused` -> `cancelled` fast path, which (unlike `_finish_run`/`_pause_
+    run`) is a caller-committed function, not one that commits on a bare
+    session itself (`worker.py`'s own module docstring: `cancel_run` "has
+    no risky external call to protect against"). The direct, non-deferred
+    `record_run_state_transition` remains correct for every call site
+    inside `worker.py` that *does* commit immediately on a bare session.
+    """
+    session.info.setdefault("_pending_run_state_transitions", []).append(to_status)
+
+
+def queue_cancellation_latency(session: Session, duration_seconds: float) -> None:
+    """Defers a `cancellation_latency_seconds` observation until commit --
+    same caller-committed reasoning as `queue_run_state_transition`.
+    """
+    session.info.setdefault("_pending_cancellation_latencies", []).append(duration_seconds)
 
 
 # ---------------------------------------------------------------------------

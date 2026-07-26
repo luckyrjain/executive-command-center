@@ -407,6 +407,191 @@ def test_validate_graph_shape_requires_action_ref_for_action_steps() -> None:
     assert any("action_ref required" in v for v in violations)
 
 
+# ---------------------------------------------------------------------------
+# Task 6: compensate_ref structural validation (Decision 9).
+# ---------------------------------------------------------------------------
+
+
+def _graph_with_compensation() -> dict[str, Any]:
+    """A well-formed graph: `s1` (action) declares `compensate_ref="c1"`;
+    `c1` (compensation) is never a target of any `on_success`/`on_failure`
+    edge, only referenced via `compensate_ref`.
+    """
+    return {
+        "steps": [
+            {
+                "step_id": "s1",
+                "step_type": "action",
+                "action_ref": "fake.external_action",
+                "compensate_ref": "c1",
+                "on_success": "s2",
+                "on_failure": "failed",
+            },
+            {
+                "step_id": "s2",
+                "step_type": "action",
+                "action_ref": "fake.external_action",
+                "on_success": "succeeded",
+                "on_failure": "failed",
+            },
+            {
+                "step_id": "c1",
+                "step_type": "compensation",
+                "action_ref": "fake.external_action",
+            },
+        ]
+    }
+
+
+def test_validate_graph_shape_accepts_well_formed_compensate_ref() -> None:
+    assert automation_workflows.validate_graph_shape(_graph_with_compensation()) == []
+
+
+def test_validate_graph_shape_rejects_compensate_ref_on_non_action_step() -> None:
+    graph = {
+        "steps": [
+            {
+                "step_id": "s1",
+                "step_type": "condition",
+                "compensate_ref": "c1",
+                "on_success": "c1",
+            },
+            {"step_id": "c1", "step_type": "compensation", "action_ref": "fake.external_action"},
+        ]
+    }
+    violations = automation_workflows.validate_graph_shape(graph)
+    assert any("compensate_ref is only valid on step_type='action'" in v for v in violations)
+
+
+def test_validate_graph_shape_rejects_compensate_ref_to_unknown_step() -> None:
+    graph = {
+        "steps": [
+            {
+                "step_id": "s1",
+                "step_type": "action",
+                "action_ref": "fake.external_action",
+                "compensate_ref": "nonexistent",
+                "on_success": "succeeded",
+            }
+        ]
+    }
+    violations = automation_workflows.validate_graph_shape(graph)
+    assert any("compensate_ref references unknown step" in v for v in violations)
+
+
+def test_validate_graph_shape_rejects_compensate_ref_to_non_compensation_step() -> None:
+    graph = {
+        "steps": [
+            {
+                "step_id": "s1",
+                "step_type": "action",
+                "action_ref": "fake.external_action",
+                "compensate_ref": "s2",
+                "on_success": "s2",
+            },
+            {
+                "step_id": "s2",
+                "step_type": "action",
+                "action_ref": "fake.external_action",
+                "on_success": "succeeded",
+            },
+        ]
+    }
+    violations = automation_workflows.validate_graph_shape(graph)
+    assert any("must name a step_type='compensation' step" in v for v in violations)
+
+
+def test_validate_graph_shape_rejects_compensation_step_as_on_success_target() -> None:
+    graph = {
+        "steps": [
+            {
+                "step_id": "s1",
+                "step_type": "action",
+                "action_ref": "fake.external_action",
+                "on_success": "c1",
+            },
+            {"step_id": "c1", "step_type": "compensation", "action_ref": "fake.external_action"},
+        ]
+    }
+    violations = automation_workflows.validate_graph_shape(graph)
+    assert any("never as a target of on_success/on_failure" in v for v in violations)
+
+
+def test_validate_graph_shape_rejects_compensation_step_as_on_failure_target() -> None:
+    graph = {
+        "steps": [
+            {
+                "step_id": "s1",
+                "step_type": "action",
+                "action_ref": "fake.external_action",
+                "on_success": "succeeded",
+                "on_failure": "c1",
+            },
+            {"step_id": "c1", "step_type": "compensation", "action_ref": "fake.external_action"},
+        ]
+    }
+    violations = automation_workflows.validate_graph_shape(graph)
+    assert any("never as a target of on_success/on_failure" in v for v in violations)
+
+
+def test_validate_graph_shape_rejects_nested_compensate_ref() -> None:
+    graph = {
+        "steps": [
+            {
+                "step_id": "s1",
+                "step_type": "action",
+                "action_ref": "fake.external_action",
+                "compensate_ref": "c1",
+                "on_success": "succeeded",
+            },
+            {
+                "step_id": "c1",
+                "step_type": "compensation",
+                "action_ref": "fake.external_action",
+                "compensate_ref": "c2",
+            },
+            {"step_id": "c2", "step_type": "compensation", "action_ref": "fake.external_action"},
+        ]
+    }
+    violations = automation_workflows.validate_graph_shape(graph)
+    assert any("must not itself declare a compensate_ref" in v for v in violations)
+
+
+def test_validate_graph_shape_rejects_two_action_steps_sharing_one_compensate_ref() -> None:
+    """Found during Task 6's own review: `worker._dispatch_compensation_step`
+    idempotency-gates on `workflow_run_steps`' `(run_id, step_index)` key --
+    the compensation step's own graph position -- so if two action steps
+    both named the same `compensate_ref`, the second step's dispatch would
+    silently find the first's row already `succeeded` and return early,
+    never calling `compensate()` or writing a `compensation_steps` ledger
+    row for the second original step. Rejected here at graph-validation
+    time instead of loosening that dispatch idempotency key.
+    """
+    graph = {
+        "steps": [
+            {
+                "step_id": "s1",
+                "step_type": "action",
+                "action_ref": "fake.external_action",
+                "compensate_ref": "c1",
+                "on_success": "s2",
+            },
+            {
+                "step_id": "s2",
+                "step_type": "action",
+                "action_ref": "fake.external_action",
+                "compensate_ref": "c1",
+                "on_success": "succeeded",
+            },
+            {"step_id": "c1", "step_type": "compensation", "action_ref": "fake.external_action"},
+        ]
+    }
+    violations = automation_workflows.validate_graph_shape(graph)
+    assert any(
+        "already claimed by step 's1'" in v and "compensate_ref 'c1'" in v for v in violations
+    )
+
+
 def test_create_workflow_draft_creates_family_and_first_version(
     workflow_test_context: tuple[TestClient, UUID, UUID, str],
 ) -> None:
