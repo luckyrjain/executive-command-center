@@ -17,6 +17,28 @@ its own coverage:
    retry-pending run is not reclaimed before its backoff window elapses,
    and is reclaimed once it has.
 4. `_retry_backoff_seconds`'s own schedule (2s/4s/8s for attempts 1/2/3).
+
+Plus the two retry-resume seam guarantees added by the post-Task-6 audit of
+`run_step`'s existing-row branch (worker.py's own "Task 6 retry-resume,
+corrected" docstring section). Both are the direct analogues, for a
+resumed attempt, of properties `test_automation_worker_postgres.py` already
+proves for a first attempt:
+
+5. **A resumed attempt commits `'dispatched'` before calling `execute()`,
+   so a crash inside that call resolves to `'unknown'`, never a second
+   `execute()`.** The retry-path analogue of
+   `test_unknown_outcome_surfaces_without_retry` (the brand-new-row
+   crash-in-the-gap case) and of `DigestVisibilityProbeAdapter`'s
+   independent-connection durability probe. Before the fix the row stayed
+   at `'retrying'` across `execute()`, so the next worker to claim the run
+   after a mid-`execute()` crash took the identical re-dispatch branch and
+   called `execute()` again -- once per lease expiry, unbounded.
+6. **A resumed attempt re-checks policy usability.** The retry-path
+   analogue of `test_revoking_policy_mid_run_blocks_the_next_step_but_not_
+   the_one_already_succeeded` (which revokes between two *different*
+   steps); this revokes between two attempts of the *same* step. Before
+   the fix `_evaluate_dispatch_gate` ran only on first dispatch, so a
+   policy revoked during the backoff window was never re-consulted.
 """
 
 from __future__ import annotations
@@ -103,6 +125,109 @@ class AlwaysTransientAdapter:
     def execute(self, action_input: EchoInput) -> EchoOutput:  # noqa: D102
         self.execute_calls += 1
         raise TransientAdapterError("always fails")
+
+
+class SimulatedProcessDeath(BaseException):
+    """Deliberately **not** an `Exception` subclass.
+
+    `run_step`'s two `except` clauses catch `TransientAdapterError` and
+    `Exception`; a `BaseException` that is neither propagates straight out
+    without `run_step` recording any outcome and without its session ever
+    committing again -- which is exactly the observable database aftermath
+    of the process dying mid-`execute()`, the one crash timing Decision 3's
+    commit-before-`execute()` rule exists to cover. Raising this instead of
+    genuinely killing a process is what makes the crash assertion
+    deterministic: the test can still read the committed row afterwards.
+    """
+
+
+def _committed_step_status_over_independent_connection(run_id: UUID, step_index: int) -> str | None:
+    """Reads one `workflow_run_steps` row's `status` over a brand-new
+    connection -- never the caller's own `session`, so it cannot see that
+    session's uncommitted work through the same transaction.
+
+    This is the load-bearing mechanic behind the two probe adapters below,
+    exactly as in `test_automation_worker_postgres.py`'s
+    `DigestVisibilityProbeAdapter`: under this database's default READ
+    COMMITTED isolation an uncommitted write is invisible outside its own
+    transaction, so a probe called from inside `adapter.execute()` that
+    observes `'dispatched'` proves `run_step` really did `COMMIT` that
+    transition *before* calling `execute()`, rather than merely `flush()`
+    it or (the bug being fixed) never write it at all.
+    """
+    with engine.connect() as independent_connection:
+        row = (
+            independent_connection.execute(
+                text(
+                    "SELECT status FROM workflow_run_steps "
+                    "WHERE run_id = :run_id AND step_index = :step_index"
+                ),
+                {"run_id": run_id, "step_index": step_index},
+            )
+            .mappings()
+            .one_or_none()
+        )
+    return row["status"] if row is not None else None
+
+
+class _RetryDispatchProbeAdapter:
+    """Shared base for the two probes below: on every `execute()` call it
+    records the committed `status` an independent connection sees for its own
+    step row, raises `TransientAdapterError` on call 1 (driving the step to
+    `'retrying'`), and delegates call 2 -- the resumed attempt, the one this
+    fix is about -- to `_second_attempt`.
+    """
+
+    input_schema = EchoInput
+    output_schema = EchoOutput
+    reversible = True
+    high_impact_categories: frozenset[str] = frozenset()
+
+    def __init__(self, run_id: UUID, step_index: int) -> None:
+        self._run_id = run_id
+        self._step_index = step_index
+        self.execute_calls = 0
+        self.statuses_seen_from_independent_connection: list[str | None] = []
+
+    def simulate(self, action_input: EchoInput) -> EchoOutput:  # noqa: D102
+        return EchoOutput(value=action_input.value)
+
+    def _second_attempt(self, action_input: EchoInput) -> EchoOutput:
+        raise NotImplementedError
+
+    def execute(self, action_input: EchoInput) -> EchoOutput:  # noqa: D102
+        self.execute_calls += 1
+        self.statuses_seen_from_independent_connection.append(
+            _committed_step_status_over_independent_connection(self._run_id, self._step_index)
+        )
+        if self.execute_calls == 1:
+            raise TransientAdapterError("transient failure, attempt 1")
+        return self._second_attempt(action_input)
+
+
+class RetryThenCrashProbeAdapter(_RetryDispatchProbeAdapter):
+    """Fails transiently once, then "crashes" on the resumed attempt --
+    leaving behind precisely the database state a real mid-`execute()`
+    process death leaves, for the test to assert on.
+    """
+
+    adapter_id = "test.retry-then-crash-probe"
+
+    def _second_attempt(self, action_input: EchoInput) -> EchoOutput:
+        raise SimulatedProcessDeath("the worker process died inside execute()")
+
+
+class RetryThenSucceedProbeAdapter(_RetryDispatchProbeAdapter):
+    """Fails transiently once, then succeeds on the resumed attempt -- the
+    non-crashing counterpart, guarding against a fix that double-dispatches
+    (`execute_calls` must be exactly 2) while still proving both attempts
+    were preceded by a committed `'dispatched'` row.
+    """
+
+    adapter_id = "test.retry-then-succeed-probe"
+
+    def _second_attempt(self, action_input: EchoInput) -> EchoOutput:
+        return EchoOutput(value=action_input.value)
 
 
 def _make_registry(*adapters: Any) -> AdapterRegistry:
@@ -419,3 +544,305 @@ def test_retry_backoff_seconds_schedule() -> None:
     assert automation_worker._retry_backoff_seconds(1) == 2
     assert automation_worker._retry_backoff_seconds(2) == 4
     assert automation_worker._retry_backoff_seconds(3) == 8
+
+
+# ---------------------------------------------------------------------------
+# 5. Retry-resume commits 'dispatched' before execute(), so a crash inside
+#    that call resolves to 'unknown' -- never a second execute().
+# ---------------------------------------------------------------------------
+
+
+def _expire_backoff_window(run_id: UUID) -> None:
+    """Advance `next_attempt_at` into the past -- exactly the state a real
+    clock reaching the backoff deadline produces, with no sleep (this
+    module's `test_claim_next_run_does_not_reclaim_before_next_attempt_at_
+    but_does_after` uses the identical mechanic).
+    """
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "UPDATE workflow_runs SET next_attempt_at = now() - interval '1 second' "
+                "WHERE id = :id"
+            ),
+            {"id": run_id},
+        )
+
+
+def _expire_lease(run_id: UUID) -> None:
+    """Push `leased_until` into the past, the way a crashed worker's lease
+    simply stops being renewed (`test_automation_worker_postgres.py`'s
+    `test_crash_recovery_reclaims_expired_leased_run` uses the same shape).
+    """
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "UPDATE workflow_runs SET leased_until = now() - interval '1 second' WHERE id = :id"
+            ),
+            {"id": run_id},
+        )
+
+
+def _single_step_row(workspace_id: UUID, run_id: UUID) -> Any:
+    with SessionFactory() as session:
+        steps = automation_worker.list_run_steps(session, workspace_id, run_id)
+    assert len(steps) == 1
+    return steps[0]
+
+
+def test_retry_resume_commits_dispatched_before_execute_so_a_crash_becomes_unknown(
+    retry_test_context: tuple[UUID, UUID],
+) -> None:
+    """The retry-path analogue of `test_automation_worker_postgres.py`'s
+    `test_unknown_outcome_surfaces_without_retry`.
+
+    A resumed attempt must get the identical crash-in-the-gap protection a
+    first attempt already had: the row committed as `'dispatched'` *before*
+    `execute()`, so a crash anywhere inside that call leaves
+    `'dispatched'`+no-outcome for the next claim attempt to resolve to
+    `'unknown'`/`needs_review`.
+
+    Before the fix, the row stayed at `'retrying'` for the whole duration of
+    `execute()`. A crash there left `'retrying'`, the next worker to claim
+    the run read `'retrying'`, took the identical re-dispatch branch, and
+    called `execute()` a *second* time on a side effect that may already
+    have partially or fully occurred -- repeatable once per lease expiry,
+    with no bound at all. Both halves are asserted directly: what the
+    adapter saw committed while it was running, and that the second claim
+    attempt never calls `execute()` again.
+    """
+    workspace_id, user_id = retry_test_context
+    workflow_id = f"test.retry-resume-crash.{uuid4().hex}"
+    graph = _chained_graph(_action_step("s1", "test.retry-then-crash-probe"))
+    _publish_workflow(workspace_id, user_id, workflow_id, graph)
+
+    run = _enqueue_and_claim(workspace_id, user_id, workflow_id)
+    adapter = RetryThenCrashProbeAdapter(run.id, 0)
+    registry = _make_registry(adapter)
+
+    # Attempt 1: transient failure -> the step row is 'retrying', the run is
+    # released back to 'queued' behind a future next_attempt_at.
+    with SessionFactory() as session:
+        first_outcome = automation_worker.run_step(session, run, 0, registry)
+    assert first_outcome.status == "retrying"
+    assert adapter.execute_calls == 1
+    assert _single_step_row(workspace_id, run.id).status == "retrying"
+
+    # The backoff window elapses and a worker reclaims the run.
+    _expire_backoff_window(run.id)
+    with SessionFactory() as session:
+        reclaimed = automation_worker.claim_next_run(session, "worker-b")
+    assert reclaimed is not None
+    assert reclaimed.id == run.id
+
+    # Attempt 2 (the resume): the worker process dies inside execute().
+    # SimulatedProcessDeath is not an `Exception`, so run_step records no
+    # outcome and its session never commits again -- the aftermath is
+    # exactly what a real crash at this instant leaves behind.
+    with pytest.raises(SimulatedProcessDeath):  # noqa: PT012
+        with SessionFactory() as session:
+            automation_worker.run_step(session, reclaimed, 0, registry)
+    assert adapter.execute_calls == 2
+
+    # The whole point: the adapter, reading over a connection that cannot
+    # see run_step's uncommitted work, saw a *committed* 'dispatched' row on
+    # the resumed attempt -- not the 'retrying' it would have seen before
+    # this fix. (Attempt 1's own observation is 'dispatched' too, from the
+    # brand-new-row INSERT+commit that always worked.)
+    assert adapter.statuses_seen_from_independent_connection == ["dispatched", "dispatched"]
+
+    # And the durable aftermath of the crash is 'dispatched' with no
+    # outcome, attempt_count carried forward untouched by the resume.
+    crashed_step = _single_step_row(workspace_id, run.id)
+    assert crashed_step.status == "dispatched"
+    assert crashed_step.attempt_count == 1
+    assert crashed_step.finished_at is None
+
+    # The next worker to claim the run resolves that to 'unknown' without
+    # ever calling execute() again -- "unknown external outcome moves to
+    # review, never blind retry" (EXECUTION-CONTRACT.md), now holding on the
+    # retry path exactly as it always did on the first-dispatch path.
+    _expire_lease(run.id)
+    with SessionFactory() as session:
+        reclaimed_after_crash = automation_worker.claim_next_run(session, "worker-c")
+    assert reclaimed_after_crash is not None
+    assert reclaimed_after_crash.id == run.id
+    with SessionFactory() as session:
+        finished = automation_worker.process_claimed_run(
+            session, reclaimed_after_crash, registry, "worker-c"
+        )
+    assert finished.status == "needs_review"
+    assert finished.finished_at is None
+    assert adapter.execute_calls == 2  # never a third call
+    assert _single_step_row(workspace_id, run.id).status == "unknown"
+
+
+def test_retry_resume_still_succeeds_with_exactly_one_execute_call_per_attempt(
+    retry_test_context: tuple[UUID, UUID],
+) -> None:
+    """Regression guard for the fix itself: adding the pre-`execute()`
+    `'dispatched'` commit to the retry-resume path must not double-dispatch.
+    A normal (non-crashed) resume still succeeds, `execute()` is called
+    exactly once per attempt (two calls total, never three), `attempt_count`
+    stays at the value the single transient failure produced, and both
+    attempts were preceded by a committed `'dispatched'` row.
+    """
+    workspace_id, user_id = retry_test_context
+    workflow_id = f"test.retry-resume-succeed.{uuid4().hex}"
+    graph = _chained_graph(_action_step("s1", "test.retry-then-succeed-probe"))
+    _publish_workflow(workspace_id, user_id, workflow_id, graph)
+
+    run = _enqueue_and_claim(workspace_id, user_id, workflow_id)
+    adapter = RetryThenSucceedProbeAdapter(run.id, 0)
+    registry = _make_registry(adapter)
+
+    with SessionFactory() as session:
+        first_outcome = automation_worker.run_step(session, run, 0, registry)
+    assert first_outcome.status == "retrying"
+    assert adapter.execute_calls == 1
+
+    _expire_backoff_window(run.id)
+    with SessionFactory() as session:
+        reclaimed = automation_worker.claim_next_run(session, "worker-b")
+    assert reclaimed is not None
+
+    with SessionFactory() as session:
+        finished = automation_worker.process_claimed_run(session, reclaimed, registry, "worker-b")
+    assert finished.status == "succeeded"
+    assert adapter.execute_calls == 2
+    assert adapter.statuses_seen_from_independent_connection == ["dispatched", "dispatched"]
+
+    succeeded_step = _single_step_row(workspace_id, run.id)
+    assert succeeded_step.status == "succeeded"
+    assert succeeded_step.attempt_count == 1
+
+
+# ---------------------------------------------------------------------------
+# 6. Retry-resume re-checks policy usability.
+# ---------------------------------------------------------------------------
+
+
+def test_revoking_policy_between_two_retry_attempts_blocks_the_resumed_attempt(
+    retry_test_context: tuple[UUID, UUID],
+) -> None:
+    """The same-step analogue of `test_automation_worker_postgres.py`'s
+    `test_revoking_policy_mid_run_blocks_the_next_step_but_not_the_one_
+    already_succeeded`, which revokes between two *different* steps. Here the
+    revocation lands inside one step's own retry backoff window.
+
+    `APPROVAL-POLICY.md`: "Revocation takes effect immediately for any
+    not-yet-started step" -- a step waiting out a backoff window has not
+    started its next attempt, so the resumed attempt must be blocked.
+    Before the fix `_evaluate_dispatch_gate` ran only on first dispatch, so
+    the retried `execute()` proceeded under authority that had been
+    withdrawn.
+    """
+    workspace_id, user_id = retry_test_context
+    workflow_id = f"test.retry-resume-revoked.{uuid4().hex}"
+    graph = _chained_graph(_action_step("s1", "test.always-transient"))
+    active = _publish_workflow(workspace_id, user_id, workflow_id, graph)
+    assert active.policy_ref is not None
+    adapter = AlwaysTransientAdapter()
+    registry = _make_registry(adapter)
+
+    run = _enqueue_and_claim(workspace_id, user_id, workflow_id)
+
+    # Attempt 1: transient failure -> 'retrying', run 'queued' behind a
+    # future next_attempt_at.
+    with SessionFactory() as session:
+        first_outcome = automation_worker.run_step(session, run, 0, registry)
+    assert first_outcome.status == "retrying"
+    assert adapter.execute_calls == 1
+    with SessionFactory() as session:
+        requeued = automation_worker.get_run(session, workspace_id, run.id)
+    assert requeued is not None
+    assert requeued.status == "queued"
+    assert requeued.next_attempt_at is not None
+    assert requeued.next_attempt_at > datetime.now(UTC)
+    assert _single_step_row(workspace_id, run.id).status == "retrying"
+
+    # The authorizing policy is revoked *between* the two attempts.
+    with SessionFactory() as session, session.begin():
+        revoked = automation_policy.revoke_policy(session, workspace_id, user_id, active.policy_ref)
+    assert isinstance(revoked, automation_policy.AutomationPolicy)
+
+    # The backoff window elapses; the run is reclaimed as usual (revocation
+    # is not a claim-time gate -- it is enforced at dispatch, like the
+    # first-dispatch case).
+    _expire_backoff_window(run.id)
+    with SessionFactory() as session:
+        reclaimed = automation_worker.claim_next_run(session, "worker-b")
+    assert reclaimed is not None
+    assert reclaimed.id == run.id
+
+    # run_step returns the identical outcome value first dispatch returns
+    # for a revoked policy -- not a StepOutcome, and no execute() call.
+    with SessionFactory() as session:
+        blocked = automation_worker.run_step(session, reclaimed, 0, registry)
+    assert isinstance(blocked, automation_worker.StepBlockedByPolicy)
+    assert blocked.step_index == 0
+    assert blocked.reason == "policy_revoked"
+    assert adapter.execute_calls == 1  # unchanged -- never re-executed
+
+    # The step row is untouched by the blocked attempt: still 'retrying',
+    # attempt_count still 1, deliberately never advanced to 'dispatched'
+    # (nothing was dispatched).
+    still_retrying = _single_step_row(workspace_id, run.id)
+    assert still_retrying.status == "retrying"
+    assert still_retrying.attempt_count == 1
+
+    # Driven through process_claimed_run, StepBlockedByPolicy maps to
+    # needs_review through the exact same branch a first-dispatch block
+    # takes -- no retry-specific run state.
+    _expire_lease(run.id)
+    _expire_backoff_window(run.id)
+    with SessionFactory() as session:
+        reclaimed_again = automation_worker.claim_next_run(session, "worker-c")
+    assert reclaimed_again is not None
+    with SessionFactory() as session:
+        finished = automation_worker.process_claimed_run(
+            session, reclaimed_again, registry, "worker-c"
+        )
+    assert finished.status == "needs_review"
+    assert finished.finished_at is None
+    assert adapter.execute_calls == 1
+
+
+def test_expiring_policy_between_two_retry_attempts_blocks_the_resumed_attempt(
+    retry_test_context: tuple[UUID, UUID],
+) -> None:
+    """The expiry half of the same gap -- `is_policy_usable` covers revoked
+    *and* expired, and `StepBlockedByPolicy.reason` distinguishes them, so
+    the resumed attempt must report `'policy_expired'` here rather than
+    `'policy_revoked'`.
+    """
+    workspace_id, user_id = retry_test_context
+    workflow_id = f"test.retry-resume-expired.{uuid4().hex}"
+    graph = _chained_graph(_action_step("s1", "test.always-transient"))
+    active = _publish_workflow(workspace_id, user_id, workflow_id, graph)
+    assert active.policy_ref is not None
+    adapter = AlwaysTransientAdapter()
+    registry = _make_registry(adapter)
+
+    run = _enqueue_and_claim(workspace_id, user_id, workflow_id)
+    with SessionFactory() as session:
+        first_outcome = automation_worker.run_step(session, run, 0, registry)
+    assert first_outcome.status == "retrying"
+    assert adapter.execute_calls == 1
+
+    # The policy expires during the backoff window.
+    with engine.begin() as connection:
+        connection.execute(
+            text("UPDATE automation_policies SET expires_at = :past WHERE id = :id"),
+            {"past": datetime.now(UTC) - timedelta(seconds=1), "id": active.policy_ref},
+        )
+
+    _expire_backoff_window(run.id)
+    with SessionFactory() as session:
+        reclaimed = automation_worker.claim_next_run(session, "worker-b")
+    assert reclaimed is not None
+    with SessionFactory() as session:
+        blocked = automation_worker.run_step(session, reclaimed, 0, registry)
+    assert isinstance(blocked, automation_worker.StepBlockedByPolicy)
+    assert blocked.reason == "policy_expired"
+    assert adapter.execute_calls == 1
+    assert _single_step_row(workspace_id, run.id).status == "retrying"
