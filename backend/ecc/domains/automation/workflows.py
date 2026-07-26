@@ -1486,27 +1486,43 @@ def _simulate_steps(
 
 @router.post("/workflows/{version_id}/simulate", response_model=SimulateResponse)
 def simulate_workflow_endpoint(
-    version_id: UUID, auth: AuthDep, session: SessionDep
+    version_id: UUID, auth: AuthDep, session: SessionDep, _csrf: CsrfDep
 ) -> SimulateResponse:
     """Decision 4's simulation entrypoint. Workspace-scoped and 404-isolated
     exactly like every other endpoint in this module (`get_workflow_version_
     by_id`); addressed by `version_id`, exactly like `publish`/`disable`.
 
-    **A deliberate, documented judgment call: no `CsrfDep`/`Idempotency-Key`
-    on this endpoint, even though `API-SCHEMAS.md` lists this route as a
-    `POST`.** Every other mutating endpoint in this module requires both
-    because it writes a row; this one writes none, under any outcome
-    (proven directly by this task's own zero-rows-changed test) -- adding
-    idempotency-lock/CSRF ceremony here would protect a property (replay-
-    safety of a state change) this endpoint does not have, since it makes
-    no state change to replay-protect. Kept as `POST`, not `GET`, only
-    because `API-SCHEMAS.md`'s own already-approved route is a `POST` --
-    this activation's `input_mapping` has no live templating today (`worker.
-    _resolve_step`'s own docstring), so this endpoint's simulation is fully
-    determined by the version's own already-pinned graph and needs no
-    request body; a later task giving `/simulate` real per-call input
-    overrides would be the natural place to add one and would also be the
-    natural point to reconsider this judgment call.
+    **`CsrfDep` but no `Idempotency-Key` -- the minimal correct pattern for a
+    mutating-method route with no state change** (security audit batch C
+    corrected the earlier reasoning here, which had bundled the two together
+    and dropped both). The two protect different properties and are not a
+    package deal: an `Idempotency-Key` makes a *state change* replay-safe, and
+    this endpoint genuinely has none to replay-protect (no code path here
+    opens a transaction, and `_simulate_steps` reaches only `adapter.
+    simulate()`, never `execute()`/`compensate()` -- proven by this module's
+    own zero-rows-changed test across all seven tables), so it is correctly
+    still absent. CSRF, by contrast, protects against a *cross-site caller*
+    driving this route with the victim's ambient session cookie at all --
+    which is worth refusing regardless of whether a row is written, because
+    this route is authenticated, workspace-scoped, and returns the caller's
+    own pinned graph plus every adapter's declared side effects and each
+    step's approval/policy gating: a read a third-party origin has no
+    business eliciting. It was also the only mutating-method `/api/v1` route
+    in the codebase without it, so leaving it out made the codebase's
+    otherwise-uniform "every non-`GET` route carries `CsrfDep`" invariant
+    unstateable and unauditable, which is its own cost. `POST /attention/
+    regenerate` and `POST /ai/runs/{run_id}/cancel` are the established
+    precedent for CSRF-without-idempotency, so this matches an existing
+    pattern rather than inventing one.
+
+    Kept as `POST`, not `GET`, only because `API-SCHEMAS.md`'s own
+    already-approved route is a `POST` -- this activation's `input_mapping`
+    has no live templating today (`worker._resolve_step`'s own docstring), so
+    this endpoint's simulation is fully determined by the version's own
+    already-pinned graph and needs no request body; a later task giving
+    `/simulate` real per-call input overrides would be the natural place to
+    add one, and would be the point at which an `Idempotency-Key` might
+    finally have something to protect.
     """
     version = get_workflow_version_by_id(session, auth.workspace_id, version_id)
     if version is None:

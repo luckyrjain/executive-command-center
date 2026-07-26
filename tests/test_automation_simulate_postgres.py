@@ -11,6 +11,11 @@ Covers, per this task's own required minimum:
    requests`/`audit_events`/`event_outbox` (plus `notes`, since `local.
    create_note` is exercised) -- the endpoint-level extension of `TEST-
    PLAN.md`'s per-adapter fault-injection requirement (Decision 4).
+1b. Security audit batch C: `/simulate` now requires a valid CSRF token
+   (`CsrfDep`), like every other mutating-method `/api/v1` route -- a
+   missing or wrong `X-CSRF-Token` is a 403, the correct one still a 200.
+   It still requires no `Idempotency-Key` (it has no state change to
+   replay-protect), so every successful-call test below sends CSRF only.
 2. `local.create_note`/`local.send_test_notification`/`fake.external_
    action`'s own declared `simulate()` output is surfaced faithfully.
 3. An approval-requiring step is correctly flagged (`dispatch_gate ==
@@ -299,12 +304,65 @@ def test_simulate_never_writes_any_row(
     version = _publish_workflow_direct(workspace_id, user_id, workflow_id, graph)
 
     before = _snapshot(workspace_id)
-    response = client.post(f"/api/v1/automations/workflows/{version.id}/simulate")
+    response = client.post(
+        f"/api/v1/automations/workflows/{version.id}/simulate", headers=_headers(token)
+    )
     assert response.status_code == 200
     after = _snapshot(workspace_id)
 
     assert before == after
     assert all(count == 0 for count in before.values())
+
+
+# ---------------------------------------------------------------------------
+# 1b. CSRF protection (security audit batch C).
+# ---------------------------------------------------------------------------
+
+
+def test_simulate_requires_csrf(
+    simulate_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    """`/simulate` was the only mutating-method `/api/v1` route in the
+    codebase without `CsrfDep` (security audit batch C -- see `workflows.
+    simulate_workflow_endpoint`'s own docstring for why "writes no row" is
+    not a reason to omit CSRF). Structured exactly like `test_automation_
+    workflows_postgres.py`'s `test_create_workflow_requires_csrf` and `test_
+    automation_runs_postgres.py`'s `test_create_run_endpoint_requires_csrf`:
+    an otherwise-valid, fully-authenticated request (the session cookie is
+    still on the client) with no `X-CSRF-Token` header must be rejected.
+
+    No `Idempotency-Key` appears in either the rejected or the accepted case
+    -- this route deliberately does not require one (nothing to
+    replay-protect), so the two protections are exercised independently here,
+    unlike the `create_workflow`/`create_run` tests above whose routes
+    require both.
+    """
+    client, workspace_id, user_id, token = simulate_test_context
+    workflow_id = f"test.sim-no-csrf.{uuid4().hex}"
+    graph = _linear_graph(_action_step("s1", "local.send_test_notification"))
+    version = _publish_workflow_direct(workspace_id, user_id, workflow_id, graph)
+
+    missing = client.post(
+        f"/api/v1/automations/workflows/{version.id}/simulate",
+        headers={"X-Correlation-ID": str(uuid4())},
+    )
+    assert missing.status_code == 403
+
+    # A present-but-wrong token is rejected too, not merely a missing one
+    # (require_csrf's own compare_digest branch, distinct from its
+    # "header absent" branch).
+    wrong = client.post(
+        f"/api/v1/automations/workflows/{version.id}/simulate",
+        headers={"X-CSRF-Token": "not-the-real-token", "X-Correlation-ID": str(uuid4())},
+    )
+    assert wrong.status_code == 403
+
+    # And the same request with the correct token still succeeds -- proving
+    # the 403s above are the CSRF check, not an unrelated regression.
+    allowed = client.post(
+        f"/api/v1/automations/workflows/{version.id}/simulate", headers=_headers(token)
+    )
+    assert allowed.status_code == 200
 
 
 # ---------------------------------------------------------------------------
@@ -331,7 +389,9 @@ def test_simulate_surfaces_local_create_note_declared_output(
     )
     version = _publish_workflow_direct(workspace_id, user_id, workflow_id, graph)
 
-    response = client.post(f"/api/v1/automations/workflows/{version.id}/simulate")
+    response = client.post(
+        f"/api/v1/automations/workflows/{version.id}/simulate", headers=_headers(token)
+    )
     assert response.status_code == 200
     body = response.json()
     assert body["workflow_id"] == workflow_id
@@ -365,7 +425,9 @@ def test_simulate_surfaces_local_send_test_notification_declared_output(
     )
     version = _publish_workflow_direct(workspace_id, user_id, workflow_id, graph)
 
-    response = client.post(f"/api/v1/automations/workflows/{version.id}/simulate")
+    response = client.post(
+        f"/api/v1/automations/workflows/{version.id}/simulate", headers=_headers(token)
+    )
     assert response.status_code == 200
     [step] = response.json()["steps"]
     assert step["preview"]["message"] == "Hello from a simulation."
@@ -393,7 +455,9 @@ def test_simulate_surfaces_fake_external_action_declared_output(
     )
     version = _publish_workflow_direct(workspace_id, user_id, workflow_id, graph)
 
-    response = client.post(f"/api/v1/automations/workflows/{version.id}/simulate")
+    response = client.post(
+        f"/api/v1/automations/workflows/{version.id}/simulate", headers=_headers(token)
+    )
     assert response.status_code == 200
     [step] = response.json()["steps"]
     assert step["preview"]["external_ref"] == "issue-123"
@@ -428,7 +492,9 @@ def test_simulate_flags_approval_without_creating_approval_request(
     version = _publish_workflow_direct(workspace_id, user_id, workflow_id, graph)
 
     before = _count(workspace_id, "approval_requests")
-    response = client.post(f"/api/v1/automations/workflows/{version.id}/simulate")
+    response = client.post(
+        f"/api/v1/automations/workflows/{version.id}/simulate", headers=_headers(token)
+    )
     assert response.status_code == 200
     [step] = response.json()["steps"]
     assert step["dispatch_gate"] == "requires_approval"
@@ -462,7 +528,9 @@ def test_simulate_rejects_workspace_scope_mismatch_before_calling_simulate(
     )
     version = _publish_workflow_direct(workspace_id, user_id, workflow_id, graph)
 
-    response = client.post(f"/api/v1/automations/workflows/{version.id}/simulate")
+    response = client.post(
+        f"/api/v1/automations/workflows/{version.id}/simulate", headers=_headers(token)
+    )
     assert response.status_code == 200
     [step] = response.json()["steps"]
     assert step["error"] == "SimulateWorkspaceScopeMismatch"
@@ -511,7 +579,9 @@ def test_simulate_degrades_gracefully_for_unregistered_action_ref(
     graph = _linear_graph(_action_step("s1", "test.definitely-not-a-real-adapter"))
     version = _publish_workflow_direct(workspace_id, user_id, workflow_id, graph)
 
-    response = client.post(f"/api/v1/automations/workflows/{version.id}/simulate")
+    response = client.post(
+        f"/api/v1/automations/workflows/{version.id}/simulate", headers=_headers(token)
+    )
     assert response.status_code == 200
     [step] = response.json()["steps"]
     assert step["dispatch_gate"] == "adapter_not_registered"
@@ -553,7 +623,9 @@ def test_simulate_policy_blocked_takes_precedence_over_adapter_not_registered(
         activated = automation_workflows.activate_workflow_version(session, workspace_id, draft.id)
     assert isinstance(activated, automation_workflows.WorkflowVersion)
 
-    response = client.post(f"/api/v1/automations/workflows/{activated.id}/simulate")
+    response = client.post(
+        f"/api/v1/automations/workflows/{activated.id}/simulate", headers=_headers(token)
+    )
     assert response.status_code == 200
     [step] = response.json()["steps"]
     assert step["dispatch_gate"] == "policy_blocked"
@@ -577,7 +649,10 @@ def test_simulate_workspace_isolation(
         other_client = TestClient(app)
         other_client.cookies.set("ecc_session", other_token)
         try:
-            response = other_client.post(f"/api/v1/automations/workflows/{version.id}/simulate")
+            response = other_client.post(
+                f"/api/v1/automations/workflows/{version.id}/simulate",
+                headers=_headers(other_token),
+            )
             assert response.status_code == 404
         finally:
             other_client.close()

@@ -316,6 +316,28 @@ an attribute name, not a specific adapter), and inert for any adapter whose
 `input_schema` carries no `workspace_id` field at all (every one of Task
 2-4's own test fakes, and `fake.external_action`).
 
+**Security audit batch C: `ActorScopeMismatch`, the actor half of the same
+check.** Task 5's `WorkspaceScopeMismatch` covered only *which workspace* a
+graph-authored `input_mapping` could steer an adapter's write into; it left
+*which user* entirely unchecked. `local.create_note` is the one registered
+adapter whose `input_schema` declares an `actor_id`, and it writes that value
+into `notes.owner_id`/`created_by`/`updated_by` plus an `audit_events` row's
+own `actor_id` (`authorization_result='allowed'`, `source='automation'`) --
+so a workflow author could publish a step naming a *different* member of
+their own workspace and produce both a note owned by that member and a forged
+audit entry attributing their own automation to that member. `run_step` and
+`_dispatch_compensation_step` now call `_enforce_actor_scope` alongside
+`_enforce_workspace_scope` at every one of the three pre-`execute()`/
+pre-`compensate()` call sites, comparing any validated `action_input.actor_id`
+against `workflow_runs.created_by` -- the run-starting user `enqueue_run`
+persists from its own server-resolved `actor_id` argument, never from a
+request body or a graph. Same generic attribute-sniffing shape, same
+"surfaces as an ordinary classified step failure" integration
+(`error_class = 'ActorScopeMismatch'`), same inertness for an adapter with no
+such field. See `ActorScopeMismatch`'s own docstring for the full reasoning
+and for why "must equal `created_by`" (rather than the looser "must be some
+member of this workspace") is the deliberate bar.
+
 **Task 6: bounded retry (`docs/phases/phase-005/EXECUTION-CONTRACT.md`'s
 "Retries use bounded exponential backoff only for classified transient
 failures ... never for a step whose side effect may have already partially
@@ -821,6 +843,49 @@ class WorkspaceScopeMismatch(ValueError):
     (`error_class = 'WorkspaceScopeMismatch'`), not an unhandled crash.
     Inert (never raised) for any adapter whose `input_schema` carries no
     `workspace_id` field at all.
+    """
+
+
+class ActorScopeMismatch(ValueError):
+    """`WorkspaceScopeMismatch`'s sibling for the *actor* half of the same
+    confused-deputy question, closing a real forged-attribution hole found
+    during this batch's own security audit. `WorkspaceScopeMismatch` already
+    stops a workflow author from steering an adapter's write into another
+    *workspace*; nothing stopped that same author from steering it onto
+    another *user* inside their own workspace. `local.create_note`'s
+    `CreateNoteInput.actor_id` is populated verbatim from the graph-authored
+    `input_mapping` (`_resolve_step` returns it unchanged -- there is still
+    no live templating engine, see this module's Task 5 section), and its
+    `execute()` writes that value straight into `notes.owner_id`/`created_by`
+    /`updated_by` *and* into an `audit_events` row's own `actor_id` with
+    `authorization_result='allowed'`, `source='automation'`. So member A
+    could publish a workflow naming member B's UUID and produce a note owned
+    by B plus an audit row attributing A's automation to B -- a forged entry
+    in the one table the whole system treats as authoritative provenance.
+
+    `run_step` is again the one place that already holds both values and can
+    cheaply compare them before `execute()` is ever called: `workflow_runs.
+    created_by` (written by `enqueue_run` from its own `actor_id` argument,
+    which every caller -- `runs.py`'s `POST /automations/runs` via `auth.
+    user_id`, and `scheduler.py`'s fire path -- resolves server-side, never
+    from a request body or a graph) records which user actually started this
+    run. Raised when a validated `action_input` declares an `actor_id` field
+    that is not that user. Caught by the same broad `except Exception`
+    already wrapping the `execute()`/`compensate()` calls, so this surfaces
+    as an ordinary classified step failure (`error_class =
+    'ActorScopeMismatch'`), exactly like `WorkspaceScopeMismatch`, never an
+    unhandled crash. Inert (never raised) for any adapter whose
+    `input_schema` carries no `actor_id` field at all -- today that is every
+    registered adapter except `local.create_note`, and every one of Tasks
+    2-4's own test fakes.
+
+    Note this is deliberately *stricter* than "same workspace": an author
+    may only ever attribute an automation write to themselves, because
+    `created_by` is the only user identity this dispatch path can prove.
+    A future adapter that legitimately needs to act on another user's behalf
+    would need a real delegation record to check against, not a graph-
+    authored literal -- which is precisely the check this class exists to
+    refuse to guess at.
     """
 
 
@@ -1337,6 +1402,26 @@ def _enforce_workspace_scope(action_input: Any, run: WorkflowRun, step: dict[str
         )
 
 
+def _enforce_actor_scope(action_input: Any, run: WorkflowRun, step: dict[str, Any]) -> None:
+    """`_enforce_workspace_scope`'s sibling for the actor half of the same
+    confused-deputy question (`ActorScopeMismatch`'s own docstring has the
+    full forged-attribution reasoning). Called from the identical call sites
+    -- `run_step` and both branches of `_dispatch_compensation_step` --
+    immediately after the workspace check and always before `execute()`/
+    `compensate()`. `getattr(..., None)` keeps this inert for any adapter
+    whose `input_schema` declares no `actor_id` field at all, exactly like
+    the workspace check does for `workspace_id`.
+    """
+    input_actor_id = getattr(action_input, "actor_id", None)
+    if input_actor_id is not None and input_actor_id != run.created_by:
+        raise ActorScopeMismatch(
+            f"step '{step.get('step_id')}' resolved input names "
+            f"actor_id={input_actor_id}, which does not match run {run.id}'s "
+            f"own created_by={run.created_by} -- an automation write may only ever "
+            f"be attributed to the user who started the run"
+        )
+
+
 def _resolve_step(session: Session, run: WorkflowRun, step_index: int) -> dict[str, Any]:
     """Reads `step_index` out of the run's pinned `workflow_versions.graph`
     -- reuses `workflows.get_workflow_version` (Task 1) rather than
@@ -1748,8 +1833,13 @@ def run_step(
         # Task 6 so compensation dispatch can reuse it verbatim) -- see
         # WorkspaceScopeMismatch's own docstring immediately above for why
         # this check, and not a different mechanism, is the right place
-        # for it.
+        # for it. _enforce_actor_scope closes the same hole's actor half
+        # (ActorScopeMismatch's own docstring: a graph-authored actor_id
+        # could otherwise forge note ownership and audit attribution onto
+        # another user in the same workspace). Both run before execute() is
+        # ever called, and neither is skipped on any path that reaches it.
         _enforce_workspace_scope(action_input, run, step)
+        _enforce_actor_scope(action_input, run, step)
         output_model = adapter.execute(action_input)
         output_dict = output_model.model_dump(mode="json")
     except TransientAdapterError as exc:
@@ -2108,11 +2198,13 @@ def _dispatch_compensation_step(
             original_resolved_input: dict[str, Any] = original_step.get("input_mapping", {})
             action_input = original_adapter.input_schema.model_validate(original_resolved_input)
             _enforce_workspace_scope(action_input, run, original_step)
+            _enforce_actor_scope(action_input, run, original_step)
             output_model = call_compensate(original_adapter, action_input)
         else:
             assert compensation_adapter is not None
             action_input = compensation_adapter.input_schema.model_validate(resolved_comp_input)
             _enforce_workspace_scope(action_input, run, compensation_step)
+            _enforce_actor_scope(action_input, run, compensation_step)
             output_model = compensation_adapter.execute(action_input)
         output_dict = output_model.model_dump(mode="json")
     except Exception as exc:  # noqa: BLE001 -- an adapter may raise any error class

@@ -46,6 +46,12 @@ Covers, per this task's own required minimum:
    step's own `input_mapping` is rejected before `execute()` ever runs
    (`worker.WorkspaceScopeMismatch`, this task's own self-review addition
    -- see `worker.py`'s and `local_adapters.py`'s own module docstrings).
+8. Security audit batch C: actor isolation. A step whose `input_mapping.
+   actor_id` names a *different* user in the *same* workspace than the one
+   who actually started the run is rejected before `execute()` ever runs
+   (`worker.ActorScopeMismatch`) -- so a workflow author can neither hand
+   another member ownership of a note they never created nor manufacture an
+   `audit_events` row attributing their own automation to that member.
 """
 
 from __future__ import annotations
@@ -251,6 +257,47 @@ def _notes_count(workspace_id: UUID) -> int:
             {"workspace_id": workspace_id},
         ).scalar()
     return int(result or 0)
+
+
+def _note_created_audit_count(workspace_id: UUID, actor_id: UUID) -> int:
+    """How many `note.created` audit rows name `actor_id` as the acting user
+    in this workspace -- the forged-attribution artefact test 8 below must
+    prove never gets written (`_write_note_audit_and_outbox` sets
+    `authorization_result='allowed'`/`source='automation'` on every row it
+    writes, so such a row is a positive, authoritative claim that this user
+    authorized the write).
+    """
+    with engine.connect() as connection:
+        result = connection.execute(
+            text(
+                "SELECT COUNT(*) FROM audit_events WHERE workspace_id = :workspace_id "
+                "AND actor_id = :actor_id AND event_type = 'note.created'"
+            ),
+            {"workspace_id": workspace_id, "actor_id": actor_id},
+        ).scalar()
+    return int(result or 0)
+
+
+def _seed_second_user(workspace_id: UUID) -> UUID:
+    """A second real member of the *same* workspace -- test 8's "member B."
+    Cleaned up by `_cleanup_workspace`'s existing per-workspace `users`
+    delete, so this needs no teardown of its own.
+    """
+    user_id = uuid4()
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO users (id, workspace_id, email, password_hash, created_at) "
+                "VALUES (:id, :workspace_id, :email, 'test-password-hash', :now)"
+            ),
+            {
+                "id": user_id,
+                "workspace_id": workspace_id,
+                "email": f"{user_id}@example.test",
+                "now": datetime.now(UTC),
+            },
+        )
+    return user_id
 
 
 # ---------------------------------------------------------------------------
@@ -709,3 +756,125 @@ def test_local_create_note_rejects_mismatched_workspace_id_before_execute(
     finally:
         with engine.begin() as connection:
             connection.execute(text("DELETE FROM workspaces WHERE id = :id"), {"id": workspace_b})
+
+
+# ---------------------------------------------------------------------------
+# 8. Actor isolation for local.create_note (security audit batch C).
+# ---------------------------------------------------------------------------
+
+
+def test_local_create_note_rejects_mismatched_actor_id_before_execute(
+    adapters_test_context: tuple[UUID, UUID],
+) -> None:
+    """The forged-attribution case Task 5's own `workspace_id`-only check
+    left open, and the one that needs no second workspace at all: member A
+    (`run_creator`, the user who actually starts the run) publishes a
+    `local.create_note` step whose `input_mapping.actor_id` names member B
+    (`victim`), a different real member of the *same* workspace.
+
+    Before `worker.ActorScopeMismatch`, this succeeded, and produced two
+    forged artefacts: a `notes` row whose `owner_id`/`created_by`/
+    `updated_by` were all B, and an `audit_events` row asserting
+    `actor_id = B`, `authorization_result = 'allowed'`, `source =
+    'automation'` -- i.e. the authoritative provenance record claimed B
+    authorized a write B never touched. Both are asserted absent here, not
+    merely "no exception leaked": zero `notes` rows in the workspace, and
+    zero `note.created` audit rows naming *either* user.
+    """
+    workspace_id, run_creator = adapters_test_context
+    victim = _seed_second_user(workspace_id)
+    workflow_id = f"test.adapters.actor-mismatch.{uuid4().hex}"
+    graph = _chained_graph(
+        _action_step(
+            "s1",
+            "local.create_note",
+            input_mapping={
+                "workspace_id": str(workspace_id),
+                # Deliberately wrong: the run below is started by
+                # `run_creator`, but this step attributes the note and its
+                # audit trail to `victim`.
+                "actor_id": str(victim),
+                "title": "Forged on behalf of another member",
+                "body": "This must never be written, and never be attributed to anyone.",
+            },
+        )
+    )
+    _publish_workflow(workspace_id, run_creator, workflow_id, graph)
+
+    with SessionFactory() as session, session.begin():
+        queued = automation_worker.enqueue_run(
+            session, workspace_id, run_creator, workflow_id=workflow_id
+        )
+    assert isinstance(queued, automation_worker.WorkflowRun)
+    # The value the new check compares against -- recorded server-side by
+    # enqueue_run, never authored into the graph.
+    assert queued.created_by == run_creator
+
+    with SessionFactory() as session:
+        claimed = automation_worker.claim_next_run(session, "worker-a")
+        assert claimed is not None
+        finished = automation_worker.process_claimed_run(
+            session, claimed, automation_adapters.registry, "worker-a"
+        )
+    assert finished.status == "failed"
+
+    with SessionFactory() as session, session.begin():
+        steps = automation_worker.list_run_steps(session, workspace_id, queued.id)
+    assert len(steps) == 1
+    assert steps[0].status == "failed"
+    assert steps[0].error_class == "ActorScopeMismatch"
+
+    # No note, under either user's name.
+    assert _notes_count(workspace_id) == 0
+    # And critically, no forged audit attribution for either user.
+    assert _note_created_audit_count(workspace_id, victim) == 0
+    assert _note_created_audit_count(workspace_id, run_creator) == 0
+
+
+def test_local_create_note_still_dispatches_when_actor_id_matches_run_creator(
+    adapters_test_context: tuple[UUID, UUID],
+) -> None:
+    """The no-regression half: a correctly-authored step (`actor_id` == the
+    run's own `created_by`) is unaffected by `_enforce_actor_scope` and still
+    produces a real, correctly-attributed note plus its `note.created` audit
+    row. Asserted here explicitly against `audit_events.actor_id` -- test 2
+    above already covers the `notes` row itself, but nothing previously
+    pinned the audit row's own actor, which is exactly the field the new
+    check exists to keep honest.
+    """
+    workspace_id, run_creator = adapters_test_context
+    # A second member exists in this workspace but is named nowhere -- proof
+    # the check keys off `created_by`, not merely "some user id is present."
+    other_member = _seed_second_user(workspace_id)
+    workflow_id = f"test.adapters.actor-match.{uuid4().hex}"
+    graph = _chained_graph(
+        _action_step(
+            "s1",
+            "local.create_note",
+            input_mapping={
+                "workspace_id": str(workspace_id),
+                "actor_id": str(run_creator),
+                "title": "Correctly attributed",
+                "body": "Authored by, and attributed to, the user who started the run.",
+            },
+        )
+    )
+    _publish_workflow(workspace_id, run_creator, workflow_id, graph)
+
+    with SessionFactory() as session, session.begin():
+        queued = automation_worker.enqueue_run(
+            session, workspace_id, run_creator, workflow_id=workflow_id
+        )
+    assert isinstance(queued, automation_worker.WorkflowRun)
+
+    with SessionFactory() as session:
+        claimed = automation_worker.claim_next_run(session, "worker-a")
+        assert claimed is not None
+        finished = automation_worker.process_claimed_run(
+            session, claimed, automation_adapters.registry, "worker-a"
+        )
+    assert finished.status == "succeeded"
+
+    assert _notes_count(workspace_id) == 1
+    assert _note_created_audit_count(workspace_id, run_creator) == 1
+    assert _note_created_audit_count(workspace_id, other_member) == 0

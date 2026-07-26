@@ -67,7 +67,7 @@ from json import dumps
 from typing import Annotated, Any
 from uuid import UUID, uuid4
 
-from fastapi import APIRouter, Depends, Header, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException, Path
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
@@ -596,7 +596,9 @@ class KillSwitchStatusResponse(BaseModel):
 
 @router.get("/workflows/{workflow_id}/kill_switch", response_model=KillSwitchStatusResponse)
 def workflow_kill_switch_status_endpoint(
-    workflow_id: str, auth: AuthDep, session: SessionDep
+    workflow_id: Annotated[str, Path(max_length=200)],
+    auth: AuthDep,
+    session: SessionDep,
 ) -> KillSwitchStatusResponse:
     """A pure read -- no `CsrfDep`/`Idempotency-Key`, matching every other
     `GET` in this package (`workflows.list_workflows_endpoint`, `runs.
@@ -608,6 +610,15 @@ def workflow_kill_switch_status_endpoint(
     elsewhere in this package), so this simply reports "no switch, of either
     scope, for this workflow_id" for a workflow_id that happens not to
     exist, the same as it would for one that exists but was never killed.
+
+    `Path(max_length=200)` mirrors `policy.list_policies_endpoint`/`triggers.
+    list_triggers_endpoint`'s own `Query(max_length=200)` on the identical
+    field, and matches `automation_kill_switches.workflow_id`'s real column
+    type (`sa.String(200)`, migration `0042_phase5_compensation_retry_kill_
+    switch.py`). Added by security audit batch C: opaque-but-unbounded meant
+    an over-long `workflow_id` reached the database and surfaced as an
+    uncaught `DataError`/500 rather than an ordinary `422` validation
+    response -- a client's malformed input reported as a server fault.
     """
     active_global = get_active_kill_switch(session, auth.workspace_id, None)
     active_workflow = get_active_kill_switch(session, auth.workspace_id, workflow_id)
@@ -629,13 +640,19 @@ def workflow_kill_switch_status_endpoint(
 
 @router.post("/workflows/{workflow_id}/kill_switch", response_model=KillSwitchResponse)
 def workflow_kill_switch_endpoint(
-    workflow_id: str,
+    workflow_id: Annotated[str, Path(max_length=200)],
     payload: KillSwitchRequest,
     auth: AuthDep,
     session: SessionDep,
     _csrf: CsrfDep,
     idempotency_key: IdempotencyHeader,
 ) -> KillSwitchResponse:
+    """`Path(max_length=200)` -- see `workflow_kill_switch_status_endpoint`'s
+    own docstring for the reasoning; this is the route where an over-long
+    `workflow_id` actually reached an `INSERT` against
+    `automation_kill_switches.workflow_id` (`sa.String(200)`) and produced a
+    `DataError`/500 instead of a `422`.
+    """
     request_hash = _request_hash(payload, f"kill_switch:{workflow_id}")
     return _handle_kill_switch_request(
         session, auth, workflow_id, payload, idempotency_key, request_hash
