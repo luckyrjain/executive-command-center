@@ -163,7 +163,27 @@ def validate_graph_shape(graph: dict[str, Any]) -> list[str]:
     accidentally treat it as an ordinary next step) and must never itself
     declare a `compensate_ref` (no nested compensation, matching this
     task's own scope boundary -- Decision 9 describes one level of
-    compensation, not a chain).
+    compensation, not a chain); (5) a given `step_type == "compensation"`
+    step must be the `compensate_ref` target of at most one action step.
+    `worker._dispatch_compensation_step` idempotency-gates a compensation
+    dispatch on `workflow_run_steps`' own `(run_id, step_index)` key --
+    the compensation step's *graph position*, not the pair of (compensation
+    step, original step) -- exactly like every other step in this table.
+    If two action steps declared the same `compensate_ref`, the second
+    step's dispatch would find the first's row already `succeeded` at that
+    `step_index` and return early without ever calling `compensate()` or
+    writing a `compensation_steps` ledger row for the second original step
+    -- a silent, unrecorded skip a human reviewing `compensation_steps`
+    would have no way to notice, discovered during this task's own review.
+    Rejecting the shared target at graph-validation time (an author who
+    genuinely needs to undo two steps' effects the same way authors two
+    separate `step_type='compensation'` steps, even if both name the same
+    `action_ref`) is the correct fix here, not changing the dispatch
+    idempotency key -- that key's exact shape is the same
+    `(run_id, step_index)` invariant every other step in this table
+    depends on, and loosening it would be a far larger, riskier change than
+    this activation's simple, one-compensation-target-per-step graph model
+    needs.
     """
     violations: list[str] = []
     steps = graph.get("steps", [])
@@ -182,6 +202,7 @@ def validate_graph_shape(graph: dict[str, Any]) -> list[str]:
         step_id: step.get("step_type") for step_id, step in zip(step_ids, steps, strict=True)
     }
 
+    compensation_target_claimed_by: dict[str, str] = {}
     for index, step in enumerate(steps):
         step_type = step.get("step_type")
         action_ref = step.get("action_ref")
@@ -237,6 +258,16 @@ def validate_graph_shape(graph: dict[str, Any]) -> list[str]:
                         "step_type='compensation' step, not "
                         f"'{step_type_by_id.get(compensate_ref)}'"
                     )
+                else:
+                    prior_claimant = compensation_target_claimed_by.get(compensate_ref)
+                    if prior_claimant is not None:
+                        violations.append(
+                            f"step '{step_id}': compensate_ref '{compensate_ref}' is already "
+                            f"claimed by step '{prior_claimant}' -- a compensation step may be "
+                            "the compensate_ref target of at most one action step"
+                        )
+                    else:
+                        compensation_target_claimed_by[compensate_ref] = step_id
     return violations
 
 

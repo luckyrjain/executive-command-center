@@ -557,6 +557,41 @@ def test_validate_graph_shape_rejects_nested_compensate_ref() -> None:
     assert any("must not itself declare a compensate_ref" in v for v in violations)
 
 
+def test_validate_graph_shape_rejects_two_action_steps_sharing_one_compensate_ref() -> None:
+    """Found during Task 6's own review: `worker._dispatch_compensation_step`
+    idempotency-gates on `workflow_run_steps`' `(run_id, step_index)` key --
+    the compensation step's own graph position -- so if two action steps
+    both named the same `compensate_ref`, the second step's dispatch would
+    silently find the first's row already `succeeded` and return early,
+    never calling `compensate()` or writing a `compensation_steps` ledger
+    row for the second original step. Rejected here at graph-validation
+    time instead of loosening that dispatch idempotency key.
+    """
+    graph = {
+        "steps": [
+            {
+                "step_id": "s1",
+                "step_type": "action",
+                "action_ref": "fake.external_action",
+                "compensate_ref": "c1",
+                "on_success": "s2",
+            },
+            {
+                "step_id": "s2",
+                "step_type": "action",
+                "action_ref": "fake.external_action",
+                "compensate_ref": "c1",
+                "on_success": "succeeded",
+            },
+            {"step_id": "c1", "step_type": "compensation", "action_ref": "fake.external_action"},
+        ]
+    }
+    violations = automation_workflows.validate_graph_shape(graph)
+    assert any(
+        "already claimed by step 's1'" in v and "compensate_ref 'c1'" in v for v in violations
+    )
+
+
 def test_create_workflow_draft_creates_family_and_first_version(
     workflow_test_context: tuple[TestClient, UUID, UUID, str],
 ) -> None:
