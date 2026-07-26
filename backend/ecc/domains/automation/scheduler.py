@@ -162,6 +162,8 @@ from zoneinfo import ZoneInfo
 from croniter import croniter
 from sqlalchemy.orm import Session
 
+from ecc.observability import record_schedule_lag
+
 from . import triggers as triggers_module
 from . import worker as worker_module
 
@@ -215,6 +217,21 @@ class TriggerFireFailedWorkflowNotActive:
 
 
 @dataclass(frozen=True, slots=True)
+class TriggerFireFailedWorkflowKilled:
+    """Task 6: the trigger fired (its schedule was due), but `worker.
+    enqueue_run` rejected it -- a global or per-workflow kill switch
+    currently blocks this workflow (`PHASE-005-automation.md`'s Rollback
+    plan: "Global/workflow kill switches stop new runs"). The anchor still
+    advances to `now`, mirroring `TriggerFireFailedWorkflowNotActive`'s
+    identical reasoning: a killed workflow does not cause this trigger to
+    be re-evaluated as "due" on every tick forever.
+    """
+
+    trigger_id: UUID
+    workflow_id: str
+
+
+@dataclass(frozen=True, slots=True)
 class TriggerMisfireSkipped:
     """More than one scheduled occurrence elapsed since this trigger's own
     anchor, and it has `skip_missed=True` -- no catch-up fire, per
@@ -246,6 +263,7 @@ TriggerEvaluationOutcome = (
     TriggerNotDue
     | TriggerFired
     | TriggerFireFailedWorkflowNotActive
+    | TriggerFireFailedWorkflowKilled
     | TriggerMisfireSkipped
     | TriggerRaceLost
 )
@@ -291,11 +309,17 @@ class _NotDue:
 @dataclass(frozen=True, slots=True)
 class _Due:
     new_anchor: datetime
+    # Task 6 observability (PHASE-005-automation.md's "schedule lag/
+    # misfire" line): the occurrence this tick is actually resolving --
+    # `run_scheduler_once` computes `moment - first_due` from this to
+    # observe into `schedule_lag_seconds`.
+    first_due: datetime
 
 
 @dataclass(frozen=True, slots=True)
 class _MisfireSkip:
     new_anchor: datetime
+    first_due: datetime
 
 
 def _evaluate_schedule(
@@ -319,8 +343,8 @@ def _evaluate_schedule(
     second_due = _next_occurrence_after(schedule_expression, timezone_name, first_due)
     missed_a_whole_window = second_due <= now
     if missed_a_whole_window and skip_missed:
-        return _MisfireSkip(new_anchor=now)
-    return _Due(new_anchor=now)
+        return _MisfireSkip(new_anchor=now, first_due=first_due)
+    return _Due(new_anchor=now, first_due=first_due)
 
 
 # ---------------------------------------------------------------------------
@@ -391,6 +415,11 @@ def run_scheduler_once(
                     expected_last_fired_at=trigger.last_fired_at,
                 )
                 session.commit()
+            if won_race:
+                # Task 6 observability: schedule lag (PHASE-005-automation.
+                # md's "schedule lag/misfire" line) -- how late this tick
+                # noticed the (skipped) backlog occurrence.
+                record_schedule_lag((moment - decision.first_due).total_seconds())
             outcomes.append(
                 TriggerMisfireSkipped(trigger_id=trigger.id)
                 if won_race
@@ -428,9 +457,30 @@ def run_scheduler_once(
             )
             session.commit()
 
+        # Task 6 observability: schedule lag -- how late this tick actually
+        # fired relative to the occurrence it resolves, regardless of
+        # whether enqueue_run itself then rejected it (WorkflowNotActive/
+        # WorkflowKilled below still measure "the tick's own lag" honestly
+        # -- the trigger's own anchor still advanced, per this branch's
+        # comment above).
+        record_schedule_lag((moment - decision.first_due).total_seconds())
+
         if isinstance(run, worker_module.WorkflowNotActive):
             outcomes.append(
                 TriggerFireFailedWorkflowNotActive(
+                    trigger_id=trigger.id, workflow_id=trigger.workflow_id
+                )
+            )
+        elif isinstance(run, worker_module.WorkflowKilled):
+            # Task 6: a global or per-workflow kill switch blocked this
+            # otherwise-due fire -- PHASE-005-automation.md's Rollback plan
+            # ("Global/workflow kill switches stop new runs") applies to
+            # the scheduler's own fire path exactly like it does to
+            # runs.py's POST /automations/runs, both going through this
+            # same enqueue_run choke point (module docstring's "Task 6:
+            # kill switches" section).
+            outcomes.append(
+                TriggerFireFailedWorkflowKilled(
                     trigger_id=trigger.id, workflow_id=trigger.workflow_id
                 )
             )

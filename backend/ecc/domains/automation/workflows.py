@@ -143,6 +143,27 @@ def validate_graph_shape(graph: dict[str, Any]) -> list[str]:
     empty means valid. Kept as a plain function (not folded into the
     Pydantic model) so both the HTTP layer and any future non-HTTP caller
     (the Task 2 worker validating a graph before dispatch) can reuse it.
+
+    **Task 6 addition: `compensate_ref` structural rules (Decision 9).**
+    Four rules, checked per step: (1) `compensate_ref` is only meaningful on
+    a `step_type == "action"` step -- an `approval_gate`/`condition`/
+    `compensation` step declaring one is rejected (a compensation step
+    itself is not something further compensation-chains, and `approval_
+    gate`/`condition` steps have no side effect of their own to undo in this
+    activation's scope); (2) it must resolve to a `step_id` that actually
+    exists in the same graph; (3) that target step's own `step_type` must
+    be `"compensation"` (a `compensate_ref` cannot silently point at an
+    ordinary action step, which would let a graph's own main sequence
+    "accidentally" execute what was meant to be a rollback-only action);
+    (4) a `step_type == "compensation"` step must never itself be the
+    target of any `on_success`/`on_failure` edge (compensation is reachable
+    *only* through the worker's own explicit compensation-dispatch path,
+    Decision 9: "invoked only when ... explicitly marks ... never automatic
+    or inferred" -- routing the main sequence into one would let an author
+    accidentally treat it as an ordinary next step) and must never itself
+    declare a `compensate_ref` (no nested compensation, matching this
+    task's own scope boundary -- Decision 9 describes one level of
+    compensation, not a chain).
     """
     violations: list[str] = []
     steps = graph.get("steps", [])
@@ -157,11 +178,16 @@ def validate_graph_shape(graph: dict[str, Any]) -> list[str]:
         violations.append(f"duplicate step_id(s): {sorted(duplicates)}")
 
     index_by_id = {step_id: index for index, step_id in enumerate(step_ids)}
+    step_type_by_id = {
+        step_id: step.get("step_type") for step_id, step in zip(step_ids, steps, strict=True)
+    }
+
     for index, step in enumerate(steps):
         step_type = step.get("step_type")
         action_ref = step.get("action_ref")
+        step_id = step.get("step_id")
         if step_type in {"action", "compensation"} and not action_ref:
-            violations.append(f"step '{step.get('step_id')}': action_ref required for {step_type}")
+            violations.append(f"step '{step_id}': action_ref required for {step_type}")
         for edge_name in ("on_success", "on_failure"):
             target = step.get(edge_name)
             if target is None:
@@ -171,13 +197,46 @@ def validate_graph_shape(graph: dict[str, Any]) -> list[str]:
             target_index = index_by_id.get(target)
             if target_index is None:
                 violations.append(
-                    f"step '{step.get('step_id')}': {edge_name} references unknown step '{target}'"
+                    f"step '{step_id}': {edge_name} references unknown step '{target}'"
                 )
             elif target_index <= index:
                 violations.append(
-                    f"step '{step.get('step_id')}': {edge_name} references '{target}', "
+                    f"step '{step_id}': {edge_name} references '{target}', "
                     "which is not strictly later -- graphs must be acyclic and sequential"
                 )
+            elif step_type_by_id.get(target) == "compensation":
+                violations.append(
+                    f"step '{step_id}': {edge_name} references '{target}', a "
+                    "step_type='compensation' step -- compensation is reachable only "
+                    "through the worker's own explicit compensation-dispatch path, "
+                    "never as a target of on_success/on_failure"
+                )
+
+        compensate_ref = step.get("compensate_ref")
+        if compensate_ref is not None:
+            if step_type == "compensation":
+                violations.append(
+                    f"step '{step_id}': step_type='compensation' must not itself declare "
+                    "a compensate_ref -- no nested compensation"
+                )
+            elif step_type != "action":
+                violations.append(
+                    f"step '{step_id}': compensate_ref is only valid on step_type='action' "
+                    f"steps, not '{step_type}'"
+                )
+            else:
+                target_index = index_by_id.get(compensate_ref)
+                if target_index is None:
+                    violations.append(
+                        f"step '{step_id}': compensate_ref references unknown step "
+                        f"'{compensate_ref}'"
+                    )
+                elif step_type_by_id.get(compensate_ref) != "compensation":
+                    violations.append(
+                        f"step '{step_id}': compensate_ref '{compensate_ref}' must name a "
+                        "step_type='compensation' step, not "
+                        f"'{step_type_by_id.get(compensate_ref)}'"
+                    )
     return violations
 
 
@@ -543,6 +602,16 @@ class GraphStepModel(BaseModel):
     input_mapping: dict[str, Any] = Field(default_factory=dict)
     on_success: str | None = Field(default=None, max_length=100)
     on_failure: str | None = Field(default=None, max_length=100)
+    # Task 6 addition (Decision 9's compensation model): a real, disclosed
+    # gap between two already-merged tasks' own assumptions -- migration
+    # 0039's own docstring already refers to `compensate_ref` as this
+    # codebase's "existing 'opaque UUID reference into a registry/config
+    # table' precedent for `action_ref`/`compensate_ref` inside
+    # `workflow_versions.graph` itself", and Decision 9 requires it ("A
+    # workflow step may declare a paired `compensate_ref`") -- but no prior
+    # task actually added the field to this model. See `validate_graph_
+    # shape` below for the structural rules this field must satisfy.
+    compensate_ref: str | None = Field(default=None, max_length=100)
 
 
 class WorkflowGraphModel(BaseModel):

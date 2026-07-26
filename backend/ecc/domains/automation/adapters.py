@@ -106,6 +106,27 @@ class ActionAdapter(Protocol):
         ...
 
 
+class TransientAdapterError(Exception):
+    """Task 6's own addition to the adapter contract surface (`docs/phases/
+    phase-005/EXECUTION-CONTRACT.md`: "Retries use bounded exponential
+    backoff only for classified transient failures ... never for a step
+    whose side effect may have already partially occurred"). An adapter's
+    `execute()` raises this specific exception class -- and no other -- to
+    assert "this failure (a connection error, a timeout) definitely
+    occurred *before* any side effect, so a bounded automatic retry is
+    safe." Every other exception an adapter's `execute()` raises keeps
+    `ecc.domains.automation.worker.run_step`'s pre-existing, unconditional
+    behavior exactly: immediate, non-retried `'failed'` -- `run_step` never
+    guesses retry-safety for an unclassified error; only an adapter author,
+    who alone knows whether their own `execute()` body could have partially
+    run before raising, may assert it via this specific class. Declared
+    here, alongside `ActionAdapter`, rather than in `worker.py` -- an
+    adapter author needs to know about this class to use it correctly, and
+    this module (not `worker.py`) is the adapter-contract surface an
+    adapter author actually imports from.
+    """
+
+
 class AdapterAlreadyRegistered(ValueError):
     """Raised by `AdapterRegistry.register` when `adapter_id` is already
     taken -- a registration-time programming error (two adapters cannot
