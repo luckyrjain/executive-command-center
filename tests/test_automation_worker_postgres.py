@@ -1981,11 +1981,19 @@ def test_preview_only_rejected_approval_still_fails_the_run_unchanged(
 ) -> None:
     """The other half of "the approval can still be decided": rejecting a
     `preview_only` step's request behaves exactly as it does under any other
-    mode (`approvals._advance_run_after_decision` -> `failed`), and is
-    deliberately *not* rerouted to `preview_blocked` -- a human explicitly
-    declined this action, which is a different, more informative fact about
-    the run than "this mode never dispatches," and it is the outcome an
-    operator rehearsing a rejection expects to see.
+    mode, and is deliberately *not* rerouted to `preview_blocked` -- a human
+    explicitly declined this action, which is a different, more informative
+    fact about the run than "this mode never dispatches," and it is the
+    outcome an operator rehearsing a rejection expects to see.
+
+    Since the run-state audit (`claude/phase-5-audit-batch-b`),
+    `_advance_run_after_decision` no longer decides the run's fate inline --
+    a rejection writes the step's own `'failed'` outcome and re-queues the
+    run through the ordinary poll loop, exactly like an adapter-raised
+    exception does (see that module's own docstring). So this test now
+    reclaims and drives one more poll cycle before asserting `'failed'`,
+    matching the identical shape `test_rejecting_an_approval_compensates_
+    earlier_steps_like_any_other_failure` already uses.
     """
     workspace_id, user_id = worker_test_context
     workflow_id = f"test.preview-only-reject.{uuid4().hex}"
@@ -2011,10 +2019,17 @@ def test_preview_only_rejected_approval_still_fails_the_run_unchanged(
     assert isinstance(decided, automation_approvals.ApprovalRequest)
     assert decided.status == "rejected"
 
+    # The rejection re-queues the run rather than deciding its fate inline.
     with SessionFactory() as session, session.begin():
-        run_after = automation_worker.get_run(session, workspace_id, claimed.id)
-    assert run_after is not None
-    assert run_after.status == "failed"
+        requeued = automation_worker.get_run(session, workspace_id, claimed.id)
+    assert requeued is not None
+    assert requeued.status == "queued"
+
+    with SessionFactory() as session:
+        reclaimed = automation_worker.claim_next_run(session, "worker-b")
+        assert reclaimed is not None
+        finished = automation_worker.process_claimed_run(session, reclaimed, registry, "worker-b")
+    assert finished.status == "failed"
     assert adapter.execute_calls == 0
 
 
