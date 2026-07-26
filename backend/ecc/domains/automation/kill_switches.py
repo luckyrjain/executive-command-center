@@ -568,6 +568,65 @@ def _handle_kill_switch_request(
         return response
 
 
+class KillSwitchStatusResponse(BaseModel):
+    """Task 7a's addition -- `UX-STATES.md`'s own named gap: "a future UI
+    surfaces the workflow's own current kill-switch state ... so an
+    operator sees *why* new runs are rejected before attempting one, not
+    only after." Wraps `list_kill_switches`/`get_active_kill_switch`,
+    interpreted for one specific workflow rather than reused as-is
+    (`KillSwitchResponse` alone cannot express "killed by which scope,"
+    since a global and a per-workflow switch can each be independently
+    active or not) -- a documented choice, not a mechanical reuse of the
+    existing response model. `killed` is `True` if *either* scope has an
+    active row, mirroring `is_workflow_killed`'s own "either scope" OR
+    exactly. `history` is this workflow's own per-workflow-scope rows only
+    (`workflow_id = workflow_id`, never the global scope's own separate
+    history) -- a global switch's activation history is not specific to any
+    one workflow and would be a confusing, unbounded list to embed in a
+    per-workflow response; its *current* effective state is still fully
+    visible via `active_global`.
+    """
+
+    workflow_id: str
+    killed: bool
+    active_global: KillSwitchResponse | None
+    active_workflow: KillSwitchResponse | None
+    history: list[KillSwitchResponse]
+
+
+@router.get("/workflows/{workflow_id}/kill_switch", response_model=KillSwitchStatusResponse)
+def workflow_kill_switch_status_endpoint(
+    workflow_id: str, auth: AuthDep, session: SessionDep
+) -> KillSwitchStatusResponse:
+    """A pure read -- no `CsrfDep`/`Idempotency-Key`, matching every other
+    `GET` in this package (`workflows.list_workflows_endpoint`, `runs.
+    list_runs_endpoint`). Workspace-scoped via `auth.workspace_id`; does not
+    itself validate that `workflow_id` names a real `workflow_definitions`
+    row (neither do the two `POST` endpoints below -- a kill switch's own
+    scope is an opaque string, matching how `workflow_runs.workflow_id`/
+    `automation_policies.workflow_id` are already opaque, no-FK references
+    elsewhere in this package), so this simply reports "no switch, of either
+    scope, for this workflow_id" for a workflow_id that happens not to
+    exist, the same as it would for one that exists but was never killed.
+    """
+    active_global = get_active_kill_switch(session, auth.workspace_id, None)
+    active_workflow = get_active_kill_switch(session, auth.workspace_id, workflow_id)
+    history = [
+        switch
+        for switch in list_kill_switches(session, auth.workspace_id)
+        if switch.workflow_id == workflow_id
+    ]
+    return KillSwitchStatusResponse(
+        workflow_id=workflow_id,
+        killed=active_global is not None or active_workflow is not None,
+        active_global=_to_response(None, active_global) if active_global is not None else None,
+        active_workflow=(
+            _to_response(workflow_id, active_workflow) if active_workflow is not None else None
+        ),
+        history=[_to_response(workflow_id, switch) for switch in history],
+    )
+
+
 @router.post("/workflows/{workflow_id}/kill_switch", response_model=KillSwitchResponse)
 def workflow_kill_switch_endpoint(
     workflow_id: str,

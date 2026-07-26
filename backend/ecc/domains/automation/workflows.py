@@ -49,6 +49,19 @@ from ecc.observability import (
     record_idempotency_conflict,
 )
 
+from .adapters import ActionAdapter, AdapterRegistry
+from .adapters import registry as _production_adapter_registry
+from .approvals import evaluate_approval_requirement
+from .policy import AutomationPolicy, get_policy, is_policy_usable, policy_status
+
+# Task 7a: safe to import `.adapters`/`.policy`/`.approvals` here -- confirmed
+# directly, none of those three modules imports `workflows.py` or `worker.py`
+# back (only `worker.py` imports `workflows.py`; importing `worker.py` itself
+# from here would be the one real circular-import risk, which is exactly why
+# `_redact_payload`/`SimulateWorkspaceScopeMismatch` below are small,
+# deliberate, disclosed duplicates of `worker.py`'s own equivalents rather
+# than imports of them -- see their own docstrings).
+
 WorkflowStatus = Literal["draft", "active", "retired"]
 _TERMINAL_OUTCOMES = frozenset({"succeeded", "failed", "compensating"})
 _STEP_TYPES = frozenset({"action", "approval_gate", "condition", "compensation"})
@@ -108,6 +121,58 @@ class WorkflowVersionNotActive:
     workflow_id: str
     version: int
     status: WorkflowStatus
+
+
+@dataclass(frozen=True, slots=True)
+class WorkflowVersionUnregisteredAdapter:
+    """`activate_workflow_version` was asked to publish a version whose
+    graph names an `action_ref` (on an `action`/`compensation` step) that
+    does not resolve in the adapter registry it was given -- Task 7a's own
+    gap closure. `API-SCHEMAS.md` already states, as an already-decided
+    guarantee, that "a workflow with an adapter that cannot be simulated (no
+    `simulate()` implementation) is rejected at `publish` time, not
+    discovered mid-simulation" -- but `validate_graph_shape` never actually
+    checked that `action_ref` resolves to anything at all, and every object
+    `AdapterRegistry.register` accepts already satisfies the `ActionAdapter`
+    Protocol, which requires *both* `simulate()` and `execute()` (`adapters.
+    py`'s own docstring). So there is no registered-but-`simulate()`-less
+    adapter this activation's own contract can produce -- the only way a
+    step's adapter "cannot be simulated" is if `action_ref` does not resolve
+    in the registry at all. This dataclass is the mechanical source of the
+    narrower, real check this task closes.
+    """
+
+    workflow_id: str
+    version: int
+    violations: tuple[str, ...]
+
+
+def unregistered_action_refs(graph: dict[str, Any], adapter_registry: AdapterRegistry) -> list[str]:
+    """Every `action`/`compensation` step's own `action_ref` must resolve in
+    `adapter_registry` -- returns a list of violation strings, empty means
+    every `action_ref` resolves. A plain function (mirrors `validate_graph_
+    shape`'s own "kept as a plain function so both the HTTP layer and any
+    future non-HTTP caller can reuse it" rationale) rather than folded into
+    `validate_graph_shape` itself, since this check needs a live
+    `AdapterRegistry` (a runtime, mutable-in-theory concern) while `validate_
+    graph_shape` is deliberately pure/context-free and runs at *draft*
+    creation time, before an author's intended adapter may even be
+    registered yet -- this check instead runs at *publish* time
+    (`activate_workflow_version` below), matching `API-SCHEMAS.md`'s own
+    "rejected at publish time" wording exactly, not at draft time.
+    """
+    violations: list[str] = []
+    for step in graph.get("steps", []):
+        step_type = step.get("step_type")
+        if step_type not in {"action", "compensation"}:
+            continue
+        action_ref = step.get("action_ref")
+        if action_ref and action_ref not in adapter_registry:
+            violations.append(
+                f"step '{step.get('step_id')}': action_ref '{action_ref}' is not a "
+                "registered adapter"
+            )
+    return violations
 
 
 @dataclass(frozen=True, slots=True)
@@ -502,8 +567,17 @@ def create_workflow_draft(
 
 
 def activate_workflow_version(
-    session: Session, workspace_id: UUID, version_id: UUID
-) -> WorkflowVersion | WorkflowVersionNotFound | WorkflowVersionNotDraft:
+    session: Session,
+    workspace_id: UUID,
+    version_id: UUID,
+    *,
+    adapter_registry: AdapterRegistry | None = None,
+) -> (
+    WorkflowVersion
+    | WorkflowVersionNotFound
+    | WorkflowVersionNotDraft
+    | WorkflowVersionUnregisteredAdapter
+):
     """Publish a draft version (design doc Decision 2's activation
     mechanism): retires whichever version is currently `active` for this
     `workflow_id` (if any and if it is not already the target row) and
@@ -521,6 +595,29 @@ def activate_workflow_version(
     below) catches the rare `IntegrityError` a still-successful race past
     this lock would raise and converts it into a clean 409 rather than
     propagating a raw Postgres exception.
+
+    **Task 7a: `adapter_registry` is optional, deliberately not required.**
+    When given, every `action`/`compensation` step's `action_ref` must
+    resolve in it or this call returns `WorkflowVersionUnregisteredAdapter`
+    instead of activating anything (`unregistered_action_refs`'s own
+    docstring has the full reasoning for why this check belongs here, at
+    publish time, not at draft time). When omitted (`None`, the default),
+    no such check runs at all -- **not** because the check is optional in
+    principle, but because this function is called directly (bypassing
+    `publish_workflow_endpoint`) by every other Phase 5 task's own test
+    suite to publish a workflow naming a test-only, deliberately-
+    unregistered `action_ref` (a private `AdapterRegistry()` instance those
+    tests build separately, never the shared production `adapters.
+    registry`) purely to exercise lifecycle behavior (locking, immutability,
+    already-active idempotency) unrelated to this task's own gap. Requiring
+    a registry unconditionally would break every one of those pre-existing
+    call sites for a property they were never testing. `publish_workflow_
+    endpoint` below is the one real caller that matters for this task's own
+    guarantee -- it always passes the shared production `adapters.registry`,
+    so every *real* publish (the only path a genuine future `/simulate` or
+    `/runs` call could ever reach) is checked, while direct, test-only calls
+    to this function remain exactly as permissive as they were before this
+    task, unless a caller opts in.
     """
     target_row = (
         session.execute(
@@ -544,6 +641,15 @@ def activate_workflow_version(
             version=target_row["version"],
             status=target_row["status"],
         )
+
+    if adapter_registry is not None:
+        violations = unregistered_action_refs(target_row["graph"], adapter_registry)
+        if violations:
+            return WorkflowVersionUnregisteredAdapter(
+                workflow_id=target_row["workflow_id"],
+                version=target_row["version"],
+                violations=tuple(violations),
+            )
 
     now = datetime.now(UTC)
     current_active = (
@@ -984,7 +1090,18 @@ def publish_workflow_endpoint(
             return cached
 
         try:
-            result = activate_workflow_version(session, auth.workspace_id, version_id)
+            # Task 7a: always checked against the shared production
+            # registry -- the one real call site this task's own guarantee
+            # ("a workflow with an adapter that cannot be simulated ... is
+            # rejected at publish time") needs to hold for. See `activate_
+            # workflow_version`'s own docstring for why the plain function
+            # itself leaves this optional.
+            result = activate_workflow_version(
+                session,
+                auth.workspace_id,
+                version_id,
+                adapter_registry=_production_adapter_registry,
+            )
         except IntegrityError as exc:
             # Backstop only -- FOR UPDATE locking inside
             # activate_workflow_version already closes this race under this
@@ -1003,6 +1120,22 @@ def publish_workflow_endpoint(
                     "workflow_id": result.workflow_id,
                     "version": result.version,
                     "status": result.status,
+                },
+            )
+        if isinstance(result, WorkflowVersionUnregisteredAdapter):
+            # Task 7a. 422, not 409 -- this is a graph-content validation
+            # failure (the same class of problem SCHEMA_INVALID's own 422
+            # covers at draft time: the payload itself is unpublishable),
+            # not a conflict about the row's own lifecycle state the way
+            # WORKFLOW_VERSION_NOT_DRAFT/WORKFLOW_VERSION_ACTIVE_CONFLICT
+            # are. Documented choice -- see this task's own PR evidence.
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "ACTION_REF_NOT_REGISTERED",
+                    "workflow_id": result.workflow_id,
+                    "version": result.version,
+                    "violations": list(result.violations),
                 },
             )
 
@@ -1063,3 +1196,278 @@ def disable_workflow_endpoint(
         )
         _store_idempotency(session, auth, idempotency_key, request_hash, response, now)
         return response
+
+
+# ---------------------------------------------------------------------------
+# Task 7a: POST /api/v1/automations/workflows/{version_id}/simulate
+# (design doc Decision 4, `API-SCHEMAS.md`'s own `/simulate` paragraph).
+#
+# Runs the identical graph-walk/step-resolution shape `worker._resolve_step`
+# uses for real dispatch (`step.get("input_mapping", {})`, verbatim -- this
+# codebase does not yet implement live `$trigger.*`/prior-step-output
+# templating, `worker.py`'s own module docstring has the full disclosure,
+# equally true here), but this module deliberately does **not** import
+# anything from `worker.py` itself: `worker.py` already imports `workflows.
+# get_active_workflow_version`/`get_workflow_version`, so importing back from
+# `worker.py` here would be a real circular import, not a hypothetical one.
+# `_redact_payload`/`SimulateWorkspaceScopeMismatch` below are small,
+# deliberate, disclosed duplicates of `worker._redact_payload`/`worker.
+# WorkspaceScopeMismatch` for exactly this reason -- the same "a module-level
+# helper duplicated per-module to avoid a real architectural problem"
+# precedent this file's own `_request_hash`/`_lock_idempotency`/`_load_
+# cached`/`_store_idempotency` already set relative to `runs.py`/`policy.py`/
+# `kill_switches.py`'s identically-named, independently-defined equivalents.
+#
+# No `workflow_runs`/`workflow_run_steps`/`compensation_steps`/`approval_
+# requests`/`audit_events`/`event_outbox` row is ever written by this
+# endpoint -- there is no code path here that opens a transaction, and
+# `adapter.execute()`/`adapter.compensate()` are never called, only
+# `adapter.simulate()` -- proven directly by `tests/test_automation_
+# simulate_postgres.py`'s own zero-rows-changed test across all six tables,
+# extending `TEST-PLAN.md`'s per-adapter fault-injection requirement (Decision
+# 4) to the endpoint level.
+# ---------------------------------------------------------------------------
+
+_SIMULATE_REDACTION_MARKERS = (
+    "secret",
+    "password",
+    "token",
+    "credential",
+    "api_key",
+    "authorization",
+)
+_SIMULATE_REDACTED_VALUE = "[REDACTED]"
+
+DispatchGate = Literal[
+    "clear", "requires_approval", "policy_blocked", "adapter_not_registered", "not_applicable"
+]
+PolicyBlockReason = Literal["no_policy", "policy_revoked", "policy_expired"]
+
+
+class SimulateWorkspaceScopeMismatch(ValueError):
+    """This module's own copy of `worker.WorkspaceScopeMismatch`'s exact
+    confused-deputy check (`worker.py`'s own docstring has the full
+    reasoning), applied here against the *workflow version's* own pinned
+    `workspace_id` rather than a `run`'s (a simulation has no `workflow_
+    runs` row to compare against). A separate class, not an import of
+    `worker.WorkspaceScopeMismatch` itself, for the identical circular-
+    import reason this section's own module-docstring-adjacent comment
+    states -- `worker.py` cannot be imported from here.
+    """
+
+
+def _simulate_redact_payload(value: Any) -> Any:
+    """A deliberate, disclosed duplicate of `worker._redact_payload` (same
+    marker list, same recursive shape) -- see this section's own header
+    comment for why this is an import-cycle-avoiding duplication, not an
+    oversight. Applied to a step's `simulate()` output before it is ever
+    returned over HTTP: this response is never persisted, but it is still an
+    adapter's own output a caller did not author, and `DATA-MODEL.md`'s
+    "step payloads are redacted" discipline extends naturally to it.
+    """
+    if isinstance(value, dict):
+        redacted: dict[str, Any] = {}
+        for key, inner in value.items():
+            if any(marker in key.lower() for marker in _SIMULATE_REDACTION_MARKERS):
+                redacted[key] = _SIMULATE_REDACTED_VALUE
+            else:
+                redacted[key] = _simulate_redact_payload(inner)
+        return redacted
+    if isinstance(value, list):
+        return [_simulate_redact_payload(item) for item in value]
+    return value
+
+
+class SimulateStepResult(BaseModel):
+    step_index: int
+    step_id: str
+    step_type: str
+    action_ref: str | None = None
+    # Decision 9's compensation model, surfaced here per this task's own
+    # instruction: an action step's own declared compensate_ref target is
+    # shown as part of that step's own entry -- compensation steps
+    # themselves are never part of the main preview walk below (matches
+    # Task 6's own "reachable only through compensate_ref" rule).
+    compensate_ref: str | None = None
+    preview: dict[str, Any] | None = None
+    # API-SCHEMAS.md: "declared side effects (per adapter, reversible and
+    # high_impact_categories)" -- realized verbatim as these two fields,
+    # the adapter's own static declarations (Decision 8), not derived from
+    # the simulate() call itself. `high_impact_categories` is also this
+    # response's own realization of API-SCHEMAS.md's "requested permissions/
+    # scopes" wording -- this activation has no separate scope concept
+    # beyond the seven-category taxonomy (Decision 5) an adapter already
+    # declares statically.
+    reversible: bool | None = None
+    high_impact_categories: list[str] = Field(default_factory=list)
+    dispatch_gate: DispatchGate
+    policy_block_reason: PolicyBlockReason | None = None
+    error: str | None = None
+
+
+class SimulateResponse(BaseModel):
+    workflow_id: str
+    version: int
+    steps: list[SimulateStepResult]
+
+
+def _simulate_steps(
+    session: Session, version: WorkflowVersion, adapter_registry: AdapterRegistry
+) -> list[SimulateStepResult]:
+    """The graph-walk itself. `adapter.execute()`/`adapter.compensate()` are
+    never referenced anywhere in this function's body -- the orchestration
+    loop here has no code path that can reach either, matching Decision 4's
+    own "not merely 'not called'" requirement literally, not just in intent.
+
+    Reuses `approvals.evaluate_approval_requirement` -- the exact same
+    policy-checking logic `worker._evaluate_dispatch_gate` already uses for
+    real dispatch -- against the version's own pinned `policy_ref`, so this
+    preview's "every approval point the run would hit" (`API-SCHEMAS.md`,
+    verbatim) is a genuine re-evaluation of the same policy logic a real run
+    would apply, not a separate, potentially-drifting guess. `action_step_
+    count_so_far` is tracked the same way `worker._count_dispatched_action_
+    steps` would report it for a real run that had reached this point with
+    every prior action step having succeeded -- i.e. the count of *prior*
+    action steps in this walk, never off-by-one against the step under
+    evaluation, mirroring that function's own docstring precisely.
+    """
+    steps: list[dict[str, Any]] = version.graph.get("steps", [])
+    policy_row: AutomationPolicy | None = None
+    if version.policy_ref is not None:
+        policy_row = get_policy(session, version.workspace_id, version.policy_ref)
+
+    results: list[SimulateStepResult] = []
+    action_step_count_so_far = 0
+    for index, step in enumerate(steps):
+        step_type_raw = step.get("step_type")
+        step_type = str(step_type_raw)
+        step_id = str(step.get("step_id", ""))
+
+        if step_type_raw == "compensation":
+            # Reachable only through compensate_ref (Task 6's own rule) --
+            # never part of the main preview walk, matches the required
+            # behavior for this endpoint exactly.
+            continue
+
+        if step_type_raw in {"approval_gate", "condition"}:
+            # No adapter to call -- represented structurally only, matching
+            # process_claimed_run's own main-loop skip logic for these two
+            # step types (Task 6).
+            results.append(
+                SimulateStepResult(
+                    step_index=index,
+                    step_id=step_id,
+                    step_type=step_type,
+                    dispatch_gate="not_applicable",
+                )
+            )
+            continue
+
+        # step_type_raw == "action" from here on (validate_graph_shape
+        # restricts step_type to the four known values at draft time).
+        action_ref = step.get("action_ref")
+        compensate_ref = step.get("compensate_ref")
+        adapter: ActionAdapter | None = adapter_registry.get(action_ref) if action_ref else None
+
+        if adapter is None:
+            # A version drafted before this task's own publish-time check
+            # existed (or hand-constructed to bypass it) could still name an
+            # unresolvable action_ref -- degrade gracefully, never a 500,
+            # and never call simulate() for this step (this task's own
+            # required behavior).
+            results.append(
+                SimulateStepResult(
+                    step_index=index,
+                    step_id=step_id,
+                    step_type=step_type,
+                    action_ref=action_ref,
+                    compensate_ref=compensate_ref,
+                    dispatch_gate="adapter_not_registered",
+                    error="AdapterNotRegistered",
+                )
+            )
+            action_step_count_so_far += 1
+            continue
+
+        resolved_input: dict[str, Any] = step.get("input_mapping", {})
+        preview_dict: dict[str, Any] | None = None
+        error: str | None = None
+        try:
+            action_input = adapter.input_schema.model_validate(resolved_input)
+            input_workspace_id = getattr(action_input, "workspace_id", None)
+            if input_workspace_id is not None and input_workspace_id != version.workspace_id:
+                raise SimulateWorkspaceScopeMismatch(
+                    f"step '{step_id}' resolved input names workspace_id="
+                    f"{input_workspace_id}, which does not match workflow version "
+                    f"{version.id}'s own workspace_id={version.workspace_id}"
+                )
+            preview_model = adapter.simulate(action_input)
+            preview_dict = _simulate_redact_payload(preview_model.model_dump(mode="json"))
+        except Exception as exc:  # noqa: BLE001 -- mirrors run_step's own broad adapter-call catch
+            error = type(exc).__name__
+
+        dispatch_gate: DispatchGate
+        policy_block_reason: PolicyBlockReason | None
+        if policy_row is None:
+            dispatch_gate = "policy_blocked"
+            policy_block_reason = "no_policy"
+        elif not is_policy_usable(policy_row):
+            dispatch_gate = "policy_blocked"
+            lifecycle = policy_status(policy_row)
+            policy_block_reason = "policy_revoked" if lifecycle == "revoked" else "policy_expired"
+        else:
+            policy_block_reason = None
+            requires_approval = evaluate_approval_requirement(
+                adapter, policy_row, action_step_count_so_far=action_step_count_so_far
+            )
+            dispatch_gate = "requires_approval" if requires_approval else "clear"
+
+        results.append(
+            SimulateStepResult(
+                step_index=index,
+                step_id=step_id,
+                step_type=step_type,
+                action_ref=action_ref,
+                compensate_ref=compensate_ref,
+                preview=preview_dict,
+                reversible=adapter.reversible,
+                high_impact_categories=sorted(adapter.high_impact_categories),
+                dispatch_gate=dispatch_gate,
+                policy_block_reason=policy_block_reason,
+                error=error,
+            )
+        )
+        action_step_count_so_far += 1
+
+    return results
+
+
+@router.post("/workflows/{version_id}/simulate", response_model=SimulateResponse)
+def simulate_workflow_endpoint(
+    version_id: UUID, auth: AuthDep, session: SessionDep
+) -> SimulateResponse:
+    """Decision 4's simulation entrypoint. Workspace-scoped and 404-isolated
+    exactly like every other endpoint in this module (`get_workflow_version_
+    by_id`); addressed by `version_id`, exactly like `publish`/`disable`.
+
+    **A deliberate, documented judgment call: no `CsrfDep`/`Idempotency-Key`
+    on this endpoint, even though `API-SCHEMAS.md` lists this route as a
+    `POST`.** Every other mutating endpoint in this module requires both
+    because it writes a row; this one writes none, under any outcome
+    (proven directly by this task's own zero-rows-changed test) -- adding
+    idempotency-lock/CSRF ceremony here would protect a property (replay-
+    safety of a state change) this endpoint does not have, since it makes
+    no state change to replay-protect. Kept as `POST`, not `GET`, only
+    because `API-SCHEMAS.md`'s own already-approved route is a `POST` --
+    this activation's `input_mapping` has no live templating today (`worker.
+    _resolve_step`'s own docstring), so this endpoint's simulation is fully
+    determined by the version's own already-pinned graph and needs no
+    request body; a later task giving `/simulate` real per-call input
+    overrides would be the natural place to add one and would also be the
+    natural point to reconsider this judgment call.
+    """
+    version = get_workflow_version_by_id(session, auth.workspace_id, version_id)
+    if version is None:
+        raise HTTPException(status_code=404, detail="WORKFLOW_NOT_FOUND")
+    steps = _simulate_steps(session, version, _production_adapter_registry)
+    return SimulateResponse(workflow_id=version.workflow_id, version=version.version, steps=steps)

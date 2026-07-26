@@ -42,6 +42,16 @@ the time a step row reaches this endpoint (`worker.py`'s own module
 docstring: "any dict key ... has its value replaced before either ...
 column is ever written").
 
+**Task 7a: `RunDetailResponse` also embeds `compensation_steps`.** `worker.
+list_compensation_steps` (existing since Task 6, never wired into this
+router before now) -- `UX-STATES.md`'s own named gap for "partially
+compensated" being visible via a real endpoint, not only a direct DB read
+(`docs.superpowers/specs/2026-07-25-phase-5-automation-design.md`'s "shows
+steps, permissions, side effects, approval points and irreversibility"
+extends naturally to the compensation ledger too). `compensation_steps`
+carries no `input`/`output` field at all (unlike `workflow_run_steps`), so
+there is nothing for this endpoint to redact there either.
+
 **Required error codes in scope here** (`API-SCHEMAS.md`): `schema_invalid`
 (mechanically enforced by every request model's own Pydantic validation --
 FastAPI's `422` response for a malformed body) and `workflow_not_active`
@@ -144,8 +154,28 @@ class RunResponse(BaseModel):
     updated_at: datetime
 
 
+class CompensationStepResponse(BaseModel):
+    """Task 7a's addition -- `UX-STATES.md`'s own named gap: "'Partially
+    compensated' is realized as a run in `compensation_failed` whose
+    `compensation_steps` ledger (`GET /automations/runs/{id}`, once a
+    future task exposes it ...) shows a mix of `succeeded`/`failed` rows."
+    Mirrors `RunStepResponse`'s own shape for the sibling table exactly --
+    the same fields `worker.CompensationStep` itself carries, minus
+    `id`/`workspace_id`/`run_id` (implicit from the containing response),
+    matching `RunStepResponse`'s own identical omissions.
+    """
+
+    compensates_step_index: int
+    status: str
+    action_digest: str | None
+    started_at: datetime | None
+    finished_at: datetime | None
+    error_class: str | None
+
+
 class RunDetailResponse(RunResponse):
     steps: list[RunStepResponse]
+    compensation_steps: list[CompensationStepResponse]
 
 
 class RunListResponse(BaseModel):
@@ -187,9 +217,30 @@ def _step_to_response(step: WorkflowRunStep) -> RunStepResponse:
     )
 
 
-def _to_detail_response(run: WorkflowRun, steps: list[WorkflowRunStep]) -> RunDetailResponse:
+def _compensation_step_to_response(
+    step: worker_module.CompensationStep,
+) -> CompensationStepResponse:
+    return CompensationStepResponse(
+        compensates_step_index=step.compensates_step_index,
+        status=step.status,
+        action_digest=step.action_digest,
+        started_at=step.started_at,
+        finished_at=step.finished_at,
+        error_class=step.error_class,
+    )
+
+
+def _to_detail_response(
+    run: WorkflowRun,
+    steps: list[WorkflowRunStep],
+    compensation_steps: list[worker_module.CompensationStep],
+) -> RunDetailResponse:
     base = _to_response(run)
-    return RunDetailResponse(**base.model_dump(), steps=[_step_to_response(s) for s in steps])
+    return RunDetailResponse(
+        **base.model_dump(),
+        steps=[_step_to_response(s) for s in steps],
+        compensation_steps=[_compensation_step_to_response(c) for c in compensation_steps],
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -367,7 +418,8 @@ def get_run_endpoint(run_id: UUID, auth: AuthDep, session: SessionDep) -> RunDet
     if run is None:
         raise HTTPException(status_code=404, detail="RUN_NOT_FOUND")
     steps = worker_module.list_run_steps(session, auth.workspace_id, run_id)
-    return _to_detail_response(run, steps)
+    compensation_steps = worker_module.list_compensation_steps(session, auth.workspace_id, run_id)
+    return _to_detail_response(run, steps, compensation_steps)
 
 
 @router.post("/runs", response_model=RunResponse, status_code=status.HTTP_201_CREATED)
