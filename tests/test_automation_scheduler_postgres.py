@@ -41,6 +41,7 @@ from __future__ import annotations
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from hashlib import sha256
 from typing import Any
 from uuid import UUID, uuid4
@@ -50,6 +51,7 @@ from sqlalchemy import text
 
 from ecc.config import get_settings
 from ecc.database import SessionFactory, engine
+from ecc.domains.automation import policy as automation_policy
 from ecc.domains.automation import scheduler as automation_scheduler
 from ecc.domains.automation import triggers as automation_triggers
 from ecc.domains.automation import worker as automation_worker
@@ -268,13 +270,19 @@ def _cleanup_workspace(workspace_id: UUID) -> None:
 
 
 def _publish_workflow(
-    workspace_id: UUID, user_id: UUID, workflow_id: str
+    workspace_id: UUID, user_id: UUID, workflow_id: str, *, rate_limit: dict[str, Any] | None = None
 ) -> automation_workflows.WorkflowVersion:
     """A minimal active workflow -- scheduler tests only ever assert on
     `enqueue_run`'s own enqueue-time behavior (trigger_ref, status,
     pinned version), never on step dispatch, so no policy and a
     single-step graph pointing at an adapter no test here ever runs is
     enough.
+
+    `rate_limit` is the one exception: passing it attaches a real policy
+    (which `enqueue_run`'s rate-limit check needs a `policy_ref` to resolve
+    at all), for `test_rate_limited_scheduled_fire_advances_the_anchor_and_
+    reports_its_own_outcome` below. Left `None` -- and therefore
+    policy-less, exactly as before -- for every other test here.
     """
     graph = {
         "steps": [
@@ -288,6 +296,37 @@ def _publish_workflow(
             }
         ]
     }
+    policy_ref: UUID | None = None
+    if rate_limit is not None:
+        # automation_policies FKs `workflow_id` to workflow_definitions, so a
+        # throwaway draft has to create that family row first -- the same
+        # sequencing test_automation_worker_postgres.py's own _publish_workflow
+        # helper documents.
+        with SessionFactory() as session, session.begin():
+            automation_workflows.create_workflow_draft(
+                session,
+                workspace_id,
+                user_id,
+                workflow_id=workflow_id,
+                graph=graph,
+                trigger_refs=[],
+                policy_ref=None,
+            )
+        with SessionFactory() as session, session.begin():
+            policy_ref = automation_policy.create_policy(
+                session,
+                workspace_id,
+                user_id,
+                workflow_id=workflow_id,
+                action_types=[],
+                data_classes=[],
+                value_limit=Decimal("1000000"),
+                count_limit=1000,
+                rate_limit=rate_limit,
+                schedule=None,
+                approval_mode="bounded_recurring",
+            ).id
+
     with SessionFactory() as session, session.begin():
         draft = automation_workflows.create_workflow_draft(
             session,
@@ -296,7 +335,7 @@ def _publish_workflow(
             workflow_id=workflow_id,
             graph=graph,
             trigger_refs=[],
-            policy_ref=None,
+            policy_ref=policy_ref,
         )
         activated = automation_workflows.activate_workflow_version(session, workspace_id, draft.id)
     assert isinstance(activated, automation_workflows.WorkflowVersion)
@@ -594,6 +633,62 @@ def test_workflow_not_active_still_advances_anchor_without_enqueuing_run(
         and o.trigger_id == trigger.id
     ]
     assert failed_again == []
+
+
+def test_rate_limited_scheduled_fire_advances_the_anchor_and_reports_its_own_outcome(
+    scheduler_test_context: tuple[UUID, UUID],
+) -> None:
+    """The fire path enqueue-time rate limiting exists for. A schedule
+    trigger whose workflow has already used its policy's hourly allowance
+    must (a) be reported as `TriggerFireFailedRateLimited`, not silently
+    treated as a successful fire, (b) still advance its own anchor -- so it
+    is not re-evaluated as "due" on every subsequent tick until the window
+    rolls over, mirroring the two pre-existing fire-failure outcomes'
+    identical reasoning -- and (c) leave no extra `workflow_runs` row.
+    """
+    workspace_id, user_id = scheduler_test_context
+    workflow_id = f"test.sched-rate-limit.{uuid4().hex}"
+    _publish_workflow(
+        workspace_id, user_id, workflow_id, rate_limit={"runs_per_workflow_per_hour": 1}
+    )
+    # Consume the whole allowance before the tick, through the same
+    # choke point the scheduler itself will use.
+    with SessionFactory() as session, session.begin():
+        first = automation_worker.enqueue_run(
+            session, workspace_id, user_id, workflow_id=workflow_id
+        )
+    assert isinstance(first, automation_worker.WorkflowRun)
+
+    trigger = _create_schedule_trigger(
+        workspace_id, user_id, workflow_id, schedule_expression="0 * * * *", timezone="UTC"
+    )
+    _set_created_at(trigger.id, datetime(2026, 3, 1, 0, 0, tzinfo=UTC))
+
+    tick_now = datetime(2026, 3, 1, 1, 30, tzinfo=UTC)
+    outcomes = automation_scheduler.run_scheduler_once(SessionFactory, now=tick_now)
+    rate_limited = [
+        o
+        for o in outcomes
+        if isinstance(o, automation_scheduler.TriggerFireFailedRateLimited)
+        and o.trigger_id == trigger.id
+    ]
+    assert len(rate_limited) == 1
+    assert rate_limited[0].workflow_id == workflow_id
+    # Not misreported as a successful fire.
+    assert not [
+        o
+        for o in outcomes
+        if isinstance(o, automation_scheduler.TriggerFired) and o.trigger_id == trigger.id
+    ]
+
+    with SessionFactory() as session, session.begin():
+        refreshed = automation_triggers.get_trigger(session, workspace_id, trigger.id)
+    assert refreshed is not None
+    assert refreshed.last_fired_at == tick_now
+
+    with SessionFactory() as session, session.begin():
+        runs = automation_worker.list_runs(session, workspace_id)
+    assert len([run for run in runs if run.workflow_id == workflow_id]) == 1
 
 
 # ---------------------------------------------------------------------------

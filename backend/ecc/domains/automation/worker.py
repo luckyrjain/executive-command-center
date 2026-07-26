@@ -563,6 +563,59 @@ only a claim-time gate that would otherwise let `queued` rows silently pile
 up forever behind an active switch; `scheduler.run_scheduler_once`'s fire
 path and `runs.py`'s `POST /automations/runs` both call this same
 `enqueue_run`, so neither needs its own separate kill-switch check.
+
+**`preview_only` mechanically prevents real dispatch -- a docs-vs-code
+correction, not a new feature.** `docs/phases/phase-005/APPROVAL-POLICY.md`
+and `docs/runbooks/PHASE-5-DOGFOOD.md` both describe `automation_policies.
+approval_mode = 'preview_only'` as a mode guaranteeing zero real side
+effects, and that runbook's Stage 1 plan depends on the guarantee being
+mechanical ("zero real side effects of any kind during this stage"). It was
+not: Task 3 implemented `preview_only` identically to `per_run` (reading
+"(a)" of the two `approvals.py`'s own module docstring laid out) -- every
+step required approval, but an *approved* `preview_only` step went on to
+call the adapter's real `execute()`. A human about to open a live dogfood
+window was relying on a guarantee the code did not make. `_evaluate_
+dispatch_gate` now implements reading "(b)": a step whose resolved policy is
+in `preview_only` mode returns `StepBlockedByPreviewOnlyPolicy` instead of
+ever clearing to dispatch, regardless of whether an approval exists and was
+granted. Three properties of that fix are load-bearing, each documented at
+its own site rather than only here: the check sits on `_evaluate_dispatch_
+gate`'s **single** `return None` (so the guarantee is a structural property
+of that function's shape, not an assertion a later edit could forget to
+repeat -- see its docstring, including why an unregistered `action_ref` is
+blocked there too, which is what keeps the compensation sequence
+unreachable under this mode); the approval sub-flow still runs first and
+unchanged (a `preview_only` step still creates a real, decidable
+`approval_requests` row and still pauses its run in `waiting_approval` --
+rehearsing that flow with zero side effects is the entire purpose of the
+mode); and `process_claimed_run` maps the outcome to the new terminal
+`'preview_blocked'` run status (migration `0043`) rather than to
+`needs_review`, because nothing is broken, nothing is ambiguous, and no
+operator action exists that would let the run proceed -- see
+`StepBlockedByPreviewOnlyPolicy`'s own docstring for why this is a distinct
+outcome type rather than a fourth `StepBlockedByPolicy.reason`.
+
+**`rate_limit` is enforced at enqueue time (`RunRateLimited`) -- the second
+half of the same docs-vs-code correction.** `APPROVAL-POLICY.md`'s resolved
+control table ("Runs per workflow per hour | 10 ... Next run past the limit
+rejected at enqueue with `rate_limited`"), `API-SCHEMAS.md`'s required
+`rate_limited` error code and `TEST-PLAN.md`'s own named boundary scenario
+("the 11th run within an hour under a 10/hour policy is rejected
+`rate_limited`") all described a control nothing in this package actually
+applied: `policy.py` stored and returned `rate_limit`, and no code anywhere
+read it. `enqueue_run` now counts this `(workspace_id, workflow_id)`'s runs
+queued inside the trailing hour and rejects the next one past the policy's
+own ceiling, before writing any row -- the same "reject at the one choke
+point, before any row exists" shape `WorkflowNotActive`/`WorkflowKilled`
+already use, which is what makes it true for the scheduler's fire path and
+not only for `POST /automations/runs`. That matters concretely: a
+`* * * * *` schedule trigger was previously able to drive unlimited real
+dispatches under a single policy, since `count_limit` is scoped to one run
+and resets on every new one -- this is the only limit in the model that
+bounds how many runs a policy authorizes at all. See `_configured_runs_per_
+hour` for why an uninterpretable `rate_limit` blob means "no ceiling" rather
+than "zero" (the one deliberate non-fail-closed judgment in this module),
+and `_count_runs_in_rate_limit_window` for exactly which rows count.
 """
 
 from dataclasses import dataclass
@@ -590,7 +643,13 @@ from ecc.observability import (
 
 from . import kill_switches
 from . import policy as policy_module
-from .adapters import AdapterRegistry, TransientAdapterError, call_compensate, compensable
+from .adapters import (
+    ActionAdapter,
+    AdapterRegistry,
+    TransientAdapterError,
+    call_compensate,
+    compensable,
+)
 from .approvals import (
     create_approval_request,
     evaluate_approval_requirement,
@@ -614,6 +673,12 @@ RunStatus = Literal[
     "compensation_failed",
     "expired",
     "rate_limited",
+    # The `preview_only` dispatch block (migration 0043 widens
+    # `ck_workflow_runs_status` for it) -- module docstring's "`preview_only`
+    # mechanically prevents real dispatch" section. Terminal, and
+    # deliberately neither `needs_review` (nothing is broken) nor `failed`
+    # (nothing failed).
+    "preview_blocked",
 ]
 StepStatus = Literal[
     "pending", "dispatched", "succeeded", "failed", "unknown", "skipped", "retrying"
@@ -647,6 +712,12 @@ _TERMINAL_RUN_STATUSES = frozenset(
         "compensation_failed",
         "expired",
         "rate_limited",
+        # Terminal by design: a run blocked by its own `preview_only` policy
+        # can never dispatch, and no reachable state change could ever let
+        # it (a run pins `policy_id` at enqueue time and
+        # `automation_policies` has no update path at all -- only create and
+        # revoke). See migration 0043's own docstring for the full reasoning.
+        "preview_blocked",
     }
 )
 
@@ -819,6 +890,36 @@ class StepBlockedByPolicy:
 
 
 @dataclass(frozen=True, slots=True)
+class StepBlockedByPreviewOnlyPolicy:
+    """`run_step` did not dispatch `step_index` -- the run's policy is
+    perfectly usable (present, unrevoked, unexpired) but its `approval_mode`
+    is `preview_only`, a mode that by design never authorizes a real side
+    effect, no matter what approval decision was recorded (module
+    docstring's "`preview_only` mechanically prevents real dispatch"
+    section). No `workflow_run_steps` row is written, matching
+    `StepBlockedByPolicy`/`StepAwaitingApproval`.
+
+    **Deliberately a distinct type rather than a fourth `StepBlockedBy
+    Policy.reason`.** `StepBlockedByPolicy`'s three existing reasons all
+    mean the same thing operationally -- *this policy authorizes nothing at
+    all* -- and `process_claimed_run` maps every one of them to
+    `needs_review`, the state an operator is told to investigate and resolve
+    (`docs/runbooks/PHASE-5-RECOVERY.md`). This outcome means the opposite:
+    the policy is exactly as authorizing as its author intended, there is
+    nothing to fix, and no human action exists that would let this run
+    proceed. Folding it into that dataclass would have made every existing
+    `isinstance(outcome, StepBlockedByPolicy)` call site silently wrong
+    (mapping a healthy preview run onto a review queue); a separate type
+    makes every such call site a type error until it is considered, which is
+    exactly the review pressure a safety-relevant new outcome should create.
+    `process_claimed_run` maps this to the terminal `run.status =
+    'preview_blocked'` (migration 0043).
+    """
+
+    step_index: int
+
+
+@dataclass(frozen=True, slots=True)
 class WorkflowNotActive:
     """`enqueue_run` was asked to run a `workflow_id` with no `active`
     `workflow_versions` row -- the mechanical source of `API-SCHEMAS.md`'s
@@ -841,6 +942,31 @@ class WorkflowKilled:
     """
 
     workflow_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class RunRateLimited:
+    """`enqueue_run` was asked to start a run that would exceed the
+    authorizing policy's own `rate_limit.runs_per_workflow_per_hour`
+    ceiling -- `APPROVAL-POLICY.md`'s resolved control, verbatim: "Next run
+    past the limit rejected at enqueue with `rate_limited`". The mechanical
+    source of `API-SCHEMAS.md`'s required `rate_limited` error code
+    (`runs.py`'s `POST /automations/runs` maps this to `409`;
+    `scheduler.run_scheduler_once` maps it to `TriggerFireFailedRate
+    Limited`), and the enqueue-time counterpart of the per-*run*
+    `count_limit` the dispatch gate already enforces.
+
+    `limit` is the policy's own configured ceiling; `runs_in_window` is how
+    many `workflow_runs` rows for this exact `(workspace_id, workflow_id)`
+    were queued inside the trailing hour at the moment of rejection --
+    carried on the outcome (rather than left for a caller to re-query) so an
+    error response can say *how* far over the limit the caller is without a
+    second round trip.
+    """
+
+    workflow_id: str
+    limit: int
+    runs_in_window: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -1125,6 +1251,87 @@ def list_compensation_steps(
 # Enqueue
 # ---------------------------------------------------------------------------
 
+# `automation_policies.rate_limit` is an opaque JSONB blob (migration 0038,
+# `policy.py`'s `rate_limit: dict[str, Any]`) whose one documented,
+# system-defaulted key is this one -- `APPROVAL-POLICY.md`'s "Runs per
+# workflow per hour | 10 (policy default, overridable per policy)".
+# `policy.create_policy` inserts `{"runs_per_workflow_per_hour": 10}` for
+# any caller that omits `rate_limit` entirely.
+_RATE_LIMIT_RUNS_PER_HOUR_KEY = "runs_per_workflow_per_hour"
+
+# The trailing window `APPROVAL-POLICY.md`'s control is denominated in
+# ("Runs per workflow per hour"). Interpolated into the count SQL below so
+# this number lives in exactly one place, matching this module's own
+# discipline for `LEASE_DURATION_SECONDS`/`MAX_RETRY_ATTEMPTS`.
+RATE_LIMIT_WINDOW_INTERVAL = "1 hour"
+
+
+def _configured_runs_per_hour(policy_row: policy_module.AutomationPolicy) -> int | None:
+    """The policy's own runs-per-workflow-per-hour ceiling, or `None` when
+    this policy configures no such ceiling at all.
+
+    **Only a non-negative `int` is enforced; anything else means "no
+    ceiling," deliberately.** `rate_limit` is caller-authored JSONB with no
+    Pydantic schema of its own (`policy.PolicyCreateRequest.rate_limit:
+    dict[str, Any] | None`), so this function can be handed a missing key, a
+    string, a float, `None`, or a nested object. Treating an
+    uninterpretable value as *unlimited* rather than as zero is the one
+    place in this module that deliberately does not fail closed, and the
+    reasoning is worth stating explicitly rather than leaving to a reader's
+    inference: failing closed here would mean a single malformed `rate_limit`
+    blob permanently rejects every run of that workflow with a `rate_limited`
+    error whose remedy (edit the policy) does not exist -- `automation_
+    policies` has no update endpoint, only create and revoke, so the
+    workspace would have to author a replacement policy *and* republish the
+    workflow version bound to it to recover. That is a real, unrecoverable
+    availability failure traded against a very small authority risk: an
+    author who wrote a malformed `rate_limit` still explicitly authored
+    every *other* limit this policy carries (`count_limit` still gates
+    per-run dispatch, `approval_mode` still gates every step, `expires_at`
+    still bounds the whole policy), so "no runs-per-hour ceiling" is a
+    narrowing of one control, not an authority bypass. `bool` is excluded
+    explicitly because `isinstance(True, int)` is `True` in Python and
+    `{"runs_per_workflow_per_hour": true}` is not a ceiling of 1.
+    """
+    raw = policy_row.rate_limit.get(_RATE_LIMIT_RUNS_PER_HOUR_KEY)
+    if isinstance(raw, bool) or not isinstance(raw, int) or raw < 0:
+        return None
+    return raw
+
+
+def _count_runs_in_rate_limit_window(session: Session, workspace_id: UUID, workflow_id: str) -> int:
+    """How many `workflow_runs` rows for this exact `(workspace_id,
+    workflow_id)` were queued inside the trailing `RATE_LIMIT_WINDOW_
+    INTERVAL` -- the count `APPROVAL-POLICY.md`'s "Runs per workflow per
+    hour" control is compared against.
+
+    **`queued_at`, not `started_at`/`created_at`, and every status counts.**
+    `queued_at` is the moment a run entered the queue and is the only
+    timestamp every run has (`started_at` is `NULL` until a worker claims
+    it, so counting on it would let an unbounded backlog of never-claimed
+    runs accumulate freely -- exactly the unbounded-enqueue abuse vector
+    this limit exists to close). Counting rows of *every* status means a run
+    that was cancelled, failed or blocked still consumes its slot in the
+    window: the control governs how many runs a policy authorizes *starting*
+    per hour, not how many succeed, and making failures free to retry would
+    turn a fast-failing workflow into an unlimited dispatch loop. One
+    caveat a reader should know rather than discover: `queued_at` is
+    refreshed when a run is requeued (`approvals._advance_run_after_
+    decision` on approval, `resume_run` after a pause), so a long-lived run
+    that pauses and resumes stays counted in whatever window its most
+    recent requeue falls into -- it is still exactly one row either way,
+    never double-counted.
+    """
+    result = session.execute(
+        text(
+            "SELECT COUNT(*) FROM workflow_runs "
+            "WHERE workspace_id = :workspace_id AND workflow_id = :workflow_id "
+            f"AND queued_at > now() - interval '{RATE_LIMIT_WINDOW_INTERVAL}'"
+        ),
+        {"workspace_id": workspace_id, "workflow_id": workflow_id},
+    ).scalar()
+    return int(result or 0)
+
 
 def enqueue_run(
     session: Session,
@@ -1133,7 +1340,7 @@ def enqueue_run(
     *,
     workflow_id: str,
     trigger_ref: str | None = None,
-) -> WorkflowRun | WorkflowNotActive | WorkflowKilled:
+) -> WorkflowRun | WorkflowNotActive | WorkflowKilled | RunRateLimited:
     """Creates a `queued` `workflow_runs` row pinned to `workflow_id`'s
     current `active` `workflow_versions` row -- reuses `workflows.
     get_active_workflow_version` (Task 1) rather than re-querying for an
@@ -1150,12 +1357,50 @@ def enqueue_run(
     `scheduler.run_scheduler_once`'s fire path and `runs.py`'s `POST
     /automations/runs` go through, so neither needs its own separate
     kill-switch check (module docstring's "Task 6: kill switches" section).
+
+    **Rate limiting (`RunRateLimited`).** Also rejects, before any row is
+    written, when the authorizing policy's own `rate_limit.runs_per_workflow_
+    per_hour` ceiling has already been reached by runs queued inside the
+    trailing hour -- `APPROVAL-POLICY.md`'s resolved control verbatim ("Next
+    run past the limit rejected at enqueue with `rate_limited`"). Checked
+    here, at the same single choke point `WorkflowNotActive`/`WorkflowKilled`
+    already use, precisely because that makes it true for *both* entry
+    points at once (`runs.py`'s `POST /automations/runs` and `scheduler.
+    run_scheduler_once`'s fire path) rather than only the HTTP one -- the
+    scheduler path is the one that actually matters for this control, since a
+    `* * * * *` schedule trigger is the concrete unbounded-dispatch vector
+    the per-run `count_limit` cannot bound (it is scoped to a single run and
+    resets on every new one). The policy is the one this run *would* be
+    dispatched under, resolved server-side from the active version's own
+    `policy_ref` -- never a caller-supplied value (`API-SCHEMAS.md`'s
+    confused-deputy rule).
     """
     active = get_active_workflow_version(session, workspace_id, workflow_id)
     if active is None:
         return WorkflowNotActive(workflow_id=workflow_id)
     if kill_switches.is_workflow_killed(session, workspace_id, workflow_id):
         return WorkflowKilled(workflow_id=workflow_id)
+
+    # A workflow with no policy at all (`policy_ref is None`) or one naming a
+    # row that no longer resolves is deliberately *not* rate-limited here:
+    # it has no configured ceiling to enforce, and it is already
+    # unconditionally blocked at dispatch time by the fail-closed "no policy
+    # means no authority" gate (`_evaluate_dispatch_gate`), so no side effect
+    # can follow from letting the row be created.
+    if active.policy_ref is not None:
+        policy_row = policy_module.get_policy(session, workspace_id, active.policy_ref)
+        if policy_row is not None:
+            limit = _configured_runs_per_hour(policy_row)
+            if limit is not None:
+                runs_in_window = _count_runs_in_rate_limit_window(
+                    session, workspace_id, workflow_id
+                )
+                if runs_in_window >= limit:
+                    return RunRateLimited(
+                        workflow_id=workflow_id,
+                        limit=limit,
+                        runs_in_window=runs_in_window,
+                    )
 
     now = datetime.now(UTC)
     run_id = uuid4()
@@ -1552,40 +1797,31 @@ def _resolve_usable_policy(
     return policy_row
 
 
-def _evaluate_dispatch_gate(
+def _evaluate_approval_gate(
     session: Session,
     run: WorkflowRun,
     step_index: int,
     digest: str,
-    step: dict[str, Any],
-    adapter_registry: AdapterRegistry,
-) -> StepBlockedByPolicy | StepAwaitingApproval | None:
-    """Task 3's gate (module docstring's own section has the full
-    reasoning) -- called from `run_step`'s `else:` branch, i.e. when no
-    `workflow_run_steps` row exists yet for this step at all. Returns
-    `None` when the step is cleared to dispatch immediately: either the
-    policy is usable and no approval is required, or an `approved` request
-    already matches this exact, freshly-computed `digest`.
+    adapter: ActionAdapter,
+    policy_row: policy_module.AutomationPolicy,
+) -> StepAwaitingApproval | None:
+    """The approval half of Task 3's gate, extracted verbatim from
+    `_evaluate_dispatch_gate` so that function's own single `return None`
+    (its one and only "cleared to really dispatch" exit) can be guarded by
+    the `preview_only` check below it -- see `_evaluate_dispatch_gate`'s own
+    docstring for why that structural property, rather than a second check
+    somewhere else, is what makes the `preview_only` guarantee mechanical.
+    Behaviour is unchanged from Task 3: `None` means "no fresh human
+    approval is needed for this exact digest," either because
+    `evaluate_approval_requirement` said none was required or because an
+    `approved` request already matches the live digest.
 
-    Its policy-usability half lives in `_resolve_usable_policy` so
-    `run_step`'s retry-resume path can re-enforce exactly that same check
-    (and only that check -- re-deriving the approval requirement for a
-    step that may already carry a decided approval from an earlier attempt
-    is a separate, unresolved question) without duplicating the lookup.
+    Its caller (`_evaluate_dispatch_gate`) resolves policy usability through
+    `_resolve_usable_policy` -- the same helper `run_step`'s retry-resume
+    path reuses -- rather than this function re-deriving it, so the two
+    call sites that must both enforce "is this policy still usable" share
+    one implementation rather than two drifting copies.
     """
-    resolved = _resolve_usable_policy(session, run, step_index)
-    if isinstance(resolved, StepBlockedByPolicy):
-        return resolved
-    policy_row = resolved
-
-    adapter = adapter_registry.get(step["action_ref"])
-    if adapter is None:
-        # Not a policy/approval concern -- the existing "AdapterNotRegistered"
-        # branch further down handles an unregistered action_ref; clear
-        # this gate and let dispatch proceed to that branch unchanged from
-        # Task 2.
-        return None
-
     action_step_count_so_far = _count_dispatched_action_steps(session, run.workspace_id, run.id)
     if not evaluate_approval_requirement(
         adapter, policy_row, action_step_count_so_far=action_step_count_so_far
@@ -1611,9 +1847,83 @@ def _evaluate_dispatch_gate(
     return StepAwaitingApproval(step_index, created.id)
 
 
+def _evaluate_dispatch_gate(
+    session: Session,
+    run: WorkflowRun,
+    step_index: int,
+    digest: str,
+    step: dict[str, Any],
+    adapter_registry: AdapterRegistry,
+) -> StepBlockedByPolicy | StepAwaitingApproval | StepBlockedByPreviewOnlyPolicy | None:
+    """Task 3's gate (module docstring's own section has the full
+    reasoning) -- only ever called from `run_step`'s `else:` branch, i.e.
+    only when no `workflow_run_steps` row exists yet for this step at all.
+    Returns `None` when the step is cleared to dispatch for real: the
+    policy is usable, its mode permits real dispatch at all, and either no
+    approval was required or an `approved` request already matches this
+    exact, freshly-computed `digest`.
+
+    **The `preview_only` block is placed on this function's single `return
+    None`, deliberately, and that placement is the whole mechanism.** Every
+    other exit above it is already a non-dispatch outcome, so guarding the
+    one remaining exit means there is no reachable path from a
+    `preview_only` policy to `adapter.execute()` at all -- the guarantee is
+    a structural property of this function's shape rather than an assertion
+    a future edit could forget to repeat. Two consequences worth being
+    explicit about, since both were real design questions and neither is
+    obvious from the code alone:
+
+    1. **The approval sub-flow runs *first*, unchanged.** A `preview_only`
+       step still creates a real `approval_requests` row, still pauses its
+       run in `waiting_approval`, and can still be approved or rejected by a
+       human through the ordinary `/approvals` endpoints -- which is the
+       entire point of the mode per `docs/runbooks/PHASE-5-DOGFOOD.md`'s
+       Stage 1 (an operator practising the real approval flow with zero real
+       side effects). Only the *dispatch* that would otherwise follow an
+       approval is blocked. Checking `preview_only` before the approval
+       sub-flow would have been simpler code and a worse mode: it would make
+       `preview_only` unable to exercise the very flow it exists to rehearse.
+    2. **An unregistered `action_ref` under `preview_only` is blocked here
+       too, not passed through to `run_step`'s own `AdapterNotRegistered`
+       branch.** That branch writes a `'failed'` step row, and a `'failed'`
+       step is what triggers `_qualifying_compensations`/`_run_compensation_
+       sequence` -- which *does* call real `execute()`/`compensate()` on
+       compensation adapters. So passing that case through would leave one
+       genuine path from a `preview_only` policy to a real side effect
+       (unregistered action step fails -> its compensation dispatches for
+       real). Blocking it here closes that path without touching
+       compensation dispatch at all: under `preview_only` no action step can
+       ever reach a `'failed'` outcome, so the compensation sequence is
+       simply never reachable.
+    Policy usability is resolved through `_resolve_usable_policy` -- the
+    same helper `run_step`'s retry-resume path calls to re-enforce exactly
+    this check on every resumed attempt, not just first dispatch -- so
+    there is one implementation of "is this policy still usable," not two.
+    """
+    resolved = _resolve_usable_policy(session, run, step_index)
+    if isinstance(resolved, StepBlockedByPolicy):
+        return resolved
+    policy_row = resolved
+
+    adapter = adapter_registry.get(step["action_ref"])
+    if adapter is not None:
+        awaiting = _evaluate_approval_gate(session, run, step_index, digest, adapter, policy_row)
+        if awaiting is not None:
+            return awaiting
+
+    # Reaching here means one of exactly two things: this step's approval
+    # requirement (if it had one) is satisfied for this exact live digest, or
+    # its `action_ref` does not resolve in the registry at all (which
+    # `run_step`'s own AdapterNotRegistered branch handles for every mode
+    # except preview_only -- see point 2 in this function's docstring).
+    if policy_row.approval_mode == "preview_only":
+        return StepBlockedByPreviewOnlyPolicy(step_index)
+    return None
+
+
 def run_step(
     session: Session, run: WorkflowRun, step_index: int, adapter_registry: AdapterRegistry
-) -> StepOutcome | StepAwaitingApproval | StepBlockedByPolicy:
+) -> StepOutcome | StepAwaitingApproval | StepBlockedByPolicy | StepBlockedByPreviewOnlyPolicy:
     """Dispatches (or resumes) exactly one step. At-most-one-effect
     (Decision 3): a `workflow_run_steps` row already `succeeded` under
     this `(run_id, step_index)` key is returned as-is, `execute()` is
@@ -1638,7 +1948,11 @@ def run_step(
     returns `StepBlockedByPolicy`/`StepAwaitingApproval` instead of a
     `StepOutcome`, and no row is written at all (module docstring's own
     "Task 3's approval/policy gate" section has the full reasoning for why
-    this ordering, not "write `dispatched` first," is required).
+    this ordering, not "write `dispatched` first," is required). A step whose
+    policy is in `preview_only` mode returns the third such outcome,
+    `StepBlockedByPreviewOnlyPolicy`, no matter what approval decision
+    exists -- also before any row is written (module docstring's
+    "`preview_only` mechanically prevents real dispatch" section).
 
     **Task 6, as corrected by the retry-resume audit.** A `'retrying'`-status
     existing row (a reclaimed, now-due run resuming the exact step a prior
@@ -2562,6 +2876,21 @@ def process_claimed_run(
             return _pause_run(session, run, "waiting_approval")
         if isinstance(outcome, StepBlockedByPolicy):
             return _pause_run(session, run, "needs_review")
+        if isinstance(outcome, StepBlockedByPreviewOnlyPolicy):
+            # The run's policy is healthy and authorizes exactly what its
+            # author intended -- it simply never authorizes a real side
+            # effect (`StepBlockedByPreviewOnlyPolicy`'s own docstring /
+            # migration 0043). `_finish_run`, not `_pause_run`: this is
+            # genuinely terminal (no reachable state change could ever let
+            # this run dispatch), so `finished_at` is stamped and the run
+            # leaves the claimable set for good, rather than sitting in a
+            # resumable-looking state implying an operator action that does
+            # not exist. Any `approval_requests` row this step created
+            # before reaching here stays exactly as it is -- decided or
+            # pending, fully visible in the approval inbox: rehearsing that
+            # flow is the whole purpose of the mode
+            # (`docs/runbooks/PHASE-5-DOGFOOD.md`'s Stage 1).
+            return _finish_run(session, run, "preview_blocked")
         if outcome.status == "succeeded":
             step_index += 1
             continue

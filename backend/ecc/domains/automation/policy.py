@@ -21,6 +21,64 @@ whatever later task builds the run-dispatch path that actually needs to
 gate on them (Decision 6: an expired or revoked policy blocks *future*
 runs; this task builds no run dispatch, so nothing beyond `revoke_policy`
 below currently calls them for an HTTP effect).
+
+## Which policy scope fields are actually enforced (accepted limitation)
+
+This module stores and returns all eight scope/limit fields
+`APPROVAL-POLICY.md` names. Only some of them are compared against anything
+at dispatch or enqueue time, and the difference is disclosed here (rather
+than left for a reader to discover by grepping for call sites) in the same
+"state the real boundary explicitly" style
+`docs/phases/phase-005/IMPLEMENTATION-STATUS.md` already uses for Phase 5's
+other accepted limitations:
+
+- **`approval_mode` -- enforced.** `approvals.evaluate_approval_requirement`
+  (per-step approval requirement) plus `worker._evaluate_dispatch_gate`'s
+  `preview_only` dispatch block.
+- **`expires_at`/`revoked_at` -- enforced.** `is_policy_usable`, called by
+  `worker._evaluate_dispatch_gate` before every not-yet-started step.
+- **`count_limit` -- enforced.** `evaluate_approval_requirement`'s
+  `policy-limit-exceeding` check, per run.
+- **`rate_limit` (`runs_per_workflow_per_hour`) -- enforced.**
+  `worker.enqueue_run` rejects the next run past the ceiling
+  (`worker.RunRateLimited` -> `rate_limited`).
+- **`schedule` -- not a control on this table.** Schedule authority lives on
+  `triggers` (`trigger_type='schedule'` and its own `schedule_expression`/
+  `timezone`), which is what `scheduler.py` actually evaluates; this column
+  is descriptive metadata about the authorized cadence, never a second
+  scheduler input.
+- **`action_types` -- NOT enforced.** Stored, returned by
+  `GET /automations/policies`, never compared against a dispatching adapter.
+- **`data_classes` -- NOT enforced.** Same: stored and returned, never
+  compared.
+- **`value_limit` -- NOT enforced.** Same: stored and returned (and
+  required/non-nullable, so an author must still choose a number), never
+  summed against anything.
+
+**The three unenforced fields, stated plainly: a policy scoped to specific
+`action_types` or `data_classes` currently authorizes any registered adapter
+regardless of that adapter's actual type or data classification, and a
+`value_limit` of any size constrains nothing.** They are stored, returned by
+the API, and intended for future enforcement -- they are not a live control
+today. The reason is a missing model, not an oversight: enforcing them
+requires per-adapter metadata mapping an adapter identity to its action type
+and the data classes it touches (and, for `value_limit`, a monetary amount
+per dispatch), and `adapters.ActionAdapter` declares no such fields --
+Decision 8's contract carries `adapter_id`, `input_schema`/`output_schema`,
+`reversible` and `high_impact_categories`, and nothing else. Adding that
+metadata means extending the adapter protocol, backfilling it for every
+registered adapter, deciding how an adapter that declines to classify itself
+is treated (fail-closed, matching `high_impact_categories`' own precedent),
+and threading it through both `_evaluate_dispatch_gate` and
+`workflows._simulate_steps` -- a design change of its own, deliberately not
+attempted as part of a docs-vs-code reconciliation. What *is* enforced
+meanwhile is the part that does not need adapter metadata at all:
+`high_impact_categories` (which every adapter already declares) always
+forces per-run approval, `approval_mode` gates or blocks every step, and
+`expires_at`/`revoked_at`/`count_limit`/`rate_limit` all bound authority by
+time and volume. The gap is real but narrow: it is "this policy does not
+narrow *which kinds* of registered adapter it authorizes," not "this policy
+authorizes unattended execution."
 """
 
 from dataclasses import dataclass

@@ -94,6 +94,18 @@ def main() -> int:
                         f"{worker_id}\tscheduler\tworkflow-not-active\t"
                         f"{outcome.trigger_id}\t{outcome.workflow_id}"
                     )
+                elif isinstance(outcome, scheduler_module.TriggerFireFailedRateLimited):
+                    # Enqueue-time rate limiting (`worker.RunRateLimited`).
+                    # Printed rather than silently dropped specifically
+                    # because this fire path has no HTTP response an operator
+                    # could otherwise see the rejection in, and no
+                    # `workflow_runs` row is written for it either -- without
+                    # a line here, a schedule trigger quietly exhausting its
+                    # policy's hourly allowance would be invisible.
+                    print(
+                        f"{worker_id}\tscheduler\trate-limited\t"
+                        f"{outcome.trigger_id}\t{outcome.workflow_id}"
+                    )
             last_scheduler_tick = loop_started_at
 
         elapsed = time.monotonic() - loop_started_at

@@ -168,6 +168,56 @@ describe('RunWorkspace', () => {
     await waitFor(() => expect(screen.getByText(/This run's own policy is currently revoked/)).toBeTruthy())
   })
 
+  it('shows a preview_blocked run as a normal finished outcome, not an error, and offers no stop actions', async () => {
+    // The docs-vs-code fix for `preview_only`: a run under a preview-only
+    // policy terminates in `preview_blocked` having dispatched nothing. This
+    // asserts the UI presents that honestly -- an operator in Stage 1 of
+    // `docs/runbooks/PHASE-5-DOGFOOD.md` must not read the mode working
+    // correctly as a bug, and must not be offered Pause/Resume/Cancel
+    // buttons for a run that is already finished.
+    const detail: RunDetail = {
+      ...baseRun,
+      status: 'preview_blocked',
+      steps: [],
+      compensation_steps: [],
+    }
+    vi.stubGlobal('fetch', mockFetchByPath({
+      '/api/v1/automations/runs/run-1': detail,
+      '/api/v1/automations/runs': { runs: [{ ...baseRun, status: 'preview_blocked' }] },
+      '/kill_switch': noSwitch,
+      '/policies': noPolicies,
+    }))
+    const { container } = renderWorkspace()
+
+    await waitFor(() => expect(screen.getByRole('button', { name: 'View' })).toBeTruthy())
+    fireEvent.click(screen.getByRole('button', { name: 'View' }))
+
+    await waitFor(() => expect(screen.getByText('Preview only -- no real action was taken.')).toBeTruthy())
+    expect(screen.getByText(/never authorizes a real\s+side effect/)).toBeTruthy()
+    // Not an error: no role="alert" anywhere on this run's detail, and no
+    // error-panel styling on the explanation.
+    expect(container.querySelectorAll('[role="alert"]').length).toBe(0)
+    expect(container.querySelectorAll('.error-panel').length).toBe(0)
+    // Terminal: no stop/resume action is offered.
+    expect(screen.queryByRole('button', { name: 'Cancel' })).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Pause' })).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Resume' })).toBeNull()
+  })
+
+  it('explains an enqueue-time rate_limited rejection with the policy\'s own limit', async () => {
+    const fetch = vi.fn()
+      .mockImplementationOnce(() => response({ runs: [] }))
+      .mockImplementationOnce(() => response({ error: { code: 'RATE_LIMITED', message: 'Rate Limited', details: { workflow_id: 'weekly-digest', limit: 10, runs_in_window: 10 } } }, 409))
+    vi.stubGlobal('fetch', fetch)
+    renderWorkspace()
+
+    await waitFor(() => expect(screen.getByText('No runs match this filter.')).toBeTruthy())
+    fireEvent.change(screen.getByLabelText('Workflow ID to run'), { target: { value: 'weekly-digest' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Start run' }))
+
+    expect(await screen.findByText(/already used its policy's limit of 10 runs per hour/)).toBeTruthy()
+  })
+
   it('pauses an in-flight run', async () => {
     const runningRun: Run = { ...baseRun, status: 'running' }
     const runningDetail: RunDetail = { ...runningRun, steps: [], compensation_steps: [] }

@@ -19,50 +19,69 @@ unreachable -- the migration 0038 `CHECK` constraint and `PolicyCreate
 Request`'s own `Literal` both already restrict it to three values) also
 defaults to requiring approval rather than silently permitting dispatch.
 
-**`preview_only` is treated identically to `per_run` here: every action
-step requires approval, not merely the high-impact ones.** This is a
-genuine judgment call, not a mechanical reading of `APPROVAL-POLICY.md` --
-that document names the mode but does not itself state whether a
-`bounded` step still dispatches unattended under it. Two readings were
-available: (a) `preview_only` behaves exactly like `per_run` (approval
-gates every step) or (b) `preview_only` additionally blocks *even an
-approved* step from ever reaching `execute()`, permanently confining a
-policy in this mode to `POST /automations/workflows/{id}/simulate`
-(Decision 4) and never real dispatch at all. This task implements (a),
-the more conservative of the two mechanically achievable readings given
-this task's own scope: `/simulate` blocking `execute()` entirely from its
-own code path is already true by construction (Decision 4, `adapters.py`'s
-module docstring -- "the orchestration loop for a simulation request has
-no code path that can reach `execute`"), so (b) would require this
-module to *also* re-derive "was this run started via `/simulate` or a real
-`POST /runs`" and block dispatch a second way for a `preview_only` policy
-specifically -- a second enforcement mechanism for a property `/simulate`
-already guarantees structurally, and one this task's own scope (approval
-gating and policy-driven revocation enforcement at the worker's dispatch
-path, not the `/simulate` endpoint itself) does not otherwise touch. (a)
-is also the literal, textual safe reading the letter of "nothing executes
-unattended" demands and no more: an approved `preview_only` step still
-requires the identical fresh human sign-off `per_run` would have demanded,
-so nothing in this mode ever dispatches without a human explicitly having
-looked at *this exact* `action_digest` and said yes. A reviewer who reads
-(b) as the intended meaning should treat this as the one judgment call in
-this task most worth double-checking; nothing else in this module depends
-on the distinction being resolved either way.
+**`preview_only` requires approval for every step here, exactly like
+`per_run` -- and a step under it can still never reach `execute()`, which
+this function is deliberately not the place that enforces.** Two readings of
+`APPROVAL-POLICY.md`'s named-but-underspecified `preview_only` mode were
+available: (a) `preview_only` behaves exactly like `per_run` (approval gates
+every step, and an approved step then dispatches for real) or (b)
+`preview_only` additionally blocks *even an approved* step from ever
+reaching `execute()`, so a policy in this mode never produces a real side
+effect at all. **Reading (b) is what is implemented**, across two modules,
+and the split is deliberate:
+
+- *This* function keeps returning `True` for every `preview_only` step, and
+  that is not a formality. It is what makes the mode's real purpose work:
+  an operator in `docs/runbooks/PHASE-5-DOGFOOD.md`'s Stage 1 practises the
+  genuine approval flow -- a real `approval_requests` row, a real digest to
+  echo, a real `/approve` or `/reject` decision, a real run transition out
+  of `waiting_approval` -- against a policy that cannot cause a side effect.
+  Short-circuiting `preview_only` to "blocked" *here* would be simpler code
+  and would gut the mode, leaving nothing to rehearse.
+- `worker._evaluate_dispatch_gate` is where (b)'s actual guarantee lives:
+  after this function's requirement (if any) is satisfied for the live
+  digest, that gate checks the resolved policy's `approval_mode` on its own
+  single "cleared to dispatch" exit and returns `worker.StepBlockedBy
+  PreviewOnlyPolicy` for `preview_only`, so there is no reachable path from
+  a policy in this mode to `adapter.execute()`. `process_claimed_run` maps
+  that outcome to the terminal `'preview_blocked'` run status (migration
+  `0043`) -- not `needs_review`: nothing is broken and no human action could
+  let the run proceed. That function's own docstring carries the full
+  mechanism, including why the check sits on that one exit specifically and
+  why an unregistered `action_ref` is blocked there too.
+
+**Why the earlier reading (a) was wrong, recorded rather than quietly
+replaced.** The original argument for (a) was that `POST /automations/
+workflows/{id}/simulate` already cannot reach `execute()` by construction
+(Decision 4, `adapters.py`'s module docstring), so a second enforcement
+mechanism for `preview_only` specifically looked redundant. It is not
+redundant, because the two mechanisms guard different things: `/simulate`
+guarantees that *a simulation request* has no path to `execute()`, while
+`preview_only` is a property of *a policy* -- and a `preview_only` policy is
+reachable from `POST /automations/runs` and from a schedule trigger, neither
+of which goes anywhere near `/simulate`. Under (a), the sequence "start a
+real run against a `preview_only` policy, approve the step it pauses on,
+watch the adapter execute for real" was fully available, which is precisely
+the sequence `APPROVAL-POLICY.md` and `PHASE-5-DOGFOOD.md`'s Stage 1
+threshold ("zero real side effects of any kind ... mechanically guaranteed")
+told an operator was impossible. (a) satisfied "nothing executes unattended"
+but not "this mode never executes," and the documents promise the second.
 
 **`policy-limit-exceeding` is evaluated using `count_limit` only.**
 `value_limit` has no adapter-declared monetary field to compare against in
 this activation (`docs/superpowers/specs/...design.md` Decision 5's own
 table: "No connector in this activation has monetary side effects" --
 identical reasoning to why `value_limit` itself has no system-wide
-default), so there is nothing to sum against it; `rate_limit` (runs per
-workflow per hour) is an *enqueue-time* concern per `APPROVAL-POLICY.md`'s
-own table ("the next run past the limit rejected at enqueue with
-`rate_limited`"), not a per-step dispatch-time concern, and wiring a
-`rate_limited` enqueue rejection is out of this task's explicit scope
-(approval gating and policy revocation/expiry enforcement at the worker's
-dispatch path -- this task's own instructions name only `run_step`/
-`process_claimed_run` as the wiring point). `count_limit` is therefore
-evaluated as: has this run already dispatched (attempted -- a
+default), so there is nothing to sum against it -- see `policy.py`'s own
+"which policy scope fields are actually enforced" docstring section for the
+honest, per-field status of `action_types`/`data_classes`/`value_limit`,
+none of which any dispatching code compares an adapter against. `rate_limit`
+(runs per workflow per hour) is an *enqueue-time* concern per
+`APPROVAL-POLICY.md`'s own table ("the next run past the limit rejected at
+enqueue with `rate_limited`"), not a per-step dispatch-time concern, and it
+*is* now enforced -- at that enqueue-time choke point, by
+`worker.enqueue_run`/`worker.RunRateLimited`, not here. `count_limit` is
+therefore evaluated as: has this run already dispatched (attempted -- a
 `workflow_run_steps` row of any status exists) `count_limit` or more
 action steps? If so, the next one is `policy-limit-exceeding` and requires
 approval even under `bounded_recurring` for an otherwise-`bounded`
@@ -229,6 +248,12 @@ def evaluate_approval_requirement(
     if adapter.high_impact_categories:
         return True
     if policy.approval_mode in ("preview_only", "per_run"):
+        # `preview_only` answers this question identically to `per_run` on
+        # purpose -- it is *also* blocked from real dispatch afterwards, by
+        # `worker._evaluate_dispatch_gate`, never here (module docstring's
+        # own "`preview_only` requires approval for every step" section: this
+        # function returning `True` is what gives an operator a real
+        # approval flow to rehearse under the mode).
         return True
     if policy.approval_mode != "bounded_recurring":
         # Unreachable under the current schema (CHECK constraint / Literal
