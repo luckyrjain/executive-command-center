@@ -56,6 +56,9 @@ function errorMessage(error: unknown): string {
   }
   if (error.code === 'WORKFLOW_VERSION_CONFLICT') return 'Another version was created for this workflow at the same time. Reload and retry.'
   if (error.code === 'POLICY_NOT_FOUND') return 'That policy ID does not exist in this workspace.'
+  if (error.code === 'OFFLINE') return 'You are offline, so workflows could not be read or created.'
+  if (error.code === 'NETWORK_ERROR') return 'Could not reach the server, so workflows could not be read or created.'
+  if (error.status === 401) return 'Your session is no longer valid. Sign in again to view workflows.'
   return error.message
 }
 
@@ -125,7 +128,7 @@ export default function WorkflowList({ onSelect }: { onSelect: (versionId: strin
       <h2 id="automation-workflow-list-title">Workflows</h2>
 
       {query.isLoading ? <p role="status">Loading workflows…</p> : null}
-      {query.isError ? <div role="alert" className="inline-status error-panel">{query.error.message}</div> : null}
+      {query.isError ? <div role="alert" className="inline-status error-panel">{errorMessage(query.error)}</div> : null}
       {query.data && workflows.length === 0 ? <p className="empty-state">No workflows yet. Draft one below.</p> : null}
 
       <ol className="work-list">
@@ -158,42 +161,53 @@ export default function WorkflowList({ onSelect }: { onSelect: (versionId: strin
         {formError ? <div role="alert" className="inline-status error-panel">{formError}</div> : null}
         {createMutation.isError ? <div role="alert" className="inline-status error-panel">{errorMessage(createMutation.error)}</div> : null}
 
+        {/* These three inputs take their accessible name from their own
+            wrapping label's visible text (WCAG 2.5.3 Label in Name). "Trigger
+            references"/"Policy ID" as `aria-label`s did *not* contain the
+            visible "Trigger references (comma separated)"/"Policy ID (optional
+            -- …)" text, and "Workflow ID" merely duplicated it. */}
         <label>Workflow ID
-          <input aria-label="Workflow ID" required value={workflowId} onChange={(e) => setWorkflowId(e.target.value)} placeholder="e.g. weekly-note-digest" />
+          <input required value={workflowId} onChange={(e) => setWorkflowId(e.target.value)} placeholder="e.g. weekly-note-digest" />
         </label>
         <label>Trigger references (comma separated)
-          <input aria-label="Trigger references" value={triggerRefs} onChange={(e) => setTriggerRefs(e.target.value)} />
+          <input value={triggerRefs} onChange={(e) => setTriggerRefs(e.target.value)} />
         </label>
         <label>Policy ID (optional -- attach after creating one from the Policies tab)
-          <input aria-label="Policy ID" value={policyRef} onChange={(e) => setPolicyRef(e.target.value)} placeholder="policy UUID" />
+          <input value={policyRef} onChange={(e) => setPolicyRef(e.target.value)} placeholder="policy UUID" />
         </label>
 
         <fieldset>
           <legend>Steps</legend>
+          {/* Each step field keeps an `aria-label` -- with several steps in one
+              form, "Step ID" alone would name every step's id field identically
+              -- but the label now *starts with* the field's own visible text and
+              only appends the step number after it ("Step ID for step 1", not
+              "Step 1 ID"), so the visible text is contained in the accessible
+              name as WCAG 2.5.3 requires. */}
           {steps.map((step, index) => (
             <div key={index} className="work-panel automation-step-editor">
               <label>Step ID
-                <input aria-label={`Step ${index + 1} ID`} required value={step.step_id} onChange={(e) => updateStep(index, { step_id: e.target.value })} />
+                <input aria-label={`Step ID for step ${index + 1}`} required value={step.step_id} onChange={(e) => updateStep(index, { step_id: e.target.value })} />
               </label>
               <label>Step type
-                <select aria-label={`Step ${index + 1} type`} value={step.step_type} onChange={(e) => updateStep(index, { step_type: e.target.value as GraphStep['step_type'] })}>
+                <select aria-label={`Step type for step ${index + 1}`} value={step.step_type} onChange={(e) => updateStep(index, { step_type: e.target.value as GraphStep['step_type'] })}>
                   {STEP_TYPES.map((type) => <option key={type} value={type}>{type.replaceAll('_', ' ')}</option>)}
                 </select>
               </label>
               <label>Action reference
-                <input aria-label={`Step ${index + 1} action reference`} value={step.action_ref} onChange={(e) => updateStep(index, { action_ref: e.target.value })} placeholder="e.g. local.create_note" />
+                <input aria-label={`Action reference for step ${index + 1}`} value={step.action_ref} onChange={(e) => updateStep(index, { action_ref: e.target.value })} placeholder="e.g. local.create_note" />
               </label>
               <label>Input mapping (JSON object)
-                <textarea aria-label={`Step ${index + 1} input mapping`} value={step.input_mapping} onChange={(e) => updateStep(index, { input_mapping: e.target.value })} />
+                <textarea aria-label={`Input mapping (JSON object) for step ${index + 1}`} value={step.input_mapping} onChange={(e) => updateStep(index, { input_mapping: e.target.value })} />
               </label>
               <label>On success
-                <input aria-label={`Step ${index + 1} on success`} value={step.on_success} onChange={(e) => updateStep(index, { on_success: e.target.value })} placeholder="succeeded, failed, or another step_id" />
+                <input aria-label={`On success for step ${index + 1}`} value={step.on_success} onChange={(e) => updateStep(index, { on_success: e.target.value })} placeholder="succeeded, failed, or another step_id" />
               </label>
               <label>On failure
-                <input aria-label={`Step ${index + 1} on failure`} value={step.on_failure} onChange={(e) => updateStep(index, { on_failure: e.target.value })} placeholder="succeeded, failed, or another step_id" />
+                <input aria-label={`On failure for step ${index + 1}`} value={step.on_failure} onChange={(e) => updateStep(index, { on_failure: e.target.value })} placeholder="succeeded, failed, or another step_id" />
               </label>
               <label>Compensate reference (action steps only)
-                <input aria-label={`Step ${index + 1} compensate reference`} value={step.compensate_ref} onChange={(e) => updateStep(index, { compensate_ref: e.target.value })} placeholder="a compensation step_id" />
+                <input aria-label={`Compensate reference (action steps only) for step ${index + 1}`} value={step.compensate_ref} onChange={(e) => updateStep(index, { compensate_ref: e.target.value })} placeholder="a compensation step_id" />
               </label>
               {steps.length > 1 ? (
                 <button type="button" onClick={() => setSteps((current) => current.filter((_, i) => i !== index))}>

@@ -85,8 +85,8 @@ describe('WorkflowList', () => {
 
     await waitFor(() => expect(screen.getByText('No workflows yet. Draft one below.')).toBeTruthy())
     fireEvent.change(screen.getByLabelText('Workflow ID'), { target: { value: 'new-flow' } })
-    fireEvent.change(screen.getByLabelText('Step 1 ID'), { target: { value: 's1' } })
-    fireEvent.change(screen.getByLabelText('Step 1 action reference'), { target: { value: 'local.create_note' } })
+    fireEvent.change(screen.getByLabelText('Step ID for step 1'), { target: { value: 's1' } })
+    fireEvent.change(screen.getByLabelText('Action reference for step 1'), { target: { value: 'local.create_note' } })
     fireEvent.click(screen.getByRole('button', { name: 'Create draft' }))
 
     await waitFor(() => expect(onSelect).toHaveBeenCalledWith('new-version-1'))
@@ -104,11 +104,57 @@ describe('WorkflowList', () => {
     await waitFor(() => expect(screen.getByText('No workflows yet. Draft one below.')).toBeTruthy())
 
     fireEvent.change(screen.getByLabelText('Workflow ID'), { target: { value: 'bad-json-flow' } })
-    fireEvent.change(screen.getByLabelText('Step 1 ID'), { target: { value: 's1' } })
-    fireEvent.change(screen.getByLabelText('Step 1 input mapping'), { target: { value: '{not valid json' } })
+    fireEvent.change(screen.getByLabelText('Step ID for step 1'), { target: { value: 's1' } })
+    fireEvent.change(screen.getByLabelText('Input mapping (JSON object) for step 1'), { target: { value: '{not valid json' } })
     fireEvent.click(screen.getByRole('button', { name: 'Create draft' }))
 
     expect(await screen.findByText(/input mapping must be valid JSON/)).toBeTruthy()
+  })
+
+  it('names the visible label text in every control\'s accessible name (WCAG 2.5.3 Label in Name)', async () => {
+    vi.stubGlobal('fetch', vi.fn(() => response({ workflows: [] })))
+    renderList()
+    await waitFor(() => expect(screen.getByText('No workflows yet. Draft one below.')).toBeTruthy())
+
+    // Visible label text is the whole accessible name where no
+    // disambiguation is needed...
+    expect(screen.getByLabelText('Trigger references (comma separated)')).toBeTruthy()
+    expect(screen.getByLabelText('Policy ID (optional -- attach after creating one from the Policies tab)')).toBeTruthy()
+    // ...and is the *prefix* of it where a step number must disambiguate one
+    // of several identical fields. The old "Step 1 ID"/"Step 1 type" names did
+    // not contain their own visible label text at all.
+    for (const [visible, accessible] of [
+      ['Step ID', 'Step ID for step 1'],
+      ['Step type', 'Step type for step 1'],
+      ['Input mapping (JSON object)', 'Input mapping (JSON object) for step 1'],
+      ['Action reference', 'Action reference for step 1'],
+      ['On success', 'On success for step 1'],
+      ['On failure', 'On failure for step 1'],
+      ['Compensate reference (action steps only)', 'Compensate reference (action steps only) for step 1'],
+    ]) {
+      const control = screen.getByLabelText(accessible)
+      expect(control.getAttribute('aria-label')?.startsWith(visible)).toBe(true)
+    }
+  })
+
+  it('maps a failed workflow-list fetch through errorMessage(), never the raw backend message', async () => {
+    // retry: 1 on the list query overrides the client default, so the mock
+    // keeps failing and the wait outlasts React Query's ~1s backoff.
+    vi.stubGlobal('fetch', vi.fn(() => response({ error: { code: 'POLICY_NOT_FOUND', message: 'Policy Not Found' } }, 404)))
+    renderList()
+
+    const alert = await screen.findByRole('alert', {}, { timeout: 3000 })
+    expect(alert.textContent).toContain('That policy ID does not exist in this workspace.')
+    expect(alert.textContent).not.toContain('Policy Not Found')
+    expect(screen.queryByText('No workflows yet. Draft one below.')).toBeNull()
+  })
+
+  it('maps an unreachable server on the workflow list to a readable sentence', async () => {
+    vi.stubGlobal('fetch', vi.fn(() => Promise.reject(new TypeError('fetch failed'))))
+    renderList()
+
+    const alert = await screen.findByRole('alert', {}, { timeout: 3000 })
+    expect(alert.textContent).toContain('Could not reach the server')
   })
 
   it('surfaces SCHEMA_INVALID violations as readable text, never raw JSON', async () => {
@@ -120,7 +166,7 @@ describe('WorkflowList', () => {
     await waitFor(() => expect(screen.getByText('No workflows yet. Draft one below.')).toBeTruthy())
 
     fireEvent.change(screen.getByLabelText('Workflow ID'), { target: { value: 'invalid-flow' } })
-    fireEvent.change(screen.getByLabelText('Step 1 ID'), { target: { value: 's1' } })
+    fireEvent.change(screen.getByLabelText('Step ID for step 1'), { target: { value: 's1' } })
     fireEvent.click(screen.getByRole('button', { name: 'Create draft' }))
 
     expect(await screen.findByText(/action_ref required for action/)).toBeTruthy()

@@ -96,8 +96,8 @@ export async function run({ page, baseURL }) {
   // --- Draft a workflow -----------------------------------------------
   const automationPanel = page.locator('#automation-panel')
   await automationPanel.getByLabel('Workflow ID').fill(WORKFLOW_ID)
-  await automationPanel.getByLabel('Step 1 ID').fill('create-note')
-  await automationPanel.getByLabel('Step 1 action reference').fill('local.create_note')
+  await automationPanel.getByLabel('Step ID for step 1').fill('create-note')
+  await automationPanel.getByLabel('Action reference for step 1').fill('local.create_note')
   await automationPanel.getByRole('button', { name: 'Create draft' }).click()
 
   const detail = automationPanel.locator('section[aria-labelledby="automation-workflow-detail-title"]')
@@ -165,8 +165,8 @@ export async function run({ page, baseURL }) {
   await page.getByRole('tab', { name: 'Policies' }).click()
   await assertNoSeriousAccessibilityViolations(page, { include: '#automation-panel' })
   const policiesPanel = automationPanel.locator('section[aria-labelledby="automation-policy-title"]')
-  await policiesPanel.getByLabel('Policy workflow ID').fill(WORKFLOW_ID)
-  await policiesPanel.getByLabel('Policy count limit').fill('5')
+  await policiesPanel.getByLabel('Workflow ID', { exact: true }).fill(WORKFLOW_ID)
+  await policiesPanel.getByLabel('Count limit', { exact: true }).fill('5')
   await policiesPanel.getByRole('button', { name: 'Create policy' }).click()
   await policiesPanel.getByText(WORKFLOW_ID, { exact: true }).waitFor()
 
@@ -204,7 +204,7 @@ export async function run({ page, baseURL }) {
   await page.getByRole('tab', { name: 'Kill switches' }).click()
   await assertNoSeriousAccessibilityViolations(page, { include: '#automation-panel' })
   const killSwitchPanel = automationPanel.locator('section[aria-labelledby="automation-kill-switch-title"]')
-  await killSwitchPanel.getByLabel('Kill switch reason').fill('incident under investigation')
+  await killSwitchPanel.getByLabel('Reason (optional, recorded on the switch)').fill('incident under investigation')
   await killSwitchPanel.getByLabel('Workflow ID to check').fill(WORKFLOW_ID)
   await killSwitchPanel.getByRole('button', { name: 'Activate for this workflow', exact: true }).click()
   await killSwitchPanel.getByRole('button', { name: 'Check current status' }).click()

@@ -25,6 +25,9 @@ function errorMessage(error: unknown): string {
   if (error.code === 'POLICY_REVOKED') return `This policy was already revoked${details?.revoked_at ? ` at ${new Date(details.revoked_at).toLocaleString()}` : ''}.`
   if (error.code === 'POLICY_EXPIRED') return `This policy already expired${details?.expires_at ? ` at ${new Date(details.expires_at).toLocaleString()}` : ''} and cannot be revoked further.`
   if (error.code === 'POLICY_NOT_FOUND') return 'That policy no longer exists in this workspace.'
+  if (error.code === 'OFFLINE') return 'You are offline, so policies could not be read or changed.'
+  if (error.code === 'NETWORK_ERROR') return 'Could not reach the server, so policies could not be read or changed.'
+  if (error.status === 401) return 'Your session is no longer valid. Sign in again to review policies.'
   return error.message
 }
 
@@ -86,12 +89,20 @@ export default function PolicyPanel() {
     <section className="work-panel" aria-labelledby="automation-policy-title">
       <h2 id="automation-policy-title">Authority &amp; policy review</h2>
 
+      {/* Every input in this panel drops its `aria-label` in favour of its own
+          wrapping label's visible text (WCAG 2.5.3 Label in Name): the old
+          names ("Filter policies by workflow ID", "Policy value limit", …)
+          did not contain the visible text a speech-input user can read, and
+          each visible label is already unique within this panel, so none of
+          them needs extra disambiguating context. `Revoke policy for {id}` on
+          the revoke button below stays -- there it is one visible "Revoke"
+          per row and the visible text *is* a substring of the name. */}
       <label>Filter by workflow ID
-        <input aria-label="Filter policies by workflow ID" value={workflowFilter} onChange={(e) => setWorkflowFilter(e.target.value)} />
+        <input value={workflowFilter} onChange={(e) => setWorkflowFilter(e.target.value)} />
       </label>
 
       {query.isLoading ? <p role="status">Loading policies…</p> : null}
-      {query.isError ? <div role="alert" className="inline-status error-panel">{query.error.message}</div> : null}
+      {query.isError ? <div role="alert" className="inline-status error-panel">{errorMessage(query.error)}</div> : null}
       {query.data && policies.length === 0 ? <p className="empty-state">No policies recorded yet.</p> : null}
       {revokeMutation.isError ? <div role="alert" className="inline-status error-panel">{errorMessage(revokeMutation.error)}</div> : null}
 
@@ -126,27 +137,27 @@ export default function PolicyPanel() {
         {createMutation.isError ? <div role="alert" className="inline-status error-panel">{errorMessage(createMutation.error)}</div> : null}
 
         <label>Workflow ID
-          <input aria-label="Policy workflow ID" required value={draft.workflowId} onChange={(e) => setDraft({ ...draft, workflowId: e.target.value })} />
+          <input required value={draft.workflowId} onChange={(e) => setDraft({ ...draft, workflowId: e.target.value })} />
         </label>
         <label>Action types (comma separated)
-          <input aria-label="Policy action types" value={draft.actionTypes} onChange={(e) => setDraft({ ...draft, actionTypes: e.target.value })} />
+          <input value={draft.actionTypes} onChange={(e) => setDraft({ ...draft, actionTypes: e.target.value })} />
         </label>
         <label>Data classes (comma separated)
-          <input aria-label="Policy data classes" value={draft.dataClasses} onChange={(e) => setDraft({ ...draft, dataClasses: e.target.value })} />
+          <input value={draft.dataClasses} onChange={(e) => setDraft({ ...draft, dataClasses: e.target.value })} />
         </label>
         <label>Value limit
-          <input aria-label="Policy value limit" type="number" min={0} step="0.01" value={draft.valueLimit} onChange={(e) => setDraft({ ...draft, valueLimit: e.target.value })} />
+          <input type="number" min={0} step="0.01" value={draft.valueLimit} onChange={(e) => setDraft({ ...draft, valueLimit: e.target.value })} />
         </label>
         <label>Count limit
-          <input aria-label="Policy count limit" type="number" min={0} step={1} value={draft.countLimit} onChange={(e) => setDraft({ ...draft, countLimit: e.target.value })} />
+          <input type="number" min={0} step={1} value={draft.countLimit} onChange={(e) => setDraft({ ...draft, countLimit: e.target.value })} />
         </label>
         <label>Approval mode
-          <select aria-label="Policy approval mode" value={draft.approvalMode} onChange={(e) => setDraft({ ...draft, approvalMode: e.target.value as ApprovalMode })}>
+          <select value={draft.approvalMode} onChange={(e) => setDraft({ ...draft, approvalMode: e.target.value as ApprovalMode })}>
             {APPROVAL_MODES.map((mode) => <option key={mode} value={mode}>{mode.replaceAll('_', ' ')}</option>)}
           </select>
         </label>
         <label>Schedule note (optional)
-          <input aria-label="Policy schedule note" value={draft.schedule} onChange={(e) => setDraft({ ...draft, schedule: e.target.value })} />
+          <input value={draft.schedule} onChange={(e) => setDraft({ ...draft, schedule: e.target.value })} />
         </label>
         <button type="submit" disabled={pending}>{createMutation.isPending ? 'Creating…' : 'Create policy'}</button>
       </form>
