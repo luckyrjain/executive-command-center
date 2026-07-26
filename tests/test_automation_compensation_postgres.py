@@ -890,6 +890,8 @@ def test_usable_policy_still_compensates_normally(
 
     assert finished.status == "compensated"
     assert undo.execute_calls == 1
+
+
 # ---------------------------------------------------------------------------
 # 8. A *human rejection* triggers the same compensation as an adapter
 #    exception -- the Task 3 x Task 6 seam an adversarial review found open.

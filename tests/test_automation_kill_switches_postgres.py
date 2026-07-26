@@ -627,6 +627,8 @@ def test_kill_switch_rejects_overlong_workflow_id_with_422(
     )
     assert accepted.status_code == 200
     assert accepted.json()["workflow_id"] == at_limit
+
+
 # ---------------------------------------------------------------------------
 # 8. Activation parks already-queued runs, so deactivation never silently
 #    auto-resumes anything (this module's own corrected docstring).
