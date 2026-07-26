@@ -471,6 +471,46 @@ completion, matching this module's existing "an already-dispatched step is
 never force-interrupted" philosophy, generalized to a whole compensation
 sequence rather than one step.
 
+**Compensation dispatch re-checks the run's policy, and must (a real,
+security-relevant bug this fixes).** `_dispatch_compensation_step` reached
+`execute()`/`compensate()` with no policy or approval evaluation of any kind
+-- it went straight from its idempotency check to resolving an adapter and
+calling it. Two independent invariants were violated by that, and each needed
+its own fix, in a different place:
+
+1. **Policy revocation was ignored during rollback.** `APPROVAL-POLICY.md`:
+   "**Revocation** takes effect immediately for any not-yet-started step." A
+   compensation step is not-yet-started right up to the moment its adapter is
+   called, so a policy revoked (or expired, or deleted) at any point after
+   the last ordinary step's own `_evaluate_dispatch_gate` still authorized a
+   real, un-reauthorized side effect. `_dispatch_compensation_step` now calls
+   `_compensation_policy_usable` (the identical `get_policy`/`is_policy_
+   usable` question the gate asks, deliberately re-read from the database
+   rather than cached) before resolving either adapter, and on failure marks
+   the step *and* its ledger row `'failed'` with
+   `error_class='PolicyUnusableDuringCompensation'` without invoking
+   anything.
+2. **The high-impact approval invariant was bypassable by graph
+   construction.** Any adapter with a non-empty `high_impact_categories`
+   "always requires per-run approval regardless of policy mode"
+   (`APPROVAL-POLICY.md`) -- enforced for `action` steps by
+   `_evaluate_dispatch_gate`, and by nothing at all for a `step_type=
+   'compensation'` step, whose `action_ref` was free to name any registered
+   adapter. A low-impact `s0` with `compensate_ref='c0'`, where `c0` named a
+   high-impact adapter, therefore had that adapter's real `execute()` called
+   with zero `approval_requests` rows the moment any later step in the run
+   failed. This one is **not** fixed here: creating an approval request from
+   a compensation step would mean parking a rollback in `waiting_approval`
+   with no approval-inbox surface to resolve it from. It is fixed
+   structurally at publish time instead --
+   `workflows.high_impact_compensation_action_refs` refuses to activate any
+   graph whose compensation step names a high-impact adapter, so the bypass
+   is unreachable by construction for every adapter that will ever be
+   registered, not merely for the ones that exist today.
+
+Neither change alters ordinary action-step dispatch, retries, or
+`_evaluate_dispatch_gate` itself in any way.
+
 **Task 6: a disclosed, real scope boundary -- compensation dispatch is not
 crash-resumable.** `_CLAIMABLE_PREDICATE` is deliberately *not* widened to
 reclaim `status = 'compensating'` rows the way it already is for `'leased'`/
@@ -2015,6 +2055,98 @@ def _qualifying_compensations(
     return qualifying
 
 
+def _compensation_policy_usable(session: Session, run: WorkflowRun) -> bool:
+    """Whether `run`'s authorizing policy still authorizes anything *right
+    now* -- the exact same three-part question `_evaluate_dispatch_gate`
+    asks for an ordinary action step (`run.policy_id` set at all, the named
+    `automation_policies` row still exists, `policy.is_policy_usable`
+    reports `True`), re-asked here because a compensation sequence can begin
+    arbitrarily long after the last time that gate ran.
+
+    Deliberately re-read from the database rather than cached from the
+    gate's earlier evaluation: `APPROVAL-POLICY.md`'s "**Revocation** takes
+    effect immediately for any not-yet-started step" is only true if the
+    revocation is observed by whatever is about to start a step, and a
+    compensation step is by definition not-yet-started at this point. Reads
+    with `policy.get_policy` (no `FOR UPDATE`) -- this is a point-in-time
+    authorization read, not a mutation that needs to serialize against a
+    concurrent `revoke_policy`; under READ COMMITTED it sees every
+    revocation committed before this statement, which is exactly the
+    guarantee that sentence requires. Fails closed on `policy_id is None`
+    and on a missing row, identically to `_evaluate_dispatch_gate`'s own
+    `"no_policy"` branch ("no policy means no authority" -- an unset
+    `policy_id` is never an implicit all-bounded default).
+    """
+    if run.policy_id is None:
+        return False
+    policy_row = policy_module.get_policy(session, run.workspace_id, run.policy_id)
+    if policy_row is None:
+        return False
+    return policy_module.is_policy_usable(policy_row)
+
+
+def _fail_compensation_row(
+    session: Session,
+    run: WorkflowRun,
+    *,
+    original_index: int,
+    compensation_index: int,
+    error_class: str,
+) -> None:
+    """Marks an already-`'dispatched'` compensation step `'failed'` with
+    `error_class`, in both places a compensation outcome is recorded (the
+    `workflow_run_steps` row at the compensation step's own `step_index`
+    *and* the `compensation_steps` ledger row keyed by the *original* step's
+    index), durably commits, and records both metrics -- the shared shape
+    every "this compensation will not execute" branch of `_dispatch_
+    compensation_step` needs. Extracted so a new such branch cannot
+    accidentally update one of the two rows and not the other, which would
+    leave the ledger a human reads for partial-recovery status disagreeing
+    with the step row (`PHASE-005-automation.md`'s "partial compensation is
+    visible" criterion depends on those two never diverging).
+
+    `'failed'`, never `'unknown'`: both statuses are non-`'succeeded'` and
+    so both drive `_run_compensation_sequence` to `'compensation_failed'`,
+    but `'unknown'` means specifically "the side effect may or may not have
+    happened, a human must find out" (this module's crash-in-the-gap case),
+    while every caller of this helper knows for certain the adapter was
+    never invoked at all. Recording that as `'unknown'` would send an
+    operator hunting for an effect that provably does not exist.
+    """
+    now = datetime.now(UTC)
+    session.execute(
+        text(
+            "UPDATE workflow_run_steps SET status = 'failed', error_class = :error_class, "
+            "finished_at = :now, updated_at = :now "
+            f"{_STEP_ROW_WHERE}"
+        ),
+        {
+            "error_class": error_class,
+            "now": now,
+            "workspace_id": run.workspace_id,
+            "run_id": run.id,
+            "step_index": compensation_index,
+        },
+    )
+    session.execute(
+        text(
+            "UPDATE compensation_steps SET status = 'failed', error_class = :error_class, "
+            "finished_at = :now, updated_at = :now WHERE workspace_id = :workspace_id "
+            "AND run_id = :run_id AND compensates_step_index = :original_index"
+        ),
+        {
+            "error_class": error_class,
+            "now": now,
+            "workspace_id": run.workspace_id,
+            "run_id": run.id,
+            "original_index": original_index,
+        },
+    )
+    session.commit()
+    record_step_outcome("failed")
+    record_compensation_outcome("failed")
+
+
 def _dispatch_compensation_step(
     session: Session,
     run: WorkflowRun,
@@ -2036,6 +2168,48 @@ def _dispatch_compensation_step(
     *compensation* step's own `step_id`/`input_mapping` -- it identifies
     *this compensation dispatch attempt*, distinct from the original step
     it is undoing, never the original step's own digest.
+
+    **Policy usability is re-checked at dispatch time, immediately before
+    either adapter is resolved (`_compensation_policy_usable`).** This
+    function does *not* call `_evaluate_dispatch_gate`, and that is
+    deliberate rather than an oversight: that gate's second half creates
+    `approval_requests` rows and returns `StepAwaitingApproval`, a shape
+    this function cannot produce (it returns `StepOutcome`) and a state a
+    compensation step has nowhere to wait in -- there is no approval-inbox
+    surface for a compensation step, so a compensation step routed into
+    `waiting_approval` would strand the run's rollback indefinitely.
+    Building that surface is a genuinely larger design change (approval-inbox
+    UI wiring for compensation specifically) than this fix.
+
+    What is *not* excusable, and is what this check fixes, is the policy
+    half. Before it, a compensation sequence would call a real `execute()`/
+    `compensate()` even when the run's authorizing policy had been revoked
+    (or had expired, or was missing entirely) since the last ordinary step
+    was gated -- directly contradicting `APPROVAL-POLICY.md`'s "**Revocation**
+    takes effect immediately for any not-yet-started step" and `EXECUTION-
+    CONTRACT.md`'s "compensation executes only declared, **authorized**
+    steps." A compensation step is not-yet-started at this point by
+    definition, so a revocation committed at any moment before this check
+    must stop it. On an unusable policy this writes `'failed'` /
+    `error_class='PolicyUnusableDuringCompensation'` to both the step row
+    and the ledger row (`_fail_compensation_row`, which explains the
+    `'failed'`-not-`'unknown'` choice) and returns without touching any
+    adapter -- so `_run_compensation_sequence` sees a non-`'succeeded'`
+    outcome, keeps attempting every remaining qualifying compensation
+    exactly as it does for any other failure (never stopping early), and
+    finishes the run `'compensation_failed'`, which is precisely the
+    "surface partial recovery for human review" outcome an operator needs:
+    the run's effects were not rolled back, and the ledger says why.
+
+    The complementary, structural half of this fix lives at publish time:
+    `workflows.high_impact_compensation_action_refs` rejects any graph whose
+    compensation step names a high-impact adapter at all, so the *approval*
+    invariant this function cannot enforce at dispatch time is instead made
+    unreachable by construction (see `workflows.WorkflowVersionHighImpact
+    CompensationAdapter`'s docstring for the full bug description). This
+    dispatch-time check remains necessary regardless, for the failure mode
+    that one cannot cover: a policy revoked after an entirely legal,
+    low-impact graph was already published.
     """
     resolved_comp_input: dict[str, Any] = compensation_step.get("input_mapping", {})
     digest = compute_action_digest(
@@ -2149,6 +2323,20 @@ def _dispatch_compensation_step(
         # path" requirement.
         session.commit()
 
+    # Policy re-check, before either adapter is resolved and before any
+    # compensating side effect can occur -- see this function's own
+    # docstring ("Policy usability is re-checked at dispatch time") for why
+    # this exists and what it deliberately does not do.
+    if not _compensation_policy_usable(session, run):
+        _fail_compensation_row(
+            session,
+            run,
+            original_index=original_index,
+            compensation_index=compensation_index,
+            error_class="PolicyUnusableDuringCompensation",
+        )
+        return StepOutcome(compensation_index, "failed", None, "PolicyUnusableDuringCompensation")
+
     # The two-shapes judgment call (module docstring): prefer the
     # *original* step's own registered adapter's compensate(), called with
     # the *original* step's own resolved input (matches
@@ -2160,37 +2348,13 @@ def _dispatch_compensation_step(
     compensation_adapter = adapter_registry.get(compensation_step.get("action_ref", ""))
 
     if original_adapter is None and compensation_adapter is None:
-        now = datetime.now(UTC)
-        session.execute(
-            text(
-                "UPDATE workflow_run_steps SET status = 'failed', "
-                "error_class = 'AdapterNotRegistered', finished_at = :now, updated_at = :now "
-                f"{_STEP_ROW_WHERE}"
-            ),
-            {
-                "now": now,
-                "workspace_id": run.workspace_id,
-                "run_id": run.id,
-                "step_index": compensation_index,
-            },
+        _fail_compensation_row(
+            session,
+            run,
+            original_index=original_index,
+            compensation_index=compensation_index,
+            error_class="AdapterNotRegistered",
         )
-        session.execute(
-            text(
-                "UPDATE compensation_steps SET status = 'failed', "
-                "error_class = 'AdapterNotRegistered', finished_at = :now, updated_at = :now "
-                "WHERE workspace_id = :workspace_id AND run_id = :run_id "
-                "AND compensates_step_index = :original_index"
-            ),
-            {
-                "now": now,
-                "workspace_id": run.workspace_id,
-                "run_id": run.id,
-                "original_index": original_index,
-            },
-        )
-        session.commit()
-        record_step_outcome("failed")
-        record_compensation_outcome("failed")
         return StepOutcome(compensation_index, "failed", None, "AdapterNotRegistered")
 
     try:
@@ -2208,38 +2372,13 @@ def _dispatch_compensation_step(
             output_model = compensation_adapter.execute(action_input)
         output_dict = output_model.model_dump(mode="json")
     except Exception as exc:  # noqa: BLE001 -- an adapter may raise any error class
-        now = datetime.now(UTC)
-        session.execute(
-            text(
-                "UPDATE workflow_run_steps SET status = 'failed', error_class = :error_class, "
-                "finished_at = :now, updated_at = :now "
-                f"{_STEP_ROW_WHERE}"
-            ),
-            {
-                "error_class": type(exc).__name__,
-                "now": now,
-                "workspace_id": run.workspace_id,
-                "run_id": run.id,
-                "step_index": compensation_index,
-            },
+        _fail_compensation_row(
+            session,
+            run,
+            original_index=original_index,
+            compensation_index=compensation_index,
+            error_class=type(exc).__name__,
         )
-        session.execute(
-            text(
-                "UPDATE compensation_steps SET status = 'failed', error_class = :error_class, "
-                "finished_at = :now, updated_at = :now WHERE workspace_id = :workspace_id "
-                "AND run_id = :run_id AND compensates_step_index = :original_index"
-            ),
-            {
-                "error_class": type(exc).__name__,
-                "now": now,
-                "workspace_id": run.workspace_id,
-                "run_id": run.id,
-                "original_index": original_index,
-            },
-        )
-        session.commit()
-        record_step_outcome("failed")
-        record_compensation_outcome("failed")
         return StepOutcome(compensation_index, "failed", None, type(exc).__name__)
 
     now = datetime.now(UTC)
@@ -2291,6 +2430,19 @@ def _run_compensation_sequence(
     requested_at`/kill-switch are deliberately never re-checked here --
     module docstring's "once compensation starts, it runs to its own
     completion" note.
+
+    A compensation blocked by an unusable policy
+    (`_dispatch_compensation_step`'s `_compensation_policy_usable` check,
+    `error_class='PolicyUnusableDuringCompensation'`) is deliberately just
+    another non-`'succeeded'` `StepOutcome` here and needs no branch of its
+    own: this loop's "never stop early" guarantee is what makes every
+    remaining qualifying compensation still get attempted and recorded, so a
+    human reading `compensation_steps` sees one blocked row per compensation
+    that was supposed to run rather than one blocked row and then silence.
+    Every subsequent iteration will re-read the same revoked policy and block
+    identically, which is the intended outcome -- the run finishes
+    `'compensation_failed'` with a complete, per-step explanation of why
+    nothing was rolled back.
     """
     all_succeeded = True
     for original_index, original_step, compensation_index, compensation_step in qualifying:

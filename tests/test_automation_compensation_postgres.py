@@ -21,6 +21,15 @@ per this task's own required minimum:
    own `compensate()` is preferred when the adapter declares one, called
    with the *original* step's own resolved input (not the compensation
    step's); a distinct compensation-step adapter is used otherwise.
+7. The dispatch-time half of the compensation approval-gate-bypass fix
+   (`worker._compensation_policy_usable`): a policy revoked mid-run blocks
+   compensation dispatch entirely -- the compensation adapter's
+   `execute()`/`compensate()` is never called, and both the step row and the
+   `compensation_steps` ledger row record `'failed'` /
+   `'PolicyUnusableDuringCompensation'`. The complementary publish-time half
+   (`workflows.high_impact_compensation_action_refs`, which rejects a
+   compensation step naming a high-impact adapter outright) is covered in
+   `test_automation_workflows_postgres.py`, since it never dispatches a run.
 """
 
 from __future__ import annotations
@@ -155,6 +164,94 @@ class FailingCompensationAdapter:
     def compensate(self, action_input: EchoInput) -> EchoOutput:  # noqa: D102
         self.compensate_calls += 1
         raise RuntimeError("compensation blew up")
+
+
+class PolicyRevokingFailingAdapter:
+    """Fails the step that triggers compensation, and -- immediately before
+    raising, from its own separate session/transaction -- revokes the run's
+    authorizing policy. This is how "the policy is revoked *mid-run*, after
+    every ordinary step's own `_evaluate_dispatch_gate` already passed, but
+    before compensation dispatches" is expressed deterministically in a
+    single-threaded test: `process_claimed_run` drives a whole run to a
+    terminal state inside one call, so the only place to interpose a
+    concurrent policy change is inside an adapter the worker itself invokes.
+
+    Uses a fresh `SessionFactory()` session deliberately, not the worker's:
+    the revocation must be *committed by someone else* for the worker's own
+    later `get_policy` read to see it, which is exactly the real-world shape
+    (an operator hitting `POST /policies/{id}/revoke` while a run is in
+    flight). Safe against lock contention because the worker's session has
+    no open transaction at this moment -- `run_step` committed the step's
+    `'dispatched'` row before calling `execute()` (this module's
+    digest-before-execute discipline) -- and because `get_policy` never takes
+    `FOR UPDATE`.
+    """
+
+    def __init__(
+        self, adapter_id: str, *, workspace_id: UUID, policy_id: UUID, actor_id: UUID
+    ) -> None:
+        self.adapter_id = adapter_id
+        self.input_schema = EchoInput
+        self.output_schema = EchoOutput
+        self.reversible = True
+        self.high_impact_categories: frozenset[str] = frozenset()
+        self.execute_calls = 0
+        self._workspace_id = workspace_id
+        self._policy_id = policy_id
+        self._actor_id = actor_id
+
+    def simulate(self, action_input: EchoInput) -> EchoOutput:  # noqa: D102
+        return EchoOutput(value=action_input.value)
+
+    def execute(self, action_input: EchoInput) -> EchoOutput:  # noqa: D102
+        self.execute_calls += 1
+        with SessionFactory() as session, session.begin():
+            revoked = automation_policy.revoke_policy(
+                session, self._workspace_id, self._actor_id, self._policy_id
+            )
+        assert isinstance(revoked, automation_policy.AutomationPolicy)
+        assert revoked.revoked_at is not None
+        raise RuntimeError("this step always fails, and revoked the policy on its way out")
+
+
+class HighImpactUndoAdapter:
+    """A compensation-step adapter that declares a non-empty
+    `high_impact_categories` -- the shape every other fake in this module
+    deliberately does not have (they all declare `frozenset()`), and the
+    shape the compensation approval-gate-bypass bug turned into an
+    unapproved real execution.
+
+    Registered under the *compensation* step's own `action_ref` and
+    declaring no `compensate()`, so `_dispatch_compensation_step` resolves
+    the fallback shape and would call this adapter's ordinary `execute()`.
+    `execute_calls` staying at 0 is the assertion that matters: it is direct
+    evidence no side effect occurred, not merely that a status column says
+    so.
+
+    A graph naming this adapter from a compensation step could no longer be
+    published through `publish_workflow_endpoint` (that is fix 1's
+    publish-time rejection, covered in `test_automation_workflows_
+    postgres.py`). This module's `_publish_workflow` calls
+    `activate_workflow_version` *without* an `adapter_registry`, which is
+    exactly how an already-published, pre-fix workflow behaves -- so this is
+    a faithful stand-in for the existing rows the dispatch-time check has to
+    protect, not a contrived bypass.
+    """
+
+    def __init__(self, adapter_id: str) -> None:
+        self.adapter_id = adapter_id
+        self.input_schema = EchoInput
+        self.output_schema = EchoOutput
+        self.reversible = False
+        self.high_impact_categories: frozenset[str] = frozenset({"person-directed"})
+        self.execute_calls = 0
+
+    def simulate(self, action_input: EchoInput) -> EchoOutput:  # noqa: D102
+        return EchoOutput(value=action_input.value)
+
+    def execute(self, action_input: EchoInput) -> EchoOutput:  # noqa: D102
+        self.execute_calls += 1
+        return EchoOutput(value=f"undone:{action_input.value}")
 
 
 class DedicatedUndoAdapter:
@@ -571,3 +668,153 @@ def test_original_adapter_without_compensate_falls_back_to_dedicated_undo_adapte
     assert finished.status == "compensated"
     assert undo.execute_calls == 1
     assert undo.last_executed_value == "from-comp-step"
+
+
+# ---------------------------------------------------------------------------
+# 7. A policy revoked mid-run blocks compensation dispatch entirely
+#    (`worker._compensation_policy_usable`).
+#
+#    The bug: `_dispatch_compensation_step` called `execute()`/`compensate()`
+#    with no policy check of any kind, so a policy revoked after the last
+#    ordinary step was gated still produced a real, un-reauthorized side
+#    effect -- contradicting `APPROVAL-POLICY.md`'s "Revocation takes effect
+#    immediately for any not-yet-started step" and `EXECUTION-CONTRACT.md`'s
+#    "compensation executes only declared, *authorized* steps." Worse, the
+#    compensation step's `action_ref` was free to name a high-impact adapter,
+#    so what ran unapproved could be exactly the class of action that
+#    "always requires per-run approval regardless of policy mode."
+# ---------------------------------------------------------------------------
+
+
+def test_policy_revoked_mid_run_blocks_compensation_and_never_calls_the_adapter(
+    compensation_test_context: tuple[UUID, UUID],
+) -> None:
+    """`s1` (low-impact, no `compensate()`) succeeds with `compensate_ref=
+    'c1'`; `s2` revokes the run's policy and then fails, triggering
+    compensation; `c1` names a *high-impact* adapter -- precisely the
+    gate-bypass scenario. The compensation must not execute: the adapter is
+    never called, and both the `workflow_run_steps` row and the
+    `compensation_steps` ledger row record `'failed'` /
+    `'PolicyUnusableDuringCompensation'`, with the run ending
+    `'compensation_failed'` for human review rather than `'compensated'`.
+    """
+    workspace_id, user_id = compensation_test_context
+    workflow_id = f"test.revoked-mid-run.{uuid4().hex}"
+    graph = _linear_graph(
+        _action_step("s1", "test.s1", compensate_ref="c1", input_mapping={"value": "original"}),
+        _action_step("s2", "test.s2"),
+        _compensation_step("c1", "test.undo-s1", input_mapping={"value": "undo-me"}),
+    )
+    version = _publish_workflow(workspace_id, user_id, workflow_id, graph)
+    assert version.policy_ref is not None
+
+    s1 = SucceedingAdapter("test.s1")  # no compensate() -> fallback shape
+    s2 = PolicyRevokingFailingAdapter(
+        "test.s2", workspace_id=workspace_id, policy_id=version.policy_ref, actor_id=user_id
+    )
+    undo = HighImpactUndoAdapter("test.undo-s1")
+    registry = _make_registry(s1, s2, undo)
+
+    finished = _run_to_completion(workspace_id, user_id, workflow_id, registry)
+
+    # Both ordinary steps really did dispatch (their own gate passed while
+    # the policy was still usable) -- this is a mid-run revocation, not a
+    # run that was never authorized at all.
+    assert s1.execute_calls == 1
+    assert s2.execute_calls == 1
+
+    # The compensation adapter was never invoked. This, not a status column,
+    # is the real proof no unapproved side effect occurred.
+    assert undo.execute_calls == 0
+
+    assert finished.status == "compensation_failed"
+
+    with SessionFactory() as session:
+        steps = automation_worker.list_run_steps(session, workspace_id, finished.id)
+        ledger = automation_worker.list_compensation_steps(session, workspace_id, finished.id)
+
+    comp_step = next(step for step in steps if step.step_type == "compensation")
+    assert comp_step.step_index == 2
+    assert comp_step.status == "failed"
+    assert comp_step.error_class == "PolicyUnusableDuringCompensation"
+    assert comp_step.output is None
+
+    # The ledger a human reads for partial-recovery status agrees with the
+    # step row -- the two must never diverge.
+    assert len(ledger) == 1
+    assert ledger[0].compensates_step_index == 0
+    assert ledger[0].status == "failed"
+    assert ledger[0].error_class == "PolicyUnusableDuringCompensation"
+
+
+def test_policy_revoked_mid_run_blocks_every_qualifying_compensation_not_just_the_first(
+    compensation_test_context: tuple[UUID, UUID],
+) -> None:
+    """`_run_compensation_sequence`'s "never stop early, keep attempting
+    every qualifying compensation" guarantee must survive the new blocked
+    outcome: two qualifying compensations both get their own attempt, so a
+    human sees one blocked ledger row per compensation that was supposed to
+    run rather than one blocked row and then silence.
+    """
+    workspace_id, user_id = compensation_test_context
+    workflow_id = f"test.revoked-mid-run-two.{uuid4().hex}"
+    graph = _linear_graph(
+        _action_step("s1", "test.s1", compensate_ref="c1"),
+        _action_step("s2", "test.s2", compensate_ref="c2"),
+        _action_step("s3", "test.s3"),
+        _compensation_step("c1", "test.undo-s1"),
+        _compensation_step("c2", "test.undo-s2"),
+    )
+    version = _publish_workflow(workspace_id, user_id, workflow_id, graph)
+    assert version.policy_ref is not None
+
+    s1 = SucceedingAdapter("test.s1")
+    s2 = SucceedingAdapter("test.s2")
+    s3 = PolicyRevokingFailingAdapter(
+        "test.s3", workspace_id=workspace_id, policy_id=version.policy_ref, actor_id=user_id
+    )
+    undo1 = HighImpactUndoAdapter("test.undo-s1")
+    undo2 = HighImpactUndoAdapter("test.undo-s2")
+    registry = _make_registry(s1, s2, s3, undo1, undo2)
+
+    finished = _run_to_completion(workspace_id, user_id, workflow_id, registry)
+
+    assert finished.status == "compensation_failed"
+    assert undo1.execute_calls == 0
+    assert undo2.execute_calls == 0
+
+    with SessionFactory() as session:
+        ledger = automation_worker.list_compensation_steps(session, workspace_id, finished.id)
+    assert [(row.compensates_step_index, row.status, row.error_class) for row in ledger] == [
+        (0, "failed", "PolicyUnusableDuringCompensation"),
+        (1, "failed", "PolicyUnusableDuringCompensation"),
+    ]
+
+
+def test_usable_policy_still_compensates_normally(
+    compensation_test_context: tuple[UUID, UUID],
+) -> None:
+    """Negative control for the new check: the same graph shape as the
+    revocation test, with the policy left untouched, still compensates and
+    ends `'compensated'` -- so a failing revocation test is evidence about
+    the policy check specifically, not about compensation dispatch being
+    broken in general.
+    """
+    workspace_id, user_id = compensation_test_context
+    workflow_id = f"test.policy-usable-comp.{uuid4().hex}"
+    graph = _linear_graph(
+        _action_step("s1", "test.s1", compensate_ref="c1"),
+        _action_step("s2", "test.s2"),
+        _compensation_step("c1", "test.undo-s1", input_mapping={"value": "undo-me"}),
+    )
+    _publish_workflow(workspace_id, user_id, workflow_id, graph)
+
+    s1 = SucceedingAdapter("test.s1")
+    s2 = FailingAdapter("test.s2")
+    undo = DedicatedUndoAdapter("test.undo-s1")
+    registry = _make_registry(s1, s2, undo)
+
+    finished = _run_to_completion(workspace_id, user_id, workflow_id, registry)
+
+    assert finished.status == "compensated"
+    assert undo.execute_calls == 1
