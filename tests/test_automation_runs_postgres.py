@@ -435,6 +435,15 @@ def test_get_run_endpoint_returns_detail_with_step_state(
     assert len(body["steps"]) == 1
     assert body["steps"][0]["status"] == "succeeded"
     assert body["steps"][0]["output"] == {"value": ""}
+    # Task 7: attempt_count (workflow_run_steps, Task 6) was never wired
+    # into this response before now -- a real gap found while building the
+    # "retrying" run-detail UI, closed as a pure response-shape addition.
+    assert body["steps"][0]["attempt_count"] == 0
+    # Found during my own independent review of Task 7's PR: action_ref was
+    # never surfaced at all, so an approver had no way to see the actual
+    # target (which adapter/action) a step invokes -- resolved at read time
+    # from the run's own pinned (workflow_id, workflow_version) graph.
+    assert body["steps"][0]["action_ref"] == adapter.adapter_id
 
 
 def test_get_run_endpoint_unknown_id_is_404(

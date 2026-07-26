@@ -18,6 +18,8 @@ import * as attentionQueue from './scenarios/attention-queue.mjs'
 import * as attentionPlanning from './scenarios/attention-planning.mjs'
 import * as attentionMeetingPrep from './scenarios/attention-meeting-prep.mjs'
 import * as attentionExplanation from './scenarios/attention-explanation.mjs'
+import * as automationLifecycle from './scenarios/automation-lifecycle.mjs'
+import * as automationApprovalsKeyboard from './scenarios/automation-approvals-keyboard.mjs'
 
 const scenarios = [
   { name: 'tasks', module: tasks },
@@ -49,6 +51,8 @@ const scenarios = [
   // Attention Queue behaviorally unaffected, not just that the enabled case
   // works). See that scenario's docstring for why this is env-var-gated.
   { name: `attention-explanation (AI runtime ${process.env.AI_EXPLANATIONS_ENABLED === '0' ? 'off' : 'on'})`, module: attentionExplanation },
+  { name: 'automation-lifecycle', module: automationLifecycle },
+  { name: 'automation-approvals-keyboard', module: automationApprovalsKeyboard },
 ]
 
 async function main() {

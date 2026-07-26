@@ -40,15 +40,16 @@ describe('WorkspaceNavigation', () => {
     expect(markup).toContain('Knowledge')
     expect(markup).toContain('Recommendations')
     expect(markup).toContain('Search &amp; audit')
+    expect(markup).toContain('Automation')
     expect(markup.match(/aria-selected="true"/g)).toHaveLength(1)
   })
 
   it('moves focus with horizontal arrow keys and wraps at either end', () => {
-    expect(nextWorkspaceIndex(0, 'ArrowRight', 11)).toBe(1)
-    expect(nextWorkspaceIndex(10, 'ArrowRight', 11)).toBe(0)
-    expect(nextWorkspaceIndex(0, 'ArrowLeft', 11)).toBe(10)
-    expect(nextWorkspaceIndex(3, 'Home', 11)).toBe(0)
-    expect(nextWorkspaceIndex(3, 'End', 11)).toBe(10)
+    expect(nextWorkspaceIndex(0, 'ArrowRight', 12)).toBe(1)
+    expect(nextWorkspaceIndex(11, 'ArrowRight', 12)).toBe(0)
+    expect(nextWorkspaceIndex(0, 'ArrowLeft', 12)).toBe(11)
+    expect(nextWorkspaceIndex(3, 'Home', 12)).toBe(0)
+    expect(nextWorkspaceIndex(3, 'End', 12)).toBe(11)
 
     const focus = [vi.fn(), vi.fn()]
     const navigate = vi.fn()
@@ -69,16 +70,16 @@ describe('WorkspaceNavigation', () => {
     expect(tabs[0].tabIndex).toBe(-1)
 
     expect(fireEvent.keyDown(tabs[1], { key: 'End' })).toBe(false)
-    expect(document.activeElement).toBe(tabs[10])
-    expect(tabs[10].getAttribute('aria-selected')).toBe('true')
+    expect(document.activeElement).toBe(tabs[11])
+    expect(tabs[11].getAttribute('aria-selected')).toBe('true')
 
-    expect(fireEvent.keyDown(tabs[10], { key: 'Home' })).toBe(false)
+    expect(fireEvent.keyDown(tabs[11], { key: 'Home' })).toBe(false)
     expect(document.activeElement).toBe(tabs[0])
     expect(tabs[0].getAttribute('aria-selected')).toBe('true')
 
     expect(fireEvent.keyDown(tabs[0], { key: 'ArrowLeft' })).toBe(false)
-    expect(document.activeElement).toBe(tabs[10])
-    expect(tabs[10].tabIndex).toBe(0)
+    expect(document.activeElement).toBe(tabs[11])
+    expect(tabs[11].tabIndex).toBe(0)
     expect(tabs.filter((tab) => tab.getAttribute('aria-selected') === 'true')).toHaveLength(1)
   })
 

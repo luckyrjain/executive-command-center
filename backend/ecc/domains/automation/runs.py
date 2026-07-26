@@ -97,6 +97,7 @@ from ecc.observability import (
 )
 
 from . import worker as worker_module
+from . import workflows as workflows_module
 from .worker import (
     RunStatus,
     WorkflowRun,
@@ -132,6 +133,30 @@ class RunStepResponse(BaseModel):
     step_type: str
     status: str
     action_digest: str | None
+    # Task 7 addition: `workflow_run_steps.attempt_count` (Task 6) was never
+    # wired into this response before now -- a real, small, disclosed gap
+    # found while building the "retrying" UX-STATES.md state (`status ==
+    # "retrying"` alone tells a caller a step is retrying, but not which
+    # attempt, out of `MAX_RETRY_ATTEMPTS`, it's on). `worker.
+    # WorkflowRunStep` already carries this field; this is a pure response-
+    # shape addition, no new query.
+    attempt_count: int
+    # Found during my own independent review of this task's PR: `UX-
+    # STATES.md`'s own approval-decision requirement ("the exact target ...
+    # shown before the approve action is reachable") was not actually met --
+    # this response carried `step_type` (a generic `'action'`/`'approval_
+    # gate'`/...) and the raw redacted `input`, but never *which* adapter/
+    # action a step invokes, so an approver had no way to see the actual
+    # target of what they were authorizing. `workflow_run_steps` itself has
+    # no `action_ref` column (only `workflow_versions.graph` does, resolved
+    # at dispatch time and never persisted onto the row) -- resolved here at
+    # read time instead, from the run's own pinned `(workflow_id,
+    # workflow_version)` graph, no migration needed. `None` for a step whose
+    # `step_type` has no `action_ref` at all (`approval_gate`/`condition`) or
+    # whose pinned version could not be resolved (should not happen for any
+    # run that ever dispatched a step, since dispatch itself requires the
+    # version to exist -- a defensive `None`, not an assumed invariant).
+    action_ref: str | None
     input: dict[str, Any]
     output: dict[str, Any] | None
     started_at: datetime | None
@@ -203,18 +228,44 @@ def _to_response(run: WorkflowRun) -> RunResponse:
     )
 
 
-def _step_to_response(step: WorkflowRunStep) -> RunStepResponse:
+def _step_to_response(
+    step: WorkflowRunStep, action_ref_by_index: dict[int, str]
+) -> RunStepResponse:
     return RunStepResponse(
         step_index=step.step_index,
         step_type=step.step_type,
         status=step.status,
         action_digest=step.action_digest,
+        attempt_count=step.attempt_count,
+        action_ref=action_ref_by_index.get(step.step_index),
         input=step.input,
         output=step.output,
         started_at=step.started_at,
         finished_at=step.finished_at,
         error_class=step.error_class,
     )
+
+
+def _action_ref_by_step_index(session: Session, run: WorkflowRun) -> dict[int, str]:
+    """Resolves every step's own `action_ref` from the run's pinned
+    `(workflow_id, workflow_version)` graph -- the same immutable graph
+    `worker.run_step` itself dispatches against, so this is a genuine
+    reflection of what each step actually invokes, not a guess. Returns an
+    empty map (never raises) if the pinned version cannot be resolved --
+    `RunStepResponse.action_ref` degrades to `None` per its own docstring
+    rather than failing the whole run-detail request over a display-only
+    field.
+    """
+    version = workflows_module.get_workflow_version(
+        session, run.workspace_id, run.workflow_id, run.workflow_version
+    )
+    if version is None:
+        return {}
+    return {
+        index: step["action_ref"]
+        for index, step in enumerate(version.graph.get("steps", []))
+        if step.get("action_ref")
+    }
 
 
 def _compensation_step_to_response(
@@ -234,11 +285,12 @@ def _to_detail_response(
     run: WorkflowRun,
     steps: list[WorkflowRunStep],
     compensation_steps: list[worker_module.CompensationStep],
+    action_ref_by_index: dict[int, str],
 ) -> RunDetailResponse:
     base = _to_response(run)
     return RunDetailResponse(
         **base.model_dump(),
-        steps=[_step_to_response(s) for s in steps],
+        steps=[_step_to_response(s, action_ref_by_index) for s in steps],
         compensation_steps=[_compensation_step_to_response(c) for c in compensation_steps],
     )
 
@@ -419,7 +471,8 @@ def get_run_endpoint(run_id: UUID, auth: AuthDep, session: SessionDep) -> RunDet
         raise HTTPException(status_code=404, detail="RUN_NOT_FOUND")
     steps = worker_module.list_run_steps(session, auth.workspace_id, run_id)
     compensation_steps = worker_module.list_compensation_steps(session, auth.workspace_id, run_id)
-    return _to_detail_response(run, steps, compensation_steps)
+    action_ref_by_index = _action_ref_by_step_index(session, run)
+    return _to_detail_response(run, steps, compensation_steps, action_ref_by_index)
 
 
 @router.post("/runs", response_model=RunResponse, status_code=status.HTTP_201_CREATED)
