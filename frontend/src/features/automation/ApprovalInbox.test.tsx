@@ -168,6 +168,72 @@ describe('ApprovalInbox', () => {
     expect(fetch.mock.calls[2][0]).toContain('/approvals/approval-1/reject')
   })
 
+  // The two tests below cover the *server's* own 409 codes. The
+  // 'surfaces approval_expired as a distinct state' test above is a
+  // client-side test: it feeds the component an already-past `expires_at` and
+  // asserts the computed-expiry path (EXPIRED badge, both buttons disabled),
+  // which never issues a request at all. `errorMessage`'s
+  // APPROVAL_EXPIRED/APPROVAL_ALREADY_DECIDED branches were consequently
+  // implemented but unexercised -- and they are reachable in exactly the
+  // situations where the client-side check is *wrong*, which is when a
+  // readable message matters most. UX-STATES.md requires both
+  // ("additionally handling the server's own `APPROVAL_EXPIRED`/
+  // `APPROVAL_ALREADY_DECIDED`/`DIGEST_MISMATCH` responses as distinct,
+  // specific messages -- never a generic error string"); only DIGEST_MISMATCH
+  // had a test.
+  it('surfaces the server\'s APPROVAL_ALREADY_DECIDED 409 as its own specific message, not the raw backend message', async () => {
+    // The race this covers: two humans open the inbox, one approves, the
+    // other's still-rendered card says `pending`. Nothing client-side can
+    // detect that -- `isExpired`/`decided` are both computed from the stale
+    // list payload -- so the only signal is the server's 409. Without the
+    // mapping, the second operator sees `main._error_payload`'s title-cased
+    // fallback ("Approval Already Decided") and cannot tell whether their own
+    // click landed, which invites a retry against a request that is already
+    // resolved.
+    const fetch = vi.fn()
+      .mockImplementationOnce(() => response({ approvals: [pendingApproval] }))
+      .mockImplementationOnce(() => response(runDetail))
+      .mockImplementationOnce(() => response({ error: { code: 'APPROVAL_ALREADY_DECIDED', message: 'Approval Already Decided', details: { decision: 'approved', decided_at: '2026-07-25T01:00:00Z' } } }, 409))
+    vi.stubGlobal('fetch', fetch)
+    renderInbox()
+
+    await waitFor(() => expect(screen.getByText(/Run run-1 · step 0/)).toBeTruthy())
+    fireEvent.change(screen.getByLabelText('Echo action digest for run run-1 step 0'), { target: { value: 'digest-abc123' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Approve' }))
+
+    // The mapped sentence names *which* decision already happened -- the one
+    // fact that tells the operator whether to act further.
+    expect(await screen.findByText(/This approval was already approved/)).toBeTruthy()
+    // And never the raw backend message alongside or instead of it.
+    expect(screen.queryByText('Approval Already Decided')).toBeNull()
+  })
+
+  it('surfaces the server\'s APPROVAL_EXPIRED 409 even when the client still believes the approval is live', async () => {
+    // `pendingApproval.expires_at` is deliberately left in the future, so
+    // `isExpired` is false, the EXPIRED badge is absent and both buttons are
+    // enabled -- the component genuinely believes this request is decidable.
+    // That is the whole point: client and server compute expiry from
+    // different clocks (`approvals.approval_lifecycle_status` is authoritative
+    // and evaluated at decision time), so this branch is reachable only in
+    // the disagreement case the client-side test above cannot produce.
+    // Rejecting is used rather than approving because reject needs no digest,
+    // which keeps this test about the error mapping alone.
+    const fetch = vi.fn()
+      .mockImplementationOnce(() => response({ approvals: [pendingApproval] }))
+      .mockImplementationOnce(() => response(runDetail))
+      .mockImplementationOnce(() => response({ error: { code: 'APPROVAL_EXPIRED', message: 'Approval Expired', details: { expires_at: '2026-07-26T00:00:00Z' } } }, 409))
+    vi.stubGlobal('fetch', fetch)
+    renderInbox()
+
+    await waitFor(() => expect(screen.getByText(/Run run-1 · step 0/)).toBeTruthy())
+    expect(screen.queryByText(/EXPIRED/)).toBeNull()
+    expect((screen.getByRole('button', { name: 'Reject' }) as HTMLButtonElement).disabled).toBe(false)
+    fireEvent.click(screen.getByRole('button', { name: 'Reject' }))
+
+    expect(await screen.findByText(/This approval expired.*and can no longer be decided/)).toBeTruthy()
+    expect(screen.queryByText('Approval Expired')).toBeNull()
+  })
+
   it('shows the empty state when nothing is pending', async () => {
     vi.stubGlobal('fetch', vi.fn(() => response({ approvals: [] })))
     renderInbox()

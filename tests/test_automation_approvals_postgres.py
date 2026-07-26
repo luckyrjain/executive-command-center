@@ -13,6 +13,13 @@ Dispatch-path wiring (the gate actually inserted into `worker.run_step`,
 including "an adapter's `execute()` is never called while a step awaits
 approval") is covered in `tests/test_automation_worker_postgres.py`
 instead, alongside the rest of that module's own worker-level fixtures.
+
+Plus one gap closed by the test-coverage audit: **cross-workspace isolation
+for `POST /approvals/{id}/reject`**. Only `/approve` had that test, and
+`/approve` is the half that carries a second, independent defence (the
+echoed `action_digest`); `/reject` takes an empty body and terminally fails
+the victim's run. See `test_reject_is_rejected_across_workspaces`' own
+docstring for the full reasoning.
 """
 
 from __future__ import annotations
@@ -779,3 +786,123 @@ def test_approvals_are_isolated_across_workspaces(
                 text("DELETE FROM users WHERE workspace_id = :id"), {"id": workspace_b}
             )
             connection.execute(text("DELETE FROM workspaces WHERE id = :id"), {"id": workspace_b})
+
+
+def test_reject_is_rejected_across_workspaces(
+    approval_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    """The cross-workspace half of `POST /approvals/{id}/reject`, which had
+    none before this test -- `test_approvals_are_isolated_across_workspaces`
+    above covers the list route and `/approve`, but not `/reject`.
+
+    The asymmetry mattered more than it looks. `/approve` carries a second,
+    independent defence: the caller must echo the request's own
+    `action_digest`, so even a workspace-scoping regression would leave a
+    cross-workspace approve blocked by `DIGEST_MISMATCH` for anyone who could
+    not also read the victim's digest. `/reject` takes an **empty body** by
+    design (`reject_endpoint`'s own `_EmptyBody`) -- there is nothing to echo
+    and nothing to guess. A regression that dropped `auth.workspace_id` from
+    `decide_approval`'s lookup would therefore be caught by the existing
+    approve test only incidentally, and not at all for reject.
+
+    The consequence is terminal, not merely noisy. A rejection is not a
+    no-op: `approvals._advance_run_after_decision` writes the rejected step
+    as a real `'failed'` `workflow_run_steps` row and re-queues the run, so
+    the next poll cycle drives the victim's run to `'failed'` (or through
+    compensation), with `execute()` never called. One unauthenticated-to-this-
+    workspace request would permanently kill someone else's in-flight run.
+
+    404 `APPROVAL_NOT_FOUND` -- the same response an id that never existed
+    gets -- so the route never confirms the approval is real, matching the
+    `/approve` assertion's own shape and this codebase's isolation
+    convention.
+    """
+    client, workspace_a, user_a, token_a = approval_test_context
+    workflow_id = f"test.isolation-reject.{uuid4().hex}"
+    _publish_high_impact_workflow(workspace_a, user_a, workflow_id)
+    run, pending, adapter = _pause_run_awaiting_approval(workspace_a, user_a, workflow_id)
+
+    workspace_b = uuid4()
+    user_b = uuid4()
+    token_b = f"session-{uuid4()}"
+    now = datetime.now(UTC)
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO workspaces (id, name, timezone, created_at) "
+                "VALUES (:id, 'Approval Reject Isolation Peer', 'Asia/Kolkata', :now)"
+            ),
+            {"id": workspace_b, "now": now},
+        )
+        connection.execute(
+            text(
+                "INSERT INTO users (id, workspace_id, email, password_hash, created_at) "
+                "VALUES (:id, :workspace_id, :email, 'test-password-hash', :now)"
+            ),
+            {
+                "id": user_b,
+                "workspace_id": workspace_b,
+                "email": f"{user_b}@example.test",
+                "now": now,
+            },
+        )
+        connection.execute(
+            text(
+                "INSERT INTO sessions (id, workspace_id, user_id, token_hash, "
+                "expires_at, last_seen_at) "
+                "VALUES (:id, :workspace_id, :user_id, :token_hash, :expires_at, :now)"
+            ),
+            {
+                "id": uuid4(),
+                "workspace_id": workspace_b,
+                "user_id": user_b,
+                "token_hash": sha256(token_b.encode()).hexdigest(),
+                "expires_at": now + timedelta(hours=1),
+                "now": now,
+            },
+        )
+
+    other_client = TestClient(app)
+    other_client.cookies.set("ecc_session", token_b)
+    try:
+        reject_response = other_client.post(
+            f"/api/v1/automations/approvals/{pending.id}/reject",
+            headers=_headers(token_b, key="cross-workspace-reject"),
+        )
+        assert reject_response.status_code == 404
+        assert reject_response.json()["error"]["code"] == "APPROVAL_NOT_FOUND"
+    finally:
+        other_client.close()
+        _cleanup_workspace(workspace_b)
+
+    # The refused call had no effect of any kind on the victim: the request is
+    # still undecided and the run is still parked awaiting a decision from its
+    # own workspace, not re-queued toward 'failed'. Asserting the *run* too,
+    # not only the approval row, is what makes this a test about the
+    # consequence rather than about a status column -- a partial write that
+    # left the approval pending but re-queued the run would still be a
+    # cross-workspace kill.
+    with SessionFactory() as session:
+        still_pending = automation_approvals.get_pending_approval(
+            session, workspace_a, run.id, pending.step_index
+        )
+        victim_run = automation_worker.get_run(session, workspace_a, run.id)
+        victim_steps = automation_worker.list_run_steps(session, workspace_a, run.id)
+    assert still_pending is not None
+    assert still_pending.id == pending.id
+    assert still_pending.status == "pending"
+    assert victim_run is not None
+    assert victim_run.status == "waiting_approval"
+    # No `'failed'`/`ApprovalRejected` step row was written -- the specific
+    # trace a landed cross-workspace rejection would have left behind.
+    assert [step for step in victim_steps if step.status == "failed"] == []
+    assert adapter.execute_calls == 0
+
+    # Still decidable by its real owner, so the 404 above was about
+    # authorization and not about the request having become undecidable.
+    own_reject = client.post(
+        f"/api/v1/automations/approvals/{pending.id}/reject",
+        headers=_headers(token_a, key="own-workspace-reject"),
+    )
+    assert own_reject.status_code == 200, own_reject.text
+    assert own_reject.json()["status"] == "rejected"

@@ -25,6 +25,19 @@ the other graph-validation and publish-endpoint coverage, rather than in
 `test_automation_compensation_postgres.py` -- they are publish-path
 properties and never dispatch a run. The dispatch-time half of that same fix
 (`worker._compensation_policy_usable`) is covered in that other module.
+
+Plus two gaps closed by the test-coverage audit, both about `POST
+/workflows/{id}/disable` -- the route that had only same-workspace 409
+coverage while its sibling `/publish` had both:
+
+6. **Cross-workspace disable** is a 404, so workspace B cannot retire
+   workspace A's active version (a denial of service against a running
+   automation, strictly more consequential than the cross-workspace publish
+   already covered).
+7. **`Idempotency-Key` replay on disable, and `IDEMPOTENCY_CONFLICT` when one
+   key is reused across `/publish` and `/disable`** -- this module's own
+   hand-copied `_request_hash`/`_load_cached` pair had a replay test for
+   `POST /workflows` only and no conflict test of any kind.
 """
 
 from collections.abc import Iterator
@@ -1297,6 +1310,232 @@ def test_workflow_is_hidden_across_workspaces(
     finally:
         other_client.close()
         _cleanup_workspace(other_workspace_id)
+
+
+def test_disable_is_rejected_across_workspaces(
+    workflow_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    """The cross-workspace half of `POST /workflows/{id}/disable`, which had
+    only same-workspace coverage (`test_disable_draft_workflow_is_workflow_
+    not_active`'s 409) before this test.
+
+    `test_workflow_is_hidden_across_workspaces` above already proves this
+    property for `/publish`; leaving `/disable` uncovered meant the two
+    sibling routes -- written together, sharing `_load_cached`/`_write_side_
+    effects`/`session.begin()` scaffolding, and differing only in which
+    domain function they call -- had asymmetric protection. A regression that
+    dropped `auth.workspace_id` from `disable_workflow_version`'s own
+    `WHERE` clause (or reordered its not-found check after the mutation)
+    would be caught for publish and pass silently for disable.
+
+    Disable is the more consequential of the pair to leave open. Publishing
+    someone else's draft activates a version they wrote and would have
+    activated anyway; disabling their *active* version is an unauthenticated
+    denial of service against a running automation -- every subsequent
+    `enqueue_run` for that workflow fails `WORKFLOW_NOT_ACTIVE`, with the
+    only trace being an `audit_events` row attributed to a user in a
+    different workspace.
+
+    404, not 403: `WORKFLOW_NOT_FOUND` is the same response an id that never
+    existed gets, so the route never confirms to workspace B that this
+    version id is real -- the identical shape `/publish`'s own isolation
+    assertion pins.
+    """
+    client, _workspace_id, _user_id, token = workflow_test_context
+    workflow_id = f"test.cross-workspace-disable.{uuid4().hex}"
+    created = client.post(
+        "/api/v1/automations/workflows",
+        json={"workflow_id": workflow_id, "graph": _valid_graph(), "trigger_refs": []},
+        headers=_headers(token, key="cross-disable-create"),
+    ).json()
+    published = client.post(
+        f"/api/v1/automations/workflows/{created['id']}/publish",
+        headers=_headers(token, key="cross-disable-publish"),
+    )
+    assert published.status_code == 200, published.text
+    assert published.json()["status"] == "active"
+
+    other_workspace_id = uuid4()
+    other_user_id = uuid4()
+    other_token = f"session-{uuid4()}"
+    now = datetime.now(UTC)
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO workspaces (id, name, timezone, created_at) "
+                "VALUES (:id, 'Disable Isolation Peer', 'UTC', :now)"
+            ),
+            {"id": other_workspace_id, "now": now},
+        )
+        connection.execute(
+            text(
+                "INSERT INTO users (id, workspace_id, email, password_hash, created_at) "
+                "VALUES (:id, :workspace_id, :email, 'hash', :now)"
+            ),
+            {
+                "id": other_user_id,
+                "workspace_id": other_workspace_id,
+                "email": f"{other_user_id}@example.test",
+                "now": now,
+            },
+        )
+        connection.execute(
+            text(
+                "INSERT INTO sessions (id, workspace_id, user_id, token_hash, "
+                "expires_at, last_seen_at) "
+                "VALUES (:id, :workspace_id, :user_id, :token_hash, :expires_at, :now)"
+            ),
+            {
+                "id": uuid4(),
+                "workspace_id": other_workspace_id,
+                "user_id": other_user_id,
+                "token_hash": sha256(other_token.encode()).hexdigest(),
+                "expires_at": now + timedelta(hours=1),
+                "now": now,
+            },
+        )
+    other_client = TestClient(app)
+    other_client.cookies.set("ecc_session", other_token)
+    try:
+        disable_response = other_client.post(
+            f"/api/v1/automations/workflows/{created['id']}/disable",
+            headers=_headers(other_token, key="cross-disable-1"),
+        )
+        assert disable_response.status_code == 404
+        assert disable_response.json()["error"]["code"] == "WORKFLOW_NOT_FOUND"
+    finally:
+        other_client.close()
+        _cleanup_workspace(other_workspace_id)
+
+    # The version really is still active in its own workspace -- the refused
+    # call had no partial effect, and the owning workspace can still disable
+    # it itself (so the 404 above was about authorization, not about the row
+    # having become undisableable).
+    with SessionFactory() as session:
+        still_active = automation_workflows.get_workflow_version_by_id(
+            session, _workspace_id, UUID(created["id"])
+        )
+    assert still_active is not None
+    assert still_active.status == "active"
+
+    own_disable = client.post(
+        f"/api/v1/automations/workflows/{created['id']}/disable",
+        headers=_headers(token, key="cross-disable-own"),
+    )
+    assert own_disable.status_code == 200, own_disable.text
+    assert own_disable.json()["status"] == "retired"
+
+
+# ---------------------------------------------------------------------------
+# Idempotency-Key handling on POST /workflows/{id}/disable.
+#
+# Added by the test-coverage audit: this module had a replay test for
+# `POST /workflows` only (`test_create_workflow_idempotency_replay_returns_
+# identical_response`) and no conflict test of any kind. Disable is the
+# mutating route worth covering next -- creating a draft twice is harmless,
+# while disable retires the version every `enqueue_run` resolves against.
+# ---------------------------------------------------------------------------
+
+
+def test_disable_workflow_idempotency_key_replays_cached_response(
+    workflow_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    """A retried disable under the same key replays the first 200 rather than
+    surfacing the `409 WORKFLOW_NOT_ACTIVE` that a genuine second disable
+    attempt correctly produces (`test_disable_draft_workflow_is_workflow_not_
+    active` covers that other case).
+
+    Same reasoning as the policy-revoke replay test: disable is a
+    stop-the-automation action, so the retry-after-a-dropped-response path is
+    exactly the one an operator exercises under pressure, and a 409 there is
+    indistinguishable from "someone else disabled this" -- ambiguity about
+    whose intent took effect, at the worst possible moment.
+
+    The `retired` status and `version` are compared field-by-field rather
+    than just checking two 200s, because the replay must return the *same*
+    row's state: `_load_cached` deserializing into `WorkflowVersionResponse`
+    is a hand-copied helper in this module, and a mismatch between what was
+    cached and what is replayed is the failure mode a status-code-only
+    assertion misses entirely.
+    """
+    client, _workspace_id, _user_id, token = workflow_test_context
+    workflow_id = f"test.http-disable-idempotent.{uuid4().hex}"
+    created = client.post(
+        "/api/v1/automations/workflows",
+        json={"workflow_id": workflow_id, "graph": _valid_graph(), "trigger_refs": []},
+        headers=_headers(token, key="disable-idempotent-create"),
+    ).json()
+    client.post(
+        f"/api/v1/automations/workflows/{created['id']}/publish",
+        headers=_headers(token, key="disable-idempotent-publish"),
+    )
+
+    headers = _headers(token, key="off-retry-key")
+    first = client.post(f"/api/v1/automations/workflows/{created['id']}/disable", headers=headers)
+    second = client.post(f"/api/v1/automations/workflows/{created['id']}/disable", headers=headers)
+
+    assert first.status_code == 200, first.text
+    assert second.status_code == 200, second.text
+    ignored = {"request_id", "correlation_id"}
+    first_body = {k: v for k, v in first.json().items() if k not in ignored}
+    second_body = {k: v for k, v in second.json().items() if k not in ignored}
+    assert first_body == second_body
+    assert first_body["status"] == "retired"
+
+
+def test_publish_then_disable_under_one_key_is_idempotency_conflict(
+    workflow_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    """Both `/publish` and `/disable` take an empty body, so the *action*
+    string (`f"publish:{version_id}"` vs `f"disable:{version_id}"`) is the
+    only thing separating their request hashes. Reusing one key across the
+    two must 409 `IDEMPOTENCY_CONFLICT`.
+
+    The regression this guards is the mirror image of the policy-revoke
+    conflict test's: if the action prefix were ever dropped from
+    `_request_hash`'s material -- an easy "these two endpoints hash the same
+    empty body, why compute it twice" edit -- then a disable issued under a
+    key already used to publish the same version would return the cached
+    *publish* response. The caller would be told the version is `active`
+    while the disable it asked for never happened, which is the strictly
+    worse direction of the two: an operator believes an automation was left
+    running when they actually failed to stop it, or vice versa, with no
+    error anywhere to prompt a re-check.
+
+    The persisted state is asserted, not just the 409, so this test fails on a
+    silently-applied second write as well as on a silent replay.
+    """
+    from ecc.observability import render_metrics
+
+    client, _workspace_id, _user_id, token = workflow_test_context
+    workflow_id = f"test.http-publish-disable-key.{uuid4().hex}"
+    created = client.post(
+        "/api/v1/automations/workflows",
+        json={"workflow_id": workflow_id, "graph": _valid_graph(), "trigger_refs": []},
+        headers=_headers(token, key="publish-disable-create"),
+    ).json()
+
+    headers = _headers(token, key="publish-disable-shared-key")
+    published = client.post(
+        f"/api/v1/automations/workflows/{created['id']}/publish", headers=headers
+    )
+    assert published.status_code == 200, published.text
+    assert published.json()["status"] == "active"
+
+    conflicting = client.post(
+        f"/api/v1/automations/workflows/{created['id']}/disable", headers=headers
+    )
+    assert conflicting.status_code == 409
+    assert conflicting.json()["error"]["code"] == "IDEMPOTENCY_CONFLICT"
+    assert 'ecc_idempotency_conflicts_total{domain="automation_workflows"}' in render_metrics()
+
+    # Neither a replay nor a write: the version is still active.
+    with SessionFactory() as session:
+        persisted = automation_workflows.get_workflow_version_by_id(
+            session, _workspace_id, UUID(created["id"])
+        )
+    assert persisted is not None
+    assert persisted.status == "active"
 
 
 def test_create_workflow_rejects_nonexistent_policy_ref(

@@ -6,6 +6,13 @@ Covers: policy creation (90-day default expiry, required non-nullable
 policy_usable`, `revoke_policy`'s state transitions (application layer),
 the DB-level `NOT NULL`/`CHECK` backstops, HTTP endpoints, and
 cross-workspace isolation.
+
+Plus, added by the test-coverage audit that found this module had no
+`Idempotency-Key` coverage of either kind: same-key replay and same-key-
+different-request `IDEMPOTENCY_CONFLICT` on `POST /policies/{id}/revoke` --
+the one policy mutation whose effect is immediate and run-affecting. See
+that section's own header comment for why `policy.py`'s independently
+hand-copied idempotency helpers make sibling-module coverage worthless here.
 """
 
 from collections.abc import Iterator
@@ -707,3 +714,140 @@ def test_policy_is_hidden_across_workspaces(
     finally:
         other_client.close()
         _cleanup_workspace(other_workspace_id)
+
+
+# ---------------------------------------------------------------------------
+# Idempotency-Key handling on POST /policies/{id}/revoke.
+#
+# Added by the test-coverage audit: this module had zero idempotency coverage
+# of either kind, despite `policy.py` carrying its own hand-copied
+# `_request_hash`/`_load_cached`/`_store_idempotency` trio (every Phase 5
+# module has an independent copy, so a passing test in `runs.py`'s or
+# `approvals.py`'s module proves nothing here). Revoke is the endpoint worth
+# covering first: it is the one policy mutation with an immediate, run-
+# affecting side effect -- `APPROVAL-POLICY.md`'s "Revocation takes effect
+# immediately for any not-yet-started step", enforced by
+# `worker._evaluate_dispatch_gate` and `worker._compensation_policy_usable`.
+# ---------------------------------------------------------------------------
+
+
+def test_revoke_policy_idempotency_key_replays_cached_response(
+    policy_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    """A retried revoke under the same `Idempotency-Key` must replay the
+    first call's 200 body, not surface the `409 POLICY_REVOKED` that a
+    *genuine* second revoke attempt correctly produces
+    (`test_revoke_policy_twice_is_policy_revoked` covers that other case,
+    with two distinct keys).
+
+    The distinction matters operationally, not just cosmetically: revoking a
+    policy is what an operator does to stop a misbehaving automation, and the
+    HTTP client retry that follows a dropped response is exactly when this
+    path runs. A client that receives 409 for its own retry cannot tell
+    "my revoke landed and this is my own retry" apart from "someone else
+    already revoked this, so my intent may not be what took effect" -- and
+    the safe-looking reaction to the ambiguity (re-check, re-issue) is how a
+    real incident acquires extra noise at its worst moment.
+
+    `version` is asserted unchanged across the replay because `revoke_policy`
+    bumps it on every real write: a replay that reached the domain function
+    instead of the cache would be visible there even if the response body
+    happened to look similar.
+    """
+    client, _workspace_id, _user_id, token = policy_test_context
+    workflow_id = f"test.http-revoke-idempotent.{uuid4().hex}"
+    _create_workflow_via_api(client, token, workflow_id)
+    created = client.post(
+        "/api/v1/automations/policies",
+        json={
+            "workflow_id": workflow_id,
+            "value_limit": "1",
+            "count_limit": 1,
+            "approval_mode": "per_run",
+        },
+        headers=_headers(token, key="revoke-idempotent-create"),
+    ).json()
+
+    headers = _headers(token, key="revoke-retry-key")
+    first = client.post(f"/api/v1/automations/policies/{created['id']}/revoke", headers=headers)
+    second = client.post(f"/api/v1/automations/policies/{created['id']}/revoke", headers=headers)
+
+    assert first.status_code == 200, first.text
+    assert second.status_code == 200, second.text
+    ignored = {"request_id", "correlation_id"}
+    first_body = {k: v for k, v in first.json().items() if k not in ignored}
+    second_body = {k: v for k, v in second.json().items() if k not in ignored}
+    assert first_body == second_body
+    assert first_body["status"] == "revoked"
+
+    # Exactly one real revoke write happened: `revoke_policy` bumps `version`
+    # on every write, so a second write would be visible as version 3.
+    listed = client.get("/api/v1/automations/policies", params={"workflow_id": workflow_id}).json()
+    persisted = next(p for p in listed["policies"] if p["id"] == created["id"])
+    assert persisted["version"] == first_body["version"]
+    assert persisted["revoked_at"] == first_body["revoked_at"]
+
+
+def test_revoke_policy_same_key_different_policy_is_idempotency_conflict(
+    policy_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    """`revoke_policy_endpoint`'s request hash is built from an *empty* body
+    plus the action string `f"revoke:{policy_id}"`, so the `policy_id` path
+    parameter is the only thing distinguishing two revoke requests. Reusing
+    one key across two different policies must therefore 409
+    `IDEMPOTENCY_CONFLICT`.
+
+    This is the conflict case for an endpoint whose body cannot vary at all,
+    and it is the one that guards a genuinely dangerous regression: if the
+    `policy_id` were ever dropped from the hash material (a plausible
+    "simplify this" edit, since every other endpoint's hash is dominated by
+    its body), revoking policy B under a key already used for policy A would
+    silently return A's cached response -- reporting policy B as revoked
+    while B stays active and its workflow keeps dispatching. A test asserting
+    only same-key/same-request replay would pass throughout that regression.
+    """
+    from ecc.observability import render_metrics
+
+    client, _workspace_id, _user_id, token = policy_test_context
+    workflow_id = f"test.http-revoke-two-policies.{uuid4().hex}"
+    _create_workflow_via_api(client, token, workflow_id)
+
+    def _create_policy(key: str) -> dict[str, object]:
+        response = client.post(
+            "/api/v1/automations/policies",
+            json={
+                "workflow_id": workflow_id,
+                "value_limit": "1",
+                "count_limit": 1,
+                "approval_mode": "per_run",
+            },
+            headers=_headers(token, key=key),
+        )
+        assert response.status_code == 201, response.text
+        return response.json()
+
+    policy_a = _create_policy("revoke-conflict-create-a")
+    policy_b = _create_policy("revoke-conflict-create-b")
+    assert policy_a["id"] != policy_b["id"]
+
+    headers = _headers(token, key="revoke-conflict-shared-key")
+    revoked_a = client.post(
+        f"/api/v1/automations/policies/{policy_a['id']}/revoke", headers=headers
+    )
+    assert revoked_a.status_code == 200, revoked_a.text
+    assert revoked_a.json()["status"] == "revoked"
+
+    conflicting = client.post(
+        f"/api/v1/automations/policies/{policy_b['id']}/revoke", headers=headers
+    )
+    assert conflicting.status_code == 409
+    assert conflicting.json()["error"]["code"] == "IDEMPOTENCY_CONFLICT"
+    assert 'ecc_idempotency_conflicts_total{domain="automation_policy"}' in render_metrics()
+
+    # The load-bearing half: policy B was never touched. A silent replay of
+    # A's response would have reported B as revoked while leaving it usable.
+    listed = client.get("/api/v1/automations/policies", params={"workflow_id": workflow_id}).json()
+    by_id = {p["id"]: p for p in listed["policies"]}
+    assert by_id[policy_a["id"]]["status"] == "revoked"
+    assert by_id[policy_b["id"]]["status"] == "active"
+    assert by_id[policy_b["id"]]["revoked_at"] is None

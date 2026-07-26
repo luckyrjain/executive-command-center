@@ -244,4 +244,44 @@ describe('RunWorkspace', () => {
 
     await waitFor(() => expect(screen.getByRole('button', { name: 'Resume' })).toBeTruthy())
   })
+
+  it('shows a readable message when Resume is refused with RUN_NOT_PAUSED', async () => {
+    // UX-STATES.md's Paused row requires Pause/Resume to be offered "per
+    // `RUN_NOT_PAUSED`'s own error surface, mapped to a readable message".
+    // `errorMessage`'s RUN_NOT_PAUSED branch was implemented but had no test:
+    // every existing mutation-error test in this file goes through the
+    // *create-run* mutation (KILL_SWITCH_ACTIVE, RATE_LIMITED), which is a
+    // different `useMutation` in a different component (`RunWorkspace`'s own,
+    // not `RunDetailView`'s). So the run-control error panel -- a separate
+    // `mutate.isError` render site -- was never exercised at all.
+    //
+    // The scenario is real and not rare: this view renders whatever the last
+    // fetch returned, so a run that was `paused` when the detail loaded can be
+    // reclaimed and back to `running` by the time a human clicks Resume. The
+    // mapped message must name the status the server actually found
+    // (`details.status`), because "cannot be resumed" alone leaves the
+    // operator unable to tell "it already restarted on its own" from "it
+    // reached a terminal state and my rollback plan needs to change".
+    const pausedRun: Run = { ...baseRun, status: 'paused' }
+    const pausedDetail: RunDetail = { ...pausedRun, steps: [], compensation_steps: [] }
+    // Call order mirrors the pause test above: initial list, initial detail,
+    // kill-switch status (the policies query stays disabled -- it is gated on
+    // `needs_review`), then the resume POST that fails.
+    const fetch = vi.fn()
+      .mockImplementationOnce(() => response({ runs: [pausedRun] }))
+      .mockImplementationOnce(() => response(pausedDetail))
+      .mockImplementationOnce(() => response(noSwitch))
+      .mockImplementationOnce(() => response({ error: { code: 'RUN_NOT_PAUSED', message: 'Run Not Paused', details: { status: 'running' } } }, 409))
+    vi.stubGlobal('fetch', fetch)
+    renderWorkspace()
+
+    await waitFor(() => expect(screen.getByRole('button', { name: 'View' })).toBeTruthy())
+    fireEvent.click(screen.getByRole('button', { name: 'View' }))
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Resume' })).toBeTruthy())
+    fireEvent.click(screen.getByRole('button', { name: 'Resume' }))
+
+    expect(await screen.findByText('This run is running, so it cannot be resumed.')).toBeTruthy()
+    // Never the backend's own title-cased fallback message.
+    expect(screen.queryByText('Run Not Paused')).toBeNull()
+  })
 })

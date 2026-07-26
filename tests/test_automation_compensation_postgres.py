@@ -42,6 +42,16 @@ mechanic joins up with the rest of the run-state machine:
    `'compensating'` -- `_mark_compensating` is lease-guarded, and
    `'compensating'` with a `NULL` lease is a state no claim predicate ever
    reclaims (`worker.py`'s "Lease-ownership guard" section).
+
+Plus one added by the test-coverage audit:
+
+10. **A genuinely mixed ledger** -- one compensation succeeds and a
+    *different* one fails inside a single sequence, and the persisted
+    `compensation_steps` ledger records both outcomes. Every test above
+    exercises a uniform ledger (all-succeeded, all-blocked, or a single row),
+    none of which can distinguish `_run_compensation_sequence`'s "never stop
+    early" guarantee from an early exit after the first failure. See that
+    test's own docstring for the case-by-case reasoning.
 """
 
 from __future__ import annotations
@@ -1059,3 +1069,107 @@ def test_a_lease_lost_mid_execute_never_strands_the_run_in_compensating(
         cancelled = automation_worker.cancel_run(session, workspace_id, queued.id)
     assert isinstance(cancelled, automation_worker.WorkflowRun)
     assert cancelled.status == "cancelled"
+
+
+# ---------------------------------------------------------------------------
+# 10. A genuinely MIXED compensation ledger -- one succeeded row and one
+#     failed row from a single compensation sequence.
+# ---------------------------------------------------------------------------
+
+
+def test_a_mixed_compensation_sequence_records_both_outcomes_in_the_ledger(
+    compensation_test_context: tuple[UUID, UUID],
+) -> None:
+    """The direct assertion for `_run_compensation_sequence`'s "never stop
+    early, keep attempting every qualifying compensation" guarantee, which no
+    existing test in this module actually pinned against a *mixed* ledger.
+
+    What was already covered, and why none of it catches the regression:
+
+    - Test 2/6 (`compensated`): every compensation succeeds -- an early-exit
+      bug is unreachable because there is no failure to exit on.
+    - Test 4 (`compensation_failed`): exactly *one* qualifying compensation
+      exists, so "stopped after the first failure" and "attempted all of
+      them" produce byte-identical ledgers.
+    - Test 3 (descending order): two qualifying compensations, but both
+      succeed, and the assertion is a `dispatch_log` list built by the fake
+      adapters themselves -- it proves call order, not that the persisted
+      ledger a human reads records each outcome.
+    - Test 7's second case (both blocked by a revoked policy): two rows, but
+      both `'failed'` with the *same* `error_class`, so it cannot distinguish
+      "each compensation was independently evaluated" from "the first
+      failure's outcome was copied onto the rest."
+
+    This test closes that: two qualifying compensations where the **first one
+    attempted fails and the second succeeds**. Dispatch order is descending
+    by original step index (`_qualifying_compensations`), so `s2`'s
+    compensation -- the one whose adapter raises -- runs first, and `s1`'s --
+    the one that succeeds -- runs second. An early-exit regression therefore
+    loses a compensation that *would have worked*: the ledger drops to a
+    single failed row, `s1.compensate_calls` stays 0, and a real side effect
+    stays un-rolled-back with nothing in the ledger to tell a human it was
+    ever supposed to be undone. That is the concrete harm the "so partial
+    compensation is visible" guarantee exists to prevent, and this is the
+    only ordering in which a stop-early bug is observable at all.
+
+    The same test also pins the reverse mistake in `all_succeeded`'s
+    bookkeeping: the *last* compensation attempted here succeeds, so a
+    regression that recomputed the flag per-iteration rather than latching it
+    would report the run `'compensated'` -- claiming a complete rollback while
+    the ledger holds a failed row. Both the run status and the ledger are
+    asserted for exactly that reason; neither alone is sufficient.
+    """
+    workspace_id, user_id = compensation_test_context
+    workflow_id = f"test.mixed-compensation.{uuid4().hex}"
+    # s1's compensation succeeds; s2's raises. Descending dispatch order means
+    # s2's failure is encountered *before* s1's compensation is attempted.
+    s1 = CompensatableAdapter("test.s1")
+    s2 = FailingCompensationAdapter("test.s2")
+    s3 = FailingAdapter("test.s3")
+    graph = _linear_graph(
+        _action_step("s1", "test.s1", compensate_ref="c1", input_mapping={"value": "first"}),
+        _action_step("s2", "test.s2", compensate_ref="c2", input_mapping={"value": "second"}),
+        _action_step("s3", "test.s3"),
+        _compensation_step("c1", "test.s1"),
+        _compensation_step("c2", "test.s2"),
+    )
+    _publish_workflow(workspace_id, user_id, workflow_id, graph)
+    registry = _make_registry(s1, s2, s3)
+
+    finished = _run_to_completion(workspace_id, user_id, workflow_id, registry)
+
+    # Both compensations were genuinely attempted -- the second one only runs
+    # at all if the sequence did not stop on the first one's exception.
+    assert s2.compensate_calls == 1
+    assert s1.compensate_calls == 1
+    assert s1.last_compensated_value == "first"
+
+    # One failure anywhere in the sequence is enough for compensation_failed,
+    # even though the chronologically last compensation succeeded.
+    assert finished.status == "compensation_failed"
+
+    with SessionFactory() as session:
+        steps = automation_worker.list_run_steps(session, workspace_id, finished.id)
+        ledger = automation_worker.list_compensation_steps(session, workspace_id, finished.id)
+
+    # The ledger -- the artefact a human reads to decide what still needs
+    # manual rollback -- holds exactly one succeeded row and one failed row,
+    # each attributed to the original step it was supposed to undo.
+    assert [(row.compensates_step_index, row.status) for row in ledger] == [
+        (0, "succeeded"),
+        (1, "failed"),
+    ]
+    assert sum(1 for row in ledger if row.status == "succeeded") == 1
+    assert sum(1 for row in ledger if row.status == "failed") == 1
+    failed_row = next(row for row in ledger if row.status == "failed")
+    assert failed_row.error_class == "RuntimeError"
+    succeeded_row = next(row for row in ledger if row.status == "succeeded")
+    assert succeeded_row.error_class is None
+
+    # The `workflow_run_steps` rows agree with the ledger row-for-row -- the
+    # two tables must never diverge, and a mixed sequence is the case where a
+    # copy-the-last-outcome bug in either writer would show up.
+    comp_steps = {step.step_index: step for step in steps if step.step_type == "compensation"}
+    assert comp_steps[3].status == "succeeded"  # c1, compensating s1
+    assert comp_steps[4].status == "failed"  # c2, compensating s2
+    assert comp_steps[4].error_class == "RuntimeError"
