@@ -165,6 +165,13 @@ LifecycleStatus = Literal["pending", "approved", "rejected", "expired"]
 
 _APPROVAL_EXPIRY_HOURS = 24
 
+# The `workflow_run_steps.error_class` a human rejection writes onto the
+# step it declined (`_advance_run_after_decision`'s own docstring). Named
+# rather than inlined so `worker.py`'s own `'failed'`-outcome handling and
+# this module's tests refer to one definition -- the same "exactly one place
+# this value lives" discipline `worker.py` applies to its own constants.
+_REJECTED_STEP_ERROR_CLASS = "ApprovalRejected"
+
 _APPROVAL_FIELDS = """
     id, workspace_id, run_id, step_index, action_digest, high_impact_categories,
     status, requested_at, expires_at, decided_at, decision, decided_by,
@@ -486,15 +493,21 @@ def decide_approval(
         ),
         {"decision": decision, "now": now, "actor_id": actor_id, "id": approval_id},
     )
-    # Unblocks (approved) or terminates (rejected) the run this request
-    # gates, in the same uncommitted unit of work as the decision itself --
-    # folded into decide_approval (rather than left for each call site to
-    # remember) so every caller, HTTP or direct, gets correct run-
+    # Unblocks (approved) or fails-with-rollback (rejected) the run this
+    # request gates, in the same uncommitted unit of work as the decision
+    # itself -- folded into decide_approval (rather than left for each call
+    # site to remember) so every caller, HTTP or direct, gets correct run-
     # advancement for free. See _advance_run_after_decision's own docstring
     # for why this is a run_id/step_index-scoped raw-SQL helper rather than
-    # a call into worker.py (circular import).
+    # a call into worker.py (circular import), and for why a rejection
+    # re-queues the run instead of terminating it here.
     _advance_run_after_decision(
-        session, workspace_id, approval.run_id, approval.step_index, decision
+        session,
+        workspace_id,
+        approval.run_id,
+        approval.step_index,
+        approval.action_digest,
+        decision,
     )
     result = get_approval(session, workspace_id, approval_id)
     assert result is not None
@@ -705,19 +718,22 @@ def _write_side_effects(
 
 
 def _advance_run_after_decision(
-    session: Session, workspace_id: UUID, run_id: UUID, step_index: int, decision: Decision
+    session: Session,
+    workspace_id: UUID,
+    run_id: UUID,
+    step_index: int,
+    action_digest: str,
+    decision: Decision,
 ) -> None:
-    """Unblocks (or terminates) the run this decision applies to. Written
-    as its own small raw-SQL helper directly against `workflow_runs`,
-    rather than importing `worker.py`'s own row-mutating functions, to
-    avoid a circular import: `worker.py` already imports this module (its
-    dispatch gate calls `evaluate_approval_requirement`/`create_approval_
-    request`/`get_pending_approval`/`get_approved_request`), so this
-    module cannot import `worker.py` back. The SQL here is intentionally
-    minimal and does not need `worker.py`'s `WorkflowRun` dataclass or its
-    read helpers -- it only ever needs to flip one row's `status` (and, for
-    rejection, the same terminal-transition shape `worker._finish_run`
-    already uses: clear the lease, stamp `finished_at`).
+    """Unblocks (or fails, with rollback) the run this decision applies to.
+    Written as its own small raw-SQL helper directly against
+    `workflow_runs`/`workflow_run_steps`, rather than importing `worker.py`'s
+    own row-mutating functions, to avoid a circular import: `worker.py`
+    already imports this module (its dispatch gate calls `evaluate_approval_
+    requirement`/`create_approval_request`/`get_pending_approval`/`get_
+    approved_request`), so this module cannot import `worker.py` back. The
+    SQL here is intentionally minimal and does not need `worker.py`'s
+    `WorkflowRun` dataclass or its read helpers.
 
     Only acts if the run is still exactly `waiting_approval` **and** still
     paused at this exact `step_index` -- an approval decided for a step the
@@ -725,15 +741,62 @@ def _advance_run_after_decision(
     reachable in this task's own scope, since a run only ever pauses on
     its own `current_step_index` -- somehow advanced independently) is a
     no-op here, never a stale resurrection of a run that moved on for a
-    different reason. `approved` sends the run back to `queued`
-    (`claim_next_run`'s ordinary claim predicate picks it up on its next
-    poll cycle -- reusing the existing claim/poll machinery entirely,
-    exactly as this task's own instructions frame "a later poll cycle ...
-    re-enters `process_claimed_run` and finds the approval already
-    satisfied"); `rejected` sends it straight to `failed` (a human declined
-    this action -- there is nothing left to resume, matching how an
-    adapter's own raised exception also produces `failed`, not
-    `needs_review`, for a definitively-classified, not ambiguous, outcome).
+    different reason.
+
+    **Both decisions send the run back to `'queued'`, and neither
+    terminates it here.** `approved` always did: `claim_next_run`'s ordinary
+    claim predicate picks it up on the next poll cycle, `run_step`'s gate
+    re-evaluates for the same step, finds the now-`approved` row matching
+    the live digest, and dispatches -- reusing the existing claim/poll
+    machinery entirely, with no resume-specific code path.
+
+    `rejected` now does the same thing, and this is the fix to a real
+    Task 3 x Task 6 seam bug an adversarial review found. This branch used
+    to write `status = 'failed'` directly, justified by "matching how an
+    adapter's own raised exception also produces `failed`" -- a
+    justification Task 6 silently invalidated when it routed
+    adapter-exception failures through `worker._qualifying_compensations`/
+    `_mark_compensating`/`_run_compensation_sequence` instead. The result
+    was that an identical step failing by accident (an adapter raised) got
+    its already-succeeded predecessors compensated, while the same step
+    failing because **a human explicitly said no** did not -- the more
+    consequential case getting strictly worse handling, and no rollback of
+    real side effects an operator had just declined to build on.
+
+    Rather than duplicating Task 6's compensation-qualifying logic here (or
+    importing it, which the circular import above forbids, or extracting it
+    to a third module, which would split one cohesive mechanic across two
+    files for one call site), this writes the *one* fact `worker.py` needs
+    in order to reach that logic through its own existing, single code
+    path, and hands the run back to the poll loop:
+
+    1. A `workflow_run_steps` row for the rejected `step_index` at
+       `status='failed'`, `error_class='ApprovalRejected'`, carrying the
+       approval's own `action_digest`. (The gate deliberately writes no row
+       for a step it pauses -- `worker.py`'s "Task 3's approval/policy gate"
+       section -- so this is normally an `INSERT`; `ON CONFLICT` makes it
+       idempotent against any row that somehow already exists.) `input` is
+       left `'{}'` deliberately: no adapter input was ever resolved or sent
+       for this step, and this row records the rejection, not a dispatch
+       attempt.
+    2. `status = 'queued'` on the run.
+
+    `run_step`'s existing-row branch then returns that `'failed'` outcome
+    *without ever calling `execute()`* (a `'failed'` row short-circuits
+    exactly like a `'succeeded'` one, and the gate never re-runs because a
+    row now exists -- so no second approval request is ever created and no
+    dispatch loop is possible), and `process_claimed_run`'s own `'failed'`
+    branch takes it from there: compensations for qualifying
+    already-succeeded steps if any are declared, ending
+    `'compensated'`/`'compensation_failed'`, or the unchanged
+    `_finish_run(..., 'failed')` if none are. A rejected run in a workflow
+    with no `compensate_ref` anywhere therefore still ends `'failed'`,
+    exactly as before -- just one poll cycle later, and now through the
+    same seam every other failure goes through. Parking a run back in
+    `'queued'` to let the ordinary claim/poll machinery continue it is this
+    module's and `worker.py`'s established pattern for precisely this
+    situation, not a new one (`approved` above; `resume_run`; the bounded-
+    retry path's own `next_attempt_at` re-queue).
     """
     row = (
         session.execute(
@@ -746,30 +809,46 @@ def _advance_run_after_decision(
         .mappings()
         .one_or_none()
     )
-    if (
-        row is None
-        or row["status"] != "waiting_approval"
-        or row["current_step_index"] != step_index
-    ):
+    if row is None:
+        return
+    if row["status"] != "waiting_approval" or row["current_step_index"] != step_index:
         return
 
     now = datetime.now(UTC)
-    if decision == "approved":
+    if decision == "rejected":
         session.execute(
             text(
-                "UPDATE workflow_runs SET status = 'queued', queued_at = :now, "
-                "leased_by = NULL, leased_until = NULL, updated_at = :now WHERE id = :id"
+                """
+                INSERT INTO workflow_run_steps (
+                    id, workspace_id, run_id, step_index, step_type, status,
+                    action_digest, input, started_at, finished_at, error_class,
+                    created_at, updated_at
+                ) VALUES (
+                    :id, :workspace_id, :run_id, :step_index, 'action', 'failed',
+                    :action_digest, '{}'::jsonb, :now, :now, :error_class, :now, :now
+                )
+                ON CONFLICT ON CONSTRAINT uq_workflow_run_steps_run_step_index DO UPDATE SET
+                    status = 'failed', error_class = :error_class,
+                    finished_at = :now, updated_at = :now
+                """
             ),
-            {"now": now, "id": run_id},
+            {
+                "id": uuid4(),
+                "workspace_id": workspace_id,
+                "run_id": run_id,
+                "step_index": step_index,
+                "action_digest": action_digest,
+                "error_class": _REJECTED_STEP_ERROR_CLASS,
+                "now": now,
+            },
         )
-    else:
-        session.execute(
-            text(
-                "UPDATE workflow_runs SET status = 'failed', finished_at = :now, "
-                "leased_by = NULL, leased_until = NULL, updated_at = :now WHERE id = :id"
-            ),
-            {"now": now, "id": run_id},
-        )
+    session.execute(
+        text(
+            "UPDATE workflow_runs SET status = 'queued', queued_at = :now, "
+            "leased_by = NULL, leased_until = NULL, updated_at = :now WHERE id = :id"
+        ),
+        {"now": now, "id": run_id},
+    )
 
 
 @router.get("/approvals", response_model=ApprovalListResponse)

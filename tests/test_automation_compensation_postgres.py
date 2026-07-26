@@ -30,6 +30,18 @@ per this task's own required minimum:
    (`workflows.high_impact_compensation_action_refs`, which rejects a
    compensation step naming a high-impact adapter outright) is covered in
    `test_automation_workflows_postgres.py`, since it never dispatches a run.
+
+Plus two regressions added by the run-state audit, both about how this
+mechanic joins up with the rest of the run-state machine:
+
+8. A step failing because **a human rejected its approval** compensates
+   exactly like the identical step failing because its adapter raised --
+   the Task 3 x Task 6 seam `approvals._advance_run_after_decision` used to
+   bypass entirely by writing `'failed'` straight onto the run.
+9. A lease lost inside one step's `execute()` never strands the run in
+   `'compensating'` -- `_mark_compensating` is lease-guarded, and
+   `'compensating'` with a `NULL` lease is a state no claim predicate ever
+   reclaims (`worker.py`'s "Lease-ownership guard" section).
 """
 
 from __future__ import annotations
@@ -47,6 +59,7 @@ from sqlalchemy import text
 
 from ecc.config import get_settings
 from ecc.database import SessionFactory, engine
+from ecc.domains.automation import approvals as automation_approvals
 from ecc.domains.automation import policy as automation_policy
 from ecc.domains.automation import worker as automation_worker
 from ecc.domains.automation import workflows as automation_workflows
@@ -276,6 +289,65 @@ class DedicatedUndoAdapter:
         self.execute_calls += 1
         self.last_executed_value = action_input.value
         return EchoOutput(value=f"undone:{action_input.value}")
+
+
+class HighImpactAdapter:
+    """`person-directed` (Decision 5) -- always requires a fresh per-run
+    human approval regardless of `approval_mode`, so a step using it pauses
+    the run in `waiting_approval` instead of dispatching. Used by this
+    module's rejection-path test to make a *human's* "no" the thing that
+    fails a step, rather than an adapter exception.
+    """
+
+    def __init__(self, adapter_id: str) -> None:
+        self.adapter_id = adapter_id
+        self.input_schema = EchoInput
+        self.output_schema = EchoOutput
+        self.reversible = False
+        self.high_impact_categories: frozenset[str] = frozenset({"person-directed"})
+        self.execute_calls = 0
+
+    def simulate(self, action_input: EchoInput) -> EchoOutput:  # noqa: D102
+        return EchoOutput(value=action_input.value)
+
+    def execute(self, action_input: EchoInput) -> EchoOutput:  # noqa: D102
+        self.execute_calls += 1
+        return EchoOutput(value=action_input.value)
+
+
+class LeaseHandoverFailingAdapter:
+    """Raises (so the compensation path is taken) *after* simulating a
+    complete lease handover on an independent connection: a second worker
+    reclaiming this run and parking it in `needs_review` with `leased_by =
+    NULL`, exactly as `worker._pause_run` would. No crash or `sleep` is
+    needed -- a step slower than `LEASE_DURATION_SECONDS` plus one other
+    worker's ordinary poll cycle produces this same state, which is why the
+    hole this reproduces was rated HIGH rather than theoretical.
+    """
+
+    def __init__(self, adapter_id: str, run_id: UUID) -> None:
+        self.adapter_id = adapter_id
+        self.input_schema = EchoInput
+        self.output_schema = EchoOutput
+        self.reversible = True
+        self.high_impact_categories: frozenset[str] = frozenset()
+        self._run_id = run_id
+        self.execute_calls = 0
+
+    def simulate(self, action_input: EchoInput) -> EchoOutput:  # noqa: D102
+        return EchoOutput(value=action_input.value)
+
+    def execute(self, action_input: EchoInput) -> EchoOutput:  # noqa: D102
+        self.execute_calls += 1
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    "UPDATE workflow_runs SET status = 'needs_review', leased_by = NULL, "
+                    "leased_until = NULL, updated_at = now() WHERE id = :id"
+                ),
+                {"id": self._run_id},
+            )
+        raise RuntimeError("failed after losing the lease")
 
 
 def _make_registry(*adapters: Any) -> AdapterRegistry:
@@ -818,3 +890,170 @@ def test_usable_policy_still_compensates_normally(
 
     assert finished.status == "compensated"
     assert undo.execute_calls == 1
+# ---------------------------------------------------------------------------
+# 8. A *human rejection* triggers the same compensation as an adapter
+#    exception -- the Task 3 x Task 6 seam an adversarial review found open.
+# ---------------------------------------------------------------------------
+
+
+def test_rejecting_an_approval_compensates_earlier_steps_like_any_other_failure(
+    compensation_test_context: tuple[UUID, UUID],
+) -> None:
+    """Regression test for a real inconsistency at the approval/compensation
+    seam (`approvals._advance_run_after_decision`'s own docstring has the
+    full write-up). Task 3's rejection path wrote `status = 'failed'`
+    straight onto the run, justified in its own docstring as "matching how
+    an adapter's own raised exception also produces `failed`" -- a
+    justification Task 6 invalidated when it routed adapter-exception
+    failures through `_qualifying_compensations`/`_mark_compensating`/
+    `_run_compensation_sequence`. The result was that this exact workflow
+    compensated `s1` if `s2` failed by accident, but did **not** if a human
+    explicitly declined `s2` -- the more consequential case getting the
+    worse handling, and a real side effect left un-rolled-back.
+
+    Structurally identical to test 2 above (`s1` succeeds with a
+    `compensate_ref`, `s2` fails, `c1` compensates `s1`, run ends
+    `'compensated'`), with exactly one thing swapped: `s2` fails because a
+    human rejected it rather than because its adapter raised.
+    """
+    workspace_id, user_id = compensation_test_context
+    workflow_id = f"test.reject-compensates.{uuid4().hex}"
+    s1 = CompensatableAdapter("test.s1")
+    s2 = HighImpactAdapter("test.s2")
+    graph = _linear_graph(
+        _action_step("s1", "test.s1", compensate_ref="c1", input_mapping={"value": "original"}),
+        _action_step("s2", "test.s2"),
+        _compensation_step("c1", "test.s1"),
+    )
+    _publish_workflow(workspace_id, user_id, workflow_id, graph)
+    registry = _make_registry(s1, s2)
+
+    with SessionFactory() as session, session.begin():
+        queued = automation_worker.enqueue_run(
+            session, workspace_id, user_id, workflow_id=workflow_id
+        )
+    assert isinstance(queued, automation_worker.WorkflowRun)
+    with SessionFactory() as session:
+        claimed = automation_worker.claim_next_run(session, "worker-a")
+        assert claimed is not None
+        paused = automation_worker.process_claimed_run(session, claimed, registry, "worker-a")
+    assert paused.status == "waiting_approval"
+    assert s1.execute_calls == 1  # the step that will need undoing really ran
+    assert s2.execute_calls == 0
+
+    with SessionFactory() as session, session.begin():
+        pending = automation_approvals.get_pending_approval(session, workspace_id, queued.id, 1)
+        assert pending is not None
+        decided = automation_approvals.decide_approval(
+            session, workspace_id, user_id, pending.id, "rejected", current_action_digest=None
+        )
+    assert isinstance(decided, automation_approvals.ApprovalRequest)
+    assert decided.status == "rejected"
+
+    # The rejection records the rejected step as an ordinary 'failed' step
+    # and hands the run back to the poll loop -- it does not decide the
+    # run's own fate inline any more.
+    with SessionFactory() as session:
+        requeued = automation_worker.get_run(session, workspace_id, queued.id)
+    assert requeued is not None
+    assert requeued.status == "queued"
+
+    with SessionFactory() as session:
+        reclaimed = automation_worker.claim_next_run(session, "worker-b")
+        assert reclaimed is not None
+        finished = automation_worker.process_claimed_run(session, reclaimed, registry, "worker-b")
+
+    # The whole point: identical outcome to test 2's adapter-exception case.
+    assert finished.status == "compensated"
+    assert s1.compensate_calls == 1
+    assert s1.last_compensated_value == "original"
+    assert s2.execute_calls == 0  # the rejected step is never dispatched
+
+    with SessionFactory() as session:
+        steps = automation_worker.list_run_steps(session, workspace_id, queued.id)
+        ledger = automation_worker.list_compensation_steps(session, workspace_id, queued.id)
+    by_index = {step.step_index: step for step in steps}
+    assert by_index[0].status == "succeeded"
+    # The rejected step ends in exactly the state an ordinary failed action
+    # step would, with a classified error_class naming why.
+    assert by_index[1].status == "failed"
+    assert by_index[1].error_class == "ApprovalRejected"
+    assert by_index[1].step_type == "action"
+    assert by_index[1].action_digest == pending.action_digest
+    assert by_index[2].step_type == "compensation"
+    assert by_index[2].status == "succeeded"
+    assert [(row.compensates_step_index, row.status) for row in ledger] == [(0, "succeeded")]
+
+
+# ---------------------------------------------------------------------------
+# 9. A lease lost mid-execute never strands the run in 'compensating'.
+# ---------------------------------------------------------------------------
+
+
+def test_a_lease_lost_mid_execute_never_strands_the_run_in_compensating(
+    compensation_test_context: tuple[UUID, UUID],
+) -> None:
+    """Regression test for the concrete HIGH failure the lease-ownership
+    review named (`worker.py`'s "Lease-ownership guard" docstring section).
+    `renew_lease` is called once per step, so the whole of one `execute()`
+    is a window in which a second worker can reclaim the run -- and
+    `_mark_compensating` used to write `status = 'compensating'`
+    unconditionally, `WHERE id = :id`. Because `'compensating'` is
+    deliberately excluded from `_CLAIMABLE_PREDICATE` and *nothing anywhere*
+    reclaims a `'compensating'` run whose `leased_by` is `NULL` (that
+    module's own disclosed scope-boundary note), the pre-fix behaviour left
+    the run stranded permanently -- no crash required, an ordinary lease
+    handover was enough.
+
+    Here `s2`'s `execute()` performs that handover itself and then raises,
+    so the failing worker reaches `_mark_compensating` owning nothing.
+    Post-fix it writes nothing, dispatches no compensation under a lease it
+    does not hold, and reports the run's real persisted state.
+    """
+    workspace_id, user_id = compensation_test_context
+    workflow_id = f"test.lease-lost-compensating.{uuid4().hex}"
+    s1 = CompensatableAdapter("test.s1")
+    graph = _linear_graph(
+        _action_step("s1", "test.s1", compensate_ref="c1", input_mapping={"value": "original"}),
+        _action_step("s2", "test.s2"),
+        _compensation_step("c1", "test.s1"),
+    )
+    _publish_workflow(workspace_id, user_id, workflow_id, graph)
+
+    with SessionFactory() as session, session.begin():
+        queued = automation_worker.enqueue_run(
+            session, workspace_id, user_id, workflow_id=workflow_id
+        )
+    assert isinstance(queued, automation_worker.WorkflowRun)
+    s2 = LeaseHandoverFailingAdapter("test.s2", queued.id)
+    registry = _make_registry(s1, s2)
+
+    with SessionFactory() as session:
+        claimed = automation_worker.claim_next_run(session, "worker-a")
+        assert claimed is not None
+        finished = automation_worker.process_claimed_run(session, claimed, registry, "worker-a")
+
+    assert s2.execute_calls == 1  # the step really did run and really did fail
+    # The stranding bug: pre-fix this was 'compensating' with leased_by NULL,
+    # which no claim predicate ever picks up again.
+    assert finished.status != "compensating"
+    assert finished.status == "needs_review"  # the new owner's own state
+    assert finished.leased_by is None
+    # No compensation was dispatched under a lease this worker did not hold.
+    assert s1.compensate_calls == 0
+
+    with SessionFactory() as session:
+        persisted = automation_worker.get_run(session, workspace_id, queued.id)
+        ledger = automation_worker.list_compensation_steps(session, workspace_id, queued.id)
+        steps = automation_worker.list_run_steps(session, workspace_id, queued.id)
+    assert persisted is not None
+    assert persisted.status == "needs_review"
+    assert ledger == []
+    # No compensation step row either -- only the two action steps.
+    assert {step.step_index for step in steps} == {0, 1}
+    # And the run is not stranded: it sits in a state an operator can now
+    # actually act on (`cancel_run`'s needs_review escape hatch).
+    with SessionFactory() as session, session.begin():
+        cancelled = automation_worker.cancel_run(session, workspace_id, queued.id)
+    assert isinstance(cancelled, automation_worker.WorkflowRun)
+    assert cancelled.status == "cancelled"

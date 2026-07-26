@@ -23,6 +23,16 @@ Covers, per this task's own required minimum:
    column's own `sa.String(200)` is a 422 on both the activate and the
    status route, never an uncaught `DataError`/500; exactly 200 characters
    is still accepted.
+
+Plus, added by the run-state audit that found the gap in this module's own
+"no auto-resume on re-enable" claim (`kill_switches.py`'s corrected
+docstring):
+
+8. **Activation parks already-`'queued'` runs** (never-claimed and
+   retry-pending alike, per-workflow and global scope) into `needs_review`,
+   so a later deactivation genuinely resumes nothing -- the property the
+   recovery runbook documents, previously true only for runs a worker
+   happened to observe being killed.
 """
 
 from __future__ import annotations
@@ -617,3 +627,134 @@ def test_kill_switch_rejects_overlong_workflow_id_with_422(
     )
     assert accepted.status_code == 200
     assert accepted.json()["workflow_id"] == at_limit
+# ---------------------------------------------------------------------------
+# 8. Activation parks already-queued runs, so deactivation never silently
+#    auto-resumes anything (this module's own corrected docstring).
+# ---------------------------------------------------------------------------
+
+
+def test_activating_a_kill_switch_parks_already_queued_runs_for_review(
+    kill_switch_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    """Regression test for the gap an adversarial review found in this
+    module's own "no auto-resume on re-enable" claim (see its corrected
+    docstring). That claim rested on a killed run landing in `needs_review`,
+    which is never claimable -- true only for a run a worker happened to be
+    actively dispatching when the switch fired. A run already sitting in
+    `'queued'` was never touched by anything: `enqueue_run`'s kill-switch
+    rejection only blocks *new* rows. So it waited out the whole incident
+    invisibly and the very first poll cycle after deactivation claimed and
+    dispatched it, with zero operator review -- exactly what the recovery
+    runbook says must not happen.
+
+    Activation now parks it in `needs_review` up front, so the "requires
+    explicit operator action to resume" property holds for real.
+    """
+    _client, workspace_id, user_id, _token = kill_switch_test_context
+    workflow_id = f"test.park-queued.{uuid4().hex}"
+    _publish_workflow(workspace_id, user_id, workflow_id)
+    echo = _EchoAdapter()
+
+    with SessionFactory() as session, session.begin():
+        queued = automation_worker.enqueue_run(
+            session, workspace_id, user_id, workflow_id=workflow_id
+        )
+    assert isinstance(queued, automation_worker.WorkflowRun)
+    assert queued.status == "queued"
+
+    with SessionFactory() as session, session.begin():
+        automation_kill_switches.activate_kill_switch(
+            session, workspace_id, workflow_id, "incident", user_id
+        )
+
+    with SessionFactory() as session:
+        parked = automation_worker.get_run(session, workspace_id, queued.id)
+    assert parked is not None
+    assert parked.status == "needs_review"  # visible to an operator, not silently queued
+    assert parked.finished_at is None  # needs_review is not terminal
+    assert parked.leased_by is None
+
+    with SessionFactory() as session, session.begin():
+        assert (
+            automation_kill_switches.deactivate_kill_switch(
+                session, workspace_id, workflow_id, user_id
+            )
+            is True
+        )
+
+    # The whole point: deactivation resumes nothing. The run stays parked
+    # and no poll cycle picks it up.
+    with SessionFactory() as session:
+        after = automation_worker.get_run(session, workspace_id, queued.id)
+    assert after is not None
+    assert after.status == "needs_review"
+    with SessionFactory() as session:
+        assert automation_worker.claim_next_run(session, "worker-a") is None
+    assert echo.execute_calls == 0
+
+
+def test_activating_a_global_kill_switch_parks_every_workflows_queued_runs(
+    kill_switch_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    """The global-scope half of the fix, plus the retry-pending case the
+    review named explicitly: `worker.run_step`'s bounded-retry path parks a
+    run back in `'queued'` with a `next_attempt_at`, so a retry-pending run
+    is exactly as invisible-and-silently-resumable as a never-claimed one.
+    A global switch (`workflow_id IS NULL`) covers every workflow in the
+    workspace, mirroring `is_workflow_killed`'s own "either scope" semantics.
+    """
+    _client, workspace_id, user_id, _token = kill_switch_test_context
+    workflow_a = f"test.park-global-a.{uuid4().hex}"
+    workflow_b = f"test.park-global-b.{uuid4().hex}"
+    _publish_workflow(workspace_id, user_id, workflow_a)
+    _publish_workflow(workspace_id, user_id, workflow_b)
+
+    with SessionFactory() as session, session.begin():
+        run_a = automation_worker.enqueue_run(
+            session, workspace_id, user_id, workflow_id=workflow_a
+        )
+        run_b = automation_worker.enqueue_run(
+            session, workspace_id, user_id, workflow_id=workflow_b
+        )
+    assert isinstance(run_a, automation_worker.WorkflowRun)
+    assert isinstance(run_b, automation_worker.WorkflowRun)
+
+    # Make run_b look exactly like a retry-pending run (the shape run_step's
+    # TransientAdapterError branch leaves behind): still 'queued', lease
+    # released, backoff not yet elapsed.
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "UPDATE workflow_runs SET next_attempt_at = now() + interval '1 hour' "
+                "WHERE id = :id"
+            ),
+            {"id": run_b.id},
+        )
+
+    with SessionFactory() as session, session.begin():
+        automation_kill_switches.activate_kill_switch(
+            session, workspace_id, None, "global incident", user_id
+        )
+
+    with SessionFactory() as session:
+        statuses = {
+            run.workflow_id: run.status
+            for run in automation_worker.list_runs(session, workspace_id)
+        }
+    assert statuses == {workflow_a: "needs_review", workflow_b: "needs_review"}
+
+    with SessionFactory() as session, session.begin():
+        automation_kill_switches.deactivate_kill_switch(session, workspace_id, None, user_id)
+
+    with SessionFactory() as session:
+        assert automation_worker.claim_next_run(session, "worker-a") is None
+    with SessionFactory() as session:
+        still_parked = {run.status for run in automation_worker.list_runs(session, workspace_id)}
+    assert still_parked == {"needs_review"}
+
+    # And each is now individually actionable by an operator (`cancel_run`'s
+    # needs_review escape hatch), rather than merely stuck.
+    with SessionFactory() as session, session.begin():
+        cancelled = automation_worker.cancel_run(session, workspace_id, run_a.id)
+    assert isinstance(cancelled, automation_worker.WorkflowRun)
+    assert cancelled.status == "cancelled"
