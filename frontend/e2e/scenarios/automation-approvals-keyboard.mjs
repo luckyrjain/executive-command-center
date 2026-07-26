@@ -3,6 +3,33 @@ import assert from 'node:assert/strict'
 import { createFixtureApi } from '../fixtures.mjs'
 import { assertNoSeriousAccessibilityViolations } from '../accessibility.mjs'
 
+/**
+ * Presses real `Tab` keys (never `.focus()`, which jumps the DOM's active
+ * element directly and proves nothing about actual sequential tab-order
+ * reachability or the absence of a keyboard trap) until `locator` becomes
+ * the focused element, up to `maxPresses` attempts. Found during
+ * independent review: this scenario originally used `.focus()` for every
+ * transition after the initial landing tab, which -- unlike `conflict-
+ * audit-keyboard.mjs`/`knowledge-keyboard.mjs`'s own real-`Tab`-press
+ * precedent -- never actually exercised the browser's real tab order, so
+ * it could not have caught a keyboard trap or an unreachable control. A
+ * bounded "press Tab until this element is focused" loop (rather than a
+ * hardcoded press count, which would require knowing this component
+ * tree's exact intervening-element count in advance and would silently go
+ * stale the moment that count changed) proves genuine reachability while
+ * staying robust to unrelated markup changes.
+ */
+async function tabTo(page, locator, maxPresses = 15) {
+  for (let attempt = 0; attempt < maxPresses; attempt += 1) {
+    if (await locator.evaluate((el) => el === document.activeElement).catch(() => false)) return
+    await page.keyboard.press('Tab')
+  }
+  assert.ok(
+    await locator.evaluate((el) => el === document.activeElement),
+    `expected to reach the target element via real Tab presses within ${maxPresses} attempts`,
+  )
+}
+
 const RUN_ID = 'keyboard-run-1'
 const APPROVAL_ID = 'keyboard-approval-1'
 const DIGEST = 'keyboard-digest-xyz789'
@@ -60,6 +87,7 @@ export async function run({ page, baseURL }) {
             status: 'pending',
             action_digest: DIGEST,
             attempt_count: 0,
+            action_ref: 'fake.external_action',
             input: { amount: 42 },
             output: null,
             started_at: null,
@@ -86,9 +114,12 @@ export async function run({ page, baseURL }) {
 
   await page.getByRole('heading', { name: 'Workflows & approvals', level: 1 }).waitFor()
 
-  // Reach the Approvals sub-tab via the nested tablist, keyboard only.
-  const workflowsSubTab = page.getByRole('tab', { name: 'Workflows' })
-  await workflowsSubTab.focus()
+  // Tab from the now-focused outer tablist into the nested Workflows/
+  // Approvals tablist (real Tab press, matching `conflict-audit-
+  // keyboard.mjs`'s identical outer-to-nested-tablist transition), then
+  // reach the Approvals sub-tab via that nested tablist's own roving
+  // tabindex, keyboard only.
+  await page.keyboard.press('Tab')
   await page.keyboard.press('ArrowRight')
   assert.equal(await page.evaluate(() => document.activeElement?.textContent), 'Approvals')
   assert.equal(await page.getByRole('tab', { name: 'Approvals' }).getAttribute('aria-selected'), 'true')
@@ -98,21 +129,23 @@ export async function run({ page, baseURL }) {
   await assertNoSeriousAccessibilityViolations(page, { include: '#automation-panel' })
 
   // Expand the redacted payload summary via keyboard (a <details>/<summary>
-  // element is natively focusable and toggles on Enter).
+  // element is natively focusable and toggles on Enter) -- reached by real
+  // Tab presses from the nested tablist, not `.focus()`, so this actually
+  // proves the control sits somewhere in the page's real tab order.
   const summaryToggle = approvalsPanel.getByText('Payload summary (redacted)')
-  await summaryToggle.focus()
+  await tabTo(page, summaryToggle)
   await page.keyboard.press('Enter')
   await approvalsPanel.getByText(/"amount": 42/).waitFor()
 
   // Tab forward into the digest-echo field -- never pre-filled -- and type
   // the correct digest read directly off the page, keyboard only.
   const digestInput = approvalsPanel.getByLabel(`Echo action digest for run ${RUN_ID} step 0`)
-  await digestInput.focus()
+  await tabTo(page, digestInput)
   assert.equal(await digestInput.inputValue(), '')
   await page.keyboard.type(DIGEST)
 
   const approveButton = approvalsPanel.getByRole('button', { name: 'Approve' })
-  await approveButton.focus()
+  await tabTo(page, approveButton)
   await page.keyboard.press('Enter')
 
   await approvalsPanel.getByText('No approvals are waiting on you.').waitFor()

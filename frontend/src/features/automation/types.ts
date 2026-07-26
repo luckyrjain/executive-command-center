@@ -162,6 +162,12 @@ export type RunStep = {
   // attempt, out of the backend's fixed MAX_RETRY_ATTEMPTS = 3 (2s/4s/8s
   // backoff, `worker.py`), this step is on.
   attempt_count: number
+  // Found during independent review: without this, an approver had no way
+  // to see *which* adapter/action a step actually invokes (only the
+  // generic `step_type` and raw input) -- resolved server-side from the
+  // run's own pinned workflow-version graph. `null` for a step with no
+  // adapter at all (`approval_gate`/`condition`).
+  action_ref: string | null
   input: Record<string, unknown>
   output: Record<string, unknown> | null
   started_at: string | null

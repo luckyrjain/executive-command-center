@@ -36,7 +36,7 @@ const runDetail: RunDetail = {
   finished_at: null,
   created_at: '2026-07-25T00:00:00Z',
   updated_at: '2026-07-25T00:00:00Z',
-  steps: [{ step_index: 0, step_type: 'action', status: 'pending', action_digest: 'digest-abc123', attempt_count: 0, input: { note_title: 'Board memo' }, output: null, started_at: null, finished_at: null, error_class: null }],
+  steps: [{ step_index: 0, step_type: 'action', status: 'pending', action_digest: 'digest-abc123', attempt_count: 0, action_ref: 'local.create_note', input: { note_title: 'Board memo' }, output: null, started_at: null, finished_at: null, error_class: null }],
   compensation_steps: [],
 }
 
@@ -76,6 +76,7 @@ describe('ApprovalInbox', () => {
     await waitFor(() => expect(screen.getByText(/Run run-1 · step 0/)).toBeTruthy())
     expect(screen.getByText('destructive')).toBeTruthy()
     expect(screen.getByText(/expires 7\/27\/2026|expires.*2026/)).toBeTruthy()
+    await waitFor(() => expect(screen.getByText('local.create_note')).toBeTruthy())
     await waitFor(() => expect(screen.getByText('Payload summary (redacted)')).toBeTruthy())
     fireEvent.click(screen.getByText('Payload summary (redacted)'))
     expect(screen.getByText(/Board memo/)).toBeTruthy()

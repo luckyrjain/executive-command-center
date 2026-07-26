@@ -59,6 +59,7 @@ export async function run({ page, baseURL }) {
             status: 'pending',
             action_digest: DIGEST,
             attempt_count: 0,
+            action_ref: 'local.create_note',
             input: { note_title: 'Weekly digest note' },
             output: null,
             started_at: null,

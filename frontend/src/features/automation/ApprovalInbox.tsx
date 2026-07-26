@@ -80,10 +80,13 @@ function ApprovalCard({ approval, onDecided }: { approval: Approval; onDecided: 
       {runDetail.isLoading ? <p role="status">Loading step payload…</p> : null}
       {runDetail.isError ? <div role="alert" className="inline-status error-panel">Could not load this step's payload ({runDetail.error.message}). Do not approve blind -- retry loading before deciding.</div> : null}
       {step ? (
-        <details>
-          <summary>Payload summary (redacted)</summary>
-          <pre>{JSON.stringify(step.input, null, 2)}</pre>
-        </details>
+        <>
+          <p>Target: <strong>{step.action_ref ?? 'unknown -- could not resolve this step\'s adapter'}</strong></p>
+          <details>
+            <summary>Payload summary (redacted)</summary>
+            <pre>{JSON.stringify(step.input, null, 2)}</pre>
+          </details>
+        </>
       ) : null}
 
       <p>Action digest to authorize: <code>{approval.action_digest}</code></p>

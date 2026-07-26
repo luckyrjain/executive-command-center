@@ -94,7 +94,7 @@ describe('RunWorkspace', () => {
     const detail: RunDetail = {
       ...baseRun,
       status: 'compensation_failed',
-      steps: [{ step_index: 0, step_type: 'action', status: 'succeeded', action_digest: 'd1', attempt_count: 0, input: {}, output: {}, started_at: null, finished_at: null, error_class: null }],
+      steps: [{ step_index: 0, step_type: 'action', status: 'succeeded', action_digest: 'd1', attempt_count: 0, action_ref: 'local.create_note', input: {}, output: {}, started_at: null, finished_at: null, error_class: null }],
       compensation_steps: [
         { compensates_step_index: 0, status: 'succeeded', action_digest: 'c1', started_at: null, finished_at: null, error_class: null },
         { compensates_step_index: 1, status: 'failed', action_digest: 'c2', started_at: null, finished_at: null, error_class: 'RuntimeError' },
@@ -120,7 +120,7 @@ describe('RunWorkspace', () => {
     const detail: RunDetail = {
       ...baseRun,
       status: 'queued',
-      steps: [{ step_index: 0, step_type: 'action', status: 'retrying', action_digest: 'd1', attempt_count: 2, input: {}, output: null, started_at: null, finished_at: null, error_class: 'TransientAdapterError' }],
+      steps: [{ step_index: 0, step_type: 'action', status: 'retrying', action_digest: 'd1', attempt_count: 2, action_ref: 'local.send_test_notification', input: {}, output: null, started_at: null, finished_at: null, error_class: 'TransientAdapterError' }],
       compensation_steps: [],
     }
     vi.stubGlobal('fetch', mockFetchByPath({
