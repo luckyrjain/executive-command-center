@@ -589,6 +589,16 @@ def test_approve_endpoint_digest_mismatch_is_409(
 def test_reject_endpoint_success_fails_the_run(
     approval_test_context: tuple[TestClient, UUID, UUID, str],
 ) -> None:
+    """The HTTP-surface half of the rejection-path change (`approvals.
+    _advance_run_after_decision`'s own docstring has the reasoning): a
+    rejection records the rejected step as a real `'failed'`
+    `workflow_run_steps` row and re-queues the run rather than writing
+    `'failed'` onto the run inline, so `worker.process_claimed_run`'s own
+    `'failed'` branch -- the same seam an adapter exception goes through --
+    decides whether compensation applies. This one-step workflow declares
+    no `compensate_ref`, so the run still ends `'failed'`, one poll cycle
+    later, with `execute()` never called.
+    """
     client, workspace_id, user_id, token = approval_test_context
     workflow_id = f"test.http-reject.{uuid4().hex}"
     _publish_high_impact_workflow(workspace_id, user_id, workflow_id)
@@ -602,8 +612,18 @@ def test_reject_endpoint_success_fails_the_run(
     assert response.json()["status"] == "rejected"
 
     with SessionFactory() as session, session.begin():
-        finished = automation_worker.get_run(session, workspace_id, run.id)
-    assert finished is not None
+        requeued = automation_worker.get_run(session, workspace_id, run.id)
+        steps = automation_worker.list_run_steps(session, workspace_id, run.id)
+    assert requeued is not None
+    assert requeued.status == "queued"
+    assert [(step.status, step.error_class) for step in steps] == [("failed", "ApprovalRejected")]
+
+    registry = AdapterRegistry()
+    registry.register(adapter)  # type: ignore[arg-type]
+    with SessionFactory() as session:
+        reclaimed = automation_worker.claim_next_run(session, "worker-b")
+        assert reclaimed is not None
+        finished = automation_worker.process_claimed_run(session, reclaimed, registry, "worker-b")
     assert finished.status == "failed"
     assert adapter.execute_calls == 0
 

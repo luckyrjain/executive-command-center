@@ -99,6 +99,45 @@ protect against, so both remain ordinary caller-committed mutations
 (`with session.begin():` is correct for them, matching every Task 1
 endpoint's own convention).
 
+**Lease-ownership guard on every run-state write (`_LEASE_OWNERSHIP_
+PREDICATE`) -- a real bug found by an adversarial review of this module,
+fixed here.** Before this fix, `renew_lease` was the *only* run-state
+write in this module that checked whether the calling worker still held
+the run's lease; `_mark_running`, `_finish_run`, `_pause_run`,
+`_mark_compensating` and `run_step`'s own retry-path run `UPDATE` all
+wrote `WHERE id = :id` unconditionally. Since `renew_lease` is called
+once per step (module docstring's "Heartbeat shape" section, immediately
+below), the exposure window is one step's entire `execute()` duration --
+and no crash is required to lose the lease inside it, only a step slower
+than `LEASE_DURATION_SECONDS` (30s) plus a second worker's ordinary poll
+cycle. The concrete failure that made this HIGH rather than theoretical:
+worker A dispatches a slow step; A's lease expires; worker B reclaims the
+run, marks A's still-running step `'unknown'` and the run `'needs_review'`
+with `leased_by = NULL`; A's `execute()` *then* returns and A proceeds to
+`_mark_compensating`, unconditionally setting `status = 'compensating'` on
+a run whose lease is now `NULL`. `'compensating'` is deliberately excluded
+from `_CLAIMABLE_PREDICATE` and nothing anywhere reclaims a `NULL`-lease
+`'compensating'` run (see the "disclosed, real scope boundary" note
+further down), so that run is stranded permanently.
+
+Every such write now carries `leased_by = :worker_id`, `RETURNING`s its
+row, and treats zero matched rows as the explicit, first-class "this
+worker no longer owns this run" outcome -- `_write_owned_run_state` is the
+single shape all of them share, following `renew_lease`'s own existing
+convention (`None` return, caller must stop advancing the run) rather than
+inventing a second one. `process_claimed_run`'s bail-out on that outcome
+is the same one it already had for a lost heartbeat: return the run's
+*persisted* state, whatever its real owner has left it in, never this
+worker's intended one. Two deliberate exceptions, each documented at its
+own definition: `_mark_running` carries the guard but tolerates a zero-row
+result (it runs immediately after `claim_next_run` with no adapter call in
+between, and the very next `renew_lease` catches a lost lease one line
+later through the identical path), and `enqueue_run`/`cancel_run`/
+`pause_run`/`resume_run` carry no guard at all because they are
+operator-initiated calls against runs that hold no lease to begin with
+(`queued`/`paused`/`needs_review`/`waiting_approval` all have `leased_by
+= NULL`) -- there is no in-flight step for them to protect.
+
 **Heartbeat shape (a documented choice, not the only possible one).**
 `renew_lease` is a plain, independently callable, independently testable
 function (`renew_lease(session, workspace_id, run_id, worker_id)`) --
@@ -220,10 +259,19 @@ to `0` -- unchanged from Task 2's own crash-recovery checkpoint, since
 `waiting_approval` never advances `current_step_index` past the step it
 paused on), and `run_step`'s gate re-evaluates for that same step,
 finds the now-`approved` row matching the live digest via `get_approved_
-request`, and proceeds to dispatch. A `rejected` decision instead flips
-the run straight to `'failed'` (a human declined -- there is nothing left
-to resume, matching how an adapter's own raised exception also produces
-`failed`, not `needs_review`, for a definitively-classified outcome). This
+request`, and proceeds to dispatch. **A `rejected` decision reuses the
+exact same requeue mechanic** (an adversarial review found the original
+"flip straight to `'failed'`" shape had gone stale the moment Task 6
+routed adapter failures through compensation -- see `approvals._advance_
+run_after_decision`'s own docstring for the full reasoning): the rejected
+step gets a real `workflow_run_steps` row at `status='failed'`/
+`error_class='ApprovalRejected'` and the run goes back to `'queued'`, so
+the next poll cycle's `run_step` short-circuits on that already-`'failed'`
+row without ever calling `execute()` and `process_claimed_run`'s own
+`'failed'` branch below dispatches whatever compensations qualify --
+identical handling to an adapter that raised, which is exactly the point.
+A rejected run in a workflow declaring no `compensate_ref` anywhere still
+ends `'failed'`, unchanged, just via the same seam. This
 was a genuine design choice this task's own instructions flagged as
 "architecturally significant" -- the alternative (a distinct `claim_next_
 run`-adjacent reclaim predicate specifically for `waiting_approval` rows)
@@ -549,13 +597,22 @@ and reclaim already goes through, not a second check bolted on elsewhere.
 is_workflow_killed` at the identical point its `cancel_requested_at`/
 `pause_requested_at` checks already run (before dispatching each
 not-yet-dispatched step) -- a kill switch discovered mid-run stops the run
-via `_pause_run(session, run, "needs_review")`, reusing the existing
-terminal-until-human-action state (this module's own "unusable policy"
-precedent, Task 3) rather than inventing a new run status; per the runbook,
-re-enabling the kill switch later does **not** implicitly resume this run
--- `needs_review` is not in `_CLAIMABLE_PREDICATE`'s claimable set
+via `_pause_run(session, run, "needs_review", worker_id)`, reusing the
+existing terminal-until-human-action state (this module's own "unusable
+policy" precedent, Task 3) rather than inventing a new run status; per the
+runbook, re-enabling the kill switch later does **not** implicitly resume
+this run -- `needs_review` is not in `_CLAIMABLE_PREDICATE`'s claimable set
 regardless of kill-switch state, so there is no code path that could
-auto-resume it either way. `enqueue_run` checks `kill_switches.
+auto-resume it either way. **That covers only a run a worker actively
+observed being killed**, though: a run already sitting in `'queued'` (or
+parked back there by the bounded-retry path) when a switch activates is not
+touched by this check at all, and would be claimed by the very first poll
+cycle after a deactivation. Closing that hole is `kill_switches.
+activate_kill_switch`'s own job, not this module's -- see that module's
+corrected docstring ("How that guarantee is actually achieved"): activation
+now transitions every currently-`'queued'` run in the switch's scope to
+`'needs_review'` up front, so no run is left in a state a deactivation
+could silently resume. `enqueue_run` checks `kill_switches.
 is_workflow_killed` before creating any `workflow_runs` row at all and
 rejects with `WorkflowKilled` if killed -- "Global/workflow kill switches
 stop new runs" (`PHASE-005-automation.md`'s Rollback plan, verbatim), not
@@ -651,6 +708,7 @@ from .adapters import (
     compensable,
 )
 from .approvals import (
+    approval_lifecycle_status,
     create_approval_request,
     evaluate_approval_requirement,
     get_approved_request,
@@ -721,6 +779,18 @@ _TERMINAL_RUN_STATUSES = frozenset(
     }
 )
 
+# `cancel_run`'s immediate-cancel set: every non-terminal run status that is
+# also never claimable by `_CLAIMABLE_PREDICATE` and holds no lease, so
+# there is no in-flight step for a cancellation to interrupt and no poll
+# cycle that would ever revisit the run to observe `cancel_requested_at`
+# on its own. For each of these, setting the flag *without* also flipping
+# `status` is not "cancellation pending" -- it is a permanently stuck run
+# carrying a flag nothing consults (see `cancel_run`'s own docstring).
+# `waiting_approval` is deliberately *not* in this set: it is conditionally
+# cancellable, only once its approval request has genuinely expired --
+# `_is_immediately_cancellable` below has the full reasoning.
+_IMMEDIATELY_CANCELLABLE_RUN_STATUSES = frozenset({"queued", "paused", "needs_review"})
+
 # See module docstring point 2: the reclaim predicate's expired-lease
 # branch spans both lease-bearing states, not `leased` alone. Task 6 adds
 # two more conjuncts: `next_attempt_at` gates a retry-pending run until its
@@ -746,6 +816,21 @@ _CLAIMABLE_PREDICATE = (
     "    AND aks_workflow.workflow_id = workflow_runs.workflow_id AND aks_workflow.active"
     ")"
 )
+
+# The lease-ownership precondition every run-state write that can run
+# *after* a potentially-long adapter call must carry (module docstring's
+# "Lease-ownership guard" section). Deliberately `leased_by` only -- not
+# also `leased_until > now()` -- for exactly the reason `renew_lease`
+# already checks ownership and not expiry: the failure mode this guard
+# exists to prevent is *another worker having reclaimed the run*, which
+# necessarily overwrites `leased_by` (a reclaim sets it to the new worker;
+# `_pause_run`/`_finish_run` set it to `NULL`). A lease that has merely
+# ticked past `leased_until` without anyone reclaiming it is still this
+# worker's own lease, and refusing to record that worker's own step outcome
+# under it would throw away a real, known outcome for no safety gain --
+# precisely the case (a step slower than `LEASE_DURATION_SECONDS`) where
+# recording the outcome matters most.
+_LEASE_OWNERSHIP_PREDICATE = "leased_by = :worker_id"
 
 _RUN_FIELDS = """
     id, workspace_id, workflow_id, workflow_version, policy_id, trigger_ref,
@@ -1539,26 +1624,97 @@ def renew_lease(
     return _row_to_run(dict(row))
 
 
-def _mark_running(session: Session, run: WorkflowRun) -> WorkflowRun:
+def _current_run(session: Session, run: WorkflowRun) -> WorkflowRun:
+    """Re-reads `run`'s true, currently-persisted state -- what every
+    "this worker no longer owns this run" bail-out returns, so a caller
+    always gets whatever state the run's *real* owner has left it in
+    rather than this worker's own stale in-memory copy.
+    """
+    current = get_run(session, run.workspace_id, run.id)
+    assert current is not None
+    return current
+
+
+def _write_owned_run_state(
+    session: Session,
+    run: WorkflowRun,
+    worker_id: str,
+    assignments: str,
+    params: dict[str, Any],
+    *,
+    extra_predicate: str = "",
+) -> WorkflowRun | None:
+    """The single, lease-guarded shape every run-state transition below
+    performs its `UPDATE workflow_runs` through -- module docstring's
+    "Lease-ownership guard" section has the full reasoning for why an
+    unguarded write here is a real, no-crash-required way to permanently
+    strand a run.
+
+    Follows `renew_lease`'s own established convention exactly (that
+    function was, before this fix, the only run-state write in this module
+    that checked ownership at all): the `UPDATE` carries
+    `_LEASE_OWNERSHIP_PREDICATE` and `RETURNING`, and a `None` return means
+    "zero rows matched -- this worker does not hold this run's lease any
+    more, someone else already owns it." A `None` return is never an error:
+    it is the ordinary, expected outcome of a lease handover, and every
+    caller must stop advancing the run rather than retrying or writing
+    anyway. The transaction is rolled back on that path so no partial,
+    unowned write is left pending on this session.
+    """
+    row = (
+        session.execute(
+            text(
+                f"""
+                UPDATE workflow_runs SET {assignments}
+                WHERE workspace_id = :workspace_id AND id = :id
+                  AND {_LEASE_OWNERSHIP_PREDICATE} {extra_predicate}
+                RETURNING {_RUN_FIELDS}
+                """
+            ),
+            {**params, "workspace_id": run.workspace_id, "id": run.id, "worker_id": worker_id},
+        )
+        .mappings()
+        .one_or_none()
+    )
+    if row is None:
+        session.rollback()
+        return None
+    session.commit()
+    return _row_to_run(dict(row))
+
+
+def _mark_running(session: Session, run: WorkflowRun, worker_id: str) -> WorkflowRun:
+    """Deliberately the one run-state transition that does *not* abort on a
+    lost lease, and the one that keeps returning a plain `WorkflowRun`.
+    It carries the `leased_by = :worker_id` guard (so it can never relabel
+    a run a second worker has already reclaimed as this worker's own
+    `'running'`), but a zero-row result is simply tolerated exactly as it
+    always was: this write runs immediately after `claim_next_run`, with no
+    adapter call in between, so a lost lease here is vanishingly unlikely,
+    and `process_claimed_run`'s very next `renew_lease` call already
+    detects and handles it one line later through the same code path a
+    lease lost mid-loop takes. Returning the freshly re-read run keeps that
+    single bail-out point, rather than adding a second, near-identical one.
+    """
     now = datetime.now(UTC)
     session.execute(
         text(
             "UPDATE workflow_runs SET status = 'running', "
             "started_at = COALESCE(started_at, :now), updated_at = :now "
-            "WHERE id = :id AND status = 'leased'"
+            f"WHERE id = :id AND status = 'leased' AND {_LEASE_OWNERSHIP_PREDICATE}"
         ),
-        {"now": now, "id": run.id},
+        {"now": now, "id": run.id, "worker_id": worker_id},
     )
     # Durable before the first step is dispatched -- module docstring's
     # commit-placement note; matches every other write in this function's
     # call chain.
     session.commit()
-    result = get_run(session, run.workspace_id, run.id)
-    assert result is not None
-    return result
+    return _current_run(session, run)
 
 
-def _finish_run(session: Session, run: WorkflowRun, status: RunStatus) -> WorkflowRun:
+def _finish_run(
+    session: Session, run: WorkflowRun, status: RunStatus, worker_id: str
+) -> WorkflowRun | None:
     """Reserved for genuinely terminal states (`_TERMINAL_RUN_STATUSES`) --
     stamps `finished_at`. Never call this for `waiting_approval` or
     `needs_review`: both are excluded from `_TERMINAL_RUN_STATUSES`
@@ -1570,48 +1726,59 @@ def _finish_run(session: Session, run: WorkflowRun, status: RunStatus) -> Workfl
     still-active) run showing a non-null `finished_at` from the moment it
     merely paused, until it next reaches a real terminal state. Use
     `_pause_run` for those two instead.
+
+    Lease-guarded (`_write_owned_run_state`): every call site reaches this
+    function *after* an adapter's `execute()`/`compensate()` has returned,
+    which is exactly the window in which a second worker can have reclaimed
+    the run. `None` means the lease was lost and nothing was written.
     """
     now = datetime.now(UTC)
-    session.execute(
-        text(
-            "UPDATE workflow_runs SET status = :status, finished_at = :now, updated_at = :now, "
-            "leased_by = NULL, leased_until = NULL WHERE id = :id"
-        ),
-        {"status": status, "now": now, "id": run.id},
+    result = _write_owned_run_state(
+        session,
+        run,
+        worker_id,
+        "status = :status, finished_at = :now, updated_at = :now, "
+        "leased_by = NULL, leased_until = NULL",
+        {"status": status, "now": now},
     )
-    session.commit()
-    record_run_state_transition(status)
-    result = get_run(session, run.workspace_id, run.id)
-    assert result is not None
+    if result is not None:
+        record_run_state_transition(status)
     return result
 
 
-def _pause_run(session: Session, run: WorkflowRun, status: RunStatus) -> WorkflowRun:
-    """For `waiting_approval`/`needs_review` -- releases the lease (this
-    worker is done with the run for now) exactly like `_finish_run`, but
-    deliberately never touches `finished_at`: neither state is terminal
-    (`_TERMINAL_RUN_STATUSES` excludes both), and `waiting_approval` has a
-    real resume path back to `'queued'` (`approvals._advance_run_after_
-    decision`) that a stale `finished_at` would otherwise leave behind on
-    an actively-progressing run -- see `_finish_run`'s own docstring for
-    the full reasoning.
+def _pause_run(
+    session: Session, run: WorkflowRun, status: RunStatus, worker_id: str
+) -> WorkflowRun | None:
+    """For `waiting_approval`/`needs_review`/`paused` -- releases the lease
+    (this worker is done with the run for now) exactly like `_finish_run`,
+    but deliberately never touches `finished_at`: none of the three is
+    terminal (`_TERMINAL_RUN_STATUSES` excludes all of them), and
+    `waiting_approval` has a real resume path back to `'queued'`
+    (`approvals._advance_run_after_decision`) that a stale `finished_at`
+    would otherwise leave behind on an actively-progressing run -- see
+    `_finish_run`'s own docstring for the full reasoning.
+
+    Lease-guarded for the identical reason `_finish_run` is: releasing a
+    lease is only this worker's to do while this worker still holds it, and
+    two of the three states it writes (`waiting_approval`, `needs_review`)
+    are unclaimable, so writing one onto a run a different worker is
+    actively dispatching would strand that run outright. `None` means the
+    lease was lost and nothing was written.
     """
     now = datetime.now(UTC)
-    session.execute(
-        text(
-            "UPDATE workflow_runs SET status = :status, updated_at = :now, "
-            "leased_by = NULL, leased_until = NULL WHERE id = :id"
-        ),
-        {"status": status, "now": now, "id": run.id},
+    result = _write_owned_run_state(
+        session,
+        run,
+        worker_id,
+        "status = :status, updated_at = :now, leased_by = NULL, leased_until = NULL",
+        {"status": status, "now": now},
     )
-    session.commit()
-    record_run_state_transition(status)
-    result = get_run(session, run.workspace_id, run.id)
-    assert result is not None
+    if result is not None:
+        record_run_state_transition(status)
     return result
 
 
-def _mark_compensating(session: Session, run: WorkflowRun) -> WorkflowRun:
+def _mark_compensating(session: Session, run: WorkflowRun, worker_id: str) -> WorkflowRun | None:
     """Task 6: transitions a run whose most recent step failed (with at
     least one qualifying compensation to attempt) to `'compensating'` --
     module docstring's "Task 6: compensation dispatch" section. Deliberately
@@ -1619,16 +1786,25 @@ def _mark_compensating(session: Session, run: WorkflowRun) -> WorkflowRun:
     unlike `_finish_run`/`_pause_run`): this is an automatic continuation
     of the same claimed run's own dispatch, not a state a different worker
     should be able to pick up mid-sequence.
+
+    **This is the single most important lease-guarded write in the module**
+    (module docstring's "Lease-ownership guard" section): `'compensating'`
+    is deliberately excluded from `_CLAIMABLE_PREDICATE` and no code path
+    anywhere reclaims a `'compensating'` run whose `leased_by` is `NULL`,
+    so writing this status onto a run this worker no longer owns strands
+    that run permanently -- no crash required, an ordinary lease handover
+    is enough. `None` means the lease was lost and nothing was written.
     """
     now = datetime.now(UTC)
-    session.execute(
-        text("UPDATE workflow_runs SET status = 'compensating', updated_at = :now WHERE id = :id"),
-        {"now": now, "id": run.id},
+    result = _write_owned_run_state(
+        session,
+        run,
+        worker_id,
+        "status = 'compensating', updated_at = :now",
+        {"now": now},
     )
-    session.commit()
-    record_run_state_transition("compensating")
-    result = get_run(session, run.workspace_id, run.id)
-    assert result is not None
+    if result is not None:
+        record_run_state_transition("compensating")
     return result
 
 
@@ -1922,7 +2098,12 @@ def _evaluate_dispatch_gate(
 
 
 def run_step(
-    session: Session, run: WorkflowRun, step_index: int, adapter_registry: AdapterRegistry
+    session: Session,
+    run: WorkflowRun,
+    step_index: int,
+    adapter_registry: AdapterRegistry,
+    *,
+    worker_id: str | None = None,
 ) -> StepOutcome | StepAwaitingApproval | StepBlockedByPolicy | StepBlockedByPreviewOnlyPolicy:
     """Dispatches (or resumes) exactly one step. At-most-one-effect
     (Decision 3): a `workflow_run_steps` row already `succeeded` under
@@ -1986,6 +2167,18 @@ def run_step(
     `'queued'` (module docstring's "Task 6: bounded retry" section) -- once
     exhausted, it falls through to the ordinary, unconditional `'failed'`
     path below, unchanged from Task 2.
+
+    **`worker_id`** is the lease this dispatch is running under, used
+    solely to guard that one retry-path run-level write (module docstring's
+    "Lease-ownership guard" section): releasing a run's lease back to
+    `'queued'` is only valid while this worker still holds it, and that
+    write happens *after* `execute()` returned, so the lease may be gone by
+    then. Keyword-only and optional because a caller that is not
+    dispatching under a lease at all -- a direct, single-step
+    `run_step(...)` call, the shape every test in this codebase uses to
+    exercise one step deterministically -- has no `worker_id` to assert and
+    gets exactly the pre-guard behavior. `process_claimed_run`, the only
+    production caller, always passes it.
     """
     step = _resolve_step(session, run, step_index)
     if step.get("step_type") != "action":
@@ -2207,6 +2400,55 @@ def run_step(
             backoff_seconds = _retry_backoff_seconds(new_attempt_count)
             now = datetime.now(UTC)
             next_attempt_at = now + timedelta(seconds=backoff_seconds)
+            # Release the lease back to 'queued', resumable at this exact
+            # step_index (current_step_index is already persisted as
+            # step_index by process_claimed_run's own loop before calling
+            # run_step) -- the identical lease-release shape _pause_run
+            # uses, except this is a direct UPDATE here (run_step's own
+            # commit-placement discipline, not a call to _pause_run, since
+            # _pause_run has no next_attempt_at parameter and this is not
+            # one of its two named states).
+            #
+            # Performed *before* the step-row write, and lease-guarded when
+            # a `worker_id` was supplied (module docstring's
+            # "Lease-ownership guard" section): `execute()` has already
+            # returned by this point, so a second worker may have reclaimed
+            # the run in the meantime -- and this particular write both
+            # re-queues the run and clears `leased_by`, so performing it
+            # unowned would silently revoke that second worker's live claim
+            # mid-dispatch. Ordering it first is what lets a lost lease bail
+            # out having written *nothing at all*: this worker does not own
+            # this run any more, so neither its run row nor its step row is
+            # this worker's to touch. The step stays `'dispatched'`, which
+            # the run's real owner resolves through the ordinary,
+            # fail-closed `unknown`/`needs_review` path.
+            ownership_predicate = (
+                f" AND {_LEASE_OWNERSHIP_PREDICATE}" if worker_id is not None else ""
+            )
+            # `RETURNING id` rather than a `rowcount` check -- the same
+            # "did this compare-and-swap actually match a row" shape
+            # `claim_next_run`/`renew_lease`/`_write_owned_run_state` all use.
+            run_update = session.execute(
+                text(
+                    "UPDATE workflow_runs SET status = 'queued', "
+                    "next_attempt_at = :next_attempt_at, "
+                    "leased_by = NULL, leased_until = NULL, updated_at = :now "
+                    f"WHERE id = :id{ownership_predicate} RETURNING id"
+                ),
+                {
+                    "next_attempt_at": next_attempt_at,
+                    "now": now,
+                    "id": run.id,
+                    "worker_id": worker_id,
+                },
+            ).first()
+            if worker_id is not None and run_update is None:
+                session.rollback()
+                # Reported as 'retrying' purely so process_claimed_run's own
+                # already-correct "stop advancing this run and return its
+                # current persisted state" branch handles it -- there is no
+                # separate control flow needed for a lost lease here.
+                return StepOutcome(step_index, "retrying", None, type(exc).__name__)
             session.execute(
                 text(
                     "UPDATE workflow_run_steps SET status = 'retrying', "
@@ -2221,22 +2463,6 @@ def run_step(
                     "run_id": run.id,
                     "step_index": step_index,
                 },
-            )
-            # Release the lease back to 'queued', resumable at this exact
-            # step_index (current_step_index is already persisted as
-            # step_index by process_claimed_run's own loop before calling
-            # run_step) -- the identical lease-release shape _pause_run
-            # uses, except this is a direct UPDATE here (run_step's own
-            # commit-placement discipline, not a call to _pause_run, since
-            # _pause_run has no next_attempt_at parameter and this is not
-            # one of its two named states).
-            session.execute(
-                text(
-                    "UPDATE workflow_runs SET status = 'queued', "
-                    "next_attempt_at = :next_attempt_at, "
-                    "leased_by = NULL, leased_until = NULL, updated_at = :now WHERE id = :id"
-                ),
-                {"next_attempt_at": next_attempt_at, "now": now, "id": run.id},
             )
             session.commit()
             record_step_outcome("retrying")
@@ -2762,9 +2988,7 @@ def _run_compensation_sequence(
     for original_index, original_step, compensation_index, compensation_step in qualifying:
         renewed = renew_lease(session, run.workspace_id, run.id, worker_id)
         if renewed is None:
-            current = get_run(session, run.workspace_id, run.id)
-            assert current is not None
-            return current
+            return _current_run(session, run)
         run = renewed
 
         outcome = _dispatch_compensation_step(
@@ -2780,7 +3004,12 @@ def _run_compensation_sequence(
             all_succeeded = False
 
     final_status: RunStatus = "compensated" if all_succeeded else "compensation_failed"
-    return _finish_run(session, run, final_status)
+    finished = _finish_run(session, run, final_status, worker_id)
+    # A lost lease here (the last compensation's own adapter call outlasted
+    # the lease and a second worker reclaimed) leaves the run in whatever
+    # state its new owner set -- never blindly overwritten with a terminal
+    # compensation status this worker no longer has the authority to write.
+    return finished if finished is not None else _current_run(session, run)
 
 
 # ---------------------------------------------------------------------------
@@ -2815,10 +3044,19 @@ def process_claimed_run(
     compensations and, if any exist, dispatches them via `_run_
     compensation_sequence` instead (module docstring, point 2).
     """
-    run = _mark_running(session, run)
+    run = _mark_running(session, run, worker_id)
     version = get_workflow_version(session, run.workspace_id, run.workflow_id, run.workflow_version)
     assert version is not None
     steps: list[dict[str, Any]] = version.graph.get("steps", [])
+
+    def _stop(transitioned: WorkflowRun | None) -> WorkflowRun:
+        """Every lease-guarded transition below returns `None` when this
+        worker turned out not to hold the run's lease any more (module
+        docstring's "Lease-ownership guard" section) -- in that case the
+        run's real owner is authoritative, so report its persisted state
+        rather than this worker's intended one.
+        """
+        return transitioned if transitioned is not None else _current_run(session, run)
 
     step_index = run.current_step_index
     while step_index < len(steps):
@@ -2836,15 +3074,13 @@ def process_claimed_run(
 
         renewed = renew_lease(session, run.workspace_id, run.id, worker_id)
         if renewed is None:
-            current = get_run(session, run.workspace_id, run.id)
-            assert current is not None
-            return current
+            return _current_run(session, run)
         run = renewed
 
         if run.cancel_requested_at is not None:
             cancellation_latency = (datetime.now(UTC) - run.cancel_requested_at).total_seconds()
             record_cancellation_latency(cancellation_latency)
-            return _finish_run(session, run, "cancelled")
+            return _stop(_finish_run(session, run, "cancelled", worker_id))
         if run.pause_requested_at is not None:
             # Task 4 -- the user-initiated pause flag, checked at the
             # identical point in the loop as cancel_requested_at (module
@@ -2854,10 +3090,10 @@ def process_claimed_run(
             # -- happens to be exactly what a non-terminal pause needs too;
             # this is not the same pause as Task 3's own waiting_approval/
             # needs_review transitions, only the same underlying mechanic.
-            return _pause_run(session, run, "paused")
+            return _stop(_pause_run(session, run, "paused", worker_id))
         if kill_switches.is_workflow_killed(session, run.workspace_id, run.workflow_id):
             # Task 6 -- module docstring's "Task 6: kill switches" section.
-            return _pause_run(session, run, "needs_review")
+            return _stop(_pause_run(session, run, "needs_review", worker_id))
 
         session.execute(
             text(
@@ -2867,15 +3103,15 @@ def process_claimed_run(
             {"step_index": step_index, "id": run.id},
         )
 
-        outcome = run_step(session, run, step_index, adapter_registry)
+        outcome = run_step(session, run, step_index, adapter_registry, worker_id=worker_id)
         if isinstance(outcome, StepAwaitingApproval):
             # current_step_index is already persisted as step_index (the
             # UPDATE immediately above) -- the run pauses exactly where it
             # is, never rewound; resuming re-enters this same step_index
             # (module docstring's "Resuming a waiting_approval run" note).
-            return _pause_run(session, run, "waiting_approval")
+            return _stop(_pause_run(session, run, "waiting_approval", worker_id))
         if isinstance(outcome, StepBlockedByPolicy):
-            return _pause_run(session, run, "needs_review")
+            return _stop(_pause_run(session, run, "needs_review", worker_id))
         if isinstance(outcome, StepBlockedByPreviewOnlyPolicy):
             # The run's policy is healthy and authorizes exactly what its
             # author intended -- it simply never authorizes a real side
@@ -2890,7 +3126,7 @@ def process_claimed_run(
             # pending, fully visible in the approval inbox: rehearsing that
             # flow is the whole purpose of the mode
             # (`docs/runbooks/PHASE-5-DOGFOOD.md`'s Stage 1).
-            return _finish_run(session, run, "preview_blocked")
+            return _stop(_finish_run(session, run, "preview_blocked", worker_id))
         if outcome.status == "succeeded":
             step_index += 1
             continue
@@ -2898,21 +3134,30 @@ def process_claimed_run(
             # Task 6: run_step itself already released the lease and set
             # run.status='queued'/next_attempt_at (module docstring's "Task
             # 6: bounded retry" section) -- nothing further to do here
-            # except stop advancing this run.
-            current = get_run(session, run.workspace_id, run.id)
-            assert current is not None
-            return current
+            # except stop advancing this run. Also the branch a lost lease
+            # on that same retry write lands in (run_step's own note).
+            return _current_run(session, run)
         if outcome.status == "failed":
             # Task 6: compensation dispatch, module docstring point 2.
             qualifying = _qualifying_compensations(session, run, steps, step_index)
             if not qualifying:
-                return _finish_run(session, run, "failed")
-            run = _mark_compensating(session, run)
+                return _stop(_finish_run(session, run, "failed", worker_id))
+            compensating = _mark_compensating(session, run, worker_id)
+            if compensating is None:
+                # The lease was lost while this step's own execute() was
+                # still running and a second worker already owns this run --
+                # writing 'compensating' here anyway is precisely the
+                # permanent-stranding bug the guard exists to prevent
+                # (module docstring's "Lease-ownership guard" section), and
+                # starting a compensation sequence under a lease we do not
+                # hold would race that owner's own dispatch.
+                return _current_run(session, run)
+            run = compensating
             return _run_compensation_sequence(
                 session, run, adapter_registry, worker_id, steps, qualifying
             )
         if outcome.status == "unknown":
-            return _pause_run(session, run, "needs_review")
+            return _stop(_pause_run(session, run, "needs_review", worker_id))
         # 'skipped' -- never produced by run_step in this task's scope;
         # handled here only so a future step type that legitimately skips
         # itself advances cleanly rather than looping forever.
@@ -2925,7 +3170,7 @@ def process_claimed_run(
         ),
         {"step_index": len(steps), "id": run.id},
     )
-    return _finish_run(session, run, "succeeded")
+    return _stop(_finish_run(session, run, "succeeded", worker_id))
 
 
 def run_worker_once(
@@ -2951,6 +3196,51 @@ def run_worker_once(
 # ---------------------------------------------------------------------------
 # Cancellation
 # ---------------------------------------------------------------------------
+
+
+def _is_immediately_cancellable(
+    session: Session, workspace_id: UUID, run_id: UUID, status: RunStatus, current_step_index: int
+) -> bool:
+    """Whether `cancel_run` should flip this run straight to `'cancelled'`
+    itself rather than only record `cancel_requested_at` and leave the flag
+    for `process_claimed_run`'s own loop to observe.
+
+    The rule is one property, not a list of special cases: **a run that no
+    poll cycle will ever revisit must be cancelled here or not at all.**
+    `_IMMEDIATELY_CANCELLABLE_RUN_STATUSES` covers the three unconditional
+    cases (`queued` -- never claimed, so nothing in flight; `paused` and
+    `needs_review` -- both deliberately unclaimable, so
+    `process_claimed_run` is never called for them again without an
+    explicit operator action that, for `needs_review`, does not exist at
+    all).
+
+    `waiting_approval` is the one conditional case, and the condition is
+    the approval request's *real* `expires_at`, never merely the run's
+    status: while a request is genuinely still pending, a human may be
+    about to decide it, and `decide_approval` will then resume or reject
+    the run properly -- cancelling out from under that decision would be
+    wrong. Once `expires_at` has passed, though, `decide_approval` returns
+    `ApprovalExpired` for **both** `/approve` and `/reject` (that module's
+    own "never implicitly approved" rule), so there is no longer any
+    decision anyone can make: nobody can approve it, nobody can reject it,
+    and without this branch nobody could cancel it either. A
+    `waiting_approval` run with no pending request at all is treated the
+    same way and for the same reason -- there is literally nothing left to
+    decide, so it is stranded in exactly the same sense as an expired one
+    (reachable if a decision no-oped against a run that had moved on;
+    `_advance_run_after_decision`'s own `current_step_index` guard).
+    """
+    if status in _IMMEDIATELY_CANCELLABLE_RUN_STATUSES:
+        return True
+    if status != "waiting_approval":
+        # 'leased'/'running'/'compensating' -- lease-bearing, actively being
+        # dispatched by some worker. Unchanged behavior: record the flag
+        # only, and let that worker's own loop stop itself at its next
+        # checkpoint (`EXECUTION-CONTRACT.md`: "a step already dispatched to
+        # its adapter completes ... rather than being force-interrupted").
+        return False
+    pending = get_pending_approval(session, workspace_id, run_id, current_step_index)
+    return pending is None or approval_lifecycle_status(pending) == "expired"
 
 
 def cancel_run(
@@ -2985,12 +3275,41 @@ def cancel_run(
     (`leased_by`/`leased_until` are both `NULL`), so there is no in-flight
     step to protect -- cancelling it has exactly the same safety
     properties as cancelling a never-claimed `'queued'` run.
+
+    **`'needs_review'` runs, and `'waiting_approval'` runs whose approval
+    request has genuinely expired, are now cancelled immediately too -- a
+    second, strictly worse instance of the exact bug the paragraph above
+    describes, found by an adversarial review of this module.** The
+    `'paused'` fix above stopped one step short: `'needs_review'` and
+    `'waiting_approval'` are *also* excluded from `_CLAIMABLE_PREDICATE`,
+    *also* never revisited by `process_claimed_run`, and -- unlike
+    `'paused'`, which at least has `resume_run` -- had **no** exit at all.
+    Nothing anywhere transitions a run out of `'needs_review'` once a
+    policy block, an unknown-outcome crash recovery, or a kill-switch
+    discovery parks it there; and once a `'waiting_approval'` run's request
+    passes `expires_at`, `decide_approval` returns `ApprovalExpired` for
+    both `/approve` and `/reject`. So before this fix an operator faced with
+    either could call `cancel_run`, receive a cheerful `200` with
+    `cancel_requested_at` set, and have absolutely nothing happen -- ever.
+    Both now reach `'cancelled'` (terminal, `finished_at` stamped) through
+    the identical mechanics `'queued'`/`'paused'` already use, and for the
+    identical safety reason: `_pause_run` released the lease on the way into
+    both states, so `leased_by`/`leased_until` are already `NULL` and there
+    is no in-flight step for the transition to interrupt -- which is also
+    why this function needs none of the lease-ownership guarding the
+    worker-side transitions above carry. A still-pending, not-yet-expired
+    `'waiting_approval'` run is deliberately **not** cancellable this way
+    (a human may be one click from deciding it); see
+    `_is_immediately_cancellable`. The expired `approval_requests` row
+    itself is left exactly as it is -- `status` stays `'pending'` and
+    reports as `'expired'` through `approval_lifecycle_status`, per that
+    module's "`expired` is computed, never stored" rule.
     """
     row = (
         session.execute(
             text(
-                "SELECT status FROM workflow_runs WHERE workspace_id = :workspace_id AND id = :id "
-                "FOR UPDATE"
+                "SELECT status, current_step_index FROM workflow_runs "
+                "WHERE workspace_id = :workspace_id AND id = :id FOR UPDATE"
             ),
             {"workspace_id": workspace_id, "id": run_id},
         )
@@ -3013,9 +3332,12 @@ def cancel_run(
         ),
         {"now": now, "id": run_id},
     )
-    if row["status"] in ("queued", "paused"):
-        # 'paused' included alongside 'queued' -- module docstring's own
-        # "real bug found and fixed" note above has the full reasoning.
+    if _is_immediately_cancellable(
+        session, workspace_id, run_id, row["status"], row["current_step_index"]
+    ):
+        # 'paused'/'needs_review'/an expired-approval 'waiting_approval' all
+        # included alongside 'queued' -- this function's own docstring and
+        # `_is_immediately_cancellable`'s have the full reasoning.
         session.execute(
             text(
                 "UPDATE workflow_runs SET status = 'cancelled', finished_at = :now, "

@@ -47,15 +47,48 @@ recovery interaction" section is the authority on what re-enabling a
 previously-killed workflow does *not* do:** "Re-enabling a previously-
 killed workflow does not automatically resume its paused runs ... the
 operator explicitly resolves [it] the same way an `unknown` outcome is
-resolved ... not implicitly on re-enable." This module implements exactly
-that by construction, not by an extra check: a run a kill switch stopped
-mid-dispatch is left in `needs_review` (`worker.process_claimed_run`'s own
-kill-switch check, this task's addition) -- `needs_review` is not in
-`worker._CLAIMABLE_PREDICATE`'s claimable set at all, kill switch active or
-not, so deactivating this module's own row has no code path that would
-ever auto-resume it; an operator must explicitly act on the run (resolve
-the review, or a future retry/resume path), completely independent of this
-module's own activate/deactivate functions.
+resolved ... not implicitly on re-enable."
+
+**How that guarantee is actually achieved -- corrected.** This docstring
+previously claimed the property held "by construction, not by an extra
+check," on the grounds that a killed run lands in `needs_review` and
+`needs_review` is never in `worker._CLAIMABLE_PREDICATE`'s claimable set.
+An adversarial review found that reasoning covered only *one* of the ways a
+run can be in flight when a switch activates -- the case where a worker
+happened to be actively dispatching the run and observed the kill switch
+itself (`worker.process_claimed_run`'s own per-step check). It did **not**
+cover two others, and for those the documented guarantee was simply false:
+
+1. **Runs already sitting in `'queued'`** when the switch activates.
+   `worker.enqueue_run`'s kill-switch rejection only blocks *new* rows; it
+   never touches rows already queued.
+2. **Retry-pending runs**, which `worker.run_step`'s bounded-retry path
+   deliberately parks back in `'queued'` with a `next_attempt_at`.
+
+Both sat quietly in `'queued'` for the entire incident -- invisible as
+anything needing review -- and the instant the switch was deactivated the
+very next poll cycle claimed and dispatched them, with zero operator
+review. `activate_kill_switch` therefore now performs one extra, explicit
+step (`_park_queued_runs_for_review`): at **activation** time it transitions
+every currently-`'queued'` run in the affected scope (global -> every
+workflow in the workspace; per-workflow -> that one workflow) straight to
+`'needs_review'`. That restores "by construction" for real, in the strong
+sense: after activation there is no run left in any state a later
+deactivation could silently resume from, so deactivation itself remains a
+pure kill-switch-row mutation that touches no run at all. It also matches
+the fail-closed, operator-visible philosophy the rest of this system uses
+-- `needs_review` is the same terminal-until-human-action state an unusable
+policy, an ambiguous `unknown` outcome, and a mid-dispatch kill-switch
+discovery already land in, so an incident leaves one uniform queue of runs
+for an operator to work through rather than two with different visibility.
+
+Deliberately scoped to `'queued'` only. A `'leased'`/`'running'`/
+`'compensating'` run is lease-bearing and actively owned by some worker:
+stealing it here would violate the same lease-ownership discipline
+`worker.py`'s own transitions enforce, and it is unnecessary -- that
+worker's own per-step kill-switch check parks it in `needs_review` itself.
+A `'paused'` run already requires an explicit `resume_run`, and
+`waiting_approval`/terminal runs are not resumable by a poll cycle at all.
 """
 
 from __future__ import annotations
@@ -78,6 +111,7 @@ from ecc.database import get_session
 from ecc.observability import (
     queue_kill_switch_event,
     queue_lifecycle_event,
+    queue_run_state_transition,
     record_audit_outbox_failure,
     record_idempotency_conflict,
 )
@@ -316,6 +350,59 @@ def _write_kill_switch_audit(
     queue_kill_switch_event(session, _scope_label(workflow_id), event_type.rsplit(".", 1)[-1])
 
 
+def _park_queued_runs_for_review(
+    session: Session, workspace_id: UUID, workflow_id: str | None, now: datetime
+) -> list[UUID]:
+    """Transitions every currently-`'queued'` `workflow_runs` row in this
+    switch's scope to `'needs_review'` -- the extra, explicit step
+    `activate_kill_switch` performs so that "deactivating a kill switch
+    never silently auto-resumes anything" is true for *all* in-flight runs,
+    not only the ones a worker happened to observe (module docstring's own
+    corrected "How that guarantee is actually achieved" section has the full
+    reasoning and the two cases the previous claim missed).
+
+    Raw SQL against another module's table, deliberately, for the identical
+    circular-import reason `approvals._advance_run_after_decision` already
+    documents in the mirror direction: `worker.py` imports this module (its
+    claim predicate and per-step loop both need `is_workflow_killed`), so
+    this module cannot import `worker.py` back to reuse `_pause_run`. The
+    statement is the same shape `_pause_run` writes anyway -- set the
+    status, release any lease fields, never touch `finished_at`
+    (`needs_review` is not terminal). `next_attempt_at` is deliberately
+    left as-is on a retry-pending run: it is inert while the run is
+    unclaimable, and it is real forensic information about where the run was
+    when the incident hit.
+
+    Scope mirrors `is_workflow_killed`'s own semantics exactly: a global
+    switch (`workflow_id is None`) covers every workflow in the workspace, a
+    per-workflow switch only its own `workflow_id`. Returns the parked run
+    ids so the caller can report/count them; caller-committed, like every
+    other write in this module.
+    """
+    scope_clause = "" if workflow_id is None else "AND workflow_id = :workflow_id"
+    params: dict[str, Any] = {"workspace_id": workspace_id, "now": now}
+    if workflow_id is not None:
+        params["workflow_id"] = workflow_id
+    parked = [
+        row[0]
+        for row in session.execute(
+            text(
+                "UPDATE workflow_runs SET status = 'needs_review', leased_by = NULL, "
+                "leased_until = NULL, updated_at = :now "
+                "WHERE workspace_id = :workspace_id AND status = 'queued' "
+                f"{scope_clause} RETURNING id"
+            ),
+            params,
+        ).all()
+    ]
+    for _ in parked:
+        # Deferred rather than recorded directly -- this module is
+        # caller-committed, exactly like `worker.cancel_run`'s own fast path
+        # (`ecc.observability.queue_run_state_transition`'s own docstring).
+        queue_run_state_transition(session, "needs_review")
+    return parked
+
+
 def activate_kill_switch(
     session: Session,
     workspace_id: UUID,
@@ -324,13 +411,23 @@ def activate_kill_switch(
     actor_id: UUID,
 ) -> KillSwitch:
     """Idempotent for an already-active exact scope (module docstring) --
-    returns the existing row unchanged, writes no duplicate audit event.
+    returns the existing row unchanged, writes no duplicate audit event and
+    parks no runs (a switch that is already active has already done both,
+    and `enqueue_run` has been rejecting new runs ever since).
     Otherwise inserts a fresh row and commits (caller-committed, matching
     every other Phase 5 mutation's `with session.begin():` convention --
     this function itself does not call `session.commit()`, unlike `worker.
     py`'s own bare-session discipline, since kill-switch activation has no
     risky external call to protect against the way `run_step`'s digest-
     before-execute write does).
+
+    **Also parks every currently-`'queued'` run in this switch's scope into
+    `'needs_review'`** (`_park_queued_runs_for_review`) -- in the same
+    uncommitted unit of work as the switch row itself, so a switch can never
+    become active without its scope's queued runs having been parked, and
+    vice versa. Module docstring's "How that guarantee is actually achieved
+    -- corrected" section explains why this extra step is required rather
+    than the property holding for free.
     """
     existing = get_active_kill_switch(session, workspace_id, workflow_id)
     if existing is not None:
@@ -368,6 +465,7 @@ def activate_kill_switch(
         reason=reason,
         now=now,
     )
+    _park_queued_runs_for_review(session, workspace_id, workflow_id, now)
     result = get_kill_switch(session, workspace_id, kill_switch_id)
     assert result is not None
     return result

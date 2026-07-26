@@ -25,6 +25,18 @@ minimum:
 8. Workspace isolation.
 9. Redaction of secret-shaped keys in stored `input`/`output`.
 10. The heartbeat (`renew_lease`) as an independently testable function.
+
+Plus, added by the run-state audit of `worker.py`:
+
+11. A lease lost *inside* one step's `execute()` (the window `renew_lease`'s
+    once-per-step cadence leaves open) never lets the original worker
+    overwrite the new owner's run state -- `worker.py`'s "Lease-ownership
+    guard" module-docstring section.
+12. `cancel_run` is a real escape hatch for the two states that previously
+    had none: `needs_review`, and `waiting_approval` whose approval request
+    has genuinely expired -- plus the deliberate negative case, a
+    still-decidable `waiting_approval` run, which must not be cancelled out
+    from under the human about to decide it.
 """
 
 from __future__ import annotations
@@ -194,6 +206,49 @@ class DigestVisibilityProbeAdapter:
             )
         if row is not None and row["status"] == "dispatched" and row["action_digest"]:
             self.saw_dispatched_row_from_independent_connection = True
+        return EchoOutput(value=action_input.value)
+
+
+class LeaseHandoverAdapter:
+    """Reproduces a real lease handover *inside* one step's `execute()` --
+    the exposure window `renew_lease`'s once-per-step cadence leaves open
+    (`worker.py`'s "Lease-ownership guard" module-docstring section). No
+    crash and no `sleep` are needed to hit it: a step slower than
+    `LEASE_DURATION_SECONDS` plus one other worker's ordinary poll cycle is
+    enough, so this adapter simply performs, on an independent connection,
+    exactly the writes that second worker would have performed -- reclaim
+    the run, then park it (`needs_review`, `leased_by = NULL`, the shape
+    `worker._pause_run` writes) -- and then returns normally.
+
+    The first worker's `execute()` therefore returns holding no valid lease,
+    which is precisely the state in which its *next* run-state write used to
+    clobber the new owner's state unconditionally.
+    """
+
+    adapter_id = "test.lease-handover"
+    input_schema = EchoInput
+    output_schema = EchoOutput
+    reversible = True
+    high_impact_categories: frozenset[str] = frozenset()
+
+    def __init__(self, run_id: UUID, *, stolen_by: str = "worker-b") -> None:
+        self._run_id = run_id
+        self._stolen_by = stolen_by
+        self.execute_calls = 0
+
+    def simulate(self, action_input: EchoInput) -> EchoOutput:  # noqa: D102
+        return EchoOutput(value=action_input.value)
+
+    def execute(self, action_input: EchoInput) -> EchoOutput:  # noqa: D102
+        self.execute_calls += 1
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    "UPDATE workflow_runs SET status = 'needs_review', leased_by = NULL, "
+                    "leased_until = NULL, updated_at = now() WHERE id = :id"
+                ),
+                {"id": self._run_id},
+            )
         return EchoOutput(value=action_input.value)
 
 
@@ -740,6 +795,64 @@ def test_renew_lease_returns_none_for_wrong_worker_id(
     assert result is None
 
 
+def test_a_lease_lost_mid_execute_never_overwrites_the_new_owners_run_state(
+    worker_test_context: tuple[UUID, UUID],
+) -> None:
+    """Regression test for the lease-ownership hole an adversarial review of
+    `worker.py` found (that module's "Lease-ownership guard" docstring
+    section has the full write-up). `renew_lease` was the only run-state
+    write in the module that checked ownership, and it runs only once per
+    step -- so for one whole `execute()` duration, `_finish_run`/
+    `_pause_run`/`_mark_compensating`/the retry-path run `UPDATE` could all
+    write to a run a second worker had already reclaimed, because every one
+    of them said only `WHERE id = :id`.
+
+    Here the step succeeds while a second worker reclaims and parks the run
+    in `needs_review`. Before the fix, the original worker's
+    `_finish_run(..., 'succeeded')` then unconditionally stamped
+    `status='succeeded'`/`finished_at` over that -- silently reporting
+    success for a run its real owner had flagged for human review, and
+    resurrecting a run out of a non-terminal state nothing had asked to
+    resume. After the fix the guarded write matches zero rows, and
+    `process_claimed_run` reports the run's *persisted* state instead of its
+    own intended one.
+    """
+    workspace_id, user_id = worker_test_context
+    workflow_id = f"test.lease-handover.{uuid4().hex}"
+    graph = _chained_graph(_action_step("s1", "test.lease-handover"))
+    _publish_workflow(workspace_id, user_id, workflow_id, graph)
+
+    with SessionFactory() as session, session.begin():
+        queued = automation_worker.enqueue_run(
+            session, workspace_id, user_id, workflow_id=workflow_id
+        )
+    assert isinstance(queued, automation_worker.WorkflowRun)
+
+    handover = LeaseHandoverAdapter(queued.id)
+    registry = _make_registry(handover)
+    with SessionFactory() as session:
+        claimed = automation_worker.claim_next_run(session, "worker-a")
+        assert claimed is not None
+        finished = automation_worker.process_claimed_run(session, claimed, registry, "worker-a")
+
+    assert handover.execute_calls == 1  # the step really did run to completion
+    assert finished.status == "needs_review"  # the new owner's state, not 'succeeded'
+    assert finished.finished_at is None
+    assert finished.leased_by is None
+
+    with SessionFactory() as session:
+        persisted = automation_worker.get_run(session, workspace_id, queued.id)
+    assert persisted is not None
+    assert persisted.status == "needs_review"
+    assert persisted.finished_at is None
+    # The step's own outcome row is still recorded truthfully -- only the
+    # *run*-level transition is withheld (the guard is on run state, not on
+    # the record of what this step actually did).
+    with SessionFactory() as session:
+        steps = automation_worker.list_run_steps(session, workspace_id, queued.id)
+    assert [step.status for step in steps] == ["succeeded"]
+
+
 # ---------------------------------------------------------------------------
 # 4. Full run success path.
 # ---------------------------------------------------------------------------
@@ -1164,6 +1277,201 @@ def test_cancel_unknown_run_returns_not_found(worker_test_context: tuple[UUID, U
     with SessionFactory() as session, session.begin():
         result = automation_worker.cancel_run(session, workspace_id, uuid4())
     assert isinstance(result, automation_worker.WorkflowRunNotFound)
+
+
+def _run_parked_in_needs_review(workspace_id: UUID, user_id: UUID) -> automation_worker.WorkflowRun:
+    """Drives a run into `'needs_review'` the same way `test_no_policy_
+    blocks_dispatch_as_needs_review` does (publish with `policy_ref=None`,
+    fail closed at the dispatch gate) -- the cheapest of the three real
+    routes into that state (the others being an ambiguous `unknown` outcome
+    and a mid-dispatch kill-switch discovery); all three land there through
+    the identical `_pause_run(..., 'needs_review')` call, so which one a
+    cancellation test uses does not matter.
+    """
+    workflow_id = f"test.needs-review-cancel.{uuid4().hex}"
+    graph = _chained_graph(_action_step("s1", "test.echo"))
+    with SessionFactory() as session, session.begin():
+        draft = automation_workflows.create_workflow_draft(
+            session,
+            workspace_id,
+            user_id,
+            workflow_id=workflow_id,
+            graph=graph,
+            trigger_refs=[],
+            policy_ref=None,
+        )
+        automation_workflows.activate_workflow_version(session, workspace_id, draft.id)
+    with SessionFactory() as session, session.begin():
+        queued = automation_worker.enqueue_run(
+            session, workspace_id, user_id, workflow_id=workflow_id
+        )
+    assert isinstance(queued, automation_worker.WorkflowRun)
+    registry = _make_registry(EchoAdapter())
+    with SessionFactory() as session:
+        claimed = automation_worker.claim_next_run(session, "worker-a")
+        assert claimed is not None
+        parked = automation_worker.process_claimed_run(session, claimed, registry, "worker-a")
+    assert parked.status == "needs_review"
+    return parked
+
+
+def test_cancel_a_needs_review_run_becomes_cancelled_not_stuck(
+    worker_test_context: tuple[UUID, UUID],
+) -> None:
+    """Regression test for the second half of the "a flag nothing ever
+    consults is not a cancellation" bug an adversarial review found
+    (`worker.cancel_run`'s own docstring has the full write-up). A previous
+    self-review fixed this for `'paused'` but stopped there:
+    `'needs_review'` is *also* excluded from `_CLAIMABLE_PREDICATE`, *also*
+    never revisited by `process_claimed_run` -- and, unlike `'paused'`, has
+    no `resume_run` either, so nothing anywhere ever moves a run out of it.
+    Before the fix, cancelling such a run set `cancel_requested_at`, changed
+    nothing else, and left the run permanently unactionable by any endpoint.
+    """
+    workspace_id, user_id = worker_test_context
+    parked = _run_parked_in_needs_review(workspace_id, user_id)
+    # Precondition for the fix's safety argument: `_pause_run` already
+    # released the lease on the way in, so there is no in-flight step to
+    # protect (`cancel_run`'s own docstring).
+    assert parked.leased_by is None
+    assert parked.leased_until is None
+
+    with SessionFactory() as session, session.begin():
+        cancelled = automation_worker.cancel_run(session, workspace_id, parked.id)
+    assert isinstance(cancelled, automation_worker.WorkflowRun)
+    assert cancelled.status == "cancelled"  # not stuck in 'needs_review'
+    assert cancelled.finished_at is not None
+    assert cancelled.cancel_requested_at is not None
+
+    # Genuinely terminal, not merely relabelled: a second cancel is a no-op
+    # and the run is never claimable again.
+    with SessionFactory() as session, session.begin():
+        again = automation_worker.cancel_run(session, workspace_id, parked.id)
+    assert isinstance(again, automation_worker.WorkflowRun)
+    assert again.status == "cancelled"
+    with SessionFactory() as session:
+        assert automation_worker.claim_next_run(session, "worker-z") is None
+
+
+def test_cancel_a_waiting_approval_run_whose_request_expired_becomes_cancelled(
+    worker_test_context: tuple[UUID, UUID],
+) -> None:
+    """The other permanently-unactionable state the same review found. Once
+    a `'waiting_approval'` run's request passes `expires_at`,
+    `decide_approval` returns `ApprovalExpired` for **both** `/approve` and
+    `/reject` -- so nobody can approve it, nobody can reject it, and before
+    this fix nobody could cancel it either (`'waiting_approval'` was not in
+    `cancel_run`'s immediate-cancel set). Cancellation is the escape hatch,
+    and it is now available exactly once the request is genuinely expired.
+    """
+    workspace_id, user_id = worker_test_context
+    workflow_id = f"test.cancel-expired-approval.{uuid4().hex}"
+    graph = _chained_graph(_action_step("s1", "test.high-impact"))
+    _publish_workflow(workspace_id, user_id, workflow_id, graph)
+    with SessionFactory() as session, session.begin():
+        automation_worker.enqueue_run(session, workspace_id, user_id, workflow_id=workflow_id)
+
+    adapter = HighImpactAdapter()
+    registry = _make_registry(adapter)
+    with SessionFactory() as session:
+        claimed = automation_worker.claim_next_run(session, "worker-a")
+        assert claimed is not None
+        paused = automation_worker.process_claimed_run(session, claimed, registry, "worker-a")
+    assert paused.status == "waiting_approval"
+    assert paused.leased_by is None  # `_pause_run` already released the lease
+
+    with SessionFactory() as session, session.begin():
+        pending = automation_approvals.get_pending_approval(session, workspace_id, claimed.id, 0)
+    assert pending is not None
+    with engine.begin() as connection:
+        connection.execute(
+            text("UPDATE approval_requests SET expires_at = :past WHERE id = :id"),
+            {"past": datetime.now(UTC) - timedelta(seconds=1), "id": pending.id},
+        )
+
+    # Confirms the premise: neither decision is available any more.
+    for decision in ("approved", "rejected"):
+        with SessionFactory() as session, session.begin():
+            decided = automation_approvals.decide_approval(
+                session,
+                workspace_id,
+                user_id,
+                pending.id,
+                decision,  # type: ignore[arg-type]
+                current_action_digest=pending.action_digest,
+            )
+        assert isinstance(decided, automation_approvals.ApprovalExpired)
+
+    with SessionFactory() as session, session.begin():
+        cancelled = automation_worker.cancel_run(session, workspace_id, claimed.id)
+    assert isinstance(cancelled, automation_worker.WorkflowRun)
+    assert cancelled.status == "cancelled"
+    assert cancelled.finished_at is not None
+    assert adapter.execute_calls == 0
+
+    # The approval row itself is deliberately untouched -- `status` stays
+    # `'pending'` and `expired` remains computed, never stored (approvals.py's
+    # own "three-valued, not four" rule).
+    with SessionFactory() as session:
+        refreshed = automation_approvals.get_approval(session, workspace_id, pending.id)
+    assert refreshed is not None
+    assert refreshed.status == "pending"
+    assert automation_approvals.approval_lifecycle_status(refreshed) == "expired"
+
+
+def test_cancel_a_still_pending_waiting_approval_run_is_not_immediate(
+    worker_test_context: tuple[UUID, UUID],
+) -> None:
+    """The deliberate negative half of the fix above: a `'waiting_approval'`
+    run whose request is still genuinely pending must **not** be cancelled
+    out from under a human who may be about to decide it
+    (`worker._is_immediately_cancellable`). Only `cancel_requested_at` is
+    recorded, and the decision path stays fully available -- the flag then
+    takes effect at the run's next real checkpoint, exactly like
+    cancelling any other actively-progressing run.
+    """
+    workspace_id, user_id = worker_test_context
+    workflow_id = f"test.cancel-live-approval.{uuid4().hex}"
+    graph = _chained_graph(_action_step("s1", "test.high-impact"))
+    _publish_workflow(workspace_id, user_id, workflow_id, graph)
+    with SessionFactory() as session, session.begin():
+        automation_worker.enqueue_run(session, workspace_id, user_id, workflow_id=workflow_id)
+
+    adapter = HighImpactAdapter()
+    registry = _make_registry(adapter)
+    with SessionFactory() as session:
+        claimed = automation_worker.claim_next_run(session, "worker-a")
+        assert claimed is not None
+        paused = automation_worker.process_claimed_run(session, claimed, registry, "worker-a")
+    assert paused.status == "waiting_approval"
+
+    with SessionFactory() as session, session.begin():
+        result = automation_worker.cancel_run(session, workspace_id, claimed.id)
+    assert isinstance(result, automation_worker.WorkflowRun)
+    assert result.status == "waiting_approval"  # NOT cancelled -- still decidable
+    assert result.cancel_requested_at is not None
+    assert result.finished_at is None
+
+    # Still fully decidable, and the pending cancellation then takes effect
+    # at the resumed run's own next checkpoint rather than being lost.
+    with SessionFactory() as session, session.begin():
+        pending = automation_approvals.get_pending_approval(session, workspace_id, claimed.id, 0)
+        assert pending is not None
+        decided = automation_approvals.decide_approval(
+            session,
+            workspace_id,
+            user_id,
+            pending.id,
+            "approved",
+            current_action_digest=pending.action_digest,
+        )
+    assert isinstance(decided, automation_approvals.ApprovalRequest)
+    with SessionFactory() as session:
+        reclaimed = automation_worker.claim_next_run(session, "worker-b")
+        assert reclaimed is not None
+        finished = automation_worker.process_claimed_run(session, reclaimed, registry, "worker-b")
+    assert finished.status == "cancelled"
+    assert adapter.execute_calls == 0
 
 
 # ---------------------------------------------------------------------------
@@ -1673,11 +1981,19 @@ def test_preview_only_rejected_approval_still_fails_the_run_unchanged(
 ) -> None:
     """The other half of "the approval can still be decided": rejecting a
     `preview_only` step's request behaves exactly as it does under any other
-    mode (`approvals._advance_run_after_decision` -> `failed`), and is
-    deliberately *not* rerouted to `preview_blocked` -- a human explicitly
-    declined this action, which is a different, more informative fact about
-    the run than "this mode never dispatches," and it is the outcome an
-    operator rehearsing a rejection expects to see.
+    mode, and is deliberately *not* rerouted to `preview_blocked` -- a human
+    explicitly declined this action, which is a different, more informative
+    fact about the run than "this mode never dispatches," and it is the
+    outcome an operator rehearsing a rejection expects to see.
+
+    Since the run-state audit (`claude/phase-5-audit-batch-b`),
+    `_advance_run_after_decision` no longer decides the run's fate inline --
+    a rejection writes the step's own `'failed'` outcome and re-queues the
+    run through the ordinary poll loop, exactly like an adapter-raised
+    exception does (see that module's own docstring). So this test now
+    reclaims and drives one more poll cycle before asserting `'failed'`,
+    matching the identical shape `test_rejecting_an_approval_compensates_
+    earlier_steps_like_any_other_failure` already uses.
     """
     workspace_id, user_id = worker_test_context
     workflow_id = f"test.preview-only-reject.{uuid4().hex}"
@@ -1703,10 +2019,17 @@ def test_preview_only_rejected_approval_still_fails_the_run_unchanged(
     assert isinstance(decided, automation_approvals.ApprovalRequest)
     assert decided.status == "rejected"
 
+    # The rejection re-queues the run rather than deciding its fate inline.
     with SessionFactory() as session, session.begin():
-        run_after = automation_worker.get_run(session, workspace_id, claimed.id)
-    assert run_after is not None
-    assert run_after.status == "failed"
+        requeued = automation_worker.get_run(session, workspace_id, claimed.id)
+    assert requeued is not None
+    assert requeued.status == "queued"
+
+    with SessionFactory() as session:
+        reclaimed = automation_worker.claim_next_run(session, "worker-b")
+        assert reclaimed is not None
+        finished = automation_worker.process_claimed_run(session, reclaimed, registry, "worker-b")
+    assert finished.status == "failed"
     assert adapter.execute_calls == 0
 
 
@@ -1977,6 +2300,16 @@ def test_revoking_policy_mid_run_blocks_the_next_step_but_not_the_one_already_su
 def test_rejected_approval_fails_the_run_without_dispatching(
     worker_test_context: tuple[UUID, UUID],
 ) -> None:
+    """A rejection no longer writes `status='failed'` straight onto the run
+    (`approvals._advance_run_after_decision`'s own docstring has the full
+    reasoning for that change): it records the rejected step as a real
+    `'failed'` `workflow_run_steps` row and re-queues the run so
+    `process_claimed_run`'s ordinary `'failed'` branch -- the same one an
+    adapter exception goes through -- decides what happens next. This
+    workflow declares no `compensate_ref`, so that branch reaches the
+    identical `'failed'` terminal state this test always asserted, one poll
+    cycle later, still without ever calling `execute()`.
+    """
     workspace_id, user_id = worker_test_context
     workflow_id = f"test.rejected.{uuid4().hex}"
     graph = _chained_graph(_action_step("s1", "test.high-impact"))
@@ -2004,9 +2337,23 @@ def test_rejected_approval_fails_the_run_without_dispatching(
 
     with SessionFactory() as session, session.begin():
         run = automation_worker.get_run(session, workspace_id, claimed.id)
+        steps = automation_worker.list_run_steps(session, workspace_id, claimed.id)
     assert run is not None
-    assert run.status == "failed"
-    assert adapter.execute_calls == 0
+    assert run.status == "queued"  # handed back to the poll loop, not terminated inline
+    assert run.finished_at is None
+    assert len(steps) == 1
+    assert steps[0].step_index == 0
+    assert steps[0].status == "failed"
+    assert steps[0].error_class == "ApprovalRejected"
+    assert steps[0].action_digest == pending.action_digest
+
+    with SessionFactory() as session:
+        reclaimed = automation_worker.claim_next_run(session, "worker-b")
+        assert reclaimed is not None
+        finished = automation_worker.process_claimed_run(session, reclaimed, registry, "worker-b")
+    assert finished.status == "failed"
+    assert finished.finished_at is not None
+    assert adapter.execute_calls == 0  # never dispatched, before or after the reject
 
 
 def test_approving_with_mismatched_digest_is_rejected_and_never_dispatches(
