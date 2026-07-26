@@ -834,7 +834,7 @@ def test_list_workflows_via_endpoint(
 ) -> None:
     client, _workspace_id, _user_id, token = workflow_test_context
     workflow_id = f"test.http-list.{uuid4().hex}"
-    client.post(
+    created = client.post(
         "/api/v1/automations/workflows",
         json={"workflow_id": workflow_id, "graph": _valid_graph(), "trigger_refs": []},
         headers=_headers(token, key="list-create"),
@@ -845,6 +845,22 @@ def test_list_workflows_via_endpoint(
     assert workflow_id in summaries
     assert summaries[workflow_id]["latest_version"] == 1
     assert summaries[workflow_id]["active_version"] is None
+    # Task 7: the list summary must carry the latest version's own row id
+    # (never a bare version number) so a caller can navigate straight into
+    # GET /workflows/{version_id}, which is addressed by that UUID, not by
+    # (workflow_id, version) -- a real gap found and closed while building
+    # the frontend workflow list against this endpoint.
+    assert summaries[workflow_id]["latest_version_id"] == created.json()["id"]
+    assert summaries[workflow_id]["active_version_id"] is None
+
+    publish = client.post(
+        f"/api/v1/automations/workflows/{created.json()['id']}/publish",
+        headers=_headers(token, key="list-publish"),
+    )
+    assert publish.status_code == 200
+    republished = client.get("/api/v1/automations/workflows")
+    republished_by_id = {w["workflow_id"]: w for w in republished.json()["workflows"]}
+    assert republished_by_id[workflow_id]["active_version_id"] == created.json()["id"]
 
 
 def test_publish_workflow_via_endpoint(

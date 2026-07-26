@@ -132,6 +132,14 @@ class RunStepResponse(BaseModel):
     step_type: str
     status: str
     action_digest: str | None
+    # Task 7 addition: `workflow_run_steps.attempt_count` (Task 6) was never
+    # wired into this response before now -- a real, small, disclosed gap
+    # found while building the "retrying" UX-STATES.md state (`status ==
+    # "retrying"` alone tells a caller a step is retrying, but not which
+    # attempt, out of `MAX_RETRY_ATTEMPTS`, it's on). `worker.
+    # WorkflowRunStep` already carries this field; this is a pure response-
+    # shape addition, no new query.
+    attempt_count: int
     input: dict[str, Any]
     output: dict[str, Any] | None
     started_at: datetime | None
@@ -209,6 +217,7 @@ def _step_to_response(step: WorkflowRunStep) -> RunStepResponse:
         step_type=step.step_type,
         status=step.status,
         action_digest=step.action_digest,
+        attempt_count=step.attempt_count,
         input=step.input,
         output=step.output,
         started_at=step.started_at,

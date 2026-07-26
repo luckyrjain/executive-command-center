@@ -181,6 +181,20 @@ class WorkflowSummary:
     latest_version: int
     latest_status: WorkflowStatus
     active_version: int | None
+    # Task 7: a real, disclosed gap found and closed while building the
+    # frontend against this endpoint -- `GET /workflows/{version_id}`
+    # (below) is addressed by a version row's own UUID, never by
+    # `(workflow_id, version)`, but this summary previously exposed only
+    # the bare version *number*, giving a caller (a workflow-list UI) no
+    # way to link from this list into that detail endpoint at all. Adding
+    # the two version rows' own row ids this summary already has on hand
+    # (it already loaded every version row to compute `latest`/`active`)
+    # is a small, additive field addition, not a new query or endpoint --
+    # mirrors Task 7a's own "small, disclosed, additive gap closure found
+    # while building the thing that needs it" precedent (`kill_switches.
+    # py`'s `GET .../kill_switch`, `/simulate`).
+    latest_version_id: UUID
+    active_version_id: UUID | None
 
 
 def compute_definition_hash(
@@ -448,6 +462,8 @@ def list_workflows(session: Session, workspace_id: UUID) -> list[WorkflowSummary
                 latest_version=latest.version,
                 latest_status=latest.status,
                 active_version=active.version if active is not None else None,
+                latest_version_id=latest.id,
+                active_version_id=active.id if active is not None else None,
             )
         )
     return summaries
@@ -782,6 +798,10 @@ class WorkflowSummaryResponse(BaseModel):
     latest_version: int
     latest_status: WorkflowStatus
     active_version: int | None
+    # Task 7 addition -- see `WorkflowSummary`'s own docstring comment above
+    # for the full "why this was missing" reasoning.
+    latest_version_id: UUID
+    active_version_id: UUID | None
 
 
 class WorkflowListResponse(BaseModel):
@@ -980,6 +1000,8 @@ def list_workflows_endpoint(auth: AuthDep, session: SessionDep) -> WorkflowListR
                 latest_version=summary.latest_version,
                 latest_status=summary.latest_status,
                 active_version=summary.active_version,
+                latest_version_id=summary.latest_version_id,
+                active_version_id=summary.active_version_id,
             )
             for summary in summaries
         ]

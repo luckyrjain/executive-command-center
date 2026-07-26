@@ -19,6 +19,13 @@ const WORKSPACES: ReadonlyArray<{ view: WorkspaceView; label: string }> = [
   { view: 'knowledge', label: 'Knowledge' },
   { view: 'recommendations', label: 'Recommendations' },
   { view: 'search-audit', label: 'Search & audit' },
+  // Appended at the end, deliberately -- inserting anywhere earlier would
+  // shift every later tab's roving-tabindex position and break the fixed
+  // ArrowRight-count assertions in frontend/e2e/scenarios/
+  // conflict-audit-keyboard.mjs (and any other scenario relying on this
+  // array's existing order), none of which this task should have to
+  // rewrite just to add one more tab.
+  { view: 'automation', label: 'Automation' },
 ]
 
 export function nextWorkspaceIndex(current: number, key: string, count: number): number {

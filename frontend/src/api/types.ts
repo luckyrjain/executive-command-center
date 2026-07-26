@@ -10,6 +10,7 @@ export type WorkspaceView =
   | 'attention'
   | 'planner'
   | 'meeting-prep'
+  | 'automation'
 
 export type ApiRequestOptions = Omit<RequestInit, 'body' | 'headers'> & {
   body?: unknown

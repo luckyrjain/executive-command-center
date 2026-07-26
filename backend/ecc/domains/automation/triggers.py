@@ -1,14 +1,39 @@
 """Trigger CRUD (`triggers`) -- design doc Decision 7 / `DATA-MODEL.md`.
 
-Deliberately **no `APIRouter` in this module** -- `docs/phases/phase-005/
-API-SCHEMAS.md`'s Task-1-scoped surface (`GET|POST /automations/workflows`,
-`GET /automations/workflows/{id}`, `POST .../publish|disable`, `GET|POST
-/automations/policies`, `POST /automations/policies/{id}/revoke`) names no
-trigger endpoint; the design doc's own scheduler/event-subscriber (Decision
-7) is later worker work (Task 2+) this task does not build. This mirrors
-`ecc.domains.ai_runtime.tools`'s shape exactly: a pure data-layer module
-with no HTTP surface of its own, whose functions exist for a later task
-(and, here, this task's own tests) to call directly.
+**Task 7: `GET /api/v1/automations/triggers` added below.** Every prior
+task through Task 7a deliberately left this module router-less (see the
+"Task 1-7a" paragraph retained below for the original, still-accurate
+reasoning for *why* -- no trigger endpoint was in scope). Task 7's own
+frontend work (`PHASE-005-automation.md`'s Frontend changes: "... schedule
+controls ...") found a genuine gap building against that contract: a
+workflow's `GET .../workflows/{id}` response exposes only `trigger_refs:
+list[str]` (bare reference strings, e.g. `"manual"` or a trigger's own
+`str(id)`) -- never a trigger's own `schedule_expression`/`timezone`/
+`skip_missed`/`last_fired_at`, so a "schedule controls" UI has no real data
+to render a workflow's own configured trigger(s) or next-fire information
+against. Mirroring `kill_switches.py`'s own Task 7a precedent (`GET
+.../kill_switch`, a small, disclosed, additive read-only endpoint closing
+a UI-blocking backend gap found while building the thing that needs it,
+not a separate task or PR) -- see this module's own new `router` section
+below for the endpoint itself. Deliberately **read-only**: no CRUD, no
+mutation, no new HTTP surface for `create_trigger` -- this activation's
+"schedule controls" need only *display* a workflow's own already-configured
+trigger(s), never author new ones from the browser (workflow authoring
+happens via `POST /automations/workflows`'s own `trigger_refs` field,
+unchanged by this task).
+
+**Task 1-7a: no `APIRouter` in this module** (historical context for the
+addition above) -- `docs/phases/phase-005/API-SCHEMAS.md`'s Task-1-scoped
+surface (`GET|POST /automations/workflows`, `GET /automations/
+workflows/{id}`, `POST .../publish|disable`, `GET|POST /automations/
+policies`, `POST /automations/policies/{id}/revoke`) named no trigger
+endpoint; the design doc's own scheduler/event-subscriber (Decision 7) was
+later worker work (Task 2+) that task did not build. This mirrored `ecc.
+domains.ai_runtime.tools`'s shape: a pure data-layer module with no HTTP
+surface of its own, whose functions exist for a later task (and, here,
+that task's own tests) to call directly. Task 7 above is the first task to
+add a router to this module -- a narrow, disclosed, additive change to that
+precedent, not a reversal of it.
 
 Every *workspace-scoped* function here is workspace-scoped the same way
 `workflows.py`/`policy.py` are -- no such function accepts anything that
@@ -30,11 +55,16 @@ workspace by accident.
 
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any, Literal, cast
+from typing import Annotated, Any, Literal, cast
 from uuid import UUID, uuid4
 
+from fastapi import APIRouter, Depends, Query
+from pydantic import BaseModel
 from sqlalchemy import CursorResult, text
 from sqlalchemy.orm import Session
+
+from ecc.auth import AuthDep
+from ecc.database import get_session
 
 TriggerType = Literal["manual", "event", "schedule"]
 
@@ -273,3 +303,73 @@ def mark_trigger_fired(
     # broader Result[Any] regardless of statement kind, so this narrows
     # explicitly rather than silencing the check.
     return cast("CursorResult[Any]", result).rowcount > 0
+
+
+# ---------------------------------------------------------------------------
+# Task 7: GET /api/v1/automations/triggers -- a small, disclosed, additive
+# read surface closing the "schedule controls" gap named in this module's
+# own docstring above. Mirrors kill_switches.py's `workflow_kill_switch_
+# status_endpoint` for router/auth/response-model conventions: a pure read,
+# no `CsrfDep`/`Idempotency-Key` (nothing is written), workspace-scoped via
+# `auth.workspace_id`, optionally filtered by `workflow_id` (`list_triggers`
+# already supports this filter -- unused by any caller until now).
+# ---------------------------------------------------------------------------
+
+router = APIRouter(prefix="/api/v1/automations", tags=["automation"])
+SessionDep = Annotated[Session, Depends(get_session)]
+
+
+class TriggerResponse(BaseModel):
+    id: UUID
+    workflow_id: str
+    trigger_type: TriggerType
+    event_type_filter: str | None
+    schedule_expression: str | None
+    timezone: str | None
+    skip_missed: bool
+    last_fired_at: datetime | None
+    created_at: datetime
+    updated_at: datetime
+
+
+class TriggerListResponse(BaseModel):
+    triggers: list[TriggerResponse]
+
+
+def _to_response(trigger: Trigger) -> TriggerResponse:
+    return TriggerResponse(
+        id=trigger.id,
+        workflow_id=trigger.workflow_id,
+        trigger_type=trigger.trigger_type,
+        event_type_filter=trigger.event_type_filter,
+        schedule_expression=trigger.schedule_expression,
+        timezone=trigger.timezone,
+        skip_missed=trigger.skip_missed,
+        last_fired_at=trigger.last_fired_at,
+        created_at=trigger.created_at,
+        updated_at=trigger.updated_at,
+    )
+
+
+@router.get("/triggers", response_model=TriggerListResponse)
+def list_triggers_endpoint(
+    auth: AuthDep,
+    session: SessionDep,
+    workflow_id: Annotated[str | None, Query(max_length=200)] = None,
+) -> TriggerListResponse:
+    """Every trigger (`manual`/`event`/`schedule`) configured for the
+    caller's workspace, optionally narrowed to one `workflow_id` -- the read
+    a "schedule controls" view needs to show a workflow's own configured
+    trigger(s) and next-fire-relevant fields (`schedule_expression`/
+    `timezone`/`skip_missed`/`last_fired_at`) before a user attempts a new
+    run, matching `UX-STATES.md`'s own "shows ... side effects ... before
+    approval" spirit extended to schedule visibility. Does not compute a
+    projected next-fire timestamp (that is `scheduler._next_occurrence_
+    after`'s own pure function, not exposed here) -- `last_fired_at` plus
+    the trigger's own `schedule_expression`/`timezone`/`skip_missed` is
+    what this task's own scope needs a human to read and reason about
+    manually; a later task adding a computed "next fire" field would be a
+    natural, small extension of this same endpoint.
+    """
+    triggers = list_triggers(session, auth.workspace_id, workflow_id=workflow_id)
+    return TriggerListResponse(triggers=[_to_response(trigger) for trigger in triggers])

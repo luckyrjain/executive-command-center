@@ -272,6 +272,36 @@ button:disabled { opacity: .6; cursor: wait; }
 .audit-meta span { text-transform: capitalize; }
 .explore-empty { margin: 32px 0 0; color: #5a6472; text-align: center; }
 
+.automation-workspace { display: grid; gap: 24px; }
+.automation-step-editor { margin-top: 16px; display: grid; gap: 10px; }
+
+/* UX-STATES.md: simulation results must be "visually and structurally
+ * distinct from real run history at every surface -- a simulated step can
+ * never be mistaken for one that produced real side effects." A thick,
+ * high-contrast dashed border plus an always-visible banner label (never
+ * only a subtle color change) -- distinct from `.ai-explanation`'s own
+ * dashed treatment so simulation output is never confused with AI-generated
+ * commentary either. */
+.simulation-panel {
+  margin-top: 20px;
+  border: 3px dashed #9a5b00;
+  border-radius: 18px;
+  background: repeating-linear-gradient(135deg, #fff8ec, #fff8ec 12px, #fef2da 12px, #fef2da 24px);
+  padding: clamp(18px, 3vw, 30px);
+}
+.simulation-banner {
+  margin: 0 0 16px;
+  border-radius: 999px;
+  background: #9a5b00;
+  color: white;
+  padding: 8px 16px;
+  font-weight: 800;
+  font-size: 13px;
+  letter-spacing: .04em;
+  text-transform: uppercase;
+  display: inline-block;
+}
+
 @media (max-width: 800px) {
   .app-shell { padding-top: 28px; }
   .topbar { align-items: center; }

@@ -435,6 +435,10 @@ def test_get_run_endpoint_returns_detail_with_step_state(
     assert len(body["steps"]) == 1
     assert body["steps"][0]["status"] == "succeeded"
     assert body["steps"][0]["output"] == {"value": ""}
+    # Task 7: attempt_count (workflow_run_steps, Task 6) was never wired
+    # into this response before now -- a real gap found while building the
+    # "retrying" run-detail UI, closed as a pure response-shape addition.
+    assert body["steps"][0]["attempt_count"] == 0
 
 
 def test_get_run_endpoint_unknown_id_is_404(

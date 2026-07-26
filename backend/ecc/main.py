@@ -28,6 +28,7 @@ from ecc.domains.automation.approvals import router as automation_approvals_rout
 from ecc.domains.automation.kill_switches import router as automation_kill_switches_router
 from ecc.domains.automation.policy import router as automation_policies_router
 from ecc.domains.automation.runs import router as automation_runs_router
+from ecc.domains.automation.triggers import router as automation_triggers_router
 from ecc.domains.automation.workflows import router as automation_workflows_router
 from ecc.domains.calendar.events import router as calendar_events_router
 from ecc.domains.communication.commitments import router as commitments_router
@@ -165,6 +166,15 @@ app.include_router(automation_runs_router)
 # API-SCHEMAS.md's endpoint list (neither route existed there before this
 # task); see that module's own docstring for the full reasoning.
 app.include_router(automation_kill_switches_router)
+# Phase 5 Task 7: GET /automations/triggers -- a small, disclosed, additive
+# read surface (ecc.domains.automation.triggers) closing a real "schedule
+# controls" UI gap found while building the frontend against this contract:
+# no endpoint exposed a trigger's own schedule_expression/timezone/
+# skip_missed/last_fired_at before this task (a workflow's own
+# trigger_refs were bare reference strings only). Read-only, no CRUD --
+# see that module's own docstring for the full reasoning, mirroring
+# kill_switches.py's identical Task 7a precedent.
+app.include_router(automation_triggers_router)
 app.middleware("http")(rejected_mutation_audit_middleware)
 # Pure-ASGI body size guard: registered via add_middleware (not the
 # "http" dispatch helper) so it can intercept the raw receive() channel and

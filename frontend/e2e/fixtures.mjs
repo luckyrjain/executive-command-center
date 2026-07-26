@@ -641,6 +641,305 @@ function makeAiRuntimeApi(overrides = {}) {
   return { dispatch, runs }
 }
 
+/**
+ * Phase 5 automation surface (`docs/phases/phase-005/API-SCHEMAS.md`):
+ * workflows/versions, policies, runs (+ steps/compensation ledger),
+ * approvals, kill switches and the Task 7 `GET /automations/triggers`
+ * read endpoint. This fixture has no real worker loop behind it (there is
+ * no durable-execution engine in a browser-only mock) -- every state
+ * transition a real worker would produce automatically (queued -> running
+ * -> waiting_approval, a policy-revoked block surfacing on a run, a kill
+ * switch discovered mid-dispatch) is instead scripted directly by the
+ * scenario itself via the returned `runs`/`policies`/`workflowVersions`/
+ * `killSwitches` handles, exactly like `attention-queue.mjs` already
+ * drives `fixtures.collections.risks.mutate(...)` directly rather than
+ * simulating a real risk-review backend. `POST /workflows` and `POST
+ * /policies` are deliberately not full replicas of the real backend's own
+ * SCHEMA_INVALID/POLICY validation -- this fixture proves the UI's own
+ * request/response wiring and state rendering, not the backend's own
+ * validation logic (already covered by `tests/test_automation_*_postgres.
+ * py`).
+ */
+function makeAutomationApi(overrides = {}) {
+  let nextVersionSeq = 1
+  const workflowVersions = [...(overrides.workflowVersions ?? [])]
+  const policies = [...(overrides.policies ?? [])]
+  const runs = [...(overrides.runs ?? [])]
+  const runSteps = new Map(Object.entries(overrides.runSteps ?? {}))
+  const runCompensationSteps = new Map(Object.entries(overrides.runCompensationSteps ?? {}))
+  const approvals = [...(overrides.approvals ?? [])]
+  const triggers = [...(overrides.triggers ?? [])]
+  const simulateResponses = new Map(Object.entries(overrides.simulateResponses ?? {}))
+  const buildRun = overrides.buildRun ?? null
+  const killSwitches = {
+    global: overrides.globalKillSwitch ?? null,
+    perWorkflow: new Map(Object.entries(overrides.workflowKillSwitches ?? {})),
+    history: new Map(Object.entries(overrides.killSwitchHistory ?? {})),
+  }
+
+  function summaries() {
+    const byWorkflow = new Map()
+    for (const version of workflowVersions) {
+      const list = byWorkflow.get(version.workflow_id) ?? []
+      list.push(version)
+      byWorkflow.set(version.workflow_id, list)
+    }
+    return [...byWorkflow.entries()].map(([workflow_id, versions]) => {
+      const latest = versions[versions.length - 1]
+      const active = versions.find((v) => v.status === 'active')
+      return {
+        workflow_id,
+        latest_version: latest.version,
+        latest_status: latest.status,
+        active_version: active ? active.version : null,
+        latest_version_id: latest.id,
+        active_version_id: active ? active.id : null,
+      }
+    })
+  }
+
+  function killSwitchStatus(workflowId) {
+    const activeWorkflow = killSwitches.perWorkflow.get(workflowId) ?? null
+    return {
+      workflow_id: workflowId,
+      killed: Boolean(killSwitches.global?.active) || Boolean(activeWorkflow?.active),
+      active_global: killSwitches.global?.active ? killSwitches.global : null,
+      active_workflow: activeWorkflow?.active ? activeWorkflow : null,
+      history: killSwitches.history.get(workflowId) ?? [],
+    }
+  }
+
+  function dispatch(pathname, method, body, queryString) {
+    if (!pathname.startsWith('/api/v1/automations')) return null
+    const params = new URLSearchParams(queryString)
+
+    if (pathname === '/api/v1/automations/workflows' && method === 'GET') {
+      return { status: 200, body: { workflows: summaries() } }
+    }
+    if (pathname === '/api/v1/automations/workflows' && method === 'POST') {
+      const workflowVersionsForId = workflowVersions.filter((v) => v.workflow_id === body.workflow_id)
+      const version = workflowVersionsForId.length ? Math.max(...workflowVersionsForId.map((v) => v.version)) + 1 : 1
+      const created = {
+        id: `automation-version-${nextVersionSeq++}`,
+        workflow_id: body.workflow_id,
+        version,
+        graph: body.graph,
+        trigger_refs: body.trigger_refs ?? [],
+        policy_ref: body.policy_ref ?? null,
+        definition_hash: `fixture-hash-${nextVersionSeq}`,
+        status: 'draft',
+        created_at: nowIso(),
+        updated_at: nowIso(),
+      }
+      workflowVersions.push(created)
+      return { status: 201, body: created }
+    }
+    const versionMatch = pathname.match(/^\/api\/v1\/automations\/workflows\/([^/]+)$/)
+    if (versionMatch && method === 'GET') {
+      const version = workflowVersions.find((v) => v.id === versionMatch[1])
+      if (!version) return { status: 404, body: { error: { code: 'WORKFLOW_NOT_FOUND', message: 'Not found' } } }
+      return { status: 200, body: version }
+    }
+    const publishMatch = pathname.match(/^\/api\/v1\/automations\/workflows\/([^/]+)\/publish$/)
+    if (publishMatch && method === 'POST') {
+      const version = workflowVersions.find((v) => v.id === publishMatch[1])
+      if (!version) return { status: 404, body: { error: { code: 'WORKFLOW_NOT_FOUND', message: 'Not found' } } }
+      if (version.status === 'active') return { status: 200, body: version }
+      if (version.status === 'retired') {
+        return { status: 409, body: { error: { code: 'WORKFLOW_VERSION_NOT_DRAFT', message: 'Workflow Version Not Draft', details: { status: version.status } } } }
+      }
+      for (const other of workflowVersions) {
+        if (other.workflow_id === version.workflow_id && other.status === 'active') other.status = 'retired'
+      }
+      version.status = 'active'
+      version.updated_at = nowIso()
+      return { status: 200, body: version }
+    }
+    const disableMatch = pathname.match(/^\/api\/v1\/automations\/workflows\/([^/]+)\/disable$/)
+    if (disableMatch && method === 'POST') {
+      const version = workflowVersions.find((v) => v.id === disableMatch[1])
+      if (!version) return { status: 404, body: { error: { code: 'WORKFLOW_NOT_FOUND', message: 'Not found' } } }
+      if (version.status !== 'active') {
+        return { status: 409, body: { error: { code: 'WORKFLOW_NOT_ACTIVE', message: 'Workflow Not Active', details: { status: version.status } } } }
+      }
+      version.status = 'retired'
+      version.updated_at = nowIso()
+      return { status: 200, body: version }
+    }
+    const simulateMatch = pathname.match(/^\/api\/v1\/automations\/workflows\/([^/]+)\/simulate$/)
+    if (simulateMatch && method === 'POST') {
+      const version = workflowVersions.find((v) => v.id === simulateMatch[1])
+      if (!version) return { status: 404, body: { error: { code: 'WORKFLOW_NOT_FOUND', message: 'Not found' } } }
+      const scripted = simulateResponses.get(version.id)
+      if (scripted) return { status: 200, body: scripted }
+      return {
+        status: 200,
+        body: {
+          workflow_id: version.workflow_id,
+          version: version.version,
+          steps: (version.graph.steps ?? [])
+            .filter((step) => step.step_type === 'action')
+            .map((step, index) => ({
+              step_index: index,
+              step_id: step.step_id,
+              step_type: step.step_type,
+              action_ref: step.action_ref ?? null,
+              compensate_ref: step.compensate_ref ?? null,
+              preview: { simulated: true },
+              reversible: true,
+              high_impact_categories: [],
+              dispatch_gate: 'clear',
+              policy_block_reason: null,
+              error: null,
+            })),
+        },
+      }
+    }
+
+    const workflowKillSwitchStatusMatch = pathname.match(/^\/api\/v1\/automations\/workflows\/([^/]+)\/kill_switch$/)
+    if (workflowKillSwitchStatusMatch && method === 'GET') {
+      return { status: 200, body: killSwitchStatus(decodeURIComponent(workflowKillSwitchStatusMatch[1])) }
+    }
+    if (workflowKillSwitchStatusMatch && method === 'POST') {
+      const workflowId = decodeURIComponent(workflowKillSwitchStatusMatch[1])
+      const switchObj = { workflow_id: workflowId, active: body.active, reason: body.reason ?? null, activated_by: 'fixture-user', activated_at: nowIso(), deactivated_by: body.active ? null : 'fixture-user', deactivated_at: body.active ? null : nowIso() }
+      killSwitches.perWorkflow.set(workflowId, switchObj)
+      const history = killSwitches.history.get(workflowId) ?? []
+      killSwitches.history.set(workflowId, [...history, switchObj])
+      return { status: 200, body: switchObj }
+    }
+    if (pathname === '/api/v1/automations/kill_switch' && method === 'POST') {
+      const switchObj = { workflow_id: null, active: body.active, reason: body.reason ?? null, activated_by: 'fixture-user', activated_at: nowIso(), deactivated_by: body.active ? null : 'fixture-user', deactivated_at: body.active ? null : nowIso() }
+      killSwitches.global = switchObj
+      return { status: 200, body: switchObj }
+    }
+
+    if (pathname === '/api/v1/automations/policies' && method === 'GET') {
+      const workflowId = params.get('workflow_id')
+      const items = policies.filter((p) => !workflowId || p.workflow_id === workflowId)
+      return { status: 200, body: { policies: items } }
+    }
+    if (pathname === '/api/v1/automations/policies' && method === 'POST') {
+      const created = {
+        id: `automation-policy-${policies.length + 1}`,
+        workflow_id: body.workflow_id,
+        action_types: body.action_types ?? [],
+        data_classes: body.data_classes ?? [],
+        value_limit: String(body.value_limit ?? 0),
+        count_limit: body.count_limit ?? 0,
+        rate_limit: body.rate_limit ?? { runs_per_workflow_per_hour: 10 },
+        schedule: body.schedule ?? null,
+        approval_mode: body.approval_mode,
+        expires_at: new Date(Date.now() + 90 * 24 * 60 * 60 * 1000).toISOString(),
+        revoked_at: null,
+        status: 'active',
+        version: 1,
+        created_at: nowIso(),
+        updated_at: nowIso(),
+      }
+      policies.push(created)
+      return { status: 201, body: created }
+    }
+    const revokeMatch = pathname.match(/^\/api\/v1\/automations\/policies\/([^/]+)\/revoke$/)
+    if (revokeMatch && method === 'POST') {
+      const policy = policies.find((p) => p.id === revokeMatch[1])
+      if (!policy) return { status: 404, body: { error: { code: 'POLICY_NOT_FOUND', message: 'Not found' } } }
+      if (policy.revoked_at) {
+        return { status: 409, body: { error: { code: 'POLICY_REVOKED', message: 'Policy Revoked', details: { revoked_at: policy.revoked_at } } } }
+      }
+      policy.revoked_at = nowIso()
+      policy.status = 'revoked'
+      policy.updated_at = nowIso()
+      return { status: 200, body: policy }
+    }
+
+    if (pathname === '/api/v1/automations/runs' && method === 'GET') {
+      const statusFilter = params.get('status')
+      const items = runs.filter((r) => !statusFilter || r.status === statusFilter)
+      return { status: 200, body: { runs: items } }
+    }
+    if (pathname === '/api/v1/automations/runs' && method === 'POST') {
+      const killed = killSwitchStatus(body.workflow_id).killed
+      if (killed) {
+        return { status: 409, body: { error: { code: 'KILL_SWITCH_ACTIVE', message: 'Kill Switch Active', details: { workflow_id: body.workflow_id } } } }
+      }
+      const created = buildRun ? buildRun(body) : {
+        id: `automation-run-${runs.length + 1}`,
+        workflow_id: body.workflow_id,
+        workflow_version: 1,
+        policy_id: null,
+        trigger_ref: 'manual:fixture-user',
+        status: 'queued',
+        current_step_index: 0,
+        queued_at: nowIso(),
+        started_at: null,
+        finished_at: null,
+        created_at: nowIso(),
+        updated_at: nowIso(),
+      }
+      if (!created) return { status: 409, body: { error: { code: 'WORKFLOW_NOT_ACTIVE', message: 'Workflow Not Active', details: { workflow_id: body.workflow_id } } } }
+      runs.push(created)
+      if (!runSteps.has(created.id)) runSteps.set(created.id, [])
+      if (!runCompensationSteps.has(created.id)) runCompensationSteps.set(created.id, [])
+      return { status: 201, body: created }
+    }
+    const runDetailMatch = pathname.match(/^\/api\/v1\/automations\/runs\/([^/]+)$/)
+    if (runDetailMatch && method === 'GET') {
+      const run = runs.find((r) => r.id === runDetailMatch[1])
+      if (!run) return { status: 404, body: { error: { code: 'RUN_NOT_FOUND', message: 'Not found' } } }
+      return { status: 200, body: { ...run, steps: runSteps.get(run.id) ?? [], compensation_steps: runCompensationSteps.get(run.id) ?? [] } }
+    }
+    const runActionMatch = pathname.match(/^\/api\/v1\/automations\/runs\/([^/]+)\/(pause|resume|cancel)$/)
+    if (runActionMatch && method === 'POST') {
+      const [, runId, action] = runActionMatch
+      const run = runs.find((r) => r.id === runId)
+      if (!run) return { status: 404, body: { error: { code: 'RUN_NOT_FOUND', message: 'Not found' } } }
+      if (action === 'pause') run.status = 'paused'
+      if (action === 'resume') {
+        if (run.status !== 'paused') return { status: 409, body: { error: { code: 'RUN_NOT_PAUSED', message: 'Run Not Paused', details: { status: run.status } } } }
+        run.status = 'queued'
+      }
+      if (action === 'cancel') run.status = 'cancelled'
+      run.updated_at = nowIso()
+      return { status: 200, body: run }
+    }
+
+    if (pathname === '/api/v1/automations/approvals' && method === 'GET') {
+      const statusFilter = params.get('status')
+      const items = approvals.filter((a) => !statusFilter || a.status === statusFilter)
+      return { status: 200, body: { approvals: items } }
+    }
+    const decideMatch = pathname.match(/^\/api\/v1\/automations\/approvals\/([^/]+)\/(approve|reject)$/)
+    if (decideMatch && method === 'POST') {
+      const [, approvalId, decision] = decideMatch
+      const approval = approvals.find((a) => a.id === approvalId)
+      if (!approval) return { status: 404, body: { error: { code: 'APPROVAL_NOT_FOUND', message: 'Not found' } } }
+      if (approval.status !== 'pending') {
+        return { status: 409, body: { error: { code: 'APPROVAL_ALREADY_DECIDED', message: 'Approval Already Decided', details: { decision: approval.decision, decided_at: approval.decided_at } } } }
+      }
+      if (decision === 'approve' && body.action_digest !== approval.action_digest) {
+        return { status: 409, body: { error: { code: 'DIGEST_MISMATCH', message: 'Digest Mismatch', details: { expected_digest: approval.action_digest, provided_digest: body.action_digest ?? null } } } }
+      }
+      approval.status = decision === 'approve' ? 'approved' : 'rejected'
+      approval.decision = approval.status
+      approval.decided_at = nowIso()
+      approval.decided_by = 'fixture-user'
+      approval.updated_at = nowIso()
+      return { status: 200, body: approval }
+    }
+
+    if (pathname === '/api/v1/automations/triggers' && method === 'GET') {
+      const workflowId = params.get('workflow_id')
+      const items = triggers.filter((t) => !workflowId || t.workflow_id === workflowId)
+      return { status: 200, body: { triggers: items } }
+    }
+
+    return null
+  }
+
+  return { dispatch, workflowVersions, policies, runs, runSteps, runCompensationSteps, approvals, triggers, killSwitches }
+}
+
 const defaultDashboardSections = {
   today_schedule: [{ id: 'm1', title: 'Leadership review', starts_at: '2026-07-15T04:30:00Z' }],
   top_priorities: [{ entity_id: 't1', title: 'Approve hiring plan', score: 92, status: 'in_progress' }],
@@ -758,6 +1057,7 @@ export async function createFixtureApi(page, overrides = {}) {
   })
   const attention = makeAttentionApi({ ...overrides.attention, risksCollection: risks })
   const aiRuntime = makeAiRuntimeApi(overrides.aiRuntime)
+  const automation = makeAutomationApi(overrides.automation ?? {})
 
   // `route.fulfill()` synthesizes a response without touching the real
   // network, so `context.setOffline(true)` alone does NOT stop a mocked
@@ -916,6 +1216,10 @@ export async function createFixtureApi(page, overrides = {}) {
       const result = aiRuntime.dispatch(pathname, method, body)
       if (result) return result
     }
+    if (pathname.startsWith('/api/v1/automations')) {
+      const result = automation.dispatch(pathname, method, body, queryString)
+      if (result) return result
+    }
     for (const resource of resources) {
       const result = resource(pathname, method, body, queryString)
       if (result) return result
@@ -944,6 +1248,7 @@ export async function createFixtureApi(page, overrides = {}) {
     knowledge,
     attention,
     aiRuntime,
+    automation,
     dashboard,
     brief,
     evidence,
