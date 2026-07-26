@@ -640,9 +640,20 @@ def test_publish_succeeds_with_only_registered_adapters(
                 "compensate_ref": "c1",
             },
             {
+                # `local.create_note`, not `fake.external_action`: this test
+                # asserts only that publishing succeeds when every
+                # `action_ref` resolves, and a compensation step's own
+                # `action_ref` must additionally name a *non*-high-impact
+                # adapter (`workflows.high_impact_compensation_action_refs`
+                # -- compensation dispatch never creates the per-run approval
+                # request a high-impact adapter requires, so such a graph is
+                # now rejected at publish). `fake.external_action` declares
+                # `high_impact_categories={'public'}`; `local.create_note`
+                # declares none, so it keeps this test testing exactly what
+                # it was written to test.
                 "step_id": "c1",
                 "step_type": "compensation",
-                "action_ref": "fake.external_action",
+                "action_ref": "local.create_note",
                 "input_mapping": {},
             },
         ]

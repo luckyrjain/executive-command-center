@@ -147,6 +147,104 @@ class WorkflowVersionUnregisteredAdapter:
     violations: tuple[str, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class WorkflowVersionHighImpactCompensationAdapter:
+    """`activate_workflow_version` was asked to publish a version whose
+    graph contains a `step_type='compensation'` step whose own `action_ref`
+    resolves, in the adapter registry it was given, to an adapter declaring
+    a non-empty `high_impact_categories` -- rejected fail-closed at publish
+    time by `high_impact_compensation_action_refs` below.
+
+    **The gate-bypass bug this exists to make unreachable by construction.**
+    Every ordinary `action` step passes through `worker._evaluate_dispatch_
+    gate` before its adapter's `execute()` is ever called, and that gate
+    turns any adapter with a non-empty `high_impact_categories` into a
+    mandatory per-run `approval_requests` row (`APPROVAL-POLICY.md`'s
+    high-impact taxonomy: "always requires per-run approval regardless of
+    policy mode"). `worker._dispatch_compensation_step` -- the *only* code
+    path that dispatches a `step_type='compensation'` step -- deliberately
+    does not run that gate at all: compensation is an automatic
+    continuation of a failing run's own rollback, not a fresh, separately
+    approvable human-facing action, and there is no approval-inbox surface
+    for a compensation step to wait in. That is a defensible design for a
+    *low-impact* undo action, but before this check nothing anywhere
+    constrained which adapter a compensation step's `action_ref` could
+    name: `validate_graph_shape` only constrains a compensation step's
+    *shape* (its target is claimed by exactly one action step, is itself
+    `step_type='compensation'`, is not itself a compensation target), and
+    `unregistered_action_refs` only requires the `action_ref` resolve to
+    *something* registered. So a workflow author could publish a graph
+    whose low-impact `s0` declared `compensate_ref='c0'` where `c0` named a
+    high-impact adapter (e.g. `local.send_test_notification`,
+    `high_impact_categories={'person-directed'}`); once any later step in
+    that run failed, `c0` would call that adapter's real `execute()` with
+    **no** `approval_requests` row ever created -- a direct violation of
+    the "always requires per-run approval" invariant and of `EXECUTION-
+    CONTRACT.md`'s "compensation executes only declared, authorized steps".
+
+    Rejecting the *graph* is the fix, not adding a dispatch-time
+    high-impact check: a structural, publish-time rejection makes the
+    bypass unreachable for every adapter that will ever be registered
+    (including Phase 6's real connectors), whereas a dispatch-time check
+    could only ever fail a run that already reached rollback, leaving an
+    already-published graph as a standing liability. `worker._dispatch_
+    compensation_step` additionally re-checks policy usability at dispatch
+    time (`PolicyUnusableDuringCompensation`), which covers the different
+    failure mode this check cannot: a policy revoked *after* an
+    already-legal graph was published.
+    """
+
+    workflow_id: str
+    version: int
+    violations: tuple[str, ...]
+
+
+def high_impact_compensation_action_refs(
+    graph: dict[str, Any], adapter_registry: AdapterRegistry
+) -> list[str]:
+    """No `step_type='compensation'` step's own `action_ref` may resolve to
+    an adapter declaring a non-empty `high_impact_categories` -- returns a
+    list of violation strings, empty means every compensation step names a
+    non-high-impact adapter. See `WorkflowVersionHighImpactCompensation
+    Adapter`'s own docstring for the full reasoning (the approval-gate
+    bypass this makes structurally unreachable).
+
+    A plain function alongside `unregistered_action_refs`, for the identical
+    reason that one is not folded into `validate_graph_shape`: this check
+    needs a live `AdapterRegistry` to answer "what does this `action_ref`
+    actually declare," while `validate_graph_shape` is deliberately pure and
+    runs at *draft* creation time, when an author's intended adapter may not
+    even be registered yet. Like `unregistered_action_refs`, this therefore
+    runs at *publish* time only (`activate_workflow_version` below).
+
+    An `action_ref` that does not resolve at all is deliberately **not** a
+    violation here -- `unregistered_action_refs` already rejects that case,
+    with its own distinct error code, and `activate_workflow_version` runs
+    it first; reporting the same graph defect twice under two codes would
+    make the 422 a caller sees depend on check ordering rather than on what
+    is actually wrong.
+    """
+    violations: list[str] = []
+    for step in graph.get("steps", []):
+        if step.get("step_type") != "compensation":
+            continue
+        action_ref = step.get("action_ref")
+        if not action_ref:
+            continue
+        adapter: ActionAdapter | None = adapter_registry.get(action_ref)
+        if adapter is None:
+            continue
+        categories = adapter.high_impact_categories
+        if categories:
+            violations.append(
+                f"step '{step.get('step_id')}': action_ref '{action_ref}' declares "
+                f"high_impact_categories {sorted(categories)}; a step_type='compensation' "
+                "step must name a non-high-impact adapter, because compensation dispatch "
+                "never creates a per-run approval request"
+            )
+    return violations
+
+
 def unregistered_action_refs(graph: dict[str, Any], adapter_registry: AdapterRegistry) -> list[str]:
     """Every `action`/`compensation` step's own `action_ref` must resolve in
     `adapter_registry` -- returns a list of violation strings, empty means
@@ -263,6 +361,20 @@ def validate_graph_shape(graph: dict[str, Any]) -> list[str]:
     depends on, and loosening it would be a far larger, riskier change than
     this activation's simple, one-compensation-target-per-step graph model
     needs.
+
+    **Not checked here, deliberately: which adapter a compensation step's
+    own `action_ref` names.** The five rules above are all about graph
+    *shape* -- answerable from the graph alone, which is exactly why this
+    function can stay pure and run at draft time. The sixth rule a
+    compensation step must satisfy (it may not name an adapter declaring a
+    non-empty `high_impact_categories`, since `worker._dispatch_
+    compensation_step` never creates a per-run approval request the way
+    `worker._evaluate_dispatch_gate` does for an ordinary action step)
+    cannot be answered without a live `AdapterRegistry`, so it lives in
+    `high_impact_compensation_action_refs` above and runs at publish time
+    alongside `unregistered_action_refs`. A reader adding a new
+    compensation-step constraint should decide between the two on exactly
+    that basis: pure/graph-only goes here, registry-dependent goes there.
     """
     violations: list[str] = []
     steps = graph.get("steps", [])
@@ -593,6 +705,7 @@ def activate_workflow_version(
     | WorkflowVersionNotFound
     | WorkflowVersionNotDraft
     | WorkflowVersionUnregisteredAdapter
+    | WorkflowVersionHighImpactCompensationAdapter
 ):
     """Publish a draft version (design doc Decision 2's activation
     mechanism): retires whichever version is currently `active` for this
@@ -613,13 +726,20 @@ def activate_workflow_version(
     propagating a raw Postgres exception.
 
     **Task 7a: `adapter_registry` is optional, deliberately not required.**
-    When given, every `action`/`compensation` step's `action_ref` must
+    When given, two registry-dependent publish-time checks run, in this
+    order: (1) every `action`/`compensation` step's `action_ref` must
     resolve in it or this call returns `WorkflowVersionUnregisteredAdapter`
     instead of activating anything (`unregistered_action_refs`'s own
     docstring has the full reasoning for why this check belongs here, at
-    publish time, not at draft time). When omitted (`None`, the default),
-    no such check runs at all -- **not** because the check is optional in
-    principle, but because this function is called directly (bypassing
+    publish time, not at draft time); (2) no `step_type='compensation'`
+    step's own `action_ref` may resolve to an adapter declaring a non-empty
+    `high_impact_categories`, or this call returns `WorkflowVersion
+    HighImpactCompensationAdapter` instead -- the structural, fail-closed
+    half of the compensation approval-gate-bypass fix (that class's own
+    docstring has the full bug description; `worker._dispatch_compensation_
+    step`'s dispatch-time policy re-check is the other half). When omitted
+    (`None`, the default), neither check runs -- **not** because they are
+    optional in principle, but because this function is called directly (bypassing
     `publish_workflow_endpoint`) by every other Phase 5 task's own test
     suite to publish a workflow naming a test-only, deliberately-
     unregistered `action_ref` (a private `AdapterRegistry()` instance those
@@ -665,6 +785,20 @@ def activate_workflow_version(
                 workflow_id=target_row["workflow_id"],
                 version=target_row["version"],
                 violations=tuple(violations),
+            )
+        # Checked strictly after the unregistered-adapter check above, and
+        # only when that one found nothing: an `action_ref` that resolves to
+        # nothing at all is that check's concern, not this one, so ordering
+        # these two guarantees a caller's 422 names the defect that actually
+        # applies (see `high_impact_compensation_action_refs`' own docstring).
+        high_impact_violations = high_impact_compensation_action_refs(
+            target_row["graph"], adapter_registry
+        )
+        if high_impact_violations:
+            return WorkflowVersionHighImpactCompensationAdapter(
+                workflow_id=target_row["workflow_id"],
+                version=target_row["version"],
+                violations=tuple(high_impact_violations),
             )
 
     now = datetime.now(UTC)
@@ -1155,6 +1289,39 @@ def publish_workflow_endpoint(
                 status_code=422,
                 detail={
                     "code": "ACTION_REF_NOT_REGISTERED",
+                    "workflow_id": result.workflow_id,
+                    "version": result.version,
+                    "violations": list(result.violations),
+                },
+            )
+        if isinstance(result, WorkflowVersionHighImpactCompensationAdapter):
+            # The compensation approval-gate-bypass fix's publish-time half
+            # (`WorkflowVersionHighImpactCompensationAdapter`'s own docstring
+            # has the bug description). 422, on the identical
+            # graph-content-validation reasoning as ACTION_REF_NOT_REGISTERED
+            # immediately above -- the submitted graph itself is
+            # unpublishable, which is not a lifecycle conflict -- and with
+            # the same `violations` list shape, so an existing client
+            # rendering that list needs no new field to show a useful
+            # message. A *distinct* code, not a reuse of ACTION_REF_NOT_
+            # REGISTERED: the remedy differs (that one means "register the
+            # adapter or fix the typo"; this one means "this action may not
+            # be used as a rollback at all"), and a caller that cannot tell
+            # them apart cannot tell an author what to do. An explicit
+            # `message` is supplied (`main._error_payload` prefers it over
+            # its title-cased-code fallback) so any client without a
+            # code-specific branch for this new code still renders a
+            # readable sentence rather than "Compensation Action Ref High
+            # Impact".
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "COMPENSATION_ACTION_REF_HIGH_IMPACT",
+                    "message": (
+                        "A compensation step cannot use a high-impact action: compensation "
+                        "runs automatically during rollback and never asks for per-run "
+                        "approval."
+                    ),
                     "workflow_id": result.workflow_id,
                     "version": result.version,
                     "violations": list(result.violations),

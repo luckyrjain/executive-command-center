@@ -14,6 +14,17 @@ triggers -- the data layer only"):
 4. `GET|POST /api/v1/automations/workflows`, `GET .../{id}`,
    `POST .../{id}/publish|disable`.
 5. Cross-workspace isolation.
+
+Also covers the publish-time half of the compensation approval-gate-bypass
+fix (`workflows.high_impact_compensation_action_refs` /
+`WorkflowVersionHighImpactCompensationAdapter`): a `step_type='compensation'`
+step whose own `action_ref` names an adapter declaring a non-empty
+`high_impact_categories` is rejected at publish with
+`422 COMPENSATION_ACTION_REF_HIGH_IMPACT`. Those tests live here, alongside
+the other graph-validation and publish-endpoint coverage, rather than in
+`test_automation_compensation_postgres.py` -- they are publish-path
+properties and never dispatch a run. The dispatch-time half of that same fix
+(`worker._compensation_policy_usable`) is covered in that other module.
 """
 
 from collections.abc import Iterator
@@ -32,6 +43,7 @@ from sqlalchemy.exc import IntegrityError, ProgrammingError
 from ecc.config import get_settings
 from ecc.database import SessionFactory, engine
 from ecc.domains.automation import workflows as automation_workflows
+from ecc.domains.automation.adapters import registry as production_adapter_registry
 from ecc.main import app
 
 settings = get_settings()
@@ -590,6 +602,217 @@ def test_validate_graph_shape_rejects_two_action_steps_sharing_one_compensate_re
     assert any(
         "already claimed by step 's1'" in v and "compensate_ref 'c1'" in v for v in violations
     )
+
+
+# ---------------------------------------------------------------------------
+# Compensation steps may never name a high-impact adapter (publish-time,
+# registry-dependent -- `workflows.high_impact_compensation_action_refs`).
+#
+# The bug this closes: `worker._dispatch_compensation_step` is the only code
+# path that dispatches a `step_type='compensation'` step, and it deliberately
+# never runs `worker._evaluate_dispatch_gate`, so it never creates the
+# `approval_requests` row that `APPROVAL-POLICY.md` requires for *any*
+# adapter declaring a non-empty `high_impact_categories` ("always requires
+# per-run approval regardless of policy mode"). Nothing previously stopped a
+# compensation step's own `action_ref` from naming such an adapter, so a
+# low-impact action step with a `compensate_ref` pointing at one would run
+# that adapter's real `execute()`, unapproved, the moment any later step in
+# the run failed. Rejecting the graph at publish time makes that unreachable
+# by construction, for every adapter that will ever be registered.
+#
+# These use the shared *production* registry (`adapters.registry`) rather
+# than a private fake: the point is the real declared categories of the real
+# adapters (`local.send_test_notification` -> {'person-directed'},
+# `fake.external_action` -> {'public'}, `local.create_note` -> frozenset()),
+# which is exactly what `publish_workflow_endpoint` checks against.
+# ---------------------------------------------------------------------------
+
+
+def _graph_with_high_impact_compensation() -> dict[str, Any]:
+    """`s1` is a low-impact action (`local.create_note`, no declared
+    categories) whose `compensate_ref` points at `c1`, a compensation step
+    naming `local.send_test_notification` -- an adapter declaring
+    `high_impact_categories={'person-directed'}`. Structurally valid by
+    every `validate_graph_shape` rule; unpublishable only because of what
+    `c1`'s `action_ref` resolves to.
+    """
+    return {
+        "steps": [
+            {
+                "step_id": "s1",
+                "step_type": "action",
+                "action_ref": "local.create_note",
+                "input_mapping": {},
+                "on_success": "succeeded",
+                "on_failure": "failed",
+                "compensate_ref": "c1",
+            },
+            {
+                "step_id": "c1",
+                "step_type": "compensation",
+                "action_ref": "local.send_test_notification",
+                "input_mapping": {},
+            },
+        ]
+    }
+
+
+def test_high_impact_compensation_graph_is_shape_valid_so_only_the_new_check_rejects_it() -> None:
+    """Establishes that the pure, registry-free shape validation genuinely
+    does *not* catch this -- i.e. the new publish-time check is the only
+    thing standing between this graph and an unapproved high-impact
+    execution, which is precisely why it has to exist.
+    """
+    assert automation_workflows.validate_graph_shape(_graph_with_high_impact_compensation()) == []
+
+
+def test_high_impact_compensation_action_refs_flags_the_compensation_step() -> None:
+    violations = automation_workflows.high_impact_compensation_action_refs(
+        _graph_with_high_impact_compensation(), production_adapter_registry
+    )
+    assert len(violations) == 1
+    assert "step 'c1'" in violations[0]
+    assert "local.send_test_notification" in violations[0]
+    assert "person-directed" in violations[0]
+
+
+def test_high_impact_compensation_action_refs_ignores_high_impact_action_steps() -> None:
+    """Only `step_type='compensation'` steps are constrained. An ordinary
+    action step naming a high-impact adapter is entirely legal -- it goes
+    through `worker._evaluate_dispatch_gate`, which creates the per-run
+    approval request. Narrowing this check to compensation steps is the
+    whole point; widening it would break every legitimate high-impact
+    workflow.
+    """
+    graph = {
+        "steps": [
+            {
+                "step_id": "s1",
+                "step_type": "action",
+                "action_ref": "local.send_test_notification",
+                "input_mapping": {},
+                "on_success": "succeeded",
+                "on_failure": "failed",
+                "compensate_ref": "c1",
+            },
+            {
+                "step_id": "c1",
+                "step_type": "compensation",
+                "action_ref": "local.create_note",
+                "input_mapping": {},
+            },
+        ]
+    }
+    assert (
+        automation_workflows.high_impact_compensation_action_refs(
+            graph, production_adapter_registry
+        )
+        == []
+    )
+
+
+def test_high_impact_compensation_action_refs_leaves_unresolvable_refs_to_the_other_check() -> None:
+    """An `action_ref` that resolves to nothing is `unregistered_action_
+    refs`' concern (its own distinct 422 code), not this one's -- so this
+    function must stay silent about it, or the 422 a caller sees would
+    depend on check ordering rather than on what is actually wrong.
+    """
+    graph = {
+        "steps": [
+            {
+                "step_id": "s1",
+                "step_type": "action",
+                "action_ref": "local.create_note",
+                "input_mapping": {},
+                "on_success": "succeeded",
+                "on_failure": "failed",
+                "compensate_ref": "c1",
+            },
+            {
+                "step_id": "c1",
+                "step_type": "compensation",
+                "action_ref": "test.definitely-not-a-real-adapter",
+                "input_mapping": {},
+            },
+        ]
+    }
+    assert (
+        automation_workflows.high_impact_compensation_action_refs(
+            graph, production_adapter_registry
+        )
+        == []
+    )
+    assert automation_workflows.unregistered_action_refs(graph, production_adapter_registry) != []
+
+
+def test_activate_workflow_version_rejects_high_impact_compensation_adapter(
+    workflow_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    _client, workspace_id, user_id, _token = workflow_test_context
+    workflow_id = f"test.high-impact-comp.{uuid4().hex}"
+    _insert_workflow_family(workspace_id, user_id, workflow_id)
+    draft_id = _insert_version_row(
+        workspace_id,
+        user_id,
+        workflow_id,
+        version=1,
+        status="draft",
+        graph=_graph_with_high_impact_compensation(),
+    )
+
+    with SessionFactory() as session:
+        with session.begin():
+            result = automation_workflows.activate_workflow_version(
+                session,
+                workspace_id,
+                draft_id,
+                adapter_registry=production_adapter_registry,
+            )
+        assert isinstance(result, automation_workflows.WorkflowVersionHighImpactCompensationAdapter)
+        assert result.workflow_id == workflow_id
+        assert any("local.send_test_notification" in v for v in result.violations)
+
+    # The version genuinely never activated.
+    with engine.connect() as connection:
+        status = connection.execute(
+            text("SELECT status FROM workflow_versions WHERE id = :id"), {"id": draft_id}
+        ).scalar_one()
+    assert status == "draft"
+
+
+def test_publish_high_impact_compensation_step_is_rejected_422(
+    workflow_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    """The end-to-end guarantee: the real HTTP publish path (which always
+    passes the shared production registry) refuses to activate a graph whose
+    compensation step names a high-impact adapter.
+    """
+    client, _workspace_id, _user_id, token = workflow_test_context
+    created = client.post(
+        "/api/v1/automations/workflows",
+        json={
+            "workflow_id": f"test.publish-high-impact-comp.{uuid4().hex}",
+            "graph": _graph_with_high_impact_compensation(),
+            "trigger_refs": [],
+        },
+        headers=_headers(token, key="high-impact-comp-create"),
+    ).json()
+    assert "id" in created, created
+
+    publish = client.post(
+        f"/api/v1/automations/workflows/{created['id']}/publish",
+        headers=_headers(token, key="high-impact-comp-publish"),
+    )
+    assert publish.status_code == 422, publish.text
+    error = publish.json()["error"]
+    assert error["code"] == "COMPENSATION_ACTION_REF_HIGH_IMPACT"
+    # A readable message, never a title-cased code and never raw JSON.
+    assert "per-run approval" in error["message"]
+    violations = error["details"]["violations"]
+    assert any("local.send_test_notification" in v for v in violations)
+
+    # Still a draft -- nothing was activated.
+    assert client.get(f"/api/v1/automations/workflows/{created['id']}").json()["status"] == "draft"
 
 
 def test_create_workflow_draft_creates_family_and_first_version(
