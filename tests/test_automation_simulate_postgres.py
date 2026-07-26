@@ -436,6 +436,61 @@ def test_simulate_flags_approval_without_creating_approval_request(
     assert before == after == 0
 
 
+def test_simulate_rejects_workspace_scope_mismatch_before_calling_simulate(
+    simulate_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    """The one confused-deputy check `/simulate` adds
+    (`SimulateWorkspaceScopeMismatch`) had zero test coverage before this
+    review pass -- verified only by reading the code that the mismatch is
+    caught before `adapter.simulate()` is ever called. Proven directly here:
+    a step whose resolved `input_mapping.workspace_id` names a foreign
+    workspace must surface as an error, never a leaked preview.
+    """
+    client, workspace_id, user_id, token = simulate_test_context
+    foreign_workspace_id = uuid4()
+    workflow_id = f"test.sim-scope-mismatch.{uuid4().hex}"
+    graph = _linear_graph(
+        _action_step(
+            "s1",
+            "local.create_note",
+            input_mapping={
+                "workspace_id": str(foreign_workspace_id),
+                "actor_id": str(user_id),
+                "body": "cross-workspace scope mismatch probe",
+            },
+        )
+    )
+    version = _publish_workflow_direct(workspace_id, user_id, workflow_id, graph)
+
+    response = client.post(f"/api/v1/automations/workflows/{version.id}/simulate")
+    assert response.status_code == 200
+    [step] = response.json()["steps"]
+    assert step["error"] == "SimulateWorkspaceScopeMismatch"
+    assert step["preview"] is None
+
+
+def test_simulate_redact_payload_replaces_marker_keys() -> None:
+    """None of the three registered adapters' own `simulate()` output
+    schemas happen to contain a redaction-marker-matching key, so no
+    end-to-end test above ever exercises `_simulate_redact_payload`'s
+    actual replacement branch (only its pass-through branch). Proven
+    directly at the unit level instead.
+    """
+    payload = {
+        "note": "visible",
+        "api_key": "should-not-appear",
+        "nested": {"password": "also-hidden", "ok": "fine"},
+        "items": [{"credential": "gone"}, {"visible": "kept"}],
+    }
+    redacted = automation_workflows._simulate_redact_payload(payload)
+    assert redacted["note"] == "visible"
+    assert redacted["api_key"] == "[REDACTED]"
+    assert redacted["nested"]["password"] == "[REDACTED]"
+    assert redacted["nested"]["ok"] == "fine"
+    assert redacted["items"][0]["credential"] == "[REDACTED]"
+    assert redacted["items"][1]["visible"] == "kept"
+
+
 # ---------------------------------------------------------------------------
 # 4. Unregistered action_ref degrades gracefully.
 # ---------------------------------------------------------------------------
@@ -461,6 +516,49 @@ def test_simulate_degrades_gracefully_for_unregistered_action_ref(
     [step] = response.json()["steps"]
     assert step["dispatch_gate"] == "adapter_not_registered"
     assert step["error"] == "AdapterNotRegistered"
+    assert step["preview"] is None
+
+
+def test_simulate_policy_blocked_takes_precedence_over_adapter_not_registered(
+    simulate_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    """Found during review: `_simulate_steps` originally checked adapter
+    registration before policy usability, so a step whose policy was
+    unusable *and* whose action_ref was unregistered wrongly reported
+    `adapter_not_registered` -- a real run on the identical graph would
+    report `policy_blocked` first via `worker._evaluate_dispatch_gate`
+    (policy checked before the adapter is even resolved) and never reach
+    the adapter-registration question at all. This is exactly the
+    "identical graph-walk ... not a separate, potentially-drifting guess"
+    property Decision 4 requires. Uses a version with no policy at all
+    (`policy_ref=None`, a valid, unattached-policy draft state -- `DATA-
+    MODEL.md`: "a workflow can be drafted before or after its intended
+    policy") naming an unregistered action_ref, so both conditions are
+    true simultaneously and only the ordering distinguishes the two
+    possible (wrong vs. correct) outcomes.
+    """
+    client, workspace_id, user_id, token = simulate_test_context
+    workflow_id = f"test.sim-policy-precedence.{uuid4().hex}"
+    graph = _linear_graph(_action_step("s1", "test.definitely-not-a-real-adapter"))
+    with SessionFactory() as session, session.begin():
+        draft = automation_workflows.create_workflow_draft(
+            session,
+            workspace_id,
+            user_id,
+            workflow_id=workflow_id,
+            graph=graph,
+            trigger_refs=[],
+            policy_ref=None,
+        )
+        activated = automation_workflows.activate_workflow_version(session, workspace_id, draft.id)
+    assert isinstance(activated, automation_workflows.WorkflowVersion)
+
+    response = client.post(f"/api/v1/automations/workflows/{activated.id}/simulate")
+    assert response.status_code == 200
+    [step] = response.json()["steps"]
+    assert step["dispatch_gate"] == "policy_blocked"
+    assert step["policy_block_reason"] == "no_policy"
+    assert step["error"] is None
     assert step["preview"] is None
 
 

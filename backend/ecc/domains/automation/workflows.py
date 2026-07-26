@@ -1369,6 +1369,37 @@ def _simulate_steps(
         compensate_ref = step.get("compensate_ref")
         adapter: ActionAdapter | None = adapter_registry.get(action_ref) if action_ref else None
 
+        # Policy usability is checked BEFORE adapter registration, exactly
+        # mirroring worker._evaluate_dispatch_gate's own real-dispatch
+        # ordering (policy_id/get_policy/is_policy_usable first; the
+        # adapter is resolved only once the policy already cleared) --
+        # found during review: this branch originally checked adapter
+        # registration first, which meant a step whose policy was
+        # unusable *and* whose action_ref was unregistered wrongly
+        # reported "adapter_not_registered" here while a real run on the
+        # identical graph would report "policy_blocked" first and never
+        # even reach the adapter-registration question. Reordered to
+        # match Decision 4's own "identical graph-walk ... not a
+        # separate, potentially-drifting guess" requirement literally.
+        dispatch_gate: DispatchGate
+        policy_block_reason: PolicyBlockReason | None
+        if policy_row is None:
+            dispatch_gate = "policy_blocked"
+            policy_block_reason = "no_policy"
+        elif not is_policy_usable(policy_row):
+            dispatch_gate = "policy_blocked"
+            lifecycle = policy_status(policy_row)
+            policy_block_reason = "policy_revoked" if lifecycle == "revoked" else "policy_expired"
+        elif adapter is None:
+            dispatch_gate = "adapter_not_registered"
+            policy_block_reason = None
+        else:
+            policy_block_reason = None
+            requires_approval = evaluate_approval_requirement(
+                adapter, policy_row, action_step_count_so_far=action_step_count_so_far
+            )
+            dispatch_gate = "requires_approval" if requires_approval else "clear"
+
         if adapter is None:
             # A version drafted before this task's own publish-time check
             # existed (or hand-constructed to bypass it) could still name an
@@ -1382,8 +1413,13 @@ def _simulate_steps(
                     step_type=step_type,
                     action_ref=action_ref,
                     compensate_ref=compensate_ref,
-                    dispatch_gate="adapter_not_registered",
-                    error="AdapterNotRegistered",
+                    dispatch_gate=dispatch_gate,
+                    policy_block_reason=policy_block_reason,
+                    error=(
+                        "AdapterNotRegistered"
+                        if dispatch_gate == "adapter_not_registered"
+                        else None
+                    ),
                 )
             )
             action_step_count_so_far += 1
@@ -1405,22 +1441,6 @@ def _simulate_steps(
             preview_dict = _simulate_redact_payload(preview_model.model_dump(mode="json"))
         except Exception as exc:  # noqa: BLE001 -- mirrors run_step's own broad adapter-call catch
             error = type(exc).__name__
-
-        dispatch_gate: DispatchGate
-        policy_block_reason: PolicyBlockReason | None
-        if policy_row is None:
-            dispatch_gate = "policy_blocked"
-            policy_block_reason = "no_policy"
-        elif not is_policy_usable(policy_row):
-            dispatch_gate = "policy_blocked"
-            lifecycle = policy_status(policy_row)
-            policy_block_reason = "policy_revoked" if lifecycle == "revoked" else "policy_expired"
-        else:
-            policy_block_reason = None
-            requires_approval = evaluate_approval_requirement(
-                adapter, policy_row, action_step_count_so_far=action_step_count_so_far
-            )
-            dispatch_gate = "requires_approval" if requires_approval else "clear"
 
         results.append(
             SimulateStepResult(
