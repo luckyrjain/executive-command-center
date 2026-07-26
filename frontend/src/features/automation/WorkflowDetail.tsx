@@ -2,7 +2,7 @@ import { useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
 import { ApiError, apiRequest } from '../../api/client'
-import type { KillSwitchStatus, TriggerListResponse, WorkflowVersion } from './types'
+import type { KillSwitchStatus, PolicyListResponse, TriggerListResponse, WorkflowVersion } from './types'
 import SimulationView from './SimulationView'
 
 /** Real, distinct, readable feedback for every documented publish/disable
@@ -18,6 +18,9 @@ function errorMessage(error: unknown): string {
   }
   if (error.code === 'WORKFLOW_NOT_ACTIVE') return 'This version is not currently active, so it cannot be disabled.'
   if (error.code === 'WORKFLOW_NOT_FOUND') return 'This workflow version no longer exists in this workspace.'
+  if (error.code === 'OFFLINE') return 'You are offline, so this could not be read from or sent to the server.'
+  if (error.code === 'NETWORK_ERROR') return 'Could not reach the server, so this could not be read or changed.'
+  if (error.status === 401) return 'Your session is no longer valid. Sign in again to view or change this workflow.'
   return error.message
 }
 
@@ -41,6 +44,7 @@ export default function WorkflowDetail({ versionId }: { versionId: string }) {
   })
 
   const workflowId = detail.data?.workflow_id ?? null
+  const policyRef = detail.data?.policy_ref ?? null
 
   const triggers = useQuery({
     queryKey: ['automation', 'triggers', workflowId],
@@ -55,6 +59,21 @@ export default function WorkflowDetail({ versionId }: { versionId: string }) {
     enabled: workflowId !== null,
     retry: 1,
   })
+
+  /** The attached policy's own lifecycle status, cross-referenced the same
+   * way `RunWorkspace.tsx`'s `RunDetailView` resolves a run's `policy_id`
+   * against the workflow-filtered policy list -- `version.policy_ref` alone
+   * is a bare UUID that says nothing about whether the authority it names is
+   * still active, expired or revoked. Policies are only ever fetched as a
+   * `workflow_id`-filtered list in this feature (`PolicyPanel.tsx`,
+   * `RunWorkspace.tsx`); there is no fetch-one-policy-by-id endpoint. */
+  const policies = useQuery({
+    queryKey: ['automation', 'policies', workflowId],
+    queryFn: () => apiRequest<PolicyListResponse>(`/api/v1/automations/policies?workflow_id=${encodeURIComponent(workflowId ?? '')}`),
+    enabled: workflowId !== null && policyRef !== null,
+    retry: 1,
+  })
+  const attachedPolicy = policies.data?.policies.find((policy) => policy.id === policyRef) ?? null
 
   const publishMutation = useMutation({
     mutationFn: () => apiRequest<WorkflowVersion>(`/api/v1/automations/workflows/${versionId}/publish`, { method: 'POST' }),
@@ -80,14 +99,25 @@ export default function WorkflowDetail({ versionId }: { versionId: string }) {
       }),
     onSuccess: () => {
       setKillSwitchReason('')
-      void queryClient.invalidateQueries({ queryKey: ['automation', 'kill-switch', workflowId] })
+      // Prefix, not the exact `workflowId` key -- a global switch toggled from
+      // `KillSwitchPanel.tsx` and this workflow's own switch share the same
+      // effective state, so every kill-switch query is refetched together.
+      void queryClient.invalidateQueries({ queryKey: ['automation', 'kill-switch'] })
     },
   })
 
   const pending = publishMutation.isPending || disableMutation.isPending || killSwitchMutation.isPending
+  /** UX-STATES.md requires a workflow's kill-switch state be visible *before*
+   * a user could attempt a blocked action. While that state is still loading
+   * or has failed to load it is genuinely unknown, so every action a kill
+   * switch would block is disabled rather than offered against an unverified
+   * assumption that nothing is blocked. */
+  const killSwitchUnknown = killSwitch.isLoading || killSwitch.isError
+  const globalKillActive = killSwitch.data?.active_global != null
+  const workflowKillActive = killSwitch.data?.active_workflow != null
 
   if (detail.isLoading) return <p role="status">Loading workflow…</p>
-  if (detail.isError) return <div role="alert" className="inline-status error-panel">{detail.error.message}</div>
+  if (detail.isError) return <div role="alert" className="inline-status error-panel">{errorMessage(detail.error)}</div>
   if (!detail.data) return null
   const version = detail.data
 
@@ -97,10 +127,27 @@ export default function WorkflowDetail({ versionId }: { versionId: string }) {
       <dl>
         <div><dt>Status</dt><dd>{version.status}</dd></div>
         <div><dt>Trigger references</dt><dd>{version.trigger_refs.join(', ') || 'none'}</dd></div>
-        <div><dt>Policy</dt><dd>{version.policy_ref ?? 'none attached'}</dd></div>
+        <div><dt>Policy</dt><dd>
+          {version.policy_ref === null ? 'none attached' : (
+            <>
+              {version.policy_ref}
+              {policies.isLoading ? ' · checking this policy\'s current status…' : null}
+              {policies.isError ? <span role="alert"> · status could not be confirmed ({errorMessage(policies.error)})</span> : null}
+              {attachedPolicy ? ` · currently ${attachedPolicy.status}` : null}
+              {policies.data && !attachedPolicy ? ' · not in this workflow\'s policy list, so its status is not knowable here' : null}
+            </>
+          )}
+        </dd></div>
         <div><dt>Definition hash</dt><dd>{version.definition_hash}</dd></div>
       </dl>
 
+      {killSwitch.isLoading ? <p role="status">Loading kill-switch status… actions a kill switch would block are disabled until it loads.</p> : null}
+      {killSwitch.isError ? (
+        <div role="alert" className="inline-status error-panel">
+          <p>Kill-switch status could not be confirmed -- actions are disabled until it loads. This workflow may or may not be blocked from starting new runs; that is not knowable from here right now.</p>
+          <p>{errorMessage(killSwitch.error)}</p>
+        </div>
+      ) : null}
       {killSwitch.data ? (
         <div role="status" className={killSwitch.data.killed ? 'inline-status error-panel' : 'inline-status'} aria-label="Kill switch status">
           {killSwitch.data.killed
@@ -108,16 +155,43 @@ export default function WorkflowDetail({ versionId }: { versionId: string }) {
             : 'No kill switch is active for this workflow. New runs are permitted (subject to policy and approval gates).'}
         </div>
       ) : null}
+      {/* A global switch is not addressed by any workflow_id, so a
+          per-workflow deactivate returns 200 and changes nothing about the
+          block -- a false remedy. With a global switch active, that button is
+          only offered when this workflow *also* has its own active switch
+          (where it does do something real, just not enough), and the note
+          below always points at where the global block is actually cleared. */}
+      {globalKillActive ? (
+        <p role="status" className="inline-status">
+          The active block is global, so no per-workflow action here clears it -- deactivate the global kill switch from the Kill switches tab.
+          {workflowKillActive ? ' This workflow also has its own switch active; deactivating it below leaves the global block in place.' : ''}
+        </p>
+      ) : null}
       <div className="work-actions">
+        {/* No `aria-label`: the wrapping label's visible text is the accessible
+            name (WCAG 2.5.3 -- "Kill switch reason" did not contain the visible
+            "Kill switch reason (optional)"), and it is the only reason field on
+            this surface. */}
         <label>Kill switch reason (optional)
-          <input aria-label="Kill switch reason" value={killSwitchReason} onChange={(e) => setKillSwitchReason(e.target.value)} disabled={!workflowId} />
+          <input value={killSwitchReason} onChange={(e) => setKillSwitchReason(e.target.value)} disabled={!workflowId || killSwitchUnknown} />
         </label>
-        <button type="button" disabled={pending || !workflowId} onClick={() => killSwitchMutation.mutate(true)}>Activate kill switch for this workflow</button>
-        <button type="button" disabled={pending || !workflowId} onClick={() => killSwitchMutation.mutate(false)}>Deactivate kill switch for this workflow</button>
+        <button type="button" disabled={pending || !workflowId || killSwitchUnknown} onClick={() => killSwitchMutation.mutate(true)}>Activate kill switch for this workflow</button>
+        {globalKillActive && !workflowKillActive ? null : (
+          <button type="button" disabled={pending || !workflowId || killSwitchUnknown} onClick={() => killSwitchMutation.mutate(false)}>Deactivate kill switch for this workflow</button>
+        )}
       </div>
 
       <h3>Schedule &amp; triggers</h3>
       {triggers.isLoading ? <p role="status">Loading trigger configuration…</p> : null}
+      {/* Without this branch a failed trigger fetch renders a bare heading and
+          an empty list -- visually identical to a manual-only workflow, even
+          for one on a real cron schedule. */}
+      {triggers.isError ? (
+        <div role="alert" className="inline-status error-panel">
+          <p>Trigger configuration could not be loaded, so this workflow's schedule is unknown -- it may still be on a schedule that fires automatically. This is not the same as having no triggers.</p>
+          <p>{errorMessage(triggers.error)}</p>
+        </div>
+      ) : null}
       {triggers.data && triggers.data.triggers.length === 0 ? <p className="empty-state">No configured triggers for this workflow.</p> : null}
       <ul aria-label="Configured triggers">
         {(triggers.data?.triggers ?? []).map((trigger) => (
@@ -151,7 +225,7 @@ export default function WorkflowDetail({ versionId }: { versionId: string }) {
 
       <div className="work-actions">
         {version.status === 'draft' ? (
-          <button type="button" disabled={pending} onClick={() => publishMutation.mutate()}>Publish this version</button>
+          <button type="button" disabled={pending || killSwitchUnknown} onClick={() => publishMutation.mutate()}>Publish this version</button>
         ) : null}
         {version.status === 'active' ? (
           <button type="button" disabled={pending} onClick={() => disableMutation.mutate()}>Disable this version</button>

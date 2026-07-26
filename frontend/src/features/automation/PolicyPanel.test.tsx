@@ -94,6 +94,43 @@ describe('PolicyPanel', () => {
     expect(await screen.findByText(/already expired/)).toBeTruthy()
   })
 
+  it('takes every control\'s accessible name from its own visible label text (WCAG 2.5.3 Label in Name)', async () => {
+    vi.stubGlobal('fetch', vi.fn(() => response({ policies: [] })))
+    renderPanel()
+    await waitFor(() => expect(screen.getByText('No policies recorded yet.')).toBeTruthy())
+
+    // The old accessible names ("Filter policies by workflow ID", "Policy
+    // value limit", …) did not contain the visible label text a speech-input
+    // user reads off the screen.
+    for (const visible of [
+      'Filter by workflow ID', 'Workflow ID', 'Action types (comma separated)', 'Data classes (comma separated)',
+      'Value limit', 'Count limit', 'Approval mode', 'Schedule note (optional)',
+    ]) {
+      expect(screen.getByLabelText(visible).hasAttribute('aria-label')).toBe(false)
+    }
+  })
+
+  it('maps a failed policy-list fetch through errorMessage(), never the raw backend message', async () => {
+    // retry: 1 on the list query overrides the client default, so the mock
+    // keeps failing and the wait outlasts React Query's ~1s backoff.
+    vi.stubGlobal('fetch', vi.fn(() => response({ error: { code: 'WORKFLOW_NOT_FOUND', message: 'Workflow Not Found' } }, 404)))
+    renderPanel()
+
+    const alert = await screen.findByRole('alert', {}, { timeout: 3000 })
+    expect(alert.textContent).toContain('does not exist in this workspace yet')
+    expect(alert.textContent).not.toContain('Workflow Not Found')
+    // A failed list is never the "no policies" empty state.
+    expect(screen.queryByText('No policies recorded yet.')).toBeNull()
+  })
+
+  it('maps an unreachable server on the policy list to a readable sentence', async () => {
+    vi.stubGlobal('fetch', vi.fn(() => Promise.reject(new TypeError('fetch failed'))))
+    renderPanel()
+
+    const alert = await screen.findByRole('alert', {}, { timeout: 3000 })
+    expect(alert.textContent).toContain('Could not reach the server')
+  })
+
   it('creates a policy with the exact numeric limits entered, not a hardcoded default', async () => {
     const fetch = vi.fn()
       .mockImplementationOnce(() => response({ policies: [] }))
@@ -103,8 +140,8 @@ describe('PolicyPanel', () => {
     renderPanel()
 
     await waitFor(() => expect(screen.getByText('No policies recorded yet.')).toBeTruthy())
-    fireEvent.change(screen.getByLabelText('Policy workflow ID'), { target: { value: 'weekly-digest' } })
-    fireEvent.change(screen.getByLabelText('Policy count limit'), { target: { value: '25' } })
+    fireEvent.change(screen.getByLabelText('Workflow ID'), { target: { value: 'weekly-digest' } })
+    fireEvent.change(screen.getByLabelText('Count limit'), { target: { value: '25' } })
     fireEvent.click(screen.getByRole('button', { name: 'Create policy' }))
 
     await waitFor(() => expect(fetch).toHaveBeenCalledTimes(3))

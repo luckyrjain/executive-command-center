@@ -38,14 +38,28 @@ function renderDetail(versionId = 'version-1') {
   return { client, ...utils }
 }
 
-function mockFetchByPath(routes: Record<string, unknown>) {
+/** A route's fixture is either a body (200) or a `[body, status]` pair, so a
+ * single *secondary* query can be made to fail while every other route still
+ * answers normally -- the exact shape the fixed-up error branches need. */
+type Route = unknown | [unknown, number]
+
+function mockFetchByPath(routes: Record<string, Route>) {
   return vi.fn((input: RequestInfo | URL) => {
     const url = String(input)
-    for (const [path, body] of Object.entries(routes)) {
-      if (url.includes(path)) return response(body)
+    for (const [path, route] of Object.entries(routes)) {
+      if (!url.includes(path)) continue
+      return Array.isArray(route) && route.length === 2 && typeof route[1] === 'number'
+        ? response(route[0], route[1])
+        : response(route)
     }
     return response({ error: { code: 'NOT_FOUND', message: 'no fixture route' } }, 404)
   })
+}
+
+const serverError = [{ error: { code: 'REQUEST_FAILED', message: 'Internal Server Error' } }, 500] as [unknown, number]
+
+function publishButton() {
+  return screen.getByRole('button', { name: 'Publish this version' }) as HTMLButtonElement
 }
 
 beforeEach(() => {
@@ -116,8 +130,9 @@ describe('WorkflowDetail', () => {
     vi.stubGlobal('fetch', fetch)
     renderDetail()
 
-    await waitFor(() => expect(screen.getByRole('button', { name: 'Publish this version' })).toBeTruthy())
-    fireEvent.click(screen.getByRole('button', { name: 'Publish this version' }))
+    // Publish stays disabled until the kill-switch state is actually known.
+    await waitFor(() => expect(publishButton().disabled).toBe(false))
+    fireEvent.click(publishButton())
     await waitFor(() => expect(screen.getByText('active', { exact: true })).toBeTruthy())
   })
 
@@ -130,8 +145,8 @@ describe('WorkflowDetail', () => {
     vi.stubGlobal('fetch', fetch)
     renderDetail()
 
-    await waitFor(() => expect(screen.getByRole('button', { name: 'Publish this version' })).toBeTruthy())
-    fireEvent.click(screen.getByRole('button', { name: 'Publish this version' }))
+    await waitFor(() => expect(publishButton().disabled).toBe(false))
+    fireEvent.click(publishButton())
     expect(await screen.findByText(/references an unregistered action/)).toBeTruthy()
   })
 
@@ -146,5 +161,155 @@ describe('WorkflowDetail', () => {
     await waitFor(() => expect(screen.getByRole('button', { name: 'Simulate this version' })).toBeTruthy())
     fireEvent.click(screen.getByRole('button', { name: 'Simulate this version' }))
     expect(screen.getByText(/SIMULATION -- preview only/)).toBeTruthy()
+  })
+
+  // --- Kill-switch state unknown: never silently "not blocked" -----------
+
+  it('says the kill-switch state could not be confirmed and disables every blocked action when its fetch fails', async () => {
+    // retry: 1 on the kill-switch query overrides the client's retry: false,
+    // so the mock must keep failing and the wait must outlast the ~1s backoff
+    // (AttentionQueue.test.tsx's convention for the same shape).
+    vi.stubGlobal('fetch', mockFetchByPath({
+      '/api/v1/automations/workflows/version-1': draftVersion,
+      '/api/v1/automations/triggers': noTriggers,
+      '/kill_switch': serverError,
+    }))
+    renderDetail()
+
+    const alert = await screen.findByRole('alert', {}, { timeout: 3000 })
+    expect(alert.textContent).toContain('Kill-switch status could not be confirmed')
+    expect(alert.textContent).toContain('actions are disabled until it loads')
+    // Never the reassuring reading while the truth is unknown.
+    expect(screen.queryByText(/No kill switch is active/)).toBeNull()
+    expect(publishButton().disabled).toBe(true)
+    expect((screen.getByRole('button', { name: 'Activate kill switch for this workflow' }) as HTMLButtonElement).disabled).toBe(true)
+    expect((screen.getByRole('button', { name: 'Deactivate kill switch for this workflow' }) as HTMLButtonElement).disabled).toBe(true)
+  })
+
+  it('disables publish and the kill-switch toggles while the kill-switch state is still loading', async () => {
+    vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url.includes('/kill_switch')) return new Promise<Response>(() => {}) // never settles
+      if (url.includes('/api/v1/automations/triggers')) return response(noTriggers)
+      return response(draftVersion)
+    }))
+    renderDetail()
+
+    await waitFor(() => expect(screen.getByText('weekly-digest · v1')).toBeTruthy())
+    expect(screen.getByText(/Loading kill-switch status/)).toBeTruthy()
+    expect(publishButton().disabled).toBe(true)
+    expect((screen.getByRole('button', { name: 'Activate kill switch for this workflow' }) as HTMLButtonElement).disabled).toBe(true)
+  })
+
+  // --- A global block is not clearable per workflow -----------------------
+
+  it('does not offer a per-workflow deactivate as the remedy for a purely global kill switch', async () => {
+    const globalOnly: KillSwitchStatus = {
+      workflow_id: 'weekly-digest',
+      killed: true,
+      active_global: { workflow_id: null, active: true, reason: 'incident', activated_by: 'user-1', activated_at: '2026-07-20T00:00:00Z', deactivated_by: null, deactivated_at: null },
+      active_workflow: null,
+      history: [],
+    }
+    vi.stubGlobal('fetch', mockFetchByPath({
+      '/api/v1/automations/workflows/version-1': draftVersion,
+      '/api/v1/automations/triggers': noTriggers,
+      '/kill_switch': globalOnly,
+    }))
+    renderDetail()
+
+    await waitFor(() => expect(screen.getByText(/Kill switch active \(global\)/)).toBeTruthy())
+    expect(screen.getByText(/deactivate the global kill switch from the Kill switches tab/)).toBeTruthy()
+    expect(screen.queryByRole('button', { name: 'Deactivate kill switch for this workflow' })).toBeNull()
+  })
+
+  it('keeps the per-workflow deactivate when this workflow also has its own switch, but says it will not clear the global block', async () => {
+    const both: KillSwitchStatus = {
+      workflow_id: 'weekly-digest',
+      killed: true,
+      active_global: { workflow_id: null, active: true, reason: 'incident', activated_by: 'user-1', activated_at: '2026-07-20T00:00:00Z', deactivated_by: null, deactivated_at: null },
+      active_workflow: { workflow_id: 'weekly-digest', active: true, reason: 'local', activated_by: 'user-1', activated_at: '2026-07-21T00:00:00Z', deactivated_by: null, deactivated_at: null },
+      history: [],
+    }
+    vi.stubGlobal('fetch', mockFetchByPath({
+      '/api/v1/automations/workflows/version-1': draftVersion,
+      '/api/v1/automations/triggers': noTriggers,
+      '/kill_switch': both,
+    }))
+    renderDetail()
+
+    await waitFor(() => expect(screen.getByText(/Kill switch active \(global and this workflow\)/)).toBeTruthy())
+    expect(screen.getByText(/leaves the global block in place/)).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'Deactivate kill switch for this workflow' })).toBeTruthy()
+  })
+
+  // --- Triggers: a failed fetch is not "no triggers" ----------------------
+
+  it('says the schedule is unknown when the trigger fetch fails, never the no-triggers empty state', async () => {
+    vi.stubGlobal('fetch', mockFetchByPath({
+      '/api/v1/automations/workflows/version-1': draftVersion,
+      '/api/v1/automations/triggers': serverError,
+      '/kill_switch': noSwitch,
+    }))
+    renderDetail()
+
+    const alert = await screen.findByRole('alert', {}, { timeout: 3000 })
+    expect(alert.textContent).toContain('Trigger configuration could not be loaded')
+    expect(alert.textContent).toContain('may still be on a schedule')
+    expect(screen.queryByText('No configured triggers for this workflow.')).toBeNull()
+  })
+
+  // --- Policy: a bare UUID is not a lifecycle status ----------------------
+
+  it('resolves the attached policy_ref to its real lifecycle status, not just the bare id', async () => {
+    const withPolicy = { ...draftVersion, policy_ref: 'policy-1' }
+    vi.stubGlobal('fetch', mockFetchByPath({
+      '/api/v1/automations/workflows/version-1': withPolicy,
+      '/api/v1/automations/triggers': noTriggers,
+      '/api/v1/automations/policies': { policies: [{ id: 'policy-1', workflow_id: 'weekly-digest', action_types: [], data_classes: [], value_limit: '0', count_limit: 10, rate_limit: {}, schedule: null, approval_mode: 'per_run', expires_at: '2026-10-01T00:00:00Z', revoked_at: '2026-07-22T00:00:00Z', status: 'revoked', version: 1, created_at: '2026-07-01T00:00:00Z', updated_at: '2026-07-22T00:00:00Z' }] },
+      '/kill_switch': noSwitch,
+    }))
+    renderDetail()
+
+    await waitFor(() => expect(screen.getByText(/policy-1 · currently revoked/)).toBeTruthy())
+  })
+
+  it('says the attached policy\'s status could not be confirmed when the policy fetch fails, never implying it is fine', async () => {
+    const withPolicy = { ...draftVersion, policy_ref: 'policy-1' }
+    vi.stubGlobal('fetch', mockFetchByPath({
+      '/api/v1/automations/workflows/version-1': withPolicy,
+      '/api/v1/automations/triggers': noTriggers,
+      '/api/v1/automations/policies': serverError,
+      '/kill_switch': noSwitch,
+    }))
+    renderDetail()
+
+    const alert = await screen.findByRole('alert', {}, { timeout: 3000 })
+    expect(alert.textContent).toContain('status could not be confirmed')
+  })
+
+  it('does not fetch policies at all for a version with no policy attached', async () => {
+    const fetch = mockFetchByPath({
+      '/api/v1/automations/workflows/version-1': draftVersion,
+      '/api/v1/automations/triggers': noTriggers,
+      '/kill_switch': noSwitch,
+    })
+    vi.stubGlobal('fetch', fetch)
+    renderDetail()
+
+    await waitFor(() => expect(screen.getByText(/No kill switch is active/)).toBeTruthy())
+    expect(screen.getByText('none attached')).toBeTruthy()
+    expect(fetch.mock.calls.some((call) => String(call[0]).includes('/api/v1/automations/policies'))).toBe(false)
+  })
+
+  // --- The main detail fetch goes through errorMessage() too --------------
+
+  it('maps a failed detail fetch through errorMessage(), never the raw backend message', async () => {
+    vi.stubGlobal('fetch', vi.fn(() => response({ error: { code: 'WORKFLOW_NOT_FOUND', message: 'Workflow Not Found' } }, 404)))
+    renderDetail()
+
+    const alert = await screen.findByRole('alert', {}, { timeout: 3000 })
+    expect(alert.textContent).toContain('no longer exists in this workspace')
+    expect(alert.textContent).not.toContain('Workflow Not Found')
   })
 })
