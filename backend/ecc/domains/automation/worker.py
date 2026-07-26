@@ -161,6 +161,16 @@ resume behavior this task needs (see `process_claimed_run`'s own note
 below) with no separate "resume" code path required inside `run_step`
 itself.
 
+One clarification this ordering does *not* imply, and which was wrongly
+read as an implication when Task 6's retry landed: "the gate runs only
+where no row exists" is a statement about the *approval* half of the gate,
+which needs the no-row state to stay unambiguous. It is not a statement
+about the *policy-usability* half, which has no such dependency and must be
+re-enforced on every attempt. `run_step`'s retry-resume branch therefore
+calls `_resolve_usable_policy` (the shared extraction of that half) again
+before re-dispatching -- see this docstring's "Task 6 retry-resume,
+corrected" section below.
+
 `_evaluate_dispatch_gate`'s two blocking outcomes:
 
 1. **No usable policy (`StepBlockedByPolicy`).** `run.policy_id is None`,
@@ -335,8 +345,49 @@ another `TransientAdapterError`), `run_step` falls through to the ordinary,
 unconditional `'failed'` path unchanged -- bounded, never indefinite. A
 `'retrying'`-status existing row (a reclaimed, now-due run resuming the
 exact step it paused on) is handled in `run_step`'s existing-row branch by
-falling through to a fresh dispatch attempt that `UPDATE`s the same row
-(never a second `INSERT`), reusing its existing `attempt_count`.
+re-dispatching that same row -- an `UPDATE`, never a second `INSERT`,
+reusing its existing `attempt_count`.
+
+**Task 6 retry-resume, corrected: a resumed attempt now gets both of first
+dispatch's pre-`execute()` guarantees, not neither.** As originally
+merged, the `'retrying'` branch went straight from "row exists" to
+`adapter.execute()`, skipping the two things the no-existing-row `else:`
+branch does first. Both omissions were real bugs, confirmed by a
+line-by-line audit of this exact seam, and both are fixed here:
+
+1. **The row is transitioned to `'dispatched'` and that write is durably
+   committed before `execute()` is called** -- the same `session.commit()`
+   discipline, for the same reason, as the brand-new-row `INSERT`. Without
+   it the row sat at `'retrying'` for the whole duration of `execute()`, so
+   a crash (or a lease expiring) mid-call left `'retrying'` behind; the
+   next worker to claim the run read `'retrying'`, took this identical
+   re-dispatch branch, and called `execute()` a second time on a side
+   effect that may already have partially or fully occurred -- repeatable
+   once per lease expiry, with no bound. With the fix, that crash leaves
+   `'dispatched'`+no-outcome, which the existing `dispatched` branch
+   resolves to `'unknown'`/`needs_review` exactly as it does for a
+   first-attempt crash. Decision 3's at-most-one-effect guarantee now holds
+   on the retry path as well as the first-dispatch path.
+2. **Policy usability is re-evaluated on every resumed attempt**
+   (`_resolve_usable_policy`, shared verbatim with
+   `_evaluate_dispatch_gate` rather than copy-pasted). `_evaluate_dispatch_
+   gate` runs only in the `else:` branch, so a policy revoked or expired
+   *during* a retry's backoff window was never re-consulted and the retried
+   `execute()` proceeded under authority that had been withdrawn --
+   contradicting `APPROVAL-POLICY.md`'s "revocation takes effect
+   immediately for any not-yet-started step," since a step waiting out a
+   backoff window has not started its next attempt. Every other authority
+   mechanism -- kill switch (`_CLAIMABLE_PREDICATE`, and again in
+   `process_claimed_run`), cancel, pause -- was already re-consulted on
+   every reclaim/resume; policy usability was the lone exception. The
+   resumed check returns the same `StepBlockedByPolicy` value first
+   dispatch returns, so `process_claimed_run` maps it to `needs_review`
+   through the identical branch, with no retry-specific run state.
+   Deliberately narrow: only the *policy-usability* half of the gate is
+   re-run. The approval-requirement half is not, because a step
+   re-attempted after a transient failure may already carry a decided
+   approval bound to this exact digest from an earlier attempt, and
+   getting that right is a distinct change from closing this gap.
 
 **Task 6: compensation dispatch (`docs/superpowers/specs/
 2026-07-25-phase-5-automation-design.md` Decision 9).** `workflows.
@@ -1330,21 +1381,37 @@ def _count_dispatched_action_steps(session: Session, workspace_id: UUID, run_id:
     return int(result or 0)
 
 
-def _evaluate_dispatch_gate(
-    session: Session,
-    run: WorkflowRun,
-    step_index: int,
-    digest: str,
-    step: dict[str, Any],
-    adapter_registry: AdapterRegistry,
-) -> StepBlockedByPolicy | StepAwaitingApproval | None:
-    """Task 3's gate (module docstring's own section has the full
-    reasoning) -- only ever called from `run_step`'s `else:` branch, i.e.
-    only when no `workflow_run_steps` row exists yet for this step at all.
-    Returns `None` when the step is cleared to dispatch immediately:
-    either the policy is usable and no approval is required, or an
-    `approved` request already matches this exact, freshly-computed
-    `digest`.
+def _resolve_usable_policy(
+    session: Session, run: WorkflowRun, step_index: int
+) -> policy_module.AutomationPolicy | StepBlockedByPolicy:
+    """The policy-usability half of Task 3's dispatch gate, extracted so
+    the two paths that must both enforce it share one implementation
+    rather than two drifting copies: `_evaluate_dispatch_gate` (first
+    dispatch, no `workflow_run_steps` row yet) and `run_step`'s
+    retry-resume path (an existing `'retrying'` row being re-dispatched
+    after its backoff window).
+
+    Fail-closed in all three unusable shapes, exactly as the module
+    docstring's "No usable policy" section describes: `run.policy_id is
+    None` (no authority was ever attached), `policy.get_policy` finds no
+    such row, or `policy.is_policy_usable` reports `False` (revoked or
+    expired -- `policy.policy_status` distinguishes which, and that
+    distinction is carried through to `StepBlockedByPolicy.reason`).
+    Returns the resolved, currently-usable `AutomationPolicy` otherwise,
+    so a caller that needs it for approval evaluation does not have to
+    look it up a second time.
+
+    **Why the retry-resume path must call this too (a real bug fixed
+    after Task 6, not the original shape).** Revocation "takes effect
+    immediately for any not-yet-started step" (`APPROVAL-POLICY.md`
+    verbatim), and a step waiting out a retry backoff window is precisely
+    a not-yet-started *attempt*. Before this fix, the gate ran only on
+    first dispatch, so a policy revoked or expired *during* a retry's
+    backoff window was never re-consulted and the retried `execute()`
+    proceeded under withdrawn authority -- the one authority mechanism
+    that was not re-checked on resume, while the kill switch
+    (`_CLAIMABLE_PREDICATE` and again in `process_claimed_run`), cancel
+    and pause all already were.
     """
     if run.policy_id is None:
         return StepBlockedByPolicy(step_index, "no_policy")
@@ -1357,6 +1424,34 @@ def _evaluate_dispatch_gate(
             "policy_revoked" if lifecycle == "revoked" else "policy_expired"
         )
         return StepBlockedByPolicy(step_index, reason)
+    return policy_row
+
+
+def _evaluate_dispatch_gate(
+    session: Session,
+    run: WorkflowRun,
+    step_index: int,
+    digest: str,
+    step: dict[str, Any],
+    adapter_registry: AdapterRegistry,
+) -> StepBlockedByPolicy | StepAwaitingApproval | None:
+    """Task 3's gate (module docstring's own section has the full
+    reasoning) -- called from `run_step`'s `else:` branch, i.e. when no
+    `workflow_run_steps` row exists yet for this step at all. Returns
+    `None` when the step is cleared to dispatch immediately: either the
+    policy is usable and no approval is required, or an `approved` request
+    already matches this exact, freshly-computed `digest`.
+
+    Its policy-usability half lives in `_resolve_usable_policy` so
+    `run_step`'s retry-resume path can re-enforce exactly that same check
+    (and only that check -- re-deriving the approval requirement for a
+    step that may already carry a decided approval from an earlier attempt
+    is a separate, unresolved question) without duplicating the lookup.
+    """
+    resolved = _resolve_usable_policy(session, run, step_index)
+    if isinstance(resolved, StepBlockedByPolicy):
+        return resolved
+    policy_row = resolved
 
     adapter = adapter_registry.get(step["action_ref"])
     if adapter is None:
@@ -1420,17 +1515,38 @@ def run_step(
     "Task 3's approval/policy gate" section has the full reasoning for why
     this ordering, not "write `dispatched` first," is required).
 
-    **Task 6.** A `'retrying'`-status existing row (a reclaimed, now-due
-    run resuming the exact step a prior `TransientAdapterError` paused it
-    on) falls through to a fresh dispatch attempt below exactly like the
-    `'pending'`/`'skipped'` case always has -- the row is `UPDATE`d, never
-    re-`INSERT`ed, and its `attempt_count` carries forward. If that
-    dispatch attempt raises `TransientAdapterError` again and `attempt_
-    count < MAX_RETRY_ATTEMPTS`, `run_step` itself durably commits another
-    `'retrying'` transition and releases the run's lease back to `'queued'`
-    (module docstring's "Task 6: bounded retry" section) -- once exhausted,
-    it falls through to the ordinary, unconditional `'failed'` path below,
-    unchanged from Task 2.
+    **Task 6, as corrected by the retry-resume audit.** A `'retrying'`-status
+    existing row (a reclaimed, now-due run resuming the exact step a prior
+    `TransientAdapterError` paused it on) is re-dispatched below: the row is
+    `UPDATE`d, never re-`INSERT`ed, and its `attempt_count` carries forward.
+    Two guarantees the `else:` branch already provided for a brand-new row
+    are enforced on this path too -- both were missing when Task 6 first
+    landed, and neither omission was intentional:
+
+    * **The policy is re-checked.** `_resolve_usable_policy` (the shared
+      policy-usability half of `_evaluate_dispatch_gate`) runs again before
+      the adapter is touched, so a policy revoked or expired *during* the
+      backoff window returns `StepBlockedByPolicy` -- the same value, and
+      therefore the same `needs_review` mapping in `process_claimed_run` --
+      instead of executing under withdrawn authority. Only policy
+      usability is re-evaluated; the approval-requirement half is not
+      re-derived on a resume (see the inline comment on that branch).
+    * **A `'dispatched'` transition is durably committed first.** Exactly
+      as for a brand-new row, the row reads `'dispatched'` in the database
+      before `execute()` is ever called, so a crash anywhere inside that
+      call leaves `'dispatched'`+no-outcome -- which the next claim
+      attempt's `existing["status"] == "dispatched"` branch resolves to
+      `'unknown'`/`needs_review`, never a second `execute()`. Previously the
+      row stayed at `'retrying'` across the call, so a crash mid-`execute()`
+      sent the next worker down this very same re-dispatch branch, calling
+      `execute()` again -- with no bound, once per lease expiry.
+
+    If the re-dispatched attempt raises `TransientAdapterError` again and
+    `attempt_count < MAX_RETRY_ATTEMPTS`, `run_step` itself durably commits
+    another `'retrying'` transition and releases the run's lease back to
+    `'queued'` (module docstring's "Task 6: bounded retry" section) -- once
+    exhausted, it falls through to the ordinary, unconditional `'failed'`
+    path below, unchanged from Task 2.
     """
     step = _resolve_step(session, run, step_index)
     if step.get("step_type") != "action":
@@ -1489,13 +1605,75 @@ def run_step(
             record_step_outcome("unknown")
             record_unknown_outcome()
             return StepOutcome(step_index, "unknown", None, None)
-        # 'pending'/'skipped'/'retrying' rows fall through to a fresh
-        # dispatch attempt below -- 'pending'/'skipped' are never written by
-        # this module (Task 2's own original comment); 'retrying' (Task 6)
-        # is written by this same function on a prior TransientAdapterError
-        # and is deliberately treated identically: not yet dispatched *this*
-        # attempt, so re-dispatch below, reusing (never re-INSERTing) this
-        # row.
+        # 'pending'/'skipped'/'retrying' rows are re-dispatched below,
+        # reusing (never re-INSERTing) this row and carrying its
+        # `attempt_count` forward. 'pending'/'skipped' are never written by
+        # this module (Task 2's own original comment), so in practice this
+        # is the retry-resume path: a 'retrying' row written by this same
+        # function on a prior TransientAdapterError, whose run has since
+        # been reclaimed now that its `next_attempt_at` backoff window has
+        # elapsed.
+        #
+        # Two things must happen before the adapter is touched, and both
+        # were missing before this fix -- each was a real bug, not a
+        # deliberate asymmetry with the `else:` branch below:
+        #
+        # 1. **Re-check policy usability.** Revocation "takes effect
+        #    immediately for any not-yet-started step"
+        #    (`APPROVAL-POLICY.md`), and this attempt has not started. A
+        #    policy revoked or expired *during* the backoff window is
+        #    caught here and returns StepBlockedByPolicy -- the identical
+        #    outcome value `_evaluate_dispatch_gate` returns for the same
+        #    condition on first dispatch, so `process_claimed_run` maps it
+        #    to `needs_review` through the identical branch. Only the
+        #    policy-usability half of the gate is re-evaluated (shared with
+        #    the `else:` branch via `_resolve_usable_policy`); the
+        #    approval-requirement half is deliberately not re-derived here,
+        #    because a step re-attempted after a transient failure may
+        #    already carry a decided approval from an earlier attempt and
+        #    reasoning about that correctly is a separate change.
+        # 2. **Durably commit a 'dispatched' transition.** The `else:`
+        #    branch's INSERT+commit exists so that a crash between the
+        #    commit and the outcome leaves a row a later claim attempt
+        #    resolves to 'unknown' rather than blindly re-executing
+        #    (Decision 3 / EXECUTION-CONTRACT.md). A retry-resume needs the
+        #    exact same protection and previously had none: it went to
+        #    `execute()` with the row still reading 'retrying', so a crash
+        #    mid-`execute()` left 'retrying' behind, and the next worker to
+        #    claim the run after lease expiry took this same branch and
+        #    called `execute()` again -- unboundedly, on a side effect that
+        #    may already have partially or fully occurred.
+        blocked = _resolve_usable_policy(session, run, step_index)
+        if isinstance(blocked, StepBlockedByPolicy):
+            return blocked
+
+        now = datetime.now(UTC)
+        session.execute(
+            text(
+                "UPDATE workflow_run_steps SET status = 'dispatched', updated_at = :now "
+                f"{_STEP_ROW_WHERE}"
+            ),
+            {
+                "now": now,
+                "workspace_id": run.workspace_id,
+                "run_id": run.id,
+                "step_index": step_index,
+            },
+        )
+        # `attempt_count` is deliberately left exactly as read above (it
+        # carries forward across the resume and is only ever incremented by
+        # the TransientAdapterError branch below), as are `started_at`
+        # (the first attempt's start is the step's start) and `error_class`
+        # (the prior attempt's classification, unchanged from before this
+        # fix, which likewise never cleared it on a successful resume).
+        #
+        # The same real COMMIT the `else:` branch performs, for the same
+        # reason and with the same guarantee: a crash on the very next line
+        # leaves this row durably at status='dispatched' with no outcome,
+        # which the `existing["status"] == "dispatched"` branch above
+        # resolves to 'unknown'/needs_review on the next claim attempt --
+        # never a second execute() call.
+        session.commit()
 
     else:
         # Task 3's gate -- must run before any workflow_run_steps row for
