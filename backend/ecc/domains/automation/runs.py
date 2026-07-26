@@ -59,8 +59,15 @@ FastAPI's `422` response for a malformed body) and `workflow_not_active`
 for a workflow with no active version -- also covers "workflow does not
 exist at all," which resolves to the identical `None` from `get_active_
 workflow_version` either way, matching `workflows.py`'s own established
-precedent of not distinguishing the two). `policy_expired`/`policy_revoked`/
-`rate_limited`/`digest_mismatch`/`approval_expired`/`simulation_only` are
+precedent of not distinguishing the two). `rate_limited` (`RATE_LIMITED`,
+409) is handled here too, as of the `preview_only`/`rate_limit` docs-vs-code
+reconciliation: `worker.enqueue_run` rejects a run that would exceed its
+authorizing policy's own `rate_limit.runs_per_workflow_per_hour` ceiling
+before creating any `workflow_runs` row at all (`APPROVAL-POLICY.md`: "Next
+run past the limit rejected at enqueue with `rate_limited`"), and this
+endpoint maps that outcome to the required error code -- the same shape
+`workflow_not_active`/`kill_switch_active` already use. `policy_expired`/
+`policy_revoked`/`digest_mismatch`/`approval_expired`/`simulation_only` are
 not surfaced by this router directly -- they are properties of a run's own
 step-dispatch outcome (`needs_review`/`waiting_approval`, already fully
 handled inside `worker.run_step`/`approvals.py`) visible through this
@@ -509,6 +516,26 @@ def create_run_endpoint(
             raise HTTPException(
                 status_code=409,
                 detail={"code": "WORKFLOW_NOT_ACTIVE", "workflow_id": result.workflow_id},
+            )
+        if isinstance(result, worker_module.RunRateLimited):
+            # API-SCHEMAS.md's required `rate_limited` error code, real for
+            # the first time (see worker.py's own "`rate_limit` is enforced
+            # at enqueue time" docstring section for the full docs-vs-code
+            # history). 409, matching WORKFLOW_NOT_ACTIVE/KILL_SWITCH_ACTIVE:
+            # like both of those, this is a conflict with the target's own
+            # current state (this workflow has already used its hourly
+            # allowance), not a malformed payload -- and, like both, it is
+            # raised only after `enqueue_run` has already declined to write
+            # any `workflow_runs` row, so the rejection leaves no partial
+            # state behind for a caller to clean up.
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "RATE_LIMITED",
+                    "workflow_id": result.workflow_id,
+                    "limit": result.limit,
+                    "runs_in_window": result.runs_in_window,
+                },
             )
         if isinstance(result, worker_module.WorkflowKilled):
             # Task 6: API-SCHEMAS.md's kill_switch_active error code, for

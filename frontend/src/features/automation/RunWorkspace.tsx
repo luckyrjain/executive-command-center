@@ -12,7 +12,16 @@ const MAX_RETRY_ATTEMPTS = 3
 const RUN_STATUSES: RunStatus[] = [
   'queued', 'leased', 'running', 'waiting_approval', 'paused', 'needs_review',
   'succeeded', 'failed', 'cancelled', 'compensating', 'compensated', 'compensation_failed',
-  'expired', 'rate_limited',
+  'expired', 'rate_limited', 'preview_blocked',
+]
+
+/** Terminal statuses -- nothing further will happen to a run in one of
+ * these, so neither Pause/Resume nor Cancel is offered. `preview_blocked`
+ * belongs here for the same reason `succeeded` does: the run is finished,
+ * not stuck (see statusDescription below). */
+const TERMINAL_RUN_STATUSES: RunStatus[] = [
+  'succeeded', 'failed', 'cancelled', 'compensated', 'compensation_failed',
+  'expired', 'rate_limited', 'preview_blocked',
 ]
 
 /** Plain-language description of every DATA-MODEL.md run status --
@@ -36,15 +45,21 @@ function statusDescription(status: RunStatus): string {
     case 'compensation_failed': return 'Failed, and at least one compensation action itself failed or is unknown -- see the compensation ledger below for exactly which.'
     case 'expired': return 'Expired.'
     case 'rate_limited': return 'Blocked by the policy\'s own rate limit.'
+    case 'preview_blocked': return 'Finished without dispatching anything -- this run\'s policy is preview-only, which never authorizes a real action. Nothing failed and nothing needs fixing.'
     default: return status
   }
 }
 
 function errorMessage(error: unknown): string {
   if (!(error instanceof ApiError)) return error instanceof Error ? error.message : 'Request failed.'
-  const details = error.current as { workflow_id?: string; status?: string } | undefined
+  const details = error.current as { workflow_id?: string; status?: string; limit?: number } | undefined
   if (error.code === 'WORKFLOW_NOT_ACTIVE') return `Workflow "${details?.workflow_id ?? ''}" has no active version -- publish a version before running it.`
   if (error.code === 'KILL_SWITCH_ACTIVE') return `A kill switch is active for workflow "${details?.workflow_id ?? ''}" -- new runs are rejected until it is deactivated.`
+  // Enqueue-time rate limiting (`worker.RunRateLimited`): the policy's own
+  // runs-per-workflow-per-hour ceiling is already used up for this trailing
+  // hour. Names the limit so an operator can tell "misconfigured policy"
+  // apart from "I really did start that many runs".
+  if (error.code === 'RATE_LIMITED') return `Workflow "${details?.workflow_id ?? ''}" has already used its policy's limit of ${details?.limit ?? 'allowed'} runs per hour -- the next run is rejected until the trailing hour rolls over.`
   if (error.code === 'RUN_NOT_PAUSED') return `This run is ${details?.status ?? 'not paused'}, so it cannot be resumed.`
   if (error.code === 'RUN_NOT_FOUND') return 'This run no longer exists in this workspace.'
   return error.message
@@ -101,6 +116,23 @@ function RunDetailView({ run }: { run: RunDetail }) {
         </div>
       ) : null}
 
+      {run.status === 'preview_blocked' ? (
+        // role="status", not role="alert", and no error-panel class: a
+        // preview-only run reaching its end without dispatching is the
+        // mode working exactly as designed, not a fault an operator has to
+        // react to. Rendering it as an error would misreport the one
+        // guarantee `docs/runbooks/PHASE-5-DOGFOOD.md`'s Stage 1 depends on.
+        <div role="status" className="inline-status">
+          <strong>Preview only -- no real action was taken.</strong>
+          <p>
+            This run&apos;s policy is in <code>preview_only</code> mode, which never authorizes a real
+            side effect: every step was gated, any approval below was recorded for real, and no
+            adapter was ever executed. Switch the workflow&apos;s policy to <code>per_run</code> or{' '}
+            <code>bounded_recurring</code> and start a new run to dispatch for real.
+          </p>
+        </div>
+      ) : null}
+
       {run.status === 'compensation_failed' ? (
         <div role="alert" className="inline-status error-panel">
           <strong>{mixedCompensation ? 'Partially compensated' : 'Compensation failed'}</strong> -- see the compensation ledger below for exactly which rollback actions succeeded and which did not.
@@ -111,7 +143,7 @@ function RunDetailView({ run }: { run: RunDetail }) {
       <div className="work-actions">
         {['queued', 'leased', 'running', 'waiting_approval'].includes(run.status) ? <button type="button" disabled={pending} onClick={() => mutate.mutate('pause')}>Pause</button> : null}
         {run.status === 'paused' ? <button type="button" disabled={pending} onClick={() => mutate.mutate('resume')}>Resume</button> : null}
-        {!['succeeded', 'failed', 'cancelled', 'compensated', 'compensation_failed'].includes(run.status) ? <button type="button" disabled={pending} onClick={() => mutate.mutate('cancel')}>Cancel</button> : null}
+        {!TERMINAL_RUN_STATUSES.includes(run.status) ? <button type="button" disabled={pending} onClick={() => mutate.mutate('cancel')}>Cancel</button> : null}
       </div>
 
       <h4>Steps</h4>

@@ -49,7 +49,10 @@ diverge; (2) `PHASE-005-automation.md`'s own Exit criteria phrase --
 "advances from preview to bounded actions" -- names a *staged* progression
 this activation's own policy model (`automation_policies.approval_mode`:
 `preview_only` -> `per_run`/`bounded_recurring`) already makes mechanically
-real, which Phase 3's own flat 14-day window had no equivalent of. This
+real -- `preview_only` cannot dispatch a real action at all, so the
+progression between stages is an actual change in what the system is
+capable of, not merely a change in operator intent -- which Phase 3's own
+flat 14-day window had no equivalent of. This
 document therefore splits the 14 days into two distinct 7-day stages rather
 than one undifferentiated window, so the record itself demonstrates the
 staged progression the exit criterion names, not only the total duration:
@@ -59,12 +62,33 @@ staged progression the exit criterion names, not only the total duration:
   starting a real run). Goal: prove simulation fidelity, the workflow
   builder, policy authoring and the UI's own simulation-vs-real visual
   distinction hold up under real, unscripted use -- with the success
-  threshold of **zero real side effects of any kind** during this stage
-  (mechanically guaranteed by `preview_only`'s own dispatch-gate semantics,
-  `approvals.evaluate_approval_requirement`, and `/simulate`'s own
-  structural inability to reach `execute()` -- this stage's threshold is
-  therefore a real-world confirmation of an already-proven backend
-  guarantee, not a new risk).
+  threshold of **zero real side effects of any kind** during this stage.
+  That threshold is mechanically guaranteed by two independent mechanisms,
+  and this stage is a real-world confirmation of an already-proven backend
+  guarantee rather than a new risk: `/simulate`'s own structural inability
+  to reach `execute()` (Decision 4 -- no code path from that endpoint to an
+  adapter's `execute()` exists at all), and, for a *real* run started
+  against a `preview_only` policy, `worker._evaluate_dispatch_gate`
+  returning `StepBlockedByPreviewOnlyPolicy` on its single cleared-to-
+  dispatch exit, which terminates the run in the `preview_blocked` status
+  without ever calling `execute()` -- **including for a step whose approval
+  was already granted.** An operator can therefore practise the entire
+  approval flow during this stage (real approval requests, real digest
+  echoes, real approve/reject decisions, real run transitions) with no
+  reachable path to a side effect. Two consequences worth knowing before the
+  window opens: a Stage 1 run that you approve will finish as
+  `preview_blocked` rather than `succeeded`, which is the correct, expected
+  outcome and not a defect to log as an issue; and the `/simulate` view's
+  own per-step `dispatch_gate` still reads `requires_approval` (not
+  something preview-specific) for these steps, so read it as "this step
+  would need approval," not as "this step would then run."
+  **Correction, disclosed:** an earlier revision of this section credited
+  this guarantee to `approvals.evaluate_approval_requirement`, which only
+  ever enforced "no step dispatches unattended" -- an approved
+  `preview_only` step really did execute for real until the dispatch-gate
+  block above was implemented. If any Stage 1 usage happened against a build
+  predating that fix, it does not satisfy this threshold and must be
+  re-recorded.
 - **Stage 2 -- Bounded real actions (days 8-14).** At least one workflow's
   policy is switched to `per_run` or `bounded_recurring` and real runs are
   started against real local adapters (`local.create_note`, `local.

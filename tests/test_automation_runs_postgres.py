@@ -189,7 +189,12 @@ def _headers(token: str, key: str | None = None) -> dict[str, str]:
 
 
 def _publish_workflow(
-    workspace_id: UUID, user_id: UUID, workflow_id: str, *, steps: int = 1
+    workspace_id: UUID,
+    user_id: UUID,
+    workflow_id: str,
+    *,
+    steps: int = 1,
+    rate_limit: dict[str, Any] | None = None,
 ) -> automation_workflows.WorkflowVersion:
     """An active workflow with a usable, generous `bounded_recurring`
     policy attached -- Task 3's dispatch gate fail-closes on a run with
@@ -200,6 +205,11 @@ def _publish_workflow(
     helper. A throwaway version=1 draft exists solely to create the
     `workflow_definitions` family row `automation_policies`' own FK
     requires, immediately superseded by the real, policy-bound draft.
+
+    `rate_limit=None` keeps `create_policy`'s own documented system default
+    (`{"runs_per_workflow_per_hour": 10}`) -- harmless for every test here,
+    each of which uses a fresh `workflow_id` and starts well under ten runs.
+    `test_create_run_endpoint_rate_limited_is_409` passes an explicit value.
     """
     graph = _chained_graph(*[_action_step(f"s{i + 1}", "test.runs-echo") for i in range(steps)])
     with SessionFactory() as session, session.begin():
@@ -222,7 +232,7 @@ def _publish_workflow(
             data_classes=[],
             value_limit=Decimal("1000000"),
             count_limit=1000,
-            rate_limit=None,
+            rate_limit=rate_limit,
             schedule=None,
             approval_mode="bounded_recurring",
         )
@@ -315,6 +325,47 @@ def test_create_run_endpoint_workflow_not_active_is_409(
     )
     assert response.status_code == 409
     assert response.json()["error"]["code"] == "WORKFLOW_NOT_ACTIVE"
+
+
+def test_create_run_endpoint_rate_limited_is_409(
+    runs_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    """`API-SCHEMAS.md`'s required `rate_limited` error code, surfaced by
+    the endpoint for the first time. `worker.enqueue_run` rejects the run
+    past the policy's own `runs_per_workflow_per_hour` ceiling before any
+    `workflow_runs` row is written (`APPROVAL-POLICY.md`: "rejected at
+    enqueue with `rate_limited`"), and this endpoint maps that to a 409
+    naming the limit -- the same shape `WORKFLOW_NOT_ACTIVE`/
+    `KILL_SWITCH_ACTIVE` already use.
+    """
+    client, workspace_id, user_id, token = runs_test_context
+    workflow_id = f"test.http-rate-limit.{uuid4().hex}"
+    _publish_workflow(
+        workspace_id, user_id, workflow_id, rate_limit={"runs_per_workflow_per_hour": 1}
+    )
+
+    first = client.post(
+        "/api/v1/automations/runs",
+        json={"workflow_id": workflow_id},
+        headers=_headers(token, key=f"rate-limit-1-{uuid4().hex}"),
+    )
+    assert first.status_code == 201
+
+    second = client.post(
+        "/api/v1/automations/runs",
+        json={"workflow_id": workflow_id},
+        headers=_headers(token, key=f"rate-limit-2-{uuid4().hex}"),
+    )
+    assert second.status_code == 409
+    error = second.json()["error"]
+    assert error["code"] == "RATE_LIMITED"
+    assert error["details"]["workflow_id"] == workflow_id
+    assert error["details"]["limit"] == 1
+
+    # Rejected *before* any row was written -- exactly one run exists.
+    with SessionFactory() as session, session.begin():
+        runs = automation_worker.list_runs(session, workspace_id)
+    assert len([run for run in runs if run.workflow_id == workflow_id]) == 1
 
 
 def test_create_run_endpoint_requires_csrf(

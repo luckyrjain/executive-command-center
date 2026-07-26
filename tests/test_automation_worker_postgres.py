@@ -316,12 +316,20 @@ def _create_policy(
     *,
     approval_mode: automation_policy.ApprovalMode = "bounded_recurring",
     count_limit: int = 1000,
+    rate_limit: dict[str, Any] | None = None,
 ) -> automation_policy.AutomationPolicy:
     """Task 3's own test helper. `create_policy` requires `workflow_id` to
     already name a real `workflow_definitions` row (`policy.py`'s own FK),
     so this is always called *after* `automation_workflows.create_workflow_
     draft` has created that row for the same `workflow_id` -- `_publish_
     workflow` below sequences the two calls accordingly.
+
+    `rate_limit=None` keeps `create_policy`'s own documented fallback
+    (`{"runs_per_workflow_per_hour": 10}`, `APPROVAL-POLICY.md`'s system
+    default), which is what every pre-existing test in this module gets --
+    harmless for all of them, since each creates its own fresh `workflow_id`
+    and none enqueues ten runs against one workflow. The rate-limit tests
+    below pass an explicit value.
     """
     with SessionFactory() as session, session.begin():
         return automation_policy.create_policy(
@@ -333,7 +341,7 @@ def _create_policy(
             data_classes=[],
             value_limit=Decimal("1000000"),
             count_limit=count_limit,
-            rate_limit=None,
+            rate_limit=rate_limit,
             schedule=None,
             approval_mode=approval_mode,
         )
@@ -347,6 +355,7 @@ def _publish_workflow(
     *,
     approval_mode: automation_policy.ApprovalMode = "bounded_recurring",
     count_limit: int = 1000,
+    rate_limit: dict[str, Any] | None = None,
 ) -> automation_workflows.WorkflowVersion:
     """Task 3 extends this in place (this task's own instruction): every
     run in this test module now resolves against a real, *usable*
@@ -386,7 +395,12 @@ def _publish_workflow(
             policy_ref=None,
         )
     policy_row = _create_policy(
-        workspace_id, user_id, workflow_id, approval_mode=approval_mode, count_limit=count_limit
+        workspace_id,
+        user_id,
+        workflow_id,
+        approval_mode=approval_mode,
+        count_limit=count_limit,
+        rate_limit=rate_limit,
     )
     with SessionFactory() as session, session.begin():
         draft = automation_workflows.create_workflow_draft(
@@ -450,6 +464,155 @@ def test_enqueue_run_pins_active_version_and_is_queued(
     assert run.current_step_index == 0
     assert run.trigger_ref == "manual:test"
     assert run.leased_by is None
+
+
+# ---------------------------------------------------------------------------
+# 1b. enqueue_run's rate limit (`APPROVAL-POLICY.md`'s "Runs per workflow per
+# hour | 10 (policy default, overridable per policy) | Next run past the
+# limit rejected at enqueue with `rate_limited`"; `TEST-PLAN.md`'s own named
+# "Rate-limit boundary tests" scenario, which had no implementation and no
+# test before this change).
+# ---------------------------------------------------------------------------
+
+
+def test_eleventh_run_within_an_hour_under_a_ten_per_hour_policy_is_rate_limited(
+    worker_test_context: tuple[UUID, UUID],
+) -> None:
+    """`TEST-PLAN.md`'s scenario, verbatim: "the 11th run within an hour
+    under a 10/hour policy is rejected `rate_limited`, not silently queued."
+    Asserts both halves of "not silently queued": the rejection is a real
+    `RunRateLimited` outcome carrying the limit it hit, and the eleventh row
+    genuinely does not exist (the count stays at ten).
+    """
+    workspace_id, user_id = worker_test_context
+    workflow_id = f"test.rate-limit.{uuid4().hex}"
+    graph = _chained_graph(_action_step("s1", "test.echo"))
+    _publish_workflow(
+        workspace_id,
+        user_id,
+        workflow_id,
+        graph,
+        rate_limit={"runs_per_workflow_per_hour": 10},
+    )
+
+    for index in range(10):
+        with SessionFactory() as session, session.begin():
+            accepted = automation_worker.enqueue_run(
+                session, workspace_id, user_id, workflow_id=workflow_id
+            )
+        assert isinstance(accepted, automation_worker.WorkflowRun), (
+            f"run {index + 1} of 10 should be within the limit"
+        )
+
+    with SessionFactory() as session, session.begin():
+        eleventh = automation_worker.enqueue_run(
+            session, workspace_id, user_id, workflow_id=workflow_id
+        )
+    assert isinstance(eleventh, automation_worker.RunRateLimited)
+    assert eleventh.workflow_id == workflow_id
+    assert eleventh.limit == 10
+    assert eleventh.runs_in_window == 10
+
+    with SessionFactory() as session, session.begin():
+        runs = automation_worker.list_runs(session, workspace_id)
+    assert len([run for run in runs if run.workflow_id == workflow_id]) == 10
+
+
+def test_rate_limit_ignores_runs_queued_outside_the_trailing_hour(
+    worker_test_context: tuple[UUID, UUID],
+) -> None:
+    """The window is genuinely trailing, not a lifetime cap: ten runs
+    back-dated past the hour boundary do not consume the current window's
+    allowance. Back-dated by direct `UPDATE` (the only way to age a
+    `queued_at` without waiting an hour), the same technique this module
+    already uses to age a lease for the crash-recovery tests.
+    """
+    workspace_id, user_id = worker_test_context
+    workflow_id = f"test.rate-limit-window.{uuid4().hex}"
+    graph = _chained_graph(_action_step("s1", "test.echo"))
+    _publish_workflow(
+        workspace_id, user_id, workflow_id, graph, rate_limit={"runs_per_workflow_per_hour": 2}
+    )
+
+    for _ in range(2):
+        with SessionFactory() as session, session.begin():
+            automation_worker.enqueue_run(session, workspace_id, user_id, workflow_id=workflow_id)
+    with SessionFactory() as session, session.begin():
+        blocked = automation_worker.enqueue_run(
+            session, workspace_id, user_id, workflow_id=workflow_id
+        )
+    assert isinstance(blocked, automation_worker.RunRateLimited)
+
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "UPDATE workflow_runs SET queued_at = queued_at - interval '2 hours' "
+                "WHERE workspace_id = :workspace_id AND workflow_id = :workflow_id"
+            ),
+            {"workspace_id": workspace_id, "workflow_id": workflow_id},
+        )
+
+    with SessionFactory() as session, session.begin():
+        allowed_again = automation_worker.enqueue_run(
+            session, workspace_id, user_id, workflow_id=workflow_id
+        )
+    assert isinstance(allowed_again, automation_worker.WorkflowRun)
+
+
+def test_rate_limit_is_scoped_per_workflow_not_per_workspace(
+    worker_test_context: tuple[UUID, UUID],
+) -> None:
+    """ "Runs per *workflow* per hour" -- one workflow exhausting its own
+    allowance never blocks a different workflow in the same workspace.
+    """
+    workspace_id, user_id = worker_test_context
+    graph = _chained_graph(_action_step("s1", "test.echo"))
+    exhausted_id = f"test.rate-limit-a.{uuid4().hex}"
+    other_id = f"test.rate-limit-b.{uuid4().hex}"
+    _publish_workflow(
+        workspace_id, user_id, exhausted_id, graph, rate_limit={"runs_per_workflow_per_hour": 1}
+    )
+    _publish_workflow(
+        workspace_id, user_id, other_id, graph, rate_limit={"runs_per_workflow_per_hour": 1}
+    )
+
+    with SessionFactory() as session, session.begin():
+        automation_worker.enqueue_run(session, workspace_id, user_id, workflow_id=exhausted_id)
+    with SessionFactory() as session, session.begin():
+        blocked = automation_worker.enqueue_run(
+            session, workspace_id, user_id, workflow_id=exhausted_id
+        )
+    assert isinstance(blocked, automation_worker.RunRateLimited)
+
+    with SessionFactory() as session, session.begin():
+        unaffected = automation_worker.enqueue_run(
+            session, workspace_id, user_id, workflow_id=other_id
+        )
+    assert isinstance(unaffected, automation_worker.WorkflowRun)
+
+
+def test_rate_limit_absent_from_policy_means_no_ceiling(
+    worker_test_context: tuple[UUID, UUID],
+) -> None:
+    """`_configured_runs_per_hour`'s one deliberate non-fail-closed
+    judgment, pinned by a test so it can never drift silently: a policy
+    whose `rate_limit` blob names no usable `runs_per_workflow_per_hour`
+    value at all is treated as having no runs-per-hour ceiling, not a
+    ceiling of zero (which would permanently reject every run of that
+    workflow with no reachable remedy -- `automation_policies` has no update
+    endpoint). See that function's own docstring for the full trade-off.
+    """
+    workspace_id, user_id = worker_test_context
+    workflow_id = f"test.rate-limit-unset.{uuid4().hex}"
+    graph = _chained_graph(_action_step("s1", "test.echo"))
+    _publish_workflow(workspace_id, user_id, workflow_id, graph, rate_limit={})
+
+    for _ in range(12):
+        with SessionFactory() as session, session.begin():
+            accepted = automation_worker.enqueue_run(
+                session, workspace_id, user_id, workflow_id=workflow_id
+            )
+        assert isinstance(accepted, automation_worker.WorkflowRun)
 
 
 # ---------------------------------------------------------------------------
@@ -1383,8 +1546,13 @@ def test_preview_only_and_per_run_modes_require_approval_for_bounded_step(
     worker_test_context: tuple[UUID, UUID], approval_mode: automation_policy.ApprovalMode
 ) -> None:
     """Neither `preview_only` nor `per_run` lets a `bounded` step dispatch
-    unattended -- this task's own judgment call (`approvals.py`'s module
-    docstring: "preview_only is treated identically to per_run here").
+    unattended -- both gate every action step, high-impact or not
+    (`approvals.evaluate_approval_requirement`). The two modes diverge only
+    *after* an approval is granted: `per_run` then dispatches for real,
+    `preview_only` never does (see `test_preview_only_never_dispatches_even_
+    after_an_approved_digest` below) -- so this test's assertions hold
+    identically for both and are deliberately left unchanged by the
+    `preview_only` fix.
     """
     workspace_id, user_id = worker_test_context
     workflow_id = f"test.mode-gate.{approval_mode}.{uuid4().hex}"
@@ -1402,6 +1570,261 @@ def test_preview_only_and_per_run_modes_require_approval_for_bounded_step(
         finished = automation_worker.process_claimed_run(session, claimed, registry, "worker-a")
     assert finished.status == "waiting_approval"
     assert adapter.execute_calls == 0
+
+
+# ---------------------------------------------------------------------------
+# `preview_only` mechanically prevents real dispatch (the docs-vs-code fix:
+# `APPROVAL-POLICY.md`/`docs/runbooks/PHASE-5-DOGFOOD.md` both promise
+# "zero real side effects" for this mode; before this fix an *approved*
+# preview_only step called the adapter's real execute()).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("action_ref", ["test.echo", "test.high-impact"])
+def test_preview_only_never_dispatches_even_after_an_approved_digest(
+    worker_test_context: tuple[UUID, UUID], action_ref: str
+) -> None:
+    """The central guarantee, asserted on the adapter's own call counter --
+    not on a status string. A `preview_only` policy pauses the step for
+    approval exactly like `per_run`; the approval is granted with the
+    correct live digest and the run is requeued by `approvals._advance_run_
+    after_decision` exactly like any approved run; the next claim/process
+    cycle then terminates the run in `preview_blocked` **without** ever
+    calling `execute()`. Parametrized over a `bounded` adapter and a
+    high-impact one, since the two reach the dispatch gate through different
+    branches of `evaluate_approval_requirement` and both must be blocked.
+    """
+    workspace_id, user_id = worker_test_context
+    workflow_id = f"test.preview-only.{action_ref}.{uuid4().hex}"
+    graph = _chained_graph(_action_step("s1", action_ref, input_mapping={"value": "x"}))
+    _publish_workflow(workspace_id, user_id, workflow_id, graph, approval_mode="preview_only")
+    with SessionFactory() as session, session.begin():
+        automation_worker.enqueue_run(session, workspace_id, user_id, workflow_id=workflow_id)
+
+    adapter: Any = EchoAdapter() if action_ref == "test.echo" else HighImpactAdapter()
+    registry = _make_registry(adapter)
+    with SessionFactory() as session:
+        claimed = automation_worker.claim_next_run(session, "worker-a")
+    assert claimed is not None
+    with SessionFactory() as session:
+        paused = automation_worker.process_claimed_run(session, claimed, registry, "worker-a")
+
+    # Phase 1: the approval flow is fully real under this mode -- rehearsing
+    # it is the whole point (PHASE-5-DOGFOOD.md's Stage 1).
+    assert paused.status == "waiting_approval"
+    assert paused.finished_at is None
+    assert adapter.execute_calls == 0
+    with SessionFactory() as session, session.begin():
+        pending = automation_approvals.get_pending_approval(session, workspace_id, claimed.id, 0)
+    assert pending is not None
+
+    # Phase 2: a real human decision, digest-echoed, accepted.
+    with SessionFactory() as session, session.begin():
+        decided = automation_approvals.decide_approval(
+            session,
+            workspace_id,
+            user_id,
+            pending.id,
+            "approved",
+            current_action_digest=pending.action_digest,
+        )
+    assert isinstance(decided, automation_approvals.ApprovalRequest)
+    assert decided.status == "approved"
+    with SessionFactory() as session, session.begin():
+        requeued = automation_worker.get_run(session, workspace_id, claimed.id)
+    assert requeued is not None
+    assert requeued.status == "queued"
+
+    # Phase 3: the approved step is re-evaluated and still never dispatches.
+    with SessionFactory() as session:
+        reclaimed = automation_worker.claim_next_run(session, "worker-b")
+    assert reclaimed is not None
+    with SessionFactory() as session:
+        finished = automation_worker.process_claimed_run(session, reclaimed, registry, "worker-b")
+
+    assert finished.status == "preview_blocked"
+    # The property that actually matters, stated against the adapter itself:
+    # no real side effect happened, approval or no approval.
+    assert adapter.execute_calls == 0
+    # Terminal, honestly: `finished_at` stamped, lease released, and no
+    # longer claimable by any subsequent poll cycle.
+    assert finished.finished_at is not None
+    assert finished.leased_by is None
+    with SessionFactory() as session:
+        assert automation_worker.claim_next_run(session, "worker-c") is None
+
+    # No workflow_run_steps row is written for a blocked step, matching
+    # StepBlockedByPolicy/StepAwaitingApproval's identical discipline.
+    with SessionFactory() as session, session.begin():
+        steps = automation_worker.list_run_steps(session, workspace_id, claimed.id)
+    assert steps == []
+
+    # The approval itself survives untouched and stays fully inspectable --
+    # an operator's own record of the decision they practised.
+    with SessionFactory() as session, session.begin():
+        approvals_after = automation_approvals.list_approvals(session, workspace_id)
+    assert len(approvals_after) == 1
+    assert approvals_after[0].status == "approved"
+    assert approvals_after[0].decided_by == user_id
+
+
+def test_preview_only_rejected_approval_still_fails_the_run_unchanged(
+    worker_test_context: tuple[UUID, UUID],
+) -> None:
+    """The other half of "the approval can still be decided": rejecting a
+    `preview_only` step's request behaves exactly as it does under any other
+    mode (`approvals._advance_run_after_decision` -> `failed`), and is
+    deliberately *not* rerouted to `preview_blocked` -- a human explicitly
+    declined this action, which is a different, more informative fact about
+    the run than "this mode never dispatches," and it is the outcome an
+    operator rehearsing a rejection expects to see.
+    """
+    workspace_id, user_id = worker_test_context
+    workflow_id = f"test.preview-only-reject.{uuid4().hex}"
+    graph = _chained_graph(_action_step("s1", "test.echo"))
+    _publish_workflow(workspace_id, user_id, workflow_id, graph, approval_mode="preview_only")
+    with SessionFactory() as session, session.begin():
+        automation_worker.enqueue_run(session, workspace_id, user_id, workflow_id=workflow_id)
+
+    adapter = EchoAdapter()
+    registry = _make_registry(adapter)
+    with SessionFactory() as session:
+        claimed = automation_worker.claim_next_run(session, "worker-a")
+    assert claimed is not None
+    with SessionFactory() as session:
+        automation_worker.process_claimed_run(session, claimed, registry, "worker-a")
+
+    with SessionFactory() as session, session.begin():
+        pending = automation_approvals.get_pending_approval(session, workspace_id, claimed.id, 0)
+        assert pending is not None
+        decided = automation_approvals.decide_approval(
+            session, workspace_id, user_id, pending.id, "rejected", current_action_digest=None
+        )
+    assert isinstance(decided, automation_approvals.ApprovalRequest)
+    assert decided.status == "rejected"
+
+    with SessionFactory() as session, session.begin():
+        run_after = automation_worker.get_run(session, workspace_id, claimed.id)
+    assert run_after is not None
+    assert run_after.status == "failed"
+    assert adapter.execute_calls == 0
+
+
+def test_preview_only_unregistered_adapter_is_preview_blocked_never_failed(
+    worker_test_context: tuple[UUID, UUID],
+) -> None:
+    """Closes the one path from `preview_only` to a real side effect that a
+    naive placement of the check would have left open. `run_step`'s
+    `AdapterNotRegistered` branch writes a `'failed'` step row, and a
+    `'failed'` step is exactly what triggers `_qualifying_compensations`/
+    `_run_compensation_sequence`, which *does* call real `execute()`/
+    `compensate()` on compensation adapters. `_evaluate_dispatch_gate`
+    therefore blocks the unregistered-adapter case under `preview_only` too,
+    which makes `'failed'` unreachable for any action step under this mode
+    and the compensation sequence unreachable with it -- without this test
+    module needing to touch compensation dispatch at all.
+    """
+    workspace_id, user_id = worker_test_context
+    workflow_id = f"test.preview-only-unregistered.{uuid4().hex}"
+    graph = _chained_graph(_action_step("s1", "test.not-registered-anywhere"))
+    _publish_workflow(workspace_id, user_id, workflow_id, graph, approval_mode="preview_only")
+    with SessionFactory() as session, session.begin():
+        automation_worker.enqueue_run(session, workspace_id, user_id, workflow_id=workflow_id)
+
+    # A registry that deliberately does not contain this step's action_ref.
+    registry = _make_registry(EchoAdapter())
+    with SessionFactory() as session:
+        claimed = automation_worker.claim_next_run(session, "worker-a")
+    assert claimed is not None
+    with SessionFactory() as session:
+        finished = automation_worker.process_claimed_run(session, claimed, registry, "worker-a")
+
+    assert finished.status == "preview_blocked"
+    with SessionFactory() as session, session.begin():
+        steps = automation_worker.list_run_steps(session, workspace_id, claimed.id)
+    # Crucially: no 'failed' row exists, so nothing downstream can interpret
+    # this run as a failure with compensations to dispatch.
+    assert steps == []
+    with SessionFactory() as session, session.begin():
+        compensations = automation_worker.list_compensation_steps(session, workspace_id, claimed.id)
+    assert compensations == []
+
+
+def test_per_run_mode_still_dispatches_for_real_once_approved(
+    worker_test_context: tuple[UUID, UUID],
+) -> None:
+    """The explicit no-regression counterpart to the `preview_only` fix:
+    `per_run` must keep behaving exactly as it did -- gate the step, then
+    dispatch for real once a human approves. If the `preview_only` check
+    were ever placed one branch too high in `_evaluate_dispatch_gate` (or
+    keyed off the wrong field), this test is what fails.
+    """
+    workspace_id, user_id = worker_test_context
+    workflow_id = f"test.per-run-unaffected.{uuid4().hex}"
+    graph = _chained_graph(_action_step("s1", "test.echo", input_mapping={"value": "x"}))
+    _publish_workflow(workspace_id, user_id, workflow_id, graph, approval_mode="per_run")
+    with SessionFactory() as session, session.begin():
+        automation_worker.enqueue_run(session, workspace_id, user_id, workflow_id=workflow_id)
+
+    adapter = EchoAdapter()
+    registry = _make_registry(adapter)
+    with SessionFactory() as session:
+        claimed = automation_worker.claim_next_run(session, "worker-a")
+    assert claimed is not None
+    with SessionFactory() as session:
+        paused = automation_worker.process_claimed_run(session, claimed, registry, "worker-a")
+    assert paused.status == "waiting_approval"
+    assert adapter.execute_calls == 0
+
+    with SessionFactory() as session, session.begin():
+        pending = automation_approvals.get_pending_approval(session, workspace_id, claimed.id, 0)
+        assert pending is not None
+        automation_approvals.decide_approval(
+            session,
+            workspace_id,
+            user_id,
+            pending.id,
+            "approved",
+            current_action_digest=pending.action_digest,
+        )
+
+    with SessionFactory() as session:
+        reclaimed = automation_worker.claim_next_run(session, "worker-b")
+    assert reclaimed is not None
+    with SessionFactory() as session:
+        finished = automation_worker.process_claimed_run(session, reclaimed, registry, "worker-b")
+    assert finished.status == "succeeded"
+    assert adapter.execute_calls == 1
+
+
+def test_bounded_recurring_mode_is_unaffected_by_the_preview_only_block(
+    worker_test_context: tuple[UUID, UUID],
+) -> None:
+    """The second no-regression counterpart: a `bounded_recurring` policy
+    still dispatches a `bounded` step with no approval at all, across a
+    multi-step graph, and never reaches `preview_blocked`.
+    """
+    workspace_id, user_id = worker_test_context
+    workflow_id = f"test.bounded-unaffected.{uuid4().hex}"
+    graph = _chained_graph(
+        _action_step("s1", "test.echo", input_mapping={"value": "first"}),
+        _action_step("s2", "test.echo", input_mapping={"value": "second"}),
+    )
+    _publish_workflow(workspace_id, user_id, workflow_id, graph, approval_mode="bounded_recurring")
+    with SessionFactory() as session, session.begin():
+        automation_worker.enqueue_run(session, workspace_id, user_id, workflow_id=workflow_id)
+
+    adapter = EchoAdapter()
+    registry = _make_registry(adapter)
+    with SessionFactory() as session:
+        claimed = automation_worker.claim_next_run(session, "worker-a")
+    assert claimed is not None
+    with SessionFactory() as session:
+        finished = automation_worker.process_claimed_run(session, claimed, registry, "worker-a")
+    assert finished.status == "succeeded"
+    assert adapter.execute_calls == 2
+    with SessionFactory() as session, session.begin():
+        assert automation_approvals.list_approvals(session, workspace_id) == []
 
 
 def test_no_policy_blocks_dispatch_as_needs_review(worker_test_context: tuple[UUID, UUID]) -> None:

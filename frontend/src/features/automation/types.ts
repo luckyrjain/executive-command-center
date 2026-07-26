@@ -142,6 +142,13 @@ export type RunStatus =
   | 'compensation_failed'
   | 'expired'
   | 'rate_limited'
+  // A run whose policy is in `preview_only` mode: every step was gated,
+  // approvals could be requested and decided for real, and no step ever
+  // dispatched -- `preview_only` never authorizes a real side effect
+  // (`worker.StepBlockedByPreviewOnlyPolicy`, migration 0043). Terminal, and
+  // deliberately NOT an error state: nothing failed, nothing is ambiguous,
+  // and no operator action exists that would let the run proceed.
+  | 'preview_blocked'
 
 export type RunStepStatus =
   | 'pending'

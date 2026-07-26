@@ -232,6 +232,33 @@ class TriggerFireFailedWorkflowKilled:
 
 
 @dataclass(frozen=True, slots=True)
+class TriggerFireFailedRateLimited:
+    """The trigger fired (its schedule was due), but `worker.enqueue_run`
+    rejected it -- this workflow has already used its authorizing policy's
+    own `rate_limit.runs_per_workflow_per_hour` allowance inside the
+    trailing hour (`APPROVAL-POLICY.md`: "Next run past the limit rejected
+    at enqueue with `rate_limited`"). The anchor still advances to `now`,
+    mirroring `TriggerFireFailedWorkflowNotActive`/`TriggerFireFailedWorkflow
+    Killed`'s identical reasoning exactly: a rate-limited fire must not
+    leave this trigger permanently "due," re-evaluated on every single tick
+    until the window rolls over.
+
+    **This is the outcome that made enqueue-time rate limiting worth
+    enforcing at all.** A `* * * * *` schedule trigger reaches this code
+    path sixty times an hour; before enforcement existed, every one of those
+    fires became a real, dispatchable run under a single policy, because the
+    only count-shaped limit in the model (`count_limit`) is scoped to one
+    run and resets on every new one. `runs_per_workflow_per_hour` is the one
+    control that bounds the number of runs a policy authorizes, and this
+    fire path -- not the HTTP one, where a human is at least present per
+    request -- is where that bound actually does work.
+    """
+
+    trigger_id: UUID
+    workflow_id: str
+
+
+@dataclass(frozen=True, slots=True)
 class TriggerMisfireSkipped:
     """More than one scheduled occurrence elapsed since this trigger's own
     anchor, and it has `skip_missed=True` -- no catch-up fire, per
@@ -264,6 +291,7 @@ TriggerEvaluationOutcome = (
     | TriggerFired
     | TriggerFireFailedWorkflowNotActive
     | TriggerFireFailedWorkflowKilled
+    | TriggerFireFailedRateLimited
     | TriggerMisfireSkipped
     | TriggerRaceLost
 )
@@ -460,9 +488,9 @@ def run_scheduler_once(
         # Task 6 observability: schedule lag -- how late this tick actually
         # fired relative to the occurrence it resolves, regardless of
         # whether enqueue_run itself then rejected it (WorkflowNotActive/
-        # WorkflowKilled below still measure "the tick's own lag" honestly
-        # -- the trigger's own anchor still advanced, per this branch's
-        # comment above).
+        # WorkflowKilled/RunRateLimited below still measure "the tick's own
+        # lag" honestly -- the trigger's own anchor still advanced, per this
+        # branch's comment above).
         record_schedule_lag((moment - decision.first_due).total_seconds())
 
         if isinstance(run, worker_module.WorkflowNotActive):
@@ -483,6 +511,14 @@ def run_scheduler_once(
                 TriggerFireFailedWorkflowKilled(
                     trigger_id=trigger.id, workflow_id=trigger.workflow_id
                 )
+            )
+        elif isinstance(run, worker_module.RunRateLimited):
+            # The authorizing policy's own runs-per-workflow-per-hour
+            # ceiling is already used up for this trailing hour
+            # (`TriggerFireFailedRateLimited`'s own docstring explains why
+            # this fire path is the one that most needs that bound).
+            outcomes.append(
+                TriggerFireFailedRateLimited(trigger_id=trigger.id, workflow_id=trigger.workflow_id)
             )
         else:
             outcomes.append(
