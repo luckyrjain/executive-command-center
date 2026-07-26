@@ -116,6 +116,31 @@ in workspace A whose step `input_mapping.workspace_id` deliberately names
 workspace B is rejected before `execute()` runs, and zero rows land in
 either workspace's `notes` table).
 
+**Security audit batch C: the same check now covers `actor_id`, which was
+the genuinely exploitable half.** The paragraph above reasoned carefully
+about `workspace_id` and then applied the fix to `workspace_id` only --
+leaving `actor_id`, whose provenance is *identically* untrustworthy (same
+graph-authored `input_mapping`, same absent templating engine), enforced
+nowhere. That gap was real and reachable entirely within one workspace's
+own authorization boundary: `execute()` below writes `action_input.actor_id`
+into `notes.owner_id` *and* `notes.created_by`/`updated_by`, and `_write_
+note_audit_and_outbox` writes it into an `audit_events` row's `actor_id`
+with `authorization_result='allowed'`, `source='automation'`. So member A,
+who is fully authorized to author workflows, could name member B's UUID and
+manufacture (a) a note B appears to own and have created, and (b) an audit
+event asserting B authorized an automation B never touched -- forged
+provenance in the one table the system treats as the record of who did what.
+`worker._enforce_actor_scope` now rejects any `action_input.actor_id` that
+is not the dispatching run's own `workflow_runs.created_by` (raising
+`worker.ActorScopeMismatch`, whose docstring carries the full discussion),
+at the identical pre-`execute()` point and with the identical inert-if-absent
+shape. Practically, that means this adapter can only ever attribute a note
+and its audit trail to the user who actually started the run -- which is
+also the only user identity this dispatch path can prove. See `tests/test_
+automation_adapters_postgres.py`'s actor-mismatch test for the direct proof
+(zero `notes` rows, zero forged `audit_events` rows, step `error_class =
+'ActorScopeMismatch'`).
+
 **`local.create_note`'s output deliberately excludes the note's own
 `body`.** `worker.py`'s `_redact_payload` only redacts by dict *key* name
 (`secret`/`password`/`token`/`credential`/`api_key`/`authorization`
@@ -181,7 +206,12 @@ from ecc.observability import queue_lifecycle_event, record_audit_outbox_failure
 class CreateNoteInput(BaseModel):
     """`workspace_id`/`actor_id` are required, explicit fields -- this
     module's own docstring ("provenance") section has the full trust-
-    boundary discussion. `title`/`body`/`note_type`/`meeting_id`/
+    boundary discussion. Neither is trusted as authored: `worker.run_step`
+    rejects a `workspace_id` that is not the dispatching run's own
+    (`WorkspaceScopeMismatch`) and an `actor_id` that is not the run's own
+    `created_by` (`ActorScopeMismatch`, security audit batch C) before
+    `execute()` is ever reached, so in practice `actor_id` can only be the
+    user who started the run. `title`/`body`/`note_type`/`meeting_id`/
     `source_type`/`source_ref`/`restricted` mirror `ecc.domains.knowledge.
     notes.NoteCreate` field-for-field (studied directly against that model
     rather than guessed), reusing its `NoteType`/`SourceType` literals
@@ -235,6 +265,17 @@ def _write_note_audit_and_outbox(
     `correlation_id` are freshly generated (no `Request` object exists in
     this call path at all), mirroring `notes.py`'s own `_request_ids`
     fallback for the identical "no request context" case.
+
+    `actor_id` is written verbatim into `audit_events.actor_id` alongside
+    `authorization_result='allowed'` -- i.e. this row is a positive assertion
+    that the named user authorized this write. It is therefore only ever safe
+    to call this helper with an `actor_id` that has been proven, not merely
+    authored: `worker._enforce_actor_scope` is what proves it (rejecting any
+    `CreateNoteInput.actor_id` that is not the dispatching run's own
+    `workflow_runs.created_by`) before `execute()` above can reach this
+    function at all. Batch C's audit found this unenforced, which made a
+    forged `audit_events` row reachable by any workflow author -- see this
+    module's own docstring for that discussion.
     """
     request_id = uuid4()
     correlation_id = uuid4()

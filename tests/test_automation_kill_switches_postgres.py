@@ -19,6 +19,10 @@ Covers, per this task's own required minimum:
 6. `process_claimed_run`'s per-step loop stops a run mid-dispatch
    (`needs_review`) the moment a kill switch is discovered, before its
    next not-yet-dispatched step.
+7. Security audit batch C: a `workflow_id` path parameter longer than the
+   column's own `sa.String(200)` is a 422 on both the activate and the
+   status route, never an uncaught `DataError`/500; exactly 200 characters
+   is still accepted.
 """
 
 from __future__ import annotations
@@ -565,3 +569,51 @@ def test_process_claimed_run_stops_mid_dispatch_on_kill_switch(
     with SessionFactory() as session:
         steps = automation_worker.list_run_steps(session, workspace_id, queued.id)
     assert {step.step_index for step in steps} == {0}
+
+
+# ---------------------------------------------------------------------------
+# 7. workflow_id path-parameter length validation (security audit batch C).
+# ---------------------------------------------------------------------------
+
+
+def test_kill_switch_rejects_overlong_workflow_id_with_422(
+    kill_switch_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    """`automation_kill_switches.workflow_id` is `sa.String(200)` (migration
+    `0042_phase5_compensation_retry_kill_switch.py`), but the `workflow_id`
+    path parameter carried no length constraint -- so an over-long value
+    passed FastAPI validation, reached the `INSERT`, and surfaced as an
+    uncaught `DataError`/500: a client's malformed input reported as a server
+    fault. `Path(max_length=200)` (mirroring `policy.list_policies_endpoint`/
+    `triggers.list_triggers_endpoint`'s own `Query(max_length=200)` on the
+    identical field) makes it an ordinary 422 instead.
+
+    Asserted on both routes that take this path parameter -- the `POST`
+    activate route (the one that actually reached the database) and the `GET`
+    status route (which only reads, but must agree on what a valid
+    `workflow_id` is, or the two disagree about the same identifier).
+    Exactly-200 characters is asserted to still be accepted, so this pins the
+    boundary rather than merely "long values fail."
+    """
+    client, _workspace_id, _user_id, token = kill_switch_test_context
+    overlong = "w" * 201
+
+    activate = client.post(
+        f"/api/v1/automations/workflows/{overlong}/kill_switch",
+        json={"active": True, "reason": "over-long workflow_id"},
+        headers=_headers(token, key="overlong-workflow-id-1"),
+    )
+    assert activate.status_code == 422
+
+    status = client.get(f"/api/v1/automations/workflows/{overlong}/kill_switch")
+    assert status.status_code == 422
+
+    # The boundary itself is still valid -- 200 characters fits the column.
+    at_limit = "w" * 200
+    accepted = client.post(
+        f"/api/v1/automations/workflows/{at_limit}/kill_switch",
+        json={"active": True, "reason": "exactly at the limit"},
+        headers=_headers(token, key="at-limit-workflow-id-1"),
+    )
+    assert accepted.status_code == 200
+    assert accepted.json()["workflow_id"] == at_limit
