@@ -453,7 +453,7 @@ def test_create_connector_rejects_invalid_credential(
         headers=_headers(token, key=str(uuid4())),
     )
     assert response.status_code == 422
-    assert response.json()["detail"]["code"] == "CONNECTOR_AUTHORIZATION_FAILED"
+    assert response.json()["error"]["code"] == "CONNECTOR_AUTHORIZATION_FAILED"
 
 
 def test_create_connector_rejects_unsupported_provider(
@@ -466,7 +466,7 @@ def test_create_connector_rejects_unsupported_provider(
         headers=_headers(token, key=str(uuid4())),
     )
     assert response.status_code == 404
-    assert response.json()["detail"] == "CONNECTOR_PROVIDER_NOT_SUPPORTED"
+    assert response.json()["error"]["code"] == "CONNECTOR_PROVIDER_NOT_SUPPORTED"
 
 
 def test_create_connector_rejects_duplicate_connection(
@@ -486,7 +486,7 @@ def test_create_connector_rejects_duplicate_connection(
         headers=_headers(token, key=str(uuid4())),
     )
     assert second.status_code == 409
-    assert second.json()["detail"] == "CONNECTOR_ALREADY_CONNECTED"
+    assert second.json()["error"]["code"] == "CONNECTOR_ALREADY_CONNECTED"
 
 
 def test_create_connector_idempotency_replay_and_conflict(
@@ -513,7 +513,7 @@ def test_create_connector_idempotency_replay_and_conflict(
         headers=_headers(token, key=key),
     )
     assert conflict.status_code == 409
-    assert conflict.json()["detail"] == "IDEMPOTENCY_CONFLICT"
+    assert conflict.json()["error"]["code"] == "IDEMPOTENCY_CONFLICT"
 
     with engine.begin() as connection:
         count = connection.execute(
@@ -667,7 +667,7 @@ def test_sync_rejected_after_disconnect(
         headers=_headers(token, key=str(uuid4())),
     )
     assert sync_after_disconnect.status_code == 409
-    assert sync_after_disconnect.json()["detail"] == "CONNECTOR_DISCONNECTED"
+    assert sync_after_disconnect.json()["error"]["code"] == "CONNECTOR_DISCONNECTED"
 
 
 def test_sync_and_disable_cross_workspace_404(
@@ -730,14 +730,14 @@ def test_sync_and_disable_cross_workspace_404(
             headers=_headers(token_b, key=str(uuid4())),
         )
         assert sync_response.status_code == 404
-        assert sync_response.json()["detail"] == "CONNECTOR_NOT_FOUND"
+        assert sync_response.json()["error"]["code"] == "CONNECTOR_NOT_FOUND"
 
         disable_response = client_b.post(
             f"/api/v1/engineering/connectors/{account_id}/disable",
             headers=_headers(token_b, key=str(uuid4())),
         )
         assert disable_response.status_code == 404
-        assert disable_response.json()["detail"] == "CONNECTOR_NOT_FOUND"
+        assert disable_response.json()["error"]["code"] == "CONNECTOR_NOT_FOUND"
 
         client_b.close()
     finally:
@@ -1140,7 +1140,14 @@ def test_disable_idempotency_replay(
         headers=_headers(token, key=key),
     )
     assert replay.status_code == 200
-    assert replay.json() == first.json()
+    # `request_id`/`correlation_id` are injected fresh per HTTP request by
+    # `ecc.main.response_contract_middleware`, not part of the cached
+    # response body itself -- excluded here matching `test_automation_
+    # workflows_postgres.py`'s identical replay-comparison precedent.
+    ignored = {"request_id", "correlation_id"}
+    first_body = {k: v for k, v in first.json().items() if k not in ignored}
+    replay_body = {k: v for k, v in replay.json().items() if k not in ignored}
+    assert replay_body == first_body
 
 
 def test_sync_connector_provider_not_supported(
@@ -1155,4 +1162,4 @@ def test_sync_connector_provider_not_supported(
         headers=_headers(token, key=str(uuid4())),
     )
     assert response.status_code == 404
-    assert response.json()["detail"] == "CONNECTOR_PROVIDER_NOT_SUPPORTED"
+    assert response.json()["error"]["code"] == "CONNECTOR_PROVIDER_NOT_SUPPORTED"
