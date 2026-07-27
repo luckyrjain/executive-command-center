@@ -19,7 +19,7 @@ Companion to `docs/superpowers/specs/2026-07-27-phase-6-engineering-workspace-de
 
 ## Task 3 — GitLab read sync
 
-Same contract, GitLab REST/webhook API.
+**Complete.** Real GitLab REST API backfill/incremental sync through the same `ConnectorAdapter` contract Task 2 implements for GitHub (`gitlab_adapter.GitLabAdapter`) -- no new migration, since `repositories` (migration `0045_phase6_repositories.py`) already names `gitlab` in its provider CHECK constraint. Applies every lesson Task 2's own review rounds found from the first version: real scope checking (`GET /personal_access_tokens/self` always returns actual granted scopes, no fabricated-fallback risk), a still-rate-limited retry degrading to `partial` rather than raising, the `_MAX_PAGES_PER_CALL` bound reporting `partial` rather than a silent `succeeded`, and `response.links` for `Link`-header pagination. Genuine (not no-op) best-effort `disconnect()` via `DELETE /personal_access_tokens/self`, realistically expected to fail at this connector's own default read-only scopes. Same deferrals as Task 2: work items/changes/reviews/deployments and webhook ingestion's receiving endpoint.
 
 ## Task 4 — Jira work-item sync
 
