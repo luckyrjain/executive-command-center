@@ -548,3 +548,98 @@ def test_disable_does_not_touch_a_different_connector_accounts_rows(
     listed = client.get("/api/v1/engineering/repositories").json()["repositories"]
     states = {repo["name"]: repo["freshness_state"] for repo in listed}
     assert states == {"from-disabled": "disconnected", "from-other": "fresh"}
+
+
+def _insert_change(workspace_id: UUID, connector_account_id: UUID, repository_id: UUID) -> UUID:
+    change_id = uuid4()
+    now = datetime.now(UTC)
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                """
+                INSERT INTO changes (
+                    id, workspace_id, connector_account_id, repository_id, provider,
+                    external_id, title, source_url, permission_state, freshness_state,
+                    observed_at, created_at, updated_at
+                ) VALUES (
+                    :id, :ws, :acct, :repo, 'github', :ext, 'A change', 'https://x',
+                    'active', 'fresh', :now, :now, :now
+                )
+                """
+            ),
+            {
+                "id": change_id,
+                "ws": workspace_id,
+                "acct": connector_account_id,
+                "repo": repository_id,
+                "ext": f"change-{change_id}",
+                "now": now,
+            },
+        )
+    return change_id
+
+
+def _insert_review(workspace_id: UUID, connector_account_id: UUID, change_id: UUID) -> UUID:
+    review_id = uuid4()
+    now = datetime.now(UTC)
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                """
+                INSERT INTO reviews (
+                    id, workspace_id, connector_account_id, change_id, provider,
+                    external_id, source_url, permission_state, freshness_state,
+                    observed_at, created_at, updated_at
+                ) VALUES (
+                    :id, :ws, :acct, :change, 'github', :ext, 'https://x',
+                    'active', 'fresh', :now, :now, :now
+                )
+                """
+            ),
+            {
+                "id": review_id,
+                "ws": workspace_id,
+                "acct": connector_account_id,
+                "change": change_id,
+                "ext": f"review-{review_id}",
+                "now": now,
+            },
+        )
+    return review_id
+
+
+def test_disable_marks_changes_and_reviews_disconnected(
+    query_endpoints_test_context: tuple[TestClient, UUID, UUID],
+) -> None:
+    """A round-2 correctness re-review of the disable cascade found the
+    first fix pass only covered `repositories`/`engineering_work_items`,
+    leaving `changes`/`reviews` (migration `0048`, the identical
+    `workspace_id`/`connector_account_id`/`freshness_state` shape)
+    permanently `fresh` after disable. Neither has a `GET` endpoint yet
+    (a disclosed gap -- see `API-SCHEMAS.md`), so this checks the real
+    column directly rather than through a query endpoint.
+    """
+    client, workspace_id, user_id = query_endpoints_test_context
+    token = client.cookies.get("ecc_session")
+    assert token is not None
+    account_id = _insert_connector_account(workspace_id, user_id)
+    repository_id = _insert_repository(workspace_id, account_id, name="repo-a")
+    change_id = _insert_change(workspace_id, account_id, repository_id)
+    _insert_review(workspace_id, account_id, change_id)
+
+    response = client.post(
+        f"/api/v1/engineering/connectors/{account_id}/disable",
+        headers=_headers(token, key=str(uuid4())),
+    )
+    assert response.status_code == 200, response.text
+
+    with engine.begin() as connection:
+        change_state = connection.execute(
+            text("SELECT freshness_state FROM changes WHERE id = :id"), {"id": change_id}
+        ).scalar_one()
+        review_state = connection.execute(
+            text("SELECT freshness_state FROM reviews WHERE connector_account_id = :acct"),
+            {"acct": account_id},
+        ).scalar_one()
+    assert change_state == "disconnected"
+    assert review_state == "disconnected"
