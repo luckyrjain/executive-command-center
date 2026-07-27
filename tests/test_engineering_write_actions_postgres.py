@@ -605,14 +605,23 @@ def test_gitlab_add_note_success_excludes_body_from_output(
 def test_gitlab_add_note_rejects_dot_segment_project_path(project_path: str) -> None:
     """`quote(project_path, safe="")` percent-encodes every `/` but never
     touches `.` (an RFC 3986 unreserved character) -- so a slash-free
-    value of "." or ".." would otherwise survive encoding as a literal
-    dot-segment that httpx resolves against the request path *before*
-    sending it, letting `/projects/{value}/issues/{iid}/notes` resolve to
-    a different endpoint entirely (e.g. `/issues/{iid}/notes`) outside the
-    `/projects/*` subtree this adapter's containment story assumes every
-    request stays inside. This must be rejected at input validation, well
-    before any network call -- proven here without a mock transport at
-    all, since a validation failure must never even construct the model.
+    value of "." or ".." (this parametrization's first two cases) would
+    otherwise survive encoding as a literal dot-segment that httpx
+    resolves against the request path *before* sending it, letting
+    `/projects/{value}/issues/{iid}/notes` resolve to a different endpoint
+    entirely (e.g. `/issues/{iid}/notes`) outside the `/projects/*`
+    subtree this adapter's containment story assumes every request stays
+    inside. The remaining three cases (a `..`/empty segment alongside a
+    real `/`) are not independently wire-exploitable the same way --
+    `quote(safe="")` already turns their `/` into `%2F`, so httpx's
+    dot-segment resolution never sees an unencoded `/` to collapse across
+    -- but they are still malformed, meaningless project identifiers with
+    no legitimate GitLab project this could ever name, so the validator
+    rejects them too rather than special-casing "harmless nonsense" apart
+    from "dangerous nonsense." Either way, rejection happens at input
+    validation, well before any network call -- proven here without a
+    mock transport at all, since a validation failure must never even
+    construct the model.
     """
     with pytest.raises(ValidationError):
         GitLabAddNoteInput(
