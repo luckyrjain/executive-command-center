@@ -382,10 +382,18 @@ def test_github_add_issue_comment_rejects_connector_account_in_different_workspa
 def test_github_add_issue_comment_rejects_wrong_provider_connector_account(
     write_actions_test_context: tuple[UUID, UUID],
 ) -> None:
+    """A real, synced repository row must exist for `repository_id`
+    (contrary to `_insert_repository`'s own hardcoded `provider = 'github'`
+    literal, unrelated to the connector account's own provider column) --
+    otherwise the containment check alone (not the provider check this
+    test means to isolate) would already reject the call, and the test
+    would pass even if `_load_credential`'s provider check were deleted.
+    """
     workspace_id, user_id = write_actions_test_context
     jira_account_id = _insert_connector_account(
         workspace_id, user_id, provider="jira", credential="site.atlassian.net|a@b.com|tok"
     )
+    repository_id = _insert_repository(workspace_id, jira_account_id)
 
     def handler(request: httpx.Request) -> httpx.Response:
         raise AssertionError("must not make a network call for a wrong-provider account")
@@ -395,7 +403,7 @@ def test_github_add_issue_comment_rejects_wrong_provider_connector_account(
         workspace_id=workspace_id,
         actor_id=user_id,
         connector_account_id=jira_account_id,
-        repository_id=uuid4(),
+        repository_id=repository_id,
         issue_number=1,
         body="x",
     )
@@ -1000,10 +1008,19 @@ def test_jira_add_comment_rejects_connector_account_in_different_workspace(
 def test_jira_add_comment_rejects_wrong_provider_connector_account(
     write_actions_test_context: tuple[UUID, UUID],
 ) -> None:
+    """A real, synced work item row must exist for `work_item_id` (its
+    containment query filters on `connector_account_id` and `provider =
+    'jira'` literally, independent of the connector account's own
+    provider column) -- otherwise the containment check alone (not the
+    provider check this test means to isolate) would already reject the
+    call, and the test would pass even if `_load_credential`'s provider
+    check were deleted.
+    """
     workspace_id, user_id = write_actions_test_context
     github_account_id = _insert_connector_account(
         workspace_id, user_id, provider="github", credential="ghp_x"
     )
+    work_item_id = _insert_work_item(workspace_id, github_account_id)
 
     def handler(request: httpx.Request) -> httpx.Response:
         raise AssertionError("must not make a network call for a wrong-provider account")
@@ -1013,7 +1030,7 @@ def test_jira_add_comment_rejects_wrong_provider_connector_account(
         workspace_id=workspace_id,
         actor_id=user_id,
         connector_account_id=github_account_id,
-        work_item_id=uuid4(),
+        work_item_id=work_item_id,
         body="x",
     )
     with pytest.raises(WriteActionRejected):
