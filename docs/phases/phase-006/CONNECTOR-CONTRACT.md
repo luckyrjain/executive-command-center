@@ -2,7 +2,7 @@
 id: PHASE-006-CONNECTOR
 title: Engineering Connector Contract
 status: Approved for Implementation
-version: 0.8.0
+version: 0.9.0
 owner: Lucky Jain
 ---
 
@@ -100,3 +100,7 @@ Atlassian exposes no public REST API for a personal API token to revoke itself -
 ## Task 6 status
 
 No change to this contract or to any adapter. `incidents`/`engineering_decisions` (`backend/ecc/domains/engineering/decisions_incidents.py`) are workspace-authored records, not a connector-synced resource type -- no incident-management provider connector exists in this phase's scope (GitHub/GitLab/Jira are not incident-management tools), so there is no `backfill`/`incremental_sync` dispatch, no cursor, and no `ConnectorAdapter` involvement at all for this task. See `DATA-MODEL.md`'s own "Task 1-6 status" section and that module's docstring for the full reasoning.
+
+## Task 7 status
+
+The write-scope table above (`repo`/`api`/`write:jira-work`) is now genuinely used: `ecc.domains.engineering.write_actions` (three `ecc.domains.automation.adapters.ActionAdapter`s -- `github.add_issue_comment`, `gitlab.add_note`, `jira.add_comment`) decrypts and reuses the identical `connector_accounts.encrypted_credentials` this contract already governs, rather than a second credential store. No `ConnectorAdapter` change -- these are not `backfill`/`incremental_sync` participants, so no new `resource_type`, cursor, or webhook surface. **Scope pre-checking against `granted_scopes` is not implemented, disclosed rather than silently assumed**: GitHub's classic `repo` scope is already read+write with nothing separate to detect, and `granted_scopes` is empty for both a fine-grained GitHub PAT and every Jira personal API token (`JiraAdapter.required_scopes` is unconditionally `frozenset()`); only GitLab's `granted_scopes` is reliable enough to check. Implementing a scope check that only works for one of three providers would imply a guarantee this contract cannot actually make -- these adapters instead rely on the provider's own 401/403 at write time, surfaced as a plain (non-retried) failure. See `write_actions.py`'s own module docstring for the full reasoning, including why every adapter declares `high_impact_categories={"public"}` unconditionally (the actual, load-bearing access control, given `automation/policy.py`'s own documented "`action_types`/`data_classes`/`value_limit` are stored but never enforced" gap).

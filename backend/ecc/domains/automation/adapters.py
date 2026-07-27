@@ -229,3 +229,22 @@ registry = AdapterRegistry()
 registry.register(LocalCreateNoteAdapter())
 registry.register(LocalSendTestNotificationAdapter())
 registry.register(FakeExternalActionAdapter())
+
+# Phase 6 Engineering Workspace Task 7 ("Approved write actions") --
+# GitHub/GitLab/Jira write adapters (`ecc.domains.engineering.write_
+# actions`). Imported here, after `TransientAdapterError` is already
+# defined above, rather than at the top of this module, to avoid a
+# circular import: `write_actions.py` itself imports `TransientAdapterError`
+# from this module, mirroring `ecc.domains.engineering.connectors`'s own
+# identical bottom-of-file import for `GitHubAdapter`/`GitLabAdapter`/
+# `JiraAdapter`. See that module's own docstring for the full scope,
+# containment, and retry-safety reasoning behind these three adapters.
+from ecc.domains.engineering.write_actions import (  # noqa: E402
+    GitHubAddIssueCommentAdapter,
+    GitLabAddNoteAdapter,
+    JiraAddCommentAdapter,
+)
+
+registry.register(GitHubAddIssueCommentAdapter())
+registry.register(GitLabAddNoteAdapter())
+registry.register(JiraAddCommentAdapter())
