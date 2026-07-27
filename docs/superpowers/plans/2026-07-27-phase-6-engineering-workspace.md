@@ -13,7 +13,7 @@ Companion to `docs/superpowers/specs/2026-07-27-phase-6-engineering-workspace-de
 
 ## Task 2 — GitHub read sync
 
-**Repositories complete.** Real GitHub REST API backfill/incremental sync through the same `ConnectorAdapter` contract Task 1 defines (`github_adapter.GitHubAdapter`, migration `0045_phase6_repositories.py`). Task 1's disclosed pool-exhaustion risk is resolved (`sync_connector_endpoint` restructured into three phases across two pooled connections -- see `connector_accounts.py`'s own module docstring).
+**Repositories complete.** Real GitHub REST API backfill/incremental sync through the same `ConnectorAdapter` contract Task 1 defines (`github_adapter.GitHubAdapter`, migration `0045_phase6_repositories.py`). Task 1's disclosed pool-exhaustion risk is resolved (`sync_connector_endpoint`/`create_connector_endpoint` restructured into phases across separate pooled connections, with a partial-unique-index-backed guard (`uq_sync_runs_running_per_account`, migration `0046`) serializing concurrent syncs per account after review found the initial restructuring alone reintroduced idempotency/cursor races -- see `connector_accounts.py`'s own module docstring).
 
 **Deferred to a Task 2 follow-up, not yet done:** work items (issues), changes (commits/PRs), reviews, deployments (`DATA-MODEL.md`'s remaining projection tables); webhook ingestion has no receiving HTTP endpoint or webhook-secret storage yet (`GitHubAdapter.handle_webhook` implements the parsing/upsert logic but is not wired to a public route -- see that module's own docstring for why).
 

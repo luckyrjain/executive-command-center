@@ -82,37 +82,22 @@ from .connectors import (
 )
 
 GITHUB_API_BASE_URL = "https://api.github.com"
-_REQUIRED_SCOPES: frozenset[str] = frozenset(
-    {"contents:read", "metadata:read", "pull_requests:read", "issues:read"}
-)
+# Classic OAuth scope name, not the fine-grained-PAT/GitHub-App permission
+# vocabulary (`contents:read` etc.) `CONNECTOR-CONTRACT.md`'s scopes table
+# originally listed. `X-OAuth-Scopes` -- the only header this endpoint
+# exposes to check against -- is only ever populated for classic OAuth
+# tokens/PATs, and only ever contains classic OAuth scope names; `repo`
+# grants read (and write) access to both public and private repository
+# contents, which is what backfill/incremental sync of repository metadata
+# needs. See `authorize`'s own docstring for the fine-grained-PAT case,
+# where this header is absent and there is nothing to check at all.
+_REQUIRED_SCOPES: frozenset[str] = frozenset({"repo"})
 _PAGE_SIZE = 100
 # Bounded per-call page fetch -- a workspace with more pages than this
 # resumes across multiple `/sync` calls via the cursor, rather than one
 # request paginating unboundedly through an arbitrarily large account.
 _MAX_PAGES_PER_CALL = 10
 _RATE_LIMIT_MAX_WAIT_SECONDS = 5.0
-
-
-def _parse_link_header(link_header: str | None) -> dict[str, str]:
-    """Parses a GitHub `Link` response header into `{rel: url}`, e.g.
-    `{"next": "https://api.github.com/user/repos?page=2", "last": "..."}`.
-    """
-    if not link_header:
-        return {}
-    links: dict[str, str] = {}
-    for part in link_header.split(","):
-        segments = part.split(";")
-        if len(segments) < 2:
-            continue
-        url = segments[0].strip().strip("<>")
-        rel = None
-        for segment in segments[1:]:
-            segment = segment.strip()
-            if segment.startswith('rel="') and segment.endswith('"'):
-                rel = segment[len('rel="') : -1]
-        if rel:
-            links[rel] = url
-    return links
 
 
 def _content_hash(repo: Mapping[str, Any]) -> str:
@@ -239,9 +224,24 @@ class GitHubAdapter:
             return None
         self._sleep(wait_seconds)
         try:
-            return self._client.request(method, path, headers=headers, params=params)
+            retry_response = self._client.request(method, path, headers=headers, params=params)
         except httpx.HTTPError as exc:
             raise RuntimeError(f"GitHub request failed: {exc}") from exc
+
+        # A second rate-limit hit right after the bounded wait must not be
+        # trusted as a normal response -- review found this previously fell
+        # through to the caller's own `status_code != 200` branch, which
+        # raises an opaque `RuntimeError` (the whole sync run reported
+        # `failed`) instead of the same clean `partial` + preserved-cursor
+        # outcome a first-hit rate limit gets. One retry is the bound; a
+        # still-limited retry gives up exactly like the first check does.
+        retry_is_rate_limited = retry_response.status_code == 429 or (
+            retry_response.status_code == 403
+            and retry_response.headers.get("X-RateLimit-Remaining") == "0"
+        )
+        if retry_is_rate_limited:
+            return None
+        return retry_response
 
     def _rate_limit_wait_seconds(self, response: httpx.Response) -> float | None:
         retry_after = response.headers.get("Retry-After")
@@ -260,6 +260,22 @@ class GitHubAdapter:
         return None
 
     def authorize(self, credential: str) -> ConnectorAuthorization:
+        """Raises `AdapterAuthorizationError` for an invalid/rejected
+        credential, or for a classic token/PAT that is valid but missing a
+        required scope. **Cannot verify scopes for a fine-grained PAT** --
+        GitHub does not emit `X-OAuth-Scopes` at all for that token type
+        (there is no header-based signal for a fine-grained PAT's actual
+        repository/permission grants on this endpoint), so this method
+        distinguishes "header absent" from "header present but empty":
+        only the former is treated as an unverifiable fine-grained PAT
+        (accepted, with an honestly-empty `granted_scopes` rather than a
+        fabricated full grant); the latter (a classic OAuth token
+        authorized with zero scopes) still fails the subset check below
+        like any other under-scoped classic token. See
+        `CONNECTOR-CONTRACT.md`'s "Accepted limitation" section -- refusing
+        every fine-grained PAT outright would make GitHub's own recommended
+        modern token type unusable through this connector.
+        """
         try:
             response = self._client.get("/user", headers=self._headers(credential))
         except httpx.HTTPError as exc:
@@ -271,12 +287,25 @@ class GitHubAdapter:
                 f"GitHub authorization failed with status {response.status_code}"
             )
         body = response.json()
-        scopes_header = response.headers.get("X-OAuth-Scopes", "")
-        granted = frozenset(scope.strip() for scope in scopes_header.split(",") if scope.strip())
+
+        if "X-OAuth-Scopes" in response.headers:
+            granted = frozenset(
+                scope.strip()
+                for scope in response.headers["X-OAuth-Scopes"].split(",")
+                if scope.strip()
+            )
+            if not _REQUIRED_SCOPES.issubset(granted):
+                missing = ", ".join(sorted(_REQUIRED_SCOPES - granted))
+                raise AdapterAuthorizationError(
+                    f"GitHub token is missing required scope(s): {missing}"
+                )
+        else:
+            granted = frozenset()
+
         return ConnectorAuthorization(
             external_account_id=str(body["id"]),
             display_name=body.get("login") or f"github-{body['id']}",
-            granted_scopes=granted or _REQUIRED_SCOPES,
+            granted_scopes=granted,
         )
 
     def backfill(self, account: ConnectorAccountContext, resource_type: str) -> SyncOutcome:
@@ -355,9 +384,35 @@ class GitHubAdapter:
                 if newest_updated_at is None or (updated_at and updated_at > newest_updated_at):
                     newest_updated_at = updated_at
 
-            if stopped_early or "next" not in _parse_link_header(response.headers.get("Link")):
+            # `response.links` (httpx's own RFC 8288 `Link`-header parser)
+            # replaces a hand-rolled comma-split here -- review found the
+            # naive split could mis-parse a `Link` header whose URL itself
+            # contains a comma (a legal, if unusual, query-string value),
+            # silently truncating pagination early.
+            if stopped_early or "next" not in response.links:
                 break
             page += 1
+        else:
+            # The loop ran `_MAX_PAGES_PER_CALL` iterations without ever
+            # `break`-ing -- i.e. the last page fetched still had further
+            # pages available (`response.links` still had `"next"`). Review
+            # found this previously fell through to the same `succeeded`
+            # return below, silently capping a large account's backfill at
+            # ~`_MAX_PAGES_PER_CALL * _PAGE_SIZE` repositories with no
+            # signal that more remained. `next_cursor` is still the newest
+            # `updated_at` observed so far, so a subsequent sync call
+            # resumes -- this is `partial`, not `failed`.
+            return SyncOutcome(
+                resource_type="repository",
+                items_processed=items_processed,
+                status="partial",
+                next_cursor=newest_updated_at,
+                error_summary=(
+                    f"GitHub repository sync hit the {_MAX_PAGES_PER_CALL}-page "
+                    "per-call bound with more pages remaining; sync paused, "
+                    "will resume next call"
+                ),
+            )
 
         return SyncOutcome(
             resource_type="repository",
@@ -393,6 +448,21 @@ class GitHubAdapter:
         )
 
     def refresh_permissions(self, account: ConnectorAccountContext) -> PermissionState:
+        """**Accepted limitation:** this only re-validates the credential
+        itself (`GET /user` still succeeding), not repository-level access
+        distinct from validity -- GitHub has no endpoint that reports
+        "which of this token's previously-visible repositories can it still
+        see" in one call, and this task's scope is repository sync only
+        (no stored list of specific repos to individually re-check against
+        `GET /repos/{owner}/{repo}` yet). A token that is still valid but
+        has lost access to a specific org/repo is not distinguished from
+        one that still has full access by this method alone -- that case
+        surfaces instead through the ordinary sync path, where a
+        previously-visible repository simply stops appearing in `GET
+        /user/repos`'s results (Task 2 does not yet mark a no-longer-listed
+        `repositories` row `permission_lost`; see `CONNECTOR-CONTRACT.md`'s
+        matching "Accepted limitation" entry).
+        """
         try:
             response = self._client.get("/user", headers=self._headers(account.credential))
         except httpx.HTTPError:

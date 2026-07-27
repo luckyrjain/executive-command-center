@@ -45,6 +45,24 @@ bookkeeping transactions don't need `NullPool`'s "never pool this
 connection at all" property, only "don't hold a pooled connection during
 the slow part."
 
+**Closing a pooled connection between phases also releases the
+serialization it used to provide, so three narrower guarantees replace
+the one broad lock this restructuring removed:** `uq_sync_runs_running_
+per_account` (migration `0046`) makes phase 1's own `INSERT INTO
+sync_runs (...status='running'...)` the serialization point -- a second
+`/sync` call for the same account (concurrent, or a same-Idempotency-Key
+retry racing ahead of the first call's not-yet-written idempotency
+record) cannot itself reach a `running` row until the first call's phase
+3 has already moved its row out of `running`, so it gets `409
+CONNECTOR_SYNC_IN_PROGRESS` from the resulting `IntegrityError` rather
+than either double-executing the adapter call or racing the `sync_
+cursors` UPSERT. Phase 3's `connector_accounts` UPDATEs additionally
+guard `AND status != 'disconnected'` (a concurrent `/disable` can still
+commit during phase 2, and must win, never be clobbered back by a
+stale sync outcome) and read the account's actual post-UPDATE `version`
+via `RETURNING` (`_finalize_account_version`) rather than recomputing it
+from phase 1's now-stale in-memory snapshot.
+
 **Accepted limitation, disclosed rather than silently absent:**
 `ConnectorAdapter.refresh_permissions` has no HTTP caller in this task --
 `API-SCHEMAS.md` names no dedicated permission-refresh endpoint, and
@@ -225,6 +243,31 @@ def list_connector_accounts(session: Session, workspace_id: UUID) -> list[Connec
         .all()
     )
     return [_row_to_account(dict(row)) for row in rows]
+
+
+def _finalize_account_version(
+    session: Session, account_id: UUID, *, update_sql: str, params: dict[str, Any]
+) -> int:
+    """`update_sql` must include both `AND status != 'disconnected'` (so a
+    concurrent `/disable` that already committed between phase 1 and this
+    call is never clobbered back to `'error'`/re-stamped by a stale sync
+    outcome) and `RETURNING version`. Returns the account's actual current
+    version for the audit trail -- reading the real post-UPDATE value
+    (or, when the guard skipped the update, a fresh `SELECT`) rather than
+    the caller re-deriving it from phase 1's now-stale `account.version +
+    1` snapshot, which review found could diverge from the database's
+    actual value once any other write landed on this account between
+    phase 1 and phase 3.
+    """
+    row = session.execute(text(update_sql), params).mappings().one_or_none()
+    if row is not None:
+        return int(row["version"])
+    return int(
+        session.execute(
+            text("SELECT version FROM connector_accounts WHERE id = :id"),
+            {"id": account_id},
+        ).scalar_one()
+    )
 
 
 def _get_encrypted_credential(session: Session, workspace_id: UUID, account_id: UUID) -> bytes:
@@ -485,8 +528,32 @@ def create_connector_endpoint(
     _csrf: CsrfDep,
     idempotency_key: IdempotencyHeader,
 ) -> ConnectorAccountResponse:
+    """Two phases across two pooled connections, mirroring `sync_connector_
+    endpoint`'s own pool-exhaustion fix. `adapter.authorize()` is a real
+    outbound HTTP call (e.g. GitHub's `GET /user`) with the same latency
+    profile as `backfill`/`incremental_sync` -- holding `session`'s pooled
+    connection across it would reintroduce, for connector creation, the
+    exact pool-exhaustion risk `/sync` was restructured to avoid.
+
+    1. Validate the provider and check the idempotency cache -- inside
+       `session`'s own short transaction.
+    2. Close `session`, then call `adapter.authorize()` with no pooled
+       connection held.
+    3. Insert the new connector account on a fresh session.
+
+    Unlike `/sync`, a duplicate concurrent call racing past the (released
+    after phase 1) advisory lock is an accepted, already-handled outcome
+    rather than a new risk this restructuring introduces: `authorize()` has
+    no side effect at the provider to duplicate (GitHub's `GET /user` is
+    read-only), and the loser of phase 3's `INSERT` simply hits the
+    pre-existing `uq_connector_accounts_workspace_provider_external_id`
+    constraint and returns the pre-existing `409
+    CONNECTOR_ALREADY_CONNECTED` -- not a new failure mode.
+    """
     request_hash = _request_hash(payload, "create_connector")
     now = datetime.now(UTC)
+
+    # --- Phase 1: idempotency check, provider validation ------------------
     with session.begin():
         _lock_idempotency(session, auth, idempotency_key)
         cached = _load_cached(session, auth, idempotency_key, request_hash)
@@ -497,18 +564,25 @@ def create_connector_endpoint(
         if adapter is None:
             raise HTTPException(status_code=404, detail="CONNECTOR_PROVIDER_NOT_SUPPORTED")
 
-        try:
-            authorization = adapter.authorize(payload.credential)
-        except AdapterAuthorizationError as exc:
-            detail = {
-                "code": "CONNECTOR_AUTHORIZATION_FAILED",
-                "error": _sanitize_adapter_error(str(exc)),
-            }
-            raise HTTPException(status_code=422, detail=detail) from exc
+    # Phase 1's transaction has committed. Release the connection back to
+    # the pool before the (potentially slow) adapter call below.
+    session.close()
 
-        account_id = uuid4()
+    # --- Phase 2: the adapter call -- no pooled connection held here ------
+    try:
+        authorization = adapter.authorize(payload.credential)
+    except AdapterAuthorizationError as exc:
+        detail = {
+            "code": "CONNECTOR_AUTHORIZATION_FAILED",
+            "error": _sanitize_adapter_error(str(exc)),
+        }
+        raise HTTPException(status_code=422, detail=detail) from exc
+
+    # --- Phase 3: persist the account, on a fresh connection --------------
+    account_id = uuid4()
+    with SessionFactory() as create_session, create_session.begin():
         try:
-            session.execute(
+            create_session.execute(
                 text(
                     """
                     INSERT INTO connector_accounts (
@@ -537,11 +611,11 @@ def create_connector_endpoint(
         except IntegrityError as exc:
             raise HTTPException(status_code=409, detail="CONNECTOR_ALREADY_CONNECTED") from exc
 
-        created = get_connector_account(session, auth.workspace_id, account_id)
+        created = get_connector_account(create_session, auth.workspace_id, account_id)
         assert created is not None
         response = _to_response(created)
         _write_side_effects(
-            session,
+            create_session,
             auth,
             request,
             event_type="connector_account.created",
@@ -550,7 +624,7 @@ def create_connector_endpoint(
             now=now,
         )
         _store_idempotency(
-            session,
+            create_session,
             auth,
             idempotency_key,
             request_hash,
@@ -597,6 +671,12 @@ def sync_connector_endpoint(
     A real adapter's own domain-projection writes (e.g. `github_adapter.
     _upsert_repository`) already follow this same discipline independently
     -- see that function's own docstring.
+
+    Raises `409 CONNECTOR_SYNC_IN_PROGRESS` if another sync for this
+    account is still `running` (`uq_sync_runs_running_per_account`,
+    migration `0046`) -- see the module docstring's "closing a pooled
+    connection between phases" section for why this, not a held lock,
+    is what serializes concurrent syncs here.
     """
     request_hash = _request_hash(payload, f"sync:{account_id}")
     now = datetime.now(UTC)
@@ -629,26 +709,36 @@ def sync_connector_endpoint(
         credential = decrypt_credential(encrypted)
 
         run_id = uuid4()
-        session.execute(
-            text(
-                """
-                INSERT INTO sync_runs (
-                    id, workspace_id, connector_account_id, run_type, status,
-                    items_processed, started_at, created_at
-                ) VALUES (
-                    :id, :workspace_id, :connector_account_id, :run_type, 'running',
-                    0, :started_at, :started_at
-                )
-                """
-            ),
-            {
-                "id": run_id,
-                "workspace_id": auth.workspace_id,
-                "connector_account_id": account_id,
-                "run_type": payload.run_type,
-                "started_at": now,
-            },
-        )
+        try:
+            session.execute(
+                text(
+                    """
+                    INSERT INTO sync_runs (
+                        id, workspace_id, connector_account_id, run_type, status,
+                        items_processed, started_at, created_at
+                    ) VALUES (
+                        :id, :workspace_id, :connector_account_id, :run_type, 'running',
+                        0, :started_at, :started_at
+                    )
+                    """
+                ),
+                {
+                    "id": run_id,
+                    "workspace_id": auth.workspace_id,
+                    "connector_account_id": account_id,
+                    "run_type": payload.run_type,
+                    "started_at": now,
+                },
+            )
+        except IntegrityError as exc:
+            # `uq_sync_runs_running_per_account` (migration 0046): another
+            # sync for this account is still `running`. This INSERT is the
+            # only place that row can be created, so this is also what
+            # closes the lost-cursor-update and idempotency-replay races a
+            # bare `FOR UPDATE` lock can no longer prevent by itself once
+            # this handler releases its connection before phase 2's slow
+            # adapter call -- see this function's own docstring.
+            raise HTTPException(status_code=409, detail="CONNECTOR_SYNC_IN_PROGRESS") from exc
 
         cursor_row = (
             session.execute(
@@ -703,13 +793,16 @@ def sync_connector_endpoint(
                 ),
                 {"error": failure_summary, "completed_at": completed_at, "id": run_id},
             )
-            outcome_session.execute(
-                text(
+            audit_version = _finalize_account_version(
+                outcome_session,
+                account_id,
+                update_sql=(
                     "UPDATE connector_accounts SET status = 'error', last_error = :error, "
                     "updated_at = :now, updated_by = :actor_id, version = version + 1 "
-                    "WHERE id = :id"
+                    "WHERE id = :id AND status != 'disconnected' "
+                    "RETURNING version"
                 ),
-                {
+                params={
                     "error": failure_summary,
                     "now": completed_at,
                     "actor_id": auth.user_id,
@@ -734,7 +827,7 @@ def sync_connector_endpoint(
                 request,
                 event_type="connector_account.sync_failed",
                 aggregate_id=account_id,
-                version=account.version + 1,
+                version=audit_version,
                 now=completed_at,
             )
             _store_idempotency(
@@ -794,13 +887,16 @@ def sync_connector_endpoint(
                     "now": completed_at,
                 },
             )
-        outcome_session.execute(
-            text(
+        audit_version = _finalize_account_version(
+            outcome_session,
+            account_id,
+            update_sql=(
                 "UPDATE connector_accounts SET last_synced_at = :now, last_error = :error, "
                 "updated_at = :now, updated_by = :actor_id, version = version + 1 "
-                "WHERE id = :id"
+                "WHERE id = :id AND status != 'disconnected' "
+                "RETURNING version"
             ),
-            {
+            params={
                 "now": completed_at,
                 "error": error_summary,
                 "actor_id": auth.user_id,
@@ -824,7 +920,7 @@ def sync_connector_endpoint(
             request,
             event_type="connector_account.synced",
             aggregate_id=account_id,
-            version=account.version + 1,
+            version=audit_version,
             now=completed_at,
         )
         _store_idempotency(

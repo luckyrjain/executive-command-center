@@ -2,7 +2,7 @@
 id: PHASE-006-CONNECTOR
 title: Engineering Connector Contract
 status: Approved for Implementation
-version: 0.2.0
+version: 0.3.0
 owner: Lucky Jain
 ---
 
@@ -24,9 +24,20 @@ Least privilege, read-only by default; a write scope is requested only when a sp
 
 | Provider | Read scopes | Write scopes (write actions only) |
 |---|---|---|
-| GitHub | `contents:read`, `metadata:read`, `pull_requests:read`, `issues:read` | `contents:write`, `pull_requests:write` |
+| GitHub | `repo` (classic OAuth token/PAT scope; see Task 2 status below for the fine-grained-PAT limitation) | `repo` (already read+write; no separate write scope to request) |
 | GitLab | `read_api`, `read_repository` | `api` |
 | Jira | `read:jira-work` | `write:jira-work` |
+
+**GitHub's scope vocabulary correction (Task 2).** The row above originally
+named GitHub App/fine-grained-PAT permission identifiers (`contents:read`,
+`metadata:read`, `pull_requests:read`, `issues:read`) as if they were the
+provider's OAuth scopes. They are not: `github_adapter.GitHubAdapter`
+authorizes against classic PATs/OAuth tokens via `GET /user`'s
+`X-OAuth-Scopes` response header, and that header only ever contains
+classic OAuth scope names (`repo`, `read:org`, etc.), never the
+fine-grained vocabulary. `repo` is the single classic scope that grants
+read (and write) access to both public and private repository contents --
+the only scope this task's repository sync needs.
 
 Every scope actually granted at authorization time is recorded on the `connector_accounts` row and returned by `GET /engineering/connectors` -- never the credential itself.
 
@@ -46,4 +57,12 @@ Disconnect's provider-side credential revocation is best-effort: if the adapter'
 
 ## Task 2 status
 
-`github_adapter.GitHubAdapter` implements the contract above for repositories only: `authorize` (`GET /user`, parses granted scopes from `X-OAuth-Scopes`), bounded-retry rate-limit handling (`403`/`429` plus `X-RateLimit-Remaining`/`Retry-After`/`X-RateLimit-Reset`, one bounded wait, `partial` sync status beyond it), and `disconnect` as a documented no-op (a personal access token has no revocation API a connector can call on the user's behalf). Work items/changes/reviews/deployments and webhook ingestion's receiving endpoint are not yet implemented -- see `github_adapter.py`'s own module docstring and `docs/phases/phase-006/IMPLEMENTATION-STATUS.md`'s Task 2 evidence.
+`github_adapter.GitHubAdapter` implements the contract above for repositories only: `authorize` (`GET /user`, checks granted scopes from `X-OAuth-Scopes` against the required `repo` scope for a classic token/PAT, rejecting an under-scoped credential), bounded-retry rate-limit handling (`403`/`429` plus `X-RateLimit-Remaining`/`Retry-After`/`X-RateLimit-Reset`, one bounded wait, `partial` sync status beyond it -- a still-rate-limited retry also degrades to `partial` rather than an opaque failure), and `disconnect` as a documented no-op (a personal access token has no revocation API a connector can call on the user's behalf). Work items/changes/reviews/deployments and webhook ingestion's receiving endpoint are not yet implemented -- see `github_adapter.py`'s own module docstring and `docs/phases/phase-006/IMPLEMENTATION-STATUS.md`'s Task 2 evidence.
+
+## Accepted limitation (Task 2): fine-grained PAT scopes are unverifiable
+
+GitHub does not emit `X-OAuth-Scopes` at all for a fine-grained personal access token (only classic OAuth tokens/PATs get that header) -- there is no header-based signal on `GET /user` (or anywhere else) exposing a fine-grained PAT's actual repository/permission grants for this adapter to check. `authorize` distinguishes "header absent" (fine-grained PAT) from "header present but empty" (a classic token authorized with zero scopes, which still fails the scope check normally): for the former, the credential is accepted with an honestly-empty `granted_scopes` rather than a fabricated full-scope grant -- refusing every fine-grained PAT outright would make GitHub's own currently-recommended token type unusable through this connector. An operator connecting a fine-grained PAT sees an empty scope list on `GET /engineering/connectors` and cannot rely on this endpoint's scope check to catch an under-permissioned fine-grained PAT in advance; a downstream sync call simply failing/going `permission_lost` remains the actual signal for that case, identical in kind to how `refresh_permissions` already detects access loss after the fact rather than up front.
+
+## Accepted limitation (Task 2): `refresh_permissions` re-validates, does not diff access
+
+`GitHubAdapter.refresh_permissions` re-checks only whether the credential itself is still valid (`GET /user` succeeding), not whether it has lost access to a *specific* previously-synced repository while remaining otherwise valid -- GitHub has no single endpoint reporting "which of this token's previously-visible repositories can it still see," and this task's scope (repository sync only) stores no per-repo re-check list `refresh_permissions` could iterate. A token that is still valid but has lost access to one org/repo is not distinguished from a fully-permissioned one by this method; that case instead surfaces through the ordinary sync path, where a previously-visible repository simply stops appearing in `GET /user/repos`'s results. Task 2 does not yet mark a no-longer-listed `repositories` row `permission_lost` on that basis -- disclosed here as deferred, not silently assumed handled, matching this section's identical "disclose rather than silently absent" precedent above.

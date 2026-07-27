@@ -6,16 +6,24 @@ Covers, per this task's own scope ("GitHub read sync -- repositories
 only, no work-items/changes/reviews/deployments yet"):
 
 1. `GitHubAdapter.authorize`: success (parses `X-OAuth-Scopes`), 401
-   rejection, non-200 rejection, network-error rejection.
+   rejection, non-200 rejection, network-error rejection, rejecting a
+   classic token missing the required `repo` scope, and accepting a
+   fine-grained PAT (no `X-OAuth-Scopes` header at all) with an honestly
+   empty `granted_scopes` rather than a fabricated full grant.
 2. `GitHubAdapter._sync_repositories` (`httpx.MockTransport` for the
    GitHub API call; a real seeded workspace/connector_account row is still
    required, since `_upsert_repository` -- mirroring `ecc.domains.
    automation.local_adapters.LocalCreateNoteAdapter`'s own "opens its own
    session" precedent -- genuinely writes to `repositories` rather than
-   being itself mocked): single page, pagination via the `Link` header,
-   the incremental-cursor stop-early condition, and rate-limit handling
-   both succeeding after a bounded wait and giving up beyond it
-   (`partial`, which never reaches `_upsert_repository` at all).
+   being itself mocked): single page, pagination via the `Link` header
+   (including a `next` URL containing a comma, proving `response.links`
+   parses correctly where a hand-rolled comma-split would not), the
+   incremental-cursor stop-early condition, rate-limit handling succeeding
+   after a bounded wait, giving up beyond it (`partial`, which never
+   reaches `_upsert_repository` at all), and giving up the same way when
+   the one retry is itself still rate-limited, and the `_MAX_PAGES_PER_CALL`
+   bound reporting `partial` (with the cursor preserved) rather than a
+   silent `succeeded` when more pages remain.
 3. `refresh_permissions`/`disconnect`/`handle_webhook` contract coverage.
 4. End-to-end through the real `/sync` endpoint (monkeypatched registry
    substituting a mock-transport `GitHubAdapter` for `"github"`):
@@ -97,6 +105,40 @@ def test_github_adapter_authorize_success_parses_scopes() -> None:
     assert authorization.external_account_id == "555"
     assert authorization.display_name == "octocat"
     assert authorization.granted_scopes == frozenset({"repo", "read:user"})
+
+
+def test_github_adapter_authorize_rejects_missing_required_scope() -> None:
+    """A classic OAuth token/PAT (`X-OAuth-Scopes` present) missing the
+    required `repo` scope is rejected -- review found the previous
+    fallback (`granted or _REQUIRED_SCOPES`) fabricated a full grant
+    whenever the header was empty/missing instead of ever checking it.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return _json_response(
+            {"id": 1, "login": "x"}, headers={"X-OAuth-Scopes": "read:user, gist"}
+        )
+
+    adapter = GitHubAdapter(transport=httpx.MockTransport(handler))
+    with pytest.raises(AdapterAuthorizationError, match="repo"):
+        adapter.authorize("classic-token-missing-repo-scope")
+
+
+def test_github_adapter_authorize_fine_grained_pat_has_no_scopes_header() -> None:
+    """GitHub never emits `X-OAuth-Scopes` for a fine-grained PAT -- this
+    is accepted (not rejected: refusing every fine-grained PAT outright
+    would make GitHub's own recommended modern token type unusable
+    through this connector) with an honestly-empty `granted_scopes`
+    rather than a fabricated full grant. See `CONNECTOR-CONTRACT.md`'s
+    matching "Accepted limitation" section.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return _json_response({"id": 1, "login": "x"})  # no X-OAuth-Scopes header
+
+    adapter = GitHubAdapter(transport=httpx.MockTransport(handler))
+    authorization = adapter.authorize("fine-grained-pat")
+    assert authorization.granted_scopes == frozenset()
 
 
 def test_github_adapter_authorize_rejects_401() -> None:
@@ -337,6 +379,90 @@ def test_rate_limit_gives_up_beyond_bounded_wait() -> None:
     assert outcome.items_processed == 0
     assert outcome.error_summary is not None
     assert "rate limit" in outcome.error_summary.lower()
+
+
+def test_rate_limit_still_limited_after_retry_reports_partial_not_failure() -> None:
+    """A second consecutive rate-limit hit (the retry response is itself
+    still rate-limited) previously fell through to the `status_code !=
+    200` branch, raising an opaque `RuntimeError` -- the whole sync run
+    reported `failed` instead of the same clean `partial` + preserved-
+    cursor outcome a first-hit rate limit gets. One retry is the bound;
+    review found a still-limited retry must give up the same way.
+    """
+    calls = {"count": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls["count"] += 1
+        return _json_response(
+            {"message": "rate limited"},
+            status_code=429,
+            headers={"Retry-After": "0"},
+        )
+
+    adapter = GitHubAdapter(transport=httpx.MockTransport(handler), sleep=lambda seconds: None)
+    outcome = adapter.backfill(_account_context(), "repository")
+    assert outcome.status == "partial"
+    assert outcome.items_processed == 0
+    assert calls["count"] == 2
+
+
+def test_page_cap_reports_partial_with_more_pages_remaining(
+    seeded_account_context: ConnectorAccountContext,
+) -> None:
+    """Hitting `_MAX_PAGES_PER_CALL` while the last-fetched page still had
+    a `next` link previously fell through to the same `succeeded` return
+    every genuinely-complete sync gets -- silently capping a large
+    account's backfill with no signal that more repositories remained.
+    """
+    from ecc.domains.engineering import github_adapter as github_adapter_module
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        page = int(request.url.params["page"])
+        return _json_response(
+            [_repo(page, full_name=f"acme/r{page}", updated_at=f"2024-01-{page:02d}T00:00:00Z")],
+            headers={"Link": '<https://api.github.com/user/repos?page=999>; rel="next"'},
+        )
+
+    adapter = GitHubAdapter(transport=httpx.MockTransport(handler))
+    outcome = adapter.backfill(seeded_account_context, "repository")
+    assert outcome.status == "partial"
+    assert outcome.items_processed == github_adapter_module._MAX_PAGES_PER_CALL
+    assert outcome.next_cursor is not None
+    assert outcome.error_summary is not None
+    assert "page" in outcome.error_summary.lower()
+
+
+def test_link_header_next_url_containing_comma_still_paginates(
+    seeded_account_context: ConnectorAccountContext,
+) -> None:
+    """`response.links` (httpx's own RFC 8288 parser) replaces a hand-
+    rolled comma-split that could mis-parse a `Link` header whose URL
+    itself contains a comma (a legal, if unusual, query-string value),
+    silently truncating pagination early.
+    """
+    page1 = [_repo(1, full_name="acme/a", updated_at="2024-01-05T00:00:00Z")]
+    page2 = [_repo(2, full_name="acme/b", updated_at="2024-01-04T00:00:00Z")]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        page = request.url.params.get("page")
+        if page == "1":
+            return _json_response(
+                page1,
+                headers={
+                    "Link": (
+                        '<https://api.github.com/user/repos?page=2&q=a,b>; rel="next", '
+                        '<https://api.github.com/user/repos?page=9>; rel="last"'
+                    )
+                },
+            )
+        if page == "2":
+            return _json_response(page2)
+        raise AssertionError(f"unexpected page {page}")
+
+    adapter = GitHubAdapter(transport=httpx.MockTransport(handler))
+    outcome = adapter.backfill(seeded_account_context, "repository")
+    assert outcome.items_processed == 2
+    assert outcome.next_cursor == "2024-01-05T00:00:00Z"
 
 
 def test_refresh_permissions() -> None:
