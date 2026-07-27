@@ -227,6 +227,34 @@ def test_github_adapter_authorize_rejects_network_error() -> None:
         adapter.authorize("token")
 
 
+# --- unit-level: _safe_repo_path_segment (final Phase 6 review) ------------
+
+
+@pytest.mark.parametrize("full_name", ["..", ".", "acme/..", "../widgets", "acme/./widgets", ""])
+def test_safe_repo_path_segment_rejects_dot_and_empty_segments(full_name: str) -> None:
+    """Mirrors `GitLabAddNoteInput._reject_dot_segments`'s own parametrized
+    test -- `full_name` is never directly user input (it comes from
+    `repositories.name`, itself populated only from GitHub's own repo-
+    listing response), but this helper is the sole defense-in-depth
+    backstop against the same dot-segment path-escape bug class if that
+    assumption were ever wrong, and it had zero test coverage, positive or
+    negative, before this test (final Phase 6 review found this gap)."""
+    from ecc.domains.engineering.github_adapter import _safe_repo_path_segment
+
+    with pytest.raises(RuntimeError, match="invalid path segment"):
+        _safe_repo_path_segment(full_name)
+
+
+@pytest.mark.parametrize("full_name", ["acme/widgets", "acme/repo.name", "acme-org/repo-name"])
+def test_safe_repo_path_segment_passes_through_a_real_repo_name(full_name: str) -> None:
+    """A literal `.` *inside* a segment (e.g. `repo.name`) is a real,
+    legitimate GitHub repo name and must not be rejected -- only a
+    segment that is *exactly* `.`/`..`/empty is a dot-segment."""
+    from ecc.domains.engineering.github_adapter import _safe_repo_path_segment
+
+    assert _safe_repo_path_segment(full_name) == full_name
+
+
 # --- unit-level: repository sync (no database) -----------------------------
 
 
