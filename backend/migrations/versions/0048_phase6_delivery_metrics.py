@@ -85,11 +85,13 @@ endpoint), `window`, `numerator`, `denominator`, `population` and
 = 'insufficient_coverage'`, per the contract's "no numeric value" rule.
 `details_json` holds a small JSON-encoded object for a metric whose full
 shape genuinely doesn't reduce to one scalar `value` -- work ageing's own
-contract definition is "distribution... bucketed," not a single number;
-`value` still carries a convenient scalar summary (the bucketed
-distribution's median) alongside the full bucket counts in
-`details_json`, rather than adding a second table for the one metric
-that needs more than a scalar.
+contract definition is "distribution... bucketed," and blocked work's is
+"count and median age," neither a single number; each still carries a
+convenient scalar summary in `value` (work ageing's own bucketed
+distribution's median; blocked work's own count) alongside the fuller
+shape in `details_json` (work ageing's bucket counts; blocked work's
+median age), rather than adding a second table for the two metrics that
+need more than a scalar.
 
 **`aggregation_scope` is a closed enum of exactly `system`/`team`/
 `workstream` per Decision 3**, but this task's own engine only ever

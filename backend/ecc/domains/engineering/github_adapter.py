@@ -70,15 +70,20 @@ repository from where it left off, not from scratch.
 **Reviews: sourced from already-synced `changes`, not a second API
 discovery step.** `_sync_reviews` walks this connector account's own
 `changes` rows (already fanned out by `_sync_changes`) ordered by
-`merged_at` descending, calling `GET /repos/{owner}/{repo}/pulls/
-{provider_number}/reviews` once per still-uncovered change (a merged
-PR's review count is realistically small enough that one unpaginated
-call per change is sufficient for this task's scope; a PR with over 100
-reviews would be truncated -- an accepted, disclosed edge case, not
-silently handled). The cursor is the single newest `merged_at` already
-covered -- simpler than the changes cursor above, since the source of
-"what needs syncing" is our own already-ordered `changes` table, not a
-live paginated API response.
+`merged_at` **ascending** (oldest still-uncovered change first --
+deliberately, not descending: this method's cursor is a single
+timestamp, not the changes cursor's per-repository JSON, so an early
+per-call budget cutoff must leave off at the oldest unprocessed change,
+never skip past it, or an older change would never be reachable again
+once the cursor advances past newer ones), calling `GET /repos/{owner}/
+{repo}/pulls/{provider_number}/reviews` once per still-uncovered change
+(a merged PR's review count is realistically small enough that one
+unpaginated call per change is sufficient for this task's scope; a PR
+with over 100 reviews would be truncated -- an accepted, disclosed edge
+case, not silently handled). The cursor is the single newest `merged_at`
+already covered -- simpler than the changes cursor above, since the
+source of "what needs syncing" is our own already-ordered `changes`
+table, not a live paginated API response.
 
 **Rate-limit handling.** GitHub signals exhaustion via `403`/`429` plus
 `X-RateLimit-Remaining: 0` and `X-RateLimit-Reset` (unix epoch) or
@@ -742,7 +747,20 @@ class GitHubAdapter:
         )
         per_repo_cursor: dict[str, str] = {}
         if since_cursor:
-            parsed = loads(since_cursor)
+            # A cursor that isn't valid JSON, or doesn't have this
+            # method's own `{"repos": {...}}` shape (e.g. a flat-
+            # timestamp-style cursor left over from a schema change, or
+            # a resource type's cursor read against the wrong one),
+            # degrades to "no per-repository progress recorded yet"
+            # rather than raising -- review found the previous version
+            # let `loads` raise uncaught, turning a recoverable resumable
+            # sync into an opaque `failed` run instead of the graceful,
+            # bounded-and-resumable degrade this method aims for
+            # everywhere else.
+            try:
+                parsed = loads(since_cursor)
+            except ValueError:
+                parsed = None
             if isinstance(parsed, dict) and isinstance(parsed.get("repos"), dict):
                 per_repo_cursor = dict(parsed["repos"])
 

@@ -29,6 +29,7 @@ from __future__ import annotations
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
+from hmac import new as hmac_new
 from uuid import UUID, uuid4
 
 import pytest
@@ -37,7 +38,11 @@ from sqlalchemy import text
 
 from ecc.config import get_settings
 from ecc.database import SessionFactory, engine
-from ecc.domains.engineering.metrics import compute_and_store_metrics, compute_metrics
+from ecc.domains.engineering.metrics import (
+    _bucket_ages_days,
+    compute_and_store_metrics,
+    compute_metrics,
+)
 from ecc.main import app
 
 settings = get_settings()
@@ -389,6 +394,23 @@ def test_work_ageing_and_blocked_work_computation(workspace: UUID) -> None:
     assert 39 <= blocked_work.details["median_age_days"] <= 41
 
 
+def test_bucket_ages_days_boundaries_are_inclusive_on_the_low_side() -> None:
+    """`_bucket_ages_days` uses `<=` at each boundary -- an item aged
+    exactly 7/30/90 days must land in the *lower* bucket (`0-7d`/
+    `8-30d`/`31-90d`), not the next one up. Tested directly against exact
+    float boundaries (not through the full DB round-trip, which would be
+    subject to a real timing gap between this test's own `now` and
+    `compute_metrics`'s internal `datetime.now(UTC)` call skewing an
+    exactly-7.0-day item to just over the boundary) -- off-by-one
+    boundary bugs are common enough here to warrant a precise,
+    deterministic test rather than relying on the ~3d/~40d/~100d values
+    the main computation test above uses, none of which land exactly on
+    a boundary.
+    """
+    buckets = _bucket_ages_days([7.0, 30.0, 90.0, 90.1, 6.9])
+    assert buckets == {"0-7d": 2, "8-30d": 1, "31-90d": 1, "90d+": 1}
+
+
 def test_work_ageing_counts_items_missing_created_at_separately(workspace: UUID) -> None:
     account_id = _insert_connector_account(workspace, provider="jira")
     _insert_work_item(
@@ -542,12 +564,54 @@ def test_compute_and_store_metrics_is_insert_only(workspace: UUID) -> None:
     assert count == 14
 
 
+def test_details_json_round_trips_through_the_database(workspace: UUID) -> None:
+    """Every `details` assertion elsewhere in this file checks the
+    in-memory `MetricSnapshot` returned by `compute_metrics`, never a row
+    actually read back after `compute_and_store_metrics`'s own
+    `dumps(snapshot.details)` write -- proves the JSON text column
+    genuinely round-trips (write, then a fresh read-and-parse), not just
+    that the in-memory dict was correct before serialization.
+    """
+    from json import loads
+
+    account_id = _insert_connector_account(workspace, provider="jira")
+    now = datetime.now(UTC)
+    _insert_work_item(
+        workspace,
+        account_id,
+        external_id="open-3d",
+        status="Open",
+        provider_created_at=now - timedelta(days=3),
+    )
+
+    with SessionFactory() as session:
+        compute_and_store_metrics(session, workspace_id=workspace)
+        session.commit()
+
+    with engine.begin() as connection:
+        details_json = connection.execute(
+            text(
+                "SELECT details_json FROM delivery_metric_snapshots "
+                "WHERE workspace_id = :ws AND metric_key = 'work_ageing'"
+            ),
+            {"ws": workspace},
+        ).scalar_one()
+    assert details_json is not None
+    details = loads(details_json)
+    assert details["buckets"]["0-7d"] == 1
+    assert details["items_missing_created_at"] == 0
+
+
 # --- end-to-end: real GET /engineering/metrics endpoint ---------------------
 
 
 def _headers_for_session(token: str) -> dict[str, str]:
-    del token  # GET requests carry no CSRF/mutation headers, unlike POST
-    return {"X-Correlation-ID": str(uuid4())}
+    # GET /engineering/metrics requires CsrfDep too, despite being a GET --
+    # it writes new rows on every call. See get_metrics_endpoint's own
+    # docstring for why a state-changing GET needs the same CSRF check
+    # every other write endpoint in this domain already requires.
+    csrf = hmac_new(settings.session_secret.encode(), token.encode(), "sha256").hexdigest()
+    return {"X-CSRF-Token": csrf, "X-Correlation-ID": str(uuid4())}
 
 
 @pytest.fixture
@@ -604,6 +668,26 @@ def test_get_metrics_endpoint_returns_all_seven_metrics(
     }
     for row in body["metrics"]:
         assert row["coverage_status"] == "insufficient_coverage"  # nothing connected yet
+
+
+def test_get_metrics_endpoint_rejects_missing_csrf_token(
+    workspace: UUID, client_context: tuple[TestClient, str]
+) -> None:
+    """A state-changing GET (writes seven rows every call) authenticated
+    only by a session cookie is reachable by a plain cross-site top-level
+    navigation, which still attaches the cookie -- CsrfDep closes that,
+    the same mechanism every mutation endpoint in this domain already
+    requires. A missing X-CSRF-Token header must be rejected.
+    """
+    client, _token = client_context
+    response = client.get("/api/v1/engineering/metrics", headers={"X-Correlation-ID": str(uuid4())})
+    assert response.status_code == 403
+    with engine.begin() as connection:
+        count = connection.execute(
+            text("SELECT count(*) FROM delivery_metric_snapshots WHERE workspace_id = :ws"),
+            {"ws": workspace},
+        ).scalar_one()
+    assert count == 0
 
 
 def test_get_metrics_endpoint_is_workspace_isolated(

@@ -572,6 +572,117 @@ def test_link_header_next_url_containing_comma_still_paginates(
 # --- unit-level: change sync (Task 5) ---------------------------------------
 
 
+def test_changes_backfill_with_no_synced_repositories_is_a_zero_item_no_op(
+    seeded_account_context: ConnectorAccountContext,
+) -> None:
+    """No repository has been synced yet for this connector account --
+    `_list_synced_repositories` returns an empty list, so the fan-out
+    loop never executes at all. Must still report `succeeded`/0 items
+    rather than crashing or reporting `partial`.
+    """
+    adapter = GitHubAdapter(transport=httpx.MockTransport(lambda r: _json_response([])))
+    outcome = adapter.backfill(seeded_account_context, "change")
+    assert outcome.status == "succeeded"
+    assert outcome.items_processed == 0
+    assert outcome.next_cursor == '{"repos":{}}'
+
+
+def test_changes_backfill_repo_with_no_prs_at_all_reports_succeeded(
+    seeded_account_context: ConnectorAccountContext,
+) -> None:
+    """Distinct from `test_changes_backfill_ignores_closed_but_not_merged_prs`
+    -- this repo's own PR list response is entirely empty (`[]`), not
+    merely lacking merged ones.
+    """
+    _seed_repository(
+        workspace_id=seeded_account_context.workspace_id,
+        connector_account_id=seeded_account_context.connector_account_id,
+        external_id="101",
+        name="acme/repo1",
+    )
+    adapter = GitHubAdapter(transport=httpx.MockTransport(lambda r: _json_response([])))
+    outcome = adapter.backfill(seeded_account_context, "change")
+    assert outcome.status == "succeeded"
+    assert outcome.items_processed == 0
+
+
+def test_changes_incremental_sync_with_malformed_cursor_degrades_to_fresh_walk(
+    seeded_account_context: ConnectorAccountContext,
+) -> None:
+    """A cursor that isn't valid JSON (e.g. a flat-timestamp-style cursor
+    left over from a schema change, or another resource type's cursor
+    read against the wrong one) must degrade to "no per-repository
+    progress recorded yet" rather than raising `json.JSONDecodeError`
+    uncaught -- review found the previous version turned this into an
+    opaque `failed` sync run instead of a graceful, resumable one.
+    """
+    repo_id = _seed_repository(
+        workspace_id=seeded_account_context.workspace_id,
+        connector_account_id=seeded_account_context.connector_account_id,
+        external_id="101",
+        name="acme/repo1",
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return _json_response(
+            [
+                _pr(
+                    1,
+                    number=1,
+                    title="Fix",
+                    merged_at="2024-01-02T00:00:00Z",
+                    updated_at="2024-01-02T00:00:00Z",
+                )
+            ]
+        )
+
+    adapter = GitHubAdapter(transport=httpx.MockTransport(handler))
+    outcome = adapter.incremental_sync(seeded_account_context, "change", "not-valid-json{{{")
+    assert outcome.status == "succeeded"
+    assert outcome.items_processed == 1
+
+    with engine.begin() as connection:
+        count = connection.execute(
+            text("SELECT count(*) FROM changes WHERE workspace_id = :workspace_id"),
+            {"workspace_id": seeded_account_context.workspace_id},
+        ).scalar_one()
+    assert count == 1
+    assert repo_id  # the seeded repo was actually reached
+
+
+def test_changes_incremental_sync_with_wrong_shaped_json_cursor_degrades_to_fresh_walk(
+    seeded_account_context: ConnectorAccountContext,
+) -> None:
+    """Valid JSON, but not this method's own `{"repos": {...}}` shape
+    (e.g. a plain JSON string or number) -- must also degrade gracefully,
+    not just malformed-JSON specifically.
+    """
+    _seed_repository(
+        workspace_id=seeded_account_context.workspace_id,
+        connector_account_id=seeded_account_context.connector_account_id,
+        external_id="101",
+        name="acme/repo1",
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return _json_response(
+            [
+                _pr(
+                    1,
+                    number=1,
+                    title="Fix",
+                    merged_at="2024-01-02T00:00:00Z",
+                    updated_at="2024-01-02T00:00:00Z",
+                )
+            ]
+        )
+
+    adapter = GitHubAdapter(transport=httpx.MockTransport(handler))
+    outcome = adapter.incremental_sync(seeded_account_context, "change", '"2024-01-01T00:00:00Z"')
+    assert outcome.status == "succeeded"
+    assert outcome.items_processed == 1
+
+
 def test_changes_backfill_fans_out_over_two_repos(
     seeded_account_context: ConnectorAccountContext,
 ) -> None:
@@ -936,6 +1047,43 @@ def test_reviews_skips_pending_reviews_with_no_submitted_at(
         if request.url.path == "/repos/acme/repo1/issues/42/timeline":
             return _json_response([])
         raise AssertionError(f"unexpected path {request.url.path}")
+
+    adapter = GitHubAdapter(transport=httpx.MockTransport(handler))
+    outcome = adapter.backfill(seeded_account_context, "review")
+    assert outcome.status == "succeeded"
+    assert outcome.items_processed == 0
+
+
+def test_reviews_backfill_with_zero_reviews_skips_the_timeline_call(
+    seeded_account_context: ConnectorAccountContext,
+) -> None:
+    """Distinct from `test_reviews_skips_pending_reviews_with_no_submitted_at`
+    above (which returns a non-empty, PENDING-only list, still entering
+    the `if reviews:` branch) -- this change has a genuinely empty
+    reviews list, so the timeline call's own second-request budget slot
+    must never be spent at all. A request to the timeline path would
+    raise `AssertionError` via `handler`, so a passing test proves the
+    call never happened.
+    """
+    repo = _seed_repository(
+        workspace_id=seeded_account_context.workspace_id,
+        connector_account_id=seeded_account_context.connector_account_id,
+        external_id="101",
+        name="acme/repo1",
+    )
+    _seed_change(
+        workspace_id=seeded_account_context.workspace_id,
+        connector_account_id=seeded_account_context.connector_account_id,
+        repository_id=repo,
+        external_id="9001",
+        provider_number="42",
+        merged_at=datetime(2024, 1, 2, tzinfo=UTC),
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/repos/acme/repo1/pulls/42/reviews":
+            return _json_response([])
+        raise AssertionError(f"unexpected path {request.url.path} -- timeline should not be called")
 
     adapter = GitHubAdapter(transport=httpx.MockTransport(handler))
     outcome = adapter.backfill(seeded_account_context, "review")

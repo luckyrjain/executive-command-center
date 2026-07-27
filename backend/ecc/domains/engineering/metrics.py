@@ -67,6 +67,25 @@ column with no literal "blocked" in its name) will undercount, which is
 a real, disclosed limitation rather than a silently wrong number: no
 metric here is asserted more precise than this heuristic actually is.
 
+**`review_latency`'s population is narrower than "merged changes with at
+least one review," disclosed.** `DELIVERY-INTELLIGENCE-CONTRACT.md`'s own
+population line names any merged change with at least one review; this
+implementation further requires a captured `requested_at`, since the
+metric's own definition is a *duration from request to first review*,
+which is meaningless without a request timestamp. `requested_at` is
+`None` for two real, distinct reasons (`github_adapter.py`'s own
+docstring): no `review_requested` timeline event exists at all (an
+ad-hoc review with no formal request), or the timeline fetch -- a single
+unpaginated call -- doesn't reach far enough back to find a real one
+that happened. Either way, that change is silently excluded from
+`population`, not merely left with a null contribution -- a real,
+disclosed narrowing of the contract's stated population, not a
+materially different metric definition (the duration itself, once
+computed, still means exactly what the contract says). Coverage for
+this metric is the worse of the `change`/`review` sync cursors'
+individual coverage (`_worse_coverage`), since the population genuinely
+depends on both being current.
+
 **`aggregation_scope` is always `'system'`.** No `Team`/`Workstream`
 entity exists anywhere in this codebase yet -- see migration
 `0048_phase6_delivery_metrics.py`'s own docstring.
@@ -269,12 +288,29 @@ def _compute_blocked_work(session: Session, *, workspace_id: UUID, now: datetime
     )
 
 
+def _worse_coverage(
+    a: tuple[CoverageStatus, float, str | None], b: tuple[CoverageStatus, float, str | None]
+) -> tuple[CoverageStatus, float, str | None]:
+    """`review_latency`'s population depends on both `change` and
+    `review` sync being current -- a workspace whose `change` cursor is
+    stale but whose `review` cursor happens to be fresh would otherwise
+    report `complete` while materially undercounting the true
+    population (review found this real gap). Reports whichever of the
+    two resource types' coverage is lower, the more honest number.
+    """
+    return a if a[1] <= b[1] else b
+
+
 def _compute_review_latency(
     session: Session, *, workspace_id: UUID, now: datetime
 ) -> MetricSnapshot:
-    coverage_status, coverage_pct, gap = _coverage_for(
+    change_coverage = _coverage_for(
+        session, workspace_id=workspace_id, resource_type="change", providers=("github",)
+    )
+    review_coverage = _coverage_for(
         session, workspace_id=workspace_id, resource_type="review", providers=("github",)
     )
+    coverage_status, coverage_pct, gap = _worse_coverage(change_coverage, review_coverage)
     window_start = now - _REVIEW_LATENCY_WINDOW
     rows = (
         session.execute(
@@ -282,7 +318,7 @@ def _compute_review_latency(
                 """
             SELECT DISTINCT ON (r.change_id) r.requested_at, r.submitted_at
             FROM reviews r
-            JOIN changes c ON c.id = r.change_id
+            JOIN changes c ON c.id = r.change_id AND c.workspace_id = r.workspace_id
             WHERE r.workspace_id = :workspace_id
               AND c.merged_at >= :window_start
               AND r.requested_at IS NOT NULL
@@ -295,12 +331,18 @@ def _compute_review_latency(
         .mappings()
         .all()
     )
-    population = len(rows)
+    # `population` is the count of changes actually contributing to
+    # `value` below (a negative "latency" -- submitted before requested,
+    # a data-integrity edge case, not expected in practice -- is dropped
+    # from both, keeping the two internally consistent) rather than the
+    # raw row count before that filter, which review found could
+    # otherwise silently diverge from what the median was computed over.
     latencies_seconds = [
         (row["submitted_at"] - row["requested_at"]).total_seconds()
         for row in rows
         if row["submitted_at"] >= row["requested_at"]
     ]
+    population = len(latencies_seconds)
     value = median(latencies_seconds) if latencies_seconds else None
     return MetricSnapshot(
         metric_key="review_latency",

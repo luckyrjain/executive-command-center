@@ -1205,7 +1205,7 @@ def list_sync_runs_endpoint(
 
 
 @router.get("/metrics", response_model=MetricsListResponse)
-def get_metrics_endpoint(auth: AuthDep, session: SessionDep) -> MetricsListResponse:
+def get_metrics_endpoint(auth: AuthDep, session: SessionDep, _csrf: CsrfDep) -> MetricsListResponse:
     """Computes all seven `DELIVERY-INTELLIGENCE-CONTRACT.md` metrics for
     the caller's own workspace and persists each as a new, immutable
     `delivery_metric_snapshots` row -- **a deliberate, disclosed
@@ -1222,6 +1222,17 @@ def get_metrics_endpoint(auth: AuthDep, session: SessionDep) -> MetricsListRespo
     is still itself immutable once written (never updated or deleted),
     so this is additive history, not a mutation any caller needs to
     reason about differently from a pure read.
+
+    **`CsrfDep`, despite being a `GET`.** Review found that a state-
+    changing `GET` (this one writes seven rows every call) authenticated
+    only by a `SameSite=Lax` session cookie is reachable by a top-level
+    cross-site navigation (`window.location = ".../metrics"`), which
+    still attaches the cookie -- exactly the write-amplification/data-
+    pollution risk `CsrfDep` exists to close on every other state-
+    changing endpoint in this file. `require_csrf` checks a custom
+    `X-CSRF-Token` header, not the HTTP method, so applying it here is
+    the same mechanism, not a special case: a plain cross-site navigation
+    cannot set a custom header, so it now gets a 403 instead of a write.
     """
     snapshots = compute_and_store_metrics(session, workspace_id=auth.workspace_id)
     session.commit()
