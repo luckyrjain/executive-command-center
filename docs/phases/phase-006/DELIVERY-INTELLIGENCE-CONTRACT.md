@@ -2,7 +2,7 @@
 id: PHASE-006-DELIVERY-INTELLIGENCE
 title: Delivery Intelligence Contract
 status: Approved for Implementation
-version: 0.3.0
+version: 0.4.0
 owner: Lucky Jain
 ---
 
@@ -39,6 +39,14 @@ No metric computation, snapshot table, or coverage-threshold enforcement exists 
 ## Task 5 status
 
 `backend/ecc/domains/engineering/metrics.py` implements the snapshot-computation engine and coverage-threshold policy above against real data, via `GET /engineering/metrics`. **Only three of the seven metrics are genuinely computable in this activation: `work_ageing`, `blocked_work`, `review_latency`.** The other four all require `deployments` and/or `incidents` data -- `lead_time_for_changes`' own population above is "changes merged... *with a linked deployment*," not merely merged changes -- and neither table exists yet (`deployments` has no task assigned to it at all; `incidents` is explicit Task 6 scope, per `DATA-MODEL.md`'s own "Tasks 5-6" note). These four always report `coverage_status = 'insufficient_coverage'` and `value = None` -- the contract's own "no metric is computed or displayed below 50% coverage at all" rule applied to its most extreme case (0%, because no source exists at all), not a new exception to it. See `metrics.py`'s own module docstring for the full design, including its three disclosed accepted limitations below.
+
+## Task 6 status
+
+`incidents` (migration `0049_phase6_decisions_incidents.py`) makes `time_to_restore` the fourth genuinely computable metric: `_compute_time_to_restore` reads resolved incidents directly, exactly this contract's own population/window/numerator definition above (median detected-at-to-resolved-at duration over the rolling 30-day window). `delivery_frequency`, `lead_time_for_changes` and `change_failure_rate` remain `insufficient_coverage` -- each still needs `deployments`, which has no task assigned to it at all, and `change_failure_rate`'s own population ("deployments followed by a linked incident within 24h") needs both tables together, not `incidents` alone. See the new accepted-limitation section immediately below for `time_to_restore`'s own coverage semantics, deliberately different from the other three real metrics'.
+
+## Accepted limitation (Task 6): `time_to_restore`'s coverage is unconditionally `complete`, not sync-cursor-derived
+
+`incidents` is a workspace-authored table, not a connector-synced projection (no adapter writes it, no `sync_cursors` row exists for it) -- there is no "freshness lag" for the Task 5 coverage mechanism above to measure. Whatever has been captured in `incidents` *is* the complete, current state of that table by construction; `population = 0` (no incidents resolved in the window) is reported as a legitimate "nothing to restore from" result, not conflated with the "no source exists at all" meaning `insufficient_coverage` carries for the three metrics still blocked on `deployments`. See `metrics.py`'s own module docstring.
 
 ## Accepted limitation (Task 5): coverage is inferred from sync-cursor recency, not a dedicated backfill-completion ledger
 

@@ -2,27 +2,42 @@
 `docs/phases/phase-006/DELIVERY-INTELLIGENCE-CONTRACT.md`'s seven
 approved metric definitions made concrete against real data).
 
-**Only three of the seven metrics are genuinely computable in this
-activation: `work_ageing`, `blocked_work`, `review_latency`.** The other
-four -- `delivery_frequency`, `lead_time_for_changes`, `change_failure_
-rate`, `time_to_restore` -- all require `deployments` and/or `incidents`
-data (`lead_time_for_changes`'s own contract population is "changes
-merged in window *with a linked deployment*," not merely merged changes
--- `github_adapter.py`'s new `_sync_changes`/`_sync_reviews` alone does
-not satisfy that), and neither table exists yet (`DATA-MODEL.md`'s own
-"Tasks 5-6" note: `incidents` is explicit Task 6 scope; `deployments` has
-no task assigned to it at all yet, disclosed in
+**Four of the seven metrics are genuinely computable as of Task 6:
+`work_ageing`, `blocked_work`, `review_latency`, `time_to_restore`.** The
+remaining three -- `delivery_frequency`, `lead_time_for_changes`,
+`change_failure_rate` -- all require `deployments` data
+(`lead_time_for_changes`'s own contract population is "changes merged in
+window *with a linked deployment*," not merely merged changes --
+`github_adapter.py`'s new `_sync_changes`/`_sync_reviews` alone does not
+satisfy that; `change_failure_rate`'s own population is "deployments
+followed by a linked incident within 24h," so `incidents` alone, added
+this task, is not sufficient either), and `deployments` has no task
+assigned to it at all yet (`DATA-MODEL.md`'s own note, disclosed in
 `github_adapter.py`/`gitlab_adapter.py`'s own module docstrings as
 deferred). Rather than compute a number under a materially different
 definition than the contract states (a real risk this codebase's own
 review history has caught before -- see `jira_adapter.py`'s DST-cursor
 fix and its "never fabricate a number that looks plausible but isn't
-backed by real data" precedent), these four always report
+backed by real data" precedent), these three always report
 `coverage_status = 'insufficient_coverage'`, `value = None`, exactly
 matching `DELIVERY-INTELLIGENCE-CONTRACT.md`'s own "no metric is
 computed or displayed below 50% coverage at all" rule applied to its
 most extreme case: 0% coverage, because no source exists at all yet, not
 merely an under-synced one.
+
+**`time_to_restore`'s coverage is unconditionally `'complete'`, a
+deliberately different semantics than the other three real metrics'
+sync-cursor-freshness coverage, disclosed.** `incidents` (migration
+`0049_phase6_decisions_incidents.py`) is a workspace-authored table, not
+a connector-synced projection -- there is no `sync_cursors` row, no
+external source, and therefore no "freshness lag" for `_coverage_for`'s
+own reasoning to measure at all. Whatever has been captured in
+`incidents` *is* the complete, current state of that table by
+construction (the same immediacy any direct database write has); a
+`population = 0` result (no incidents resolved in the window) is a
+legitimate "nothing to restore from" state, not a coverage gap, and is
+reported as such rather than conflated with the "no source exists yet"
+meaning `insufficient_coverage` carries for the three metrics above.
 
 **Coverage is inferred from `sync_cursors.updated_at` recency, not a
 separate historical completeness ledger.** `sync_cursors` is upserted on
@@ -126,6 +141,7 @@ _PARTIAL_COVERAGE_THRESHOLD = 50.0
 # freshness window -- see this module's own docstring.
 _FRESHNESS_WINDOW = timedelta(minutes=5)
 _REVIEW_LATENCY_WINDOW = timedelta(days=30)
+_TIME_TO_RESTORE_WINDOW = timedelta(days=30)
 _CLOSED_STATUSES = frozenset({"done", "closed", "resolved"})
 _BLOCKED_STATUS_MARKER = "blocked"
 
@@ -358,6 +374,42 @@ def _compute_review_latency(
     )
 
 
+def _compute_time_to_restore(
+    session: Session, *, workspace_id: UUID, now: datetime
+) -> MetricSnapshot:
+    window_start = now - _TIME_TO_RESTORE_WINDOW
+    rows = (
+        session.execute(
+            text(
+                """
+                SELECT detected_at, resolved_at FROM incidents
+                WHERE workspace_id = :workspace_id
+                  AND status = 'resolved'
+                  AND resolved_at >= :window_start
+                """
+            ),
+            {"workspace_id": workspace_id, "window_start": window_start},
+        )
+        .mappings()
+        .all()
+    )
+    durations_seconds = [(row["resolved_at"] - row["detected_at"]).total_seconds() for row in rows]
+    population = len(durations_seconds)
+    value = median(durations_seconds) if durations_seconds else None
+    return MetricSnapshot(
+        metric_key="time_to_restore",
+        window_label="30d",
+        population=population,
+        numerator=None,
+        denominator=None,
+        value=value,
+        details=None,
+        coverage_status="complete",
+        coverage_percentage=100.0,
+        coverage_gap_description=None,
+    )
+
+
 def _insufficient_coverage_snapshot(
     metric_key: MetricKey, *, window_label: str, gap: str
 ) -> MetricSnapshot:
@@ -376,7 +428,7 @@ def _insufficient_coverage_snapshot(
 
 
 def compute_metrics(session: Session, *, workspace_id: UUID) -> list[MetricSnapshot]:
-    """Computes all seven metric snapshots -- three real, four
+    """Computes all seven metric snapshots -- four real, three
     `insufficient_coverage` -- without writing them. Split from
     `compute_and_store_metrics` so a caller (or a test) can inspect
     computed values without also creating a new immutable row each call.
@@ -401,11 +453,7 @@ def compute_metrics(session: Session, *, workspace_id: UUID) -> list[MetricSnaps
             window_label="30d",
             gap="No deployment or incident sync exists yet",
         ),
-        _insufficient_coverage_snapshot(
-            "time_to_restore",
-            window_label="30d",
-            gap="No incident sync exists yet (Task 6 scope)",
-        ),
+        _compute_time_to_restore(session, workspace_id=workspace_id, now=now),
         _compute_work_ageing(session, workspace_id=workspace_id, now=now),
         _compute_blocked_work(session, workspace_id=workspace_id, now=now),
         _compute_review_latency(session, workspace_id=workspace_id, now=now),

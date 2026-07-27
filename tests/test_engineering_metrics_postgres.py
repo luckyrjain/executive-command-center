@@ -83,6 +83,8 @@ def workspace() -> Iterator[UUID]:
         with engine.begin() as connection:
             for table in (
                 "delivery_metric_snapshots",
+                "incident_changes",
+                "incidents",
                 "reviews",
                 "changes",
                 "engineering_work_items",
@@ -557,23 +559,164 @@ def test_review_latency_excludes_changes_outside_window(workspace: UUID) -> None
     assert review_latency.population == 0
 
 
+def _insert_incident(
+    workspace_id: UUID,
+    *,
+    status: str,
+    detected_at: datetime,
+    resolved_at: datetime | None,
+) -> UUID:
+    incident_id = uuid4()
+    now = datetime.now(UTC)
+    with engine.begin() as connection:
+        user_id = connection.execute(
+            text("SELECT id FROM users WHERE workspace_id = :ws"), {"ws": workspace_id}
+        ).scalar_one()
+        connection.execute(
+            text(
+                """
+                INSERT INTO incidents (
+                    id, workspace_id, title, severity, status, detected_at,
+                    resolved_at, version, created_by, updated_by, created_at, updated_at
+                ) VALUES (
+                    :id, :ws, 'An incident', 'high', :status, :detected_at,
+                    :resolved_at, 1, :actor, :actor, :now, :now
+                )
+                """
+            ),
+            {
+                "id": incident_id,
+                "ws": workspace_id,
+                "status": status,
+                "detected_at": detected_at,
+                "resolved_at": resolved_at,
+                "actor": user_id,
+                "now": now,
+            },
+        )
+    return incident_id
+
+
+# --- time_to_restore ---------------------------------------------------------
+
+
+def test_time_to_restore_median_of_resolved_incidents_in_window(workspace: UUID) -> None:
+    now = datetime.now(UTC)
+    _insert_incident(
+        workspace,
+        status="resolved",
+        detected_at=now - timedelta(days=1, hours=2),
+        resolved_at=now - timedelta(days=1),
+    )
+    _insert_incident(
+        workspace,
+        status="resolved",
+        detected_at=now - timedelta(days=2, hours=6),
+        resolved_at=now - timedelta(days=2),
+    )
+    # Still open -- must not contribute to the population or the median.
+    _insert_incident(
+        workspace, status="open", detected_at=now - timedelta(hours=1), resolved_at=None
+    )
+    # Resolved, but outside the 30-day window -- must be excluded too.
+    _insert_incident(
+        workspace,
+        status="resolved",
+        detected_at=now - timedelta(days=45, hours=3),
+        resolved_at=now - timedelta(days=45),
+    )
+
+    with SessionFactory() as session:
+        snapshots = compute_metrics(session, workspace_id=workspace)
+    time_to_restore = next(s for s in snapshots if s.metric_key == "time_to_restore")
+    assert time_to_restore.population == 2
+    assert time_to_restore.value == timedelta(hours=4).total_seconds()
+    assert time_to_restore.coverage_status == "complete"
+    assert time_to_restore.coverage_percentage == 100.0
+
+
+def test_time_to_restore_is_workspace_isolated(workspace: UUID) -> None:
+    other_workspace_id = uuid4()
+    other_user_id = uuid4()
+    now = datetime.now(UTC)
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO workspaces (id, name, timezone, created_at) "
+                "VALUES (:id, 'Other Workspace', 'UTC', :now)"
+            ),
+            {"id": other_workspace_id, "now": now},
+        )
+        connection.execute(
+            text(
+                "INSERT INTO users (id, workspace_id, email, password_hash, created_at) "
+                "VALUES (:id, :workspace_id, :email, 'x', :now)"
+            ),
+            {
+                "id": other_user_id,
+                "workspace_id": other_workspace_id,
+                "email": f"{other_user_id}@example.test",
+                "now": now,
+            },
+        )
+    try:
+        _insert_incident(
+            other_workspace_id,
+            status="resolved",
+            detected_at=now - timedelta(hours=2),
+            resolved_at=now,
+        )
+        with SessionFactory() as session:
+            snapshots = compute_metrics(session, workspace_id=workspace)
+        time_to_restore = next(s for s in snapshots if s.metric_key == "time_to_restore")
+        assert time_to_restore.population == 0
+        assert time_to_restore.value is None
+    finally:
+        with engine.begin() as connection:
+            for table in ("incidents", "users"):
+                connection.execute(
+                    text(f"DELETE FROM {table} WHERE workspace_id = :ws"),  # noqa: S608
+                    {"ws": other_workspace_id},
+                )
+            connection.execute(
+                text("DELETE FROM workspaces WHERE id = :ws"), {"ws": other_workspace_id}
+            )
+
+
 # --- always-insufficient metrics --------------------------------------------
 
 
-def test_deployment_and_incident_dependent_metrics_always_insufficient(workspace: UUID) -> None:
+def test_deployment_dependent_metrics_always_insufficient(workspace: UUID) -> None:
     with SessionFactory() as session:
         snapshots = compute_metrics(session, workspace_id=workspace)
     for metric_key in (
         "delivery_frequency",
         "lead_time_for_changes",
         "change_failure_rate",
-        "time_to_restore",
     ):
         snapshot = next(s for s in snapshots if s.metric_key == metric_key)
         assert snapshot.coverage_status == "insufficient_coverage"
         assert snapshot.coverage_percentage == 0.0
         assert snapshot.value is None
         assert snapshot.population == 0
+
+
+def test_time_to_restore_is_complete_coverage_with_no_incidents(workspace: UUID) -> None:
+    """`time_to_restore` (Task 6) reads directly from the workspace-
+    authored `incidents` table, not a connector sync cursor -- its
+    coverage is unconditionally `'complete'` even with zero incidents
+    recorded (a legitimate "nothing to restore from" state), unlike the
+    three deployment-dependent metrics above which report
+    `insufficient_coverage` because no source exists at all. See
+    `metrics.py`'s own module docstring for the full reasoning.
+    """
+    with SessionFactory() as session:
+        snapshots = compute_metrics(session, workspace_id=workspace)
+    snapshot = next(s for s in snapshots if s.metric_key == "time_to_restore")
+    assert snapshot.coverage_status == "complete"
+    assert snapshot.coverage_percentage == 100.0
+    assert snapshot.value is None
+    assert snapshot.population == 0
 
 
 # --- compute_and_store_metrics: insert-only ---------------------------------
@@ -702,7 +845,12 @@ def test_get_metrics_endpoint_returns_all_seven_metrics(
         "review_latency",
     }
     for row in body["metrics"]:
-        assert row["coverage_status"] == "insufficient_coverage"  # nothing connected yet
+        if row["metric_key"] == "time_to_restore":
+            # Workspace-authored, not sync-dependent -- always "complete"
+            # coverage even with zero incidents. See metrics.py's docstring.
+            assert row["coverage_status"] == "complete"
+        else:
+            assert row["coverage_status"] == "insufficient_coverage"  # nothing connected yet
 
 
 def test_get_metrics_endpoint_rejects_missing_csrf_token(

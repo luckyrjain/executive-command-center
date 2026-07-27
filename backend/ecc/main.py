@@ -33,6 +33,9 @@ from ecc.domains.automation.workflows import router as automation_workflows_rout
 from ecc.domains.calendar.events import router as calendar_events_router
 from ecc.domains.communication.commitments import router as commitments_router
 from ecc.domains.engineering.connector_accounts import router as engineering_connectors_router
+from ecc.domains.engineering.decisions_incidents import (
+    router as engineering_decisions_incidents_router,
+)
 from ecc.domains.governance.recommendation_mutations import (
     router as recommendation_mutations_router,
 )
@@ -183,6 +186,14 @@ app.include_router(automation_triggers_router)
 # (ecc.domains.engineering.connectors.registry) -- no real GitHub/GitLab/
 # Jira provider call exists yet, that is a later task.
 app.include_router(engineering_connectors_router)
+# Phase 6 Engineering Workspace Task 6: decisions and incidents,
+# workspace-authored (not connector-synced) records correlated to
+# `changes` -- GET|POST /engineering/incidents, POST .../{id}/resolve,
+# GET|POST /engineering/decisions, POST .../{id}/decide (ecc.domains.
+# engineering.decisions_incidents). See that module's own docstring for
+# the disclosed scope (no deployments/work-item correlation yet, Phase 2
+# identity resolution deferred).
+app.include_router(engineering_decisions_incidents_router)
 app.middleware("http")(rejected_mutation_audit_middleware)
 # Pure-ASGI body size guard: registered via add_middleware (not the
 # "http" dispatch helper) so it can intercept the raw receive() channel and

@@ -2,7 +2,7 @@
 id: PHASE-006-CONNECTOR
 title: Engineering Connector Contract
 status: Approved for Implementation
-version: 0.7.0
+version: 0.8.0
 owner: Lucky Jain
 ---
 
@@ -96,3 +96,7 @@ Atlassian exposes no public REST API for a personal API token to revoke itself -
 `github_adapter.GitHubAdapter` extends the contract above with two new resource types: `change` (merged pull requests) and `review`. Neither is a new lifecycle operation -- both flow through the existing `backfill`/`incremental_sync` methods, dispatching on `resource_type` exactly as `repository` already does. **Changes use per-repository fan-out, not the GitHub Search API**: `_sync_changes` walks the repositories this same connector account has already synced (read from `repositories`, no second GitHub call to rediscover them), sharing the core REST API's 5,000-requests/hour budget rather than the Search API's separate, much stricter 30-requests/minute one. Its cursor is a JSON object (`{"repos": {repository_external_id: newest_updated_at, ...}}`), not a single timestamp, since "caught up" is a per-repository fact under fan-out. **Reviews are sourced from already-synced `changes`**, not a second discovery step: `_sync_reviews` walks this account's own `changes` rows ordered by `merged_at`, fetching each still-uncovered change's reviews plus (a second call) its timeline for the `review_requested` event `review-requested-at`/`review-submitted-at` latency needs -- neither the reviews endpoint nor any other single GitHub endpoint carries both. A change is only advanced past (its cursor moved forward) once both calls succeed, so a rate-limited timeline call retries the same change next time rather than permanently losing its `requested_at`. GitLab's own `change`/`review` sync remains deferred to a Task 5 follow-up -- see `gitlab_adapter.py`'s own module docstring for the real API-shape differences (a global `scope=all` merge-request endpoint exists, unlike GitHub's fan-out need, but GitLab's approvals endpoint is Premium/Ultimate-only) that make this a genuine design pass, not a copy-paste.
 
 `backend/ecc/domains/engineering/metrics.py` implements `DELIVERY-INTELLIGENCE-CONTRACT.md`'s coverage-threshold policy against real `sync_cursors` freshness data; see that contract document's own "Task 5 status" and three "Accepted limitation" sections for the full design and disclosed gaps.
+
+## Task 6 status
+
+No change to this contract or to any adapter. `incidents`/`engineering_decisions` (`backend/ecc/domains/engineering/decisions_incidents.py`) are workspace-authored records, not a connector-synced resource type -- no incident-management provider connector exists in this phase's scope (GitHub/GitLab/Jira are not incident-management tools), so there is no `backfill`/`incremental_sync` dispatch, no cursor, and no `ConnectorAdapter` involvement at all for this task. See `DATA-MODEL.md`'s own "Task 1-6 status" section and that module's docstring for the full reasoning.
