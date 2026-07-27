@@ -48,9 +48,44 @@ of this task's first PR found:
 18. `disable` still succeeds when the stored credential fails to decrypt
     (e.g. after an encryption-key rotation) -- corrupted ciphertext
     inserted directly, decrypt failure must not block disconnecting.
+
+Plus a third batch closing gaps a multi-persona review of Task 2's PR
+found in the pool-exhaustion restructuring `sync_connector_endpoint`
+underwent for that task (`connector_accounts.py`'s module docstring has
+the full mechanism):
+
+19. `uq_sync_runs_running_per_account` (migration 0046) rejects a `/sync`
+    call while another run for the same account is still `running` with
+    `409 CONNECTOR_SYNC_IN_PROGRESS`, closing the lost-cursor-update and
+    idempotency-double-execution races the phase restructuring reopened.
+20. The audit trail's `aggregate_version` matches the account's actual
+    post-update `version` (via `_finalize_account_version`/`RETURNING`),
+    not phase 1's now-stale in-memory snapshot -- both the sync-success
+    and sync-failure event paths.
+21. `_finalize_account_version`'s `AND status != 'disconnected'` guard,
+    exercised directly (the concurrent-disable scenario it protects
+    requires real thread concurrency to reproduce over HTTP).
+
+Plus a fourth batch closing gaps a second review round of the third
+batch's own fixes found:
+
+22. `test_two_concurrent_syncs_for_same_account_second_gets_conflict`:
+    the migration-0046 guard proven against two *real*, genuinely
+    concurrent `/sync` requests (`ThreadPoolExecutor` + a blocking fake
+    adapter), not just a synthetically pre-inserted `running` row.
+23. A `running` `sync_runs` row old enough to be a crashed request's
+    leftover is reaped (marked `failed`) before a new `/sync` call is
+    blocked by it; a recent one is not reaped and still correctly blocks.
+24. `create_connector_endpoint`'s own idempotency-retry race (a
+    same-key retry racing ahead of phase 3), proven against two real
+    concurrent requests the same way as item 22, and closed by re-
+    checking the idempotency cache after an `IntegrityError` rather than
+    unconditionally returning `409 CONNECTOR_ALREADY_CONNECTED`.
 """
 
+import threading
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
@@ -183,6 +218,103 @@ class _RaisingDisconnectAdapter(_SpyDisconnectAdapter):
     def disconnect(self, account: ConnectorAccountContext) -> None:
         self.disconnect_calls.append(account)
         raise RuntimeError("revocation endpoint down")
+
+
+@dataclass
+class _SlowAdapter:
+    """Blocks inside `backfill`/`incremental_sync` (phase 2, no pooled
+    connection held) until released -- lets a test hold a real `/sync`
+    request open in phase 2 so a second, genuinely concurrent request can
+    race it, rather than only racing against a synthetically pre-inserted
+    `running` row.
+    """
+
+    provider: str = "sandbox"
+    required_scopes: frozenset[str] = field(default_factory=lambda: frozenset({"contents:read"}))
+    entered_phase2: threading.Event = field(default_factory=threading.Event)
+    release: threading.Event = field(default_factory=threading.Event)
+
+    def authorize(self, credential: str) -> ConnectorAuthorization:
+        return ConnectorAuthorization(
+            external_account_id="slow-account",
+            display_name="Slow fake",
+            granted_scopes=self.required_scopes,
+        )
+
+    def backfill(self, account: ConnectorAccountContext, resource_type: str) -> SyncOutcome:
+        self.entered_phase2.set()
+        self.release.wait(timeout=5)
+        return SyncOutcome(
+            resource_type=resource_type, items_processed=1, status="succeeded", next_cursor="1"
+        )
+
+    def incremental_sync(
+        self, account: ConnectorAccountContext, resource_type: str, cursor: str | None
+    ) -> SyncOutcome:
+        return self.backfill(account, resource_type)
+
+    def handle_webhook(
+        self, account: ConnectorAccountContext, payload: bytes, headers: object
+    ) -> SyncOutcome:
+        raise NotImplementedError
+
+    def refresh_permissions(self, account: ConnectorAccountContext) -> str:
+        return "active"
+
+    def disconnect(self, account: ConnectorAccountContext) -> None:
+        return None
+
+
+@dataclass
+class _SlowAuthorizeAdapter:
+    """Blocks inside `authorize` (`create_connector_endpoint`'s own phase
+    2, no pooled connection held) on a two-party `threading.Barrier` --
+    the `POST /connectors` analogue of `_SlowAdapter` above, needed since
+    that fake only blocks in `backfill`/`incremental_sync`, never
+    `authorize`.
+
+    A `Barrier`, not an `Event` a first caller sets and a second caller
+    waits on, is deliberate: it guarantees *both* concurrent requests have
+    already completed their own phase 1 (including a genuine idempotency-
+    cache miss -- neither could have found a cached response yet, since
+    neither has reached phase 3) before *either* is released into phase 3.
+    An Event-based "release immediately after submitting the second
+    request" ordering does not guarantee this -- the second request still
+    has its own phase 1 ahead of it when released, so it could resolve via
+    phase 1's own pre-existing cache check instead of ever reaching phase
+    3's `IntegrityError`/cache-recheck path the test exists to exercise.
+    """
+
+    provider: str = "sandbox"
+    required_scopes: frozenset[str] = field(default_factory=lambda: frozenset({"contents:read"}))
+    barrier: threading.Barrier = field(default_factory=lambda: threading.Barrier(2, timeout=5))
+
+    def authorize(self, credential: str) -> ConnectorAuthorization:
+        self.barrier.wait()
+        return ConnectorAuthorization(
+            external_account_id="slow-authorize-account",
+            display_name="Slow authorize fake",
+            granted_scopes=self.required_scopes,
+        )
+
+    def backfill(self, account: ConnectorAccountContext, resource_type: str) -> SyncOutcome:
+        raise NotImplementedError
+
+    def incremental_sync(
+        self, account: ConnectorAccountContext, resource_type: str, cursor: str | None
+    ) -> SyncOutcome:
+        raise NotImplementedError
+
+    def handle_webhook(
+        self, account: ConnectorAccountContext, payload: bytes, headers: object
+    ) -> SyncOutcome:
+        raise NotImplementedError
+
+    def refresh_permissions(self, account: ConnectorAccountContext) -> str:
+        return "active"
+
+    def disconnect(self, account: ConnectorAccountContext) -> None:
+        return None
 
 
 def _registry_with(adapter: Any) -> ConnectorRegistry:
@@ -1154,7 +1286,10 @@ def test_sync_connector_provider_not_supported(
     engineering_test_context: tuple[TestClient, UUID, UUID, str],
 ) -> None:
     client, workspace_id, user_id, token = engineering_test_context
-    account_id = _insert_connector_account(workspace_id, user_id, provider="github")
+    # 'gitlab' is a valid provider per the CHECK constraint but has no
+    # registered adapter yet (Task 3) -- 'github' no longer serves this
+    # test's purpose as of Task 2, which registers a real adapter for it.
+    account_id = _insert_connector_account(workspace_id, user_id, provider="gitlab")
 
     response = client.post(
         f"/api/v1/engineering/connectors/{account_id}/sync",
@@ -1163,3 +1298,418 @@ def test_sync_connector_provider_not_supported(
     )
     assert response.status_code == 404
     assert response.json()["error"]["code"] == "CONNECTOR_PROVIDER_NOT_SUPPORTED"
+
+
+# --- third review batch: pool-exhaustion-fix review-fix (migration 0046) ---
+# `sync_connector_endpoint`'s restructuring into phases across two pooled
+# connections (Task 2) initially reintroduced three races since closing the
+# pooled connection between phases also released the guarantees a single
+# held transaction used to provide across the whole handler -- see
+# `connector_accounts.py`'s module docstring for the full mechanism these
+# tests exercise.
+
+
+def test_sync_conflict_when_another_run_still_in_progress(
+    engineering_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    """`uq_sync_runs_running_per_account` (migration 0046) makes starting a
+    sync itself atomic -- a second `/sync` call for the same account while
+    another `sync_runs` row is still `running` (simulated here by inserting
+    one directly, standing in for a real concurrent request still in its
+    slow adapter-call phase) gets `409 CONNECTOR_SYNC_IN_PROGRESS` rather
+    than racing the cursor UPSERT or double-executing the adapter call.
+    """
+    client, workspace_id, _user_id, token = engineering_test_context
+    created = client.post(
+        "/api/v1/engineering/connectors",
+        json={"provider": "sandbox", "credential": "token-in-progress"},
+        headers=_headers(token, key=str(uuid4())),
+    ).json()
+    account_id = UUID(created["id"])
+    now = datetime.now(UTC)
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                """
+                INSERT INTO sync_runs (
+                    id, workspace_id, connector_account_id, run_type, status,
+                    items_processed, started_at, created_at
+                ) VALUES (:id, :workspace_id, :account_id, 'backfill', 'running', 0, :now, :now)
+                """
+            ),
+            {"id": uuid4(), "workspace_id": workspace_id, "account_id": account_id, "now": now},
+        )
+
+    response = client.post(
+        f"/api/v1/engineering/connectors/{account_id}/sync",
+        json={"run_type": "backfill", "resource_type": "repository"},
+        headers=_headers(token, key=str(uuid4())),
+    )
+    assert response.status_code == 409, response.text
+    assert response.json()["error"]["code"] == "CONNECTOR_SYNC_IN_PROGRESS"
+
+    with engine.begin() as connection:
+        run_count = connection.execute(
+            text("SELECT count(*) FROM sync_runs WHERE connector_account_id = :account_id"),
+            {"account_id": account_id},
+        ).scalar_one()
+        # Only the one directly-inserted `running` row -- the conflicting
+        # request never got as far as inserting its own.
+        assert run_count == 1
+
+
+def test_sync_audit_version_matches_actual_account_version_not_stale_snapshot(
+    engineering_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    """Phase 3 previously wrote `account.version + 1` (phase 1's in-memory
+    snapshot) into the audit trail's `aggregate_version` instead of the
+    database's real post-update value -- `_finalize_account_version` fixes
+    this via `UPDATE ... RETURNING version`. Two syncs in a row prove the
+    audit trail tracks the account's real version at each step (2, then 3),
+    not a value that could silently diverge once other writes land on the
+    account between phase 1 and phase 3.
+    """
+    client, workspace_id, _user_id, token = engineering_test_context
+    created = client.post(
+        "/api/v1/engineering/connectors",
+        json={"provider": "sandbox", "credential": "token-version"},
+        headers=_headers(token, key=str(uuid4())),
+    ).json()
+    account_id = UUID(created["id"])
+    assert created["version"] == 1
+
+    for expected_version in (2, 3):
+        sync = client.post(
+            f"/api/v1/engineering/connectors/{account_id}/sync",
+            json={"run_type": "backfill", "resource_type": "repository"},
+            headers=_headers(token, key=str(uuid4())),
+        )
+        assert sync.status_code == 201, sync.text
+
+        with engine.begin() as connection:
+            db_version = connection.execute(
+                text("SELECT version FROM connector_accounts WHERE id = :id"),
+                {"id": account_id},
+            ).scalar_one()
+            audit_version = connection.execute(
+                text(
+                    "SELECT aggregate_version FROM audit_events WHERE aggregate_id = :id "
+                    "AND event_type = 'connector_account.synced' ORDER BY occurred_at DESC LIMIT 1"
+                ),
+                {"id": account_id},
+            ).scalar_one()
+        assert db_version == expected_version
+        assert audit_version == expected_version
+
+
+def test_sync_failure_audit_version_matches_actual_account_version(
+    engineering_test_context: tuple[TestClient, UUID, UUID, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Same fix as the success path above, exercised on the failure branch
+    (`connector_account.sync_failed`), which computed its own separate
+    stale `account.version + 1` before this fix.
+    """
+    client, workspace_id, user_id, token = engineering_test_context
+    monkeypatch.setattr(
+        connector_accounts_module, "connector_registry", _registry_with(_RaisingAdapter())
+    )
+    account_id = _insert_connector_account(workspace_id, user_id)
+
+    response = client.post(
+        f"/api/v1/engineering/connectors/{account_id}/sync",
+        json={"run_type": "backfill", "resource_type": "repository"},
+        headers=_headers(token, key=str(uuid4())),
+    )
+    assert response.status_code == 201, response.text
+
+    with engine.begin() as connection:
+        db_version = connection.execute(
+            text("SELECT version FROM connector_accounts WHERE id = :id"), {"id": account_id}
+        ).scalar_one()
+        audit_version = connection.execute(
+            text(
+                "SELECT aggregate_version FROM audit_events WHERE aggregate_id = :id "
+                "AND event_type = 'connector_account.sync_failed'"
+            ),
+            {"id": account_id},
+        ).scalar_one()
+    assert db_version == 2
+    assert audit_version == 2
+
+
+def test_finalize_account_version_guard_skips_disconnected_account(
+    engineering_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    """Direct unit-level test of `_finalize_account_version`'s `AND status
+    != 'disconnected'` guard -- the scenario it protects (a concurrent
+    `/disable` committing between phase 1 and phase 3 of `/sync`) requires
+    real thread-level concurrency to reproduce end-to-end through the HTTP
+    API; this proves the guard mechanism itself directly, mirroring this
+    file's existing precedent of testing internal helpers when a race
+    can't be reproduced synchronously (see `_RaisingAdapter` et al. above).
+    """
+    client, workspace_id, user_id, token = engineering_test_context
+    account_id = _insert_connector_account(workspace_id, user_id, status="disconnected")
+    now = datetime.now(UTC)
+
+    from ecc.database import SessionFactory
+
+    with SessionFactory() as session, session.begin():
+        version = connector_accounts_module._finalize_account_version(
+            session,
+            account_id,
+            update_sql=(
+                "UPDATE connector_accounts SET last_synced_at = :now, last_error = :error, "
+                "updated_at = :now, updated_by = :actor_id, version = version + 1 "
+                "WHERE id = :id AND status != 'disconnected' RETURNING version"
+            ),
+            params={"now": now, "error": None, "actor_id": user_id, "id": account_id},
+        )
+    # Real current version (1), not incremented -- the guard skipped the
+    # UPDATE because the account is disconnected, and _finalize_account_
+    # version fell back to a plain SELECT rather than returning a
+    # would-be-incremented value that was never actually written.
+    assert version == 1
+
+    with engine.begin() as connection:
+        row = (
+            connection.execute(
+                text("SELECT version, status FROM connector_accounts WHERE id = :id"),
+                {"id": account_id},
+            )
+            .mappings()
+            .one()
+        )
+    assert row["version"] == 1
+    assert row["status"] == "disconnected"
+
+
+def test_two_concurrent_syncs_for_same_account_second_gets_conflict(
+    engineering_test_context: tuple[TestClient, UUID, UUID, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Real concurrent HTTP requests against real, separate database
+    connections -- mirrors `test_automation_scheduler_postgres.py`'s
+    `test_two_concurrent_ticks_racing_the_same_due_trigger_fire_exactly_
+    once` precedent for the identical class of property. Thread A's
+    `/sync` call is held genuinely mid-phase-2 (via `_SlowAdapter` blocking
+    on an `Event`, with no pooled connection held) until thread B's own
+    concurrent `/sync` call has been issued and its response observed --
+    proving `uq_sync_runs_running_per_account` (migration 0046) serializes
+    two real competing requests, not just a synthetic pre-seeded row.
+    """
+    client, workspace_id, _user_id, token = engineering_test_context
+    slow_adapter = _SlowAdapter()
+    monkeypatch.setattr(
+        connector_accounts_module, "connector_registry", _registry_with(slow_adapter)
+    )
+    created = client.post(
+        "/api/v1/engineering/connectors",
+        json={"provider": "sandbox", "credential": "token-concurrent"},
+        headers=_headers(token, key=str(uuid4())),
+    ).json()
+    account_id = created["id"]
+
+    def _sync(sync_client: TestClient) -> Any:
+        return sync_client.post(
+            f"/api/v1/engineering/connectors/{account_id}/sync",
+            json={"run_type": "backfill", "resource_type": "repository"},
+            headers=_headers(token, key=str(uuid4())),
+        )
+
+    client_a = TestClient(app)
+    client_a.cookies.set("ecc_session", token)
+    client_b = TestClient(app)
+    client_b.cookies.set("ecc_session", token)
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            future_a = pool.submit(_sync, client_a)
+            assert slow_adapter.entered_phase2.wait(timeout=5), "thread A never reached phase 2"
+            future_b = pool.submit(_sync, client_b)
+            response_b = future_b.result(timeout=5)
+            slow_adapter.release.set()
+            response_a = future_a.result(timeout=5)
+    finally:
+        client_a.close()
+        client_b.close()
+
+    assert response_a.status_code == 201, response_a.text
+    assert response_a.json()["status"] == "succeeded"
+    assert response_b.status_code == 409, response_b.text
+    assert response_b.json()["error"]["code"] == "CONNECTOR_SYNC_IN_PROGRESS"
+
+    with engine.begin() as connection:
+        run_count = connection.execute(
+            text("SELECT count(*) FROM sync_runs WHERE connector_account_id = :account_id"),
+            {"account_id": UUID(account_id)},
+        ).scalar_one()
+    assert run_count == 1
+
+
+def test_stale_running_sync_run_is_reaped_not_permanently_stuck(
+    engineering_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    """Security review found the pool-exhaustion restructuring's own fix
+    (making a `running` row the serialization point) has a failure mode a
+    single spanning transaction never had: a process crash/kill between
+    phase 1's commit and phase 3 leaves the row `running` forever, wedging
+    every future `/sync` call behind it (`409 CONNECTOR_SYNC_IN_PROGRESS`)
+    with no recovery path. Phase 1 reaps any `running` row older than
+    `_STALE_RUNNING_SYNC_THRESHOLD` before its own `INSERT` -- simulated
+    here via a directly-inserted `running` row backdated well past that
+    threshold, standing in for a request that crashed long ago.
+    """
+    client, workspace_id, _user_id, token = engineering_test_context
+    created = client.post(
+        "/api/v1/engineering/connectors",
+        json={"provider": "sandbox", "credential": "token-stale"},
+        headers=_headers(token, key=str(uuid4())),
+    ).json()
+    account_id = UUID(created["id"])
+    stale_started_at = datetime.now(UTC) - timedelta(hours=1)
+    stale_run_id = uuid4()
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                """
+                INSERT INTO sync_runs (
+                    id, workspace_id, connector_account_id, run_type, status,
+                    items_processed, started_at, created_at
+                ) VALUES (:id, :workspace_id, :account_id, 'backfill', 'running', 0, :now, :now)
+                """
+            ),
+            {
+                "id": stale_run_id,
+                "workspace_id": workspace_id,
+                "account_id": account_id,
+                "now": stale_started_at,
+            },
+        )
+
+    response = client.post(
+        f"/api/v1/engineering/connectors/{account_id}/sync",
+        json={"run_type": "backfill", "resource_type": "repository"},
+        headers=_headers(token, key=str(uuid4())),
+    )
+    assert response.status_code == 201, response.text
+    assert response.json()["status"] == "succeeded"
+
+    with engine.begin() as connection:
+        stale_row = (
+            connection.execute(
+                text("SELECT status FROM sync_runs WHERE id = :id"), {"id": stale_run_id}
+            )
+            .mappings()
+            .one()
+        )
+    assert stale_row["status"] == "failed"
+
+
+def test_recent_running_sync_run_is_not_reaped(
+    engineering_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    """The reap in the test above must never touch a genuinely still-in-
+    flight sync -- a `running` row within `_STALE_RUNNING_SYNC_THRESHOLD`
+    still correctly blocks a new `/sync` call with `409
+    CONNECTOR_SYNC_IN_PROGRESS`, exactly as `test_sync_conflict_when_
+    another_run_still_in_progress` above already proves for a fresh row;
+    this proves the reap's age boundary itself, not just its absence.
+    """
+    client, workspace_id, _user_id, token = engineering_test_context
+    created = client.post(
+        "/api/v1/engineering/connectors",
+        json={"provider": "sandbox", "credential": "token-recent"},
+        headers=_headers(token, key=str(uuid4())),
+    ).json()
+    account_id = UUID(created["id"])
+    recent_started_at = datetime.now(UTC) - timedelta(minutes=1)
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                """
+                INSERT INTO sync_runs (
+                    id, workspace_id, connector_account_id, run_type, status,
+                    items_processed, started_at, created_at
+                ) VALUES (:id, :workspace_id, :account_id, 'backfill', 'running', 0, :now, :now)
+                """
+            ),
+            {
+                "id": uuid4(),
+                "workspace_id": workspace_id,
+                "account_id": account_id,
+                "now": recent_started_at,
+            },
+        )
+
+    response = client.post(
+        f"/api/v1/engineering/connectors/{account_id}/sync",
+        json={"run_type": "backfill", "resource_type": "repository"},
+        headers=_headers(token, key=str(uuid4())),
+    )
+    assert response.status_code == 409, response.text
+    assert response.json()["error"]["code"] == "CONNECTOR_SYNC_IN_PROGRESS"
+
+
+def test_create_connector_idempotent_retry_racing_phase_three_replays_response(
+    engineering_test_context: tuple[TestClient, UUID, UUID, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Correctness and API-contract review both found `create_connector_
+    endpoint`'s phase split could turn a genuine same-Idempotency-Key retry
+    (racing ahead of the first call's own phase 3, e.g. after a client-side
+    timeout during a slow `authorize()`) into `409
+    CONNECTOR_ALREADY_CONNECTED` instead of the replayed response the
+    `Idempotency-Key` contract promises. Real concurrent requests, same
+    mechanism as the `/sync` race test above, but synchronized via
+    `_SlowAuthorizeAdapter`'s two-party `Barrier` rather than an `Event`
+    one thread sets and the other waits on -- see that fake's own
+    docstring for why an `Event`-based ordering here would let this test
+    pass without ever reaching the code path it claims to exercise
+    (thread B resolving via phase 1's own pre-existing cache check instead
+    of phase 3's `IntegrityError`/cache-recheck).
+    """
+    client, _workspace_id, _user_id, token = engineering_test_context
+    slow_adapter = _SlowAuthorizeAdapter()
+    monkeypatch.setattr(
+        connector_accounts_module, "connector_registry", _registry_with(slow_adapter)
+    )
+    idempotency_key = str(uuid4())
+
+    def _create(create_client: TestClient) -> Any:
+        return create_client.post(
+            "/api/v1/engineering/connectors",
+            json={"provider": "sandbox", "credential": "token-idempotent-race"},
+            headers=_headers(token, key=idempotency_key),
+        )
+
+    client_a = TestClient(app)
+    client_a.cookies.set("ecc_session", token)
+    client_b = TestClient(app)
+    client_b.cookies.set("ecc_session", token)
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            future_a = pool.submit(_create, client_a)
+            future_b = pool.submit(_create, client_b)
+            response_a = future_a.result(timeout=10)
+            response_b = future_b.result(timeout=10)
+    finally:
+        client_a.close()
+        client_b.close()
+
+    assert response_a.status_code == 201, response_a.text
+    assert response_b.status_code == 201, response_b.text
+    ignored = {"request_id", "correlation_id"}
+    body_a = {k: v for k, v in response_a.json().items() if k not in ignored}
+    body_b = {k: v for k, v in response_b.json().items() if k not in ignored}
+    assert body_a == body_b
+
+    with engine.begin() as connection:
+        account_count = connection.execute(
+            text(
+                "SELECT count(*) FROM connector_accounts WHERE workspace_id = :workspace_id "
+                "AND provider = 'sandbox' AND external_account_id = 'slow-authorize-account'"
+            ),
+            {"workspace_id": _workspace_id},
+        ).scalar_one()
+    assert account_count == 1
