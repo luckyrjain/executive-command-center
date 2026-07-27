@@ -1,8 +1,8 @@
 ---
 id: PHASE-006
 title: Engineering Workspace
-status: Draft
-version: 0.2.0
+status: Approved for Implementation
+version: 0.3.0
 owner: Lucky Jain
 depends_on:
   - PHASE-005
@@ -21,6 +21,10 @@ contracts:
 ---
 
 # PHASE-006 — Engineering Workspace
+
+## Approved decisions
+
+Contracts moved from Draft after resolving `docs/phases/PHASE-REVIEW.md:137`'s three named approval-gate items (provider scopes and retention; connector release set; metric definitions and source-coverage thresholds) in `docs/superpowers/specs/2026-07-27-phase-6-engineering-workspace-design.md`, per that document's own Decision 1-3 sections. In summary: GitHub ships first as the reference connector, with GitLab and Jira explicitly sequenced next against the same `ConnectorAdapter` contract (not descoped); connector credentials are encrypted at rest (Fernet, RFC-005 v1.4.0) with least-privilege read-only scopes by default, no raw provider payload retention, and disconnect/delete kept as two distinct operator actions; the seven `DELIVERY-INTELLIGENCE-CONTRACT.md` metrics are made concrete with windows, population and a 95%/50% coverage-threshold policy, aggregated at system/team/workstream level only, never per person. Implementation begins with Task 1 (connector framework and source projections) by the same kind of repository-owner parallel-start exception Phases 2-5 each received, proceeding alongside Phase 5's own still-open exit gate (`docs/runbooks/PHASE-5-DOGFOOD.md`, 0 of 14 days logged) -- this does not itself close that gate. Implementation plan: `docs/superpowers/plans/2026-07-27-phase-6-engineering-workspace.md`. Delivery status: `docs/phases/phase-006/IMPLEMENTATION-STATUS.md`.
 
 ## Objective
 

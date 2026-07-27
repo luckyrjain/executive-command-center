@@ -1,0 +1,212 @@
+"""Connector-independent adapter contract and in-process registry (design
+doc Decision 1: `docs/superpowers/specs/2026-07-27-phase-6-engineering-
+workspace-design.md`, `docs/phases/phase-006/CONNECTOR-CONTRACT.md`).
+
+Mirrors `ecc.domains.automation.adapters.ActionAdapter`/`AdapterRegistry`'s
+shape deliberately -- structural typing (`typing.Protocol`, not an ABC),
+`@runtime_checkable` so `ConnectorRegistry.register` can `isinstance()`
+-check a candidate at registration time, and one shared production
+`registry` instance a later real GitHub/GitLab/Jira adapter registers into
+alongside this task's own `sandbox.github` (`sandbox_adapter.py`). This is
+a **second, distinct registry**, not a reuse of Phase 5's -- a connector
+owns read sync and account lifecycle; a Phase 5 `ActionAdapter` owns one
+write action. Phase 6's own write actions (a later task) are registered
+into *that* registry, per `docs/phases/PHASE-REVIEW.md` finding F-03 --
+this module has nothing to do with writes.
+
+`CONNECTOR-CONTRACT.md`'s seven lifecycle operations -- authorize,
+validate, backfill, incremental sync, webhook ingestion where available,
+permission refresh, disconnect -- map onto this Protocol's methods below.
+"Validate" is folded into `authorize`'s own return value (an adapter that
+cannot validate a credential simply raises during `authorize`, rather than
+a separate round-trip) since no adapter in this task's scope has a
+distinct post-authorization revalidation step from a fresh credential.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Mapping
+from dataclasses import dataclass
+from typing import Literal, Protocol, runtime_checkable
+from uuid import UUID
+
+PermissionState = Literal["active", "permission_lost", "deleted"]
+SyncStatus = Literal["succeeded", "failed", "partial"]
+
+
+@dataclass(frozen=True, slots=True)
+class ConnectorAuthorization:
+    """What `ConnectorAdapter.authorize` returns on success -- never the
+    credential itself (the caller already holds it). `external_account_id`
+    and `display_name` populate `connector_accounts` directly;
+    `granted_scopes` is what `GET /engineering/connectors` shows an
+    operator, per design doc Decision 2 ("an operator can see exactly what
+    a connection can do").
+    """
+
+    external_account_id: str
+    display_name: str
+    granted_scopes: frozenset[str]
+
+
+@dataclass(frozen=True, slots=True)
+class ConnectorAccountContext:
+    """Passed to every post-authorization adapter method. `credential` is
+    the already-decrypted plaintext (`ecc.domains.engineering.crypto.
+    decrypt_credential`'s output) -- held only for the duration of one
+    call, never persisted by this module.
+    """
+
+    workspace_id: UUID
+    connector_account_id: UUID
+    external_account_id: str
+    credential: str
+
+
+@dataclass(frozen=True, slots=True)
+class SyncOutcome:
+    """Result of a backfill/incremental/webhook sync call.
+    `items_processed` and `status` are written to `sync_runs`;
+    `next_cursor` (when not `None`) is written to `sync_cursors` for the
+    given `resource_type`, resuming from that position on the next call --
+    `CONNECTOR-CONTRACT.md`: "Sync is incremental, idempotent, resumable."
+    """
+
+    resource_type: str
+    items_processed: int
+    status: SyncStatus
+    next_cursor: str | None
+    error_summary: str | None = None
+
+
+class AdapterAuthorizationError(Exception):
+    """Raised by `ConnectorAdapter.authorize` when the supplied credential
+    is invalid, expired, or lacks a scope this adapter requires -- a
+    caller-facing rejection, not a transient/retryable failure.
+    """
+
+
+@runtime_checkable
+class ConnectorAdapter(Protocol):
+    """Structural contract every registered connector adapter satisfies.
+    `provider` is the stable slug stored in `connector_accounts.provider`
+    (the `ck_connector_accounts_provider` CHECK constraint's closed set:
+    `github`, `gitlab`, `jira`, `sandbox`) and doubles as this registry's
+    lookup key.
+    """
+
+    provider: str
+    required_scopes: frozenset[str]
+
+    def authorize(self, credential: str) -> ConnectorAuthorization:
+        """Validate `credential` against the provider (or, for a sandbox
+        adapter, an in-memory fake) and return the account identity/scopes
+        it resolves to. Raises `AdapterAuthorizationError` on rejection --
+        never partially registers an account.
+        """
+        ...
+
+    def backfill(self, account: ConnectorAccountContext, resource_type: str) -> SyncOutcome:
+        """Full historical sync for one resource type, from no prior
+        cursor. `CONNECTOR-CONTRACT.md`: "Backfill resumes without
+        duplicate projections" -- an adapter implementing real pagination
+        must itself be resumable if interrupted mid-backfill; this task's
+        sandbox adapter is small enough to complete in one call.
+        """
+        ...
+
+    def incremental_sync(
+        self, account: ConnectorAccountContext, resource_type: str, cursor: str | None
+    ) -> SyncOutcome:
+        """Resumes from `cursor` (the `sync_cursors.cursor_value` most
+        recently persisted for this account/resource_type), or behaves
+        like a fresh backfill if `cursor` is `None`.
+        """
+        ...
+
+    def handle_webhook(
+        self, account: ConnectorAccountContext, payload: bytes, headers: Mapping[str, str]
+    ) -> SyncOutcome:
+        """Provider push notification ingestion. `CONNECTOR-CONTRACT.md`:
+        "deduplicates webhook/poll overlap" -- an adapter's own
+        implementation is responsible for that dedupe (e.g. against the
+        same `content_hash`/cursor an incremental poll would also observe),
+        not this module.
+        """
+        ...
+
+    def refresh_permissions(self, account: ConnectorAccountContext) -> PermissionState:
+        """Re-checks whether the credential still has access (distinct from
+        whether it is merely *valid* -- a token can remain valid while
+        losing repository/project access). `CONNECTOR-CONTRACT.md`:
+        "Provider deletion, access loss and rename are distinct states."
+        """
+        ...
+
+    def disconnect(self, account: ConnectorAccountContext) -> None:
+        """Best-effort provider-side credential revocation.
+        `CONNECTOR-CONTRACT.md`: "Disconnect revokes credentials when
+        possible and stops future sync" -- stopping future sync is this
+        module's caller's responsibility (`connector_accounts.status`
+        transition to `disconnected`), not this method's; this method only
+        performs the provider-side revocation call, and must not raise for
+        "provider does not support revocation" (that is an expected,
+        non-error outcome for some providers/PAT-based auth, only a real
+        revocation-attempt failure should raise).
+        """
+        ...
+
+
+class AdapterAlreadyRegistered(ValueError):
+    """Raised by `ConnectorRegistry.register` when `provider` is already
+    taken -- a registration-time programming error, not a runtime
+    condition any caller input can trigger.
+    """
+
+
+class ConnectorRegistry:
+    """A small in-process `dict[str, ConnectorAdapter]`-backed registry
+    `ecc.domains.engineering.connector_accounts` resolves a connector
+    account's `provider` against. Deliberately an instance, not a single
+    mutate-and-restore global -- mirrors `ecc.domains.automation.adapters.
+    AdapterRegistry`'s identical reasoning: each test builds its own
+    registry with whatever fake adapter it needs, and the shared
+    production `registry` below is one particular instance real product
+    code registers into.
+    """
+
+    def __init__(self) -> None:
+        self._by_provider: dict[str, ConnectorAdapter] = {}
+
+    def register(self, adapter: ConnectorAdapter) -> None:
+        if not isinstance(adapter, ConnectorAdapter):
+            raise TypeError(
+                f"object registered for provider={adapter.provider!r} does not satisfy "
+                "the ConnectorAdapter protocol (missing a required attribute or method)"
+            )
+        if adapter.provider in self._by_provider:
+            raise AdapterAlreadyRegistered(f"provider '{adapter.provider}' is already registered")
+        self._by_provider[adapter.provider] = adapter
+
+    def get(self, provider: str) -> ConnectorAdapter | None:
+        return self._by_provider.get(provider)
+
+    def providers(self) -> tuple[str, ...]:
+        return tuple(sorted(self._by_provider))
+
+    def __contains__(self, provider: object) -> bool:
+        return provider in self._by_provider
+
+    def __len__(self) -> int:
+        return len(self._by_provider)
+
+
+# Shared production registry. This task registers only `sandbox.github`
+# (see `sandbox_adapter.py`) -- no real GitHub/GitLab/Jira adapter exists
+# yet, matching this task's own explicit scope boundary ("connector
+# framework and source projections", not "GitHub read sync", which is
+# Task 2).
+from .sandbox_adapter import SandboxGithubAdapter  # noqa: E402
+
+registry = ConnectorRegistry()
+registry.register(SandboxGithubAdapter())

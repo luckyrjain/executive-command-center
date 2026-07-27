@@ -32,6 +32,7 @@ from ecc.domains.automation.triggers import router as automation_triggers_router
 from ecc.domains.automation.workflows import router as automation_workflows_router
 from ecc.domains.calendar.events import router as calendar_events_router
 from ecc.domains.communication.commitments import router as commitments_router
+from ecc.domains.engineering.connector_accounts import router as engineering_connectors_router
 from ecc.domains.governance.recommendation_mutations import (
     router as recommendation_mutations_router,
 )
@@ -175,6 +176,13 @@ app.include_router(automation_kill_switches_router)
 # see that module's own docstring for the full reasoning, mirroring
 # kill_switches.py's identical Task 7a precedent.
 app.include_router(automation_triggers_router)
+# Phase 6 Engineering Workspace Task 1: connector framework and source
+# projections -- GET|POST /engineering/connectors, POST .../{id}/sync,
+# POST .../{id}/disable, GET /engineering/sync-runs (ecc.domains.
+# engineering.connector_accounts). Registers one sandbox adapter
+# (ecc.domains.engineering.connectors.registry) -- no real GitHub/GitLab/
+# Jira provider call exists yet, that is a later task.
+app.include_router(engineering_connectors_router)
 app.middleware("http")(rejected_mutation_audit_middleware)
 # Pure-ASGI body size guard: registered via add_middleware (not the
 # "http" dispatch helper) so it can intercept the raw receive() channel and

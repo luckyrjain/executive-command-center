@@ -41,6 +41,17 @@ dependencies = [
   # on top -- `ecc.domains.automation.scheduler._next_occurrence_after`
   # is the one call site.
   "croniter==6.2.4",
+  # Phase 6 Engineering Workspace Task 1 (RFC-005 v1.4.0 amendment,
+  # design doc Decision 2): Fernet symmetric authenticated encryption for
+  # connector OAuth/PAT credentials at rest (`ecc.domains.engineering.
+  # crypto`). No encryption-at-rest primitive existed anywhere in this
+  # codebase before this task (checked directly against pyproject.toml /
+  # uv.lock and RFC-005.md's baseline before adding this line) --
+  # `argon2-cffi` is one-way password hashing, not reversible symmetric
+  # encryption, so it cannot serve this need. `cryptography` (pyca) is the
+  # standard, widely-audited Python crypto library; only its `Fernet`
+  # recipe is used.
+  "cryptography==49.0.0",
 ]
 
 [project.optional-dependencies]
