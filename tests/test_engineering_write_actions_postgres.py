@@ -56,6 +56,7 @@ from ecc.domains.automation import policy as automation_policy
 from ecc.domains.automation import worker as automation_worker
 from ecc.domains.automation import workflows as automation_workflows
 from ecc.domains.automation.adapters import AdapterRegistry, TransientAdapterError
+from ecc.domains.engineering import write_actions as write_actions_module
 from ecc.domains.engineering.crypto import encrypt_credential
 from ecc.domains.engineering.write_actions import (
     GitHubAddIssueCommentAdapter,
@@ -269,6 +270,80 @@ def test_shared_registry_resolves_all_three_write_adapters() -> None:
 
 
 # ---------------------------------------------------------------------------
+# 1b. `_load_credential` workspace-scoping, isolated from any containment check
+# ---------------------------------------------------------------------------
+
+
+def test_load_credential_rejects_connector_account_in_different_workspace(
+    write_actions_test_context: tuple[UUID, UUID],
+) -> None:
+    """The adapter-level `..._rejects_connector_account_in_different_workspace`
+    tests below cannot isolate this check the way the wrong-provider tests
+    isolate theirs: `repositories`/`engineering_work_items` both carry a
+    compound FK on `(workspace_id, connector_account_id)` referencing
+    `connector_accounts` -- so a row genuinely tied to a cross-workspace
+    account can only ever exist under *that* account's own real workspace,
+    never under the caller's workspace_id too (confirmed empirically: this
+    exact insert raises `IntegrityError` under Postgres). That means the
+    containment check can never accidentally succeed for a truly
+    cross-workspace account regardless of `_load_credential`'s own
+    behavior, which is a good defense-in-depth property of the schema, but
+    it also means the adapter-level tests alone cannot prove `_load_
+    credential`'s workspace filter itself is doing the rejecting rather
+    than the containment check masking it. This test calls `_load_
+    credential` directly instead, isolating exactly that: the same account,
+    looked up under its own real workspace, succeeds; looked up under a
+    different workspace_id, is rejected.
+    """
+    workspace_id, user_id = write_actions_test_context
+    other_workspace_id = uuid4()
+    other_user_id = uuid4()
+    now = datetime.now(UTC)
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO workspaces (id, name, timezone, created_at) "
+                "VALUES (:id, 'Other', 'UTC', :now)"
+            ),
+            {"id": other_workspace_id, "now": now},
+        )
+        connection.execute(
+            text(
+                "INSERT INTO users (id, workspace_id, email, password_hash, created_at) "
+                "VALUES (:id, :workspace_id, :email, 'x', :now)"
+            ),
+            {
+                "id": other_user_id,
+                "workspace_id": other_workspace_id,
+                "email": f"{other_user_id}@example.test",
+                "now": now,
+            },
+        )
+    try:
+        other_account_id = _insert_connector_account(
+            other_workspace_id, other_user_id, provider="github", credential="ghp_other"
+        )
+        with SessionFactory() as session:
+            credential = write_actions_module._load_credential(
+                session,
+                workspace_id=other_workspace_id,
+                connector_account_id=other_account_id,
+                expected_provider="github",
+            )
+        assert credential == "ghp_other"
+
+        with SessionFactory() as session, pytest.raises(WriteActionRejected):
+            write_actions_module._load_credential(
+                session,
+                workspace_id=workspace_id,
+                connector_account_id=other_account_id,
+                expected_provider="github",
+            )
+    finally:
+        _cleanup_workspace(other_workspace_id)
+
+
+# ---------------------------------------------------------------------------
 # 2. github.add_issue_comment
 # ---------------------------------------------------------------------------
 
@@ -333,6 +408,19 @@ def test_github_add_issue_comment_rejects_repository_not_synced_by_this_connecto
 def test_github_add_issue_comment_rejects_connector_account_in_different_workspace(
     write_actions_test_context: tuple[UUID, UUID],
 ) -> None:
+    """`repository_id=uuid4()` here is a never-synced placeholder, not a
+    real repository row -- unlike the wrong-provider tests above, a real
+    repository row cannot be constructed for this scenario at all (the
+    compound FK on `(workspace_id, connector_account_id)` makes a row tied
+    to a genuinely cross-workspace account impossible under this test's
+    own `workspace_id`), so this test alone cannot prove `_load_
+    credential`'s workspace check specifically is what rejects the call
+    rather than the containment check. `test_load_credential_rejects_
+    connector_account_in_different_workspace` above isolates that check
+    directly; this test still adds value as an end-to-end proof that the
+    adapter rejects the call one way or another, and makes no network
+    call regardless of which check does the rejecting.
+    """
     workspace_id, user_id = write_actions_test_context
     other_workspace_id = uuid4()
     other_user_id = uuid4()
@@ -990,6 +1078,14 @@ def test_jira_add_comment_rejects_work_item_not_synced_by_this_connector(
 def test_jira_add_comment_rejects_connector_account_in_different_workspace(
     write_actions_test_context: tuple[UUID, UUID],
 ) -> None:
+    """`work_item_id=uuid4()` here is a never-synced placeholder, not a
+    real work-item row -- see `test_github_add_issue_comment_rejects_
+    connector_account_in_different_workspace`'s own docstring for why a
+    real work-item row cannot be constructed for this scenario at all
+    (identical compound-FK reasoning applies to `engineering_work_items`);
+    `test_load_credential_rejects_connector_account_in_different_
+    workspace` isolates the workspace check directly.
+    """
     workspace_id, user_id = write_actions_test_context
     other_workspace_id = uuid4()
     other_user_id = uuid4()
