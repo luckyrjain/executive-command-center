@@ -1,4 +1,4 @@
-"""Phase 6 Engineering Workspace Task 2: GitHub read sync
+"""Phase 6 Engineering Workspace Task 2/5: GitHub read sync
 (`docs/superpowers/plans/2026-07-27-phase-6-engineering-workspace.md`,
 `backend/ecc/domains/engineering/github_adapter.py`).
 
@@ -32,6 +32,19 @@ only, no work-items/changes/reviews/deployments yet"):
    three-phase `sync_connector_endpoint` (Task 1's disclosed pool-
    exhaustion fix) still produces the same externally-observable result
    as the single-transaction version it replaced.
+
+**Task 5 adds** (`github_adapter.py`'s own "Changes"/"Reviews" module-
+docstring sections have the full design): `_sync_changes`'s per-
+repository fan-out over already-synced `repositories` rows (single repo,
+multiple repos sharing one call's page budget, the JSON per-repository
+cursor persisting real progress, the `_MAX_PAGES_PER_CALL` bound), a
+merged-PR filter (a closed-but-not-merged PR is never upserted),
+`_sync_reviews`'s reviews-plus-timeline two-call-per-change shape
+(`requested_at` from the earliest `review_requested` timeline event,
+applied to every review synced for that change; a change whose timeline
+call fails is not advanced past, so its `requested_at` is retried rather
+than stuck `NULL`), and end-to-end coverage through the real `/sync`
+endpoint for both new resource types.
 """
 
 from __future__ import annotations
@@ -86,6 +99,36 @@ def _json_response(
         headers={"content-type": "application/json", **(headers or {})},
         content=dumps(body),
     )
+
+
+def _pr(
+    pr_id: int, *, number: int, title: str, merged_at: str | None, updated_at: str
+) -> dict[str, Any]:
+    return {
+        "id": pr_id,
+        "number": number,
+        "title": title,
+        "html_url": f"https://github.com/acme/repo/pull/{number}",
+        "state": "closed",
+        "user": {"id": 900 + pr_id},
+        "created_at": "2024-01-01T00:00:00Z",
+        "merged_at": merged_at,
+        "updated_at": updated_at,
+    }
+
+
+def _review(review_id: int, *, state: str, submitted_at: str | None) -> dict[str, Any]:
+    return {
+        "id": review_id,
+        "user": {"id": 700 + review_id},
+        "state": state,
+        "submitted_at": submitted_at,
+        "html_url": f"https://github.com/acme/repo/pull/1#review-{review_id}",
+    }
+
+
+def _timeline_event(event: str, *, created_at: str) -> dict[str, Any]:
+    return {"event": event, "created_at": created_at}
 
 
 # --- unit-level: GitHubAdapter.authorize -----------------------------------
@@ -264,7 +307,12 @@ def seeded_account_context() -> Iterator[ConnectorAccountContext]:
         )
     finally:
         with engine.begin() as connection:
-            for table in ("repositories", "connector_accounts", "users"):
+            # `reviews`/`changes` are FK'd `ON DELETE CASCADE` from
+            # `repositories`/`connector_accounts`, so deleting those two
+            # would clean them up regardless -- listed explicitly anyway,
+            # matching this fixture's existing style of naming every
+            # table rather than relying on cascade alone.
+            for table in ("reviews", "changes", "repositories", "connector_accounts", "users"):
                 connection.execute(
                     text(f"DELETE FROM {table} WHERE workspace_id = :workspace_id"),  # noqa: S608
                     {"workspace_id": workspace_id},
@@ -273,6 +321,43 @@ def seeded_account_context() -> Iterator[ConnectorAccountContext]:
                 text("DELETE FROM workspaces WHERE id = :workspace_id"),
                 {"workspace_id": workspace_id},
             )
+
+
+def _seed_repository(
+    *, workspace_id: UUID, connector_account_id: UUID, external_id: str, name: str
+) -> UUID:
+    """Directly inserts a `repositories` row -- `_sync_changes` fans out
+    over whatever this same connector account has already synced, so
+    change/review tests need at least one such row to exist before
+    exercising it, without needing a full repository-sync call first.
+    """
+    repository_id = uuid4()
+    now = datetime.now(UTC)
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                """
+                INSERT INTO repositories (
+                    id, workspace_id, connector_account_id, provider, external_id,
+                    name, source_url, default_branch, permission_state, freshness_state,
+                    observed_at, created_at, updated_at
+                ) VALUES (
+                    :id, :workspace_id, :connector_account_id, 'github', :external_id,
+                    :name, :source_url, 'main', 'active', 'fresh', :now, :now, :now
+                )
+                """
+            ),
+            {
+                "id": repository_id,
+                "workspace_id": workspace_id,
+                "connector_account_id": connector_account_id,
+                "external_id": external_id,
+                "name": name,
+                "source_url": f"https://github.com/{name}",
+                "now": now,
+            },
+        )
+    return repository_id
 
 
 def test_backfill_single_page(seeded_account_context: ConnectorAccountContext) -> None:
@@ -484,6 +569,456 @@ def test_link_header_next_url_containing_comma_still_paginates(
     assert outcome.next_cursor == "2024-01-05T00:00:00Z"
 
 
+# --- unit-level: change sync (Task 5) ---------------------------------------
+
+
+def test_changes_backfill_fans_out_over_two_repos(
+    seeded_account_context: ConnectorAccountContext,
+) -> None:
+    repo1 = _seed_repository(
+        workspace_id=seeded_account_context.workspace_id,
+        connector_account_id=seeded_account_context.connector_account_id,
+        external_id="101",
+        name="acme/repo1",
+    )
+    repo2 = _seed_repository(
+        workspace_id=seeded_account_context.workspace_id,
+        connector_account_id=seeded_account_context.connector_account_id,
+        external_id="102",
+        name="acme/repo2",
+    )
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.url.path)
+        if request.url.path == "/repos/acme/repo1/pulls":
+            return _json_response(
+                [
+                    _pr(
+                        1,
+                        number=1,
+                        title="Fix 1",
+                        merged_at="2024-01-02T00:00:00Z",
+                        updated_at="2024-01-02T00:00:00Z",
+                    )
+                ]
+            )
+        if request.url.path == "/repos/acme/repo2/pulls":
+            return _json_response(
+                [
+                    _pr(
+                        2,
+                        number=5,
+                        title="Fix 2",
+                        merged_at="2024-01-03T00:00:00Z",
+                        updated_at="2024-01-03T00:00:00Z",
+                    )
+                ]
+            )
+        raise AssertionError(f"unexpected path {request.url.path}")
+
+    adapter = GitHubAdapter(transport=httpx.MockTransport(handler))
+    outcome = adapter.backfill(seeded_account_context, "change")
+    assert outcome.status == "succeeded"
+    assert outcome.items_processed == 2
+    assert set(calls) == {"/repos/acme/repo1/pulls", "/repos/acme/repo2/pulls"}
+
+    with engine.begin() as connection:
+        rows = connection.execute(
+            text(
+                "SELECT external_id, repository_id FROM changes "
+                "WHERE workspace_id = :workspace_id ORDER BY external_id"
+            ),
+            {"workspace_id": seeded_account_context.workspace_id},
+        ).all()
+    assert [(row.external_id, row.repository_id) for row in rows] == [
+        ("1", repo1),
+        ("2", repo2),
+    ]
+
+
+def test_changes_backfill_ignores_closed_but_not_merged_prs(
+    seeded_account_context: ConnectorAccountContext,
+) -> None:
+    _seed_repository(
+        workspace_id=seeded_account_context.workspace_id,
+        connector_account_id=seeded_account_context.connector_account_id,
+        external_id="101",
+        name="acme/repo1",
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return _json_response(
+            [
+                _pr(
+                    1,
+                    number=1,
+                    title="Closed, not merged",
+                    merged_at=None,
+                    updated_at="2024-01-02T00:00:00Z",
+                )
+            ]
+        )
+
+    adapter = GitHubAdapter(transport=httpx.MockTransport(handler))
+    outcome = adapter.backfill(seeded_account_context, "change")
+    assert outcome.status == "succeeded"
+    assert outcome.items_processed == 0
+
+    with engine.begin() as connection:
+        count = connection.execute(
+            text("SELECT count(*) FROM changes WHERE workspace_id = :workspace_id"),
+            {"workspace_id": seeded_account_context.workspace_id},
+        ).scalar_one()
+    assert count == 0
+
+
+def test_changes_incremental_sync_resumes_per_repository_cursor(
+    seeded_account_context: ConnectorAccountContext,
+) -> None:
+    """Proves the JSON per-repository cursor shape: repo1's own cursor is
+    already caught up (its page-1 response is entirely at-or-before its
+    own stored cursor), while repo2 has a genuinely newer PR -- only
+    repo2's PR should be (re-)upserted, and the returned cursor must
+    still carry repo1's own unchanged value forward, not drop it.
+    """
+    from json import dumps as json_dumps
+
+    repo1 = _seed_repository(
+        workspace_id=seeded_account_context.workspace_id,
+        connector_account_id=seeded_account_context.connector_account_id,
+        external_id="101",
+        name="acme/repo1",
+    )
+    repo2 = _seed_repository(
+        workspace_id=seeded_account_context.workspace_id,
+        connector_account_id=seeded_account_context.connector_account_id,
+        external_id="102",
+        name="acme/repo2",
+    )
+    since_cursor = json_dumps(
+        {"repos": {"101": "2024-01-05T00:00:00Z", "102": "2024-01-01T00:00:00Z"}}
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/repos/acme/repo1/pulls":
+            return _json_response(
+                [
+                    _pr(
+                        1,
+                        number=1,
+                        title="Old",
+                        merged_at="2024-01-04T00:00:00Z",
+                        updated_at="2024-01-04T00:00:00Z",
+                    )
+                ]
+            )
+        if request.url.path == "/repos/acme/repo2/pulls":
+            return _json_response(
+                [
+                    _pr(
+                        2,
+                        number=5,
+                        title="New",
+                        merged_at="2024-01-06T00:00:00Z",
+                        updated_at="2024-01-06T00:00:00Z",
+                    )
+                ]
+            )
+        raise AssertionError(f"unexpected path {request.url.path}")
+
+    adapter = GitHubAdapter(transport=httpx.MockTransport(handler))
+    outcome = adapter.incremental_sync(seeded_account_context, "change", since_cursor)
+    assert outcome.status == "succeeded"
+    assert outcome.items_processed == 1
+    assert outcome.next_cursor is not None
+    from json import loads as json_loads
+
+    cursor = json_loads(outcome.next_cursor)
+    assert cursor["repos"]["101"] == "2024-01-05T00:00:00Z"
+    assert cursor["repos"]["102"] == "2024-01-06T00:00:00Z"
+
+    with engine.begin() as connection:
+        external_ids = {
+            row[0]
+            for row in connection.execute(
+                text("SELECT external_id FROM changes WHERE workspace_id = :workspace_id"),
+                {"workspace_id": seeded_account_context.workspace_id},
+            )
+        }
+    assert external_ids == {"2"}
+    assert repo1 and repo2  # both repos exist; only repo2's PR was new
+
+
+def test_changes_page_cap_reports_partial_with_progress_preserved(
+    seeded_account_context: ConnectorAccountContext,
+) -> None:
+    from ecc.domains.engineering import github_adapter as github_adapter_module
+
+    _seed_repository(
+        workspace_id=seeded_account_context.workspace_id,
+        connector_account_id=seeded_account_context.connector_account_id,
+        external_id="101",
+        name="acme/repo1",
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        page = int(request.url.params["page"])
+        return _json_response(
+            [
+                _pr(
+                    page,
+                    number=page,
+                    title=f"PR {page}",
+                    merged_at=f"2024-01-{page:02d}T00:00:00Z",
+                    updated_at=f"2024-01-{page:02d}T00:00:00Z",
+                )
+            ],
+            headers={
+                "Link": '<https://api.github.com/repos/acme/repo1/pulls?page=999>; rel="next"'
+            },
+        )
+
+    adapter = GitHubAdapter(transport=httpx.MockTransport(handler))
+    outcome = adapter.backfill(seeded_account_context, "change")
+    assert outcome.status == "partial"
+    assert outcome.items_processed == github_adapter_module._MAX_PAGES_PER_CALL
+    assert outcome.next_cursor is not None
+    assert outcome.error_summary is not None
+
+
+def test_changes_rate_limit_gives_up_reports_partial(
+    seeded_account_context: ConnectorAccountContext,
+) -> None:
+    _seed_repository(
+        workspace_id=seeded_account_context.workspace_id,
+        connector_account_id=seeded_account_context.connector_account_id,
+        external_id="101",
+        name="acme/repo1",
+    )
+    adapter = GitHubAdapter(
+        transport=httpx.MockTransport(
+            lambda r: _json_response(
+                {"message": "rate limited"},
+                status_code=403,
+                headers={"X-RateLimit-Remaining": "0", "Retry-After": "3600"},
+            )
+        ),
+        sleep=lambda seconds: None,
+    )
+    outcome = adapter.backfill(seeded_account_context, "change")
+    assert outcome.status == "partial"
+    assert outcome.items_processed == 0
+
+
+def test_non_change_resource_type_still_a_zero_item_no_op_for_unregistered_types() -> None:
+    adapter = GitHubAdapter(transport=httpx.MockTransport(lambda r: _json_response([])))
+    outcome = adapter.backfill(_account_context(), "deployment")
+    assert outcome.items_processed == 0
+    assert outcome.status == "succeeded"
+
+
+# --- unit-level: review sync (Task 5) ---------------------------------------
+
+
+def _seed_change(
+    *,
+    workspace_id: UUID,
+    connector_account_id: UUID,
+    repository_id: UUID,
+    external_id: str,
+    provider_number: str,
+    merged_at: datetime,
+) -> UUID:
+    change_id = uuid4()
+    now = datetime.now(UTC)
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                """
+                INSERT INTO changes (
+                    id, workspace_id, connector_account_id, repository_id, provider,
+                    external_id, provider_number, title, source_url, status, merged_at,
+                    permission_state, freshness_state, observed_at, created_at, updated_at
+                ) VALUES (
+                    :id, :workspace_id, :connector_account_id, :repository_id, 'github',
+                    :external_id, :provider_number, 'A change', 'https://x', 'closed', :merged_at,
+                    'active', 'fresh', :now, :now, :now
+                )
+                """
+            ),
+            {
+                "id": change_id,
+                "workspace_id": workspace_id,
+                "connector_account_id": connector_account_id,
+                "repository_id": repository_id,
+                "external_id": external_id,
+                "provider_number": provider_number,
+                "merged_at": merged_at,
+                "now": now,
+            },
+        )
+    return change_id
+
+
+def test_reviews_backfill_captures_requested_at_from_timeline(
+    seeded_account_context: ConnectorAccountContext,
+) -> None:
+    repo = _seed_repository(
+        workspace_id=seeded_account_context.workspace_id,
+        connector_account_id=seeded_account_context.connector_account_id,
+        external_id="101",
+        name="acme/repo1",
+    )
+    _seed_change(
+        workspace_id=seeded_account_context.workspace_id,
+        connector_account_id=seeded_account_context.connector_account_id,
+        repository_id=repo,
+        external_id="9001",
+        provider_number="42",
+        merged_at=datetime(2024, 1, 2, tzinfo=UTC),
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/repos/acme/repo1/pulls/42/reviews":
+            return _json_response(
+                [_review(1, state="APPROVED", submitted_at="2024-01-01T12:00:00Z")]
+            )
+        if request.url.path == "/repos/acme/repo1/issues/42/timeline":
+            return _json_response(
+                [
+                    _timeline_event("review_requested", created_at="2024-01-01T11:00:00Z"),
+                    _timeline_event("review_requested", created_at="2024-01-01T10:00:00Z"),
+                    _timeline_event("commented", created_at="2024-01-01T10:30:00Z"),
+                ]
+            )
+        raise AssertionError(f"unexpected path {request.url.path}")
+
+    adapter = GitHubAdapter(transport=httpx.MockTransport(handler))
+    outcome = adapter.backfill(seeded_account_context, "review")
+    assert outcome.status == "succeeded"
+    assert outcome.items_processed == 1
+
+    with engine.begin() as connection:
+        row = connection.execute(
+            text(
+                "SELECT review_state, requested_at, submitted_at FROM reviews "
+                "WHERE workspace_id = :workspace_id"
+            ),
+            {"workspace_id": seeded_account_context.workspace_id},
+        ).one()
+    assert row.review_state == "approved"
+    assert row.requested_at == datetime(2024, 1, 1, 10, 0, tzinfo=UTC)
+    assert row.submitted_at == datetime(2024, 1, 1, 12, 0, tzinfo=UTC)
+
+
+def test_reviews_skips_pending_reviews_with_no_submitted_at(
+    seeded_account_context: ConnectorAccountContext,
+) -> None:
+    repo = _seed_repository(
+        workspace_id=seeded_account_context.workspace_id,
+        connector_account_id=seeded_account_context.connector_account_id,
+        external_id="101",
+        name="acme/repo1",
+    )
+    _seed_change(
+        workspace_id=seeded_account_context.workspace_id,
+        connector_account_id=seeded_account_context.connector_account_id,
+        repository_id=repo,
+        external_id="9001",
+        provider_number="42",
+        merged_at=datetime(2024, 1, 2, tzinfo=UTC),
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/repos/acme/repo1/pulls/42/reviews":
+            return _json_response([_review(1, state="PENDING", submitted_at=None)])
+        if request.url.path == "/repos/acme/repo1/issues/42/timeline":
+            return _json_response([])
+        raise AssertionError(f"unexpected path {request.url.path}")
+
+    adapter = GitHubAdapter(transport=httpx.MockTransport(handler))
+    outcome = adapter.backfill(seeded_account_context, "review")
+    assert outcome.status == "succeeded"
+    assert outcome.items_processed == 0
+
+
+def test_reviews_incremental_sync_stops_at_prior_merged_at_cursor(
+    seeded_account_context: ConnectorAccountContext,
+) -> None:
+    repo = _seed_repository(
+        workspace_id=seeded_account_context.workspace_id,
+        connector_account_id=seeded_account_context.connector_account_id,
+        external_id="101",
+        name="acme/repo1",
+    )
+    _seed_change(
+        workspace_id=seeded_account_context.workspace_id,
+        connector_account_id=seeded_account_context.connector_account_id,
+        repository_id=repo,
+        external_id="9001",
+        provider_number="42",
+        merged_at=datetime(2024, 1, 1, tzinfo=UTC),
+    )
+
+    adapter = GitHubAdapter(transport=httpx.MockTransport(lambda r: _json_response([])))
+    outcome = adapter.incremental_sync(
+        seeded_account_context, "review", datetime(2024, 1, 2, tzinfo=UTC).isoformat()
+    )
+    assert outcome.status == "succeeded"
+    assert outcome.items_processed == 0
+
+
+def test_reviews_rate_limit_on_timeline_call_gives_up_without_advancing_cursor(
+    seeded_account_context: ConnectorAccountContext,
+) -> None:
+    """The reviews call itself succeeds, but the follow-up timeline call
+    is rate-limited beyond the bound -- the change must not be advanced
+    past (its `requested_at` would otherwise be stuck unset forever,
+    since the cursor-driven query never looks backward).
+    """
+    repo = _seed_repository(
+        workspace_id=seeded_account_context.workspace_id,
+        connector_account_id=seeded_account_context.connector_account_id,
+        external_id="101",
+        name="acme/repo1",
+    )
+    _seed_change(
+        workspace_id=seeded_account_context.workspace_id,
+        connector_account_id=seeded_account_context.connector_account_id,
+        repository_id=repo,
+        external_id="9001",
+        provider_number="42",
+        merged_at=datetime(2024, 1, 2, tzinfo=UTC),
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/repos/acme/repo1/pulls/42/reviews":
+            return _json_response(
+                [_review(1, state="APPROVED", submitted_at="2024-01-01T12:00:00Z")]
+            )
+        if request.url.path == "/repos/acme/repo1/issues/42/timeline":
+            return _json_response(
+                {"message": "rate limited"},
+                status_code=403,
+                headers={"X-RateLimit-Remaining": "0", "Retry-After": "3600"},
+            )
+        raise AssertionError(f"unexpected path {request.url.path}")
+
+    adapter = GitHubAdapter(transport=httpx.MockTransport(handler), sleep=lambda seconds: None)
+    outcome = adapter.backfill(seeded_account_context, "review")
+    assert outcome.status == "partial"
+    assert outcome.items_processed == 0
+    assert outcome.next_cursor is None
+
+    with engine.begin() as connection:
+        count = connection.execute(
+            text("SELECT count(*) FROM reviews WHERE workspace_id = :workspace_id"),
+            {"workspace_id": seeded_account_context.workspace_id},
+        ).scalar_one()
+    assert count == 0
+
+
 def test_refresh_permissions() -> None:
     def unauthorized(request: httpx.Request) -> httpx.Response:
         return _json_response({"message": "Bad credentials"}, status_code=401)
@@ -575,6 +1110,8 @@ def engineering_test_context() -> Iterator[tuple[TestClient, UUID, UUID, str]]:
 def _cleanup_workspace(workspace_id: UUID) -> None:
     with engine.begin() as connection:
         for table in (
+            "reviews",
+            "changes",
             "repositories",
             "sync_runs",
             "sync_cursors",
@@ -738,3 +1275,61 @@ def test_sync_reports_partial_on_rate_limit_and_records_it(
     # connector account is not moved to 'error' the way an adapter
     # exception would; only sync_runs.status/error_summary reflect it.
     assert account_status == "active"
+
+
+def test_sync_change_resource_type_through_real_endpoint(
+    engineering_test_context: tuple[TestClient, UUID, UUID, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """End-to-end proof that `resource_type: "change"` reaches
+    `_sync_changes` through the real `/sync` endpoint (not just the
+    adapter called directly), fanning out over a repository already
+    synced via a prior repository backfill.
+    """
+    client, workspace_id, user_id, token = engineering_test_context
+    account_id = _insert_github_connector_account(workspace_id, user_id)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/user/repos":
+            return _json_response(
+                [_repo(1, full_name="acme/repo1", updated_at="2024-01-01T00:00:00Z")]
+            )
+        if request.url.path == "/repos/acme/repo1/pulls":
+            return _json_response(
+                [
+                    _pr(
+                        9,
+                        number=9,
+                        title="Fix",
+                        merged_at="2024-01-02T00:00:00Z",
+                        updated_at="2024-01-02T00:00:00Z",
+                    )
+                ]
+            )
+        raise AssertionError(f"unexpected path {request.url.path}")
+
+    registry = ConnectorRegistry()
+    registry.register(GitHubAdapter(transport=httpx.MockTransport(handler)))
+    monkeypatch.setattr(connector_accounts_module, "connector_registry", registry)
+
+    repo_response = client.post(
+        f"/api/v1/engineering/connectors/{account_id}/sync",
+        json={"run_type": "backfill", "resource_type": "repository"},
+        headers=_headers(token, key=str(uuid4())),
+    )
+    assert repo_response.status_code == 201, repo_response.text
+
+    change_response = client.post(
+        f"/api/v1/engineering/connectors/{account_id}/sync",
+        json={"run_type": "backfill", "resource_type": "change"},
+        headers=_headers(token, key=str(uuid4())),
+    )
+    assert change_response.status_code == 201, change_response.text
+    assert change_response.json()["items_processed"] == 1
+
+    with engine.begin() as connection:
+        title = connection.execute(
+            text("SELECT title FROM changes WHERE workspace_id = :workspace_id"),
+            {"workspace_id": workspace_id},
+        ).scalar_one()
+    assert title == "Fix"

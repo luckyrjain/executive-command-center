@@ -1,0 +1,685 @@
+"""Phase 6 Engineering Workspace Task 5: delivery and reliability metrics
+(`docs/superpowers/plans/2026-07-27-phase-6-engineering-workspace.md`,
+`backend/ecc/domains/engineering/metrics.py`).
+
+Covers, per this task's own scope (see `metrics.py`'s own module
+docstring for the full "only three of seven metrics are real" design):
+
+1. `_coverage_for`: insufficient (no connected account), insufficient
+   (no source resource type at all -- empty `providers`), partial (one
+   of two accounts freshly synced), complete (all fresh).
+2. `work_ageing`/`blocked_work`: correct population (open items only,
+   closed items excluded), correct bucketing/median age, blocked-status
+   heuristic, missing-`provider_created_at` items excluded from the
+   age calculation but still counted in `population`.
+3. `review_latency`: correct median (requested_at to first submitted_at
+   per change), a change with no `requested_at` excluded, a merge
+   outside the 30-day window excluded.
+4. `delivery_frequency`/`lead_time_for_changes`/`change_failure_rate`/
+   `time_to_restore`: always `insufficient_coverage`, `value=None`
+   -- no deployment/incident sync exists yet.
+5. `compute_and_store_metrics`: writes seven immutable rows every call
+   (insert-only -- calling it twice produces fourteen rows, never
+   updates the first seven).
+6. End-to-end through the real `GET /engineering/metrics` endpoint.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Iterator
+from datetime import UTC, datetime, timedelta
+from hashlib import sha256
+from uuid import UUID, uuid4
+
+import pytest
+from fastapi.testclient import TestClient
+from sqlalchemy import text
+
+from ecc.config import get_settings
+from ecc.database import SessionFactory, engine
+from ecc.domains.engineering.metrics import compute_and_store_metrics, compute_metrics
+from ecc.main import app
+
+settings = get_settings()
+pytestmark = pytest.mark.skipif(
+    not settings.database_url.startswith("postgresql"),
+    reason="PostgreSQL integration test",
+)
+
+
+@pytest.fixture
+def workspace() -> Iterator[UUID]:
+    workspace_id = uuid4()
+    user_id = uuid4()
+    now = datetime.now(UTC)
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO workspaces (id, name, timezone, created_at) "
+                "VALUES (:id, 'Metrics Unit Test', 'UTC', :now)"
+            ),
+            {"id": workspace_id, "now": now},
+        )
+        connection.execute(
+            text(
+                "INSERT INTO users (id, workspace_id, email, password_hash, created_at) "
+                "VALUES (:id, :workspace_id, :email, 'test-password-hash', :now)"
+            ),
+            {
+                "id": user_id,
+                "workspace_id": workspace_id,
+                "email": f"{user_id}@example.test",
+                "now": now,
+            },
+        )
+    try:
+        yield workspace_id
+    finally:
+        with engine.begin() as connection:
+            for table in (
+                "delivery_metric_snapshots",
+                "reviews",
+                "changes",
+                "engineering_work_items",
+                "repositories",
+                "sync_cursors",
+                "connector_accounts",
+                "users",
+            ):
+                connection.execute(
+                    text(f"DELETE FROM {table} WHERE workspace_id = :workspace_id"),  # noqa: S608
+                    {"workspace_id": workspace_id},
+                )
+            connection.execute(
+                text("DELETE FROM workspaces WHERE id = :workspace_id"),
+                {"workspace_id": workspace_id},
+            )
+
+
+def _insert_connector_account(workspace_id: UUID, *, provider: str, status: str = "active") -> UUID:
+    account_id = uuid4()
+    now = datetime.now(UTC)
+    with engine.begin() as connection:
+        user_id = connection.execute(
+            text("SELECT id FROM users WHERE workspace_id = :ws"), {"ws": workspace_id}
+        ).scalar_one()
+        connection.execute(
+            text(
+                """
+                INSERT INTO connector_accounts (
+                    id, workspace_id, provider, external_account_id, display_name,
+                    granted_scopes, encrypted_credentials, status, version,
+                    created_by, updated_by, created_at, updated_at
+                ) VALUES (
+                    :id, :workspace_id, :provider, :ext, 'Fixture account',
+                    ARRAY[]::text[], :cred, :status, 1, :actor, :actor, :now, :now
+                )
+                """
+            ),
+            {
+                "id": account_id,
+                "workspace_id": workspace_id,
+                "provider": provider,
+                "ext": f"{provider}-acct-{account_id}",
+                "cred": b"fake",
+                "status": status,
+                "actor": user_id,
+                "now": now,
+            },
+        )
+    return account_id
+
+
+def _insert_cursor(
+    workspace_id: UUID, account_id: UUID, *, resource_type: str, updated_at: datetime
+) -> None:
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO sync_cursors (id, workspace_id, connector_account_id, "
+                "resource_type, cursor_value, updated_at) "
+                "VALUES (:id, :ws, :acct, :rt, 'x', :updated_at)"
+            ),
+            {
+                "id": uuid4(),
+                "ws": workspace_id,
+                "acct": account_id,
+                "rt": resource_type,
+                "updated_at": updated_at,
+            },
+        )
+
+
+def _insert_work_item(
+    workspace_id: UUID,
+    account_id: UUID,
+    *,
+    external_id: str,
+    status: str,
+    provider_created_at: datetime | None,
+) -> None:
+    now = datetime.now(UTC)
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                """
+                INSERT INTO engineering_work_items (
+                    id, workspace_id, connector_account_id, provider, external_id,
+                    title, source_url, item_type, status, permission_state, freshness_state,
+                    provider_created_at, observed_at, created_at, updated_at
+                ) VALUES (
+                    :id, :ws, :acct, 'jira', :ext, :title, 'https://x', 'Bug', :status,
+                    'active', 'fresh', :created, :now, :now, :now
+                )
+                """
+            ),
+            {
+                "id": uuid4(),
+                "ws": workspace_id,
+                "acct": account_id,
+                "ext": external_id,
+                "title": external_id,
+                "status": status,
+                "created": provider_created_at,
+                "now": now,
+            },
+        )
+
+
+def _insert_repo(workspace_id: UUID, account_id: UUID, *, external_id: str) -> UUID:
+    repository_id = uuid4()
+    now = datetime.now(UTC)
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                """
+                INSERT INTO repositories (
+                    id, workspace_id, connector_account_id, provider, external_id,
+                    name, source_url, default_branch, permission_state, freshness_state,
+                    observed_at, created_at, updated_at
+                ) VALUES (
+                    :id, :ws, :acct, 'github', :ext, :name, 'https://x', 'main',
+                    'active', 'fresh', :now, :now, :now
+                )
+                """
+            ),
+            {
+                "id": repository_id,
+                "ws": workspace_id,
+                "acct": account_id,
+                "ext": external_id,
+                "name": f"acme/{external_id}",
+                "now": now,
+            },
+        )
+    return repository_id
+
+
+def _insert_change(
+    workspace_id: UUID,
+    account_id: UUID,
+    repository_id: UUID,
+    *,
+    external_id: str,
+    merged_at: datetime,
+) -> UUID:
+    change_id = uuid4()
+    now = datetime.now(UTC)
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                """
+                INSERT INTO changes (
+                    id, workspace_id, connector_account_id, repository_id, provider,
+                    external_id, provider_number, title, source_url, status, merged_at,
+                    permission_state, freshness_state, observed_at, created_at, updated_at
+                ) VALUES (
+                    :id, :ws, :acct, :repo, 'github', :ext, :num, 'A change', 'https://x',
+                    'closed', :merged_at, 'active', 'fresh', :now, :now, :now
+                )
+                """
+            ),
+            {
+                "id": change_id,
+                "ws": workspace_id,
+                "acct": account_id,
+                "repo": repository_id,
+                "ext": external_id,
+                "num": external_id,
+                "merged_at": merged_at,
+                "now": now,
+            },
+        )
+    return change_id
+
+
+def _insert_review(
+    workspace_id: UUID,
+    account_id: UUID,
+    change_id: UUID,
+    *,
+    external_id: str,
+    requested_at: datetime | None,
+    submitted_at: datetime,
+) -> None:
+    now = datetime.now(UTC)
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                """
+                INSERT INTO reviews (
+                    id, workspace_id, connector_account_id, change_id, provider,
+                    external_id, source_url, reviewer_external_id, review_state,
+                    requested_at, submitted_at, permission_state, freshness_state,
+                    observed_at, created_at, updated_at
+                ) VALUES (
+                    :id, :ws, :acct, :change, 'github', :ext, 'https://x', '1', 'approved',
+                    :requested_at, :submitted_at, 'active', 'fresh', :now, :now, :now
+                )
+                """
+            ),
+            {
+                "id": uuid4(),
+                "ws": workspace_id,
+                "acct": account_id,
+                "change": change_id,
+                "ext": external_id,
+                "requested_at": requested_at,
+                "submitted_at": submitted_at,
+                "now": now,
+            },
+        )
+
+
+# --- coverage --------------------------------------------------------------
+
+
+def test_coverage_insufficient_when_no_connected_account(workspace: UUID) -> None:
+    with SessionFactory() as session:
+        snapshots = compute_metrics(session, workspace_id=workspace)
+    work_ageing = next(s for s in snapshots if s.metric_key == "work_ageing")
+    assert work_ageing.coverage_status == "insufficient_coverage"
+    assert work_ageing.coverage_percentage == 0.0
+    assert work_ageing.coverage_gap_description is not None
+
+
+def test_coverage_complete_when_cursor_fresh(workspace: UUID) -> None:
+    account_id = _insert_connector_account(workspace, provider="jira")
+    _insert_cursor(workspace, account_id, resource_type="work_item", updated_at=datetime.now(UTC))
+    with SessionFactory() as session:
+        snapshots = compute_metrics(session, workspace_id=workspace)
+    work_ageing = next(s for s in snapshots if s.metric_key == "work_ageing")
+    assert work_ageing.coverage_status == "complete"
+    assert work_ageing.coverage_percentage == 100.0
+    assert work_ageing.coverage_gap_description is None
+
+
+def test_coverage_partial_when_one_of_two_accounts_stale(workspace: UUID) -> None:
+    fresh_account = _insert_connector_account(workspace, provider="jira")
+    stale_account = _insert_connector_account(workspace, provider="jira")
+    _insert_cursor(
+        workspace, fresh_account, resource_type="work_item", updated_at=datetime.now(UTC)
+    )
+    _insert_cursor(
+        workspace,
+        stale_account,
+        resource_type="work_item",
+        updated_at=datetime.now(UTC) - timedelta(hours=1),
+    )
+    with SessionFactory() as session:
+        snapshots = compute_metrics(session, workspace_id=workspace)
+    work_ageing = next(s for s in snapshots if s.metric_key == "work_ageing")
+    assert work_ageing.coverage_status == "partial"
+    assert work_ageing.coverage_percentage == 50.0
+    assert work_ageing.coverage_gap_description is not None
+
+
+def test_coverage_ignores_inactive_accounts(workspace: UUID) -> None:
+    _insert_connector_account(workspace, provider="jira", status="disconnected")
+    with SessionFactory() as session:
+        snapshots = compute_metrics(session, workspace_id=workspace)
+    work_ageing = next(s for s in snapshots if s.metric_key == "work_ageing")
+    assert work_ageing.coverage_status == "insufficient_coverage"
+
+
+# --- work_ageing / blocked_work --------------------------------------------
+
+
+def test_work_ageing_and_blocked_work_computation(workspace: UUID) -> None:
+    account_id = _insert_connector_account(workspace, provider="jira")
+    _insert_cursor(workspace, account_id, resource_type="work_item", updated_at=datetime.now(UTC))
+    now = datetime.now(UTC)
+    _insert_work_item(
+        workspace,
+        account_id,
+        external_id="open-3d",
+        status="In Progress",
+        provider_created_at=now - timedelta(days=3),
+    )
+    _insert_work_item(
+        workspace,
+        account_id,
+        external_id="blocked-40d",
+        status="Blocked",
+        provider_created_at=now - timedelta(days=40),
+    )
+    _insert_work_item(
+        workspace,
+        account_id,
+        external_id="done-100d",
+        status="Done",
+        provider_created_at=now - timedelta(days=100),
+    )
+
+    with SessionFactory() as session:
+        snapshots = compute_metrics(session, workspace_id=workspace)
+
+    work_ageing = next(s for s in snapshots if s.metric_key == "work_ageing")
+    assert work_ageing.population == 2  # "done" excluded
+    assert work_ageing.value is not None
+    assert 21 <= work_ageing.value <= 22  # median of ~3 and ~40 days
+    assert work_ageing.details is not None
+    assert work_ageing.details["buckets"]["0-7d"] == 1
+    assert work_ageing.details["buckets"]["31-90d"] == 1
+
+    blocked_work = next(s for s in snapshots if s.metric_key == "blocked_work")
+    assert blocked_work.population == 2
+    assert blocked_work.value == 1.0
+    assert blocked_work.details is not None
+    assert 39 <= blocked_work.details["median_age_days"] <= 41
+
+
+def test_work_ageing_counts_items_missing_created_at_separately(workspace: UUID) -> None:
+    account_id = _insert_connector_account(workspace, provider="jira")
+    _insert_work_item(
+        workspace,
+        account_id,
+        external_id="no-created-at",
+        status="Open",
+        provider_created_at=None,
+    )
+    with SessionFactory() as session:
+        snapshots = compute_metrics(session, workspace_id=workspace)
+    work_ageing = next(s for s in snapshots if s.metric_key == "work_ageing")
+    assert work_ageing.population == 1
+    assert work_ageing.value is None
+    assert work_ageing.details is not None
+    assert work_ageing.details["items_missing_created_at"] == 1
+
+
+# --- review_latency ----------------------------------------------------------
+
+
+def test_review_latency_median_of_first_review_per_change(workspace: UUID) -> None:
+    account_id = _insert_connector_account(workspace, provider="github")
+    _insert_cursor(workspace, account_id, resource_type="review", updated_at=datetime.now(UTC))
+    repo_id = _insert_repo(workspace, account_id, external_id="101")
+    now = datetime.now(UTC)
+
+    change1 = _insert_change(
+        workspace, account_id, repo_id, external_id="1", merged_at=now - timedelta(days=1)
+    )
+    _insert_review(
+        workspace,
+        account_id,
+        change1,
+        external_id="r1",
+        requested_at=now - timedelta(hours=5),
+        submitted_at=now - timedelta(hours=3),
+    )
+    # A second, later review on the same change must not count -- only
+    # the first (earliest submitted_at) is "first-review-at".
+    _insert_review(
+        workspace,
+        account_id,
+        change1,
+        external_id="r2",
+        requested_at=now - timedelta(hours=5),
+        submitted_at=now - timedelta(hours=1),
+    )
+
+    change2 = _insert_change(
+        workspace, account_id, repo_id, external_id="2", merged_at=now - timedelta(days=2)
+    )
+    _insert_review(
+        workspace,
+        account_id,
+        change2,
+        external_id="r3",
+        requested_at=now - timedelta(hours=10),
+        submitted_at=now - timedelta(hours=8),
+    )
+
+    with SessionFactory() as session:
+        snapshots = compute_metrics(session, workspace_id=workspace)
+    review_latency = next(s for s in snapshots if s.metric_key == "review_latency")
+    assert review_latency.population == 2
+    assert review_latency.value == timedelta(hours=2).total_seconds()
+
+
+def test_review_latency_excludes_changes_without_requested_at(workspace: UUID) -> None:
+    account_id = _insert_connector_account(workspace, provider="github")
+    repo_id = _insert_repo(workspace, account_id, external_id="101")
+    now = datetime.now(UTC)
+    change_id = _insert_change(
+        workspace, account_id, repo_id, external_id="1", merged_at=now - timedelta(days=1)
+    )
+    _insert_review(
+        workspace,
+        account_id,
+        change_id,
+        external_id="r1",
+        requested_at=None,
+        submitted_at=now - timedelta(hours=3),
+    )
+    with SessionFactory() as session:
+        snapshots = compute_metrics(session, workspace_id=workspace)
+    review_latency = next(s for s in snapshots if s.metric_key == "review_latency")
+    assert review_latency.population == 0
+    assert review_latency.value is None
+
+
+def test_review_latency_excludes_changes_outside_window(workspace: UUID) -> None:
+    account_id = _insert_connector_account(workspace, provider="github")
+    repo_id = _insert_repo(workspace, account_id, external_id="101")
+    now = datetime.now(UTC)
+    change_id = _insert_change(
+        workspace, account_id, repo_id, external_id="1", merged_at=now - timedelta(days=45)
+    )
+    _insert_review(
+        workspace,
+        account_id,
+        change_id,
+        external_id="r1",
+        requested_at=now - timedelta(days=45, hours=5),
+        submitted_at=now - timedelta(days=45, hours=3),
+    )
+    with SessionFactory() as session:
+        snapshots = compute_metrics(session, workspace_id=workspace)
+    review_latency = next(s for s in snapshots if s.metric_key == "review_latency")
+    assert review_latency.population == 0
+
+
+# --- always-insufficient metrics --------------------------------------------
+
+
+def test_deployment_and_incident_dependent_metrics_always_insufficient(workspace: UUID) -> None:
+    with SessionFactory() as session:
+        snapshots = compute_metrics(session, workspace_id=workspace)
+    for metric_key in (
+        "delivery_frequency",
+        "lead_time_for_changes",
+        "change_failure_rate",
+        "time_to_restore",
+    ):
+        snapshot = next(s for s in snapshots if s.metric_key == metric_key)
+        assert snapshot.coverage_status == "insufficient_coverage"
+        assert snapshot.coverage_percentage == 0.0
+        assert snapshot.value is None
+        assert snapshot.population == 0
+
+
+# --- compute_and_store_metrics: insert-only ---------------------------------
+
+
+def test_compute_and_store_metrics_is_insert_only(workspace: UUID) -> None:
+    with SessionFactory() as session:
+        first = compute_and_store_metrics(session, workspace_id=workspace)
+        session.commit()
+    with SessionFactory() as session:
+        second = compute_and_store_metrics(session, workspace_id=workspace)
+        session.commit()
+
+    assert len(first) == 7
+    assert len(second) == 7
+    assert {row["id"] for row in first}.isdisjoint({row["id"] for row in second})
+
+    with engine.begin() as connection:
+        count = connection.execute(
+            text("SELECT count(*) FROM delivery_metric_snapshots WHERE workspace_id = :ws"),
+            {"ws": workspace},
+        ).scalar_one()
+    assert count == 14
+
+
+# --- end-to-end: real GET /engineering/metrics endpoint ---------------------
+
+
+def _headers_for_session(token: str) -> dict[str, str]:
+    del token  # GET requests carry no CSRF/mutation headers, unlike POST
+    return {"X-Correlation-ID": str(uuid4())}
+
+
+@pytest.fixture
+def client_context(workspace: UUID) -> Iterator[tuple[TestClient, str]]:
+    token = f"session-{uuid4()}"
+    now = datetime.now(UTC)
+    with engine.begin() as connection:
+        user_id = connection.execute(
+            text("SELECT id FROM users WHERE workspace_id = :ws"), {"ws": workspace}
+        ).scalar_one()
+        connection.execute(
+            text(
+                "INSERT INTO sessions (id, workspace_id, user_id, token_hash, "
+                "expires_at, last_seen_at) "
+                "VALUES (:id, :workspace_id, :user_id, :token_hash, :expires_at, :now)"
+            ),
+            {
+                "id": uuid4(),
+                "workspace_id": workspace,
+                "user_id": user_id,
+                "token_hash": sha256(token.encode()).hexdigest(),
+                "expires_at": now + timedelta(hours=1),
+                "now": now,
+            },
+        )
+    client = TestClient(app)
+    client.cookies.set("ecc_session", token)
+    try:
+        yield client, token
+    finally:
+        client.close()
+        with engine.begin() as connection:
+            connection.execute(
+                text("DELETE FROM sessions WHERE workspace_id = :ws"), {"ws": workspace}
+            )
+
+
+def test_get_metrics_endpoint_returns_all_seven_metrics(
+    workspace: UUID, client_context: tuple[TestClient, str]
+) -> None:
+    client, token = client_context
+    response = client.get("/api/v1/engineering/metrics", headers=_headers_for_session(token))
+    assert response.status_code == 200, response.text
+    body = response.json()
+    metric_keys = {row["metric_key"] for row in body["metrics"]}
+    assert metric_keys == {
+        "delivery_frequency",
+        "lead_time_for_changes",
+        "change_failure_rate",
+        "time_to_restore",
+        "work_ageing",
+        "blocked_work",
+        "review_latency",
+    }
+    for row in body["metrics"]:
+        assert row["coverage_status"] == "insufficient_coverage"  # nothing connected yet
+
+
+def test_get_metrics_endpoint_is_workspace_isolated(
+    workspace: UUID, client_context: tuple[TestClient, str]
+) -> None:
+    client, token = client_context
+    other_workspace_id = uuid4()
+    other_account_id = uuid4()
+    now = datetime.now(UTC)
+    other_user_id = uuid4()
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO workspaces (id, name, timezone, created_at) "
+                "VALUES (:id, 'Other Workspace', 'UTC', :now)"
+            ),
+            {"id": other_workspace_id, "now": now},
+        )
+        connection.execute(
+            text(
+                "INSERT INTO users (id, workspace_id, email, password_hash, created_at) "
+                "VALUES (:id, :workspace_id, :email, 'x', :now)"
+            ),
+            {
+                "id": other_user_id,
+                "workspace_id": other_workspace_id,
+                "email": f"{other_user_id}@example.test",
+                "now": now,
+            },
+        )
+        connection.execute(
+            text(
+                """
+                INSERT INTO connector_accounts (
+                    id, workspace_id, provider, external_account_id, display_name,
+                    granted_scopes, encrypted_credentials, status, version,
+                    created_by, updated_by, created_at, updated_at
+                ) VALUES (
+                    :id, :workspace_id, 'jira', 'other-acct', 'Other',
+                    ARRAY[]::text[], :cred, 'active', 1, :actor, :actor, :now, :now
+                )
+                """
+            ),
+            {
+                "id": other_account_id,
+                "workspace_id": other_workspace_id,
+                "cred": b"fake",
+                "actor": other_user_id,
+                "now": now,
+            },
+        )
+        connection.execute(
+            text(
+                "INSERT INTO sync_cursors (id, workspace_id, connector_account_id, "
+                "resource_type, cursor_value, updated_at) "
+                "VALUES (:id, :ws, :acct, 'work_item', 'x', :now)"
+            ),
+            {"id": uuid4(), "ws": other_workspace_id, "acct": other_account_id, "now": now},
+        )
+
+    try:
+        response = client.get("/api/v1/engineering/metrics", headers=_headers_for_session(token))
+        assert response.status_code == 200, response.text
+        work_ageing = next(
+            row for row in response.json()["metrics"] if row["metric_key"] == "work_ageing"
+        )
+        # The caller's own workspace has no connected account -- the
+        # *other* workspace's freshly-synced account must never leak in.
+        assert work_ageing["coverage_status"] == "insufficient_coverage"
+    finally:
+        with engine.begin() as connection:
+            for table in ("sync_cursors", "connector_accounts", "users"):
+                connection.execute(
+                    text(f"DELETE FROM {table} WHERE workspace_id = :ws"),  # noqa: S608
+                    {"ws": other_workspace_id},
+                )
+            connection.execute(
+                text("DELETE FROM workspaces WHERE id = :ws"), {"ws": other_workspace_id}
+            )

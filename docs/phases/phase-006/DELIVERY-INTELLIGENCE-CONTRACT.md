@@ -2,7 +2,7 @@
 id: PHASE-006-DELIVERY-INTELLIGENCE
 title: Delivery Intelligence Contract
 status: Approved for Implementation
-version: 0.2.0
+version: 0.3.0
 owner: Lucky Jain
 ---
 
@@ -35,3 +35,19 @@ A metric is presented as `complete` coverage only when at least 95% of its popul
 ## Accepted limitation (Task 1)
 
 No metric computation, snapshot table, or coverage-threshold enforcement exists yet -- this document's numbers are the approved target for Task 5 ("Delivery and reliability metrics", `docs/superpowers/plans/2026-07-27-phase-6-engineering-workspace.md`). Task 1 delivers only the connector platform these metrics will eventually read from.
+
+## Task 5 status
+
+`backend/ecc/domains/engineering/metrics.py` implements the snapshot-computation engine and coverage-threshold policy above against real data, via `GET /engineering/metrics`. **Only three of the seven metrics are genuinely computable in this activation: `work_ageing`, `blocked_work`, `review_latency`.** The other four all require `deployments` and/or `incidents` data -- `lead_time_for_changes`' own population above is "changes merged... *with a linked deployment*," not merely merged changes -- and neither table exists yet (`deployments` has no task assigned to it at all; `incidents` is explicit Task 6 scope, per `DATA-MODEL.md`'s own "Tasks 5-6" note). These four always report `coverage_status = 'insufficient_coverage'` and `value = None` -- the contract's own "no metric is computed or displayed below 50% coverage at all" rule applied to its most extreme case (0%, because no source exists at all), not a new exception to it. See `metrics.py`'s own module docstring for the full design, including its three disclosed accepted limitations below.
+
+## Accepted limitation (Task 5): coverage is inferred from sync-cursor recency, not a dedicated backfill-completion ledger
+
+`_coverage_for` treats a resource type as "fresh" for a connector account when `sync_cursors.updated_at` (upserted on every sync call that returns a cursor, `succeeded` or `partial` alike) falls within the phase's own five-minute incremental-lag NFR, and averages that across every active connector account of the metric's relevant provider(s). This does not distinguish "backfill fully complete" from "a bounded-page sync recently made some progress" -- a connector that just connected a repository with thousands of PRs could show `complete` coverage after one recent but far-from-exhaustive sync call. A dedicated backfill-completion ledger is a real gap this task does not close.
+
+## Accepted limitation (Task 5): `GET /engineering/metrics` computes and stores on every call, not a pure read
+
+This phase has no periodic sync/computation scheduler yet -- `GET /engineering/metrics` is itself the computation trigger, writing seven new immutable `delivery_metric_snapshots` rows on every call, mirroring `POST /connectors/{id}/sync`'s own identical "manual trigger only" reality since Task 1. A deliberate, disclosed departure from pure REST `GET` semantics; see `connector_accounts.py`'s `get_metrics_endpoint` docstring.
+
+## Accepted limitation (Task 5): heuristic "open"/"blocked" work-item classification
+
+Jira's workflow statuses are fully customizable per project; there is no per-workspace status-category configuration to consult yet. `work_ageing`'s population treats any work item whose `status` case-insensitively matches `done`/`closed`/`resolved` as closed, everything else as open; `blocked_work` treats any open item whose `status` case-insensitively contains `blocked` as blocked. A workspace using different status vocabulary (e.g. a custom "On Hold" column) will undercount -- a real, disclosed limitation, not a silently wrong number.

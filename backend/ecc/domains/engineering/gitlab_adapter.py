@@ -15,6 +15,23 @@ identical in scope to `github_adapter.py`'s own Task 2 precedent --
 remain deferred; `backfill`/`incremental_sync` return a zero-item success
 outcome for any other `resource_type` rather than raising.
 
+**Still true as of Task 5.** Task 5 ("delivery and reliability metrics")
+added GitHub `change`/`review` sync (`github_adapter.py`'s own module
+docstring has the full design) but explicitly scoped GitLab's own
+merge-request/approval sync to a Task 5 follow-up rather than doubling
+this task's already-large scope in one PR -- GitLab's real API shape
+genuinely differs enough to need its own design pass, not a copy-paste
+of GitHub's: a global `GET /merge_requests?scope=all&state=merged`
+endpoint exists (no per-project fan-out needed, unlike GitHub's Search-
+API-vs-fan-out tradeoff), but GitLab's approvals endpoint (`GET
+/projects/:id/merge_requests/:iid/approvals`) is Premium/Ultimate-only --
+a Free-tier-compatible reviews implementation needs a notes/discussions-
+based fallback GitHub's design has no analogue for. Disclosed here
+rather than silently left unmentioned; a metric computed only from
+GitHub-sourced `changes`/`reviews` reports `partial`/`insufficient_
+coverage` for any workspace whose repositories are GitLab-only, per
+`DELIVERY-INTELLIGENCE-CONTRACT.md`'s own coverage-threshold policy.
+
 **Scope verification is genuinely complete here, unlike GitHub's.**
 GitLab's `GET /personal_access_tokens/self` returns the token's actual
 granted `scopes` directly in the JSON response body for every personal
