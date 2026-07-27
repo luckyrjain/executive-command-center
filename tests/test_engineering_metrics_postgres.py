@@ -479,6 +479,41 @@ def test_review_latency_median_of_first_review_per_change(workspace: UUID) -> No
     assert review_latency.value == timedelta(hours=2).total_seconds()
 
 
+def test_review_latency_coverage_is_the_worse_of_change_and_review_cursors(
+    workspace: UUID,
+) -> None:
+    """`review_latency`'s population depends on both `change` and
+    `review` sync being current -- `_worse_coverage` must report the
+    lower of the two, not just whichever one happens to be fresh. Proven
+    in both directions: `change` cursor fresh but `review` cursor
+    missing (insufficient), and the reverse.
+    """
+    account_id = _insert_connector_account(workspace, provider="github")
+    _insert_cursor(workspace, account_id, resource_type="change", updated_at=datetime.now(UTC))
+    # No `review` cursor at all -- that resource type's own coverage is
+    # insufficient, and must win over `change`'s complete coverage.
+
+    with SessionFactory() as session:
+        snapshots = compute_metrics(session, workspace_id=workspace)
+    review_latency = next(s for s in snapshots if s.metric_key == "review_latency")
+    assert review_latency.coverage_status == "insufficient_coverage"
+    assert review_latency.coverage_percentage == 0.0
+
+
+def test_review_latency_coverage_is_complete_only_when_both_cursors_are_fresh(
+    workspace: UUID,
+) -> None:
+    account_id = _insert_connector_account(workspace, provider="github")
+    _insert_cursor(workspace, account_id, resource_type="change", updated_at=datetime.now(UTC))
+    _insert_cursor(workspace, account_id, resource_type="review", updated_at=datetime.now(UTC))
+
+    with SessionFactory() as session:
+        snapshots = compute_metrics(session, workspace_id=workspace)
+    review_latency = next(s for s in snapshots if s.metric_key == "review_latency")
+    assert review_latency.coverage_status == "complete"
+    assert review_latency.coverage_percentage == 100.0
+
+
 def test_review_latency_excludes_changes_without_requested_at(workspace: UUID) -> None:
     account_id = _insert_connector_account(workspace, provider="github")
     repo_id = _insert_repo(workspace, account_id, external_id="101")

@@ -369,16 +369,19 @@ def _earliest_review_requested_at(timeline_events: list[Mapping[str, Any]]) -> s
 def _list_changes_needing_reviews(
     *, workspace_id: Any, connector_account_id: Any, since_merged_at: datetime | None
 ) -> list[dict[str, Any]]:
-    """Changes already synced by `_sync_changes`, newest-merged first,
-    restricted to those merged after `since_merged_at` -- `_sync_reviews`'
-    own resumable cursor is the newest `merged_at` already covered
-    (parsed from the outward-facing string cursor into a real `datetime`
-    by its caller, since `changes.merged_at` is a real `TIMESTAMPTZ`
-    column, not text), so this query is the direct SQL expression of
-    "what's new since then." Needs `repositories.name` (not just
-    `changes.repository_id`) to build the `GET /repos/{owner}/{repo}/
-    pulls/{number}/reviews` URL, hence the join rather than a second
-    per-change lookup.
+    """Changes already synced by `_sync_changes`, **oldest-merged first**
+    (ascending -- the module docstring's own "Reviews" section has the
+    full reasoning: a single flat `merged_at` cursor means an early
+    per-call budget cutoff must leave off at the oldest still-uncovered
+    change, never skip past it toward newer ones), restricted to those
+    merged after `since_merged_at` -- `_sync_reviews`'s own resumable
+    cursor is the newest `merged_at` already covered (parsed from the
+    outward-facing string cursor into a real `datetime` by its caller,
+    since `changes.merged_at` is a real `TIMESTAMPTZ` column, not text),
+    so this query is the direct SQL expression of "what's new since
+    then." Needs `repositories.name` (not just `changes.repository_id`)
+    to build the `GET /repos/{owner}/{repo}/pulls/{number}/reviews` URL,
+    hence the join rather than a second per-change lookup.
     """
     with SessionFactory() as session:
         params: dict[str, Any] = {
