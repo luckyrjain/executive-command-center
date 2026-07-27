@@ -1,0 +1,126 @@
+// @vitest-environment jsdom
+
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+
+import IncidentsPanel from './IncidentsPanel'
+import type { Incident } from './types'
+
+function response(body: unknown, status = 200) {
+  return Promise.resolve(new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } }))
+}
+
+function incident(overrides: Partial<Incident> = {}): Incident {
+  return {
+    id: 'incident-1',
+    title: 'Checkout outage',
+    description: 'Payments failing',
+    severity: 'high',
+    status: 'open',
+    detected_at: '2026-07-26T12:00:00Z',
+    resolved_at: null,
+    change_ids: [],
+    version: 1,
+    created_at: '2026-07-26T12:00:00Z',
+    updated_at: '2026-07-26T12:00:00Z',
+    ...overrides,
+  }
+}
+
+function renderPanel() {
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } })
+  return render(<QueryClientProvider client={client}><IncidentsPanel /></QueryClientProvider>)
+}
+
+beforeEach(() => {
+  document.cookie = 'ecc_csrf=incidents-token; Secure; SameSite=Strict'
+  vi.stubGlobal('crypto', { randomUUID: vi.fn(() => 'incidents-request-id') })
+})
+afterEach(() => { cleanup(); vi.unstubAllGlobals() })
+
+describe('IncidentsPanel', () => {
+  it('shows an empty state matching the default open filter', async () => {
+    vi.stubGlobal('fetch', vi.fn(() => response({ incidents: [] })))
+    renderPanel()
+    expect(await screen.findByText('No incidents match this filter.')).toBeTruthy()
+  })
+
+  it('lists an open incident with a resolve action', async () => {
+    vi.stubGlobal('fetch', vi.fn(() => response({ incidents: [incident()] })))
+    renderPanel()
+    expect(await screen.findByText('Checkout outage')).toBeTruthy()
+    expect(screen.getByText('Payments failing')).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'Resolve now' })).toBeTruthy()
+  })
+
+  it('does not show a resolve action for an already-resolved incident', async () => {
+    vi.stubGlobal('fetch', vi.fn(() => response({ incidents: [incident({ status: 'resolved', resolved_at: '2026-07-27T00:00:00Z' })] })))
+    renderPanel()
+    await screen.findByText('Checkout outage')
+    expect(screen.queryByRole('button', { name: 'Resolve now' })).toBeNull()
+  })
+
+  it('captures a new incident with the entered title and severity', async () => {
+    const fetch = vi.fn((_input: RequestInfo | URL, init?: RequestInit) => {
+      if ((init?.method ?? 'GET').toUpperCase() === 'POST') return response(incident())
+      return response({ incidents: [] })
+    })
+    vi.stubGlobal('fetch', fetch)
+    renderPanel()
+
+    await screen.findByText('No incidents match this filter.')
+    fireEvent.change(screen.getByLabelText('Incident title'), { target: { value: 'Checkout outage' } })
+    fireEvent.change(screen.getByLabelText('Severity'), { target: { value: 'critical' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Capture incident' }))
+
+    await waitFor(() => expect(fetch).toHaveBeenCalledWith('/api/v1/engineering/incidents', expect.objectContaining({ method: 'POST' })))
+    const call = fetch.mock.calls.find((c) => (c[1] as RequestInit | undefined)?.method === 'POST')
+    const body = JSON.parse(String((call?.[1] as RequestInit).body))
+    expect(body.title).toBe('Checkout outage')
+    expect(body.severity).toBe('critical')
+  })
+
+  it('resolves an open incident', async () => {
+    const fetch = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      if (url.includes('/resolve')) return response(incident({ status: 'resolved', resolved_at: '2026-07-27T00:00:00Z' }))
+      return response({ incidents: [incident()] })
+    })
+    vi.stubGlobal('fetch', fetch)
+    renderPanel()
+
+    await screen.findByText('Checkout outage')
+    fireEvent.click(screen.getByRole('button', { name: 'Resolve now' }))
+    await waitFor(() => expect(fetch).toHaveBeenCalledWith(expect.stringContaining('/incidents/incident-1/resolve'), expect.objectContaining({ method: 'POST' })))
+  })
+
+  it('maps INCIDENT_ALREADY_RESOLVED to a readable sentence, never the raw code', async () => {
+    const fetch = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      if (url.includes('/resolve')) return response({ error: { code: 'INCIDENT_ALREADY_RESOLVED', message: 'Incident Already Resolved' } }, 409)
+      return response({ incidents: [incident()] })
+    })
+    vi.stubGlobal('fetch', fetch)
+    renderPanel()
+
+    await screen.findByText('Checkout outage')
+    fireEvent.click(screen.getByRole('button', { name: 'Resolve now' }))
+    expect(await screen.findByText(/This incident was already resolved/)).toBeTruthy()
+    expect(screen.queryByText('Incident Already Resolved')).toBeNull()
+  })
+
+  it('switches the status filter and refetches accordingly', async () => {
+    const fetch = vi.fn((input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url.includes('status=resolved')) return response({ incidents: [incident({ status: 'resolved', resolved_at: '2026-07-27T00:00:00Z' })] })
+      return response({ incidents: [incident()] })
+    })
+    vi.stubGlobal('fetch', fetch)
+    renderPanel()
+
+    await screen.findByText('Checkout outage')
+    fireEvent.click(screen.getByRole('button', { name: 'resolved' }))
+    await waitFor(() => expect(fetch).toHaveBeenCalledWith(expect.stringContaining('status=resolved'), expect.anything()))
+  })
+})

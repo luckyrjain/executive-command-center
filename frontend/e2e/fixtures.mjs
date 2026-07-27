@@ -940,6 +940,178 @@ function makeAutomationApi(overrides = {}) {
   return { dispatch, workflowVersions, policies, runs, runSteps, runCompensationSteps, approvals, triggers, killSwitches }
 }
 
+/**
+ * In-memory fake of the Phase 6 Engineering Workspace API surface
+ * (`GET|POST /api/v1/engineering/connectors`, `.../sync`, `.../disable`,
+ * `GET .../sync-runs`, `.../repositories`, `.../work-items`, `.../incidents`,
+ * `.../decisions`, `.../metrics`) -- mirrors `makeAutomationApi`'s own shape.
+ * There is no real backend behind this fixture (this codebase's own
+ * "browser-only mock" convention, matching every other Phase 1-5
+ * scenario) -- a scenario that needs to move a connector between states
+ * (e.g. `active` -> `rate_limited` -> `disconnected`) mutates `fixtures.
+ * engineering.connectors` directly, the same way `automation-lifecycle.mjs`
+ * scripts a run's own state transitions via `fixtures.automation.runs`.
+ */
+function makeEngineeringApi(overrides = {}) {
+  const connectors = [...(overrides.connectors ?? [])]
+  const syncRuns = [...(overrides.syncRuns ?? [])]
+  const repositories = [...(overrides.repositories ?? [])]
+  const workItems = [...(overrides.workItems ?? [])]
+  const incidents = [...(overrides.incidents ?? [])]
+  const decisions = [...(overrides.decisions ?? [])]
+  const metrics = [...(overrides.metrics ?? [])]
+  let nextId = 1
+
+  function dispatch(pathname, method, body, queryString) {
+    if (!pathname.startsWith('/api/v1/engineering')) return null
+    const params = new URLSearchParams(queryString)
+
+    if (pathname === '/api/v1/engineering/connectors' && method === 'GET') {
+      return { status: 200, body: { connectors } }
+    }
+    if (pathname === '/api/v1/engineering/connectors' && method === 'POST') {
+      const created = {
+        id: `engineering-connector-${nextId++}`,
+        provider: body.provider,
+        external_account_id: `fixture-${body.provider}-account`,
+        display_name: `${body.provider} (fixture)`,
+        granted_scopes: [],
+        status: 'pending',
+        status_detail: null,
+        last_synced_at: null,
+        last_error: null,
+        disconnected_at: null,
+        version: 1,
+        created_at: nowIso(),
+        updated_at: nowIso(),
+      }
+      connectors.push(created)
+      return { status: 201, body: created }
+    }
+    const syncMatch = pathname.match(/^\/api\/v1\/engineering\/connectors\/([^/]+)\/sync$/)
+    if (syncMatch && method === 'POST') {
+      const connector = connectors.find((c) => c.id === syncMatch[1])
+      if (!connector) return { status: 404, body: { error: { code: 'CONNECTOR_NOT_FOUND', message: 'Not found' } } }
+      const run = {
+        id: `engineering-sync-run-${nextId++}`,
+        connector_account_id: connector.id,
+        run_type: body.run_type,
+        status: 'succeeded',
+        items_processed: 0,
+        error_summary: null,
+        started_at: nowIso(),
+        completed_at: nowIso(),
+      }
+      syncRuns.push(run)
+      connector.last_synced_at = nowIso()
+      return { status: 201, body: run }
+    }
+    const disableMatch = pathname.match(/^\/api\/v1\/engineering\/connectors\/([^/]+)\/disable$/)
+    if (disableMatch && method === 'POST') {
+      const connector = connectors.find((c) => c.id === disableMatch[1])
+      if (!connector) return { status: 404, body: { error: { code: 'CONNECTOR_NOT_FOUND', message: 'Not found' } } }
+      connector.status = 'disconnected'
+      connector.disconnected_at = nowIso()
+      return { status: 200, body: connector }
+    }
+    if (pathname === '/api/v1/engineering/sync-runs' && method === 'GET') {
+      const connectorAccountId = params.get('connector_account_id')
+      const items = syncRuns.filter((r) => !connectorAccountId || r.connector_account_id === connectorAccountId)
+      return { status: 200, body: { sync_runs: items } }
+    }
+    if (pathname === '/api/v1/engineering/repositories' && method === 'GET') {
+      const connectorAccountId = params.get('connector_account_id')
+      const items = repositories.filter((r) => !connectorAccountId || r.connector_account_id === connectorAccountId)
+      return { status: 200, body: { repositories: items } }
+    }
+    if (pathname === '/api/v1/engineering/work-items' && method === 'GET') {
+      const connectorAccountId = params.get('connector_account_id')
+      const statusFilter = params.get('status')
+      const items = workItems.filter((item) =>
+        (!connectorAccountId || item.connector_account_id === connectorAccountId)
+        && (!statusFilter || item.status === statusFilter))
+      return { status: 200, body: { work_items: items } }
+    }
+    if (pathname === '/api/v1/engineering/incidents' && method === 'GET') {
+      const statusFilter = params.get('status')
+      const items = incidents.filter((incident) => !statusFilter || incident.status === statusFilter)
+      return { status: 200, body: { incidents: items } }
+    }
+    if (pathname === '/api/v1/engineering/incidents' && method === 'POST') {
+      const created = {
+        id: `engineering-incident-${nextId++}`,
+        title: body.title,
+        description: body.description ?? null,
+        severity: body.severity ?? 'medium',
+        status: 'open',
+        detected_at: body.detected_at,
+        resolved_at: null,
+        change_ids: body.change_ids ?? [],
+        version: 1,
+        created_at: nowIso(),
+        updated_at: nowIso(),
+      }
+      incidents.push(created)
+      return { status: 201, body: created }
+    }
+    const resolveMatch = pathname.match(/^\/api\/v1\/engineering\/incidents\/([^/]+)\/resolve$/)
+    if (resolveMatch && method === 'POST') {
+      const incident = incidents.find((i) => i.id === resolveMatch[1])
+      if (!incident) return { status: 404, body: { error: { code: 'INCIDENT_NOT_FOUND', message: 'Not found' } } }
+      if (incident.status === 'resolved') {
+        return { status: 409, body: { error: { code: 'INCIDENT_ALREADY_RESOLVED', message: 'Already resolved' } } }
+      }
+      incident.status = 'resolved'
+      incident.resolved_at = body.resolved_at
+      incident.version += 1
+      incident.updated_at = nowIso()
+      return { status: 200, body: incident }
+    }
+    if (pathname === '/api/v1/engineering/decisions' && method === 'GET') {
+      const statusFilter = params.get('status')
+      const items = decisions.filter((decision) => !statusFilter || decision.status === statusFilter)
+      return { status: 200, body: { decisions: items } }
+    }
+    if (pathname === '/api/v1/engineering/decisions' && method === 'POST') {
+      const created = {
+        id: `engineering-decision-${nextId++}`,
+        title: body.title,
+        description: body.description ?? null,
+        rationale: null,
+        status: 'proposed',
+        decided_at: null,
+        change_ids: body.change_ids ?? [],
+        version: 1,
+        created_at: nowIso(),
+        updated_at: nowIso(),
+      }
+      decisions.push(created)
+      return { status: 201, body: created }
+    }
+    const decideMatch = pathname.match(/^\/api\/v1\/engineering\/decisions\/([^/]+)\/decide$/)
+    if (decideMatch && method === 'POST') {
+      const decision = decisions.find((d) => d.id === decideMatch[1])
+      if (!decision) return { status: 404, body: { error: { code: 'DECISION_NOT_FOUND', message: 'Not found' } } }
+      if (decision.status !== 'proposed') {
+        return { status: 409, body: { error: { code: 'DECISION_NOT_PROPOSED', message: 'Not proposed' } } }
+      }
+      decision.status = 'decided'
+      decision.decided_at = body.decided_at
+      decision.rationale = body.rationale ?? decision.rationale
+      decision.version += 1
+      decision.updated_at = nowIso()
+      return { status: 200, body: decision }
+    }
+    if (pathname === '/api/v1/engineering/metrics' && method === 'GET') {
+      return { status: 200, body: { metrics } }
+    }
+
+    return null
+  }
+
+  return { dispatch, connectors, syncRuns, repositories, workItems, incidents, decisions, metrics }
+}
+
 const defaultDashboardSections = {
   today_schedule: [{ id: 'm1', title: 'Leadership review', starts_at: '2026-07-15T04:30:00Z' }],
   top_priorities: [{ entity_id: 't1', title: 'Approve hiring plan', score: 92, status: 'in_progress' }],
@@ -1058,6 +1230,7 @@ export async function createFixtureApi(page, overrides = {}) {
   const attention = makeAttentionApi({ ...overrides.attention, risksCollection: risks })
   const aiRuntime = makeAiRuntimeApi(overrides.aiRuntime)
   const automation = makeAutomationApi(overrides.automation ?? {})
+  const engineering = makeEngineeringApi(overrides.engineering ?? {})
 
   // `route.fulfill()` synthesizes a response without touching the real
   // network, so `context.setOffline(true)` alone does NOT stop a mocked
@@ -1220,6 +1393,10 @@ export async function createFixtureApi(page, overrides = {}) {
       const result = automation.dispatch(pathname, method, body, queryString)
       if (result) return result
     }
+    if (pathname.startsWith('/api/v1/engineering')) {
+      const result = engineering.dispatch(pathname, method, body, queryString)
+      if (result) return result
+    }
     for (const resource of resources) {
       const result = resource(pathname, method, body, queryString)
       if (result) return result
@@ -1249,6 +1426,7 @@ export async function createFixtureApi(page, overrides = {}) {
     attention,
     aiRuntime,
     automation,
+    engineering,
     dashboard,
     brief,
     evidence,

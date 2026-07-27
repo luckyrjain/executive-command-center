@@ -20,6 +20,8 @@ import * as attentionMeetingPrep from './scenarios/attention-meeting-prep.mjs'
 import * as attentionExplanation from './scenarios/attention-explanation.mjs'
 import * as automationLifecycle from './scenarios/automation-lifecycle.mjs'
 import * as automationApprovalsKeyboard from './scenarios/automation-approvals-keyboard.mjs'
+import * as engineeringConnectorStates from './scenarios/engineering-connector-states.mjs'
+import * as engineeringLifecycle from './scenarios/engineering-lifecycle.mjs'
 
 const scenarios = [
   { name: 'tasks', module: tasks },
@@ -53,6 +55,8 @@ const scenarios = [
   { name: `attention-explanation (AI runtime ${process.env.AI_EXPLANATIONS_ENABLED === '0' ? 'off' : 'on'})`, module: attentionExplanation },
   { name: 'automation-lifecycle', module: automationLifecycle },
   { name: 'automation-approvals-keyboard', module: automationApprovalsKeyboard },
+  { name: 'engineering-connector-states', module: engineeringConnectorStates },
+  { name: 'engineering-lifecycle', module: engineeringLifecycle },
 ]
 
 async function main() {

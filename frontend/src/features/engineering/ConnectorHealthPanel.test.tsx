@@ -1,0 +1,207 @@
+// @vitest-environment jsdom
+
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+
+import ConnectorHealthPanel from './ConnectorHealthPanel'
+import type { ConnectorAccount, SyncRun } from './types'
+
+function response(body: unknown, status = 200) {
+  return Promise.resolve(new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } }))
+}
+
+function connector(overrides: Partial<ConnectorAccount> = {}): ConnectorAccount {
+  return {
+    id: 'connector-1',
+    provider: 'github',
+    external_account_id: 'gh-1',
+    display_name: 'Acme GitHub',
+    granted_scopes: ['repo'],
+    status: 'active',
+    status_detail: null,
+    last_synced_at: '2026-07-27T00:00:00Z',
+    last_error: null,
+    disconnected_at: null,
+    version: 1,
+    created_at: '2026-07-01T00:00:00Z',
+    updated_at: '2026-07-27T00:00:00Z',
+    ...overrides,
+  }
+}
+
+function renderPanel() {
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } })
+  return render(<QueryClientProvider client={client}><ConnectorHealthPanel /></QueryClientProvider>)
+}
+
+beforeEach(() => {
+  document.cookie = 'ecc_csrf=connector-health-token; Secure; SameSite=Strict'
+  vi.stubGlobal('crypto', { randomUUID: vi.fn(() => 'connector-health-request-id') })
+})
+afterEach(() => { cleanup(); vi.unstubAllGlobals() })
+
+function stubFetch(connectors: ConnectorAccount[], syncRuns: SyncRun[] = []) {
+  vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL) => {
+    const url = String(input)
+    if (url.includes('/sync-runs')) return response({ sync_runs: syncRuns })
+    if (url.includes('/connectors')) return response({ connectors })
+    return response({}, 404)
+  }))
+}
+
+describe('ConnectorHealthPanel', () => {
+  it('shows an empty state when no connectors exist', async () => {
+    stubFetch([])
+    renderPanel()
+    expect(await screen.findByText('No connectors are configured for this workspace yet.')).toBeTruthy()
+  })
+
+  // --- UX-STATES.md required degraded states -----------------------------
+
+  it('shows "first sync" state for a pending connector with no sync history', async () => {
+    stubFetch([connector({ status: 'pending', last_synced_at: null })])
+    renderPanel()
+    expect(await screen.findByText(/first sync not yet run/)).toBeTruthy()
+    expect(screen.getByText('No sync has ever run for this connector -- data will appear once a backfill completes.')).toBeTruthy()
+  })
+
+  it('shows the backfill state from sync history while a backfill is running', async () => {
+    stubFetch(
+      [connector({ status: 'active' })],
+      [{ id: 'run-1', connector_account_id: 'connector-1', run_type: 'backfill', status: 'running', items_processed: 3, error_summary: null, started_at: '2026-07-27T00:00:00Z', completed_at: null }],
+    )
+    renderPanel()
+    fireEvent.click(await screen.findByText(/Sync history/))
+    expect(await screen.findByText(/in progress/)).toBeTruthy()
+  })
+
+  it('shows partial-permissions state distinctly from a plain active connector', async () => {
+    stubFetch([connector({ status: 'permission_lost', status_detail: 'scope revoked upstream' })])
+    renderPanel()
+    expect(await screen.findByText(/partial permissions -- provider revoked some access/)).toBeTruthy()
+    expect(screen.getByText(/scope revoked upstream/)).toBeTruthy()
+  })
+
+  it('shows a stale-connector banner derived from last_synced_at age', async () => {
+    stubFetch([connector({ status: 'active', last_synced_at: '2020-01-01T00:00:00Z' })])
+    renderPanel()
+    expect(await screen.findByText(/this connector may be showing stale data/)).toBeTruthy()
+  })
+
+  it('does not show a stale banner for a recently synced connector', async () => {
+    stubFetch([connector({ status: 'active', last_synced_at: new Date().toISOString() })])
+    renderPanel()
+    await screen.findByText('Acme GitHub')
+    expect(screen.queryByText(/this connector may be showing stale data/)).toBeNull()
+  })
+
+  it('shows the rate-limited state', async () => {
+    stubFetch([connector({ status: 'rate_limited' })])
+    renderPanel()
+    expect(await screen.findByText(/rate limited by the provider/)).toBeTruthy()
+  })
+
+  it('shows the disconnected state and disables its own actions', async () => {
+    stubFetch([connector({ status: 'disconnected' })])
+    renderPanel()
+    expect(await screen.findByText('disconnected')).toBeTruthy()
+    expect((screen.getByRole('button', { name: 'Start sync' }) as HTMLButtonElement).disabled).toBe(true)
+    expect((screen.getByRole('button', { name: 'Disconnect' }) as HTMLButtonElement).disabled).toBe(true)
+  })
+
+  it('shows the provider-unavailable state with the real error detail', async () => {
+    stubFetch([connector({ status: 'error', last_error: 'GitHub returned 503' })])
+    renderPanel()
+    expect(await screen.findByText(/provider unavailable/)).toBeTruthy()
+    expect(screen.getByText('GitHub returned 503')).toBeTruthy()
+  })
+
+  // --- Actions -------------------------------------------------------------
+
+  it('creates a connector with the entered provider and credential', async () => {
+    const fetch = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      if ((init?.method ?? 'GET').toUpperCase() === 'POST') return response(connector())
+      if (url.includes('/sync-runs')) return response({ sync_runs: [] })
+      return response({ connectors: [] })
+    })
+    vi.stubGlobal('fetch', fetch)
+    renderPanel()
+
+    await screen.findByText('No connectors are configured for this workspace yet.')
+    fireEvent.change(screen.getByLabelText('Credential'), { target: { value: 'ghp_secret' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Connect' }))
+
+    await waitFor(() => expect(fetch).toHaveBeenCalledWith(expect.stringContaining('/api/v1/engineering/connectors'), expect.objectContaining({ method: 'POST' })))
+    const call = fetch.mock.calls.find((c) => (c[1] as RequestInit | undefined)?.method === 'POST')
+    expect(JSON.parse(String((call?.[1] as RequestInit).body))).toEqual({ provider: 'github', credential: 'ghp_secret' })
+  })
+
+  it('maps CONNECTOR_AUTHORIZATION_FAILED to a readable sentence, never the raw code', async () => {
+    const fetch = vi.fn((_input: RequestInfo | URL, init?: RequestInit) => {
+      if ((init?.method ?? 'GET').toUpperCase() === 'POST') {
+        return response({ error: { code: 'CONNECTOR_AUTHORIZATION_FAILED', message: 'Connector Authorization Failed', details: { reason: 'bad token' } } }, 422)
+      }
+      return response({ connectors: [] })
+    })
+    vi.stubGlobal('fetch', fetch)
+    renderPanel()
+
+    await screen.findByText('No connectors are configured for this workspace yet.')
+    fireEvent.change(screen.getByLabelText('Credential'), { target: { value: 'bad' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Connect' }))
+
+    expect(await screen.findByText(/The provider rejected this credential: bad token/)).toBeTruthy()
+    expect(screen.queryByText('Connector Authorization Failed')).toBeNull()
+  })
+
+  it('starts a sync with the selected run type and resource type', async () => {
+    const fetch = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      if (url.includes('/sync') && (init?.method ?? '').toUpperCase() === 'POST') return response({ id: 'run-2', connector_account_id: 'connector-1', run_type: 'incremental', status: 'succeeded', items_processed: 1, error_summary: null, started_at: '2026-07-27T00:00:00Z', completed_at: '2026-07-27T00:01:00Z' })
+      if (url.includes('/sync-runs')) return response({ sync_runs: [] })
+      return response({ connectors: [connector()] })
+    })
+    vi.stubGlobal('fetch', fetch)
+    renderPanel()
+
+    await screen.findByText('Acme GitHub')
+    fireEvent.change(screen.getByLabelText('Run type for Acme GitHub'), { target: { value: 'incremental' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Start sync' }))
+
+    await waitFor(() => expect(fetch).toHaveBeenCalledWith(expect.stringContaining('/connectors/connector-1/sync'), expect.objectContaining({ method: 'POST' })))
+    const call = fetch.mock.calls.find((c) => String(c[0]).includes('/connectors/connector-1/sync'))
+    expect(JSON.parse(String((call?.[1] as RequestInit).body))).toEqual({ run_type: 'incremental', resource_type: 'repository' })
+  })
+
+  it('maps CONNECTOR_SYNC_IN_PROGRESS to a readable sentence', async () => {
+    const fetch = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      if (url.includes('/sync') && (init?.method ?? '').toUpperCase() === 'POST') return response({ error: { code: 'CONNECTOR_SYNC_IN_PROGRESS', message: 'Connector Sync In Progress' } }, 409)
+      if (url.includes('/sync-runs')) return response({ sync_runs: [] })
+      return response({ connectors: [connector()] })
+    })
+    vi.stubGlobal('fetch', fetch)
+    renderPanel()
+
+    await screen.findByText('Acme GitHub')
+    fireEvent.click(screen.getByRole('button', { name: 'Start sync' }))
+    expect(await screen.findByText(/A sync is already running for this connector/)).toBeTruthy()
+  })
+
+  it('disconnects a connector', async () => {
+    const fetch = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      if (url.includes('/disable')) return response(connector({ status: 'disconnected' }))
+      if (url.includes('/sync-runs')) return response({ sync_runs: [] })
+      return response({ connectors: [connector()] })
+    })
+    vi.stubGlobal('fetch', fetch)
+    renderPanel()
+
+    await screen.findByText('Acme GitHub')
+    fireEvent.click(screen.getByRole('button', { name: 'Disconnect' }))
+    await waitFor(() => expect(fetch).toHaveBeenCalledWith(expect.stringContaining('/connectors/connector-1/disable'), expect.objectContaining({ method: 'POST' })))
+  })
+})

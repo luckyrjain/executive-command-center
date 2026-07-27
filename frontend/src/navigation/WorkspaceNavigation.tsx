@@ -26,6 +26,7 @@ const WORKSPACES: ReadonlyArray<{ view: WorkspaceView; label: string }> = [
   // array's existing order), none of which this task should have to
   // rewrite just to add one more tab.
   { view: 'automation', label: 'Automation' },
+  { view: 'engineering', label: 'Engineering' },
 ]
 
 export function nextWorkspaceIndex(current: number, key: string, count: number): number {
