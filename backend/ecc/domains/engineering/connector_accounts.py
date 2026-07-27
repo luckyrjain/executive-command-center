@@ -22,11 +22,27 @@ credential").
 **Sync is dispatched synchronously, inline in the request handler, not
 through a durable worker.** Unlike Phase 5's `workflow_runs` (crash-safe,
 lease-based, potentially long-running), a Task 1 sync call is a single
-adapter method call against either a sandbox fake (this task) or, in a
-later task, a bounded real HTTP call with its own timeout -- there is no
-multi-step graph to crash-recover mid-way through. `sync_runs.status` still
-records `running` before the call and `succeeded`/`failed`/`partial` after,
-so a stuck run remains visible for scale reasons.
+adapter method call against a sandbox fake -- instant, in-memory, no I/O.
+`sync_runs.status` still records `running` before the call and
+`succeeded`/`failed`/`partial` after, so a stuck run remains visible for
+scale reasons.
+
+**Must change before Task 2 registers a real network-calling adapter.**
+This handler's entire body, including the adapter call, runs inside one
+`with session.begin():` against `ecc.database.SessionFactory`, bound to
+the shared app-wide `engine` pool (`pool_size=5 + max_overflow=10 = 15`
+connections total, `database.py`). That is fine only because this task's
+adapter call is instant -- a real GitHub/GitLab/Jira backfill (thousands of
+paginated calls under rate limiting, or simply a slow/degraded provider)
+would hold one of those 15 connections for the adapter's entire real-world
+duration, and a handful of concurrent syncs would exhaust the pool and
+start starving every unrelated endpoint in the app, not just engineering
+ones. This codebase already solved the identical problem for `ai_runtime`
+(`database.py`'s dedicated `NullPool` `lock_engine`, `ai_runtime/runtime.
+py`'s `_held_idempotency_lock`) -- Task 2 must apply the same fix (a
+dedicated connection, or moving sync dispatch off the request path
+entirely into a worker) rather than carrying today's transaction shape
+into a real provider call unchanged.
 
 **Accepted limitation, disclosed rather than silently absent:**
 `ConnectorAdapter.refresh_permissions` has no HTTP caller in this task --
@@ -71,8 +87,50 @@ from .crypto import decrypt_credential, encrypt_credential
 ConnectorStatus = Literal[
     "pending", "active", "permission_lost", "rate_limited", "disconnected", "error"
 ]
+# The full set `sync_runs.run_type` (and `SyncRunResponse`) can hold --
+# 'webhook' rows exist once a later task adds webhook ingestion, but no
+# HTTP caller in this task ever writes one (see `ManualSyncRunType` below).
 RunType = Literal["backfill", "incremental", "webhook"]
+# `POST .../sync` is a manual-trigger endpoint only -- 'webhook' is
+# deliberately excluded from the *request* body's own type (unlike `RunType`
+# above), since `sync_connector_endpoint` has no code path that would ever
+# accept it: the handler's own dispatch only branches on 'backfill'/
+# 'incremental'. Reusing `RunType` here previously advertised 'webhook' as
+# a legal request value in the generated OpenAPI schema despite every such
+# request being unconditionally rejected -- narrowing this type is the fix,
+# not a runtime check, so the schema itself stops overclaiming.
+ManualSyncRunType = Literal["backfill", "incremental"]
 RunStatus = Literal["running", "succeeded", "failed", "partial"]
+# Matches migration `0044_phase6_connector_platform.py`'s
+# `ck_sync_cursors_resource_type` CHECK constraint exactly -- accepting any
+# string here (the previous shape) let a request reach the cursor UPSERT
+# with an out-of-set value, which the CHECK constraint then rejected as an
+# unhandled `IntegrityError`/500 rather than a clean 422. Validating the
+# same closed set at the API boundary means a caller gets a structured
+# FastAPI/Pydantic validation error instead.
+ResourceType = Literal["repository", "work_item", "change", "review", "deployment", "incident"]
+
+_MAX_ADAPTER_ERROR_LENGTH = 300
+
+
+def _sanitize_adapter_error(message: str) -> str:
+    """Adapter exception text is untrusted, provider-controlled content
+    that ends up in workspace-visible fields (`connector_accounts.
+    last_error`, `sync_runs.error_summary`, and the immediate 422 response
+    body on an authorization failure). A real (non-sandbox) adapter's HTTP
+    client exception commonly embeds a full request URL, headers, or an
+    echoed-back rejected token -- this sandbox adapter's own fixed-string
+    failure never exercises that risk, but Task 2's real GitHub/GitLab/Jira
+    adapter will. This is deliberately a blunt length cap, not credential-
+    shaped-substring scrubbing (which cannot be done reliably in general)
+    -- the actual guarantee an adapter author must uphold is not raising a
+    credential in their own exception text at all, matching `ecc.domains.
+    automation.local_adapters`' identical "an adapter-author contract
+    obligation the runtime cannot mechanically prove" precedent for
+    `simulate()`'s side-effect-free requirement.
+    """
+    return message[:_MAX_ADAPTER_ERROR_LENGTH]
+
 
 _ACCOUNT_FIELDS = """
     id, workspace_id, provider, external_account_id, display_name,
@@ -124,13 +182,25 @@ def _row_to_account(row: dict[str, Any]) -> ConnectorAccount:
 
 
 def get_connector_account(
-    session: Session, workspace_id: UUID, account_id: UUID
+    session: Session, workspace_id: UUID, account_id: UUID, *, for_update: bool = False
 ) -> ConnectorAccount | None:
+    """`for_update=True` takes `FOR UPDATE`, serializing concurrent mutators
+    of the same account (mirrors `automation/policy.py`'s `revoke_policy`
+    precedent). Both `sync_connector_endpoint` and `disable_connector_
+    endpoint` load the account this way before mutating it: two concurrent
+    `/sync` calls for the same account (different Idempotency-Keys, so the
+    advisory-lock replay guard alone would not serialize them) would
+    otherwise both read the same `sync_cursors` value before either
+    commits, racing a lost cursor update -- this row lock closes that
+    window by making the second caller block until the first transaction
+    commits or rolls back.
+    """
+    clause = "FOR UPDATE" if for_update else ""
     row = (
         session.execute(
             text(
                 f"SELECT {_ACCOUNT_FIELDS} FROM connector_accounts "
-                "WHERE workspace_id = :workspace_id AND id = :id"
+                f"WHERE workspace_id = :workspace_id AND id = :id {clause}"
             ),
             {"workspace_id": workspace_id, "id": account_id},
         )
@@ -205,8 +275,8 @@ class ConnectorAccountListResponse(BaseModel):
 
 class SyncRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    run_type: RunType
-    resource_type: str = Field(min_length=1, max_length=30)
+    run_type: ManualSyncRunType
+    resource_type: ResourceType
 
 
 class SyncRunResponse(BaseModel):
@@ -428,7 +498,10 @@ def create_connector_endpoint(
         try:
             authorization = adapter.authorize(payload.credential)
         except AdapterAuthorizationError as exc:
-            detail = {"code": "CONNECTOR_AUTHORIZATION_FAILED", "error": str(exc)}
+            detail = {
+                "code": "CONNECTOR_AUTHORIZATION_FAILED",
+                "error": _sanitize_adapter_error(str(exc)),
+            }
             raise HTTPException(status_code=422, detail=detail) from exc
 
         account_id = uuid4()
@@ -486,7 +559,11 @@ def create_connector_endpoint(
         return response
 
 
-@router.post("/connectors/{account_id}/sync", response_model=SyncRunResponse)
+@router.post(
+    "/connectors/{account_id}/sync",
+    response_model=SyncRunResponse,
+    status_code=status.HTTP_201_CREATED,
+)
 def sync_connector_endpoint(
     account_id: UUID,
     payload: SyncRequest,
@@ -504,7 +581,14 @@ def sync_connector_endpoint(
         if cached is not None:
             return SyncRunResponse.model_validate(cached)
 
-        account = get_connector_account(session, auth.workspace_id, account_id)
+        # `for_update=True`: locks this account's row for the whole
+        # transaction, serializing a second concurrent `/sync` call for the
+        # same account (different Idempotency-Key, so the advisory-lock
+        # replay guard above does not itself serialize them) until this one
+        # commits -- closes the lost-cursor-update race a plain unlocked
+        # read would otherwise allow between the `cursor_row` read below and
+        # the cursor UPSERT.
+        account = get_connector_account(session, auth.workspace_id, account_id, for_update=True)
         if account is None:
             raise HTTPException(status_code=404, detail="CONNECTOR_NOT_FOUND")
         if account.status == "disconnected":
@@ -566,27 +650,30 @@ def sync_connector_endpoint(
         try:
             if payload.run_type == "backfill":
                 outcome = adapter.backfill(context, payload.resource_type)
-            elif payload.run_type == "incremental":
-                outcome = adapter.incremental_sync(context, payload.resource_type, prior_cursor)
             else:
-                raise HTTPException(status_code=422, detail="UNSUPPORTED_RUN_TYPE_FOR_MANUAL_SYNC")
-        except HTTPException:
-            raise
+                outcome = adapter.incremental_sync(context, payload.resource_type, prior_cursor)
         except Exception as exc:  # noqa: BLE001 -- classified as a failed sync run, not a crash
+            failure_summary = _sanitize_adapter_error(str(exc))
             completed_at = datetime.now(UTC)
             session.execute(
                 text(
                     "UPDATE sync_runs SET status = 'failed', error_summary = :error, "
                     "completed_at = :completed_at WHERE id = :id"
                 ),
-                {"error": str(exc), "completed_at": completed_at, "id": run_id},
+                {"error": failure_summary, "completed_at": completed_at, "id": run_id},
             )
             session.execute(
                 text(
                     "UPDATE connector_accounts SET status = 'error', last_error = :error, "
-                    "updated_at = :now, version = version + 1 WHERE id = :id"
+                    "updated_at = :now, updated_by = :actor_id, version = version + 1 "
+                    "WHERE id = :id"
                 ),
-                {"error": str(exc), "now": completed_at, "id": account_id},
+                {
+                    "error": failure_summary,
+                    "now": completed_at,
+                    "actor_id": auth.user_id,
+                    "id": account_id,
+                },
             )
             run_row = (
                 session.execute(
@@ -600,12 +687,29 @@ def sync_connector_endpoint(
                 .one()
             )
             response = SyncRunResponse(**dict(run_row))
+            _write_side_effects(
+                session,
+                auth,
+                request,
+                event_type="connector_account.sync_failed",
+                aggregate_id=account_id,
+                version=account.version + 1,
+                now=completed_at,
+            )
             _store_idempotency(
                 session, auth, idempotency_key, request_hash, response.model_dump(mode="json"), now
             )
             return response
 
         completed_at = datetime.now(UTC)
+        # `outcome.error_summary` is adapter-returned, untrusted content
+        # (same reasoning as `_sanitize_adapter_error`'s own docstring) --
+        # sanitized once here and reused below rather than persisted raw.
+        error_summary = (
+            _sanitize_adapter_error(outcome.error_summary)
+            if outcome.error_summary is not None
+            else None
+        )
         session.execute(
             text(
                 "UPDATE sync_runs SET status = :status, items_processed = :items_processed, "
@@ -614,7 +718,7 @@ def sync_connector_endpoint(
             {
                 "status": outcome.status,
                 "items_processed": outcome.items_processed,
-                "error_summary": outcome.error_summary,
+                "error_summary": error_summary,
                 "completed_at": completed_at,
                 "id": run_id,
             },
@@ -647,9 +751,15 @@ def sync_connector_endpoint(
         session.execute(
             text(
                 "UPDATE connector_accounts SET last_synced_at = :now, last_error = :error, "
-                "updated_at = :now, version = version + 1 WHERE id = :id"
+                "updated_at = :now, updated_by = :actor_id, version = version + 1 "
+                "WHERE id = :id"
             ),
-            {"now": completed_at, "error": outcome.error_summary, "id": account_id},
+            {
+                "now": completed_at,
+                "error": error_summary,
+                "actor_id": auth.user_id,
+                "id": account_id,
+            },
         )
 
         response = SyncRunResponse(
@@ -658,7 +768,7 @@ def sync_connector_endpoint(
             run_type=payload.run_type,
             status=outcome.status,
             items_processed=outcome.items_processed,
-            error_summary=outcome.error_summary,
+            error_summary=error_summary,
             started_at=now,
             completed_at=completed_at,
         )
@@ -694,21 +804,37 @@ def disable_connector_endpoint(
         if cached is not None:
             return ConnectorAccountResponse.model_validate(cached)
 
-        account = get_connector_account(session, auth.workspace_id, account_id)
+        # `for_update=True`: see sync_connector_endpoint's identical comment
+        # -- serializes a concurrent disable/sync against the same account.
+        account = get_connector_account(session, auth.workspace_id, account_id, for_update=True)
         if account is None:
             raise HTTPException(status_code=404, detail="CONNECTOR_NOT_FOUND")
 
         if account.status != "disconnected":
             adapter = connector_registry.get(account.provider)
             if adapter is not None:
-                encrypted = _get_encrypted_credential(session, auth.workspace_id, account_id)
-                context = ConnectorAccountContext(
-                    workspace_id=auth.workspace_id,
-                    connector_account_id=account_id,
-                    external_account_id=account.external_account_id,
-                    credential=decrypt_credential(encrypted),
-                )
+                # Decryption and the adapter's own revocation call are both
+                # best-effort here, deliberately in the same try/except --
+                # a revocation attempt must never leave a connector stuck
+                # unable to disconnect. Concretely: if `ECC_CONNECTOR_TOKEN_
+                # ENCRYPTION_KEY` was rotated without re-encrypting stored
+                # credentials, `decrypt_credential` raises `cryptography.
+                # fernet.InvalidToken` -- previously that propagated
+                # unhandled out of this block (decrypt happened *outside*
+                # the try/except), 500ing the request and leaving the
+                # connector permanently stuck in its prior status with no
+                # way through this API to disconnect it. Folding decrypt
+                # into the same best-effort block means "cannot even
+                # attempt revocation" degrades exactly like "attempted
+                # revocation and it failed" -- both still disconnect.
                 try:
+                    encrypted = _get_encrypted_credential(session, auth.workspace_id, account_id)
+                    context = ConnectorAccountContext(
+                        workspace_id=auth.workspace_id,
+                        connector_account_id=account_id,
+                        external_account_id=account.external_account_id,
+                        credential=decrypt_credential(encrypted),
+                    )
                     adapter.disconnect(context)
                 except Exception:  # noqa: BLE001 -- best-effort revocation, never blocks disconnect
                     pass

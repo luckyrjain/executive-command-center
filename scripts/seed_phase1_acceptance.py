@@ -155,6 +155,12 @@ _WORKSPACE_ID_TABLES: tuple[str, ...] = (
     # repeats a fifth time.
     "compensation_steps",
     "automation_kill_switches",
+    # Phase 6 Task 1 (migration 0044) -- connector_accounts/sync_cursors/
+    # sync_runs, also workspace-scoped; seeded here from day one for the
+    # same reason, closing this exact gap before it repeats a sixth time.
+    "connector_accounts",
+    "sync_cursors",
+    "sync_runs",
 )
 # `workspaces` is scoped by its own `id`, not a `workspace_id` column.
 _WORKSPACE_TABLE = "workspaces"
@@ -234,6 +240,9 @@ def _fixture_ids(label: str) -> dict[str, UUID]:
         "approval_request": seed_id(label, "approval_request", "acceptance"),
         "compensation_step": seed_id(label, "compensation_step", "acceptance"),
         "kill_switch": seed_id(label, "kill_switch", "acceptance"),
+        "connector_account": seed_id(label, "connector_account", "acceptance"),
+        "sync_cursor": seed_id(label, "sync_cursor", "acceptance"),
+        "sync_run": seed_id(label, "sync_run", "acceptance"),
     }
 
 
@@ -1773,6 +1782,79 @@ def _seed_automation(cur: psycopg.Cursor[Any], label: str, ids: Mapping[str, UUI
     )
 
 
+def _seed_engineering(cur: psycopg.Cursor[Any], label: str, ids: Mapping[str, UUID]) -> None:
+    """Phase 6 Task 1 (migration 0044) -- connector_accounts/sync_cursors/
+    sync_runs, workspace-scoped like every Phase 5 automation table above.
+    ``encrypted_credentials`` holds fixture bytes only -- never a real
+    Fernet ciphertext derived from an actual secret, and never decrypted by
+    anything this drill exercises -- mirroring how the Phase 5 seed above
+    uses fixture ``input``/``output`` JSON rather than any real payload.
+    One ``sync_cursors`` row and one completed ``sync_runs`` row reference
+    the seeded ``connector_accounts`` row via its composite
+    ``(workspace_id, connector_account_id)`` FK.
+    """
+    cur.execute(
+        """
+        INSERT INTO connector_accounts (
+            id, workspace_id, provider, external_account_id, display_name,
+            granted_scopes, encrypted_credentials, status, status_detail,
+            last_synced_at, last_error, disconnected_at, version,
+            created_by, updated_by, created_at, updated_at
+        ) VALUES (
+            %(id)s, %(workspace_id)s, 'sandbox', %(external_account_id)s, %(display_name)s,
+            %(granted_scopes)s, %(encrypted_credentials)s, 'active', NULL,
+            %(now)s, NULL, NULL, 1,
+            %(actor)s, %(actor)s, %(now)s, %(now)s
+        )
+        ON CONFLICT (id) DO NOTHING
+        """,
+        {
+            "id": ids["connector_account"],
+            "workspace_id": ids["workspace"],
+            "external_account_id": f"sandbox-{label}-acceptance",
+            "display_name": "Phase 1 acceptance seed connector",
+            "granted_scopes": ["contents:read", "metadata:read"],
+            "encrypted_credentials": b"phase1-seed-fixture-not-a-real-credential",
+            "actor": ids["user"],
+            "now": SEED_EPOCH,
+        },
+    )
+    cur.execute(
+        """
+        INSERT INTO sync_cursors (
+            id, workspace_id, connector_account_id, resource_type, cursor_value, updated_at
+        ) VALUES (
+            %(id)s, %(workspace_id)s, %(connector_account_id)s, 'repository', '1', %(now)s
+        )
+        ON CONFLICT (id) DO NOTHING
+        """,
+        {
+            "id": ids["sync_cursor"],
+            "workspace_id": ids["workspace"],
+            "connector_account_id": ids["connector_account"],
+            "now": SEED_EPOCH,
+        },
+    )
+    cur.execute(
+        """
+        INSERT INTO sync_runs (
+            id, workspace_id, connector_account_id, run_type, status,
+            items_processed, error_summary, started_at, completed_at, created_at
+        ) VALUES (
+            %(id)s, %(workspace_id)s, %(connector_account_id)s, 'backfill', 'succeeded',
+            3, NULL, %(now)s, %(now)s, %(now)s
+        )
+        ON CONFLICT (id) DO NOTHING
+        """,
+        {
+            "id": ids["sync_run"],
+            "workspace_id": ids["workspace"],
+            "connector_account_id": ids["connector_account"],
+            "now": SEED_EPOCH,
+        },
+    )
+
+
 def seed(conn: psycopg.Connection[Any]) -> None:
     """Insert deterministic Phase 1 fixtures into every table for both workspaces.
 
@@ -1818,6 +1900,11 @@ def seed(conn: psycopg.Connection[Any]) -> None:
             # policies/triggers all reference workflow_definitions, seeded
             # first inside _seed_automation itself.
             _seed_automation(cur, label, ids)
+            # Phase 6 Task 1 (migration 0044) -- connector_accounts/
+            # sync_cursors/sync_runs; sync_cursors/sync_runs reference
+            # connector_accounts, seeded first inside _seed_engineering
+            # itself.
+            _seed_engineering(cur, label, ids)
 
 
 def fixture_row_checksums(conn: psycopg.Connection[Any]) -> dict[str, str]:

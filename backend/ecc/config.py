@@ -216,6 +216,14 @@ def _validate_connector_token_encryption_key(key: str) -> None:
             "ECC_CONNECTOR_TOKEN_ENCRYPTION_KEY must be set outside development "
             "(generate one with `Fernet.generate_key()`)."
         )
+    lowered = key.casefold()
+    for marker in _PLACEHOLDER_SECRET_MARKERS:
+        if marker in lowered:
+            raise ConfigurationError(
+                "ECC_CONNECTOR_TOKEN_ENCRYPTION_KEY looks like a development placeholder "
+                f"(matched {marker!r}); generate a real key with `Fernet.generate_key()` "
+                "before deploying outside development."
+            )
     try:
         decoded = urlsafe_b64decode(key.encode("ascii"))
     except (ValueError, TypeError) as exc:

@@ -5,7 +5,7 @@ Companion to `docs/superpowers/specs/2026-07-27-phase-6-engineering-workspace-de
 ## Task 1 — Connector framework and source projections (this activation)
 
 - Migration: `connector_accounts`, `sync_cursors`, `sync_runs` (`docs/phases/phase-006/DATA-MODEL.md`). The remaining projection tables (`repositories`, `engineering_work_items`, `changes`, `reviews`, `deployments`, `incidents`, `engineering_decisions`, `service_links`, `delivery_metric_snapshots`, `source_tombstones`) are added by Tasks 2-6 below, the task that first populates each one -- matching Phase 5 Task 1's identical precedent (`workflow_runs` wasn't created until Task 2's own migration).
-- `ecc.domains.engineering.connectors`: `ConnectorAdapter` Protocol (`authorize`/`validate`/`backfill`/`incremental_sync`/`handle_webhook`/`refresh_permissions`/`disconnect`) and `ConnectorRegistry`, mirroring `ecc.domains.automation.adapters.ActionAdapter`'s structural-typing shape.
+- `ecc.domains.engineering.connectors`: `ConnectorAdapter` Protocol (`authorize`/`backfill`/`incremental_sync`/`handle_webhook`/`refresh_permissions`/`disconnect` -- "validate" is folded into `authorize`'s return value, not a separate method) and `ConnectorRegistry`, mirroring `ecc.domains.automation.adapters.ActionAdapter`'s structural-typing shape.
 - `ecc.domains.engineering.crypto`: Fernet-based `encrypt_credential`/`decrypt_credential` over `ECC_CONNECTOR_TOKEN_ENCRYPTION_KEY`.
 - `ecc.domains.engineering.sandbox_adapter`: one deliberately-fake `sandbox.github` adapter (no network call) registered into the shared production registry, exercising the full contract shape end to end.
 - `ecc.domains.engineering.connector_accounts`: `GET|POST /api/v1/engineering/connectors`, `POST .../{id}/sync`, `POST .../{id}/disable`, `GET /api/v1/engineering/sync-runs`.
@@ -14,6 +14,8 @@ Companion to `docs/superpowers/specs/2026-07-27-phase-6-engineering-workspace-de
 ## Task 2 — GitHub read sync
 
 Real GitHub REST API backfill/incremental sync and webhook ingestion through the same `ConnectorAdapter` contract Task 1 defines. Repositories, work items (issues), changes (commits/PRs), reviews, deployments projected per `DATA-MODEL.md`. Rate-limit handling and bounded backoff per `CONNECTOR-CONTRACT.md`.
+
+**Must resolve Task 1's disclosed pool-exhaustion risk before landing a real adapter call** (`connector_accounts.py`'s own module docstring has the full reasoning): `sync_connector_endpoint` currently dispatches the adapter call synchronously inside a `session.begin()` block on the shared, 15-connection-capped `engine` pool, which was safe only because Task 1's sandbox adapter is instant and in-memory. A real GitHub backfill is not. Apply the same fix this codebase already used for `ai_runtime` (`database.py`'s dedicated `NullPool` `lock_engine`) -- either a dedicated connection for the sync call, or moving dispatch off the request path into a worker -- rather than carrying today's transaction shape forward unchanged.
 
 ## Task 3 — GitLab read sync
 

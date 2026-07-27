@@ -23,12 +23,39 @@ projections -- the platform layer only"):
    same key is reused with a different payload.
 8. Cross-workspace 404s on sync/disable (workspace B cannot act on
    workspace A's connector).
+
+Plus a second, post-first-review batch closing gaps a multi-persona review
+of this task's first PR found:
+
+9. The adapter-raises-exception failure path on `/sync` (`sync_runs.
+   status='failed'`, `connector_accounts.status='error'`, `updated_by` set,
+   an audit/outbox row written) -- exercised via a throwaway raising fake
+   adapter substituted into `connector_accounts.connector_registry`
+   (monkeypatched), since the real `sandbox.github` adapter never raises.
+10. Direct-SQL rejection tests for all five migration CHECK constraints.
+11. `run_type='webhook'`/an out-of-set `resource_type` on `/sync` is now a
+    Pydantic 422 validation error, not a runtime branch -- both request-
+    shape rejections are tested.
+12. `disable` actually invokes `adapter.disconnect()` (spy adapter), and
+    still succeeds when that call raises (a second, raising fake adapter).
+13. Two different workspaces connecting with the identical credential both
+    succeed (the unique constraint is workspace-scoped, not global).
+14. `GET /sync-runs` with no `connector_account_id` filter.
+15. `Idempotency-Key` replay (not just conflict) on `/sync` and `/disable`.
+16. `CONNECTOR_PROVIDER_NOT_SUPPORTED` reachable from `/sync` (a connector
+    row for a provider with no registered adapter, inserted directly).
+17. `updated_by` is set correctly by a sync call (success and failure).
+18. `disable` still succeeds when the stored credential fails to decrypt
+    (e.g. after an encryption-key rotation) -- corrupted ciphertext
+    inserted directly, decrypt failure must not block disconnecting.
 """
 
 from collections.abc import Iterator
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from hmac import new
+from typing import Any
 from uuid import UUID, uuid4
 
 import pytest
@@ -37,10 +64,13 @@ from sqlalchemy import text
 
 from ecc.config import get_settings
 from ecc.database import engine
+from ecc.domains.engineering import connector_accounts as connector_accounts_module
 from ecc.domains.engineering.connectors import (
     AdapterAuthorizationError,
     ConnectorAccountContext,
+    ConnectorAuthorization,
     ConnectorRegistry,
+    SyncOutcome,
 )
 from ecc.domains.engineering.crypto import decrypt_credential, encrypt_credential
 from ecc.domains.engineering.sandbox_adapter import SandboxGithubAdapter
@@ -51,6 +81,114 @@ pytestmark = pytest.mark.skipif(
     not settings.database_url.startswith("postgresql"),
     reason="PostgreSQL integration test",
 )
+
+
+# --- throwaway fake adapters for the failure/spy paths ----------------------
+# All registered under `provider = "sandbox"` -- `ck_connector_accounts_
+# provider`'s CHECK constraint only allows `github`/`gitlab`/`jira`/
+# `sandbox` (proven directly by the constraint-rejection tests below), so a
+# test-only provider slug is not an option. Each test that uses one of
+# these inserts its `connector_accounts` row directly via SQL (bypassing
+# `create_connector_endpoint`, which would otherwise resolve `"sandbox"`
+# against the *real* `SandboxGithubAdapter`) and monkeypatches
+# `connector_accounts.connector_registry` to a throwaway registry mapping
+# `"sandbox"` to the fake adapter instead, for that test only. Each fake
+# satisfies `ConnectorAdapter` structurally (`@runtime_checkable`),
+# matching `sandbox_adapter.SandboxGithubAdapter`'s own shape.
+
+
+@dataclass
+class _RaisingAdapter:
+    """Every sync call raises -- the real `sandbox.github` adapter never
+    does, so this is the only way to exercise `/sync`'s failure path.
+    """
+
+    provider: str = "sandbox"
+    required_scopes: frozenset[str] = field(default_factory=lambda: frozenset({"contents:read"}))
+
+    def authorize(self, credential: str) -> ConnectorAuthorization:
+        return ConnectorAuthorization(
+            external_account_id="raising-account",
+            display_name="Raising fake",
+            granted_scopes=self.required_scopes,
+        )
+
+    def backfill(self, account: ConnectorAccountContext, resource_type: str) -> SyncOutcome:
+        raise RuntimeError("simulated adapter failure")
+
+    def incremental_sync(
+        self, account: ConnectorAccountContext, resource_type: str, cursor: str | None
+    ) -> SyncOutcome:
+        raise RuntimeError("simulated adapter failure")
+
+    def handle_webhook(
+        self, account: ConnectorAccountContext, payload: bytes, headers: object
+    ) -> SyncOutcome:
+        raise NotImplementedError
+
+    def refresh_permissions(self, account: ConnectorAccountContext) -> str:
+        return "active"
+
+    def disconnect(self, account: ConnectorAccountContext) -> None:
+        return None
+
+
+@dataclass
+class _SpyDisconnectAdapter:
+    """Records every `disconnect()` call so a test can assert it actually
+    happened, rather than only asserting the HTTP-level status transition.
+    """
+
+    provider: str = "sandbox"
+    required_scopes: frozenset[str] = field(default_factory=lambda: frozenset({"contents:read"}))
+    disconnect_calls: list[ConnectorAccountContext] = field(default_factory=list)
+
+    def authorize(self, credential: str) -> ConnectorAuthorization:
+        return ConnectorAuthorization(
+            external_account_id="spy-account",
+            display_name="Spy fake",
+            granted_scopes=self.required_scopes,
+        )
+
+    def backfill(self, account: ConnectorAccountContext, resource_type: str) -> SyncOutcome:
+        return SyncOutcome(
+            resource_type=resource_type, items_processed=1, status="succeeded", next_cursor="1"
+        )
+
+    def incremental_sync(
+        self, account: ConnectorAccountContext, resource_type: str, cursor: str | None
+    ) -> SyncOutcome:
+        return self.backfill(account, resource_type)
+
+    def handle_webhook(
+        self, account: ConnectorAccountContext, payload: bytes, headers: object
+    ) -> SyncOutcome:
+        raise NotImplementedError
+
+    def refresh_permissions(self, account: ConnectorAccountContext) -> str:
+        return "active"
+
+    def disconnect(self, account: ConnectorAccountContext) -> None:
+        self.disconnect_calls.append(account)
+
+
+@dataclass
+class _RaisingDisconnectAdapter(_SpyDisconnectAdapter):
+    """`disconnect()` always raises -- proves `disable` still succeeds
+    (best-effort revocation) rather than only asserting the happy path.
+    """
+
+    provider: str = "sandbox"
+
+    def disconnect(self, account: ConnectorAccountContext) -> None:
+        self.disconnect_calls.append(account)
+        raise RuntimeError("revocation endpoint down")
+
+
+def _registry_with(adapter: Any) -> ConnectorRegistry:
+    registry = ConnectorRegistry()
+    registry.register(adapter)
+    return registry
 
 
 # --- unit-level: sandbox adapter / registry / crypto (no database) ---------
@@ -107,6 +245,19 @@ def test_sandbox_adapter_refresh_permissions() -> None:
     )
     assert adapter.refresh_permissions(active_context) == "active"
     assert adapter.refresh_permissions(lost_context) == "permission_lost"
+
+
+def test_sandbox_adapter_handle_webhook() -> None:
+    adapter = SandboxGithubAdapter()
+    context = ConnectorAccountContext(
+        workspace_id=uuid4(), connector_account_id=uuid4(), external_account_id="x", credential="ok"
+    )
+    with_payload = adapter.handle_webhook(context, b'{"event": "push"}', {})
+    assert with_payload.items_processed == 1
+    assert with_payload.status == "succeeded"
+
+    empty_payload = adapter.handle_webhook(context, b"", {})
+    assert empty_payload.items_processed == 0
 
 
 def test_connector_registry_rejects_duplicate_provider() -> None:
@@ -208,6 +359,58 @@ def _headers(token: str, key: str | None = None) -> dict[str, str]:
     if key is not None:
         headers["Idempotency-Key"] = key
     return headers
+
+
+def _insert_connector_account(
+    workspace_id: UUID,
+    user_id: UUID,
+    *,
+    provider: str = "sandbox",
+    external_account_id: str | None = None,
+    credential: str = "fixture-credential",
+    encrypted_credentials: bytes | None = None,
+    status: str = "active",
+) -> UUID:
+    """Inserts a `connector_accounts` row directly, bypassing `POST
+    /connectors` (and therefore its `authorize()` call) -- used by tests
+    that need a row for a provider the real registry has no adapter for
+    (`CONNECTOR_PROVIDER_NOT_SUPPORTED` on `/sync`), or one a monkeypatched
+    fake adapter will handle instead of the real `SandboxGithubAdapter`.
+    `encrypted_credentials` overrides the encrypted form of `credential`
+    entirely when supplied -- used to seed deliberately-corrupt ciphertext
+    for the decrypt-failure-during-disable test.
+    """
+    account_id = uuid4()
+    now = datetime.now(UTC)
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                """
+                INSERT INTO connector_accounts (
+                    id, workspace_id, provider, external_account_id, display_name,
+                    granted_scopes, encrypted_credentials, status, version,
+                    created_by, updated_by, created_at, updated_at
+                ) VALUES (
+                    :id, :workspace_id, :provider, :external_account_id, :display_name,
+                    :granted_scopes, :encrypted_credentials, :status, 1,
+                    :actor_id, :actor_id, :now, :now
+                )
+                """
+            ),
+            {
+                "id": account_id,
+                "workspace_id": workspace_id,
+                "provider": provider,
+                "external_account_id": external_account_id or f"fixture-{account_id}",
+                "display_name": "Fixture connector",
+                "granted_scopes": ["contents:read"],
+                "encrypted_credentials": encrypted_credentials or encrypt_credential(credential),
+                "status": status,
+                "actor_id": user_id,
+                "now": now,
+            },
+        )
+    return account_id
 
 
 def test_create_connector_success_never_returns_credential(
@@ -396,7 +599,7 @@ def test_sync_backfill_then_incremental_advances_cursor_and_records_runs(
         json={"run_type": "backfill", "resource_type": "repository"},
         headers=_headers(token, key=str(uuid4())),
     )
-    assert backfill.status_code == 200, backfill.text
+    assert backfill.status_code == 201, backfill.text
     assert backfill.json()["status"] == "succeeded"
     assert backfill.json()["items_processed"] == 3
 
@@ -405,7 +608,7 @@ def test_sync_backfill_then_incremental_advances_cursor_and_records_runs(
         json={"run_type": "incremental", "resource_type": "repository"},
         headers=_headers(token, key=str(uuid4())),
     )
-    assert incremental.status_code == 200, incremental.text
+    assert incremental.status_code == 201, incremental.text
     assert incremental.json()["items_processed"] == 1
 
     with engine.begin() as connection:
@@ -419,16 +622,12 @@ def test_sync_backfill_then_incremental_advances_cursor_and_records_runs(
         assert cursor == "2"
 
         last_synced = connection.execute(
-            text(
-                "SELECT last_synced_at FROM connector_accounts WHERE id = :account_id"
-            ),
+            text("SELECT last_synced_at FROM connector_accounts WHERE id = :account_id"),
             {"account_id": UUID(account_id)},
         ).scalar_one()
         assert last_synced is not None
 
-    runs = client.get(
-        "/api/v1/engineering/sync-runs", params={"connector_account_id": account_id}
-    )
+    runs = client.get("/api/v1/engineering/sync-runs", params={"connector_account_id": account_id})
     assert runs.status_code == 200
     run_bodies = runs.json()["sync_runs"]
     assert len(run_bodies) == 2
@@ -543,3 +742,417 @@ def test_sync_and_disable_cross_workspace_404(
         client_b.close()
     finally:
         _cleanup_workspace(workspace_b_id)
+
+
+# --- second review batch: failure path, constraints, spies, edge cases -----
+
+
+def test_sync_adapter_failure_marks_run_and_account_failed(
+    engineering_test_context: tuple[TestClient, UUID, UUID, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, workspace_id, user_id, token = engineering_test_context
+    monkeypatch.setattr(
+        connector_accounts_module, "connector_registry", _registry_with(_RaisingAdapter())
+    )
+    account_id = _insert_connector_account(workspace_id, user_id)
+
+    response = client.post(
+        f"/api/v1/engineering/connectors/{account_id}/sync",
+        json={"run_type": "backfill", "resource_type": "repository"},
+        headers=_headers(token, key=str(uuid4())),
+    )
+    # Still 201: a real sync_runs row was created and is returned, even
+    # though the sync itself failed -- see connector_accounts.py's own
+    # module docstring for this status-code reasoning.
+    assert response.status_code == 201, response.text
+    body = response.json()
+    assert body["status"] == "failed"
+    assert "simulated adapter failure" in body["error_summary"]
+
+    with engine.begin() as connection:
+        account_row = (
+            connection.execute(
+                text(
+                    "SELECT status, last_error, updated_by FROM connector_accounts WHERE id = :id"
+                ),
+                {"id": account_id},
+            )
+            .mappings()
+            .one()
+        )
+        assert account_row["status"] == "error"
+        assert account_row["last_error"] is not None
+        assert account_row["updated_by"] == user_id
+
+        audit_count = connection.execute(
+            text(
+                "SELECT count(*) FROM audit_events WHERE workspace_id = :workspace_id "
+                "AND event_type = 'connector_account.sync_failed'"
+            ),
+            {"workspace_id": workspace_id},
+        ).scalar_one()
+        assert audit_count == 1
+
+
+def test_sync_success_sets_updated_by(
+    engineering_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    client, workspace_id, user_id, token = engineering_test_context
+    account_id = _insert_connector_account(workspace_id, user_id)
+
+    response = client.post(
+        f"/api/v1/engineering/connectors/{account_id}/sync",
+        json={"run_type": "backfill", "resource_type": "repository"},
+        headers=_headers(token, key=str(uuid4())),
+    )
+    assert response.status_code == 201, response.text
+
+    with engine.begin() as connection:
+        updated_by = connection.execute(
+            text("SELECT updated_by FROM connector_accounts WHERE id = :id"),
+            {"id": account_id},
+        ).scalar_one()
+        assert updated_by == user_id
+
+
+@pytest.mark.parametrize(
+    ("table", "column", "value"),
+    [
+        ("connector_accounts", "provider", "not-a-real-provider"),
+        ("connector_accounts", "status", "not-a-real-status"),
+    ],
+)
+def test_connector_accounts_check_constraints_reject_invalid_values(
+    engineering_test_context: tuple[TestClient, UUID, UUID, str],
+    table: str,
+    column: str,
+    value: str,
+) -> None:
+    from psycopg.errors import CheckViolation
+    from sqlalchemy.exc import IntegrityError
+
+    _client, workspace_id, user_id, _token = engineering_test_context
+    now = datetime.now(UTC)
+    with pytest.raises(IntegrityError) as excinfo:
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO connector_accounts (
+                        id, workspace_id, provider, external_account_id, display_name,
+                        granted_scopes, encrypted_credentials, status, version,
+                        created_by, updated_by, created_at, updated_at
+                    ) VALUES (
+                        :id, :workspace_id, :provider, 'x', 'x',
+                        ARRAY['contents:read'], :creds, :status, 1,
+                        :actor_id, :actor_id, :now, :now
+                    )
+                    """
+                ),
+                {
+                    "id": uuid4(),
+                    "workspace_id": workspace_id,
+                    "provider": value if column == "provider" else "sandbox",
+                    "status": value if column == "status" else "active",
+                    "creds": b"x",
+                    "actor_id": user_id,
+                    "now": now,
+                },
+            )
+    assert isinstance(excinfo.value.orig, CheckViolation)
+
+
+def test_sync_cursors_and_sync_runs_check_constraints_reject_invalid_values(
+    engineering_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    from psycopg.errors import CheckViolation
+    from sqlalchemy.exc import IntegrityError
+
+    _client, workspace_id, user_id, _token = engineering_test_context
+    account_id = _insert_connector_account(workspace_id, user_id)
+    now = datetime.now(UTC)
+
+    with pytest.raises(IntegrityError) as excinfo:
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    "INSERT INTO sync_cursors (id, workspace_id, connector_account_id, "
+                    "resource_type, cursor_value, updated_at) VALUES "
+                    "(:id, :workspace_id, :account_id, 'not-a-real-resource-type', '1', :now)"
+                ),
+                {
+                    "id": uuid4(),
+                    "workspace_id": workspace_id,
+                    "account_id": account_id,
+                    "now": now,
+                },
+            )
+    assert isinstance(excinfo.value.orig, CheckViolation)
+
+    with pytest.raises(IntegrityError) as excinfo:
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    "INSERT INTO sync_runs (id, workspace_id, connector_account_id, run_type, "
+                    "status, items_processed, started_at, created_at) VALUES "
+                    "(:id, :workspace_id, :account_id, 'not-a-real-run-type', 'running', "
+                    "0, :now, :now)"
+                ),
+                {
+                    "id": uuid4(),
+                    "workspace_id": workspace_id,
+                    "account_id": account_id,
+                    "now": now,
+                },
+            )
+    assert isinstance(excinfo.value.orig, CheckViolation)
+
+    with pytest.raises(IntegrityError) as excinfo:
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    "INSERT INTO sync_runs (id, workspace_id, connector_account_id, run_type, "
+                    "status, items_processed, started_at, created_at) VALUES "
+                    "(:id, :workspace_id, :account_id, 'backfill', 'not-a-real-status', "
+                    "0, :now, :now)"
+                ),
+                {
+                    "id": uuid4(),
+                    "workspace_id": workspace_id,
+                    "account_id": account_id,
+                    "now": now,
+                },
+            )
+    assert isinstance(excinfo.value.orig, CheckViolation)
+
+
+def test_sync_rejects_invalid_run_type_and_resource_type(
+    engineering_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    client, workspace_id, user_id, token = engineering_test_context
+    account_id = _insert_connector_account(workspace_id, user_id)
+
+    webhook_attempt = client.post(
+        f"/api/v1/engineering/connectors/{account_id}/sync",
+        json={"run_type": "webhook", "resource_type": "repository"},
+        headers=_headers(token, key=str(uuid4())),
+    )
+    assert webhook_attempt.status_code == 422
+
+    bad_resource_type = client.post(
+        f"/api/v1/engineering/connectors/{account_id}/sync",
+        json={"run_type": "backfill", "resource_type": "not-a-real-resource-type"},
+        headers=_headers(token, key=str(uuid4())),
+    )
+    assert bad_resource_type.status_code == 422
+
+    with engine.begin() as connection:
+        run_count = connection.execute(
+            text("SELECT count(*) FROM sync_runs WHERE connector_account_id = :id"),
+            {"id": account_id},
+        ).scalar_one()
+        assert run_count == 0
+
+
+def test_disable_invokes_adapter_disconnect(
+    engineering_test_context: tuple[TestClient, UUID, UUID, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, workspace_id, user_id, token = engineering_test_context
+    spy = _SpyDisconnectAdapter()
+    monkeypatch.setattr(connector_accounts_module, "connector_registry", _registry_with(spy))
+    account_id = _insert_connector_account(workspace_id, user_id)
+
+    response = client.post(
+        f"/api/v1/engineering/connectors/{account_id}/disable",
+        headers=_headers(token, key=str(uuid4())),
+    )
+    assert response.status_code == 200
+    assert response.json()["status"] == "disconnected"
+    assert len(spy.disconnect_calls) == 1
+    assert spy.disconnect_calls[0].connector_account_id == account_id
+
+
+def test_disable_succeeds_when_adapter_disconnect_raises(
+    engineering_test_context: tuple[TestClient, UUID, UUID, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, workspace_id, user_id, token = engineering_test_context
+    raising = _RaisingDisconnectAdapter()
+    monkeypatch.setattr(connector_accounts_module, "connector_registry", _registry_with(raising))
+    account_id = _insert_connector_account(workspace_id, user_id)
+
+    response = client.post(
+        f"/api/v1/engineering/connectors/{account_id}/disable",
+        headers=_headers(token, key=str(uuid4())),
+    )
+    assert response.status_code == 200
+    assert response.json()["status"] == "disconnected"
+    assert len(raising.disconnect_calls) == 1
+
+
+def test_disable_succeeds_when_credential_cannot_be_decrypted(
+    engineering_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    client, workspace_id, user_id, token = engineering_test_context
+    account_id = _insert_connector_account(
+        workspace_id, user_id, encrypted_credentials=b"not-a-valid-fernet-token"
+    )
+
+    response = client.post(
+        f"/api/v1/engineering/connectors/{account_id}/disable",
+        headers=_headers(token, key=str(uuid4())),
+    )
+    assert response.status_code == 200
+    assert response.json()["status"] == "disconnected"
+
+
+def test_create_connector_same_credential_different_workspaces_both_succeed(
+    engineering_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    client, _workspace_id, _user_id, token = engineering_test_context
+    first = client.post(
+        "/api/v1/engineering/connectors",
+        json={"provider": "sandbox", "credential": "shared-credential"},
+        headers=_headers(token, key=str(uuid4())),
+    )
+    assert first.status_code == 201
+
+    workspace_b_id = uuid4()
+    user_b_id = uuid4()
+    token_b = f"session-{uuid4()}"
+    now = datetime.now(UTC)
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO workspaces (id, name, timezone, created_at) "
+                "VALUES (:id, 'Workspace B Shared Credential', 'Asia/Kolkata', :now)"
+            ),
+            {"id": workspace_b_id, "now": now},
+        )
+        connection.execute(
+            text(
+                "INSERT INTO users (id, workspace_id, email, password_hash, created_at) "
+                "VALUES (:id, :workspace_id, :email, 'test-password-hash', :now)"
+            ),
+            {
+                "id": user_b_id,
+                "workspace_id": workspace_b_id,
+                "email": f"{user_b_id}@example.test",
+                "now": now,
+            },
+        )
+        connection.execute(
+            text(
+                "INSERT INTO sessions (id, workspace_id, user_id, token_hash, "
+                "expires_at, last_seen_at) "
+                "VALUES (:id, :workspace_id, :user_id, :token_hash, :expires_at, :now)"
+            ),
+            {
+                "id": uuid4(),
+                "workspace_id": workspace_b_id,
+                "user_id": user_b_id,
+                "token_hash": sha256(token_b.encode()).hexdigest(),
+                "expires_at": now + timedelta(hours=1),
+                "now": now,
+            },
+        )
+    try:
+        client_b = TestClient(app)
+        client_b.cookies.set("ecc_session", token_b)
+        second = client_b.post(
+            "/api/v1/engineering/connectors",
+            json={"provider": "sandbox", "credential": "shared-credential"},
+            headers=_headers(token_b, key=str(uuid4())),
+        )
+        assert second.status_code == 201
+        assert second.json()["id"] != first.json()["id"]
+        client_b.close()
+    finally:
+        _cleanup_workspace(workspace_b_id)
+
+
+def test_list_sync_runs_without_connector_filter(
+    engineering_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    client, workspace_id, user_id, token = engineering_test_context
+    account_id = _insert_connector_account(workspace_id, user_id)
+    client.post(
+        f"/api/v1/engineering/connectors/{account_id}/sync",
+        json={"run_type": "backfill", "resource_type": "repository"},
+        headers=_headers(token, key=str(uuid4())),
+    )
+
+    response = client.get("/api/v1/engineering/sync-runs")
+    assert response.status_code == 200
+    runs = response.json()["sync_runs"]
+    assert len(runs) == 1
+    assert runs[0]["connector_account_id"] == str(account_id)
+
+
+def test_sync_idempotency_replay(
+    engineering_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    client, workspace_id, user_id, token = engineering_test_context
+    account_id = _insert_connector_account(workspace_id, user_id)
+    key = str(uuid4())
+    payload = {"run_type": "backfill", "resource_type": "repository"}
+
+    first = client.post(
+        f"/api/v1/engineering/connectors/{account_id}/sync",
+        json=payload,
+        headers=_headers(token, key=key),
+    )
+    assert first.status_code == 201
+
+    replay = client.post(
+        f"/api/v1/engineering/connectors/{account_id}/sync",
+        json=payload,
+        headers=_headers(token, key=key),
+    )
+    assert replay.status_code == 201
+    assert replay.json()["id"] == first.json()["id"]
+
+    with engine.begin() as connection:
+        run_count = connection.execute(
+            text("SELECT count(*) FROM sync_runs WHERE connector_account_id = :id"),
+            {"id": account_id},
+        ).scalar_one()
+        assert run_count == 1
+
+
+def test_disable_idempotency_replay(
+    engineering_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    client, workspace_id, user_id, token = engineering_test_context
+    account_id = _insert_connector_account(workspace_id, user_id)
+    key = str(uuid4())
+
+    first = client.post(
+        f"/api/v1/engineering/connectors/{account_id}/disable",
+        headers=_headers(token, key=key),
+    )
+    assert first.status_code == 200
+
+    replay = client.post(
+        f"/api/v1/engineering/connectors/{account_id}/disable",
+        headers=_headers(token, key=key),
+    )
+    assert replay.status_code == 200
+    assert replay.json() == first.json()
+
+
+def test_sync_connector_provider_not_supported(
+    engineering_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    client, workspace_id, user_id, token = engineering_test_context
+    account_id = _insert_connector_account(workspace_id, user_id, provider="github")
+
+    response = client.post(
+        f"/api/v1/engineering/connectors/{account_id}/sync",
+        json={"run_type": "backfill", "resource_type": "repository"},
+        headers=_headers(token, key=str(uuid4())),
+    )
+    assert response.status_code == 404
+    assert response.json()["detail"] == "CONNECTOR_PROVIDER_NOT_SUPPORTED"

@@ -203,9 +203,26 @@ def upgrade() -> None:
         "sync_runs",
         ["workspace_id", "connector_account_id", "started_at"],
     )
+    # `GET /engineering/sync-runs` with no `connector_account_id` filter (the
+    # plain "show sync history for this workspace" case) orders by
+    # `started_at DESC` over `workspace_id` alone -- the composite index
+    # above has `connector_account_id` as its unbound middle column in that
+    # case, so it cannot itself satisfy the ORDER BY (Postgres would still
+    # need a separate Sort over every matching row). This second index
+    # exists specifically for that unfiltered path; `sync_runs` is a
+    # write-once-per-sync-call table expected to grow faster than
+    # `connector_accounts`, so leaving this ordering uncovered would be the
+    # first place this phase's own "metric queries p95 <1 second" NFR
+    # degrades as history accumulates.
+    op.create_index(
+        "ix_sync_runs_workspace_started",
+        "sync_runs",
+        ["workspace_id", "started_at"],
+    )
 
 
 def downgrade() -> None:
+    op.drop_index("ix_sync_runs_workspace_started", table_name="sync_runs")
     op.drop_index("ix_sync_runs_workspace_account_started", table_name="sync_runs")
     op.drop_table("sync_runs")
     op.drop_table("sync_cursors")
