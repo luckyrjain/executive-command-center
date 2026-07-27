@@ -175,6 +175,14 @@ _WORKSPACE_ID_TABLES: tuple[str, ...] = (
     "changes",
     "reviews",
     "delivery_metric_snapshots",
+    # Phase 6 Task 6 (migration 0049) -- incidents/engineering_decisions
+    # and their change-correlation join tables, also workspace-scoped;
+    # seeded here from day one for the same reason, closing this exact
+    # gap before it repeats a tenth time.
+    "incidents",
+    "engineering_decisions",
+    "incident_changes",
+    "decision_changes",
 )
 # `workspaces` is scoped by its own `id`, not a `workspace_id` column.
 _WORKSPACE_TABLE = "workspaces"
@@ -262,6 +270,10 @@ def _fixture_ids(label: str) -> dict[str, UUID]:
         "change": seed_id(label, "change", "acceptance"),
         "review": seed_id(label, "review", "acceptance"),
         "delivery_metric_snapshot": seed_id(label, "delivery_metric_snapshot", "acceptance"),
+        "incident": seed_id(label, "incident", "acceptance"),
+        "engineering_decision": seed_id(label, "engineering_decision", "acceptance"),
+        "incident_change": seed_id(label, "incident_change", "acceptance"),
+        "decision_change": seed_id(label, "decision_change", "acceptance"),
     }
 
 
@@ -1820,6 +1832,15 @@ def _seed_engineering(cur: psycopg.Cursor[Any], label: str, ids: Mapping[str, UU
 
     Phase 6 Task 4 (migration 0047) extends this same function with one
     ``engineering_work_items`` row, for the identical reason.
+
+    Phase 6 Task 6 (migration 0049) extends this same function with one
+    resolved ``incidents`` row, one decided ``engineering_decisions``
+    row, and one join row each in ``incident_changes``/
+    ``decision_changes`` linking both back to the seeded ``changes`` row
+    above -- workspace-authored (not connector-synced), but still
+    workspace-scoped and therefore discovered generically by
+    ``verify_restore.sh``'s workspace-isolation check, the same reason
+    every table above must be seeded here.
     """
     cur.execute(
         """
@@ -2004,6 +2025,79 @@ def _seed_engineering(cur: psycopg.Cursor[Any], label: str, ids: Mapping[str, UU
         {
             "id": ids["delivery_metric_snapshot"],
             "workspace_id": ids["workspace"],
+            "now": SEED_EPOCH,
+        },
+    )
+    cur.execute(
+        """
+        INSERT INTO incidents (
+            id, workspace_id, title, description, severity, status,
+            detected_at, resolved_at, version, created_by, updated_by,
+            created_at, updated_at
+        ) VALUES (
+            %(id)s, %(workspace_id)s, %(title)s, %(description)s, 'high', 'resolved',
+            %(detected_at)s, %(resolved_at)s, 1, %(actor)s, %(actor)s, %(now)s, %(now)s
+        )
+        ON CONFLICT (id) DO NOTHING
+        """,
+        {
+            "id": ids["incident"],
+            "workspace_id": ids["workspace"],
+            "title": f"Acceptance incident ({label})",
+            "description": "Phase 1 acceptance seed fixture incident",
+            "detected_at": SEED_EPOCH - timedelta(hours=2),
+            "resolved_at": SEED_EPOCH,
+            "actor": ids["user"],
+            "now": SEED_EPOCH,
+        },
+    )
+    cur.execute(
+        """
+        INSERT INTO engineering_decisions (
+            id, workspace_id, title, description, rationale, status,
+            decided_at, version, created_by, updated_by, created_at, updated_at
+        ) VALUES (
+            %(id)s, %(workspace_id)s, %(title)s, %(description)s, %(rationale)s, 'decided',
+            %(decided_at)s, 1, %(actor)s, %(actor)s, %(now)s, %(now)s
+        )
+        ON CONFLICT (id) DO NOTHING
+        """,
+        {
+            "id": ids["engineering_decision"],
+            "workspace_id": ids["workspace"],
+            "title": f"Acceptance decision ({label})",
+            "description": "Phase 1 acceptance seed fixture decision",
+            "rationale": "Because the acceptance drill needs a decided row",
+            "decided_at": SEED_EPOCH,
+            "actor": ids["user"],
+            "now": SEED_EPOCH,
+        },
+    )
+    cur.execute(
+        """
+        INSERT INTO incident_changes (id, workspace_id, incident_id, change_id, created_at)
+        VALUES (%(id)s, %(workspace_id)s, %(incident_id)s, %(change_id)s, %(now)s)
+        ON CONFLICT (id) DO NOTHING
+        """,
+        {
+            "id": ids["incident_change"],
+            "workspace_id": ids["workspace"],
+            "incident_id": ids["incident"],
+            "change_id": ids["change"],
+            "now": SEED_EPOCH,
+        },
+    )
+    cur.execute(
+        """
+        INSERT INTO decision_changes (id, workspace_id, decision_id, change_id, created_at)
+        VALUES (%(id)s, %(workspace_id)s, %(decision_id)s, %(change_id)s, %(now)s)
+        ON CONFLICT (id) DO NOTHING
+        """,
+        {
+            "id": ids["decision_change"],
+            "workspace_id": ids["workspace"],
+            "decision_id": ids["engineering_decision"],
+            "change_id": ids["change"],
             "now": SEED_EPOCH,
         },
     )

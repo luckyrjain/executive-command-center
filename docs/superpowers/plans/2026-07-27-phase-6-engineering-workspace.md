@@ -33,7 +33,9 @@ To make `review_latency`/`work_ageing` real rather than deferred alongside the o
 
 ## Task 6 — Decisions, incidents and knowledge linking
 
-`engineering_decisions` capture, incident correlation to changes/deployments, and ambiguous-identity resolution raised against Phase 2's existing `resolution_candidates`/`merge_entities` endpoints (design doc's "why this isn't a green field" section) rather than a second resolution mechanism.
+**Complete, partial scope disclosed.** Implements `incidents`/`engineering_decisions` capture, resolve/decide transitions, listing, and correlation to `changes` (via `incident_changes`/`decision_changes` join tables, migration `0049`) -- making `time_to_restore` the fourth genuinely computable metric (Task 5 left it, along with `delivery_frequency`/`lead_time_for_changes`/`change_failure_rate`, always `insufficient_coverage` since no `incidents` table existed yet). `delivery_frequency`/`lead_time_for_changes`/`change_failure_rate` remain blocked -- all three still need `deployments`, which this plan never assigns to any task.
+
+Two real gaps deliberately deferred, not silently absent, matching this phase's own established precedent for splitting a task's real scope across PRs (Task 5's GitLab change/review-sync deferral is the identical pattern): correlation to `deployments`/work items (no concrete caller populates a second pair of join tables yet); and ambiguous-identity resolution raised against Phase 2's existing `resolution_candidates`/`merge_entities` endpoints (design doc's "why this isn't a green field" section) rather than a second resolution mechanism -- `engineering_work_items.reporter_external_id`/`assignee_external_id`, `changes.author_external_id` and `reviews.reviewer_external_id` all remain unresolved raw provider identifiers after this task; wiring them into Phase 2's real scoring/threshold/deterministic-match logic is a substantial integration in its own right, deferred to a documented follow-up.
 
 ## Task 7 — Approved write actions
 
