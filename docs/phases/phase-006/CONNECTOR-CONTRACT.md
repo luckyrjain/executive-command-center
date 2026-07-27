@@ -2,7 +2,7 @@
 id: PHASE-006-CONNECTOR
 title: Engineering Connector Contract
 status: Approved for Implementation
-version: 0.6.0
+version: 0.7.0
 owner: Lucky Jain
 ---
 
@@ -90,3 +90,9 @@ Unlike both GitHub (whose classic tokens report real scopes via `X-OAuth-Scopes`
 ## Accepted limitation (Task 4): Jira `disconnect()` cannot revoke, identical in kind to GitHub's
 
 Atlassian exposes no public REST API for a personal API token to revoke itself -- unlike GitLab's genuine `DELETE /personal_access_tokens/self`, a Jira API token can only be revoked by a human, manually, at `https://id.atlassian.com/manage-profile/security/api-tokens`. `disconnect()` is therefore a documented no-op, matching `CONNECTOR-CONTRACT.md`'s "must not raise for provider does not support revocation" expected outcome and identical in effect (though not mechanism) to `github_adapter.py`'s own hard no-op.
+
+## Task 5 status
+
+`github_adapter.GitHubAdapter` extends the contract above with two new resource types: `change` (merged pull requests) and `review`. Neither is a new lifecycle operation -- both flow through the existing `backfill`/`incremental_sync` methods, dispatching on `resource_type` exactly as `repository` already does. **Changes use per-repository fan-out, not the GitHub Search API**: `_sync_changes` walks the repositories this same connector account has already synced (read from `repositories`, no second GitHub call to rediscover them), sharing the core REST API's 5,000-requests/hour budget rather than the Search API's separate, much stricter 30-requests/minute one. Its cursor is a JSON object (`{"repos": {repository_external_id: newest_updated_at, ...}}`), not a single timestamp, since "caught up" is a per-repository fact under fan-out. **Reviews are sourced from already-synced `changes`**, not a second discovery step: `_sync_reviews` walks this account's own `changes` rows ordered by `merged_at`, fetching each still-uncovered change's reviews plus (a second call) its timeline for the `review_requested` event `review-requested-at`/`review-submitted-at` latency needs -- neither the reviews endpoint nor any other single GitHub endpoint carries both. A change is only advanced past (its cursor moved forward) once both calls succeed, so a rate-limited timeline call retries the same change next time rather than permanently losing its `requested_at`. GitLab's own `change`/`review` sync remains deferred to a Task 5 follow-up -- see `gitlab_adapter.py`'s own module docstring for the real API-shape differences (a global `scope=all` merge-request endpoint exists, unlike GitHub's fan-out need, but GitLab's approvals endpoint is Premium/Ultimate-only) that make this a genuine design pass, not a copy-paste.
+
+`backend/ecc/domains/engineering/metrics.py` implements `DELIVERY-INTELLIGENCE-CONTRACT.md`'s coverage-threshold policy against real `sync_cursors` freshness data; see that contract document's own "Task 5 status" and three "Accepted limitation" sections for the full design and disclosed gaps.

@@ -1,6 +1,7 @@
 """Phase 6 Engineering Workspace domain package (Task 1: connector
 framework and source projections; Task 2: GitHub read sync; Task 3:
-GitLab read sync; Task 4: Jira work-item sync).
+GitLab read sync; Task 4: Jira work-item sync; Task 5: delivery and
+reliability metrics).
 
 `docs/superpowers/specs/2026-07-27-phase-6-engineering-workspace-design.md`
 / `docs/phases/phase-006/DATA-MODEL.md`. This package owns
@@ -10,17 +11,23 @@ GitLab read sync; Task 4: Jira work-item sync).
 encryption (`crypto.py`), one deliberately-fake sandbox adapter
 (`sandbox_adapter.py`) exercising that contract end to end without a real
 network call, and three real, non-sandbox adapters: `github_adapter.py`
-and `gitlab_adapter.py` (repository backfill/incremental sync, populating
-the shared `repositories` table from migration
-`0045_phase6_repositories.py`), and `jira_adapter.py` (work-item backfill/
-incremental sync, populating `engineering_work_items` from migration
-`0047_phase6_work_items.py`) -- all three against the identical
-`ConnectorAdapter` contract.
+(repository/change/review backfill/incremental sync, populating
+`repositories` from migration `0045_phase6_repositories.py` and
+`changes`/`reviews` from migration `0048_phase6_delivery_metrics.py`),
+`gitlab_adapter.py` (repository sync only -- its own `change`/`review`
+sync is deferred to a Task 5 follow-up, see that module's own docstring),
+and `jira_adapter.py` (work-item backfill/incremental sync, populating
+`engineering_work_items` from migration `0047_phase6_work_items.py`) --
+all three against the identical `ConnectorAdapter` contract. `metrics.py`
+computes `DELIVERY-INTELLIGENCE-CONTRACT.md`'s seven approved metrics
+against that data (only three are genuinely computable yet -- see that
+module's own docstring), writing immutable snapshots to
+`delivery_metric_snapshots` (also migration `0048`) via `GET /engineering/
+metrics`.
 
-Delivery/reliability metric computation, decision/incident linking and
-write actions do not exist in this package yet -- each is a later task per
-`docs/superpowers/plans/2026-07-27-phase-6-engineering-workspace.md`.
-Changes/reviews/deployments and webhook ingestion's receiving endpoint are
-also deferred for all three real adapters -- see each adapter's own
-module docstring.
+Decision/incident linking and write actions do not exist in this package
+yet -- each is a later task per `docs/superpowers/plans/2026-07-27-
+phase-6-engineering-workspace.md`. `deployments` and webhook ingestion's
+receiving endpoint remain deferred for every real adapter -- see each
+adapter's own module docstring.
 """

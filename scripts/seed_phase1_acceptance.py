@@ -169,6 +169,12 @@ _WORKSPACE_ID_TABLES: tuple[str, ...] = (
     # workspace-scoped; seeded here from day one for the same reason,
     # closing this exact gap before it repeats an eighth time.
     "engineering_work_items",
+    # Phase 6 Task 5 (migration 0048) -- changes/reviews/delivery_metric_
+    # snapshots, also workspace-scoped; seeded here from day one for the
+    # same reason, closing this exact gap before it repeats a ninth time.
+    "changes",
+    "reviews",
+    "delivery_metric_snapshots",
 )
 # `workspaces` is scoped by its own `id`, not a `workspace_id` column.
 _WORKSPACE_TABLE = "workspaces"
@@ -253,6 +259,9 @@ def _fixture_ids(label: str) -> dict[str, UUID]:
         "sync_run": seed_id(label, "sync_run", "acceptance"),
         "repository": seed_id(label, "repository", "acceptance"),
         "work_item": seed_id(label, "work_item", "acceptance"),
+        "change": seed_id(label, "change", "acceptance"),
+        "review": seed_id(label, "review", "acceptance"),
+        "delivery_metric_snapshot": seed_id(label, "delivery_metric_snapshot", "acceptance"),
     }
 
 
@@ -1921,6 +1930,80 @@ def _seed_engineering(cur: psycopg.Cursor[Any], label: str, ids: Mapping[str, UU
             "reporter_external_id": f"acceptance-reporter-{label}",
             "assignee_external_id": f"acceptance-assignee-{label}",
             "content_hash": sha256(f"acceptance-work-item-{label}".encode()).hexdigest(),
+            "now": SEED_EPOCH,
+        },
+    )
+    cur.execute(
+        """
+        INSERT INTO changes (
+            id, workspace_id, connector_account_id, repository_id, provider,
+            external_id, provider_number, title, source_url, status, merged_at,
+            permission_state, freshness_state, content_hash, provider_updated_at,
+            observed_at, created_at, updated_at
+        ) VALUES (
+            %(id)s, %(workspace_id)s, %(connector_account_id)s, %(repository_id)s, 'sandbox',
+            %(external_id)s, %(provider_number)s, %(title)s, %(source_url)s, 'closed', %(now)s,
+            'active', 'fresh', %(content_hash)s, %(now)s,
+            %(now)s, %(now)s, %(now)s
+        )
+        ON CONFLICT (id) DO NOTHING
+        """,
+        {
+            "id": ids["change"],
+            "workspace_id": ids["workspace"],
+            "connector_account_id": ids["connector_account"],
+            "repository_id": ids["repository"],
+            "external_id": f"acceptance-change-{label}",
+            "provider_number": "1",
+            "title": f"Acceptance change ({label})",
+            "source_url": f"https://example.test/acceptance/{label}-change",
+            "content_hash": sha256(f"acceptance-change-{label}".encode()).hexdigest(),
+            "now": SEED_EPOCH,
+        },
+    )
+    cur.execute(
+        """
+        INSERT INTO reviews (
+            id, workspace_id, connector_account_id, change_id, provider,
+            external_id, source_url, reviewer_external_id, review_state,
+            requested_at, submitted_at, permission_state, freshness_state,
+            content_hash, provider_updated_at, observed_at, created_at, updated_at
+        ) VALUES (
+            %(id)s, %(workspace_id)s, %(connector_account_id)s, %(change_id)s, 'sandbox',
+            %(external_id)s, %(source_url)s, %(reviewer_external_id)s, 'approved',
+            %(now)s, %(now)s, 'active', 'fresh',
+            %(content_hash)s, %(now)s, %(now)s, %(now)s, %(now)s
+        )
+        ON CONFLICT (id) DO NOTHING
+        """,
+        {
+            "id": ids["review"],
+            "workspace_id": ids["workspace"],
+            "connector_account_id": ids["connector_account"],
+            "change_id": ids["change"],
+            "external_id": f"acceptance-review-{label}",
+            "source_url": f"https://example.test/acceptance/{label}-review",
+            "reviewer_external_id": f"acceptance-reviewer-{label}",
+            "content_hash": sha256(f"acceptance-review-{label}".encode()).hexdigest(),
+            "now": SEED_EPOCH,
+        },
+    )
+    cur.execute(
+        """
+        INSERT INTO delivery_metric_snapshots (
+            id, workspace_id, metric_key, definition_version, aggregation_scope,
+            window_label, population, numerator, denominator, value,
+            coverage_status, coverage_percentage, computed_at, created_at
+        ) VALUES (
+            %(id)s, %(workspace_id)s, 'blocked_work', 1, 'system',
+            'point_in_time', 0, 0, 0, 0,
+            'insufficient_coverage', 0, %(now)s, %(now)s
+        )
+        ON CONFLICT (id) DO NOTHING
+        """,
+        {
+            "id": ids["delivery_metric_snapshot"],
+            "workspace_id": ids["workspace"],
             "now": SEED_EPOCH,
         },
     )

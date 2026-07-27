@@ -87,6 +87,17 @@ token can only be revoked by a human, manually, from `https://
 id.atlassian.com/manage-profile/security/api-tokens`. This matches
 `CONNECTOR-CONTRACT.md`'s "must not raise for provider does not support
 revocation" expected outcome.
+
+**Also captures `fields.created` as of Task 5** (migration
+`0048_phase6_delivery_metrics.py`'s `engineering_work_items.provider_
+created_at` column, added by that later task, not this one). Task 4's
+own `_SEARCH_FIELDS`/`_upsert_work_item` never selected or stored an
+issue's own creation date -- harmless until Task 5's `work_ageing` metric
+needed "how long has this item been open," which cannot be derived from
+`provider_updated_at`/this row's own `observed_at` alone (the latter is
+"when this system first saw it," not "when it was actually opened," and
+a backfilled old issue synced today would otherwise report a
+misleadingly small age). See `metrics.py`'s own module docstring.
 """
 
 from __future__ import annotations
@@ -119,7 +130,7 @@ _PAGE_SIZE = 100
 # py`/`gitlab_adapter.py`'s own `_MAX_PAGES_PER_CALL`.
 _MAX_PAGES_PER_CALL = 10
 _RATE_LIMIT_MAX_WAIT_SECONDS = 5.0
-_SEARCH_FIELDS = "summary,issuetype,status,reporter,assignee,updated"
+_SEARCH_FIELDS = "summary,issuetype,status,reporter,assignee,created,updated"
 
 
 class _InvalidCredentialError(Exception):
@@ -186,6 +197,7 @@ def _content_hash(issue: Mapping[str, Any]) -> str:
             "key": issue.get("key"),
             "summary": fields.get("summary"),
             "status": (fields.get("status") or {}).get("name"),
+            "created": fields.get("created"),
             "updated": fields.get("updated"),
         },
         sort_keys=True,
@@ -222,12 +234,14 @@ def _upsert_work_item(
                     id, workspace_id, connector_account_id, provider, external_id,
                     title, source_url, item_type, status, reporter_external_id,
                     assignee_external_id, permission_state, freshness_state,
-                    content_hash, provider_updated_at, observed_at, created_at, updated_at
+                    content_hash, provider_created_at, provider_updated_at,
+                    observed_at, created_at, updated_at
                 ) VALUES (
                     :id, :workspace_id, :connector_account_id, :provider, :external_id,
                     :title, :source_url, :item_type, :status, :reporter_external_id,
                     :assignee_external_id, 'active', 'fresh',
-                    :content_hash, :provider_updated_at, :now, :now, :now
+                    :content_hash, :provider_created_at, :provider_updated_at,
+                    :now, :now, :now
                 )
                 ON CONFLICT (workspace_id, connector_account_id, external_id) DO UPDATE SET
                     title = EXCLUDED.title,
@@ -239,6 +253,7 @@ def _upsert_work_item(
                     permission_state = 'active',
                     freshness_state = 'fresh',
                     content_hash = EXCLUDED.content_hash,
+                    provider_created_at = EXCLUDED.provider_created_at,
                     provider_updated_at = EXCLUDED.provider_updated_at,
                     observed_at = EXCLUDED.observed_at,
                     updated_at = EXCLUDED.updated_at
@@ -257,6 +272,7 @@ def _upsert_work_item(
                 "reporter_external_id": reporter.get("accountId"),
                 "assignee_external_id": assignee.get("accountId"),
                 "content_hash": _content_hash(issue),
+                "provider_created_at": fields.get("created"),
                 "provider_updated_at": fields.get("updated"),
                 "now": now,
             },

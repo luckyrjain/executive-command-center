@@ -126,6 +126,7 @@ from .connectors import (
     registry as connector_registry,
 )
 from .crypto import decrypt_credential, encrypt_credential
+from .metrics import compute_and_store_metrics
 
 ConnectorStatus = Literal[
     "pending", "active", "permission_lost", "rate_limited", "disconnected", "error"
@@ -392,6 +393,32 @@ class SyncRunResponse(BaseModel):
 
 class SyncRunListResponse(BaseModel):
     sync_runs: list[SyncRunResponse]
+
+
+class MetricSnapshotResponse(BaseModel):
+    """See `metrics.py`'s own module docstring for `coverage_status`/
+    `coverage_percentage`/`coverage_gap_description`'s meaning, and for
+    why `value`/`numerator`/`denominator`/`details` are all `None` for a
+    metric this activation cannot yet compute (`delivery_frequency`,
+    `lead_time_for_changes`, `change_failure_rate`, `time_to_restore`).
+    """
+
+    id: UUID
+    metric_key: str
+    window_label: str
+    population: int
+    numerator: float | None
+    denominator: float | None
+    value: float | None
+    details: dict[str, Any] | None
+    coverage_status: Literal["complete", "partial", "insufficient_coverage"]
+    coverage_percentage: float
+    coverage_gap_description: str | None
+    computed_at: datetime
+
+
+class MetricsListResponse(BaseModel):
+    metrics: list[MetricSnapshotResponse]
 
 
 class _EmptyBody(BaseModel):
@@ -1175,3 +1202,40 @@ def list_sync_runs_endpoint(
         .all()
     )
     return SyncRunListResponse(sync_runs=[SyncRunResponse(**dict(row)) for row in rows])
+
+
+@router.get("/metrics", response_model=MetricsListResponse)
+def get_metrics_endpoint(auth: AuthDep, session: SessionDep, _csrf: CsrfDep) -> MetricsListResponse:
+    """Computes all seven `DELIVERY-INTELLIGENCE-CONTRACT.md` metrics for
+    the caller's own workspace and persists each as a new, immutable
+    `delivery_metric_snapshots` row -- **a deliberate, disclosed
+    departure from pure REST `GET` semantics.** This phase has no
+    periodic sync/computation scheduler yet (`metrics.py`'s own module
+    docstring); without one, a purely read-only `GET` returning only
+    already-stored snapshots would return nothing at all for a workspace
+    whose metrics have never been computed, or a stale number for one
+    that hasn't been recomputed recently. Making the `GET` itself the
+    trigger -- mirroring `POST /connectors/{id}/sync`'s own identical
+    "manual trigger only" reality since Task 1 -- means this endpoint
+    always reflects the current state of already-synced data, at the
+    cost of writing a new snapshot row on every call. Each snapshot row
+    is still itself immutable once written (never updated or deleted),
+    so this is additive history, not a mutation any caller needs to
+    reason about differently from a pure read.
+
+    **`CsrfDep`, despite being a `GET`.** Review found that a state-
+    changing `GET` (this one writes seven rows every call) authenticated
+    only by a `SameSite=Lax` session cookie is reachable by a top-level
+    cross-site navigation (`window.location = ".../metrics"`), which
+    still attaches the cookie -- exactly the write-amplification/data-
+    pollution risk `CsrfDep` exists to close on every other state-
+    changing endpoint in this file. `require_csrf` checks a custom
+    `X-CSRF-Token` header, not the HTTP method, so applying it here is
+    the same mechanism, not a special case: a plain cross-site navigation
+    cannot set a custom header, so it now gets a 403 instead of a write.
+    """
+    snapshots = compute_and_store_metrics(session, workspace_id=auth.workspace_id)
+    session.commit()
+    return MetricsListResponse(
+        metrics=[MetricSnapshotResponse(**snapshot) for snapshot in snapshots]
+    )
