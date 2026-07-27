@@ -138,7 +138,12 @@ class _InvalidCredentialError(Exception):
 # description of the credential format) closes an otherwise-real SSRF risk
 # where an operator-supplied `site` could point this adapter's outbound
 # request at an arbitrary internal host instead.
-_JIRA_SITE_PATTERN = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.atlassian\.net$")
+# `\Z` (not `$`) so a trailing newline can't slip through -- `$` matches
+# immediately before a trailing "\n" in Python's `re`, which `fullmatch`
+# alone does not protect against.
+_JIRA_SITE_PATTERN = re.compile(
+    r"\A[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.atlassian\.net\Z"
+)
 
 
 def _parse_credential(credential: str) -> tuple[str, str, str]:

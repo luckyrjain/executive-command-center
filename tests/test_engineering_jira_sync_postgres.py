@@ -159,6 +159,35 @@ def test_jira_adapter_authorize_rejects_non_atlassian_site() -> None:
         adapter.authorize("internal.example.test|jane@acme.test|jira-api-token")
 
 
+def test_jira_adapter_authorize_rejects_subdomain_confusion_site() -> None:
+    """A `site` crafted to end in the real `atlassian.net` suffix as a
+    substring (rather than being a genuine `atlassian.net` subdomain) must
+    still be rejected -- the pattern's anchoring is the entire SSRF
+    protection, so this specifically exercises the anchoring rather than
+    just "some non-atlassian host is rejected."
+    """
+    adapter = JiraAdapter(transport=httpx.MockTransport(lambda r: _json_response({})))
+    with pytest.raises(AdapterAuthorizationError, match="atlassian.net"):
+        adapter.authorize("acme.atlassian.net.evil.test|jane@acme.test|jira-api-token")
+
+
+def test_backfill_rejects_non_atlassian_site_too() -> None:
+    """The SSRF guard lives in `_parse_credential`, called from every
+    URL-building path, not just `authorize` -- proves `backfill` (via
+    `_sync_work_items`) also refuses to issue a request to a malicious
+    `site` rather than the check only guarding the authorize call.
+    """
+    adapter = JiraAdapter(transport=httpx.MockTransport(lambda r: _json_response({})))
+    context = ConnectorAccountContext(
+        workspace_id=uuid4(),
+        connector_account_id=uuid4(),
+        external_account_id="acc-1",
+        credential="internal.example.test|jane@acme.test|jira-api-token",
+    )
+    with pytest.raises(RuntimeError, match="atlassian.net"):
+        adapter.backfill(context, "work_item")
+
+
 def test_jira_adapter_authorize_rejects_401() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return _json_response({"message": "Unauthorized"}, status_code=401)
@@ -421,6 +450,35 @@ def test_incremental_sync_stops_at_prior_cursor(
     )
     assert outcome.items_processed == 1
     assert outcome.next_cursor == "2024-01-05T00:00:00.000+0000"
+
+
+def test_incremental_sync_cursor_comparison_is_dst_safe(
+    seeded_account_context: ConnectorAccountContext,
+) -> None:
+    """A regression lock for the fix comparing `fields.updated` as parsed,
+    timezone-aware datetimes rather than raw strings. A Jira site observing
+    US Eastern's real 2024-11-03 fall-back DST transition can serialize a
+    genuinely *later* instant with a *smaller* offset (`-0500` after the
+    transition vs `-0400` before it) such that the two timestamp strings
+    sort in the wrong order lexicographically: "01:15...-0500" (06:15 UTC)
+    is a lexicographically smaller string than "01:30...-0400" (05:30 UTC)
+    even though it is chronologically 45 minutes later. Under the old raw-
+    string comparison this issue would have been incorrectly treated as
+    not-newer-than-cursor and silently dropped; the fix must still process
+    it and must still report it as the new cursor.
+    """
+    cursor = "2024-11-03T01:30:00.000-0400"
+    later_issue_smaller_string = _issue(
+        1, key="ACME-1", summary="Genuinely later", updated="2024-11-03T01:15:00.000-0500"
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return _json_response(_search_response([later_issue_smaller_string], total=1))
+
+    adapter = JiraAdapter(transport=httpx.MockTransport(handler))
+    outcome = adapter.incremental_sync(seeded_account_context, "work_item", cursor=cursor)
+    assert outcome.items_processed == 1
+    assert outcome.next_cursor == "2024-11-03T01:15:00.000-0500"
 
 
 def test_incremental_sync_with_no_cursor_behaves_like_backfill(
