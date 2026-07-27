@@ -170,6 +170,34 @@ def test_gitlab_adapter_authorize_rejects_network_error() -> None:
         adapter.authorize("token")
 
 
+def test_gitlab_adapter_authorize_rejects_second_call_non_200() -> None:
+    """`authorize`'s two-call sequence (`personal_access_tokens/self` then
+    `/user`) has a failure mode GitHub's single-call `authorize` has no
+    analogue for -- the first call succeeding (valid, in-scope token) but
+    the second (`GET /user`, for identity) failing. Untested by review.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/personal_access_tokens/self"):
+            return _json_response(_token_self_response(scopes=["read_api", "read_repository"]))
+        return _json_response({"message": "Server error"}, status_code=500)
+
+    adapter = GitLabAdapter(transport=httpx.MockTransport(handler))
+    with pytest.raises(AdapterAuthorizationError):
+        adapter.authorize("token")
+
+
+def test_gitlab_adapter_authorize_rejects_second_call_network_error() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/personal_access_tokens/self"):
+            return _json_response(_token_self_response(scopes=["read_api", "read_repository"]))
+        raise httpx.ConnectError("connection refused")
+
+    adapter = GitLabAdapter(transport=httpx.MockTransport(handler))
+    with pytest.raises(AdapterAuthorizationError):
+        adapter.authorize("token")
+
+
 # --- unit-level: repository sync (no database) ------------------------------
 
 
@@ -401,6 +429,46 @@ def test_rate_limit_still_limited_after_retry_reports_partial_not_failure() -> N
     assert calls["count"] == 2
 
 
+def test_rate_limit_gives_up_immediately_when_retry_after_header_absent() -> None:
+    """`_rate_limit_wait_seconds` returns `None` when `Retry-After` is
+    absent entirely -- a distinct code path from "present but too large,"
+    untested by review.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return _json_response({"message": "rate limited"}, status_code=429)
+
+    adapter = GitLabAdapter(transport=httpx.MockTransport(handler), sleep=lambda seconds: None)
+    outcome = adapter.backfill(_account_context(), "repository")
+    assert outcome.status == "partial"
+    assert outcome.items_processed == 0
+
+
+def test_rate_limit_gives_up_immediately_when_retry_after_malformed() -> None:
+    """`_rate_limit_wait_seconds`'s `except ValueError: return None` branch
+    for a non-numeric `Retry-After` value -- untested by review.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return _json_response(
+            {"message": "rate limited"}, status_code=429, headers={"Retry-After": "soon"}
+        )
+
+    adapter = GitLabAdapter(transport=httpx.MockTransport(handler), sleep=lambda seconds: None)
+    outcome = adapter.backfill(_account_context(), "repository")
+    assert outcome.status == "partial"
+    assert outcome.items_processed == 0
+
+
+def test_sync_repositories_raises_on_generic_failure_status() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return _json_response({"message": "Server error"}, status_code=500)
+
+    adapter = GitLabAdapter(transport=httpx.MockTransport(handler))
+    with pytest.raises(RuntimeError, match="500"):
+        adapter.backfill(_account_context(), "repository")
+
+
 def test_page_cap_reports_partial_with_more_pages_remaining(
     seeded_account_context: ConnectorAccountContext,
 ) -> None:
@@ -442,6 +510,19 @@ def test_refresh_permissions() -> None:
     assert active_adapter.refresh_permissions(_account_context()) == "active"
 
 
+def test_refresh_permissions_fails_open_on_network_error() -> None:
+    """Deliberate fail-open (matches `GitHubAdapter.refresh_permissions`'s
+    identical precedent): a transient network failure must not be
+    mistaken for a real permission-loss signal.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("connection refused")
+
+    adapter = GitLabAdapter(transport=httpx.MockTransport(handler))
+    assert adapter.refresh_permissions(_account_context()) == "active"
+
+
 def test_disconnect_succeeds_on_204() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.method == "DELETE"
@@ -471,7 +552,30 @@ def test_disconnect_raises_on_expected_insufficient_scope_failure() -> None:
         adapter.disconnect(_account_context())
 
 
-def test_handle_webhook_ignores_non_project_hook_events() -> None:
+def test_disconnect_succeeds_on_404_already_revoked() -> None:
+    """`404` (token already deleted/revoked out-of-band, e.g. through
+    GitLab's own settings UI) is treated as success alongside GitLab's
+    documented `204` -- disconnecting must not fail just because the
+    provider-side token no longer exists to revoke.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return _json_response({"message": "404 Not Found"}, status_code=404)
+
+    adapter = GitLabAdapter(transport=httpx.MockTransport(handler))
+    assert adapter.disconnect(_account_context()) is None
+
+
+def test_disconnect_raises_on_network_error() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("connection refused")
+
+    adapter = GitLabAdapter(transport=httpx.MockTransport(handler))
+    with pytest.raises(RuntimeError, match="revocation request failed"):
+        adapter.disconnect(_account_context())
+
+
+def test_handle_webhook_ignores_non_push_hook_events() -> None:
     adapter = GitLabAdapter()
     outcome = adapter.handle_webhook(
         _account_context(), b'{"object_kind": "issue"}', {"X-Gitlab-Event": "Issue Hook"}
@@ -481,8 +585,36 @@ def test_handle_webhook_ignores_non_project_hook_events() -> None:
 
 def test_handle_webhook_ignores_empty_payload() -> None:
     adapter = GitLabAdapter()
-    outcome = adapter.handle_webhook(_account_context(), b"", {"X-Gitlab-Event": "Project Hook"})
+    outcome = adapter.handle_webhook(_account_context(), b"", {"X-Gitlab-Event": "Push Hook"})
     assert outcome.items_processed == 0
+
+
+def test_handle_webhook_upserts_on_real_push_hook_payload(
+    seeded_account_context: ConnectorAccountContext,
+) -> None:
+    """Review found `handle_webhook` previously gated on `X-Gitlab-Event:
+    Project Hook` -- not a real GitLab webhook event value (GitLab has no
+    such event; `Push Hook` is the real project-webhook event whose
+    payload nests a `project` object). This proves the parsing/upsert
+    logic itself actually works against a real `Push Hook` payload shape,
+    not just the two no-op branches above.
+    """
+    adapter = GitLabAdapter()
+    project = _project(1, path="acme/a", updated_at="2024-01-01T00:00:00Z")
+    payload = dumps({"object_kind": "push", "project": project}).encode()
+
+    outcome = adapter.handle_webhook(
+        seeded_account_context, payload, {"X-Gitlab-Event": "Push Hook"}
+    )
+    assert outcome.items_processed == 1
+    assert outcome.status == "succeeded"
+
+    with engine.begin() as connection:
+        name = connection.execute(
+            text("SELECT name FROM repositories WHERE workspace_id = :workspace_id"),
+            {"workspace_id": seeded_account_context.workspace_id},
+        ).scalar_one()
+    assert name == "acme/a"
 
 
 # --- integration: real /sync endpoint, mocked GitLab transport -------------

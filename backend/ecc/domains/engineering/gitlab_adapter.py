@@ -47,10 +47,13 @@ mechanism to `github_adapter.py`'s own `while`/`else` structure.
 
 **Webhook ingestion has no receiving HTTP endpoint yet, and no signature
 verification.** `handle_webhook` implements the parsing/upsert logic the
-`ConnectorAdapter` contract asks for (GitLab's `X-Gitlab-Event: Project
-Hook` header, `project` body key), but wiring a real receiving route (and
-the webhook-secret-token storage a real signature check needs) is
-disclosed as deferred, identical to `github_adapter.py`'s own deferral.
+`ConnectorAdapter` contract asks for (GitLab's `X-Gitlab-Event: Push Hook`
+header -- fired on every push, the only project-webhook event whose
+payload nests a `project` object with the fields `_upsert_repository`
+needs; GitLab's own "Project Hook" is not a real `X-Gitlab-Event` value),
+but wiring a real receiving route (and the webhook-secret-token storage a
+real signature check needs) is disclosed as deferred, identical to
+`github_adapter.py`'s own deferral.
 Do not wire this method to a public route before that gap is closed.
 
 **`disconnect()` attempts real revocation, unlike GitHub's hard no-op.**
@@ -391,7 +394,7 @@ class GitLabAdapter:
         from json import loads
 
         event_type = headers.get("X-Gitlab-Event") or headers.get("x-gitlab-event")
-        if event_type != "Project Hook" or not payload:
+        if event_type != "Push Hook" or not payload:
             return SyncOutcome(
                 resource_type="repository", items_processed=0, status="succeeded", next_cursor=None
             )
@@ -412,6 +415,16 @@ class GitLabAdapter:
         )
 
     def refresh_permissions(self, account: ConnectorAccountContext) -> PermissionState:
+        """Fails open (returns `"active"`) on a network error or any
+        response other than a clear `401`/revoked/inactive signal --
+        matches `GitHubAdapter.refresh_permissions`'s identical tradeoff:
+        a transient failure (a `403`/`5xx` blip, a rate limit) must not be
+        mistaken for a real permission-loss signal. `PermissionState`'s
+        `"deleted"` value is never returned by either adapter -- GitLab
+        (like GitHub) has no single call reporting "this account itself
+        was deleted" distinct from "this token no longer works," so this
+        adapter can only ever distinguish `active` from `permission_lost`.
+        """
         try:
             response = self._client.get(
                 "/personal_access_tokens/self", headers=self._headers(account.credential)
