@@ -2,7 +2,7 @@
 id: PHASE-006-CONNECTOR
 title: Engineering Connector Contract
 status: Approved for Implementation
-version: 0.5.0
+version: 0.6.0
 owner: Lucky Jain
 ---
 
@@ -26,7 +26,7 @@ Least privilege, read-only by default; a write scope is requested only when a sp
 |---|---|---|
 | GitHub | `repo` (classic OAuth token/PAT scope; see Task 2 status below for the fine-grained-PAT limitation) | `repo` (already read+write; no separate write scope to request) |
 | GitLab | `read_api`, `read_repository` | `api` |
-| Jira | `read:jira-work` | `write:jira-work` |
+| Jira | `read:jira-work` (see Task 4 status below for why a personal API token cannot actually be checked against this label) | `write:jira-work` |
 
 **GitHub's scope vocabulary correction (Task 2).** The row above originally
 named GitHub App/fine-grained-PAT permission identifiers (`contents:read`,
@@ -78,3 +78,15 @@ GitHub does not emit `X-OAuth-Scopes` at all for a fine-grained personal access 
 **GitLab's scope verification has no analogue of GitHub's fine-grained-PAT gap.** `GET /personal_access_tokens/self` returns every GitLab personal access token's actual granted `scopes` in its JSON response body -- unlike GitHub's `X-OAuth-Scopes` header, this signal is never simply absent for a token type this connector supports. `authorize` always checks `granted_scopes` against `_REQUIRED_SCOPES` (`read_api`, `read_repository`) and rejects an under-scoped, inactive, or revoked token; the "Accepted limitation (Task 2): fine-grained PAT scopes are unverifiable" section above is GitHub-specific and does not apply to this adapter.
 
 **GitLab's `disconnect()` attempts real revocation, expected to fail at this connector's own default scope.** GitLab exposes `DELETE /personal_access_tokens/self`, a genuine self-revocation endpoint classic GitHub PATs have no equivalent of -- `gitlab_adapter.py` calls it rather than treating revocation as universally unsupported. This connector's own default read-only scopes (`read_api`, `read_repository`) do not include the `api`/`self_rotate` scope GitLab requires for this call in practice, so the attempt is realistically expected to return `403` for a connection authorized at this connector's own default scope. It is attempted anyway (never silently skipped) and any failure is still absorbed by `disable_connector_endpoint`'s existing best-effort try/except (`CONNECTOR-CONTRACT.md`'s "Accepted limitation (Task 1)" above) -- disconnecting a workspace's GitLab connection always succeeds even though the provider-side token itself is expected to remain live until revoked through GitLab's own settings UI, identical in effect to GitHub's hard no-op despite the different mechanism.
+
+## Task 4 status
+
+`jira_adapter.JiraAdapter` implements the contract above for work items only -- Jira is not a source-control provider, so there is no repository/change/review/deployment analogue for this adapter at all. `authorize` (`GET /rest/api/3/myself` via HTTP Basic auth over a `site|email|api_token`-encoded credential, since Jira Cloud is multi-tenant unlike GitHub/GitLab's single shared host), bounded-retry rate-limit handling (`429` plus `Retry-After`, one bounded wait, `partial` sync status beyond it -- identical in shape to `gitlab_adapter.py`'s handling), offset-based pagination (`startAt`/`maxResults`/`total`, not a `Link` header), and `disconnect` as a documented no-op (like GitHub's, not GitLab's -- Atlassian exposes no public self-revocation API for a personal API token). Changes/reviews/deployments do not apply to this provider at all, and webhook ingestion's receiving endpoint is not yet implemented -- see `jira_adapter.py`'s own module docstring and `docs/phases/phase-006/IMPLEMENTATION-STATUS.md`'s Task 4 evidence.
+
+## Accepted limitation (Task 4): Jira personal API tokens have no scope-verification mechanism at all
+
+Unlike both GitHub (whose classic tokens report real scopes via `X-OAuth-Scopes`, with only fine-grained PATs falling into the unverifiable gap above) and GitLab (whose tokens always report real scopes via `GET /personal_access_tokens/self`), a Jira Cloud personal API token carries no scope grant of its own to report at all -- `read:jira-work`/`write:jira-work` are OAuth 2.0 (3LO) app-installation permission labels, not something `GET /rest/api/3/myself` (or any other endpoint) exposes for a personal API token's Basic-auth credential. `JiraAdapter.required_scopes` is therefore the empty set, and `authorize` always returns an honestly-empty `granted_scopes` rather than a fabricated match against the table above -- an operator connecting Jira sees an empty scope list on `GET /engineering/connectors` and, as with GitHub's fine-grained-PAT case, cannot rely on this endpoint's scope check to catch an under-permissioned token in advance; a downstream sync call failing is the actual signal.
+
+## Accepted limitation (Task 4): Jira `disconnect()` cannot revoke, identical in kind to GitHub's
+
+Atlassian exposes no public REST API for a personal API token to revoke itself -- unlike GitLab's genuine `DELETE /personal_access_tokens/self`, a Jira API token can only be revoked by a human, manually, at `https://id.atlassian.com/manage-profile/security/api-tokens`. `disconnect()` is therefore a documented no-op, matching `CONNECTOR-CONTRACT.md`'s "must not raise for provider does not support revocation" expected outcome and identical in effect (though not mechanism) to `github_adapter.py`'s own hard no-op.

@@ -203,16 +203,19 @@ class ConnectorRegistry:
 
 # Shared production registry. Task 1 registered only `sandbox.github` (see
 # `sandbox_adapter.py`) -- no real adapter existed yet. Task 2 added the
-# real `github` adapter (`github_adapter.py`); Task 3 adds `gitlab`
-# (`gitlab_adapter.py`) against the identical contract. `sandbox` remains
-# registered for tests/simulation, matching Phase 5's identical precedent
-# of keeping its own fake adapters registered alongside real ones. No Jira
-# adapter exists yet (Task 4).
+# real `github` adapter (`github_adapter.py`); Task 3 added `gitlab`
+# (`gitlab_adapter.py`); Task 4 adds `jira` (`jira_adapter.py`) against the
+# identical contract -- work items only, since Jira is not a source-
+# control provider. `sandbox` remains registered for tests/simulation,
+# matching Phase 5's identical precedent of keeping its own fake adapters
+# registered alongside real ones.
 from .github_adapter import GitHubAdapter  # noqa: E402
 from .gitlab_adapter import GitLabAdapter  # noqa: E402
+from .jira_adapter import JiraAdapter  # noqa: E402
 from .sandbox_adapter import SandboxGithubAdapter  # noqa: E402
 
 registry = ConnectorRegistry()
 registry.register(SandboxGithubAdapter())
 registry.register(GitHubAdapter())
 registry.register(GitLabAdapter())
+registry.register(JiraAdapter())

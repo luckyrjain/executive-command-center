@@ -1284,13 +1284,22 @@ def test_disable_idempotency_replay(
 
 def test_sync_connector_provider_not_supported(
     engineering_test_context: tuple[TestClient, UUID, UUID, str],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Every provider in `ck_connector_accounts_provider`'s closed set
+    (`github`/`gitlab`/`jira`/`sandbox`) now has a registered adapter as
+    of Task 4 -- there is no longer a real, CHECK-constraint-valid
+    provider value this test can use to reach `CONNECTOR_PROVIDER_NOT_
+    SUPPORTED` the way Tasks 1-3 each did in turn (each real adapter this
+    phase added retired the previous task's own "use this still-
+    unregistered provider" fixture). Monkeypatching in an empty registry
+    exercises the identical code path (`connector_registry.get(...)
+    returns None`) without depending on a real provider slug staying
+    unimplemented, which is no longer true for any of them.
+    """
     client, workspace_id, user_id, token = engineering_test_context
-    # 'jira' is a valid provider per the CHECK constraint but has no
-    # registered adapter yet (Task 4) -- 'github'/'gitlab' no longer serve
-    # this test's purpose as of Tasks 2-3, which register real adapters
-    # for both.
-    account_id = _insert_connector_account(workspace_id, user_id, provider="jira")
+    monkeypatch.setattr(connector_accounts_module, "connector_registry", ConnectorRegistry())
+    account_id = _insert_connector_account(workspace_id, user_id, provider="sandbox")
 
     response = client.post(
         f"/api/v1/engineering/connectors/{account_id}/sync",
