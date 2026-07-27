@@ -49,12 +49,18 @@ mechanism to `github_adapter.py`'s own `while`/`else` structure.
 verification.** `handle_webhook` implements the parsing/upsert logic the
 `ConnectorAdapter` contract asks for (GitLab's `X-Gitlab-Event: Push Hook`
 header -- fired on every push, the only project-webhook event whose
-payload nests a `project` object with the fields `_upsert_repository`
-needs; GitLab's own "Project Hook" is not a real `X-Gitlab-Event` value),
-but wiring a real receiving route (and the webhook-secret-token storage a
-real signature check needs) is disclosed as deferred, identical to
-`github_adapter.py`'s own deferral.
-Do not wire this method to a public route before that gap is closed.
+payload nests a `project` object; GitLab's own "Project Hook" is not a
+real `X-Gitlab-Event` value). That embedded `project` object is GitLab's
+smaller webhook-event schema, not the full `GET /projects` REST
+representation -- it has no `last_activity_at` field, so `_with_push_
+event_activity_timestamp` synthesizes one from the push's most recent
+commit timestamp (or the time of receipt, if the push carried no
+commits) before this method calls `_upsert_repository`, rather than
+silently persisting a `NULL provider_updated_at` for every webhook-
+driven upsert. Wiring a real receiving route (and the webhook-secret-
+token storage a real signature check needs) is disclosed as deferred,
+identical to `github_adapter.py`'s own deferral. Do not wire this method
+to a public route before that gap is closed.
 
 **`disconnect()` attempts real revocation, unlike GitHub's hard no-op.**
 GitLab exposes `DELETE /personal_access_tokens/self`, a genuine self-
@@ -169,6 +175,30 @@ def _upsert_repository(
             },
         )
         session.commit()
+
+
+def _with_push_event_activity_timestamp(
+    project: Mapping[str, Any], body: Mapping[str, Any]
+) -> dict[str, Any]:
+    """A real GitLab `Push Hook` payload's embedded `project` object has no
+    `last_activity_at` field -- that field only exists on the full `GET
+    /projects` REST representation, not the smaller schema GitLab's
+    webhook events share. Without this, `_upsert_repository`'s `provider_
+    updated_at` would silently become `NULL` for every webhook-driven
+    upsert, diverging from REST-sync-driven upserts (review found this
+    exact gap). The last entry in `commits` (GitLab orders this array
+    oldest-first) is the most recent commit's own timestamp -- a
+    reasonable proxy for "when was this project last updated" -- falling
+    back to the time this webhook was received if the push carried no
+    commits at all (e.g. a tag-only push or a branch deletion).
+    """
+    if project.get("last_activity_at"):
+        return dict(project)
+    commits = body.get("commits") or []
+    timestamp = commits[-1].get("timestamp") if commits else None
+    merged = dict(project)
+    merged["last_activity_at"] = timestamp or datetime.now(UTC).isoformat()
+    return merged
 
 
 class GitLabAdapter:
@@ -408,7 +438,7 @@ class GitLabAdapter:
             workspace_id=account.workspace_id,
             connector_account_id=account.connector_account_id,
             provider=self.provider,
-            project=project,
+            project=_with_push_event_activity_timestamp(project, body),
         )
         return SyncOutcome(
             resource_type="repository", items_processed=1, status="succeeded", next_cursor=None

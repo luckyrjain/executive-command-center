@@ -596,12 +596,33 @@ def test_handle_webhook_upserts_on_real_push_hook_payload(
     Project Hook` -- not a real GitLab webhook event value (GitLab has no
     such event; `Push Hook` is the real project-webhook event whose
     payload nests a `project` object). This proves the parsing/upsert
-    logic itself actually works against a real `Push Hook` payload shape,
-    not just the two no-op branches above.
+    logic itself actually works against a real `Push Hook` payload shape
+    -- deliberately *not* reusing `_project()` (that helper's shape
+    matches the full `GET /projects` REST representation, which is a
+    genuinely different, larger schema than what GitLab's webhook events
+    actually carry -- a real Push Hook's embedded `project` object has no
+    `last_activity_at` field at all, only `commits`). Also proves the
+    synthesized-timestamp fallback: `provider_updated_at` ends up as the
+    most recent commit's own `timestamp`, not `NULL`.
     """
     adapter = GitLabAdapter()
-    project = _project(1, path="acme/a", updated_at="2024-01-01T00:00:00Z")
-    payload = dumps({"object_kind": "push", "project": project}).encode()
+    payload = dumps(
+        {
+            "object_kind": "push",
+            "project": {
+                "id": 1,
+                "path_with_namespace": "acme/a",
+                "web_url": "https://gitlab.com/acme/a",
+                "default_branch": "main",
+                # No `last_activity_at` -- real Push Hook payloads never
+                # carry this field on the embedded `project` object.
+            },
+            "commits": [
+                {"id": "abc123", "timestamp": "2024-01-01T00:00:00Z"},
+                {"id": "def456", "timestamp": "2024-01-02T00:00:00Z"},
+            ],
+        }
+    ).encode()
 
     outcome = adapter.handle_webhook(
         seeded_account_context, payload, {"X-Gitlab-Event": "Push Hook"}
@@ -610,11 +631,59 @@ def test_handle_webhook_upserts_on_real_push_hook_payload(
     assert outcome.status == "succeeded"
 
     with engine.begin() as connection:
-        name = connection.execute(
-            text("SELECT name FROM repositories WHERE workspace_id = :workspace_id"),
+        row = (
+            connection.execute(
+                text(
+                    "SELECT name, provider_updated_at FROM repositories "
+                    "WHERE workspace_id = :workspace_id"
+                ),
+                {"workspace_id": seeded_account_context.workspace_id},
+            )
+            .mappings()
+            .one()
+        )
+    assert row["name"] == "acme/a"
+    # The *last* commit in the array (GitLab orders oldest-first) is the
+    # one whose timestamp becomes provider_updated_at -- not NULL, and not
+    # the first commit's earlier timestamp.
+    assert row["provider_updated_at"] == datetime(2024, 1, 2, tzinfo=UTC)
+
+
+def test_handle_webhook_synthesizes_receipt_time_when_push_has_no_commits(
+    seeded_account_context: ConnectorAccountContext,
+) -> None:
+    """A tag-only push or branch deletion carries an empty `commits` array
+    -- `provider_updated_at` must still end up as a real timestamp (the
+    time of receipt), never `NULL`.
+    """
+    adapter = GitLabAdapter()
+    payload = dumps(
+        {
+            "object_kind": "push",
+            "project": {
+                "id": 2,
+                "path_with_namespace": "acme/b",
+                "web_url": "https://gitlab.com/acme/b",
+                "default_branch": "main",
+            },
+            "commits": [],
+        }
+    ).encode()
+
+    outcome = adapter.handle_webhook(
+        seeded_account_context, payload, {"X-Gitlab-Event": "Push Hook"}
+    )
+    assert outcome.items_processed == 1
+
+    with engine.begin() as connection:
+        provider_updated_at = connection.execute(
+            text(
+                "SELECT provider_updated_at FROM repositories "
+                "WHERE workspace_id = :workspace_id AND external_id = '2'"
+            ),
             {"workspace_id": seeded_account_context.workspace_id},
         ).scalar_one()
-    assert name == "acme/a"
+    assert provider_updated_at is not None
 
 
 # --- integration: real /sync endpoint, mocked GitLab transport -------------
