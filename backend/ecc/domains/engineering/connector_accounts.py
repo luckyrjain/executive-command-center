@@ -168,6 +168,23 @@ _MAX_ADAPTER_ERROR_LENGTH = 300
 # handful of HTTP round trips -- real syncs complete in seconds, not
 # minutes), so this reaps only genuinely-abandoned rows, never a slow but
 # still-in-flight one.
+#
+# **Accepted limitation, disclosed rather than silently generalized:**
+# this bound is justified by `github_adapter.GitHubAdapter`'s own
+# contract-level guarantees, not any invariant `ConnectorAdapter` itself
+# promises -- a future adapter (GitLab/Jira, Task 3/4, or a later
+# GitHub follow-up removing `_MAX_PAGES_PER_CALL`'s cap) whose legitimate
+# single call can genuinely run longer than this threshold would have its
+# still-in-flight row reaped and a second, genuinely concurrent adapter
+# call dispatched against the same account/cursor -- reintroducing the
+# lost-cursor-update race this whole mechanism exists to prevent. Revisit
+# this constant (or make it adapter-declared) before registering an
+# adapter without an equivalent per-call duration bound. Phase 3's own
+# `AND status = 'running'` guards (below) at least ensure a late-arriving
+# outcome for an already-reaped run can never silently overwrite the
+# reaper's recorded status -- the narrower, always-safe half of this
+# problem -- even though they do not prevent the concurrent-call overlap
+# itself.
 _STALE_RUNNING_SYNC_THRESHOLD = timedelta(minutes=10)
 
 
@@ -582,13 +599,17 @@ def create_connector_endpoint(
     A genuine same-Idempotency-Key retry racing ahead of the first
     request's own phase 3 (e.g. a client-side timeout during a slow
     `authorize()` call, retried with the same key) reaches phase 3's
-    `INSERT` concurrently with the original request. Because Postgres only
-    raises the `uq_connector_accounts_workspace_provider_external_id`
-    conflict once the winning row is actually committed -- and the winner's
-    entire phase 3 (`INSERT` + `_write_side_effects` + `_store_idempotency`)
-    is one transaction -- the loser's `IntegrityError` can only fire *after*
-    the winner has already stored its idempotency record. So the `except
-    IntegrityError` handler below re-checks the idempotency cache before
+    `INSERT` concurrently with the original request. Postgres blocks a
+    concurrent conflicting `INSERT` on `uq_connector_accounts_workspace_
+    provider_external_id` until the transaction holding the not-yet-
+    committed conflicting row commits or rolls back -- so as long as the
+    winner's entire phase 3 (`INSERT` + `_write_side_effects` +
+    `_store_idempotency`) is genuinely **one transaction** (the `INSERT`
+    runs inside a `begin_nested()` SAVEPOINT of the same outer transaction,
+    not a separate top-level transaction of its own), a losing
+    `IntegrityError` can only fire *after* the winner has already stored
+    its idempotency record. So the `except IntegrityError` handler below
+    re-checks the idempotency cache before
     concluding this is a genuine "already connected" duplicate: if found,
     it returns the winner's real response (a correct idempotent replay,
     matching every other endpoint's `Idempotency-Key` contract) instead of
@@ -630,9 +651,24 @@ def create_connector_endpoint(
 
     # --- Phase 3: persist the account, on a fresh connection --------------
     account_id = uuid4()
-    with SessionFactory() as create_session:
+    with SessionFactory() as create_session, create_session.begin():
         try:
-            with create_session.begin():
+            # A SAVEPOINT (`begin_nested`), not a second top-level
+            # transaction -- the INSERT below must stay inside the SAME
+            # outer transaction as the audit/idempotency-store work later
+            # in this block. Postgres blocks a concurrent conflicting
+            # INSERT until the transaction that owns the not-yet-committed
+            # conflicting row commits or rolls back; if that INSERT and
+            # this request's own audit/idempotency write were two separate
+            # transactions (as an earlier version of this fix had it), the
+            # first (insert-only) transaction could commit -- unblocking a
+            # competing insert -- before the second transaction (the
+            # idempotency store) had even started, defeating the
+            # `except IntegrityError` cache re-check below. Keeping both
+            # in one transaction is what makes "a losing IntegrityError
+            # here proves the winner's idempotency record already
+            # committed" true rather than merely asserted.
+            with create_session.begin_nested():
                 create_session.execute(
                     text(
                         """
@@ -660,11 +696,12 @@ def create_connector_endpoint(
                     },
                 )
         except IntegrityError:
-            # `create_session.begin()`'s own `__exit__` already rolled back
-            # on the exception above -- safe to issue a fresh read here.
-            # See this function's own docstring for why re-checking the
-            # cache (rather than assuming this is a genuine duplicate) is
-            # correct specifically here.
+            # `begin_nested()`'s own `__exit__` already rolled back to the
+            # SAVEPOINT on the exception above -- the outer transaction
+            # itself is still open and healthy, so a fresh read here is
+            # safe. See this function's own docstring for why re-checking
+            # the cache (rather than assuming this is a genuine duplicate)
+            # is correct specifically here.
             cached_after_conflict = _load_cached(
                 create_session, auth, idempotency_key, request_hash
             )
@@ -672,28 +709,27 @@ def create_connector_endpoint(
                 return ConnectorAccountResponse.model_validate(cached_after_conflict)
             raise HTTPException(status_code=409, detail="CONNECTOR_ALREADY_CONNECTED") from None
 
-        with create_session.begin():
-            created = get_connector_account(create_session, auth.workspace_id, account_id)
-            assert created is not None
-            response = _to_response(created)
-            _write_side_effects(
-                create_session,
-                auth,
-                request,
-                event_type="connector_account.created",
-                aggregate_id=created.id,
-                version=created.version,
-                now=now,
-            )
-            _store_idempotency(
-                create_session,
-                auth,
-                idempotency_key,
-                request_hash,
-                response.model_dump(mode="json"),
-                now,
-                response_status=status.HTTP_201_CREATED,
-            )
+        created = get_connector_account(create_session, auth.workspace_id, account_id)
+        assert created is not None
+        response = _to_response(created)
+        _write_side_effects(
+            create_session,
+            auth,
+            request,
+            event_type="connector_account.created",
+            aggregate_id=created.id,
+            version=created.version,
+            now=now,
+        )
+        _store_idempotency(
+            create_session,
+            auth,
+            idempotency_key,
+            request_hash,
+            response.model_dump(mode="json"),
+            now,
+            response_status=status.HTTP_201_CREATED,
+        )
         return response
 
 
@@ -874,10 +910,13 @@ def sync_connector_endpoint(
     completed_at = datetime.now(UTC)
     with SessionFactory() as outcome_session, outcome_session.begin():
         if adapter_failed:
+            # `AND status = 'running'`: see the success-path UPDATE's
+            # identical comment below -- must not silently overwrite a
+            # reaper's already-recorded terminal status.
             outcome_session.execute(
                 text(
                     "UPDATE sync_runs SET status = 'failed', error_summary = :error, "
-                    "completed_at = :completed_at WHERE id = :id"
+                    "completed_at = :completed_at WHERE id = :id AND status = 'running'"
                 ),
                 {"error": failure_summary, "completed_at": completed_at, "id": run_id},
             )
@@ -937,10 +976,20 @@ def sync_connector_endpoint(
             if outcome.error_summary is not None
             else None
         )
+        # `AND status = 'running'`: if this call's own `sync_runs` row was
+        # already reaped as stale (`_STALE_RUNNING_SYNC_THRESHOLD`) by a
+        # later request before this adapter call finally returned, this
+        # UPDATE must not silently overwrite the reaper's terminal status
+        # with a late-arriving outcome -- that would mask the overlap this
+        # row's `failed`/reaped status exists to record. The `SELECT`
+        # below reads whichever status actually won (this update's own, or
+        # the reaper's), so the response returned always matches the
+        # database rather than trusting the locally-held `outcome`.
         outcome_session.execute(
             text(
                 "UPDATE sync_runs SET status = :status, items_processed = :items_processed, "
-                "error_summary = :error_summary, completed_at = :completed_at WHERE id = :id"
+                "error_summary = :error_summary, completed_at = :completed_at "
+                "WHERE id = :id AND status = 'running'"
             ),
             {
                 "status": outcome.status,
@@ -992,16 +1041,18 @@ def sync_connector_endpoint(
             },
         )
 
-        response = SyncRunResponse(
-            id=run_id,
-            connector_account_id=account_id,
-            run_type=payload.run_type,
-            status=outcome.status,
-            items_processed=outcome.items_processed,
-            error_summary=error_summary,
-            started_at=now,
-            completed_at=completed_at,
+        run_row = (
+            outcome_session.execute(
+                text(
+                    "SELECT id, connector_account_id, run_type, status, items_processed, "
+                    "error_summary, started_at, completed_at FROM sync_runs WHERE id = :id"
+                ),
+                {"id": run_id},
+            )
+            .mappings()
+            .one()
         )
+        response = SyncRunResponse(**dict(run_row))
         _write_side_effects(
             outcome_session,
             auth,

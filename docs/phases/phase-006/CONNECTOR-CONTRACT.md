@@ -2,7 +2,7 @@
 id: PHASE-006-CONNECTOR
 title: Engineering Connector Contract
 status: Approved for Implementation
-version: 0.3.0
+version: 0.4.0
 owner: Lucky Jain
 ---
 
@@ -66,3 +66,7 @@ GitHub does not emit `X-OAuth-Scopes` at all for a fine-grained personal access 
 ## Accepted limitation (Task 2): `refresh_permissions` re-validates, does not diff access
 
 `GitHubAdapter.refresh_permissions` re-checks only whether the credential itself is still valid (`GET /user` succeeding), not whether it has lost access to a *specific* previously-synced repository while remaining otherwise valid -- GitHub has no single endpoint reporting "which of this token's previously-visible repositories can it still see," and this task's scope (repository sync only) stores no per-repo re-check list `refresh_permissions` could iterate. A token that is still valid but has lost access to one org/repo is not distinguished from a fully-permissioned one by this method; that case instead surfaces through the ordinary sync path, where a previously-visible repository simply stops appearing in `GET /user/repos`'s results. Task 2 does not yet mark a no-longer-listed `repositories` row `permission_lost` on that basis -- disclosed here as deferred, not silently assumed handled, matching this section's identical "disclose rather than silently absent" precedent above.
+
+## Accepted limitation (Task 2): the stale-running-sync reap bound is adapter-specific, not contract-level
+
+`sync_connector_endpoint`'s `_STALE_RUNNING_SYNC_THRESHOLD` (`connector_accounts.py`) reaps a `running` `sync_runs` row older than 10 minutes before starting a new sync for the same account -- recovery for a crashed request, not a normal code path. That bound is justified entirely by `GitHubAdapter`'s own bounded call shape (`_MAX_PAGES_PER_CALL`, `_RATE_LIMIT_MAX_WAIT_SECONDS`), not by any duration guarantee the `ConnectorAdapter` Protocol itself makes. A future adapter (GitLab/Jira, Tasks 3-4, or a later GitHub change removing today's page cap) whose legitimate single call can genuinely exceed this bound would have its still-in-flight row reaped and a second, genuinely concurrent call dispatched against the same account -- reintroducing the lost-cursor-update race `uq_sync_runs_running_per_account` (migration 0046) exists to prevent. This constant must be revisited (or made adapter-declared) before registering an adapter without an equivalent per-call duration bound of its own. `sync_connector_endpoint`'s phase 3 UPDATEs are guarded (`AND status = 'running'`) so a late-arriving outcome for an already-reaped run can never silently overwrite the reaper's recorded status -- the narrower, always-safe half of this problem -- though that guard does not by itself prevent the concurrent-call overlap.

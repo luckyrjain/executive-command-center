@@ -268,19 +268,29 @@ class _SlowAdapter:
 @dataclass
 class _SlowAuthorizeAdapter:
     """Blocks inside `authorize` (`create_connector_endpoint`'s own phase
-    2, no pooled connection held) until released -- the `POST /connectors`
-    analogue of `_SlowAdapter` above, needed since that fake only blocks in
-    `backfill`/`incremental_sync`, never `authorize`.
+    2, no pooled connection held) on a two-party `threading.Barrier` --
+    the `POST /connectors` analogue of `_SlowAdapter` above, needed since
+    that fake only blocks in `backfill`/`incremental_sync`, never
+    `authorize`.
+
+    A `Barrier`, not an `Event` a first caller sets and a second caller
+    waits on, is deliberate: it guarantees *both* concurrent requests have
+    already completed their own phase 1 (including a genuine idempotency-
+    cache miss -- neither could have found a cached response yet, since
+    neither has reached phase 3) before *either* is released into phase 3.
+    An Event-based "release immediately after submitting the second
+    request" ordering does not guarantee this -- the second request still
+    has its own phase 1 ahead of it when released, so it could resolve via
+    phase 1's own pre-existing cache check instead of ever reaching phase
+    3's `IntegrityError`/cache-recheck path the test exists to exercise.
     """
 
     provider: str = "sandbox"
     required_scopes: frozenset[str] = field(default_factory=lambda: frozenset({"contents:read"}))
-    entered_phase2: threading.Event = field(default_factory=threading.Event)
-    release: threading.Event = field(default_factory=threading.Event)
+    barrier: threading.Barrier = field(default_factory=lambda: threading.Barrier(2, timeout=5))
 
     def authorize(self, credential: str) -> ConnectorAuthorization:
-        self.entered_phase2.set()
-        self.release.wait(timeout=5)
+        self.barrier.wait()
         return ConnectorAuthorization(
             external_account_id="slow-authorize-account",
             display_name="Slow authorize fake",
@@ -1651,12 +1661,13 @@ def test_create_connector_idempotent_retry_racing_phase_three_replays_response(
     timeout during a slow `authorize()`) into `409
     CONNECTOR_ALREADY_CONNECTED` instead of the replayed response the
     `Idempotency-Key` contract promises. Real concurrent requests, same
-    mechanism as the `/sync` race test above: thread A is held mid-phase-2
-    (blocked inside `authorize` itself) by `_SlowAuthorizeAdapter`; thread B
-    (same Idempotency-Key) is submitted once A has genuinely entered phase
-    2, then both are released together, proving the fix's `except
-    IntegrityError` cache re-check actually fires for a real race, not just
-    a synthetic one.
+    mechanism as the `/sync` race test above, but synchronized via
+    `_SlowAuthorizeAdapter`'s two-party `Barrier` rather than an `Event`
+    one thread sets and the other waits on -- see that fake's own
+    docstring for why an `Event`-based ordering here would let this test
+    pass without ever reaching the code path it claims to exercise
+    (thread B resolving via phase 1's own pre-existing cache check instead
+    of phase 3's `IntegrityError`/cache-recheck).
     """
     client, _workspace_id, _user_id, token = engineering_test_context
     slow_adapter = _SlowAuthorizeAdapter()
@@ -1679,11 +1690,9 @@ def test_create_connector_idempotent_retry_racing_phase_three_replays_response(
     try:
         with ThreadPoolExecutor(max_workers=2) as pool:
             future_a = pool.submit(_create, client_a)
-            assert slow_adapter.entered_phase2.wait(timeout=5), "thread A never reached phase 2"
             future_b = pool.submit(_create, client_b)
-            slow_adapter.release.set()
-            response_a = future_a.result(timeout=5)
-            response_b = future_b.result(timeout=5)
+            response_a = future_a.result(timeout=10)
+            response_b = future_b.result(timeout=10)
     finally:
         client_a.close()
         client_b.close()
