@@ -255,11 +255,24 @@ def _compute_work_ageing(session: Session, *, workspace_id: UUID, now: datetime)
         for item in open_items
         if item["provider_created_at"] is not None
     ]
-    value = median(ages_days) if ages_days else None
-    details = {
-        "buckets": _bucket_ages_days(ages_days),
-        "items_missing_created_at": population - len(ages_days),
-    }
+    # Below the 50% coverage floor, `value`/`details` must be null even
+    # though `population`/`ages_days` are already known -- coverage and
+    # population are computed independently here, and a previously-synced
+    # (now disconnected, or merely stale-cursor) connector's rows must not
+    # render a real number stamped `insufficient_coverage` (review found
+    # this: `_insufficient_coverage_snapshot` already enforces the same
+    # rule for the three deployment-dependent metrics, but this function's
+    # own population query has no equivalent gate).
+    insufficient = coverage_status == "insufficient_coverage"
+    value = None if insufficient else (median(ages_days) if ages_days else None)
+    details = (
+        None
+        if insufficient
+        else {
+            "buckets": _bucket_ages_days(ages_days),
+            "items_missing_created_at": population - len(ages_days),
+        }
+    )
     return MetricSnapshot(
         metric_key="work_ageing",
         window_label="point_in_time",
@@ -289,14 +302,21 @@ def _compute_blocked_work(session: Session, *, workspace_id: UUID, now: datetime
         for item in blocked_items
         if item["provider_created_at"] is not None
     ]
-    details = {"median_age_days": median(blocked_ages_days)} if blocked_ages_days else None
+    # See `_compute_work_ageing`'s identical comment -- below the coverage
+    # floor, no numeric field may render a real number.
+    insufficient = coverage_status == "insufficient_coverage"
+    details = (
+        None
+        if insufficient
+        else ({"median_age_days": median(blocked_ages_days)} if blocked_ages_days else None)
+    )
     return MetricSnapshot(
         metric_key="blocked_work",
         window_label="point_in_time",
         population=population,
-        numerator=float(blocked_count),
-        denominator=float(population) if population else None,
-        value=float(blocked_count),
+        numerator=None if insufficient else float(blocked_count),
+        denominator=None if insufficient else (float(population) if population else None),
+        value=None if insufficient else float(blocked_count),
         details=details,
         coverage_status=coverage_status,
         coverage_percentage=coverage_pct,
@@ -359,7 +379,10 @@ def _compute_review_latency(
         if row["submitted_at"] >= row["requested_at"]
     ]
     population = len(latencies_seconds)
-    value = median(latencies_seconds) if latencies_seconds else None
+    # See `_compute_work_ageing`'s identical comment -- below the coverage
+    # floor, no numeric field may render a real number.
+    insufficient = coverage_status == "insufficient_coverage"
+    value = None if insufficient else (median(latencies_seconds) if latencies_seconds else None)
     return MetricSnapshot(
         metric_key="review_latency",
         window_label="30d",

@@ -578,6 +578,42 @@ def test_read_routes_are_not_mutation_rate_limited(
         assert response.status_code == 200
 
 
+def test_engineering_metrics_get_is_mutation_rate_limited(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`GET /api/v1/engineering/metrics` is the one documented exception
+    to "reads are free" -- it writes new snapshot rows on every call (see
+    `metrics.py`'s module docstring), so it must be rate-limited like a
+    real mutation even though it's a GET (final Phase 6 review finding).
+    A different GET at a different path must stay unaffected."""
+    import ecc.http_security as http_security
+
+    limiter = http_security._MutationRateLimiter(window_seconds=60.0, max_requests=1)
+    monkeypatch.setattr(http_security, "_mutation_rate_limiter", limiter)
+    app = FastAPI()
+    app.middleware("http")(http_security.mutation_rate_limit_middleware)
+
+    @app.get("/api/v1/engineering/metrics")
+    def get_metrics() -> dict:
+        return {"metrics": []}
+
+    @app.get("/api/v1/widgets")
+    def list_widgets() -> dict:
+        return {"items": []}
+
+    client = TestClient(app)
+    client.cookies.set("ecc_session", "same-session-token")
+
+    first = client.get("/api/v1/engineering/metrics")
+    second = client.get("/api/v1/engineering/metrics")
+    assert first.status_code == 200
+    assert second.status_code == 429
+    assert int(second.headers["Retry-After"]) >= 1
+
+    for _ in range(5):
+        assert client.get("/api/v1/widgets").status_code == 200
+
+
 def test_health_check_unaffected_by_mutation_rate_limit(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

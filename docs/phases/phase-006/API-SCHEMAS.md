@@ -2,7 +2,7 @@
 id: PHASE-006-API-SCHEMAS
 title: Phase 6 Engineering Workspace API
 status: Approved for Implementation
-version: 0.6.0
+version: 0.6.1
 owner: Lucky Jain
 ---
 
@@ -17,8 +17,10 @@ GET /engineering/repositories
 GET /engineering/work-items
 GET /engineering/changes
 GET /engineering/deployments
-GET /engineering/incidents
+GET|POST /engineering/incidents
+POST /engineering/incidents/{id}/resolve
 GET|POST /engineering/decisions
+POST /engineering/decisions/{id}/decide
 GET /engineering/metrics
 ```
 

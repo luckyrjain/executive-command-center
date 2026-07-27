@@ -154,6 +154,24 @@ _MAX_PAGES_PER_CALL = 10
 _RATE_LIMIT_MAX_WAIT_SECONDS = 5.0
 
 
+def _safe_repo_path_segment(full_name: str) -> str:
+    """Defense-in-depth against the same dot-segment path-escape bug class
+    `write_actions.py`'s `GitLabAddNoteInput._reject_dot_segments` closed
+    for GitLab's user-supplied `project_path` (final Phase 6 review
+    finding). `full_name` here is never directly user input -- it always
+    comes from `repositories.name`, itself populated only from GitHub's
+    own repo-listing response (`_upsert_repository`, below), and GitHub's
+    naming rules already disallow the `.`/`..`/empty path segments that
+    make the underlying bug exploitable -- but validating at every call
+    site that builds a request path from it, rather than trusting that
+    upstream policy as the only backstop, keeps this adapter consistent
+    with the GitLab adapter's own containment story.
+    """
+    if any(segment in ("", ".", "..") for segment in full_name.split("/")):
+        raise RuntimeError(f"repository name {full_name!r} contains an invalid path segment")
+    return full_name
+
+
 def _content_hash(repo: Mapping[str, Any]) -> str:
     material = dumps(
         {
@@ -399,7 +417,7 @@ def _list_changes_needing_reviews(
                     c.id, c.external_id, c.provider_number, c.merged_at,
                     r.name AS repository_name
                 FROM changes c
-                JOIN repositories r ON r.id = c.repository_id
+                JOIN repositories r ON r.id = c.repository_id AND r.workspace_id = c.workspace_id
                 WHERE c.workspace_id = :workspace_id
                   AND c.connector_account_id = :connector_account_id
                   AND c.provider = 'github'
@@ -786,7 +804,7 @@ class GitHubAdapter:
                 calls_made += 1
                 response = self._request_with_rate_limit_retry(
                     "GET",
-                    f"/repos/{repo['name']}/pulls",
+                    f"/repos/{_safe_repo_path_segment(repo['name'])}/pulls",
                     headers=headers,
                     params={
                         "state": "closed",
@@ -888,7 +906,8 @@ class GitHubAdapter:
             calls_made += 1
             response = self._request_with_rate_limit_retry(
                 "GET",
-                f"/repos/{change['repository_name']}/pulls/{change['provider_number']}/reviews",
+                f"/repos/{_safe_repo_path_segment(change['repository_name'])}"
+                f"/pulls/{change['provider_number']}/reviews",
                 headers=headers,
                 params={"per_page": _PAGE_SIZE},
             )
@@ -914,7 +933,7 @@ class GitHubAdapter:
                 calls_made += 1
                 timeline_response = self._request_with_rate_limit_retry(
                     "GET",
-                    f"/repos/{change['repository_name']}/issues/"
+                    f"/repos/{_safe_repo_path_segment(change['repository_name'])}/issues/"
                     f"{change['provider_number']}/timeline",
                     headers=headers,
                     params={"per_page": _PAGE_SIZE},

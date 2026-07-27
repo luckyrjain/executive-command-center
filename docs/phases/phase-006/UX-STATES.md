@@ -2,7 +2,7 @@
 id: PHASE-006-UX-STATES
 title: Phase 6 Engineering UX States
 status: Approved for Implementation
-version: 0.3.0
+version: 0.3.1
 owner: Lucky Jain
 ---
 
@@ -24,4 +24,4 @@ Charts always show definition, window, coverage and evidence drill-down. Never d
 
 **Two disclosed additive query endpoints** (`GET /engineering/repositories`, `GET /engineering/work-items`) were added as part of this task -- see `API-SCHEMAS.md`'s own "Task 8 status" note. **Charts always show definition/window/coverage/evidence**: `MetricCard.tsx` (shared by Delivery and Reliability) renders all four together for every metric snapshot, including the `insufficient_coverage` case, which shows "not yet available" rather than a misleading number. **No person rankings**: verified structurally -- no metric card, panel, or endpoint in this feature carries a `person_id`/engineer-scoped field at all.
 
-Verified via component tests (55 cases across the 8 panels/shell, covering every state above) and two Playwright browser-acceptance scenarios (`engineering-connector-states.mjs`, `engineering-lifecycle.mjs`) with `@axe-core/playwright` accessibility checks after every tab switch, asserting zero serious/critical WCAG violations.
+Verified via component tests (78 cases across 9 files -- the 8 panels plus the `EngineeringWorkspace` shell -- covering every state above, after several post-merge review-fix rounds; see `IMPLEMENTATION-STATUS.md`'s Task 8 and "Final whole-phase review" sections and `TEST-PLAN.md`'s Task 8 status for the full breakdown) and two Playwright browser-acceptance scenarios (`engineering-connector-states.mjs`, `engineering-lifecycle.mjs`) with `@axe-core/playwright` accessibility checks after every tab switch, asserting zero serious/critical WCAG violations.

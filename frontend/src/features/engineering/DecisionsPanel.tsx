@@ -9,6 +9,7 @@ function errorMessage(error: unknown): string {
   if (error.code === 'OFFLINE') return 'You are offline, so this request was not sent.'
   if (error.code === 'NETWORK_ERROR') return 'Could not reach the server. Nothing was sent.'
   if (error.code === 'IDEMPOTENCY_CONFLICT') return 'A different request was already recorded under this request key. Reload and retry.'
+  if (error.code === 'CSRF_TOKEN_REQUIRED' || error.code === 'CSRF_TOKEN_INVALID') return 'Your session\'s security token is missing or stale. Reload the page and try again.'
   if (error.code === 'CHANGE_NOT_FOUND') {
     const detail = error.current as { change_ids?: string[] } | undefined
     return `One or more change IDs do not exist in this workspace: ${detail?.change_ids?.join(', ') ?? 'unknown'}.`

@@ -29,15 +29,27 @@ This file covers, per that disclosed scope:
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
+from hmac import new
 from uuid import UUID, uuid4
 
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import text
 
+from ecc.config import get_settings
 from ecc.database import engine
 from ecc.domains.engineering.crypto import encrypt_credential
 from ecc.main import app
+
+settings = get_settings()
+
+
+def _headers(token: str, key: str | None = None) -> dict[str, str]:
+    csrf = new(settings.session_secret.encode(), token.encode(), "sha256").hexdigest()
+    headers = {"X-CSRF-Token": csrf, "X-Correlation-ID": str(uuid4())}
+    if key is not None:
+        headers["Idempotency-Key"] = key
+    return headers
 
 
 @pytest.fixture
@@ -464,3 +476,170 @@ def test_list_work_items_cross_workspace_isolation(
         assert titles == ["mine"]
     finally:
         _cleanup_workspace(other_workspace_id)
+
+
+# --- disable cascades freshness_state (final Phase 6 review finding) ----
+#
+# `CONNECTOR-CONTRACT.md`: disabling a connector retains its previously-
+# synced projections, visible not deleted, with a `disconnected` freshness
+# state -- `disable_connector_endpoint` never implemented that cascade, so
+# these rows kept reporting `freshness_state='fresh'` forever after
+# disable. These two tests prove the cascade landed and is workspace- and
+# connector-account-scoped, not a blanket update.
+
+
+def test_disable_marks_repositories_disconnected(
+    query_endpoints_test_context: tuple[TestClient, UUID, UUID],
+) -> None:
+    client, workspace_id, user_id = query_endpoints_test_context
+    token = client.cookies.get("ecc_session")
+    assert token is not None
+    account_id = _insert_connector_account(workspace_id, user_id)
+    _insert_repository(workspace_id, account_id, name="repo-a")
+
+    response = client.post(
+        f"/api/v1/engineering/connectors/{account_id}/disable",
+        headers=_headers(token, key=str(uuid4())),
+    )
+    assert response.status_code == 200, response.text
+
+    listed = client.get("/api/v1/engineering/repositories")
+    assert listed.status_code == 200, listed.text
+    assert [repo["freshness_state"] for repo in listed.json()["repositories"]] == ["disconnected"]
+
+
+def test_disable_marks_work_items_disconnected(
+    query_endpoints_test_context: tuple[TestClient, UUID, UUID],
+) -> None:
+    client, workspace_id, user_id = query_endpoints_test_context
+    token = client.cookies.get("ecc_session")
+    assert token is not None
+    account_id = _insert_connector_account(workspace_id, user_id, provider="jira", credential="tok")
+    _insert_work_item(workspace_id, account_id, title="item-a")
+
+    response = client.post(
+        f"/api/v1/engineering/connectors/{account_id}/disable",
+        headers=_headers(token, key=str(uuid4())),
+    )
+    assert response.status_code == 200, response.text
+
+    listed = client.get("/api/v1/engineering/work-items")
+    assert listed.status_code == 200, listed.text
+    assert [item["freshness_state"] for item in listed.json()["work_items"]] == ["disconnected"]
+
+
+def test_disable_does_not_touch_a_different_connector_accounts_rows(
+    query_endpoints_test_context: tuple[TestClient, UUID, UUID],
+) -> None:
+    client, workspace_id, user_id = query_endpoints_test_context
+    token = client.cookies.get("ecc_session")
+    assert token is not None
+    disabled_account = _insert_connector_account(workspace_id, user_id, credential="ghp_a")
+    other_account = _insert_connector_account(workspace_id, user_id, credential="ghp_b")
+    _insert_repository(workspace_id, disabled_account, name="from-disabled")
+    _insert_repository(workspace_id, other_account, name="from-other")
+
+    response = client.post(
+        f"/api/v1/engineering/connectors/{disabled_account}/disable",
+        headers=_headers(token, key=str(uuid4())),
+    )
+    assert response.status_code == 200, response.text
+
+    listed = client.get("/api/v1/engineering/repositories").json()["repositories"]
+    states = {repo["name"]: repo["freshness_state"] for repo in listed}
+    assert states == {"from-disabled": "disconnected", "from-other": "fresh"}
+
+
+def _insert_change(workspace_id: UUID, connector_account_id: UUID, repository_id: UUID) -> UUID:
+    change_id = uuid4()
+    now = datetime.now(UTC)
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                """
+                INSERT INTO changes (
+                    id, workspace_id, connector_account_id, repository_id, provider,
+                    external_id, title, source_url, permission_state, freshness_state,
+                    observed_at, created_at, updated_at
+                ) VALUES (
+                    :id, :ws, :acct, :repo, 'github', :ext, 'A change', 'https://x',
+                    'active', 'fresh', :now, :now, :now
+                )
+                """
+            ),
+            {
+                "id": change_id,
+                "ws": workspace_id,
+                "acct": connector_account_id,
+                "repo": repository_id,
+                "ext": f"change-{change_id}",
+                "now": now,
+            },
+        )
+    return change_id
+
+
+def _insert_review(workspace_id: UUID, connector_account_id: UUID, change_id: UUID) -> UUID:
+    review_id = uuid4()
+    now = datetime.now(UTC)
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                """
+                INSERT INTO reviews (
+                    id, workspace_id, connector_account_id, change_id, provider,
+                    external_id, source_url, permission_state, freshness_state,
+                    observed_at, created_at, updated_at
+                ) VALUES (
+                    :id, :ws, :acct, :change, 'github', :ext, 'https://x',
+                    'active', 'fresh', :now, :now, :now
+                )
+                """
+            ),
+            {
+                "id": review_id,
+                "ws": workspace_id,
+                "acct": connector_account_id,
+                "change": change_id,
+                "ext": f"review-{review_id}",
+                "now": now,
+            },
+        )
+    return review_id
+
+
+def test_disable_marks_changes_and_reviews_disconnected(
+    query_endpoints_test_context: tuple[TestClient, UUID, UUID],
+) -> None:
+    """A round-2 correctness re-review of the disable cascade found the
+    first fix pass only covered `repositories`/`engineering_work_items`,
+    leaving `changes`/`reviews` (migration `0048`, the identical
+    `workspace_id`/`connector_account_id`/`freshness_state` shape)
+    permanently `fresh` after disable. Neither has a `GET` endpoint yet
+    (a disclosed gap -- see `API-SCHEMAS.md`), so this checks the real
+    column directly rather than through a query endpoint.
+    """
+    client, workspace_id, user_id = query_endpoints_test_context
+    token = client.cookies.get("ecc_session")
+    assert token is not None
+    account_id = _insert_connector_account(workspace_id, user_id)
+    repository_id = _insert_repository(workspace_id, account_id, name="repo-a")
+    change_id = _insert_change(workspace_id, account_id, repository_id)
+    _insert_review(workspace_id, account_id, change_id)
+
+    response = client.post(
+        f"/api/v1/engineering/connectors/{account_id}/disable",
+        headers=_headers(token, key=str(uuid4())),
+    )
+    assert response.status_code == 200, response.text
+
+    with engine.begin() as connection:
+        change_state = connection.execute(
+            text("SELECT freshness_state FROM changes WHERE id = :id"), {"id": change_id}
+        ).scalar_one()
+        review_state = connection.execute(
+            text("SELECT freshness_state FROM reviews WHERE connector_account_id = :acct"),
+            {"acct": account_id},
+        ).scalar_one()
+    assert change_state == "disconnected"
+    assert review_state == "disconnected"

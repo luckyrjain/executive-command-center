@@ -352,6 +352,87 @@ def test_coverage_ignores_inactive_accounts(workspace: UUID) -> None:
     assert work_ageing.coverage_status == "insufficient_coverage"
 
 
+def test_insufficient_coverage_nulls_the_value_even_when_previously_synced_rows_exist(
+    workspace: UUID,
+) -> None:
+    """Final Phase 6 review finding: `_coverage_for` and the population
+    queries (`_open_work_items`, the `reviews`/`changes` join) are
+    computed independently -- nothing previously nulled `value`/
+    `numerator`/`denominator`/`details` once coverage regressed to
+    `insufficient_coverage`, even though `population` (and thus a real
+    computed value) can still be nonzero from rows synced before the
+    connector was disconnected or its cursor went stale. This is exactly
+    the scenario a disconnected-but-previously-synced connector (or a
+    merely stale sync cursor with no scheduler to refresh it) produces --
+    the frontend's own `MetricCard.tsx`/`DeliveryPanel.tsx` both assert no
+    number is ever shown below 50% coverage, so the backend must actually
+    guarantee it, not just usually happen to.
+    """
+    # An active connector account with NO fresh sync cursor at all --
+    # `_coverage_for` reports `insufficient_coverage`/0.0%, identical to
+    # what a disconnected-but-previously-synced or merely stale-cursor
+    # connector produces, while these previously-synced rows still exist.
+    account_id = _insert_connector_account(workspace, provider="jira")
+    now = datetime.now(UTC)
+    _insert_work_item(
+        workspace,
+        account_id,
+        external_id="open-3d",
+        status="In Progress",
+        provider_created_at=now - timedelta(days=3),
+    )
+    _insert_work_item(
+        workspace,
+        account_id,
+        external_id="blocked-40d",
+        status="Blocked",
+        provider_created_at=now - timedelta(days=40),
+    )
+
+    with SessionFactory() as session:
+        snapshots = compute_metrics(session, workspace_id=workspace)
+
+    work_ageing = next(s for s in snapshots if s.metric_key == "work_ageing")
+    assert work_ageing.coverage_status == "insufficient_coverage"
+    assert work_ageing.population == 2  # population is still real and nonzero
+    assert work_ageing.value is None
+    assert work_ageing.details is None
+
+    blocked_work = next(s for s in snapshots if s.metric_key == "blocked_work")
+    assert blocked_work.coverage_status == "insufficient_coverage"
+    assert blocked_work.population == 2
+    assert blocked_work.value is None
+    assert blocked_work.numerator is None
+    assert blocked_work.denominator is None
+    assert blocked_work.details is None
+
+
+def test_review_latency_insufficient_coverage_nulls_the_value(workspace: UUID) -> None:
+    account_id = _insert_connector_account(workspace, provider="github")
+    repo_id = _insert_repo(workspace, account_id, external_id="101")
+    now = datetime.now(UTC)
+    change_id = _insert_change(
+        workspace, account_id, repo_id, external_id="1", merged_at=now - timedelta(days=1)
+    )
+    _insert_review(
+        workspace,
+        account_id,
+        change_id,
+        external_id="r1",
+        requested_at=now - timedelta(hours=5),
+        submitted_at=now - timedelta(hours=3),
+    )
+    # No `change`/`review` sync cursor at all -- insufficient_coverage,
+    # even though a real review-latency population exists.
+
+    with SessionFactory() as session:
+        snapshots = compute_metrics(session, workspace_id=workspace)
+    review_latency = next(s for s in snapshots if s.metric_key == "review_latency")
+    assert review_latency.coverage_status == "insufficient_coverage"
+    assert review_latency.population == 1
+    assert review_latency.value is None
+
+
 # --- work_ageing / blocked_work --------------------------------------------
 
 
@@ -418,6 +499,7 @@ def test_bucket_ages_days_boundaries_are_inclusive_on_the_low_side() -> None:
 
 def test_work_ageing_counts_items_missing_created_at_separately(workspace: UUID) -> None:
     account_id = _insert_connector_account(workspace, provider="jira")
+    _insert_cursor(workspace, account_id, resource_type="work_item", updated_at=datetime.now(UTC))
     _insert_work_item(
         workspace,
         account_id,
@@ -439,6 +521,7 @@ def test_work_ageing_counts_items_missing_created_at_separately(workspace: UUID)
 
 def test_review_latency_median_of_first_review_per_change(workspace: UUID) -> None:
     account_id = _insert_connector_account(workspace, provider="github")
+    _insert_cursor(workspace, account_id, resource_type="change", updated_at=datetime.now(UTC))
     _insert_cursor(workspace, account_id, resource_type="review", updated_at=datetime.now(UTC))
     repo_id = _insert_repo(workspace, account_id, external_id="101")
     now = datetime.now(UTC)
@@ -779,6 +862,7 @@ def test_details_json_round_trips_through_the_database(workspace: UUID) -> None:
     from json import loads
 
     account_id = _insert_connector_account(workspace, provider="jira")
+    _insert_cursor(workspace, account_id, resource_type="work_item", updated_at=datetime.now(UTC))
     now = datetime.now(UTC)
     _insert_work_item(
         workspace,

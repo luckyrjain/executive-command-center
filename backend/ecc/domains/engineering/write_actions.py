@@ -142,7 +142,7 @@ from sqlalchemy.orm import Session
 import ecc.domains.engineering.connectors  # noqa: F401
 from ecc.database import SessionFactory
 from ecc.domains.engineering.crypto import decrypt_credential
-from ecc.domains.engineering.github_adapter import GITHUB_API_BASE_URL
+from ecc.domains.engineering.github_adapter import GITHUB_API_BASE_URL, _safe_repo_path_segment
 from ecc.domains.engineering.gitlab_adapter import GITLAB_API_BASE_URL
 from ecc.domains.engineering.jira_adapter import _parse_credential as _parse_jira_credential
 
@@ -330,7 +330,7 @@ class GitHubAddIssueCommentAdapter:
                 f"repository_id {action_input.repository_id} is not a repository this "
                 f"connector account has synced in this workspace"
             )
-        full_name = repo["name"]
+        full_name = _safe_repo_path_segment(repo["name"])
         headers = {
             "Authorization": f"Bearer {credential}",
             "Accept": "application/vnd.github+json",

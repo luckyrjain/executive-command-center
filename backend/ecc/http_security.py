@@ -183,6 +183,18 @@ class MaxBodySizeMiddleware:
 _MUTATION_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 _MUTATION_PATH_PREFIX = "/api/v1"
 
+# `GET /api/v1/engineering/metrics` is the one documented exception to the
+# "reads are free" reasoning above: it deliberately writes seven new
+# `delivery_metric_snapshots` rows on every call, a departure from pure
+# REST semantics disclosed in `metrics.py`'s module docstring and
+# `connector_accounts.py`'s `get_metrics_endpoint` docstring. CSRF already
+# blocks the cross-site vector, but nothing previously rate-limited a
+# same-origin, authenticated caller from looping this endpoint to grow
+# that table without bound (final Phase 6 review finding) -- an explicit,
+# narrow allow-list here rather than broadening the method-based rule,
+# since every other GET in this API genuinely is a pure, unlimited read.
+_MUTATING_GET_PATHS = frozenset({"/api/v1/engineering/metrics"})
+
 # Window/threshold: the largest observed sequential mutation-call count in a
 # single existing test fixture is 17 (tests/test_calendar_meetings_postgres.py,
 # one session token across several event/meeting lifecycle calls). 40
@@ -346,9 +358,9 @@ def _rate_limit_key(request: Request, *, host: str) -> str:
 
 
 def _is_mutation_route(request: Request) -> bool:
-    if request.method not in _MUTATION_METHODS:
-        return False
-    return request.url.path.startswith(_MUTATION_PATH_PREFIX)
+    if request.method in _MUTATION_METHODS:
+        return request.url.path.startswith(_MUTATION_PATH_PREFIX)
+    return request.method == "GET" and request.url.path in _MUTATING_GET_PATHS
 
 
 async def mutation_rate_limit_middleware(

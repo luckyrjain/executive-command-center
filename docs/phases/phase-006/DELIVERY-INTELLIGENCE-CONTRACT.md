@@ -2,7 +2,7 @@
 id: PHASE-006-DELIVERY-INTELLIGENCE
 title: Delivery Intelligence Contract
 status: Approved for Implementation
-version: 0.4.0
+version: 0.4.1
 owner: Lucky Jain
 ---
 
@@ -59,3 +59,7 @@ This phase has no periodic sync/computation scheduler yet -- `GET /engineering/m
 ## Accepted limitation (Task 5): heuristic "open"/"blocked" work-item classification
 
 Jira's workflow statuses are fully customizable per project; there is no per-workspace status-category configuration to consult yet. `work_ageing`'s population treats any work item whose `status` case-insensitively matches `done`/`closed`/`resolved` as closed, everything else as open; `blocked_work` treats any open item whose `status` case-insensitively contains `blocked` as blocked. A workspace using different status vocabulary (e.g. a custom "On Hold" column) will undercount -- a real, disclosed limitation, not a silently wrong number.
+
+## Accepted limitation (final Phase 6 review): `aggregation_scope` only ever produces `system` scope in this activation
+
+This document's own line above ("metrics aggregate at system/team/workstream level") describes the schema's full closed-enum capability, but no `Team`/`Workstream` entity exists anywhere in this codebase yet (`metrics.py`'s own module docstring, migration `0048_phase6_delivery_metrics.py`'s docstring) -- there is nothing for a `team`/`workstream`-scoped snapshot to scope by. `compute_and_store_metrics` always writes `aggregation_scope = 'system'`; the enum's other two values are a real, schema-level capability reserved for a future task that introduces those entities, not something obtainable today. This is the same kind of gap the accepted-limitation sections above already disclose for other fields (backfill-completion ledger, heuristic status classification) -- flagged here because a reader of this contract alone, without also reading `metrics.py`'s docstring, would otherwise believe team/workstream aggregation is available now.
