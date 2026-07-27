@@ -173,12 +173,19 @@ under `{"public"}` -- design doc Decision 5's own taxonomy table lists
 systems") with "None registered this slice (no production connector exists
 yet -- Phase 6)"; using this deliberately-fake, deliberately-in-memory
 adapter to exercise the `public` category's own approval-gate semantics end
-to end closes that "zero registered examples" gap for at least a fake
-adapter, the same way `local.send_test_notification` already does for
-`person-directed`. A reviewer could reasonably prefer `reversible=True,
-high_impact_categories=frozenset()` instead (a `bounded` fake, needing no
-approval) -- this is a judgment call, not a mechanical reading of the
-design doc, and is called out as such in this task's own PR evidence.
+to end closed that "zero registered examples" gap for at least a fake
+adapter at the time, the same way `local.send_test_notification` already
+does for `person-directed`. Phase 6 Task 7 has since registered three real
+production adapters under `{"public"}` (`ecc.domains.engineering.
+write_actions`'s `github.add_issue_comment`/`gitlab.add_note`/`jira.
+add_comment`), so this category's own approval-gate semantics are no
+longer exercised only by this fake -- this adapter remains registered for
+the identical reason `local.send_test_notification` does: a deterministic,
+no-real-side-effect fixture for tests that don't want a real provider
+call. A reviewer could reasonably prefer `reversible=True, high_impact_
+categories=frozenset()` instead (a `bounded` fake, needing no approval)
+-- this is a judgment call, not a mechanical reading of the design doc,
+and is called out as such in this task's own PR evidence.
 """
 
 from __future__ import annotations

@@ -52,6 +52,22 @@ from typing import Any, Protocol, runtime_checkable
 
 from pydantic import BaseModel
 
+# Phase 6 Engineering Workspace Task 7 ("Approved write actions") --
+# GitHub/GitLab/Jira write adapters. Safe to import here, at this
+# module's own top, alongside `local_adapters`: `write_actions.py` has no
+# top-level dependency on this module at all (its own need for
+# `TransientAdapterError` is a lazy, inside-the-function import, not a
+# module-level one -- see that module's own docstring for why a plain
+# top-level import here would otherwise recreate a genuine, direction-
+# independent circular import between these two exact modules). See
+# `write_actions.py`'s own docstring for the full scope, containment, and
+# retry-safety reasoning behind these three adapters.
+from ecc.domains.engineering.write_actions import (
+    GitHubAddIssueCommentAdapter,
+    GitLabAddNoteAdapter,
+    JiraAddCommentAdapter,
+)
+
 from .local_adapters import (
     FakeExternalActionAdapter,
     LocalCreateNoteAdapter,
@@ -229,3 +245,11 @@ registry = AdapterRegistry()
 registry.register(LocalCreateNoteAdapter())
 registry.register(LocalSendTestNotificationAdapter())
 registry.register(FakeExternalActionAdapter())
+
+# Phase 6 Engineering Workspace Task 7 ("Approved write actions") --
+# GitHub/GitLab/Jira write adapters. See that module's own docstring for
+# the full scope, containment, and retry-safety reasoning behind these
+# three adapters.
+registry.register(GitHubAddIssueCommentAdapter())
+registry.register(GitLabAddNoteAdapter())
+registry.register(JiraAddCommentAdapter())
