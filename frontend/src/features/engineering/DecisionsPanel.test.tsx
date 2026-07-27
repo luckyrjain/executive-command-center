@@ -96,6 +96,27 @@ describe('DecisionsPanel', () => {
     expect(await screen.findByRole('alert')).toBeTruthy()
   })
 
+  it('maps a stale CSRF token to a reload instruction, never the generic "not permitted" 403 fallback', async () => {
+    // Both CSRF_TOKEN_REQUIRED/CSRF_TOKEN_INVALID carry HTTP 403, same as a
+    // real permission failure -- final Phase 6 review found this panel (and
+    // IncidentsPanel) fell through to the generic 403 fallback instead of
+    // the CSRF-specific message ConnectorHealthPanel already handles.
+    const fetch = vi.fn((_input: RequestInfo | URL, init?: RequestInit) => {
+      if ((init?.method ?? 'GET').toUpperCase() === 'POST') {
+        return response({ error: { code: 'CSRF_TOKEN_INVALID', message: 'Csrf Token Invalid' } }, 403)
+      }
+      return response({ decisions: [] })
+    })
+    vi.stubGlobal('fetch', fetch)
+    renderPanel()
+
+    await screen.findByText('No decisions match this filter.')
+    fireEvent.change(screen.getByLabelText('Decision title'), { target: { value: 'Adopt trunk-based development' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Propose decision' }))
+    expect(await screen.findByText(/security token is missing or stale/)).toBeTruthy()
+    expect(screen.queryByText('You are not permitted to manage decisions in this workspace.')).toBeNull()
+  })
+
   it('decides a proposed decision with an optional rationale', async () => {
     const fetch = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input)

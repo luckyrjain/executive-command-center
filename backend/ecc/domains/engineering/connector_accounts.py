@@ -1215,6 +1215,21 @@ def disable_connector_endpoint(
                 ),
                 {"now": now, "actor_id": auth.user_id, "id": account_id},
             )
+            # `CONNECTOR-CONTRACT.md`: disconnect retains previously-synced
+            # projections, visible not deleted, with a `disconnected`
+            # freshness state -- a real gap the final Phase 6 review found:
+            # this cascade never existed, so every already-synced row kept
+            # reporting `freshness_state = 'fresh'` forever after disable.
+            for table in ("repositories", "engineering_work_items"):
+                session.execute(
+                    text(  # noqa: S608 -- table name is one of two fixed literals, never user input
+                        f"UPDATE {table} SET freshness_state = 'disconnected', "
+                        "updated_at = :now WHERE workspace_id = :workspace_id "
+                        "AND connector_account_id = :account_id "
+                        "AND freshness_state != 'disconnected'"
+                    ),
+                    {"now": now, "workspace_id": auth.workspace_id, "account_id": account_id},
+                )
 
         updated = get_connector_account(session, auth.workspace_id, account_id)
         assert updated is not None
