@@ -39,6 +39,7 @@ export async function run({ page, baseURL }) {
     engineering: {
       connectors: [
         connector({ id: 'conn-pending', provider: 'github', display_name: 'Acme GitHub (new)', status: 'pending' }),
+        connector({ id: 'conn-backfilling', provider: 'github', display_name: 'Acme GitHub (backfilling)', status: 'pending' }),
         connector({ id: 'conn-active', provider: 'github', display_name: 'Acme GitHub (active)', status: 'active', last_synced_at: iso(-60 * 60 * 1000) }),
         connector({ id: 'conn-permission', provider: 'gitlab', display_name: 'Acme GitLab', status: 'permission_lost', status_detail: 'Scope revoked by an administrator', last_synced_at: iso(-60 * 60 * 1000) }),
         connector({ id: 'conn-stale', provider: 'github', display_name: 'Acme GitHub (stale)', status: 'active', last_synced_at: iso(-30 * 24 * 60 * 60 * 1000) }),
@@ -47,7 +48,7 @@ export async function run({ page, baseURL }) {
         connector({ id: 'conn-to-disconnect', provider: 'github', display_name: 'Acme GitHub (to disconnect)', status: 'active', last_synced_at: iso(-60 * 60 * 1000) }),
       ],
       syncRuns: [
-        { id: 'run-backfill', connector_account_id: 'conn-pending', run_type: 'backfill', status: 'running', items_processed: 4, error_summary: null, started_at: iso(-60_000), completed_at: null },
+        { id: 'run-backfill', connector_account_id: 'conn-backfilling', run_type: 'backfill', status: 'running', items_processed: 4, error_summary: null, started_at: iso(-60_000), completed_at: null },
       ],
       repositories: [
         { id: 'repo-active', connector_account_id: 'conn-active', provider: 'github', external_id: 'gh-1', name: 'acme/widgets', source_url: 'https://github.com/acme/widgets', default_branch: 'main', permission_state: 'active', freshness_state: 'fresh', provider_updated_at: iso(-60 * 60 * 1000), observed_at: iso(-60 * 60 * 1000), created_at: iso(-30 * 24 * 60 * 60 * 1000), updated_at: iso(-60 * 60 * 1000) },
@@ -64,13 +65,24 @@ export async function run({ page, baseURL }) {
 
   const panel = page.locator('#engineering-panel')
 
-  // --- First sync: a pending connector with an in-progress backfill ------
+  // --- First sync: a pending connector with no sync history at all -------
   const pendingCard = panel.locator('li', { hasText: 'Acme GitHub (new)' })
   await pendingCard.getByText('first sync not yet run').waitFor()
   await pendingCard.getByText('No sync has ever run for this connector').waitFor()
-  await pendingCard.getByText(/Sync history/).click()
-  await pendingCard.getByText(/backfill/).waitFor()
-  await pendingCard.getByText(/in progress/).waitFor()
+
+  // --- Backfill: a distinct connector whose first sync is already
+  // running -- "no sync has ever run" must NOT also appear here, since a
+  // sync genuinely has run (started, at least) -------------------------
+  const backfillingCard = panel.locator('li', { hasText: 'Acme GitHub (backfilling)' })
+  await backfillingCard.getByText(/Sync history/).click()
+  const backfillingSyncHistory = backfillingCard.getByLabel('Sync runs for Acme GitHub (backfilling)')
+  await backfillingSyncHistory.getByText('backfill', { exact: true }).waitFor()
+  await backfillingSyncHistory.getByText(/in progress/).waitFor()
+  assert.equal(
+    await backfillingCard.getByText('No sync has ever run for this connector').count(),
+    0,
+    'a connector with an already-running backfill must not also claim no sync has ever run',
+  )
 
   // --- Partial permissions -------------------------------------------------
   const permissionCard = panel.locator('li', { hasText: 'Acme GitLab' }).filter({ hasText: 'partial permissions' })

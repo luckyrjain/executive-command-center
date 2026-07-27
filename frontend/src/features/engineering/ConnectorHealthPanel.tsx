@@ -116,7 +116,13 @@ function ConnectorCard({ connector, syncRuns, now, onChanged }: {
   })
 
   const stale = isStale(connector, now)
-  const neverSynced = connector.status === 'pending' || syncRuns.length === 0
+  // Deliberately keyed on `syncRuns.length` alone, not `connector.status
+  // === 'pending'` -- a connector can still report `pending` while its
+  // very first backfill is already `running` (the account-level status
+  // only flips once that sync completes), and showing "no sync has ever
+  // run" alongside a visible, in-progress sync history would be a
+  // contradiction, not a UX state that exists in this data model.
+  const neverSynced = syncRuns.length === 0
 
   return (
     <li>

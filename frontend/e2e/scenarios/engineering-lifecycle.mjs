@@ -54,13 +54,20 @@ export async function run({ page, baseURL }) {
   await page.getByRole('tab', { name: 'Delivery' }).click()
   await assertNoSeriousAccessibilityViolations(page, { include: '#engineering-panel' })
   const deliveryPanel = panel.locator('section[aria-labelledby="engineering-delivery-title"]')
-  await deliveryPanel.getByText('Delivery frequency').waitFor()
+  // `getByText` substring-matches case-insensitively by default, and this
+  // panel's own intro paragraph names every metric by its label ("delivery
+  // frequency, lead time, change failure rate, ...") -- `exact: true`
+  // disambiguates the metric card's own heading from that prose.
+  await deliveryPanel.getByText('Delivery frequency', { exact: true }).waitFor()
   await deliveryPanel.getByText('not yet available').waitFor()
   await deliveryPanel.getByText(/Coverage: insufficient coverage \(0%\)/).waitFor()
   await deliveryPanel.getByText(/Coverage: partial \(62%\)/).waitFor()
   await deliveryPanel.getByText(/GitLab backfill 62% complete/).waitFor()
-  await deliveryPanel.locator('li', { hasText: 'Review latency' }).getByText('Evidence').click()
-  await deliveryPanel.getByText('6').waitFor()
+  const reviewLatencyCard = deliveryPanel.locator('li', { hasText: 'Review latency' })
+  await reviewLatencyCard.getByText('Evidence').click()
+  // `exact: true` -- population "6" would otherwise substring-match this
+  // same card's own "62%" coverage percentage.
+  await reviewLatencyCard.getByText('6', { exact: true }).waitFor()
 
   // --- Reliability: only the incident-recovery metric --------------------
   await page.getByRole('tab', { name: 'Reliability' }).click()
