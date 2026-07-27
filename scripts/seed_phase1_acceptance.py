@@ -165,6 +165,10 @@ _WORKSPACE_ID_TABLES: tuple[str, ...] = (
     # scoped; seeded here from day one for the same reason, closing this
     # exact gap before it repeats a seventh time.
     "repositories",
+    # Phase 6 Task 4 (migration 0047) -- engineering_work_items, also
+    # workspace-scoped; seeded here from day one for the same reason,
+    # closing this exact gap before it repeats an eighth time.
+    "engineering_work_items",
 )
 # `workspaces` is scoped by its own `id`, not a `workspace_id` column.
 _WORKSPACE_TABLE = "workspaces"
@@ -248,6 +252,7 @@ def _fixture_ids(label: str) -> dict[str, UUID]:
         "sync_cursor": seed_id(label, "sync_cursor", "acceptance"),
         "sync_run": seed_id(label, "sync_run", "acceptance"),
         "repository": seed_id(label, "repository", "acceptance"),
+        "work_item": seed_id(label, "work_item", "acceptance"),
     }
 
 
@@ -1803,6 +1808,9 @@ def _seed_engineering(cur: psycopg.Cursor[Any], label: str, ids: Mapping[str, UU
     discovered generically by ``verify_restore.sh``'s workspace-isolation
     check, so it must be seeded here from day one rather than repeat the
     Task 1 gap CI found on this table's own first PR.
+
+    Phase 6 Task 4 (migration 0047) extends this same function with one
+    ``engineering_work_items`` row, for the identical reason.
     """
     cur.execute(
         """
@@ -1885,6 +1893,34 @@ def _seed_engineering(cur: psycopg.Cursor[Any], label: str, ids: Mapping[str, UU
             "name": f"acceptance/{label}-repo",
             "source_url": f"https://example.test/acceptance/{label}-repo",
             "content_hash": sha256(f"acceptance-repo-{label}".encode()).hexdigest(),
+            "now": SEED_EPOCH,
+        },
+    )
+    cur.execute(
+        """
+        INSERT INTO engineering_work_items (
+            id, workspace_id, connector_account_id, provider, external_id,
+            title, source_url, item_type, status, reporter_external_id,
+            assignee_external_id, permission_state, freshness_state,
+            content_hash, provider_updated_at, observed_at, created_at, updated_at
+        ) VALUES (
+            %(id)s, %(workspace_id)s, %(connector_account_id)s, 'sandbox', %(external_id)s,
+            %(title)s, %(source_url)s, 'Task', 'To Do', %(reporter_external_id)s,
+            %(assignee_external_id)s, 'active', 'fresh',
+            %(content_hash)s, %(now)s, %(now)s, %(now)s, %(now)s
+        )
+        ON CONFLICT (id) DO NOTHING
+        """,
+        {
+            "id": ids["work_item"],
+            "workspace_id": ids["workspace"],
+            "connector_account_id": ids["connector_account"],
+            "external_id": f"acceptance-work-item-{label}",
+            "title": f"Acceptance work item ({label})",
+            "source_url": f"https://example.test/acceptance/{label}-work-item",
+            "reporter_external_id": f"acceptance-reporter-{label}",
+            "assignee_external_id": f"acceptance-assignee-{label}",
+            "content_hash": sha256(f"acceptance-work-item-{label}".encode()).hexdigest(),
             "now": SEED_EPOCH,
         },
     )

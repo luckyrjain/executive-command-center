@@ -91,6 +91,7 @@ revocation" expected outcome.
 
 from __future__ import annotations
 
+import re
 import time
 from base64 import b64encode
 from collections.abc import Callable, Mapping
@@ -128,12 +129,49 @@ class _InvalidCredentialError(Exception):
     """
 
 
+# `site` becomes the host of every request URL this adapter builds
+# (`f"https://{site}/rest/api/3/..."`), and the credential supplying it is
+# workspace-operator-controlled input -- unlike `github_adapter.py`/
+# `gitlab_adapter.py`, whose base URLs are hardcoded constants, not user
+# data. Restricting `site` to the real shape of a Jira Cloud tenant host
+# (`{subdomain}.atlassian.net`, matching this module's own module-docstring
+# description of the credential format) closes an otherwise-real SSRF risk
+# where an operator-supplied `site` could point this adapter's outbound
+# request at an arbitrary internal host instead.
+_JIRA_SITE_PATTERN = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.atlassian\.net$")
+
+
 def _parse_credential(credential: str) -> tuple[str, str, str]:
     parts = credential.split("|", 2)
     if len(parts) != 3 or not all(parts):
         raise _InvalidCredentialError("Jira credential must be in the form 'site|email|api_token'")
     site, email, api_token = parts
+    if not _JIRA_SITE_PATTERN.match(site):
+        raise _InvalidCredentialError(
+            "Jira credential's site must be a bare '{subdomain}.atlassian.net' hostname"
+        )
     return site, email, api_token
+
+
+def _parse_jira_timestamp(value: str | None) -> datetime | None:
+    """Jira's `fields.updated` is an ISO-8601 timestamp carrying the
+    issuing site's own configured timezone offset (not always UTC/`Z`,
+    unlike GitHub/GitLab's serialization) -- comparing two such strings
+    lexicographically is unsound across a DST transition, where a later
+    instant can serialize with a *smaller* numeric offset and therefore
+    sort as lexicographically earlier. Parsing into a real timezone-aware
+    `datetime` and comparing those instead avoids that. Returns `None` on
+    an unparseable value rather than raising -- `_sync_work_items` treats
+    that as "not comparable," never stopping early on it, which is the
+    safe direction to fail in (a possible extra sync, never a silently
+    dropped update).
+    """
+    if value is None:
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:
+        return None
 
 
 def _content_hash(issue: Mapping[str, Any]) -> str:
@@ -342,6 +380,8 @@ class JiraAdapter:
         headers = self._headers(email, api_token)
         items_processed = 0
         newest_updated_at = since_cursor
+        newest_updated_dt = _parse_jira_timestamp(since_cursor)
+        since_cursor_dt = _parse_jira_timestamp(since_cursor)
         start_at = 0
         page = 1
         stopped_early = False
@@ -378,10 +418,11 @@ class JiraAdapter:
             for issue in issues:
                 fields = issue.get("fields") or {}
                 updated_at = fields.get("updated")
+                updated_dt = _parse_jira_timestamp(updated_at)
                 if (
-                    since_cursor is not None
-                    and updated_at is not None
-                    and updated_at <= since_cursor
+                    since_cursor_dt is not None
+                    and updated_dt is not None
+                    and updated_dt <= since_cursor_dt
                 ):
                     stopped_early = True
                     break
@@ -393,8 +434,11 @@ class JiraAdapter:
                     issue=issue,
                 )
                 items_processed += 1
-                if newest_updated_at is None or (updated_at and updated_at > newest_updated_at):
+                if updated_dt is not None and (
+                    newest_updated_dt is None or updated_dt > newest_updated_dt
+                ):
                     newest_updated_at = updated_at
+                    newest_updated_dt = updated_dt
 
             start_at += len(issues)
             if stopped_early or start_at >= total:

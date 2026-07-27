@@ -67,16 +67,28 @@ _SITE = "acme.atlassian.net"
 _CREDENTIAL = f"{_SITE}|jane@acme.test|jira-api-token"
 
 
-def _issue(issue_id: int, *, key: str, summary: str, updated: str) -> dict[str, Any]:
+_UNSET: dict[str, Any] = {}
+
+
+def _issue(
+    issue_id: int,
+    *,
+    key: str,
+    summary: str,
+    updated: str,
+    status: str = "In Progress",
+    assignee: dict[str, Any] | None = _UNSET,
+    reporter: dict[str, Any] | None = _UNSET,
+) -> dict[str, Any]:
     return {
         "id": issue_id,
         "key": key,
         "fields": {
             "summary": summary,
             "issuetype": {"name": "Bug"},
-            "status": {"name": "In Progress"},
-            "reporter": {"accountId": "reporter-1"},
-            "assignee": {"accountId": "assignee-1"},
+            "status": {"name": status},
+            "reporter": {"accountId": "reporter-1"} if reporter is _UNSET else reporter,
+            "assignee": {"accountId": "assignee-1"} if assignee is _UNSET else assignee,
             "updated": updated,
         },
     }
@@ -126,6 +138,25 @@ def test_jira_adapter_authorize_rejects_malformed_credential() -> None:
     adapter = JiraAdapter(transport=httpx.MockTransport(lambda r: _json_response({})))
     with pytest.raises(AdapterAuthorizationError, match="site\\|email\\|api_token"):
         adapter.authorize("not-the-right-shape")
+
+
+def test_jira_adapter_authorize_rejects_empty_credential_segment() -> None:
+    adapter = JiraAdapter(transport=httpx.MockTransport(lambda r: _json_response({})))
+    with pytest.raises(AdapterAuthorizationError, match="site\\|email\\|api_token"):
+        adapter.authorize("|jane@acme.test|jira-api-token")
+
+
+def test_jira_adapter_authorize_rejects_non_atlassian_site() -> None:
+    """`site` becomes the host of every request URL this adapter builds --
+    unlike GitHub/GitLab's hardcoded base URLs, it flows straight from
+    operator-supplied credential input. A `site` that isn't a genuine
+    `{subdomain}.atlassian.net` Jira Cloud host must be rejected outright
+    rather than letting this adapter issue an outbound request to it (an
+    SSRF risk an internal/arbitrary host would otherwise open up).
+    """
+    adapter = JiraAdapter(transport=httpx.MockTransport(lambda r: _json_response({})))
+    with pytest.raises(AdapterAuthorizationError, match="atlassian.net"):
+        adapter.authorize("internal.example.test|jane@acme.test|jira-api-token")
 
 
 def test_jira_adapter_authorize_rejects_401() -> None:
@@ -279,6 +310,98 @@ def test_backfill_paginates_via_offset(seeded_account_context: ConnectorAccountC
     outcome = adapter.backfill(seeded_account_context, "work_item")
     assert outcome.items_processed == 2
     assert outcome.next_cursor == "2024-01-05T00:00:00.000+0000"
+
+
+def test_backfill_writes_null_assignee_and_reporter_for_unassigned_issue(
+    seeded_account_context: ConnectorAccountContext,
+) -> None:
+    """Jira issues are routinely unassigned/unreported -- `fields.assignee`/
+    `fields.reporter` come back as JSON `null`, not merely absent, on a real
+    Jira response. `_upsert_work_item`'s defensive `fields.get(...) or {}`
+    handling must actually be exercised by a real null value, not just
+    assumed correct because every other test's fixture always supplies one.
+    """
+    issue = _issue(
+        1,
+        key="ACME-1",
+        summary="Unassigned bug",
+        updated="2024-01-01T00:00:00.000+0000",
+        assignee=None,
+        reporter=None,
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return _json_response(_search_response([issue]))
+
+    adapter = JiraAdapter(transport=httpx.MockTransport(handler))
+    outcome = adapter.backfill(seeded_account_context, "work_item")
+    assert outcome.status == "succeeded"
+    assert outcome.items_processed == 1
+
+    with engine.begin() as connection:
+        row = connection.execute(
+            text(
+                "SELECT reporter_external_id, assignee_external_id "
+                "FROM engineering_work_items WHERE workspace_id = :workspace_id"
+            ),
+            {"workspace_id": seeded_account_context.workspace_id},
+        ).one()
+    assert row.reporter_external_id is None
+    assert row.assignee_external_id is None
+
+
+def test_backfill_then_resync_with_changed_title_updates_row_and_content_hash(
+    seeded_account_context: ConnectorAccountContext,
+) -> None:
+    """Proves `_upsert_work_item`'s `ON CONFLICT` clause actually updates an
+    existing row (rather than silently no-op'ing) and that `_content_hash`
+    genuinely changes when a real content field (title) changes -- not just
+    that a first-time insert works.
+    """
+    first = _issue(
+        1, key="ACME-1", summary="Original title", updated="2024-01-01T00:00:00.000+0000"
+    )
+
+    def first_handler(request: httpx.Request) -> httpx.Response:
+        return _json_response(_search_response([first]))
+
+    adapter = JiraAdapter(transport=httpx.MockTransport(first_handler))
+    adapter.backfill(seeded_account_context, "work_item")
+
+    with engine.begin() as connection:
+        before = connection.execute(
+            text(
+                "SELECT title, content_hash FROM engineering_work_items "
+                "WHERE workspace_id = :workspace_id"
+            ),
+            {"workspace_id": seeded_account_context.workspace_id},
+        ).one()
+
+    renamed = _issue(
+        1, key="ACME-1", summary="Renamed title", updated="2024-01-02T00:00:00.000+0000"
+    )
+
+    def second_handler(request: httpx.Request) -> httpx.Response:
+        return _json_response(_search_response([renamed]))
+
+    adapter2 = JiraAdapter(transport=httpx.MockTransport(second_handler))
+    adapter2.incremental_sync(
+        seeded_account_context, "work_item", cursor="2024-01-01T00:00:00.000+0000"
+    )
+
+    with engine.begin() as connection:
+        rows = connection.execute(
+            text(
+                "SELECT title, content_hash FROM engineering_work_items "
+                "WHERE workspace_id = :workspace_id"
+            ),
+            {"workspace_id": seeded_account_context.workspace_id},
+        ).all()
+    assert len(rows) == 1
+    after = rows[0]
+    assert after.title == "Renamed title"
+    assert before.title == "Original title"
+    assert after.content_hash != before.content_hash
 
 
 def test_incremental_sync_stops_at_prior_cursor(
@@ -480,6 +603,14 @@ def test_handle_webhook_ignores_empty_payload() -> None:
     adapter = JiraAdapter()
     outcome = adapter.handle_webhook(_account_context(), b"", {})
     assert outcome.items_processed == 0
+
+
+def test_handle_webhook_ignores_matching_event_with_no_issue_key() -> None:
+    adapter = JiraAdapter()
+    payload = dumps({"webhookEvent": "jira:issue_updated"}).encode()
+    outcome = adapter.handle_webhook(_account_context(), payload, {})
+    assert outcome.items_processed == 0
+    assert outcome.status == "succeeded"
 
 
 def test_handle_webhook_upserts_on_real_issue_updated_payload(
