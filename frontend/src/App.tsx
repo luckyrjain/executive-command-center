@@ -21,6 +21,7 @@ import RiskReviewQueue from './features/attention/RiskReviewQueue'
 import Planner from './features/attention/Planner'
 import MeetingPrep from './features/attention/MeetingPrep'
 import AutomationWorkspace from './features/automation/AutomationWorkspace'
+import EngineeringWorkspace from './features/engineering/EngineeringWorkspace'
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:8000'
 
@@ -167,6 +168,7 @@ export default function App() {
         : currentView === 'recommendations' ? <RecommendationPanel />
         : currentView === 'search-audit' ? <SearchAuditPanel />
         : currentView === 'automation' ? <AutomationWorkspace />
+        : currentView === 'engineering' ? <EngineeringWorkspace />
         : <><header className="topbar">
           <div>
             <p className="eyebrow">EXECUTIVE COMMAND CENTER</p>

@@ -422,6 +422,60 @@ class MetricsListResponse(BaseModel):
     metrics: list[MetricSnapshotResponse]
 
 
+# Phase 6 Task 8 ("Executive UX and browser acceptance") -- neither this
+# plan doc's own route sketch nor any of Tasks 1-7 named a GET query
+# surface for `repositories`/`engineering_work_items`, even though Task 2
+# has synced `repositories` since migration `0045_phase6_repositories.py`
+# and Task 4 has synced `engineering_work_items` since migration
+# `0047_phase6_work_items.py`. The Repositories/Source Coverage UX
+# surfaces this task builds have nothing to query without these two thin
+# list endpoints -- the same "add the query endpoint the UX genuinely
+# needs" disclosed-scope pattern every one of Tasks 5-7 already used once
+# (`GET /engineering/metrics`, `POST /engineering/incidents`, the write
+# adapters themselves).
+class RepositoryResponse(BaseModel):
+    id: UUID
+    connector_account_id: UUID
+    provider: str
+    external_id: str
+    name: str
+    source_url: str
+    default_branch: str | None
+    permission_state: Literal["active", "permission_lost", "deleted"]
+    freshness_state: Literal["fresh", "stale", "disconnected"]
+    provider_updated_at: datetime | None
+    observed_at: datetime
+    created_at: datetime
+    updated_at: datetime
+
+
+class RepositoryListResponse(BaseModel):
+    repositories: list[RepositoryResponse]
+
+
+class WorkItemResponse(BaseModel):
+    id: UUID
+    connector_account_id: UUID
+    provider: str
+    external_id: str
+    title: str
+    source_url: str
+    item_type: str | None
+    status: str | None
+    reporter_external_id: str | None
+    assignee_external_id: str | None
+    permission_state: Literal["active", "permission_lost", "deleted"]
+    freshness_state: Literal["fresh", "stale", "disconnected"]
+    provider_created_at: datetime | None
+    observed_at: datetime
+    created_at: datetime
+    updated_at: datetime
+
+
+class WorkItemListResponse(BaseModel):
+    work_items: list[WorkItemResponse]
+
+
 class _EmptyBody(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -1240,3 +1294,76 @@ def get_metrics_endpoint(auth: AuthDep, session: SessionDep, _csrf: CsrfDep) -> 
     return MetricsListResponse(
         metrics=[MetricSnapshotResponse(**snapshot) for snapshot in snapshots]
     )
+
+
+@router.get("/repositories", response_model=RepositoryListResponse)
+def list_repositories_endpoint(
+    auth: AuthDep,
+    session: SessionDep,
+    connector_account_id: Annotated[UUID | None, Query()] = None,
+) -> RepositoryListResponse:
+    """Task 8's own disclosed addition -- see `RepositoryResponse`'s own
+    comment above for why. Mirrors `list_sync_runs_endpoint`'s shape
+    exactly: workspace-scoped, an optional `connector_account_id` filter,
+    no pagination (matching every other list endpoint in this file, none
+    of which paginate at this activation's expected data volume).
+    """
+    clause = "AND connector_account_id = :connector_account_id" if connector_account_id else ""
+    params: dict[str, Any] = {"workspace_id": auth.workspace_id}
+    if connector_account_id:
+        params["connector_account_id"] = connector_account_id
+    rows = (
+        session.execute(
+            text(
+                "SELECT id, connector_account_id, provider, external_id, name, source_url, "
+                "default_branch, permission_state, freshness_state, provider_updated_at, "
+                "observed_at, created_at, updated_at FROM repositories "
+                f"WHERE workspace_id = :workspace_id {clause} ORDER BY name ASC"  # noqa: S608
+            ),
+            params,
+        )
+        .mappings()
+        .all()
+    )
+    return RepositoryListResponse(repositories=[RepositoryResponse(**dict(row)) for row in rows])
+
+
+@router.get("/work-items", response_model=WorkItemListResponse)
+def list_work_items_endpoint(
+    auth: AuthDep,
+    session: SessionDep,
+    connector_account_id: Annotated[UUID | None, Query()] = None,
+    status_filter: Annotated[str | None, Query(alias="status")] = None,
+) -> WorkItemListResponse:
+    """Same disclosed-addition reasoning as `list_repositories_endpoint`
+    above -- `engineering_work_items` has been synced since Task 4 with
+    no query surface until now. `status_filter` is a plain string
+    equality match, not a `Literal`, since `engineering_work_items.status`
+    carries no CHECK constraint (unlike `incidents.status`'s closed
+    enum): it is provider-specific free text, and GitHub/GitLab/Jira each
+    use a different vocabulary for "open"/"done" that this activation
+    cannot honestly enumerate as a closed set.
+    """
+    clauses = []
+    params: dict[str, Any] = {"workspace_id": auth.workspace_id}
+    if connector_account_id:
+        clauses.append("AND connector_account_id = :connector_account_id")
+        params["connector_account_id"] = connector_account_id
+    if status_filter:
+        clauses.append("AND status = :status_filter")
+        params["status_filter"] = status_filter
+    rows = (
+        session.execute(
+            text(
+                "SELECT id, connector_account_id, provider, external_id, title, source_url, "
+                "item_type, status, reporter_external_id, assignee_external_id, "
+                "permission_state, freshness_state, provider_created_at, observed_at, "
+                "created_at, updated_at FROM engineering_work_items "
+                f"WHERE workspace_id = :workspace_id {' '.join(clauses)} ORDER BY title ASC"  # noqa: S608
+            ),
+            params,
+        )
+        .mappings()
+        .all()
+    )
+    return WorkItemListResponse(work_items=[WorkItemResponse(**dict(row)) for row in rows])

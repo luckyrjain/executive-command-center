@@ -45,10 +45,13 @@ function requestHeaders(options: ApiRequestOptions, mutation: boolean): Record<s
   const headers = Object.fromEntries(new Headers(options.headers).entries())
   headers.Accept = 'application/json'
   if (options.body !== undefined) headers['Content-Type'] = 'application/json'
-  if (mutation) {
-    headers['X-CSRF-Token'] = cookieValue('ecc_csrf')
-    headers['Idempotency-Key'] = crypto.randomUUID()
-  }
+  // `options.csrf` is a separate condition from `mutation`, not folded into
+  // it: a handful of GET endpoints have a real server-side side effect and
+  // require `CsrfDep` despite being safe HTTP methods (see `ApiRequestOptions.
+  // csrf`'s own comment) -- Idempotency-Key stays gated on `mutation` alone,
+  // since none of those GETs declare an idempotency-key dependency at all.
+  if (mutation || options.csrf) headers['X-CSRF-Token'] = cookieValue('ecc_csrf')
+  if (mutation) headers['Idempotency-Key'] = crypto.randomUUID()
   return headers
 }
 

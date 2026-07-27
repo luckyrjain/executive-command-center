@@ -1,0 +1,88 @@
+import { useRef, useState, type KeyboardEvent } from 'react'
+
+import { moveWorkspaceFocus } from '../../navigation/WorkspaceNavigation'
+import EngineeringOverview from './EngineeringOverview'
+import DeliveryPanel from './DeliveryPanel'
+import ReliabilityPanel from './ReliabilityPanel'
+import RepositoriesPanel from './RepositoriesPanel'
+import IncidentsPanel from './IncidentsPanel'
+import DecisionsPanel from './DecisionsPanel'
+import ConnectorHealthPanel from './ConnectorHealthPanel'
+import CoveragePanel from './CoveragePanel'
+import type { EngineeringView } from './types'
+
+const TABS: ReadonlyArray<{ view: EngineeringView; label: string }> = [
+  { view: 'overview', label: 'Overview' },
+  { view: 'delivery', label: 'Delivery' },
+  { view: 'reliability', label: 'Reliability' },
+  { view: 'repositories', label: 'Repositories' },
+  { view: 'incidents', label: 'Incidents' },
+  { view: 'decisions', label: 'Decisions' },
+  { view: 'connector-health', label: 'Connector health' },
+  { view: 'coverage', label: 'Source coverage' },
+]
+
+/**
+ * Top-level shell for the Phase 6 Engineering Workspace surface
+ * (`docs/phases/phase-006/UX-STATES.md`: "Engineering overview, delivery,
+ * reliability, repositories, incidents, decisions, connector health and
+ * source coverage"). One `WorkspaceView` slot ('engineering'), with its
+ * own internal tablist -- mirrors `AutomationWorkspace.tsx`'s identical
+ * nested-tablist shape (reuses `WorkspaceNavigation.tsx`'s own
+ * roving-tabindex helper rather than re-deriving the same keyboard logic
+ * a second time).
+ */
+export default function EngineeringWorkspace() {
+  const [view, setView] = useState<EngineeringView>('overview')
+  const tabs = useRef<Array<HTMLButtonElement | null>>([])
+
+  function handleKeyDown(event: KeyboardEvent<HTMLButtonElement>, current: number) {
+    const moved = moveWorkspaceFocus(current, event.key, tabs.current, (nextIndex) => {
+      setView(TABS[nextIndex].view)
+    })
+    if (!moved) return
+    event.preventDefault()
+  }
+
+  return (
+    <section className="engineering-workspace" aria-labelledby="engineering-title">
+      <div className="work-heading">
+        <div>
+          <p className="eyebrow">ENGINEERING</p>
+          <h1 id="engineering-title">Engineering workspace</h1>
+          <p>Connected repositories, work items, delivery and reliability metrics, incidents and decisions -- across every connected GitHub, GitLab, and Jira account.</p>
+        </div>
+      </div>
+
+      <div className="tab-list" role="tablist" aria-label="Engineering views">
+        {TABS.map((tab, tabIndex) => (
+          <button
+            key={tab.view}
+            id={`engineering-tab-${tab.view}`}
+            ref={(element) => { tabs.current[tabIndex] = element }}
+            type="button"
+            role="tab"
+            aria-controls="engineering-panel"
+            aria-selected={view === tab.view}
+            tabIndex={view === tab.view ? 0 : -1}
+            onClick={() => setView(tab.view)}
+            onKeyDown={(event) => handleKeyDown(event, tabIndex)}
+          >
+            {tab.label}
+          </button>
+        ))}
+      </div>
+
+      <div id="engineering-panel" role="tabpanel" aria-labelledby={`engineering-tab-${view}`}>
+        {view === 'overview' ? <EngineeringOverview onNavigate={setView} />
+          : view === 'delivery' ? <DeliveryPanel />
+          : view === 'reliability' ? <ReliabilityPanel />
+          : view === 'repositories' ? <RepositoriesPanel />
+          : view === 'incidents' ? <IncidentsPanel />
+          : view === 'decisions' ? <DecisionsPanel />
+          : view === 'connector-health' ? <ConnectorHealthPanel />
+          : <CoveragePanel />}
+      </div>
+    </section>
+  )
+}
