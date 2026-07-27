@@ -8,9 +8,9 @@ framework and source projections; Task 2: GitHub read sync).
 -- plus the connector-adapter contract (`connectors.py`), credential
 encryption (`crypto.py`), one deliberately-fake sandbox adapter
 (`sandbox_adapter.py`) exercising that contract end to end without a real
-network call, and the first real, non-sandbox adapter (`github_adapter.py`,
-`repositories`, migration `0045_phase6_repositories.py`) -- repository
-backfill/incremental sync only.
+network call, and the first real, non-sandbox adapter (`github_adapter.py`)
+-- populating the `repositories` table (migration
+`0045_phase6_repositories.py`), repository backfill/incremental sync only.
 
 No GitLab/Jira adapter, delivery/reliability metric computation,
 decision/incident linking or write action exists in this package yet --

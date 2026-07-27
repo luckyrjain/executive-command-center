@@ -124,6 +124,22 @@ def test_github_adapter_authorize_rejects_missing_required_scope() -> None:
         adapter.authorize("classic-token-missing-repo-scope")
 
 
+def test_github_adapter_authorize_rejects_classic_token_with_empty_scopes_header() -> None:
+    """Distinct from the fine-grained-PAT case below: `X-OAuth-Scopes`
+    *present but empty* (a classic OAuth token authorized with zero
+    scopes) is a real, checkable signal -- unlike an *absent* header, this
+    must still fail the same subset check as any other under-scoped
+    classic token, not be treated as unverifiable.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return _json_response({"id": 1, "login": "x"}, headers={"X-OAuth-Scopes": ""})
+
+    adapter = GitHubAdapter(transport=httpx.MockTransport(handler))
+    with pytest.raises(AdapterAuthorizationError, match="repo"):
+        adapter.authorize("classic-token-zero-scopes")
+
+
 def test_github_adapter_authorize_fine_grained_pat_has_no_scopes_header() -> None:
     """GitHub never emits `X-OAuth-Scopes` for a fine-grained PAT -- this
     is accepted (not rejected: refusing every fine-grained PAT outright
@@ -403,6 +419,9 @@ def test_rate_limit_still_limited_after_retry_reports_partial_not_failure() -> N
     outcome = adapter.backfill(_account_context(), "repository")
     assert outcome.status == "partial"
     assert outcome.items_processed == 0
+    assert outcome.next_cursor is None
+    assert outcome.error_summary is not None
+    assert "rate limit" in outcome.error_summary.lower()
     assert calls["count"] == 2
 
 

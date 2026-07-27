@@ -63,6 +63,29 @@ stale sync outcome) and read the account's actual post-UPDATE `version`
 via `RETURNING` (`_finalize_account_version`) rather than recomputing it
 from phase 1's now-stale in-memory snapshot.
 
+**A `running` row this same fix could otherwise wedge forever, also
+fixed.** Making a `running` row the serialization point (above) has its
+own failure mode a single spanning transaction never had: if the process
+crashes/is killed between phase 1's commit and phase 3, nothing ever
+rolls that row back, permanently blocking every future `/sync` call for
+the account behind a `running` row nothing will ever complete. Phase 1
+reaps any `running` row for this account older than
+`_STALE_RUNNING_SYNC_THRESHOLD` (marking it `failed`) before attempting
+its own `INSERT`, bounded generously above any legitimate call's real
+duration so a genuinely still-in-flight sync is never touched.
+
+**`create_connector_endpoint` needed the identical treatment for its own
+`Idempotency-Key` contract**, not just the pool-exhaustion fix -- a
+same-key retry racing ahead of the first call's phase 3 was returning
+`409 CONNECTOR_ALREADY_CONNECTED` instead of the replayed response the
+`Idempotency-Key` contract promises. Since phase 3's `INSERT` is the only
+place `uq_connector_accounts_workspace_provider_external_id` can conflict
+(unlike `/sync`'s phase-1 conflict point), a losing `IntegrityError` here
+*does* guarantee the winner's whole phase 3 (including
+`_store_idempotency`) already committed -- so the `except IntegrityError`
+handler re-checks the idempotency cache before concluding this is a
+genuine duplicate connection. See that function's own docstring.
+
 **Accepted limitation, disclosed rather than silently absent:**
 `ConnectorAdapter.refresh_permissions` has no HTTP caller in this task --
 `API-SCHEMAS.md` names no dedicated permission-refresh endpoint, and
@@ -131,6 +154,21 @@ RunStatus = Literal["running", "succeeded", "failed", "partial"]
 ResourceType = Literal["repository", "work_item", "change", "review", "deployment", "incident"]
 
 _MAX_ADAPTER_ERROR_LENGTH = 300
+# `uq_sync_runs_running_per_account` (migration 0046) makes a `running`
+# `sync_runs` row the thing that serializes concurrent syncs -- but unlike
+# the single-transaction handler it replaced, a process crash/kill between
+# phase 1's commit and phase 3's outcome-recording (network partition, pod
+# eviction, a hard worker timeout) no longer auto-rolls back that row via
+# transaction abort. Left unhandled, that would permanently wedge every
+# future `/sync` call for the account behind a `running` row nothing will
+# ever complete -- a real availability regression security review found in
+# the phase restructuring, not a pre-existing/accepted limitation. Bounded
+# generously above any legitimate call's real duration (bounded rate-limit
+# wait is <=5s, `_MAX_PAGES_PER_CALL` bounds one call's own pagination to a
+# handful of HTTP round trips -- real syncs complete in seconds, not
+# minutes), so this reaps only genuinely-abandoned rows, never a slow but
+# still-in-flight one.
+_STALE_RUNNING_SYNC_THRESHOLD = timedelta(minutes=10)
 
 
 def _sanitize_adapter_error(message: str) -> str:
@@ -541,14 +579,26 @@ def create_connector_endpoint(
        connection held.
     3. Insert the new connector account on a fresh session.
 
-    Unlike `/sync`, a duplicate concurrent call racing past the (released
-    after phase 1) advisory lock is an accepted, already-handled outcome
-    rather than a new risk this restructuring introduces: `authorize()` has
-    no side effect at the provider to duplicate (GitHub's `GET /user` is
-    read-only), and the loser of phase 3's `INSERT` simply hits the
-    pre-existing `uq_connector_accounts_workspace_provider_external_id`
-    constraint and returns the pre-existing `409
-    CONNECTOR_ALREADY_CONNECTED` -- not a new failure mode.
+    A genuine same-Idempotency-Key retry racing ahead of the first
+    request's own phase 3 (e.g. a client-side timeout during a slow
+    `authorize()` call, retried with the same key) reaches phase 3's
+    `INSERT` concurrently with the original request. Because Postgres only
+    raises the `uq_connector_accounts_workspace_provider_external_id`
+    conflict once the winning row is actually committed -- and the winner's
+    entire phase 3 (`INSERT` + `_write_side_effects` + `_store_idempotency`)
+    is one transaction -- the loser's `IntegrityError` can only fire *after*
+    the winner has already stored its idempotency record. So the `except
+    IntegrityError` handler below re-checks the idempotency cache before
+    concluding this is a genuine "already connected" duplicate: if found,
+    it returns the winner's real response (a correct idempotent replay,
+    matching every other endpoint's `Idempotency-Key` contract) instead of
+    a `409` the retrying client did not earn. Only an actual pre-existing
+    connection (no matching cached response) still gets `409
+    CONNECTOR_ALREADY_CONNECTED`. This same reasoning does not transfer to
+    `/sync`'s own `409 CONNECTOR_SYNC_IN_PROGRESS` -- there, the conflicting
+    unique row is written in *phase 1*, before the slow adapter call, so a
+    losing retry's conflict gives no such guarantee the winner has finished
+    -- that 409 is a genuine "come back later," not a replayable result.
     """
     request_hash = _request_hash(payload, "create_connector")
     now = datetime.now(UTC)
@@ -580,58 +630,70 @@ def create_connector_endpoint(
 
     # --- Phase 3: persist the account, on a fresh connection --------------
     account_id = uuid4()
-    with SessionFactory() as create_session, create_session.begin():
+    with SessionFactory() as create_session:
         try:
-            create_session.execute(
-                text(
-                    """
-                    INSERT INTO connector_accounts (
-                        id, workspace_id, provider, external_account_id, display_name,
-                        granted_scopes, encrypted_credentials, status, version,
-                        created_by, updated_by, created_at, updated_at
-                    ) VALUES (
-                        :id, :workspace_id, :provider, :external_account_id, :display_name,
-                        :granted_scopes, :encrypted_credentials, 'active', 1,
-                        :actor_id, :actor_id, :now, :now
-                    )
-                    """
-                ),
-                {
-                    "id": account_id,
-                    "workspace_id": auth.workspace_id,
-                    "provider": payload.provider,
-                    "external_account_id": authorization.external_account_id,
-                    "display_name": authorization.display_name,
-                    "granted_scopes": list(authorization.granted_scopes),
-                    "encrypted_credentials": encrypt_credential(payload.credential),
-                    "actor_id": auth.user_id,
-                    "now": now,
-                },
+            with create_session.begin():
+                create_session.execute(
+                    text(
+                        """
+                        INSERT INTO connector_accounts (
+                            id, workspace_id, provider, external_account_id, display_name,
+                            granted_scopes, encrypted_credentials, status, version,
+                            created_by, updated_by, created_at, updated_at
+                        ) VALUES (
+                            :id, :workspace_id, :provider, :external_account_id, :display_name,
+                            :granted_scopes, :encrypted_credentials, 'active', 1,
+                            :actor_id, :actor_id, :now, :now
+                        )
+                        """
+                    ),
+                    {
+                        "id": account_id,
+                        "workspace_id": auth.workspace_id,
+                        "provider": payload.provider,
+                        "external_account_id": authorization.external_account_id,
+                        "display_name": authorization.display_name,
+                        "granted_scopes": list(authorization.granted_scopes),
+                        "encrypted_credentials": encrypt_credential(payload.credential),
+                        "actor_id": auth.user_id,
+                        "now": now,
+                    },
+                )
+        except IntegrityError:
+            # `create_session.begin()`'s own `__exit__` already rolled back
+            # on the exception above -- safe to issue a fresh read here.
+            # See this function's own docstring for why re-checking the
+            # cache (rather than assuming this is a genuine duplicate) is
+            # correct specifically here.
+            cached_after_conflict = _load_cached(
+                create_session, auth, idempotency_key, request_hash
             )
-        except IntegrityError as exc:
-            raise HTTPException(status_code=409, detail="CONNECTOR_ALREADY_CONNECTED") from exc
+            if cached_after_conflict is not None:
+                return ConnectorAccountResponse.model_validate(cached_after_conflict)
+            raise HTTPException(status_code=409, detail="CONNECTOR_ALREADY_CONNECTED") from None
 
-        created = get_connector_account(create_session, auth.workspace_id, account_id)
-        assert created is not None
-        response = _to_response(created)
-        _write_side_effects(
-            create_session,
-            auth,
-            request,
-            event_type="connector_account.created",
-            aggregate_id=created.id,
-            version=created.version,
-            now=now,
-        )
-        _store_idempotency(
-            create_session,
-            auth,
-            idempotency_key,
-            request_hash,
-            response.model_dump(mode="json"),
-            now,
-            response_status=status.HTTP_201_CREATED,
-        )
+        with create_session.begin():
+            created = get_connector_account(create_session, auth.workspace_id, account_id)
+            assert created is not None
+            response = _to_response(created)
+            _write_side_effects(
+                create_session,
+                auth,
+                request,
+                event_type="connector_account.created",
+                aggregate_id=created.id,
+                version=created.version,
+                now=now,
+            )
+            _store_idempotency(
+                create_session,
+                auth,
+                idempotency_key,
+                request_hash,
+                response.model_dump(mode="json"),
+                now,
+                response_status=status.HTTP_201_CREATED,
+            )
         return response
 
 
@@ -707,6 +769,32 @@ def sync_connector_endpoint(
 
         encrypted = _get_encrypted_credential(session, auth.workspace_id, account_id)
         credential = decrypt_credential(encrypted)
+
+        # Reap a `running` row this account's own *own* earlier request left
+        # behind by crashing/being killed between phase 1's commit and phase
+        # 3's outcome-recording (a real availability regression: unlike the
+        # single-transaction handler this replaced, that window is no
+        # longer auto-rolled-back by a transaction abort). Scoped to rows
+        # older than `_STALE_RUNNING_SYNC_THRESHOLD` so a genuinely still-
+        # in-flight concurrent sync is never touched -- see that constant's
+        # own docstring.
+        session.execute(
+            text(
+                """
+                UPDATE sync_runs SET status = 'failed',
+                    error_summary = 'reaped: no outcome recorded within the stale threshold',
+                    completed_at = :now
+                WHERE workspace_id = :workspace_id AND connector_account_id = :connector_account_id
+                    AND status = 'running' AND started_at < :stale_before
+                """
+            ),
+            {
+                "now": now,
+                "workspace_id": auth.workspace_id,
+                "connector_account_id": account_id,
+                "stale_before": now - _STALE_RUNNING_SYNC_THRESHOLD,
+            },
+        )
 
         run_id = uuid4()
         try:
