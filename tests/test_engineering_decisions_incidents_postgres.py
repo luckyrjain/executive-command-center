@@ -18,10 +18,23 @@ deferred-Phase-2-identity-resolution disclosure):
 8. `CsrfDep` rejection (missing `X-CSRF-Token`) for all four mutation
    endpoints.
 9. Cross-workspace isolation: workspace B cannot resolve/decide/see
-   workspace A's rows, and cannot link to workspace A's `changes`.
-10. The migration's own CHECK-constraint consistency between `status` and
-    the relevant timestamp column, exercised at the HTTP layer (a
-    resolve/decide call can never produce a status/timestamp mismatch).
+   workspace A's rows (including both `GET` list endpoints), and cannot
+   link to workspace A's `changes`.
+10. Every migration CHECK constraint, exercised directly at the SQL layer
+    in both directions (`ck_incidents_severity`, `ck_incidents_status`,
+    `ck_incidents_resolved_at_matches_status`, `ck_engineering_decisions_
+    status`, `ck_engineering_decisions_decided_at_matches_status`,
+    including `superseded`'s positive and negative cases).
+11. `Idempotency-Key` conflict (a replayed key with a different payload)
+    for all four mutation endpoints, not just replay with an identical one.
+12. A duplicate `change_id` within one create payload is deduplicated
+    rather than 500ing on the join table's own unique constraint.
+13. Pydantic-layer 422s: invalid `severity`, empty `title`.
+14. A real `ThreadPoolExecutor` concurrency test proving the lost-update
+    race a review round found in `resolve_incident_endpoint` (a stale
+    read followed by an unconditional write) is actually closed by the
+    atomic `UPDATE ... WHERE status = 'open' ... RETURNING version` guard,
+    not just reasoned about.
 """
 
 from __future__ import annotations
@@ -1005,6 +1018,80 @@ def test_decide_decision_cross_workspace_404(
             headers=_headers(other_token, key=str(uuid4())),
         )
         assert response.status_code == 404
+
+
+def test_decide_decision_concurrent_calls_never_lose_an_update(
+    engineering_test_context: tuple[TestClient, UUID, UUID, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The identical race `test_resolve_incident_concurrent_calls_never_
+    lose_an_update` proves for incidents -- `decide_decision_endpoint`'s
+    own atomic `UPDATE ... WHERE status = 'proposed' ... RETURNING
+    version` guard is the exact same fix, applied to a different table,
+    and deserves the identical real-concurrency proof rather than resting
+    on "the code looks the same" alone.
+    """
+    client, _workspace_id, _user_id, token = engineering_test_context
+    decision_id = _create_decision(client, token)
+    now = datetime.now(UTC)
+
+    entered_read = threading.Event()
+    release = threading.Event()
+    paused_once = threading.Event()
+    original_get_decision = decisions_incidents_module._get_decision
+
+    def _paused_get_decision(
+        session: Session, workspace_id: UUID, dec_id: UUID
+    ) -> dict[str, Any] | None:
+        row = original_get_decision(session, workspace_id, dec_id)
+        if str(dec_id) == decision_id and not paused_once.is_set():
+            paused_once.set()
+            entered_read.set()
+            release.wait(timeout=5)
+        return row
+
+    monkeypatch.setattr(decisions_incidents_module, "_get_decision", _paused_get_decision)
+
+    client_a = TestClient(app)
+    client_a.cookies.set("ecc_session", token)
+    client_b = TestClient(app)
+    client_b.cookies.set("ecc_session", token)
+
+    def _decide(client: TestClient) -> Any:
+        return client.post(
+            f"/api/v1/engineering/decisions/{decision_id}/decide",
+            json={"decided_at": now.isoformat()},
+            headers=_headers(token, key=str(uuid4())),
+        )
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            future_a = pool.submit(_decide, client_a)
+            assert entered_read.wait(timeout=5), "thread A never reached its existing-row read"
+            future_b = pool.submit(_decide, client_b)
+            response_b = future_b.result(timeout=5)
+            release.set()
+            response_a = future_a.result(timeout=5)
+    finally:
+        client_a.close()
+        client_b.close()
+
+    statuses = sorted([response_a.status_code, response_b.status_code])
+    assert statuses == [200, 409]
+    loser = response_a if response_a.status_code == 409 else response_b
+    assert loser.json()["error"]["code"] == "DECISION_NOT_PROPOSED"
+
+    with engine.begin() as connection:
+        row = (
+            connection.execute(
+                text("SELECT status, version FROM engineering_decisions WHERE id = :id"),
+                {"id": UUID(decision_id)},
+            )
+            .mappings()
+            .one()
+        )
+    assert row["status"] == "decided"
+    assert row["version"] == 2
 
 
 # --- GET /decisions ------------------------------------------------------------
