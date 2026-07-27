@@ -30,6 +30,7 @@ from types import ModuleType
 
 import httpx
 import pytest
+from cryptography.fernet import Fernet
 from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.testclient import TestClient
@@ -47,6 +48,12 @@ from ecc.http_security import (
 # hardcoded literal here trips static-analysis "hardcoded secret" scanners
 # (CWE-547) even though nothing here is an actual credential.
 VALID_PROD_SECRET = secrets.token_urlsafe(40)
+# Phase 6 Engineering Workspace Task 1: `validate_production_settings` now
+# also rejects a missing/malformed `ECC_CONNECTOR_TOKEN_ENCRYPTION_KEY`
+# outside development -- every "valid production settings" fixture below
+# needs a real Fernet key alongside the existing session secret/CORS origin,
+# the same way it already needed those two.
+VALID_CONNECTOR_TOKEN_KEY = Fernet.generate_key().decode()
 
 
 def _settings(**overrides: object) -> Settings:
@@ -71,6 +78,7 @@ def _settings(**overrides: object) -> Settings:
         "database_url": "postgresql+psycopg://ecc:ecc@localhost:5432/ecc",
         "session_secret": VALID_PROD_SECRET,
         "cors_origins": "https://app.example.com",
+        "connector_token_encryption_key": VALID_CONNECTOR_TOKEN_KEY,
     }
     base.update(overrides)
     return Settings.model_construct(**base)  # type: ignore[arg-type]
@@ -246,6 +254,7 @@ def _reload_main(monkeypatch: pytest.MonkeyPatch, environment: str | None) -> Mo
         monkeypatch.setenv("ECC_ENV", environment)
     monkeypatch.setenv("ECC_SESSION_SECRET", VALID_PROD_SECRET)
     monkeypatch.setenv("ECC_CORS_ORIGINS", "https://app.example.com")
+    monkeypatch.setenv("ECC_CONNECTOR_TOKEN_ENCRYPTION_KEY", VALID_CONNECTOR_TOKEN_KEY)
     config_module.get_settings.cache_clear()
     return importlib.reload(main_module)
 
@@ -259,7 +268,12 @@ def restore_main_module() -> Iterator[None]:
     # overwriting it with tests/conftest.py's dev-default literal instead of
     # restoring it would silently mutate the process env for every test that
     # runs afterward.
-    restore_vars = ("ECC_ENV", "ECC_CORS_ORIGINS", "ECC_SESSION_SECRET")
+    restore_vars = (
+        "ECC_ENV",
+        "ECC_CORS_ORIGINS",
+        "ECC_SESSION_SECRET",
+        "ECC_CONNECTOR_TOKEN_ENCRYPTION_KEY",
+    )
     prior_values = {name: os.environ.get(name) for name in restore_vars}
 
     yield

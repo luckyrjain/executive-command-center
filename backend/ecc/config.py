@@ -1,3 +1,4 @@
+from base64 import urlsafe_b64decode
 from functools import lru_cache
 
 from pydantic import Field
@@ -63,6 +64,18 @@ class Settings(BaseSettings):
     # prior phase.
     meeting_prep_ai_enrichment_enabled: bool = Field(
         default=False, validation_alias="ECC_MEETING_PREP_AI_ENRICHMENT_ENABLED"
+    )
+    # Phase 6 Engineering Workspace Task 1 (design doc Decision 2): the
+    # Fernet key `ecc.domains.engineering.crypto` uses to encrypt connector
+    # OAuth/PAT credentials at rest. Empty by default -- outside
+    # development, `validate_production_settings` below fails closed
+    # rather than let a connector credential be written unencrypted or
+    # under a guessed key. In development, `crypto.py` derives a
+    # deterministic fallback key from `session_secret` so local dev needs
+    # no second secret configured, the same permissive-in-dev-only shape
+    # `session_secret` itself already has.
+    connector_token_encryption_key: str = Field(
+        default="", validation_alias="ECC_CONNECTOR_TOKEN_ENCRYPTION_KEY"
     )
 
     @property
@@ -155,6 +168,7 @@ def validate_production_settings(settings: Settings) -> None:
 
     _validate_session_secret(settings.session_secret)
     _validate_cors_origins(settings.cors_origin_list)
+    _validate_connector_token_encryption_key(settings.connector_token_encryption_key)
 
 
 def _validate_session_secret(secret: str) -> None:
@@ -185,3 +199,39 @@ def _validate_cors_origins(origins: list[str]) -> None:
             raise ConfigurationError(
                 f"ECC_CORS_ORIGINS entry {origin!r} must use https:// outside development."
             )
+
+
+def _validate_connector_token_encryption_key(key: str) -> None:
+    """Fail closed outside development rather than let `ecc.domains.
+    engineering.crypto` silently fall back to a key derived from
+    `session_secret` (that fallback is documented as development-only).
+    Structural validation only (decodes to exactly 32 bytes, the length
+    Fernet's own key format requires) -- this module deliberately does not
+    import `cryptography` itself, matching its existing dependency-light
+    style; `crypto.py`'s own `Fernet(key)` call is the authoritative format
+    check at first use.
+    """
+    if not key:
+        raise ConfigurationError(
+            "ECC_CONNECTOR_TOKEN_ENCRYPTION_KEY must be set outside development "
+            "(generate one with `Fernet.generate_key()`)."
+        )
+    lowered = key.casefold()
+    for marker in _PLACEHOLDER_SECRET_MARKERS:
+        if marker in lowered:
+            raise ConfigurationError(
+                "ECC_CONNECTOR_TOKEN_ENCRYPTION_KEY looks like a development placeholder "
+                f"(matched {marker!r}); generate a real key with `Fernet.generate_key()` "
+                "before deploying outside development."
+            )
+    try:
+        decoded = urlsafe_b64decode(key.encode("ascii"))
+    except (ValueError, TypeError) as exc:
+        raise ConfigurationError(
+            "ECC_CONNECTOR_TOKEN_ENCRYPTION_KEY must be a valid urlsafe-base64 Fernet key."
+        ) from exc
+    if len(decoded) != 32:
+        raise ConfigurationError(
+            "ECC_CONNECTOR_TOKEN_ENCRYPTION_KEY must decode to exactly 32 bytes "
+            "(a Fernet key), like the output of `Fernet.generate_key()`."
+        )

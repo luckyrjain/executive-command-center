@@ -4,7 +4,7 @@
 
 **Foundation:** Phase 0 baseline approved and implemented  
 **Current delivery:** [Phase 1 — Executive Dashboard MVP](phases/PHASE-001-executive-dashboard-mvp.md) — engineering delivery complete on `feature/phase-1-production-hardening` (Tasks 1-11 of `superpowers/plans/2026-07-16-phase-1-completion.md`, each independently reviewed with zero Critical or Important findings); Phase 1 exit remains open pending the seven-day daily-use validation gate and human change review — see [Phase 1 Implementation Status](phases/phase-001/IMPLEMENTATION-STATUS.md)  
-**Future specifications:** Phase 2 Approved for Implementation and in progress (parallel to Phase 1's open exit gates); Phase 3 Approved for Implementation and beginning (parallel-start exception granted, same as Phase 2's); Phase 4 engineering delivery complete, exit gates open (known-limitation floor misses accepted, parallel-start exception granted, same as Phase 2's and Phase 3's); Phase 5 engineering delivery complete through Task 7 (parallel-start exception granted, same as Phase 2/3/4's), exit gate open pending `docs/runbooks/PHASE-5-DOGFOOD.md`'s real, human-operator-driven staged dogfood record (0 of 14 required days logged); Phases 6–9 published as Draft / Planned
+**Future specifications:** Phase 2 Approved for Implementation and in progress (parallel to Phase 1's open exit gates); Phase 3 Approved for Implementation and beginning (parallel-start exception granted, same as Phase 2's); Phase 4 engineering delivery complete, exit gates open (known-limitation floor misses accepted, parallel-start exception granted, same as Phase 2's and Phase 3's); Phase 5 engineering delivery complete through Task 7 (parallel-start exception granted, same as Phase 2/3/4's), exit gate open pending `docs/runbooks/PHASE-5-DOGFOOD.md`'s real, human-operator-driven staged dogfood record (0 of 14 required days logged); Phase 6 Approved for Implementation and beginning Task 1 (parallel-start exception granted, same as Phase 2/3/4/5's), proceeding alongside Phase 5's own still-open exit gate; Phases 7–9 published as Draft / Planned
 
 The [canonical phase index](phases/README.md) lists every primary specification and supporting contract. The [Phase 0–9 documentation review](phases/PHASE-REVIEW.md) records completeness findings and approval gates.
 
@@ -30,7 +30,7 @@ Phase 0 — Repository Foundation         [Implemented]
   -> Phase 3 — Human Attention Engine  [Approved for Implementation; in progress, parallel-start exception granted]
   -> Phase 4 — AI Runtime              [Engineering delivery complete; exit gates open, known limitations accepted]
   -> Phase 5 — Automation              [Engineering delivery complete through Task 7; exit gate open pending staged dogfood]
-  -> Phase 6 — Engineering Workspace   [Draft]
+  -> Phase 6 — Engineering Workspace   [Approved for Implementation; beginning Task 1]
   -> Phase 7 — Personal Intelligence   [Draft]
   -> Phase 8 — Multi-user Workspaces   [Draft]
   -> Phase 9 — Enterprise              [Draft]
@@ -121,11 +121,17 @@ Dogfood record: [Phase 5 Dogfood Validation Record](runbooks/PHASE-5-DOGFOOD.md)
 
 ## Phase 6 — Engineering Workspace
 
-**Status:** Draft / Planned.
+**Status:** Approved for Implementation; contracts moved from Draft after resolving `docs/phases/PHASE-REVIEW.md:137`'s three named approval-gate items (provider scopes and retention, connector release set, metric definitions and source-coverage thresholds) in `docs/superpowers/specs/2026-07-27-phase-6-engineering-workspace-design.md`, per that document's Decision 1-3 sections, resolved in `PHASE-006-engineering-workspace.md`'s "Approved decisions" section. Implementation begins by explicit repository-owner authorization to proceed in parallel with Phase 5's own open exit gate (the staged dogfood record, 0 of 14 required days logged) -- the same kind of exception Phase 2, Phase 3, Phase 4 and Phase 5 each received; this authorization does not itself close Phase 5's exit gate.
+
+Engineering delivery has begun with Task 1 (connector framework and source projections: the `ConnectorAdapter` contract, encrypted credential storage, connector lifecycle API and a sandbox adapter exercising the full contract shape) -- see `docs/phases/phase-006/IMPLEMENTATION-STATUS.md` for task-by-task evidence. GitHub/GitLab/Jira real-provider sync, delivery/reliability metrics, decision/incident linking, approved write actions and the frontend surface remain queued, in that order.
 
 GitHub, GitLab and Jira connectors; delivery/reliability intelligence; incidents; decisions; evidence and source coverage without person scoring.
 
-Specification: [PHASE-006](phases/PHASE-006-engineering-workspace.md)
+Specification: [PHASE-006](phases/PHASE-006-engineering-workspace.md)  
+Design doc: [Phase 6 Engineering Workspace Design](superpowers/specs/2026-07-27-phase-6-engineering-workspace-design.md)  
+Technology activation: [RFC-005 v1.4.0](RFC-005.md)  
+Implementation plan: [Phase 6 Engineering Workspace Implementation Plan](superpowers/plans/2026-07-27-phase-6-engineering-workspace.md)  
+Implementation status: [Phase 6 Implementation Status](phases/phase-006/IMPLEMENTATION-STATUS.md)
 
 ## Phase 7 — Personal Intelligence
 
