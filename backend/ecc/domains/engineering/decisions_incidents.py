@@ -80,6 +80,13 @@ IdempotencyHeader = Annotated[
 
 IncidentSeverity = Literal["low", "medium", "high", "critical"]
 IncidentStatus = Literal["open", "resolved"]
+# `superseded` (an ADR-style "a later decision replaced this one" state) is
+# schema-level future-proofing only -- migration 0049's own CHECK
+# constraint allows it, but no endpoint in this task can ever transition a
+# decision into it. Disclosed, not a missing feature of this task: adding
+# a real "supersede" transition without a concrete caller yet would be
+# speculative scope, the same reasoning this task already applies to
+# deferring deployment/work-item correlation.
 DecisionStatus = Literal["proposed", "decided", "superseded"]
 
 _IDEMPOTENCY_TTL = timedelta(hours=24)
@@ -304,6 +311,18 @@ def _write_side_effects(
     queue_lifecycle_event(session, "engineering_decisions_incidents", event_type, "allowed")
 
 
+def _deduplicated(change_ids: list[UUID]) -> list[UUID]:
+    """A duplicate `change_id` in the request payload would otherwise reach
+    the per-id `INSERT INTO incident_changes`/`decision_changes` loop
+    twice, violating `uq_incident_changes_pair`/`uq_decision_changes_pair`
+    (migration `0049`) and raising an unhandled `IntegrityError` -- 500ing
+    a request that should simply link the change once. Dedupes up front,
+    preserving order, so both the FK-existence check and the insert loop
+    below only ever see each id once.
+    """
+    return list(dict.fromkeys(change_ids))
+
+
 def _validate_change_ids(session: Session, workspace_id: UUID, change_ids: list[UUID]) -> None:
     if not change_ids:
         return
@@ -322,7 +341,10 @@ def _validate_change_ids(session: Session, workspace_id: UUID, change_ids: list[
     if missing:
         raise HTTPException(
             status_code=422,
-            detail=f"CHANGE_NOT_FOUND: {', '.join(str(m) for m in sorted(missing, key=str))}",
+            detail={
+                "code": "CHANGE_NOT_FOUND",
+                "change_ids": sorted(str(m) for m in missing),
+            },
         )
 
 
@@ -405,7 +427,8 @@ def create_incident_endpoint(
         if cached is not None:
             return IncidentResponse.model_validate(cached)
 
-        _validate_change_ids(session, auth.workspace_id, payload.change_ids)
+        change_ids = _deduplicated(payload.change_ids)
+        _validate_change_ids(session, auth.workspace_id, change_ids)
 
         incident_id = uuid4()
         session.execute(
@@ -431,7 +454,7 @@ def create_incident_endpoint(
                 "now": now,
             },
         )
-        for change_id in payload.change_ids:
+        for change_id in change_ids:
             session.execute(
                 text(
                     "INSERT INTO incident_changes "
@@ -498,21 +521,40 @@ def resolve_incident_endpoint(
         if payload.resolved_at < existing["detected_at"]:
             raise HTTPException(status_code=422, detail="RESOLVED_AT_BEFORE_DETECTED_AT")
 
-        new_version = existing["version"] + 1
-        session.execute(
-            text(
-                "UPDATE incidents SET status = 'resolved', resolved_at = :resolved_at, "
-                "version = :new_version, updated_by = :actor_id, updated_at = :now "
-                "WHERE id = :id"
-            ),
-            {
-                "resolved_at": payload.resolved_at,
-                "new_version": new_version,
-                "actor_id": auth.user_id,
-                "now": now,
-                "id": incident_id,
-            },
+        # `AND status = 'open'` makes this UPDATE the actual serialization
+        # point, not the `existing["status"]` check above (a stale read two
+        # concurrent resolve calls -- different Idempotency-Keys, so the
+        # advisory lock above doesn't serialize them -- could both pass).
+        # `version = version + 1 ... RETURNING version` computes the new
+        # version from the database's real current value, never a
+        # possibly-stale Python-side `existing["version"] + 1`, mirroring
+        # `connector_accounts.py`'s `_finalize_account_version` pattern. A
+        # `None` result means another transaction already resolved this
+        # incident between our read above and this UPDATE -- report the
+        # identical 409 the plain read-based check above would have given
+        # had it run a moment later, rather than silently overwriting.
+        updated = (
+            session.execute(
+                text(
+                    "UPDATE incidents SET status = 'resolved', resolved_at = :resolved_at, "
+                    "version = version + 1, updated_by = :actor_id, updated_at = :now "
+                    "WHERE id = :id AND workspace_id = :workspace_id AND status = 'open' "
+                    "RETURNING version"
+                ),
+                {
+                    "resolved_at": payload.resolved_at,
+                    "actor_id": auth.user_id,
+                    "now": now,
+                    "id": incident_id,
+                    "workspace_id": auth.workspace_id,
+                },
+            )
+            .mappings()
+            .one_or_none()
         )
+        if updated is None:
+            raise HTTPException(status_code=409, detail="INCIDENT_ALREADY_RESOLVED")
+        new_version = int(updated["version"])
         row = _get_incident(session, auth.workspace_id, incident_id)
         assert row is not None
         response = _to_incident_response(session, row)
@@ -576,7 +618,8 @@ def create_decision_endpoint(
         if cached is not None:
             return DecisionResponse.model_validate(cached)
 
-        _validate_change_ids(session, auth.workspace_id, payload.change_ids)
+        change_ids = _deduplicated(payload.change_ids)
+        _validate_change_ids(session, auth.workspace_id, change_ids)
 
         decision_id = uuid4()
         session.execute(
@@ -601,7 +644,7 @@ def create_decision_endpoint(
                 "now": now,
             },
         )
-        for change_id in payload.change_ids:
+        for change_id in change_ids:
             session.execute(
                 text(
                     "INSERT INTO decision_changes "
@@ -666,23 +709,37 @@ def decide_decision_endpoint(
         if existing["status"] != "proposed":
             raise HTTPException(status_code=409, detail="DECISION_NOT_PROPOSED")
 
-        new_version = existing["version"] + 1
         rationale = payload.rationale if payload.rationale is not None else existing["rationale"]
-        session.execute(
-            text(
-                "UPDATE engineering_decisions SET status = 'decided', decided_at = :decided_at, "
-                "rationale = :rationale, version = :new_version, updated_by = :actor_id, "
-                "updated_at = :now WHERE id = :id"
-            ),
-            {
-                "decided_at": payload.decided_at,
-                "rationale": rationale,
-                "new_version": new_version,
-                "actor_id": auth.user_id,
-                "now": now,
-                "id": decision_id,
-            },
+        # `AND status = 'proposed'` makes this UPDATE the actual
+        # serialization point -- see resolve_incident_endpoint's identical
+        # comment for why the plain read-based check above cannot prevent
+        # a race between two concurrent decide calls using different
+        # Idempotency-Keys. `version = version + 1 ... RETURNING version`
+        # mirrors connector_accounts.py's `_finalize_account_version`.
+        updated = (
+            session.execute(
+                text(
+                    "UPDATE engineering_decisions SET status = 'decided', "
+                    "decided_at = :decided_at, rationale = :rationale, version = version + 1, "
+                    "updated_by = :actor_id, updated_at = :now "
+                    "WHERE id = :id AND workspace_id = :workspace_id AND status = 'proposed' "
+                    "RETURNING version"
+                ),
+                {
+                    "decided_at": payload.decided_at,
+                    "rationale": rationale,
+                    "actor_id": auth.user_id,
+                    "now": now,
+                    "id": decision_id,
+                    "workspace_id": auth.workspace_id,
+                },
+            )
+            .mappings()
+            .one_or_none()
         )
+        if updated is None:
+            raise HTTPException(status_code=409, detail="DECISION_NOT_PROPOSED")
+        new_version = int(updated["version"])
         row = _get_decision(session, auth.workspace_id, decision_id)
         assert row is not None
         response = _to_decision_response(session, row)

@@ -3,7 +3,8 @@
 `backend/ecc/domains/engineering/metrics.py`).
 
 Covers, per this task's own scope (see `metrics.py`'s own module
-docstring for the full "only three of seven metrics are real" design):
+docstring for the full "four of seven metrics are real as of Task 6"
+design):
 
 1. `_coverage_for`: insufficient (no connected account), insufficient
    (no source resource type at all -- empty `providers`), partial (one
@@ -15,9 +16,10 @@ docstring for the full "only three of seven metrics are real" design):
 3. `review_latency`: correct median (requested_at to first submitted_at
    per change), a change with no `requested_at` excluded, a merge
    outside the 30-day window excluded.
-4. `delivery_frequency`/`lead_time_for_changes`/`change_failure_rate`/
-   `time_to_restore`: always `insufficient_coverage`, `value=None`
-   -- no deployment/incident sync exists yet.
+4. `delivery_frequency`/`lead_time_for_changes`/`change_failure_rate`:
+   always `insufficient_coverage`, `value=None` -- no deployment sync
+   exists yet. `time_to_restore` (Task 6) is real -- see the dedicated
+   `time_to_restore` section below, not always `insufficient_coverage`.
 5. `compute_and_store_metrics`: writes seven immutable rows every call
    (insert-only -- calling it twice produces fourteen rows, never
    updates the first seven).
@@ -40,6 +42,7 @@ from ecc.config import get_settings
 from ecc.database import SessionFactory, engine
 from ecc.domains.engineering.metrics import (
     _bucket_ages_days,
+    _compute_time_to_restore,
     compute_and_store_metrics,
     compute_metrics,
 )
@@ -633,6 +636,29 @@ def test_time_to_restore_median_of_resolved_incidents_in_window(workspace: UUID)
     assert time_to_restore.value == timedelta(hours=4).total_seconds()
     assert time_to_restore.coverage_status == "complete"
     assert time_to_restore.coverage_percentage == 100.0
+
+
+def test_time_to_restore_window_boundary_is_inclusive(workspace: UUID) -> None:
+    """`_compute_time_to_restore`'s query filters `resolved_at &gt;=
+    window_start`, so an incident resolved exactly 30 days ago must be
+    *included*, not excluded by an off-by-one `&gt;` instead of `&gt;=`.
+    Called directly with an explicit `now` (the function accepts one)
+    rather than through `compute_metrics`'s own internal `datetime.now(UTC)`
+    call, avoiding the exact kind of timing-skew false boundary this
+    codebase's own `_bucket_ages_days` test already had to work around.
+    """
+    now = datetime.now(UTC)
+    window_start = now - timedelta(days=30)
+    _insert_incident(
+        workspace,
+        status="resolved",
+        detected_at=window_start - timedelta(hours=3),
+        resolved_at=window_start,
+    )
+    with SessionFactory() as session:
+        snapshot = _compute_time_to_restore(session, workspace_id=workspace, now=now)
+    assert snapshot.population == 1
+    assert snapshot.value == timedelta(hours=3).total_seconds()
 
 
 def test_time_to_restore_is_workspace_isolated(workspace: UUID) -> None:

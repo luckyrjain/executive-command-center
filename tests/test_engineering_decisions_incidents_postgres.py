@@ -26,18 +26,24 @@ deferred-Phase-2-identity-resolution disclosure):
 
 from __future__ import annotations
 
+import threading
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from hmac import new as hmac_new
+from typing import Any
 from uuid import UUID, uuid4
 
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import text
+from sqlalchemy.orm import Session
 
 from ecc.config import get_settings
 from ecc.database import engine
+from ecc.domains.engineering import decisions_incidents as decisions_incidents_module
 from ecc.main import app
 
 settings = get_settings()
@@ -78,6 +84,60 @@ def _cleanup_workspace(workspace_id: UUID) -> None:
         connection.execute(
             text("DELETE FROM workspaces WHERE id = :workspace_id"), {"workspace_id": workspace_id}
         )
+
+
+@contextmanager
+def _other_workspace_client() -> Iterator[tuple[TestClient, UUID, str]]:
+    """A second, genuinely isolated workspace/user/session -- used by every
+    cross-workspace-isolation test in this file so that pattern isn't
+    duplicated inline in each one.
+    """
+    other_workspace_id = uuid4()
+    other_user_id = uuid4()
+    other_token = f"session-{uuid4()}"
+    now = datetime.now(UTC)
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO workspaces (id, name, timezone, created_at) "
+                "VALUES (:id, 'Other Workspace', 'UTC', :now)"
+            ),
+            {"id": other_workspace_id, "now": now},
+        )
+        connection.execute(
+            text(
+                "INSERT INTO users (id, workspace_id, email, password_hash, created_at) "
+                "VALUES (:id, :workspace_id, :email, 'x', :now)"
+            ),
+            {
+                "id": other_user_id,
+                "workspace_id": other_workspace_id,
+                "email": f"{other_user_id}@example.test",
+                "now": now,
+            },
+        )
+        connection.execute(
+            text(
+                "INSERT INTO sessions (id, workspace_id, user_id, token_hash, "
+                "expires_at, last_seen_at) "
+                "VALUES (:id, :workspace_id, :user_id, :token_hash, :expires_at, :now)"
+            ),
+            {
+                "id": uuid4(),
+                "workspace_id": other_workspace_id,
+                "user_id": other_user_id,
+                "token_hash": sha256(other_token.encode()).hexdigest(),
+                "expires_at": now + timedelta(hours=1),
+                "now": now,
+            },
+        )
+    other_client = TestClient(app)
+    other_client.cookies.set("ecc_session", other_token)
+    try:
+        yield other_client, other_workspace_id, other_token
+    finally:
+        other_client.close()
+        _cleanup_workspace(other_workspace_id)
 
 
 @pytest.fixture
@@ -258,17 +318,20 @@ def test_create_incident_rejects_change_id_not_in_workspace(
 ) -> None:
     client, _workspace_id, _user_id, token = engineering_test_context
     now = datetime.now(UTC)
+    missing_change_id = str(uuid4())
     response = client.post(
         "/api/v1/engineering/incidents",
         json={
             "title": "Prod outage",
             "detected_at": now.isoformat(),
-            "change_ids": [str(uuid4())],
+            "change_ids": [missing_change_id],
         },
         headers=_headers(token, key=str(uuid4())),
     )
     assert response.status_code == 422
-    assert "CHANGE_NOT_FOUND" in response.json()["error"]["code"]
+    body = response.json()
+    assert body["error"]["code"] == "CHANGE_NOT_FOUND"
+    assert body["error"]["details"]["change_ids"] == [missing_change_id]
 
 
 def test_create_incident_idempotency_replay(
@@ -430,6 +493,29 @@ def test_resolve_incident_idempotency_replay(
     assert replay.json()["version"] == first.json()["version"]
 
 
+def test_resolve_incident_idempotency_conflict_on_payload_mismatch(
+    engineering_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    client, _workspace_id, _user_id, token = engineering_test_context
+    now = datetime.now(UTC)
+    incident_id = _create_incident(client, token, detected_at=now - timedelta(hours=2))
+    key = str(uuid4())
+
+    first = client.post(
+        f"/api/v1/engineering/incidents/{incident_id}/resolve",
+        json={"resolved_at": now.isoformat()},
+        headers=_headers(token, key=key),
+    )
+    assert first.status_code == 200
+    conflict = client.post(
+        f"/api/v1/engineering/incidents/{incident_id}/resolve",
+        json={"resolved_at": (now - timedelta(minutes=1)).isoformat()},
+        headers=_headers(token, key=key),
+    )
+    assert conflict.status_code == 409
+    assert conflict.json()["error"]["code"] == "IDEMPOTENCY_CONFLICT"
+
+
 def test_resolve_incident_rejects_missing_csrf_token(
     engineering_test_context: tuple[TestClient, UUID, UUID, str],
 ) -> None:
@@ -451,56 +537,92 @@ def test_resolve_incident_cross_workspace_404(
     now = datetime.now(UTC)
     incident_id = _create_incident(client, token, detected_at=now - timedelta(hours=2))
 
-    other_workspace_id = uuid4()
-    other_user_id = uuid4()
-    other_token = f"session-{uuid4()}"
-    with engine.begin() as connection:
-        connection.execute(
-            text(
-                "INSERT INTO workspaces (id, name, timezone, created_at) "
-                "VALUES (:id, 'Other Workspace', 'UTC', :now)"
-            ),
-            {"id": other_workspace_id, "now": now},
-        )
-        connection.execute(
-            text(
-                "INSERT INTO users (id, workspace_id, email, password_hash, created_at) "
-                "VALUES (:id, :workspace_id, :email, 'x', :now)"
-            ),
-            {
-                "id": other_user_id,
-                "workspace_id": other_workspace_id,
-                "email": f"{other_user_id}@example.test",
-                "now": now,
-            },
-        )
-        connection.execute(
-            text(
-                "INSERT INTO sessions (id, workspace_id, user_id, token_hash, "
-                "expires_at, last_seen_at) "
-                "VALUES (:id, :workspace_id, :user_id, :token_hash, :expires_at, :now)"
-            ),
-            {
-                "id": uuid4(),
-                "workspace_id": other_workspace_id,
-                "user_id": other_user_id,
-                "token_hash": sha256(other_token.encode()).hexdigest(),
-                "expires_at": now + timedelta(hours=1),
-                "now": now,
-            },
-        )
-    other_client = TestClient(app)
-    other_client.cookies.set("ecc_session", other_token)
-    try:
+    with _other_workspace_client() as (other_client, _other_workspace_id, other_token):
         response = other_client.post(
             f"/api/v1/engineering/incidents/{incident_id}/resolve",
             json={"resolved_at": now.isoformat()},
             headers=_headers(other_token, key=str(uuid4())),
         )
         assert response.status_code == 404
+
+
+def test_resolve_incident_concurrent_calls_never_lose_an_update(
+    engineering_test_context: tuple[TestClient, UUID, UUID, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two concurrent `/resolve` calls for the same open incident, using
+    different Idempotency-Keys (so the per-key advisory lock does not
+    serialize them) -- proves the atomic `UPDATE ... WHERE status = 'open'
+    ... RETURNING version` guard actually prevents the lost-update
+    correctness review found in the original read-then-blind-write
+    implementation. Thread A is paused (via a monkeypatched `_get_incident`)
+    right after its own initial `existing` read -- the exact race window
+    the fix closes -- until thread B has fully resolved the incident.
+    Without the fix, thread A's stale `existing["version"] + 1` and its
+    unconditional `UPDATE ... WHERE id = :id` would silently overwrite
+    thread B's already-committed resolution.
+    """
+    client, _workspace_id, _user_id, token = engineering_test_context
+    now = datetime.now(UTC)
+    incident_id = _create_incident(client, token, detected_at=now - timedelta(hours=2))
+
+    entered_read = threading.Event()
+    release = threading.Event()
+    paused_once = threading.Event()
+    original_get_incident = decisions_incidents_module._get_incident
+
+    def _paused_get_incident(
+        session: Session, workspace_id: UUID, inc_id: UUID
+    ) -> dict[str, Any] | None:
+        row = original_get_incident(session, workspace_id, inc_id)
+        if str(inc_id) == incident_id and not paused_once.is_set():
+            paused_once.set()
+            entered_read.set()
+            release.wait(timeout=5)
+        return row
+
+    monkeypatch.setattr(decisions_incidents_module, "_get_incident", _paused_get_incident)
+
+    client_a = TestClient(app)
+    client_a.cookies.set("ecc_session", token)
+    client_b = TestClient(app)
+    client_b.cookies.set("ecc_session", token)
+
+    def _resolve(client: TestClient) -> Any:
+        return client.post(
+            f"/api/v1/engineering/incidents/{incident_id}/resolve",
+            json={"resolved_at": now.isoformat()},
+            headers=_headers(token, key=str(uuid4())),
+        )
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            future_a = pool.submit(_resolve, client_a)
+            assert entered_read.wait(timeout=5), "thread A never reached its existing-row read"
+            future_b = pool.submit(_resolve, client_b)
+            response_b = future_b.result(timeout=5)
+            release.set()
+            response_a = future_a.result(timeout=5)
     finally:
-        other_client.close()
-        _cleanup_workspace(other_workspace_id)
+        client_a.close()
+        client_b.close()
+
+    statuses = sorted([response_a.status_code, response_b.status_code])
+    assert statuses == [200, 409]
+    loser = response_a if response_a.status_code == 409 else response_b
+    assert loser.json()["error"]["code"] == "INCIDENT_ALREADY_RESOLVED"
+
+    with engine.begin() as connection:
+        row = (
+            connection.execute(
+                text("SELECT status, version FROM incidents WHERE id = :id"),
+                {"id": UUID(incident_id)},
+            )
+            .mappings()
+            .one()
+        )
+    assert row["status"] == "resolved"
+    assert row["version"] == 2
 
 
 # --- GET /incidents -----------------------------------------------------------
@@ -534,6 +656,85 @@ def test_list_incidents_with_and_without_status_filter(
     open_ids = {row["id"] for row in open_response.json()["incidents"]}
     assert open_id in open_ids
     assert resolved_id not in open_ids
+
+
+def test_list_incidents_is_workspace_isolated(
+    engineering_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    client, _workspace_id, _user_id, token = engineering_test_context
+    now = datetime.now(UTC)
+    own_incident_id = _create_incident(client, token, detected_at=now - timedelta(hours=1))
+
+    with _other_workspace_client() as (other_client, _other_workspace_id, other_token):
+        other_incident_id = _create_incident(
+            other_client, other_token, detected_at=now - timedelta(hours=1)
+        )
+
+        own_response = client.get(
+            "/api/v1/engineering/incidents", headers={"X-Correlation-ID": str(uuid4())}
+        )
+        own_ids = {row["id"] for row in own_response.json()["incidents"]}
+        assert own_incident_id in own_ids
+        assert other_incident_id not in own_ids
+
+        other_response = other_client.get(
+            "/api/v1/engineering/incidents", headers={"X-Correlation-ID": str(uuid4())}
+        )
+        other_ids = {row["id"] for row in other_response.json()["incidents"]}
+        assert other_incident_id in other_ids
+        assert own_incident_id not in other_ids
+
+
+def test_create_incident_deduplicates_repeated_change_ids(
+    engineering_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    """A duplicate `change_id` in the request payload must not reach the
+    per-id `INSERT INTO incident_changes` loop twice -- that would violate
+    `uq_incident_changes_pair` and 500 instead of simply linking the
+    change once.
+    """
+    client, workspace_id, user_id, token = engineering_test_context
+    change_id = _insert_change(workspace_id, user_id)
+    now = datetime.now(UTC)
+    response = client.post(
+        "/api/v1/engineering/incidents",
+        json={
+            "title": "Prod outage",
+            "detected_at": now.isoformat(),
+            "change_ids": [str(change_id), str(change_id)],
+        },
+        headers=_headers(token, key=str(uuid4())),
+    )
+    assert response.status_code == 201, response.text
+    assert response.json()["change_ids"] == [str(change_id)]
+
+
+def test_create_incident_rejects_invalid_severity(
+    engineering_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    client, _workspace_id, _user_id, token = engineering_test_context
+    response = client.post(
+        "/api/v1/engineering/incidents",
+        json={
+            "title": "X",
+            "detected_at": datetime.now(UTC).isoformat(),
+            "severity": "urgent",
+        },
+        headers=_headers(token, key=str(uuid4())),
+    )
+    assert response.status_code == 422
+
+
+def test_create_incident_rejects_empty_title(
+    engineering_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    client, _workspace_id, _user_id, token = engineering_test_context
+    response = client.post(
+        "/api/v1/engineering/incidents",
+        json={"title": "", "detected_at": datetime.now(UTC).isoformat()},
+        headers=_headers(token, key=str(uuid4())),
+    )
+    assert response.status_code == 422
 
 
 # --- POST /decisions ----------------------------------------------------------
@@ -573,13 +774,16 @@ def test_create_decision_rejects_change_id_not_in_workspace(
     engineering_test_context: tuple[TestClient, UUID, UUID, str],
 ) -> None:
     client, _workspace_id, _user_id, token = engineering_test_context
+    missing_change_id = str(uuid4())
     response = client.post(
         "/api/v1/engineering/decisions",
-        json={"title": "X", "change_ids": [str(uuid4())]},
+        json={"title": "X", "change_ids": [missing_change_id]},
         headers=_headers(token, key=str(uuid4())),
     )
     assert response.status_code == 422
-    assert "CHANGE_NOT_FOUND" in response.json()["error"]["code"]
+    body = response.json()
+    assert body["error"]["code"] == "CHANGE_NOT_FOUND"
+    assert body["error"]["details"]["change_ids"] == [missing_change_id]
 
 
 def test_create_decision_rejects_missing_csrf_token(
@@ -592,6 +796,52 @@ def test_create_decision_rejects_missing_csrf_token(
         headers={"Idempotency-Key": str(uuid4()), "X-Correlation-ID": str(uuid4())},
     )
     assert response.status_code == 403
+
+
+def test_create_decision_deduplicates_repeated_change_ids(
+    engineering_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    client, workspace_id, user_id, token = engineering_test_context
+    change_id = _insert_change(workspace_id, user_id)
+    response = client.post(
+        "/api/v1/engineering/decisions",
+        json={"title": "X", "change_ids": [str(change_id), str(change_id)]},
+        headers=_headers(token, key=str(uuid4())),
+    )
+    assert response.status_code == 201, response.text
+    assert response.json()["change_ids"] == [str(change_id)]
+
+
+def test_create_decision_rejects_empty_title(
+    engineering_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    client, _workspace_id, _user_id, token = engineering_test_context
+    response = client.post(
+        "/api/v1/engineering/decisions",
+        json={"title": ""},
+        headers=_headers(token, key=str(uuid4())),
+    )
+    assert response.status_code == 422
+
+
+def test_create_decision_idempotency_conflict_on_payload_mismatch(
+    engineering_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    client, _workspace_id, _user_id, token = engineering_test_context
+    key = str(uuid4())
+    first = client.post(
+        "/api/v1/engineering/decisions",
+        json={"title": "First"},
+        headers=_headers(token, key=key),
+    )
+    assert first.status_code == 201
+    conflict = client.post(
+        "/api/v1/engineering/decisions",
+        json={"title": "Second"},
+        headers=_headers(token, key=key),
+    )
+    assert conflict.status_code == 409
+    assert conflict.json()["error"]["code"] == "IDEMPOTENCY_CONFLICT"
 
 
 # --- POST /decisions/{id}/decide ----------------------------------------------
@@ -719,6 +969,44 @@ def test_decide_decision_rejects_missing_csrf_token(
     assert response.status_code == 403
 
 
+def test_decide_decision_idempotency_conflict_on_payload_mismatch(
+    engineering_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    client, _workspace_id, _user_id, token = engineering_test_context
+    decision_id = _create_decision(client, token)
+    now = datetime.now(UTC)
+    key = str(uuid4())
+
+    first = client.post(
+        f"/api/v1/engineering/decisions/{decision_id}/decide",
+        json={"decided_at": now.isoformat()},
+        headers=_headers(token, key=key),
+    )
+    assert first.status_code == 200
+    conflict = client.post(
+        f"/api/v1/engineering/decisions/{decision_id}/decide",
+        json={"decided_at": now.isoformat(), "rationale": "A different rationale"},
+        headers=_headers(token, key=key),
+    )
+    assert conflict.status_code == 409
+    assert conflict.json()["error"]["code"] == "IDEMPOTENCY_CONFLICT"
+
+
+def test_decide_decision_cross_workspace_404(
+    engineering_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    client, _workspace_id, _user_id, token = engineering_test_context
+    decision_id = _create_decision(client, token)
+
+    with _other_workspace_client() as (other_client, _other_workspace_id, other_token):
+        response = other_client.post(
+            f"/api/v1/engineering/decisions/{decision_id}/decide",
+            json={"decided_at": datetime.now(UTC).isoformat()},
+            headers=_headers(other_token, key=str(uuid4())),
+        )
+        assert response.status_code == 404
+
+
 # --- GET /decisions ------------------------------------------------------------
 
 
@@ -750,6 +1038,30 @@ def test_list_decisions_with_and_without_status_filter(
     proposed_ids = {row["id"] for row in proposed_response.json()["decisions"]}
     assert proposed_id in proposed_ids
     assert decided_id not in proposed_ids
+
+
+def test_list_decisions_is_workspace_isolated(
+    engineering_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    client, _workspace_id, _user_id, token = engineering_test_context
+    own_decision_id = _create_decision(client, token)
+
+    with _other_workspace_client() as (other_client, _other_workspace_id, other_token):
+        other_decision_id = _create_decision(other_client, other_token)
+
+        own_response = client.get(
+            "/api/v1/engineering/decisions", headers={"X-Correlation-ID": str(uuid4())}
+        )
+        own_ids = {row["id"] for row in own_response.json()["decisions"]}
+        assert own_decision_id in own_ids
+        assert other_decision_id not in own_ids
+
+        other_response = other_client.get(
+            "/api/v1/engineering/decisions", headers={"X-Correlation-ID": str(uuid4())}
+        )
+        other_ids = {row["id"] for row in other_response.json()["decisions"]}
+        assert other_decision_id in other_ids
+        assert own_decision_id not in other_ids
 
 
 # --- direct-SQL CHECK constraint tests -----------------------------------------
@@ -793,6 +1105,185 @@ def test_engineering_decisions_check_constraint_rejects_decided_without_decided_
                         version, created_by, updated_by, created_at, updated_at
                     ) VALUES (
                         :id, :ws, 'Bad row', 'decided', NULL,
+                        1, :actor, :actor, :now, :now
+                    )
+                    """
+                ),
+                {"id": uuid4(), "ws": workspace_id, "actor": user_id, "now": now},
+            )
+
+
+def test_incidents_check_constraint_rejects_open_with_resolved_at(
+    engineering_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    _client, workspace_id, user_id, _token = engineering_test_context
+    now = datetime.now(UTC)
+    with pytest.raises(Exception, match="ck_incidents_resolved_at_matches_status"):
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO incidents (
+                        id, workspace_id, title, severity, status, detected_at,
+                        resolved_at, version, created_by, updated_by, created_at, updated_at
+                    ) VALUES (
+                        :id, :ws, 'Bad row', 'high', 'open', :now,
+                        :now, 1, :actor, :actor, :now, :now
+                    )
+                    """
+                ),
+                {"id": uuid4(), "ws": workspace_id, "actor": user_id, "now": now},
+            )
+
+
+def test_engineering_decisions_check_constraint_rejects_proposed_with_decided_at(
+    engineering_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    _client, workspace_id, user_id, _token = engineering_test_context
+    now = datetime.now(UTC)
+    with pytest.raises(Exception, match="ck_engineering_decisions_decided_at_matches_status"):
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO engineering_decisions (
+                        id, workspace_id, title, status, decided_at,
+                        version, created_by, updated_by, created_at, updated_at
+                    ) VALUES (
+                        :id, :ws, 'Bad row', 'proposed', :now,
+                        1, :actor, :actor, :now, :now
+                    )
+                    """
+                ),
+                {"id": uuid4(), "ws": workspace_id, "actor": user_id, "now": now},
+            )
+
+
+def test_engineering_decisions_check_constraint_rejects_superseded_without_decided_at(
+    engineering_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    _client, workspace_id, user_id, _token = engineering_test_context
+    now = datetime.now(UTC)
+    with pytest.raises(Exception, match="ck_engineering_decisions_decided_at_matches_status"):
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO engineering_decisions (
+                        id, workspace_id, title, status, decided_at,
+                        version, created_by, updated_by, created_at, updated_at
+                    ) VALUES (
+                        :id, :ws, 'Bad row', 'superseded', NULL,
+                        1, :actor, :actor, :now, :now
+                    )
+                    """
+                ),
+                {"id": uuid4(), "ws": workspace_id, "actor": user_id, "now": now},
+            )
+
+
+def test_engineering_decisions_check_constraint_accepts_superseded_with_decided_at(
+    engineering_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    """The positive counterpart to the rejection test above -- proves
+    `superseded` is a genuinely allowed status (schema-level future-
+    proofing, no reachable endpoint transition yet -- see `DecisionStatus`'s
+    own docstring comment), not merely a value the CHECK constraint happens
+    to also reject.
+    """
+    _client, workspace_id, user_id, _token = engineering_test_context
+    now = datetime.now(UTC)
+    row_id = uuid4()
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                """
+                INSERT INTO engineering_decisions (
+                    id, workspace_id, title, status, decided_at,
+                    version, created_by, updated_by, created_at, updated_at
+                ) VALUES (
+                    :id, :ws, 'Superseded row', 'superseded', :now,
+                    1, :actor, :actor, :now, :now
+                )
+                """
+            ),
+            {"id": row_id, "ws": workspace_id, "actor": user_id, "now": now},
+        )
+        connection.execute(text("DELETE FROM engineering_decisions WHERE id = :id"), {"id": row_id})
+
+
+def test_incidents_check_constraint_rejects_invalid_severity(
+    engineering_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    _client, workspace_id, user_id, _token = engineering_test_context
+    now = datetime.now(UTC)
+    with pytest.raises(Exception, match="ck_incidents_severity"):
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO incidents (
+                        id, workspace_id, title, severity, status, detected_at,
+                        resolved_at, version, created_by, updated_by, created_at, updated_at
+                    ) VALUES (
+                        :id, :ws, 'Bad row', 'urgent', 'open', :now,
+                        NULL, 1, :actor, :actor, :now, :now
+                    )
+                    """
+                ),
+                {"id": uuid4(), "ws": workspace_id, "actor": user_id, "now": now},
+            )
+
+
+def test_incidents_check_constraint_rejects_invalid_status(
+    engineering_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    """An invalid `status` value necessarily also fails
+    `ck_incidents_resolved_at_matches_status`'s own OR-expression (neither
+    branch's status literal matches), so Postgres does not deterministically
+    report `ck_incidents_status` by name specifically -- matched generically
+    against "violates check constraint" instead of pinning either name.
+    """
+    _client, workspace_id, user_id, _token = engineering_test_context
+    now = datetime.now(UTC)
+    with pytest.raises(Exception, match="violates check constraint"):
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO incidents (
+                        id, workspace_id, title, severity, status, detected_at,
+                        resolved_at, version, created_by, updated_by, created_at, updated_at
+                    ) VALUES (
+                        :id, :ws, 'Bad row', 'high', 'closed', :now,
+                        NULL, 1, :actor, :actor, :now, :now
+                    )
+                    """
+                ),
+                {"id": uuid4(), "ws": workspace_id, "actor": user_id, "now": now},
+            )
+
+
+def test_engineering_decisions_check_constraint_rejects_invalid_status(
+    engineering_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    """See `test_incidents_check_constraint_rejects_invalid_status`'s own
+    docstring -- the identical reasoning applies to `ck_engineering_
+    decisions_status` and `ck_engineering_decisions_decided_at_matches_
+    status`.
+    """
+    _client, workspace_id, user_id, _token = engineering_test_context
+    now = datetime.now(UTC)
+    with pytest.raises(Exception, match="violates check constraint"):
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO engineering_decisions (
+                        id, workspace_id, title, status, decided_at,
+                        version, created_by, updated_by, created_at, updated_at
+                    ) VALUES (
+                        :id, :ws, 'Bad row', 'rejected', NULL,
                         1, :actor, :actor, :now, :now
                     )
                     """

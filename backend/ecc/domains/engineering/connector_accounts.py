@@ -400,7 +400,8 @@ class MetricSnapshotResponse(BaseModel):
     `coverage_percentage`/`coverage_gap_description`'s meaning, and for
     why `value`/`numerator`/`denominator`/`details` are all `None` for a
     metric this activation cannot yet compute (`delivery_frequency`,
-    `lead_time_for_changes`, `change_failure_rate`, `time_to_restore`).
+    `lead_time_for_changes`, `change_failure_rate` -- `time_to_restore`
+    became real as of Phase 6 Task 6).
     """
 
     id: UUID
