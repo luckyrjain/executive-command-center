@@ -45,6 +45,7 @@ from uuid import UUID, uuid4
 
 import httpx
 import pytest
+from pydantic import ValidationError
 from sqlalchemy import text
 
 from ecc.config import get_settings
@@ -598,6 +599,30 @@ def test_gitlab_add_note_success_excludes_body_from_output(
     assert output.note_external_id == "99"
     assert "note_99" in output.source_url
     assert "shouldnotleak" not in output.model_dump_json()
+
+
+@pytest.mark.parametrize("project_path", ["..", ".", "acme/..", "../widgets", "acme//widgets"])
+def test_gitlab_add_note_rejects_dot_segment_project_path(project_path: str) -> None:
+    """`quote(project_path, safe="")` percent-encodes every `/` but never
+    touches `.` (an RFC 3986 unreserved character) -- so a slash-free
+    value of "." or ".." would otherwise survive encoding as a literal
+    dot-segment that httpx resolves against the request path *before*
+    sending it, letting `/projects/{value}/issues/{iid}/notes` resolve to
+    a different endpoint entirely (e.g. `/issues/{iid}/notes`) outside the
+    `/projects/*` subtree this adapter's containment story assumes every
+    request stays inside. This must be rejected at input validation, well
+    before any network call -- proven here without a mock transport at
+    all, since a validation failure must never even construct the model.
+    """
+    with pytest.raises(ValidationError):
+        GitLabAddNoteInput(
+            workspace_id=uuid4(),
+            actor_id=uuid4(),
+            connector_account_id=uuid4(),
+            project_path=project_path,
+            issue_iid=1,
+            body="x",
+        )
 
 
 def test_gitlab_add_note_rejects_nonexistent_connector_account(

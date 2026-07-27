@@ -121,7 +121,7 @@ from urllib.parse import quote
 from uuid import UUID
 
 import httpx
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
@@ -369,6 +369,25 @@ class GitLabAddNoteInput(BaseModel):
     project_path: str = Field(min_length=1, max_length=500)
     issue_iid: int = Field(gt=0)
     body: str = Field(min_length=1, max_length=65536)
+
+    @field_validator("project_path")
+    @classmethod
+    def _reject_dot_segments(cls, value: str) -> str:
+        # `quote(value, safe="")` (this module's `GitLabAddNoteAdapter.
+        # execute`) percent-encodes every `/` in `value`, but `.` is an
+        # RFC 3986 *unreserved* character `quote` never touches -- so a
+        # slash-free `value` of "." or ".." survives encoding as a literal
+        # dot-segment, which httpx (and any RFC-3986-compliant client)
+        # then resolves against the request path *before* sending it. A
+        # bare ".." here turns `/projects/{value}/issues/{iid}/notes` into
+        # `/issues/{iid}/notes` on the wire -- a different endpoint
+        # entirely, outside the `/projects/*` subtree this adapter's own
+        # containment story assumes every request stays inside. Rejecting
+        # any "."/".." path segment closes this without rejecting a real
+        # GitLab project path, which never contains one.
+        if any(segment in ("", ".", "..") for segment in value.split("/")):
+            raise ValueError("project_path must not contain an empty, '.', or '..' path segment")
+        return value
 
 
 class GitLabAddNoteOutput(BaseModel):
