@@ -61,7 +61,7 @@ inputs are validated against this workspace's own already-synced
 sync) -- a workflow can only name a repository or issue this connection
 has actually observed, not an arbitrary `owner/repo` string typed into a
 workflow's `input_mapping`. GitLab has **no equivalent containment**:
-Task 5's own module docstring (`github_adapter.py`) discloses that
+Task 5's own module docstring (`gitlab_adapter.py`) discloses that
 GitLab's `changes`/`reviews` sync is deferred to a Task 5 follow-up that
 has not landed, so no synced GitLab issue/MR projection exists yet to
 validate `project_path`/`issue_iid` against at all -- `gitlab.add_note`'s
@@ -141,11 +141,28 @@ from sqlalchemy.orm import Session
 # uses the `connectors` module itself.
 import ecc.domains.engineering.connectors  # noqa: F401
 from ecc.database import SessionFactory
-from ecc.domains.automation.adapters import TransientAdapterError
 from ecc.domains.engineering.crypto import decrypt_credential
 from ecc.domains.engineering.github_adapter import GITHUB_API_BASE_URL
 from ecc.domains.engineering.gitlab_adapter import GITLAB_API_BASE_URL
 from ecc.domains.engineering.jira_adapter import _parse_credential as _parse_jira_credential
+
+# `TransientAdapterError` is deliberately imported inside `_classify_and_
+# raise`/`_raise_for_write_response` below, not here at module top-level.
+# A top-level `from ecc.domains.automation.adapters import
+# TransientAdapterError` would recreate a genuine two-way circular import
+# with that exact module (`adapters.py` registers this module's three
+# adapters at its own bottom) -- and, unlike the `connectors`-ordering
+# fix immediately above, no import ordering resolves it: reproduced
+# directly against a real interpreter, `import ecc.domains.engineering.
+# write_actions` as the very first touch of either module raises
+# `ImportError: cannot import name 'GitHubAddIssueCommentAdapter' from
+# partially initialized module`, regardless of whether `connectors` was
+# already loaded. Deferring the import into the two functions that
+# actually use the exception class (called only at runtime, long after
+# both modules have finished loading) removes this module's import-time
+# dependency on `automation.adapters` entirely, closing the cycle
+# unconditionally rather than relying on which module happens to import
+# first.
 
 
 class WriteActionRejected(ValueError):
@@ -190,6 +207,12 @@ def _load_credential(
 
 
 def _classify_and_raise(provider: str, exc: httpx.HTTPError) -> None:
+    # Imported here, not at module top -- see this module's own docstring
+    # ("no top-level dependency on `ecc.domains.automation.adapters`") for
+    # why a lazy import is the actual fix for the write_actions<->adapters
+    # circular import, not merely an import-ordering workaround.
+    from ecc.domains.automation.adapters import TransientAdapterError
+
     if isinstance(exc, httpx.ConnectError | httpx.ConnectTimeout):
         raise TransientAdapterError(
             f"{provider} write request failed before it was sent: {exc}"
@@ -200,6 +223,8 @@ def _classify_and_raise(provider: str, exc: httpx.HTTPError) -> None:
 
 
 def _raise_for_write_response(provider: str, response: httpx.Response) -> None:
+    from ecc.domains.automation.adapters import TransientAdapterError
+
     if response.status_code == 429:
         raise TransientAdapterError(
             f"{provider} write request rejected (rate limited, never reached the write path): "
@@ -473,7 +498,7 @@ class JiraAddCommentAdapter:
             work_item = (
                 session.execute(
                     text(
-                        "SELECT external_id FROM engineering_work_items "
+                        "SELECT external_id, source_url FROM engineering_work_items "
                         "WHERE workspace_id = :workspace_id AND id = :id "
                         "AND connector_account_id = :connector_account_id AND provider = 'jira'"
                     ),
@@ -494,6 +519,15 @@ class JiraAddCommentAdapter:
         site, email, api_token = _parse_jira_credential(credential)
         basic = b64encode(f"{email}:{api_token}".encode()).decode()
         headers = {"Authorization": f"Basic {basic}", "Accept": "application/json"}
+        # `external_id` is Jira's internal numeric issue id (`jira_adapter.
+        # _upsert_work_item` stores `str(issue["id"])`), which the REST
+        # comment endpoint accepts as `{issueIdOrKey}` -- but Jira's web
+        # `/browse/{...}` route only resolves the human-facing issue *key*
+        # (e.g. "PROJ-123"), not the numeric id. `engineering_work_items.
+        # source_url` already holds the correct `https://{site}/browse/
+        # {key}` link (`jira_adapter.py`'s own sync code builds it that
+        # way); reused here for the output link rather than reconstructed
+        # from `external_id`, which would silently produce a broken link.
         issue_id = work_item["external_id"]
         try:
             response = self._client.post(
@@ -520,6 +554,6 @@ class JiraAddCommentAdapter:
         return JiraAddCommentOutput(
             workspace_id=action_input.workspace_id,
             comment_external_id=str(payload["id"]),
-            source_url=f"https://{site}/browse/{issue_id}?focusedCommentId={payload['id']}",
+            source_url=f"{work_item['source_url']}?focusedCommentId={payload['id']}",
             created_at=datetime.now(UTC),
         )

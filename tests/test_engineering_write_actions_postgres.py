@@ -35,6 +35,8 @@ retry-safety classification" reasoning):
 
 from __future__ import annotations
 
+import json
+from base64 import b64encode
 from collections.abc import Iterator
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -205,8 +207,20 @@ def _insert_repository(
 
 
 def _insert_work_item(
-    workspace_id: UUID, connector_account_id: UUID, *, external_id: str = "10001"
+    workspace_id: UUID,
+    connector_account_id: UUID,
+    *,
+    external_id: str = "10001",
+    source_url: str = "https://acme.atlassian.net/browse/PROJ-5",
 ) -> UUID:
+    """`external_id` (Jira's internal numeric issue id) and `source_url`
+    (built from the human-facing issue *key*, e.g. "PROJ-5") are
+    deliberately different values by default -- matching real
+    `jira_adapter.py` sync data exactly, and proving `jira.add_comment`'s
+    output `source_url` is derived from the stored `source_url` column,
+    not reconstructed from `external_id` (which would silently produce a
+    broken `/browse/{numeric-id}` link).
+    """
     work_item_id = uuid4()
     now = datetime.now(UTC)
     with engine.begin() as connection:
@@ -218,7 +232,7 @@ def _insert_work_item(
                     title, source_url, item_type, status, permission_state, freshness_state,
                     observed_at, created_at, updated_at
                 ) VALUES (
-                    :id, :ws, :acct, 'jira', :ext, 'A work item', 'https://x', 'Bug', 'To Do',
+                    :id, :ws, :acct, 'jira', :ext, 'A work item', :source_url, 'Bug', 'To Do',
                     'active', 'fresh', :now, :now, :now
                 )
                 """
@@ -228,6 +242,7 @@ def _insert_work_item(
                 "ws": workspace_id,
                 "acct": connector_account_id,
                 "ext": external_id,
+                "source_url": source_url,
                 "now": now,
             },
         )
@@ -577,7 +592,7 @@ def test_gitlab_add_note_success_excludes_body_from_output(
     assert "shouldnotleak" not in output.model_dump_json()
 
 
-def test_gitlab_add_note_rejects_connector_account_in_different_workspace(
+def test_gitlab_add_note_rejects_nonexistent_connector_account(
     write_actions_test_context: tuple[UUID, UUID],
 ) -> None:
     workspace_id, user_id = write_actions_test_context
@@ -590,6 +605,104 @@ def test_gitlab_add_note_rejects_connector_account_in_different_workspace(
         workspace_id=workspace_id,
         actor_id=user_id,
         connector_account_id=uuid4(),
+        project_path="acme/widgets",
+        issue_iid=1,
+        body="x",
+    )
+    with pytest.raises(WriteActionRejected):
+        adapter.execute(action_input)
+
+
+def test_gitlab_add_note_rejects_connector_account_in_different_workspace(
+    write_actions_test_context: tuple[UUID, UUID],
+) -> None:
+    workspace_id, user_id = write_actions_test_context
+    other_workspace_id = uuid4()
+    other_user_id = uuid4()
+    now = datetime.now(UTC)
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO workspaces (id, name, timezone, created_at) "
+                "VALUES (:id, 'Other', 'UTC', :now)"
+            ),
+            {"id": other_workspace_id, "now": now},
+        )
+        connection.execute(
+            text(
+                "INSERT INTO users (id, workspace_id, email, password_hash, created_at) "
+                "VALUES (:id, :workspace_id, :email, 'x', :now)"
+            ),
+            {
+                "id": other_user_id,
+                "workspace_id": other_workspace_id,
+                "email": f"{other_user_id}@example.test",
+                "now": now,
+            },
+        )
+    try:
+        other_account_id = _insert_connector_account(
+            other_workspace_id, other_user_id, provider="gitlab", credential="glpat-other"
+        )
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            raise AssertionError("must not make a network call for a cross-workspace account")
+
+        adapter = GitLabAddNoteAdapter(transport=httpx.MockTransport(handler))
+        action_input = GitLabAddNoteInput(
+            workspace_id=workspace_id,
+            actor_id=user_id,
+            connector_account_id=other_account_id,
+            project_path="acme/widgets",
+            issue_iid=1,
+            body="x",
+        )
+        with pytest.raises(WriteActionRejected):
+            adapter.execute(action_input)
+    finally:
+        _cleanup_workspace(other_workspace_id)
+
+
+def test_gitlab_add_note_rejects_wrong_provider_connector_account(
+    write_actions_test_context: tuple[UUID, UUID],
+) -> None:
+    workspace_id, user_id = write_actions_test_context
+    github_account_id = _insert_connector_account(
+        workspace_id, user_id, provider="github", credential="ghp_x"
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError("must not make a network call for a wrong-provider account")
+
+    adapter = GitLabAddNoteAdapter(transport=httpx.MockTransport(handler))
+    action_input = GitLabAddNoteInput(
+        workspace_id=workspace_id,
+        actor_id=user_id,
+        connector_account_id=github_account_id,
+        project_path="acme/widgets",
+        issue_iid=1,
+        body="x",
+    )
+    with pytest.raises(WriteActionRejected):
+        adapter.execute(action_input)
+
+
+def test_gitlab_add_note_rejects_disconnected_connector_account(
+    write_actions_test_context: tuple[UUID, UUID],
+) -> None:
+    workspace_id, user_id = write_actions_test_context
+    account_id = _insert_connector_account(
+        workspace_id, user_id, provider="gitlab", credential="glpat-x", status="disconnected"
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError("must not make a network call for a disconnected account")
+
+    adapter = GitLabAddNoteAdapter(transport=httpx.MockTransport(handler))
+    action_input = GitLabAddNoteInput(
+        workspace_id=workspace_id,
+        actor_id=user_id,
+        connector_account_id=account_id,
         project_path="acme/widgets",
         issue_iid=1,
         body="x",
@@ -622,6 +735,133 @@ def test_gitlab_add_note_connection_failure_is_transient(
         adapter.execute(action_input)
 
 
+def test_gitlab_add_note_read_timeout_is_not_transient(
+    write_actions_test_context: tuple[UUID, UUID],
+) -> None:
+    workspace_id, user_id = write_actions_test_context
+    account_id = _insert_connector_account(
+        workspace_id, user_id, provider="gitlab", credential="glpat-x"
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("timed out", request=request)
+
+    adapter = GitLabAddNoteAdapter(transport=httpx.MockTransport(handler))
+    action_input = GitLabAddNoteInput(
+        workspace_id=workspace_id,
+        actor_id=user_id,
+        connector_account_id=account_id,
+        project_path="acme/widgets",
+        issue_iid=1,
+        body="x",
+    )
+    with pytest.raises(RuntimeError):
+        adapter.execute(action_input)
+
+
+def test_gitlab_add_note_rate_limited_is_transient(
+    write_actions_test_context: tuple[UUID, UUID],
+) -> None:
+    workspace_id, user_id = write_actions_test_context
+    account_id = _insert_connector_account(
+        workspace_id, user_id, provider="gitlab", credential="glpat-x"
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(429, headers={"Retry-After": "1"})
+
+    adapter = GitLabAddNoteAdapter(transport=httpx.MockTransport(handler))
+    action_input = GitLabAddNoteInput(
+        workspace_id=workspace_id,
+        actor_id=user_id,
+        connector_account_id=account_id,
+        project_path="acme/widgets",
+        issue_iid=1,
+        body="x",
+    )
+    with pytest.raises(TransientAdapterError):
+        adapter.execute(action_input)
+
+
+def test_gitlab_add_note_4xx_is_not_transient(
+    write_actions_test_context: tuple[UUID, UUID],
+) -> None:
+    workspace_id, user_id = write_actions_test_context
+    account_id = _insert_connector_account(
+        workspace_id, user_id, provider="gitlab", credential="glpat-x"
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(404, json={"message": "404 Not found"})
+
+    adapter = GitLabAddNoteAdapter(transport=httpx.MockTransport(handler))
+    action_input = GitLabAddNoteInput(
+        workspace_id=workspace_id,
+        actor_id=user_id,
+        connector_account_id=account_id,
+        project_path="acme/widgets",
+        issue_iid=1,
+        body="x",
+    )
+    with pytest.raises(RuntimeError):
+        adapter.execute(action_input)
+
+
+def test_gitlab_add_note_simulate_makes_no_network_call(
+    write_actions_test_context: tuple[UUID, UUID],
+) -> None:
+    workspace_id, user_id = write_actions_test_context
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError("simulate() must never make a network call")
+
+    adapter = GitLabAddNoteAdapter(transport=httpx.MockTransport(handler))
+    action_input = GitLabAddNoteInput(
+        workspace_id=workspace_id,
+        actor_id=user_id,
+        connector_account_id=uuid4(),
+        project_path="acme/widgets",
+        issue_iid=1,
+        body="x",
+    )
+    output = adapter.simulate(action_input)
+    assert isinstance(output, GitLabAddNoteOutput)
+    assert output.workspace_id == workspace_id
+
+
+def test_gitlab_add_note_no_containment_check_by_design(
+    write_actions_test_context: tuple[UUID, UUID],
+) -> None:
+    """Disclosed asymmetry, made explicit (not merely incidental): unlike
+    `github.add_issue_comment`/`jira.add_comment`, `gitlab.add_note` has
+    no synced-projection lookup at all -- an arbitrary `project_path`/
+    `issue_iid` this workspace's connector never actually observed still
+    succeeds, because GitLab's own change/review sync (the table this
+    would validate against) does not exist yet. See this module's own
+    docstring for the full reasoning.
+    """
+    workspace_id, user_id = write_actions_test_context
+    account_id = _insert_connector_account(
+        workspace_id, user_id, provider="gitlab", credential="glpat-x"
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return _json_response(201, {"id": 42})
+
+    adapter = GitLabAddNoteAdapter(transport=httpx.MockTransport(handler))
+    action_input = GitLabAddNoteInput(
+        workspace_id=workspace_id,
+        actor_id=user_id,
+        connector_account_id=account_id,
+        project_path="nonexistent/never-synced",
+        issue_iid=999,
+        body="x",
+    )
+    output = adapter.execute(action_input)
+    assert isinstance(output, GitLabAddNoteOutput)
+    assert output.note_external_id == "42"
+
+
 # ---------------------------------------------------------------------------
 # 4. jira.add_comment
 # ---------------------------------------------------------------------------
@@ -634,11 +874,32 @@ def test_jira_add_comment_success_excludes_body_from_output(
     account_id = _insert_connector_account(
         workspace_id, user_id, provider="jira", credential="acme.atlassian.net|a@b.com|tok"
     )
-    work_item_id = _insert_work_item(workspace_id, account_id, external_id="10001")
+    work_item_id = _insert_work_item(
+        workspace_id,
+        account_id,
+        external_id="10001",
+        source_url="https://acme.atlassian.net/browse/PROJ-5",
+    )
 
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.url.host == "acme.atlassian.net"
         assert request.url.path == "/rest/api/3/issue/10001/comment"
+        assert request.headers["Authorization"] == ("Basic " + b64encode(b"a@b.com:tok").decode())
+        body = json.loads(request.content)
+        assert body == {
+            "body": {
+                "type": "doc",
+                "version": 1,
+                "content": [
+                    {
+                        "type": "paragraph",
+                        "content": [
+                            {"type": "text", "text": "a secret-looking value: tok-shouldnotleak"}
+                        ],
+                    }
+                ],
+            }
+        }
         return _json_response(201, {"id": "20002"})
 
     adapter = JiraAddCommentAdapter(transport=httpx.MockTransport(handler))
@@ -652,7 +913,12 @@ def test_jira_add_comment_success_excludes_body_from_output(
     output = adapter.execute(action_input)
     assert isinstance(output, JiraAddCommentOutput)
     assert output.comment_external_id == "20002"
-    assert "20002" in output.source_url
+    # The 10001-vs-PROJ-5 distinction is the whole point: `external_id`
+    # (Jira's internal numeric id, used for the API call above) must
+    # never leak into the *link* -- only the real, browsable issue key
+    # (from the work item's own stored `source_url`) may.
+    assert output.source_url == "https://acme.atlassian.net/browse/PROJ-5?focusedCommentId=20002"
+    assert "10001" not in output.source_url
     assert "shouldnotleak" not in output.model_dump_json()
 
 
@@ -677,6 +943,226 @@ def test_jira_add_comment_rejects_work_item_not_synced_by_this_connector(
     )
     with pytest.raises(WriteActionRejected):
         adapter.execute(action_input)
+
+
+def test_jira_add_comment_rejects_connector_account_in_different_workspace(
+    write_actions_test_context: tuple[UUID, UUID],
+) -> None:
+    workspace_id, user_id = write_actions_test_context
+    other_workspace_id = uuid4()
+    other_user_id = uuid4()
+    now = datetime.now(UTC)
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO workspaces (id, name, timezone, created_at) "
+                "VALUES (:id, 'Other', 'UTC', :now)"
+            ),
+            {"id": other_workspace_id, "now": now},
+        )
+        connection.execute(
+            text(
+                "INSERT INTO users (id, workspace_id, email, password_hash, created_at) "
+                "VALUES (:id, :workspace_id, :email, 'x', :now)"
+            ),
+            {
+                "id": other_user_id,
+                "workspace_id": other_workspace_id,
+                "email": f"{other_user_id}@example.test",
+                "now": now,
+            },
+        )
+    try:
+        other_account_id = _insert_connector_account(
+            other_workspace_id,
+            other_user_id,
+            provider="jira",
+            credential="other.atlassian.net|a@b.com|tok",
+        )
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            raise AssertionError("must not make a network call for a cross-workspace account")
+
+        adapter = JiraAddCommentAdapter(transport=httpx.MockTransport(handler))
+        action_input = JiraAddCommentInput(
+            workspace_id=workspace_id,
+            actor_id=user_id,
+            connector_account_id=other_account_id,
+            work_item_id=uuid4(),
+            body="x",
+        )
+        with pytest.raises(WriteActionRejected):
+            adapter.execute(action_input)
+    finally:
+        _cleanup_workspace(other_workspace_id)
+
+
+def test_jira_add_comment_rejects_wrong_provider_connector_account(
+    write_actions_test_context: tuple[UUID, UUID],
+) -> None:
+    workspace_id, user_id = write_actions_test_context
+    github_account_id = _insert_connector_account(
+        workspace_id, user_id, provider="github", credential="ghp_x"
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError("must not make a network call for a wrong-provider account")
+
+    adapter = JiraAddCommentAdapter(transport=httpx.MockTransport(handler))
+    action_input = JiraAddCommentInput(
+        workspace_id=workspace_id,
+        actor_id=user_id,
+        connector_account_id=github_account_id,
+        work_item_id=uuid4(),
+        body="x",
+    )
+    with pytest.raises(WriteActionRejected):
+        adapter.execute(action_input)
+
+
+def test_jira_add_comment_rejects_disconnected_connector_account(
+    write_actions_test_context: tuple[UUID, UUID],
+) -> None:
+    workspace_id, user_id = write_actions_test_context
+    account_id = _insert_connector_account(
+        workspace_id,
+        user_id,
+        provider="jira",
+        credential="acme.atlassian.net|a@b.com|tok",
+        status="disconnected",
+    )
+    work_item_id = _insert_work_item(workspace_id, account_id)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError("must not make a network call for a disconnected account")
+
+    adapter = JiraAddCommentAdapter(transport=httpx.MockTransport(handler))
+    action_input = JiraAddCommentInput(
+        workspace_id=workspace_id,
+        actor_id=user_id,
+        connector_account_id=account_id,
+        work_item_id=work_item_id,
+        body="x",
+    )
+    with pytest.raises(WriteActionRejected):
+        adapter.execute(action_input)
+
+
+def test_jira_add_comment_connection_failure_is_transient(
+    write_actions_test_context: tuple[UUID, UUID],
+) -> None:
+    workspace_id, user_id = write_actions_test_context
+    account_id = _insert_connector_account(
+        workspace_id, user_id, provider="jira", credential="acme.atlassian.net|a@b.com|tok"
+    )
+    work_item_id = _insert_work_item(workspace_id, account_id)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("connection refused", request=request)
+
+    adapter = JiraAddCommentAdapter(transport=httpx.MockTransport(handler))
+    action_input = JiraAddCommentInput(
+        workspace_id=workspace_id,
+        actor_id=user_id,
+        connector_account_id=account_id,
+        work_item_id=work_item_id,
+        body="x",
+    )
+    with pytest.raises(TransientAdapterError):
+        adapter.execute(action_input)
+
+
+def test_jira_add_comment_read_timeout_is_not_transient(
+    write_actions_test_context: tuple[UUID, UUID],
+) -> None:
+    workspace_id, user_id = write_actions_test_context
+    account_id = _insert_connector_account(
+        workspace_id, user_id, provider="jira", credential="acme.atlassian.net|a@b.com|tok"
+    )
+    work_item_id = _insert_work_item(workspace_id, account_id)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("timed out", request=request)
+
+    adapter = JiraAddCommentAdapter(transport=httpx.MockTransport(handler))
+    action_input = JiraAddCommentInput(
+        workspace_id=workspace_id,
+        actor_id=user_id,
+        connector_account_id=account_id,
+        work_item_id=work_item_id,
+        body="x",
+    )
+    with pytest.raises(RuntimeError):
+        adapter.execute(action_input)
+
+
+def test_jira_add_comment_rate_limited_is_transient(
+    write_actions_test_context: tuple[UUID, UUID],
+) -> None:
+    workspace_id, user_id = write_actions_test_context
+    account_id = _insert_connector_account(
+        workspace_id, user_id, provider="jira", credential="acme.atlassian.net|a@b.com|tok"
+    )
+    work_item_id = _insert_work_item(workspace_id, account_id)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(429, headers={"Retry-After": "1"})
+
+    adapter = JiraAddCommentAdapter(transport=httpx.MockTransport(handler))
+    action_input = JiraAddCommentInput(
+        workspace_id=workspace_id,
+        actor_id=user_id,
+        connector_account_id=account_id,
+        work_item_id=work_item_id,
+        body="x",
+    )
+    with pytest.raises(TransientAdapterError):
+        adapter.execute(action_input)
+
+
+def test_jira_add_comment_4xx_is_not_transient(
+    write_actions_test_context: tuple[UUID, UUID],
+) -> None:
+    workspace_id, user_id = write_actions_test_context
+    account_id = _insert_connector_account(
+        workspace_id, user_id, provider="jira", credential="acme.atlassian.net|a@b.com|tok"
+    )
+    work_item_id = _insert_work_item(workspace_id, account_id)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return _json_response(404, {"errorMessages": ["Issue does not exist"]})
+
+    adapter = JiraAddCommentAdapter(transport=httpx.MockTransport(handler))
+    action_input = JiraAddCommentInput(
+        workspace_id=workspace_id,
+        actor_id=user_id,
+        connector_account_id=account_id,
+        work_item_id=work_item_id,
+        body="x",
+    )
+    with pytest.raises(RuntimeError):
+        adapter.execute(action_input)
+
+
+def test_jira_add_comment_simulate_makes_no_network_call(
+    write_actions_test_context: tuple[UUID, UUID],
+) -> None:
+    workspace_id, user_id = write_actions_test_context
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError("simulate() must never make a network call")
+
+    adapter = JiraAddCommentAdapter(transport=httpx.MockTransport(handler))
+    action_input = JiraAddCommentInput(
+        workspace_id=workspace_id,
+        actor_id=user_id,
+        connector_account_id=uuid4(),
+        work_item_id=uuid4(),
+        body="x",
+    )
+    output = adapter.simulate(action_input)
+    assert isinstance(output, JiraAddCommentOutput)
+    assert output.workspace_id == workspace_id
 
 
 # ---------------------------------------------------------------------------
