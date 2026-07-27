@@ -43,3 +43,7 @@ Disconnect and delete are two distinct, separately confirmed operations. Disconn
 ## Accepted limitation (Task 1)
 
 Disconnect's provider-side credential revocation is best-effort: if the adapter's `disconnect()` call itself fails (or the stored credential cannot be decrypted, e.g. after an encryption-key rotation without re-encryption), the connector is still marked `disconnected` and future sync still stops -- a revocation failure must never block a caller from severing the connection. The provider-side credential may remain live until revoked through the provider's own console in that case; this is disclosed here rather than silently assumed away.
+
+## Task 2 status
+
+`github_adapter.GitHubAdapter` implements the contract above for repositories only: `authorize` (`GET /user`, parses granted scopes from `X-OAuth-Scopes`), bounded-retry rate-limit handling (`403`/`429` plus `X-RateLimit-Remaining`/`Retry-After`/`X-RateLimit-Reset`, one bounded wait, `partial` sync status beyond it), and `disconnect` as a documented no-op (a personal access token has no revocation API a connector can call on the user's behalf). Work items/changes/reviews/deployments and webhook ingestion's receiving endpoint are not yet implemented -- see `github_adapter.py`'s own module docstring and `docs/phases/phase-006/IMPLEMENTATION-STATUS.md`'s Task 2 evidence.

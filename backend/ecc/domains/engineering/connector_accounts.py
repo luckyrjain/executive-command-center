@@ -3,15 +3,16 @@
 `POST .../{id}/sync`, `POST .../{id}/disable` and `GET /api/v1/engineering/
 sync-runs` (`docs/phases/phase-006/API-SCHEMAS.md`).
 
-Phase 6 Task 1 -- the connector-platform layer only. Dispatches into
-`ecc.domains.engineering.connectors.registry` (this task registers exactly
-one adapter, `sandbox.github` -- no real GitHub/GitLab/Jira network call
-happens anywhere in this module). A real provider's own rate limiting/
-pagination/backoff lives inside that provider's own future adapter, not
-here -- this module's own responsibility is account lifecycle, credential
-encryption, cursor persistence and sync-run bookkeeping, identical in kind
-to how `ecc.domains.automation.policy`/`approvals` own policy/approval
-lifecycle while `worker.py` owns actual dispatch.
+Phase 6 Task 1 added the connector-platform layer with exactly one
+adapter, `sandbox.github` (no real network call). Task 2 adds the first
+real adapter, `github` (`github_adapter.GitHubAdapter`) -- registered into
+the same `ecc.domains.engineering.connectors.registry` this module
+dispatches into. A real provider's own rate limiting/pagination/backoff
+lives inside that provider's own adapter, not here -- this module's own
+responsibility is account lifecycle, credential encryption, cursor
+persistence and sync-run bookkeeping, identical in kind to how `ecc.
+domains.automation.policy`/`approvals` own policy/approval lifecycle while
+`worker.py` owns actual dispatch.
 
 **A connector account's credential is never selected into any response
 model in this module** -- `ConnectorAccountResponse` has no field that
@@ -20,29 +21,29 @@ status endpoints return authorization state and granted scopes, never the
 credential").
 
 **Sync is dispatched synchronously, inline in the request handler, not
-through a durable worker.** Unlike Phase 5's `workflow_runs` (crash-safe,
-lease-based, potentially long-running), a Task 1 sync call is a single
-adapter method call against a sandbox fake -- instant, in-memory, no I/O.
+through a durable worker** -- unlike Phase 5's `workflow_runs` (crash-safe,
+lease-based, potentially long-running), a sync call is a single adapter
+method call with no multi-step graph to crash-recover mid-way through.
 `sync_runs.status` still records `running` before the call and
-`succeeded`/`failed`/`partial` after, so a stuck run remains visible for
-scale reasons.
+`succeeded`/`failed`/`partial` after, so a stuck run remains visible.
 
-**Must change before Task 2 registers a real network-calling adapter.**
-This handler's entire body, including the adapter call, runs inside one
-`with session.begin():` against `ecc.database.SessionFactory`, bound to
-the shared app-wide `engine` pool (`pool_size=5 + max_overflow=10 = 15`
-connections total, `database.py`). That is fine only because this task's
-adapter call is instant -- a real GitHub/GitLab/Jira backfill (thousands of
-paginated calls under rate limiting, or simply a slow/degraded provider)
-would hold one of those 15 connections for the adapter's entire real-world
-duration, and a handful of concurrent syncs would exhaust the pool and
-start starving every unrelated endpoint in the app, not just engineering
-ones. This codebase already solved the identical problem for `ai_runtime`
-(`database.py`'s dedicated `NullPool` `lock_engine`, `ai_runtime/runtime.
-py`'s `_held_idempotency_lock`) -- Task 2 must apply the same fix (a
-dedicated connection, or moving sync dispatch off the request path
-entirely into a worker) rather than carrying today's transaction shape
-into a real provider call unchanged.
+**Pool-exhaustion fix (Task 1's own disclosed blocker for Task 2, now
+resolved).** `sync_connector_endpoint` no longer holds one `session.
+begin()` transaction across the entire adapter call. It now runs in three
+phases on two separate pooled connections: (1) validate + reserve the
+run on the request's own injected `session`, (2) explicitly `session.
+close()` -- releasing that connection back to the shared, `pool_size=5 +
+max_overflow=10 = 15`-connection-capped `engine` pool -- *before* calling
+`adapter.backfill`/`incremental_sync`, so a real provider's HTTP call
+(seconds, not microseconds) never holds a pooled connection hostage, and
+(3) record the outcome on a fresh `SessionFactory()` session. See that
+function's own docstring for the phase-by-phase detail. This mirrors, in
+spirit, this codebase's existing `ai_runtime` `NullPool` `lock_engine`
+precedent (`database.py`) -- a different mechanism (explicit close/reopen
+rather than a second engine), chosen because this handler's short
+bookkeeping transactions don't need `NullPool`'s "never pool this
+connection at all" property, only "don't hold a pooled connection during
+the slow part."
 
 **Accepted limitation, disclosed rather than silently absent:**
 `ConnectorAdapter.refresh_permissions` has no HTTP caller in this task --
@@ -68,7 +69,7 @@ from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from ecc.auth import AuthContext, AuthDep, CsrfDep
-from ecc.database import get_session
+from ecc.database import SessionFactory, get_session
 from ecc.observability import (
     queue_lifecycle_event,
     record_audit_outbox_failure,
@@ -78,6 +79,7 @@ from ecc.observability import (
 from .connectors import (
     AdapterAuthorizationError,
     ConnectorAccountContext,
+    SyncOutcome,
 )
 from .connectors import (
     registry as connector_registry,
@@ -573,21 +575,46 @@ def sync_connector_endpoint(
     _csrf: CsrfDep,
     idempotency_key: IdempotencyHeader,
 ) -> SyncRunResponse:
+    """Three phases, deliberately on **two separate pooled connections**
+    rather than one transaction spanning the whole handler -- the fix
+    Task 1's own module docstring flagged as required before a real,
+    network-calling adapter (`github_adapter.GitHubAdapter`, Task 2)
+    could be dispatched from here:
+
+    1. Validate the account/adapter, read the prior cursor, and insert the
+       `running` `sync_runs` row -- inside `session`'s own transaction.
+    2. Close `session` explicitly (releasing its connection back to the
+       engine pool) *before* calling `adapter.backfill`/`incremental_sync`
+       -- a real adapter's HTTP call can legitimately take seconds; no
+       pooled connection is held for that duration, so a handful of
+       concurrent syncs can no longer starve every unrelated endpoint's
+       connection pool the way holding `session` open across that call
+       would.
+    3. Record the outcome on a **fresh** session (`SessionFactory()`, a new
+       connection from the same pool, held only for this short bookkeeping
+       transaction) -- never the closed `session` from phase 1.
+
+    A real adapter's own domain-projection writes (e.g. `github_adapter.
+    _upsert_repository`) already follow this same discipline independently
+    -- see that function's own docstring.
+    """
     request_hash = _request_hash(payload, f"sync:{account_id}")
     now = datetime.now(UTC)
+
+    # --- Phase 1: validate, reserve the run, read the cursor -------------
     with session.begin():
         _lock_idempotency(session, auth, idempotency_key)
         cached = _load_cached(session, auth, idempotency_key, request_hash)
         if cached is not None:
             return SyncRunResponse.model_validate(cached)
 
-        # `for_update=True`: locks this account's row for the whole
+        # `for_update=True`: locks this account's row for this short
         # transaction, serializing a second concurrent `/sync` call for the
         # same account (different Idempotency-Key, so the advisory-lock
-        # replay guard above does not itself serialize them) until this one
-        # commits -- closes the lost-cursor-update race a plain unlocked
-        # read would otherwise allow between the `cursor_row` read below and
-        # the cursor UPSERT.
+        # replay guard above does not itself serialize them) -- closes the
+        # lost-cursor-update race a plain unlocked read would otherwise
+        # allow between the `cursor_row` read below and the cursor UPSERT
+        # in phase 3.
         account = get_connector_account(session, auth.workspace_id, account_id, for_update=True)
         if account is None:
             raise HTTPException(status_code=404, detail="CONNECTOR_NOT_FOUND")
@@ -600,12 +627,6 @@ def sync_connector_endpoint(
 
         encrypted = _get_encrypted_credential(session, auth.workspace_id, account_id)
         credential = decrypt_credential(encrypted)
-        context = ConnectorAccountContext(
-            workspace_id=auth.workspace_id,
-            connector_account_id=account_id,
-            external_account_id=account.external_account_id,
-            credential=credential,
-        )
 
         run_id = uuid4()
         session.execute(
@@ -647,22 +668,42 @@ def sync_connector_endpoint(
         )
         prior_cursor = cursor_row["cursor_value"] if cursor_row is not None else None
 
-        try:
-            if payload.run_type == "backfill":
-                outcome = adapter.backfill(context, payload.resource_type)
-            else:
-                outcome = adapter.incremental_sync(context, payload.resource_type, prior_cursor)
-        except Exception as exc:  # noqa: BLE001 -- classified as a failed sync run, not a crash
-            failure_summary = _sanitize_adapter_error(str(exc))
-            completed_at = datetime.now(UTC)
-            session.execute(
+    # Phase 1's transaction has committed. Release the connection back to
+    # the pool before the (potentially slow) adapter call in phase 2 --
+    # the actual pool-exhaustion fix; see this function's own docstring.
+    session.close()
+
+    # --- Phase 2: the adapter call -- no pooled connection held here -----
+    context = ConnectorAccountContext(
+        workspace_id=auth.workspace_id,
+        connector_account_id=account_id,
+        external_account_id=account.external_account_id,
+        credential=credential,
+    )
+    adapter_failed = False
+    outcome: SyncOutcome | None = None
+    failure_summary: str | None = None
+    try:
+        if payload.run_type == "backfill":
+            outcome = adapter.backfill(context, payload.resource_type)
+        else:
+            outcome = adapter.incremental_sync(context, payload.resource_type, prior_cursor)
+    except Exception as exc:  # noqa: BLE001 -- classified as a failed sync run, not a crash
+        adapter_failed = True
+        failure_summary = _sanitize_adapter_error(str(exc))
+
+    # --- Phase 3: record the outcome, on a fresh connection ---------------
+    completed_at = datetime.now(UTC)
+    with SessionFactory() as outcome_session, outcome_session.begin():
+        if adapter_failed:
+            outcome_session.execute(
                 text(
                     "UPDATE sync_runs SET status = 'failed', error_summary = :error, "
                     "completed_at = :completed_at WHERE id = :id"
                 ),
                 {"error": failure_summary, "completed_at": completed_at, "id": run_id},
             )
-            session.execute(
+            outcome_session.execute(
                 text(
                     "UPDATE connector_accounts SET status = 'error', last_error = :error, "
                     "updated_at = :now, updated_by = :actor_id, version = version + 1 "
@@ -676,7 +717,7 @@ def sync_connector_endpoint(
                 },
             )
             run_row = (
-                session.execute(
+                outcome_session.execute(
                     text(
                         "SELECT id, connector_account_id, run_type, status, items_processed, "
                         "error_summary, started_at, completed_at FROM sync_runs WHERE id = :id"
@@ -688,7 +729,7 @@ def sync_connector_endpoint(
             )
             response = SyncRunResponse(**dict(run_row))
             _write_side_effects(
-                session,
+                outcome_session,
                 auth,
                 request,
                 event_type="connector_account.sync_failed",
@@ -697,11 +738,16 @@ def sync_connector_endpoint(
                 now=completed_at,
             )
             _store_idempotency(
-                session, auth, idempotency_key, request_hash, response.model_dump(mode="json"), now
+                outcome_session,
+                auth,
+                idempotency_key,
+                request_hash,
+                response.model_dump(mode="json"),
+                now,
             )
             return response
 
-        completed_at = datetime.now(UTC)
+        assert outcome is not None
         # `outcome.error_summary` is adapter-returned, untrusted content
         # (same reasoning as `_sanitize_adapter_error`'s own docstring) --
         # sanitized once here and reused below rather than persisted raw.
@@ -710,7 +756,7 @@ def sync_connector_endpoint(
             if outcome.error_summary is not None
             else None
         )
-        session.execute(
+        outcome_session.execute(
             text(
                 "UPDATE sync_runs SET status = :status, items_processed = :items_processed, "
                 "error_summary = :error_summary, completed_at = :completed_at WHERE id = :id"
@@ -724,7 +770,7 @@ def sync_connector_endpoint(
             },
         )
         if outcome.next_cursor is not None:
-            session.execute(
+            outcome_session.execute(
                 text(
                     """
                     INSERT INTO sync_cursors (
@@ -748,7 +794,7 @@ def sync_connector_endpoint(
                     "now": completed_at,
                 },
             )
-        session.execute(
+        outcome_session.execute(
             text(
                 "UPDATE connector_accounts SET last_synced_at = :now, last_error = :error, "
                 "updated_at = :now, updated_by = :actor_id, version = version + 1 "
@@ -773,7 +819,7 @@ def sync_connector_endpoint(
             completed_at=completed_at,
         )
         _write_side_effects(
-            session,
+            outcome_session,
             auth,
             request,
             event_type="connector_account.synced",
@@ -782,7 +828,12 @@ def sync_connector_endpoint(
             now=completed_at,
         )
         _store_idempotency(
-            session, auth, idempotency_key, request_hash, response.model_dump(mode="json"), now
+            outcome_session,
+            auth,
+            idempotency_key,
+            request_hash,
+            response.model_dump(mode="json"),
+            now,
         )
         return response
 

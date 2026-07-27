@@ -13,9 +13,9 @@ Companion to `docs/superpowers/specs/2026-07-27-phase-6-engineering-workspace-de
 
 ## Task 2 — GitHub read sync
 
-Real GitHub REST API backfill/incremental sync and webhook ingestion through the same `ConnectorAdapter` contract Task 1 defines. Repositories, work items (issues), changes (commits/PRs), reviews, deployments projected per `DATA-MODEL.md`. Rate-limit handling and bounded backoff per `CONNECTOR-CONTRACT.md`.
+**Repositories complete.** Real GitHub REST API backfill/incremental sync through the same `ConnectorAdapter` contract Task 1 defines (`github_adapter.GitHubAdapter`, migration `0045_phase6_repositories.py`). Task 1's disclosed pool-exhaustion risk is resolved (`sync_connector_endpoint` restructured into three phases across two pooled connections -- see `connector_accounts.py`'s own module docstring).
 
-**Must resolve Task 1's disclosed pool-exhaustion risk before landing a real adapter call** (`connector_accounts.py`'s own module docstring has the full reasoning): `sync_connector_endpoint` currently dispatches the adapter call synchronously inside a `session.begin()` block on the shared, 15-connection-capped `engine` pool, which was safe only because Task 1's sandbox adapter is instant and in-memory. A real GitHub backfill is not. Apply the same fix this codebase already used for `ai_runtime` (`database.py`'s dedicated `NullPool` `lock_engine`) -- either a dedicated connection for the sync call, or moving dispatch off the request path into a worker -- rather than carrying today's transaction shape forward unchanged.
+**Deferred to a Task 2 follow-up, not yet done:** work items (issues), changes (commits/PRs), reviews, deployments (`DATA-MODEL.md`'s remaining projection tables); webhook ingestion has no receiving HTTP endpoint or webhook-secret storage yet (`GitHubAdapter.handle_webhook` implements the parsing/upsert logic but is not wired to a public route -- see that module's own docstring for why).
 
 ## Task 3 — GitLab read sync
 

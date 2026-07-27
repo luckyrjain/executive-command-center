@@ -201,12 +201,15 @@ class ConnectorRegistry:
         return len(self._by_provider)
 
 
-# Shared production registry. This task registers only `sandbox.github`
-# (see `sandbox_adapter.py`) -- no real GitHub/GitLab/Jira adapter exists
-# yet, matching this task's own explicit scope boundary ("connector
-# framework and source projections", not "GitHub read sync", which is
-# Task 2).
+# Shared production registry. Task 1 registered only `sandbox.github` (see
+# `sandbox_adapter.py`) -- no real adapter existed yet. Task 2 adds the
+# real `github` adapter (`github_adapter.py`) alongside it; `sandbox`
+# remains registered for tests/simulation, matching Phase 5's identical
+# precedent of keeping its own fake adapters registered alongside real
+# ones. No GitLab/Jira adapter exists yet (Tasks 3-4).
+from .github_adapter import GitHubAdapter  # noqa: E402
 from .sandbox_adapter import SandboxGithubAdapter  # noqa: E402
 
 registry = ConnectorRegistry()
 registry.register(SandboxGithubAdapter())
+registry.register(GitHubAdapter())

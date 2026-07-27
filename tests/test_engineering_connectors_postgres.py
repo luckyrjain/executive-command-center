@@ -1154,7 +1154,10 @@ def test_sync_connector_provider_not_supported(
     engineering_test_context: tuple[TestClient, UUID, UUID, str],
 ) -> None:
     client, workspace_id, user_id, token = engineering_test_context
-    account_id = _insert_connector_account(workspace_id, user_id, provider="github")
+    # 'gitlab' is a valid provider per the CHECK constraint but has no
+    # registered adapter yet (Task 3) -- 'github' no longer serves this
+    # test's purpose as of Task 2, which registers a real adapter for it.
+    account_id = _insert_connector_account(workspace_id, user_id, provider="gitlab")
 
     response = client.post(
         f"/api/v1/engineering/connectors/{account_id}/sync",
