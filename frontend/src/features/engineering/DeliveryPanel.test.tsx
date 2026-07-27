@@ -94,6 +94,14 @@ describe('DeliveryPanel', () => {
     expect(await screen.findByText('3 items')).toBeTruthy()
   })
 
+  it('renders change_failure_rate as a percentage, converting the raw 0-1 fraction', async () => {
+    vi.stubGlobal('fetch', vi.fn(() => response({
+      metrics: [metric({ metric_key: 'change_failure_rate', value: 0.235, population: 20 })],
+    })))
+    renderPanel()
+    expect(await screen.findByText('23.5%')).toBeTruthy()
+  })
+
   it('only shows delivery/flow metrics, not time_to_restore', async () => {
     vi.stubGlobal('fetch', vi.fn(() => response({
       metrics: [
