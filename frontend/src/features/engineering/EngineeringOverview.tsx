@@ -9,6 +9,7 @@ import type {
   MetricsListResponse,
 } from './types'
 import { METRIC_LABELS } from './metricDefinitions'
+import { formatValue } from './MetricCard'
 
 /**
  * A single-glance summary of this workspace's engineering surfaces --
@@ -110,7 +111,7 @@ export default function EngineeringOverview({ onNavigate }: { onNavigate: (view:
             <>
               {headline.map((metric) => (
                 <p key={metric.id}>
-                  {METRIC_LABELS[metric.metric_key]}: {metric.value === null ? 'not yet available' : metric.value.toFixed(2)}
+                  {METRIC_LABELS[metric.metric_key]}: {formatValue(metric)}
                   {' '}(coverage: {metric.coverage_status.replaceAll('_', ' ')})
                 </p>
               ))}

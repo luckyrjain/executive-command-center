@@ -57,6 +57,28 @@ describe('EngineeringOverview', () => {
     expect(await screen.findByText(/Delivery frequency: 0.03/)).toBeTruthy()
   })
 
+  it('renders time_to_restore in the headline metrics converted from raw seconds to days, not a bare seconds count', async () => {
+    // `_compute_time_to_restore` stores a raw `.total_seconds()` median with
+    // no day conversion -- this headline list must apply the same
+    // seconds-to-days conversion as `MetricCard`'s own `formatValue`, not
+    // render the raw number directly (the bug round-2 correctness review
+    // found in this exact list).
+    vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url.includes('/metrics')) {
+        return response({
+          metrics: [
+            { id: 'm2', metric_key: 'time_to_restore', window_label: '30d', population: 3, numerator: null, denominator: null, value: 14400, details: null, coverage_status: 'complete', coverage_percentage: 100, coverage_gap_description: null, computed_at: '2026-07-27T00:00:00Z' },
+          ],
+        })
+      }
+      return emptyResponseFor(url)
+    }))
+    renderOverview()
+    expect(await screen.findByText(/Time to restore: 0\.2 days/)).toBeTruthy()
+    expect(screen.queryByText(/14400/)).toBeNull()
+  })
+
   it('calls onNavigate with the correct view when a quick-jump button is clicked', async () => {
     vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL) => emptyResponseFor(String(input))))
     const onNavigate = renderOverview()

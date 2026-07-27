@@ -82,6 +82,20 @@ describe('DecisionsPanel', () => {
     await waitFor(() => expect(fetch).toHaveBeenCalledWith('/api/v1/engineering/decisions', expect.objectContaining({ method: 'POST' })))
   })
 
+  it('surfaces a failed decision proposal as an alert', async () => {
+    const fetch = vi.fn((_input: RequestInfo | URL, init?: RequestInit) => {
+      if ((init?.method ?? 'GET').toUpperCase() === 'POST') return response({ error: { code: 'VALIDATION_ERROR', message: 'title is required' } }, 422)
+      return response({ decisions: [] })
+    })
+    vi.stubGlobal('fetch', fetch)
+    renderPanel()
+
+    await screen.findByText('No decisions match this filter.')
+    fireEvent.change(screen.getByLabelText('Decision title'), { target: { value: 'Adopt trunk-based development' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Propose decision' }))
+    expect(await screen.findByRole('alert')).toBeTruthy()
+  })
+
   it('decides a proposed decision with an optional rationale', async () => {
     const fetch = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input)

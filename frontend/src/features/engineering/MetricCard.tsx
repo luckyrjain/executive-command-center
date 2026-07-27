@@ -25,7 +25,7 @@ function coverageClass(status: MetricSnapshot['coverage_status']): string {
 // once a future task makes it real.
 const SECONDS_METRICS = new Set(['time_to_restore', 'review_latency', 'lead_time_for_changes'])
 
-function formatValue(metric: MetricSnapshot): string {
+export function formatValue(metric: MetricSnapshot): string {
   if (metric.value === null) return 'not yet available'
   if (metric.metric_key === 'change_failure_rate') return `${(metric.value * 100).toFixed(1)}%`
   if (metric.metric_key === 'delivery_frequency') return `${metric.value.toFixed(2)} / day`

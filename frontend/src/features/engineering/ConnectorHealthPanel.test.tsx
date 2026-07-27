@@ -238,4 +238,19 @@ describe('ConnectorHealthPanel', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Disconnect' }))
     await waitFor(() => expect(fetch).toHaveBeenCalledWith(expect.stringContaining('/connectors/connector-1/disable'), expect.objectContaining({ method: 'POST' })))
   })
+
+  it('surfaces a failed disconnect as an alert, mapping CONNECTOR_NOT_FOUND to a readable sentence', async () => {
+    const fetch = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      if (url.includes('/disable')) return response({ error: { code: 'CONNECTOR_NOT_FOUND', message: 'Connector Not Found' } }, 404)
+      if (url.includes('/sync-runs')) return response({ sync_runs: [] })
+      return response({ connectors: [connector()] })
+    })
+    vi.stubGlobal('fetch', fetch)
+    renderPanel()
+
+    await screen.findByText('Acme GitHub')
+    fireEvent.click(screen.getByRole('button', { name: 'Disconnect' }))
+    expect(await screen.findByText('This connector no longer exists in this workspace.')).toBeTruthy()
+  })
 })

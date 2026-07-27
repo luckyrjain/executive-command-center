@@ -88,6 +88,20 @@ describe('IncidentsPanel', () => {
     expect(body.severity).toBe('critical')
   })
 
+  it('surfaces a failed incident capture as an alert', async () => {
+    const fetch = vi.fn((_input: RequestInfo | URL, init?: RequestInit) => {
+      if ((init?.method ?? 'GET').toUpperCase() === 'POST') return response({ error: { code: 'VALIDATION_ERROR', message: 'title is required' } }, 422)
+      return response({ incidents: [] })
+    })
+    vi.stubGlobal('fetch', fetch)
+    renderPanel()
+
+    await screen.findByText('No incidents match this filter.')
+    fireEvent.change(screen.getByLabelText('Incident title'), { target: { value: 'Checkout outage' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Capture incident' }))
+    expect(await screen.findByRole('alert')).toBeTruthy()
+  })
+
   it('resolves an open incident', async () => {
     const fetch = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input)
