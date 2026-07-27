@@ -24,7 +24,11 @@ const DELIVERY_METRICS: ReadonlyArray<MetricKey> = [
 export default function DeliveryPanel() {
   const query = useQuery({
     queryKey: ['engineering', 'metrics'],
-    queryFn: () => apiRequest<MetricsListResponse>('/api/v1/engineering/metrics'),
+    // `csrf: true` -- this GET has a real server-side side effect (writes
+    // fresh metric snapshot rows on every call) and requires `CsrfDep` on
+    // the backend despite being a GET; see `ApiRequestOptions.csrf`'s own
+    // comment in `api/types.ts`.
+    queryFn: () => apiRequest<MetricsListResponse>('/api/v1/engineering/metrics', { csrf: true }),
     retry: 1,
   })
 

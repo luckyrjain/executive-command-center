@@ -45,6 +45,13 @@ describe('DecisionsPanel', () => {
     expect(await screen.findByText('No decisions match this filter.')).toBeTruthy()
   })
 
+  it('surfaces a load failure as an alert, not a silent empty list', async () => {
+    vi.stubGlobal('fetch', vi.fn(() => Promise.reject(new TypeError('fetch failed'))))
+    renderPanel()
+    expect(await screen.findByRole('alert', {}, { timeout: 3000 })).toBeTruthy()
+    expect(screen.queryByText('No decisions match this filter.')).toBeNull()
+  })
+
   it('lists a proposed decision with a decide action', async () => {
     vi.stubGlobal('fetch', vi.fn(() => response({ decisions: [decision()] })))
     renderPanel()

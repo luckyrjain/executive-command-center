@@ -17,7 +17,8 @@ import type { MetricsListResponse } from './types'
 export default function ReliabilityPanel() {
   const query = useQuery({
     queryKey: ['engineering', 'metrics'],
-    queryFn: () => apiRequest<MetricsListResponse>('/api/v1/engineering/metrics'),
+    // `csrf: true` -- see `DeliveryPanel.tsx`'s identical comment.
+    queryFn: () => apiRequest<MetricsListResponse>('/api/v1/engineering/metrics', { csrf: true }),
     retry: 1,
   })
 

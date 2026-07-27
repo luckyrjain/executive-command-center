@@ -95,6 +95,13 @@ describe('CoveragePanel', () => {
     expect(await screen.findByText(/No connectors are configured yet/)).toBeTruthy()
   })
 
+  it('surfaces a load failure as an alert, not a silent empty list', async () => {
+    vi.stubGlobal('fetch', vi.fn(() => Promise.reject(new TypeError('fetch failed'))))
+    renderPanel()
+    expect(await screen.findByRole('alert', {}, { timeout: 3000 })).toBeTruthy()
+    expect(screen.queryByText(/No connectors are configured yet/)).toBeNull()
+  })
+
   it('rolls up repository and work-item counts per connector', async () => {
     stubFetch({
       connectors: [connector()],

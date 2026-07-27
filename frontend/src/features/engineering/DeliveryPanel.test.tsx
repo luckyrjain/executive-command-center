@@ -2,7 +2,7 @@
 
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { cleanup, fireEvent, render, screen } from '@testing-library/react'
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import DeliveryPanel from './DeliveryPanel'
 import type { MetricSnapshot } from './types'
@@ -34,9 +34,66 @@ function renderPanel() {
   return render(<QueryClientProvider client={client}><DeliveryPanel /></QueryClientProvider>)
 }
 
+beforeEach(() => {
+  document.cookie = 'ecc_csrf=delivery-panel-token; Secure; SameSite=Strict'
+})
 afterEach(() => { cleanup(); vi.unstubAllGlobals() })
 
 describe('DeliveryPanel', () => {
+  it('sends the CSRF token even though this is a GET request', async () => {
+    // GET /engineering/metrics has a real server-side side effect (writes
+    // fresh snapshot rows every call) and requires CsrfDep on the backend
+    // despite being a safe HTTP method -- confirms the frontend actually
+    // attaches the header this GET needs, not just that the panel renders.
+    const fetch = vi.fn(() => response({ metrics: [metric()] }))
+    vi.stubGlobal('fetch', fetch)
+    renderPanel()
+    await screen.findByText('Delivery frequency')
+    expect(fetch).toHaveBeenCalledWith(
+      expect.stringContaining('/engineering/metrics'),
+      expect.objectContaining({ headers: expect.objectContaining({ 'X-CSRF-Token': 'delivery-panel-token' }) }),
+    )
+  })
+
+  it('surfaces a load failure as an alert, not a silent empty list', async () => {
+    vi.stubGlobal('fetch', vi.fn(() => Promise.reject(new TypeError('fetch failed'))))
+    renderPanel()
+    expect(await screen.findByRole('alert', {}, { timeout: 3000 })).toBeTruthy()
+  })
+
+  it('converts review_latency\'s raw-seconds value into days, never showing the raw seconds figure', async () => {
+    // `_compute_review_latency` (backend/ecc/domains/engineering/metrics.py)
+    // stores a raw `.total_seconds()` median with no day conversion --
+    // 14400 seconds is a real 4-hour review latency, which must render as
+    // "0.2 days", never as "14400.0 days" (the bug this test guards).
+    vi.stubGlobal('fetch', vi.fn(() => response({
+      metrics: [metric({ metric_key: 'review_latency', value: 14400 })],
+    })))
+    renderPanel()
+    expect(await screen.findByText('0.2 days')).toBeTruthy()
+    expect(screen.queryByText(/14400/)).toBeNull()
+  })
+
+  it('renders work_ageing\'s value as a median age in days, not an item count', async () => {
+    // `_compute_work_ageing`'s `value` is a median AGE IN DAYS (already
+    // divided by 86400 on the backend) -- distinct from `blocked_work`'s
+    // `value`, which is a plain count of blocked items. The two must not
+    // be formatted identically.
+    vi.stubGlobal('fetch', vi.fn(() => response({
+      metrics: [metric({ metric_key: 'work_ageing', value: 5.5, population: 12 })],
+    })))
+    renderPanel()
+    expect(await screen.findByText('5.5 days')).toBeTruthy()
+  })
+
+  it('renders blocked_work\'s value as an item count, not a duration', async () => {
+    vi.stubGlobal('fetch', vi.fn(() => response({
+      metrics: [metric({ metric_key: 'blocked_work', value: 3, population: 10 })],
+    })))
+    renderPanel()
+    expect(await screen.findByText('3 items')).toBeTruthy()
+  })
+
   it('only shows delivery/flow metrics, not time_to_restore', async () => {
     vi.stubGlobal('fetch', vi.fn(() => response({
       metrics: [

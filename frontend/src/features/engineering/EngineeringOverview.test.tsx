@@ -2,7 +2,7 @@
 
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { cleanup, fireEvent, render, screen } from '@testing-library/react'
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import EngineeringOverview from './EngineeringOverview'
 
@@ -24,9 +24,22 @@ function renderOverview(onNavigate = vi.fn()) {
   return onNavigate
 }
 
+beforeEach(() => {
+  document.cookie = 'ecc_csrf=overview-token; Secure; SameSite=Strict'
+})
 afterEach(() => { cleanup(); vi.unstubAllGlobals() })
 
 describe('EngineeringOverview', () => {
+  it('sends the CSRF token on its own metrics fetch even though it is a GET request', async () => {
+    const fetch = vi.fn((input: RequestInfo | URL, _init?: RequestInit) => emptyResponseFor(String(input)))
+    vi.stubGlobal('fetch', fetch)
+    renderOverview()
+    await screen.findByText('Headline metrics')
+    const metricsCall = fetch.mock.calls.find((c) => String(c[0]).includes('/metrics'))
+    expect(metricsCall).toBeTruthy()
+    expect((metricsCall?.[1] as RequestInit | undefined)?.headers).toMatchObject({ 'X-CSRF-Token': 'overview-token' })
+  })
+
   it('summarizes connectors, incidents, decisions and headline metrics', async () => {
     vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL) => {
       const url = String(input)
@@ -72,5 +85,37 @@ describe('EngineeringOverview', () => {
     }))
     renderOverview()
     expect(await screen.findByText('1 connected. All healthy.')).toBeTruthy()
+  })
+
+  it('does not count a disconnected connector as connected or needing attention', async () => {
+    // disable_connector_endpoint never deletes the row, only flips status
+    // to 'disconnected' -- such rows persist in GET /connectors forever,
+    // and a deliberately-disconnected account is neither "connected" (it
+    // provides no data) nor "needing attention" (nothing is wrong, its
+    // owner already acted).
+    vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url.includes('/connectors')) {
+        return response({
+          connectors: [
+            { id: 'c1', provider: 'github', external_account_id: 'x', display_name: 'Acme', granted_scopes: [], status: 'active', status_detail: null, last_synced_at: null, last_error: null, disconnected_at: null, version: 1, created_at: '2026-07-01T00:00:00Z', updated_at: '2026-07-01T00:00:00Z' },
+            { id: 'c2', provider: 'gitlab', external_account_id: 'y', display_name: 'Old GitLab', granted_scopes: [], status: 'disconnected', status_detail: null, last_synced_at: null, last_error: null, disconnected_at: '2026-07-20T00:00:00Z', version: 2, created_at: '2026-06-01T00:00:00Z', updated_at: '2026-07-20T00:00:00Z' },
+          ],
+        })
+      }
+      return emptyResponseFor(url)
+    }))
+    renderOverview()
+    expect(await screen.findByText('1 connected. All healthy.')).toBeTruthy()
+  })
+
+  it('surfaces a connector-list load failure as an alert', async () => {
+    vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url.includes('/connectors')) return Promise.reject(new TypeError('fetch failed'))
+      return emptyResponseFor(url)
+    }))
+    renderOverview()
+    expect(await screen.findByRole('alert', {}, { timeout: 3000 })).toBeTruthy()
   })
 })

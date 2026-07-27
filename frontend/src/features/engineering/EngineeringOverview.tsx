@@ -36,12 +36,20 @@ export default function EngineeringOverview({ onNavigate }: { onNavigate: (view:
   })
   const metrics = useQuery({
     queryKey: ['engineering', 'metrics'],
-    queryFn: () => apiRequest<MetricsListResponse>('/api/v1/engineering/metrics'),
+    // `csrf: true` -- see `DeliveryPanel.tsx`'s identical comment.
+    queryFn: () => apiRequest<MetricsListResponse>('/api/v1/engineering/metrics', { csrf: true }),
     retry: 1,
   })
 
   const connectorList = connectors.data?.connectors ?? []
-  const degradedConnectors = connectorList.filter((c) => c.status !== 'active' && c.status !== 'pending')
+  // `disable_connector_endpoint` never deletes a connector_accounts row, it
+  // only flips status to 'disconnected' -- such rows persist in `GET
+  // /connectors` forever, so they must be excluded from both counts below:
+  // a deliberately-disconnected account is not "connected" (it provides no
+  // data) and does not "need attention" (nothing is wrong with it, its
+  // owner already acted).
+  const connectedConnectors = connectorList.filter((c) => c.status !== 'disconnected')
+  const degradedConnectors = connectedConnectors.filter((c) => c.status !== 'active' && c.status !== 'pending')
   const headline = (metrics.data?.metrics ?? []).filter(
     (metric) => metric.metric_key === 'delivery_frequency' || metric.metric_key === 'time_to_restore',
   )
@@ -58,7 +66,7 @@ export default function EngineeringOverview({ onNavigate }: { onNavigate: (view:
           {connectors.isError ? <div role="alert" className="inline-status error-panel">{connectors.error.message}</div> : null}
           {connectors.data ? (
             <>
-              <p>{connectorList.length} connected. {degradedConnectors.length > 0 ? `${degradedConnectors.length} need attention.` : 'All healthy.'}</p>
+              <p>{connectedConnectors.length} connected. {degradedConnectors.length > 0 ? `${degradedConnectors.length} need attention.` : 'All healthy.'}</p>
               <div className="work-actions">
                 <button type="button" onClick={() => onNavigate('connector-health')}>View connector health</button>
               </div>

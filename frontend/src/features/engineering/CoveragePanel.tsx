@@ -103,7 +103,7 @@ export default function CoveragePanel() {
 
       {loading ? <p role="status">Loading source coverage…</p> : null}
       {anyError ? <div role="alert" className="inline-status error-panel">{anyError instanceof Error ? anyError.message : 'Request failed.'}</div> : null}
-      {!loading && connectorList.length === 0 ? (
+      {!loading && !anyError && connectorList.length === 0 ? (
         <p className="empty-state">No connectors are configured yet -- connect one from Connector health to see coverage here.</p>
       ) : null}
 

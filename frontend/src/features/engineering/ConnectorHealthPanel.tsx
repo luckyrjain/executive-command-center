@@ -33,8 +33,13 @@ function errorMessage(error: unknown): string {
   if (error.code === 'CONNECTOR_PROVIDER_NOT_SUPPORTED') return 'This provider has no registered connector adapter.'
   if (error.code === 'CONNECTOR_ALREADY_CONNECTED') return 'This workspace already has a connector for this account.'
   if (error.code === 'CONNECTOR_AUTHORIZATION_FAILED') {
-    const detail = error.current as { reason?: string } | undefined
-    return `The provider rejected this credential${detail?.reason ? `: ${detail.reason}` : '.'}`
+    // The backend's own detail dict is `{"code": ..., "error": &lt;sanitized
+    // message&gt;}` (`create_connector_endpoint`'s `AdapterAuthorizationError`
+    // handler) -- `main.py`'s `_error_payload` strips only `code`/`message`
+    // out into `details`, so the real field name surviving onto `ApiError.
+    // current` is `error`, never `reason`.
+    const detail = error.current as { error?: string } | undefined
+    return `The provider rejected this credential${detail?.error ? `: ${detail.error}` : '.'}`
   }
   if (error.code === 'CONNECTOR_NOT_FOUND') return 'This connector no longer exists in this workspace.'
   if (error.code === 'CONNECTOR_DISCONNECTED') return 'This connector is already disconnected.'

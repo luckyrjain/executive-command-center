@@ -57,6 +57,13 @@ describe('ConnectorHealthPanel', () => {
     expect(await screen.findByText('No connectors are configured for this workspace yet.')).toBeTruthy()
   })
 
+  it('surfaces a connector-list load failure as an alert, not a silent empty list', async () => {
+    vi.stubGlobal('fetch', vi.fn(() => Promise.reject(new TypeError('fetch failed'))))
+    renderPanel()
+    expect(await screen.findByRole('alert', {}, { timeout: 3000 })).toBeTruthy()
+    expect(screen.queryByText('No connectors are configured for this workspace yet.')).toBeNull()
+  })
+
   // --- UX-STATES.md required degraded states -----------------------------
 
   it('shows "first sync" state for a pending connector with no sync history', async () => {
@@ -74,6 +81,28 @@ describe('ConnectorHealthPanel', () => {
     renderPanel()
     fireEvent.click(await screen.findByText(/Sync history/))
     expect(await screen.findByText(/in progress/)).toBeTruthy()
+  })
+
+  it('shows a partial sync run with its own status and no error alert (a rate-limit page-bound resume, not a failure)', async () => {
+    stubFetch(
+      [connector({ status: 'active' })],
+      [{ id: 'run-partial', connector_account_id: 'connector-1', run_type: 'incremental', status: 'partial', items_processed: 12, error_summary: null, started_at: '2026-07-27T00:00:00Z', completed_at: '2026-07-27T00:05:00Z' }],
+    )
+    renderPanel()
+    fireEvent.click(await screen.findByText(/Sync history/))
+    expect(await screen.findByText(/partial/)).toBeTruthy()
+    expect(screen.queryByRole('alert')).toBeNull()
+  })
+
+  it('shows a failed sync run with its real error_summary as an alert', async () => {
+    stubFetch(
+      [connector({ status: 'active' })],
+      [{ id: 'run-failed', connector_account_id: 'connector-1', run_type: 'backfill', status: 'failed', items_processed: 0, error_summary: 'GitHub returned 500 Internal Server Error', started_at: '2026-07-27T00:00:00Z', completed_at: '2026-07-27T00:01:00Z' }],
+    )
+    renderPanel()
+    fireEvent.click(await screen.findByText(/Sync history/))
+    expect(await screen.findByText(/failed/)).toBeTruthy()
+    expect(screen.getByRole('alert').textContent).toContain('GitHub returned 500 Internal Server Error')
   })
 
   it('shows partial-permissions state distinctly from a plain active connector', async () => {
@@ -139,9 +168,14 @@ describe('ConnectorHealthPanel', () => {
   })
 
   it('maps CONNECTOR_AUTHORIZATION_FAILED to a readable sentence, never the raw code', async () => {
+    // The real backend's detail dict is `{"code": ..., "error": <message>}`
+    // (`create_connector_endpoint`'s `AdapterAuthorizationError` handler),
+    // and `main.py`'s `_error_payload` strips only `code`/`message` into
+    // `details` -- so `error` (not `reason`) is the field name that
+    // actually survives onto the client's `ApiError.current`.
     const fetch = vi.fn((_input: RequestInfo | URL, init?: RequestInit) => {
       if ((init?.method ?? 'GET').toUpperCase() === 'POST') {
-        return response({ error: { code: 'CONNECTOR_AUTHORIZATION_FAILED', message: 'Connector Authorization Failed', details: { reason: 'bad token' } } }, 422)
+        return response({ error: { code: 'CONNECTOR_AUTHORIZATION_FAILED', message: 'Connector Authorization Failed', details: { error: 'bad token' } } }, 422)
       }
       return response({ connectors: [] })
     })

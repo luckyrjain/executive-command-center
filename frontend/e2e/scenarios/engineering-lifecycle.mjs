@@ -31,8 +31,15 @@ export async function run({ page, baseURL }) {
       decisions: [],
       metrics: [
         { id: 'm-delivery-frequency', metric_key: 'delivery_frequency', window_label: '30d', population: 0, numerator: null, denominator: null, value: null, details: null, coverage_status: 'insufficient_coverage', coverage_percentage: 0, coverage_gap_description: 'No deployments source is available yet', computed_at: iso() },
-        { id: 'm-review-latency', metric_key: 'review_latency', window_label: '30d', population: 6, numerator: 2.4, denominator: null, value: 2.4, details: null, coverage_status: 'partial', coverage_percentage: 62, coverage_gap_description: 'GitLab backfill 62% complete', computed_at: iso() },
-        { id: 'm-time-to-restore', metric_key: 'time_to_restore', window_label: '30d', population: 3, numerator: 3, denominator: null, value: 4.2, details: null, coverage_status: 'complete', coverage_percentage: 100, coverage_gap_description: null, computed_at: iso() },
+        // `numerator`/`denominator` are always `null` for these two metrics
+        // (`_compute_review_latency`/`_compute_time_to_restore`, backend/ecc/
+        // domains/engineering/metrics.py) -- `value` is a raw `.total_seconds()`
+        // median, never pre-converted to days, so these are real seconds
+        // figures (207360s = 2.4 days, 362880s = 4.2 days) matching what the
+        // real backend would actually produce, not the "already in days"
+        // shortcut the frontend's own display bug this fixture used to mask.
+        { id: 'm-review-latency', metric_key: 'review_latency', window_label: '30d', population: 6, numerator: null, denominator: null, value: 207360, details: null, coverage_status: 'partial', coverage_percentage: 62, coverage_gap_description: 'GitLab backfill 62% complete', computed_at: iso() },
+        { id: 'm-time-to-restore', metric_key: 'time_to_restore', window_label: '30d', population: 3, numerator: null, denominator: null, value: 362880, details: null, coverage_status: 'complete', coverage_percentage: 100, coverage_gap_description: null, computed_at: iso() },
       ],
     },
   })

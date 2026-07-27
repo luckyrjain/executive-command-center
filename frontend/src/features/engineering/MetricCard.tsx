@@ -7,11 +7,31 @@ function coverageClass(status: MetricSnapshot['coverage_status']): string {
   return 'inline-status'
 }
 
+// `value`'s own unit is metric-specific, read directly off `metrics.py`'s
+// own computation (never guessed): `_compute_time_to_restore`/`_compute_
+// review_latency` both store a raw `.total_seconds()` median with no
+// day conversion (confirmed against `_compute_time_to_restore`'s own
+// test asserting `value == timedelta(hours=4).total_seconds()`), unlike
+// `_compute_work_ageing`, which explicitly divides by 86400 into a
+// median AGE IN DAYS -- despite `work_ageing` and `blocked_work` sharing
+// this component's "open work item health" framing, their `value`
+// fields are not the same kind of number: `_compute_blocked_work`'s
+// `value` is `float(blocked_count)`, a plain count, while `work_ageing`'s
+// is a duration. `lead_time_for_changes` is not yet computed by any
+// function in this codebase (always `insufficient_coverage`), but its
+// design-doc definition ("commit-to-merge + merge-to-deploy duration")
+// is the same shape as `time_to_restore`/`review_latency`, so it is
+// grouped with them here rather than left to default to the wrong unit
+// once a future task makes it real.
+const SECONDS_METRICS = new Set(['time_to_restore', 'review_latency', 'lead_time_for_changes'])
+
 function formatValue(metric: MetricSnapshot): string {
   if (metric.value === null) return 'not yet available'
   if (metric.metric_key === 'change_failure_rate') return `${(metric.value * 100).toFixed(1)}%`
   if (metric.metric_key === 'delivery_frequency') return `${metric.value.toFixed(2)} / day`
-  if (metric.metric_key === 'blocked_work' || metric.metric_key === 'work_ageing') return `${metric.value.toFixed(0)} items`
+  if (metric.metric_key === 'blocked_work') return `${metric.value.toFixed(0)} items`
+  if (metric.metric_key === 'work_ageing') return `${metric.value.toFixed(1)} days`
+  if (SECONDS_METRICS.has(metric.metric_key)) return `${(metric.value / 86400).toFixed(1)} days`
   return `${metric.value.toFixed(1)} days`
 }
 

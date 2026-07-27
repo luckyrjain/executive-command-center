@@ -46,6 +46,13 @@ describe('IncidentsPanel', () => {
     expect(await screen.findByText('No incidents match this filter.')).toBeTruthy()
   })
 
+  it('surfaces a load failure as an alert, not a silent empty list', async () => {
+    vi.stubGlobal('fetch', vi.fn(() => Promise.reject(new TypeError('fetch failed'))))
+    renderPanel()
+    expect(await screen.findByRole('alert', {}, { timeout: 3000 })).toBeTruthy()
+    expect(screen.queryByText('No incidents match this filter.')).toBeNull()
+  })
+
   it('lists an open incident with a resolve action', async () => {
     vi.stubGlobal('fetch', vi.fn(() => response({ incidents: [incident()] })))
     renderPanel()
