@@ -470,7 +470,11 @@ def test_incremental_resync_refreshes_suggestion_without_touching_confirmed_team
                 "status, confidence, version, created_at, updated_at) "
                 "VALUES (:id, :workspace_id, 'team', 'Platform', 'active', 1.0, 1, :now, :now)"
             ),
-            {"id": confirmed_team_id, "workspace_id": seeded_account_context.workspace_id, "now": datetime.now(UTC)},
+            {
+                "id": confirmed_team_id,
+                "workspace_id": seeded_account_context.workspace_id,
+                "now": datetime.now(UTC),
+            },
         )
         connection.execute(
             text(
@@ -506,7 +510,8 @@ def test_incremental_resync_refreshes_suggestion_without_touching_confirmed_team
         with engine.begin() as connection:
             connection.execute(
                 text(
-                    "UPDATE repositories SET team_entity_id = NULL WHERE workspace_id = :workspace_id"
+                    "UPDATE repositories SET team_entity_id = NULL "
+                    "WHERE workspace_id = :workspace_id"
                 ),
                 {"workspace_id": seeded_account_context.workspace_id},
             )

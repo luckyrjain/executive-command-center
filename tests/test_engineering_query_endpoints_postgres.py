@@ -132,7 +132,9 @@ def _cleanup_workspace(workspace_id: UUID) -> None:
         )
 
 
-def _insert_team_entity(workspace_id: UUID, *, name: str = "Platform", status: str = "active") -> UUID:
+def _insert_team_entity(
+    workspace_id: UUID, *, name: str = "Platform", status: str = "active"
+) -> UUID:
     entity_id = uuid4()
     now = datetime.now(UTC)
     with engine.begin() as connection:
@@ -142,7 +144,13 @@ def _insert_team_entity(workspace_id: UUID, *, name: str = "Platform", status: s
                 "status, confidence, version, created_at, updated_at) "
                 "VALUES (:id, :workspace_id, 'team', :name, :status, 1.0, 1, :now, :now)"
             ),
-            {"id": entity_id, "workspace_id": workspace_id, "name": name, "status": status, "now": now},
+            {
+                "id": entity_id,
+                "workspace_id": workspace_id,
+                "name": name,
+                "status": status,
+                "now": now,
+            },
         )
     return entity_id
 
@@ -734,9 +742,7 @@ def test_list_work_items_filters_by_team_entity_id(
     _insert_work_item(workspace_id, account_id, title="assigned", team_entity_id=team_id)
     _insert_work_item(workspace_id, account_id, title="unassigned")
 
-    response = client.get(
-        "/api/v1/engineering/work-items", params={"team_entity_id": str(team_id)}
-    )
+    response = client.get("/api/v1/engineering/work-items", params={"team_entity_id": str(team_id)})
     assert response.status_code == 200, response.text
     titles = [item["title"] for item in response.json()["work_items"]]
     assert titles == ["assigned"]
@@ -772,7 +778,9 @@ def test_assign_repository_team_clears_with_null(
     assert token is not None
     account_id = _insert_connector_account(workspace_id, user_id)
     team_id = _insert_team_entity(workspace_id)
-    repository_id = _insert_repository(workspace_id, account_id, name="repo-a", team_entity_id=team_id)
+    repository_id = _insert_repository(
+        workspace_id, account_id, name="repo-a", team_entity_id=team_id
+    )
 
     response = client.post(
         f"/api/v1/engineering/repositories/{repository_id}/team",
