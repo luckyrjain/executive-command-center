@@ -2,7 +2,7 @@
 id: PHASE-006-DELIVERY-INTELLIGENCE
 title: Delivery Intelligence Contract
 status: Approved for Implementation
-version: 0.4.1
+version: 0.4.2
 owner: Lucky Jain
 ---
 
@@ -62,4 +62,4 @@ Jira's workflow statuses are fully customizable per project; there is no per-wor
 
 ## Accepted limitation (final Phase 6 review): `aggregation_scope` only ever produces `system` scope in this activation
 
-This document's own line above ("metrics aggregate at system/team/workstream level") describes the schema's full closed-enum capability, but no `Team`/`Workstream` entity exists anywhere in this codebase yet (`metrics.py`'s own module docstring, migration `0048_phase6_delivery_metrics.py`'s docstring) -- there is nothing for a `team`/`workstream`-scoped snapshot to scope by. `compute_and_store_metrics` always writes `aggregation_scope = 'system'`; the enum's other two values are a real, schema-level capability reserved for a future task that introduces those entities, not something obtainable today. This is the same kind of gap the accepted-limitation sections above already disclose for other fields (backfill-completion ledger, heuristic status classification) -- flagged here because a reader of this contract alone, without also reading `metrics.py`'s docstring, would otherwise believe team/workstream aggregation is available now.
+This document's own line above ("metrics aggregate at system/team/workstream level") describes the schema's full closed-enum capability, but `compute_and_store_metrics` always writes `aggregation_scope = 'system'` -- the enum's other two values remain unreachable today, not something obtainable now. `metrics.py`'s own module docstring said "no `Team`/`Workstream` entity exists anywhere in this codebase yet" as of the final Phase 6 review; that specific claim is now stale -- `"team"` was added to `EntityKind` (`backend/ecc/domains/knowledge/entities.py`, `docs/phases/phase-002/DATA-MODEL.md`) as a follow-up. What's still genuinely missing, and what actually blocks `team`-scoped snapshots: (1) no `Workstream` kind exists yet, and (2) even for `team`, nothing links a `repository`/`engineering_work_item`/`change`/`review` row to the team entity that owns it -- the entity exists, but this metrics engine has no way to know which rows belong to which team. Populating that linkage (and only then wiring `aggregation_scope` to actually produce `team` snapshots) is deliberately deferred to its own task. This is the same kind of gap the accepted-limitation sections above already disclose for other fields (backfill-completion ledger, heuristic status classification) -- flagged here because a reader of this contract alone would otherwise believe team/workstream aggregation is close to available, when the entity existing is only the first of at least two more steps.

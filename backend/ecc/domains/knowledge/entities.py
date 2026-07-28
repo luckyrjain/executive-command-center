@@ -26,7 +26,15 @@ from ecc.observability import (
 
 router = APIRouter(prefix="/api/v1/knowledge/entities", tags=["knowledge-entities"])
 
-EntityKind = Literal["person", "organization", "project", "topic", "decision", "document"]
+# "team" added to unblock team-scoped views in later phases (e.g. Phase 6
+# engineering ownership, team-scoped dashboards) -- entities_mutations.py/
+# resolution.py/entity_operations.py/claims.py are all kind-agnostic
+# already, so this Literal is the only code change needed for baseline
+# create/list/patch/dedup/merge support.
+# Populating team membership/ownership (which repo, work item, or dashboard
+# belongs to which team) is deliberately out of scope here -- see
+# `docs/phases/phase-002/DATA-MODEL.md`'s own entry for this addition.
+EntityKind = Literal["person", "organization", "project", "topic", "decision", "document", "team"]
 EntityStatus = Literal["active", "archived", "redirected"]
 SessionDep = Annotated[Session, Depends(get_session)]
 IdempotencyHeader = Annotated[
