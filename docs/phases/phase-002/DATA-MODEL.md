@@ -2,7 +2,7 @@
 id: PHASE-002-DATA-MODEL
 title: Phase 2 Knowledge Platform Data Model
 status: Approved for Implementation
-version: 0.6.0
+version: 0.7.0
 owner: Lucky Jain
 ---
 
@@ -20,7 +20,7 @@ Version 0.1.0 of this document proposed `knowledge_entities`, `relationships`, a
 
 | Record | Purpose | Required fields | Physical table |
 |---|---|---|---|
-| `knowledge_entities` | Canonical person, organization, project, topic, decision or document | id, workspace_id, kind, canonical_name, summary, status, version | `pkos_nodes`, extended with `status`, `confidence`, `version` (`node_type`/`canonical_name`/`attributes` already exist and map to `kind`/`canonical_name`/free-form fields; the originally-proposed `entity_id` column was dropped by migration `0020_phase2_drop_dead_entity_id.py` -- no shipped code path ever wrote a non-NULL value to it) |
+| `knowledge_entities` | Canonical person, organization, project, topic, decision, document or team | id, workspace_id, kind, canonical_name, summary, status, version | `pkos_nodes`, extended with `status`, `confidence`, `version` (`node_type`/`canonical_name`/`attributes` already exist and map to `kind`/`canonical_name`/free-form fields; the originally-proposed `entity_id` column was dropped by migration `0020_phase2_drop_dead_entity_id.py` -- no shipped code path ever wrote a non-NULL value to it). **`team` (added post-Phase-6)**: same shape as every other kind, `canonical_name`/`summary` only -- no team-specific `attributes` schema exists yet (no kind has one; `attributes` is freeform JSONB with only `{"summary": ...}` ever written by any kind today), and no cross-domain linkage (e.g. from `repositories`/`engineering_work_items`) exists yet either. `resolution.py`/`entity_operations.py`/`claims.py` needed zero changes -- both are fully kind-agnostic already. |
 | `entity_aliases` | Names and external identifiers | entity_id, alias_type, normalized_value, source_id, confidence | new table, `entity_id` FK to `pkos_nodes`. **Accepted gap**: no shipped endpoint ever inserts a row here -- `GET /entities/{id}/aliases` (list) is the only HTTP surface, merge's `_rehome_aliases` only moves existing rows between entities, and resolution scoring's alias-overlap factor and retrieval's exact-alias-match tier both read the table but nothing writes to it outside test fixtures. In a real deployment this table stays permanently empty and those read paths are dead code in practice. Building the write path (an "attach an alias/external identifier" endpoint) is a real feature addition, not a completeness-audit bug fix, and is intentionally out of scope for this fix pass; see `IMPLEMENTATION-STATUS.md` for tracking. |
 | `knowledge_claims` | Atomic attributable facts | subject_id, predicate, value_json, source_id, confidence, valid_from, valid_to, superseded_by | new table, `subject_id` FK to `pkos_nodes` |
 | `relationships` | Typed directed connection | from_entity_id, relationship_type, to_entity_id, evidence_id, confidence, valid interval | `pkos_edges`, extended with `confidence`, `evidence_id`, `valid_from`, `valid_to`, `status` (`source_node_id`/`target_node_id`/`edge_type`/`attributes` already exist and map to `from_entity_id`/`to_entity_id`/`relationship_type`/free-form fields) |

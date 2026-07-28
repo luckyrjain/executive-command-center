@@ -101,9 +101,14 @@ this metric is the worse of the `change`/`review` sync cursors'
 individual coverage (`_worse_coverage`), since the population genuinely
 depends on both being current.
 
-**`aggregation_scope` is always `'system'`.** No `Team`/`Workstream`
-entity exists anywhere in this codebase yet -- see migration
-`0048_phase6_delivery_metrics.py`'s own docstring.
+**`aggregation_scope` is always `'system'`.** A `"team"` `EntityKind` now
+exists (`ecc.domains.knowledge.entities`), but nothing here reads it --
+no `repository`/`engineering_work_item`/`change`/`review` row is linked
+to the team entity that owns it, so this engine has no way to know which
+rows to group into a `team`-scoped snapshot even though the entity to
+scope by finally exists. `Workstream` still has no entity at all. See
+`docs/phases/phase-006/DELIVERY-INTELLIGENCE-CONTRACT.md`'s matching
+accepted-limitation section.
 
 **Snapshots are insert-only.** `compute_and_store_metrics` never updates
 or deletes an existing `delivery_metric_snapshots` row -- each call

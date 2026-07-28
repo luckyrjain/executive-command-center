@@ -1,4 +1,4 @@
-export type EntityKind = 'person' | 'organization' | 'project' | 'topic' | 'decision' | 'document'
+export type EntityKind = 'person' | 'organization' | 'project' | 'topic' | 'decision' | 'document' | 'team'
 export type EntityStatus = 'active' | 'archived' | 'redirected'
 
 export type KnowledgeEntity = {

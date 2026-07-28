@@ -311,6 +311,46 @@ def test_entity_lifecycle_is_transactional_and_workspace_scoped(
     assert "knowledge_entity.restored.v1" in outbox_types
 
 
+def test_entity_create_and_filter_supports_team_kind(
+    knowledge_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    """`team` was added to `EntityKind` to unblock team-scoped views in
+    later phases (e.g. Phase 6 engineering ownership, team-scoped
+    dashboards) -- `entities.py`/`resolution.py`/`entity_operations.py`/
+    `claims.py` are all kind-agnostic, so the only real code surface this
+    addition touches is the `Literal` itself, validated by Pydantic. This
+    proves the new kind round-trips end to end (create, get, list-filter),
+    not just that the type-checker accepts it as a literal value.
+    """
+    client, _workspace_id, _user_id, token = knowledge_test_context
+
+    create = client.post(
+        "/api/v1/knowledge/entities",
+        headers=_headers(token, "create-team"),
+        json={"kind": "team", "canonical_name": "Platform Engineering"},
+    )
+    assert create.status_code == 201, create.text
+    created = create.json()
+    assert created["kind"] == "team"
+    assert created["canonical_name"] == "Platform Engineering"
+
+    fetched = client.get(
+        f"/api/v1/knowledge/entities/{created['id']}", headers=_headers(token, "get-team")
+    )
+    assert fetched.status_code == 200
+    assert fetched.json()["kind"] == "team"
+
+    filtered = client.get(
+        "/api/v1/knowledge/entities",
+        params={"kind": "team"},
+        headers=_headers(token, "list-team"),
+    )
+    assert filtered.status_code == 200
+    ids = {item["id"] for item in filtered.json()["items"]}
+    assert created["id"] in ids
+    assert all(item["kind"] == "team" for item in filtered.json()["items"])
+
+
 def test_entity_create_requires_kind_and_canonical_name(
     knowledge_test_context: tuple[TestClient, UUID, UUID, str],
 ) -> None:

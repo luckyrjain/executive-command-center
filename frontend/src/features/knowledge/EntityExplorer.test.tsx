@@ -96,6 +96,30 @@ describe('EntityExplorer', () => {
     expect(payload).toEqual({ kind: 'person', canonical_name: 'Grace Hopper', summary: null })
   })
 
+  it('offers "team" as a selectable kind and creates one', async () => {
+    const created = { ...personEntity, id: 'entity-team', kind: 'team', canonical_name: 'Platform Engineering' }
+    const fetch = routedFetch([
+      { method: 'GET', match: (path) => path === '/api/v1/knowledge/entities', handle: () => jsonResponse({ items: [], next_cursor: null }) },
+      { method: 'POST', match: (path) => path === '/api/v1/knowledge/entities', handle: () => jsonResponse(created, 201) },
+      { method: 'GET', match: (path) => path === `/api/v1/knowledge/entities/${created.id}`, handle: () => jsonResponse(created) },
+      { method: 'GET', match: (path) => path === `/api/v1/knowledge/entities/${created.id}/aliases`, handle: () => jsonResponse({ items: [] }) },
+      { method: 'GET', match: (path) => path === `/api/v1/knowledge/entities/${created.id}/claims`, handle: () => jsonResponse({ items: [] }) },
+      { method: 'GET', match: (path) => path === `/api/v1/knowledge/entities/${created.id}/relationships`, handle: () => jsonResponse({ items: [] }) },
+      { method: 'GET', match: (path) => path === `/api/v1/knowledge/entities/${created.id}/timeline`, handle: () => jsonResponse({ items: [], next_cursor: null }) },
+    ])
+    vi.stubGlobal('fetch', fetch)
+    renderExplorer()
+
+    fireEvent.change(screen.getByLabelText('Entity kind'), { target: { value: 'team' } })
+    fireEvent.change(screen.getByLabelText('Canonical name'), { target: { value: 'Platform Engineering' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Create entity' }))
+
+    await screen.findByText('Platform Engineering')
+    const createCall = fetch.mock.calls.find(([, init]) => init?.method === 'POST')
+    const payload = JSON.parse(String(createCall?.[1]?.body))
+    expect(payload).toEqual({ kind: 'team', canonical_name: 'Platform Engineering', summary: null })
+  })
+
   it('searches and opens entity detail from a result', async () => {
     const fetch = routedFetch([
       { method: 'GET', match: (path) => path === '/api/v1/knowledge/entities', handle: () => jsonResponse({ items: [], next_cursor: null }) },

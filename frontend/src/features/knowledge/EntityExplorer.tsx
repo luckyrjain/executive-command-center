@@ -5,7 +5,7 @@ import { apiRequest } from '../../api/client'
 import EntityDetail from './EntityDetail'
 import type { EntityKind, EntityList, KnowledgeEntity, RetrievalResponse } from './types'
 
-const ENTITY_KINDS: EntityKind[] = ['person', 'organization', 'project', 'topic', 'decision', 'document']
+const ENTITY_KINDS: EntityKind[] = ['person', 'organization', 'project', 'topic', 'decision', 'document', 'team']
 
 type CreateDraft = { kind: EntityKind; canonicalName: string; summary: string }
 
