@@ -1,7 +1,8 @@
-import { useQuery } from '@tanstack/react-query'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
 import { apiRequest } from '../../api/client'
-import type { Repository, RepositoryListResponse } from './types'
+import type { EntityList } from '../knowledge/types'
+import type { Repository, RepositoryListResponse, TeamAssignmentRequest } from './types'
 
 function badgeClass(state: Repository['permission_state'] | Repository['freshness_state']): string {
   if (state === 'permission_lost' || state === 'deleted' || state === 'disconnected') return 'inline-status error-panel'
@@ -13,7 +14,60 @@ function timestamp(value: string | null): string {
   return value ? new Date(value).toLocaleString() : 'unknown'
 }
 
-function RepositoryRow({ repository }: { repository: Repository }) {
+function listTeams(): Promise<EntityList> {
+  return apiRequest('/api/v1/knowledge/entities?kind=team&limit=100')
+}
+
+function assignTeam(repositoryId: string, teamEntityId: string | null): Promise<Repository> {
+  const body: TeamAssignmentRequest = { team_entity_id: teamEntityId }
+  return apiRequest(`/api/v1/engineering/repositories/${repositoryId}/team`, { method: 'POST', body })
+}
+
+/**
+ * `POST /api/v1/engineering/repositories/{id}/team` -- the "human confirms"
+ * half of migration `0050_phase6_team_linkage.py`'s hybrid design.
+ * `suggested_team_name` (refreshed by the owning connector adapter on every
+ * sync) is shown as a hint only, never auto-applied -- a select bound to
+ * `team_entity_id` is the only thing that writes the confirmed link,
+ * populated from the same team entities `frontend/src/features/knowledge/
+ * EntityExplorer.tsx` already lets a user create (`kind: 'team'`).
+ */
+function TeamAssignment({
+  repository,
+  teamsById,
+}: {
+  repository: Repository
+  teamsById: Map<string, string>
+}) {
+  const queryClient = useQueryClient()
+  const mutation = useMutation({
+    mutationFn: (teamEntityId: string | null) => assignTeam(repository.id, teamEntityId),
+    onSuccess: () => { void queryClient.invalidateQueries({ queryKey: ['engineering', 'repositories'] }) },
+  })
+
+  return (
+    <div className="work-actions">
+      <label>
+        {`Team for ${repository.name}`}
+        <select
+          aria-label={`Team for ${repository.name}`}
+          value={repository.team_entity_id ?? ''}
+          disabled={mutation.isPending}
+          onChange={(event) => mutation.mutate(event.target.value === '' ? null : event.target.value)}
+        >
+          <option value="">Unassigned</option>
+          {[...teamsById.entries()].map(([id, name]) => <option key={id} value={id}>{name}</option>)}
+        </select>
+      </label>
+      {!repository.team_entity_id && repository.suggested_team_name ? (
+        <small>suggested: {repository.suggested_team_name}</small>
+      ) : null}
+      {mutation.isError ? <span role="alert" className="inline-status error-panel">{mutation.error.message}</span> : null}
+    </div>
+  )
+}
+
+function RepositoryRow({ repository, teamsById }: { repository: Repository; teamsById: Map<string, string> }) {
   return (
     <li>
       <div>
@@ -28,6 +82,7 @@ function RepositoryRow({ repository }: { repository: Repository }) {
           {repository.freshness_state === 'fresh' ? 'fresh' : repository.freshness_state}
         </span>
       </div>
+      <TeamAssignment repository={repository} teamsById={teamsById} />
       <a href={repository.source_url} target="_blank" rel="noreferrer">View on {repository.provider}</a>
     </li>
   )
@@ -48,8 +103,10 @@ export default function RepositoriesPanel() {
     queryFn: () => apiRequest<RepositoryListResponse>('/api/v1/engineering/repositories'),
     retry: 1,
   })
+  const teamsQuery = useQuery({ queryKey: ['knowledge', 'entities', 'team'], queryFn: listTeams, retry: 1 })
 
   const repositories = query.data?.repositories ?? []
+  const teamsById = new Map((teamsQuery.data?.items ?? []).map((entity) => [entity.id, entity.canonical_name]))
 
   return (
     <section className="work-panel" aria-labelledby="engineering-repositories-title">
@@ -63,7 +120,9 @@ export default function RepositoriesPanel() {
       ) : null}
 
       <ul className="work-list">
-        {repositories.map((repository) => <RepositoryRow key={repository.id} repository={repository} />)}
+        {repositories.map((repository) => (
+          <RepositoryRow key={repository.id} repository={repository} teamsById={teamsById} />
+        ))}
       </ul>
     </section>
   )

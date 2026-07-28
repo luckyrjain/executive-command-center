@@ -207,11 +207,13 @@ def _upsert_repository(
                 INSERT INTO repositories (
                     id, workspace_id, connector_account_id, provider, external_id,
                     name, source_url, default_branch, permission_state, freshness_state,
-                    content_hash, provider_updated_at, observed_at, created_at, updated_at
+                    content_hash, provider_updated_at, observed_at, created_at, updated_at,
+                    suggested_team_name
                 ) VALUES (
                     :id, :workspace_id, :connector_account_id, :provider, :external_id,
                     :name, :source_url, :default_branch, 'active', 'fresh',
-                    :content_hash, :provider_updated_at, :now, :now, :now
+                    :content_hash, :provider_updated_at, :now, :now, :now,
+                    :suggested_team_name
                 )
                 ON CONFLICT (workspace_id, connector_account_id, external_id) DO UPDATE SET
                     name = EXCLUDED.name,
@@ -222,7 +224,8 @@ def _upsert_repository(
                     content_hash = EXCLUDED.content_hash,
                     provider_updated_at = EXCLUDED.provider_updated_at,
                     observed_at = EXCLUDED.observed_at,
-                    updated_at = EXCLUDED.updated_at
+                    updated_at = EXCLUDED.updated_at,
+                    suggested_team_name = EXCLUDED.suggested_team_name
                 """
             ),
             {
@@ -237,6 +240,13 @@ def _upsert_repository(
                 "content_hash": _content_hash(repo),
                 "provider_updated_at": provider_updated_at,
                 "now": now,
+                # GitHub's own `owner.login` -- the org or user this repository
+                # belongs to -- is the closest real signal to "which team owns
+                # this" the repository-list/webhook payload carries. A hint
+                # only, never written to `team_entity_id` (see migration
+                # `0050_phase6_team_linkage.py`'s own docstring for why this
+                # column is sync-writable but the FK column is not).
+                "suggested_team_name": (repo.get("owner") or {}).get("login"),
             },
         )
         session.commit()

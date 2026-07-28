@@ -2,7 +2,7 @@
 id: PHASE-006-API-SCHEMAS
 title: Phase 6 Engineering Workspace API
 status: Approved for Implementation
-version: 0.6.1
+version: 0.7.0
 owner: Lucky Jain
 ---
 
@@ -14,7 +14,9 @@ POST /engineering/connectors/{id}/sync|disable
 GET /engineering/sync-runs
 GET /engineering/overview
 GET /engineering/repositories
+POST /engineering/repositories/{id}/team
 GET /engineering/work-items
+POST /engineering/work-items/{id}/team
 GET /engineering/changes
 GET /engineering/deployments
 GET|POST /engineering/incidents
@@ -33,5 +35,7 @@ GET /engineering/metrics
 **Task 7 status**: no new route -- this doc's own closing line ("Optional mutations route through approved automation policies") is exactly this task's own shape: three write actions (`github.add_issue_comment`, `gitlab.add_note`, `jira.add_comment`) registered as `ecc.domains.automation.adapters.ActionAdapter`s (`ecc.domains.engineering.write_actions`), reachable only through a workflow's own `action_ref` and Phase 5's existing `POST /automations/workflows`/`POST /automations/runs`/`POST /automations/approvals/{id}/approve` surface -- no second authority mechanism, no new HTTP endpoint. See that module's own docstring for the scope (one action concept -- add a comment to an existing issue/PR/MR -- across all three providers), containment, and retry-safety reasoning.
 
 **Task 8 status**: `GET /engineering/repositories` and `GET /engineering/work-items` are now implemented (`ecc.domains.engineering.connector_accounts.list_repositories_endpoint`/`list_work_items_endpoint`) -- real, disclosed additions beyond this task's own plan-doc scope ("Executive UX and browser acceptance"), matching the identical "add the query endpoint the UX genuinely needs" precedent Tasks 5-7 each already set once. Neither table lacked data (`repositories` since Task 2, `engineering_work_items` since Task 4) -- only a query surface, which the Repositories and Source Coverage frontend views have nothing to read without. `GET /engineering/changes`, `GET /engineering/deployments`, and `GET /engineering/overview` remain unimplemented query surfaces: `changes`/`deployments` have no frontend consumer in this task's own eight required views (Repository/Incident/Decision detail views reference `change_ids` as opaque UUIDs, never a `changes` list), and "overview" is served entirely client-side by composing the connectors/incidents/decisions/metrics responses already returned by existing endpoints, needing no dedicated aggregate route of its own.
+
+**Team linkage status (migration `0050_phase6_team_linkage.py`)**: `POST /engineering/repositories/{id}/team` and `POST /engineering/work-items/{id}/team` (`assign_repository_team_endpoint`/`assign_work_item_team_endpoint`) are new -- the "human confirms" half of a hybrid auto-suggest design (`docs/phases/phase-002/DATA-MODEL.md`'s "team" entry, `CONNECTOR-CONTRACT.md`'s new "Team linkage status" section). Body: `{"team_entity_id": "<uuid>" | null}` -- a UUID must reference a real, active, `kind="team"` `pkos_nodes` row in the caller's own workspace (404 `TEAM_ENTITY_NOT_FOUND` / 422 `TEAM_ENTITY_KIND_MISMATCH` otherwise); `null` clears an existing assignment. No `Idempotency-Key` header -- unlike `POST /connectors` or `POST /connectors/{id}/sync` (real `INSERT`s an exactly-once retry contract matters for), this is a plain `UPDATE` of one column to a caller-supplied value, already idempotent by construction. Both `GET /engineering/repositories` and `GET /engineering/work-items` also gained an optional `team_entity_id` query filter, and both response bodies gained `team_entity_id`/`suggested_team_name` fields.
 
 Connector creation returns required scopes and authorization state, never token values. Queries expose source coverage, freshness, definitions and evidence. Optional mutations route through approved automation policies. Signed cursors, isolation, redaction, idempotency and concurrency rules apply.

@@ -130,7 +130,7 @@ _PAGE_SIZE = 100
 # py`/`gitlab_adapter.py`'s own `_MAX_PAGES_PER_CALL`.
 _MAX_PAGES_PER_CALL = 10
 _RATE_LIMIT_MAX_WAIT_SECONDS = 5.0
-_SEARCH_FIELDS = "summary,issuetype,status,reporter,assignee,created,updated"
+_SEARCH_FIELDS = "summary,issuetype,status,reporter,assignee,created,updated,project"
 
 
 class _InvalidCredentialError(Exception):
@@ -225,6 +225,7 @@ def _upsert_work_item(
     issuetype = fields.get("issuetype") or {}
     reporter = fields.get("reporter") or {}
     assignee = fields.get("assignee") or {}
+    project = fields.get("project") or {}
     key = issue.get("key") or str(issue["id"])
     with SessionFactory() as session:
         session.execute(
@@ -235,13 +236,13 @@ def _upsert_work_item(
                     title, source_url, item_type, status, reporter_external_id,
                     assignee_external_id, permission_state, freshness_state,
                     content_hash, provider_created_at, provider_updated_at,
-                    observed_at, created_at, updated_at
+                    observed_at, created_at, updated_at, suggested_team_name
                 ) VALUES (
                     :id, :workspace_id, :connector_account_id, :provider, :external_id,
                     :title, :source_url, :item_type, :status, :reporter_external_id,
                     :assignee_external_id, 'active', 'fresh',
                     :content_hash, :provider_created_at, :provider_updated_at,
-                    :now, :now, :now
+                    :now, :now, :now, :suggested_team_name
                 )
                 ON CONFLICT (workspace_id, connector_account_id, external_id) DO UPDATE SET
                     title = EXCLUDED.title,
@@ -256,7 +257,8 @@ def _upsert_work_item(
                     provider_created_at = EXCLUDED.provider_created_at,
                     provider_updated_at = EXCLUDED.provider_updated_at,
                     observed_at = EXCLUDED.observed_at,
-                    updated_at = EXCLUDED.updated_at
+                    updated_at = EXCLUDED.updated_at,
+                    suggested_team_name = EXCLUDED.suggested_team_name
                 """
             ),
             {
@@ -275,6 +277,13 @@ def _upsert_work_item(
                 "provider_created_at": fields.get("created"),
                 "provider_updated_at": fields.get("updated"),
                 "now": now,
+                # Jira has no native "team" construct at all -- the issue's
+                # own `project.name` is the closest real signal available
+                # (an explicit heuristic, not a claim that a Jira project
+                # *is* a team; see migration `0050_phase6_team_linkage.py`'s
+                # own docstring and `CONNECTOR-CONTRACT.md`'s updated
+                # per-provider suggestion note).
+                "suggested_team_name": project.get("name"),
             },
         )
         session.commit()

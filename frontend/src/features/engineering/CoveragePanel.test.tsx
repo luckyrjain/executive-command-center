@@ -45,6 +45,8 @@ function repository(overrides: Partial<Repository> = {}): Repository {
     observed_at: '2026-07-26T00:00:00Z',
     created_at: '2026-07-01T00:00:00Z',
     updated_at: '2026-07-26T00:00:00Z',
+    team_entity_id: null,
+    suggested_team_name: null,
     ...overrides,
   }
 }
@@ -67,6 +69,8 @@ function workItem(overrides: Partial<WorkItem> = {}): WorkItem {
     observed_at: '2026-07-26T00:00:00Z',
     created_at: '2026-07-01T00:00:00Z',
     updated_at: '2026-07-26T00:00:00Z',
+    team_entity_id: null,
+    suggested_team_name: null,
     ...overrides,
   }
 }

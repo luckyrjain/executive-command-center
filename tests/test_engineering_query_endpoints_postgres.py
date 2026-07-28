@@ -106,10 +106,17 @@ def query_endpoints_test_context() -> Iterator[tuple[TestClient, UUID, UUID]]:
 
 def _cleanup_workspace(workspace_id: UUID) -> None:
     with engine.begin() as connection:
+        # `repositories`/`engineering_work_items` are deleted before
+        # `pkos_nodes` even though their `team_entity_id` FK is nullable --
+        # tidiness, not a hard ordering requirement (a `NULL`-valued FK row
+        # is never a blocker), but keeping every referencing row gone
+        # before its referenced `pkos_nodes` row avoids depending on that
+        # nullability by coincidence.
         for table in (
             "engineering_work_items",
             "repositories",
             "connector_accounts",
+            "pkos_nodes",
             "event_outbox",
             "audit_events",
             "idempotency_records",
@@ -123,6 +130,21 @@ def _cleanup_workspace(workspace_id: UUID) -> None:
         connection.execute(
             text("DELETE FROM workspaces WHERE id = :workspace_id"), {"workspace_id": workspace_id}
         )
+
+
+def _insert_team_entity(workspace_id: UUID, *, name: str = "Platform", status: str = "active") -> UUID:
+    entity_id = uuid4()
+    now = datetime.now(UTC)
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO pkos_nodes (id, workspace_id, node_type, canonical_name, "
+                "status, confidence, version, created_at, updated_at) "
+                "VALUES (:id, :workspace_id, 'team', :name, :status, 1.0, 1, :now, :now)"
+            ),
+            {"id": entity_id, "workspace_id": workspace_id, "name": name, "status": status, "now": now},
+        )
+    return entity_id
 
 
 def _insert_connector_account(
@@ -164,6 +186,8 @@ def _insert_repository(
     name: str,
     permission_state: str = "active",
     freshness_state: str = "fresh",
+    team_entity_id: UUID | None = None,
+    suggested_team_name: str | None = None,
 ) -> UUID:
     repository_id = uuid4()
     now = datetime.now(UTC)
@@ -174,10 +198,11 @@ def _insert_repository(
                 INSERT INTO repositories (
                     id, workspace_id, connector_account_id, provider, external_id,
                     name, source_url, default_branch, permission_state, freshness_state,
-                    observed_at, created_at, updated_at
+                    observed_at, created_at, updated_at, team_entity_id, suggested_team_name
                 ) VALUES (
                     :id, :ws, :acct, 'github', :ext, :name, 'https://x', 'main',
-                    :permission_state, :freshness_state, :now, :now, :now
+                    :permission_state, :freshness_state, :now, :now, :now,
+                    :team_entity_id, :suggested_team_name
                 )
                 """
             ),
@@ -190,6 +215,8 @@ def _insert_repository(
                 "permission_state": permission_state,
                 "freshness_state": freshness_state,
                 "now": now,
+                "team_entity_id": team_entity_id,
+                "suggested_team_name": suggested_team_name,
             },
         )
     return repository_id
@@ -203,6 +230,8 @@ def _insert_work_item(
     status: str | None = "To Do",
     reporter_external_id: str | None = "reporter-raw-123",
     assignee_external_id: str | None = "assignee-raw-456",
+    team_entity_id: UUID | None = None,
+    suggested_team_name: str | None = None,
 ) -> UUID:
     work_item_id = uuid4()
     now = datetime.now(UTC)
@@ -214,10 +243,11 @@ def _insert_work_item(
                     id, workspace_id, connector_account_id, provider, external_id,
                     title, source_url, item_type, status, reporter_external_id,
                     assignee_external_id, permission_state, freshness_state,
-                    observed_at, created_at, updated_at
+                    observed_at, created_at, updated_at, team_entity_id, suggested_team_name
                 ) VALUES (
                     :id, :ws, :acct, 'jira', :ext, :title, 'https://x', 'Bug', :status,
-                    :reporter, :assignee, 'active', 'fresh', :now, :now, :now
+                    :reporter, :assignee, 'active', 'fresh', :now, :now, :now,
+                    :team_entity_id, :suggested_team_name
                 )
                 """
             ),
@@ -231,6 +261,8 @@ def _insert_work_item(
                 "reporter": reporter_external_id,
                 "assignee": assignee_external_id,
                 "now": now,
+                "team_entity_id": team_entity_id,
+                "suggested_team_name": suggested_team_name,
             },
         )
     return work_item_id
@@ -643,3 +675,262 @@ def test_disable_marks_changes_and_reviews_disconnected(
         ).scalar_one()
     assert change_state == "disconnected"
     assert review_state == "disconnected"
+
+
+# --- team linkage (migration `0050_phase6_team_linkage.py`) ---------------
+#
+# "hybrid: auto-suggest, human confirms": `suggested_team_name` is exercised
+# by the adapter-level tests (`test_engineering_github_sync_postgres.py`
+# et al) since only a sync call populates it; this section covers the
+# "human confirms" half -- `POST .../repositories/{id}/team` and `POST
+# .../work-items/{id}/team` -- plus both list endpoints' new
+# `team_entity_id` filter.
+
+
+def test_list_repositories_exposes_team_fields(
+    query_endpoints_test_context: tuple[TestClient, UUID, UUID],
+) -> None:
+    client, workspace_id, user_id = query_endpoints_test_context
+    account_id = _insert_connector_account(workspace_id, user_id)
+    team_id = _insert_team_entity(workspace_id)
+    _insert_repository(
+        workspace_id,
+        account_id,
+        name="repo-a",
+        team_entity_id=team_id,
+        suggested_team_name="acme",
+    )
+
+    response = client.get("/api/v1/engineering/repositories")
+    assert response.status_code == 200, response.text
+    repo = response.json()["repositories"][0]
+    assert repo["team_entity_id"] == str(team_id)
+    assert repo["suggested_team_name"] == "acme"
+
+
+def test_list_repositories_filters_by_team_entity_id(
+    query_endpoints_test_context: tuple[TestClient, UUID, UUID],
+) -> None:
+    client, workspace_id, user_id = query_endpoints_test_context
+    account_id = _insert_connector_account(workspace_id, user_id)
+    team_id = _insert_team_entity(workspace_id)
+    _insert_repository(workspace_id, account_id, name="assigned", team_entity_id=team_id)
+    _insert_repository(workspace_id, account_id, name="unassigned")
+
+    response = client.get(
+        "/api/v1/engineering/repositories", params={"team_entity_id": str(team_id)}
+    )
+    assert response.status_code == 200, response.text
+    names = [repo["name"] for repo in response.json()["repositories"]]
+    assert names == ["assigned"]
+
+
+def test_list_work_items_filters_by_team_entity_id(
+    query_endpoints_test_context: tuple[TestClient, UUID, UUID],
+) -> None:
+    client, workspace_id, user_id = query_endpoints_test_context
+    account_id = _insert_connector_account(workspace_id, user_id, provider="jira", credential="tok")
+    team_id = _insert_team_entity(workspace_id)
+    _insert_work_item(workspace_id, account_id, title="assigned", team_entity_id=team_id)
+    _insert_work_item(workspace_id, account_id, title="unassigned")
+
+    response = client.get(
+        "/api/v1/engineering/work-items", params={"team_entity_id": str(team_id)}
+    )
+    assert response.status_code == 200, response.text
+    titles = [item["title"] for item in response.json()["work_items"]]
+    assert titles == ["assigned"]
+
+
+def test_assign_repository_team_sets_confirmed_link(
+    query_endpoints_test_context: tuple[TestClient, UUID, UUID],
+) -> None:
+    client, workspace_id, user_id = query_endpoints_test_context
+    token = client.cookies.get("ecc_session")
+    assert token is not None
+    account_id = _insert_connector_account(workspace_id, user_id)
+    repository_id = _insert_repository(workspace_id, account_id, name="repo-a")
+    team_id = _insert_team_entity(workspace_id)
+
+    response = client.post(
+        f"/api/v1/engineering/repositories/{repository_id}/team",
+        json={"team_entity_id": str(team_id)},
+        headers=_headers(token),
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["team_entity_id"] == str(team_id)
+
+    listed = client.get("/api/v1/engineering/repositories")
+    assert listed.json()["repositories"][0]["team_entity_id"] == str(team_id)
+
+
+def test_assign_repository_team_clears_with_null(
+    query_endpoints_test_context: tuple[TestClient, UUID, UUID],
+) -> None:
+    client, workspace_id, user_id = query_endpoints_test_context
+    token = client.cookies.get("ecc_session")
+    assert token is not None
+    account_id = _insert_connector_account(workspace_id, user_id)
+    team_id = _insert_team_entity(workspace_id)
+    repository_id = _insert_repository(workspace_id, account_id, name="repo-a", team_entity_id=team_id)
+
+    response = client.post(
+        f"/api/v1/engineering/repositories/{repository_id}/team",
+        json={"team_entity_id": None},
+        headers=_headers(token),
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["team_entity_id"] is None
+
+
+def test_assign_repository_team_404_for_unknown_repository(
+    query_endpoints_test_context: tuple[TestClient, UUID, UUID],
+) -> None:
+    client, workspace_id, _user_id = query_endpoints_test_context
+    token = client.cookies.get("ecc_session")
+    assert token is not None
+    team_id = _insert_team_entity(workspace_id)
+
+    response = client.post(
+        f"/api/v1/engineering/repositories/{uuid4()}/team",
+        json={"team_entity_id": str(team_id)},
+        headers=_headers(token),
+    )
+    assert response.status_code == 404
+    assert response.json()["error"]["code"] == "REPOSITORY_NOT_FOUND"
+
+
+def test_assign_repository_team_404_for_unknown_team_entity(
+    query_endpoints_test_context: tuple[TestClient, UUID, UUID],
+) -> None:
+    client, workspace_id, user_id = query_endpoints_test_context
+    token = client.cookies.get("ecc_session")
+    assert token is not None
+    account_id = _insert_connector_account(workspace_id, user_id)
+    repository_id = _insert_repository(workspace_id, account_id, name="repo-a")
+
+    response = client.post(
+        f"/api/v1/engineering/repositories/{repository_id}/team",
+        json={"team_entity_id": str(uuid4())},
+        headers=_headers(token),
+    )
+    assert response.status_code == 404
+    assert response.json()["error"]["code"] == "TEAM_ENTITY_NOT_FOUND"
+
+
+def test_assign_repository_team_422_for_wrong_entity_kind(
+    query_endpoints_test_context: tuple[TestClient, UUID, UUID],
+) -> None:
+    """The confirmed link must reference a real `kind="team"` entity, not
+    any `pkos_nodes` row -- e.g. confirming a same-named `organization`
+    entity by mistake (the exact real-world name-collision risk
+    `docs/phases/phase-002/DATA-MODEL.md`'s own disclosed gap already
+    names for `team` vs. `organization`/`project`).
+    """
+    client, workspace_id, user_id = query_endpoints_test_context
+    token = client.cookies.get("ecc_session")
+    assert token is not None
+    account_id = _insert_connector_account(workspace_id, user_id)
+    repository_id = _insert_repository(workspace_id, account_id, name="repo-a")
+    wrong_kind_entity = _insert_team_entity(workspace_id, name="Acme")
+    with engine.begin() as connection:
+        connection.execute(
+            text("UPDATE pkos_nodes SET node_type = 'organization' WHERE id = :id"),
+            {"id": wrong_kind_entity},
+        )
+
+    response = client.post(
+        f"/api/v1/engineering/repositories/{repository_id}/team",
+        json={"team_entity_id": str(wrong_kind_entity)},
+        headers=_headers(token),
+    )
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "TEAM_ENTITY_KIND_MISMATCH"
+
+
+def test_assign_repository_team_rejects_cross_workspace_entity(
+    query_endpoints_test_context: tuple[TestClient, UUID, UUID],
+) -> None:
+    client, workspace_id, user_id = query_endpoints_test_context
+    token = client.cookies.get("ecc_session")
+    assert token is not None
+    account_id = _insert_connector_account(workspace_id, user_id)
+    repository_id = _insert_repository(workspace_id, account_id, name="repo-a")
+
+    other_workspace_id = uuid4()
+    now = datetime.now(UTC)
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO workspaces (id, name, timezone, created_at) "
+                "VALUES (:id, 'Other', 'UTC', :now)"
+            ),
+            {"id": other_workspace_id, "now": now},
+        )
+    try:
+        other_team_id = _insert_team_entity(other_workspace_id)
+        response = client.post(
+            f"/api/v1/engineering/repositories/{repository_id}/team",
+            json={"team_entity_id": str(other_team_id)},
+            headers=_headers(token),
+        )
+        assert response.status_code == 404
+        assert response.json()["error"]["code"] == "TEAM_ENTITY_NOT_FOUND"
+    finally:
+        _cleanup_workspace(other_workspace_id)
+
+
+def test_assign_work_item_team_sets_confirmed_link(
+    query_endpoints_test_context: tuple[TestClient, UUID, UUID],
+) -> None:
+    client, workspace_id, user_id = query_endpoints_test_context
+    token = client.cookies.get("ecc_session")
+    assert token is not None
+    account_id = _insert_connector_account(workspace_id, user_id, provider="jira", credential="tok")
+    work_item_id = _insert_work_item(workspace_id, account_id, title="item-a")
+    team_id = _insert_team_entity(workspace_id)
+
+    response = client.post(
+        f"/api/v1/engineering/work-items/{work_item_id}/team",
+        json={"team_entity_id": str(team_id)},
+        headers=_headers(token),
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["team_entity_id"] == str(team_id)
+
+
+def test_assign_work_item_team_404_for_unknown_work_item(
+    query_endpoints_test_context: tuple[TestClient, UUID, UUID],
+) -> None:
+    client, workspace_id, _user_id = query_endpoints_test_context
+    token = client.cookies.get("ecc_session")
+    assert token is not None
+    team_id = _insert_team_entity(workspace_id)
+
+    response = client.post(
+        f"/api/v1/engineering/work-items/{uuid4()}/team",
+        json={"team_entity_id": str(team_id)},
+        headers=_headers(token),
+    )
+    assert response.status_code == 404
+    assert response.json()["error"]["code"] == "WORK_ITEM_NOT_FOUND"
+
+
+def test_assign_repository_team_rejects_unknown_fields(
+    query_endpoints_test_context: tuple[TestClient, UUID, UUID],
+) -> None:
+    """`TeamAssignmentRequest`'s `model_config = ConfigDict(extra="forbid")`
+    -- matches every other write-body model in this codebase.
+    """
+    client, workspace_id, user_id = query_endpoints_test_context
+    token = client.cookies.get("ecc_session")
+    assert token is not None
+    account_id = _insert_connector_account(workspace_id, user_id)
+    repository_id = _insert_repository(workspace_id, account_id, name="repo-a")
+
+    response = client.post(
+        f"/api/v1/engineering/repositories/{repository_id}/team",
+        json={"team_entity_id": None, "unexpected": "field"},
+        headers=_headers(token),
+    )
+    assert response.status_code == 422
