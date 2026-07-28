@@ -18,8 +18,12 @@ function listTeams(): Promise<EntityList> {
   return apiRequest('/api/v1/knowledge/entities?kind=team&limit=100')
 }
 
-function assignTeam(repositoryId: string, teamEntityId: string | null): Promise<Repository> {
-  const body: TeamAssignmentRequest = { team_entity_id: teamEntityId }
+function assignTeam(
+  repositoryId: string,
+  expectedVersion: number,
+  teamEntityId: string | null,
+): Promise<Repository> {
+  const body: TeamAssignmentRequest = { expected_version: expectedVersion, team_entity_id: teamEntityId }
   return apiRequest(`/api/v1/engineering/repositories/${repositoryId}/team`, { method: 'POST', body })
 }
 
@@ -41,7 +45,8 @@ function TeamAssignment({
 }) {
   const queryClient = useQueryClient()
   const mutation = useMutation({
-    mutationFn: (teamEntityId: string | null) => assignTeam(repository.id, teamEntityId),
+    mutationFn: (teamEntityId: string | null) =>
+      assignTeam(repository.id, repository.team_assignment_version, teamEntityId),
     onSuccess: () => { void queryClient.invalidateQueries({ queryKey: ['engineering', 'repositories'] }) },
   })
 

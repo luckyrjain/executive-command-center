@@ -149,10 +149,15 @@ export type Repository = {
   // Team linkage (migration `0050_phase6_team_linkage.py`) -- `team_entity_id`
   // is the human-confirmed link (set only via `POST .../team` below, never by
   // a sync); `suggested_team_name` is a sync-refreshed hint a human reads
-  // before confirming, never itself a link. See that migration's own
+  // before confirming, never itself a link. `team_assignment_version`/
+  // `team_assignment_updated_by` are that endpoint's own optimistic-
+  // concurrency/audit fields, scoped to this one field (not the whole row --
+  // see the migration's own docstring for why). See that migration's own
   // docstring for the "hybrid: auto-suggest, human confirms" design.
   team_entity_id: string | null
   suggested_team_name: string | null
+  team_assignment_version: number
+  team_assignment_updated_by: string | null
 }
 
 export type RepositoryListResponse = { repositories: Repository[] }
@@ -181,10 +186,12 @@ export type WorkItem = {
   // See `Repository`'s identical fields above.
   team_entity_id: string | null
   suggested_team_name: string | null
+  team_assignment_version: number
+  team_assignment_updated_by: string | null
 }
 
 export type WorkItemListResponse = { work_items: WorkItem[] }
 
 // --- Team assignment (`POST /engineering/repositories|work-items/{id}/team`) --
 
-export type TeamAssignmentRequest = { team_entity_id: string | null }
+export type TeamAssignmentRequest = { expected_version: number; team_entity_id: string | null }

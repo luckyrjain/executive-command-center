@@ -28,6 +28,8 @@ function repository(overrides: Partial<Repository> = {}): Repository {
     updated_at: '2026-07-26T00:00:00Z',
     team_entity_id: null,
     suggested_team_name: null,
+    team_assignment_version: 1,
+    team_assignment_updated_by: null,
     ...overrides,
   }
 }
@@ -52,7 +54,10 @@ function stubFetch({
         const teamEntityId = (JSON.parse(String(init.body)) as { team_entity_id: string | null }).team_entity_id
         const repositoryId = url.split('/repositories/')[1]?.split('/team')[0]
         const repo = state.find((candidate) => candidate.id === repositoryId)
-        if (repo) repo.team_entity_id = teamEntityId
+        if (repo) {
+          repo.team_entity_id = teamEntityId
+          repo.team_assignment_version += 1
+        }
         return response(repo ?? {})
       }
       return response({ repositories: state })
@@ -134,6 +139,25 @@ describe('RepositoriesPanel', () => {
     const calls = (fetch as unknown as { mock: { calls: [RequestInfo | URL, RequestInit?][] } }).mock.calls
     const postCall = calls.find(([, init]) => init?.method === 'POST')
     expect(String(postCall?.[0])).toContain('/api/v1/engineering/repositories/repo-1/team')
-    expect(JSON.parse(String(postCall?.[1]?.body))).toEqual({ team_entity_id: 'team-1' })
+    expect(JSON.parse(String(postCall?.[1]?.body))).toEqual({ expected_version: 1, team_entity_id: 'team-1' })
+  })
+
+  it('surfaces a failed team assignment as an alert next to the dropdown', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input)
+        if (url.includes('/knowledge/entities')) return response({ items: [{ id: 'team-1', canonical_name: 'Platform Engineering' }] })
+        if (init?.method === 'POST' && url.includes('/team')) {
+          return response({ error: { code: 'VERSION_CONFLICT', message: 'Someone else changed this first.' } }, 409)
+        }
+        return response({ repositories: [repository()] })
+      }),
+    )
+    renderPanel()
+    const select = await screen.findByLabelText('Team for acme/widgets')
+    fireEvent.change(select, { target: { value: 'team-1' } })
+
+    expect(await screen.findByRole('alert')).toBeTruthy()
   })
 })

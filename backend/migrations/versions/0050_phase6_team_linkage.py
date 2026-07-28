@@ -71,6 +71,40 @@ table would be exactly the same kind of unreachable-value column
 migration. Wiring the engine itself is real, separate follow-up work; see
 `docs/phases/phase-006/DELIVERY-INTELLIGENCE-CONTRACT.md`'s updated
 "Task 5 status" section.
+
+**Two more columns, added after review, giving the confirm-endpoint write
+path the same optimistic-concurrency and audit discipline every other
+human-editable write in this codebase already has** (`entities_mutations.
+py`'s `update_entity` -- `expected_version`/`409 VERSION_CONFLICT`,
+`Idempotency-Key`, and an `audit_events`/`event_outbox` write via
+`_write_side_effects` -- is the closest precedent; the first PR draft of
+this migration shipped `team_entity_id`/`suggested_team_name` alone,
+which review correctly flagged as leaving the *first human-editable field
+either table has ever had* with no version, no audit trail, and no
+idempotency contract, unlike every sibling mutating endpoint in this
+router):
+
+- `team_assignment_version` (`BIGINT NOT NULL DEFAULT 1`): **not** a
+  whole-row version the way `connector_accounts.version`/`pkos_nodes.
+  version` are -- `repositories`/`engineering_work_items` remain
+  overwhelmingly sync-owned rows (every other column keeps being
+  refreshed by an adapter's own upsert on every sync call), so a
+  whole-row version would bump on every routine sync and make the
+  human's own optimistic-concurrency check spuriously fail moments after
+  they loaded the page, for a field they never touched. This column is
+  scoped to exactly the one field a human can write: only `POST .../team`
+  increments it, a sync's own `ON CONFLICT ... DO UPDATE SET` never
+  mentions it (identical "sync-silent" contract to `team_entity_id`
+  itself) -- so `expected_version`/`409 VERSION_CONFLICT` only ever fires
+  on a genuine concurrent *team assignment* race, never a coincidental
+  sync landing in between.
+- `team_assignment_updated_by` (nullable composite FK to `users`,
+  `ON DELETE RESTRICT` -- matching `incidents.created_by`/`updated_by`'s
+  own identical shape, migration `0049`): who last confirmed or cleared
+  the team link. Nullable (unlike `incidents.updated_by`'s `NOT NULL`)
+  because most rows start, and many will stay, unassigned -- there is no
+  human actor to record until the first `POST .../team` call ever
+  happens for that row.
 """
 
 import sqlalchemy as sa
@@ -89,6 +123,13 @@ def upgrade() -> None:
     for table in ("repositories", "engineering_work_items"):
         op.add_column(table, sa.Column("team_entity_id", uuid, nullable=True))
         op.add_column(table, sa.Column("suggested_team_name", sa.String(500), nullable=True))
+        op.add_column(
+            table,
+            sa.Column(
+                "team_assignment_version", sa.BigInteger(), nullable=False, server_default="1"
+            ),
+        )
+        op.add_column(table, sa.Column("team_assignment_updated_by", uuid, nullable=True))
         op.create_foreign_key(
             f"fk_{table}_workspace_team_entity",
             table,
@@ -96,12 +137,25 @@ def upgrade() -> None:
             ["workspace_id", "team_entity_id"],
             ["workspace_id", "id"],
         )
+        op.create_foreign_key(
+            f"fk_{table}_workspace_team_assignment_updated_by",
+            table,
+            "users",
+            ["workspace_id", "team_assignment_updated_by"],
+            ["workspace_id", "id"],
+            ondelete="RESTRICT",
+        )
         op.create_index(f"ix_{table}_team_entity", table, ["workspace_id", "team_entity_id"])
 
 
 def downgrade() -> None:
     for table in ("repositories", "engineering_work_items"):
         op.drop_index(f"ix_{table}_team_entity", table_name=table)
+        op.drop_constraint(
+            f"fk_{table}_workspace_team_assignment_updated_by", table, type_="foreignkey"
+        )
         op.drop_constraint(f"fk_{table}_workspace_team_entity", table, type_="foreignkey")
+        op.drop_column(table, "team_assignment_updated_by")
+        op.drop_column(table, "team_assignment_version")
         op.drop_column(table, "suggested_team_name")
         op.drop_column(table, "team_entity_id")
