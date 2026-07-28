@@ -97,6 +97,8 @@ none of Datadog's three resource types is a repository, work item,
 change, or review -- they get their own new tables instead.
 """
 
+from typing import Any
+
 import sqlalchemy as sa
 from alembic import op
 from sqlalchemy.dialects import postgresql
@@ -124,7 +126,7 @@ def upgrade() -> None:
         "'deployment', 'incident', 'monitor', 'service_definition', 'dashboard')",
     )
 
-    def _projection_columns() -> list[sa.Column]:
+    def _projection_columns() -> list[sa.Column[Any]]:
         return [
             sa.Column("id", uuid, primary_key=True),
             sa.Column("workspace_id", uuid, nullable=False),
