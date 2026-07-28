@@ -102,13 +102,17 @@ individual coverage (`_worse_coverage`), since the population genuinely
 depends on both being current.
 
 **`aggregation_scope` is always `'system'`.** A `"team"` `EntityKind` now
-exists (`ecc.domains.knowledge.entities`), but nothing here reads it --
-no `repository`/`engineering_work_item`/`change`/`review` row is linked
-to the team entity that owns it, so this engine has no way to know which
-rows to group into a `team`-scoped snapshot even though the entity to
-scope by finally exists. `Workstream` still has no entity at all. See
-`docs/phases/phase-006/DELIVERY-INTELLIGENCE-CONTRACT.md`'s matching
-accepted-limitation section.
+exists (`ecc.domains.knowledge.entities`), and migration `0050_phase6_
+team_linkage.py` went further, giving `repository`/`engineering_work_item`
+a real (human-confirmed) `team_entity_id` link -- `changes`/`reviews`
+inherit it transitively through their own `repository_id`/`change_id`
+FKs. Still, nothing *here* reads any of that: `compute_and_store_metrics`
+has no per-team grouping query and no `team_entity_id` parameter, so this
+engine still has no code path that produces a `team`-scoped snapshot even
+though the linkage it would need now exists and is queryable (`GET
+/engineering/repositories?team_entity_id=...`). `Workstream` still has no
+entity at all. See `docs/phases/phase-006/DELIVERY-INTELLIGENCE-
+CONTRACT.md`'s matching accepted-limitation section.
 
 **Snapshots are insert-only.** `compute_and_store_metrics` never updates
 or deletes an existing `delivery_metric_snapshots` row -- each call

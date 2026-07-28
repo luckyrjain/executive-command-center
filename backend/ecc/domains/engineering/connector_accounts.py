@@ -447,6 +447,21 @@ class RepositoryResponse(BaseModel):
     observed_at: datetime
     created_at: datetime
     updated_at: datetime
+    # Team linkage (migration `0050_phase6_team_linkage.py`) -- see that
+    # migration's own docstring for the "hybrid: auto-suggest, human
+    # confirms" design. `suggested_team_name` is refreshed by the owning
+    # adapter on every sync; `team_entity_id` is set only through `POST
+    # .../repositories/{id}/team` below and never touched by a sync.
+    # `team_assignment_version`/`team_assignment_updated_by` are that same
+    # endpoint's own optimistic-concurrency/audit fields -- scoped to this
+    # one field, not the whole row, since the row's other columns keep
+    # being refreshed by sync (see the migration's own docstring for why a
+    # whole-row version would spuriously conflict with a sync landing in
+    # between).
+    team_entity_id: UUID | None
+    suggested_team_name: str | None
+    team_assignment_version: int
+    team_assignment_updated_by: UUID | None
 
 
 class RepositoryListResponse(BaseModel):
@@ -470,10 +485,38 @@ class WorkItemResponse(BaseModel):
     observed_at: datetime
     created_at: datetime
     updated_at: datetime
+    # See `RepositoryResponse`'s identical fields above.
+    team_entity_id: UUID | None
+    suggested_team_name: str | None
+    team_assignment_version: int
+    team_assignment_updated_by: UUID | None
 
 
 class WorkItemListResponse(BaseModel):
     work_items: list[WorkItemResponse]
+
+
+class TeamAssignmentRequest(BaseModel):
+    """Body for `POST .../repositories/{id}/team` and `POST .../work-items/
+    {id}/team` -- the "human confirms" half of migration `0050_phase6_
+    team_linkage.py`'s hybrid design. `team_entity_id: None` clears an
+    existing assignment (a human can change their mind or unassign, not
+    just assign once); a UUID must reference an active `kind="team"`
+    `pkos_nodes` row in the caller's own workspace, checked by `_validate_
+    team_entity` below -- the same "existence + kind, checked at write
+    time" precedent `waiting.py`'s `_counterparty_node_type` already
+    established for `waiting_links.counterparty_entity_id`.
+
+    `expected_version` mirrors `entities_mutations.py`'s `EntityPatch`
+    exactly (checked against `team_assignment_version`, the field-scoped
+    counter migration `0050`'s own docstring explains) -- review found the
+    first draft of this endpoint had no optimistic-concurrency check at
+    all, unlike every other mutating endpoint in this codebase.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+    expected_version: int = Field(ge=1)
+    team_entity_id: UUID | None = None
 
 
 class _EmptyBody(BaseModel):
@@ -1321,24 +1364,34 @@ def list_repositories_endpoint(
     auth: AuthDep,
     session: SessionDep,
     connector_account_id: Annotated[UUID | None, Query()] = None,
+    team_entity_id: Annotated[UUID | None, Query()] = None,
 ) -> RepositoryListResponse:
     """Task 8's own disclosed addition -- see `RepositoryResponse`'s own
     comment above for why. Mirrors `list_sync_runs_endpoint`'s shape
     exactly: workspace-scoped, an optional `connector_account_id` filter,
     no pagination (matching every other list endpoint in this file, none
     of which paginate at this activation's expected data volume).
+    `team_entity_id` (migration `0050_phase6_team_linkage.py`) is the
+    team-scoped-view filter that addition exists to enable -- a plain
+    equality match against the confirmed link, never the suggestion.
     """
-    clause = "AND connector_account_id = :connector_account_id" if connector_account_id else ""
+    clauses = []
     params: dict[str, Any] = {"workspace_id": auth.workspace_id}
     if connector_account_id:
+        clauses.append("AND connector_account_id = :connector_account_id")
         params["connector_account_id"] = connector_account_id
+    if team_entity_id:
+        clauses.append("AND team_entity_id = :team_entity_id")
+        params["team_entity_id"] = team_entity_id
     rows = (
         session.execute(
             text(
                 "SELECT id, connector_account_id, provider, external_id, name, source_url, "
                 "default_branch, permission_state, freshness_state, provider_updated_at, "
-                "observed_at, created_at, updated_at FROM repositories "
-                f"WHERE workspace_id = :workspace_id {clause} ORDER BY name ASC"  # noqa: S608
+                "observed_at, created_at, updated_at, team_entity_id, suggested_team_name, "
+                "team_assignment_version, team_assignment_updated_by "
+                "FROM repositories "
+                f"WHERE workspace_id = :workspace_id {' '.join(clauses)} ORDER BY name ASC"  # noqa: S608
             ),
             params,
         )
@@ -1354,6 +1407,7 @@ def list_work_items_endpoint(
     session: SessionDep,
     connector_account_id: Annotated[UUID | None, Query()] = None,
     status_filter: Annotated[str | None, Query(alias="status")] = None,
+    team_entity_id: Annotated[UUID | None, Query()] = None,
 ) -> WorkItemListResponse:
     """Same disclosed-addition reasoning as `list_repositories_endpoint`
     above -- `engineering_work_items` has been synced since Task 4 with
@@ -1362,7 +1416,8 @@ def list_work_items_endpoint(
     carries no CHECK constraint (unlike `incidents.status`'s closed
     enum): it is provider-specific free text, and GitHub/GitLab/Jira each
     use a different vocabulary for "open"/"done" that this activation
-    cannot honestly enumerate as a closed set.
+    cannot honestly enumerate as a closed set. `team_entity_id` mirrors
+    `list_repositories_endpoint`'s identical filter.
     """
     clauses = []
     params: dict[str, Any] = {"workspace_id": auth.workspace_id}
@@ -1372,13 +1427,18 @@ def list_work_items_endpoint(
     if status_filter:
         clauses.append("AND status = :status_filter")
         params["status_filter"] = status_filter
+    if team_entity_id:
+        clauses.append("AND team_entity_id = :team_entity_id")
+        params["team_entity_id"] = team_entity_id
     rows = (
         session.execute(
             text(
                 "SELECT id, connector_account_id, provider, external_id, title, source_url, "
                 "item_type, status, reporter_external_id, assignee_external_id, "
                 "permission_state, freshness_state, provider_created_at, observed_at, "
-                "created_at, updated_at FROM engineering_work_items "
+                "created_at, updated_at, team_entity_id, suggested_team_name, "
+                "team_assignment_version, team_assignment_updated_by "
+                "FROM engineering_work_items "
                 f"WHERE workspace_id = :workspace_id {' '.join(clauses)} ORDER BY title ASC"  # noqa: S608
             ),
             params,
@@ -1387,3 +1447,282 @@ def list_work_items_endpoint(
         .all()
     )
     return WorkItemListResponse(work_items=[WorkItemResponse(**dict(row)) for row in rows])
+
+
+def _validate_team_entity(session: Session, auth: AuthContext, team_entity_id: UUID | None) -> None:
+    """Mirrors `waiting.py`'s `_counterparty_node_type` precedent: an
+    existence + kind check against `pkos_nodes` at write time, not a
+    schema-level FK alone (the FK only proves the row exists in *some*
+    workspace at commit time via the composite constraint -- it cannot
+    express "and its `node_type` must be `'team'`"). `None` is valid and
+    means "clear the assignment," so this only runs the check when a real
+    id was supplied.
+    """
+    if team_entity_id is None:
+        return
+    row = session.execute(
+        text(
+            "SELECT node_type FROM pkos_nodes "
+            "WHERE workspace_id = :workspace_id AND id = :id AND status = 'active'"
+        ),
+        {"workspace_id": auth.workspace_id, "id": team_entity_id},
+    ).one_or_none()
+    if row is None:
+        raise HTTPException(status_code=404, detail="TEAM_ENTITY_NOT_FOUND")
+    if row[0] != "team":
+        raise HTTPException(status_code=422, detail="TEAM_ENTITY_KIND_MISMATCH")
+
+
+def _write_team_assignment_side_effects(
+    session: Session,
+    auth: AuthContext,
+    request: Request,
+    *,
+    aggregate_type: str,
+    event_type: str,
+    aggregate_id: UUID,
+    version: int,
+    now: datetime,
+) -> None:
+    """`repositories`/`engineering_work_items`-scoped sibling of this
+    module's own `_write_side_effects` (used by `create_connector_
+    endpoint`/`sync_connector_endpoint`/`disable_connector_endpoint`) --
+    kept separate rather than adding an `aggregate_type` parameter to that
+    existing function, since its `record_audit_outbox_failure`/`queue_
+    lifecycle_event` calls are hardcoded to the `"engineering_connector_
+    account"` metric name those three call sites all share, and widening
+    an already-tested helper's signature for one new caller family risks
+    touching behavior outside this endpoint's own scope.
+    """
+    request_id, correlation_id = _request_ids(request)
+    try:
+        session.execute(
+            text(
+                """
+                INSERT INTO audit_events (
+                    id, workspace_id, event_type, aggregate_type, aggregate_id,
+                    aggregate_version, actor_id, request_id, correlation_id,
+                    changed_fields, authorization_result, source, metadata, occurred_at
+                ) VALUES (
+                    :id, :workspace_id, :event_type, :aggregate_type, :aggregate_id,
+                    :aggregate_version, :actor_id, :request_id, :correlation_id,
+                    ARRAY['team_entity_id'], 'allowed', 'user', '{}'::jsonb, :occurred_at
+                )
+                """
+            ),
+            {
+                "id": uuid4(),
+                "workspace_id": auth.workspace_id,
+                "event_type": event_type,
+                "aggregate_type": aggregate_type,
+                "aggregate_id": aggregate_id,
+                "aggregate_version": version,
+                "actor_id": auth.user_id,
+                "request_id": request_id,
+                "correlation_id": correlation_id,
+                "occurred_at": now,
+            },
+        )
+        session.execute(
+            text(
+                """
+                INSERT INTO event_outbox (
+                    event_id, workspace_id, event_type, event_version,
+                    correlation_id, payload, occurred_at, attempt_count
+                ) VALUES (
+                    :event_id, :workspace_id, :event_type_v1, 1,
+                    :correlation_id, CAST(:payload AS jsonb), :occurred_at, 0
+                )
+                """
+            ),
+            {
+                "event_id": uuid4(),
+                "workspace_id": auth.workspace_id,
+                "event_type_v1": f"{event_type}.v1",
+                "correlation_id": correlation_id,
+                "payload": dumps({"aggregate_id": str(aggregate_id), "version": version}),
+                "occurred_at": now,
+            },
+        )
+    except SQLAlchemyError:
+        record_audit_outbox_failure(aggregate_type)
+        raise
+    queue_lifecycle_event(session, aggregate_type, event_type, "allowed")
+
+
+@router.post("/repositories/{repository_id}/team", response_model=RepositoryResponse)
+def assign_repository_team_endpoint(
+    repository_id: UUID,
+    payload: TeamAssignmentRequest,
+    request: Request,
+    auth: AuthDep,
+    session: SessionDep,
+    _csrf: CsrfDep,
+    idempotency_key: IdempotencyHeader,
+) -> RepositoryResponse:
+    """The "human confirms" half of migration `0050_phase6_team_linkage.
+    py`'s hybrid design for `repositories`. Mirrors `entities_mutations.
+    py`'s `update_entity` in full after review found the first draft of
+    this endpoint had none of `update_entity`'s optimistic-concurrency,
+    idempotency, or audit-trail discipline, unlike every other mutating
+    endpoint in this codebase: `expected_version` checked against `team_
+    assignment_version` (409 `VERSION_CONFLICT` on mismatch, the same
+    field-scoped counter migration `0050`'s own docstring explains --
+    never the whole row's, since sync keeps refreshing every other
+    column), `Idempotency-Key` with the same lock/cache/store pattern
+    `create_connector_endpoint`/`sync_connector_endpoint`/`disable_
+    connector_endpoint` already use, and an `audit_events`/`event_outbox`
+    write recording who confirmed or cleared the link and when.
+    """
+    request_hash = _request_hash(payload, f"assign_repository_team:{repository_id}")
+    now = datetime.now(UTC)
+    with session.begin():
+        _lock_idempotency(session, auth, idempotency_key)
+        cached = _load_cached(session, auth, idempotency_key, request_hash)
+        if cached is not None:
+            return RepositoryResponse.model_validate(cached)
+
+        _validate_team_entity(session, auth, payload.team_entity_id)
+
+        current = session.execute(
+            text(
+                "SELECT team_assignment_version FROM repositories "
+                "WHERE workspace_id = :workspace_id AND id = :id FOR UPDATE"
+            ),
+            {"workspace_id": auth.workspace_id, "id": repository_id},
+        ).one_or_none()
+        if current is None:
+            raise HTTPException(status_code=404, detail="REPOSITORY_NOT_FOUND")
+        if current[0] != payload.expected_version:
+            raise HTTPException(status_code=409, detail="VERSION_CONFLICT")
+
+        row = (
+            session.execute(
+                text(
+                    """
+                UPDATE repositories SET team_entity_id = :team_entity_id,
+                    team_assignment_version = team_assignment_version + 1,
+                    team_assignment_updated_by = :actor_id,
+                    updated_at = :now
+                WHERE workspace_id = :workspace_id AND id = :id
+                RETURNING id, connector_account_id, provider, external_id, name, source_url,
+                    default_branch, permission_state, freshness_state, provider_updated_at,
+                    observed_at, created_at, updated_at, team_entity_id, suggested_team_name,
+                    team_assignment_version, team_assignment_updated_by
+                """
+                ),
+                {
+                    "team_entity_id": payload.team_entity_id,
+                    "actor_id": auth.user_id,
+                    "now": now,
+                    "workspace_id": auth.workspace_id,
+                    "id": repository_id,
+                },
+            )
+            .mappings()
+            .one()
+        )
+        response = RepositoryResponse(**dict(row))
+        event_type = (
+            "repository.team_cleared"
+            if payload.team_entity_id is None
+            else "repository.team_assigned"
+        )
+        _write_team_assignment_side_effects(
+            session,
+            auth,
+            request,
+            aggregate_type="repository",
+            event_type=event_type,
+            aggregate_id=repository_id,
+            version=response.team_assignment_version,
+            now=now,
+        )
+        _store_idempotency(
+            session, auth, idempotency_key, request_hash, response.model_dump(mode="json"), now
+        )
+        return response
+
+
+@router.post("/work-items/{work_item_id}/team", response_model=WorkItemResponse)
+def assign_work_item_team_endpoint(
+    work_item_id: UUID,
+    payload: TeamAssignmentRequest,
+    request: Request,
+    auth: AuthDep,
+    session: SessionDep,
+    _csrf: CsrfDep,
+    idempotency_key: IdempotencyHeader,
+) -> WorkItemResponse:
+    """Identical shape and reasoning to `assign_repository_team_endpoint`
+    above, for `engineering_work_items`.
+    """
+    request_hash = _request_hash(payload, f"assign_work_item_team:{work_item_id}")
+    now = datetime.now(UTC)
+    with session.begin():
+        _lock_idempotency(session, auth, idempotency_key)
+        cached = _load_cached(session, auth, idempotency_key, request_hash)
+        if cached is not None:
+            return WorkItemResponse.model_validate(cached)
+
+        _validate_team_entity(session, auth, payload.team_entity_id)
+
+        current = session.execute(
+            text(
+                "SELECT team_assignment_version FROM engineering_work_items "
+                "WHERE workspace_id = :workspace_id AND id = :id FOR UPDATE"
+            ),
+            {"workspace_id": auth.workspace_id, "id": work_item_id},
+        ).one_or_none()
+        if current is None:
+            raise HTTPException(status_code=404, detail="WORK_ITEM_NOT_FOUND")
+        if current[0] != payload.expected_version:
+            raise HTTPException(status_code=409, detail="VERSION_CONFLICT")
+
+        row = (
+            session.execute(
+                text(
+                    """
+                UPDATE engineering_work_items SET team_entity_id = :team_entity_id,
+                    team_assignment_version = team_assignment_version + 1,
+                    team_assignment_updated_by = :actor_id,
+                    updated_at = :now
+                WHERE workspace_id = :workspace_id AND id = :id
+                RETURNING id, connector_account_id, provider, external_id, title, source_url,
+                    item_type, status, reporter_external_id, assignee_external_id,
+                    permission_state, freshness_state, provider_created_at, observed_at,
+                    created_at, updated_at, team_entity_id, suggested_team_name,
+                    team_assignment_version, team_assignment_updated_by
+                """
+                ),
+                {
+                    "team_entity_id": payload.team_entity_id,
+                    "actor_id": auth.user_id,
+                    "now": now,
+                    "workspace_id": auth.workspace_id,
+                    "id": work_item_id,
+                },
+            )
+            .mappings()
+            .one()
+        )
+        response = WorkItemResponse(**dict(row))
+        event_type = (
+            "engineering_work_item.team_cleared"
+            if payload.team_entity_id is None
+            else "engineering_work_item.team_assigned"
+        )
+        _write_team_assignment_side_effects(
+            session,
+            auth,
+            request,
+            aggregate_type="engineering_work_item",
+            event_type=event_type,
+            aggregate_id=work_item_id,
+            version=response.team_assignment_version,
+            now=now,
+        )
+        _store_idempotency(
+            session, auth, idempotency_key, request_hash, response.model_dump(mode="json"), now
+        )
+        return response

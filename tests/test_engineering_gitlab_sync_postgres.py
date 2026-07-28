@@ -68,14 +68,19 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def _project(project_id: int, *, path: str, updated_at: str) -> dict[str, Any]:
-    return {
+def _project(
+    project_id: int, *, path: str, updated_at: str, namespace: Any = None
+) -> dict[str, Any]:
+    result: dict[str, Any] = {
         "id": project_id,
         "path_with_namespace": path,
         "web_url": f"https://gitlab.com/{path}",
         "default_branch": "main",
         "last_activity_at": updated_at,
     }
+    if namespace is not None:
+        result["namespace"] = namespace
+    return result
 
 
 def _json_response(
@@ -304,6 +309,59 @@ def test_backfill_single_page(seeded_account_context: ConnectorAccountContext) -
     assert outcome.status == "succeeded"
     assert outcome.items_processed == 2
     assert outcome.next_cursor == "2024-01-03T00:00:00Z"
+
+
+def test_backfill_populates_suggested_team_name_from_namespace_object(
+    seeded_account_context: ConnectorAccountContext,
+) -> None:
+    """Migration `0050_phase6_team_linkage.py`'s "hybrid: auto-suggest,
+    human confirms" design -- `_upsert_repository` now writes GitLab's own
+    `namespace.name` (the group or user this project belongs to) into
+    `repositories.suggested_team_name`. The full `GET /projects` REST
+    representation nests `namespace` as an object -- see the next test for
+    the webhook payload's differently-shaped bare-string `namespace`.
+    """
+    projects = [
+        _project(
+            1,
+            path="acme/a",
+            updated_at="2024-01-03T00:00:00Z",
+            namespace={"id": 9, "name": "Acme Group", "path": "acme", "kind": "group"},
+        )
+    ]
+    adapter = GitLabAdapter(transport=httpx.MockTransport(lambda r: _json_response(projects)))
+    adapter.backfill(seeded_account_context, "repository")
+
+    with engine.begin() as connection:
+        suggested = connection.execute(
+            text("SELECT suggested_team_name FROM repositories WHERE workspace_id = :workspace_id"),
+            {"workspace_id": seeded_account_context.workspace_id},
+        ).scalar_one()
+    assert suggested == "Acme Group"
+
+
+def test_backfill_suggested_team_name_handles_bare_string_namespace(
+    seeded_account_context: ConnectorAccountContext,
+) -> None:
+    """A real GitLab `Push Hook` webhook payload's embedded `project.
+    namespace` is a bare display-name string, not the REST API's nested
+    object -- the identical REST-vs-webhook schema mismatch `_with_push_
+    event_activity_timestamp`'s own docstring documents for
+    `last_activity_at`. `_suggested_team_name` must handle both shapes
+    without raising.
+    """
+    projects = [
+        _project(1, path="acme/a", updated_at="2024-01-03T00:00:00Z", namespace="Acme Group")
+    ]
+    adapter = GitLabAdapter(transport=httpx.MockTransport(lambda r: _json_response(projects)))
+    adapter.backfill(seeded_account_context, "repository")
+
+    with engine.begin() as connection:
+        suggested = connection.execute(
+            text("SELECT suggested_team_name FROM repositories WHERE workspace_id = :workspace_id"),
+            {"workspace_id": seeded_account_context.workspace_id},
+        ).scalar_one()
+    assert suggested == "Acme Group"
 
 
 def test_backfill_paginates_via_link_header(

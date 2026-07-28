@@ -79,19 +79,19 @@ def _issue(
     status: str = "In Progress",
     assignee: dict[str, Any] | None = _UNSET,
     reporter: dict[str, Any] | None = _UNSET,
+    project: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    return {
-        "id": issue_id,
-        "key": key,
-        "fields": {
-            "summary": summary,
-            "issuetype": {"name": "Bug"},
-            "status": {"name": status},
-            "reporter": {"accountId": "reporter-1"} if reporter is _UNSET else reporter,
-            "assignee": {"accountId": "assignee-1"} if assignee is _UNSET else assignee,
-            "updated": updated,
-        },
+    fields: dict[str, Any] = {
+        "summary": summary,
+        "issuetype": {"name": "Bug"},
+        "status": {"name": status},
+        "reporter": {"accountId": "reporter-1"} if reporter is _UNSET else reporter,
+        "assignee": {"accountId": "assignee-1"} if assignee is _UNSET else assignee,
+        "updated": updated,
     }
+    if project is not None:
+        fields["project"] = project
+    return {"id": issue_id, "key": key, "fields": fields}
 
 
 def _search_response(
@@ -321,6 +321,46 @@ def test_backfill_single_page(seeded_account_context: ConnectorAccountContext) -
     assert outcome.status == "succeeded"
     assert outcome.items_processed == 2
     assert outcome.next_cursor == "2024-01-03T00:00:00.000+0000"
+
+
+def test_backfill_populates_suggested_team_name_from_project_name(
+    seeded_account_context: ConnectorAccountContext,
+) -> None:
+    """Migration `0050_phase6_team_linkage.py`'s "hybrid: auto-suggest,
+    human confirms" design -- Jira has no native "team" construct at all,
+    so `_upsert_work_item` uses the issue's own `fields.project.name` as
+    the closest available heuristic (an explicit, disclosed heuristic --
+    see that migration's own docstring and `CONNECTOR-CONTRACT.md`).
+    `_SEARCH_FIELDS` now requests `project` too, so this also proves that
+    field reaches the JQL search request.
+    """
+    issues = [
+        _issue(
+            1,
+            key="ACME-1",
+            summary="First bug",
+            updated="2024-01-03T00:00:00.000+0000",
+            project={"key": "ACME", "name": "Acme Platform"},
+        )
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/rest/api/3/search":
+            assert "project" in request.url.params.get("fields", "")
+        return _json_response(_search_response(issues))
+
+    adapter = JiraAdapter(transport=httpx.MockTransport(handler))
+    adapter.backfill(seeded_account_context, "work_item")
+
+    with engine.begin() as connection:
+        suggested = connection.execute(
+            text(
+                "SELECT suggested_team_name FROM engineering_work_items "
+                "WHERE workspace_id = :workspace_id"
+            ),
+            {"workspace_id": seeded_account_context.workspace_id},
+        ).scalar_one()
+    assert suggested == "Acme Platform"
 
 
 def test_backfill_paginates_via_offset(seeded_account_context: ConnectorAccountContext) -> None:

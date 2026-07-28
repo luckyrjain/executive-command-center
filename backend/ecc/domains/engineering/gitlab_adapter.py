@@ -142,6 +142,29 @@ def _content_hash(project: Mapping[str, Any]) -> str:
     return sha256(material.encode("utf-8")).hexdigest()
 
 
+def _suggested_team_name(project: Mapping[str, Any]) -> str | None:
+    """GitLab's own `namespace` field -- the group or user this project
+    belongs to -- mirrors `github_adapter.py`'s identical `owner.login`
+    hint (see migration `0050_phase6_team_linkage.py`'s own docstring for
+    why this is a free-text suggestion, never a link). Its *shape* differs
+    between the two payloads this function is called with: the full `GET
+    /projects` REST representation nests it as an object (`{"name": ...,
+    "path": ..., "kind": ...}`), but a real GitLab `Push Hook` webhook
+    payload's own `project.namespace` is a bare display-name string --
+    the identical REST-vs-webhook schema mismatch `_with_push_event_
+    activity_timestamp`'s own docstring already documents for
+    `last_activity_at`. Handling both shapes here, rather than assuming
+    the REST dict shape, avoids an `AttributeError` crashing every
+    webhook-driven upsert.
+    """
+    namespace = project.get("namespace")
+    if isinstance(namespace, Mapping):
+        return namespace.get("name")
+    if isinstance(namespace, str) and namespace:
+        return namespace
+    return None
+
+
 def _upsert_repository(
     *, workspace_id: Any, connector_account_id: Any, provider: str, project: Mapping[str, Any]
 ) -> None:
@@ -152,6 +175,7 @@ def _upsert_repository(
     """
     now = datetime.now(UTC)
     provider_updated_at = project.get("last_activity_at")
+    suggested_team_name = _suggested_team_name(project)
     with SessionFactory() as session:
         session.execute(
             text(
@@ -159,11 +183,13 @@ def _upsert_repository(
                 INSERT INTO repositories (
                     id, workspace_id, connector_account_id, provider, external_id,
                     name, source_url, default_branch, permission_state, freshness_state,
-                    content_hash, provider_updated_at, observed_at, created_at, updated_at
+                    content_hash, provider_updated_at, observed_at, created_at, updated_at,
+                    suggested_team_name
                 ) VALUES (
                     :id, :workspace_id, :connector_account_id, :provider, :external_id,
                     :name, :source_url, :default_branch, 'active', 'fresh',
-                    :content_hash, :provider_updated_at, :now, :now, :now
+                    :content_hash, :provider_updated_at, :now, :now, :now,
+                    :suggested_team_name
                 )
                 ON CONFLICT (workspace_id, connector_account_id, external_id) DO UPDATE SET
                     name = EXCLUDED.name,
@@ -174,7 +200,8 @@ def _upsert_repository(
                     content_hash = EXCLUDED.content_hash,
                     provider_updated_at = EXCLUDED.provider_updated_at,
                     observed_at = EXCLUDED.observed_at,
-                    updated_at = EXCLUDED.updated_at
+                    updated_at = EXCLUDED.updated_at,
+                    suggested_team_name = EXCLUDED.suggested_team_name
                 """
             ),
             {
@@ -189,6 +216,7 @@ def _upsert_repository(
                 "content_hash": _content_hash(project),
                 "provider_updated_at": provider_updated_at,
                 "now": now,
+                "suggested_team_name": suggested_team_name,
             },
         )
         session.commit()

@@ -118,7 +118,11 @@ export async function run({ page, baseURL }) {
   await page.getByRole('tab', { name: 'Repositories' }).click()
   await assertNoSeriousAccessibilityViolations(page, { include: '#engineering-panel' })
   const reposPanel = panel.locator('section[aria-labelledby="engineering-repositories-title"]')
-  await reposPanel.getByText('acme/widgets').waitFor()
+  // `{ exact: true }` -- migration `0050_phase6_team_linkage.py`'s new
+  // per-repository team-assignment `<label>` ("Team for acme/widgets")
+  // also contains this substring, so a non-exact match now resolves to
+  // two elements (the repository name itself and that label).
+  await reposPanel.getByText('acme/widgets', { exact: true }).waitFor()
   const permissionRepoRow = reposPanel.locator('li', { hasText: 'acme/internal-tools' })
   await permissionRepoRow.getByText('permission lost').waitFor()
   await permissionRepoRow.getByText('stale').waitFor()
