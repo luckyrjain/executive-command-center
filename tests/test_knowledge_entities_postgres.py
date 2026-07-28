@@ -316,11 +316,12 @@ def test_entity_create_and_filter_supports_team_kind(
 ) -> None:
     """`team` was added to `EntityKind` to unblock team-scoped views in
     later phases (e.g. Phase 6 engineering ownership, team-scoped
-    dashboards) -- `entities.py`/`resolution.py`/`entity_operations.py`/
-    `claims.py` are all kind-agnostic, so the only real code surface this
-    addition touches is the `Literal` itself, validated by Pydantic. This
-    proves the new kind round-trips end to end (create, get, list-filter),
-    not just that the type-checker accepts it as a literal value.
+    dashboards) -- `entities_mutations.py`/`resolution.py`/
+    `entity_operations.py`/`claims.py` are all kind-agnostic, so the only
+    real code surface this addition touches is the `Literal` itself in
+    `entities.py`, validated by Pydantic. This proves the new kind
+    round-trips end to end (create, get, list-filter), not just that the
+    type-checker accepts it as a literal value.
     """
     client, _workspace_id, _user_id, token = knowledge_test_context
 
@@ -349,6 +350,39 @@ def test_entity_create_and_filter_supports_team_kind(
     ids = {item["id"] for item in filtered.json()["items"]}
     assert created["id"] in ids
     assert all(item["kind"] == "team" for item in filtered.json()["items"])
+
+    # `test_entity_lifecycle_is_transactional_and_workspace_scoped` above
+    # only exercises patch/archive/restore for kind="project" -- proving
+    # the same lifecycle for "team" too, not just create/get/list, since
+    # `EntityPatch` (`entities_mutations.py`) has no `kind` field at all
+    # (kind-immutability is a schema-level 422, not a runtime branch) and
+    # archive/restore only ever branch on `status`, never `kind`.
+    patch = client.patch(
+        f"/api/v1/knowledge/entities/{created['id']}",
+        headers=_headers(token, "patch-team"),
+        json={"expected_version": 1, "summary": "Owns the developer platform"},
+    )
+    assert patch.status_code == 200, patch.text
+    assert patch.json()["kind"] == "team"
+    assert patch.json()["summary"] == "Owns the developer platform"
+
+    archive = client.post(
+        f"/api/v1/knowledge/entities/{created['id']}/archive",
+        headers=_headers(token, "archive-team"),
+        json={"expected_version": 2},
+    )
+    assert archive.status_code == 200
+    assert archive.json()["kind"] == "team"
+    assert archive.json()["status"] == "archived"
+
+    restore = client.post(
+        f"/api/v1/knowledge/entities/{created['id']}/restore",
+        headers=_headers(token, "restore-team"),
+        json={"expected_version": 3},
+    )
+    assert restore.status_code == 200
+    assert restore.json()["kind"] == "team"
+    assert restore.json()["status"] == "active"
 
 
 def test_entity_create_requires_kind_and_canonical_name(
