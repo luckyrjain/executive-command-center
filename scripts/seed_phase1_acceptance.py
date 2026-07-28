@@ -183,6 +183,13 @@ _WORKSPACE_ID_TABLES: tuple[str, ...] = (
     "engineering_decisions",
     "incident_changes",
     "decision_changes",
+    # Phase 6 Datadog connector follow-up (migration 0051) --
+    # datadog_monitors/datadog_service_definitions/datadog_dashboards, also
+    # workspace-scoped; seeded here from day one for the same reason,
+    # closing this exact gap before it repeats an eleventh time.
+    "datadog_monitors",
+    "datadog_service_definitions",
+    "datadog_dashboards",
 )
 # `workspaces` is scoped by its own `id`, not a `workspace_id` column.
 _WORKSPACE_TABLE = "workspaces"
@@ -274,6 +281,10 @@ def _fixture_ids(label: str) -> dict[str, UUID]:
         "engineering_decision": seed_id(label, "engineering_decision", "acceptance"),
         "incident_change": seed_id(label, "incident_change", "acceptance"),
         "decision_change": seed_id(label, "decision_change", "acceptance"),
+        "datadog_connector_account": seed_id(label, "datadog_connector_account", "acceptance"),
+        "datadog_monitor": seed_id(label, "datadog_monitor", "acceptance"),
+        "datadog_service_definition": seed_id(label, "datadog_service_definition", "acceptance"),
+        "datadog_dashboard": seed_id(label, "datadog_dashboard", "acceptance"),
     }
 
 
@@ -2098,6 +2109,119 @@ def _seed_engineering(cur: psycopg.Cursor[Any], label: str, ids: Mapping[str, UU
             "workspace_id": ids["workspace"],
             "decision_id": ids["engineering_decision"],
             "change_id": ids["change"],
+            "now": SEED_EPOCH,
+        },
+    )
+
+    # Datadog connector follow-up (migration 0051) -- a separate
+    # connector_account (provider='datadog') from the 'sandbox' one seeded
+    # above, since a real Datadog row would genuinely reference one of its
+    # own rather than another provider's; one row each in the three new
+    # projection tables, for the identical reason repositories/engineering_
+    # work_items are seeded here: workspace-scoped tables discovered
+    # generically by verify_restore.sh's workspace-isolation check.
+    cur.execute(
+        """
+        INSERT INTO connector_accounts (
+            id, workspace_id, provider, external_account_id, display_name,
+            granted_scopes, encrypted_credentials, status, status_detail,
+            last_synced_at, last_error, disconnected_at, version,
+            created_by, updated_by, created_at, updated_at
+        ) VALUES (
+            %(id)s, %(workspace_id)s, 'datadog', %(external_account_id)s, %(display_name)s,
+            %(granted_scopes)s, %(encrypted_credentials)s, 'active', NULL,
+            %(now)s, NULL, NULL, 1,
+            %(actor)s, %(actor)s, %(now)s, %(now)s
+        )
+        ON CONFLICT (id) DO NOTHING
+        """,
+        {
+            "id": ids["datadog_connector_account"],
+            "workspace_id": ids["workspace"],
+            "external_account_id": f"datadog-{label}-acceptance",
+            "display_name": "Phase 1 acceptance seed Datadog connector",
+            "granted_scopes": [],
+            "encrypted_credentials": b"phase1-seed-fixture-not-a-real-credential",
+            "actor": ids["user"],
+            "now": SEED_EPOCH,
+        },
+    )
+    cur.execute(
+        """
+        INSERT INTO datadog_monitors (
+            id, workspace_id, connector_account_id, provider, external_id,
+            source_url, permission_state, freshness_state, content_hash,
+            provider_updated_at, observed_at, created_at, updated_at,
+            name, monitor_type, query, overall_state
+        ) VALUES (
+            %(id)s, %(workspace_id)s, %(connector_account_id)s, 'datadog', %(external_id)s,
+            %(source_url)s, 'active', 'fresh', %(content_hash)s,
+            %(now)s, %(now)s, %(now)s, %(now)s,
+            %(name)s, 'metric alert', 'avg(last_5m):avg:system.load.1{*} > 1', 'OK'
+        )
+        ON CONFLICT (id) DO NOTHING
+        """,
+        {
+            "id": ids["datadog_monitor"],
+            "workspace_id": ids["workspace"],
+            "connector_account_id": ids["datadog_connector_account"],
+            "external_id": f"acceptance-monitor-{label}",
+            "source_url": f"https://app.datadoghq.com/monitors/acceptance-{label}",
+            "content_hash": sha256(f"acceptance-monitor-{label}".encode()).hexdigest(),
+            "name": f"acceptance-{label}-monitor",
+            "now": SEED_EPOCH,
+        },
+    )
+    cur.execute(
+        """
+        INSERT INTO datadog_service_definitions (
+            id, workspace_id, connector_account_id, provider, external_id,
+            source_url, permission_state, freshness_state, content_hash,
+            observed_at, created_at, updated_at,
+            name, team, tier, description
+        ) VALUES (
+            %(id)s, %(workspace_id)s, %(connector_account_id)s, 'datadog', %(external_id)s,
+            %(source_url)s, 'active', 'fresh', %(content_hash)s,
+            %(now)s, %(now)s, %(now)s,
+            %(name)s, %(team)s, '1', 'Phase 1 acceptance seed fixture service'
+        )
+        ON CONFLICT (id) DO NOTHING
+        """,
+        {
+            "id": ids["datadog_service_definition"],
+            "workspace_id": ids["workspace"],
+            "connector_account_id": ids["datadog_connector_account"],
+            "external_id": f"acceptance-service-{label}",
+            "source_url": f"https://app.datadoghq.com/services/acceptance-{label}-service",
+            "content_hash": sha256(f"acceptance-service-{label}".encode()).hexdigest(),
+            "name": f"acceptance-{label}-service",
+            "team": f"team-acceptance-{label}",
+            "now": SEED_EPOCH,
+        },
+    )
+    cur.execute(
+        """
+        INSERT INTO datadog_dashboards (
+            id, workspace_id, connector_account_id, provider, external_id,
+            source_url, permission_state, freshness_state, content_hash,
+            provider_updated_at, observed_at, created_at, updated_at,
+            title, description
+        ) VALUES (
+            %(id)s, %(workspace_id)s, %(connector_account_id)s, 'datadog', %(external_id)s,
+            %(source_url)s, 'active', 'fresh', %(content_hash)s,
+            %(now)s, %(now)s, %(now)s, %(now)s,
+            %(title)s, 'Phase 1 acceptance seed fixture dashboard'
+        )
+        ON CONFLICT (id) DO NOTHING
+        """,
+        {
+            "id": ids["datadog_dashboard"],
+            "workspace_id": ids["workspace"],
+            "connector_account_id": ids["datadog_connector_account"],
+            "external_id": f"acceptance-dashboard-{label}",
+            "source_url": f"https://app.datadoghq.com/dashboard/acceptance-{label}",
+            "content_hash": sha256(f"acceptance-dashboard-{label}".encode()).hexdigest(),
+            "title": f"Acceptance dashboard ({label})",
             "now": SEED_EPOCH,
         },
     )

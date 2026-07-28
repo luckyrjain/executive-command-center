@@ -181,6 +181,22 @@ def test_datadog_adapter_authorize_rejects_403_app_key() -> None:
         adapter.authorize(_CREDENTIAL)
 
 
+def test_datadog_adapter_authorize_rejects_non_200_app_key_status() -> None:
+    """Mirrors the API-key check's own equivalent branch -- a non-403,
+    non-200 status (e.g. a transient 500) on the app-key check must also
+    reject, not just the specific 403 case above.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v1/validate":
+            return _json_response({"valid": True})
+        return _json_response({"errors": ["Server error"]}, status_code=500)
+
+    adapter = DatadogAdapter(transport=httpx.MockTransport(handler))
+    with pytest.raises(AdapterAuthorizationError, match="500"):
+        adapter.authorize(_CREDENTIAL)
+
+
 def test_datadog_adapter_authorize_rejects_network_error() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         raise httpx.ConnectError("connection refused")
@@ -334,8 +350,10 @@ def test_monitor_page_cap_reports_partial_with_more_pages_remaining(
     def handler(request: httpx.Request) -> httpx.Response:
         page = int(request.url.params["page"])
         return _json_response(
-            [_monitor(page * datadog_adapter_module._PAGE_SIZE + i, name=f"M{page}-{i}")
-             for i in range(datadog_adapter_module._PAGE_SIZE)]
+            [
+                _monitor(page * datadog_adapter_module._PAGE_SIZE + i, name=f"M{page}-{i}")
+                for i in range(datadog_adapter_module._PAGE_SIZE)
+            ]
         )
 
     adapter = DatadogAdapter(transport=httpx.MockTransport(handler))
@@ -355,6 +373,7 @@ def test_incremental_sync_behaves_like_backfill_no_delta_filter(
     used here documents an incremental delta filter, so `incremental_sync`
     is identical to `backfill` and always returns `next_cursor=None`.
     """
+
     def handler(request: httpx.Request) -> httpx.Response:
         page = int(request.url.params["page"])
         return _json_response([_monitor(1, name="Only monitor")] if page == 0 else [])
@@ -376,12 +395,13 @@ def test_backfill_then_resync_with_changed_query_updates_content_hash(
     adapter.backfill(seeded_account_context, "monitor")
 
     with engine.begin() as connection:
-        before_hash = connection.execute(
+        before = connection.execute(
             text(
-                "SELECT content_hash FROM datadog_monitors WHERE workspace_id = :workspace_id"
+                "SELECT content_hash, observed_at FROM datadog_monitors "
+                "WHERE workspace_id = :workspace_id"
             ),
             {"workspace_id": seeded_account_context.workspace_id},
-        ).scalar_one()
+        ).one()
 
     changed = _monitor(1, name="Watched")
     changed["overall_state"] = "Alert"
@@ -396,14 +416,18 @@ def test_backfill_then_resync_with_changed_query_updates_content_hash(
     with engine.begin() as connection:
         rows = connection.execute(
             text(
-                "SELECT content_hash, overall_state FROM datadog_monitors "
+                "SELECT content_hash, overall_state, observed_at FROM datadog_monitors "
                 "WHERE workspace_id = :workspace_id"
             ),
             {"workspace_id": seeded_account_context.workspace_id},
         ).all()
     assert len(rows) == 1
     assert rows[0].overall_state == "Alert"
-    assert rows[0].content_hash != before_hash
+    assert rows[0].content_hash != before.content_hash
+    # Regression lock: `_upsert_monitor`'s own `ON CONFLICT ... DO UPDATE`
+    # once omitted `observed_at`, leaving it frozen at first-sync time
+    # forever despite every other field correctly refreshing on resync.
+    assert rows[0].observed_at > before.observed_at
 
 
 def test_backfill_service_definitions_single_page(
@@ -439,6 +463,162 @@ def test_backfill_service_definitions_single_page(
         "shopping-cart": ("team-shopping-cart", "team-shopping-cart"),
         "checkout": (None, None),
     }
+
+
+def test_backfill_service_definitions_paginates(
+    seeded_account_context: ConnectorAccountContext,
+) -> None:
+    from ecc.domains.engineering import datadog_adapter as datadog_adapter_module
+
+    page0 = [_service_definition(f"service-{i}") for i in range(datadog_adapter_module._PAGE_SIZE)]
+    page1 = [_service_definition("last-service")]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        page_number = int(request.url.params["page[number]"])
+        if page_number == 0:
+            return _json_response({"data": page0})
+        if page_number == 1:
+            return _json_response({"data": page1})
+        raise AssertionError(f"unexpected page[number] {page_number}")
+
+    adapter = DatadogAdapter(transport=httpx.MockTransport(handler))
+    outcome = adapter.backfill(seeded_account_context, "service_definition")
+    assert outcome.status == "succeeded"
+    assert outcome.items_processed == datadog_adapter_module._PAGE_SIZE + 1
+
+
+def test_service_definition_page_cap_reports_partial_with_more_pages_remaining(
+    seeded_account_context: ConnectorAccountContext,
+) -> None:
+    from ecc.domains.engineering import datadog_adapter as datadog_adapter_module
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        page_number = int(request.url.params["page[number]"])
+        return _json_response(
+            {
+                "data": [
+                    _service_definition(f"service-{page_number}-{i}")
+                    for i in range(datadog_adapter_module._PAGE_SIZE)
+                ]
+            }
+        )
+
+    adapter = DatadogAdapter(transport=httpx.MockTransport(handler))
+    outcome = adapter.backfill(seeded_account_context, "service_definition")
+    assert outcome.status == "partial"
+    assert outcome.items_processed == (
+        datadog_adapter_module._MAX_PAGES_PER_CALL * datadog_adapter_module._PAGE_SIZE
+    )
+    assert outcome.error_summary is not None
+    assert "page" in outcome.error_summary.lower()
+
+
+def test_backfill_then_resync_service_definition_with_changed_team_updates_content_hash(
+    seeded_account_context: ConnectorAccountContext,
+) -> None:
+    """Mirrors the monitor-side resync regression lock above -- proves
+    `_upsert_service_definition`'s own `ON CONFLICT ... DO UPDATE` clause
+    genuinely updates an existing row (including `observed_at`) rather
+    than silently no-op'ing, a code path the single-page backfill test
+    above never exercises since it only ever inserts.
+    """
+
+    def first_handler(request: httpx.Request) -> httpx.Response:
+        page_number = int(request.url.params["page[number]"])
+        definition = [_service_definition("shopping-cart", team="team-a")]
+        return _json_response({"data": definition if page_number == 0 else []})
+
+    adapter = DatadogAdapter(transport=httpx.MockTransport(first_handler))
+    adapter.backfill(seeded_account_context, "service_definition")
+
+    with engine.begin() as connection:
+        before = connection.execute(
+            text(
+                "SELECT content_hash, observed_at FROM datadog_service_definitions "
+                "WHERE workspace_id = :workspace_id"
+            ),
+            {"workspace_id": seeded_account_context.workspace_id},
+        ).one()
+
+    def second_handler(request: httpx.Request) -> httpx.Response:
+        page_number = int(request.url.params["page[number]"])
+        definition = [_service_definition("shopping-cart", team="team-b")]
+        return _json_response({"data": definition if page_number == 0 else []})
+
+    adapter2 = DatadogAdapter(transport=httpx.MockTransport(second_handler))
+    adapter2.backfill(seeded_account_context, "service_definition")
+
+    with engine.begin() as connection:
+        rows = connection.execute(
+            text(
+                "SELECT content_hash, team, observed_at FROM datadog_service_definitions "
+                "WHERE workspace_id = :workspace_id"
+            ),
+            {"workspace_id": seeded_account_context.workspace_id},
+        ).all()
+    assert len(rows) == 1
+    assert rows[0].team == "team-b"
+    assert rows[0].content_hash != before.content_hash
+    assert rows[0].observed_at > before.observed_at
+
+
+def test_backfill_then_resync_dashboard_with_changed_title_updates_content_hash(
+    seeded_account_context: ConnectorAccountContext,
+) -> None:
+    """Mirrors the monitor/service-definition resync regression locks
+    above for `_upsert_dashboard`'s own `ON CONFLICT ... DO UPDATE` clause.
+    """
+
+    def first_handler(request: httpx.Request) -> httpx.Response:
+        return _json_response({"dashboards": [_dashboard("abc-123", title="Original")]})
+
+    adapter = DatadogAdapter(transport=httpx.MockTransport(first_handler))
+    adapter.backfill(seeded_account_context, "dashboard")
+
+    with engine.begin() as connection:
+        before = connection.execute(
+            text(
+                "SELECT content_hash, observed_at FROM datadog_dashboards "
+                "WHERE workspace_id = :workspace_id"
+            ),
+            {"workspace_id": seeded_account_context.workspace_id},
+        ).one()
+
+    def second_handler(request: httpx.Request) -> httpx.Response:
+        return _json_response({"dashboards": [_dashboard("abc-123", title="Renamed")]})
+
+    adapter2 = DatadogAdapter(transport=httpx.MockTransport(second_handler))
+    adapter2.backfill(seeded_account_context, "dashboard")
+
+    with engine.begin() as connection:
+        rows = connection.execute(
+            text(
+                "SELECT content_hash, title, observed_at FROM datadog_dashboards "
+                "WHERE workspace_id = :workspace_id"
+            ),
+            {"workspace_id": seeded_account_context.workspace_id},
+        ).all()
+    assert len(rows) == 1
+    assert rows[0].title == "Renamed"
+    assert rows[0].content_hash != before.content_hash
+    assert rows[0].observed_at > before.observed_at
+
+
+def test_dashboard_sync_raises_on_generic_failure_status(
+    seeded_account_context: ConnectorAccountContext,
+) -> None:
+    """The generic-failure-status test elsewhere in this file only
+    exercises `monitor`'s own status check -- `_sync_dashboards` parses a
+    different envelope after its own independent `!= 200` check, so this
+    proves that branch specifically raises rather than mis-parsing.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return _json_response({"errors": ["Server error"]}, status_code=500)
+
+    adapter = DatadogAdapter(transport=httpx.MockTransport(handler))
+    with pytest.raises(RuntimeError, match="500"):
+        adapter.backfill(seeded_account_context, "dashboard")
 
 
 def test_backfill_dashboards_single_unbounded_call(
@@ -697,27 +877,35 @@ def _insert_datadog_connector_account(workspace_id: UUID, user_id: UUID) -> UUID
     [
         (
             "monitor",
-            lambda: (lambda request: _json_response(
-                [_monitor(1, name="Only monitor")] if int(request.url.params["page"]) == 0 else []
-            )),
+            lambda: (
+                lambda request: _json_response(
+                    [_monitor(1, name="Only monitor")]
+                    if int(request.url.params["page"]) == 0
+                    else []
+                )
+            ),
             "datadog_monitors",
             "name",
         ),
         (
             "service_definition",
-            lambda: (lambda request: _json_response(
-                {"data": [_service_definition("only-service")]}
-                if int(request.url.params["page[number]"]) == 0
-                else {"data": []}
-            )),
+            lambda: (
+                lambda request: _json_response(
+                    {"data": [_service_definition("only-service")]}
+                    if int(request.url.params["page[number]"]) == 0
+                    else {"data": []}
+                )
+            ),
             "datadog_service_definitions",
             "name",
         ),
         (
             "dashboard",
-            lambda: (lambda request: _json_response(
-                {"dashboards": [_dashboard("abc-123", title="Only dashboard")]}
-            )),
+            lambda: (
+                lambda request: _json_response(
+                    {"dashboards": [_dashboard("abc-123", title="Only dashboard")]}
+                )
+            ),
             "datadog_dashboards",
             "title",
         ),

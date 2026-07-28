@@ -18,8 +18,10 @@ picking just one:
   signals" data -- each monitor is a real latency/error-rate/traffic/
   saturation alert with a live `OK`/`Alert`/`Warn`/`No Data`-style state.
   The best-documented of the three: confirmed pagination (`page`/
-  `page_size` or `id_offset`) and confirmed team-tag filtering
-  (`monitor_tags`, e.g. `team:platform`).
+  `page_size`). `datadog_adapter.py` parses a monitor's own `team:<name>`
+  tag client-side after fetching (not a server-side `monitor_tags` query
+  filter, which this adapter does not use); see that module's own
+  docstring for the exact mechanism.
 - **`datadog_service_definitions`** (`GET /api/v2/services/definitions`):
   Datadog's own Service Catalog, with a **real, first-class `team`
   field** -- unlike every other provider this codebase connects to
@@ -67,13 +69,19 @@ Jira project name, just with much better underlying data quality here).
 
 **Deliberately deferred, disclosed, not silently expanded into this
 task**: no `POST .../datadog/{monitors,service-definitions,dashboards}/
-{id}/team` confirm endpoints, no `team_entity_id` query filter, and no
-frontend UI for these three new tables -- this task's own scope is the
-connector/sync layer (mirroring GitHub Task 2's own "first task lands
-sync, not every downstream feature" precedent). Wiring team confirmation
-and a query surface for these three tables is real, separate follow-up
-work, matching the same "land exactly what this task needs" discipline
-every prior Phase 6 migration in this chain has followed.
+{id}/team` confirm endpoints, and no frontend UI for these three new
+tables -- this task's own scope is the connector/sync layer plus the
+read-only query surface it needs to be usable at all (mirroring
+`list_repositories_endpoint`'s own precedent), not the write/confirm
+side or a UI. The three new `GET /engineering/monitors|service-
+definitions|dashboards` endpoints this same task adds *do* include an
+optional `team_entity_id` query filter (read-only, identical to
+`list_repositories_endpoint`'s own filter) -- only the confirm-write
+endpoint and the frontend UI are the deferred half, not the filter.
+Wiring team confirmation and a frontend surface for these three tables
+is real, separate follow-up work, matching the same "land exactly what
+this task needs" discipline every prior Phase 6 migration in this chain
+has followed.
 
 **Two existing CHECK constraints widen, nothing else changes.**
 `connector_accounts.provider` gains `'datadog'`

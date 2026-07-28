@@ -115,6 +115,11 @@ def _cleanup_workspace(workspace_id: UUID) -> None:
         for table in (
             "engineering_work_items",
             "repositories",
+            "datadog_monitors",
+            "datadog_service_definitions",
+            "datadog_dashboards",
+            "changes",
+            "reviews",
             "connector_accounts",
             "pkos_nodes",
             "event_outbox",
@@ -683,6 +688,250 @@ def test_disable_marks_changes_and_reviews_disconnected(
         ).scalar_one()
     assert change_state == "disconnected"
     assert review_state == "disconnected"
+
+
+# --- Datadog connector (migration `0051_phase6_datadog_connector.py`) ------
+
+
+def _insert_datadog_monitor(
+    workspace_id: UUID, connector_account_id: UUID, *, name: str = "acceptance monitor"
+) -> UUID:
+    monitor_id = uuid4()
+    now = datetime.now(UTC)
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                """
+                INSERT INTO datadog_monitors (
+                    id, workspace_id, connector_account_id, provider, external_id,
+                    source_url, permission_state, freshness_state, observed_at,
+                    created_at, updated_at, name
+                ) VALUES (
+                    :id, :ws, :acct, 'datadog', :ext, 'https://x', 'active', 'fresh',
+                    :now, :now, :now, :name
+                )
+                """
+            ),
+            {
+                "id": monitor_id,
+                "ws": workspace_id,
+                "acct": connector_account_id,
+                "ext": f"monitor-{monitor_id}",
+                "name": name,
+                "now": now,
+            },
+        )
+    return monitor_id
+
+
+def _insert_datadog_service_definition(
+    workspace_id: UUID, connector_account_id: UUID, *, name: str = "acceptance-service"
+) -> UUID:
+    definition_id = uuid4()
+    now = datetime.now(UTC)
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                """
+                INSERT INTO datadog_service_definitions (
+                    id, workspace_id, connector_account_id, provider, external_id,
+                    source_url, permission_state, freshness_state, observed_at,
+                    created_at, updated_at, name
+                ) VALUES (
+                    :id, :ws, :acct, 'datadog', :ext, 'https://x', 'active', 'fresh',
+                    :now, :now, :now, :name
+                )
+                """
+            ),
+            {
+                "id": definition_id,
+                "ws": workspace_id,
+                "acct": connector_account_id,
+                "ext": f"service-{definition_id}",
+                "name": name,
+                "now": now,
+            },
+        )
+    return definition_id
+
+
+def _insert_datadog_dashboard(
+    workspace_id: UUID, connector_account_id: UUID, *, title: str = "Acceptance dashboard"
+) -> UUID:
+    dashboard_id = uuid4()
+    now = datetime.now(UTC)
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                """
+                INSERT INTO datadog_dashboards (
+                    id, workspace_id, connector_account_id, provider, external_id,
+                    source_url, permission_state, freshness_state, observed_at,
+                    created_at, updated_at, title
+                ) VALUES (
+                    :id, :ws, :acct, 'datadog', :ext, 'https://x', 'active', 'fresh',
+                    :now, :now, :now, :title
+                )
+                """
+            ),
+            {
+                "id": dashboard_id,
+                "ws": workspace_id,
+                "acct": connector_account_id,
+                "ext": f"dashboard-{dashboard_id}",
+                "title": title,
+                "now": now,
+            },
+        )
+    return dashboard_id
+
+
+def test_disable_marks_datadog_projections_disconnected(
+    query_endpoints_test_context: tuple[TestClient, UUID, UUID],
+) -> None:
+    """PR #85's own security/correctness review found the disable cascade
+    (`test_disable_marks_changes_and_reviews_disconnected`'s own docstring
+    above has the full history of this exact gap recurring twice already)
+    had not been extended to the three Datadog tables added by migration
+    `0051_phase6_datadog_connector.py`. Unlike `changes`/`reviews`, these
+    three do have their own `GET` endpoints, so this checks through them.
+    """
+    client, workspace_id, user_id = query_endpoints_test_context
+    token = client.cookies.get("ecc_session")
+    assert token is not None
+    account_id = _insert_connector_account(
+        workspace_id, user_id, provider="datadog", credential="dd"
+    )
+    _insert_datadog_monitor(workspace_id, account_id)
+    _insert_datadog_service_definition(workspace_id, account_id)
+    _insert_datadog_dashboard(workspace_id, account_id)
+
+    response = client.post(
+        f"/api/v1/engineering/connectors/{account_id}/disable",
+        headers=_headers(token, key=str(uuid4())),
+    )
+    assert response.status_code == 200, response.text
+
+    monitors = client.get("/api/v1/engineering/monitors").json()["monitors"]
+    definitions = client.get("/api/v1/engineering/service-definitions").json()[
+        "service_definitions"
+    ]
+    dashboards = client.get("/api/v1/engineering/dashboards").json()["dashboards"]
+    assert [m["freshness_state"] for m in monitors] == ["disconnected"]
+    assert [d["freshness_state"] for d in definitions] == ["disconnected"]
+    assert [d["freshness_state"] for d in dashboards] == ["disconnected"]
+
+
+def test_list_monitors_cross_workspace_isolation_and_team_entity_filter(
+    query_endpoints_test_context: tuple[TestClient, UUID, UUID],
+) -> None:
+    client, workspace_id, user_id = query_endpoints_test_context
+    account_id = _insert_connector_account(
+        workspace_id, user_id, provider="datadog", credential="dd"
+    )
+    team_id = _insert_team_entity(workspace_id)
+    mine = _insert_datadog_monitor(workspace_id, account_id, name="mine")
+    with engine.begin() as connection:
+        connection.execute(
+            text("UPDATE datadog_monitors SET team_entity_id = :team WHERE id = :id"),
+            {"team": team_id, "id": mine},
+        )
+    _insert_datadog_monitor(workspace_id, account_id, name="unassigned")
+
+    other_workspace_id = uuid4()
+    other_user_id = uuid4()
+    now = datetime.now(UTC)
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO workspaces (id, name, timezone, created_at) "
+                "VALUES (:id, 'Other', 'UTC', :now)"
+            ),
+            {"id": other_workspace_id, "now": now},
+        )
+        connection.execute(
+            text(
+                "INSERT INTO users (id, workspace_id, email, password_hash, created_at) "
+                "VALUES (:id, :workspace_id, :email, 'test-password-hash', :now)"
+            ),
+            {
+                "id": other_user_id,
+                "workspace_id": other_workspace_id,
+                "email": f"{other_user_id}@example.test",
+                "now": now,
+            },
+        )
+    try:
+        other_account_id = _insert_connector_account(
+            other_workspace_id, other_user_id, provider="datadog", credential="dd-other"
+        )
+        _insert_datadog_monitor(other_workspace_id, other_account_id, name="theirs")
+
+        response = client.get("/api/v1/engineering/monitors")
+        assert response.status_code == 200, response.text
+        names = {m["name"] for m in response.json()["monitors"]}
+        assert names == {"mine", "unassigned"}
+
+        filtered = client.get(
+            "/api/v1/engineering/monitors", params={"team_entity_id": str(team_id)}
+        )
+        assert filtered.status_code == 200, filtered.text
+        assert [m["name"] for m in filtered.json()["monitors"]] == ["mine"]
+    finally:
+        _cleanup_workspace(other_workspace_id)
+
+
+def test_list_service_definitions_and_dashboards_cross_workspace_isolation(
+    query_endpoints_test_context: tuple[TestClient, UUID, UUID],
+) -> None:
+    client, workspace_id, user_id = query_endpoints_test_context
+    account_id = _insert_connector_account(
+        workspace_id, user_id, provider="datadog", credential="dd"
+    )
+    _insert_datadog_service_definition(workspace_id, account_id, name="mine-service")
+    _insert_datadog_dashboard(workspace_id, account_id, title="Mine dashboard")
+
+    other_workspace_id = uuid4()
+    other_user_id = uuid4()
+    now = datetime.now(UTC)
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO workspaces (id, name, timezone, created_at) "
+                "VALUES (:id, 'Other', 'UTC', :now)"
+            ),
+            {"id": other_workspace_id, "now": now},
+        )
+        connection.execute(
+            text(
+                "INSERT INTO users (id, workspace_id, email, password_hash, created_at) "
+                "VALUES (:id, :workspace_id, :email, 'test-password-hash', :now)"
+            ),
+            {
+                "id": other_user_id,
+                "workspace_id": other_workspace_id,
+                "email": f"{other_user_id}@example.test",
+                "now": now,
+            },
+        )
+    try:
+        other_account_id = _insert_connector_account(
+            other_workspace_id, other_user_id, provider="datadog", credential="dd-other"
+        )
+        _insert_datadog_service_definition(
+            other_workspace_id, other_account_id, name="their-service"
+        )
+        _insert_datadog_dashboard(other_workspace_id, other_account_id, title="Their dashboard")
+
+        definitions = client.get("/api/v1/engineering/service-definitions").json()[
+            "service_definitions"
+        ]
+        assert [d["name"] for d in definitions] == ["mine-service"]
+
+        dashboards = client.get("/api/v1/engineering/dashboards").json()["dashboards"]
+        assert [d["title"] for d in dashboards] == ["Mine dashboard"]
+    finally:
+        _cleanup_workspace(other_workspace_id)
 
 
 # --- team linkage (migration `0050_phase6_team_linkage.py`) ---------------

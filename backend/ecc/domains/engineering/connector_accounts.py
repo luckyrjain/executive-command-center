@@ -146,9 +146,11 @@ RunType = Literal["backfill", "incremental", "webhook"]
 ManualSyncRunType = Literal["backfill", "incremental"]
 RunStatus = Literal["running", "succeeded", "failed", "partial"]
 # Matches migration `0044_phase6_connector_platform.py`'s
-# `ck_sync_cursors_resource_type` CHECK constraint exactly -- accepting any
-# string here (the previous shape) let a request reach the cursor UPSERT
-# with an out-of-set value, which the CHECK constraint then rejected as an
+# `ck_sync_cursors_resource_type` CHECK constraint exactly (widened by
+# migration `0051_phase6_datadog_connector.py` to add `monitor`/
+# `service_definition`/`dashboard`) -- accepting any string here (the
+# previous shape) let a request reach the cursor UPSERT with an
+# out-of-set value, which the CHECK constraint then rejected as an
 # unhandled `IntegrityError`/500 rather than a clean 422. Validating the
 # same closed set at the API boundary means a caller gets a structured
 # FastAPI/Pydantic validation error instead.
@@ -1352,12 +1354,23 @@ def disable_connector_endpoint(
             # freshness state -- a real gap the final Phase 6 review found:
             # this cascade never existed, so every already-synced row kept
             # reporting `freshness_state = 'fresh'` forever after disable.
-            # All four projection tables carry the identical `workspace_id`/
+            # All seven projection tables carry the identical `workspace_id`/
             # `connector_account_id`/`freshness_state` shape (migrations
-            # `0045`/`0047`/`0048`) -- a round-2 re-review of this same fix
-            # found `changes`/`reviews` had been left off the first pass,
-            # which omitted only `repositories`/`engineering_work_items`.
-            for table in ("repositories", "engineering_work_items", "changes", "reviews"):
+            # `0045`/`0047`/`0048`/`0051`) -- a round-2 re-review of this same
+            # fix found `changes`/`reviews` had been left off the first pass
+            # (which omitted only `repositories`/`engineering_work_items`),
+            # and PR #85's own security review found the three Datadog
+            # tables left off this round in turn -- the identical gap, a
+            # third time, closed here rather than repeated a fourth.
+            for table in (
+                "repositories",
+                "engineering_work_items",
+                "changes",
+                "reviews",
+                "datadog_monitors",
+                "datadog_service_definitions",
+                "datadog_dashboards",
+            ):
                 session.execute(
                     text(  # noqa: S608 -- table name is one of four fixed literals, never user input
                         f"UPDATE {table} SET freshness_state = 'disconnected', "

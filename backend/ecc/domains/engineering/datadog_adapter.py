@@ -245,6 +245,7 @@ def _upsert_monitor(
                     freshness_state = 'fresh',
                     content_hash = EXCLUDED.content_hash,
                     provider_updated_at = EXCLUDED.provider_updated_at,
+                    observed_at = EXCLUDED.observed_at,
                     updated_at = EXCLUDED.updated_at,
                     suggested_team_name = EXCLUDED.suggested_team_name,
                     name = EXCLUDED.name,
@@ -325,6 +326,7 @@ def _upsert_service_definition(
                     permission_state = 'active',
                     freshness_state = 'fresh',
                     content_hash = EXCLUDED.content_hash,
+                    observed_at = EXCLUDED.observed_at,
                     updated_at = EXCLUDED.updated_at,
                     suggested_team_name = EXCLUDED.suggested_team_name,
                     name = EXCLUDED.name,
@@ -402,6 +404,7 @@ def _upsert_dashboard(
                     freshness_state = 'fresh',
                     content_hash = EXCLUDED.content_hash,
                     provider_updated_at = EXCLUDED.provider_updated_at,
+                    observed_at = EXCLUDED.observed_at,
                     updated_at = EXCLUDED.updated_at,
                     suggested_team_name = EXCLUDED.suggested_team_name,
                     title = EXCLUDED.title,
@@ -524,9 +527,7 @@ class DatadogAdapter:
         except httpx.HTTPError as exc:
             raise AdapterAuthorizationError(f"Datadog authorization request failed: {exc}") from exc
         if app_key_response.status_code == 403:
-            raise AdapterAuthorizationError(
-                "Datadog rejected the application key (403 Forbidden)"
-            )
+            raise AdapterAuthorizationError("Datadog rejected the application key (403 Forbidden)")
         if app_key_response.status_code != 200:
             raise AdapterAuthorizationError(
                 "Datadog application key validation failed with status "
