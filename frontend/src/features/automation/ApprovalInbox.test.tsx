@@ -7,6 +7,15 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import ApprovalInbox from './ApprovalInbox'
 import type { Approval, RunDetail } from './types'
 
+// `expires_at` must stay in the future relative to whenever this suite
+// actually runs -- `ApprovalInbox.tsx`'s own `isExpired` compares it
+// against a real `new Date()` at render time, not a mocked clock. A
+// hardcoded absolute date here is a ticking time bomb (this exact fixture
+// previously read `'2026-07-27T00:00:00Z'` and started failing once real
+// wall-clock time passed it), so this is computed relative to whenever
+// the suite runs instead.
+const FUTURE_EXPIRY = new Date(Date.now() + 2 * 24 * 60 * 60 * 1000).toISOString()
+
 const pendingApproval: Approval = {
   id: 'approval-1',
   run_id: 'run-1',
@@ -15,7 +24,7 @@ const pendingApproval: Approval = {
   high_impact_categories: ['destructive'],
   status: 'pending',
   requested_at: '2026-07-25T00:00:00Z',
-  expires_at: '2026-07-27T00:00:00Z',
+  expires_at: FUTURE_EXPIRY,
   decided_at: null,
   decision: null,
   decided_by: null,
@@ -75,7 +84,7 @@ describe('ApprovalInbox', () => {
 
     await waitFor(() => expect(screen.getByText(/Run run-1 · step 0/)).toBeTruthy())
     expect(screen.getByText('destructive')).toBeTruthy()
-    expect(screen.getByText(/expires 7\/27\/2026|expires.*2026/)).toBeTruthy()
+    expect(screen.getByText(/expires \d{1,2}\/\d{1,2}\/\d{4}/)).toBeTruthy()
     await waitFor(() => expect(screen.getByText('local.create_note')).toBeTruthy())
     await waitFor(() => expect(screen.getByText('Payload summary (redacted)')).toBeTruthy())
     fireEvent.click(screen.getByText('Payload summary (redacted)'))

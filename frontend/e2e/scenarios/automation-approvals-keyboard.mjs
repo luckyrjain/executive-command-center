@@ -42,7 +42,14 @@ const pendingApproval = {
   high_impact_categories: ['financial'],
   status: 'pending',
   requested_at: '2026-07-26T00:00:00Z',
-  expires_at: '2026-07-27T00:00:00Z',
+  // Must stay in the future relative to whenever this scenario actually
+  // runs -- `ApprovalInbox.tsx`'s `isExpired` compares this against a
+  // real `new Date()` in the real browser, not a mocked clock. A
+  // hardcoded absolute date here previously rotted (this exact fixture
+  // read `'2026-07-27T00:00:00Z'`, which real wall-clock time passed,
+  // disabling the Approve control this scenario tabs into and needs
+  // enabled).
+  expires_at: new Date(Date.now() + 2 * 24 * 60 * 60 * 1000).toISOString(),
   decided_at: null,
   decision: null,
   decided_by: null,

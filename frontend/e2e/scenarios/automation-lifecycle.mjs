@@ -7,7 +7,15 @@ const WORKFLOW_ID = 'weekly-digest'
 const RUN_ID = 'lifecycle-run-1'
 const APPROVAL_ID = 'lifecycle-approval-1'
 const DIGEST = 'lifecycle-digest-abc123'
-const now = new Date('2026-07-26T12:00:00Z')
+// Genuinely `Date.now()`-relative, not a frozen historical instant -- a
+// hardcoded `now` here previously rotted (this variable's name promised
+// "now" but was actually pinned to a fixed past date, so `iso(24 * 60 *
+// 60 * 1000)`'s "expires in 24h" for the approval fixture below eventually
+// resolved to a real past time once wall-clock time caught up, silently
+// expiring the approval and disabling the Approve control this scenario
+// needs enabled). No assertion in this file depends on an exact displayed
+// date/time, so a real clock is safe here.
+const now = new Date()
 
 function iso(offsetMs = 0) {
   return new Date(now.getTime() + offsetMs).toISOString()
