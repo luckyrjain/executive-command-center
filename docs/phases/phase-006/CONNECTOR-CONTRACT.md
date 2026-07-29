@@ -2,7 +2,7 @@
 id: PHASE-006-CONNECTOR
 title: Engineering Connector Contract
 status: Approved for Implementation
-version: 0.10.0
+version: 0.11.0
 owner: Lucky Jain
 ---
 
@@ -18,6 +18,8 @@ Provider deletion, access loss and rename are distinct states. Disconnect revoke
 
 GitHub ships first, as the reference adapter against the `ConnectorAdapter` contract below; GitLab and Jira are explicitly sequenced next against the identical contract, not descoped -- `docs/superpowers/plans/2026-07-27-phase-6-engineering-workspace.md` names the task order (Task 2 GitHub, Task 3 GitLab, Task 4 Jira). A provider that cannot pass this contract by its scheduled task is explicitly descoped at that point in `docs/phases/phase-006/IMPLEMENTATION-STATUS.md`, not silently dropped.
 
+**Datadog is a post-Task-8 follow-up addition**, not part of the original four-task plan above -- an observability provider, not a source-control/work-tracking one, added against the identical `ConnectorAdapter` contract. See "Datadog connector status" below.
+
 ## Provider scopes (resolved)
 
 Least privilege, read-only by default; a write scope is requested only when a specific Phase 5-gated write action needs it, never bundled into the default read connection.
@@ -27,6 +29,7 @@ Least privilege, read-only by default; a write scope is requested only when a sp
 | GitHub | `repo` (classic OAuth token/PAT scope; see Task 2 status below for the fine-grained-PAT limitation) | `repo` (already read+write; no separate write scope to request) |
 | GitLab | `read_api`, `read_repository` | `api` |
 | Jira | `read:jira-work` (see Task 4 status below for why a personal API token cannot actually be checked against this label) | `write:jira-work` |
+| Datadog | none checkable (see "Datadog connector status" below for why an application key's scopes cannot be verified) | none -- no write action exists for this provider in this phase's scope |
 
 **GitHub's scope vocabulary correction (Task 2).** The row above originally
 named GitHub App/fine-grained-PAT permission identifiers (`contents:read`,
@@ -105,6 +108,28 @@ No change to this contract or to any adapter. `incidents`/`engineering_decisions
 
 The write-scope table above (`repo`/`api`/`write:jira-work`) is now genuinely used: `ecc.domains.engineering.write_actions` (three `ecc.domains.automation.adapters.ActionAdapter`s -- `github.add_issue_comment`, `gitlab.add_note`, `jira.add_comment`) decrypts and reuses the identical `connector_accounts.encrypted_credentials` this contract already governs, rather than a second credential store. No `ConnectorAdapter` change -- these are not `backfill`/`incremental_sync` participants, so no new `resource_type`, cursor, or webhook surface. **Scope pre-checking against `granted_scopes` is not implemented, disclosed rather than silently assumed**: GitHub's classic `repo` scope is already read+write with nothing separate to detect, and `granted_scopes` is empty for both a fine-grained GitHub PAT and every Jira personal API token (`JiraAdapter.required_scopes` is unconditionally `frozenset()`); only GitLab's `granted_scopes` is reliable enough to check. Implementing a scope check that only works for one of three providers would imply a guarantee this contract cannot actually make -- these adapters instead rely on the provider's own 401/403 at write time, surfaced as a plain (non-retried) failure. See `write_actions.py`'s own module docstring for the full reasoning, including why every adapter declares `high_impact_categories={"public"}` unconditionally (the actual, load-bearing access control, given `automation/policy.py`'s own documented "`action_types`/`data_classes`/`value_limit` are stored but never enforced" gap).
 
+## Datadog connector status (migration `0051_phase6_datadog_connector.py`)
+
+`datadog_adapter.DatadogAdapter` implements the contract above for three new resource types together -- `monitor`, `service_definition`, `dashboard` -- per the explicit choice to build all three rather than sequencing one first. Datadog is not source-control/work-tracking, so there is no `repository`/`work_item`/`change`/`review`/`deployment` analogue for this adapter at all; `backfill`/`incremental_sync` return a zero-item success outcome for any resource type outside these three, the identical precedent `jira_adapter.py` already set for `repository`/`change`/etc.
+
+**Multi-region, like Jira is multi-tenant.** A Datadog account lives at one of six documented regional API sites; the credential pipe-delimits `"{site}|{api_key}|{app_key}"`, with `site` validated against that closed set directly (not a regex -- see `datadog_adapter.py`'s own module docstring for why a fixed-membership check is a tighter SSRF bound than Jira's pattern-based one).
+
+**No stable account-identity endpoint, unlike GitHub/GitLab/Jira.** `external_account_id` is a disclosed `sha256(api_key)` hash prefix, not a real Datadog-issued identifier -- no confirmed endpoint returns one from just an API key and app key.
+
+**No scope-verification mechanism, for a different cause than Jira's identical limitation.** An application key's scopes (if scoped at all) are only readable via an endpoint requiring the key's own opaque ID, not derivable from the raw key value this adapter holds. `required_scopes` is the empty set; `authorize` always returns an honestly-empty `granted_scopes`.
+
+**No incremental delta filter exists for any of the three list endpoints.** Unlike every other provider this phase supports, none of `GET /api/v1/monitor`, `GET /api/v2/services/definitions`, or `GET /api/v1/dashboard` accepts an "updated since" parameter -- `incremental_sync` is therefore identical to `backfill` for all three resource types, and `next_cursor` is always `None` (nothing is written to `sync_cursors.cursor_value` for these three resource types, a disclosed gap rather than a bug).
+
+**Pagination differs across the three, and dashboards' is genuinely unconfirmed.** Monitors/service definitions paginate (`page`/`page_size` and `page[size]`/`page[number]` respectively, both bounded by the same `_MAX_PAGES_PER_CALL` precedent every other adapter uses); `GET /api/v1/dashboard` documents no pagination parameters at all, so this adapter fetches it in a single unbounded call and discloses that directly rather than inventing parameters the endpoint may not support.
+
+**Rate-limit handling uses `X-RateLimit-Reset` (seconds until reset), not `Retry-After`** -- otherwise the identical bounded-wait-then-degrade-to-`partial` shape (including a still-rate-limited retry also degrading to `partial`) every other adapter in this contract already uses.
+
+**`handle_webhook` is a documented no-op, unlike Jira's own parsing-without-a-route precedent.** Datadog webhook payloads are a per-monitor customer-defined template (`$ID`/`$ALERT_TITLE`/... substitution), not a fixed schema this adapter can parse without a workspace-specific contract this task does not define.
+
+**`refresh_permissions`/`disconnect` mirror Jira's documented-no-op shape** -- `refresh_permissions` re-validates the API key via `GET /api/v1/validate`; `disconnect` is a no-op, since Datadog's key-revocation endpoints require the key's own opaque ID, not derivable from the raw key value.
+
+Three new read-only list endpoints (`GET /engineering/monitors`, `/service-definitions`, `/dashboards`) were added in this same task, mirroring `list_repositories_endpoint`'s shape exactly (`API-SCHEMAS.md`'s matching section). No team-assignment confirm endpoint exists yet for any of the three new tables -- see "Team linkage status" below for why that is a deliberately deferred follow-up, not an oversight.
+
 ## Team linkage status (migration `0050_phase6_team_linkage.py`)
 
 Every read adapter now also writes `suggested_team_name` on each `repository`/`work_item` upsert -- not a new `ConnectorAdapter` method, resource type, or cursor, just one more field in the existing `_upsert_repository`/`_upsert_work_item` payload, refreshed on every backfill/incremental/webhook call exactly like every other provider-sourced column. This is the "auto-suggest" half of migration `0050_phase6_team_linkage.py`'s own hybrid design (that migration's own docstring has the full design; the "human confirms" half is `POST /engineering/repositories/{id}/team` and `POST /engineering/work-items/{id}/team`, `ecc.domains.engineering.connector_accounts` -- see `API-SCHEMAS.md`'s matching section for their `expected_version`/`Idempotency-Key`/audit-trail contract). Per provider, disclosed rather than presented as equally reliable:
@@ -114,3 +139,11 @@ Every read adapter now also writes `suggested_team_name` on each `repository`/`w
 - **Jira**: `fields.project.name` -- **an explicit heuristic, not a claim that a Jira project *is* a team.** Jira Cloud has no native "team" construct this connector's already-approved `read:jira-work` scope (or, in practice, a personal API token) exposes; a project is the closest real signal available, but one project commonly maps to several teams or one team spans several projects in a real Jira instance. Treated purely as an unconfirmed hint a human reads before confirming, never auto-applied.
 
 No sync/adapter code path ever writes the confirmed `team_entity_id` column itself -- only a human, through the two new endpoints, which validate the supplied id against a real, active, `kind="team"` `pkos_nodes` row in the caller's own workspace before accepting it (the same "existence + kind, checked at write time" precedent `waiting.py`'s `_counterparty_node_type` already established). See migration `0050_phase6_team_linkage.py`'s own docstring for the full column-by-column design and why `delivery_metric_snapshots` intentionally gains no matching column yet -- the metrics-computation engine does not read either new column, so wiring it is separate, disclosed follow-up work (`DELIVERY-INTELLIGENCE-CONTRACT.md`'s updated "Task 5 status").
+
+**Datadog (migration `0051_phase6_datadog_connector.py`) extends `suggested_team_name` to three new tables, but deliberately stops at the suggestion.** `datadog_monitors`/`datadog_service_definitions`/`datadog_dashboards` each carry `team_entity_id`/`suggested_team_name`, populated the same "auto-suggest" way as GitHub/GitLab/Jira -- but per-resource reliability differs sharply, disclosed rather than presented as equally reliable:
+
+- **Service definitions**: Datadog's own real `team` field (`attributes.schema.team`) -- copied verbatim, the most reliable suggestion of any provider this contract covers, since it is not a heuristic at all. Still requires human confirmation like every other provider's suggestion (this codebase's "never auto-create entities from external evidence" principle).
+- **Monitors**: a `team:<name>` tag parsed from the monitor's own `tags` array, Datadog's own documented convention but not a first-class field -- an explicit heuristic, one step more reliable than Jira's project-name guess since it is at least an intentional tagging convention, not an incidental proxy.
+- **Dashboards**: `GET /api/v1/dashboard`'s list response is not confirmed to include a `tags` field at all (only the full single-dashboard `GET` does, which this adapter does not call per-dashboard to avoid an N+1 sync) -- `suggested_team_name` will, in practice, very likely always resolve to `None` for this one resource type. A disclosed limitation, not a broken feature.
+
+**No confirm endpoint exists yet for any of these three tables** -- unlike `repositories`/`engineering_work_items`, `datadog_monitors`/`datadog_service_definitions`/`datadog_dashboards` were deliberately *not* given a `team_assignment_version`/`team_assignment_updated_by` pair in migration `0051`. A version column no endpoint ever bumps would be exactly as unreachable as the fields it would sit next to -- the same reasoning this migration's own docstring uses to justify not repeating that specific mistake. `team_entity_id`/`suggested_team_name` are still surfaced read-only on the three new list endpoints (queryable via a `team_entity_id` filter, matching `list_repositories_endpoint`'s identical filter), but writing a confirmed link for these three tables -- the endpoints, the frontend UI, and the version/audit columns together -- is deliberately deferred to its own follow-up task.

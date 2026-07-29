@@ -91,8 +91,8 @@ class ConnectorAdapter(Protocol):
     """Structural contract every registered connector adapter satisfies.
     `provider` is the stable slug stored in `connector_accounts.provider`
     (the `ck_connector_accounts_provider` CHECK constraint's closed set:
-    `github`, `gitlab`, `jira`, `sandbox`) and doubles as this registry's
-    lookup key.
+    `github`, `gitlab`, `jira`, `sandbox`, `datadog`) and doubles as this
+    registry's lookup key.
     """
 
     provider: str
@@ -204,11 +204,14 @@ class ConnectorRegistry:
 # Shared production registry. Task 1 registered only `sandbox.github` (see
 # `sandbox_adapter.py`) -- no real adapter existed yet. Task 2 added the
 # real `github` adapter (`github_adapter.py`); Task 3 added `gitlab`
-# (`gitlab_adapter.py`); Task 4 adds `jira` (`jira_adapter.py`) against the
-# identical contract -- work items only, since Jira is not a source-
-# control provider. `sandbox` remains registered for tests/simulation,
-# matching Phase 5's identical precedent of keeping its own fake adapters
-# registered alongside real ones.
+# (`gitlab_adapter.py`); Task 4 added `jira` (`jira_adapter.py`) -- work
+# items only, since Jira is not a source-control provider. A later
+# follow-up task adds `datadog` (`datadog_adapter.py`) -- monitors, service
+# definitions and dashboards, against the identical contract. `sandbox`
+# remains registered for tests/simulation, matching Phase 5's identical
+# precedent of keeping its own fake adapters registered alongside real
+# ones.
+from .datadog_adapter import DatadogAdapter  # noqa: E402
 from .github_adapter import GitHubAdapter  # noqa: E402
 from .gitlab_adapter import GitLabAdapter  # noqa: E402
 from .jira_adapter import JiraAdapter  # noqa: E402
@@ -219,3 +222,4 @@ registry.register(SandboxGithubAdapter())
 registry.register(GitHubAdapter())
 registry.register(GitLabAdapter())
 registry.register(JiraAdapter())
+registry.register(DatadogAdapter())

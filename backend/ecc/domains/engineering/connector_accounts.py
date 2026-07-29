@@ -146,13 +146,25 @@ RunType = Literal["backfill", "incremental", "webhook"]
 ManualSyncRunType = Literal["backfill", "incremental"]
 RunStatus = Literal["running", "succeeded", "failed", "partial"]
 # Matches migration `0044_phase6_connector_platform.py`'s
-# `ck_sync_cursors_resource_type` CHECK constraint exactly -- accepting any
-# string here (the previous shape) let a request reach the cursor UPSERT
-# with an out-of-set value, which the CHECK constraint then rejected as an
+# `ck_sync_cursors_resource_type` CHECK constraint exactly (widened by
+# migration `0051_phase6_datadog_connector.py` to add `monitor`/
+# `service_definition`/`dashboard`) -- accepting any string here (the
+# previous shape) let a request reach the cursor UPSERT with an
+# out-of-set value, which the CHECK constraint then rejected as an
 # unhandled `IntegrityError`/500 rather than a clean 422. Validating the
 # same closed set at the API boundary means a caller gets a structured
 # FastAPI/Pydantic validation error instead.
-ResourceType = Literal["repository", "work_item", "change", "review", "deployment", "incident"]
+ResourceType = Literal[
+    "repository",
+    "work_item",
+    "change",
+    "review",
+    "deployment",
+    "incident",
+    "monitor",
+    "service_definition",
+    "dashboard",
+]
 
 _MAX_ADAPTER_ERROR_LENGTH = 300
 # `uq_sync_runs_running_per_account` (migration 0046) makes a `running`
@@ -494,6 +506,85 @@ class WorkItemResponse(BaseModel):
 
 class WorkItemListResponse(BaseModel):
     work_items: list[WorkItemResponse]
+
+
+# --- Datadog projections (monitors/service definitions/dashboards) -----
+# Migration `0051_phase6_datadog_connector.py`'s own three new tables --
+# deliberately no `team_assignment_version`/`team_assignment_updated_by`
+# pair on any of these three response models, mirroring that migration's
+# own disclosed reason: no confirm-endpoint exists yet for these tables,
+# so a version column no endpoint ever bumps would be exactly as
+# unreachable as the fields it would sit next to. `team_entity_id`/
+# `suggested_team_name` are still surfaced read-only (queryable via the
+# `team_entity_id` filter below), for the same "linkage exists, confirm
+# flow is a disclosed follow-up" reasoning as everywhere else in this file.
+class MonitorResponse(BaseModel):
+    id: UUID
+    connector_account_id: UUID
+    provider: str
+    external_id: str
+    source_url: str
+    name: str
+    monitor_type: str | None
+    query: str | None
+    overall_state: str | None
+    permission_state: Literal["active", "permission_lost", "deleted"]
+    freshness_state: Literal["fresh", "stale", "disconnected"]
+    provider_updated_at: datetime | None
+    observed_at: datetime
+    created_at: datetime
+    updated_at: datetime
+    team_entity_id: UUID | None
+    suggested_team_name: str | None
+
+
+class MonitorListResponse(BaseModel):
+    monitors: list[MonitorResponse]
+
+
+class ServiceDefinitionResponse(BaseModel):
+    id: UUID
+    connector_account_id: UUID
+    provider: str
+    external_id: str
+    source_url: str
+    name: str
+    team: str | None
+    tier: str | None
+    description: str | None
+    permission_state: Literal["active", "permission_lost", "deleted"]
+    freshness_state: Literal["fresh", "stale", "disconnected"]
+    observed_at: datetime
+    created_at: datetime
+    updated_at: datetime
+    team_entity_id: UUID | None
+    suggested_team_name: str | None
+
+
+class ServiceDefinitionListResponse(BaseModel):
+    service_definitions: list[ServiceDefinitionResponse]
+
+
+class DashboardResponse(BaseModel):
+    id: UUID
+    connector_account_id: UUID
+    provider: str
+    external_id: str
+    source_url: str
+    title: str
+    description: str | None
+    permission_state: Literal["active", "permission_lost", "deleted"]
+    freshness_state: Literal["fresh", "stale", "disconnected"]
+    provider_updated_at: datetime | None
+    observed_at: datetime
+    created_at: datetime
+    updated_at: datetime
+    team_entity_id: UUID | None
+    suggested_team_name: str | None
+
+
+class DashboardListResponse(BaseModel):
+    dashboards: list[DashboardResponse]
 
 
 class TeamAssignmentRequest(BaseModel):
@@ -1263,12 +1354,23 @@ def disable_connector_endpoint(
             # freshness state -- a real gap the final Phase 6 review found:
             # this cascade never existed, so every already-synced row kept
             # reporting `freshness_state = 'fresh'` forever after disable.
-            # All four projection tables carry the identical `workspace_id`/
+            # All seven projection tables carry the identical `workspace_id`/
             # `connector_account_id`/`freshness_state` shape (migrations
-            # `0045`/`0047`/`0048`) -- a round-2 re-review of this same fix
-            # found `changes`/`reviews` had been left off the first pass,
-            # which omitted only `repositories`/`engineering_work_items`.
-            for table in ("repositories", "engineering_work_items", "changes", "reviews"):
+            # `0045`/`0047`/`0048`/`0051`) -- a round-2 re-review of this same
+            # fix found `changes`/`reviews` had been left off the first pass
+            # (which omitted only `repositories`/`engineering_work_items`),
+            # and PR #85's own security review found the three Datadog
+            # tables left off this round in turn -- the identical gap, a
+            # third time, closed here rather than repeated a fourth.
+            for table in (
+                "repositories",
+                "engineering_work_items",
+                "changes",
+                "reviews",
+                "datadog_monitors",
+                "datadog_service_definitions",
+                "datadog_dashboards",
+            ):
                 session.execute(
                     text(  # noqa: S608 -- table name is one of four fixed literals, never user input
                         f"UPDATE {table} SET freshness_state = 'disconnected', "
@@ -1447,6 +1549,116 @@ def list_work_items_endpoint(
         .all()
     )
     return WorkItemListResponse(work_items=[WorkItemResponse(**dict(row)) for row in rows])
+
+
+@router.get("/monitors", response_model=MonitorListResponse)
+def list_monitors_endpoint(
+    auth: AuthDep,
+    session: SessionDep,
+    connector_account_id: Annotated[UUID | None, Query()] = None,
+    team_entity_id: Annotated[UUID | None, Query()] = None,
+) -> MonitorListResponse:
+    """Mirrors `list_repositories_endpoint`'s shape exactly, for the
+    Datadog connector's `datadog_monitors` projection (migration
+    `0051_phase6_datadog_connector.py`).
+    """
+    clauses = []
+    params: dict[str, Any] = {"workspace_id": auth.workspace_id}
+    if connector_account_id:
+        clauses.append("AND connector_account_id = :connector_account_id")
+        params["connector_account_id"] = connector_account_id
+    if team_entity_id:
+        clauses.append("AND team_entity_id = :team_entity_id")
+        params["team_entity_id"] = team_entity_id
+    rows = (
+        session.execute(
+            text(
+                "SELECT id, connector_account_id, provider, external_id, source_url, "
+                "name, monitor_type, query, overall_state, permission_state, "
+                "freshness_state, provider_updated_at, observed_at, created_at, "
+                "updated_at, team_entity_id, suggested_team_name "
+                "FROM datadog_monitors "
+                f"WHERE workspace_id = :workspace_id {' '.join(clauses)} ORDER BY name ASC"  # noqa: S608
+            ),
+            params,
+        )
+        .mappings()
+        .all()
+    )
+    return MonitorListResponse(monitors=[MonitorResponse(**dict(row)) for row in rows])
+
+
+@router.get("/service-definitions", response_model=ServiceDefinitionListResponse)
+def list_service_definitions_endpoint(
+    auth: AuthDep,
+    session: SessionDep,
+    connector_account_id: Annotated[UUID | None, Query()] = None,
+    team_entity_id: Annotated[UUID | None, Query()] = None,
+) -> ServiceDefinitionListResponse:
+    """Mirrors `list_repositories_endpoint`'s shape exactly, for the
+    Datadog connector's `datadog_service_definitions` projection.
+    """
+    clauses = []
+    params: dict[str, Any] = {"workspace_id": auth.workspace_id}
+    if connector_account_id:
+        clauses.append("AND connector_account_id = :connector_account_id")
+        params["connector_account_id"] = connector_account_id
+    if team_entity_id:
+        clauses.append("AND team_entity_id = :team_entity_id")
+        params["team_entity_id"] = team_entity_id
+    rows = (
+        session.execute(
+            text(
+                "SELECT id, connector_account_id, provider, external_id, source_url, "
+                "name, team, tier, description, permission_state, freshness_state, "
+                "observed_at, created_at, updated_at, team_entity_id, suggested_team_name "
+                "FROM datadog_service_definitions "
+                f"WHERE workspace_id = :workspace_id {' '.join(clauses)} ORDER BY name ASC"  # noqa: S608
+            ),
+            params,
+        )
+        .mappings()
+        .all()
+    )
+    return ServiceDefinitionListResponse(
+        service_definitions=[ServiceDefinitionResponse(**dict(row)) for row in rows]
+    )
+
+
+@router.get("/dashboards", response_model=DashboardListResponse)
+def list_dashboards_endpoint(
+    auth: AuthDep,
+    session: SessionDep,
+    connector_account_id: Annotated[UUID | None, Query()] = None,
+    team_entity_id: Annotated[UUID | None, Query()] = None,
+) -> DashboardListResponse:
+    """Mirrors `list_repositories_endpoint`'s shape exactly, for the
+    Datadog connector's `datadog_dashboards` projection.
+    """
+    clauses = []
+    params: dict[str, Any] = {"workspace_id": auth.workspace_id}
+    if connector_account_id:
+        clauses.append("AND connector_account_id = :connector_account_id")
+        params["connector_account_id"] = connector_account_id
+    if team_entity_id:
+        clauses.append("AND team_entity_id = :team_entity_id")
+        params["team_entity_id"] = team_entity_id
+    rows = (
+        session.execute(
+            text(
+                "SELECT id, connector_account_id, provider, external_id, source_url, "
+                "title, description, permission_state, freshness_state, "
+                "provider_updated_at, observed_at, created_at, updated_at, "
+                "team_entity_id, suggested_team_name "
+                "FROM datadog_dashboards "
+                f"WHERE workspace_id = :workspace_id {' '.join(clauses)} ORDER BY title ASC"  # noqa: S608
+            ),
+            params,
+        )
+        .mappings()
+        .all()
+    )
+    return DashboardListResponse(dashboards=[DashboardResponse(**dict(row)) for row in rows])
 
 
 def _validate_team_entity(session: Session, auth: AuthContext, team_entity_id: UUID | None) -> None:
