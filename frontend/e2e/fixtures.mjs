@@ -553,10 +553,41 @@ function makeKnowledgeApi(overrides = {}) {
       return { status: 201, body: claim }
     }
 
+    // Resolves an entity ID to its `canonical_name`/`kind`, mirroring the
+    // real backend's join in `relationships.py` -- a team-concept gap
+    // analysis found `RelationshipResponse` used to carry bare UUIDs, which
+    // made `EntityDetail.tsx`'s relationships list (raw IDs, no names)
+    // unreadable, so the real API now always resolves both endpoints.
+    function resolveRef(id) {
+      const entity = entities.find(id)
+      return { name: entity?.canonical_name ?? id, kind: entity?.kind ?? 'unknown' }
+    }
+    function withResolvedNames(rel) {
+      const from = resolveRef(rel.from_entity_id)
+      const to = resolveRef(rel.to_entity_id)
+      return {
+        ...rel,
+        from_entity_name: from.name,
+        from_entity_kind: from.kind,
+        to_entity_name: to.name,
+        to_entity_kind: to.kind,
+      }
+    }
+
     const relationshipsMatch = pathname.match(/^\/api\/v1\/knowledge\/entities\/([^/]+)\/relationships$/)
     if (relationshipsMatch && method === 'GET') {
       const entityId = relationshipsMatch[1]
-      const items = relationships.filter((rel) => rel.from_entity_id === entityId || rel.to_entity_id === entityId)
+      const params = new URLSearchParams(queryString)
+      const relationshipType = params.get('relationship_type')
+      const direction = params.get('direction')
+      const items = relationships
+        .filter((rel) => {
+          if (direction === 'incoming') return rel.to_entity_id === entityId
+          if (direction === 'outgoing') return rel.from_entity_id === entityId
+          return rel.from_entity_id === entityId || rel.to_entity_id === entityId
+        })
+        .filter((rel) => !relationshipType || rel.relationship_type === relationshipType)
+        .map(withResolvedNames)
       return { status: 200, body: { items } }
     }
     if (relationshipsMatch && method === 'POST') {
@@ -580,7 +611,7 @@ function makeKnowledgeApi(overrides = {}) {
       }
       relationships.push(relationship)
       pushTimeline(fromId, 'relationship.created', `${body.relationship_type} -> ${body.to_entity_id}`)
-      return { status: 201, body: relationship }
+      return { status: 201, body: withResolvedNames(relationship) }
     }
 
     const timelineMatch = pathname.match(/^\/api\/v1\/knowledge\/entities\/([^/]+)\/timeline$/)
