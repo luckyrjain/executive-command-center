@@ -4,25 +4,28 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
-import RepositoriesPanel from './RepositoriesPanel'
-import type { Repository } from './types'
+import WorkItemsPanel from './WorkItemsPanel'
+import type { WorkItem } from './types'
 
 function response(body: unknown, status = 200) {
   return Promise.resolve(new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } }))
 }
 
-function repository(overrides: Partial<Repository> = {}): Repository {
+function workItem(overrides: Partial<WorkItem> = {}): WorkItem {
   return {
-    id: 'repo-1',
+    id: 'item-1',
     connector_account_id: 'connector-1',
-    provider: 'github',
-    external_id: 'gh-repo-1',
-    name: 'acme/widgets',
-    source_url: 'https://github.com/acme/widgets',
-    default_branch: 'main',
+    provider: 'jira',
+    external_id: 'ACME-1',
+    title: 'Fix the widget',
+    source_url: 'https://acme.atlassian.net/browse/ACME-1',
+    item_type: 'Bug',
+    status: 'In Progress',
+    reporter_external_id: 'reporter-1',
+    assignee_external_id: 'assignee-1',
     permission_state: 'active',
     freshness_state: 'fresh',
-    provider_updated_at: '2026-07-20T00:00:00Z',
+    provider_created_at: '2026-07-15T00:00:00Z',
     observed_at: '2026-07-26T00:00:00Z',
     created_at: '2026-07-01T00:00:00Z',
     updated_at: '2026-07-26T00:00:00Z',
@@ -35,16 +38,16 @@ function repository(overrides: Partial<Repository> = {}): Repository {
 }
 
 function stubFetch({
-  repositories,
+  workItems,
   teams = [],
 }: {
-  repositories: Repository[]
+  workItems: WorkItem[]
   teams?: { id: string; canonical_name: string }[]
 }) {
-  // Stateful, not a fixed response -- `assigning a team...` below asserts
-  // the confirmed link survives the post-mutation refetch (`onSuccess`'s
-  // `invalidateQueries`), which a fixed-response stub can't prove.
-  const state = repositories.map((repo) => ({ ...repo }))
+  // Stateful, not a fixed response -- mirrors `RepositoriesPanel.test.tsx`'s
+  // own identical reasoning: `assigning a team...` below asserts the
+  // confirmed link survives the post-mutation refetch.
+  const state = workItems.map((item) => ({ ...item }))
   vi.stubGlobal(
     'fetch',
     vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
@@ -52,55 +55,52 @@ function stubFetch({
       if (url.includes('/knowledge/entities')) return response({ items: teams })
       if (init?.method === 'POST' && url.includes('/team')) {
         const teamEntityId = (JSON.parse(String(init.body)) as { team_entity_id: string | null }).team_entity_id
-        const repositoryId = url.split('/repositories/')[1]?.split('/team')[0]
-        const repo = state.find((candidate) => candidate.id === repositoryId)
-        if (repo) {
-          repo.team_entity_id = teamEntityId
-          repo.team_assignment_version += 1
+        const workItemId = url.split('/work-items/')[1]?.split('/team')[0]
+        const item = state.find((candidate) => candidate.id === workItemId)
+        if (item) {
+          item.team_entity_id = teamEntityId
+          item.team_assignment_version += 1
         }
-        return response(repo ?? {})
+        return response(item ?? {})
       }
-      // Mirrors the real backend's `?team_entity_id=` filter
-      // (`list_repositories_endpoint`) so the "filter by team" tests below
-      // can prove the panel actually sends and reacts to it, not just that
-      // the select exists.
       const teamEntityId = new URL(url, 'http://localhost').searchParams.get('team_entity_id')
-      const filtered = teamEntityId ? state.filter((repo) => repo.team_entity_id === teamEntityId) : state
-      return response({ repositories: filtered })
+      const filtered = teamEntityId ? state.filter((item) => item.team_entity_id === teamEntityId) : state
+      return response({ work_items: filtered })
     }),
   )
 }
 
 function renderPanel() {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
-  return render(<QueryClientProvider client={client}><RepositoriesPanel /></QueryClientProvider>)
+  return render(<QueryClientProvider client={client}><WorkItemsPanel /></QueryClientProvider>)
 }
 
 afterEach(() => { cleanup(); vi.unstubAllGlobals() })
 
-describe('RepositoriesPanel', () => {
+describe('WorkItemsPanel', () => {
   it('shows an empty state ("first sync") when nothing has synced yet', async () => {
-    stubFetch({ repositories: [] })
+    stubFetch({ workItems: [] })
     renderPanel()
-    expect(await screen.findByText(/No repositories have synced yet/)).toBeTruthy()
+    expect(await screen.findByText(/No work items have synced yet/)).toBeTruthy()
   })
 
-  it('lists a repository with its provider and a link to view it', async () => {
-    stubFetch({ repositories: [repository()] })
+  it('lists a work item with its provider, status and a link to view it', async () => {
+    stubFetch({ workItems: [workItem()] })
     renderPanel()
-    expect(await screen.findByText('acme/widgets')).toBeTruthy()
-    const link = screen.getByRole('link', { name: 'View on github' })
-    expect(link.getAttribute('href')).toBe('https://github.com/acme/widgets')
+    expect(await screen.findByText('Fix the widget')).toBeTruthy()
+    expect(screen.getByText('In Progress')).toBeTruthy()
+    const link = screen.getByRole('link', { name: 'View on jira' })
+    expect(link.getAttribute('href')).toBe('https://acme.atlassian.net/browse/ACME-1')
   })
 
-  it('shows the partial-permissions state for a repository that lost permission', async () => {
-    stubFetch({ repositories: [repository({ permission_state: 'permission_lost' })] })
+  it('shows the partial-permissions state for a work item that lost permission', async () => {
+    stubFetch({ workItems: [workItem({ permission_state: 'permission_lost' })] })
     renderPanel()
     expect(await screen.findByText('permission lost')).toBeTruthy()
   })
 
-  it('shows the stale-connector state for a repository whose content has gone stale', async () => {
-    stubFetch({ repositories: [repository({ freshness_state: 'stale' })] })
+  it('shows the stale-connector state for a work item whose content has gone stale', async () => {
+    stubFetch({ workItems: [workItem({ freshness_state: 'stale' })] })
     renderPanel()
     expect(await screen.findByText('stale')).toBeTruthy()
   })
@@ -114,37 +114,37 @@ describe('RepositoriesPanel', () => {
   // --- team linkage (migration `0050_phase6_team_linkage.py`) -------------
 
   it('shows the suggested team name as a hint when unassigned', async () => {
-    stubFetch({ repositories: [repository({ suggested_team_name: 'acme' })] })
+    stubFetch({ workItems: [workItem({ suggested_team_name: 'acme' })] })
     renderPanel()
     expect(await screen.findByText('suggested: acme')).toBeTruthy()
   })
 
   it('does not show the suggestion hint once a team is confirmed', async () => {
     stubFetch({
-      repositories: [repository({ team_entity_id: 'team-1', suggested_team_name: 'acme' })],
+      workItems: [workItem({ team_entity_id: 'team-1', suggested_team_name: 'acme' })],
       teams: [{ id: 'team-1', canonical_name: 'Platform Engineering' }],
     })
     renderPanel()
-    await screen.findByText('acme/widgets')
+    await screen.findByText('Fix the widget')
     expect(screen.queryByText(/suggested:/)).toBeNull()
-    expect((screen.getByLabelText('Team for acme/widgets') as HTMLSelectElement).value).toBe('team-1')
+    expect((screen.getByLabelText('Team for Fix the widget') as HTMLSelectElement).value).toBe('team-1')
   })
 
   it('assigning a team from the dropdown posts the confirmed link and refetches', async () => {
     stubFetch({
-      repositories: [repository()],
+      workItems: [workItem()],
       teams: [{ id: 'team-1', canonical_name: 'Platform Engineering' }],
     })
     renderPanel()
-    const select = await screen.findByLabelText('Team for acme/widgets')
+    const select = await screen.findByLabelText('Team for Fix the widget')
     fireEvent.change(select, { target: { value: 'team-1' } })
 
     await waitFor(() => {
-      expect((screen.getByLabelText('Team for acme/widgets') as HTMLSelectElement).value).toBe('team-1')
+      expect((screen.getByLabelText('Team for Fix the widget') as HTMLSelectElement).value).toBe('team-1')
     })
     const calls = (fetch as unknown as { mock: { calls: [RequestInfo | URL, RequestInit?][] } }).mock.calls
     const postCall = calls.find(([, init]) => init?.method === 'POST')
-    expect(String(postCall?.[0])).toContain('/api/v1/engineering/repositories/repo-1/team')
+    expect(String(postCall?.[0])).toContain('/api/v1/engineering/work-items/item-1/team')
     expect(JSON.parse(String(postCall?.[1]?.body))).toEqual({ expected_version: 1, team_entity_id: 'team-1' })
   })
 
@@ -157,11 +157,11 @@ describe('RepositoriesPanel', () => {
         if (init?.method === 'POST' && url.includes('/team')) {
           return response({ error: { code: 'VERSION_CONFLICT', message: 'Someone else changed this first.' } }, 409)
         }
-        return response({ repositories: [repository()] })
+        return response({ work_items: [workItem()] })
       }),
     )
     renderPanel()
-    const select = await screen.findByLabelText('Team for acme/widgets')
+    const select = await screen.findByLabelText('Team for Fix the widget')
     fireEvent.change(select, { target: { value: 'team-1' } })
 
     expect(await screen.findByRole('alert')).toBeTruthy()
@@ -169,36 +169,36 @@ describe('RepositoriesPanel', () => {
 
   // --- team filter (read-only view filter, distinct from TeamAssignment) --
 
-  it('filtering by team only shows repositories assigned to that team', async () => {
+  it('filtering by team only shows work items assigned to that team', async () => {
     stubFetch({
-      repositories: [
-        repository({ id: 'repo-1', name: 'acme/widgets', team_entity_id: 'team-1' }),
-        repository({ id: 'repo-2', name: 'acme/gadgets', team_entity_id: null }),
+      workItems: [
+        workItem({ id: 'item-1', title: 'Fix the widget', team_entity_id: 'team-1' }),
+        workItem({ id: 'item-2', title: 'Ship the gadget', team_entity_id: null }),
       ],
       teams: [{ id: 'team-1', canonical_name: 'Platform Engineering' }],
     })
     renderPanel()
-    await screen.findByText('acme/widgets')
-    expect(await screen.findByText('acme/gadgets')).toBeTruthy()
+    await screen.findByText('Fix the widget')
+    expect(await screen.findByText('Ship the gadget')).toBeTruthy()
 
-    fireEvent.change(screen.getByLabelText('Filter repositories by team'), { target: { value: 'team-1' } })
+    fireEvent.change(screen.getByLabelText('Filter work items by team'), { target: { value: 'team-1' } })
 
-    expect(await screen.findByText('acme/widgets')).toBeTruthy()
-    await waitFor(() => expect(screen.queryByText('acme/gadgets')).toBeNull())
+    expect(await screen.findByText('Fix the widget')).toBeTruthy()
+    await waitFor(() => expect(screen.queryByText('Ship the gadget')).toBeNull())
     const calls = (fetch as unknown as { mock: { calls: [RequestInfo | URL, RequestInit?][] } }).mock.calls
     expect(calls.some(([url]) => String(url).includes('team_entity_id=team-1'))).toBe(true)
   })
 
-  it('shows a team-specific empty state when the filtered team has no repositories', async () => {
+  it('shows a team-specific empty state when the filtered team has no work items', async () => {
     stubFetch({
-      repositories: [repository({ team_entity_id: null })],
+      workItems: [workItem({ team_entity_id: null })],
       teams: [{ id: 'team-1', canonical_name: 'Platform Engineering' }],
     })
     renderPanel()
-    await screen.findByText('acme/widgets')
+    await screen.findByText('Fix the widget')
 
-    fireEvent.change(screen.getByLabelText('Filter repositories by team'), { target: { value: 'team-1' } })
+    fireEvent.change(screen.getByLabelText('Filter work items by team'), { target: { value: 'team-1' } })
 
-    expect(await screen.findByText('No repositories are assigned to this team yet.')).toBeTruthy()
+    expect(await screen.findByText('No work items are assigned to this team yet.')).toBeTruthy()
   })
 })

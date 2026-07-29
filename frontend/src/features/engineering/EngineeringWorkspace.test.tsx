@@ -51,9 +51,12 @@ describe('EngineeringWorkspace', () => {
     expect(screen.queryByRole('heading', { name: 'Connector health' })).toBeNull()
   })
 
-  it('renders every required surface named in UX-STATES.md', async () => {
+  it('renders every required surface named in UX-STATES.md, plus Work items', async () => {
     renderWorkspace()
-    for (const label of ['Overview', 'Delivery', 'Reliability', 'Repositories', 'Incidents', 'Decisions', 'Connector health', 'Source coverage']) {
+    // 'Work items' is a later addition beyond UX-STATES.md's original
+    // eight-surface list -- see `EngineeringWorkspace.tsx`'s own
+    // docstring for why it was added.
+    for (const label of ['Overview', 'Delivery', 'Reliability', 'Repositories', 'Work items', 'Incidents', 'Decisions', 'Connector health', 'Source coverage']) {
       expect(screen.getByRole('tab', { name: label })).toBeTruthy()
     }
   })

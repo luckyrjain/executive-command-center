@@ -1,3 +1,5 @@
+import { useState } from 'react'
+
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
 import { apiRequest } from '../../api/client'
@@ -103,9 +105,18 @@ function RepositoryRow({ repository, teamsById }: { repository: Repository; team
  * one specific repository it synced has lost permission or gone stale.
  */
 export default function RepositoriesPanel() {
+  // Read-only view filter -- distinct from `TeamAssignment`'s own select,
+  // which writes the confirmed link. Previously the only place a team
+  // entity was consumed at all was that write-side dropdown; there was no
+  // way to view just one team's repositories, despite the backend's own
+  // `?team_entity_id=` filter (migration `0050_phase6_team_linkage.py`)
+  // supporting exactly this since it shipped.
+  const [teamFilter, setTeamFilter] = useState('')
   const query = useQuery({
-    queryKey: ['engineering', 'repositories'],
-    queryFn: () => apiRequest<RepositoryListResponse>('/api/v1/engineering/repositories'),
+    queryKey: ['engineering', 'repositories', teamFilter || null],
+    queryFn: () => apiRequest<RepositoryListResponse>(
+      `/api/v1/engineering/repositories${teamFilter ? `?team_entity_id=${encodeURIComponent(teamFilter)}` : ''}`,
+    ),
     retry: 1,
   })
   const teamsQuery = useQuery({ queryKey: ['knowledge', 'entities', 'team'], queryFn: listTeams, retry: 1 })
@@ -118,10 +129,26 @@ export default function RepositoriesPanel() {
       <h2 id="engineering-repositories-title">Repositories</h2>
       <p>Every repository synced from a connected GitHub or GitLab account, with its own permission and freshness state -- never rolled up into the connector account's own status.</p>
 
+      <label>
+        Filter by team
+        <select
+          aria-label="Filter repositories by team"
+          value={teamFilter}
+          onChange={(event) => setTeamFilter(event.target.value)}
+        >
+          <option value="">All teams</option>
+          {[...teamsById.entries()].map(([id, name]) => <option key={id} value={id}>{name}</option>)}
+        </select>
+      </label>
+
       {query.isLoading ? <p role="status">Loading repositories…</p> : null}
       {query.isError ? <div role="alert" className="inline-status error-panel">{query.error.message}</div> : null}
       {query.data && repositories.length === 0 ? (
-        <p className="empty-state">No repositories have synced yet. Connect a GitHub or GitLab account and run a backfill from Connector health.</p>
+        <p className="empty-state">
+          {teamFilter
+            ? 'No repositories are assigned to this team yet.'
+            : 'No repositories have synced yet. Connect a GitHub or GitLab account and run a backfill from Connector health.'}
+        </p>
       ) : null}
 
       <ul className="work-list">

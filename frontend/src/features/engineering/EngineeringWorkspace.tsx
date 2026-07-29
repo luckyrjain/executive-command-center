@@ -5,6 +5,7 @@ import EngineeringOverview from './EngineeringOverview'
 import DeliveryPanel from './DeliveryPanel'
 import ReliabilityPanel from './ReliabilityPanel'
 import RepositoriesPanel from './RepositoriesPanel'
+import WorkItemsPanel from './WorkItemsPanel'
 import IncidentsPanel from './IncidentsPanel'
 import DecisionsPanel from './DecisionsPanel'
 import ConnectorHealthPanel from './ConnectorHealthPanel'
@@ -16,6 +17,7 @@ const TABS: ReadonlyArray<{ view: EngineeringView; label: string }> = [
   { view: 'delivery', label: 'Delivery' },
   { view: 'reliability', label: 'Reliability' },
   { view: 'repositories', label: 'Repositories' },
+  { view: 'work-items', label: 'Work items' },
   { view: 'incidents', label: 'Incidents' },
   { view: 'decisions', label: 'Decisions' },
   { view: 'connector-health', label: 'Connector health' },
@@ -26,9 +28,15 @@ const TABS: ReadonlyArray<{ view: EngineeringView; label: string }> = [
  * Top-level shell for the Phase 6 Engineering Workspace surface
  * (`docs/phases/phase-006/UX-STATES.md`: "Engineering overview, delivery,
  * reliability, repositories, incidents, decisions, connector health and
- * source coverage"). One `WorkspaceView` slot ('engineering'), with its
- * own internal tablist -- mirrors `AutomationWorkspace.tsx`'s identical
- * nested-tablist shape (reuses `WorkspaceNavigation.tsx`'s own
+ * source coverage"). `work-items` is a later addition beyond that
+ * original eight-surface list -- `GET /engineering/work-items` and its
+ * `POST .../team` confirm endpoint existed since migration `0050_phase6_
+ * team_linkage.py` with no frontend surface reading or writing them at
+ * all (`CoveragePanel.tsx` only ever used the list response for a rollup
+ * count); `WorkItemsPanel.tsx` closes that gap, mirroring `Repositories
+ * Panel.tsx`'s shape exactly. One `WorkspaceView` slot ('engineering'),
+ * with its own internal tablist -- mirrors `AutomationWorkspace.tsx`'s
+ * identical nested-tablist shape (reuses `WorkspaceNavigation.tsx`'s own
  * roving-tabindex helper rather than re-deriving the same keyboard logic
  * a second time).
  */
@@ -78,6 +86,7 @@ export default function EngineeringWorkspace() {
           : view === 'delivery' ? <DeliveryPanel />
           : view === 'reliability' ? <ReliabilityPanel />
           : view === 'repositories' ? <RepositoriesPanel />
+          : view === 'work-items' ? <WorkItemsPanel />
           : view === 'incidents' ? <IncidentsPanel />
           : view === 'decisions' ? <DecisionsPanel />
           : view === 'connector-health' ? <ConnectorHealthPanel />

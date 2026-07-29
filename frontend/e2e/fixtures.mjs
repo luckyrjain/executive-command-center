@@ -1021,15 +1021,20 @@ function makeEngineeringApi(overrides = {}) {
     }
     if (pathname === '/api/v1/engineering/repositories' && method === 'GET') {
       const connectorAccountId = params.get('connector_account_id')
-      const items = repositories.filter((r) => !connectorAccountId || r.connector_account_id === connectorAccountId)
+      const teamEntityId = params.get('team_entity_id')
+      const items = repositories.filter((r) =>
+        (!connectorAccountId || r.connector_account_id === connectorAccountId)
+        && (!teamEntityId || r.team_entity_id === teamEntityId))
       return { status: 200, body: { repositories: items } }
     }
     if (pathname === '/api/v1/engineering/work-items' && method === 'GET') {
       const connectorAccountId = params.get('connector_account_id')
       const statusFilter = params.get('status')
+      const teamEntityId = params.get('team_entity_id')
       const items = workItems.filter((item) =>
         (!connectorAccountId || item.connector_account_id === connectorAccountId)
-        && (!statusFilter || item.status === statusFilter))
+        && (!statusFilter || item.status === statusFilter)
+        && (!teamEntityId || item.team_entity_id === teamEntityId))
       return { status: 200, body: { work_items: items } }
     }
     if (pathname === '/api/v1/engineering/incidents' && method === 'GET') {
