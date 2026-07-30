@@ -86,8 +86,10 @@ DEFAULT_PER_MODEL_CALL_TIMEOUT_SECONDS = 20.0
 # post-launch audit, phase G) -- the audit's own review-caught lesson from
 # the original 20s -> 25s raise: this constant must move whenever the
 # largest per-task timeout does, or it silently becomes the thing that
-# actually fires first.
-_HTTPX_TRANSPORT_TIMEOUT_SECONDS = 37.0
+# actually fires first. Raised again, 37.0 -> 46.0, in lockstep with
+# `meeting.prep_summary`'s own 32s -> 40s raise (phase H, `router.py`'s own
+# updated comment on that field has the full real-CI-measurement history).
+_HTTPX_TRANSPORT_TIMEOUT_SECONDS = 46.0
 
 
 class OllamaCallTimeout(Exception):
