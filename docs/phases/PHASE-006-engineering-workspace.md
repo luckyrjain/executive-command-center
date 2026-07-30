@@ -111,4 +111,4 @@ Disable/revoke connectors independently and stop new sync. Preserve last-known p
 
 ## Deferred backlog
 
-Additional providers, code intelligence, incident automation, team benchmarking, organization-wide engineering analytics and autonomous repository mutations.
+Additional providers, code intelligence, incident automation, team benchmarking, organization-wide engineering analytics, team integration outside engineering (automation policies/approval routing, capacity rollups, risk ownership, commitments counterparty — access-control deferred separately to Phase 8) and autonomous repository mutations.
