@@ -46,7 +46,7 @@ from ecc.domains.engineering.connectors import (
     ConnectorRegistry,
 )
 from ecc.domains.engineering.crypto import encrypt_credential
-from ecc.domains.engineering.datadog_adapter import DatadogAdapter
+from ecc.domains.engineering.datadog_adapter import DatadogAdapter, _monitor_team_tag
 from ecc.main import app
 
 settings = get_settings()
@@ -309,6 +309,16 @@ def seeded_account_context() -> Iterator[ConnectorAccountContext]:
                 text("DELETE FROM workspaces WHERE id = :workspace_id"),
                 {"workspace_id": workspace_id},
             )
+
+
+def test_monitor_team_tag_treats_empty_value_after_prefix_as_no_suggestion() -> None:
+    """A monitor tagged exactly `"team:"` (nothing after the colon) must
+    resolve to `None`, not an empty string that would render as a blank
+    but present suggestion in the UI -- review found this specific
+    branch of the `or None` fallback had no test, unlike the populated-tag
+    case exercised throughout the other backfill tests in this file.
+    """
+    assert _monitor_team_tag(["team:", "env:prod"]) is None
 
 
 def test_backfill_monitors_single_page(seeded_account_context: ConnectorAccountContext) -> None:
@@ -708,6 +718,39 @@ def test_backfill_dashboard_rejects_non_relative_url_from_provider(
     assert source_url == "https://app.datadoghq.com/dashboard/abc-123"
 
 
+def test_backfill_dashboard_trusts_url_already_scoped_to_own_ui_host(
+    seeded_account_context: ConnectorAccountContext,
+) -> None:
+    """`_upsert_dashboard` has three URL-trust branches: a relative path
+    (covered by every other dashboard test's own fixture shape), an
+    untrusted/malicious fallback (covered by the test directly above),
+    and this one -- a `url` already prefixed with `https://{ui_host}/`,
+    which review found had zero coverage despite being the one branch
+    whose slicing (`raw_url[len(f"https://{ui_host}") :]`) could silently
+    regress into the unsafe fallback without any test noticing.
+    """
+    scoped = {
+        "id": "abc-123",
+        "title": "Overview",
+        "description": "A dashboard",
+        "url": "https://app.datadoghq.com/dashboard/abc-123-custom-slug",
+        "modified_at": "2024-01-01T00:00:00Z",
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return _json_response({"dashboards": [scoped]})
+
+    adapter = DatadogAdapter(transport=httpx.MockTransport(handler))
+    adapter.backfill(seeded_account_context, "dashboard")
+
+    with engine.begin() as connection:
+        source_url = connection.execute(
+            text("SELECT source_url FROM datadog_dashboards WHERE workspace_id = :workspace_id"),
+            {"workspace_id": seeded_account_context.workspace_id},
+        ).scalar_one()
+    assert source_url == "https://app.datadoghq.com/dashboard/abc-123-custom-slug"
+
+
 def test_backfill_dashboards_single_unbounded_call(
     seeded_account_context: ConnectorAccountContext,
 ) -> None:
@@ -861,6 +904,23 @@ def test_refresh_permissions_fails_open_on_network_error() -> None:
 
     adapter = DatadogAdapter(transport=httpx.MockTransport(handler))
     assert adapter.refresh_permissions(_account_context()) == "active"
+
+
+def test_refresh_permissions_returns_permission_lost_for_malformed_credential() -> None:
+    """`_parse_credential` is called before any network request; review
+    found this earlier, non-network branch of `refresh_permissions` (a
+    corrupted stored credential, e.g. from a botched encryption-key
+    rotation) had no test at all, unlike the already-covered
+    network-error and 403 branches.
+    """
+    context = ConnectorAccountContext(
+        workspace_id=uuid4(),
+        connector_account_id=uuid4(),
+        external_account_id="acc-1",
+        credential="not-a-valid-datadog-credential",
+    )
+    adapter = DatadogAdapter()
+    assert adapter.refresh_permissions(context) == "permission_lost"
 
 
 def test_disconnect_is_a_no_op() -> None:

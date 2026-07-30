@@ -385,6 +385,51 @@ def test_entity_create_and_filter_supports_team_kind(
     assert restore.json()["status"] == "active"
 
 
+def test_entity_list_combined_team_kind_and_active_status_filter(
+    knowledge_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    """Phase 6's `RepositoriesPanel.tsx`/`WorkItemsPanel.tsx` team dropdown
+    issues exactly this combined query (`?kind=team&status=active`) to
+    exclude an archived/merged team from the assignment picker -- review
+    found the two clauses' composition was only ever proven against a
+    mocked frontend fetch, never against this real endpoint with both
+    query params applied together in the same request.
+    """
+    client, _workspace_id, _user_id, token = knowledge_test_context
+
+    active = client.post(
+        "/api/v1/knowledge/entities",
+        headers=_headers(token, "create-active-team"),
+        json={"kind": "team", "canonical_name": "Active Team"},
+    )
+    assert active.status_code == 201, active.text
+
+    archived = client.post(
+        "/api/v1/knowledge/entities",
+        headers=_headers(token, "create-archived-team"),
+        json={"kind": "team", "canonical_name": "Archived Team"},
+    )
+    assert archived.status_code == 201, archived.text
+    client.post(
+        f"/api/v1/knowledge/entities/{archived.json()['id']}/archive",
+        headers=_headers(token, "archive-archived-team"),
+        json={"expected_version": 1},
+    )
+
+    filtered = client.get(
+        "/api/v1/knowledge/entities",
+        params={"kind": "team", "status": "active"},
+        headers=_headers(token, "list-active-teams"),
+    )
+    assert filtered.status_code == 200, filtered.text
+    names = {item["canonical_name"] for item in filtered.json()["items"]}
+    assert "Active Team" in names
+    assert "Archived Team" not in names
+    assert all(
+        item["kind"] == "team" and item["status"] == "active" for item in filtered.json()["items"]
+    )
+
+
 def test_entity_create_requires_kind_and_canonical_name(
     knowledge_test_context: tuple[TestClient, UUID, UUID, str],
 ) -> None:

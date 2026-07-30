@@ -803,6 +803,23 @@ def test_refresh_permissions_fails_open_on_network_error() -> None:
     assert adapter.refresh_permissions(_account_context()) == "active"
 
 
+def test_refresh_permissions_returns_permission_lost_for_malformed_credential() -> None:
+    """`_parse_credential` is called before any network request; review
+    found this earlier, non-network branch of `refresh_permissions` (a
+    corrupted stored credential, e.g. from a botched encryption-key
+    rotation) had no test at all, unlike the already-covered
+    network-error and 401 branches.
+    """
+    context = ConnectorAccountContext(
+        workspace_id=uuid4(),
+        connector_account_id=uuid4(),
+        external_account_id="acc-1",
+        credential="not-a-valid-jira-credential",
+    )
+    adapter = JiraAdapter()
+    assert adapter.refresh_permissions(context) == "permission_lost"
+
+
 def test_disconnect_is_a_no_op() -> None:
     adapter = JiraAdapter()
     assert adapter.disconnect(_account_context()) is None

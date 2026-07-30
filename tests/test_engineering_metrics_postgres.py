@@ -42,6 +42,7 @@ from ecc.config import get_settings
 from ecc.database import SessionFactory, engine
 from ecc.domains.engineering.metrics import (
     _bucket_ages_days,
+    _compute_review_latency,
     _compute_time_to_restore,
     compute_and_store_metrics,
     compute_metrics,
@@ -518,6 +519,52 @@ def test_work_ageing_and_blocked_work_computation(workspace: UUID) -> None:
     assert 39 <= blocked_work.details["median_age_days"] <= 41
 
 
+def test_work_ageing_excludes_items_from_a_disconnected_sibling_account(workspace: UUID) -> None:
+    """Review found that with two-or-more same-provider connector
+    accounts, once one goes `disconnected` (its rows' `freshness_state`
+    frozen forever, since the disable cascade only fires on an explicit
+    disconnect) while a sibling account stays `active` and fresh,
+    `_coverage_for` correctly excludes the disconnected account from its
+    own denominator -- but `_open_work_items` had no equivalent
+    `connector_accounts.status` scoping at all, so the disconnected
+    account's permanently-stale work items still silently contributed to
+    `population`/`value` under a `complete` coverage badge. Proven here:
+    a `disconnected` account's still-`permission_state='active'` open
+    item must not be counted at all once its account is disconnected.
+    """
+    active_account_id = _insert_connector_account(workspace, provider="jira")
+    disconnected_account_id = _insert_connector_account(
+        workspace, provider="jira", status="disconnected"
+    )
+    _insert_cursor(
+        workspace, active_account_id, resource_type="work_item", updated_at=datetime.now(UTC)
+    )
+    now = datetime.now(UTC)
+    _insert_work_item(
+        workspace,
+        active_account_id,
+        external_id="active-open",
+        status="In Progress",
+        provider_created_at=now - timedelta(days=3),
+    )
+    _insert_work_item(
+        workspace,
+        disconnected_account_id,
+        external_id="disconnected-open",
+        status="In Progress",
+        provider_created_at=now - timedelta(days=200),
+    )
+
+    with SessionFactory() as session:
+        snapshots = compute_metrics(session, workspace_id=workspace)
+
+    work_ageing = next(s for s in snapshots if s.metric_key == "work_ageing")
+    assert work_ageing.coverage_status == "complete"
+    assert work_ageing.population == 1
+    assert work_ageing.value is not None
+    assert 2 <= work_ageing.value <= 4
+
+
 def test_bucket_ages_days_boundaries_are_inclusive_on_the_low_side() -> None:
     """`_bucket_ages_days` uses `<=` at each boundary -- an item aged
     exactly 7/30/90 days must land in the *lower* bucket (`0-7d`/
@@ -681,6 +728,68 @@ def test_review_latency_excludes_changes_outside_window(workspace: UUID) -> None
         snapshots = compute_metrics(session, workspace_id=workspace)
     review_latency = next(s for s in snapshots if s.metric_key == "review_latency")
     assert review_latency.population == 0
+
+
+def test_review_latency_excludes_negative_latency_rows(workspace: UUID) -> None:
+    """A row where `submitted_at` precedes `requested_at` (a data-integrity
+    edge case, not expected in practice) must be dropped from both
+    `population` and the median, not merely left with a negative
+    contribution -- review found this filter had zero test coverage.
+    """
+    account_id = _insert_connector_account(workspace, provider="github")
+    repo_id = _insert_repo(workspace, account_id, external_id="101")
+    now = datetime.now(UTC)
+    change_id = _insert_change(
+        workspace, account_id, repo_id, external_id="1", merged_at=now - timedelta(days=1)
+    )
+    _insert_review(
+        workspace,
+        account_id,
+        change_id,
+        external_id="r1",
+        requested_at=now - timedelta(hours=1),
+        submitted_at=now - timedelta(hours=3),
+    )
+    with SessionFactory() as session:
+        snapshots = compute_metrics(session, workspace_id=workspace)
+    review_latency = next(s for s in snapshots if s.metric_key == "review_latency")
+    assert review_latency.population == 0
+    assert review_latency.value is None
+
+
+def test_review_latency_window_boundary_is_inclusive(workspace: UUID) -> None:
+    """`_compute_review_latency`'s query filters `c.merged_at &gt;=
+    window_start`, so a change merged exactly 30 days ago must be
+    *included*, not excluded by an off-by-one `&gt;` instead of `&gt;=`
+    -- the same boundary-coverage gap already closed once for
+    `_compute_time_to_restore`'s identical 30-day window (see
+    `test_time_to_restore_window_boundary_is_inclusive`), never carried
+    over to this metric's own independent window. Called directly with
+    an explicit `now` rather than through `compute_metrics`'s own
+    internal `datetime.now(UTC)` call, avoiding a timing-skew false
+    boundary.
+    """
+    account_id = _insert_connector_account(workspace, provider="github")
+    _insert_cursor(workspace, account_id, resource_type="change", updated_at=datetime.now(UTC))
+    _insert_cursor(workspace, account_id, resource_type="review", updated_at=datetime.now(UTC))
+    repo_id = _insert_repo(workspace, account_id, external_id="101")
+    now = datetime.now(UTC)
+    window_start = now - timedelta(days=30)
+    change_id = _insert_change(
+        workspace, account_id, repo_id, external_id="1", merged_at=window_start
+    )
+    _insert_review(
+        workspace,
+        account_id,
+        change_id,
+        external_id="r1",
+        requested_at=window_start - timedelta(hours=5),
+        submitted_at=window_start - timedelta(hours=3),
+    )
+    with SessionFactory() as session:
+        snapshot = _compute_review_latency(session, workspace_id=workspace, now=now)
+    assert snapshot.population == 1
+    assert snapshot.value == timedelta(hours=2).total_seconds()
 
 
 def _insert_incident(

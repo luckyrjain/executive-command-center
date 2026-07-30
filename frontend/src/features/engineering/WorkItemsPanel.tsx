@@ -143,7 +143,7 @@ export default function WorkItemsPanel() {
   return (
     <section className="work-panel" aria-labelledby="engineering-work-items-title">
       <h2 id="engineering-work-items-title">Work items</h2>
-      <p>Every work item synced from a connected GitHub, GitLab, or Jira account, with its own permission and freshness state -- never rolled up into the connector account's own status.</p>
+      <p>Every work item synced from a connected Jira account (the only provider that populates work items), with its own permission and freshness state -- never rolled up into the connector account's own status.</p>
 
       <label>
         Filter by team
@@ -163,7 +163,7 @@ export default function WorkItemsPanel() {
         <p className="empty-state">
           {teamFilter
             ? 'No work items are assigned to this team yet.'
-            : 'No work items have synced yet. Connect a GitHub, GitLab, or Jira account and run a backfill from Connector health.'}
+            : 'No work items have synced yet. Connect a Jira account and run a backfill from Connector health.'}
         </p>
       ) : null}
 

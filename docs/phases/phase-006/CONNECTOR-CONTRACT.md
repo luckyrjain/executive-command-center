@@ -2,7 +2,7 @@
 id: PHASE-006-CONNECTOR
 title: Engineering Connector Contract
 status: Approved for Implementation
-version: 0.12.0
+version: 0.13.0
 owner: Lucky Jain
 ---
 
@@ -133,6 +133,8 @@ The write-scope table above (`repo`/`api`/`write:jira-work`) is now genuinely us
 Three new read-only list endpoints (`GET /engineering/monitors`, `/service-definitions`, `/dashboards`) were added in this same task, mirroring `list_repositories_endpoint`'s shape exactly (`API-SCHEMAS.md`'s matching section). No team-assignment confirm endpoint exists yet for any of the three new tables -- see "Team linkage status" below for why that is a deliberately deferred follow-up, not an oversight.
 
 **Frontend gap, found and partially fixed by a whole-phase review.** This task shipped with zero frontend surface for Datadog at all: `ConnectorHealthPanel.tsx`'s provider-select and resource-type-select controls (the one place every prior provider addition -- GitLab, Jira -- correctly extended when it was added) were never updated to offer `datadog`/`monitor`/`service_definition`/`dashboard`, so a workspace admin had no UI path to even connect a Datadog account or trigger its sync, despite full backend support. Fixed as part of the whole-phase review (both selects now include Datadog). Still genuinely missing, and out of scope for that fix: no `MonitorsPanel`/`ServiceDefinitionsPanel`/`DashboardsPanel` equivalent to `RepositoriesPanel`/`WorkItemsPanel` exists, so a synced monitor/service-definition/dashboard still cannot be *viewed* anywhere in the product -- only queried directly via the three list endpoints above. Building those three panels is real, separate feature work, not a small fix; tracked as a follow-up, not silently absent.
+
+**`source_url` trust asymmetry, found and fixed by a third review round.** `_upsert_dashboard`'s allow-list check on Datadog's provider-returned `url` (trust only a relative path or a value already scoped to the connection's own `ui_host`, else fall back to a safe server-built default) was never applied to GitHub's `html_url` or GitLab's `web_url`, both stored verbatim and rendered as clickable links in `RepositoriesPanel.tsx` (and, for `changes`/`reviews`' identical `source_url` column, no frontend panel renders those yet). In practice both providers compute these fields server-side with no way for a repository owner to set an arbitrary scheme, so this was lower-likelihood than the Datadog case, but nothing in the code enforced that assumption. Fixed with a `_safe_source_url` helper mirroring `_upsert_dashboard`'s own pattern, applied to all three GitHub upserts (`_upsert_repository`/`_upsert_change`/`_upsert_review`) and GitLab's `_upsert_repository`.
 
 ## Team linkage status (migration `0050_phase6_team_linkage.py`)
 

@@ -16,6 +16,7 @@ function errorMessage(error: unknown): string {
   }
   if (error.code === 'DECISION_NOT_FOUND') return 'This decision no longer exists in this workspace.'
   if (error.code === 'DECISION_NOT_PROPOSED') return 'This decision has already been decided -- reload to see its current state.'
+  if (error.code === 'DECIDED_AT_BEFORE_CREATED_AT') return 'The decided time cannot be before the decision was created.'
   if (error.status === 401) return 'Your session is no longer valid. Sign in again.'
   if (error.status === 403) return 'You are not permitted to manage decisions in this workspace.'
   return error.message

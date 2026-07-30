@@ -58,7 +58,7 @@ export default function EngineeringWorkspace() {
         <div>
           <p className="eyebrow">ENGINEERING</p>
           <h1 id="engineering-title">Engineering workspace</h1>
-          <p>Connected repositories, work items, delivery and reliability metrics, incidents and decisions -- across every connected GitHub, GitLab, and Jira account.</p>
+          <p>Repositories from every connected GitHub or GitLab account, work items from every connected Jira account, plus delivery and reliability metrics, incidents and decisions.</p>
         </div>
       </div>
 

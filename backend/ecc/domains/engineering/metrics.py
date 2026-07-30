@@ -241,10 +241,23 @@ def _bucket_ages_days(ages_days: list[float]) -> dict[str, int]:
 
 
 def _open_work_items(session: Session, *, workspace_id: UUID) -> list[dict[str, Any]]:
+    # Joined to `connector_accounts` on `status = 'active'` -- review found
+    # that without this, a work item synced by an account that has since
+    # gone `disconnected`/`error`/`rate_limited`/`permission_lost` (whose
+    # rows keep `freshness_state`/`permission_state` frozen at their
+    # last-synced value forever, since the disable cascade only fires on
+    # an explicit disconnect) still contributed to `population`/`value`
+    # even though `_coverage_for`'s own denominator had already excluded
+    # that same account, letting a workspace with two-or-more same-provider
+    # connectors silently blend permanently-stale rows into a metric
+    # reported as `complete` or `partial` coverage.
     rows = session.execute(
         text(
-            "SELECT status, provider_created_at FROM engineering_work_items "
-            "WHERE workspace_id = :workspace_id AND permission_state = 'active'"
+            "SELECT w.status, w.provider_created_at FROM engineering_work_items w "
+            "JOIN connector_accounts a ON a.id = w.connector_account_id "
+            "AND a.workspace_id = w.workspace_id "
+            "WHERE w.workspace_id = :workspace_id AND w.permission_state = 'active' "
+            "AND a.status = 'active'"
         ),
         {"workspace_id": workspace_id},
     ).mappings()
@@ -364,7 +377,10 @@ def _compute_review_latency(
             SELECT DISTINCT ON (r.change_id) r.requested_at, r.submitted_at
             FROM reviews r
             JOIN changes c ON c.id = r.change_id AND c.workspace_id = r.workspace_id
+            JOIN connector_accounts a ON a.id = r.connector_account_id
+              AND a.workspace_id = r.workspace_id
             WHERE r.workspace_id = :workspace_id
+              AND a.status = 'active'
               AND c.merged_at >= :window_start
               AND r.requested_at IS NOT NULL
               AND r.submitted_at IS NOT NULL

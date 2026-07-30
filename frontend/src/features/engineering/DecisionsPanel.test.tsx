@@ -149,4 +149,19 @@ describe('DecisionsPanel', () => {
     expect(await screen.findByText(/This decision has already been decided/)).toBeTruthy()
     expect(screen.queryByText('Decision Not Proposed')).toBeNull()
   })
+
+  it('maps DECIDED_AT_BEFORE_CREATED_AT to a readable sentence, never the raw code', async () => {
+    const fetch = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      if (url.includes('/decide')) return response({ error: { code: 'DECIDED_AT_BEFORE_CREATED_AT', message: 'Decided At Before Created At' } }, 422)
+      return response({ decisions: [decision()] })
+    })
+    vi.stubGlobal('fetch', fetch)
+    renderPanel()
+
+    await screen.findByText('Adopt trunk-based development')
+    fireEvent.click(screen.getByRole('button', { name: 'Record decision' }))
+    expect(await screen.findByText(/The decided time cannot be before the decision was created/)).toBeTruthy()
+    expect(screen.queryByText('Decided At Before Created At')).toBeNull()
+  })
 })

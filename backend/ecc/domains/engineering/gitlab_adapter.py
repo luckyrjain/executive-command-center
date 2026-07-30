@@ -116,6 +116,7 @@ from .connectors import (
 )
 
 GITLAB_API_BASE_URL = "https://gitlab.com/api/v4"
+_GITLAB_WEB_BASE_URL = "https://gitlab.com"
 # `CONNECTOR-CONTRACT.md`'s resolved GitLab read scopes -- unlike GitHub's
 # `repo`, these are real GitLab OAuth/PAT scope names, and (see module
 # docstring) always checkable via `GET /personal_access_tokens/self`.
@@ -126,6 +127,22 @@ _PAGE_SIZE = 100
 # resumes across multiple `/sync` calls via the cursor.
 _MAX_PAGES_PER_CALL = 10
 _RATE_LIMIT_MAX_WAIT_SECONDS = 5.0
+
+
+def _safe_source_url(raw_url: str | None, *, fallback: str) -> str:
+    """Same allow-list defense `datadog_adapter.py`'s `_upsert_dashboard`
+    already applies to its own provider-returned `url` field, and
+    `github_adapter.py`'s identical `_safe_source_url` applies to
+    `html_url` (review found this adapter's own `web_url` field never
+    received it): a value not scoped to GitLab's own web host is never
+    trusted verbatim -- it could be `javascript:`/`data:`/an arbitrary
+    external host if the connected GitLab instance were compromised or
+    malicious -- falling back to a safe, server-constructed default
+    instead of rendering it as a clickable link.
+    """
+    if raw_url and raw_url.startswith(f"{_GITLAB_WEB_BASE_URL}/"):
+        return raw_url
+    return fallback
 
 
 def _content_hash(project: Mapping[str, Any]) -> str:
@@ -211,7 +228,13 @@ def _upsert_repository(
                 "provider": provider,
                 "external_id": str(project["id"]),
                 "name": project.get("path_with_namespace") or str(project["id"]),
-                "source_url": project.get("web_url") or "",
+                "source_url": _safe_source_url(
+                    project.get("web_url"),
+                    fallback=(
+                        f"{_GITLAB_WEB_BASE_URL}/"
+                        f"{project.get('path_with_namespace') or project['id']}"
+                    ),
+                ),
                 "default_branch": project.get("default_branch"),
                 "content_hash": _content_hash(project),
                 "provider_updated_at": provider_updated_at,
