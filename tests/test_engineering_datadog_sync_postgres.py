@@ -465,6 +465,41 @@ def test_backfill_service_definitions_single_page(
     }
 
 
+def test_backfill_skips_service_definition_missing_both_identifying_fields(
+    seeded_account_context: ConnectorAccountContext,
+) -> None:
+    """A malformed definition with neither `schema.dd-service` nor a
+    top-level `id` has no real, stable identifying key at all -- upserting
+    it anyway would fall back to a literal `external_id="None"`, and a
+    second, unrelated malformed definition in the same page would then
+    silently overwrite the first via `ON CONFLICT ... DO UPDATE`. Must be
+    skipped, not written under a shared placeholder key.
+    """
+    malformed = {"type": "service_definitions", "attributes": {"schema": {"team": "team-a"}}}
+    real = _service_definition("checkout", team="team-b")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        page_number = int(request.url.params["page[number]"])
+        return _json_response({"data": [malformed, real] if page_number == 0 else []})
+
+    adapter = DatadogAdapter(transport=httpx.MockTransport(handler))
+    outcome = adapter.backfill(seeded_account_context, "service_definition")
+    assert outcome.status == "succeeded"
+    assert outcome.items_processed == 1
+
+    with engine.begin() as connection:
+        rows = list(
+            connection.execute(
+                text(
+                    "SELECT name FROM datadog_service_definitions "
+                    "WHERE workspace_id = :workspace_id"
+                ),
+                {"workspace_id": seeded_account_context.workspace_id},
+            )
+        )
+    assert [row.name for row in rows] == ["checkout"]
+
+
 def test_backfill_service_definitions_paginates(
     seeded_account_context: ConnectorAccountContext,
 ) -> None:
@@ -619,6 +654,39 @@ def test_dashboard_sync_raises_on_generic_failure_status(
     adapter = DatadogAdapter(transport=httpx.MockTransport(handler))
     with pytest.raises(RuntimeError, match="500"):
         adapter.backfill(seeded_account_context, "dashboard")
+
+
+def test_backfill_dashboard_rejects_non_relative_url_from_provider(
+    seeded_account_context: ConnectorAccountContext,
+) -> None:
+    """A dashboard's `url` field is normally a relative path -- everything
+    else this adapter syncs builds `source_url` entirely server-side from
+    `ui_host`, but dashboards trust the provider's own `url` for the path
+    segment. A malformed or malicious value that doesn't start with `/`
+    (e.g. `javascript:alert(1)`, or an arbitrary external host) must never
+    be stored verbatim; it should fall back to the safe, server-constructed
+    default instead.
+    """
+    malicious = {
+        "id": "abc-123",
+        "title": "Overview",
+        "description": "A dashboard",
+        "url": "javascript:alert(1)",
+        "modified_at": "2024-01-01T00:00:00Z",
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return _json_response({"dashboards": [malicious]})
+
+    adapter = DatadogAdapter(transport=httpx.MockTransport(handler))
+    adapter.backfill(seeded_account_context, "dashboard")
+
+    with engine.begin() as connection:
+        source_url = connection.execute(
+            text("SELECT source_url FROM datadog_dashboards WHERE workspace_id = :workspace_id"),
+            {"workspace_id": seeded_account_context.workspace_id},
+        ).scalar_one()
+    assert source_url == "https://app.datadoghq.com/dashboard/abc-123"
 
 
 def test_backfill_dashboards_single_unbounded_call(

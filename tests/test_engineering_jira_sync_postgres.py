@@ -363,6 +363,124 @@ def test_backfill_populates_suggested_team_name_from_project_name(
     assert suggested == "Acme Platform"
 
 
+def test_backfill_suggested_team_name_is_none_without_project_field(
+    seeded_account_context: ConnectorAccountContext,
+) -> None:
+    """A real Jira issue payload missing `fields.project` entirely (rather
+    than an empty object) must not raise -- `_upsert_work_item` degrades to
+    `suggested_team_name IS NULL` instead, mirroring the analogous
+    without-owner/without-namespace tests GitHub/GitLab already have for
+    this same fallback chain.
+    """
+    issues = [_issue(1, key="ACME-1", summary="First bug", updated="2024-01-03T00:00:00.000+0000")]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return _json_response(_search_response(issues))
+
+    adapter = JiraAdapter(transport=httpx.MockTransport(handler))
+    adapter.backfill(seeded_account_context, "work_item")
+
+    with engine.begin() as connection:
+        suggested = connection.execute(
+            text(
+                "SELECT suggested_team_name FROM engineering_work_items "
+                "WHERE workspace_id = :workspace_id"
+            ),
+            {"workspace_id": seeded_account_context.workspace_id},
+        ).scalar_one()
+    assert suggested is None
+
+
+def test_incremental_resync_refreshes_suggestion_without_touching_confirmed_team(
+    seeded_account_context: ConnectorAccountContext,
+) -> None:
+    """A confirmed `team_entity_id` (set only through `POST .../work-items/
+    {id}/team`, never by a sync) must survive indefinitely across re-syncs,
+    even as `suggested_team_name` keeps refreshing from the provider's own
+    latest payload -- the same regression `github_adapter`'s own test file
+    proves, exercised here since `_upsert_work_item`'s `ON CONFLICT ... DO
+    UPDATE` clause is authored per-adapter, not shared.
+    """
+    issues = [
+        _issue(
+            1,
+            key="ACME-1",
+            summary="First bug",
+            updated="2024-01-03T00:00:00.000+0000",
+            project={"key": "ACME", "name": "Acme Platform"},
+        )
+    ]
+    adapter = JiraAdapter(
+        transport=httpx.MockTransport(lambda r: _json_response(_search_response(issues)))
+    )
+    adapter.backfill(seeded_account_context, "work_item")
+
+    confirmed_team_id = uuid4()
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO pkos_nodes (id, workspace_id, node_type, canonical_name, "
+                "status, confidence, version, created_at, updated_at) "
+                "VALUES (:id, :workspace_id, 'team', 'Platform', 'active', 1.0, 1, :now, :now)"
+            ),
+            {
+                "id": confirmed_team_id,
+                "workspace_id": seeded_account_context.workspace_id,
+                "now": datetime.now(UTC),
+            },
+        )
+        connection.execute(
+            text(
+                "UPDATE engineering_work_items SET team_entity_id = :team_id "
+                "WHERE workspace_id = :workspace_id"
+            ),
+            {"team_id": confirmed_team_id, "workspace_id": seeded_account_context.workspace_id},
+        )
+
+    issues_renamed = [
+        _issue(
+            1,
+            key="ACME-1",
+            summary="First bug",
+            updated="2024-01-04T00:00:00.000+0000",
+            project={"key": "ACME", "name": "Acme Platform Renamed"},
+        )
+    ]
+    adapter2 = JiraAdapter(
+        transport=httpx.MockTransport(lambda r: _json_response(_search_response(issues_renamed)))
+    )
+    adapter2.incremental_sync(seeded_account_context, "work_item", "2024-01-03T00:00:00.000+0000")
+
+    try:
+        with engine.begin() as connection:
+            row = connection.execute(
+                text(
+                    "SELECT suggested_team_name, team_entity_id FROM engineering_work_items "
+                    "WHERE workspace_id = :workspace_id"
+                ),
+                {"workspace_id": seeded_account_context.workspace_id},
+            ).one()
+        assert row.suggested_team_name == "Acme Platform Renamed"
+        assert row.team_entity_id == confirmed_team_id
+    finally:
+        # `seeded_account_context`'s own teardown doesn't know about the
+        # `pkos_nodes` row this test inserted directly -- clearing
+        # `engineering_work_items.team_entity_id` first, then the node
+        # itself, avoids leaving the fixture's own `DELETE FROM workspaces`
+        # blocked by the FK this test's own `UPDATE` created.
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    "UPDATE engineering_work_items SET team_entity_id = NULL "
+                    "WHERE workspace_id = :workspace_id"
+                ),
+                {"workspace_id": seeded_account_context.workspace_id},
+            )
+            connection.execute(
+                text("DELETE FROM pkos_nodes WHERE id = :id"), {"id": confirmed_team_id}
+            )
+
+
 def test_backfill_paginates_via_offset(seeded_account_context: ConnectorAccountContext) -> None:
     page1 = [_issue(1, key="ACME-1", summary="First", updated="2024-01-05T00:00:00.000+0000")]
     page2 = [_issue(2, key="ACME-2", summary="Second", updated="2024-01-04T00:00:00.000+0000")]

@@ -54,6 +54,14 @@ function TeamAssignment({
     onSuccess: () => { void queryClient.invalidateQueries({ queryKey: ['engineering', 'work-items'] }) },
   })
 
+  // See RepositoriesPanel.tsx's identical `TeamAssignment` comment: past
+  // 100 teams in a workspace (`listTeams`'s own `limit=100`, the backend's
+  // hard ceiling), an already-confirmed `team_entity_id` outside that page
+  // would otherwise leave the `<select>`'s controlled `value` matching no
+  // `<option>`, silently misrepresenting an assigned work item as
+  // unassigned.
+  const assignedTeamMissing = workItem.team_entity_id !== null && !teamsById.has(workItem.team_entity_id)
+
   return (
     <div className="work-actions">
       <label>
@@ -65,6 +73,9 @@ function TeamAssignment({
           onChange={(event) => mutation.mutate(event.target.value === '' ? null : event.target.value)}
         >
           <option value="">Unassigned</option>
+          {assignedTeamMissing ? (
+            <option value={workItem.team_entity_id ?? ''}>Assigned team (not in first 100)</option>
+          ) : null}
           {[...teamsById.entries()].map(([id, name]) => <option key={id} value={id}>{name}</option>)}
         </select>
       </label>

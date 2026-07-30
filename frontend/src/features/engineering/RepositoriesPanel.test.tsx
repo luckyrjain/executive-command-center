@@ -130,6 +130,20 @@ describe('RepositoriesPanel', () => {
     expect((screen.getByLabelText('Team for acme/widgets') as HTMLSelectElement).value).toBe('team-1')
   })
 
+  it('still shows the correct assignment when the confirmed team is outside the first 100 fetched', async () => {
+    // `listTeams` fetches at most 100 teams; a repository confirmed to a
+    // team outside that page must not silently render as "Unassigned" --
+    // the `<select>`'s controlled `value` needs an `<option>` to match.
+    stubFetch({
+      repositories: [repository({ team_entity_id: 'team-not-in-page' })],
+      teams: [{ id: 'team-1', canonical_name: 'Platform Engineering' }],
+    })
+    renderPanel()
+    const select = (await screen.findByLabelText('Team for acme/widgets')) as HTMLSelectElement
+    expect(select.value).toBe('team-not-in-page')
+    expect(screen.getByText('Assigned team (not in first 100)')).toBeTruthy()
+  })
+
   it('assigning a team from the dropdown posts the confirmed link and refetches', async () => {
     stubFetch({
       repositories: [repository()],

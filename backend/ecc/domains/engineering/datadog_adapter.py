@@ -295,7 +295,7 @@ def _upsert_service_definition(
     provider: str,
     site: str,
     definition: Mapping[str, Any],
-) -> None:
+) -> bool:
     now = datetime.now(UTC)
     ui_host = _SITE_TO_UI_HOST[site]
     attributes = definition.get("attributes") or {}
@@ -306,6 +306,13 @@ def _upsert_service_definition(
     # as `external_id` rather than the envelope's own `id` field, which is
     # not confirmed to exist consistently across API versions.
     dd_service = schema.get("dd-service") or definition.get("id")
+    if dd_service is None:
+        # A malformed definition missing both identifying fields would
+        # otherwise fall through to `external_id=str(None)=="None"`, and a
+        # second, unrelated malformed definition would then silently
+        # overwrite the first via `ON CONFLICT ... DO UPDATE` -- skip
+        # rather than risk two distinct services colliding on one row.
+        return False
     with SessionFactory() as session:
         session.execute(
             text(
@@ -352,6 +359,7 @@ def _upsert_service_definition(
             },
         )
         session.commit()
+    return True
 
 
 def _dashboard_content_hash(dashboard: Mapping[str, Any]) -> str:
@@ -378,7 +386,21 @@ def _upsert_dashboard(
     now = datetime.now(UTC)
     ui_host = _SITE_TO_UI_HOST[site]
     dashboard_id = dashboard["id"]
-    url = dashboard.get("url") or f"/dashboard/{dashboard_id}"
+    # Every other resource type's `source_url` is built entirely server-side
+    # from `ui_host`; dashboards are the one exception, since Datadog's own
+    # `url` field is normally a relative path. Unlike monitors/service
+    # definitions, a provider-returned string that is neither a relative
+    # path nor already scoped to this connection's own `ui_host` is never
+    # trusted verbatim (it could be `javascript:`/`data:`/an arbitrary
+    # external host if the connected Datadog tenant were compromised or
+    # malicious) -- fall back to the safe, server-constructed default.
+    raw_url = dashboard.get("url")
+    if raw_url and raw_url.startswith("/"):
+        url = raw_url
+    elif raw_url and raw_url.startswith(f"https://{ui_host}/"):
+        url = raw_url[len(f"https://{ui_host}") :]
+    else:
+        url = f"/dashboard/{dashboard_id}"
     # `tags` is not confirmed present on the list endpoint's own summary
     # shape (see module docstring) -- `.get` is defensive, not load-bearing.
     tags = dashboard.get("tags") or []
@@ -417,7 +439,7 @@ def _upsert_dashboard(
                 "connector_account_id": connector_account_id,
                 "provider": provider,
                 "external_id": str(dashboard_id),
-                "source_url": f"https://{ui_host}{url}" if url.startswith("/") else url,
+                "source_url": f"https://{ui_host}{url}",
                 "content_hash": _dashboard_content_hash(dashboard),
                 "provider_updated_at": dashboard.get("modified_at"),
                 "suggested_team_name": suggested_team_name,
@@ -653,14 +675,14 @@ class DatadogAdapter:
             body = response.json()
             definitions = body.get("data") or []
             for definition in definitions:
-                _upsert_service_definition(
+                if _upsert_service_definition(
                     workspace_id=account.workspace_id,
                     connector_account_id=account.connector_account_id,
                     provider=self.provider,
                     site=site,
                     definition=definition,
-                )
-                items_processed += 1
+                ):
+                    items_processed += 1
 
             if len(definitions) < _PAGE_SIZE:
                 return SyncOutcome(

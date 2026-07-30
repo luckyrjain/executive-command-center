@@ -709,7 +709,7 @@ def test_team_roster_is_relationship_type_and_direction_composed(
     entity's membership list, resolved to real names -- not bare UUIDs a
     human would have to look up one at a time.
     """
-    client, workspace_id, _user_id, token, person_id, _project_id = relationships_test_context
+    client, workspace_id, _user_id, token, person_id, project_id = relationships_test_context
     team = client.post(
         "/api/v1/knowledge/entities",
         headers=_headers(token, "roster-create-team"),
@@ -743,6 +743,22 @@ def test_team_roster_is_relationship_type_and_direction_composed(
         },
     )
 
+    # A third relationship, same MEMBER_OF type but the OUTGOING direction
+    # from the team's own perspective (team -> project). Without this edge,
+    # `direction=incoming` below would pass even if the direction filter
+    # were deleted or inverted entirely -- there would be nothing for it to
+    # wrongly include.
+    outgoing_member_of = client.post(
+        f"/api/v1/knowledge/entities/{team_id}/relationships",
+        headers=_headers(token, "roster-outgoing-member-of"),
+        json={
+            "relationship_type": "MEMBER_OF",
+            "to_entity_id": str(project_id),
+            "evidence_id": str(evidence_id),
+        },
+    )
+    assert outgoing_member_of.status_code == 201, outgoing_member_of.text
+
     roster = client.get(
         f"/api/v1/knowledge/entities/{team_id}/relationships",
         params={"relationship_type": "MEMBER_OF", "direction": "incoming"},
@@ -756,3 +772,14 @@ def test_team_roster_is_relationship_type_and_direction_composed(
     assert items[0]["from_entity_kind"] == "person"
     assert items[0]["to_entity_name"] == "Platform Engineering"
     assert items[0]["to_entity_kind"] == "team"
+
+    outgoing_roster_ids = {
+        item["id"]
+        for item in client.get(
+            f"/api/v1/knowledge/entities/{team_id}/relationships",
+            params={"relationship_type": "MEMBER_OF", "direction": "outgoing"},
+            headers=_headers(token, "roster-outgoing-list"),
+        ).json()["items"]
+    }
+    assert outgoing_member_of.json()["id"] in outgoing_roster_ids
+    assert member_of.json()["id"] not in outgoing_roster_ids
