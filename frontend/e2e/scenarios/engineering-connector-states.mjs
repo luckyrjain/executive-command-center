@@ -54,6 +54,10 @@ export async function run({ page, baseURL }) {
         { id: 'repo-active', connector_account_id: 'conn-active', provider: 'github', external_id: 'gh-1', name: 'acme/widgets', source_url: 'https://github.com/acme/widgets', default_branch: 'main', permission_state: 'active', freshness_state: 'fresh', provider_updated_at: iso(-60 * 60 * 1000), observed_at: iso(-60 * 60 * 1000), created_at: iso(-30 * 24 * 60 * 60 * 1000), updated_at: iso(-60 * 60 * 1000) },
         { id: 'repo-permission', connector_account_id: 'conn-permission', provider: 'gitlab', external_id: 'gl-1', name: 'acme/internal-tools', source_url: 'https://gitlab.com/acme/internal-tools', default_branch: 'main', permission_state: 'permission_lost', freshness_state: 'stale', provider_updated_at: iso(-30 * 24 * 60 * 60 * 1000), observed_at: iso(-30 * 24 * 60 * 60 * 1000), created_at: iso(-40 * 24 * 60 * 60 * 1000), updated_at: iso(-30 * 24 * 60 * 60 * 1000) },
       ],
+      workItems: [
+        { id: 'item-active', connector_account_id: 'conn-error', provider: 'jira', external_id: 'ACME-1', title: 'Investigate 503s', source_url: 'https://acme.atlassian.net/browse/ACME-1', item_type: 'Bug', status: 'In Progress', reporter_external_id: 'reporter-1', assignee_external_id: 'assignee-1', permission_state: 'active', freshness_state: 'fresh', provider_created_at: iso(-2 * 24 * 60 * 60 * 1000), observed_at: iso(-60 * 60 * 1000), created_at: iso(-2 * 24 * 60 * 60 * 1000), updated_at: iso(-60 * 60 * 1000) },
+        { id: 'item-permission', connector_account_id: 'conn-permission', provider: 'gitlab', external_id: 'gl-issue-1', title: 'Rotate internal tooling credentials', source_url: 'https://gitlab.com/acme/internal-tools/-/issues/1', item_type: null, status: 'To Do', reporter_external_id: 'reporter-2', assignee_external_id: null, permission_state: 'permission_lost', freshness_state: 'stale', provider_created_at: iso(-40 * 24 * 60 * 60 * 1000), observed_at: iso(-30 * 24 * 60 * 60 * 1000), created_at: iso(-40 * 24 * 60 * 60 * 1000), updated_at: iso(-30 * 24 * 60 * 60 * 1000) },
+      ],
     },
   })
 
@@ -126,4 +130,18 @@ export async function run({ page, baseURL }) {
   const permissionRepoRow = reposPanel.locator('li', { hasText: 'acme/internal-tools' })
   await permissionRepoRow.getByText('permission lost').waitFor()
   await permissionRepoRow.getByText('stale').waitFor()
+
+  // --- Work items: the identical per-row permission/freshness disclosure
+  // as Repositories, on a panel that had no frontend surface at all until
+  // this task -- `GET /engineering/work-items` and its `POST .../team`
+  // confirm endpoint existed since migration `0050_phase6_team_linkage.py`
+  // with only `CoveragePanel`'s own unresolved-identity rollup ever
+  // reading the response, never a per-item list --------------------------
+  await page.getByRole('tab', { name: 'Work items' }).click()
+  await assertNoSeriousAccessibilityViolations(page, { include: '#engineering-panel' })
+  const workItemsPanel = panel.locator('section[aria-labelledby="engineering-work-items-title"]')
+  await workItemsPanel.getByText('Investigate 503s', { exact: true }).waitFor()
+  const permissionItemRow = workItemsPanel.locator('li', { hasText: 'Rotate internal tooling credentials' })
+  await permissionItemRow.getByText('permission lost').waitFor()
+  await permissionItemRow.getByText('stale').waitFor()
 }

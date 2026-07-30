@@ -9,6 +9,7 @@ export type EngineeringView =
   | 'delivery'
   | 'reliability'
   | 'repositories'
+  | 'work-items'
   | 'incidents'
   | 'decisions'
   | 'connector-health'
