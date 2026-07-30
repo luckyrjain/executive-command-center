@@ -17,7 +17,10 @@ function timestamp(value: string | null): string {
 }
 
 function listTeams(): Promise<EntityList> {
-  return apiRequest('/api/v1/knowledge/entities?kind=team&limit=100')
+  // See RepositoriesPanel.tsx's identical `listTeams` comment: without
+  // `status=active`, an archived/redirected (merged-away) team stays
+  // selectable here forever and 404s on confirm.
+  return apiRequest('/api/v1/knowledge/entities?kind=team&status=active&limit=100')
 }
 
 function assignTeam(

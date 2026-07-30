@@ -837,6 +837,28 @@ def test_create_decision_rejects_empty_title(
     assert response.status_code == 422
 
 
+def test_create_decision_idempotency_replay(
+    engineering_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    """`create_incident`/`resolve_incident`/`decide_decision` all have this
+    same-key/same-payload replay-returns-cached-response test; `create_
+    decision` only had the conflict case.
+    """
+    client, _workspace_id, _user_id, token = engineering_test_context
+    key = str(uuid4())
+    payload = {"title": "A decision"}
+
+    first = client.post(
+        "/api/v1/engineering/decisions", json=payload, headers=_headers(token, key=key)
+    )
+    assert first.status_code == 201
+    replay = client.post(
+        "/api/v1/engineering/decisions", json=payload, headers=_headers(token, key=key)
+    )
+    assert replay.status_code == 201
+    assert replay.json()["id"] == first.json()["id"]
+
+
 def test_create_decision_idempotency_conflict_on_payload_mismatch(
     engineering_test_context: tuple[TestClient, UUID, UUID, str],
 ) -> None:
@@ -889,6 +911,27 @@ def test_decide_decision_success(
     assert body["decided_at"] is not None
     assert body["rationale"] == "Because"
     assert body["version"] == 2
+
+
+def test_decide_decision_422_when_decided_before_created(
+    engineering_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    """Mirrors `test_resolve_incident_422_when_resolved_before_detected` --
+    a whole-phase review found `decide_decision_endpoint` had no equivalent
+    temporal-ordering guard at all, so a decision could be "decided" with
+    a caller-supplied `decided_at` earlier than the decision's own
+    creation time.
+    """
+    client, _workspace_id, _user_id, token = engineering_test_context
+    decision_id = _create_decision(client, token)
+
+    response = client.post(
+        f"/api/v1/engineering/decisions/{decision_id}/decide",
+        json={"decided_at": (datetime.now(UTC) - timedelta(hours=1)).isoformat()},
+        headers=_headers(token, key=str(uuid4())),
+    )
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "DECIDED_AT_BEFORE_CREATED_AT"
 
 
 def test_decide_decision_keeps_existing_rationale_when_not_provided(

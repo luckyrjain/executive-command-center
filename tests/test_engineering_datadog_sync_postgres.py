@@ -206,6 +206,25 @@ def test_datadog_adapter_authorize_rejects_network_error() -> None:
         adapter.authorize(_CREDENTIAL)
 
 
+def test_datadog_adapter_authorize_rejects_network_error_on_second_call() -> None:
+    """`authorize` makes two sequential requests (api_key then app_key
+    validation) -- the test above only ever exercises the FIRST raising,
+    since a mock transport that raises unconditionally never reaches the
+    second URL. GitLab's own structurally identical two-call `authorize`
+    had this exact gap once (its own docstring says so) before it was
+    added; Datadog never got the equivalent test.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v1/validate":
+            return _json_response({"valid": True})
+        raise httpx.ConnectError("connection refused")
+
+    adapter = DatadogAdapter(transport=httpx.MockTransport(handler))
+    with pytest.raises(AdapterAuthorizationError):
+        adapter.authorize(_CREDENTIAL)
+
+
 # --- unit-level: resource sync (real database rows required) ----------------
 
 
@@ -762,6 +781,39 @@ def test_rate_limit_gives_up_beyond_bounded_wait() -> None:
     assert outcome.items_processed == 0
     assert outcome.error_summary is not None
     assert "rate limit" in outcome.error_summary.lower()
+
+
+def test_rate_limit_gives_up_immediately_when_reset_header_absent() -> None:
+    """`_rate_limit_wait_seconds` returns `None` when `X-RateLimit-Reset`
+    is absent entirely -- a distinct code path from "present but too
+    large," untested here despite GitLab/Jira having the equivalent test
+    for their own identical `Retry-After`-absent case.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return _json_response({"errors": ["rate limited"]}, status_code=429)
+
+    adapter = DatadogAdapter(transport=httpx.MockTransport(handler), sleep=lambda seconds: None)
+    outcome = adapter.backfill(_account_context(), "monitor")
+    assert outcome.status == "partial"
+    assert outcome.items_processed == 0
+
+
+def test_rate_limit_gives_up_immediately_when_reset_header_malformed() -> None:
+    """`_rate_limit_wait_seconds`'s `except ValueError: return None` branch
+    for a non-numeric `X-RateLimit-Reset` value -- untested here despite
+    GitLab/Jira having the equivalent test.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return _json_response(
+            {"errors": ["rate limited"]}, status_code=429, headers={"X-RateLimit-Reset": "soon"}
+        )
+
+    adapter = DatadogAdapter(transport=httpx.MockTransport(handler), sleep=lambda seconds: None)
+    outcome = adapter.backfill(_account_context(), "monitor")
+    assert outcome.status == "partial"
+    assert outcome.items_processed == 0
 
 
 def test_rate_limit_still_limited_after_retry_reports_partial_not_failure() -> None:

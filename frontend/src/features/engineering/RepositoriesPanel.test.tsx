@@ -113,6 +113,20 @@ describe('RepositoriesPanel', () => {
 
   // --- team linkage (migration `0050_phase6_team_linkage.py`) -------------
 
+  it('excludes archived/redirected teams from the team picker', async () => {
+    // Without `status=active`, a team merged away via the Knowledge
+    // Platform's own resolution flow stayed selectable forever, and
+    // confirming it 404'd server-side with no explanation in the UI.
+    stubFetch({ repositories: [repository()] })
+    renderPanel()
+    await screen.findByText('acme/widgets')
+    const entitiesCall = (fetch as unknown as { mock: { calls: [RequestInfo | URL][] } }).mock.calls.find(([input]) =>
+      String(input).includes('/knowledge/entities'),
+    )
+    expect(entitiesCall).toBeTruthy()
+    expect(String(entitiesCall?.[0])).toContain('status=active')
+  })
+
   it('shows the suggested team name as a hint when unassigned', async () => {
     stubFetch({ repositories: [repository({ suggested_team_name: 'acme' })] })
     renderPanel()

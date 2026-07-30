@@ -17,7 +17,12 @@ function timestamp(value: string | null): string {
 }
 
 function listTeams(): Promise<EntityList> {
-  return apiRequest('/api/v1/knowledge/entities?kind=team&limit=100')
+  // `status=active` excludes an archived/redirected team -- without it, a
+  // team merged away via the Knowledge Platform's own resolution flow
+  // (`MergeReview.tsx`) stayed selectable here forever, and confirming it
+  // 404'd (`_validate_team_entity` requires `status='active'`) with no
+  // indication in the UI of why.
+  return apiRequest('/api/v1/knowledge/entities?kind=team&status=active&limit=100')
 }
 
 function assignTeam(

@@ -344,6 +344,44 @@ def test_coverage_partial_when_one_of_two_accounts_stale(workspace: UUID) -> Non
     assert work_ageing.coverage_gap_description is not None
 
 
+def test_coverage_complete_at_exact_95_percent_boundary(workspace: UUID) -> None:
+    """`_coverage_for` gates on `percentage >= _COMPLETE_COVERAGE_THRESHOLD`
+    (95.0) -- the only prior tests exercise 100% ("clearly above") and 50%
+    (the *partial* threshold), never this exact value. A regression here
+    (e.g. `>` instead of `>=`, or a stray 94.0/96.0 typo) would silently
+    misclassify a borderline-fresh workspace, the same metric-gating logic
+    this task's own review history already found one real shipped bug in.
+    """
+    now = datetime.now(UTC)
+    accounts = [_insert_connector_account(workspace, provider="jira") for _ in range(20)]
+    for account_id in accounts[:19]:
+        _insert_cursor(workspace, account_id, resource_type="work_item", updated_at=now)
+    with SessionFactory() as session:
+        snapshots = compute_metrics(session, workspace_id=workspace)
+    work_ageing = next(s for s in snapshots if s.metric_key == "work_ageing")
+    assert work_ageing.coverage_percentage == 95.0
+    assert work_ageing.coverage_status == "complete"
+    assert work_ageing.coverage_gap_description is None
+
+
+def test_coverage_partial_just_under_95_percent_boundary(workspace: UUID) -> None:
+    """The mirror of the test above: one connector short of the 95%
+    threshold (18 of 19, ~94.7%) must still report `partial`, not
+    `complete` -- proving the gate is genuinely `>=`, not merely correct
+    at round numbers like 100%/50%.
+    """
+    now = datetime.now(UTC)
+    accounts = [_insert_connector_account(workspace, provider="jira") for _ in range(19)]
+    for account_id in accounts[:18]:
+        _insert_cursor(workspace, account_id, resource_type="work_item", updated_at=now)
+    with SessionFactory() as session:
+        snapshots = compute_metrics(session, workspace_id=workspace)
+    work_ageing = next(s for s in snapshots if s.metric_key == "work_ageing")
+    assert work_ageing.coverage_percentage < 95.0
+    assert work_ageing.coverage_status == "partial"
+    assert work_ageing.coverage_gap_description is not None
+
+
 def test_coverage_ignores_inactive_accounts(workspace: UUID) -> None:
     _insert_connector_account(workspace, provider="jira", status="disconnected")
     with SessionFactory() as session:
