@@ -1,8 +1,8 @@
 ---
 id: PHASE-004-IMPLEMENTATION-STATUS
 title: Phase 4 Implementation Status
-status: Implemented (Tasks 0-20 of the first activation slice); meeting.prep_summary's latency promotion floor raised (phase H) pending re-verification against a live model; attention.explain_item's prohibited-fact-count floor remains an accepted known limitation
-version: 0.16.0
+status: Implemented (Tasks 0-21 of the first activation slice); both meeting.prep_summary's latency floor and attention.explain_item's prohibited-fact-count floor cleared on a real live-model run (phase H/I); a genuine gap in the temperature=0/seed=0 reproducibility guarantee found and the affected test corrected
+version: 0.17.0
 owner: Lucky Jain
 updated: 2026-07-30
 ---
@@ -48,6 +48,7 @@ Phase 4's design work and its six-task implementation plan (`docs/superpowers/pl
 | 18 | Post-launch audit fixes, phase G: meeting.prep_summary timeout raised again (25s -> 32s) + fixed a real per-task-type promotion-floor bug | Done -- `4424d39` |
 | 19 | Audit closure: repository-owner acceptance of remaining floor misses as known limitations; Phase 5 parallel-start authorization | Done -- this commit |
 | 20 | Post-launch audit fixes, phase H: meeting.prep_summary's latency promotion-floor ceiling raised (25s -> 35s), backed by four consistent live-model measurements, and its timeout raised again (32s -> 40s) in lockstep | Done -- this commit |
+| 21 | Post-launch audit fixes, phase I: both phase H fixes verified against a real model (both floors now clear); test_execute_run_output_is_reproducible_across_two_calls's first-ever real run found strict output equality does not hold, weakened to a grounding-level assertion | Done -- this commit |
 
 ### Task 1 evidence -- model/provider registry and router
 
@@ -339,6 +340,14 @@ Direct repository-owner follow-up asking to revisit the two floor misses Task 19
 **Docs.** `EVALUATION-CONTRACT.md`: floor table's latency row updated (25s -> 35s, timeout reference 32s -> 40s); new "Phase H" paragraph recording the four-measurement history and the reasoning above. `DATA-MODEL.md`: `ai_run_steps` row's total-run-budget parenthetical updated (75s -> 91s, phase G -> phase H). `router.py`/`ollama_client.py`/`evaluation.py`: each constant's own comment updated with the phase H history in place, following this audit's own established convention of keeping the reasoning next to the number it justifies.
 
 No promotion decision has been made for `meeting.prep_summary` -- this closes the latency-floor gap specifically; the next live `ollama-evaluation` run against the new 35s ceiling is the real verification.
+
+### Task 21 evidence -- post-launch audit fixes, phase I (phase H verified; a real reproducibility gap found and the test corrected)
+
+**Phase H's fixes verified against a real model, twice.** The PR's own `ollama-evaluation` CI ran against commit `86972fc` and, on a rerun of the same commit, both times: `test_attention_explain_item_passes_every_evaluation_floor_against_real_model` and `test_meeting_prep_summary_passes_every_evaluation_floor_against_real_model` both **passed** -- the third, narrowly-scoped `attention.explain_item` prompt attempt did not regress schema validity or grounding the way the two prior attempts did, and `meeting.prep_summary` cleared its new 35s ceiling. Both real remaining floor misses from Task 19's "accepted known limitations" are now cleared. No promotion decision has been made for either task type -- this is one clean run each, not the repeated confirmation this document's own standard (Task 14/18's own precedent) would want before a promotion decision; a further live run without regression would be the next real confirming signal.
+
+**A third, previously-never-executed test found a real gap in the determinism assumption itself.** `test_execute_run_output_is_reproducible_across_two_calls` (Task evidence, "Gap 3" above) had only ever skipped in every sandbox since it was added -- this was its first real execution against genuine Ollama output, on both the original run and the rerun. Both times it failed identically: two `execute_run` calls against the identical item/prompt produced two different (but each individually valid and grounded) explanations, with the *same exact two text variants* reproduced across both independent CI job runs -- ruling out one-off environmental noise, and revealing that `temperature=0`/`seed=0` does not itself guarantee bit-identical output across separate HTTP calls to this quantized model on this inference stack, contrary to the assumption `ollama_client.py`'s own module docstring and this test's original design both made. Repository-owner direction: relax the test's assertion rather than treat this as an unfixable blocker or attempt a further speculative determinism fix -- the test now checks each call's output is independently grounded (every `cited_factor_codes` entry is a real code on the item's factors) and non-empty, rather than comparing the two calls' outputs against each other. This is a real, still-meaningful assertion (it independently exercises `execute_run`'s own grounding-validation pipeline twice), just no longer one this environment cannot actually satisfy.
+
+**Docs.** `EVALUATION-CONTRACT.md`: this section's own findings recorded (see that document's matching update). This file: this section; Delivery tasks table row 21 added.
 
 ## Sandbox constraint (carried forward from the design pass)
 

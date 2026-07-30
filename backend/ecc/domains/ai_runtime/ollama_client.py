@@ -223,6 +223,21 @@ class OllamaAdapter:
         zero-temperature decode should reduce, though this codebase's
         sandboxed CI is the only place that claim can actually be checked
         against the real model.
+
+        **Does not itself guarantee bit-identical output across separate
+        calls (phase I audit finding).** `test_execute_run_output_is_
+        reproducible_across_two_calls` (`tests/test_ai_runtime_evaluation_
+        live_ollama.py`) found, on its first-ever real run against genuine
+        Ollama output, that two calls against the identical prompt can
+        still produce two different (each individually valid) completions
+        -- reproduced identically across two independent CI runs, ruling
+        out one-off noise. `temperature=0`/`seed=0` makes each individual
+        token choice greedy given that call's own logits, but does not
+        control for engine-level floating-point non-associativity across
+        separate HTTP requests (e.g. differing batch/thread scheduling) on
+        this quantized model/inference stack -- a real, narrower guarantee
+        than this comment previously claimed. See `EVALUATION-CONTRACT.md`'s
+        own "Phase I" note for the full finding.
         """
         effective_timeout_seconds = (
             timeout_seconds if timeout_seconds is not None else self._timeout_seconds
