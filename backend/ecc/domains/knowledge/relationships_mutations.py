@@ -11,8 +11,8 @@ from ecc.auth import AuthContext, AuthDep, CsrfDep
 from ecc.database import get_session
 from ecc.domains.knowledge.relationships import (
     RelationshipResponse,
+    _fetch_relationship,
     _load_cached,
-    _project,
     _request_hash,
     _source_entity_version,
     _store_cached,
@@ -26,11 +26,6 @@ IdempotencyHeader = Annotated[
     str,
     Header(alias="Idempotency-Key", min_length=1, max_length=255),
 ]
-
-_RELATIONSHIP_FIELDS = """
-id, source_node_id, target_node_id, edge_type, confidence, evidence_id,
-valid_from, valid_to, status
-"""
 
 
 class RelationshipInvalidate(BaseModel):
@@ -80,26 +75,24 @@ def invalidate_relationship(
             raise HTTPException(status_code=404, detail="RELATIONSHIP_NOT_FOUND")
         if current["status"] != "active":
             raise HTTPException(status_code=409, detail="RELATIONSHIP_NOT_ACTIVE")
-        row = (
-            session.execute(
-                text(
-                    f"""
-                    UPDATE pkos_edges
-                    SET status = 'invalidated', valid_to = :now
-                    WHERE workspace_id = :workspace_id AND id = :relationship_id
-                    RETURNING {_RELATIONSHIP_FIELDS}
-                    """
-                ),
-                {
-                    "workspace_id": auth.workspace_id,
-                    "relationship_id": relationship_id,
-                    "now": now,
-                },
-            )
-            .mappings()
-            .one()
+        session.execute(
+            text(
+                """
+                UPDATE pkos_edges
+                SET status = 'invalidated', valid_to = :now
+                WHERE workspace_id = :workspace_id AND id = :relationship_id
+                """
+            ),
+            {
+                "workspace_id": auth.workspace_id,
+                "relationship_id": relationship_id,
+                "now": now,
+            },
         )
-        response = _project(dict(row))
+        # Fetched separately (not via `RETURNING`) since the join that
+        # resolves `from_entity_name`/`to_entity_name` reads other rows in
+        # `pkos_nodes` -- see `relationships.py`'s own `_fetch_relationship`.
+        response = _fetch_relationship(session, auth, relationship_id)
         source_version = _source_entity_version(session, auth, relationship_id)
         _write_side_effects(
             session,

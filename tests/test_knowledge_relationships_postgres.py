@@ -163,6 +163,12 @@ def test_relationship_create_and_list_from_either_direction(
     assert relationship["status"] == "active"
     assert relationship["confidence"] == 1.0
     assert relationship["evidence_id"] == str(evidence_id)
+    # Resolved from `pkos_nodes` -- see relationships.py's own docstring for
+    # why raw IDs alone made this response unusable for a human-facing list.
+    assert relationship["from_entity_name"] == "Ada Lovelace"
+    assert relationship["from_entity_kind"] == "person"
+    assert relationship["to_entity_name"] == "Analytical Engine"
+    assert relationship["to_entity_kind"] == "project"
 
     from_person = client.get(
         f"/api/v1/knowledge/entities/{person_id}/relationships",
@@ -607,3 +613,146 @@ def test_relationship_create_rejects_valid_to_at_or_before_valid_from(
         },
     )
     assert response.status_code == 422, response.text
+
+
+# --- relationship_type/direction filters (team-concept gap analysis) -------
+#
+# `MEMBER_OF` was a real, working relationship type with no way to query it
+# as a roster -- these prove a team's membership list is exactly
+# `relationship_type=MEMBER_OF&direction=incoming` composed against this
+# same generic endpoint, per relationships.py's own docstring.
+
+
+def test_relationship_direction_incoming_excludes_outgoing_edges(
+    relationships_test_context: tuple[TestClient, UUID, UUID, str, UUID, UUID],
+) -> None:
+    client, workspace_id, _user_id, token, person_id, project_id = relationships_test_context
+    evidence_id = _create_evidence(workspace_id, person_id)
+    create = client.post(
+        f"/api/v1/knowledge/entities/{person_id}/relationships",
+        headers=_headers(token, "direction-create"),
+        json={
+            "relationship_type": "WORKS_ON",
+            "to_entity_id": str(project_id),
+            "evidence_id": str(evidence_id),
+        },
+    )
+    relationship_id = create.json()["id"]
+
+    # From the person's own perspective, this is an outgoing edge -- an
+    # "incoming"-only filter must exclude it.
+    incoming = client.get(
+        f"/api/v1/knowledge/entities/{person_id}/relationships",
+        params={"direction": "incoming"},
+        headers=_headers(token, "direction-incoming-person"),
+    )
+    assert incoming.status_code == 200, incoming.text
+    assert all(item["id"] != relationship_id for item in incoming.json()["items"])
+
+    outgoing = client.get(
+        f"/api/v1/knowledge/entities/{person_id}/relationships",
+        params={"direction": "outgoing"},
+        headers=_headers(token, "direction-outgoing-person"),
+    )
+    assert outgoing.status_code == 200, outgoing.text
+    assert any(item["id"] == relationship_id for item in outgoing.json()["items"])
+
+    # From the project's own perspective, the identical edge is incoming.
+    incoming_from_project = client.get(
+        f"/api/v1/knowledge/entities/{project_id}/relationships",
+        params={"direction": "incoming"},
+        headers=_headers(token, "direction-incoming-project"),
+    )
+    assert incoming_from_project.status_code == 200, incoming_from_project.text
+    assert any(item["id"] == relationship_id for item in incoming_from_project.json()["items"])
+
+
+def test_relationship_type_filter_excludes_other_types(
+    relationships_test_context: tuple[TestClient, UUID, UUID, str, UUID, UUID],
+) -> None:
+    client, workspace_id, _user_id, token, person_id, project_id = relationships_test_context
+    evidence_id = _create_evidence(workspace_id, person_id)
+    works_on = client.post(
+        f"/api/v1/knowledge/entities/{person_id}/relationships",
+        headers=_headers(token, "type-filter-works-on"),
+        json={
+            "relationship_type": "WORKS_ON",
+            "to_entity_id": str(project_id),
+            "evidence_id": str(evidence_id),
+        },
+    )
+    depends_on = client.post(
+        f"/api/v1/knowledge/entities/{person_id}/relationships",
+        headers=_headers(token, "type-filter-depends-on"),
+        json={
+            "relationship_type": "DEPENDS_ON",
+            "to_entity_id": str(project_id),
+            "evidence_id": str(evidence_id),
+        },
+    )
+
+    filtered = client.get(
+        f"/api/v1/knowledge/entities/{person_id}/relationships",
+        params={"relationship_type": "WORKS_ON"},
+        headers=_headers(token, "type-filter-list"),
+    )
+    assert filtered.status_code == 200, filtered.text
+    listed_ids = {item["id"] for item in filtered.json()["items"]}
+    assert works_on.json()["id"] in listed_ids
+    assert depends_on.json()["id"] not in listed_ids
+
+
+def test_team_roster_is_relationship_type_and_direction_composed(
+    relationships_test_context: tuple[TestClient, UUID, UUID, str, UUID, UUID],
+) -> None:
+    """The actual "team roster" query this filter pair exists for: a team
+    entity's membership list, resolved to real names -- not bare UUIDs a
+    human would have to look up one at a time.
+    """
+    client, workspace_id, _user_id, token, person_id, _project_id = relationships_test_context
+    team = client.post(
+        "/api/v1/knowledge/entities",
+        headers=_headers(token, "roster-create-team"),
+        json={"kind": "team", "canonical_name": "Platform Engineering"},
+    )
+    assert team.status_code == 201, team.text
+    team_id = UUID(team.json()["id"])
+    evidence_id = _create_evidence(workspace_id, person_id)
+
+    member_of = client.post(
+        f"/api/v1/knowledge/entities/{person_id}/relationships",
+        headers=_headers(token, "roster-member-of"),
+        json={
+            "relationship_type": "MEMBER_OF",
+            "to_entity_id": str(team_id),
+            "evidence_id": str(evidence_id),
+        },
+    )
+    assert member_of.status_code == 201, member_of.text
+
+    # A second relationship of a different type, same two entities, to
+    # prove the roster query is genuinely type-filtered, not just showing
+    # every incoming edge.
+    client.post(
+        f"/api/v1/knowledge/entities/{person_id}/relationships",
+        headers=_headers(token, "roster-relates-to"),
+        json={
+            "relationship_type": "RELATES_TO",
+            "to_entity_id": str(team_id),
+            "evidence_id": str(evidence_id),
+        },
+    )
+
+    roster = client.get(
+        f"/api/v1/knowledge/entities/{team_id}/relationships",
+        params={"relationship_type": "MEMBER_OF", "direction": "incoming"},
+        headers=_headers(token, "roster-list"),
+    )
+    assert roster.status_code == 200, roster.text
+    items = roster.json()["items"]
+    assert len(items) == 1
+    assert items[0]["id"] == member_of.json()["id"]
+    assert items[0]["from_entity_name"] == "Ada Lovelace"
+    assert items[0]["from_entity_kind"] == "person"
+    assert items[0]["to_entity_name"] == "Platform Engineering"
+    assert items[0]["to_entity_kind"] == "team"

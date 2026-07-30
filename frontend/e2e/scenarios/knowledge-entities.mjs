@@ -78,7 +78,7 @@ export async function run({ page, baseURL }) {
   await detail.getByLabel('Evidence ID').fill(evidenceId)
   await detail.getByRole('button', { name: 'Add relationship' }).click()
   const relationships = detail.locator(`section[aria-labelledby="relationships-heading-${seedEntity.id}"]`)
-  await relationships.getByText(new RegExp(`WORKS_ON.*${seedProject.id}`)).waitFor()
+  await relationships.getByText(new RegExp(`WORKS_ON.*${seedProject.canonical_name}`)).waitFor()
 
   // The relationship also produced a timeline entry.
   const timeline = detail.locator(`section[aria-labelledby="timeline-heading-${seedEntity.id}"]`)

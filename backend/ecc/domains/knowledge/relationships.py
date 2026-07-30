@@ -4,7 +4,7 @@ from json import dumps
 from typing import Annotated, Any, Literal
 from uuid import UUID, uuid4
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
@@ -54,10 +54,23 @@ RelationshipType = Literal[
     "WORKS_ON",
 ]
 RelationshipStatus = Literal["active", "disputed", "invalidated"]
+RelationshipDirection = Literal["incoming", "outgoing"]
 
-_RELATIONSHIP_FIELDS = """
-id, source_node_id, target_node_id, edge_type, confidence, evidence_id,
-valid_from, valid_to, status
+# Resolves both endpoints' `canonical_name`/`node_type` via a join -- a real
+# gap a team-concept gap analysis found: `RelationshipResponse` previously
+# carried only raw entity UUIDs, so `EntityDetail.tsx`'s relationships list
+# rendered bare IDs with no way to tell who/what the other end actually is.
+# This is what makes a team's `MEMBER_OF` roster legible at all -- without
+# resolved names, "who's on this team" would still require a human to
+# manually look up each UUID one at a time. INNER JOIN, not LEFT, is safe:
+# `pkos_nodes` rows are archived/redirected, never hard-deleted, and
+# `create_relationship` already requires both endpoints to exist and be
+# `active` at creation time.
+_RELATIONSHIP_FIELDS_WITH_NAMES = """
+    e.id, e.source_node_id, e.target_node_id, e.edge_type, e.confidence,
+    e.evidence_id, e.valid_from, e.valid_to, e.status,
+    src.canonical_name AS from_entity_name, src.node_type AS from_entity_kind,
+    tgt.canonical_name AS to_entity_name, tgt.node_type AS to_entity_kind
 """
 
 
@@ -96,6 +109,13 @@ class RelationshipResponse(BaseModel):
     valid_from: datetime | None
     valid_to: datetime | None
     status: RelationshipStatus
+    # Resolved from `pkos_nodes` -- see `_RELATIONSHIP_FIELDS_WITH_NAMES`'s
+    # own comment for why raw IDs alone made this response unusable for a
+    # human-facing roster/relationship list.
+    from_entity_name: str
+    from_entity_kind: str
+    to_entity_name: str
+    to_entity_kind: str
 
 
 class RelationshipListResponse(BaseModel):
@@ -113,7 +133,35 @@ def _project(row: dict[str, Any]) -> RelationshipResponse:
         valid_from=row["valid_from"],
         valid_to=row["valid_to"],
         status=row["status"],
+        from_entity_name=row["from_entity_name"],
+        from_entity_kind=row["from_entity_kind"],
+        to_entity_name=row["to_entity_name"],
+        to_entity_kind=row["to_entity_kind"],
     )
+
+
+def _fetch_relationship(
+    session: Session, auth: AuthContext, relationship_id: UUID
+) -> RelationshipResponse:
+    row = (
+        session.execute(
+            text(
+                f"""
+                SELECT {_RELATIONSHIP_FIELDS_WITH_NAMES}
+                FROM pkos_edges e
+                JOIN pkos_nodes src
+                    ON src.workspace_id = e.workspace_id AND src.id = e.source_node_id
+                JOIN pkos_nodes tgt
+                    ON tgt.workspace_id = e.workspace_id AND tgt.id = e.target_node_id
+                WHERE e.workspace_id = :workspace_id AND e.id = :relationship_id
+                """
+            ),
+            {"workspace_id": auth.workspace_id, "relationship_id": relationship_id},
+        )
+        .mappings()
+        .one()
+    )
+    return _project(dict(row))
 
 
 def _request_hash(payload: BaseModel, action: str) -> str:
@@ -365,36 +413,34 @@ def create_relationship(
             raise HTTPException(status_code=404, detail="EVIDENCE_NOT_FOUND")
         if evidence_state != "available":
             raise HTTPException(status_code=422, detail="EVIDENCE_UNAVAILABLE")
-        row = (
-            session.execute(
-                text(
-                    f"""
-                    INSERT INTO pkos_edges (
-                        id, workspace_id, source_node_id, target_node_id, edge_type,
-                        attributes, confidence, evidence_id, valid_from, valid_to, status
-                    ) VALUES (
-                        :id, :workspace_id, :source, :target, :edge_type,
-                        '{{}}'::jsonb, :confidence, :evidence_id, :valid_from, :valid_to, 'active'
-                    )
-                    RETURNING {_RELATIONSHIP_FIELDS}
-                    """
-                ),
-                {
-                    "id": relationship_id,
-                    "workspace_id": auth.workspace_id,
-                    "source": entity_id,
-                    "target": payload.to_entity_id,
-                    "edge_type": payload.relationship_type,
-                    "confidence": payload.confidence,
-                    "evidence_id": payload.evidence_id,
-                    "valid_from": payload.valid_from,
-                    "valid_to": payload.valid_to,
-                },
-            )
-            .mappings()
-            .one()
+        session.execute(
+            text(
+                """
+                INSERT INTO pkos_edges (
+                    id, workspace_id, source_node_id, target_node_id, edge_type,
+                    attributes, confidence, evidence_id, valid_from, valid_to, status
+                ) VALUES (
+                    :id, :workspace_id, :source, :target, :edge_type,
+                    '{}'::jsonb, :confidence, :evidence_id, :valid_from, :valid_to, 'active'
+                )
+                """
+            ),
+            {
+                "id": relationship_id,
+                "workspace_id": auth.workspace_id,
+                "source": entity_id,
+                "target": payload.to_entity_id,
+                "edge_type": payload.relationship_type,
+                "confidence": payload.confidence,
+                "evidence_id": payload.evidence_id,
+                "valid_from": payload.valid_from,
+                "valid_to": payload.valid_to,
+            },
         )
-        response = _project(dict(row))
+        # Fetched separately (not via `RETURNING`) since the join that
+        # resolves `from_entity_name`/`to_entity_name` reads other rows in
+        # `pkos_nodes`, which a plain `INSERT ... RETURNING` cannot express.
+        response = _fetch_relationship(session, auth, relationship_id)
         _write_side_effects(
             session, auth, request, "relationship.created", relationship_id, source_version, now
         )
@@ -413,20 +459,49 @@ def create_relationship(
 
 @router.get("/entities/{entity_id}/relationships", response_model=RelationshipListResponse)
 def list_relationships(
-    entity_id: UUID, auth: AuthDep, session: SessionDep
+    entity_id: UUID,
+    auth: AuthDep,
+    session: SessionDep,
+    relationship_type: Annotated[RelationshipType | None, Query()] = None,
+    direction: Annotated[RelationshipDirection | None, Query()] = None,
 ) -> RelationshipListResponse:
+    """`relationship_type`/`direction` are optional, additive filters -- a
+    team-concept gap analysis found `MEMBER_OF` was a real, working
+    relationship type with no way to query it as a roster: a team's
+    membership list is exactly `relationship_type=MEMBER_OF&direction=
+    incoming` against this same endpoint, composed from these two filters
+    rather than a bespoke `/teams/{id}/members` route this system's own
+    fully-generic entity-kind design doesn't otherwise need. Omitting both
+    preserves this endpoint's original both-directions, every-type
+    behavior unchanged.
+    """
+    if direction == "incoming":
+        entity_clause = "e.target_node_id = :entity_id"
+    elif direction == "outgoing":
+        entity_clause = "e.source_node_id = :entity_id"
+    else:
+        entity_clause = "(e.source_node_id = :entity_id OR e.target_node_id = :entity_id)"
+    clauses = [entity_clause]
+    params: dict[str, Any] = {"workspace_id": auth.workspace_id, "entity_id": entity_id}
+    if relationship_type is not None:
+        clauses.append("e.edge_type = :relationship_type")
+        params["relationship_type"] = relationship_type
+
     rows = (
         session.execute(
             text(
                 f"""
-                SELECT {_RELATIONSHIP_FIELDS}
-                FROM pkos_edges
-                WHERE workspace_id = :workspace_id
-                  AND (source_node_id = :entity_id OR target_node_id = :entity_id)
-                ORDER BY id
+                SELECT {_RELATIONSHIP_FIELDS_WITH_NAMES}
+                FROM pkos_edges e
+                JOIN pkos_nodes src
+                    ON src.workspace_id = e.workspace_id AND src.id = e.source_node_id
+                JOIN pkos_nodes tgt
+                    ON tgt.workspace_id = e.workspace_id AND tgt.id = e.target_node_id
+                WHERE e.workspace_id = :workspace_id AND {" AND ".join(clauses)}
+                ORDER BY e.id
                 """
             ),
-            {"workspace_id": auth.workspace_id, "entity_id": entity_id},
+            params,
         )
         .mappings()
         .all()

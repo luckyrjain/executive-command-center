@@ -33,6 +33,10 @@ type ClaimDraft = { predicate: string; valueText: string; sourceId: string; conf
 
 const emptyClaimDraft: ClaimDraft = { predicate: '', valueText: '', sourceId: '', confidence: '1' }
 
+type MemberDraft = { personEntityId: string; evidenceId: string }
+
+const emptyMemberDraft: MemberDraft = { personEntityId: '', evidenceId: '' }
+
 function formatClaimValue(claim: Claim): string {
   try {
     return JSON.stringify(claim.value)
@@ -61,6 +65,7 @@ export default function EntityDetail({ entityId, onClose }: EntityDetailProps) {
   const [claimDraft, setClaimDraft] = useState<ClaimDraft>(emptyClaimDraft)
   const [correctingClaimId, setCorrectingClaimId] = useState<string | null>(null)
   const [correctionDraft, setCorrectionDraft] = useState<ClaimDraft>(emptyClaimDraft)
+  const [memberDraft, setMemberDraft] = useState<MemberDraft>(emptyMemberDraft)
 
   const entityQuery = useQuery({
     queryKey: ['knowledge', 'entity', entityId],
@@ -77,6 +82,19 @@ export default function EntityDetail({ entityId, onClose }: EntityDetailProps) {
   const relationshipsQuery = useQuery({
     queryKey: ['knowledge', 'entity', entityId, 'relationships'],
     queryFn: () => apiRequest<RelationshipList>(`/api/v1/knowledge/entities/${entityId}/relationships`),
+  })
+  // A team's roster -- `relationship_type=MEMBER_OF&direction=incoming`
+  // composed against the same generic relationships endpoint (a team-
+  // concept gap analysis found `MEMBER_OF` was a real, working
+  // relationship type with no dedicated query or UI to see who's on a
+  // team). Only fetched for `kind: 'team'` entities.
+  const membersQuery = useQuery({
+    queryKey: ['knowledge', 'entity', entityId, 'members'],
+    queryFn: () =>
+      apiRequest<RelationshipList>(
+        `/api/v1/knowledge/entities/${entityId}/relationships?relationship_type=MEMBER_OF&direction=incoming`,
+      ),
+    enabled: entityQuery.data?.kind === 'team',
   })
   const timelineQuery = useQuery({
     queryKey: ['knowledge', 'entity', entityId, 'timeline'],
@@ -125,6 +143,29 @@ export default function EntityDetail({ entityId, onClose }: EntityDetailProps) {
     },
   })
 
+  // Adding a member creates the relationship from the *person's* own
+  // entity ID (`MEMBER_OF`'s real direction: person -> team), not this
+  // team's own `entityId` -- the generic `POST /entities/{id}/relationships`
+  // always treats its path entity as the source, so this is a distinct
+  // mutation from `addRelationshipMutation` above rather than a preset
+  // draft on the same one.
+  const addMemberMutation = useMutation({
+    mutationFn: (draft: MemberDraft) =>
+      apiRequest<Relationship>(`/api/v1/knowledge/entities/${draft.personEntityId.trim()}/relationships`, {
+        method: 'POST',
+        body: {
+          relationship_type: 'MEMBER_OF',
+          to_entity_id: entityId,
+          evidence_id: draft.evidenceId.trim(),
+        },
+      }),
+    onSuccess: () => {
+      setMemberDraft(emptyMemberDraft)
+      void queryClient.invalidateQueries({ queryKey: ['knowledge', 'entity', entityId, 'members'] })
+      void queryClient.invalidateQueries({ queryKey: ['knowledge', 'entity', entityId, 'timeline'] })
+    },
+  })
+
   const recordClaimMutation = useMutation({
     mutationFn: (draft: ClaimDraft) =>
       apiRequest<Claim>(`/api/v1/knowledge/entities/${entityId}/claims`, {
@@ -166,6 +207,13 @@ export default function EntityDetail({ entityId, onClose }: EntityDetailProps) {
     event.preventDefault()
     if (relationshipDraft.toEntityId.trim() && relationshipDraft.evidenceId.trim()) {
       addRelationshipMutation.mutate(relationshipDraft)
+    }
+  }
+
+  function submitMember(event: FormEvent) {
+    event.preventDefault()
+    if (memberDraft.personEntityId.trim() && memberDraft.evidenceId.trim()) {
+      addMemberMutation.mutate(memberDraft)
     }
   }
 
@@ -372,8 +420,8 @@ export default function EntityDetail({ entityId, onClose }: EntityDetailProps) {
             {relationshipsQuery.data.items.map((relationship) => (
               <li key={relationship.id}>
                 {relationship.from_entity_id === entityId
-                  ? `${relationship.relationship_type} → ${relationship.to_entity_id}`
-                  : `${relationship.from_entity_id} → ${relationship.relationship_type} (this entity)`}
+                  ? `${relationship.relationship_type} → ${relationship.to_entity_name} (${relationship.to_entity_kind})`
+                  : `${relationship.from_entity_name} (${relationship.from_entity_kind}) → ${relationship.relationship_type} (this entity)`}
                 {relationship.status !== 'active' ? ` · ${relationship.status}` : ''}
                 <small>
                   {' '}
@@ -426,6 +474,49 @@ export default function EntityDetail({ entityId, onClose }: EntityDetailProps) {
           <button type="submit" disabled={addRelationshipMutation.isPending}>Add relationship</button>
         </form>
       </section>
+
+      {entity?.kind === 'team' ? (
+        <section aria-labelledby={`members-heading-${entityId}`}>
+          <h3 id={`members-heading-${entityId}`}>Members</h3>
+          {membersQuery.isLoading ? <p role="status">Loading members…</p> : null}
+          {membersQuery.isError ? (
+            <div role="alert">{membersQuery.error.message}</div>
+          ) : membersQuery.data?.items.length ? (
+            <ul>
+              {membersQuery.data.items.map((member) => (
+                <li key={member.id}>
+                  {member.from_entity_name} <small>· {member.from_entity_kind}</small>
+                </li>
+              ))}
+            </ul>
+          ) : membersQuery.isSuccess ? (
+            <p className="empty-state">No members recorded for this team yet.</p>
+          ) : null}
+          {addMemberMutation.error ? (
+            <div role="alert" className="inline-status error-panel">{addMemberMutation.error.message}</div>
+          ) : null}
+          <form onSubmit={submitMember}>
+            <h4>Add member</h4>
+            <label>
+              Person entity ID
+              <input
+                aria-label="Member person entity ID"
+                value={memberDraft.personEntityId}
+                onChange={(event) => setMemberDraft({ ...memberDraft, personEntityId: event.target.value })}
+              />
+            </label>
+            <label>
+              Evidence ID
+              <input
+                aria-label="Member evidence ID"
+                value={memberDraft.evidenceId}
+                onChange={(event) => setMemberDraft({ ...memberDraft, evidenceId: event.target.value })}
+              />
+            </label>
+            <button type="submit" disabled={addMemberMutation.isPending}>Add member</button>
+          </form>
+        </section>
+      ) : null}
 
       <section aria-labelledby={`timeline-heading-${entityId}`}>
         <h3 id={`timeline-heading-${entityId}`}>Timeline</h3>

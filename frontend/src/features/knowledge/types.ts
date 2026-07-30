@@ -65,6 +65,16 @@ export type Relationship = {
   valid_from: string | null
   valid_to: string | null
   status: 'active' | 'disputed' | 'invalidated'
+  // Resolved from `pkos_nodes` -- a team-concept gap analysis found the
+  // backend previously returned only raw entity UUIDs here, making
+  // `EntityDetail.tsx`'s relationships list (and, in particular, a team's
+  // `MEMBER_OF` roster) unreadable without a human manually looking up
+  // each ID. See `backend/ecc/domains/knowledge/relationships.py`'s own
+  // docstring.
+  from_entity_name: string
+  from_entity_kind: EntityKind
+  to_entity_name: string
+  to_entity_kind: EntityKind
 }
 
 export type RelationshipList = { items: Relationship[] }
