@@ -796,7 +796,7 @@ def test_httpx_transport_timeout_stays_ahead_of_every_registered_task_timeout() 
     `ollama_client.py`'s own updated comment on this constant) -- it must
     stay comfortably ahead of the largest currently-registered per-task
     timeout, or a legitimate, longer-than-default `generate(timeout_
-    seconds=...)` override (`meeting.prep_summary`'s 32s) would be
+    seconds=...)` override (`meeting.prep_summary`'s 40s) would be
     silently cut short by this constant first. This is a guard rail: if a
     future task type's own declared timeout creeps close to (or past)
     this constant, this test fails loudly instead of that gap being

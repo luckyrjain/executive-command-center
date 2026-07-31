@@ -668,6 +668,16 @@ def _measure_regenerate_p95(client: TestClient, token: str) -> tuple[float, list
     change to the budget itself or the code path being measured, the
     same category as the already-established single-retry allowance and
     CI's own `max_wal_size` bump.
+
+    The `RESET` immediately below, before the `SET`, is a self-healing
+    guard against a process crash (`SIGKILL`, an out-of-memory kill --
+    something a Python `finally` block cannot run for) between the `SET`
+    above and the `finally`'s own `RESET` in a *prior* run: without it,
+    `attention_items` would be left with autovacuum permanently disabled
+    for every later test in the same shared database until someone
+    happened to notice and reset it by hand. Cheap and idempotent when
+    there is nothing to heal (`RESET` on an already-default table storage
+    parameter is a no-op), so it costs nothing on the common path.
     """
     csrf = new(settings.session_secret.encode(), token.encode(), "sha256").hexdigest()
 
@@ -679,6 +689,7 @@ def _measure_regenerate_p95(client: TestClient, token: str) -> tuple[float, list
     assert warmup.status_code == 200
 
     with engine.begin() as connection:
+        connection.execute(text("ALTER TABLE attention_items RESET (autovacuum_enabled)"))
         connection.execute(text("ALTER TABLE attention_items SET (autovacuum_enabled = false)"))
     with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as connection:
         connection.execute(text("VACUUM (ANALYZE) attention_items"))
@@ -762,6 +773,47 @@ def test_ranking_10000_eligible_entities_under_budget(
             {"workspace_id": workspace_id},
         ).scalar_one()
     assert ranked_count >= 10_000
+
+
+def test_measure_regenerate_p95_restores_autovacuum_even_when_a_call_raises(
+    ranking_performance_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    """`_measure_regenerate_p95`'s own `finally` (above) is the only thing
+    standing between one exception mid-measurement and `attention_items`
+    being left with autovacuum permanently disabled for every later test
+    in the same shared database -- this proves that restoration actually
+    fires on a real exception path, not just on the happy path every other
+    test in this module already exercises implicitly by passing.
+    """
+    client, _workspace_id, _user_id, token = ranking_performance_context
+
+    class _BoomAfterWarmup:
+        """Forwards to the real client for the warm-up call, then raises
+        on the first timed-loop call -- proving the exception genuinely
+        propagates out of `_measure_regenerate_p95` through its `finally`,
+        not swallowed anywhere along the way.
+        """
+
+        def __init__(self, real_client: TestClient) -> None:
+            self._real_client = real_client
+            self._calls = 0
+
+        def post(self, *args: object, **kwargs: object) -> object:
+            self._calls += 1
+            if self._calls > 1:
+                raise RuntimeError("simulated failure mid-measurement")
+            return self._real_client.post(*args, **kwargs)  # type: ignore[arg-type]
+
+    with pytest.raises(RuntimeError, match="simulated failure mid-measurement"):
+        _measure_regenerate_p95(_BoomAfterWarmup(client), token)  # type: ignore[arg-type]
+
+    with engine.connect() as connection:
+        reloptions = connection.execute(
+            text("SELECT reloptions FROM pg_class WHERE oid = 'attention_items'::regclass")
+        ).scalar_one()
+    assert reloptions is None or not any(
+        opt.startswith("autovacuum_enabled=") for opt in reloptions
+    ), f"attention_items was left with a stuck autovacuum_enabled override: {reloptions!r}"
 
 
 def test_priority_scoring_10000_entities_under_500ms() -> None:

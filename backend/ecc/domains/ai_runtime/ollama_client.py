@@ -65,8 +65,8 @@ DEFAULT_PER_MODEL_CALL_TIMEOUT_SECONDS = 20.0
 # its source -- so this value cannot vary per call the way the manual
 # wall-clock deadline below can. It must stay a fixed ceiling comfortably
 # above every currently-registered task's own declared timeout (`router.py:
-# TASK_REQUIREMENTS` -- 20s/32s today) so a longer-than-`DEFAULT_PER_MODEL_
-# CALL_TIMEOUT_SECONDS` per-call override (`meeting.prep_summary`'s 32s) is
+# TASK_REQUIREMENTS` -- 20s/40s today) so a longer-than-`DEFAULT_PER_MODEL_
+# CALL_TIMEOUT_SECONDS` per-call override (`meeting.prep_summary`'s 40s) is
 # never silently cut short here first.
 #
 # This is a real, accepted trade-off, not a free backstop: for the common
