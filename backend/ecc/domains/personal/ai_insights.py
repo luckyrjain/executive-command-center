@@ -50,6 +50,8 @@ record id plus every source domain key), not lost by this column's own
 single-value shape.
 """
 
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from json import dumps
 from typing import Any
@@ -62,6 +64,7 @@ from sqlalchemy.orm import Session
 
 from ecc.auth import AuthContext, AuthDep, CsrfDep
 from ecc.config import get_settings
+from ecc.database import lock_engine
 from ecc.domains.ai_runtime.runtime import OllamaAdapterDep, execute_run
 
 from .domains import (
@@ -70,13 +73,40 @@ from .domains import (
     SessionDep,
     classification_for,
     load_cached,
-    lock_idempotency,
     request_hash,
     store_idempotency,
 )
 from .habits import InsightResponse
 
 router = APIRouter(prefix="/api/v1/personal", tags=["personal"])
+
+
+@contextmanager
+def _held_idempotency_lock(auth: AuthContext, key: str) -> Iterator[None]:
+    """Session-scoped `pg_advisory_lock`, held on its own dedicated
+    connection for this context manager's entire duration -- mirrors
+    `ai_runtime/runtime.py`'s/`ai_runtime/evaluation.py`'s identical
+    helper, for the identical reason: `execute_run` commits partway
+    through (`_persist_terminal`'s own docstring), so `domains.py:lock_
+    idempotency`'s transaction-scoped `pg_advisory_xact_lock` would
+    release the instant that first inner commit happens, long before the
+    model call this whole request is trying to serialize actually
+    finishes. Uses `lock_engine` (`NullPool`, no `statement_timeout`), not
+    the main `engine`, matching those two modules' own identical
+    rationale.
+    """
+    lock_key = f"{auth.workspace_id}:{auth.user_id}:{key}"
+    with lock_engine.connect().execution_options(isolation_level="AUTOCOMMIT") as connection:
+        connection.execute(
+            text("SELECT pg_advisory_lock(hashtextextended(:lock_key, 0))"), {"lock_key": lock_key}
+        )
+        try:
+            yield
+        finally:
+            connection.execute(
+                text("SELECT pg_advisory_unlock(hashtextextended(:lock_key, 0))"),
+                {"lock_key": lock_key},
+            )
 
 
 class InsightGenerateRequest(BaseModel):
@@ -134,11 +164,28 @@ def generate_insight_endpoint(
     idempotency_key: IdempotencyHeader,
     adapter: OllamaAdapterDep,
 ) -> InsightGenerateResponse:
+    """Three-phase shape, `execute_run` called bare between separate
+    `with session.begin():` blocks -- exactly `meeting_prep.py:create_
+    prep`'s enrichment-enabled path (and `ai_runtime/runtime.py:create_
+    run`'s own identical three-phase precedent). Calling `execute_run`
+    from *inside* a still-open `session.begin()` block closes that
+    transaction out from under the caller the instant `execute_run`'s own
+    internal commit runs (`_persist_terminal`'s docstring) -- confirmed by
+    a real `sqlalchemy.exc.InvalidRequestError: Can't operate on closed
+    transaction` this endpoint's own first draft hit in CI, not a
+    hypothetical. `_held_idempotency_lock` (session-scoped, not tied to
+    any one transaction) is what actually serializes two concurrent
+    requests sharing the same Idempotency-Key across the whole body,
+    including the model call.
+    """
     req_hash = request_hash(payload, "generate_insight")
     now = datetime.now(UTC)
-    with session.begin():
-        lock_idempotency(session, auth, idempotency_key)
-        cached = load_cached(session, auth, idempotency_key, req_hash, domain="personal_insight")
+
+    with _held_idempotency_lock(auth, idempotency_key):
+        with session.begin():
+            cached = load_cached(
+                session, auth, idempotency_key, req_hash, domain="personal_insight"
+            )
         if cached is not None:
             return InsightGenerateResponse.model_validate(cached)
 
@@ -146,9 +193,15 @@ def generate_insight_endpoint(
             response = InsightGenerateResponse(
                 available=False, insight=None, error_code="feature_disabled"
             )
-            store_idempotency(
-                session, auth, idempotency_key, req_hash, response.model_dump(mode="json"), now
-            )
+            with session.begin():
+                store_idempotency(
+                    session,
+                    auth,
+                    idempotency_key,
+                    req_hash,
+                    response.model_dump(mode="json"),
+                    now,
+                )
             return response
 
         # `data_class` (Decision 2's model-eligibility routing input, not a
@@ -178,70 +231,79 @@ def generate_insight_endpoint(
             response = InsightGenerateResponse(
                 available=False, insight=None, error_code=run.error_code
             )
-            store_idempotency(
-                session, auth, idempotency_key, req_hash, response.model_dump(mode="json"), now
-            )
+            with session.begin():
+                store_idempotency(
+                    session,
+                    auth,
+                    idempotency_key,
+                    req_hash,
+                    response.model_dump(mode="json"),
+                    now,
+                )
             return response
 
         output = run.output
         cited_record_ids: list[str] = list(output.get("cited_record_ids", []))
-        period_start, period_end = _cited_record_period(session, auth, cited_record_ids, now=now)
-        evidence: dict[str, Any] = {
-            "cited_record_ids": cited_record_ids,
-            "source_domain_keys": list(payload.source_domain_keys),
-            "model_source_period": output.get("source_period"),
-        }
+        with session.begin():
+            period_start, period_end = _cited_record_period(
+                session, auth, cited_record_ids, now=now
+            )
+            evidence: dict[str, Any] = {
+                "cited_record_ids": cited_record_ids,
+                "source_domain_keys": list(payload.source_domain_keys),
+                "model_source_period": output.get("source_period"),
+            }
 
-        insight_id = uuid4()
-        session.execute(
-            text(
-                """
-                INSERT INTO personal_insights (
-                    id, workspace_id, owner_id, domain_key, insight_key, kind, title,
-                    evidence, source_period_start, source_period_end, missing_data,
-                    confidence, limitations, professional_referral_note, computed_at
-                ) VALUES (
-                    :id, :workspace_id, :owner_id, :domain_key, :insight_key, :kind, :title,
-                    CAST(:evidence AS jsonb), :source_period_start, :source_period_end,
-                    :missing_data, :confidence, :limitations, :professional_referral_note, :now
-                )
-                """
-            ),
-            {
-                "id": insight_id,
-                "workspace_id": auth.workspace_id,
-                "owner_id": auth.user_id,
-                "domain_key": payload.source_domain_keys[0],
-                "insight_key": f"ai_insight:{run.id}",
-                "kind": output["kind"],
-                "title": output["title"],
-                "evidence": dumps(evidence),
-                "source_period_start": period_start,
-                "source_period_end": period_end,
-                "missing_data": output["missing_data"],
-                "confidence": output["confidence"],
-                "limitations": output["limitations"],
-                "professional_referral_note": output.get("professional_referral_note"),
-                "now": now,
-            },
-        )
-        row = (
+            insight_id = uuid4()
             session.execute(
                 text(
-                    "SELECT id, domain_key, kind, title, evidence, source_period_start, "
-                    "source_period_end, missing_data, confidence, limitations, "
-                    "professional_referral_note, computed_at, dismissed_at "
-                    "FROM personal_insights WHERE id = :id"
+                    """
+                    INSERT INTO personal_insights (
+                        id, workspace_id, owner_id, domain_key, insight_key, kind, title,
+                        evidence, source_period_start, source_period_end, missing_data,
+                        confidence, limitations, professional_referral_note, computed_at
+                    ) VALUES (
+                        :id, :workspace_id, :owner_id, :domain_key, :insight_key, :kind, :title,
+                        CAST(:evidence AS jsonb), :source_period_start, :source_period_end,
+                        :missing_data, :confidence, :limitations, :professional_referral_note, :now
+                    )
+                    """
                 ),
-                {"id": insight_id},
+                {
+                    "id": insight_id,
+                    "workspace_id": auth.workspace_id,
+                    "owner_id": auth.user_id,
+                    "domain_key": payload.source_domain_keys[0],
+                    "insight_key": f"ai_insight:{run.id}",
+                    "kind": output["kind"],
+                    "title": output["title"],
+                    "evidence": dumps(evidence),
+                    "source_period_start": period_start,
+                    "source_period_end": period_end,
+                    "missing_data": output["missing_data"],
+                    "confidence": output["confidence"],
+                    "limitations": output["limitations"],
+                    "professional_referral_note": output.get("professional_referral_note"),
+                    "now": now,
+                },
             )
-            .mappings()
-            .one()
-        )
-        response = InsightGenerateResponse(
-            available=True, insight=InsightResponse(**dict(row)), error_code=None
-        )
-        store_idempotency(
-            session, auth, idempotency_key, req_hash, response.model_dump(mode="json"), now
-        )
+            row = (
+                session.execute(
+                    text(
+                        "SELECT id, domain_key, kind, title, evidence, source_period_start, "
+                        "source_period_end, missing_data, confidence, limitations, "
+                        "professional_referral_note, computed_at, dismissed_at "
+                        "FROM personal_insights WHERE id = :id"
+                    ),
+                    {"id": insight_id},
+                )
+                .mappings()
+                .one()
+            )
+            response = InsightGenerateResponse(
+                available=True, insight=InsightResponse(**dict(row)), error_code=None
+            )
+            store_idempotency(
+                session, auth, idempotency_key, req_hash, response.model_dump(mode="json"), now
+            )
         return response
