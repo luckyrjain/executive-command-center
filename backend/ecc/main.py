@@ -58,6 +58,9 @@ from ecc.domains.knowledge.relationships_mutations import (
 from ecc.domains.knowledge.resolution import router as knowledge_resolution_router
 from ecc.domains.knowledge.retrieval import router as knowledge_retrieval_router
 from ecc.domains.knowledge.timeline import router as knowledge_timeline_router
+from ecc.domains.personal.domains import router as personal_domains_router
+from ecc.domains.personal.export_deletion import router as personal_export_deletion_router
+from ecc.domains.personal.habits import router as personal_habits_router
 from ecc.domains.planning.tasks import router as tasks_router
 from ecc.domains.platform.audit_queries import router as audit_queries_router
 from ecc.domains.platform.dashboard_briefs import router as dashboard_briefs_router
@@ -194,6 +197,18 @@ app.include_router(engineering_connectors_router)
 # the disclosed scope (no deployments/work-item correlation yet, Phase 2
 # identity resolution deferred).
 app.include_router(engineering_decisions_incidents_router)
+# Phase 7 Personal Intelligence Task 1: domain/consent/vault framework and
+# the `habits` reference domain -- GET|POST /personal/domains, POST
+# .../{domain_key}/enable|disable, GET|POST /personal/records, GET|PATCH
+# .../{id}, GET|POST /personal/consents, POST .../{id}/revoke (ecc.domains.
+# personal.domains); GET|POST /personal/goals|routines|check-ins, GET
+# /personal/insights, POST .../{id}/dismiss (ecc.domains.personal.habits);
+# POST /personal/domains/{domain_key}/export|delete (ecc.domains.personal.
+# export_deletion). `learning`/`travel`/`relationships`/`health`/`finance`
+# and `cross_domain_grants` do not exist yet, later tasks.
+app.include_router(personal_domains_router)
+app.include_router(personal_habits_router)
+app.include_router(personal_export_deletion_router)
 app.middleware("http")(rejected_mutation_audit_middleware)
 # Pure-ASGI body size guard: registered via add_middleware (not the
 # "http" dispatch helper) so it can intercept the raw receive() channel and
