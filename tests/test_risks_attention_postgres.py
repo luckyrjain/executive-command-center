@@ -636,6 +636,38 @@ def _measure_regenerate_p95(client: TestClient, token: str) -> tuple[float, list
     checkout or an unprimed Postgres query-plan cache for this exact
     statement shape doesn't inflate the timed sample -- it only measures
     steady-state ranking latency, which is what the 500 ms budget is about.
+
+    Every ``regenerate`` call fully rewrites ``attention_items`` (a bulk
+    ``DELETE`` plus an ``ON CONFLICT DO UPDATE`` upsert of every eligible
+    row, `attention.py`'s own docstring on ``_upsert_scored``) -- Postgres
+    ``UPDATE`` never rewrites a row in place, so each of this loop's 30+
+    calls leaves ~10,000 fresh dead tuples on a table that starts with
+    only 10,000 live ones, comfortably past autovacuum's default trigger
+    (dead tuples > 20% of live rows + 50) after just the warm-up call
+    alone. A background autovacuum worker triggered mid-loop directly
+    contends with the foreground `regenerate` calls for I/O/CPU -- this
+    session's own local repro caught autovacuum actively running against
+    a similarly bulk-churned table while an unrelated foreground bulk
+    insert missed its statement timeout entirely, direct empirical
+    confirmation of the same contention class, and a plausible real
+    driver of this test's own periodic p95 spikes (a bimodal, roughly-
+    every-third-call pattern in the real CI sample data this test's own
+    failures have recorded, not evenly-distributed noise). This is on
+    top of the already-mitigated Postgres checkpoint pressure (`ci.yml`'s
+    "Raise Postgres checkpoint threshold" step) -- a second, previously
+    undiagnosed source of the same kind of interference.
+
+    Autovacuum is disabled on `attention_items` for the duration of the
+    timed loop, with a manual `VACUUM (ANALYZE)` immediately beforehand
+    (clearing the warm-up call's own dead tuples and refreshing planner
+    statistics) -- restored in `finally` so later tests in the same suite
+    run keep the table's normal autovacuum behavior. This is measurement-
+    environment tuning for a call pattern (30 `regenerate` calls in
+    quick succession) no real user produces -- a real operator triggers
+    this endpoint occasionally, not 30 times in 20 seconds -- not a
+    change to the budget itself or the code path being measured, the
+    same category as the already-established single-retry allowance and
+    CI's own `max_wal_size` bump.
     """
     csrf = new(settings.session_secret.encode(), token.encode(), "sha256").hexdigest()
 
@@ -646,16 +678,25 @@ def _measure_regenerate_p95(client: TestClient, token: str) -> tuple[float, list
     )
     assert warmup.status_code == 200
 
-    samples: list[float] = []
-    for _ in range(RANKING_SAMPLE_SIZE):
-        started = perf_counter()
-        response = client.post(
-            "/api/v1/attention/regenerate",
-            headers={"X-CSRF-Token": csrf, "X-Correlation-ID": str(uuid4())},
-            json={},
-        )
-        samples.append(perf_counter() - started)
-        assert response.status_code == 200
+    with engine.begin() as connection:
+        connection.execute(text("ALTER TABLE attention_items SET (autovacuum_enabled = false)"))
+    with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as connection:
+        connection.execute(text("VACUUM (ANALYZE) attention_items"))
+
+    try:
+        samples: list[float] = []
+        for _ in range(RANKING_SAMPLE_SIZE):
+            started = perf_counter()
+            response = client.post(
+                "/api/v1/attention/regenerate",
+                headers={"X-CSRF-Token": csrf, "X-Correlation-ID": str(uuid4())},
+                json={},
+            )
+            samples.append(perf_counter() - started)
+            assert response.status_code == 200
+    finally:
+        with engine.begin() as connection:
+            connection.execute(text("ALTER TABLE attention_items RESET (autovacuum_enabled)"))
 
     return _p95(samples), samples
 
