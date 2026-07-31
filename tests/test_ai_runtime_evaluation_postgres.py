@@ -389,7 +389,7 @@ def test_run_evaluation_fully_grounded_run_passes_every_floor(run_context: dict)
     with SessionFactory() as session:
         run = run_evaluation(
             TASK_TYPE,
-            2,
+            3,
             _SEEDED_MODEL_ID,
             session=session,
             auth=run_context["auth"],
@@ -429,7 +429,7 @@ def test_run_evaluation_ungrounded_citation_fails_only_grounding_floor(run_conte
     with SessionFactory() as session:
         run = run_evaluation(
             TASK_TYPE,
-            2,
+            3,
             _SEEDED_MODEL_ID,
             session=session,
             auth=run_context["auth"],
@@ -457,7 +457,7 @@ def test_run_evaluation_prohibited_fact_fails_only_that_floor(run_context: dict)
     with SessionFactory() as session:
         run = run_evaluation(
             TASK_TYPE,
-            2,
+            3,
             _SEEDED_MODEL_ID,
             session=session,
             auth=run_context["auth"],
@@ -519,7 +519,7 @@ def test_run_evaluation_provider_error_on_one_example_lands_in_other_failure(
     with SessionFactory() as session:
         run = run_evaluation(
             TASK_TYPE,
-            2,
+            3,
             _SEEDED_MODEL_ID,
             session=session,
             auth=run_context["auth"],
@@ -544,7 +544,7 @@ def test_run_evaluation_permanently_schema_invalid_fails_only_that_floor(
     with SessionFactory() as session:
         run = run_evaluation(
             TASK_TYPE,
-            2,
+            3,
             _SEEDED_MODEL_ID,
             session=session,
             auth=run_context["auth"],
@@ -607,7 +607,7 @@ def test_run_evaluation_unregistered_model_raises_config_error(run_context: dict
         with pytest.raises(EvaluationConfigError) as exc_info:
             run_evaluation(
                 TASK_TYPE,
-                2,
+                3,
                 "not-a-registered-model",
                 session=session,
                 auth=run_context["auth"],
@@ -636,7 +636,7 @@ def test_run_evaluation_requested_model_not_actually_routed_raises_config_error(
         with pytest.raises(EvaluationConfigError) as exc_info:
             run_evaluation(
                 TASK_TYPE,
-                2,
+                3,
                 _SECOND_SEEDED_MODEL_ID,
                 session=session,
                 auth=run_context["auth"],
@@ -659,7 +659,7 @@ def test_run_evaluation_no_active_dataset_raises_config_error(run_context: dict)
             with pytest.raises(EvaluationConfigError) as exc_info:
                 run_evaluation(
                     TASK_TYPE,
-                    2,
+                    3,
                     _SEEDED_MODEL_ID,
                     session=session,
                     auth=run_context["auth"],
@@ -725,7 +725,7 @@ def test_get_evaluations_lists_the_seeded_dataset(
 def test_post_evaluations_runs_happy_path(run_context: dict, http_client: TestClient) -> None:
     response = http_client.post(
         "/api/v1/ai/evaluations/runs",
-        json={"task_type": TASK_TYPE, "prompt_version": 2, "model_id": _SEEDED_MODEL_ID},
+        json={"task_type": TASK_TYPE, "prompt_version": 3, "model_id": _SEEDED_MODEL_ID},
         headers=_headers(run_context["token"], key="eval-run-1"),
     )
     assert response.status_code == 200
@@ -761,7 +761,7 @@ def test_post_evaluations_runs_idempotency_store_failure_still_returns_the_compl
 
     response = http_client.post(
         "/api/v1/ai/evaluations/runs",
-        json={"task_type": TASK_TYPE, "prompt_version": 2, "model_id": _SEEDED_MODEL_ID},
+        json={"task_type": TASK_TYPE, "prompt_version": 3, "model_id": _SEEDED_MODEL_ID},
         headers=_headers(run_context["token"], key="eval-run-idempotency-store-fails"),
     )
     assert response.status_code == 200, response.text
@@ -789,14 +789,14 @@ def test_post_evaluations_runs_conflicting_payload_same_key_returns_idempotency_
 
     first = http_client.post(
         "/api/v1/ai/evaluations/runs",
-        json={"task_type": TASK_TYPE, "prompt_version": 2, "model_id": _SEEDED_MODEL_ID},
+        json={"task_type": TASK_TYPE, "prompt_version": 3, "model_id": _SEEDED_MODEL_ID},
         headers=headers,
     )
     assert first.status_code == 200, first.text
 
     conflicting = http_client.post(
         "/api/v1/ai/evaluations/runs",
-        json={"task_type": TASK_TYPE, "prompt_version": 2, "model_id": _SECOND_SEEDED_MODEL_ID},
+        json={"task_type": TASK_TYPE, "prompt_version": 3, "model_id": _SECOND_SEEDED_MODEL_ID},
         headers=headers,
     )
     assert conflicting.status_code == 409
@@ -855,7 +855,7 @@ def test_post_evaluations_runs_concurrent_same_idempotency_key_only_evaluates_on
         try:
             response = worker.post(
                 "/api/v1/ai/evaluations/runs",
-                json={"task_type": TASK_TYPE, "prompt_version": 2, "model_id": _SEEDED_MODEL_ID},
+                json={"task_type": TASK_TYPE, "prompt_version": 3, "model_id": _SEEDED_MODEL_ID},
                 headers=_headers(run_context["token"], key="concurrent-same-eval-key"),
             )
             return response.status_code, response.json()
@@ -897,7 +897,7 @@ def test_post_evaluations_runs_unknown_model_is_422(
 ) -> None:
     response = http_client.post(
         "/api/v1/ai/evaluations/runs",
-        json={"task_type": TASK_TYPE, "prompt_version": 2, "model_id": "not-registered"},
+        json={"task_type": TASK_TYPE, "prompt_version": 3, "model_id": "not-registered"},
         headers=_headers(run_context["token"], key="eval-run-bad-model"),
     )
     assert response.status_code == 422
@@ -907,7 +907,7 @@ def test_post_evaluations_runs_unknown_model_is_422(
 def test_post_evaluations_runs_requires_csrf(run_context: dict, http_client: TestClient) -> None:
     response = http_client.post(
         "/api/v1/ai/evaluations/runs",
-        json={"task_type": TASK_TYPE, "prompt_version": 2, "model_id": _SEEDED_MODEL_ID},
+        json={"task_type": TASK_TYPE, "prompt_version": 3, "model_id": _SEEDED_MODEL_ID},
         headers={"Idempotency-Key": "no-csrf"},
     )
     assert response.status_code == 403
@@ -917,7 +917,7 @@ def test_post_evaluations_runs_requires_authentication(http_client: TestClient) 
     http_client.cookies.clear()
     response = http_client.post(
         "/api/v1/ai/evaluations/runs",
-        json={"task_type": TASK_TYPE, "prompt_version": 2, "model_id": _SEEDED_MODEL_ID},
+        json={"task_type": TASK_TYPE, "prompt_version": 3, "model_id": _SEEDED_MODEL_ID},
         headers=_headers("irrelevant", key="no-auth"),
     )
     assert response.status_code == 401
@@ -929,12 +929,12 @@ def test_post_evaluations_runs_idempotent_replay_returns_identical_response(
     headers = _headers(run_context["token"], key="eval-replay-key")
     first = http_client.post(
         "/api/v1/ai/evaluations/runs",
-        json={"task_type": TASK_TYPE, "prompt_version": 2, "model_id": _SEEDED_MODEL_ID},
+        json={"task_type": TASK_TYPE, "prompt_version": 3, "model_id": _SEEDED_MODEL_ID},
         headers=headers,
     )
     second = http_client.post(
         "/api/v1/ai/evaluations/runs",
-        json={"task_type": TASK_TYPE, "prompt_version": 2, "model_id": _SEEDED_MODEL_ID},
+        json={"task_type": TASK_TYPE, "prompt_version": 3, "model_id": _SEEDED_MODEL_ID},
         headers=headers,
     )
     assert first.status_code == 200
@@ -980,7 +980,7 @@ def test_get_evaluation_run_cross_workspace_is_404(
         with SessionFactory() as session:
             run = run_evaluation(
                 TASK_TYPE,
-                2,
+                3,
                 _SEEDED_MODEL_ID,
                 session=session,
                 auth=AuthContext(workspace_id=other_workspace, user_id=other_user, timezone="UTC"),
@@ -1024,12 +1024,12 @@ def test_activate_gated_prompt_rejected_with_no_passing_evaluation(
     run_context: dict, http_client: TestClient
 ) -> None:
     """No `evaluation_runs` row exists yet in this fresh workspace -- the
-    gate must reject even a reactivation of the already-active version 2
-    (migration `0053_phase4_explain_item_prompt_v2.py`'s activated row).
+    gate must reject even a reactivation of the already-active version 3
+    (migration `0055_phase4_expl_item_prompt_v3.py`'s activated row).
     """
     response = http_client.post(
         f"/api/v1/ai/policies/{_SEEDED_PROMPT_ID}/activate",
-        json={"version": 2},
+        json={"version": 3},
         headers=_headers(run_context["token"], key="gate-reject-1"),
     )
     assert response.status_code == 409
@@ -1053,7 +1053,7 @@ def test_activate_gated_prompt_rejected_when_evaluation_exists_but_failed(
     try:
         eval_response = http_client.post(
             "/api/v1/ai/evaluations/runs",
-            json={"task_type": TASK_TYPE, "prompt_version": 2, "model_id": _SEEDED_MODEL_ID},
+            json={"task_type": TASK_TYPE, "prompt_version": 3, "model_id": _SEEDED_MODEL_ID},
             headers=_headers(run_context["token"], key="gate-fail-eval"),
         )
     finally:
@@ -1065,7 +1065,7 @@ def test_activate_gated_prompt_rejected_when_evaluation_exists_but_failed(
 
     activate_response = http_client.post(
         f"/api/v1/ai/policies/{_SEEDED_PROMPT_ID}/activate",
-        json={"version": 2},
+        json={"version": 3},
         headers=_headers(run_context["token"], key="gate-fail-activate"),
     )
     assert activate_response.status_code == 409
@@ -1077,7 +1077,7 @@ def test_activate_gated_prompt_allowed_once_evaluation_passes(
 ) -> None:
     eval_response = http_client.post(
         "/api/v1/ai/evaluations/runs",
-        json={"task_type": TASK_TYPE, "prompt_version": 2, "model_id": _SEEDED_MODEL_ID},
+        json={"task_type": TASK_TYPE, "prompt_version": 3, "model_id": _SEEDED_MODEL_ID},
         headers=_headers(run_context["token"], key="gate-pass-eval"),
     )
     assert eval_response.status_code == 200
@@ -1085,11 +1085,11 @@ def test_activate_gated_prompt_allowed_once_evaluation_passes(
 
     activate_response = http_client.post(
         f"/api/v1/ai/policies/{_SEEDED_PROMPT_ID}/activate",
-        json={"version": 2},
+        json={"version": 3},
         headers=_headers(run_context["token"], key="gate-pass-activate"),
     )
     assert activate_response.status_code == 200
-    assert activate_response.json()["active_version"] == 2
+    assert activate_response.json()["active_version"] == 3
 
 
 def test_activate_tool_definition_is_unaffected_by_the_prompt_gate(

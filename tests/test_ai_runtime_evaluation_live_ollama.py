@@ -150,10 +150,10 @@ def test_attention_explain_item_passes_every_evaluation_floor_against_real_model
     with SessionFactory() as session:
         run = run_evaluation(
             _TASK_TYPE,
-            # version=2 (migration 0053_phase4_explain_item_prompt_v2.py
-            # activated it over the original seed's version=1) -- the
-            # currently active prompt version for this task type.
-            2,
+            # version=3 (migration 0055_phase4_expl_item_prompt_v3.py
+            # activated it over version=2) -- the currently active prompt
+            # version for this task type.
+            3,
             _MODEL_ID,
             session=session,
             auth=run_context["auth"],
@@ -266,14 +266,18 @@ def test_second_registered_model_produces_a_valid_completed_run_against_real_oll
                     # toward inventing/embellishing to fill the requested
                     # explanation. Real evaluation_sets/attention_items
                     # data never has this shape (every real item has
-                    # multiple factors); using the same multi-factor
-                    # example the checked-in evaluation dataset itself uses
-                    # (tests/fixtures/phase4_evaluation_attention_explain.py's
-                    # "task_overdue_critical_pinned_blocked") is both more
-                    # representative of production data and has a real,
-                    # observed good grounding track record across this PR's
-                    # CI runs (its own failures were schema_invalid/word-count,
-                    # never grounding_failed).
+                    # multiple factors), so this uses a multi-factor item
+                    # instead. Deliberately avoids an `overdue`-flavored
+                    # factor specifically: `EVALUATION-CONTRACT.md`'s
+                    # phase L found the 1.5B model reliably substitutes the
+                    # sibling code `due_48h` for `overdue` on this exact
+                    # factor shape (`tests/fixtures/
+                    # phase4_evaluation_attention_explain.py`'s own
+                    # `commitment_overdue_critical_pinned_made_to_me`
+                    # example hits the identical failure) -- a real,
+                    # already-tracked model limitation this smoke test's
+                    # job (proving the code path completes end-to-end) has
+                    # no need to also re-exercise.
                     "factors": dumps(
                         [
                             {
@@ -283,10 +287,10 @@ def test_second_registered_model_produces_a_valid_completed_run_against_real_oll
                                 "source_field": "manual_priority",
                             },
                             {
-                                "code": "overdue",
-                                "label": "Due timing overdue",
+                                "code": "importance",
+                                "label": "High importance",
                                 "points": 25,
-                                "source_field": "due_date,due_at",
+                                "source_field": "importance",
                             },
                             {
                                 "code": "pinned",
@@ -349,7 +353,7 @@ def test_second_registered_model_produces_a_valid_completed_run_against_real_oll
         # citation list) -- all are valid completed outcomes.
         assert set(run.output["cited_factor_codes"]) <= {
             "manual_priority",
-            "overdue",
+            "importance",
             "pinned",
             "blocked",
             "stale_14d",
@@ -421,9 +425,11 @@ def test_reflection_call_produces_a_valid_completed_run_against_real_ollama(
                     "workspace_id": run_context["auth"].workspace_id,
                     "entity_id": uuid4(),
                     # Same multi-factor set as this file's second-model
-                    # smoke test, for the same reason: a real, observed
-                    # good grounding track record, not a thin single-factor
-                    # item that gives the model too little material.
+                    # smoke test, for the same reason: a real, multi-factor
+                    # item, not a thin single-factor one, and deliberately
+                    # avoiding an `overdue`-flavored factor (see that
+                    # test's own comment on the tracked `due_48h`
+                    # substitution this model reliably makes on that shape).
                     "factors": dumps(
                         [
                             {
@@ -433,10 +439,10 @@ def test_reflection_call_produces_a_valid_completed_run_against_real_ollama(
                                 "source_field": "manual_priority",
                             },
                             {
-                                "code": "overdue",
-                                "label": "Due timing overdue",
+                                "code": "importance",
+                                "label": "High importance",
                                 "points": 25,
-                                "source_field": "due_date,due_at",
+                                "source_field": "importance",
                             },
                             {
                                 "code": "pinned",
@@ -570,10 +576,11 @@ def test_execute_run_output_is_reproducible_across_two_calls(
                     "id": item_id,
                     "workspace_id": run_context["auth"].workspace_id,
                     "entity_id": uuid4(),
-                    # The same real, multi-factor, known-good-grounding
-                    # example the second-model smoke test above already
-                    # uses (see that test's own comment on why a single-
-                    # factor item is a bad choice here).
+                    # The same multi-factor example the second-model smoke
+                    # test above already uses (see that test's own comment
+                    # on why a single-factor item is a bad choice here, and
+                    # why an `overdue`-flavored factor is deliberately
+                    # avoided).
                     "factors": dumps(
                         [
                             {
@@ -583,10 +590,10 @@ def test_execute_run_output_is_reproducible_across_two_calls(
                                 "source_field": "manual_priority",
                             },
                             {
-                                "code": "overdue",
-                                "label": "Due timing overdue",
+                                "code": "importance",
+                                "label": "High importance",
                                 "points": 25,
-                                "source_field": "due_date,due_at",
+                                "source_field": "importance",
                             },
                             {
                                 "code": "pinned",
@@ -653,7 +660,7 @@ def test_execute_run_output_is_reproducible_across_two_calls(
         )
         second_output = run.output
 
-        real_factor_codes = {"manual_priority", "overdue", "pinned", "blocked", "stale_14d"}
+        real_factor_codes = {"manual_priority", "importance", "pinned", "blocked", "stale_14d"}
         for label, output in (("first", first_output), ("second", second_output)):
             cited = output["cited_factor_codes"]
             assert cited, f"{label} call cited no factor codes at all: {output!r}"
