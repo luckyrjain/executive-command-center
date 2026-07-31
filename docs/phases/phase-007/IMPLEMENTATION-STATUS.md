@@ -1,8 +1,8 @@
 ---
 id: PHASE-007-IMPLEMENTATION-STATUS
 title: Phase 7 Implementation Status
-status: Task 1 (domain/consent/vault framework and the habits reference domain), Task 2 (learning domain, no new code), Task 3 (travel domain, effective-date-range query filter) and Task 4 (relationships domain, first real field-level encryption) complete
-version: 0.5.0
+status: Task 1 (domain/consent/vault framework and the habits reference domain), Task 2 (learning domain, no new code), Task 3 (travel domain, effective-date-range query filter), Task 4 (relationships domain, first real field-level encryption) complete; Task 5 part 1 (cross_domain_grants schema and grant lifecycle, no AI-insight consumer yet) complete, part 2 not started
+version: 0.6.0
 owner: Lucky Jain
 updated: 2026-07-31
 ---
@@ -16,8 +16,8 @@ Phase 7 began by repository-owner authorization to proceed in parallel with Phas
 | Domain vault and consent model | Done -- Task 1 |
 | Manual capture, goals and routines | Done -- Task 1 (`habits` reference domain); `learning` (Task 2)/`travel` (Task 3)/`relationships` (Task 4) reuse the same generic `domain_records` mechanism with no `goals`/`routines`/`check_ins` convention of their own |
 | Import, provenance and retention | Partial -- `domain_sources`/retention-tier framework shipped in Task 1; `imported_file` source type has no real import path yet (manual entry only) |
-| Evidence-backed domain insights | Partial -- deterministic (non-AI) gap insights shipped in Task 1; AI-generated `trend`/`correlation` kinds deferred to Task 5 |
-| Cross-domain grants | Not started -- Task 5 |
+| Evidence-backed domain insights | Partial -- deterministic (non-AI) gap insights shipped in Task 1; AI-generated `trend`/`correlation` kinds deferred to Task 5 part 2 |
+| Cross-domain grants | Partial -- Task 5 part 1 (schema, create/list/revoke); no consumer reads a grant yet (part 2) |
 | Export, deletion and privacy controls | Done -- Task 1 (whole-domain export/delete, generic across every domain including `learning`); Task 4 fixed export to decrypt `relationships`' encrypted fields rather than returning ciphertext |
 | UX, safety review and dogfood | Not started -- Task 8 |
 
@@ -53,8 +53,20 @@ Phase 7 began by repository-owner authorization to proceed in parallel with Phas
 
 **Verified.** `ruff check` clean (this sandbox's globally-installed `ruff` is newer than the repo's pinned 0.12.3 and has a real formatter bug that corrupts a multi-exception `except` clause under `ruff format` -- verified the affected line by hand and confirmed `ruff check`, which CI actually runs, passes cleanly). `mypy backend` clean (155 source files). `tests/test_personal_relationships_postgres.py` + `tests/test_personal_domains_postgres.py` + `tests/test_personal_learning_postgres.py` + `tests/test_personal_travel_postgres.py` + `tests/test_production_security.py` -- 92 passed, 2 skipped. Full backend suite (excluding the two live-Ollama files and the known pre-existing sandbox-load-sensitive performance-budget test files) -- 1423 passed, 9 skipped, no failures outside that already-documented flaky category.
 
+## Task 5 evidence (part 1 of 2)
+
+**Complete: `cross_domain_grants` schema and grant lifecycle.** Repository-owner-directed split (Task 5 as originally scoped bundles this with a whole new Phase 4 evaluated task type -- materially larger and riskier than Tasks 2-4 each were): part 1 ships `cross_domain_grants` (migration `0056_phase7_cross_domain_grants.py`) and `ecc.domains.personal.grants` (`GET|POST /personal/grants`, `POST .../{id}/revoke`) with **no consumer reading a grant yet**; part 2 (the `trend`/`correlation` AI-generated insight types, their evaluation dataset, and the safety-rubric adversarial fixture set) is a separate, later PR.
+
+**Schema resolved from `DATA-MODEL.md`'s own top-line description, since nothing more concrete existed before this task.** No `target_domain_key` column -- the design doc's own wording names a target *purpose* (`purpose`, a closed enum, one value defined: `insight_generation`), not a second domain. `granted_categories` (JSONB array of strings) names which categories of `source_domain_key`'s data the grant covers. Lifecycle mirrors `domain_consents` exactly (grant once, later only ever revoke) -- no `version`/`updated_at`/`created_by` columns, same reasoning `domain_consents` itself already established. `docs/phases/phase-007/DATA-MODEL.md`'s new "Task 5 status" section and `docs/phases/phase-007/API-SCHEMAS.md`'s own Task 5 section have the full detail.
+
+**Tests.** `tests/test_personal_grants_postgres.py` (9 tests): create requires `source_domain_key` already enabled; list filters by `source_domain_key`/`active_only` (excluding both revoked and expired grants); revoke is idempotent (a no-op, not an error, on an already-revoked grant); unknown-grant 404; cross-workspace isolation; request-schema rejections (unrecognized `purpose`, empty `granted_categories`).
+
+**Backup-restore seed-script gap, closed proactively this time.** `cross_domain_grants` is workspace-scoped like every other Phase 7 table -- `scripts/seed_phase1_acceptance.py` updated with a seed row (one indefinite `insight_generation`-purposed grant against `habits` per acceptance workspace) before this shipped, not found reactively by a CI failure the way Task 1's own identical gap was (that task's own evidence section above).
+
+**Verified.** `ruff check` clean (same pre-existing sandbox ruff-version formatter quirk as Task 4's evidence above -- confirmed by hand, `ruff check` is what CI actually runs). `mypy backend` clean (157 source files). Migration round-trips (`upgrade` -> `downgrade -1` -> `upgrade`) against real Postgres. `tests/test_personal_grants_postgres.py` + every other `test_personal_*_postgres.py` file -- all passed. `scripts/seed_phase1_acceptance.py` run directly against real Postgres -- confirmed exactly 2 `cross_domain_grants` rows (one per acceptance workspace).
+
 ## What remains before Phase 7 itself can exit
 
-- Tasks 5-8 per the implementation plan: `cross_domain_grants` and the first AI-generated insight (gated on a new Phase 4 evaluation floor), `health`/`finance` (`high_stakes`, the safety rubric enforced against real diagnostic/financial-advice risk for the first time), executive UX and browser acceptance.
+- Task 5 part 2 (the `trend`/`correlation` AI-generated insight types, a new Phase 4 evaluated task type with its own dataset and safety-rubric adversarial fixture set), Tasks 6-8 per the implementation plan: `health`/`finance` (`high_stakes`, the safety rubric enforced against real diagnostic/financial-advice risk for the first time), executive UX and browser acceptance.
 - Privacy impact assessment and safety-rubric fixture sets are re-triggered per domain as each ships (design doc Decision 2's own standard), not assumed to carry over automatically from `habits`.
 - No promotion/exit decision has been made for Phase 7 as a whole -- one task's evidence is a first confirming signal for the framework, not phase completion.
