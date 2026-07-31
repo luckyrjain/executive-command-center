@@ -1,8 +1,8 @@
 ---
 id: PHASE-007
 title: Personal Intelligence
-status: Draft
-version: 0.2.0
+status: Approved for Implementation
+version: 0.3.0
 owner: Lucky Jain
 depends_on:
   - PHASE-006
@@ -21,6 +21,10 @@ contracts:
 ---
 
 # PHASE-007 — Personal Intelligence
+
+## Approved decisions
+
+Contracts moved from Draft after resolving `docs/phases/PHASE-REVIEW.md:138`'s four named approval-gate items (per-domain schema/retention; privacy impact assessment; encryption fields; high-stakes safety rubric) in `docs/superpowers/specs/2026-07-31-phase-7-personal-intelligence-design.md`, per that document's own Decision 1-4 sections. In summary: `habits` ships first as the lowest-stakes reference domain, with `learning`, `travel`, `relationships`, `health` and `finance` explicitly sequenced next (not descoped), each domain classified `standard`/`sensitive`/`high_stakes` with a matching retention-nudge cadence (none/18mo/12mo) and a per-record `retention_acknowledged_at` for `high_stakes` records specifically; personal data is encrypted at rest (Fernet, RFC-005 v1.4.0, a new dedicated `ECC_PERSONAL_DATA_ENCRYPTION_KEY` distinct from the connector-token key) for `sensitive`/`high_stakes` narrative fields only, with structured low-sensitivity fields kept plaintext/queryable; no personal-domain table participates in Phase 2's shared retrieval index, no admin override exists for personal-domain content, and Task 1 makes zero AI model calls (deterministic insights only); the high-stakes safety rubric is a schema-level required-field set plus an `EVALUATION-CONTRACT.md`-style 100%-floor adversarial fixture set, gating the first AI-generated insight (deferred to a later task) rather than being retrofitted once `health`/`finance` ship. Implementation begins with Task 1 (domain/consent/vault framework and the `habits` reference domain) by the same kind of repository-owner parallel-start exception Phases 2-6 each received, proceeding alongside Phase 6's own still-open exit gate (`docs/phases/PHASE-006-engineering-workspace.md`'s exit criteria -- sandbox/restore runbooks and non-surveillance review not yet independently signed off) -- this does not itself close that gate. Implementation plan: `docs/superpowers/plans/2026-07-31-phase-7-personal-intelligence.md`. Delivery status: `docs/phases/phase-007/IMPLEMENTATION-STATUS.md`.
 
 ## Objective
 
