@@ -122,6 +122,8 @@ _ENCRYPTED_FIELD_NAMES_BY_RECORD_TYPE: dict[str, frozenset[str]] = {
     "interaction": frozenset({"notes"}),
     "vital_reading": frozenset({"notes"}),
     "symptom_log": frozenset({"symptom_description", "notes"}),
+    "account": frozenset({"account_notes"}),
+    "transaction": frozenset({"memo"}),
 }
 
 _REDACTED_PLACEHOLDER = "***encrypted***"

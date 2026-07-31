@@ -2,7 +2,7 @@
 id: PHASE-007-DOMAIN-PRIVACY
 title: Personal Domain Privacy Contract
 status: Approved for Implementation
-version: 0.4.0
+version: 0.5.0
 owner: Lucky Jain
 ---
 
@@ -23,3 +23,5 @@ A dedicated `ECC_PERSONAL_DATA_ENCRYPTION_KEY` (Fernet, `RFC-005` v1.4.0's alrea
 **Task 4 confirmation.** `ecc.domains.personal.crypto` (Fernet, `ECC_PERSONAL_DATA_ENCRYPTION_KEY`, structurally validated outside development by `ecc.config.validate_production_settings`) now exists and is exercised for real by `relationships`' own `notes` field (`DATA-MODEL.md`'s Task 4 section). "Decrypted value never... written into an audit/outbox payload" is extended in practice to a persisted surface this contract did not name explicitly but the same principle plainly covers: `idempotency_records.response_body`, a store that would otherwise hold a decrypted response verbatim across a replayed request -- the write path builds that stored response from the still-encrypted row, decrypting only the copy actually returned to the caller. Verified against real Postgres, not just asserted: `notes` is genuinely ciphertext in `domain_records.payload` at rest, and the idempotency-records row itself never holds the decrypted value either.
 
 **Task 6 confirmation.** `health.symptom_description` -- this contract's own worked example above, named before any `health`-domain code existed -- is now a real, encrypted field (`symptom_log` record type, `DATA-MODEL.md`'s Task 6 section), alongside `vital_reading`'s own `notes`. `health` is also the first domain to exercise this contract's "Retention (resolved)" per-record acknowledgement requirement (`DATA-MODEL.md`'s Task 1 section: "every `high_stakes` `domain_records` row requires `retention_acknowledged_at` set at creation time") -- `POST /personal/records` now structurally rejects a `high_stakes`-domain record with no acknowledgement (`422 RETENTION_ACKNOWLEDGEMENT_REQUIRED`), not merely a documented expectation with no enforcement. `health` is also the first domain to prove, end to end against real (not synthetic evaluation-harness) data, that `INSIGHT-CONTRACT.md`'s conditional `professional_referral_note` requirement genuinely fires for a real `high_stakes` grant.
+
+**Task 7 confirmation.** `finance.account_notes`/`finance.transaction.memo` -- matching this contract's own "Decision 3" worked example (`finance`'s `account_notes`/transaction-memo-style free text) -- are now real, encrypted fields (`account`/`transaction` record types, `DATA-MODEL.md`'s Task 7 section). No new mechanism was required: every enforcement Task 6 built (retention acknowledgement, encryption, `professional_referral_note`) is generic on `classification`, so `finance` -- the second and last `high_stakes` domain this phase's scope names -- inherited it automatically, and `tests/test_personal_finance_postgres.py` proves each mechanism fires correctly against `finance`'s own data, not merely that `health`'s equivalent test still passes.
