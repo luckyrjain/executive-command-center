@@ -172,6 +172,24 @@ def _safe_repo_path_segment(full_name: str) -> str:
     return full_name
 
 
+_GITHUB_WEB_BASE_URL = "https://github.com"
+
+
+def _safe_source_url(raw_url: str | None, *, fallback: str) -> str:
+    """Same allow-list defense `datadog_adapter.py`'s `_upsert_dashboard`
+    already applies to its own provider-returned `url` field (review
+    found this adapter's structurally identical `html_url` fields never
+    received it): a value not scoped to GitHub's own web host is never
+    trusted verbatim -- it could be `javascript:`/`data:`/an arbitrary
+    external host if the connected GitHub instance were compromised or
+    malicious -- falling back to a safe, server-constructed default
+    instead of rendering it as a clickable link.
+    """
+    if raw_url and raw_url.startswith(f"{_GITHUB_WEB_BASE_URL}/"):
+        return raw_url
+    return fallback
+
+
 def _content_hash(repo: Mapping[str, Any]) -> str:
     material = dumps(
         {
@@ -235,7 +253,13 @@ def _upsert_repository(
                 "provider": provider,
                 "external_id": str(repo["id"]),
                 "name": repo.get("full_name") or repo.get("name") or str(repo["id"]),
-                "source_url": repo.get("html_url") or "",
+                "source_url": _safe_source_url(
+                    repo.get("html_url"),
+                    fallback=(
+                        f"{_GITHUB_WEB_BASE_URL}/"
+                        f"{repo.get('full_name') or repo.get('name') or repo['id']}"
+                    ),
+                ),
                 "default_branch": repo.get("default_branch"),
                 "content_hash": _content_hash(repo),
                 "provider_updated_at": provider_updated_at,
@@ -314,10 +338,13 @@ def _upsert_change(
     connector_account_id: Any,
     provider: str,
     repository_id: Any,
+    repository_name: str,
     pr: Mapping[str, Any],
 ) -> None:
     """Opens and commits its own session -- identical discipline to
-    `_upsert_repository`'s own docstring.
+    `_upsert_repository`'s own docstring. `repository_name` is only used
+    to build a safe fallback `source_url` (`_safe_source_url`) -- it is
+    not itself trusted for path construction here.
     """
     now = datetime.now(UTC)
     with SessionFactory() as session:
@@ -359,7 +386,13 @@ def _upsert_change(
                 "external_id": str(pr["id"]),
                 "provider_number": str(pr.get("number")) if pr.get("number") is not None else None,
                 "title": pr.get("title") or f"PR #{pr.get('number', pr['id'])}",
-                "source_url": pr.get("html_url") or "",
+                "source_url": _safe_source_url(
+                    pr.get("html_url"),
+                    fallback=(
+                        f"{_GITHUB_WEB_BASE_URL}/{repository_name}/pull/"
+                        f"{pr.get('number', pr['id'])}"
+                    ),
+                ),
                 "status": pr.get("state"),
                 "author_external_id": str((pr.get("user") or {}).get("id"))
                 if (pr.get("user") or {}).get("id") is not None
@@ -447,6 +480,8 @@ def _upsert_review(
     connector_account_id: Any,
     provider: str,
     change_id: Any,
+    repository_name: str,
+    provider_number: str,
     review: Mapping[str, Any],
     requested_at: str | None,
 ) -> None:
@@ -456,6 +491,8 @@ def _upsert_review(
     timeline) and applied to every review synced for that change -- see
     this module's own docstring for why review-request timestamps live
     on the timeline endpoint, not the reviews endpoint itself.
+    `repository_name`/`provider_number` are only used to build a safe
+    fallback `source_url` (`_safe_source_url`).
     """
     now = datetime.now(UTC)
     with SessionFactory() as session:
@@ -492,7 +529,13 @@ def _upsert_review(
                 "change_id": change_id,
                 "provider": provider,
                 "external_id": str(review["id"]),
-                "source_url": review.get("html_url") or "",
+                "source_url": _safe_source_url(
+                    review.get("html_url"),
+                    fallback=(
+                        f"{_GITHUB_WEB_BASE_URL}/{repository_name}/pull/{provider_number}"
+                        f"#pullrequestreview-{review['id']}"
+                    ),
+                ),
                 "requested_at": requested_at,
                 "reviewer_external_id": str((review.get("user") or {}).get("id"))
                 if (review.get("user") or {}).get("id") is not None
@@ -852,6 +895,7 @@ class GitHubAdapter:
                             connector_account_id=account.connector_account_id,
                             provider=self.provider,
                             repository_id=repo["id"],
+                            repository_name=repo["name"],
                             pr=pr,
                         )
                         items_processed += 1
@@ -966,6 +1010,8 @@ class GitHubAdapter:
                     connector_account_id=account.connector_account_id,
                     provider=self.provider,
                     change_id=change["id"],
+                    repository_name=change["repository_name"],
+                    provider_number=change["provider_number"],
                     review=review,
                     requested_at=requested_at,
                 )

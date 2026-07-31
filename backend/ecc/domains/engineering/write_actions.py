@@ -547,7 +547,14 @@ class JiraAddCommentAdapter:
         # {key}` link (`jira_adapter.py`'s own sync code builds it that
         # way); reused here for the output link rather than reconstructed
         # from `external_id`, which would silently produce a broken link.
-        issue_id = work_item["external_id"]
+        # Same dot-segment path-escape defense as `_safe_repo_path_segment`/
+        # `GitLabAddNoteInput._reject_dot_segments` -- review found this was
+        # the one provider write action of the three missing it: `external_id`
+        # is ordinarily a purely numeric database key, but nothing enforces
+        # that shape, so a compromised or misbehaving connected Jira instance
+        # returning a crafted `id` field could otherwise escape the intended
+        # `/rest/api/3/issue/{id}/comment` path.
+        issue_id = _safe_repo_path_segment(work_item["external_id"])
         try:
             response = self._client.post(
                 f"https://{site}/rest/api/3/issue/{issue_id}/comment",

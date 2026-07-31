@@ -1372,7 +1372,7 @@ def disable_connector_endpoint(
                 "datadog_dashboards",
             ):
                 session.execute(
-                    text(  # noqa: S608 -- table name is one of four fixed literals, never user input
+                    text(  # noqa: S608 -- table name is one of seven fixed literals, never user input
                         f"UPDATE {table} SET freshness_state = 'disconnected', "
                         "updated_at = :now WHERE workspace_id = :workspace_id "
                         "AND connector_account_id = :account_id "

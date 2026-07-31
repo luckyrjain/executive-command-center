@@ -756,26 +756,27 @@ def test_generate_without_override_still_uses_the_instance_default_deadline() ->
 
 
 def test_run_budget_meeting_prep_summary_per_model_call_seconds_diverges_from_default() -> None:
-    """`meeting.prep_summary`'s own declared timeout (32.0s, `router.py:
-    TASK_REQUIREMENTS`, phase G fix -- raised again from phase C's 25.0s
-    after real CI still missed the floor at that value) is deliberately
-    *not* equal to `ollama_client.py`'s default constant -- confirming the
-    two task types now genuinely diverge, unlike `test_run_budget_per_
-    model_call_seconds_matches_ollama_adapter_default_timeout` above
-    (which is still correct for `attention.explain_item` specifically).
+    """`meeting.prep_summary`'s own declared timeout (40.0s, `router.py:
+    TASK_REQUIREMENTS`, phase H fix -- raised again from phase G's 32.0s
+    after real CI kept clearing the timeout cleanly but missing the
+    latency promotion floor) is deliberately *not* equal to `ollama_
+    client.py`'s default constant -- confirming the two task types now
+    genuinely diverge, unlike `test_run_budget_per_model_call_seconds_
+    matches_ollama_adapter_default_timeout` above (which is still correct
+    for `attention.explain_item` specifically).
     """
     with SessionFactory() as session:
         policy = air.get_policy(session, "meeting.prep_summary")
     assert policy is not None
     budget = RunBudget.from_policy(policy)
-    assert budget.per_model_call_seconds == 32.0
+    assert budget.per_model_call_seconds == 40.0
     assert budget.per_model_call_seconds != DEFAULT_PER_MODEL_CALL_TIMEOUT_SECONDS
 
 
 def test_run_budget_meeting_prep_summary_total_wall_clock_seconds_diverges_from_default() -> None:
-    """`meeting.prep_summary`'s total per-run wall-clock budget (75.0s,
-    phase G fix) was raised in lockstep with its per-model-call timeout
-    (32.0s) so a schema-repair retry still fits twice alongside routing/
+    """`meeting.prep_summary`'s total per-run wall-clock budget (91.0s,
+    phase H fix) was raised in lockstep with its per-model-call timeout
+    (40.0s) so a schema-repair retry still fits twice alongside routing/
     tool-dispatch/validation overhead -- deliberately *not* equal to
     `attention.explain_item`'s 60.0s (`test_run_budget_from_policy_reads_
     the_seeded_routing_policy_row` above), confirming the two task types'
@@ -785,7 +786,7 @@ def test_run_budget_meeting_prep_summary_total_wall_clock_seconds_diverges_from_
         policy = air.get_policy(session, "meeting.prep_summary")
     assert policy is not None
     budget = RunBudget.from_policy(policy)
-    assert budget.total_wall_clock_seconds == 75.0
+    assert budget.total_wall_clock_seconds == 91.0
 
 
 def test_httpx_transport_timeout_stays_ahead_of_every_registered_task_timeout() -> None:
@@ -795,7 +796,7 @@ def test_httpx_transport_timeout_stays_ahead_of_every_registered_task_timeout() 
     `ollama_client.py`'s own updated comment on this constant) -- it must
     stay comfortably ahead of the largest currently-registered per-task
     timeout, or a legitimate, longer-than-default `generate(timeout_
-    seconds=...)` override (`meeting.prep_summary`'s 32s) would be
+    seconds=...)` override (`meeting.prep_summary`'s 40s) would be
     silently cut short by this constant first. This is a guard rail: if a
     future task type's own declared timeout creeps close to (or past)
     this constant, this test fails loudly instead of that gap being

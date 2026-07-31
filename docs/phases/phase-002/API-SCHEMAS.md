@@ -2,7 +2,7 @@
 id: PHASE-002-API-SCHEMAS
 title: Phase 2 Knowledge Platform API
 status: Approved for Implementation
-version: 0.4.0
+version: 0.5.0
 owner: Lucky Jain
 ---
 
@@ -20,7 +20,7 @@ GET|PATCH /knowledge/entities/{id}
 POST /knowledge/entities/{id}/archive|restore
 GET|POST /knowledge/entities/{id}/claims
 POST /knowledge/entities/{id}/claims/{claim_id}/supersede
-GET|POST /knowledge/entities/{id}/relationships
+GET|POST /knowledge/entities/{id}/relationships (GET accepts optional `relationship_type`, `direction=incoming|outgoing`)
 POST /knowledge/relationships/{relationship_id}/invalidate
 GET /knowledge/entities/{id}/timeline
 GET /knowledge/entities/{id}/aliases
@@ -41,6 +41,8 @@ POST /identity/organizations
 ## Shared representations
 
 `KnowledgeEntity` includes id, kind, canonical_name, summary, status, aliases, version and timestamps. `EvidenceRef` includes source type, locator, evidence state, observed time and optional excerpt. `MatchExplanation` includes the lexical (trigram, full-text) and, when hybrid mode is enabled, semantic factors that actually drove the ranking, without exposing sensitive internal features -- recency and authority are not scoring factors in the shipped implementation (see `RETRIEVAL-CONTRACT.md`'s ranking-order note).
+
+`RelationshipResponse` (updated, a team-concept gap analysis found the original shape unusable for a human-facing roster/relationship list): id, from_entity_id, to_entity_id, relationship_type, confidence, evidence_id, valid_from, valid_to, status, plus four fields resolved via a join against the entity table rather than left as bare UUIDs -- `from_entity_name`, `from_entity_kind`, `to_entity_name`, `to_entity_kind` (all required strings). `GET .../relationships` additionally accepts `relationship_type` (any value from the relationship-type vocabulary) and `direction` (`incoming` filters to edges where this entity is the target; `outgoing` filters to edges where it is the source; omitting both preserves the original both-directions/every-type behavior). The combination `relationship_type=MEMBER_OF&direction=incoming` composes a team's membership roster without a dedicated `/teams/{id}/members` endpoint, consistent with this API's fully-generic-entity design.
 
 ## Mutation rules
 

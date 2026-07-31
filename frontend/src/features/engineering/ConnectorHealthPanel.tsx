@@ -11,8 +11,11 @@ import type {
   SyncRunType,
 } from './types'
 
-const PROVIDERS: ReadonlyArray<ConnectorProvider> = ['github', 'gitlab', 'jira', 'sandbox']
-const RESOURCE_TYPES = ['repository', 'work_item', 'change', 'review', 'deployment', 'incident'] as const
+const PROVIDERS: ReadonlyArray<ConnectorProvider> = ['github', 'gitlab', 'jira', 'datadog', 'sandbox']
+const RESOURCE_TYPES = [
+  'repository', 'work_item', 'change', 'review', 'deployment', 'incident',
+  'monitor', 'service_definition', 'dashboard',
+] as const
 const RUN_TYPES: ReadonlyArray<Extract<SyncRunType, 'backfill' | 'incremental'>> = ['backfill', 'incremental']
 
 // This activation has no periodic freshness monitor -- "stale connector"

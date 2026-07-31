@@ -497,7 +497,10 @@ def test_execute_run_end_to_end_happy_path_persists_completed_run(run_context: d
     assert run.model_id == "qwen2.5:1.5b-instruct-q4_K_M"
     assert run.provider == "ollama"
     assert run.prompt_id == "attention.explain_item.v1"
-    assert run.prompt_version == 1
+    # version=2 (migration `0053_phase4_explain_item_prompt_v2.py`), not the
+    # original seeded version=1 -- this task type's currently active prompt
+    # content, whatever version that happens to be.
+    assert run.prompt_version == 2
     assert run.output is not None
     assert run.output["cited_factor_codes"] == ["overdue", "pinned"]
     assert run.attempts == 1
@@ -2273,20 +2276,21 @@ def test_execute_run_meeting_prep_summary_happy_path_persists_completed_run(
     assert steps[0]["trace"]["tool_name"] == "meeting.get_prep_pack"
 
 
-def test_execute_run_meeting_prep_summary_passes_its_own_32s_timeout_to_the_adapter(
+def test_execute_run_meeting_prep_summary_passes_its_own_40s_timeout_to_the_adapter(
     run_context: dict,
 ) -> None:
     """`meeting.prep_summary`'s own declared per-model-call timeout
-    (32.0s, `router.py:TASK_REQUIREMENTS`, Phase G fix -- raised again
-    from Phase C's 25.0s after real CI still missed the floor at that
-    value: `rich_all_sections` measured p95 25.09s/25.30s across two live
-    runs, `EVALUATION-CONTRACT.md`'s "Sandbox constraint" section)
-    genuinely reaches the adapter's real per-call deadline via
-    `execute_run`, not just `budgets.py:RunBudget.per_model_call_seconds`
-    (a value that, before Phase C's fix, was computed correctly but never
-    actually consumed anywhere -- the real production adapter, `runtime.
-    py:get_ollama_adapter`'s single shared FastAPI-DI instance, always
-    used its own fixed constructor default regardless of task type).
+    (40.0s, `router.py:TASK_REQUIREMENTS`, phase H fix -- raised again
+    from phase G's 32.0s after real CI kept clearing the timeout cleanly
+    but four consecutive live runs still missed the latency promotion
+    floor at p95 ~30.9-31.4s, `EVALUATION-CONTRACT.md`'s "Sandbox
+    constraint" section) genuinely reaches the adapter's real per-call
+    deadline via `execute_run`, not just `budgets.py:RunBudget.per_model_
+    call_seconds` (a value that, before Phase C's fix, was computed
+    correctly but never actually consumed anywhere -- the real production
+    adapter, `runtime.py:get_ollama_adapter`'s single shared FastAPI-DI
+    instance, always used its own fixed constructor default regardless of
+    task type).
     """
     meeting_id, participant_id = _insert_meeting_with_participant(
         run_context["workspace_id"], run_context["user_id"]
@@ -2310,7 +2314,7 @@ def test_execute_run_meeting_prep_summary_passes_its_own_32s_timeout_to_the_adap
         )
 
     assert run.status == "completed"
-    assert spy.observed_timeout_seconds == [32.0]
+    assert spy.observed_timeout_seconds == [40.0]
 
 
 def test_execute_run_attention_explain_item_still_passes_its_own_20s_timeout(

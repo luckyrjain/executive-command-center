@@ -1324,6 +1324,21 @@ def test_refresh_permissions() -> None:
     assert active_adapter.refresh_permissions(_account_context()) == "active"
 
 
+def test_refresh_permissions_fails_open_on_network_error() -> None:
+    """Deliberate fail-open: a transient network failure must not be
+    mistaken for a real permission-loss signal. GitLab/Jira/Datadog's own
+    identical fail-open behavior (each explicitly documented as mirroring
+    this adapter's own precedent) all have this regression test; this
+    adapter -- the one the other three are copying -- did not.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("connection refused")
+
+    adapter = GitHubAdapter(transport=httpx.MockTransport(handler))
+    assert adapter.refresh_permissions(_account_context()) == "active"
+
+
 def test_disconnect_is_a_no_op() -> None:
     adapter = GitHubAdapter()
     assert adapter.disconnect(_account_context()) is None

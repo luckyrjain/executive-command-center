@@ -46,7 +46,7 @@ from ecc.domains.engineering.connectors import (
     ConnectorRegistry,
 )
 from ecc.domains.engineering.crypto import encrypt_credential
-from ecc.domains.engineering.datadog_adapter import DatadogAdapter
+from ecc.domains.engineering.datadog_adapter import DatadogAdapter, _monitor_team_tag
 from ecc.main import app
 
 settings = get_settings()
@@ -206,6 +206,25 @@ def test_datadog_adapter_authorize_rejects_network_error() -> None:
         adapter.authorize(_CREDENTIAL)
 
 
+def test_datadog_adapter_authorize_rejects_network_error_on_second_call() -> None:
+    """`authorize` makes two sequential requests (api_key then app_key
+    validation) -- the test above only ever exercises the FIRST raising,
+    since a mock transport that raises unconditionally never reaches the
+    second URL. GitLab's own structurally identical two-call `authorize`
+    had this exact gap once (its own docstring says so) before it was
+    added; Datadog never got the equivalent test.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v1/validate":
+            return _json_response({"valid": True})
+        raise httpx.ConnectError("connection refused")
+
+    adapter = DatadogAdapter(transport=httpx.MockTransport(handler))
+    with pytest.raises(AdapterAuthorizationError):
+        adapter.authorize(_CREDENTIAL)
+
+
 # --- unit-level: resource sync (real database rows required) ----------------
 
 
@@ -290,6 +309,16 @@ def seeded_account_context() -> Iterator[ConnectorAccountContext]:
                 text("DELETE FROM workspaces WHERE id = :workspace_id"),
                 {"workspace_id": workspace_id},
             )
+
+
+def test_monitor_team_tag_treats_empty_value_after_prefix_as_no_suggestion() -> None:
+    """A monitor tagged exactly `"team:"` (nothing after the colon) must
+    resolve to `None`, not an empty string that would render as a blank
+    but present suggestion in the UI -- review found this specific
+    branch of the `or None` fallback had no test, unlike the populated-tag
+    case exercised throughout the other backfill tests in this file.
+    """
+    assert _monitor_team_tag(["team:", "env:prod"]) is None
 
 
 def test_backfill_monitors_single_page(seeded_account_context: ConnectorAccountContext) -> None:
@@ -465,6 +494,41 @@ def test_backfill_service_definitions_single_page(
     }
 
 
+def test_backfill_skips_service_definition_missing_both_identifying_fields(
+    seeded_account_context: ConnectorAccountContext,
+) -> None:
+    """A malformed definition with neither `schema.dd-service` nor a
+    top-level `id` has no real, stable identifying key at all -- upserting
+    it anyway would fall back to a literal `external_id="None"`, and a
+    second, unrelated malformed definition in the same page would then
+    silently overwrite the first via `ON CONFLICT ... DO UPDATE`. Must be
+    skipped, not written under a shared placeholder key.
+    """
+    malformed = {"type": "service_definitions", "attributes": {"schema": {"team": "team-a"}}}
+    real = _service_definition("checkout", team="team-b")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        page_number = int(request.url.params["page[number]"])
+        return _json_response({"data": [malformed, real] if page_number == 0 else []})
+
+    adapter = DatadogAdapter(transport=httpx.MockTransport(handler))
+    outcome = adapter.backfill(seeded_account_context, "service_definition")
+    assert outcome.status == "succeeded"
+    assert outcome.items_processed == 1
+
+    with engine.begin() as connection:
+        rows = list(
+            connection.execute(
+                text(
+                    "SELECT name FROM datadog_service_definitions "
+                    "WHERE workspace_id = :workspace_id"
+                ),
+                {"workspace_id": seeded_account_context.workspace_id},
+            )
+        )
+    assert [row.name for row in rows] == ["checkout"]
+
+
 def test_backfill_service_definitions_paginates(
     seeded_account_context: ConnectorAccountContext,
 ) -> None:
@@ -621,6 +685,72 @@ def test_dashboard_sync_raises_on_generic_failure_status(
         adapter.backfill(seeded_account_context, "dashboard")
 
 
+def test_backfill_dashboard_rejects_non_relative_url_from_provider(
+    seeded_account_context: ConnectorAccountContext,
+) -> None:
+    """A dashboard's `url` field is normally a relative path -- everything
+    else this adapter syncs builds `source_url` entirely server-side from
+    `ui_host`, but dashboards trust the provider's own `url` for the path
+    segment. A malformed or malicious value that doesn't start with `/`
+    (e.g. `javascript:alert(1)`, or an arbitrary external host) must never
+    be stored verbatim; it should fall back to the safe, server-constructed
+    default instead.
+    """
+    malicious = {
+        "id": "abc-123",
+        "title": "Overview",
+        "description": "A dashboard",
+        "url": "javascript:alert(1)",
+        "modified_at": "2024-01-01T00:00:00Z",
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return _json_response({"dashboards": [malicious]})
+
+    adapter = DatadogAdapter(transport=httpx.MockTransport(handler))
+    adapter.backfill(seeded_account_context, "dashboard")
+
+    with engine.begin() as connection:
+        source_url = connection.execute(
+            text("SELECT source_url FROM datadog_dashboards WHERE workspace_id = :workspace_id"),
+            {"workspace_id": seeded_account_context.workspace_id},
+        ).scalar_one()
+    assert source_url == "https://app.datadoghq.com/dashboard/abc-123"
+
+
+def test_backfill_dashboard_trusts_url_already_scoped_to_own_ui_host(
+    seeded_account_context: ConnectorAccountContext,
+) -> None:
+    """`_upsert_dashboard` has three URL-trust branches: a relative path
+    (covered by every other dashboard test's own fixture shape), an
+    untrusted/malicious fallback (covered by the test directly above),
+    and this one -- a `url` already prefixed with `https://{ui_host}/`,
+    which review found had zero coverage despite being the one branch
+    whose slicing (`raw_url[len(f"https://{ui_host}") :]`) could silently
+    regress into the unsafe fallback without any test noticing.
+    """
+    scoped = {
+        "id": "abc-123",
+        "title": "Overview",
+        "description": "A dashboard",
+        "url": "https://app.datadoghq.com/dashboard/abc-123-custom-slug",
+        "modified_at": "2024-01-01T00:00:00Z",
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return _json_response({"dashboards": [scoped]})
+
+    adapter = DatadogAdapter(transport=httpx.MockTransport(handler))
+    adapter.backfill(seeded_account_context, "dashboard")
+
+    with engine.begin() as connection:
+        source_url = connection.execute(
+            text("SELECT source_url FROM datadog_dashboards WHERE workspace_id = :workspace_id"),
+            {"workspace_id": seeded_account_context.workspace_id},
+        ).scalar_one()
+    assert source_url == "https://app.datadoghq.com/dashboard/abc-123-custom-slug"
+
+
 def test_backfill_dashboards_single_unbounded_call(
     seeded_account_context: ConnectorAccountContext,
 ) -> None:
@@ -696,6 +826,39 @@ def test_rate_limit_gives_up_beyond_bounded_wait() -> None:
     assert "rate limit" in outcome.error_summary.lower()
 
 
+def test_rate_limit_gives_up_immediately_when_reset_header_absent() -> None:
+    """`_rate_limit_wait_seconds` returns `None` when `X-RateLimit-Reset`
+    is absent entirely -- a distinct code path from "present but too
+    large," untested here despite GitLab/Jira having the equivalent test
+    for their own identical `Retry-After`-absent case.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return _json_response({"errors": ["rate limited"]}, status_code=429)
+
+    adapter = DatadogAdapter(transport=httpx.MockTransport(handler), sleep=lambda seconds: None)
+    outcome = adapter.backfill(_account_context(), "monitor")
+    assert outcome.status == "partial"
+    assert outcome.items_processed == 0
+
+
+def test_rate_limit_gives_up_immediately_when_reset_header_malformed() -> None:
+    """`_rate_limit_wait_seconds`'s `except ValueError: return None` branch
+    for a non-numeric `X-RateLimit-Reset` value -- untested here despite
+    GitLab/Jira having the equivalent test.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return _json_response(
+            {"errors": ["rate limited"]}, status_code=429, headers={"X-RateLimit-Reset": "soon"}
+        )
+
+    adapter = DatadogAdapter(transport=httpx.MockTransport(handler), sleep=lambda seconds: None)
+    outcome = adapter.backfill(_account_context(), "monitor")
+    assert outcome.status == "partial"
+    assert outcome.items_processed == 0
+
+
 def test_rate_limit_still_limited_after_retry_reports_partial_not_failure() -> None:
     calls = {"count": 0}
 
@@ -741,6 +904,23 @@ def test_refresh_permissions_fails_open_on_network_error() -> None:
 
     adapter = DatadogAdapter(transport=httpx.MockTransport(handler))
     assert adapter.refresh_permissions(_account_context()) == "active"
+
+
+def test_refresh_permissions_returns_permission_lost_for_malformed_credential() -> None:
+    """`_parse_credential` is called before any network request; review
+    found this earlier, non-network branch of `refresh_permissions` (a
+    corrupted stored credential, e.g. from a botched encryption-key
+    rotation) had no test at all, unlike the already-covered
+    network-error and 403 branches.
+    """
+    context = ConnectorAccountContext(
+        workspace_id=uuid4(),
+        connector_account_id=uuid4(),
+        external_account_id="acc-1",
+        credential="not-a-valid-datadog-credential",
+    )
+    adapter = DatadogAdapter()
+    assert adapter.refresh_permissions(context) == "permission_lost"
 
 
 def test_disconnect_is_a_no_op() -> None:

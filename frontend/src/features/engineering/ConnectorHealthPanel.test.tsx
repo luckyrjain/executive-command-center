@@ -167,6 +167,39 @@ describe('ConnectorHealthPanel', () => {
     expect(JSON.parse(String((call?.[1] as RequestInit).body))).toEqual({ provider: 'github', credential: 'ghp_secret' })
   })
 
+  it('offers Datadog as a connectable provider, alongside every other real adapter', async () => {
+    // A team-concept whole-phase review found this list was correctly
+    // extended when GitLab/Jira were each added, but the Datadog connector
+    // (PR #85) never got the same treatment -- a workspace admin had no UI
+    // path to connect one at all despite full backend support.
+    const fetch = vi.fn(() => response({ connectors: [] }))
+    vi.stubGlobal('fetch', fetch)
+    renderPanel()
+
+    await screen.findByText('No connectors are configured for this workspace yet.')
+    const options = [...(screen.getByLabelText('Provider') as HTMLSelectElement).options].map((option) => option.value)
+    expect(options).toEqual(['github', 'gitlab', 'jira', 'datadog', 'sandbox'])
+  })
+
+  it('offers the Datadog resource types (monitor/service_definition/dashboard) for starting a sync', async () => {
+    const fetch = vi.fn((input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url.includes('/sync-runs')) return response({ sync_runs: [] })
+      return response({ connectors: [connector()] })
+    })
+    vi.stubGlobal('fetch', fetch)
+    renderPanel()
+
+    await screen.findByText('Acme GitHub')
+    const options = [...(screen.getByLabelText('Resource type for Acme GitHub') as HTMLSelectElement).options].map(
+      (option) => option.value,
+    )
+    expect(options).toEqual([
+      'repository', 'work_item', 'change', 'review', 'deployment', 'incident',
+      'monitor', 'service_definition', 'dashboard',
+    ])
+  })
+
   it('maps CONNECTOR_AUTHORIZATION_FAILED to a readable sentence, never the raw code', async () => {
     // The real backend's detail dict is `{"code": ..., "error": <message>}`
     // (`create_connector_endpoint`'s `AdapterAuthorizationError` handler),

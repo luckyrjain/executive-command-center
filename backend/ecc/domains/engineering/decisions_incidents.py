@@ -708,6 +708,12 @@ def decide_decision_endpoint(
             raise HTTPException(status_code=404, detail="DECISION_NOT_FOUND")
         if existing["status"] != "proposed":
             raise HTTPException(status_code=409, detail="DECISION_NOT_PROPOSED")
+        # Mirrors resolve_incident_endpoint's identical `resolved_at <
+        # detected_at` guard -- a whole-phase review found this endpoint had
+        # no equivalent check at all, so a decision could be "decided"
+        # before it was even proposed.
+        if payload.decided_at < existing["created_at"]:
+            raise HTTPException(status_code=422, detail="DECIDED_AT_BEFORE_CREATED_AT")
 
         rationale = payload.rationale if payload.rationale is not None else existing["rationale"]
         # `AND status = 'proposed'` makes this UPDATE the actual

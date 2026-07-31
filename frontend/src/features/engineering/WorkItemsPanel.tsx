@@ -17,7 +17,10 @@ function timestamp(value: string | null): string {
 }
 
 function listTeams(): Promise<EntityList> {
-  return apiRequest('/api/v1/knowledge/entities?kind=team&limit=100')
+  // See RepositoriesPanel.tsx's identical `listTeams` comment: without
+  // `status=active`, an archived/redirected (merged-away) team stays
+  // selectable here forever and 404s on confirm.
+  return apiRequest('/api/v1/knowledge/entities?kind=team&status=active&limit=100')
 }
 
 function assignTeam(
@@ -54,6 +57,14 @@ function TeamAssignment({
     onSuccess: () => { void queryClient.invalidateQueries({ queryKey: ['engineering', 'work-items'] }) },
   })
 
+  // See RepositoriesPanel.tsx's identical `TeamAssignment` comment: past
+  // 100 teams in a workspace (`listTeams`'s own `limit=100`, the backend's
+  // hard ceiling), an already-confirmed `team_entity_id` outside that page
+  // would otherwise leave the `<select>`'s controlled `value` matching no
+  // `<option>`, silently misrepresenting an assigned work item as
+  // unassigned.
+  const assignedTeamMissing = workItem.team_entity_id !== null && !teamsById.has(workItem.team_entity_id)
+
   return (
     <div className="work-actions">
       <label>
@@ -65,6 +76,9 @@ function TeamAssignment({
           onChange={(event) => mutation.mutate(event.target.value === '' ? null : event.target.value)}
         >
           <option value="">Unassigned</option>
+          {assignedTeamMissing ? (
+            <option value={workItem.team_entity_id ?? ''}>Assigned team (not in first 100)</option>
+          ) : null}
           {[...teamsById.entries()].map(([id, name]) => <option key={id} value={id}>{name}</option>)}
         </select>
       </label>
@@ -129,7 +143,7 @@ export default function WorkItemsPanel() {
   return (
     <section className="work-panel" aria-labelledby="engineering-work-items-title">
       <h2 id="engineering-work-items-title">Work items</h2>
-      <p>Every work item synced from a connected GitHub, GitLab, or Jira account, with its own permission and freshness state -- never rolled up into the connector account's own status.</p>
+      <p>Every work item synced from a connected Jira account (the only provider that populates work items), with its own permission and freshness state -- never rolled up into the connector account's own status.</p>
 
       <label>
         Filter by team
@@ -149,7 +163,7 @@ export default function WorkItemsPanel() {
         <p className="empty-state">
           {teamFilter
             ? 'No work items are assigned to this team yet.'
-            : 'No work items have synced yet. Connect a GitHub, GitLab, or Jira account and run a backfill from Connector health.'}
+            : 'No work items have synced yet. Connect a Jira account and run a backfill from Connector health.'}
         </p>
       ) : null}
 

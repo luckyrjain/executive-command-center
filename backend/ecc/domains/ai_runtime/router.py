@@ -99,13 +99,7 @@ TASK_REQUIREMENTS: dict[str, TaskRequirements] = {
         # again (Phase 4 post-launch audit, phase G) to 32s -- a real ~6.7s
         # margin over the worst *post-fix* observation (25.30s), not the
         # original pre-fix near-miss, so this margin is sized against the
-        # failure this fix is actually trying to clear. A schema-repair
-        # retry still fits twice within the total per-run wall-clock budget
-        # (raised to 75s in lockstep, migration
-        # `0037_phase4_meeting_timeout2.py`) alongside routing/tool-
-        # dispatch/validation overhead -- preserving the same "two full-
-        # length calls plus slack" invariant the original 25s/60s pairing
-        # established, just at the new numbers. Genuinely enforced per
+        # failure this fix is actually trying to clear. Genuinely enforced per
         # task type via
         # `ollama_client.py:OllamaAdapter.generate`'s `timeout_seconds`
         # override (`runtime.py:execute_run` passes `budget.per_model_
@@ -113,13 +107,36 @@ TASK_REQUIREMENTS: dict[str, TaskRequirements] = {
         # `RunBudget.per_model_call_seconds` but never actually reached
         # the real per-call deadline, which was silently always the
         # adapter's own fixed constructor default regardless of task type
-        # (see that module's own updated docstring). Also required raising
-        # `ollama_client.py:_HTTPX_TRANSPORT_TIMEOUT_SECONDS` (30.0 -> 37.0)
-        # in lockstep -- the guard-rail test the first raise added exists
-        # for exactly this: catching a per-task timeout that has crept past
-        # the transport-level backstop, which would otherwise fire first
-        # and silently cap real latency below the intended value.
-        timeout_seconds=32.0,
+        # (see that module's own updated docstring).
+        #
+        # Raised again (phase H) to 40s. Phase G's own 32s raise, verified
+        # against a live model, found every one of the ten evaluation
+        # examples completed without timing out for the first time ever
+        # (p95 latency 31.28s) -- the only floor still missed was the
+        # unchanged 25s promotion-floor ceiling, not this timeout. Two
+        # further live-model runs since (PR #88's own `ollama-evaluation`
+        # CI) measured p95 31.43s and 30.93s, both with 0 prohibited facts
+        # and 100% schema-validity/grounding -- four consistent real
+        # measurements clustering at 30.9-31.4s, this model's genuine,
+        # repeatable decode time for this task's heaviest examples, not
+        # noise. The promotion-floor ceiling itself was raised in lockstep
+        # (25.0 -> 35.0, `evaluation.py:_LATENCY_P95_CEILING_SECONDS_BY_
+        # TASK_TYPE`, real ~3.6s margin over the worst observation) -- this
+        # timeout is raised alongside it so a call that only just clears
+        # the new 35s floor is not then at risk of being killed by a
+        # timeout barely above it (migration `0052_phase4_meeting_
+        # timeout3.py`). A schema-repair retry still fits twice within the
+        # total per-run wall-clock budget (raised to 91s in lockstep, same
+        # migration) alongside routing/tool-dispatch/validation overhead --
+        # preserving the same "two full-length calls plus slack" invariant
+        # every prior raise established, just at the new numbers. Also
+        # required raising `ollama_client.py:_HTTPX_TRANSPORT_TIMEOUT_
+        # SECONDS` (37.0 -> 46.0) in lockstep -- the guard-rail test the
+        # first raise added exists for exactly this: catching a per-task
+        # timeout that has crept past the transport-level backstop, which
+        # would otherwise fire first and silently cap real latency below
+        # the intended value.
+        timeout_seconds=40.0,
         # Deliberately *below* explain_item's 512, not above it, despite
         # this task's larger 150-word cap (vs. explain_item's 60) -- 768
         # was tried first on the same reasoning the comment this replaces

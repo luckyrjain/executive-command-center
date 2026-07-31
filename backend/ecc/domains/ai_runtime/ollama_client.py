@@ -65,8 +65,8 @@ DEFAULT_PER_MODEL_CALL_TIMEOUT_SECONDS = 20.0
 # its source -- so this value cannot vary per call the way the manual
 # wall-clock deadline below can. It must stay a fixed ceiling comfortably
 # above every currently-registered task's own declared timeout (`router.py:
-# TASK_REQUIREMENTS` -- 20s/32s today) so a longer-than-`DEFAULT_PER_MODEL_
-# CALL_TIMEOUT_SECONDS` per-call override (`meeting.prep_summary`'s 32s) is
+# TASK_REQUIREMENTS` -- 20s/40s today) so a longer-than-`DEFAULT_PER_MODEL_
+# CALL_TIMEOUT_SECONDS` per-call override (`meeting.prep_summary`'s 40s) is
 # never silently cut short here first.
 #
 # This is a real, accepted trade-off, not a free backstop: for the common
@@ -86,8 +86,10 @@ DEFAULT_PER_MODEL_CALL_TIMEOUT_SECONDS = 20.0
 # post-launch audit, phase G) -- the audit's own review-caught lesson from
 # the original 20s -> 25s raise: this constant must move whenever the
 # largest per-task timeout does, or it silently becomes the thing that
-# actually fires first.
-_HTTPX_TRANSPORT_TIMEOUT_SECONDS = 37.0
+# actually fires first. Raised again, 37.0 -> 46.0, in lockstep with
+# `meeting.prep_summary`'s own 32s -> 40s raise (phase H, `router.py`'s own
+# updated comment on that field has the full real-CI-measurement history).
+_HTTPX_TRANSPORT_TIMEOUT_SECONDS = 46.0
 
 
 class OllamaCallTimeout(Exception):
@@ -221,6 +223,21 @@ class OllamaAdapter:
         zero-temperature decode should reduce, though this codebase's
         sandboxed CI is the only place that claim can actually be checked
         against the real model.
+
+        **Does not itself guarantee bit-identical output across separate
+        calls (phase I audit finding).** `test_execute_run_output_is_
+        reproducible_across_two_calls` (`tests/test_ai_runtime_evaluation_
+        live_ollama.py`) found, on its first-ever real run against genuine
+        Ollama output, that two calls against the identical prompt can
+        still produce two different (each individually valid) completions
+        -- reproduced identically across two independent CI runs, ruling
+        out one-off noise. `temperature=0`/`seed=0` makes each individual
+        token choice greedy given that call's own logits, but does not
+        control for engine-level floating-point non-associativity across
+        separate HTTP requests (e.g. differing batch/thread scheduling) on
+        this quantized model/inference stack -- a real, narrower guarantee
+        than this comment previously claimed. See `EVALUATION-CONTRACT.md`'s
+        own "Phase I" note for the full finding.
         """
         effective_timeout_seconds = (
             timeout_seconds if timeout_seconds is not None else self._timeout_seconds

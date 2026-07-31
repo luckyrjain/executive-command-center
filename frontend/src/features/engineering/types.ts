@@ -15,7 +15,7 @@ export type EngineeringView =
   | 'connector-health'
   | 'coverage'
 
-export type ConnectorProvider = 'github' | 'gitlab' | 'jira' | 'sandbox'
+export type ConnectorProvider = 'github' | 'gitlab' | 'jira' | 'datadog' | 'sandbox'
 
 export type ConnectorStatus =
   | 'pending'

@@ -934,6 +934,52 @@ def test_list_service_definitions_and_dashboards_cross_workspace_isolation(
         _cleanup_workspace(other_workspace_id)
 
 
+def test_list_service_definitions_and_dashboards_filter_by_team_entity_id(
+    query_endpoints_test_context: tuple[TestClient, UUID, UUID],
+) -> None:
+    """`list_monitors_endpoint`'s `team_entity_id` filter has its own
+    dedicated test (`test_list_monitors_cross_workspace_isolation_and_
+    team_entity_filter`); review found its two siblings on service
+    definitions and dashboards apply the identical clause but had no
+    equivalent test proving it actually narrows results rather than
+    silently being a no-op or erroring.
+    """
+    client, workspace_id, user_id = query_endpoints_test_context
+    account_id = _insert_connector_account(
+        workspace_id, user_id, provider="datadog", credential="dd"
+    )
+    team_id = _insert_team_entity(workspace_id)
+    mine_definition = _insert_datadog_service_definition(
+        workspace_id, account_id, name="mine-service"
+    )
+    _insert_datadog_service_definition(workspace_id, account_id, name="unassigned-service")
+    mine_dashboard = _insert_datadog_dashboard(workspace_id, account_id, title="Mine dashboard")
+    _insert_datadog_dashboard(workspace_id, account_id, title="Unassigned dashboard")
+    with engine.begin() as connection:
+        connection.execute(
+            text("UPDATE datadog_service_definitions SET team_entity_id = :team WHERE id = :id"),
+            {"team": team_id, "id": mine_definition},
+        )
+        connection.execute(
+            text("UPDATE datadog_dashboards SET team_entity_id = :team WHERE id = :id"),
+            {"team": team_id, "id": mine_dashboard},
+        )
+
+    filtered_definitions = client.get(
+        "/api/v1/engineering/service-definitions", params={"team_entity_id": str(team_id)}
+    )
+    assert filtered_definitions.status_code == 200, filtered_definitions.text
+    assert [d["name"] for d in filtered_definitions.json()["service_definitions"]] == [
+        "mine-service"
+    ]
+
+    filtered_dashboards = client.get(
+        "/api/v1/engineering/dashboards", params={"team_entity_id": str(team_id)}
+    )
+    assert filtered_dashboards.status_code == 200, filtered_dashboards.text
+    assert [d["title"] for d in filtered_dashboards.json()["dashboards"]] == ["Mine dashboard"]
+
+
 # --- team linkage (migration `0050_phase6_team_linkage.py`) ---------------
 #
 # "hybrid: auto-suggest, human confirms": `suggested_team_name` is exercised

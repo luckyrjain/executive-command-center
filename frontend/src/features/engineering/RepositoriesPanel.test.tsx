@@ -113,6 +113,20 @@ describe('RepositoriesPanel', () => {
 
   // --- team linkage (migration `0050_phase6_team_linkage.py`) -------------
 
+  it('excludes archived/redirected teams from the team picker', async () => {
+    // Without `status=active`, a team merged away via the Knowledge
+    // Platform's own resolution flow stayed selectable forever, and
+    // confirming it 404'd server-side with no explanation in the UI.
+    stubFetch({ repositories: [repository()] })
+    renderPanel()
+    await screen.findByText('acme/widgets')
+    const entitiesCall = (fetch as unknown as { mock: { calls: [RequestInfo | URL][] } }).mock.calls.find(([input]) =>
+      String(input).includes('/knowledge/entities'),
+    )
+    expect(entitiesCall).toBeTruthy()
+    expect(String(entitiesCall?.[0])).toContain('status=active')
+  })
+
   it('shows the suggested team name as a hint when unassigned', async () => {
     stubFetch({ repositories: [repository({ suggested_team_name: 'acme' })] })
     renderPanel()
@@ -128,6 +142,20 @@ describe('RepositoriesPanel', () => {
     await screen.findByText('acme/widgets')
     expect(screen.queryByText(/suggested:/)).toBeNull()
     expect((screen.getByLabelText('Team for acme/widgets') as HTMLSelectElement).value).toBe('team-1')
+  })
+
+  it('still shows the correct assignment when the confirmed team is outside the first 100 fetched', async () => {
+    // `listTeams` fetches at most 100 teams; a repository confirmed to a
+    // team outside that page must not silently render as "Unassigned" --
+    // the `<select>`'s controlled `value` needs an `<option>` to match.
+    stubFetch({
+      repositories: [repository({ team_entity_id: 'team-not-in-page' })],
+      teams: [{ id: 'team-1', canonical_name: 'Platform Engineering' }],
+    })
+    renderPanel()
+    const select = (await screen.findByLabelText('Team for acme/widgets')) as HTMLSelectElement
+    expect(select.value).toBe('team-not-in-page')
+    expect(screen.getByText('Assigned team (not in first 100)')).toBeTruthy()
   })
 
   it('assigning a team from the dropdown posts the confirmed link and refetches', async () => {

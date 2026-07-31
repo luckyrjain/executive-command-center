@@ -140,4 +140,53 @@ describe('EngineeringOverview', () => {
     renderOverview()
     expect(await screen.findByRole('alert', {}, { timeout: 3000 })).toBeTruthy()
   })
+
+  // A whole-phase test-coverage review found only the connectors query's
+  // own `isError` path was exercised above -- the identical pattern
+  // (independent isError block per query) on incidents/decisions/metrics
+  // had zero coverage, the same "3 of 4 untested" bug class an earlier
+  // review already found and fixed once for a different panel set
+  // (ConnectorHealthPanel/IncidentsPanel/DecisionsPanel's own mutations).
+  // Each test below asserts the OTHER three sections still render their
+  // real data, proving the failure is scoped to its own query, not just
+  // that some alert appears somewhere.
+  it('surfaces an incidents load failure as its own alert, without hiding connector/decision/metric data', async () => {
+    vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url.includes('/incidents')) return Promise.reject(new TypeError('fetch failed'))
+      if (url.includes('/decisions')) return response({ decisions: [] })
+      return emptyResponseFor(url)
+    }))
+    renderOverview()
+    expect(await screen.findByRole('alert', {}, { timeout: 3000 })).toBeTruthy()
+    expect(await screen.findByText('0 connected. All healthy.')).toBeTruthy()
+    expect(await screen.findByText('0 awaiting a decision.')).toBeTruthy()
+    expect(screen.queryByText(/open\./)).toBeNull()
+  })
+
+  it('surfaces a decisions load failure as its own alert, without hiding connector/incident/metric data', async () => {
+    vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url.includes('/decisions')) return Promise.reject(new TypeError('fetch failed'))
+      return emptyResponseFor(url)
+    }))
+    renderOverview()
+    expect(await screen.findByRole('alert', {}, { timeout: 3000 })).toBeTruthy()
+    expect(await screen.findByText('0 connected. All healthy.')).toBeTruthy()
+    expect(await screen.findByText('0 open.')).toBeTruthy()
+    expect(screen.queryByText(/awaiting a decision\./)).toBeNull()
+  })
+
+  it('surfaces a metrics load failure as its own alert, without hiding connector/incident/decision data', async () => {
+    vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url.includes('/metrics')) return Promise.reject(new TypeError('fetch failed'))
+      return emptyResponseFor(url)
+    }))
+    renderOverview()
+    expect(await screen.findByRole('alert', {}, { timeout: 3000 })).toBeTruthy()
+    expect(await screen.findByText('0 connected. All healthy.')).toBeTruthy()
+    expect(await screen.findByText('0 open.')).toBeTruthy()
+    expect(await screen.findByText('0 awaiting a decision.')).toBeTruthy()
+  })
 })

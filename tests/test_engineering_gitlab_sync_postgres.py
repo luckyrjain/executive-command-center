@@ -364,6 +364,80 @@ def test_backfill_suggested_team_name_handles_bare_string_namespace(
     assert suggested == "Acme Group"
 
 
+def test_incremental_resync_refreshes_suggestion_without_touching_confirmed_team(
+    seeded_account_context: ConnectorAccountContext,
+) -> None:
+    """A confirmed `team_entity_id` (set only through `POST .../repositories/
+    {id}/team`, never by a sync) must survive indefinitely across re-syncs,
+    even as `suggested_team_name` keeps refreshing from the provider's own
+    latest payload -- the same regression `github_adapter`'s own test file
+    proves, exercised here since `_upsert_repository`'s `ON CONFLICT ... DO
+    UPDATE` clause is authored per-adapter, not shared.
+    """
+    projects = [_project(1, path="acme/a", updated_at="2024-01-03T00:00:00Z", namespace="Acme")]
+    adapter = GitLabAdapter(transport=httpx.MockTransport(lambda r: _json_response(projects)))
+    adapter.backfill(seeded_account_context, "repository")
+
+    confirmed_team_id = uuid4()
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO pkos_nodes (id, workspace_id, node_type, canonical_name, "
+                "status, confidence, version, created_at, updated_at) "
+                "VALUES (:id, :workspace_id, 'team', 'Platform', 'active', 1.0, 1, :now, :now)"
+            ),
+            {
+                "id": confirmed_team_id,
+                "workspace_id": seeded_account_context.workspace_id,
+                "now": datetime.now(UTC),
+            },
+        )
+        connection.execute(
+            text(
+                "UPDATE repositories SET team_entity_id = :team_id "
+                "WHERE workspace_id = :workspace_id"
+            ),
+            {"team_id": confirmed_team_id, "workspace_id": seeded_account_context.workspace_id},
+        )
+
+    projects_renamed = [
+        _project(1, path="acme/a", updated_at="2024-01-04T00:00:00Z", namespace="Acme Renamed")
+    ]
+    adapter2 = GitLabAdapter(
+        transport=httpx.MockTransport(lambda r: _json_response(projects_renamed))
+    )
+    adapter2.incremental_sync(seeded_account_context, "repository", "2024-01-03T00:00:00Z")
+
+    try:
+        with engine.begin() as connection:
+            row = connection.execute(
+                text(
+                    "SELECT suggested_team_name, team_entity_id FROM repositories "
+                    "WHERE workspace_id = :workspace_id"
+                ),
+                {"workspace_id": seeded_account_context.workspace_id},
+            ).one()
+        assert row.suggested_team_name == "Acme Renamed"
+        assert row.team_entity_id == confirmed_team_id
+    finally:
+        # `seeded_account_context`'s own teardown doesn't know about the
+        # `pkos_nodes` row this test inserted directly -- clearing
+        # `repositories.team_entity_id` first, then the node itself,
+        # avoids leaving the fixture's own `DELETE FROM workspaces` blocked
+        # by the FK this test's own `UPDATE` created.
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    "UPDATE repositories SET team_entity_id = NULL "
+                    "WHERE workspace_id = :workspace_id"
+                ),
+                {"workspace_id": seeded_account_context.workspace_id},
+            )
+            connection.execute(
+                text("DELETE FROM pkos_nodes WHERE id = :id"), {"id": confirmed_team_id}
+            )
+
+
 def test_backfill_paginates_via_link_header(
     seeded_account_context: ConnectorAccountContext,
 ) -> None:
