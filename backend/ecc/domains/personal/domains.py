@@ -111,10 +111,17 @@ RETENTION_NUDGE_DAYS: dict[Classification, int | None] = {
 # likely to contain real sensitive content; `contact_name`/`relationship_
 # type`/`interaction_type` are structured and low-sensitivity, so they stay
 # plaintext/queryable per design doc Decision 3's "encrypt the narrative,
-# not the whole row" tradeoff.
+# not the whole row" tradeoff. `health`'s own `vital_reading`/`symptom_log`
+# record types (Task 6, `DATA-MODEL.md`'s Task 6 section) follow the exact
+# same split -- `symptom_description` is the field name `DOMAIN-PRIVACY-
+# CONTRACT.md`'s own "Encryption fields (resolved)" section already named
+# as this domain's worked example, kept consistent here rather than
+# introducing a differently-named field at implementation time.
 _ENCRYPTED_FIELD_NAMES_BY_RECORD_TYPE: dict[str, frozenset[str]] = {
     "contact": frozenset({"notes"}),
     "interaction": frozenset({"notes"}),
+    "vital_reading": frozenset({"notes"}),
+    "symptom_log": frozenset({"symptom_description", "notes"}),
 }
 
 _REDACTED_PLACEHOLDER = "***encrypted***"
@@ -843,6 +850,13 @@ class RecordCreateRequest(BaseModel):
     payload: dict[str, Any] = Field(default_factory=dict)
     effective_at: datetime | None = None
     domain_source_id: UUID | None = None
+    # Design doc's "Retention (resolved)": every `high_stakes` `domain_
+    # records` row requires `retention_acknowledged_at` set at creation
+    # time -- consent affirmed per record, not only once at domain
+    # enablement. Ignored (never required, but still honestly recorded if
+    # supplied) for `standard`/`sensitive` domains, where this
+    # per-record acknowledgement has no defined meaning.
+    retention_acknowledged: bool = False
 
 
 class RecordPatch(BaseModel):
@@ -924,7 +938,9 @@ def create_record_endpoint(
             decrypted["payload"] = _decrypt_payload(cached["record_type"], cached["payload"])
             return RecordResponse.model_validate(decrypted)
 
-        require_enabled_domain(session, auth, payload.domain_key)
+        domain = require_enabled_domain(session, auth, payload.domain_key)
+        if domain.classification == "high_stakes" and not payload.retention_acknowledged:
+            raise HTTPException(status_code=422, detail="RETENTION_ACKNOWLEDGEMENT_REQUIRED")
 
         record_id = uuid4()
         effective_at = payload.effective_at or now
@@ -934,12 +950,12 @@ def create_record_endpoint(
                 """
                 INSERT INTO domain_records (
                     id, workspace_id, owner_id, domain_key, record_type, payload,
-                    domain_source_id, effective_at, created_by, updated_by,
-                    created_at, updated_at, version
+                    domain_source_id, effective_at, retention_acknowledged_at,
+                    created_by, updated_by, created_at, updated_at, version
                 ) VALUES (
                     :id, :workspace_id, :owner_id, :domain_key, :record_type,
                     CAST(:payload AS jsonb), :domain_source_id, :effective_at,
-                    :actor_id, :actor_id, :now, :now, 1
+                    :retention_acknowledged_at, :actor_id, :actor_id, :now, :now, 1
                 )
                 """
             ),
@@ -952,6 +968,7 @@ def create_record_endpoint(
                 "payload": dumps(encrypted_payload),
                 "domain_source_id": payload.domain_source_id,
                 "effective_at": effective_at,
+                "retention_acknowledged_at": now if payload.retention_acknowledged else None,
                 "now": now,
                 "actor_id": auth.user_id,
             },
