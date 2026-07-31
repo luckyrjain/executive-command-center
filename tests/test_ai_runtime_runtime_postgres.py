@@ -497,10 +497,10 @@ def test_execute_run_end_to_end_happy_path_persists_completed_run(run_context: d
     assert run.model_id == "qwen2.5:1.5b-instruct-q4_K_M"
     assert run.provider == "ollama"
     assert run.prompt_id == "attention.explain_item.v1"
-    # version=2 (migration `0053_phase4_explain_item_prompt_v2.py`), not the
-    # original seeded version=1 -- this task type's currently active prompt
-    # content, whatever version that happens to be.
-    assert run.prompt_version == 2
+    # version=3 (migration `0055_phase4_expl_item_prompt_v3.py`), not the
+    # original seeded version=1 or version=2 -- this task type's currently
+    # active prompt content, whatever version that happens to be.
+    assert run.prompt_version == 3
     assert run.output is not None
     assert run.output["cited_factor_codes"] == ["overdue", "pinned"]
     assert run.attempts == 1

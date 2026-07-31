@@ -33,10 +33,10 @@ function buildRun(body) {
     model_id: 'qwen2.5:1.5b-instruct-q4_K_M',
     provider: 'ollama',
     prompt_id: 'attention.explain_item.v1',
-    // version=2 (backend migration 0053_phase4_explain_item_prompt_v2.py
-    // activated it over the original seed's version=1) -- this mock
-    // reflects the real active state.
-    prompt_version: 2,
+    // version=3 (backend migration 0055_phase4_expl_item_prompt_v3.py
+    // activated it over version=2) -- this mock reflects the real
+    // active state.
+    prompt_version: 3,
     evidence: ['overdue'],
     output: { explanation_text: 'Overdue by two days, which is why it is ranked near the top.', cited_factor_codes: ['overdue'] },
     error_code: null,
@@ -121,7 +121,7 @@ export async function run({ page, baseURL }) {
 
   await section.getByText('Overdue by two days, which is why it is ranked near the top.').waitFor()
   await section.getByText(/qwen2\.5:1\.5b-instruct-q4_K_M/).waitFor()
-  await section.getByText(/prompt v2/i).waitFor()
+  await section.getByText(/prompt v3/i).waitFor()
   // The cited factor is cross-referenced back to the same evidence text
   // already visible in the deterministic factor list above it.
   await needsAction.getByLabel('Evidence for Finish the board memo').getByText('Overdue by 2 days').waitFor()

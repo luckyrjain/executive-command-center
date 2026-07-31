@@ -150,10 +150,10 @@ def test_attention_explain_item_passes_every_evaluation_floor_against_real_model
     with SessionFactory() as session:
         run = run_evaluation(
             _TASK_TYPE,
-            # version=2 (migration 0053_phase4_explain_item_prompt_v2.py
-            # activated it over the original seed's version=1) -- the
-            # currently active prompt version for this task type.
-            2,
+            # version=3 (migration 0055_phase4_expl_item_prompt_v3.py
+            # activated it over version=2) -- the currently active prompt
+            # version for this task type.
+            3,
             _MODEL_ID,
             session=session,
             auth=run_context["auth"],

@@ -44,10 +44,10 @@ function run(overrides: Partial<AiRunResponse> = {}): AiRunResponse {
     model_id: 'qwen2.5:1.5b-instruct-q4_K_M',
     provider: 'ollama',
     prompt_id: 'attention.explain_item.v1',
-    // version=2 (backend migration 0053_phase4_explain_item_prompt_v2.py
-    // activated it over the original seed's version=1), not this prompt
-    // id's original version -- this mock reflects the real active state.
-    prompt_version: 2,
+    // version=3 (backend migration 0055_phase4_expl_item_prompt_v3.py
+    // activated it over version=2), not this prompt id's original
+    // version -- this mock reflects the real active state.
+    prompt_version: 3,
     evidence: ['overdue'],
     output: { explanation_text: 'Overdue by two days and pinned for follow-up.', cited_factor_codes: ['overdue'] },
     error_code: null,
@@ -138,7 +138,7 @@ describe('AttentionExplanation', () => {
     await waitFor(() => expect(screen.getByText('Overdue by two days and pinned for follow-up.')).toBeTruthy())
     expect(screen.getByText(/Overdue by 2 days/)).toBeTruthy()
     expect(screen.getByText(/qwen2\.5:1\.5b-instruct-q4_K_M/)).toBeTruthy()
-    expect(screen.getByText(/prompt v2/i)).toBeTruthy()
+    expect(screen.getByText(/prompt v3/i)).toBeTruthy()
     expect(screen.getByText(/does not change/i)).toBeTruthy()
 
     fireEvent.click(screen.getByRole('button', { name: 'Discard AI explanation' }))

@@ -424,12 +424,14 @@ def test_tool_definitions_partial_unique_index_rejects_second_active_row(
 
 
 def test_prompt_versions_seeded_row() -> None:
-    """`attention.explain_item.v1` now has two rows -- the original migration
-    `0029` seed (version=1, retired) and migration `0053_phase4_explain_
-    item_prompt_v2.py`'s content-change row (version=2, active) -- so this
-    asserts against the currently-active row specifically, not `.one()`
-    across every version, and separately proves the retired row is still
-    there rather than replaced (this table's own immutability contract).
+    """`attention.explain_item.v1` now has three rows -- the original
+    migration `0029` seed (version=1, retired), migration `0053_phase4_
+    explain_item_prompt_v2.py`'s content-change row (version=2, retired by
+    migration `0055_phase4_expl_item_prompt_v3.py`), and migration `0055`'s
+    own row (version=3, active) -- so this asserts against the currently-
+    active row specifically, not `.one()` across every version, and
+    separately proves every retired row is still there rather than replaced
+    (this table's own immutability contract).
     """
     with engine.connect() as connection:
         rows = (
@@ -444,13 +446,13 @@ def test_prompt_versions_seeded_row() -> None:
             .mappings()
             .all()
         )
-    assert [row["version"] for row in rows] == [1, 2]
-    assert [row["status"] for row in rows] == ["retired", "active"]
+    assert [row["version"] for row in rows] == [1, 2, 3]
+    assert [row["status"] for row in rows] == ["retired", "retired", "active"]
     for row in rows:
         assert row["input_schema_ref"] == "attention.explain_item.input.v1"
         assert row["output_schema_ref"] == "attention.explain_item.output.v1"
         assert len(row["template_hash"]) == 64
-    assert rows[0]["template_hash"] != rows[1]["template_hash"]
+    assert len({row["template_hash"] for row in rows}) == 3
 
 
 def test_tool_definitions_seeded_rows() -> None:
@@ -526,11 +528,11 @@ def test_get_active_prompt_reads_the_seeded_row() -> None:
     with SessionFactory() as session:
         active = ai_prompts.get_active_prompt(session, SEEDED_PROMPT_ID)
         assert active is not None
-        # version=2 (migration `0053_phase4_explain_item_prompt_v2.py`
-        # activated it over the original migration `0029` seed), not the
-        # module-level constant's own version=1 -- whatever version is
-        # currently active for this prompt id.
-        assert active.version == 2
+        # version=3 (migration `0055_phase4_expl_item_prompt_v3.py`
+        # activated it over migration `0053_phase4_explain_item_prompt_v2.
+        # py`'s version=2), not the module-level constant's own version=1
+        # -- whatever version is currently active for this prompt id.
+        assert active.version == 3
         assert active.status == "active"
         assert ai_prompts.get_active_prompt(session, "nonexistent.prompt") is None
 
