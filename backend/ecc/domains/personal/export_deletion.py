@@ -38,7 +38,7 @@ from sqlalchemy.orm import Session
 
 from ecc.auth import AuthContext, AuthDep, CsrfDep
 
-from .domains import DomainKey, SessionDep, get_domain
+from .domains import DomainKey, SessionDep, _decrypt_payload, get_domain
 
 router = APIRouter(prefix="/api/v1/personal", tags=["personal"])
 
@@ -87,6 +87,14 @@ def export_domain_endpoint(
     later task, disclosed rather than silently substituted by this one
     JSON shape (clear field names, not a compressed/internal format, keep
     it reasonably legible in the meantime).
+
+    Each `domain_records` row's `payload` is decrypted (Task 4,
+    `ecc.domains.personal.domains._decrypt_payload`) before being included
+    here -- an explicit, user-initiated export of the owner's own data is
+    exactly the kind of single-purpose request design doc Decision 3 means
+    by "only a single-record fetch returns the decrypted value"; returning
+    ciphertext in a "human-readable" export would defeat the export's own
+    purpose.
     """
     if get_domain(session, auth, domain_key) is None:
         raise HTTPException(status_code=404, detail="DOMAIN_NOT_FOUND")
@@ -115,13 +123,16 @@ def export_domain_endpoint(
             "AND c.owner_id = :owner_id ORDER BY c.occurred_at ASC",
             params,
         ),
-        domain_records=_rows(
-            session,
-            "SELECT id, record_type, payload, effective_at, created_at FROM domain_records "
-            "WHERE workspace_id = :workspace_id AND owner_id = :owner_id "
-            "AND domain_key = :domain_key ORDER BY effective_at ASC",
-            params,
-        ),
+        domain_records=[
+            {**record, "payload": _decrypt_payload(record["record_type"], record["payload"])}
+            for record in _rows(
+                session,
+                "SELECT id, record_type, payload, effective_at, created_at FROM domain_records "
+                "WHERE workspace_id = :workspace_id AND owner_id = :owner_id "
+                "AND domain_key = :domain_key ORDER BY effective_at ASC",
+                params,
+            )
+        ],
     )
 
 

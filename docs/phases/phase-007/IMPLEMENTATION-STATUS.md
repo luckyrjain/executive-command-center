@@ -1,8 +1,8 @@
 ---
 id: PHASE-007-IMPLEMENTATION-STATUS
 title: Phase 7 Implementation Status
-status: Task 1 (domain/consent/vault framework and the habits reference domain), Task 2 (learning domain, no new code) and Task 3 (travel domain, effective-date-range query filter) complete
-version: 0.4.0
+status: Task 1 (domain/consent/vault framework and the habits reference domain), Task 2 (learning domain, no new code), Task 3 (travel domain, effective-date-range query filter) and Task 4 (relationships domain, first real field-level encryption) complete
+version: 0.5.0
 owner: Lucky Jain
 updated: 2026-07-31
 ---
@@ -14,11 +14,11 @@ Phase 7 began by repository-owner authorization to proceed in parallel with Phas
 | Slice | Status |
 |---|---|
 | Domain vault and consent model | Done -- Task 1 |
-| Manual capture, goals and routines | Done -- Task 1 (`habits` reference domain); `learning` (Task 2)/`travel` (Task 3) reuse the same generic `domain_records` mechanism with no `goals`/`routines`/`check_ins` convention of their own |
+| Manual capture, goals and routines | Done -- Task 1 (`habits` reference domain); `learning` (Task 2)/`travel` (Task 3)/`relationships` (Task 4) reuse the same generic `domain_records` mechanism with no `goals`/`routines`/`check_ins` convention of their own |
 | Import, provenance and retention | Partial -- `domain_sources`/retention-tier framework shipped in Task 1; `imported_file` source type has no real import path yet (manual entry only) |
 | Evidence-backed domain insights | Partial -- deterministic (non-AI) gap insights shipped in Task 1; AI-generated `trend`/`correlation` kinds deferred to Task 5 |
 | Cross-domain grants | Not started -- Task 5 |
-| Export, deletion and privacy controls | Done -- Task 1 (whole-domain export/delete, generic across every domain including `learning`) |
+| Export, deletion and privacy controls | Done -- Task 1 (whole-domain export/delete, generic across every domain including `learning`); Task 4 fixed export to decrypt `relationships`' encrypted fields rather than returning ciphertext |
 | UX, safety review and dogfood | Not started -- Task 8 |
 
 ## Task 1 evidence
@@ -41,8 +41,20 @@ Phase 7 began by repository-owner authorization to proceed in parallel with Phas
 
 **Verified.** `ruff check`/`ruff format --check`/`mypy backend` clean. `tests/test_personal_travel_postgres.py` + `tests/test_personal_learning_postgres.py` + `tests/test_personal_domains_postgres.py` -- 36 passed against real PostgreSQL, confirming the date-range filter addition does not regress either prior standard domain's own CRUD/export/delete paths.
 
+## Task 4 evidence
+
+**Complete.** `relationships` is `sensitive`-classified -- the first domain to actually populate `ecc.domains.personal.crypto` (Fernet, `ECC_PERSONAL_DATA_ENCRYPTION_KEY`, mirroring `ecc.domains.engineering.crypto`'s shape but `str`-typed since `domain_records.payload` is JSONB) rather than leave it deferred. `_ENCRYPTED_FIELD_NAMES_BY_RECORD_TYPE` (structurally present since Task 1, exercised against nothing until now) gains real entries: `contact`/`interaction` record types' own `notes` field. `_encrypt_payload`/`_decrypt_payload` wrap encryption immediately before `INSERT`/`UPDATE` and decryption only for single-record response paths (create/get/patch), leaving `list_records_endpoint`'s pre-existing `_redact_payload` untouched for list/summary views.
+
+**Two real gaps found and fixed before this was correct, not merely functional.** (1) `export_domain_endpoint` (`export_deletion.py`) read `domain_records.payload` directly, bypassing decryption -- for `relationships` this would have exported ciphertext instead of the human-readable export `DOMAIN-PRIVACY-CONTRACT.md` requires; fixed by decrypting each record's payload before it enters the export response (an explicit, user-initiated export of the owner's own data is exactly the "single-purpose request" design doc Decision 3 means). (2) The idempotency cache (`idempotency_records.response_body`) would otherwise have persisted the decrypted `notes` value verbatim on every create/update, defeating encryption-at-rest for that table entirely -- fixed by building the response stored via `store_idempotency` from the still-encrypted row, decrypting only the copy actually returned to the caller (and any later cache-hit replay, decrypted at read time, never written back).
+
+**Settings validation.** `ecc.config.Settings.personal_data_encryption_key` (`ECC_PERSONAL_DATA_ENCRYPTION_KEY`) added, structurally validated outside development by a new `_validate_personal_data_encryption_key`, mirroring `_validate_connector_token_encryption_key`'s exact checks (missing/placeholder/malformed-base64/wrong-decoded-length). `tests/test_production_security.py`'s shared production-settings fixture updated with a valid key so existing tests keep passing, plus four new dedicated rejection tests for the new key and a fix to `_reload_main`/`restore_main_module` (three real-app-reload tests were failing because the reloaded app now requires this key in a production-classified environment).
+
+**Tests.** `tests/test_personal_relationships_postgres.py` (9 tests) proves: enable/independent-domain isolation; `contact`/`interaction` record CRUD; `notes` is genuinely ciphertext in `domain_records.payload` at rest (verified via direct SQL against the table, not just the API response shape); list responses redact `notes` to a placeholder while get/create/patch return it decrypted; a PATCH re-encrypts new `notes` content; an idempotent replay returns the correct decrypted content to the caller while the persisted `idempotency_records` row itself never holds the decrypted value (verified via direct SQL); whole-domain export returns decrypted `notes` and deletion still removes the encrypted records.
+
+**Verified.** `ruff check` clean (this sandbox's globally-installed `ruff` is newer than the repo's pinned 0.12.3 and has a real formatter bug that corrupts a multi-exception `except` clause under `ruff format` -- verified the affected line by hand and confirmed `ruff check`, which CI actually runs, passes cleanly). `mypy backend` clean (155 source files). `tests/test_personal_relationships_postgres.py` + `tests/test_personal_domains_postgres.py` + `tests/test_personal_learning_postgres.py` + `tests/test_personal_travel_postgres.py` + `tests/test_production_security.py` -- 92 passed, 2 skipped. Full backend suite (excluding the two live-Ollama files and the known pre-existing sandbox-load-sensitive performance-budget test files) -- 1423 passed, 9 skipped, no failures outside that already-documented flaky category.
+
 ## What remains before Phase 7 itself can exit
 
-- Tasks 4-8 per the implementation plan: `relationships` (first `sensitive` domain, first real encryption caller), `cross_domain_grants` and the first AI-generated insight (gated on a new Phase 4 evaluation floor), `health`/`finance` (`high_stakes`, the safety rubric enforced against real diagnostic/financial-advice risk for the first time), executive UX and browser acceptance.
+- Tasks 5-8 per the implementation plan: `cross_domain_grants` and the first AI-generated insight (gated on a new Phase 4 evaluation floor), `health`/`finance` (`high_stakes`, the safety rubric enforced against real diagnostic/financial-advice risk for the first time), executive UX and browser acceptance.
 - Privacy impact assessment and safety-rubric fixture sets are re-triggered per domain as each ships (design doc Decision 2's own standard), not assumed to carry over automatically from `habits`.
 - No promotion/exit decision has been made for Phase 7 as a whole -- one task's evidence is a first confirming signal for the framework, not phase completion.
