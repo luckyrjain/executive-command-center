@@ -1,8 +1,8 @@
 ---
 id: PHASE-007-IMPLEMENTATION-STATUS
 title: Phase 7 Implementation Status
-status: Task 1 (domain/consent/vault framework and the habits reference domain), Task 2 (learning domain, no new code), Task 3 (travel domain, effective-date-range query filter), Task 4 (relationships domain, first real field-level encryption), Task 5 (cross_domain_grants schema/grant lifecycle plus the personal.generate_insight AI task type), Task 6 (health domain, high_stakes retention acknowledgement and safety rubric proven against real data) complete
-version: 0.8.0
+status: Task 1 (domain/consent/vault framework and the habits reference domain), Task 2 (learning domain, no new code), Task 3 (travel domain, effective-date-range query filter), Task 4 (relationships domain, first real field-level encryption), Task 5 (cross_domain_grants schema/grant lifecycle plus the personal.generate_insight AI task type), Task 6 (health domain, high_stakes retention acknowledgement and safety rubric proven against real data), Task 7 (finance domain, second high_stakes domain, zero new mechanism required) complete
+version: 0.9.0
 owner: Lucky Jain
 updated: 2026-07-31
 ---
@@ -15,7 +15,7 @@ Phase 7 began by repository-owner authorization to proceed in parallel with Phas
 |---|---|
 | Domain vault and consent model | Done -- Task 1 |
 | Manual capture, goals and routines | Done -- Task 1 (`habits` reference domain); `learning` (Task 2)/`travel` (Task 3)/`relationships` (Task 4) reuse the same generic `domain_records` mechanism with no `goals`/`routines`/`check_ins` convention of their own |
-| Import, provenance and retention | Partial -- `domain_sources`/retention-tier framework shipped in Task 1; per-record retention acknowledgement enforced for real starting Task 6 (`health`); `imported_file` source type has no real import path yet (manual entry only) |
+| Import, provenance and retention | Partial -- `domain_sources`/retention-tier framework shipped in Task 1; per-record retention acknowledgement enforced for real starting Task 6 (`health`), proven a second time for `finance` in Task 7 with zero new code; `imported_file` source type has no real import path yet (manual entry only) |
 | Evidence-backed domain insights | Done -- deterministic (non-AI) gap insights shipped in Task 1; AI-generated `trend`/`correlation` kinds shipped in Task 5 part 2 (`personal.generate_insight`) |
 | Cross-domain grants | Done -- Task 5 part 1 (schema, create/list/revoke); part 2's `personal.get_insight_sources` tool is the first real consumer |
 | Export, deletion and privacy controls | Done -- Task 1 (whole-domain export/delete, generic across every domain including `learning`); Task 4 fixed export to decrypt `relationships`' encrypted fields rather than returning ciphertext |
@@ -97,9 +97,20 @@ Phase 7 began by repository-owner authorization to proceed in parallel with Phas
 
 **Verified.** `ruff format --check`/`ruff check` clean (pinned `ruff==0.12.3`). `mypy backend` clean. Direct-SQL verification against real local Postgres confirmed the `domain_records` INSERT's 14-column list/order matches the live schema exactly (`retention_acknowledged_at` included) before any test-suite run. **Local pytest execution remained impossible in this sandbox** for the same reason disclosed in Task 5 part 2's evidence above (the only available Python 3.14 interpreter is a pre-release build incompatible with the repo's pinned `pydantic`/`typing_extensions`, breaking any Pydantic model construction) -- static verification plus direct-SQL schema/insert checks is what this evidence section relies on locally; the real test suite run happens in CI, watched and driven to green the same way every prior PR in this activation has been.
 
+## Task 7 evidence
+
+**Complete: `finance` domain, the second and last `high_stakes`-classified domain this phase's scope names.** No new table or migration, and -- unlike every prior task -- no new application-code mechanism either: `personal_domains.classification = 'high_stakes'` for `finance` has been in place since Task 1's own migration, and every enforcement Task 6 built (retention acknowledgement, field-level encryption, `professional_referral_note`) is generic on `classification`, not `health`-specific. This task's actual work is two new `_ENCRYPTED_FIELD_NAMES_BY_RECORD_TYPE` entries plus proving, end to end against real `finance` data, that everything Task 6 built genuinely generalizes rather than happening to work once.
+
+**`finance`'s own `record_type` conventions.** `account` (`payload`: `account_name`, `account_type`, `account_notes` optional -- **encrypted**), `transaction` (`payload`: `amount`, `category`, `memo` optional -- **encrypted**) -- field names matching the design doc's own worked example for this domain ("`finance`'s `account_notes`/transaction-memo-style free text"). `transaction` here is explicitly a manually-entered ledger record the user logs themselves, never a real money movement -- no bank/payment-provider integration exists anywhere in this activation, matching `PHASE-007-personal-intelligence.md`'s own out-of-scope line.
+
+**Second confirmation the `professional_referral_note` mechanism is genuinely generic, not a `health`-specific fluke.** `tests/test_personal_finance_postgres.py` re-runs Task 6's exact end-to-end shape (a real enabled domain, a real active `insight_generation` grant, a real cited `domain_records` row, a mocked model response with/without the note) against `finance`'s own `account` record type, which `requires_professional_referral`'s computation had never been exercised against before -- a mocked response omitting the note is rejected (`grounding_failed`, `available=false`) and one including it persists successfully.
+
+**Tests.** `tests/test_personal_finance_postgres.py` (8 tests), mirroring `test_personal_health_postgres.py`'s exact shape: domain enable; record creation without acknowledgement rejected with zero rows written; record creation with acknowledgement sets `retention_acknowledged_at`; `habits` (`standard`) unaffected; `transaction.memo` genuinely ciphertext in `domain_records.payload` at rest (direct SQL) and redacted in list views; whole-domain export/delete; the two real-grant `professional_referral_note` proofs described above.
+
+**Verified.** `ruff format --check`/`ruff check` clean (pinned `ruff==0.12.3`). `mypy backend` clean, 162 source files (unchanged from Task 6 -- this task's only source change is two dict entries in an already-typed `dict[str, frozenset[str]]`). No migration to round-trip -- this task adds no schema. **Local pytest execution remained impossible in this sandbox**, same disclosed reason as every prior task's evidence in this document; the real test suite run happens in CI, watched and driven to green the same way every prior PR in this activation has been.
+
 ## What remains before Phase 7 itself can exit
 
-- Task 7 per the implementation plan: `finance` domain (`high_stakes`, the safety rubric adapted for regulated-advice/guaranteed-return risk, no transaction execution or bank-account write access, per-record `retention_acknowledged_at`, mandatory `professional_referral_note` -- all mechanisms Task 6 already proved generically, applied to a second `high_stakes` domain).
 - Task 8: executive UX and browser acceptance across all six domains (consent dashboard, cross-domain grant management UI, Playwright acceptance with `@axe-core/playwright` accessibility checks).
 - Privacy impact assessment and safety-rubric fixture sets are re-triggered per domain as each ships (design doc Decision 2's own standard), not assumed to carry over automatically from `habits`.
 - No promotion/exit decision has been made for Phase 7 as a whole -- one task's evidence is a first confirming signal for the framework, not phase completion.

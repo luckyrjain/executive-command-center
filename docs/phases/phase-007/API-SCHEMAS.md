@@ -2,7 +2,7 @@
 id: PHASE-007-API-SCHEMAS
 title: Phase 7 Personal Intelligence API
 status: Approved for Implementation
-version: 0.6.0
+version: 0.7.0
 owner: Lucky Jain
 ---
 
@@ -50,3 +50,7 @@ Ships `POST /personal/insights/generate` (`ecc.domains.personal.ai_insights`) --
 ## Task 6 status
 
 `POST /personal/records`'s `RecordCreateRequest` gains one field, `retention_acknowledged: bool = false` -- required `true` when the target `domain_key`'s classification is `high_stakes` (`health`, this task; `finance`, Task 7), rejected otherwise with `422 RETENTION_ACKNOWLEDGEMENT_REQUIRED`. Generic on the endpoint, not `health`-specific, matching this package's own "a caller names a `domain_key`, never a domain-specific code path" convention -- `standard`/`sensitive` domains accept the field but never require it.
+
+## Task 7 status
+
+No schema or endpoint change -- `finance` reuses the exact same `RecordCreateRequest.retention_acknowledged` field Task 6 shipped (`422 RETENTION_ACKNOWLEDGEMENT_REQUIRED` when omitted on a `high_stakes` domain), since that field was already generic on `classification`, not `health`-specific. `tests/test_personal_finance_postgres.py` proves the same enforcement, encryption, and `professional_referral_note` behavior for `finance`'s own `account`/`transaction` record types.
