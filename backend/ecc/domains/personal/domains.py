@@ -890,12 +890,26 @@ def list_records_endpoint(
     auth: AuthDep,
     session: SessionDep,
     domain_key: Annotated[DomainKey | None, Query()] = None,
+    # `travel` (Task 3) is the first domain whose records are meaningfully
+    # time-ranged (a trip's own `effective_at` is its start date) --
+    # generic rather than travel-specific, since any domain's records can
+    # already carry an `effective_at`, matching this module's existing
+    # "a caller names a domain_key, never a domain-specific code path"
+    # convention (this module's own docstring).
+    effective_from: Annotated[datetime | None, Query()] = None,
+    effective_until: Annotated[datetime | None, Query()] = None,
 ) -> RecordListResponse:
     params: dict[str, Any] = {"workspace_id": auth.workspace_id, "owner_id": auth.user_id}
     where = "workspace_id = :workspace_id AND owner_id = :owner_id"
     if domain_key is not None:
         where += " AND domain_key = :domain_key"
         params["domain_key"] = domain_key
+    if effective_from is not None:
+        where += " AND effective_at >= :effective_from"
+        params["effective_from"] = effective_from
+    if effective_until is not None:
+        where += " AND effective_at <= :effective_until"
+        params["effective_until"] = effective_until
     rows = (
         session.execute(
             text(
