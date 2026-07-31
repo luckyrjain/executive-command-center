@@ -16,6 +16,7 @@ Two independent surfaces are covered here:
 
 from __future__ import annotations
 
+import base64
 import importlib
 import os
 import secrets
@@ -54,6 +55,11 @@ VALID_PROD_SECRET = secrets.token_urlsafe(40)
 # needs a real Fernet key alongside the existing session secret/CORS origin,
 # the same way it already needed those two.
 VALID_CONNECTOR_TOKEN_KEY = Fernet.generate_key().decode()
+# Phase 7 Personal Intelligence Task 4: same shape, for the separate
+# `ECC_PERSONAL_DATA_ENCRYPTION_KEY` (`_validate_personal_data_encryption_
+# key`) -- a distinct key from the connector one above, per
+# `Settings.personal_data_encryption_key`'s own field comment.
+VALID_PERSONAL_DATA_KEY = Fernet.generate_key().decode()
 
 
 def _settings(**overrides: object) -> Settings:
@@ -79,6 +85,7 @@ def _settings(**overrides: object) -> Settings:
         "session_secret": VALID_PROD_SECRET,
         "cors_origins": "https://app.example.com",
         "connector_token_encryption_key": VALID_CONNECTOR_TOKEN_KEY,
+        "personal_data_encryption_key": VALID_PERSONAL_DATA_KEY,
     }
     base.update(overrides)
     return Settings.model_construct(**base)  # type: ignore[arg-type]
@@ -112,6 +119,42 @@ def test_rejects_known_placeholder_session_secret_in_production() -> None:
 
 def test_rejects_env_example_placeholder_secret_in_production() -> None:
     settings = _settings(session_secret="replace-with-a-random-secret-at-least-32-characters-long")
+
+    with pytest.raises(ConfigurationError):
+        validate_production_settings(settings)
+
+
+# ---------------------------------------------------------------------------
+# validate_production_settings: missing/malformed ECC_PERSONAL_DATA_ENCRYPTION_KEY
+# ---------------------------------------------------------------------------
+
+
+def test_rejects_missing_personal_data_encryption_key_in_production() -> None:
+    settings = _settings(personal_data_encryption_key="")
+
+    with pytest.raises(ConfigurationError):
+        validate_production_settings(settings)
+
+
+def test_rejects_placeholder_personal_data_encryption_key_in_production() -> None:
+    settings = _settings(personal_data_encryption_key="development-only-placeholder-key")
+
+    with pytest.raises(ConfigurationError):
+        validate_production_settings(settings)
+
+
+def test_rejects_malformed_personal_data_encryption_key_in_production() -> None:
+    settings = _settings(personal_data_encryption_key="not-a-valid-base64-fernet-key!!!")
+
+    with pytest.raises(ConfigurationError):
+        validate_production_settings(settings)
+
+
+def test_rejects_wrong_length_personal_data_encryption_key_in_production() -> None:
+    # Valid urlsafe-base64, but decodes to fewer than the 32 bytes a real
+    # Fernet key requires.
+    short_key = base64.urlsafe_b64encode(b"too-short").decode()
+    settings = _settings(personal_data_encryption_key=short_key)
 
     with pytest.raises(ConfigurationError):
         validate_production_settings(settings)
@@ -255,6 +298,7 @@ def _reload_main(monkeypatch: pytest.MonkeyPatch, environment: str | None) -> Mo
     monkeypatch.setenv("ECC_SESSION_SECRET", VALID_PROD_SECRET)
     monkeypatch.setenv("ECC_CORS_ORIGINS", "https://app.example.com")
     monkeypatch.setenv("ECC_CONNECTOR_TOKEN_ENCRYPTION_KEY", VALID_CONNECTOR_TOKEN_KEY)
+    monkeypatch.setenv("ECC_PERSONAL_DATA_ENCRYPTION_KEY", VALID_PERSONAL_DATA_KEY)
     config_module.get_settings.cache_clear()
     return importlib.reload(main_module)
 
@@ -273,6 +317,7 @@ def restore_main_module() -> Iterator[None]:
         "ECC_CORS_ORIGINS",
         "ECC_SESSION_SECRET",
         "ECC_CONNECTOR_TOKEN_ENCRYPTION_KEY",
+        "ECC_PERSONAL_DATA_ENCRYPTION_KEY",
     )
     prior_values = {name: os.environ.get(name) for name in restore_vars}
 

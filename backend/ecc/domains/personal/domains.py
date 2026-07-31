@@ -28,17 +28,30 @@ call. `cross_domain_grants` (purpose-scoped grants distinct from a
 domain's own top-level consent) are a real, separate future concept --
 Decision 1 item 5 -- not conflated with this collapsing.
 
-**`domain_records` encryption is out of this module's scope for Task 1.**
-`habits` (this task's own reference domain) is `standard`-classified, so
-no record this module writes here has any encrypted field -- `ecc.
-domains.personal.crypto` does not exist yet, deferred to the task that
-first needs it (`relationships`). `_ENCRYPTED_FIELD_NAMES_BY_RECORD_TYPE`
-below is the mechanism a later domain plugs into (redacting a listed
-field name from `payload` in list/summary responses, returning it only
-from a single-record fetch) -- empty for every `record_type` this task
-registers, proven structurally correct now against nothing, so the later
-task adding a real encrypted field only has to populate the mapping and
-call `encrypt_field`/`decrypt_field`, not design the redaction path itself.
+**`domain_records` field-level encryption (Task 4, `relationships`).**
+`habits`/`learning`/`travel` are `standard`-classified, so no record this
+module wrote before Task 4 had any encrypted field -- `_ENCRYPTED_FIELD_
+NAMES_BY_RECORD_TYPE` was empty and `_redact_payload` was a structural
+no-op proven against nothing. `relationships` is `sensitive`-classified
+and the first domain to populate that mapping for real (`contact`/
+`interaction` record types' own `notes` field, `DATA-MODEL.md`'s Task 4
+section). `_encrypt_payload`/`_decrypt_payload` below wrap `ecc.domains.
+personal.crypto.encrypt_field`/`decrypt_field`: encryption happens once,
+immediately before `INSERT`/`UPDATE`, so the plaintext form this module
+receives from a request is never itself persisted for an encrypted field;
+decryption happens only for the single-record response paths (create/
+get/patch) -- `list_records_endpoint` keeps using `_redact_payload`
+instead, matching design doc Decision 3: "only a single-record fetch
+returns the decrypted value." The idempotency cache (`idempotency_
+records.response_body`) is a persisted store the decrypted value must
+never reach either (matching `crypto.py`'s own "never logged, returned by
+an unrelated API response, or written into an audit/outbox payload"
+discipline) -- `create_record_endpoint`/`update_record_endpoint` both
+build the response used for `store_idempotency` from the still-encrypted
+row, and decrypt only the copy actually returned to the caller; a cache
+hit (`load_cached`) decrypts the cached, still-encrypted response the
+same way before returning it, so a replayed idempotent request sees the
+same decrypted content as the original call without ever persisting it.
 """
 
 from dataclasses import dataclass
@@ -56,6 +69,7 @@ from sqlalchemy.orm import Session
 
 from ecc.auth import AuthContext, AuthDep, CsrfDep
 from ecc.database import get_session
+from ecc.domains.personal.crypto import decrypt_field, encrypt_field
 from ecc.observability import (
     queue_lifecycle_event,
     record_audit_outbox_failure,
@@ -91,10 +105,17 @@ RETENTION_NUDGE_DAYS: dict[Classification, int | None] = {
 }
 
 # `record_type` -> the set of `payload` keys that are individually
-# encrypted for a `sensitive`/`high_stakes` domain. Empty for every
-# `record_type` this task registers (`habits` is `standard`) -- see module
-# docstring.
-_ENCRYPTED_FIELD_NAMES_BY_RECORD_TYPE: dict[str, frozenset[str]] = {}
+# encrypted for a `sensitive`/`high_stakes` domain -- see module docstring.
+# `relationships`' own `contact`/`interaction` record types (Task 4,
+# `DATA-MODEL.md`'s Task 4 section): `notes` is the free-text field most
+# likely to contain real sensitive content; `contact_name`/`relationship_
+# type`/`interaction_type` are structured and low-sensitivity, so they stay
+# plaintext/queryable per design doc Decision 3's "encrypt the narrative,
+# not the whole row" tradeoff.
+_ENCRYPTED_FIELD_NAMES_BY_RECORD_TYPE: dict[str, frozenset[str]] = {
+    "contact": frozenset({"notes"}),
+    "interaction": frozenset({"notes"}),
+}
 
 _REDACTED_PLACEHOLDER = "***encrypted***"
 
@@ -113,6 +134,41 @@ def _redact_payload(record_type: str, payload: dict[str, Any]) -> dict[str, Any]
     if not encrypted_fields:
         return payload
     return {k: (_REDACTED_PLACEHOLDER if k in encrypted_fields else v) for k, v in payload.items()}
+
+
+def _encrypt_payload(record_type: str, payload: dict[str, Any]) -> dict[str, Any]:
+    """Called immediately before `INSERT`/`UPDATE` on `create_record_
+    endpoint`/`update_record_endpoint` -- the plaintext form of an
+    encrypted field is never itself persisted. A missing or non-`str`
+    value for a listed field is left as-is (an optional encrypted field
+    the caller simply didn't supply, e.g. `notes` on a `contact` record
+    with no notes yet, has nothing to encrypt).
+    """
+    encrypted_fields = _ENCRYPTED_FIELD_NAMES_BY_RECORD_TYPE.get(record_type, frozenset())
+    if not encrypted_fields:
+        return payload
+    result = dict(payload)
+    for field in encrypted_fields:
+        value = result.get(field)
+        if isinstance(value, str) and value:
+            result[field] = encrypt_field(value)
+    return result
+
+
+def _decrypt_payload(record_type: str, payload: dict[str, Any]) -> dict[str, Any]:
+    """Inverse of `_encrypt_payload` -- called only for the single-record
+    response paths (create/get/patch), never list/summary or anything
+    persisted (the module docstring's idempotency-cache note explains why).
+    """
+    encrypted_fields = _ENCRYPTED_FIELD_NAMES_BY_RECORD_TYPE.get(record_type, frozenset())
+    if not encrypted_fields:
+        return payload
+    result = dict(payload)
+    for field in encrypted_fields:
+        value = result.get(field)
+        if isinstance(value, str) and value:
+            result[field] = decrypt_field(value)
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -826,12 +882,18 @@ def create_record_endpoint(
         lock_idempotency(session, auth, idempotency_key)
         cached = load_cached(session, auth, idempotency_key, req_hash, domain="personal_record")
         if cached is not None:
-            return RecordResponse.model_validate(cached)
+            # `cached["payload"]` is still in its encrypted-at-rest form
+            # (see module docstring) -- decrypt only the copy returned to
+            # this caller, never the persisted idempotency record itself.
+            decrypted = dict(cached)
+            decrypted["payload"] = _decrypt_payload(cached["record_type"], cached["payload"])
+            return RecordResponse.model_validate(decrypted)
 
         require_enabled_domain(session, auth, payload.domain_key)
 
         record_id = uuid4()
         effective_at = payload.effective_at or now
+        encrypted_payload = _encrypt_payload(payload.record_type, payload.payload)
         session.execute(
             text(
                 """
@@ -852,7 +914,7 @@ def create_record_endpoint(
                 "owner_id": auth.user_id,
                 "domain_key": payload.domain_key,
                 "record_type": payload.record_type,
-                "payload": dumps(payload.payload),
+                "payload": dumps(encrypted_payload),
                 "domain_source_id": payload.domain_source_id,
                 "effective_at": effective_at,
                 "now": now,
@@ -861,7 +923,6 @@ def create_record_endpoint(
         )
         row = _get_record_row(session, auth, record_id)
         assert row is not None
-        response = RecordResponse(**row)
         write_side_effects(
             session,
             auth,
@@ -873,15 +934,22 @@ def create_record_endpoint(
             version=1,
             now=now,
         )
+        # `row["payload"]` is still encrypted -- this is the form persisted
+        # to the idempotency cache (module docstring's own note on why the
+        # decrypted value must never reach that table). Only the response
+        # actually returned to this caller is decrypted, built afterward.
+        stored_response = RecordResponse(**row)
         store_idempotency(
             session,
             auth,
             idempotency_key,
             req_hash,
-            response.model_dump(mode="json"),
+            stored_response.model_dump(mode="json"),
             now,
             response_status=status.HTTP_201_CREATED,
         )
+        row["payload"] = _decrypt_payload(row["record_type"], row["payload"])
+        response = RecordResponse(**row)
         return response
 
 
@@ -934,6 +1002,7 @@ def get_record_endpoint(record_id: UUID, auth: AuthDep, session: SessionDep) -> 
     row = _get_record_row(session, auth, record_id)
     if row is None:
         raise HTTPException(status_code=404, detail="RECORD_NOT_FOUND")
+    row["payload"] = _decrypt_payload(row["record_type"], row["payload"])
     return RecordResponse(**row)
 
 
@@ -953,7 +1022,11 @@ def update_record_endpoint(
         lock_idempotency(session, auth, idempotency_key)
         cached = load_cached(session, auth, idempotency_key, req_hash, domain="personal_record")
         if cached is not None:
-            return RecordResponse.model_validate(cached)
+            # See create_record_endpoint's identical note -- `cached["payload"]`
+            # is still encrypted-at-rest; decrypt only the returned copy.
+            decrypted = dict(cached)
+            decrypted["payload"] = _decrypt_payload(cached["record_type"], cached["payload"])
+            return RecordResponse.model_validate(decrypted)
 
         existing = _get_record_row(session, auth, record_id, for_update=True)
         if existing is None:
@@ -961,6 +1034,7 @@ def update_record_endpoint(
         if existing["version"] != payload.expected_version:
             raise HTTPException(status_code=409, detail="VERSION_CONFLICT")
 
+        encrypted_payload = _encrypt_payload(existing["record_type"], payload.payload)
         session.execute(
             text(
                 """
@@ -970,7 +1044,7 @@ def update_record_endpoint(
                 """
             ),
             {
-                "payload": dumps(payload.payload),
+                "payload": dumps(encrypted_payload),
                 "now": now,
                 "actor_id": auth.user_id,
                 "id": record_id,
@@ -978,7 +1052,6 @@ def update_record_endpoint(
         )
         row = _get_record_row(session, auth, record_id)
         assert row is not None
-        response = RecordResponse(**row)
         write_side_effects(
             session,
             auth,
@@ -990,7 +1063,12 @@ def update_record_endpoint(
             version=row["version"],
             now=now,
         )
+        # Same "encrypted form persisted, decrypted form returned" split as
+        # create_record_endpoint.
+        stored_response = RecordResponse(**row)
         store_idempotency(
-            session, auth, idempotency_key, req_hash, response.model_dump(mode="json"), now
+            session, auth, idempotency_key, req_hash, stored_response.model_dump(mode="json"), now
         )
+        row["payload"] = _decrypt_payload(row["record_type"], row["payload"])
+        response = RecordResponse(**row)
         return response

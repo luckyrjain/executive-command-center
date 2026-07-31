@@ -77,6 +77,21 @@ class Settings(BaseSettings):
     connector_token_encryption_key: str = Field(
         default="", validation_alias="ECC_CONNECTOR_TOKEN_ENCRYPTION_KEY"
     )
+    # Phase 7 Personal Intelligence Task 4 (design doc Decision 3): the
+    # Fernet key `ecc.domains.personal.crypto` uses to encrypt `sensitive`/
+    # `high_stakes` domain_records.payload fields at rest. Deliberately a
+    # separate key from `connector_token_encryption_key` -- a personal-data
+    # key rotation (a user requesting re-encryption of their own vault) and
+    # a connector-credential key rotation (a suspected token leak) are two
+    # different operational events with two different triggers; sharing one
+    # key would couple them, the same reasoning connector_token_encryption_
+    # key's own field comment already gives relative to session_secret.
+    # Empty by default -- outside development, validate_production_settings
+    # below fails closed rather than let a sensitive personal field be
+    # written unencrypted or under a guessed key.
+    personal_data_encryption_key: str = Field(
+        default="", validation_alias="ECC_PERSONAL_DATA_ENCRYPTION_KEY"
+    )
 
     @property
     def cors_origin_list(self) -> list[str]:
@@ -169,6 +184,7 @@ def validate_production_settings(settings: Settings) -> None:
     _validate_session_secret(settings.session_secret)
     _validate_cors_origins(settings.cors_origin_list)
     _validate_connector_token_encryption_key(settings.connector_token_encryption_key)
+    _validate_personal_data_encryption_key(settings.personal_data_encryption_key)
 
 
 def _validate_session_secret(secret: str) -> None:
@@ -233,5 +249,37 @@ def _validate_connector_token_encryption_key(key: str) -> None:
     if len(decoded) != 32:
         raise ConfigurationError(
             "ECC_CONNECTOR_TOKEN_ENCRYPTION_KEY must decode to exactly 32 bytes "
+            "(a Fernet key), like the output of `Fernet.generate_key()`."
+        )
+
+
+def _validate_personal_data_encryption_key(key: str) -> None:
+    """Same structural check as `_validate_connector_token_encryption_key`,
+    for the separate Phase 7 personal-data key -- see
+    `Settings.personal_data_encryption_key`'s own field comment for why
+    this is a distinct key rather than reusing the connector one.
+    """
+    if not key:
+        raise ConfigurationError(
+            "ECC_PERSONAL_DATA_ENCRYPTION_KEY must be set outside development "
+            "(generate one with `Fernet.generate_key()`)."
+        )
+    lowered = key.casefold()
+    for marker in _PLACEHOLDER_SECRET_MARKERS:
+        if marker in lowered:
+            raise ConfigurationError(
+                "ECC_PERSONAL_DATA_ENCRYPTION_KEY looks like a development placeholder "
+                f"(matched {marker!r}); generate a real key with `Fernet.generate_key()` "
+                "before deploying outside development."
+            )
+    try:
+        decoded = urlsafe_b64decode(key.encode("ascii"))
+    except (ValueError, TypeError) as exc:
+        raise ConfigurationError(
+            "ECC_PERSONAL_DATA_ENCRYPTION_KEY must be a valid urlsafe-base64 Fernet key."
+        ) from exc
+    if len(decoded) != 32:
+        raise ConfigurationError(
+            "ECC_PERSONAL_DATA_ENCRYPTION_KEY must decode to exactly 32 bytes "
             "(a Fernet key), like the output of `Fernet.generate_key()`."
         )
