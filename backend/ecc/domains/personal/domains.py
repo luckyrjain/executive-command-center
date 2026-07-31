@@ -124,6 +124,18 @@ def _classification_for(domain_key: str) -> Classification:
     return _CLASSIFICATION_BY_DOMAIN[domain_key]
 
 
+def classification_for(domain_key: str) -> Classification:
+    """Public wrapper over `_classification_for` -- for other domain-package
+    modules that need a source domain's classification without duplicating
+    `_CLASSIFICATION_BY_DOMAIN` (Task 5 part 2's `insight_tools.py:get_
+    insight_sources_tool`, which must know whether any source domain a
+    cross-domain insight drew from is `high_stakes` before the AI runtime
+    can require a `professional_referral_note`; `evaluation.py`'s own
+    synthetic-source seeding for this same task type).
+    """
+    return _classification_for(domain_key)
+
+
 def _redact_payload(record_type: str, payload: dict[str, Any]) -> dict[str, Any]:
     """Used only by list/summary responses -- a single-record fetch
     (`get_record_endpoint`) returns `payload` unredacted. Matches design
@@ -169,6 +181,29 @@ def _decrypt_payload(record_type: str, payload: dict[str, Any]) -> dict[str, Any
         if isinstance(value, str) and value:
             result[field] = decrypt_field(value)
     return result
+
+
+def decrypt_record_payload(record_type: str, payload: dict[str, Any]) -> dict[str, Any]:
+    """Public wrapper over `_decrypt_payload` -- for other domain-package
+    modules that need a cross-domain record's payload decrypted the same
+    way a single-record fetch/export already does (Task 5 part 2's
+    `insight_tools.py:get_insight_sources_tool`: a model reasoning about a
+    granted domain's records must see the real content, never the
+    `_redact_payload` placeholder `list_records_endpoint` returns).
+    """
+    return _decrypt_payload(record_type, payload)
+
+
+def encrypt_record_payload(record_type: str, payload: dict[str, Any]) -> dict[str, Any]:
+    """Public wrapper over `_encrypt_payload` -- for `evaluation.py`'s own
+    synthetic-source seeding for `personal.generate_insight` (Task 5 part
+    2), which must persist `domain_records.payload` encrypted at rest
+    exactly like a real write would, so the evaluation harness genuinely
+    exercises the tool's own decrypt-before-prompting path rather than
+    handing the model already-plaintext synthetic data no real record
+    would ever have.
+    """
+    return _encrypt_payload(record_type, payload)
 
 
 # ---------------------------------------------------------------------------

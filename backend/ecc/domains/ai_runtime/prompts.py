@@ -373,7 +373,9 @@ def _store_idempotency(
 # gated -- this remains scoped to prompt families with an evaluation
 # dataset registered, not every prompt family this codebase might ever
 # register.
-_GATED_PROMPT_IDS = frozenset({"attention.explain_item.v1", "meeting.prep_summary.v1"})
+_GATED_PROMPT_IDS = frozenset(
+    {"attention.explain_item.v1", "meeting.prep_summary.v1", "personal.generate_insight.v1"}
+)
 
 
 def _prompt_evaluation_floor_met(
@@ -423,6 +425,7 @@ def _prompt_evaluation_floor_met(
 _GATED_PROMPT_ID_TASK_TYPES = {
     "attention.explain_item.v1": "attention.explain_item",
     "meeting.prep_summary.v1": "meeting.prep_summary",
+    "personal.generate_insight.v1": "personal.generate_insight",
 }
 
 

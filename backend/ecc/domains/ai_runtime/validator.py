@@ -238,9 +238,20 @@ class GroundingFailure:
     check only covers the structurally-checkable citation list, matching
     Decision 9's own scoping: "checkable structurally, not just by human/
     LLM judgment").
+
+    `reason` also covers `personal.generate_insight`'s second, distinct
+    failure mode (`missing_professional_referral`, see `check_personal_
+    insight_grounding` below) -- reusing this one dataclass rather than
+    inventing a second, near-identical type for a check that is still
+    conceptually "did this output satisfy the structural safety
+    requirements it was shown enough to satisfy," just checking a
+    different field. `ungrounded_codes` is simply empty (`()`) for that
+    second reason; nothing in this dataclass claims the two reasons share
+    a meaning beyond both mapping to `execute_run`'s existing
+    `grounding_failed` error code.
     """
 
-    reason: Literal["ungrounded_citation"] = "ungrounded_citation"
+    reason: Literal["ungrounded_citation", "missing_professional_referral"] = "ungrounded_citation"
     ungrounded_codes: tuple[str, ...] = ()
 
 
@@ -365,4 +376,125 @@ def check_meeting_prep_grounding(
     ungrounded = tuple(id_ for id_ in output.cited_evidence_ids if id_ not in valid_ids)
     if ungrounded:
         return GroundingFailure(ungrounded_codes=ungrounded)
+    return None
+
+
+# ---------------------------------------------------------------------------
+# personal.generate_insight -- Phase 7 Task 5 part 2's `trend`/`correlation`
+# AI-generated insights (`docs/phases/phase-007/INSIGHT-CONTRACT.md`'s
+# safety rubric), the third task type this activation registers and the
+# first with a *conditional* structural requirement layered on top of
+# ordinary citation grounding: `professional_referral_note` must be
+# non-empty specifically when any source domain this insight actually drew
+# from is `high_stakes`-classified (`health`/`finance`).
+# ---------------------------------------------------------------------------
+
+_MAX_INSIGHT_EXPLANATION_WORDS = 120
+
+# Same defense-in-depth rationale as `_MAX_EXPLANATION_CHARS` above, scaled
+# to this schema's several free-text fields (a richer shape than either
+# prior task type's single scalar item/evidence-bundle explanation).
+_MAX_INSIGHT_TITLE_CHARS = 200
+_MAX_INSIGHT_EXPLANATION_CHARS = 3000
+_MAX_INSIGHT_SOURCE_PERIOD_CHARS = 200
+_MAX_INSIGHT_MISSING_DATA_CHARS = 500
+_MAX_INSIGHT_LIMITATIONS_CHARS = 1000
+_MAX_INSIGHT_REFERRAL_NOTE_CHARS = 500
+
+
+class PersonalInsightOutput(BaseModel):
+    """`{kind, title, explanation_text, cited_record_ids, source_period,
+    missing_data, confidence, limitations, professional_referral_note}` --
+    `INSIGHT-CONTRACT.md`'s safety rubric: "source period/missing
+    data/confidence/limitations are Pydantic-required fields on the
+    insight output schema, not a prompt-only instruction ... an insight
+    response omitting one fails schema validation and is never returned".
+    `extra="forbid"` matches every other task type's strict-mode intent.
+
+    `kind` is a closed **two**-value enum (`trend`/`correlation` only),
+    narrower than `personal_insights.kind`'s own five-value CHECK
+    constraint (`observation`/`reminder`/`planning_suggestion` are
+    deterministic-only kinds this task type never produces -- migration
+    `0054_phase7_personal_domains.py`'s Task 1 status: "trend/correlation
+    kinds (the only ones a model generates) are deferred..."). Deliberately
+    **no** numeric score/ranking/leaderboard field anywhere on this model
+    -- `INSIGHT-CONTRACT.md`'s "No insight kind computes or surfaces a
+    numeric relationship-health score, ranking or frequency leaderboard"
+    is enforced structurally, by this schema simply never having declared
+    such a field, not by a runtime check a future edit could bypass.
+
+    `missing_data` is a required non-empty string here, unlike the
+    deterministic `habits.py:InsightResponse.missing_data` (`str | None`,
+    genuinely absent for a computation with no gaps) -- this is a *model*
+    output schema, and asking a small instruction-following model to
+    correctly emit JSON `null` for "nothing missing" is a real, avoidable
+    reliability risk this schema sidesteps by requiring an explicit
+    statement either way (e.g. "none noted").
+
+    `professional_referral_note` is optional at the schema level (`None`
+    for a `standard`/`sensitive`-only insight, matching `INSIGHT-
+    CONTRACT.md`'s "absent on other domains' insights") -- the
+    *conditional* requirement ("non-empty specifically when any source
+    domain is `high_stakes`-classified") is enforced by `check_personal_
+    insight_grounding` below, after schema validation, since that
+    condition depends on which domains actually contributed to this
+    insight -- information only the caller (`runtime.py`, from the `personal.
+    get_insight_sources` tool's own output) has, not this schema.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    kind: Literal["trend", "correlation"]
+    title: str = Field(min_length=1, max_length=_MAX_INSIGHT_TITLE_CHARS)
+    explanation_text: str = Field(min_length=1, max_length=_MAX_INSIGHT_EXPLANATION_CHARS)
+    cited_record_ids: list[str] = Field(default_factory=list)
+    source_period: str = Field(min_length=1, max_length=_MAX_INSIGHT_SOURCE_PERIOD_CHARS)
+    missing_data: str = Field(min_length=1, max_length=_MAX_INSIGHT_MISSING_DATA_CHARS)
+    confidence: Literal["low", "medium", "high"]
+    limitations: str = Field(min_length=1, max_length=_MAX_INSIGHT_LIMITATIONS_CHARS)
+    professional_referral_note: str | None = Field(
+        default=None, max_length=_MAX_INSIGHT_REFERRAL_NOTE_CHARS
+    )
+
+    @field_validator("explanation_text")
+    @classmethod
+    def _max_word_count(cls, value: str) -> str:
+        word_count = len(value.split())
+        if word_count > _MAX_INSIGHT_EXPLANATION_WORDS:
+            raise ValueError(
+                f"explanation_text exceeds {_MAX_INSIGHT_EXPLANATION_WORDS} words "
+                f"(got {word_count})"
+            )
+        return value
+
+
+def check_personal_insight_grounding(
+    output: PersonalInsightOutput,
+    record_ids: Iterable[str],
+    *,
+    requires_professional_referral: bool = False,
+) -> GroundingFailure | None:
+    """`check_explain_item_grounding`'s exact citation-grounding pattern
+    (`cited_record_ids` against every `domain_records` id the `personal.
+    get_insight_sources` tool actually showed the model), plus one second,
+    independent check specific to this task type: `INSIGHT-CONTRACT.md`'s
+    "`health`/`finance`-classified insights require a non-empty
+    `professional_referral_note` field". `requires_professional_referral`
+    is supplied by the caller (`runtime.py`, computed from whether any
+    source domain the tool returned is `high_stakes`-classified) -- this
+    function has no database access and cannot re-derive it itself,
+    matching `check_explain_item_grounding`/`check_meeting_prep_
+    grounding`'s identical no-database-access discipline.
+
+    Citation grounding is checked first and returned immediately if it
+    fails -- an output that already cites a nonexistent record is rejected
+    on that basis alone, regardless of whether it also happens to include
+    a referral note.
+    """
+    valid_ids = set(record_ids)
+    ungrounded = tuple(code for code in output.cited_record_ids if code not in valid_ids)
+    if ungrounded:
+        return GroundingFailure(ungrounded_codes=ungrounded)
+    if requires_professional_referral and not (output.professional_referral_note or "").strip():
+        return GroundingFailure(reason="missing_professional_referral")
     return None

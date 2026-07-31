@@ -154,12 +154,33 @@ class InsightResponse(BaseModel):
     missing_data: str | None
     confidence: Confidence
     limitations: str
+    # `None` for every deterministic insight this module computes, and for
+    # any AI-generated (`trend`/`correlation`, Task 5 part 2) insight whose
+    # sources are all `standard`/`sensitive` -- non-empty specifically when
+    # a source is `high_stakes` (`INSIGHT-CONTRACT.md`'s safety rubric,
+    # enforced before persistence by `validator.py:check_personal_insight_
+    # grounding`, not by this response model).
+    professional_referral_note: str | None
     computed_at: datetime
     dismissed_at: datetime | None
 
 
 class InsightListResponse(BaseModel):
     insights: list[InsightResponse]
+
+
+class FeedbackCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    useful: bool
+    comment: str | None = Field(default=None, max_length=1000)
+
+
+class FeedbackResponse(BaseModel):
+    id: UUID
+    insight_id: UUID
+    useful: bool
+    comment: str | None
+    created_at: datetime
 
 
 def _get_goal_row(session: Session, auth: AuthContext, goal_id: UUID) -> dict[str, Any] | None:
@@ -571,8 +592,8 @@ def list_insights_endpoint(auth: AuthDep, session: SessionDep) -> InsightListRes
             session.execute(
                 text(
                     "SELECT id, domain_key, kind, title, evidence, source_period_start, "
-                    "source_period_end, missing_data, confidence, limitations, computed_at, "
-                    "dismissed_at FROM personal_insights "
+                    "source_period_end, missing_data, confidence, limitations, "
+                    "professional_referral_note, computed_at, dismissed_at FROM personal_insights "
                     "WHERE workspace_id = :workspace_id AND owner_id = :owner_id "
                     "AND dismissed_at IS NULL ORDER BY computed_at DESC"
                 ),
@@ -614,8 +635,9 @@ def dismiss_insight_endpoint(
             session.execute(
                 text(
                     "SELECT id, domain_key, kind, title, evidence, source_period_start, "
-                    "source_period_end, missing_data, confidence, limitations, computed_at, "
-                    "dismissed_at FROM personal_insights WHERE id = :id"
+                    "source_period_end, missing_data, confidence, limitations, "
+                    "professional_referral_note, computed_at, dismissed_at "
+                    "FROM personal_insights WHERE id = :id"
                 ),
                 {"id": insight_id},
             )
@@ -623,3 +645,73 @@ def dismiss_insight_endpoint(
             .one()
         )
         return InsightResponse(**dict(result))
+
+
+@router.post(
+    "/insights/{insight_id}/feedback",
+    response_model=FeedbackResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def feedback_insight_endpoint(
+    insight_id: UUID,
+    payload: FeedbackCreateRequest,
+    auth: AuthDep,
+    session: SessionDep,
+    _csrf: CsrfDep,
+) -> FeedbackResponse:
+    """`personal_insight_feedback` is a separate, append-only table with no
+    `kind` column of its own (migration `0059_phase7_personal_insight_
+    feedback.py`'s own docstring) -- structurally incapable of rewriting an
+    insight's own `kind`, matching `INSIGHT-CONTRACT.md`'s "`POST .../
+    feedback` never rewrites an insight's own `kind`". No idempotency-key
+    handling, matching `dismiss_insight_endpoint`'s own identical scope
+    (this module's docstring: personal content this lightweight gets the
+    same lighter treatment consistently across sibling endpoints).
+    """
+    now = datetime.now(UTC)
+    with session.begin():
+        row = (
+            session.execute(
+                text(
+                    "SELECT id FROM personal_insights "
+                    "WHERE workspace_id = :workspace_id AND owner_id = :owner_id AND id = :id"
+                ),
+                {"workspace_id": auth.workspace_id, "owner_id": auth.user_id, "id": insight_id},
+            )
+            .mappings()
+            .one_or_none()
+        )
+        if row is None:
+            raise HTTPException(status_code=404, detail="INSIGHT_NOT_FOUND")
+
+        feedback_id = uuid4()
+        session.execute(
+            text(
+                """
+                INSERT INTO personal_insight_feedback (
+                    id, workspace_id, owner_id, insight_id, useful, comment,
+                    created_by, created_at
+                ) VALUES (
+                    :id, :workspace_id, :owner_id, :insight_id, :useful, :comment,
+                    :actor_id, :now
+                )
+                """
+            ),
+            {
+                "id": feedback_id,
+                "workspace_id": auth.workspace_id,
+                "owner_id": auth.user_id,
+                "insight_id": insight_id,
+                "useful": payload.useful,
+                "comment": payload.comment,
+                "actor_id": auth.user_id,
+                "now": now,
+            },
+        )
+        return FeedbackResponse(
+            id=feedback_id,
+            insight_id=insight_id,
+            useful=payload.useful,
+            comment=payload.comment,
+            created_at=now,
+        )

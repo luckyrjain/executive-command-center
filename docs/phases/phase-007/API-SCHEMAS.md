@@ -2,7 +2,7 @@
 id: PHASE-007-API-SCHEMAS
 title: Phase 7 Personal Intelligence API
 status: Approved for Implementation
-version: 0.4.0
+version: 0.5.0
 owner: Lucky Jain
 ---
 
@@ -22,6 +22,7 @@ GET|POST /personal/grants
 POST /personal/grants/{id}/revoke
 GET /personal/insights
 POST /personal/insights/{id}/dismiss|feedback
+POST /personal/insights/generate
 ```
 
 Requests declare domain and purpose. APIs enforce consent and field policy server-side. Insight responses include kind, evidence, confidence, limitations, freshness and policy version. Health/finance suggestions never use diagnostic or guaranteed-return language.
@@ -37,3 +38,11 @@ Ships every route above except `/personal/insights/{id}/feedback` (deferred with
 ## Task 5 status (part 1 of 2)
 
 Ships `GET|POST /personal/grants`, `POST /personal/grants/{id}/revoke` (`ecc.domains.personal.grants`) -- the `cross_domain_grants` schema and grant lifecycle only, per the repository-owner-directed split (`DATA-MODEL.md`'s own Task 5 section). `POST /personal/grants` requires `source_domain_key` already be an enabled domain; `GET /personal/grants` supports optional `source_domain_key`/`active_only` query filters; revoke is idempotent. No route in this part reads or consumes a grant -- the `trend`/`correlation` AI-generated insight kinds that will are a separate, later PR (part 2).
+
+## Task 5 status (part 2 of 2)
+
+Ships `POST /personal/insights/generate` (`ecc.domains.personal.ai_insights`) -- the route that actually checks a grant before combining domains, gated behind `config.py:personal_ai_insight_generation_enabled` (default `False`). Request: `{source_domain_keys: [DomainKey, ...]}` (non-empty). Response: `{available: bool, insight: InsightResponse | null, error_code: string | null}` -- fail-open, matching `POST /meetings/{id}/prep`'s own enrichment response shape: a non-`completed` run (feature disabled, a requested domain lacking an active grant, no eligible model, a grounding/safety failure, ...) is `available=false` with that run's own `error_code`, never an HTTP error for a well-formed request. Idempotency-Key required, matching every other mutating route in this package.
+
+`POST /personal/insights/{id}/feedback` (`ecc.domains.personal.habits`, the same router `GET /personal/insights`/`POST .../dismiss` already live on) ships here, once a `trend`/`correlation` insight exists for feedback to attach to. Request: `{useful: bool, comment: string | null}`. Response: `{id, insight_id, useful, comment, created_at}` -- deliberately no `kind` field anywhere in this request/response pair, matching `INSIGHT-CONTRACT.md`'s "never rewrites an insight's own `kind`" structurally (`personal_insight_feedback` has no such column to expose).
+
+`InsightResponse` (`GET /personal/insights`'s existing shape) gains one field, `professional_referral_note: string | null` -- `null` for every deterministic insight and for any AI-generated insight whose sources are all `standard`/`sensitive`; non-empty specifically when a source is `high_stakes` (enforced before persistence, not by this response model).
