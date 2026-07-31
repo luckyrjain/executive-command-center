@@ -2,7 +2,7 @@
 id: PHASE-004-IMPLEMENTATION-STATUS
 title: Phase 4 Implementation Status
 status: Implemented (Tasks 0-21 of the first activation slice); both meeting.prep_summary's latency floor and attention.explain_item's prohibited-fact-count floor cleared on a real live-model run (phase H/I); a genuine gap in the temperature=0/seed=0 reproducibility guarantee found and the affected test corrected
-version: 0.17.0
+version: 0.18.0
 owner: Lucky Jain
 updated: 2026-07-30
 ---
@@ -49,6 +49,7 @@ Phase 4's design work and its six-task implementation plan (`docs/superpowers/pl
 | 19 | Audit closure: repository-owner acceptance of remaining floor misses as known limitations; Phase 5 parallel-start authorization | Done -- this commit |
 | 20 | Post-launch audit fixes, phase H: meeting.prep_summary's latency promotion-floor ceiling raised (25s -> 35s), backed by four consistent live-model measurements, and its timeout raised again (32s -> 40s) in lockstep | Done -- this commit |
 | 21 | Post-launch audit fixes, phase I: both phase H fixes verified against a real model (both floors now clear); test_execute_run_output_is_reproducible_across_two_calls's first-ever real run found strict output equality does not hold, weakened to a grounding-level assertion | Done -- this commit |
+| 22 | Post-launch audit, phase J: sparse_pack's intermittent schema_invalid investigated (ruled out a schema bug, confirmed the repair-retry path is already active, no raw response available to diagnose further); recorded as consistent with phase I's own reproducibility-gap finding, not independently patched | Done -- this commit |
 
 ### Task 1 evidence -- model/provider registry and router
 

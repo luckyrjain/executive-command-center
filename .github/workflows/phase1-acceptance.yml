@@ -56,7 +56,7 @@ jobs:
       - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
         with:
           version: 0.7.19
-      - name: Raise Postgres checkpoint threshold for this CI run
+      - name: Raise Postgres checkpoint threshold and autovacuum speed for this CI run
         # Default max_wal_size (1GB) is smaller than the aggregate WAL this
         # suite now generates (several tests each insert/delete 10k+ rows),
         # so Postgres logs "checkpoints are occurring too frequently" and
@@ -67,8 +67,23 @@ jobs:
         # wall-clock budget assertion. Raising max_wal_size lets WAL
         # accumulate further before a checkpoint is forced, matching
         # Postgres's own log hint. CI-only tuning, not an application change.
+        #
+        # A second, related contention source found investigating test_
+        # ranking_10000_eligible_entities_under_budget's own periodic p95
+        # spikes (Phase 3 post-launch audit): several tests upsert/delete
+        # 10,000+ rows repeatedly in a tight loop, pushing a table's dead-
+        # tuple count past autovacuum's default trigger within one or two
+        # calls -- a background autovacuum worker then contends with the
+        # suite's own foreground queries for I/O/CPU, throttled by the
+        # default cost-based delay into a longer overlap window than a
+        # burst workload like this one wants. Disabling the cost-based
+        # delay (not autovacuum itself) lets any triggered worker finish
+        # at full speed instead of spreading its I/O out over a longer
+        # window more likely to overlap this job's own performance-gate
+        # measurements.
         run: |
           PGPASSWORD=ecc psql -h localhost -U ecc -d ecc -c "ALTER SYSTEM SET max_wal_size = '4GB';"
+          PGPASSWORD=ecc psql -h localhost -U ecc -d ecc -c "ALTER SYSTEM SET autovacuum_vacuum_cost_delay = 0;"
           PGPASSWORD=ecc psql -h localhost -U ecc -d ecc -c "SELECT pg_reload_conf();"
       - run: uv sync --frozen --all-groups --python 3.14.6
       - run: uv run alembic -c backend/alembic.ini upgrade head
@@ -147,10 +162,11 @@ jobs:
       - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
         with:
           version: 0.7.19
-      - name: Raise Postgres checkpoint threshold for this CI run
+      - name: Raise Postgres checkpoint threshold and autovacuum speed for this CI run
         # See the identical step in the backup-restore job above for why.
         run: |
           PGPASSWORD=ecc psql -h localhost -U ecc -d ecc -c "ALTER SYSTEM SET max_wal_size = '4GB';"
+          PGPASSWORD=ecc psql -h localhost -U ecc -d ecc -c "ALTER SYSTEM SET autovacuum_vacuum_cost_delay = 0;"
           PGPASSWORD=ecc psql -h localhost -U ecc -d ecc -c "SELECT pg_reload_conf();"
       - run: uv sync --frozen --all-groups --python 3.14.6
       - run: uv run alembic -c backend/alembic.ini upgrade head
