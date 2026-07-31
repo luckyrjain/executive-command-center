@@ -29,6 +29,7 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import text
+from sqlalchemy.exc import SQLAlchemyError
 
 from ecc.config import get_settings
 from ecc.database import engine
@@ -306,6 +307,102 @@ def test_generate_insight_happy_path_persists_insight(
             )
         assert row["kind"] == "trend"
         assert row["professional_referral_note"] is None
+    finally:
+        get_settings.cache_clear()
+
+
+def test_generate_insight_idempotent_replay_returns_identical_response(
+    personal_test_context: tuple[TestClient, UUID, UUID, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A retried request with the same Idempotency-Key must return the
+    exact same `insight` (not generate a second row, not call the model a
+    second time), matching every other mutating endpoint in this
+    codebase's own idempotent-replay convention.
+    """
+    monkeypatch.setenv("ECC_PERSONAL_AI_INSIGHT_GENERATION_ENABLED", "true")
+    get_settings.cache_clear()
+    try:
+        client, workspace_id, owner_id, token = personal_test_context
+        record_id = _enable_and_grant_habits(
+            client, token, workspace_id=workspace_id, owner_id=owner_id
+        )
+        adapter = _mock_adapter_citing(record_id)
+        headers = _headers(token, "replay-key")
+        app.dependency_overrides[get_ollama_adapter] = lambda: adapter
+        try:
+            first = client.post(
+                "/api/v1/personal/insights/generate",
+                json={"source_domain_keys": ["habits"]},
+                headers=headers,
+            )
+            second = client.post(
+                "/api/v1/personal/insights/generate",
+                json={"source_domain_keys": ["habits"]},
+                headers=headers,
+            )
+        finally:
+            app.dependency_overrides.pop(get_ollama_adapter, None)
+
+        assert first.status_code == 200, first.text
+        assert second.status_code == 200, second.text
+        assert first.json()["insight"]["id"] == second.json()["insight"]["id"]
+
+        with engine.connect() as connection:
+            count = connection.execute(
+                text("SELECT count(*) FROM personal_insights WHERE workspace_id = :workspace_id"),
+                {"workspace_id": workspace_id},
+            ).scalar_one()
+        assert count == 1
+    finally:
+        get_settings.cache_clear()
+
+
+def test_generate_insight_idempotency_store_failure_still_returns_the_insight(
+    personal_test_context: tuple[TestClient, UUID, UUID, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The `personal_insights` row is committed in its own transaction,
+    separate from the idempotency-bookkeeping write -- a failure writing
+    only the bookkeeping record must not discard an insight the caller
+    already paid a real model call for. Mirrors `ai_runtime/runtime.py`'s
+    identical `test_post_ai_runs_idempotency_store_failure_still_returns_
+    the_completed_run` regression test.
+    """
+    import ecc.domains.personal.ai_insights as ai_insights_module
+
+    monkeypatch.setenv("ECC_PERSONAL_AI_INSIGHT_GENERATION_ENABLED", "true")
+    get_settings.cache_clear()
+    try:
+        client, workspace_id, owner_id, token = personal_test_context
+        record_id = _enable_and_grant_habits(
+            client, token, workspace_id=workspace_id, owner_id=owner_id
+        )
+        adapter = _mock_adapter_citing(record_id)
+
+        def _failing_store(*args: object, **kwargs: object) -> None:
+            raise SQLAlchemyError("simulated idempotency-record write failure")
+
+        monkeypatch.setattr(ai_insights_module, "store_idempotency", _failing_store)
+        app.dependency_overrides[get_ollama_adapter] = lambda: adapter
+        try:
+            resp = client.post(
+                "/api/v1/personal/insights/generate",
+                json={"source_domain_keys": ["habits"]},
+                headers=_headers(token, str(uuid4())),
+            )
+        finally:
+            app.dependency_overrides.pop(get_ollama_adapter, None)
+
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["available"] is True
+        assert body["insight"]["kind"] == "trend"
+
+        with engine.connect() as connection:
+            count = connection.execute(
+                text("SELECT count(*) FROM personal_insights WHERE workspace_id = :workspace_id"),
+                {"workspace_id": workspace_id},
+            ).scalar_one()
+        assert count == 1
     finally:
         get_settings.cache_clear()
 

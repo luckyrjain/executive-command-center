@@ -60,6 +60,7 @@ from uuid import UUID, uuid4
 from fastapi import APIRouter, Request
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import text
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from ecc.auth import AuthContext, AuthDep, CsrfDep
@@ -193,15 +194,18 @@ def generate_insight_endpoint(
             response = InsightGenerateResponse(
                 available=False, insight=None, error_code="feature_disabled"
             )
-            with session.begin():
-                store_idempotency(
-                    session,
-                    auth,
-                    idempotency_key,
-                    req_hash,
-                    response.model_dump(mode="json"),
-                    now,
-                )
+            try:
+                with session.begin():
+                    store_idempotency(
+                        session,
+                        auth,
+                        idempotency_key,
+                        req_hash,
+                        response.model_dump(mode="json"),
+                        now,
+                    )
+            except SQLAlchemyError:
+                pass
             return response
 
         # `data_class` (Decision 2's model-eligibility routing input, not a
@@ -231,15 +235,18 @@ def generate_insight_endpoint(
             response = InsightGenerateResponse(
                 available=False, insight=None, error_code=run.error_code
             )
-            with session.begin():
-                store_idempotency(
-                    session,
-                    auth,
-                    idempotency_key,
-                    req_hash,
-                    response.model_dump(mode="json"),
-                    now,
-                )
+            try:
+                with session.begin():
+                    store_idempotency(
+                        session,
+                        auth,
+                        idempotency_key,
+                        req_hash,
+                        response.model_dump(mode="json"),
+                        now,
+                    )
+            except SQLAlchemyError:
+                pass
             return response
 
         output = run.output
@@ -303,7 +310,22 @@ def generate_insight_endpoint(
             response = InsightGenerateResponse(
                 available=True, insight=InsightResponse(**dict(row)), error_code=None
             )
-            store_idempotency(
-                session, auth, idempotency_key, req_hash, response.model_dump(mode="json"), now
-            )
+
+        # A separate transaction, deliberately not sharing the block above:
+        # the `personal_insights` row is already committed by this point --
+        # losing only the idempotency bookkeeping record on a transient
+        # failure here must not unwind an already-successful generation the
+        # caller already paid a real model call for. Mirrors `ai_runtime/
+        # runtime.py:create_run`'s identical `try`/`except SQLAlchemyError`
+        # shape and its own documented residual risk (a same-key retry
+        # after this exact failure won't find a cached response and will
+        # re-invoke `execute_run`, a second real model call -- narrower than
+        # discarding a response, and insight, the caller already has).
+        try:
+            with session.begin():
+                store_idempotency(
+                    session, auth, idempotency_key, req_hash, response.model_dump(mode="json"), now
+                )
+        except SQLAlchemyError:
+            pass
         return response
