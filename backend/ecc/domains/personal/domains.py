@@ -51,7 +51,7 @@ from uuid import UUID, uuid4
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import text
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from ecc.auth import AuthContext, AuthDep, CsrfDep
@@ -150,13 +150,22 @@ _DOMAIN_FIELDS = (
 )
 
 
-def get_domain(session: Session, auth: AuthContext, domain_key: str) -> PersonalDomain | None:
+def get_domain(
+    session: Session, auth: AuthContext, domain_key: str, *, for_update: bool = False
+) -> PersonalDomain | None:
+    """`for_update=True` locks the row for the caller's own transaction --
+    used by `_enable_domain`/`_disable_domain` (both mutate this row) so a
+    second concurrent enable/disable for the same domain blocks until the
+    first transaction commits, mirroring `connector_accounts.
+    get_connector_account`'s identical `for_update` precedent.
+    """
+    clause = "FOR UPDATE" if for_update else ""
     row = (
         session.execute(
             text(
                 f"SELECT {_DOMAIN_FIELDS} FROM personal_domains "
                 "WHERE workspace_id = :workspace_id AND owner_id = :owner_id "
-                "AND domain_key = :domain_key"
+                f"AND domain_key = :domain_key {clause}"
             ),
             {"workspace_id": auth.workspace_id, "owner_id": auth.user_id, "domain_key": domain_key},
         )
@@ -446,6 +455,19 @@ def _enable_domain(
     domain is a new, deliberate consent event, not a resumption of the old
     one (`DOMAIN-PRIVACY-CONTRACT.md`: consent is "time-bound and
     revocable," so a lapsed consent does not silently resurrect itself).
+
+    Two concurrent first-time enables for the same domain (different
+    `Idempotency-Key`s, so `lock_idempotency`'s advisory lock does not
+    itself serialize them) would otherwise both read `existing is None`
+    and both attempt the `INSERT`, the loser hitting `uq_personal_domains_
+    owner_domain` -- an unhandled `IntegrityError`/500 rather than the
+    correct outcome (the loser should just re-enable the winner's row, the
+    same "enable" a solo caller would get). The `INSERT` runs inside a
+    `begin_nested()` SAVEPOINT so a losing conflict rolls back only that
+    savepoint, not this call's whole transaction, then falls through to the
+    identical `UPDATE`/`FOR UPDATE`-locked-read path `existing is not None`
+    already uses -- mirrors `create_connector_endpoint`'s own identical
+    `IntegrityError`-after-`begin_nested()` precedent.
     """
     req_hash = request_hash(payload, "enable_domain")
     now = datetime.now(UTC)
@@ -456,33 +478,45 @@ def _enable_domain(
             return DomainResponse.model_validate(cached)
 
         classification = _classification_for(payload.domain_key)
-        existing = get_domain(session, auth, payload.domain_key)
+        existing = get_domain(session, auth, payload.domain_key, for_update=True)
+        domain_id: UUID | None = None
         if existing is None:
             domain_id = uuid4()
-            session.execute(
-                text(
-                    """
-                    INSERT INTO personal_domains (
-                        id, workspace_id, owner_id, domain_key, classification,
-                        enabled, enabled_at, created_by, updated_by, created_at, updated_at, version
-                    ) VALUES (
-                        :id, :workspace_id, :owner_id, :domain_key, :classification,
-                        true, :now, :actor_id, :actor_id, :now, :now, 1
+            try:
+                with session.begin_nested():
+                    session.execute(
+                        text(
+                            """
+                            INSERT INTO personal_domains (
+                                id, workspace_id, owner_id, domain_key, classification,
+                                enabled, enabled_at, created_by, updated_by,
+                                created_at, updated_at, version
+                            ) VALUES (
+                                :id, :workspace_id, :owner_id, :domain_key, :classification,
+                                true, :now, :actor_id, :actor_id, :now, :now, 1
+                            )
+                            """
+                        ),
+                        {
+                            "id": domain_id,
+                            "workspace_id": auth.workspace_id,
+                            "owner_id": auth.user_id,
+                            "domain_key": payload.domain_key,
+                            "classification": classification,
+                            "now": now,
+                            "actor_id": auth.user_id,
+                        },
                     )
-                    """
-                ),
-                {
-                    "id": domain_id,
-                    "workspace_id": auth.workspace_id,
-                    "owner_id": auth.user_id,
-                    "domain_key": payload.domain_key,
-                    "classification": classification,
-                    "now": now,
-                    "actor_id": auth.user_id,
-                },
-            )
-            version = 1
-        else:
+            except IntegrityError:
+                # A concurrent first-enable won the race -- re-read (now
+                # locked) and fall through to the update branch below.
+                existing = get_domain(session, auth, payload.domain_key, for_update=True)
+                assert existing is not None
+                domain_id = None
+            else:
+                version = 1
+
+        if existing is not None:
             domain_id = existing.id
             session.execute(
                 text(
@@ -495,6 +529,7 @@ def _enable_domain(
                 {"now": now, "actor_id": auth.user_id, "id": domain_id},
             )
             version = existing.version + 1
+        assert domain_id is not None
 
         session.execute(
             text(
@@ -574,7 +609,7 @@ def _disable_domain(
         if cached is not None:
             return DomainResponse.model_validate(cached)
 
-        domain = get_domain(session, auth, domain_key)
+        domain = get_domain(session, auth, domain_key, for_update=True)
         if domain is None:
             raise HTTPException(status_code=404, detail="DOMAIN_NOT_FOUND")
 
@@ -748,12 +783,25 @@ _RECORD_FIELDS = (
 )
 
 
-def _get_record_row(session: Session, auth: AuthContext, record_id: UUID) -> dict[str, Any] | None:
+def _get_record_row(
+    session: Session, auth: AuthContext, record_id: UUID, *, for_update: bool = False
+) -> dict[str, Any] | None:
+    """`for_update=True` (used only by `update_record_endpoint`) locks the
+    row for the caller's own transaction, mirroring `connector_accounts.
+    get_connector_account`'s identical `for_update` precedent -- without
+    it, two concurrent `PATCH` calls quoting the same `expected_version`
+    could both pass the version check before either commits its own
+    `UPDATE`, silently losing one caller's write instead of the second one
+    correctly getting `VERSION_CONFLICT` (`repositories.team_assignment_
+    version`'s own `SELECT ... FOR UPDATE` in `connector_accounts.py` is
+    the established fix for this exact race in this codebase).
+    """
+    clause = "FOR UPDATE" if for_update else ""
     row = (
         session.execute(
             text(
                 f"SELECT {_RECORD_FIELDS} FROM domain_records "
-                "WHERE workspace_id = :workspace_id AND owner_id = :owner_id AND id = :id"
+                f"WHERE workspace_id = :workspace_id AND owner_id = :owner_id AND id = :id {clause}"
             ),
             {"workspace_id": auth.workspace_id, "owner_id": auth.user_id, "id": record_id},
         )
@@ -893,7 +941,7 @@ def update_record_endpoint(
         if cached is not None:
             return RecordResponse.model_validate(cached)
 
-        existing = _get_record_row(session, auth, record_id)
+        existing = _get_record_row(session, auth, record_id, for_update=True)
         if existing is None:
             raise HTTPException(status_code=404, detail="RECORD_NOT_FOUND")
         if existing["version"] != payload.expected_version:

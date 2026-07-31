@@ -190,6 +190,22 @@ _WORKSPACE_ID_TABLES: tuple[str, ...] = (
     "datadog_monitors",
     "datadog_service_definitions",
     "datadog_dashboards",
+    # Phase 7 Task 1 (migration 0054) -- personal_domains/domain_consents/
+    # domain_sources/domain_records/goals/routines/check_ins/deletion_jobs/
+    # personal_insights, also workspace-scoped; seeded here from day one
+    # for the same reason, closing this exact gap before it repeats a
+    # twelfth time (this exact class of gap was first found on this same
+    # PR's own CI run against the check_ins table -- see _seed_personal's
+    # own docstring).
+    "personal_domains",
+    "domain_consents",
+    "domain_sources",
+    "domain_records",
+    "goals",
+    "routines",
+    "check_ins",
+    "deletion_jobs",
+    "personal_insights",
 )
 # `workspaces` is scoped by its own `id`, not a `workspace_id` column.
 _WORKSPACE_TABLE = "workspaces"
@@ -285,6 +301,15 @@ def _fixture_ids(label: str) -> dict[str, UUID]:
         "datadog_monitor": seed_id(label, "datadog_monitor", "acceptance"),
         "datadog_service_definition": seed_id(label, "datadog_service_definition", "acceptance"),
         "datadog_dashboard": seed_id(label, "datadog_dashboard", "acceptance"),
+        "personal_domain": seed_id(label, "personal_domain", "habits"),
+        "domain_consent": seed_id(label, "domain_consent", "habits"),
+        "domain_source": seed_id(label, "domain_source", "habits"),
+        "domain_record": seed_id(label, "domain_record", "habits"),
+        "personal_goal": seed_id(label, "personal_goal", "habits"),
+        "personal_routine": seed_id(label, "personal_routine", "habits"),
+        "personal_check_in": seed_id(label, "personal_check_in", "habits"),
+        "personal_deletion_job": seed_id(label, "personal_deletion_job", "habits"),
+        "personal_insight": seed_id(label, "personal_insight", "habits"),
     }
 
 
@@ -2227,6 +2252,200 @@ def _seed_engineering(cur: psycopg.Cursor[Any], label: str, ids: Mapping[str, UU
     )
 
 
+def _seed_personal(cur: psycopg.Cursor[Any], label: str, ids: Mapping[str, UUID]) -> None:
+    """Phase 7 Task 1 (migration 0054) -- personal_domains/domain_consents/
+    domain_sources/domain_records/goals/routines/check_ins/deletion_jobs/
+    personal_insights, workspace-scoped like every table above. This exact
+    gap (a new workspace-scoped table with no seed row here) was found by
+    this same PR's own CI run, failing ``verify_restore.sh``'s generic
+    workspace-isolation check on ``check_ins`` -- closed here for the whole
+    table set at once, matching every prior phase's own precedent for the
+    identical class of gap.
+
+    One row per table, all under the ``habits`` reference domain: a
+    ``personal_domains`` row (enabled), one ``domain_consents`` grant, one
+    ``domain_sources``/``domain_records`` pair, one ``goals`` row, one
+    ``routines`` row (referencing the goal), one ``check_ins`` row
+    (referencing the routine), one completed ``deletion_jobs`` row (an
+    audit record of a hypothetical prior deletion -- its existence does not
+    imply the domain above is currently deleted, matching how this table's
+    own real callers write it purely as an append-only log), and one
+    ``personal_insights`` row (dismissed, so this fixture does not depend
+    on any particular gap-computation threshold holding true against
+    ``SEED_EPOCH`` at verification time).
+    """
+    cur.execute(
+        """
+        INSERT INTO personal_domains (
+            id, workspace_id, owner_id, domain_key, classification,
+            enabled, enabled_at, created_by, updated_by, created_at, updated_at, version
+        ) VALUES (
+            %(id)s, %(workspace_id)s, %(owner_id)s, 'habits', 'standard',
+            true, %(now)s, %(actor)s, %(actor)s, %(now)s, %(now)s, 1
+        )
+        ON CONFLICT (id) DO NOTHING
+        """,
+        {
+            "id": ids["personal_domain"],
+            "workspace_id": ids["workspace"],
+            "owner_id": ids["user"],
+            "actor": ids["user"],
+            "now": SEED_EPOCH,
+        },
+    )
+    cur.execute(
+        """
+        INSERT INTO domain_consents (
+            id, workspace_id, owner_id, domain_key, granted_at, created_at
+        ) VALUES (%(id)s, %(workspace_id)s, %(owner_id)s, 'habits', %(now)s, %(now)s)
+        ON CONFLICT (id) DO NOTHING
+        """,
+        {
+            "id": ids["domain_consent"],
+            "workspace_id": ids["workspace"],
+            "owner_id": ids["user"],
+            "now": SEED_EPOCH,
+        },
+    )
+    cur.execute(
+        """
+        INSERT INTO domain_sources (
+            id, workspace_id, owner_id, domain_key, source_type, label, created_at
+        ) VALUES (
+            %(id)s, %(workspace_id)s, %(owner_id)s, 'habits', 'manual',
+            'Phase 1 acceptance seed source', %(now)s
+        )
+        ON CONFLICT (id) DO NOTHING
+        """,
+        {
+            "id": ids["domain_source"],
+            "workspace_id": ids["workspace"],
+            "owner_id": ids["user"],
+            "now": SEED_EPOCH,
+        },
+    )
+    cur.execute(
+        """
+        INSERT INTO domain_records (
+            id, workspace_id, owner_id, domain_key, record_type, payload,
+            domain_source_id, effective_at, created_by, updated_by, created_at, updated_at, version
+        ) VALUES (
+            %(id)s, %(workspace_id)s, %(owner_id)s, 'habits', 'note', '{}'::jsonb,
+            %(domain_source_id)s, %(now)s, %(actor)s, %(actor)s, %(now)s, %(now)s, 1
+        )
+        ON CONFLICT (id) DO NOTHING
+        """,
+        {
+            "id": ids["domain_record"],
+            "workspace_id": ids["workspace"],
+            "owner_id": ids["user"],
+            "domain_source_id": ids["domain_source"],
+            "actor": ids["user"],
+            "now": SEED_EPOCH,
+        },
+    )
+    cur.execute(
+        """
+        INSERT INTO goals (
+            id, workspace_id, owner_id, domain_key, title, status,
+            created_by, updated_by, created_at, updated_at, version
+        ) VALUES (
+            %(id)s, %(workspace_id)s, %(owner_id)s, 'habits',
+            'Phase 1 acceptance seed goal', 'active',
+            %(actor)s, %(actor)s, %(now)s, %(now)s, 1
+        )
+        ON CONFLICT (id) DO NOTHING
+        """,
+        {
+            "id": ids["personal_goal"],
+            "workspace_id": ids["workspace"],
+            "owner_id": ids["user"],
+            "actor": ids["user"],
+            "now": SEED_EPOCH,
+        },
+    )
+    cur.execute(
+        """
+        INSERT INTO routines (
+            id, workspace_id, owner_id, domain_key, goal_id, title, cadence,
+            created_by, updated_by, created_at, updated_at, version
+        ) VALUES (
+            %(id)s, %(workspace_id)s, %(owner_id)s, 'habits', %(goal_id)s,
+            'Phase 1 acceptance seed routine', 'daily',
+            %(actor)s, %(actor)s, %(now)s, %(now)s, 1
+        )
+        ON CONFLICT (id) DO NOTHING
+        """,
+        {
+            "id": ids["personal_routine"],
+            "workspace_id": ids["workspace"],
+            "owner_id": ids["user"],
+            "goal_id": ids["personal_goal"],
+            "actor": ids["user"],
+            "now": SEED_EPOCH,
+        },
+    )
+    cur.execute(
+        """
+        INSERT INTO check_ins (
+            id, workspace_id, owner_id, domain_key, routine_id, occurred_at, created_by, created_at
+        ) VALUES (
+            %(id)s, %(workspace_id)s, %(owner_id)s, 'habits', %(routine_id)s,
+            %(now)s, %(actor)s, %(now)s
+        )
+        ON CONFLICT (id) DO NOTHING
+        """,
+        {
+            "id": ids["personal_check_in"],
+            "workspace_id": ids["workspace"],
+            "owner_id": ids["user"],
+            "routine_id": ids["personal_routine"],
+            "actor": ids["user"],
+            "now": SEED_EPOCH,
+        },
+    )
+    cur.execute(
+        """
+        INSERT INTO deletion_jobs (
+            id, workspace_id, owner_id, domain_key, scope, status,
+            requested_at, completed_at, created_by
+        ) VALUES (
+            %(id)s, %(workspace_id)s, %(owner_id)s, 'habits', 'domain', 'completed',
+            %(now)s, %(now)s, %(actor)s
+        )
+        ON CONFLICT (id) DO NOTHING
+        """,
+        {
+            "id": ids["personal_deletion_job"],
+            "workspace_id": ids["workspace"],
+            "owner_id": ids["user"],
+            "actor": ids["user"],
+            "now": SEED_EPOCH,
+        },
+    )
+    cur.execute(
+        """
+        INSERT INTO personal_insights (
+            id, workspace_id, owner_id, domain_key, insight_key, kind, title,
+            evidence, source_period_start, source_period_end, missing_data,
+            confidence, limitations, computed_at, dismissed_at
+        ) VALUES (
+            %(id)s, %(workspace_id)s, %(owner_id)s, 'habits', %(insight_key)s, 'observation',
+            'Phase 1 acceptance seed insight', '{}'::jsonb, %(now)s, %(now)s, NULL,
+            'high', 'Fixture data only, not a real computed observation.', %(now)s, %(now)s
+        )
+        ON CONFLICT (id) DO NOTHING
+        """,
+        {
+            "id": ids["personal_insight"],
+            "workspace_id": ids["workspace"],
+            "owner_id": ids["user"],
+            "insight_key": f"acceptance-{label}",
+            "now": SEED_EPOCH,
+        },
+    )
+
+
 def seed(conn: psycopg.Connection[Any]) -> None:
     """Insert deterministic Phase 1 fixtures into every table for both workspaces.
 
@@ -2277,6 +2496,13 @@ def seed(conn: psycopg.Connection[Any]) -> None:
             # connector_accounts, seeded first inside _seed_engineering
             # itself.
             _seed_engineering(cur, label, ids)
+            # Phase 7 Task 1 (migration 0054) -- personal_domains/domain_
+            # consents/domain_sources/domain_records/goals/routines/
+            # check_ins/deletion_jobs/personal_insights; every dependent
+            # row (domain_consents/domain_sources/domain_records/goals on
+            # personal_domains, routines on goals, check_ins on routines)
+            # is seeded in FK-safe order inside _seed_personal itself.
+            _seed_personal(cur, label, ids)
 
 
 def fixture_row_checksums(conn: psycopg.Connection[Any]) -> dict[str, str]:
