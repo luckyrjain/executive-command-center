@@ -2,7 +2,7 @@
 id: PHASE-007-API-SCHEMAS
 title: Phase 7 Personal Intelligence API
 status: Approved for Implementation
-version: 0.5.0
+version: 0.6.0
 owner: Lucky Jain
 ---
 
@@ -46,3 +46,7 @@ Ships `POST /personal/insights/generate` (`ecc.domains.personal.ai_insights`) --
 `POST /personal/insights/{id}/feedback` (`ecc.domains.personal.habits`, the same router `GET /personal/insights`/`POST .../dismiss` already live on) ships here, once a `trend`/`correlation` insight exists for feedback to attach to. Request: `{useful: bool, comment: string | null}`. Response: `{id, insight_id, useful, comment, created_at}` -- deliberately no `kind` field anywhere in this request/response pair, matching `INSIGHT-CONTRACT.md`'s "never rewrites an insight's own `kind`" structurally (`personal_insight_feedback` has no such column to expose).
 
 `InsightResponse` (`GET /personal/insights`'s existing shape) gains one field, `professional_referral_note: string | null` -- `null` for every deterministic insight and for any AI-generated insight whose sources are all `standard`/`sensitive`; non-empty specifically when a source is `high_stakes` (enforced before persistence, not by this response model).
+
+## Task 6 status
+
+`POST /personal/records`'s `RecordCreateRequest` gains one field, `retention_acknowledged: bool = false` -- required `true` when the target `domain_key`'s classification is `high_stakes` (`health`, this task; `finance`, Task 7), rejected otherwise with `422 RETENTION_ACKNOWLEDGEMENT_REQUIRED`. Generic on the endpoint, not `health`-specific, matching this package's own "a caller names a `domain_key`, never a domain-specific code path" convention -- `standard`/`sensitive` domains accept the field but never require it.
