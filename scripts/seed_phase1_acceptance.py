@@ -206,6 +206,9 @@ _WORKSPACE_ID_TABLES: tuple[str, ...] = (
     "check_ins",
     "deletion_jobs",
     "personal_insights",
+    # Phase 7 Task 5 part 1 (migration 0056) -- also workspace-scoped,
+    # same reason as the row above.
+    "cross_domain_grants",
 )
 # `workspaces` is scoped by its own `id`, not a `workspace_id` column.
 _WORKSPACE_TABLE = "workspaces"
@@ -310,6 +313,7 @@ def _fixture_ids(label: str) -> dict[str, UUID]:
         "personal_check_in": seed_id(label, "personal_check_in", "habits"),
         "personal_deletion_job": seed_id(label, "personal_deletion_job", "habits"),
         "personal_insight": seed_id(label, "personal_insight", "habits"),
+        "cross_domain_grant": seed_id(label, "cross_domain_grant", "habits"),
     }
 
 
@@ -2272,7 +2276,11 @@ def _seed_personal(cur: psycopg.Cursor[Any], label: str, ids: Mapping[str, UUID]
     own real callers write it purely as an append-only log), and one
     ``personal_insights`` row (dismissed, so this fixture does not depend
     on any particular gap-computation threshold holding true against
-    ``SEED_EPOCH`` at verification time).
+    ``SEED_EPOCH`` at verification time), and one ``cross_domain_grants``
+    row (Phase 7 Task 5 part 1, migration 0056 -- an indefinite,
+    ``insight_generation``-purposed grant against the same ``habits``
+    domain; no consumer reads it yet, this fixture only needs to prove the
+    table itself round-trips through backup/restore).
     """
     cur.execute(
         """
@@ -2441,6 +2449,24 @@ def _seed_personal(cur: psycopg.Cursor[Any], label: str, ids: Mapping[str, UUID]
             "workspace_id": ids["workspace"],
             "owner_id": ids["user"],
             "insight_key": f"acceptance-{label}",
+            "now": SEED_EPOCH,
+        },
+    )
+    cur.execute(
+        """
+        INSERT INTO cross_domain_grants (
+            id, workspace_id, owner_id, source_domain_key, purpose,
+            granted_categories, granted_at, expires_at, created_at
+        ) VALUES (
+            %(id)s, %(workspace_id)s, %(owner_id)s, 'habits', 'insight_generation',
+            '["habit_check_in"]'::jsonb, %(now)s, NULL, %(now)s
+        )
+        ON CONFLICT (id) DO NOTHING
+        """,
+        {
+            "id": ids["cross_domain_grant"],
+            "workspace_id": ids["workspace"],
+            "owner_id": ids["user"],
             "now": SEED_EPOCH,
         },
     )
