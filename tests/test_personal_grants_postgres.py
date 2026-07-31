@@ -145,9 +145,7 @@ def _create_grant(
     }
     if expires_at is not None:
         body["expires_at"] = expires_at
-    resp = client.post(
-        "/api/v1/personal/grants", json=body, headers=_headers(token, str(uuid4()))
-    )
+    resp = client.post("/api/v1/personal/grants", json=body, headers=_headers(token, str(uuid4())))
     assert resp.status_code == 201, resp.text
     return dict(resp.json())
 
@@ -242,9 +240,7 @@ def test_active_only_excludes_revoked_and_expired_grants(
 ) -> None:
     client, _workspace_id, _user_id, token = grants_test_context
     _enable(client, token, "habits")
-    active = _create_grant(
-        client, token, source_domain_key="habits", categories=["habit_check_in"]
-    )
+    active = _create_grant(client, token, source_domain_key="habits", categories=["habit_check_in"])
     to_revoke = _create_grant(
         client, token, source_domain_key="habits", categories=["habit_check_in"]
     )
