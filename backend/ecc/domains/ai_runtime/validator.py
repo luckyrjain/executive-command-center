@@ -34,12 +34,27 @@ row once that table exists; Task 2 tests this counting/bounding logic in
 isolation, against no database at all.
 """
 
+import logging
 import re
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError, field_validator
+
+# TEMPORARY DIAGNOSTIC -- repository-owner-authorized, one-time exception to
+# RFC-005's "raw model output MUST NOT be logged" discipline, scoped to
+# chasing `meeting.prep_summary`'s `sparse_pack` intermittent `json_invalid`
+# failure (Phase 4 post-launch audit, phase J -- previously investigated and
+# left unresolved specifically because the raw malformed text was never
+# available to inspect). Logs the raw response only on a whole-document
+# parse failure (`json_invalid`, never a field-level schema mismatch, which
+# is already diagnosable from `detail` alone) so this narrows to exactly the
+# unresolved failure mode, not every schema_invalid outcome. This CI-only
+# live-model evaluation path never carries real user data (synthetic
+# fixture examples only). Revert this block once the real cause is found
+# and fixed -- do not ship it merged.
+_TEMP_DIAGNOSTIC_LOGGER = logging.getLogger("ecc.ai_runtime.validator.temp_diagnostic")
 
 _MAX_EXPLANATION_WORDS = 60
 
@@ -159,7 +174,19 @@ def validate_output(
             _strip_markdown_fence(raw_response), strict=True
         )
     except ValidationError as exc:
-        return SchemaInvalid(detail=_summarize_validation_error(exc))
+        detail = _summarize_validation_error(exc)
+        if detail == "<root>:json_invalid":
+            # TEMPORARY DIAGNOSTIC -- see this module's top-of-file note.
+            # `ecc.logging.JsonFormatter` only emits a fixed field set and
+            # silently drops arbitrary `extra=` kwargs, so the raw text is
+            # embedded directly in the log message itself, not passed via
+            # `extra`, to actually reach the CI log output.
+            _TEMP_DIAGNOSTIC_LOGGER.warning(
+                "temp_diagnostic_json_invalid_raw_response stripped=%r original=%r",
+                _strip_markdown_fence(raw_response),
+                raw_response,
+            )
+        return SchemaInvalid(detail=detail)
     return ValidatedOutput(value=value)
 
 
