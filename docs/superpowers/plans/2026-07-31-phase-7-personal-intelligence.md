@@ -12,9 +12,9 @@ Companion to `docs/superpowers/specs/2026-07-31-phase-7-personal-intelligence-de
 - `GET|POST /personal/domains`, `POST .../{id}/enable|disable|export|delete`, `GET|POST /personal/records`, `GET|PATCH /personal/records/{id}`, `GET|POST /personal/goals|routines|check-ins`, `GET|POST /personal/consents`, `POST /personal/consents/{id}/revoke`, `GET /personal/insights`, `POST /personal/insights/{id}/dismiss` (`.../feedback` deferred to Task 5).
 - Tests: workspace/user isolation, disabled-domain-blocks-all-access, encrypted-field-never-returned-in-list-view, export completeness, deletion propagation, and the always-in-scope adversarial fixtures (no diagnostic/scoring language leaking even from a `standard` domain).
 
-## Task 2 — `learning` domain
+## Task 2 — `learning` domain (complete)
 
-Structured records: courses/resources/progress. `standard` classification, same framework Task 1 proves, no new mechanism.
+**Confirmed: no new mechanism needed, as this task's own plan anticipated.** `learning` is `standard`-classified, identical to `habits` -- Task 1's domain enablement and generic `domain_records` CRUD already accept any closed-enum `domain_key`. `tests/test_personal_learning_postgres.py` proves enable/list/disable, `course`/`resource` record CRUD (including a `course`'s `progress_pct` update), and whole-domain export/delete all work unmodified; `docs/phases/phase-007/DATA-MODEL.md`'s "Task 2 status" section documents the `course`/`resource` `record_type` payload conventions. No `goals`/`routines`/`check_ins` convention defined for `learning` -- course progress is better served by `domain_records.payload.progress_pct` than by forcing a recurring-habit shape onto content that isn't one; not attempted without a real usage need driving it.
 
 ## Task 3 — `travel` domain
 
