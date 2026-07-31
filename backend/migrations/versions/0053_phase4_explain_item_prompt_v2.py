@@ -167,13 +167,33 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     prompt_versions = _prompt_versions_table()
+    bind = op.get_bind()
+
+    # Mirrors `upgrade()`'s own defensiveness (a status-based WHERE, not a
+    # hardcoded version number) in the opposite direction: only reactivate
+    # version=1 if version=2 -- the row *this* migration activated -- is
+    # still the active one. If some later migration or runtime `activate_
+    # prompt_version` call has since moved the active pointer past version=2
+    # (e.g. to a version=3 this migration knows nothing about), downgrading
+    # must not silently steal the active pointer back to version=1 out from
+    # under it -- it should just remove its own version=2 row and leave
+    # whatever is genuinely active alone.
+    v2_is_active = bind.execute(
+        sa.select(sa.literal(1)).where(
+            prompt_versions.c.prompt_id == _PROMPT_ID,
+            prompt_versions.c.version == 2,
+            prompt_versions.c.status == "active",
+        )
+    ).first()
+
     op.execute(
         prompt_versions.delete().where(
             prompt_versions.c.prompt_id == _PROMPT_ID, prompt_versions.c.version == 2
         )
     )
-    op.execute(
-        prompt_versions.update()
-        .where(prompt_versions.c.prompt_id == _PROMPT_ID, prompt_versions.c.version == 1)
-        .values(status="active", updated_at=sa.func.now())
-    )
+    if v2_is_active is not None:
+        op.execute(
+            prompt_versions.update()
+            .where(prompt_versions.c.prompt_id == _PROMPT_ID, prompt_versions.c.version == 1)
+            .values(status="active", updated_at=sa.func.now())
+        )
