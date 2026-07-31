@@ -47,16 +47,22 @@ at all, a real and openly documented limitation, not an oversight).
 **Ephemeral, workspace-scoped synthetic data, cleaned up after the run.**
 Each example needs a real domain row for `execute_run`'s Step 1 tool
 dispatch to read -- one `attention_items` row for `attention.get_item`
-(and therefore `attention.explain_item`), or one full synthetic meeting
+(and therefore `attention.explain_item`), one full synthetic meeting
 evidence bundle for `meeting.get_prep_pack` (and therefore `meeting.prep_
-summary`). `run_evaluation` inserts that source into the *caller's own*
-workspace, runs it through `execute_run`, and deletes it again, so an
-evaluation run never leaves fabricated rows behind that could show up in
-that workspace's real Attention Queue or meeting list. The two task types'
-synthetic sources are cleaned up on different schedules for a real reason,
-not stylistic inconsistency -- see `_insert_synthetic_meeting`'s docstring
-for why `meeting.prep_summary`'s cannot be batched like `attention.explain_
-item`'s. The `ai_runs`/`ai_run_steps` rows `execute_run` itself persists are
+summary`), or a set of synthetic `personal_domains`/`cross_domain_grants`/
+`domain_records` rows for `personal.get_insight_sources` (and therefore
+`personal.generate_insight`). `run_evaluation` inserts that source into
+the *caller's own* workspace, runs it through `execute_run`, and deletes
+it again, so an evaluation run never leaves fabricated rows behind that
+could show up in that workspace's real Attention Queue, meeting list, or
+personal domain vault. These task types' synthetic sources are cleaned up
+on different schedules for real reasons, not stylistic inconsistency --
+see `_insert_synthetic_meeting`'s docstring for why `meeting.prep_
+summary`'s cannot be batched like `attention.explain_item`'s, and
+`_insert_synthetic_personal_insight_sources`'s docstring for the distinct,
+`UNIQUE` constraint-driven reason `personal.generate_insight`'s follows
+the same per-example schedule. The `ai_runs`/`ai_run_steps` rows `execute_
+run` itself persists are
 *not* deleted -- they are genuine historical run records, retained for
 reproducibility exactly like any other run (`EVALUATION-CONTRACT.md`:
 "Evaluation results, environment and artifact hashes ... are retained for
@@ -94,6 +100,7 @@ from sqlalchemy.orm import Session
 
 from ecc.auth import AuthContext, AuthDep, CsrfDep
 from ecc.database import get_session, lock_engine
+from ecc.domains.personal.domains import classification_for, encrypt_record_payload
 from ecc.observability import record_database_failure, record_idempotency_conflict
 
 from .ollama_client import OllamaAdapter
@@ -157,6 +164,17 @@ _PROHIBITED_FACT_FLOOR = 0
 _LATENCY_P95_CEILING_SECONDS_BY_TASK_TYPE: dict[str, float] = {
     "attention.explain_item": 20.0,
     "meeting.prep_summary": 35.0,
+    # Phase 7 Task 5 part 2's `personal.generate_insight` -- an initial
+    # value, not yet tuned against a real live-model measurement history
+    # (this task type has none yet, unlike the other two -- see `router.py:
+    # TASK_REQUIREMENTS["personal.generate_insight"]`'s own identical
+    # disclosure). Set below `router.py`'s own `timeout_seconds=40.0` for
+    # this task type, matching every other entry's own "promotion floor is
+    # a production-quality bar, tighter than the reliability backstop"
+    # relationship (this dict's own module-docstring-adjacent comment
+    # above) -- expected to move once a real `ollama-evaluation` run
+    # against this task type's own dataset exists to size it against.
+    "personal.generate_insight": 35.0,
 }
 
 
@@ -203,14 +221,47 @@ class MeetingPrepEvaluationExample(TypedDict):
     reference_summary: str
 
 
+class PersonalInsightSourceExample(TypedDict):
+    """One synthetic cross-domain source for a `PersonalInsightEvaluation
+    Example` -- one `personal_domains`/`cross_domain_grants` pair plus the
+    `domain_records` rows granted under it. `records[*]["record_type"]`
+    values become the synthetic grant's own `granted_categories` (the
+    union of every `record_type` used across this source's records, see
+    `_insert_synthetic_personal_insight_sources`), matching how a real
+    grant's categories are chosen by the user, not fixed per domain.
+    """
+
+    domain_key: str
+    records: list[dict[str, Any]]
+
+
+class PersonalInsightEvaluationExample(TypedDict):
+    """One row of `evaluation_sets.examples` for `task_type='personal.
+    generate_insight'` -- matches `tests/fixtures/phase7_evaluation_
+    personal_insight.py`'s `EXAMPLES` shape and migration `0058_phase7_
+    personal_insight_eval.py`'s seeded JSONB content exactly. Structurally
+    closer to `MeetingPrepEvaluationExample` than to `EvaluationExample`
+    (a variable-shaped evidence bundle rather than one scalar item), but
+    the bundle here is *cross-domain* (`sources`, a list of independent
+    domains each with their own records) rather than one meeting's fixed
+    seven sections.
+    """
+
+    key: str
+    sources: list[PersonalInsightSourceExample]
+    must_cite: list[str]
+    must_not_state: list[str]
+    reference_explanation: str
+
+
 # `evaluation_sets.examples` is untyped JSONB and this activation now stores
-# two structurally different example shapes in it (one per registered task
-# type) -- every function below that is genuinely task-type-agnostic
+# three structurally different example shapes in it (one per registered
+# task type) -- every function below that is genuinely task-type-agnostic
 # (`_score_example`/`_prohibited_matches`/`_aggregate`/`EvaluationSet.
 # examples` itself) accordingly types its `example` parameter as
-# `dict[str, Any]` rather than either specific TypedDict, and only ever
-# touches the two fields both shapes share (`key`, `must_not_state`). The
-# two TypedDicts above exist purely as construction/documentation aids for
+# `dict[str, Any]` rather than any specific TypedDict, and only ever
+# touches the two fields every shape shares (`key`, `must_not_state`). The
+# three TypedDicts above exist purely as construction/documentation aids for
 # each dataset's own fixture module and insertion helper.
 
 
@@ -421,6 +472,7 @@ def _fetch_schema_invalid_detail(session: Session, run: AiRun) -> str | None:
 _OUTPUT_TEXT_FIELD: dict[str, str] = {
     "attention.explain_item": "explanation_text",
     "meeting.prep_summary": "summary_text",
+    "personal.generate_insight": "explanation_text",
 }
 
 
@@ -927,6 +979,172 @@ def _delete_synthetic_meeting(
 
 
 # ---------------------------------------------------------------------------
+# Synthetic personal-insight sources (`task_type='personal.generate_
+# insight'`) -- ephemeral, workspace-scoped, cleaned up per-example rather
+# than batched at the end of the run, matching `meeting.prep_summary`'s own
+# per-example schedule (`_insert_synthetic_meeting`'s docstring) for a
+# related but distinct reason: `personal_domains` has a real `UNIQUE
+# (workspace_id, owner_id, domain_key)` constraint, and this dataset's
+# examples deliberately reuse the same `domain_key` across more than one
+# example -- a later example's own fresh `personal_domains` row for that
+# same key would violate that constraint (and its `cross_domain_grants`
+# row's `granted_categories` may legitimately differ between examples) if
+# an earlier example's rows for it were still in place.
+# ---------------------------------------------------------------------------
+
+_PersonalInsightSourceIds = tuple[list[UUID], list[UUID], list[UUID]]
+
+
+def _insert_synthetic_personal_insight_sources(
+    session: Session, auth: AuthContext, example: dict[str, Any], *, now: datetime
+) -> _PersonalInsightSourceIds:
+    """Inserts, for each of this example's `sources`, one `personal_domains`
+    row (enabled, so `personal.get_insight_sources`'s own enablement check
+    passes), one `cross_domain_grants` row (active, `purpose=
+    'insight_generation'`, `granted_categories` the union of every
+    `record_type` this source's own records use -- a real grant's own
+    categories are chosen the same way, by what the user actually wants
+    read, not fixed per domain), and every one of that source's `domain_
+    records` rows -- encrypted via `ecc.domains.personal.domains.encrypt_
+    record_payload` exactly like a real write would be, so this harness
+    genuinely exercises `personal.get_insight_sources`'s own decrypt-
+    before-prompting path rather than handing the model already-plaintext
+    synthetic data no real record would ever have.
+
+    Returns `(domain_ids, grant_ids, record_ids)` for `_delete_synthetic_
+    personal_insight_sources` below. Not context-managed -- see `_insert_
+    synthetic_item`'s identical rationale (this session's transaction may
+    already be autobegun by `run_evaluation`'s preceding reads).
+    """
+    domain_ids: list[UUID] = []
+    grant_ids: list[UUID] = []
+    record_ids: list[UUID] = []
+    for source in example["sources"]:
+        domain_key = source["domain_key"]
+        domain_id = uuid4()
+        domain_ids.append(domain_id)
+        session.execute(
+            text(
+                """
+                INSERT INTO personal_domains (
+                    id, workspace_id, owner_id, domain_key, classification,
+                    enabled, enabled_at, created_by, updated_by, created_at, updated_at, version
+                ) VALUES (
+                    :id, :workspace_id, :owner_id, :domain_key, :classification,
+                    true, :now, :actor_id, :actor_id, :now, :now, 1
+                )
+                """
+            ),
+            {
+                "id": domain_id,
+                "workspace_id": auth.workspace_id,
+                "owner_id": auth.user_id,
+                "domain_key": domain_key,
+                "classification": classification_for(domain_key),
+                "actor_id": auth.user_id,
+                "now": now,
+            },
+        )
+
+        record_types = sorted({record["record_type"] for record in source["records"]})
+        grant_id = uuid4()
+        grant_ids.append(grant_id)
+        session.execute(
+            text(
+                """
+                INSERT INTO cross_domain_grants (
+                    id, workspace_id, owner_id, source_domain_key, purpose,
+                    granted_categories, granted_at, expires_at, created_at
+                ) VALUES (
+                    :id, :workspace_id, :owner_id, :domain_key, 'insight_generation',
+                    CAST(:granted_categories AS jsonb), :now, NULL, :now
+                )
+                """
+            ),
+            {
+                "id": grant_id,
+                "workspace_id": auth.workspace_id,
+                "owner_id": auth.user_id,
+                "domain_key": domain_key,
+                "granted_categories": dumps(record_types),
+                "now": now,
+            },
+        )
+
+        for record in source["records"]:
+            record_id = uuid4()
+            record_ids.append(record_id)
+            encrypted_payload = encrypt_record_payload(record["record_type"], record["payload"])
+            session.execute(
+                text(
+                    """
+                    INSERT INTO domain_records (
+                        id, workspace_id, owner_id, domain_key, record_type, payload,
+                        effective_at, created_by, updated_by, created_at, updated_at, version
+                    ) VALUES (
+                        :id, :workspace_id, :owner_id, :domain_key, :record_type,
+                        CAST(:payload AS jsonb), :effective_at, :actor_id, :actor_id, :now, :now, 1
+                    )
+                    """
+                ),
+                {
+                    "id": record_id,
+                    "workspace_id": auth.workspace_id,
+                    "owner_id": auth.user_id,
+                    "domain_key": domain_key,
+                    "record_type": record["record_type"],
+                    "payload": dumps(encrypted_payload),
+                    "effective_at": now - timedelta(days=record["effective_at_days_ago"]),
+                    "actor_id": auth.user_id,
+                    "now": now,
+                },
+            )
+    session.commit()
+    return domain_ids, grant_ids, record_ids
+
+
+def _delete_synthetic_personal_insight_sources(
+    session: Session,
+    auth: AuthContext,
+    domain_ids: list[UUID],
+    grant_ids: list[UUID],
+    record_ids: list[UUID],
+) -> None:
+    """Deletes everything `_insert_synthetic_personal_insight_sources`
+    created for one example, immediately after that example is scored --
+    see that function's docstring for why. Deletes child rows (`domain_
+    records`/`cross_domain_grants`) before the `personal_domains` row they
+    FK-reference, regardless of what `ondelete=CASCADE` may or may not
+    already handle -- explicit, not relying on cascade, matching `_delete_
+    synthetic_meeting`'s identical discipline. Not context-managed -- see
+    `_insert_synthetic_item`'s identical rationale.
+    """
+    if record_ids:
+        session.execute(
+            text(
+                "DELETE FROM domain_records WHERE workspace_id = :workspace_id AND id = ANY(:ids)"
+            ),
+            {"workspace_id": auth.workspace_id, "ids": record_ids},
+        )
+    if grant_ids:
+        session.execute(
+            text(
+                "DELETE FROM cross_domain_grants WHERE workspace_id = :workspace_id "
+                "AND id = ANY(:ids)"
+            ),
+            {"workspace_id": auth.workspace_id, "ids": grant_ids},
+        )
+    if domain_ids:
+        session.execute(
+            text(
+                "DELETE FROM personal_domains WHERE workspace_id = :workspace_id AND id = ANY(:ids)"
+            ),
+            {"workspace_id": auth.workspace_id, "ids": domain_ids},
+        )
+    session.commit()
+
+
+# ---------------------------------------------------------------------------
 # generated_artifacts -- module docstring's "first concrete producer".
 # ---------------------------------------------------------------------------
 
@@ -1256,6 +1474,13 @@ def run_evaluation(
                     )
                     run_input: dict[str, Any] = {"meeting_id": str(meeting_id)}
                     source_versions: dict[str, Any] = {"meeting_id": str(meeting_id)}
+                elif task_type == "personal.generate_insight":
+                    domain_ids, grant_ids, record_ids = _insert_synthetic_personal_insight_sources(
+                        session, auth, example, now=now
+                    )
+                    source_domain_keys = [source["domain_key"] for source in example["sources"]]
+                    run_input = {"source_domain_keys": source_domain_keys}
+                    source_versions = {"source_domain_keys": source_domain_keys}
                 else:
                     item_id = _insert_synthetic_item(session, auth, example, now=now)
                     synthetic_item_ids.append(item_id)
@@ -1328,6 +1553,12 @@ def run_evaluation(
                         if session.in_transaction():
                             session.rollback()
                         _delete_synthetic_meeting(session, auth, meeting_id, node_ids, risk_ids)
+                    elif task_type == "personal.generate_insight":
+                        if session.in_transaction():
+                            session.rollback()
+                        _delete_synthetic_personal_insight_sources(
+                            session, auth, domain_ids, grant_ids, record_ids
+                        )
         finally:
             # Guard against a leftover open transaction from a mid-loop
             # exception (should not happen -- execute_run always returns an
@@ -1384,7 +1615,9 @@ class EvaluationSetListResponse(BaseModel):
 
 class EvaluationRunCreateRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    task_type: Literal["attention.explain_item", "meeting.prep_summary"]
+    task_type: Literal[
+        "attention.explain_item", "meeting.prep_summary", "personal.generate_insight"
+    ]
     prompt_version: int = Field(ge=1)
     model_id: str = Field(min_length=1, max_length=200)
 

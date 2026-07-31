@@ -58,6 +58,7 @@ from ecc.domains.knowledge.relationships_mutations import (
 from ecc.domains.knowledge.resolution import router as knowledge_resolution_router
 from ecc.domains.knowledge.retrieval import router as knowledge_retrieval_router
 from ecc.domains.knowledge.timeline import router as knowledge_timeline_router
+from ecc.domains.personal.ai_insights import router as personal_ai_insights_router
 from ecc.domains.personal.domains import router as personal_domains_router
 from ecc.domains.personal.export_deletion import router as personal_export_deletion_router
 from ecc.domains.personal.grants import router as personal_grants_router
@@ -211,6 +212,7 @@ app.include_router(personal_domains_router)
 app.include_router(personal_habits_router)
 app.include_router(personal_export_deletion_router)
 app.include_router(personal_grants_router)
+app.include_router(personal_ai_insights_router)
 app.middleware("http")(rejected_mutation_audit_middleware)
 # Pure-ASGI body size guard: registered via add_middleware (not the
 # "http" dispatch helper) so it can intercept the raw receive() channel and

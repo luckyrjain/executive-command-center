@@ -209,6 +209,10 @@ _WORKSPACE_ID_TABLES: tuple[str, ...] = (
     # Phase 7 Task 5 part 1 (migration 0056) -- also workspace-scoped,
     # same reason as the row above.
     "cross_domain_grants",
+    # Phase 7 Task 5 part 2 (migration 0059) -- also workspace-scoped, same
+    # reason as the row above (this exact gap, found on this same PR's own
+    # CI run this time).
+    "personal_insight_feedback",
 )
 # `workspaces` is scoped by its own `id`, not a `workspace_id` column.
 _WORKSPACE_TABLE = "workspaces"
@@ -314,6 +318,7 @@ def _fixture_ids(label: str) -> dict[str, UUID]:
         "personal_deletion_job": seed_id(label, "personal_deletion_job", "habits"),
         "personal_insight": seed_id(label, "personal_insight", "habits"),
         "cross_domain_grant": seed_id(label, "cross_domain_grant", "habits"),
+        "personal_insight_feedback": seed_id(label, "personal_insight_feedback", "habits"),
     }
 
 
@@ -2276,11 +2281,15 @@ def _seed_personal(cur: psycopg.Cursor[Any], label: str, ids: Mapping[str, UUID]
     own real callers write it purely as an append-only log), and one
     ``personal_insights`` row (dismissed, so this fixture does not depend
     on any particular gap-computation threshold holding true against
-    ``SEED_EPOCH`` at verification time), and one ``cross_domain_grants``
+    ``SEED_EPOCH`` at verification time), one ``cross_domain_grants``
     row (Phase 7 Task 5 part 1, migration 0056 -- an indefinite,
     ``insight_generation``-purposed grant against the same ``habits``
     domain; no consumer reads it yet, this fixture only needs to prove the
-    table itself round-trips through backup/restore).
+    table itself round-trips through backup/restore), and one
+    ``personal_insight_feedback`` row (Phase 7 Task 5 part 2, migration
+    0059 -- referencing the ``personal_insights`` row above; this fixture
+    only needs to prove the table round-trips, not that it reflects real
+    user feedback).
     """
     cur.execute(
         """
@@ -2467,6 +2476,25 @@ def _seed_personal(cur: psycopg.Cursor[Any], label: str, ids: Mapping[str, UUID]
             "id": ids["cross_domain_grant"],
             "workspace_id": ids["workspace"],
             "owner_id": ids["user"],
+            "now": SEED_EPOCH,
+        },
+    )
+    cur.execute(
+        """
+        INSERT INTO personal_insight_feedback (
+            id, workspace_id, owner_id, insight_id, useful, comment, created_by, created_at
+        ) VALUES (
+            %(id)s, %(workspace_id)s, %(owner_id)s, %(insight_id)s, true,
+            'Phase 1 acceptance seed feedback', %(actor)s, %(now)s
+        )
+        ON CONFLICT (id) DO NOTHING
+        """,
+        {
+            "id": ids["personal_insight_feedback"],
+            "workspace_id": ids["workspace"],
+            "owner_id": ids["user"],
+            "insight_id": ids["personal_insight"],
+            "actor": ids["user"],
             "now": SEED_EPOCH,
         },
     )

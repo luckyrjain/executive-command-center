@@ -155,6 +155,30 @@ TASK_REQUIREMENTS: dict[str, TaskRequirements] = {
         # explain_item's own proven-safe ceiling.
         max_output_tokens=400,
     ),
+    # Phase 7 Task 5 part 2 (`docs/phases/phase-007/INSIGHT-CONTRACT.md`):
+    # the `trend`/`correlation` AI-generated personal insights, the third
+    # task type this activation registers. `timeout_seconds`/`max_output_
+    # tokens` below are deliberately conservative *initial* values, not
+    # numbers tuned against real measurements yet -- this task type has no
+    # live-model evaluation history to size them against, unlike `meeting.
+    # prep_summary`'s own extensively-revised numbers above (see that
+    # entry's comment history). Sized by analogy: this prompt's evidence
+    # (up to two source domains' worth of `domain_records`, `personal.
+    # get_insight_sources`'s own `_MAX_RECORDS_PER_DOMAIN=50` cap per
+    # domain) can be larger than `attention.explain_item`'s single item but
+    # is not obviously larger than `meeting.prep_summary`'s seven-section
+    # bundle, so this starts at that task's own post-tuning numbers rather
+    # than `attention.explain_item`'s tighter ones -- expected to be
+    # revised in the same iterative, real-measurement-driven way once a
+    # live-model evaluation run (`ollama-evaluation` CI) actually exercises
+    # it, matching every prior raise's own documented precedent in this
+    # table.
+    "personal.generate_insight": TaskRequirements(
+        capability="summarization",
+        requires_structured_output=True,
+        timeout_seconds=40.0,
+        max_output_tokens=600,
+    ),
 }
 
 

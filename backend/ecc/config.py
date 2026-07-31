@@ -92,6 +92,16 @@ class Settings(BaseSettings):
     personal_data_encryption_key: str = Field(
         default="", validation_alias="ECC_PERSONAL_DATA_ENCRYPTION_KEY"
     )
+    # Phase 7 Task 5 part 2 (`docs/phases/phase-007/INSIGHT-CONTRACT.md`):
+    # the `trend`/`correlation` AI-generated personal insight, wired to
+    # Phase 4 (AI Runtime) via the `personal.generate_insight` task type
+    # but opt-in, mirroring `meeting_prep_ai_enrichment_enabled`'s own
+    # "deterministic core, AI optional and gated" pattern -- the
+    # deterministic (`habits.py`) insight computation is unaffected either
+    # way.
+    personal_ai_insight_generation_enabled: bool = Field(
+        default=False, validation_alias="ECC_PERSONAL_AI_INSIGHT_GENERATION_ENABLED"
+    )
 
     @property
     def cors_origin_list(self) -> list[str]:
