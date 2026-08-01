@@ -93,6 +93,13 @@ def upgrade() -> None:
     )
     for row in existing_users:
         account_id = uuid4()
+        # `.strip().casefold()`, matching `ecc.domains.identity.accounts.
+        # _normalize_email` exactly -- a bare `.casefold()` here would let a
+        # legacy `users.email` with incidental leading/trailing whitespace
+        # backfill into `accounts.email` un-stripped, silently escaping the
+        # `UNIQUE` constraint's collision check against a future stripped
+        # write of the same logical address.
+        normalized_email = row["email"].strip().casefold()
         bind.execute(
             sa.text(
                 """
@@ -102,9 +109,9 @@ def upgrade() -> None:
             ),
             {
                 "id": account_id,
-                "email": row["email"].casefold(),
+                "email": normalized_email,
                 "password_hash": row["password_hash"],
-                "display_name": row["email"].split("@", 1)[0],
+                "display_name": normalized_email.split("@", 1)[0],
                 "created_at": row["created_at"],
             },
         )

@@ -91,7 +91,13 @@ _password_hasher = PasswordHasher()
 _SESSION_MAX_AGE_SECONDS = 7 * 24 * 60 * 60
 _PENDING_LOGIN_TOKEN_MAX_AGE_SECONDS = 5 * 60
 _EMAIL_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
-_ROLES = frozenset({"owner", "admin", "member", "viewer"})
+# A fixed hash to verify a login attempt against when no account matches the
+# submitted email, so a nonexistent-email attempt pays the same Argon2id
+# verify cost as a wrong-password attempt against a real account -- without
+# this, the two cases are distinguishable by response timing alone (a
+# nonexistent email short-circuits to ~instant), letting a caller enumerate
+# registered emails despite both returning the identical 401 body.
+_DUMMY_PASSWORD_HASH = _password_hasher.hash(secrets.token_urlsafe(32))
 
 
 def _normalize_email(email: str) -> str:
@@ -346,11 +352,9 @@ def login_endpoint(
         .one_or_none()
     )
     session.rollback()
-    if (
-        account is None
-        or account["disabled_at"] is not None
-        or not _verify_password(account["password_hash"], payload.password)
-    ):
+    password_hash = account["password_hash"] if account is not None else _DUMMY_PASSWORD_HASH
+    password_ok = _verify_password(password_hash, payload.password)
+    if account is None or account["disabled_at"] is not None or not password_ok:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="INVALID_CREDENTIALS")
 
     memberships = (

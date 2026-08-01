@@ -518,3 +518,27 @@ def test_get_workspace_not_found_for_a_different_workspace_id(
     client, _workspace_id, _users_id, _account_id, token = workspace_test_context
     resp = client.get(f"/api/v1/identity/workspaces/{uuid4()}", headers=_headers(token))
     assert resp.status_code == 404, resp.text
+
+
+def test_disabling_account_revokes_an_already_issued_session_immediately(
+    workspace_test_context: tuple[TestClient, UUID, UUID, UUID, str],
+) -> None:
+    """`require_auth_context` (`ecc.auth`) joins through to `accounts` so a
+    disabled account's live sessions stop working without needing a separate
+    revocation step -- the same "no cache to invalidate" propagation
+    `docs/superpowers/specs/2026-08-01-phase-8-multi-user-design.md`
+    Decision 4 promises for every other revocation path in this phase.
+    """
+    client, _workspace_id, _users_id, account_id, token = workspace_test_context
+
+    before = client.get("/api/v1/identity/workspaces", headers=_headers(token))
+    assert before.status_code == 200, before.text
+
+    with engine.begin() as connection:
+        connection.execute(
+            text("UPDATE accounts SET disabled_at = :now WHERE id = :id"),
+            {"now": datetime.now(UTC), "id": account_id},
+        )
+
+    after = client.get("/api/v1/identity/workspaces", headers=_headers(token))
+    assert after.status_code == 401, after.text
