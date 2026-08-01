@@ -467,10 +467,10 @@ def list_check_ins_endpoint(
         session.execute(
             text(
                 "SELECT id, routine_id, occurred_at, note, created_at FROM check_ins "
-                "WHERE workspace_id = :workspace_id AND routine_id = :routine_id "
-                "ORDER BY occurred_at DESC"
+                "WHERE workspace_id = :workspace_id AND owner_id = :owner_id "
+                "AND routine_id = :routine_id ORDER BY occurred_at DESC"
             ),
-            {"workspace_id": auth.workspace_id, "routine_id": routine_id},
+            {"workspace_id": auth.workspace_id, "owner_id": auth.user_id, "routine_id": routine_id},
         )
         .mappings()
         .all()
@@ -658,18 +658,31 @@ def feedback_insight_endpoint(
     auth: AuthDep,
     session: SessionDep,
     _csrf: CsrfDep,
+    idempotency_key: IdempotencyHeader,
 ) -> FeedbackResponse:
     """`personal_insight_feedback` is a separate, append-only table with no
     `kind` column of its own (migration `0059_phase7_personal_insight_
     feedback.py`'s own docstring) -- structurally incapable of rewriting an
     insight's own `kind`, matching `INSIGHT-CONTRACT.md`'s "`POST .../
-    feedback` never rewrites an insight's own `kind`". No idempotency-key
-    handling, matching `dismiss_insight_endpoint`'s own identical scope
-    (this module's docstring: personal content this lightweight gets the
-    same lighter treatment consistently across sibling endpoints).
+    feedback` never rewrites an insight's own `kind`". Idempotency-key
+    handling mirrors `create_check_in_endpoint`'s, not `dismiss_insight_
+    endpoint`'s -- `dismiss` is an `UPDATE` (naturally idempotent: a retry
+    just re-sets `dismissed_at`), but this endpoint is an append-only
+    `INSERT` exactly like `check_ins`, so a dropped-response retry without
+    this protection would record a second feedback row for one real user
+    action, skewing any later usefulness/quality metric computed from this
+    table.
     """
+    req_hash = request_hash(payload, f"feedback_insight:{insight_id}")
     now = datetime.now(UTC)
     with session.begin():
+        lock_idempotency(session, auth, idempotency_key)
+        cached = load_cached(
+            session, auth, idempotency_key, req_hash, domain="personal_insight_feedback"
+        )
+        if cached is not None:
+            return FeedbackResponse.model_validate(cached)
+
         row = (
             session.execute(
                 text(
@@ -708,10 +721,20 @@ def feedback_insight_endpoint(
                 "now": now,
             },
         )
-        return FeedbackResponse(
+        response = FeedbackResponse(
             id=feedback_id,
             insight_id=insight_id,
             useful=payload.useful,
             comment=payload.comment,
             created_at=now,
         )
+        store_idempotency(
+            session,
+            auth,
+            idempotency_key,
+            req_hash,
+            response.model_dump(mode="json"),
+            now,
+            response_status=status.HTTP_201_CREATED,
+        )
+        return response

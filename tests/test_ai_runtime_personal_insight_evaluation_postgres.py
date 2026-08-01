@@ -8,9 +8,13 @@ replay HTTP behavior) already proven generic in `test_ai_runtime_evaluation_
 postgres.py`.
 
 Covers:
-1. Migration `0058_phase7_insight_eval.py`'s seeded `evaluation_
-   sets` version 1 row -- 10 examples, matching `tests/fixtures/
-   phase7_evaluation_personal_insight.py` exactly.
+1. The active `evaluation_sets` row for this task type -- version 2 as of
+   migration `0060_phase7_insight_eval_v2.py` (which retired migration
+   `0058_phase7_insight_eval.py`'s original version 1 row, whose invented
+   `health`/`finance` `record_type`s predated Tasks 6/7's real conventions
+   and so never exercised real field-level encryption -- see `0060`'s own
+   docstring). 10 examples, matching `tests/fixtures/phase7_evaluation_
+   personal_insight.py` exactly, whichever version is currently active.
 2. `run_evaluation` end to end (mocked Ollama transport, no live model) over
    the real 10-example dataset: a fully grounded run passes every floor; an
    ungrounded citation fails only the grounding floor; a `must_not_state`

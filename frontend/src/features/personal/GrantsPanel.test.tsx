@@ -110,7 +110,7 @@ describe('GrantsPanel', () => {
 
     await screen.findByText('No cross-domain grants yet.')
     expect(await screen.findByText(/Enable Habits in the Domains tab/)).toBeTruthy()
-    fireEvent.change(screen.getByLabelText('Granted categories'), { target: { value: 'note' } })
+    fireEvent.change(screen.getByLabelText(/Granted categories/), { target: { value: 'note' } })
     expect((screen.getByRole('button', { name: 'Create grant' }) as HTMLButtonElement).disabled).toBe(true)
   })
 
@@ -123,7 +123,7 @@ describe('GrantsPanel', () => {
 
     await screen.findByText('No cross-domain grants yet.')
     fireEvent.change(screen.getByLabelText('Source domain'), { target: { value: 'health' } })
-    fireEvent.change(screen.getByLabelText('Granted categories'), { target: { value: 'vital_reading, symptom_log' } })
+    fireEvent.change(screen.getByLabelText(/Granted categories/), { target: { value: 'vital_reading, symptom_log' } })
     await waitFor(() => expect((screen.getByRole('button', { name: 'Create grant' }) as HTMLButtonElement).disabled).toBe(false))
     fireEvent.click(screen.getByRole('button', { name: 'Create grant' }))
 
@@ -160,4 +160,45 @@ describe('GrantsPanel', () => {
     await screen.findByText('No cross-domain grants yet.')
     expect((screen.getByRole('button', { name: 'Create grant' }) as HTMLButtonElement).disabled).toBe(true)
   })
+
+  it('surfaces a domains-fetch failure as an alert', async () => {
+    const fetch = vi.fn((input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url.includes('/personal/domains')) return Promise.reject(new TypeError('fetch failed'))
+      return response({ grants: [] })
+    })
+    vi.stubGlobal('fetch', fetch)
+    renderPanel()
+    expect(await screen.findByRole('alert', {}, { timeout: 3000 })).toBeTruthy()
+  })
+
+  it('does not clear another source domain\'s in-progress draft when a create request resolves after the user has switched domains', async () => {
+    const pending = deferred<Response>()
+    const fetch = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      if ((init?.method ?? 'GET').toUpperCase() === 'POST') return pending.promise
+      if (url.includes('/personal/domains')) {
+        return response({ domains: [domain({ domain_key: 'habits' }), domain({ domain_key: 'health', classification: 'high_stakes' })] })
+      }
+      return response({ grants: [] })
+    })
+    vi.stubGlobal('fetch', fetch)
+    renderPanel()
+
+    await screen.findByText('No cross-domain grants yet.')
+    fireEvent.change(screen.getByLabelText(/Granted categories/), { target: { value: 'note-in-progress' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Create grant' }))
+
+    fireEvent.change(screen.getByLabelText('Source domain'), { target: { value: 'health' } })
+    pending.resolve(new Response(JSON.stringify(grant()), { status: 201, headers: { 'Content-Type': 'application/json' } }))
+
+    await waitFor(() => expect(fetch).toHaveBeenCalled())
+    expect((screen.getByLabelText(/Granted categories/) as HTMLInputElement).value).toBe('note-in-progress')
+  })
 })
+
+function deferred<T>() {
+  let resolve!: (value: T) => void
+  const promise = new Promise<T>((r) => { resolve = r })
+  return { promise, resolve }
+}

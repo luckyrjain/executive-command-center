@@ -61,6 +61,7 @@ from json import dumps
 from typing import Annotated, Any, Literal
 from uuid import UUID, uuid4
 
+from cryptography.fernet import InvalidToken
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import text
@@ -180,6 +181,24 @@ def _decrypt_payload(record_type: str, payload: dict[str, Any]) -> dict[str, Any
     """Inverse of `_encrypt_payload` -- called only for the single-record
     response paths (create/get/patch), never list/summary or anything
     persisted (the module docstring's idempotency-cache note explains why).
+    Also the single choke point every OTHER caller of a decrypted payload
+    goes through (`decrypt_record_payload`'s own docstring): `export_
+    domain_endpoint` and `insight_tools.py:get_insight_sources_tool`.
+
+    `decrypt_field` raises `cryptography.fernet.InvalidToken` if a field's
+    ciphertext doesn't match the currently configured key (e.g. `ECC_
+    PERSONAL_DATA_ENCRYPTION_KEY` rotated without re-encrypting stored
+    records) -- caught per field rather than left to propagate, mirroring
+    `connector_accounts.py`'s own established fix for the identical bug
+    class ("previously that propagated unhandled ... 500ing the request").
+    Left unhandled here, ONE such field would 500 `GET /records/{id}`, fail
+    `POST /domains/{domain_key}/export` for every record in that domain (not
+    just the bad one -- a real data-export right becoming unusable until the
+    row is fixed), and crash `personal.get_insight_sources` out of `execute_
+    run` with an unhandled 500 instead of `ai_insights.py`'s own documented
+    fail-open `available=False`. The placeholder is deliberately distinct
+    from `_redact_payload`'s `***encrypted***` (a normal, expected state for
+    a list view) -- this is an abnormal one, and says so.
     """
     encrypted_fields = _ENCRYPTED_FIELD_NAMES_BY_RECORD_TYPE.get(record_type, frozenset())
     if not encrypted_fields:
@@ -188,7 +207,10 @@ def _decrypt_payload(record_type: str, payload: dict[str, Any]) -> dict[str, Any
     for field in encrypted_fields:
         value = result.get(field)
         if isinstance(value, str) and value:
-            result[field] = decrypt_field(value)
+            try:
+                result[field] = decrypt_field(value)
+            except InvalidToken:
+                result[field] = "[unable to decrypt -- contact support]"
     return result
 
 
@@ -943,6 +965,23 @@ def create_record_endpoint(
         domain = require_enabled_domain(session, auth, payload.domain_key)
         if domain.classification == "high_stakes" and not payload.retention_acknowledged:
             raise HTTPException(status_code=422, detail="RETENTION_ACKNOWLEDGEMENT_REQUIRED")
+        if payload.domain_source_id is not None:
+            # `domain_records.domain_source_id`'s own FK (migration `0054`)
+            # is scoped to `(workspace_id, id)` only, not `owner_id` -- no
+            # endpoint in this activation creates `domain_sources` rows yet
+            # (manual entry only), so this is unreachable today, but a
+            # future import endpoint would otherwise let a record be linked
+            # to another owner's `domain_sources` row within the same
+            # workspace with no application-level check catching it either.
+            source_owner = session.execute(
+                text(
+                    "SELECT owner_id FROM domain_sources "
+                    "WHERE workspace_id = :workspace_id AND id = :domain_source_id"
+                ),
+                {"workspace_id": auth.workspace_id, "domain_source_id": payload.domain_source_id},
+            ).scalar_one_or_none()
+            if source_owner is None or source_owner != auth.user_id:
+                raise HTTPException(status_code=404, detail="DOMAIN_SOURCE_NOT_FOUND")
 
         record_id = uuid4()
         effective_at = payload.effective_at or now

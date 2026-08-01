@@ -537,3 +537,91 @@ def test_feedback_unknown_insight_404s(
     )
     assert resp.status_code == 404
     assert resp.json()["error"]["code"] == "INSIGHT_NOT_FOUND"
+
+
+def test_insights_and_feedback_are_workspace_isolated(
+    personal_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    """`personal_insights`/`personal_insight_feedback` are the two newest
+    tables in this phase (Task 5 part 2) and, unlike `cross_domain_grants`
+    (`test_personal_grants_postgres.py:test_grants_are_workspace_isolated`),
+    had no dedicated cross-workspace-isolation test of their own -- the only
+    prior isolation test anywhere in this phase's suite (`test_personal_
+    domains_postgres.py:test_cross_workspace_isolation`) never touches
+    either table. A second workspace's own session must not be able to
+    list, dismiss, or leave feedback on another workspace's insight.
+    """
+    client, workspace_id, owner_id, _token = personal_test_context
+    insight_id = _insert_insight_row(workspace_id, owner_id)
+
+    other_workspace_id = uuid4()
+    other_user_id = uuid4()
+    other_token = f"session-{uuid4()}"
+    now = datetime.now(UTC)
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO workspaces (id, name, timezone, created_at) "
+                "VALUES (:id, 'Other Insight Test', 'UTC', :now)"
+            ),
+            {"id": other_workspace_id, "now": now},
+        )
+        connection.execute(
+            text(
+                "INSERT INTO users (id, workspace_id, email, password_hash, created_at) "
+                "VALUES (:id, :workspace_id, :email, 'test-password-hash', :now)"
+            ),
+            {
+                "id": other_user_id,
+                "workspace_id": other_workspace_id,
+                "email": f"{other_user_id}@example.test",
+                "now": now,
+            },
+        )
+        connection.execute(
+            text(
+                "INSERT INTO sessions (id, workspace_id, user_id, token_hash, "
+                "expires_at, last_seen_at) "
+                "VALUES (:id, :workspace_id, :user_id, :token_hash, :expires_at, :now)"
+            ),
+            {
+                "id": uuid4(),
+                "workspace_id": other_workspace_id,
+                "user_id": other_user_id,
+                "token_hash": sha256(other_token.encode()).hexdigest(),
+                "expires_at": now + timedelta(hours=1),
+                "now": now,
+            },
+        )
+    try:
+        other_client = TestClient(app)
+        other_client.cookies.set("ecc_session", other_token)
+
+        other_insights = other_client.get(
+            "/api/v1/personal/insights", headers=_headers(other_token)
+        ).json()["insights"]
+        assert other_insights == []
+
+        dismiss_resp = other_client.post(
+            f"/api/v1/personal/insights/{insight_id}/dismiss",
+            headers=_headers(other_token),
+        )
+        assert dismiss_resp.status_code == 404
+        assert dismiss_resp.json()["error"]["code"] == "INSIGHT_NOT_FOUND"
+
+        feedback_resp = other_client.post(
+            f"/api/v1/personal/insights/{insight_id}/feedback",
+            json={"useful": True, "comment": "not mine"},
+            headers=_headers(other_token, str(uuid4())),
+        )
+        assert feedback_resp.status_code == 404
+        assert feedback_resp.json()["error"]["code"] == "INSIGHT_NOT_FOUND"
+
+        with engine.connect() as connection:
+            feedback_count = connection.execute(
+                text("SELECT count(*) FROM personal_insight_feedback WHERE insight_id = :id"),
+                {"id": insight_id},
+            ).scalar_one()
+        assert feedback_count == 0
+    finally:
+        _cleanup_workspace(other_workspace_id)

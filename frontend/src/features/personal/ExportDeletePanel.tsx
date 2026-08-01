@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useRef, useState } from 'react'
 import { useMutation } from '@tanstack/react-query'
 
 import { apiRequest } from '../../api/client'
@@ -14,12 +14,27 @@ export default function ExportDeletePanel() {
   const [domainKey, setDomainKey] = useState<DomainKey>('habits')
   const [deleteConfirmed, setDeleteConfirmed] = useState(false)
 
+  // Same reasoning as `RecordsPanel.tsx`'s identical ref: `mutate(domainKey)`
+  // below passes the domain as the mutation's own variable rather than a
+  // closure, so the request itself always targets the domain selected at
+  // click time even if TanStack Query rebinds a still-pending mutation's
+  // options to a later render. `domainKeyRef` covers the remaining case --
+  // an `onSuccess` side effect (unchecking the delete confirmation) that
+  // should only apply if the user is still looking at the domain the
+  // now-resolving request was for.
+  const domainKeyRef = useRef(domainKey)
+  domainKeyRef.current = domainKey
+
   const exportMutation = useMutation({
-    mutationFn: () => apiRequest<DomainExport>(`/api/v1/personal/domains/${domainKey}/export`, { method: 'POST' }),
+    mutationFn: (forDomainKey: DomainKey) =>
+      apiRequest<DomainExport>(`/api/v1/personal/domains/${forDomainKey}/export`, { method: 'POST' }),
   })
   const deleteMutation = useMutation({
-    mutationFn: () => apiRequest<DomainDeletion>(`/api/v1/personal/domains/${domainKey}/delete`, { method: 'POST' }),
-    onSuccess: () => setDeleteConfirmed(false),
+    mutationFn: (forDomainKey: DomainKey) =>
+      apiRequest<DomainDeletion>(`/api/v1/personal/domains/${forDomainKey}/delete`, { method: 'POST' }),
+    onSuccess: (_data, forDomainKey) => {
+      if (domainKeyRef.current === forDomainKey) setDeleteConfirmed(false)
+    },
   })
 
   function selectDomain(next: DomainKey) {
@@ -41,7 +56,7 @@ export default function ExportDeletePanel() {
       </label>
 
       <div className="work-actions">
-        <button type="button" disabled={exportMutation.isPending} onClick={() => exportMutation.mutate()}>
+        <button type="button" disabled={exportMutation.isPending} onClick={() => exportMutation.mutate(domainKey)}>
           {exportMutation.isPending ? 'Exporting…' : `Export ${DOMAIN_LABELS[domainKey]}`}
         </button>
       </div>
@@ -67,11 +82,12 @@ export default function ExportDeletePanel() {
         <button
           type="button"
           disabled={!deleteConfirmed || deleteMutation.isPending}
-          onClick={() => deleteMutation.mutate()}
+          onClick={() => deleteMutation.mutate(domainKey)}
         >
           {deleteMutation.isPending ? 'Deletion pending…' : `Delete ${DOMAIN_LABELS[domainKey]}`}
         </button>
       </div>
+      {deleteMutation.isPending ? <p role="status" className="inline-status">Deletion pending…</p> : null}
       {deleteMutation.isError ? <div role="alert" className="inline-status error-panel">{personalErrorMessage(deleteMutation.error)}</div> : null}
       {deleteMutation.data ? (
         <p role="status" className="inline-status">

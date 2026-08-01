@@ -32,27 +32,45 @@ from typing import Any
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from ecc.auth import AuthContext, AuthDep, CsrfDep
 
-from .domains import DomainKey, SessionDep, _decrypt_payload, get_domain
+from .domains import (
+    DomainKey,
+    IdempotencyHeader,
+    SessionDep,
+    _decrypt_payload,
+    get_domain,
+    load_cached,
+    lock_idempotency,
+    request_hash,
+    store_idempotency,
+)
 
 router = APIRouter(prefix="/api/v1/personal", tags=["personal"])
+
+
+class _EmptyBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
 
 # Every table this task's own scope populates under a domain -- deleted in
 # this order so no foreign key (`goals` <- `routines` <- `check_ins`,
 # `domain_sources` <- `domain_records`) is ever violated. `personal_
-# insights`/`domain_consents` have no further children.
+# insights`/`cross_domain_grants`/`domain_consents` are NOT included in this
+# generic loop -- each needs a query (or, for `domain_consents`, an UPDATE)
+# this loop's uniform `DELETE ... WHERE domain_key = :domain_key` shape
+# can't express (see `_delete_domain_data` and `delete_domain_endpoint`
+# below).
 _CHILD_TABLES_DELETE_ORDER = (
     "check_ins",
     "routines",
     "goals",
     "domain_records",
     "domain_sources",
-    "personal_insights",
 )
 
 
@@ -140,20 +158,73 @@ def _delete_domain_data(session: Session, auth: AuthContext, domain_key: str) ->
     params = {"workspace_id": auth.workspace_id, "owner_id": auth.user_id, "domain_key": domain_key}
     for table in _CHILD_TABLES_DELETE_ORDER:
         session.execute(
-            text(  # noqa: S608 -- table name is one of six fixed literals, never user input
+            text(  # noqa: S608 -- table name is one of five fixed literals, never user input
                 f"DELETE FROM {table} WHERE workspace_id = :workspace_id "
                 "AND owner_id = :owner_id AND domain_key = :domain_key"
             ),
             params,
         )
+    # Matches an insight recorded under this domain (`domain_key` column,
+    # the *first* requested source per `ai_insights.py`'s own docstring) OR
+    # one whose `evidence.source_domain_keys` JSONB array names this domain
+    # as ANY of its sources -- "removes ... derived content" (`DOMAIN-
+    # PRIVACY-CONTRACT.md`) means every insight this domain's now-deleted
+    # data contributed to, not only the one column a cross-domain insight
+    # happens to be filed under. A deterministic (non-AI, Task 1) insight's
+    # own `evidence` has no `source_domain_keys` key at all, so the JSONB
+    # lookup is simply absent/falsy there and the `domain_key =` match alone
+    # still governs it correctly. `personal_insight_feedback` cascades via
+    # its own FK (migration `0059`'s `ondelete="CASCADE"`), so no separate
+    # delete is needed for it here.
+    session.execute(
+        text(
+            "DELETE FROM personal_insights WHERE workspace_id = :workspace_id "
+            "AND owner_id = :owner_id "
+            "AND (domain_key = :domain_key "
+            "OR evidence -> 'source_domain_keys' ? :domain_key)"
+        ),
+        params,
+    )
+    # A grant naming this domain as its `source_domain_key` is meaningless
+    # once the domain's own data is gone -- left active, it would silently
+    # re-apply to new records the moment the user re-enables the domain,
+    # contradicting this endpoint's own "clean slate" intent.
+    session.execute(
+        text(
+            "DELETE FROM cross_domain_grants WHERE workspace_id = :workspace_id "
+            "AND owner_id = :owner_id AND source_domain_key = :domain_key"
+        ),
+        params,
+    )
 
 
 @router.post("/domains/{domain_key}/delete", response_model=DomainDeletionResponse)
 def delete_domain_endpoint(
-    domain_key: DomainKey, auth: AuthDep, session: SessionDep, _csrf: CsrfDep
+    domain_key: DomainKey,
+    auth: AuthDep,
+    session: SessionDep,
+    _csrf: CsrfDep,
+    idempotency_key: IdempotencyHeader,
 ) -> DomainDeletionResponse:
+    """Idempotency-key handling matches every other mutating endpoint in
+    this package -- the underlying `DELETE`s are individually idempotent
+    (deleting already-gone rows is a no-op), but the `personal_domains`
+    version bump and the `deletion_jobs` audit INSERT below are not: a
+    retried request without this guard would bump `version` again and
+    insert a second `'completed'` `deletion_jobs` row for the same domain
+    and moment, adding audit-log noise no other mutation in this phase
+    tolerates.
+    """
+    req_hash = request_hash(_EmptyBody(), f"delete_domain:{domain_key}")
     now = datetime.now(UTC)
     with session.begin():
+        lock_idempotency(session, auth, idempotency_key)
+        cached = load_cached(
+            session, auth, idempotency_key, req_hash, domain="personal_domain_deletion"
+        )
+        if cached is not None:
+            return DomainDeletionResponse.model_validate(cached)
+
         domain = get_domain(session, auth, domain_key)
         if domain is None:
             raise HTTPException(status_code=404, detail="DOMAIN_NOT_FOUND")
@@ -208,6 +279,10 @@ def delete_domain_endpoint(
                 "actor_id": auth.user_id,
             },
         )
-        return DomainDeletionResponse(
+        response = DomainDeletionResponse(
             id=job_id, domain_key=domain_key, status="completed", requested_at=now, completed_at=now
         )
+        store_idempotency(
+            session, auth, idempotency_key, req_hash, response.model_dump(mode="json"), now
+        )
+        return response

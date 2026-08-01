@@ -165,4 +165,74 @@ describe('RecordsPanel', () => {
 
     expect(await screen.findByText(/requires you to acknowledge its retention terms/)).toBeTruthy()
   })
+
+  it('surfaces a domains-fetch failure as an alert, not a misleading "enable this domain" message', async () => {
+    vi.stubGlobal('fetch', vi.fn(() => Promise.reject(new TypeError('fetch failed'))))
+    renderPanel()
+
+    expect(await screen.findByRole('alert', {}, { timeout: 3000 })).toBeTruthy()
+    expect(screen.queryByText(/Enable Habits in the Domains tab/)).toBeNull()
+  })
+
+  it('fetches and shows the decrypted payload for a record with a redacted field', async () => {
+    const fetch = vi.fn((input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url.endsWith(`/records/${record().id}`)) {
+        return response(record({ payload: { text: 'the real decrypted value' } }))
+      }
+      if (url.includes('/records')) return response({ records: [record({ payload: { text: '***encrypted***' } })] })
+      return response({ domains: [domain({ domain_key: 'habits', enabled: true })] })
+    })
+    vi.stubGlobal('fetch', fetch)
+    renderPanel()
+
+    await screen.findByText('***encrypted***')
+    fireEvent.click(screen.getByRole('button', { name: 'View decrypted' }))
+    expect(await screen.findByText('the real decrypted value')).toBeTruthy()
+  })
+
+  it('invalidates the requesting domain\'s query, and does not clear another domain\'s in-progress draft, when a create request resolves after the user has switched domains', async () => {
+    const pending = deferred<Response>()
+    const fetch = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      if ((init?.method ?? 'GET').toUpperCase() === 'POST') return pending.promise
+      if (url.includes('/records')) return response({ records: [] })
+      return response({
+        domains: [
+          domain({ domain_key: 'habits', enabled: true }),
+          domain({ domain_key: 'learning', enabled: true }),
+        ],
+      })
+    })
+    vi.stubGlobal('fetch', fetch)
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } })
+    render(<QueryClientProvider client={client}><RecordsPanel /></QueryClientProvider>)
+
+    await screen.findByText('No records yet for Habits.')
+    fireEvent.change(screen.getByLabelText('Record type'), { target: { value: 'note-in-progress' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Save record' }))
+
+    fireEvent.change(screen.getByLabelText('Domain'), { target: { value: 'learning' } })
+    await screen.findByText('No records yet for Learning.')
+
+    pending.resolve(new Response(
+      JSON.stringify(record({ domain_key: 'habits' })),
+      { status: 201, headers: { 'Content-Type': 'application/json' } },
+    ))
+
+    await waitFor(() => expect(
+      client.getQueryState(['personal', 'records', 'habits', '', ''])?.isInvalidated,
+    ).toBe(true))
+    // The Learning draft the user had already started typing over the old
+    // Habits text must survive -- the now-stale Habits mutation's success
+    // handler must not clear state that belongs to whatever domain is
+    // currently selected.
+    expect((screen.getByLabelText('Record type') as HTMLInputElement).value).toBe('note-in-progress')
+  })
 })
+
+function deferred<T>() {
+  let resolve!: (value: T) => void
+  const promise = new Promise<T>((r) => { resolve = r })
+  return { promise, resolve }
+}

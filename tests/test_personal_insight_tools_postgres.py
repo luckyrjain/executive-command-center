@@ -29,6 +29,7 @@ from ecc.auth import AuthContext
 from ecc.config import get_settings
 from ecc.database import SessionFactory, engine
 from ecc.domains.ai_runtime.tools import ToolNotFound, ToolResult
+from ecc.domains.personal.domains import encrypt_record_payload
 from ecc.domains.personal.insight_tools import get_insight_sources_tool
 
 settings = get_settings()
@@ -270,3 +271,42 @@ def test_granted_domain_returns_decrypted_payload_and_real_classification(
     record = source["records"][0]
     assert record["id"] == str(record_id)
     assert record["payload"] == {"routine": "Morning run"}
+
+
+def test_granted_high_stakes_domain_returns_genuinely_decrypted_narrative_field(
+    tool_context: dict,
+) -> None:
+    """The one prior decrypted-payload test above uses `habits` (`standard`
+    classification, no encrypted field at all) -- passing there proves
+    nothing about whether this tool's own `decrypt_record_payload` call
+    (`insight_tools.py`) actually decrypts anything, only that plaintext
+    passes through unchanged. This test inserts a `health` (`high_stakes`)
+    `vital_reading` record with its `notes` field genuinely Fernet-
+    encrypted at rest (via the same `encrypt_record_payload` the real
+    `create_record_endpoint` write path uses), then asserts the tool's own
+    output contains the real plaintext, not the ciphertext -- the exact
+    property `personal.generate_insight`'s prompt-assembly code depends on
+    to reason about real narrative content rather than an opaque token.
+    """
+    workspace_id, user_id = tool_context["workspace_id"], tool_context["user_id"]
+    _enable_domain(workspace_id, user_id, "health", classification="high_stakes")
+    _grant(workspace_id, user_id, "health", ["vital_reading"])
+    plaintext_notes = "felt lightheaded after standing up quickly"
+    encrypted_payload = encrypt_record_payload(
+        "vital_reading",
+        {"metric": "resting_heart_rate", "value": "62", "notes": plaintext_notes},
+    )
+    # Sanity check: genuinely encrypted before insert, not merely unchanged.
+    assert encrypted_payload["notes"] != plaintext_notes
+    record_id = _record(workspace_id, user_id, "health", "vital_reading", encrypted_payload)
+
+    with SessionFactory() as session:
+        result = get_insight_sources_tool(session, tool_context["auth"], ["health"])
+    assert isinstance(result, ToolResult)
+    source = result.output["sources"][0]
+    assert source["domain_key"] == "health"
+    assert source["classification"] == "high_stakes"
+    record = source["records"][0]
+    assert record["id"] == str(record_id)
+    assert record["payload"]["metric"] == "resting_heart_rate"
+    assert record["payload"]["notes"] == plaintext_notes

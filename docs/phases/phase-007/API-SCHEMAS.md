@@ -2,7 +2,7 @@
 id: PHASE-007-API-SCHEMAS
 title: Phase 7 Personal Intelligence API
 status: Approved for Implementation
-version: 0.7.0
+version: 0.8.0
 owner: Lucky Jain
 ---
 
@@ -49,7 +49,7 @@ Ships `POST /personal/insights/generate` (`ecc.domains.personal.ai_insights`) --
 
 ## Task 6 status
 
-`POST /personal/records`'s `RecordCreateRequest` gains one field, `retention_acknowledged: bool = false` -- required `true` when the target `domain_key`'s classification is `high_stakes` (`health`, this task; `finance`, Task 7), rejected otherwise with `422 RETENTION_ACKNOWLEDGEMENT_REQUIRED`. Generic on the endpoint, not `health`-specific, matching this package's own "a caller names a `domain_key`, never a domain-specific code path" convention -- `standard`/`sensitive` domains accept the field but never require it.
+`POST /personal/records`'s `RecordCreateRequest` gains one field, `retention_acknowledged: bool = false` -- required `true` when the target `domain_key`'s classification is `high_stakes` (`health`, this task; `finance`, Task 7), rejected otherwise with `422 RETENTION_ACKNOWLEDGEMENT_REQUIRED`. Generic on the endpoint, not `health`-specific, matching this package's own "a caller names a `domain_key`, never a domain-specific code path" convention -- `standard`/`sensitive` domains accept the field but never require it. `RecordResponse` (every record-returning response: create/get/patch/list) gains the matching read-side field, `retention_acknowledged_at: datetime | None` -- `NULL` unless the record's own creation request acknowledged it, never backfilled or inferred after the fact.
 
 ## Task 7 status
 

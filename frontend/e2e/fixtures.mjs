@@ -1206,10 +1206,20 @@ const PERSONAL_CLASSIFICATION_BY_DOMAIN = {
  * insights, cross-domain grants and export/delete, mirroring `make
  * AutomationApi`/`makeEngineeringApi`'s identical in-memory-collection
  * shape. `overrides.domains`/`records`/`insights`/`grants` seed initial
- * rows; `overrides.generateResponse` scripts a fixed `POST .../insights/
- * generate` result (default: fail-open, `available: false`, `error_code:
- * 'no_grant'`) since the real endpoint's actual model call has no fixture
- * analogue.
+ * rows.
+ *
+ * `POST .../insights/generate`'s grant-gating is computed genuinely from
+ * this fixture's own live `grants` array (an active, non-revoked, non-
+ * expired grant for every requested `source_domain_key`), mirroring the
+ * real `personal.get_insight_sources` tool's own fail-closed check --
+ * `error_code: 'not_found'` is the real backend's own string for this case
+ * (`runtime.py`: `"not_found" if prepared.reason == "not_found" else
+ * ...`), not an invented placeholder. `overrides.generateResponse` scripts
+ * what a mocked "model" would produce ONLY for the case every requested
+ * domain genuinely is granted -- there is no fixture analogue for the real
+ * endpoint's actual model call, so a scenario exercising the model-response
+ * path (e.g. a missing `professional_referral_note`) still needs to supply
+ * one explicitly.
  */
 function makePersonalApi(overrides = {}) {
   let nextId = 1
@@ -1218,7 +1228,16 @@ function makePersonalApi(overrides = {}) {
   const insights = [...(overrides.insights ?? [])]
   const grants = [...(overrides.grants ?? [])]
   const generateResponse = overrides.generateResponse
-    ?? { available: false, insight: null, error_code: 'no_grant' }
+    ?? { available: false, insight: null, error_code: 'grounding_failed' }
+
+  function hasActiveGrantFor(domainKey) {
+    const now = Date.now()
+    return grants.some((g) => (
+      g.source_domain_key === domainKey
+      && g.revoked_at == null
+      && (g.expires_at == null || new Date(g.expires_at).getTime() > now)
+    ))
+  }
 
   function findDomain(domainKey) {
     return domains.find((d) => d.domain_key === domainKey)
@@ -1312,6 +1331,11 @@ function makePersonalApi(overrides = {}) {
       }
     }
     if (pathname === '/api/v1/personal/insights/generate' && method === 'POST') {
+      const requestedDomainKeys = body.source_domain_keys ?? []
+      const everyDomainGranted = requestedDomainKeys.every((k) => hasActiveGrantFor(k))
+      if (!everyDomainGranted) {
+        return { status: 200, body: { available: false, insight: null, error_code: 'not_found' } }
+      }
       if (generateResponse.available && generateResponse.insight) insights.push(generateResponse.insight)
       return { status: 200, body: generateResponse }
     }

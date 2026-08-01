@@ -1358,9 +1358,20 @@ def _prepare_personal_insight_request(
     # from the tool's own per-source `classification` field, and carried
     # on `_PreparedRequest` so `execute_run`'s post-validation grounding
     # check (which has no tool output of its own to inspect) can enforce
-    # it without re-deriving anything.
+    # it without re-deriving anything. Gated on `source["records"]` being
+    # non-empty, not merely on the domain being requested -- `personal.get_
+    # insight_sources` always returns one entry per requested domain_key
+    # even when that domain has zero matching records (e.g. an active grant
+    # whose `granted_categories` doesn't match anything the caller has
+    # actually logged yet), and `_render_insight_source_block` below already
+    # omits such an empty source from the rendered prompt. Without this
+    # guard, requesting a `high_stakes` domain that happens to contribute no
+    # real content would still force the requirement, rejecting an
+    # otherwise-correct model response that (rightly) never mentions it --
+    # `ai_insights.py`'s own "fail-open by construction" claim otherwise
+    # doesn't hold for this specific combination.
     requires_professional_referral = any(
-        source["classification"] == "high_stakes" for source in sources
+        source["classification"] == "high_stakes" and source["records"] for source in sources
     )
 
     prompt = get_active_prompt(session, port.prompt_id)

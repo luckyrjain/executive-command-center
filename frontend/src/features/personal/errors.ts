@@ -20,6 +20,8 @@ export function personalErrorMessage(error: unknown): string {
   if (error.code === 'VERSION_CONFLICT') return 'This record changed elsewhere. Reload and retry.'
   if (error.code === 'GRANT_NOT_FOUND') return 'This grant no longer exists.'
   if (error.code === 'INSIGHT_NOT_FOUND') return 'This insight no longer exists.'
+  if (error.code === 'GOAL_NOT_FOUND') return 'This goal no longer exists.'
+  if (error.code === 'ROUTINE_NOT_FOUND') return 'This routine no longer exists.'
   if (error.status === 401) return 'Your session is no longer valid. Sign in again.'
   if (error.status === 403) return 'You are not permitted to manage personal data in this workspace.'
   return error.message

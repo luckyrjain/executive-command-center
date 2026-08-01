@@ -295,6 +295,60 @@ def test_patch_contact_notes_re_encrypts_and_returns_decrypted(
     assert "coffee" not in row["payload"]["notes"]
 
 
+def test_patch_contact_stale_version_409s_without_corrupting_the_encrypted_field(
+    relationships_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    """`test_personal_domains_postgres.py:test_record_patch_version_
+    conflict` proves the 409 path generically, but only against `habits`'
+    own unencrypted `note` record_type -- no domain whose PATCH also runs
+    through `_encrypt_payload` had ever exercised the stale-version path
+    directly. `update_record_endpoint`'s own version check runs before
+    encryption, so this is lower-risk than it looks, but nothing previously
+    proved that in a real request against a real encrypted record rather
+    than by reading the code.
+    """
+    client, workspace_id, _user_id, token = relationships_test_context
+    _enable(client, token, "relationships")
+    created = _create_contact(client, token, name="Riley Chen", notes="Original note")
+
+    stale_patch = client.patch(
+        f"/api/v1/personal/records/{created['id']}",
+        json={
+            "expected_version": 99,
+            "payload": {
+                "contact_name": "Riley Chen",
+                "relationship_type": "friend",
+                "notes": "This should never be written",
+            },
+        },
+        headers=_headers(token, str(uuid4())),
+    )
+    assert stale_patch.status_code == 409
+    assert stale_patch.json()["error"]["code"] == "VERSION_CONFLICT"
+
+    # The record itself is untouched -- still version 1, still encrypted,
+    # still decrypting back to the original (pre-conflict) note.
+    fetched = client.get(f"/api/v1/personal/records/{created['id']}", headers=_headers(token))
+    assert fetched.json()["version"] == 1
+    assert fetched.json()["payload"]["notes"] == "Original note"
+
+    with engine.connect() as connection:
+        row = (
+            connection.execute(
+                text(
+                    "SELECT payload, version FROM domain_records "
+                    "WHERE id = :id AND workspace_id = :workspace_id"
+                ),
+                {"id": created["id"], "workspace_id": workspace_id},
+            )
+            .mappings()
+            .one()
+        )
+    assert row["version"] == 1
+    assert "Original note" not in row["payload"]["notes"]
+    assert "never be written" not in row["payload"]["notes"]
+
+
 def test_interaction_record_notes_are_encrypted(
     relationships_test_context: tuple[TestClient, UUID, UUID, str],
 ) -> None:
