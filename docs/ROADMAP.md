@@ -4,7 +4,7 @@
 
 **Foundation:** Phase 0 baseline approved and implemented  
 **Current delivery:** [Phase 1 — Executive Dashboard MVP](phases/PHASE-001-executive-dashboard-mvp.md) — engineering delivery complete on `feature/phase-1-production-hardening` (Tasks 1-11 of `superpowers/plans/2026-07-16-phase-1-completion.md`, each independently reviewed with zero Critical or Important findings); Phase 1 exit remains open pending the seven-day daily-use validation gate and human change review — see [Phase 1 Implementation Status](phases/phase-001/IMPLEMENTATION-STATUS.md)  
-**Future specifications:** Phase 2 Approved for Implementation and in progress (parallel to Phase 1's open exit gates); Phase 3 Approved for Implementation and beginning (parallel-start exception granted, same as Phase 2's); Phase 4 engineering delivery complete, exit gates open (known-limitation floor misses accepted, parallel-start exception granted, same as Phase 2's and Phase 3's); Phase 5 engineering delivery complete through Task 7 (parallel-start exception granted, same as Phase 2/3/4's), exit gate open pending `docs/runbooks/PHASE-5-DOGFOOD.md`'s real, human-operator-driven staged dogfood record (0 of 14 required days logged); Phase 6 Approved for Implementation, engineering delivery complete through Task 8 (connector framework, GitHub/GitLab read sync, Jira work-item sync, delivery/reliability metrics, decisions/incidents and change-correlation, approved write actions, and the executive UX/browser-acceptance frontend surface -- partial scope disclosed on several tasks; parallel-start exception granted, same as Phase 2/3/4/5's), proceeding alongside Phase 5's own still-open exit gate, entering its own final cross-task review; Phase 7 Approved for Implementation, beginning with Task 1 (domain/consent/vault framework and the `habits` reference domain -- parallel-start exception granted, same as Phase 2/3/4/5/6's), proceeding alongside Phase 6's own still-open exit gate; Phases 8–9 published as Draft / Planned
+**Future specifications:** Phase 2 Approved for Implementation and in progress (parallel to Phase 1's open exit gates); Phase 3 Approved for Implementation and beginning (parallel-start exception granted, same as Phase 2's); Phase 4 engineering delivery complete, exit gates open (known-limitation floor misses accepted, parallel-start exception granted, same as Phase 2's and Phase 3's); Phase 5 engineering delivery complete through Task 7 (parallel-start exception granted, same as Phase 2/3/4's), exit gate open pending `docs/runbooks/PHASE-5-DOGFOOD.md`'s real, human-operator-driven staged dogfood record (0 of 14 required days logged); Phase 6 Approved for Implementation, engineering delivery complete through Task 8 (connector framework, GitHub/GitLab read sync, Jira work-item sync, delivery/reliability metrics, decisions/incidents and change-correlation, approved write actions, and the executive UX/browser-acceptance frontend surface -- partial scope disclosed on several tasks; parallel-start exception granted, same as Phase 2/3/4/5's), proceeding alongside Phase 5's own still-open exit gate, entering its own final cross-task review; Phase 7 Approved for Implementation, engineering delivery complete through Task 8 across all six domains plus a whole-phase deep-review-and-fix round (`luckyrjain/executive-command-center#99`, merged, zero open findings on re-review), proceeding alongside Phase 6's own still-open exit gate -- no promotion/exit decision made yet; Phase 8 Approved for Implementation, beginning with Task 1 (account/membership/session framework -- parallel-start exception granted, same as Phase 2/3/4/5/6/7's), proceeding alongside Phase 7's own not-yet-made exit/promotion decision; Phase 9 published as Draft / Planned
 
 The [canonical phase index](phases/README.md) lists every primary specification and supporting contract. The [Phase 0–9 documentation review](phases/PHASE-REVIEW.md) records completeness findings and approval gates.
 
@@ -31,8 +31,8 @@ Phase 0 — Repository Foundation         [Implemented]
   -> Phase 4 — AI Runtime              [Engineering delivery complete; exit gates open, known limitations accepted]
   -> Phase 5 — Automation              [Engineering delivery complete through Task 7; exit gate open pending staged dogfood]
   -> Phase 6 — Engineering Workspace   [Approved for Implementation; engineering delivery complete through Task 8]
-  -> Phase 7 — Personal Intelligence   [Approved for Implementation; beginning, parallel-start exception granted]
-  -> Phase 8 — Multi-user Workspaces   [Draft]
+  -> Phase 7 — Personal Intelligence   [Approved for Implementation; engineering delivery complete through Task 8 + review round]
+  -> Phase 8 — Multi-user Workspaces   [Approved for Implementation; beginning, parallel-start exception granted]
   -> Phase 9 — Enterprise              [Draft]
 ```
 
@@ -135,7 +135,7 @@ Implementation status: [Phase 6 Implementation Status](phases/phase-006/IMPLEMEN
 
 ## Phase 7 — Personal Intelligence
 
-**Status:** Approved for Implementation; contracts moved from Draft after resolving `docs/phases/PHASE-REVIEW.md:138`'s four named approval-gate items (per-domain schema/retention, privacy impact assessment, encryption fields, high-stakes safety rubric) in `docs/superpowers/specs/2026-07-31-phase-7-personal-intelligence-design.md`, per that document's Decision 1-4 sections, resolved in `PHASE-007-personal-intelligence.md`'s "Approved decisions" section. Implementation begins with Task 1 (domain/consent/vault framework and the `habits` reference domain, the phase's lowest-stakes domain, chosen to prove the generic framework before `health`/`finance`) by explicit repository-owner authorization to proceed in parallel with Phase 6's own open exit gate -- the same kind of exception Phase 2, 3, 4, 5 and 6 each received; this authorization does not itself close Phase 6's exit gate.
+**Status:** Approved for Implementation; contracts moved from Draft after resolving `docs/phases/PHASE-REVIEW.md:138`'s four named approval-gate items (per-domain schema/retention, privacy impact assessment, encryption fields, high-stakes safety rubric) in `docs/superpowers/specs/2026-07-31-phase-7-personal-intelligence-design.md`, per that document's Decision 1-4 sections, resolved in `PHASE-007-personal-intelligence.md`'s "Approved decisions" section. Engineering delivery complete through Task 8 (all six domains, executive UX and browser acceptance) plus a whole-phase deep-review-and-fix round (`luckyrjain/executive-command-center#99`, merged; a second independent review of that round's own diff found zero further issues before merge) -- proceeding in parallel with Phase 6's own open exit gate, the same kind of exception Phase 2, 3, 4, 5 and 6 each received; this does not itself close Phase 6's exit gate, and no separate promotion/exit decision has been made for Phase 7 itself yet.
 
 Opt-in private domains for health, finance, learning, travel, habits and relationships, with consent, bounded insights, export and deletion.
 
@@ -146,11 +146,14 @@ Implementation status: [Phase 7 Implementation Status](phases/phase-007/IMPLEMEN
 
 ## Phase 8 — Multi-user Workspaces
 
-**Status:** Draft / Planned.
+**Status:** Approved for Implementation; contracts moved from Draft after resolving `docs/phases/PHASE-REVIEW.md:139`'s four named approval-gate items (identity migration, complete authorization matrix, invitation verification, revocation propagation SLO) in `docs/superpowers/specs/2026-08-01-phase-8-multi-user-design.md`, per that document's Decision 1-4 sections, resolved in `PHASE-008-multi-user.md`'s "Approved decisions" section. Implementation begins with Task 1 (account/membership/session framework) once Phase 7's own whole-phase review round converged with zero open findings -- the same kind of repository-owner-directed sequencing every phase 2-7 transition has used; this does not itself make Phase 7's own promotion/exit decision.
 
 Membership, invitations, least-privilege permissions, explicit sharing, delegation acceptance, ownership transfer and privacy-preserving collaboration.
 
-Specification: [PHASE-008](phases/PHASE-008-multi-user.md)
+Specification: [PHASE-008](phases/PHASE-008-multi-user.md)  
+Design doc: [Phase 8 Multi-user Design](superpowers/specs/2026-08-01-phase-8-multi-user-design.md)  
+Implementation plan: [Phase 8 Multi-user Implementation Plan](superpowers/plans/2026-08-01-phase-8-multi-user.md)  
+Implementation status: [Phase 8 Implementation Status](phases/phase-008/IMPLEMENTATION-STATUS.md)
 
 ## Phase 9 — Enterprise
 

@@ -1,8 +1,8 @@
 ---
 id: PHASE-008
 title: Multi-user Workspaces
-status: Draft
-version: 0.2.0
+status: Approved for Implementation
+version: 0.3.0
 owner: Lucky Jain
 depends_on:
   - PHASE-007
@@ -21,6 +21,10 @@ contracts:
 ---
 
 # PHASE-008 — Multi-user Workspaces
+
+## Approved decisions
+
+Contracts moved from Draft after resolving `docs/phases/PHASE-REVIEW.md:139`'s four named approval-gate items (identity migration; complete authorization matrix; invitation verification; revocation propagation SLO) in `docs/superpowers/specs/2026-08-01-phase-8-multi-user-design.md`, per that document's own Decision 1-4 sections. In summary: a new workspace-independent `accounts` table becomes the thing a person authenticates as; the existing `users` table keeps its exact current role as the composite `(workspace_id, id)` FK anchor every `owner_id` column across ~14 existing tables already points to (zero disruption to those FKs), gaining only an `account_id` column, with a new `workspace_memberships` table carrying the mutable role/status a removed member's historical ownership must survive losing; a single closed `authorize()` function with a bounded `owner|admin|member|viewer` role enum plus resource/action/time-scoped `resource_grants` is the one authorization decision point every domain calls, with every Phase 7 personal-domain table hardcoded, structurally ungrantable `private` visibility (F-04's "Phase 8 roles do not grant private-vault access" made impossible, not merely undefaulted); invitations are recipient-bound by email, single-use, expiring, and re-verified against the accepting account's own email inside one row-locked transaction; revocation propagates near-instantly by construction, since no permission cache exists anywhere in this design to invalidate, measured directly in Task 3's own integration tests against the 60-second ceiling rather than merely argued to meet it. Implementation begins with Task 1 (account/membership/session framework) once Phase 7's own whole-phase review round converged with zero open findings (PR #99, merged) -- the same kind of repository-owner-directed sequencing every phase 2-7 transition has used. Implementation plan: `docs/superpowers/plans/2026-08-01-phase-8-multi-user.md`. Delivery status: `docs/phases/phase-008/IMPLEMENTATION-STATUS.md`.
 
 ## Objective
 
