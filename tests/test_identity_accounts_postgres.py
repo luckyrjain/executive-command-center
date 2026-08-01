@@ -42,7 +42,7 @@ pytestmark = pytest.mark.skipif(
 
 def _cleanup_workspace(workspace_id: UUID) -> None:
     with engine.begin() as connection:
-        for table in ("workspace_memberships", "sessions", "users", "event_outbox", "audit_events"):
+        for table in ("workspace_memberships", "sessions", "event_outbox", "audit_events", "users"):
             connection.execute(
                 text(f"DELETE FROM {table} WHERE workspace_id = :workspace_id"),  # noqa: S608
                 {"workspace_id": workspace_id},
@@ -102,14 +102,20 @@ def test_create_account_and_reject_duplicate_email(client: TestClient) -> None:
     body = resp.json()
     assert body["email"] == email
     assert body["display_name"] == "Alex"
-    _cleanup_account(UUID(body["id"]))
 
-    dup = client.post(
-        "/api/v1/identity/accounts",
-        json={"email": email.upper(), "password": "a different password", "display_name": "Alex 2"},
-    )
-    assert dup.status_code == 409, dup.text
-    assert dup.json()["error"]["code"] == "EMAIL_ALREADY_REGISTERED"
+    try:
+        dup = client.post(
+            "/api/v1/identity/accounts",
+            json={
+                "email": email.upper(),
+                "password": "a different password",
+                "display_name": "Alex 2",
+            },
+        )
+        assert dup.status_code == 409, dup.text
+        assert dup.json()["error"]["code"] == "EMAIL_ALREADY_REGISTERED"
+    finally:
+        _cleanup_account(UUID(body["id"]))
 
 
 def test_create_account_rejects_short_password(client: TestClient) -> None:
@@ -368,7 +374,7 @@ def test_authenticated_switch_requires_csrf(client: TestClient) -> None:
         account_id = create_identity(
             connection, workspace_id=workspace_id, user_id=users_id, now=now
         )
-        token = _new_session(workspace_id, users_id, now)
+    token = _new_session(workspace_id, users_id, now)
 
     try:
         client.cookies.set("ecc_session", token)

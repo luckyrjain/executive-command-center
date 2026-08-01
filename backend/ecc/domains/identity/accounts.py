@@ -543,6 +543,7 @@ def list_workspaces_endpoint(auth: AuthDep, session: SessionDep) -> WorkspaceLis
         .mappings()
         .one()
     )
+    session.rollback()
     rows = (
         session.execute(
             text(
@@ -612,6 +613,7 @@ def create_workspace_endpoint(
         .mappings()
         .one()
     )
+    session.rollback()
     now = datetime.now(UTC)
     new_workspace_id = uuid4()
     new_users_id = uuid4()
