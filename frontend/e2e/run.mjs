@@ -22,6 +22,7 @@ import * as automationLifecycle from './scenarios/automation-lifecycle.mjs'
 import * as automationApprovalsKeyboard from './scenarios/automation-approvals-keyboard.mjs'
 import * as engineeringConnectorStates from './scenarios/engineering-connector-states.mjs'
 import * as engineeringLifecycle from './scenarios/engineering-lifecycle.mjs'
+import * as personalDomainLifecycle from './scenarios/personal-domain-lifecycle.mjs'
 
 const scenarios = [
   { name: 'tasks', module: tasks },
@@ -57,6 +58,7 @@ const scenarios = [
   { name: 'automation-approvals-keyboard', module: automationApprovalsKeyboard },
   { name: 'engineering-connector-states', module: engineeringConnectorStates },
   { name: 'engineering-lifecycle', module: engineeringLifecycle },
+  { name: 'personal-domain-lifecycle', module: personalDomainLifecycle },
 ]
 
 async function main() {

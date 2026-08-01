@@ -1187,6 +1187,192 @@ const defaultAuditCorpus = [
   },
 ]
 
+// Mirrors `backend/ecc/domains/personal/domains.py`'s own fixed
+// `_CLASSIFICATION_BY_DOMAIN` -- the fixture has no server-side source of
+// truth to read this from (unlike a real backend), so it keeps its own
+// copy of the same six-domain enum the real API enforces.
+const PERSONAL_CLASSIFICATION_BY_DOMAIN = {
+  habits: 'standard',
+  learning: 'standard',
+  travel: 'standard',
+  relationships: 'sensitive',
+  health: 'high_stakes',
+  finance: 'high_stakes',
+}
+
+/**
+ * Fake of Phase 7's `/api/v1/personal/*` surface (`ecc.domains.personal.
+ * {domains,habits,grants,export_deletion,ai_insights}`) -- domains, records,
+ * insights, cross-domain grants and export/delete, mirroring `make
+ * AutomationApi`/`makeEngineeringApi`'s identical in-memory-collection
+ * shape. `overrides.domains`/`records`/`insights`/`grants` seed initial
+ * rows; `overrides.generateResponse` scripts a fixed `POST .../insights/
+ * generate` result (default: fail-open, `available: false`, `error_code:
+ * 'no_grant'`) since the real endpoint's actual model call has no fixture
+ * analogue.
+ */
+function makePersonalApi(overrides = {}) {
+  let nextId = 1
+  const domains = [...(overrides.domains ?? [])]
+  const records = [...(overrides.records ?? [])]
+  const insights = [...(overrides.insights ?? [])]
+  const grants = [...(overrides.grants ?? [])]
+  const generateResponse = overrides.generateResponse
+    ?? { available: false, insight: null, error_code: 'no_grant' }
+
+  function findDomain(domainKey) {
+    return domains.find((d) => d.domain_key === domainKey)
+  }
+
+  function setEnabled(domainKey, enabled) {
+    const now = nowIso()
+    let domain = findDomain(domainKey)
+    if (!domain) {
+      domain = {
+        id: `personal-domain-${nextId++}`,
+        domain_key: domainKey,
+        classification: PERSONAL_CLASSIFICATION_BY_DOMAIN[domainKey],
+        enabled,
+        enabled_at: enabled ? now : null,
+        version: 1,
+        created_at: now,
+        updated_at: now,
+      }
+      domains.push(domain)
+    } else {
+      domain.enabled = enabled
+      if (enabled) domain.enabled_at = now
+      domain.updated_at = now
+      domain.version += 1
+    }
+    return domain
+  }
+
+  function dispatch(pathname, method, body, queryString) {
+    if (!pathname.startsWith('/api/v1/personal')) return null
+    const params = new URLSearchParams(queryString)
+
+    if (pathname === '/api/v1/personal/domains' && method === 'GET') {
+      return { status: 200, body: { domains } }
+    }
+    const enableMatch = pathname.match(/^\/api\/v1\/personal\/domains\/([^/]+)\/enable$/)
+    if (enableMatch && method === 'POST') {
+      return { status: 200, body: setEnabled(enableMatch[1], true) }
+    }
+    const disableMatch = pathname.match(/^\/api\/v1\/personal\/domains\/([^/]+)\/disable$/)
+    if (disableMatch && method === 'POST') {
+      return { status: 200, body: setEnabled(disableMatch[1], false) }
+    }
+
+    if (pathname === '/api/v1/personal/records' && method === 'GET') {
+      const domainKey = params.get('domain_key')
+      const items = domainKey ? records.filter((r) => r.domain_key === domainKey) : records
+      return { status: 200, body: { records: items } }
+    }
+    if (pathname === '/api/v1/personal/records' && method === 'POST') {
+      const classification = PERSONAL_CLASSIFICATION_BY_DOMAIN[body.domain_key]
+      if (classification === 'high_stakes' && !body.retention_acknowledged) {
+        return { status: 422, body: { error: { code: 'RETENTION_ACKNOWLEDGEMENT_REQUIRED', message: 'Retention Acknowledgement Required' } } }
+      }
+      const now = nowIso()
+      const record = {
+        id: `personal-record-${nextId++}`,
+        domain_key: body.domain_key,
+        record_type: body.record_type,
+        payload: body.payload ?? {},
+        domain_source_id: null,
+        effective_at: now,
+        retention_acknowledged_at: body.retention_acknowledged ? now : null,
+        version: 1,
+        created_at: now,
+        updated_at: now,
+      }
+      records.push(record)
+      return { status: 201, body: record }
+    }
+
+    if (pathname === '/api/v1/personal/insights' && method === 'GET') {
+      return { status: 200, body: { insights } }
+    }
+    const dismissMatch = pathname.match(/^\/api\/v1\/personal\/insights\/([^/]+)\/dismiss$/)
+    if (dismissMatch && method === 'POST') {
+      const insight = insights.find((i) => i.id === dismissMatch[1])
+      if (!insight) return { status: 404, body: { error: { code: 'INSIGHT_NOT_FOUND', message: 'Not found' } } }
+      insight.dismissed_at = nowIso()
+      return { status: 200, body: insight }
+    }
+    const feedbackMatch = pathname.match(/^\/api\/v1\/personal\/insights\/([^/]+)\/feedback$/)
+    if (feedbackMatch && method === 'POST') {
+      return {
+        status: 201,
+        body: { id: `personal-feedback-${nextId++}`, insight_id: feedbackMatch[1], useful: body.useful, comment: body.comment ?? null, created_at: nowIso() },
+      }
+    }
+    if (pathname === '/api/v1/personal/insights/generate' && method === 'POST') {
+      if (generateResponse.available && generateResponse.insight) insights.push(generateResponse.insight)
+      return { status: 200, body: generateResponse }
+    }
+
+    if (pathname === '/api/v1/personal/grants' && method === 'GET') {
+      return { status: 200, body: { grants } }
+    }
+    if (pathname === '/api/v1/personal/grants' && method === 'POST') {
+      const now = nowIso()
+      const grant = {
+        id: `personal-grant-${nextId++}`,
+        source_domain_key: body.source_domain_key,
+        purpose: body.purpose,
+        granted_categories: body.granted_categories,
+        granted_at: now,
+        expires_at: body.expires_at ?? null,
+        revoked_at: null,
+        created_at: now,
+      }
+      grants.push(grant)
+      return { status: 201, body: grant }
+    }
+    const revokeGrantMatch = pathname.match(/^\/api\/v1\/personal\/grants\/([^/]+)\/revoke$/)
+    if (revokeGrantMatch && method === 'POST') {
+      const grant = grants.find((g) => g.id === revokeGrantMatch[1])
+      if (!grant) return { status: 404, body: { error: { code: 'GRANT_NOT_FOUND', message: 'Not found' } } }
+      if (!grant.revoked_at) grant.revoked_at = nowIso()
+      return { status: 200, body: grant }
+    }
+
+    const exportMatch = pathname.match(/^\/api\/v1\/personal\/domains\/([^/]+)\/export$/)
+    if (exportMatch && method === 'POST') {
+      const domainKey = exportMatch[1]
+      return {
+        status: 200,
+        body: {
+          domain_key: domainKey,
+          exported_at: nowIso(),
+          goals: [],
+          routines: [],
+          check_ins: [],
+          domain_records: records.filter((r) => r.domain_key === domainKey),
+        },
+      }
+    }
+    const deleteMatch = pathname.match(/^\/api\/v1\/personal\/domains\/([^/]+)\/delete$/)
+    if (deleteMatch && method === 'POST') {
+      const domainKey = deleteMatch[1]
+      for (let i = records.length - 1; i >= 0; i -= 1) {
+        if (records[i].domain_key === domainKey) records.splice(i, 1)
+      }
+      const now = nowIso()
+      return {
+        status: 200,
+        body: { id: `personal-deletion-${nextId++}`, domain_key: domainKey, status: 'completed', requested_at: now, completed_at: now },
+      }
+    }
+
+    return null
+  }
+
+  return { domains, records, insights, grants, dispatch }
+}
+
 /**
  * Installs an in-memory fake of the Phase 1 API surface onto `page`, covering
  * every workspace built in Tasks 1-5: tasks, commitments, notes, calendar
@@ -1267,6 +1453,7 @@ export async function createFixtureApi(page, overrides = {}) {
   const aiRuntime = makeAiRuntimeApi(overrides.aiRuntime)
   const automation = makeAutomationApi(overrides.automation ?? {})
   const engineering = makeEngineeringApi(overrides.engineering ?? {})
+  const personal = makePersonalApi(overrides.personal ?? {})
 
   // `route.fulfill()` synthesizes a response without touching the real
   // network, so `context.setOffline(true)` alone does NOT stop a mocked
@@ -1433,6 +1620,10 @@ export async function createFixtureApi(page, overrides = {}) {
       const result = engineering.dispatch(pathname, method, body, queryString)
       if (result) return result
     }
+    if (pathname.startsWith('/api/v1/personal')) {
+      const result = personal.dispatch(pathname, method, body, queryString)
+      if (result) return result
+    }
     for (const resource of resources) {
       const result = resource(pathname, method, body, queryString)
       if (result) return result
@@ -1463,6 +1654,7 @@ export async function createFixtureApi(page, overrides = {}) {
     aiRuntime,
     automation,
     engineering,
+    personal,
     dashboard,
     brief,
     evidence,

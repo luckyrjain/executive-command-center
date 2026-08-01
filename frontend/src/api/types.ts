@@ -12,6 +12,7 @@ export type WorkspaceView =
   | 'meeting-prep'
   | 'automation'
   | 'engineering'
+  | 'personal'
 
 export type ApiRequestOptions = Omit<RequestInit, 'body' | 'headers'> & {
   body?: unknown
