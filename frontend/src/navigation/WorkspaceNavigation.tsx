@@ -27,6 +27,7 @@ const WORKSPACES: ReadonlyArray<{ view: WorkspaceView; label: string }> = [
   // rewrite just to add one more tab.
   { view: 'automation', label: 'Automation' },
   { view: 'engineering', label: 'Engineering' },
+  { view: 'personal', label: 'Personal' },
 ]
 
 export function nextWorkspaceIndex(current: number, key: string, count: number): number {

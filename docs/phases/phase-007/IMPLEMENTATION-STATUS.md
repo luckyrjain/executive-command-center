@@ -1,8 +1,8 @@
 ---
 id: PHASE-007-IMPLEMENTATION-STATUS
 title: Phase 7 Implementation Status
-status: Task 1 (domain/consent/vault framework and the habits reference domain), Task 2 (learning domain, no new code), Task 3 (travel domain, effective-date-range query filter), Task 4 (relationships domain, first real field-level encryption), Task 5 (cross_domain_grants schema/grant lifecycle plus the personal.generate_insight AI task type), Task 6 (health domain, high_stakes retention acknowledgement and safety rubric proven against real data), Task 7 (finance domain, second high_stakes domain, zero new mechanism required) complete
-version: 0.9.0
+status: Task 1 (domain/consent/vault framework and the habits reference domain), Task 2 (learning domain, no new code), Task 3 (travel domain, effective-date-range query filter), Task 4 (relationships domain, first real field-level encryption), Task 5 (cross_domain_grants schema/grant lifecycle plus the personal.generate_insight AI task type), Task 6 (health domain, high_stakes retention acknowledgement and safety rubric proven against real data), Task 7 (finance domain, second high_stakes domain, zero new mechanism required), Task 8 (executive UX and browser acceptance across all six domains) complete
+version: 1.0.0
 owner: Lucky Jain
 updated: 2026-07-31
 ---
@@ -19,7 +19,7 @@ Phase 7 began by repository-owner authorization to proceed in parallel with Phas
 | Evidence-backed domain insights | Done -- deterministic (non-AI) gap insights shipped in Task 1; AI-generated `trend`/`correlation` kinds shipped in Task 5 part 2 (`personal.generate_insight`) |
 | Cross-domain grants | Done -- Task 5 part 1 (schema, create/list/revoke); part 2's `personal.get_insight_sources` tool is the first real consumer |
 | Export, deletion and privacy controls | Done -- Task 1 (whole-domain export/delete, generic across every domain including `learning`); Task 4 fixed export to decrypt `relationships`' encrypted fields rather than returning ciphertext |
-| UX, safety review and dogfood | Not started -- Task 8 |
+| UX, safety review and dogfood | Done -- Task 8 (`frontend/src/features/personal/`, domain-generic across all six domains, one Playwright acceptance scenario with accessibility checks) |
 
 ## Task 1 evidence
 
@@ -109,8 +109,19 @@ Phase 7 began by repository-owner authorization to proceed in parallel with Phas
 
 **Verified.** `ruff format --check`/`ruff check` clean (pinned `ruff==0.12.3`). `mypy backend` clean, 162 source files (unchanged from Task 6 -- this task's only source change is two dict entries in an already-typed `dict[str, frozenset[str]]`). No migration to round-trip -- this task adds no schema. **Local pytest execution remained impossible in this sandbox**, same disclosed reason as every prior task's evidence in this document; the real test suite run happens in CI, watched and driven to green the same way every prior PR in this activation has been.
 
+## Task 8 evidence
+
+**Complete: `frontend/src/features/personal/`, the first (and only) frontend code Phase 7 has shipped.** Tasks 1-7 were entirely backend-only -- this task built one domain-generic tabbed `PersonalWorkspace` (`DomainsPanel`, `RecordsPanel`, `InsightsPanel`, `GrantsPanel`, `ExportDeletePanel`), mirroring `EngineeringWorkspace.tsx`'s own roving-tabindex shell and reusing `apiRequest`/`ApiError` (`frontend/src/api/client.ts`) exactly as every other feature does. Deliberately generic across all six domains rather than six bespoke surfaces -- every backend endpoint this UI calls already takes a `domain_key` parameter, matching the backend's own "a caller names a `domain_key`, never a domain-specific code path" convention this entire phase has held to since Task 1. `habits`' own `goals`/`routines`/`check_ins` extras are intentionally out of scope, not named in the implementation plan's own Task 8 coverage list.
+
+**Every `UX-STATES.md`-required state is covered, or its absence is honestly disclosed** -- see that document's own new "Task 8 status" section for the full per-state mapping (disabled, no data, incomplete data, consent expired/revoked, sensitive insight, export running, deletion pending/completed). One state, **import pending, is deliberately not implemented**: this activation has no real import path at all (`imported_file` accepted as a value but no endpoint ever creates one), so there is no real state for a UI to drive through -- building one anyway would misrepresent a capability that does not exist, the same discipline this document's own "Import, provenance and retention" row has held to since Task 1.
+
+**Two genuinely new proofs this task adds, not just UI**: (1) the sensitive-insight boundary (`professional_referral_note`) and the retention-acknowledgement requirement, both built and proven against real Postgres data by Tasks 5/6/7, are now also proven reachable through the actual UI a user would use, not only through direct API calls in a test file; (2) `GrantsPanel`'s `active`/`expired`/`revoked` computation is the first place anything in this phase actually reads `cross_domain_grants.expires_at` for a purpose other than storing it -- Task 5 part 1 shipped the column, nothing before this task ever computed a state from it.
+
+**Tests.** 35 component-test cases across 5 files (`DomainsPanel.test.tsx`, `RecordsPanel.test.tsx`, `InsightsPanel.test.tsx`, `GrantsPanel.test.tsx`, `ExportDeletePanel.test.tsx`) -- Vitest + Testing Library, mirroring `ConnectorHealthPanel.test.tsx`'s own `stubFetch`/CSRF-cookie/`crypto.randomUUID` stub conventions exactly. One Playwright browser-acceptance scenario, `frontend/e2e/scenarios/personal-domain-lifecycle.mjs`: enable Habits -> capture a record -> create and revoke a cross-domain grant (alongside a pre-seeded already-expired grant, proving that state independently) -> inspect a pre-seeded `health`-sourced insight's boundary note and its `missing_data` notice, dismiss it, then attempt (and correctly fail open on) a live generate-insight call with no grant -> export Habits' one record -> delete it -- with `@axe-core/playwright` accessibility checks after every tab switch, asserting zero serious/critical violations. `frontend/e2e/fixtures.mjs` gained `makePersonalApi`, mirroring `makeAutomationApi`/`makeEngineeringApi`'s identical in-memory-collection-plus-`dispatch` shape, wired into `createFixtureApi`'s single catch-all route handler alongside every other domain's fixture.
+
+**Verified.** `tsc --noEmit` (this repo's own `lint`/`typecheck` script) clean across the whole frontend, not just the new files. All 35 new Vitest cases pass; the full frontend Vitest suite and the full 22-scenario Playwright suite (21 pre-existing scenarios plus `personal-domain-lifecycle`) were run locally against a real headless Chromium (`/opt/pw-browsers/chromium`, this sandbox's pre-installed binary) -- all 22 scenarios passed, including the new one, with zero accessibility violations reported anywhere.
+
 ## What remains before Phase 7 itself can exit
 
-- Task 8: executive UX and browser acceptance across all six domains (consent dashboard, cross-domain grant management UI, Playwright acceptance with `@axe-core/playwright` accessibility checks).
-- Privacy impact assessment and safety-rubric fixture sets are re-triggered per domain as each ships (design doc Decision 2's own standard), not assumed to carry over automatically from `habits`.
-- No promotion/exit decision has been made for Phase 7 as a whole -- one task's evidence is a first confirming signal for the framework, not phase completion.
+- Privacy impact assessment and safety-rubric fixture sets are re-triggered per domain as each ships (design doc Decision 2's own standard) -- already exercised for every domain through Task 7; no further domain work is queued.
+- No promotion/exit decision has been made for Phase 7 as a whole -- all eight tasks' evidence sections above are a first confirming signal for the framework and its UX, not a repository-owner exit decision, which remains a separate, deliberate step this document does not make on its own.
