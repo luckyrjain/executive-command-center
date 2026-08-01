@@ -1292,7 +1292,10 @@ function makePersonalApi(overrides = {}) {
     }
 
     if (pathname === '/api/v1/personal/insights' && method === 'GET') {
-      return { status: 200, body: { insights } }
+      // Mirrors `habits.py:list_insights_endpoint`'s own `AND dismissed_at
+      // IS NULL` filter -- the real endpoint never returns a dismissed
+      // insight, so neither does this fixture.
+      return { status: 200, body: { insights: insights.filter((i) => i.dismissed_at == null) } }
     }
     const dismissMatch = pathname.match(/^\/api\/v1\/personal\/insights\/([^/]+)\/dismiss$/)
     if (dismissMatch && method === 'POST') {

@@ -105,8 +105,12 @@ export async function run({ page, baseURL }) {
   await healthInsightRow.getByText('Consider discussing this with your doctor.').waitFor()
   await healthInsightRow.getByText(/Incomplete data: no readings on weekends/).waitFor()
 
+  // `GET /personal/insights` (habits.py:list_insights_endpoint) filters
+  // `dismissed_at IS NULL` server-side -- dismissing this, the only seeded
+  // insight, removes it from the list entirely rather than leaving a
+  // "Dismissed" row behind.
   await healthInsightRow.getByRole('button', { name: 'Dismiss' }).click()
-  await healthInsightRow.getByText(/Dismissed/).waitFor()
+  await insightsPanel.getByText('No insights yet -- capture a few records first.').waitFor()
   assert.equal(fixtures.personal.insights[0].dismissed_at != null, true)
 
   await insightsPanel.getByRole('checkbox', { name: /Habits/ }).click()

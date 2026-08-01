@@ -73,10 +73,20 @@ describe('InsightsPanel', () => {
     expect(await screen.findByText(/Incomplete data: no check-ins this week/)).toBeTruthy()
   })
 
-  it('dismisses an insight', async () => {
+  it('dismisses an insight, which then disappears once the list refetches', async () => {
+    // `GET /personal/insights` (habits.py:list_insights_endpoint) filters
+    // `dismissed_at IS NULL` server-side -- a dismissed insight is never
+    // returned again, so dismissing removes the row entirely rather than
+    // flipping it to a persistent "Dismissed" state. `listCallCount` mimics
+    // that: the first GET (initial render) returns the seeded insight, the
+    // second GET (triggered by the dismiss mutation's own invalidation)
+    // returns none, matching the real endpoint's own behavior across the
+    // same two calls.
+    let listCallCount = 0
     const fetch = vi.fn((input: RequestInfo | URL) => {
       if (String(input).includes('/dismiss')) return response(insight({ dismissed_at: '2026-07-27T01:00:00Z' }))
-      return response({ insights: [insight()] })
+      listCallCount += 1
+      return response({ insights: listCallCount === 1 ? [insight()] : [] })
     })
     vi.stubGlobal('fetch', fetch)
     renderPanel()
@@ -86,14 +96,8 @@ describe('InsightsPanel', () => {
       expect.stringContaining('/api/v1/personal/insights/insight-1/dismiss'),
       expect.objectContaining({ method: 'POST' }),
     ))
-  })
-
-  it('does not offer Dismiss for an already-dismissed insight', async () => {
-    vi.stubGlobal('fetch', vi.fn(() => response({ insights: [insight({ dismissed_at: '2026-07-27T01:00:00Z' })] })))
-    renderPanel()
-    await screen.findByText('Streak update')
-    expect(screen.queryByRole('button', { name: 'Dismiss' })).toBeNull()
-    expect(screen.getByText(/Dismissed/)).toBeTruthy()
+    expect(await screen.findByText('No insights yet -- capture a few records first.')).toBeTruthy()
+    expect(screen.queryByText('Streak update')).toBeNull()
   })
 
   it('submits feedback for an insight', async () => {

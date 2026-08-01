@@ -4,7 +4,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { apiRequest } from '../../api/client'
 import { personalErrorMessage, formatTimestamp } from './errors'
 import { DOMAIN_KEYS, DOMAIN_LABELS } from './types'
-import type { DomainKey, Grant, GrantListResponse } from './types'
+import type { DomainKey, DomainListResponse, Grant, GrantListResponse } from './types'
 
 type GrantState = 'active' | 'expired' | 'revoked'
 
@@ -54,6 +54,13 @@ export default function GrantsPanel() {
   const [categories, setCategories] = useState('')
   const [expiresAt, setExpiresAt] = useState('')
 
+  const domains = useQuery({
+    queryKey: ['personal', 'domains'],
+    queryFn: () => apiRequest<DomainListResponse>('/api/v1/personal/domains'),
+    retry: 1,
+  })
+  const sourceDomainEnabled = (domains.data?.domains ?? []).some((d) => d.domain_key === sourceDomainKey && d.enabled)
+
   const grants = useQuery({
     queryKey: ['personal', 'grants'],
     queryFn: () => apiRequest<GrantListResponse>('/api/v1/personal/grants'),
@@ -84,7 +91,7 @@ export default function GrantsPanel() {
 
   const now = new Date()
   const items = grants.data?.grants ?? []
-  const canSubmit = categories.split(',').map((c) => c.trim()).filter(Boolean).length > 0
+  const canSubmit = sourceDomainEnabled && categories.split(',').map((c) => c.trim()).filter(Boolean).length > 0
 
   return (
     <section className="work-panel" aria-labelledby="personal-grants-title">
@@ -106,6 +113,9 @@ export default function GrantsPanel() {
         <label>Expires (optional)
           <input aria-label="Expires at" type="datetime-local" value={expiresAt} onChange={(event) => setExpiresAt(event.target.value)} />
         </label>
+        {domains.data && !sourceDomainEnabled ? (
+          <p className="empty-state">Enable {DOMAIN_LABELS[sourceDomainKey]} in the Domains tab before granting access to its data.</p>
+        ) : null}
         <div className="work-actions">
           <button type="submit" disabled={createMutation.isPending || !canSubmit}>Create grant</button>
         </div>

@@ -61,13 +61,16 @@ function InsightCard({ insight, onDismissed }: { insight: Insight; onDismissed: 
         </div>
       ) : null}
 
-      {insight.dismissed_at ? (
-        <p className="inline-status">Dismissed {formatTimestamp(insight.dismissed_at)}</p>
-      ) : (
-        <div className="work-actions">
-          <button type="button" disabled={dismissMutation.isPending} onClick={() => dismissMutation.mutate()}>Dismiss</button>
-        </div>
-      )}
+      {/* `GET /personal/insights` (habits.py:list_insights_endpoint) filters
+          `dismissed_at IS NULL` server-side, so a dismissed insight is never
+          returned to re-render here -- dismissing one simply removes it from
+          the list on the next refetch, matching every other action in this
+          feature that leaves a row's own fate to a query invalidation rather
+          than tracking a terminal state client-side that the server itself
+          never sends back. */}
+      <div className="work-actions">
+        <button type="button" disabled={dismissMutation.isPending} onClick={() => dismissMutation.mutate()}>Dismiss</button>
+      </div>
       {dismissMutation.isError ? <div role="alert" className="inline-status error-panel">{personalErrorMessage(dismissMutation.error)}</div> : null}
 
       <FeedbackForm insight={insight} />
