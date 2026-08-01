@@ -46,6 +46,7 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 from fixtures.phase4_evaluation_attention_explain import DATASET_VERSION, EXAMPLES, TASK_TYPE
+from identity_fixtures import create_identity
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 
@@ -247,17 +248,12 @@ def run_context() -> Iterator[dict]:
             ),
             {"id": workspace_id, "created_at": now},
         )
-        connection.execute(
-            text(
-                "INSERT INTO users (id, workspace_id, email, password_hash, created_at) "
-                "VALUES (:id, :workspace_id, :email, 'hash', :created_at)"
-            ),
-            {
-                "id": user_id,
-                "workspace_id": workspace_id,
-                "email": f"{user_id}@example.test",
-                "created_at": now,
-            },
+        create_identity(
+            connection,
+            workspace_id=workspace_id,
+            user_id=user_id,
+            email=f"{user_id}@example.test",
+            now=now,
         )
         connection.execute(
             text(
@@ -963,17 +959,12 @@ def test_get_evaluation_run_cross_workspace_is_404(
             ),
             {"id": other_workspace, "created_at": now},
         )
-        connection.execute(
-            text(
-                "INSERT INTO users (id, workspace_id, email, password_hash, created_at) "
-                "VALUES (:id, :workspace_id, :email, 'hash', :created_at)"
-            ),
-            {
-                "id": other_user,
-                "workspace_id": other_workspace,
-                "email": f"{other_user}@example.test",
-                "created_at": now,
-            },
+        create_identity(
+            connection,
+            workspace_id=other_workspace,
+            user_id=other_user,
+            email=f"{other_user}@example.test",
+            now=now,
         )
     try:
         adapter = _adapter_with_responses(*_flat_responses())

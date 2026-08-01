@@ -747,6 +747,7 @@ from datetime import timedelta as _timedelta  # noqa: E402
 from hashlib import sha256 as _sha256  # noqa: E402
 from hmac import new as _hmac_new  # noqa: E402
 
+from identity_fixtures import create_identity  # noqa: E402
 from sqlalchemy import text as _text  # noqa: E402
 
 from ecc.main import app as _real_app  # noqa: E402
@@ -770,20 +771,12 @@ def _domain_test_context() -> _Iterator[tuple[TestClient, str]]:
             _text("INSERT INTO workspaces (id, name, created_at) VALUES (:id, :name, :created_at)"),
             {"id": workspace_id, "name": "Observability Domain Test", "created_at": now},
         )
-        connection.execute(
-            _text(
-                """
-                INSERT INTO users (id, workspace_id, email, password_hash, created_at)
-                VALUES (:id, :workspace_id, :email, :password_hash, :created_at)
-                """
-            ),
-            {
-                "id": user_id,
-                "workspace_id": workspace_id,
-                "email": f"{user_id}@example.test",
-                "password_hash": "test-password-hash",
-                "created_at": now,
-            },
+        create_identity(
+            connection,
+            workspace_id=workspace_id,
+            user_id=user_id,
+            email=f"{user_id}@example.test",
+            now=now,
         )
         connection.execute(
             _text(

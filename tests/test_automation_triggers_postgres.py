@@ -13,6 +13,7 @@ from datetime import UTC, datetime
 from uuid import UUID, uuid4
 
 import pytest
+from identity_fixtures import create_identity
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 
@@ -41,17 +42,12 @@ def trigger_test_context() -> Iterator[tuple[UUID, UUID]]:
             ),
             {"id": workspace_id, "now": now},
         )
-        connection.execute(
-            text(
-                "INSERT INTO users (id, workspace_id, email, password_hash, created_at) "
-                "VALUES (:id, :workspace_id, :email, 'test-password-hash', :now)"
-            ),
-            {
-                "id": user_id,
-                "workspace_id": workspace_id,
-                "email": f"{user_id}@example.test",
-                "now": now,
-            },
+        create_identity(
+            connection,
+            workspace_id=workspace_id,
+            user_id=user_id,
+            email=f"{user_id}@example.test",
+            now=now,
         )
     try:
         yield workspace_id, user_id

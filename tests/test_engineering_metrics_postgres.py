@@ -36,6 +36,7 @@ from uuid import UUID, uuid4
 
 import pytest
 from fastapi.testclient import TestClient
+from identity_fixtures import create_identity
 from sqlalchemy import text
 
 from ecc.config import get_settings
@@ -69,17 +70,12 @@ def workspace() -> Iterator[UUID]:
             ),
             {"id": workspace_id, "now": now},
         )
-        connection.execute(
-            text(
-                "INSERT INTO users (id, workspace_id, email, password_hash, created_at) "
-                "VALUES (:id, :workspace_id, :email, 'test-password-hash', :now)"
-            ),
-            {
-                "id": user_id,
-                "workspace_id": workspace_id,
-                "email": f"{user_id}@example.test",
-                "now": now,
-            },
+        create_identity(
+            connection,
+            workspace_id=workspace_id,
+            user_id=user_id,
+            email=f"{user_id}@example.test",
+            now=now,
         )
     try:
         yield workspace_id
@@ -903,17 +899,12 @@ def test_time_to_restore_is_workspace_isolated(workspace: UUID) -> None:
             ),
             {"id": other_workspace_id, "now": now},
         )
-        connection.execute(
-            text(
-                "INSERT INTO users (id, workspace_id, email, password_hash, created_at) "
-                "VALUES (:id, :workspace_id, :email, 'x', :now)"
-            ),
-            {
-                "id": other_user_id,
-                "workspace_id": other_workspace_id,
-                "email": f"{other_user_id}@example.test",
-                "now": now,
-            },
+        create_identity(
+            connection,
+            workspace_id=other_workspace_id,
+            user_id=other_user_id,
+            email=f"{other_user_id}@example.test",
+            now=now,
         )
     try:
         _insert_incident(
@@ -1146,17 +1137,12 @@ def test_get_metrics_endpoint_is_workspace_isolated(
             ),
             {"id": other_workspace_id, "now": now},
         )
-        connection.execute(
-            text(
-                "INSERT INTO users (id, workspace_id, email, password_hash, created_at) "
-                "VALUES (:id, :workspace_id, :email, 'x', :now)"
-            ),
-            {
-                "id": other_user_id,
-                "workspace_id": other_workspace_id,
-                "email": f"{other_user_id}@example.test",
-                "now": now,
-            },
+        create_identity(
+            connection,
+            workspace_id=other_workspace_id,
+            user_id=other_user_id,
+            email=f"{other_user_id}@example.test",
+            now=now,
         )
         connection.execute(
             text(

@@ -5,6 +5,7 @@ from uuid import UUID, uuid4
 
 import pytest
 from fastapi.testclient import TestClient
+from identity_fixtures import create_identity
 from sqlalchemy import text
 
 from ecc.config import get_settings
@@ -45,19 +46,12 @@ def search_audit_context() -> Iterator[tuple[TestClient, UUID, UUID, UUID]]:
             (user_id, workspace_id),
             (other_user_id, other_workspace_id),
         ):
-            connection.execute(
-                text(
-                    """
-                    INSERT INTO users (id, workspace_id, email, password_hash, created_at)
-                    VALUES (:id, :workspace_id, :email, 'test-password-hash', :created_at)
-                    """
-                ),
-                {
-                    "id": current_user,
-                    "workspace_id": current_workspace,
-                    "email": f"{current_user}@example.test",
-                    "created_at": now,
-                },
+            create_identity(
+                connection,
+                workspace_id=current_workspace,
+                user_id=current_user,
+                email=f"{current_user}@example.test",
+                now=now,
             )
         connection.execute(
             text(

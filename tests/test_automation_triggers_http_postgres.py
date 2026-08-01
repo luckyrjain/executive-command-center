@@ -21,6 +21,7 @@ from uuid import UUID, uuid4
 
 import pytest
 from fastapi.testclient import TestClient
+from identity_fixtures import create_identity
 from sqlalchemy import text
 
 from ecc.config import get_settings
@@ -46,17 +47,12 @@ def _seed_workspace(workspace_id: UUID, user_id: UUID, name: str) -> str:
             ),
             {"id": workspace_id, "name": name, "now": now},
         )
-        connection.execute(
-            text(
-                "INSERT INTO users (id, workspace_id, email, password_hash, created_at) "
-                "VALUES (:id, :workspace_id, :email, 'test-password-hash', :now)"
-            ),
-            {
-                "id": user_id,
-                "workspace_id": workspace_id,
-                "email": f"{user_id}@example.test",
-                "now": now,
-            },
+        create_identity(
+            connection,
+            workspace_id=workspace_id,
+            user_id=user_id,
+            email=f"{user_id}@example.test",
+            now=now,
         )
         connection.execute(
             text(

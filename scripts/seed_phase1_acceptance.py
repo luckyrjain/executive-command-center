@@ -234,7 +234,9 @@ def seed_id(*parts: str) -> UUID:
 def _fixture_ids(label: str) -> dict[str, UUID]:
     return {
         "workspace": seed_id(label, "workspace"),
+        "account": seed_id(label, "account", "owner"),
         "user": seed_id(label, "user", "owner"),
+        "workspace_membership": seed_id(label, "workspace_membership", "owner"),
         "session": seed_id(label, "session", "primary"),
         "node_person": seed_id(label, "pkos_node", "person"),
         "node_topic": seed_id(label, "pkos_node", "topic"),
@@ -362,17 +364,55 @@ def _seed_workspace(cur: psycopg.Cursor[Any], label: str, ids: Mapping[str, UUID
             "timezone": _tz(label),
         },
     )
+    # Phase 8 Task 1 (docs/superpowers/specs/2026-08-01-phase-8-multi-user-
+    # design.md Decision 1): identity is now `accounts` (workspace-
+    # independent) + `users` (unchanged FK anchor, gains account_id) +
+    # `workspace_memberships` (mutable role/status). This seed identity is
+    # never logged into for real (same "no-login fixture" placeholder
+    # password_hash as before), only referenced by id as every other
+    # fixture row's owner_id/created_by/updated_by.
     cur.execute(
         """
-        INSERT INTO users (id, workspace_id, email, password_hash, created_at)
-        VALUES (%(id)s, %(workspace_id)s, %(email)s, %(password_hash)s, %(created_at)s)
+        INSERT INTO accounts (id, email, password_hash, display_name, created_at)
+        VALUES (%(id)s, %(email)s, %(password_hash)s, %(display_name)s, %(created_at)s)
+        ON CONFLICT (id) DO NOTHING
+        """,
+        {
+            "id": ids["account"],
+            "email": f"phase1-seed-{label}@example.test",
+            "password_hash": "phase1-seed-fixture-no-login",
+            "display_name": f"Phase1 Seed {label.capitalize()}",
+            "created_at": SEED_EPOCH,
+        },
+    )
+    cur.execute(
+        """
+        INSERT INTO users (id, workspace_id, account_id, created_at)
+        VALUES (%(id)s, %(workspace_id)s, %(account_id)s, %(created_at)s)
         ON CONFLICT (id) DO NOTHING
         """,
         {
             "id": ids["user"],
             "workspace_id": ids["workspace"],
-            "email": f"phase1-seed-{label}@example.test",
-            "password_hash": "phase1-seed-fixture-no-login",
+            "account_id": ids["account"],
+            "created_at": SEED_EPOCH,
+        },
+    )
+    cur.execute(
+        """
+        INSERT INTO workspace_memberships (
+            id, workspace_id, account_id, users_id, role, status, invited_by, created_at, updated_at
+        ) VALUES (
+            %(id)s, %(workspace_id)s, %(account_id)s, %(users_id)s, 'owner', 'active',
+            %(users_id)s, %(created_at)s, %(created_at)s
+        )
+        ON CONFLICT (id) DO NOTHING
+        """,
+        {
+            "id": ids["workspace_membership"],
+            "workspace_id": ids["workspace"],
+            "account_id": ids["account"],
+            "users_id": ids["user"],
             "created_at": SEED_EPOCH,
         },
     )

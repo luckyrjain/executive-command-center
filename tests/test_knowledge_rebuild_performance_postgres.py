@@ -4,6 +4,7 @@ from time import perf_counter
 from uuid import UUID, uuid4
 
 import pytest
+from identity_fixtures import create_identity
 from sqlalchemy import text
 
 from ecc.config import get_settings
@@ -66,18 +67,12 @@ def rebuild_performance_context() -> Iterator[UUID]:
             text("INSERT INTO workspaces (id, name, created_at) VALUES (:id, :name, :created_at)"),
             {"id": workspace_id, "name": "Rebuild Performance", "created_at": now},
         )
-        connection.execute(
-            text(
-                "INSERT INTO users (id, workspace_id, email, password_hash, created_at) "
-                "VALUES (:id, :workspace_id, :email, :password_hash, :created_at)"
-            ),
-            {
-                "id": user_id,
-                "workspace_id": workspace_id,
-                "email": f"{user_id}@example.test",
-                "password_hash": "test-password-hash",
-                "created_at": now,
-            },
+        create_identity(
+            connection,
+            workspace_id=workspace_id,
+            user_id=user_id,
+            email=f"{user_id}@example.test",
+            now=now,
         )
         connection.execute(
             text(

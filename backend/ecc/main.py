@@ -42,6 +42,7 @@ from ecc.domains.governance.recommendation_mutations import (
 from ecc.domains.governance.recommendation_queries import router as recommendation_queries_router
 from ecc.domains.governance.risk_mutations import router as risk_mutations_router
 from ecc.domains.governance.risks import router as risks_router
+from ecc.domains.identity.accounts import router as identity_accounts_router
 from ecc.domains.identity.person_organizations import router as identity_router
 from ecc.domains.knowledge.claims import router as knowledge_claims_router
 from ecc.domains.knowledge.entities import router as knowledge_entities_router
@@ -124,6 +125,7 @@ app.include_router(knowledge_resolution_router)
 app.include_router(knowledge_entity_operations_router)
 app.include_router(knowledge_retrieval_router)
 app.include_router(identity_router)
+app.include_router(identity_accounts_router)
 app.include_router(search_router)
 app.include_router(dashboard_briefs_router)
 # Phase 4 Task 1: read-only registry/policy surface (GET /ai/models, GET

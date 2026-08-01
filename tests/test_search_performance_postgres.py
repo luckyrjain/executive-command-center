@@ -7,6 +7,7 @@ from uuid import UUID, uuid4
 
 import pytest
 from fastapi.testclient import TestClient
+from identity_fixtures import create_identity
 from phase1_dataset import seed_phase1_dataset
 from sqlalchemy import text
 
@@ -47,19 +48,12 @@ def search_performance_context() -> Iterator[tuple[TestClient, UUID]]:
             ),
             {"id": workspace_id, "created_at": now},
         )
-        connection.execute(
-            text(
-                """
-                INSERT INTO users (id, workspace_id, email, password_hash, created_at)
-                VALUES (:id, :workspace_id, :email, 'test-password-hash', :created_at)
-                """
-            ),
-            {
-                "id": user_id,
-                "workspace_id": workspace_id,
-                "email": f"{user_id}@example.test",
-                "created_at": now,
-            },
+        create_identity(
+            connection,
+            workspace_id=workspace_id,
+            user_id=user_id,
+            email=f"{user_id}@example.test",
+            now=now,
         )
         connection.execute(
             text(
