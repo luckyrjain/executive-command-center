@@ -319,6 +319,10 @@ def _fixture_ids(label: str) -> dict[str, UUID]:
         "personal_insight": seed_id(label, "personal_insight", "habits"),
         "cross_domain_grant": seed_id(label, "cross_domain_grant", "habits"),
         "personal_insight_feedback": seed_id(label, "personal_insight_feedback", "habits"),
+        "personal_domain_relationships": seed_id(label, "personal_domain", "relationships"),
+        "domain_record_relationships": seed_id(label, "domain_record", "relationships"),
+        "personal_domain_health": seed_id(label, "personal_domain", "health"),
+        "domain_record_health": seed_id(label, "domain_record", "health"),
     }
 
 
@@ -2290,6 +2294,31 @@ def _seed_personal(cur: psycopg.Cursor[Any], label: str, ids: Mapping[str, UUID]
     0059 -- referencing the ``personal_insights`` row above; this fixture
     only needs to prove the table round-trips, not that it reflects real
     user feedback).
+
+    Also: one ``personal_domains``/``domain_records`` pair each for
+    ``relationships`` (``sensitive``) and ``health`` (``high_stakes``),
+    closing a residual risk ``DOMAIN-PRIVACY-CONTRACT.md`` had disclosed
+    since Task 1 and never actually closed: "backup/restore of sensitive/
+    high_stakes records is not yet independently exercised." Every row
+    seeded above this comment is under ``habits`` (``standard``, no
+    encrypted field at all), so it never actually proved a ``sensitive``/
+    ``high_stakes`` row -- specifically, an *encrypted* JSONB payload field
+    -- survives ``pg_dump``/``pg_restore`` intact. The ``notes``/``symptom_
+    description`` values below are NOT real Fernet ciphertext (this script
+    stays psycopg-plus-stdlib-only, deliberately not importing ``ecc.
+    domains.personal.crypto`` or ``ecc.config``, both of which pull in
+    pydantic); they are fixed strings shaped like a real Fernet token
+    (URL-safe base64 text) instead. That is sufficient for what this drill
+    actually needs: proving an opaque JSONB text value in a ``sensitive``/
+    ``high_stakes``-classified row round-trips byte-for-byte through
+    backup and restore, and stays workspace-isolated -- backup/restore
+    itself operates on raw bytes with no awareness of encryption, so a
+    placeholder with the right shape verifies the identical property real
+    ciphertext would. Real encrypt/decrypt *correctness* (as opposed to
+    byte-preservation across a backup/restore cycle) is separately and
+    thoroughly proven by ``tests/test_personal_relationships_postgres.py``/
+    ``tests/test_personal_health_postgres.py``'s own direct-SQL
+    verification -- this script was never the right place for that.
     """
     cur.execute(
         """
@@ -2494,6 +2523,99 @@ def _seed_personal(cur: psycopg.Cursor[Any], label: str, ids: Mapping[str, UUID]
             "workspace_id": ids["workspace"],
             "owner_id": ids["user"],
             "insight_id": ids["personal_insight"],
+            "actor": ids["user"],
+            "now": SEED_EPOCH,
+        },
+    )
+
+    # `relationships` (`sensitive`) and `health` (`high_stakes`) -- see this
+    # function's own docstring for why these two extra domain/record pairs
+    # exist and why their "encrypted" field is a placeholder, not real
+    # Fernet ciphertext.
+    cur.execute(
+        """
+        INSERT INTO personal_domains (
+            id, workspace_id, owner_id, domain_key, classification,
+            enabled, enabled_at, created_by, updated_by, created_at, updated_at, version
+        ) VALUES (
+            %(id)s, %(workspace_id)s, %(owner_id)s, 'relationships', 'sensitive',
+            true, %(now)s, %(actor)s, %(actor)s, %(now)s, %(now)s, 1
+        )
+        ON CONFLICT (id) DO NOTHING
+        """,
+        {
+            "id": ids["personal_domain_relationships"],
+            "workspace_id": ids["workspace"],
+            "owner_id": ids["user"],
+            "actor": ids["user"],
+            "now": SEED_EPOCH,
+        },
+    )
+    # `notes` is shaped like a real Fernet token (URL-safe base64 text), not
+    # actually produced by `encrypt_field` -- see this function's own
+    # docstring for why.
+    cur.execute(
+        """
+        INSERT INTO domain_records (
+            id, workspace_id, owner_id, domain_key, record_type, payload,
+            effective_at, retention_acknowledged_at, created_by, updated_by,
+            created_at, updated_at, version
+        ) VALUES (
+            %(id)s, %(workspace_id)s, %(owner_id)s, 'relationships', 'contact',
+            '{"contact_name": "Phase 1 acceptance seed contact",
+              "notes": "gAAAAABphase1acceptanceplaceholdernotrealciphertext=="}'::jsonb,
+            %(now)s, NULL, %(actor)s, %(actor)s, %(now)s, %(now)s, 1
+        )
+        ON CONFLICT (id) DO NOTHING
+        """,
+        {
+            "id": ids["domain_record_relationships"],
+            "workspace_id": ids["workspace"],
+            "owner_id": ids["user"],
+            "actor": ids["user"],
+            "now": SEED_EPOCH,
+        },
+    )
+    cur.execute(
+        """
+        INSERT INTO personal_domains (
+            id, workspace_id, owner_id, domain_key, classification,
+            enabled, enabled_at, created_by, updated_by, created_at, updated_at, version
+        ) VALUES (
+            %(id)s, %(workspace_id)s, %(owner_id)s, 'health', 'high_stakes',
+            true, %(now)s, %(actor)s, %(actor)s, %(now)s, %(now)s, 1
+        )
+        ON CONFLICT (id) DO NOTHING
+        """,
+        {
+            "id": ids["personal_domain_health"],
+            "workspace_id": ids["workspace"],
+            "owner_id": ids["user"],
+            "actor": ids["user"],
+            "now": SEED_EPOCH,
+        },
+    )
+    # Same placeholder-shape convention as `relationships` above;
+    # `symptom_log` has two encrypted fields.
+    cur.execute(
+        """
+        INSERT INTO domain_records (
+            id, workspace_id, owner_id, domain_key, record_type, payload,
+            effective_at, retention_acknowledged_at, created_by, updated_by,
+            created_at, updated_at, version
+        ) VALUES (
+            %(id)s, %(workspace_id)s, %(owner_id)s, 'health', 'symptom_log',
+            '{"severity": "mild",
+              "symptom_description": "gAAAAABphase1acceptanceplaceholdernotrealciphertext01==",
+              "notes": "gAAAAABphase1acceptanceplaceholdernotrealciphertext02=="}'::jsonb,
+            %(now)s, %(now)s, %(actor)s, %(actor)s, %(now)s, %(now)s, 1
+        )
+        ON CONFLICT (id) DO NOTHING
+        """,
+        {
+            "id": ids["domain_record_health"],
+            "workspace_id": ids["workspace"],
+            "owner_id": ids["user"],
             "actor": ids["user"],
             "now": SEED_EPOCH,
         },

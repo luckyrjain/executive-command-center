@@ -109,4 +109,49 @@ describe('ExportDeletePanel', () => {
     expect(screen.queryByText(/Exported 0 item\(s\)/)).toBeNull()
     expect((screen.getByRole('checkbox') as HTMLInputElement).checked).toBe(false)
   })
+
+  it('shows "Deletion pending…" as a status live region while the delete request is in flight', async () => {
+    const pending = deferred<Response>()
+    vi.stubGlobal('fetch', vi.fn(() => pending.promise))
+    renderPanel()
+
+    fireEvent.click(screen.getByRole('checkbox'))
+    fireEvent.click(screen.getByRole('button', { name: 'Delete Habits' }))
+    // Both the button's own label and a dedicated live region read
+    // "Deletion pending…" -- `getAllByText` scoped to the status role
+    // confirms the live region specifically exists, not just the button.
+    await waitFor(() => expect(
+      screen.getAllByText('Deletion pending…', { selector: '[role="status"]' }).length,
+    ).toBeGreaterThan(0))
+
+    pending.resolve(new Response(JSON.stringify({
+      id: 'job-1', domain_key: 'habits', status: 'completed', requested_at: '2026-07-27T00:00:00Z', completed_at: '2026-07-27T00:00:01Z',
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } }))
+    await waitFor(() => expect(screen.queryAllByText('Deletion pending…', { selector: '[role="status"]' })).toHaveLength(0))
+  })
+
+  it('does not uncheck a different domain\'s confirmation when a stale delete request resolves after switching domains', async () => {
+    const pending = deferred<Response>()
+    const fetch = vi.fn((_input: RequestInfo | URL, init?: RequestInit) => {
+      if ((init?.method ?? 'GET').toUpperCase() === 'POST') return pending.promise
+      return response({})
+    })
+    vi.stubGlobal('fetch', fetch)
+    renderPanel()
+
+    fireEvent.click(screen.getByRole('checkbox'))
+    fireEvent.click(screen.getByRole('button', { name: 'Delete Habits' }))
+
+    fireEvent.change(screen.getByLabelText('Export domain'), { target: { value: 'learning' } })
+    fireEvent.click(screen.getByRole('checkbox'))
+    expect((screen.getByRole('checkbox') as HTMLInputElement).checked).toBe(true)
+
+    pending.resolve(new Response(JSON.stringify({
+      id: 'job-1', domain_key: 'habits', status: 'completed', requested_at: '2026-07-27T00:00:00Z', completed_at: '2026-07-27T00:00:01Z',
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } }))
+    await waitFor(() => expect(fetch).toHaveBeenCalled())
+    // The now-stale Habits deletion resolving must not silently uncheck the
+    // confirmation the user has since given for Learning.
+    expect((screen.getByRole('checkbox') as HTMLInputElement).checked).toBe(true)
+  })
 })

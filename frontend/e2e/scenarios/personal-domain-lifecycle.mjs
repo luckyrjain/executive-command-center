@@ -113,9 +113,14 @@ export async function run({ page, baseURL }) {
   await insightsPanel.getByText('No insights yet -- capture a few records first.').waitFor()
   assert.equal(fixtures.personal.insights[0].dismissed_at != null, true)
 
+  // Genuinely depends on the grant having just been revoked above (`makePersonalApi`
+  // computes this from its own live `grants` array, not a static response) --
+  // `not_found` is the real backend's own error_code for a requested domain
+  // with no active grant (`runtime.py`: `"not_found" if prepared.reason ==
+  // "not_found" ...`).
   await insightsPanel.getByRole('checkbox', { name: /Habits/ }).click()
   await insightsPanel.getByRole('button', { name: 'Generate insight' }).click()
-  await insightsPanel.getByText(/No insight available right now \(no_grant\)/).waitFor()
+  await insightsPanel.getByText(/No insight available right now \(not_found\)/).waitFor()
 
   // --- Export & delete: a real export of the captured record, then delete -
   await page.getByRole('tab', { name: 'Export & delete' }).click()

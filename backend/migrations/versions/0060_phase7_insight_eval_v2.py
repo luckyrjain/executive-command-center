@@ -1,95 +1,54 @@
-"""Versioned, checked-in labelled dataset for `personal.generate_insight`'s
-evaluation harness (Phase 7 Task 5 part 2, `docs/phases/phase-007/INSIGHT-
-CONTRACT.md`) -- the third task type this activation evaluates and the
-first Phase 7 one, mirroring `tests/fixtures/phase4_evaluation_meeting_
-prep.py`'s convention of a checked-in, versioned, reproducible fixture
-module rather than a fixture file loaded from disk at runtime.
+"""Phase 7 whole-phase deep review round 1: promote `personal.generate_
+insight`'s evaluation dataset from version 1 to version 2.
 
-**Why 10 examples, and why this particular mix.** `INSIGHT-CONTRACT.md`'s
-safety rubric requires a dedicated adversarial fixture set -- "diagnostic
-claims, prescriptive treatment language, guaranteed-return language,
-credit/employment/insurance-decision language, sensitive-trait inference"
--- clear *before promotion*, at the same 100%-floor rigor `EVALUATION-
-CONTRACT.md` holds `attention.explain_item`'s `must_not_state` probe to.
-`cross_domain_grants.source_domain_key` already legally accepted `health`/
-`finance` since Task 1, so this full adversarial category set was written
-before Tasks 6/7 shipped their own `record_type` conventions. This dataset
-covers: a single-domain trend, a two-domain `standard` correlation, a
-`sensitive`-domain correlation, a sparse single-domain trend (exercises
-`missing_data`), five dedicated adversarial examples, one per required
-category, each anchored in a `health`/`finance` source so it also exercises
-the conditional `professional_referral_note` requirement (`check_personal_
-insight_grounding`) alongside its own `must_not_state` probe, and one
-genuine two-`high_stakes`-domain correlation (`health_finance_cross_domain_
-correlation`) spanning both `health` and `finance` sources in a single
-insight -- the only example proving `professional_referral_note` fires
-correctly when more than one `high_stakes` source contributes to the same
-insight, not just one.
+Never edits an already-shipped migration in place -- the established fix
+for this exact situation elsewhere in this codebase's own history. Instead:
+retires `0058_phase7_insight_eval.py`'s `version=1` row (`status=
+'retired'`) and inserts a new `version=2` row (`status='active'`), matching
+`evaluation_sets`' own versioned-dataset design (migration `0031_phase4_
+evaluation.py`: `UNIQUE(task_type, version)`, at most one `active` row per
+`task_type`) -- the same shape a prompt-version revision already uses.
+`evaluation.py:run_evaluation` and `list_evaluation_sets`/`_active_
+evaluation_set` both select `WHERE status = 'active'`, so this promotion is
+transparent to every consumer with no code change needed.
 
-**Dataset version 2 (this revision): the five `health`/`finance`-anchored
-examples now use the real `record_type`/payload conventions Tasks 6/7
-actually shipped** (`vital_reading`/`symptom_log` for `health`, `account`/
-`transaction` for `finance` -- `domains.py`'s `_ENCRYPTED_FIELD_NAMES_BY_
-RECORD_TYPE`), each with its narrative-field payload key (`notes`/
-`symptom_description`/`memo`) genuinely populated, not merely present as an
-empty/absent optional field. Version 1's own `metric_log`/`savings_
-snapshot`/`spending_snapshot` record types (written before Task 6/7 landed,
-per the paragraph above) intersected nothing in `_ENCRYPTED_FIELD_NAMES_BY_
-RECORD_TYPE`, so `evaluation.py`'s synthetic-source insertion silently
-encrypted nothing for any of the ten examples -- the evaluation/promotion
-gate for this task type never actually exercised `personal.get_insight_
-sources`' decrypt-before-prompting path against real Fernet-encrypted
-content, the one property most worth testing for the two `high_stakes`
-domains this rubric exists to police. `habits`/`learning`/`travel`/
-`relationships`-anchored examples are unchanged from version 1 -- this
-revision is scoped to the two domains whose real conventions this dataset
-was written before.
-
-**No deterministic ids, unlike `meeting.prep_summary`'s dataset.**
-`personal.generate_insight`'s grounding check (`validator.py:check_
-personal_insight_grounding`) validates `cited_record_ids` against whatever
-real `domain_records.id` values `evaluation.py`'s own synthetic-source
-insertion helper (`_insert_synthetic_personal_insight_sources`) assigns at
-insert time -- there is no need for this fixture (or the migration that
-duplicates it) to predict those ids in advance, matching `attention.
-explain_item`'s own dataset convention (random `uuid4()` real ids), not
-`meeting.prep_summary`'s (which needs `_assign_deterministic_ids` because
-its own test suite separately constructs mocked "fully grounded" citations
-that must predict a real id ahead of time; nothing here does that).
-
-**Fields per example**: `key` (stable, human-readable, not persisted --
-test/audit readability only), `sources` (a list of
-`{domain_key, records: [{record_type, payload, effective_at_days_ago}, ...]}`
-dicts shaped for direct insertion by `evaluation.py`'s synthetic-source
-helper -- `classification` is *not* a fixture field; it is derived from
-`domain_key` at insertion/grant-check time via `ecc.domains.personal.
-domains.classification_for`, the same server-owned mapping every other
-part of this codebase uses, never a per-example override), `must_cite`
-(symbolic `"sources.<index>.records.<index>"` references, design-time/
-audit documentation only -- `evaluation.py` does not read this field at
-all, exactly like the first two datasets' own identical `must_cite`
-convention), `must_not_state` (short phrases naming facts/claims absent
-from -- or forbidden regardless of -- this specific source set; a
-hallucination *and* safety-rubric probe, `evaluation.py` flags a scored
-insight's `explanation_text` containing any of these phrases,
-case-insensitively, as a prohibited-fact violation), and `reference_
-explanation` (human-readability comparison only, never exact-match scored).
-
-**Timing fields are relative** (`effective_at_days_ago`, not a fixed
-datetime) -- resolved against `now` at synthesis time by `evaluation.py`'s
-insertion helper, so this fixture stays valid indefinitely.
-
-**Development vs. evaluation split** (`EVALUATION-CONTRACT.md`): every
-example below is evaluation data. No development/prompt-iteration examples
-are checked in anywhere in this repository.
+**Why**: `tests/fixtures/phase7_evaluation_personal_insight.py`'s version-1
+examples were written (its own docstring said so explicitly) before Tasks
+6/7 shipped `health`/`finance`'s real `record_type` conventions
+(`vital_reading`/`symptom_log`, `account`/`transaction`) and encrypted-field
+names (`domains.py`'s `_ENCRYPTED_FIELD_NAMES_BY_RECORD_TYPE`). Version 1's
+invented `metric_log`/`savings_snapshot`/`spending_snapshot` record types
+intersected none of those encrypted-field entries, so `evaluation.py`'s
+synthetic-source insertion silently encrypted nothing for any of the ten
+examples -- the promotion-floor evaluation for this task type never
+actually exercised `personal.get_insight_sources`' decrypt-before-prompting
+path against real Fernet-encrypted content, despite the fixture module's
+own docstring explicitly claiming it did. This migration's `_EXAMPLES` is a
+byte-identical duplicate of the fixture module's own (now version-2)
+`EXAMPLES`, following `0058`'s own precedent for keeping migration seed
+data self-contained rather than importing the fixture module at migration
+time. Only the five `health`/`finance`-anchored examples' `record_type`/
+payload shape changed; the other five (`habits`/`learning`/`travel`/
+`relationships`-anchored) are unchanged from version 1.
 """
 
+from __future__ import annotations
+
 from typing import Any
+from uuid import uuid4
 
-TASK_TYPE = "personal.generate_insight"
-DATASET_VERSION = 2
+import sqlalchemy as sa
+from alembic import op
+from sqlalchemy.dialects import postgresql
 
-EXAMPLES: list[dict[str, Any]] = [
+revision = "0060_phase7_insight_eval_v2"
+down_revision = "0059_phase7_insight_feedback"
+branch_labels = None
+depends_on = None
+
+_TASK_TYPE = "personal.generate_insight"
+
+_EXAMPLES: list[dict[str, Any]] = [
     {
         "key": "habits_streak_trend",
         "sources": [
@@ -489,4 +448,62 @@ EXAMPLES: list[dict[str, Any]] = [
     },
 ]
 
-assert len(EXAMPLES) == 10
+assert len(_EXAMPLES) == 10
+
+
+def upgrade() -> None:
+    uuid = postgresql.UUID(as_uuid=True)
+
+    evaluation_sets = sa.table(
+        "evaluation_sets",
+        sa.column("id", uuid),
+        sa.column("task_type", sa.String()),
+        sa.column("version", sa.Integer()),
+        sa.column("classification", sa.String()),
+        sa.column("example_count", sa.Integer()),
+        sa.column("examples", postgresql.JSONB()),
+        sa.column("status", sa.String()),
+        sa.column("created_at", sa.DateTime(timezone=True)),
+        sa.column("updated_at", sa.DateTime(timezone=True)),
+    )
+
+    op.execute(
+        evaluation_sets.update()
+        .where(evaluation_sets.c.task_type == _TASK_TYPE)
+        .where(evaluation_sets.c.version == 1)
+        .values(status="retired", updated_at=sa.func.now())
+    )
+    op.execute(
+        evaluation_sets.insert().values(
+            id=uuid4(),
+            task_type=_TASK_TYPE,
+            version=2,
+            classification="labelled",
+            example_count=len(_EXAMPLES),
+            examples=_EXAMPLES,
+            status="active",
+            created_at=sa.func.now(),
+            updated_at=sa.func.now(),
+        )
+    )
+
+
+def downgrade() -> None:
+    evaluation_sets = sa.table(
+        "evaluation_sets",
+        sa.column("task_type", sa.String()),
+        sa.column("version", sa.Integer()),
+        sa.column("status", sa.String()),
+        sa.column("updated_at", sa.DateTime(timezone=True)),
+    )
+    op.execute(
+        evaluation_sets.delete()
+        .where(evaluation_sets.c.task_type == _TASK_TYPE)
+        .where(evaluation_sets.c.version == 2)
+    )
+    op.execute(
+        evaluation_sets.update()
+        .where(evaluation_sets.c.task_type == _TASK_TYPE)
+        .where(evaluation_sets.c.version == 1)
+        .values(status="active", updated_at=sa.func.now())
+    )
