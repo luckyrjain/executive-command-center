@@ -110,6 +110,20 @@ def reverse_performance_context() -> Iterator[tuple[TestClient, UUID]]:
     finally:
         client.close()
         with engine.begin() as connection:
+            # pkos_nodes is referenced by more Phase 2+ tables (pkos_edges,
+            # resolution_candidates, claims, ...) than when this fixture's
+            # teardown budget was last checked, and REVERSE_COUNT+1 rounds of
+            # this test's 200-rehomed-relationship fixture leave enough
+            # pkos_nodes/pkos_edges rows that the DELETE's FK-integrity
+            # re-checks can exceed the connection's 5s statement_timeout
+            # (STATEMENT_TIMEOUT_MS in ecc/database.py) on CI-runner hardware
+            # -- the same root cause and fix already applied to
+            # test_knowledge_retrieval_performance_postgres.py's fixture
+            # (commit 16dc85f). That budget is an approved *application-
+            # request* SLA that was never meant to bound test cleanup.
+            # SET LOCAL scopes the relaxed budget to only this teardown
+            # transaction.
+            connection.execute(text("SET LOCAL statement_timeout = '60s'"))
             for table in (
                 "event_outbox",
                 "audit_events",
