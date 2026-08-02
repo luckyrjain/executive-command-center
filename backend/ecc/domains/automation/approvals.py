@@ -834,14 +834,15 @@ def _advance_run_after_decision(
     if decision == "rejected":
         session.execute(
             text(
-                """
+                f"""
                 INSERT INTO workflow_run_steps (
                     id, workspace_id, run_id, step_index, step_type, status,
                     action_digest, input, started_at, finished_at, error_class,
-                    created_at, updated_at
+                    created_at, updated_at, owner_id, visibility
                 ) VALUES (
                     :id, :workspace_id, :run_id, :step_index, 'action', 'failed',
-                    :action_digest, '{}'::jsonb, :now, :now, :error_class, :now, :now
+                    :action_digest, '{{}}'::jsonb, :now, :now, :error_class, :now, :now,
+                    {WORKSPACE_ORIGINAL_OWNER_SQL}, 'workspace'
                 )
                 ON CONFLICT ON CONSTRAINT uq_workflow_run_steps_run_step_index DO UPDATE SET
                     status = 'failed', error_class = :error_class,

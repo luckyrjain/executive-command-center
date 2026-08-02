@@ -685,6 +685,7 @@ from uuid import UUID, uuid4
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+from ecc.auth import AuthContext
 from ecc.observability import (
     queue_cancellation_latency,
     queue_run_state_transition,
@@ -697,6 +698,8 @@ from ecc.observability import (
     record_step_retry,
     record_unknown_outcome,
 )
+from ecc.platform import authz
+from ecc.platform.authz import WORKSPACE_ORIGINAL_OWNER_SQL
 
 from . import kill_switches
 from . import policy as policy_module
@@ -1268,7 +1271,11 @@ def get_run(session: Session, workspace_id: UUID, run_id: UUID) -> WorkflowRun |
 
 
 def list_runs(
-    session: Session, workspace_id: UUID, *, status_filter: RunStatus | None = None
+    session: Session,
+    auth: AuthContext,
+    workspace_id: UUID,
+    *,
+    status_filter: RunStatus | None = None,
 ) -> list[WorkflowRun]:
     """Workspace-scoped run listing (Task 4's `GET /automations/runs`) --
     added alongside `pause_run`/`resume_run` rather than in `runs.py`
@@ -1277,21 +1284,26 @@ def list_runs(
     (`approvals.list_approvals`, `policy.list_policies`), with the router
     module itself staying a thin HTTP-shape layer.
     """
+    visibility_sql, visibility_params = authz.visible_resource_filter_sql(
+        session, auth, resource_type="workflow_runs", action="read", table_alias="workflow_runs"
+    )
     clause = "AND status = :status_filter" if status_filter is not None else ""
-    params: dict[str, Any] = {"workspace_id": workspace_id}
+    params: dict[str, Any] = {"workspace_id": workspace_id, **visibility_params}
     if status_filter is not None:
         params["status_filter"] = status_filter
     rows = (
         session.execute(
             text(
                 f"SELECT {_RUN_FIELDS} FROM workflow_runs "
-                f"WHERE workspace_id = :workspace_id {clause} ORDER BY queued_at DESC"
+                f"WHERE workspace_id = :workspace_id AND ({visibility_sql}) "
+                f"{clause} ORDER BY queued_at DESC"
             ),
             params,
         )
         .mappings()
         .all()
     )
+    session.rollback()
     return [_row_to_run(dict(row)) for row in rows]
 
 
@@ -1495,10 +1507,11 @@ def enqueue_run(
             INSERT INTO workflow_runs (
                 id, workspace_id, workflow_id, workflow_version, policy_id,
                 trigger_ref, status, current_step_index, queued_at,
-                created_by, created_at, updated_at
+                created_by, created_at, updated_at, owner_id, visibility
             ) VALUES (
                 :id, :workspace_id, :workflow_id, :workflow_version, :policy_id,
-                :trigger_ref, 'queued', 0, :now, :created_by, :now, :now
+                :trigger_ref, 'queued', 0, :now, :created_by, :now, :now,
+                :created_by, 'workspace'
             )
             """
         ),
@@ -2320,13 +2333,15 @@ def run_step(
         now = datetime.now(UTC)
         session.execute(
             text(
-                """
+                f"""
                 INSERT INTO workflow_run_steps (
                     id, workspace_id, run_id, step_index, step_type, status,
-                    action_digest, input, started_at, created_at, updated_at
+                    action_digest, input, started_at, created_at, updated_at,
+                    owner_id, visibility
                 ) VALUES (
                     :id, :workspace_id, :run_id, :step_index, :step_type, 'dispatched',
-                    :digest, CAST(:input AS jsonb), :now, :now, :now
+                    :digest, CAST(:input AS jsonb), :now, :now, :now,
+                    {WORKSPACE_ORIGINAL_OWNER_SQL}, 'workspace'
                 )
                 """
             ),
@@ -2817,13 +2832,15 @@ def _dispatch_compensation_step(
         now = datetime.now(UTC)
         session.execute(
             text(
-                """
+                f"""
                 INSERT INTO workflow_run_steps (
                     id, workspace_id, run_id, step_index, step_type, status,
-                    action_digest, input, started_at, created_at, updated_at
+                    action_digest, input, started_at, created_at, updated_at,
+                    owner_id, visibility
                 ) VALUES (
                     :id, :workspace_id, :run_id, :step_index, 'compensation', 'dispatched',
-                    :digest, CAST(:input AS jsonb), :now, :now, :now
+                    :digest, CAST(:input AS jsonb), :now, :now, :now,
+                    {WORKSPACE_ORIGINAL_OWNER_SQL}, 'workspace'
                 )
                 """
             ),
@@ -2839,13 +2856,13 @@ def _dispatch_compensation_step(
         )
         session.execute(
             text(
-                """
+                f"""
                 INSERT INTO compensation_steps (
                     id, workspace_id, run_id, compensates_step_index, action_digest, status,
-                    started_at, created_at, updated_at
+                    started_at, created_at, updated_at, owner_id, visibility
                 ) VALUES (
                     :id, :workspace_id, :run_id, :compensates_step_index, :digest, 'dispatched',
-                    :now, :now, :now
+                    :now, :now, :now, {WORKSPACE_ORIGINAL_OWNER_SQL}, 'workspace'
                 )
                 """
             ),
