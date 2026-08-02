@@ -462,9 +462,12 @@ def test_existing_account_accepts_invitation_to_a_second_workspace(
 def test_accept_invitation_rejects_already_active_member(
     owner_context: tuple[TestClient, UUID, UUID, UUID, str],
 ) -> None:
-    """An account that is already an active member of the target workspace
-    (e.g. via some earlier, separate invitation) hits `ALREADY_MEMBER`
-    rather than silently creating a second membership.
+    """Exercises `accept_invitation_endpoint`'s *own* `ALREADY_MEMBER`
+    check (not `create_invitation_endpoint`'s -- that one would already
+    reject creating an invitation for someone who is already an active
+    member, so the membership must be granted *after* the invitation
+    exists, simulating an out-of-band membership grant or a race that
+    slips past the create-time check).
     """
     client, workspace_id, _users_id, _account_id, owner_token = owner_context
     now = datetime.now(UTC)
@@ -482,18 +485,6 @@ def test_accept_invitation_rejects_already_active_member(
             .mappings()
             .one()["email"]
         )
-        # Already an active member of `workspace_id` from some earlier,
-        # unrelated invitation -- a genuinely separate workspace for the
-        # same account, so `add_membership` (not `create_identity`) is the
-        # right helper here.
-        add_membership(
-            connection,
-            workspace_id=workspace_id,
-            account_id=existing_account_id,
-            users_id=already_member_users_id,
-            role="viewer",
-            now=now,
-        )
     existing_token = _new_session(other_workspace_id, other_users_id, now)
 
     invite = client.post(
@@ -504,6 +495,19 @@ def test_accept_invitation_rejects_already_active_member(
     assert invite.status_code == 201, invite.text
     invite_token = invite.json()["token"]
     invite_id = invite.json()["id"]
+
+    # Granted *after* the invitation was created -- a genuinely separate
+    # workspace for the same account, so `add_membership` (not
+    # `create_identity`) is the right helper here.
+    with engine.begin() as connection:
+        add_membership(
+            connection,
+            workspace_id=workspace_id,
+            account_id=existing_account_id,
+            users_id=already_member_users_id,
+            role="viewer",
+            now=now,
+        )
 
     try:
         with TestClient(app) as existing_client:
