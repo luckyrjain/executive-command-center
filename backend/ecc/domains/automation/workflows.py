@@ -48,6 +48,7 @@ from ecc.observability import (
     record_audit_outbox_failure,
     record_idempotency_conflict,
 )
+from ecc.platform import authz
 
 from .adapters import ActionAdapter, AdapterRegistry
 from .adapters import registry as _production_adapter_registry
@@ -539,7 +540,9 @@ def get_active_workflow_version(
     return _row_to_workflow_version(dict(row)) if row is not None else None
 
 
-def list_workflows(session: Session, workspace_id: UUID) -> list[WorkflowSummary]:
+def list_workflows(
+    session: Session, auth: AuthContext, workspace_id: UUID
+) -> list[WorkflowSummary]:
     """One summary per `workflow_id` family in the caller's workspace,
     ordered by slug. Derived entirely from `workflow_versions` (every
     `workflow_definitions` row always has at least one version -- the two
@@ -548,17 +551,26 @@ def list_workflows(session: Session, workspace_id: UUID) -> list[WorkflowSummary
     than a window-function query, since this activation's per-workspace
     workflow count is small.
     """
+    visibility_sql, visibility_params = authz.visible_resource_filter_sql(
+        session,
+        auth,
+        resource_type="workflow_versions",
+        action="read",
+        table_alias="workflow_versions",
+    )
     rows = (
         session.execute(
             text(
                 f"SELECT {_WORKFLOW_VERSION_FIELDS} FROM workflow_versions "
-                "WHERE workspace_id = :workspace_id ORDER BY workflow_id ASC, version ASC"
+                f"WHERE workspace_id = :workspace_id AND ({visibility_sql}) "
+                "ORDER BY workflow_id ASC, version ASC"
             ),
-            {"workspace_id": workspace_id},
+            {"workspace_id": workspace_id, **visibility_params},
         )
         .mappings()
         .all()
     )
+    session.rollback()
     by_workflow: dict[str, list[WorkflowVersion]] = {}
     for row in rows:
         version = _row_to_workflow_version(dict(row))
@@ -624,8 +636,12 @@ def create_workflow_draft(
             text(
                 """
                 INSERT INTO workflow_definitions (
-                    id, workspace_id, workflow_id, created_by, created_at, updated_at
-                ) VALUES (:id, :workspace_id, :workflow_id, :created_by, :now, :now)
+                    id, workspace_id, workflow_id, created_by, created_at, updated_at,
+                    owner_id, visibility
+                ) VALUES (
+                    :id, :workspace_id, :workflow_id, :created_by, :now, :now,
+                    :created_by, 'workspace'
+                )
                 """
             ),
             {
@@ -667,11 +683,12 @@ def create_workflow_draft(
             """
             INSERT INTO workflow_versions (
                 id, workspace_id, workflow_id, version, graph, trigger_refs, policy_ref,
-                definition_hash, status, created_by, updated_by, created_at, updated_at
+                definition_hash, status, created_by, updated_by, created_at, updated_at,
+                owner_id, visibility
             ) VALUES (
                 :id, :workspace_id, :workflow_id, :version, CAST(:graph AS jsonb),
                 CAST(:trigger_refs AS jsonb), :policy_ref, :definition_hash, 'draft',
-                :created_by, :updated_by, :now, :now
+                :created_by, :updated_by, :now, :now, :created_by, 'workspace'
             )
             """
         ),
@@ -1126,7 +1143,7 @@ def _policy_ref_exists(session: Session, workspace_id: UUID, policy_ref: UUID) -
 
 @router.get("/workflows", response_model=WorkflowListResponse)
 def list_workflows_endpoint(auth: AuthDep, session: SessionDep) -> WorkflowListResponse:
-    summaries = list_workflows(session, auth.workspace_id)
+    summaries = list_workflows(session, auth, auth.workspace_id)
     return WorkflowListResponse(
         workflows=[
             WorkflowSummaryResponse(
@@ -1146,6 +1163,12 @@ def list_workflows_endpoint(auth: AuthDep, session: SessionDep) -> WorkflowListR
 def get_workflow_endpoint(
     version_id: UUID, auth: AuthDep, session: SessionDep
 ) -> WorkflowVersionResponse:
+    visible = authz.authorize(
+        session, auth, resource_type="workflow_versions", resource_id=version_id, action="read"
+    )
+    session.rollback()
+    if not visible:
+        raise HTTPException(status_code=404, detail="WORKFLOW_NOT_FOUND")
     version = get_workflow_version_by_id(session, auth.workspace_id, version_id)
     if version is None:
         raise HTTPException(status_code=404, detail="WORKFLOW_NOT_FOUND")
@@ -1169,6 +1192,7 @@ def create_workflow_endpoint(
     editing always inserts a new row), matching this task's constrained API
     surface (`API-SCHEMAS.md` lists no separate "add version" route).
     """
+    authz.require_role_action(session, auth, "write")
     graph_dict = payload.graph.model_dump(mode="json")
     violations = validate_graph_shape(graph_dict)
     if violations:
@@ -1244,6 +1268,15 @@ def publish_workflow_endpoint(
         cached = _load_cached(session, auth, idempotency_key, request_hash)
         if cached is not None:
             return cached
+
+        if not authz.authorize(
+            session, auth, resource_type="workflow_versions", resource_id=version_id, action="read"
+        ):
+            raise HTTPException(status_code=404, detail="WORKFLOW_NOT_FOUND")
+        if not authz.authorize(
+            session, auth, resource_type="workflow_versions", resource_id=version_id, action="write"
+        ):
+            raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
 
         try:
             # Task 7a: always checked against the shared production
@@ -1358,6 +1391,15 @@ def disable_workflow_endpoint(
         cached = _load_cached(session, auth, idempotency_key, request_hash)
         if cached is not None:
             return cached
+
+        if not authz.authorize(
+            session, auth, resource_type="workflow_versions", resource_id=version_id, action="read"
+        ):
+            raise HTTPException(status_code=404, detail="WORKFLOW_NOT_FOUND")
+        if not authz.authorize(
+            session, auth, resource_type="workflow_versions", resource_id=version_id, action="write"
+        ):
+            raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
 
         result = disable_workflow_version(session, auth.workspace_id, version_id)
         if isinstance(result, WorkflowVersionNotFound):
@@ -1691,6 +1733,12 @@ def simulate_workflow_endpoint(
     add one, and would be the point at which an `Idempotency-Key` might
     finally have something to protect.
     """
+    visible = authz.authorize(
+        session, auth, resource_type="workflow_versions", resource_id=version_id, action="read"
+    )
+    session.rollback()
+    if not visible:
+        raise HTTPException(status_code=404, detail="WORKFLOW_NOT_FOUND")
     version = get_workflow_version_by_id(session, auth.workspace_id, version_id)
     if version is None:
         raise HTTPException(status_code=404, detail="WORKFLOW_NOT_FOUND")
