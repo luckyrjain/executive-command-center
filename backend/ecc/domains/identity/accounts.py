@@ -584,7 +584,7 @@ def _write_identity_audit_event(
     request: Request,
     *,
     workspace_id: UUID,
-    actor_users_id: UUID,
+    actor_users_id: UUID | None,
     event_type: str,
     aggregate_id: UUID,
     now: datetime,
@@ -597,7 +597,12 @@ def _write_identity_audit_event(
     updated` events, and `ecc.domains.identity.invitations` passes
     `aggregate_type='invitation'` for its own events rather than this
     module carrying a second, near-duplicate copy hardcoded to a different
-    aggregate type.
+    aggregate type. `actor_users_id` is `None` for the one case where no
+    workspace-scoped actor identity exists yet -- `invitations.py`'s own
+    `reject_invitation_endpoint`, where the caller is responding from a
+    session scoped to a *different* workspace and has no `users` row in
+    this event's own `workspace_id` at all; `audit_events.actor_id` is
+    nullable and its composite FK is skipped when NULL for exactly this.
     """
     try:
         request_id = UUID(request.state.request_id)

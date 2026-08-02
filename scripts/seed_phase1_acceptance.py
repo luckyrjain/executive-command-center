@@ -213,6 +213,11 @@ _WORKSPACE_ID_TABLES: tuple[str, ...] = (
     # reason as the row above (this exact gap, found on this same PR's own
     # CI run this time).
     "personal_insight_feedback",
+    # Phase 8 Task 2 (migration 0062) -- invitations, also workspace-scoped,
+    # same reason as the row above (this exact gap, found on this same PR's
+    # own CI run against the invitations table -- a thirteenth occurrence of
+    # the identical class of gap).
+    "invitations",
 )
 # `workspaces` is scoped by its own `id`, not a `workspace_id` column.
 _WORKSPACE_TABLE = "workspaces"
@@ -325,6 +330,7 @@ def _fixture_ids(label: str) -> dict[str, UUID]:
         "domain_record_relationships": seed_id(label, "domain_record", "relationships"),
         "personal_domain_health": seed_id(label, "personal_domain", "health"),
         "domain_record_health": seed_id(label, "domain_record", "health"),
+        "invitation": seed_id(label, "invitation", "acceptance"),
     }
 
 
@@ -2662,6 +2668,47 @@ def _seed_personal(cur: psycopg.Cursor[Any], label: str, ids: Mapping[str, UUID]
     )
 
 
+def _seed_invitations(cur: psycopg.Cursor[Any], label: str, ids: Mapping[str, UUID]) -> None:
+    """Phase 8 Task 2 (migration 0062) -- invitations, workspace-scoped like
+    every table above. This exact gap (a new workspace-scoped table with no
+    seed row here) was found by this same PR's own CI run, failing
+    ``verify_restore.sh``'s generic workspace-isolation check on
+    ``invitations`` -- closed here the same way every prior phase's own
+    identical gap was.
+
+    One still-pending row per workspace: ``invited_by`` references the
+    workspace's own owner-role ``users`` row seeded in ``_seed_workspace``
+    (the same composite-FK-anchor role ``owner_id``/``created_by`` already
+    play elsewhere), and ``token_hash`` is a fixed placeholder digest -- this
+    fixture is never actually accepted through the real endpoint, it only
+    needs to prove the table round-trips through backup/restore and stays
+    workspace-isolated. ``expires_at`` uses the same far-future horizon as
+    the fixture ``sessions`` row in ``_seed_workspace``, so this row never
+    reads as expired regardless of when the acceptance drill runs.
+    """
+    cur.execute(
+        """
+        INSERT INTO invitations (
+            id, workspace_id, email, role, token_hash, invited_by,
+            expires_at, accepted_at, rejected_at, revoked_at, created_at
+        ) VALUES (
+            %(id)s, %(workspace_id)s, %(email)s, 'member', %(token_hash)s,
+            %(invited_by)s, %(expires_at)s, NULL, NULL, NULL, %(created_at)s
+        )
+        ON CONFLICT (id) DO NOTHING
+        """,
+        {
+            "id": ids["invitation"],
+            "workspace_id": ids["workspace"],
+            "email": f"phase1-seed-invitee-{label}@example.test",
+            "token_hash": sha256(f"phase1-seed-invitation-{label}".encode()).hexdigest(),
+            "invited_by": ids["user"],
+            "expires_at": SEED_EPOCH + timedelta(days=36500),
+            "created_at": SEED_EPOCH,
+        },
+    )
+
+
 def seed(conn: psycopg.Connection[Any]) -> None:
     """Insert deterministic Phase 1 fixtures into every table for both workspaces.
 
@@ -2719,6 +2766,10 @@ def seed(conn: psycopg.Connection[Any]) -> None:
             # personal_domains, routines on goals, check_ins on routines)
             # is seeded in FK-safe order inside _seed_personal itself.
             _seed_personal(cur, label, ids)
+            # Phase 8 Task 2 (migration 0062) -- invitations; depends only
+            # on the owner-role users row seeded first inside
+            # _seed_workspace itself.
+            _seed_invitations(cur, label, ids)
 
 
 def fixture_row_checksums(conn: psycopg.Connection[Any]) -> dict[str, str]:

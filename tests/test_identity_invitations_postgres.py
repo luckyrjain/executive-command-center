@@ -20,7 +20,7 @@ from uuid import UUID, uuid4
 
 import pytest
 from fastapi.testclient import TestClient
-from identity_fixtures import add_membership, create_identity
+from identity_fixtures import create_identity
 from sqlalchemy import text
 
 from ecc.config import get_settings
@@ -58,6 +58,39 @@ def _cleanup_workspace(workspace_id: UUID) -> None:
 def _cleanup_account(account_id: UUID) -> None:
     with engine.begin() as connection:
         connection.execute(text("DELETE FROM accounts WHERE id = :id"), {"id": account_id})
+
+
+def _cleanup_new_member(account_id: UUID) -> None:
+    """Delete the workspace-scoped `sessions`/`audit_events`/`workspace_
+    memberships`/`users` rows a `POST /accounts?token=...` auto-join
+    created for `account_id`, in FK-safe order, before deleting the
+    account itself. Narrower than `_cleanup_workspace` (which the
+    surrounding `owner_context` fixture already runs for the *whole*
+    workspace, later, in its own `finally`) -- calling `_cleanup_account`
+    directly without this first would violate `fk_users_account`'s
+    RESTRICT, since the new member's own `users` row is still alive at
+    that point.
+    """
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "DELETE FROM sessions WHERE user_id IN "
+                "(SELECT id FROM users WHERE account_id = :id)"
+            ),
+            {"id": account_id},
+        )
+        connection.execute(
+            text(
+                "DELETE FROM audit_events WHERE actor_id IN "
+                "(SELECT id FROM users WHERE account_id = :id)"
+            ),
+            {"id": account_id},
+        )
+        connection.execute(
+            text("DELETE FROM workspace_memberships WHERE account_id = :id"), {"id": account_id}
+        )
+        connection.execute(text("DELETE FROM users WHERE account_id = :id"), {"id": account_id})
+    _cleanup_account(account_id)
 
 
 def _headers(token: str) -> dict[str, str]:
@@ -130,17 +163,17 @@ def owner_context() -> Iterator[tuple[TestClient, UUID, UUID, UUID, str]]:
 def test_create_invitation_requires_owner_or_admin(
     owner_context: tuple[TestClient, UUID, UUID, UUID, str],
 ) -> None:
-    client, workspace_id, _users_id, account_id, owner_token = owner_context
+    client, workspace_id, _users_id, _account_id, owner_token = owner_context
     now = datetime.now(UTC)
     viewer_users_id = uuid4()
+    # A genuinely separate identity, not a second membership for the
+    # owner's own account -- one account can only hold one `users` row per
+    # workspace (`uq_users_workspace_account`), so `add_membership` (which
+    # attaches an *existing* account to a *different* workspace) is the
+    # wrong helper for "a second person in this same workspace."
     with engine.begin() as connection:
-        add_membership(
-            connection,
-            workspace_id=workspace_id,
-            account_id=account_id,
-            users_id=viewer_users_id,
-            role="viewer",
-            now=now,
+        create_identity(
+            connection, workspace_id=workspace_id, user_id=viewer_users_id, now=now, role="viewer"
         )
     viewer_token = _new_session(workspace_id, viewer_users_id, now)
     with TestClient(app) as viewer_client:
@@ -201,17 +234,14 @@ def test_create_invitation_rejects_second_concurrently_pending(
 def test_list_invitations_requires_owner_or_admin(
     owner_context: tuple[TestClient, UUID, UUID, UUID, str],
 ) -> None:
-    client, workspace_id, _users_id, account_id, owner_token = owner_context
+    client, workspace_id, _users_id, _account_id, owner_token = owner_context
     now = datetime.now(UTC)
     member_users_id = uuid4()
+    # See test_create_invitation_requires_owner_or_admin's own comment --
+    # a separate identity, not a second membership for the owner's account.
     with engine.begin() as connection:
-        add_membership(
-            connection,
-            workspace_id=workspace_id,
-            account_id=account_id,
-            users_id=member_users_id,
-            role="member",
-            now=now,
+        create_identity(
+            connection, workspace_id=workspace_id, user_id=member_users_id, now=now, role="member"
         )
     member_token = _new_session(workspace_id, member_users_id, now)
     with TestClient(app) as member_client:
@@ -253,7 +283,7 @@ def test_new_recipient_registers_and_auto_joins_via_token(
         assert workspaces.status_code == 200, workspaces.text
         assert str(workspace_id) in {w["id"] for w in workspaces.json()["workspaces"]}
 
-    _cleanup_account(UUID(body["id"]))
+    _cleanup_new_member(UUID(body["id"]))
 
 
 def test_account_creation_rejects_invalid_token(client: TestClient) -> None:
@@ -464,7 +494,7 @@ def test_revoke_invitation_by_admin_prevents_later_acceptance(
 def test_revoke_invitation_requires_owner_or_admin(
     owner_context: tuple[TestClient, UUID, UUID, UUID, str],
 ) -> None:
-    client, workspace_id, _users_id, account_id, owner_token = owner_context
+    client, workspace_id, _users_id, _account_id, owner_token = owner_context
     invite = client.post(
         f"/api/v1/identity/workspaces/{workspace_id}/invitations",
         json={"email": f"{uuid4()}@example.test", "role": "member"},
@@ -474,14 +504,11 @@ def test_revoke_invitation_requires_owner_or_admin(
 
     now = datetime.now(UTC)
     viewer_users_id = uuid4()
+    # See test_create_invitation_requires_owner_or_admin's own comment --
+    # a separate identity, not a second membership for the owner's account.
     with engine.begin() as connection:
-        add_membership(
-            connection,
-            workspace_id=workspace_id,
-            account_id=account_id,
-            users_id=viewer_users_id,
-            role="viewer",
-            now=now,
+        create_identity(
+            connection, workspace_id=workspace_id, user_id=viewer_users_id, now=now, role="viewer"
         )
     viewer_token = _new_session(workspace_id, viewer_users_id, now)
     with TestClient(app) as viewer_client:

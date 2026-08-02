@@ -323,7 +323,7 @@ def accept_invitation_endpoint(
             session.execute(
                 text(
                     """
-                    SELECT workspace_id, email, role, token_hash, expires_at,
+                    SELECT workspace_id, email, role, token_hash, invited_by, expires_at,
                            accepted_at, rejected_at, revoked_at
                     FROM invitations
                     WHERE id = :id
@@ -401,6 +401,14 @@ def accept_invitation_endpoint(
                 "now": now,
             },
         )
+        # `invited_by` must be a `users.id` within `target_workspace_id` --
+        # `auth.user_id` is the accepting caller's own users_id, scoped to
+        # whichever *other* workspace their session belongs to (this
+        # endpoint exists precisely because the caller is not yet a member
+        # of `target_workspace_id`), so it can never satisfy
+        # `fk_workspace_memberships_workspace_invited_by`. The invitation's
+        # own `invited_by` (the real inviter, already a member of
+        # `target_workspace_id`) is the only value that can.
         session.execute(
             text(
                 """
@@ -419,7 +427,7 @@ def accept_invitation_endpoint(
                 "account_id": account_row["account_id"],
                 "users_id": new_users_id,
                 "role": invitation["role"],
-                "invited_by": auth.user_id,
+                "invited_by": invitation["invited_by"],
                 "now": now,
             },
         )
@@ -515,11 +523,17 @@ def reject_invitation_endpoint(
             text("UPDATE invitations SET rejected_at = :now WHERE id = :id"),
             {"now": now, "id": invitation_id},
         )
+        # Unlike accept, reject never creates a `users` row in
+        # `invitation["workspace_id"]` -- the caller has no workspace-scoped
+        # identity there to record as `actor_id`, and `auth.user_id` (scoped
+        # to whichever *other* workspace their session belongs to) would
+        # violate `fk_audit_workspace_actor`'s composite FK. `actor_id` is
+        # nullable for exactly this case.
         _write_identity_audit_event(
             session,
             request,
             workspace_id=invitation["workspace_id"],
-            actor_users_id=auth.user_id,
+            actor_users_id=None,
             event_type="invitation.rejected",
             aggregate_type="invitation",
             aggregate_id=invitation_id,

@@ -11,13 +11,21 @@ has no active membership in, even knowing the real `workspace_id`),
 `GET /identity/workspaces`, `POST /identity/workspaces`,
 `PATCH /identity/workspaces/{id}` (role-gated).
 
-No `invitations` table exists yet (Task 2) -- `POST /identity/accounts`
-is genuine self-registration in this task's own scope, and every
-membership below is seeded directly via `identity_fixtures.create_identity`/
-`add_membership`, mirroring how every other Phase 7/8 test file seeds its
-fixture identity without going through a real signup flow.
+**Task 2 has since gated `POST /identity/accounts` behind a real invitation
+token** (`ecc.domains.identity.invitations`) -- this file's own two tests
+of that endpoint's contract (`test_create_account_and_reject_duplicate_
+email`, `test_create_account_rejects_short_password`) seed a real
+`invitations` row via `_seed_invitation` and call the endpoint with its
+token, matching production usage. Every other test below is about login/
+select-workspace/workspace-CRUD behavior, not about registration itself,
+so those keep seeding fixture identities directly via `identity_fixtures.
+create_identity`/`add_membership` (or, where a real password hash must
+verify against a real password, `_seed_account`) -- going through the
+invitation-gated signup flow for tests that aren't about signup at all
+would only add unrelated setup with no behavioral payoff.
 """
 
+import secrets
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
@@ -31,6 +39,7 @@ from sqlalchemy import text
 
 from ecc.config import get_settings
 from ecc.database import engine
+from ecc.domains.identity.accounts import _hash_password
 from ecc.main import app
 
 settings = get_settings()
@@ -42,7 +51,16 @@ pytestmark = pytest.mark.skipif(
 
 def _cleanup_workspace(workspace_id: UUID) -> None:
     with engine.begin() as connection:
-        for table in ("workspace_memberships", "sessions", "event_outbox", "audit_events", "users"):
+        # `invitations.invited_by` is ON DELETE RESTRICT against `users` --
+        # must be deleted before `users`, not after.
+        for table in (
+            "workspace_memberships",
+            "sessions",
+            "event_outbox",
+            "audit_events",
+            "invitations",
+            "users",
+        ):
             connection.execute(
                 text(f"DELETE FROM {table} WHERE workspace_id = :workspace_id"),  # noqa: S608
                 {"workspace_id": workspace_id},
@@ -55,6 +73,69 @@ def _cleanup_workspace(workspace_id: UUID) -> None:
 def _cleanup_account(account_id: UUID) -> None:
     with engine.begin() as connection:
         connection.execute(text("DELETE FROM accounts WHERE id = :id"), {"id": account_id})
+
+
+def _seed_account(email: str, password: str) -> UUID:
+    """A bare `accounts` row with a real Argon2id hash of `password` and no
+    workspace membership at all -- for login tests that only need
+    credential verification (wrong-password, disabled-account, no-active-
+    membership), not a real registration flow.
+    """
+    account_id = uuid4()
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO accounts (id, email, password_hash, display_name, created_at) "
+                "VALUES (:id, :email, :password_hash, :display_name, :now)"
+            ),
+            {
+                "id": account_id,
+                "email": email,
+                "password_hash": _hash_password(password),
+                "display_name": "Test",
+                "now": datetime.now(UTC),
+            },
+        )
+    return account_id
+
+
+def _seed_invitation(
+    workspace_id: UUID, *, email: str, invited_by: UUID, role: str = "member"
+) -> str:
+    """Insert an `invitations` row directly (bypassing `create_invitation_
+    endpoint`, which needs an already-authenticated owner/admin caller --
+    these tests seed the very first invitation into a fixture workspace
+    before any session exists) and return the raw token for `POST
+    /accounts?token=...`, mirroring `invitations.py`'s own token_hash
+    convention.
+    """
+    now = datetime.now(UTC)
+    raw_token = secrets.token_urlsafe(32)
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                """
+                INSERT INTO invitations (
+                    id, workspace_id, email, role, token_hash, invited_by,
+                    expires_at, created_at
+                ) VALUES (
+                    :id, :workspace_id, :email, :role, :token_hash, :invited_by,
+                    :expires_at, :now
+                )
+                """
+            ),
+            {
+                "id": uuid4(),
+                "workspace_id": workspace_id,
+                "email": email,
+                "role": role,
+                "token_hash": sha256(raw_token.encode("utf-8")).hexdigest(),
+                "invited_by": invited_by,
+                "expires_at": now + timedelta(days=7),
+                "now": now,
+            },
+        )
+    return raw_token
 
 
 def _headers(token: str, key: str | None = None) -> dict[str, str]:
@@ -93,9 +174,25 @@ def client() -> Iterator[TestClient]:
 
 
 def test_create_account_and_reject_duplicate_email(client: TestClient) -> None:
+    now = datetime.now(UTC)
+    workspace_id = uuid4()
+    inviter_users_id = uuid4()
     email = f"{uuid4()}@example.test"
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO workspaces (id, name, created_at, timezone) "
+                "VALUES (:id, 'W', :now, 'UTC')"
+            ),
+            {"id": workspace_id, "now": now},
+        )
+        inviter_account_id = create_identity(
+            connection, workspace_id=workspace_id, user_id=inviter_users_id, now=now, role="owner"
+        )
+    token = _seed_invitation(workspace_id, email=email, invited_by=inviter_users_id)
+
     resp = client.post(
-        "/api/v1/identity/accounts",
+        f"/api/v1/identity/accounts?token={token}",
         json={"email": email, "password": "correct horse battery", "display_name": "Alex"},
     )
     assert resp.status_code == 201, resp.text
@@ -103,9 +200,13 @@ def test_create_account_and_reject_duplicate_email(client: TestClient) -> None:
     assert body["email"] == email
     assert body["display_name"] == "Alex"
 
+    # A second, still-pending invitation to the same recipient email --
+    # its own token is valid, but the account row it would create collides
+    # on `accounts.email`'s own UNIQUE constraint (case-insensitively).
+    second_token = _seed_invitation(workspace_id, email=email, invited_by=inviter_users_id)
     try:
         dup = client.post(
-            "/api/v1/identity/accounts",
+            f"/api/v1/identity/accounts?token={second_token}",
             json={
                 "email": email.upper(),
                 "password": "a different password",
@@ -115,7 +216,9 @@ def test_create_account_and_reject_duplicate_email(client: TestClient) -> None:
         assert dup.status_code == 409, dup.text
         assert dup.json()["error"]["code"] == "EMAIL_ALREADY_REGISTERED"
     finally:
+        _cleanup_workspace(workspace_id)
         _cleanup_account(UUID(body["id"]))
+        _cleanup_account(inviter_account_id)
 
 
 def test_create_account_rejects_short_password(client: TestClient) -> None:
@@ -127,7 +230,7 @@ def test_create_account_rejects_short_password(client: TestClient) -> None:
 
 
 def test_login_with_single_active_membership_auto_authenticates(client: TestClient) -> None:
-    workspace_id, users_id, account_id = uuid4(), uuid4(), None
+    workspace_id, users_id = uuid4(), uuid4()
     now = datetime.now(UTC)
     password = "a genuinely long password"
     email = f"{uuid4()}@example.test"
@@ -139,20 +242,14 @@ def test_login_with_single_active_membership_auto_authenticates(client: TestClie
             ),
             {"id": workspace_id, "now": now},
         )
-    resp = client.post(
-        "/api/v1/identity/accounts",
-        json={"email": email, "password": password, "display_name": "Login Test"},
-    )
-    assert resp.status_code == 201, resp.text
-    account_id = UUID(resp.json()["id"])
-    with engine.begin() as connection:
-        add_membership(
+        account_id = create_identity(
             connection,
             workspace_id=workspace_id,
-            account_id=account_id,
-            users_id=users_id,
-            role="owner",
+            user_id=users_id,
+            email=email,
+            password_hash=_hash_password(password),
             now=now,
+            role="owner",
         )
 
     try:
@@ -171,11 +268,7 @@ def test_login_with_single_active_membership_auto_authenticates(client: TestClie
 
 def test_login_wrong_password_is_rejected(client: TestClient) -> None:
     email = f"{uuid4()}@example.test"
-    resp = client.post(
-        "/api/v1/identity/accounts",
-        json={"email": email, "password": "the real password", "display_name": "X"},
-    )
-    account_id = UUID(resp.json()["id"])
+    account_id = _seed_account(email, "the real password")
     try:
         login = client.post(
             "/api/v1/identity/auth/login", json={"email": email, "password": "wrong password"}
@@ -189,11 +282,7 @@ def test_login_wrong_password_is_rejected(client: TestClient) -> None:
 def test_login_with_no_active_membership_is_rejected(client: TestClient) -> None:
     email = f"{uuid4()}@example.test"
     password = "another real password"
-    resp = client.post(
-        "/api/v1/identity/accounts",
-        json={"email": email, "password": password, "display_name": "X"},
-    )
-    account_id = UUID(resp.json()["id"])
+    account_id = _seed_account(email, password)
     try:
         login = client.post(
             "/api/v1/identity/auth/login", json={"email": email, "password": password}
@@ -207,11 +296,7 @@ def test_login_with_no_active_membership_is_rejected(client: TestClient) -> None
 def test_login_disabled_account_is_rejected(client: TestClient) -> None:
     email = f"{uuid4()}@example.test"
     password = "yet another real password"
-    resp = client.post(
-        "/api/v1/identity/accounts",
-        json={"email": email, "password": password, "display_name": "X"},
-    )
-    account_id = UUID(resp.json()["id"])
+    account_id = _seed_account(email, password)
     try:
         with engine.begin() as connection:
             connection.execute(
@@ -242,19 +327,14 @@ def test_login_with_two_active_memberships_returns_select_workspace(client: Test
                 ),
                 {"id": wid, "name": name, "now": now},
             )
-    resp = client.post(
-        "/api/v1/identity/accounts",
-        json={"email": email, "password": password, "display_name": "Multi"},
-    )
-    account_id = UUID(resp.json()["id"])
-    with engine.begin() as connection:
-        add_membership(
+        account_id = create_identity(
             connection,
             workspace_id=workspace_a,
-            account_id=account_id,
-            users_id=users_a,
-            role="owner",
+            user_id=users_a,
+            email=email,
+            password_hash=_hash_password(password),
             now=now,
+            role="owner",
         )
         add_membership(
             connection,
@@ -324,19 +404,14 @@ def test_select_workspace_rejects_a_workspace_the_account_has_no_membership_in(
                 ),
                 {"id": wid, "now": now},
             )
-    resp = client.post(
-        "/api/v1/identity/accounts",
-        json={"email": email, "password": password, "display_name": "X"},
-    )
-    account_id = UUID(resp.json()["id"])
-    with engine.begin() as connection:
-        add_membership(
+        account_id = create_identity(
             connection,
             workspace_id=owned_workspace,
-            account_id=account_id,
-            users_id=users_id,
-            role="owner",
+            user_id=users_id,
+            email=email,
+            password_hash=_hash_password(password),
             now=now,
+            role="owner",
         )
 
     try:
