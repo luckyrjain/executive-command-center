@@ -26,17 +26,21 @@ create a brand new one) -- this is a deliberately narrower slice than the
 phase's eventual invite-only shape, the same "framework first, breadth
 later, always disclosed" discipline Phase 7 Task 1 used for `habits`.
 
-**Pre-auth endpoints get no `Idempotency-Key`, unlike every workspace-scoped
-mutating route elsewhere in this codebase.** `idempotency_records` is keyed
-on `(workspace_id, actor_id)`, which does not exist yet at `POST /accounts`
-or the first `POST /auth/login` call -- and unlike a domain resource, a
-repeated login is not a duplication bug to guard against: creating a second
-valid session for the same account is ordinary multi-device use, not an
-error. `email`'s own `UNIQUE` constraint on `accounts` is what makes
-`POST /accounts` safe to retry (a duplicate attempt 409s cleanly, never
-double-creates). `POST /workspaces`/`PATCH /workspaces/{id}` are ordinary
-authenticated resource mutations and do carry the standard idempotency-key
-plus CSRF protection.
+**No endpoint in this module carries `Idempotency-Key`, unlike every
+workspace-scoped mutating route elsewhere in this codebase -- for two
+different reasons, not one.** `POST /accounts` and `POST /auth/login` are
+pre-auth: `idempotency_records` is keyed on `(workspace_id, actor_id)`,
+which does not exist yet at either call site, and unlike a domain resource,
+a repeated login is not a duplication bug to guard against -- creating a
+second valid session for the same account is ordinary multi-device use, not
+an error (`accounts.email`'s own `UNIQUE` constraint is what makes
+`POST /accounts` safe to retry). `POST /workspaces` is authenticated but
+still skips it deliberately (see its own docstring below -- a mistaken
+second workspace is a visible, correctable user action, not a silent
+duplicate-side-effect risk); `PATCH /workspaces/{id}` needs it least of
+all -- a field-level `UPDATE` is naturally idempotent. `POST /workspaces`
+and `PATCH /workspaces/{id}` **do** carry CSRF protection, like every other
+authenticated mutation in this codebase.
 
 **The post-login workspace-selection step is a short-lived, stateless,
 signed token, not server-side session state.** An account with more than
@@ -75,6 +79,7 @@ from sqlalchemy.orm import Session
 from ecc.auth import (
     AuthContext,
     AuthDep,
+    CsrfDep,
     CsrfHeader,
     SessionCookie,
     require_auth_context,
@@ -601,6 +606,7 @@ def create_workspace_endpoint(
     request: Request,
     auth: AuthDep,
     session: SessionDep,
+    _csrf: CsrfDep,
 ) -> WorkspaceResponse:
     """No `Idempotency-Key`/replay protection is required here beyond the
     caller's own retry judgement -- creating a second workspace by mistake
@@ -692,7 +698,12 @@ def patch_workspace_endpoint(
     request: Request,
     auth: AuthDep,
     session: SessionDep,
+    _csrf: CsrfDep,
 ) -> WorkspaceResponse:
+    """No `Idempotency-Key` needed either -- a field-level `UPDATE` is
+    naturally idempotent (replaying the same payload twice leaves the same
+    end state), unlike a `POST` that would otherwise double-create.
+    """
     if workspace_id != auth.workspace_id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="WORKSPACE_NOT_FOUND")
     now = datetime.now(UTC)
