@@ -115,6 +115,7 @@ from ecc.observability import (
     record_audit_outbox_failure,
     record_idempotency_conflict,
 )
+from ecc.platform import authz
 
 _KILL_SWITCH_FIELDS = """
     id, workspace_id, workflow_id, active, reason, activated_by, activated_at,
@@ -440,9 +441,10 @@ def activate_kill_switch(
             """
             INSERT INTO automation_kill_switches (
                 id, workspace_id, workflow_id, active, reason, activated_by,
-                activated_at, created_at, updated_at
+                activated_at, created_at, updated_at, owner_id, visibility
             ) VALUES (
-                :id, :workspace_id, :workflow_id, true, :reason, :actor_id, :now, :now, :now
+                :id, :workspace_id, :workflow_id, true, :reason, :actor_id, :now, :now, :now,
+                :actor_id, 'workspace'
             )
             """
         ),
@@ -646,6 +648,14 @@ def _handle_kill_switch_request(
     idempotency_key: str,
     request_hash: str,
 ) -> KillSwitchResponse:
+    # Kill switches are workspace-wide operational controls keyed by an
+    # opaque workflow_id string (this module's own docstring: neither
+    # endpoint validates it names a real workflow_definitions row), not a
+    # stable UUID resource -- there is no per-resource authorize() this
+    # maps onto the way every other domain's mutate endpoint does. Gated
+    # on role alone, matching regenerate_attention's identical shape for a
+    # workspace-wide operation with no single resource_id to check.
+    authz.require_role_action(session, auth, "write")
     now = datetime.now(UTC)
     with session.begin():
         _lock_idempotency(session, auth, idempotency_key)
