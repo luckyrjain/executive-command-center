@@ -20,6 +20,7 @@ from ecc.observability import (
     record_audit_outbox_failure,
     record_idempotency_conflict,
 )
+from ecc.platform import authz
 
 router = APIRouter(prefix="/api/v1/knowledge", tags=["knowledge-entity-operations"])
 SessionDep = Annotated[Session, Depends(get_session)]
@@ -443,6 +444,7 @@ def merge_entities(
     _csrf: CsrfDep,
     idempotency_key: IdempotencyHeader,
 ) -> EntityOperationResponse:
+    authz.require_role_action(session, auth, "write")
     request_hash = _request_hash(payload, "merge")
     now = datetime.now(UTC)
     with session.begin():
@@ -486,6 +488,22 @@ def merge_entities(
             else candidate["left_entity_id"]
         )
 
+        # Unlike relationships.py's create_relationship (only the source
+        # entity is actually mutated; the target is merely referenced, so it
+        # gets a read-only check), a merge writes to BOTH entities -- source
+        # is redirected, target gains source's rehomed aliases/edges -- so
+        # both need the full read-then-write two-phase check before anything
+        # is touched.
+        for entity_id in (target_id, source_id):
+            if not authz.authorize(
+                session, auth, resource_type="pkos_nodes", resource_id=entity_id, action="read"
+            ):
+                raise HTTPException(status_code=404, detail="ENTITY_NOT_FOUND")
+            if not authz.authorize(
+                session, auth, resource_type="pkos_nodes", resource_id=entity_id, action="write"
+            ):
+                raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
+
         # Lock both entities in a fixed (sorted) order regardless of which
         # is target/source, so two concurrent merges touching an
         # overlapping pair can never deadlock against each other.
@@ -523,10 +541,12 @@ def merge_entities(
                     f"""
                     INSERT INTO entity_operations (
                         id, workspace_id, operation_type, status, inputs_json,
-                        outputs_json, actor_id, reason, version, created_at, updated_at
+                        outputs_json, actor_id, reason, version, created_at, updated_at,
+                        owner_id, visibility
                     ) VALUES (
                         :id, :workspace_id, 'merge', 'active', CAST(:inputs_json AS jsonb),
-                        CAST(:outputs_json AS jsonb), :actor_id, :reason, 1, :now, :now
+                        CAST(:outputs_json AS jsonb), :actor_id, :reason, 1, :now, :now,
+                        :actor_id, 'workspace'
                     )
                     RETURNING {_OPERATION_FIELDS}
                     """
@@ -721,6 +741,23 @@ def reverse_operation(
         if cached is not None:
             return cached
 
+        if not authz.authorize(
+            session,
+            auth,
+            resource_type="entity_operations",
+            resource_id=operation_id,
+            action="read",
+        ):
+            raise HTTPException(status_code=404, detail="OPERATION_NOT_FOUND")
+        if not authz.authorize(
+            session,
+            auth,
+            resource_type="entity_operations",
+            resource_id=operation_id,
+            action="write",
+        ):
+            raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
+
         merge_op = (
             session.execute(
                 text(
@@ -746,6 +783,20 @@ def reverse_operation(
         inputs = merge_op["inputs_json"] if isinstance(merge_op["inputs_json"], dict) else {}
         source_id = UUID(inputs["source_entity_id"])
         target_id = UUID(inputs["target_entity_id"])
+
+        # Reverse mutates both of the original merge's entities the same way
+        # merge_entities itself does, so both get the same full
+        # read-then-write check, re-verified fresh here rather than trusted
+        # to still hold from whenever the original merge ran.
+        for entity_id in (target_id, source_id):
+            if not authz.authorize(
+                session, auth, resource_type="pkos_nodes", resource_id=entity_id, action="read"
+            ):
+                raise HTTPException(status_code=404, detail="ENTITY_NOT_FOUND")
+            if not authz.authorize(
+                session, auth, resource_type="pkos_nodes", resource_id=entity_id, action="write"
+            ):
+                raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
 
         if _has_post_merge_dependent_activity(session, auth, target_id, merge_op["created_at"]):
             raise HTTPException(status_code=422, detail="UNSAFE_REVERSAL")
@@ -869,11 +920,11 @@ def reverse_operation(
                     INSERT INTO entity_operations (
                         id, workspace_id, operation_type, status, inputs_json,
                         outputs_json, actor_id, reason, reverses_operation_id, version,
-                        created_at, updated_at
+                        created_at, updated_at, owner_id, visibility
                     ) VALUES (
                         :id, :workspace_id, 'reverse', 'active', CAST(:inputs_json AS jsonb),
                         CAST(:outputs_json AS jsonb), :actor_id, :reason, :reverses_id, 1,
-                        :now, :now
+                        :now, :now, :actor_id, 'workspace'
                     )
                     RETURNING {_OPERATION_FIELDS}
                     """
@@ -943,6 +994,23 @@ def split_operation(
         if cached is not None:
             return cached
 
+        if not authz.authorize(
+            session,
+            auth,
+            resource_type="entity_operations",
+            resource_id=operation_id,
+            action="read",
+        ):
+            raise HTTPException(status_code=404, detail="OPERATION_NOT_FOUND")
+        if not authz.authorize(
+            session,
+            auth,
+            resource_type="entity_operations",
+            resource_id=operation_id,
+            action="write",
+        ):
+            raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
+
         merge_op = (
             session.execute(
                 text(
@@ -968,6 +1036,19 @@ def split_operation(
         inputs = merge_op["inputs_json"] if isinstance(merge_op["inputs_json"], dict) else {}
         source_id = UUID(inputs["source_entity_id"])
         target_id = UUID(inputs["target_entity_id"])
+
+        # Split mutates both of the original merge's entities the same way
+        # merge_entities/reverse_operation do -- same full read-then-write
+        # check on both, re-verified fresh here.
+        for entity_id in (target_id, source_id):
+            if not authz.authorize(
+                session, auth, resource_type="pkos_nodes", resource_id=entity_id, action="read"
+            ):
+                raise HTTPException(status_code=404, detail="ENTITY_NOT_FOUND")
+            if not authz.authorize(
+                session, auth, resource_type="pkos_nodes", resource_id=entity_id, action="write"
+            ):
+                raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
 
         # Same fixed lock order as merge/reverse -- never deadlocks against
         # a concurrent merge or reverse touching the same pair.
@@ -1093,11 +1174,11 @@ def split_operation(
                     INSERT INTO entity_operations (
                         id, workspace_id, operation_type, status, inputs_json,
                         outputs_json, actor_id, reason, reverses_operation_id, version,
-                        created_at, updated_at
+                        created_at, updated_at, owner_id, visibility
                     ) VALUES (
                         :id, :workspace_id, 'split', 'active', CAST(:inputs_json AS jsonb),
                         CAST(:outputs_json AS jsonb), :actor_id, :reason, :reverses_id, 1,
-                        :now, :now
+                        :now, :now, :actor_id, 'workspace'
                     )
                     RETURNING {_OPERATION_FIELDS}
                     """
