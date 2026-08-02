@@ -16,15 +16,16 @@ algorithm, `argon2-cffi`, present in `pyproject.toml` since before this
 task but never yet exercised by any code path) is this module's own first
 real caller.
 
-**Self-registration now, invitation-gated later -- disclosed, not silent.**
-`POST /accounts` has no invitation-token requirement in this task: Task 2
-adds the `invitations` table and tightens this endpoint to require a valid,
-matching token, per the implementation plan's own Task 2 scope. An account
-created here starts with zero workspace memberships (there is no self-
-service way to join an existing workspace, only `POST /workspaces` to
-create a brand new one) -- this is a deliberately narrower slice than the
-phase's eventual invite-only shape, the same "framework first, breadth
-later, always disclosed" discipline Phase 7 Task 1 used for `habits`.
+**Invitation-gated as of Task 2.** `POST /accounts` now requires a valid,
+matching, unresolved `invitations.token` (query parameter) -- see
+`ecc.domains.identity.invitations`' own module docstring for the full
+acceptance-path reasoning (why this single call registers the account
+*and* completes acceptance in one transaction, rather than requiring a
+separate authenticated `/accept` call a brand-new recipient could not yet
+make). Self-registration with no invitation at all is closed; creating a
+workspace with no invitation still works, but only for an already-
+authenticated account (`POST /workspaces`), which now itself requires
+having gone through an invitation first.
 
 **No endpoint in this module carries `Idempotency-Key`, unlike every
 workspace-scoped mutating route elsewhere in this codebase -- for two
@@ -70,7 +71,7 @@ from uuid import UUID, uuid4
 
 from argon2 import PasswordHasher
 from argon2.exceptions import VerifyMismatchError
-from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
@@ -244,6 +245,8 @@ class AccountResponse(BaseModel):
     email: str
     display_name: str
     created_at: datetime
+    workspace_id: UUID
+    role: str
 
 
 class LoginRequest(BaseModel):
@@ -310,11 +313,62 @@ class WorkspaceListResponse(BaseModel):
 
 
 @router.post("/accounts", response_model=AccountResponse, status_code=status.HTTP_201_CREATED)
-def create_account_endpoint(payload: AccountCreateRequest, session: SessionDep) -> AccountResponse:
-    account_id = uuid4()
+def create_account_endpoint(
+    payload: AccountCreateRequest,
+    request: Request,
+    response: Response,
+    session: SessionDep,
+    token: str = Query(...),
+) -> AccountResponse:
+    """Registration and invitation acceptance in one transaction -- see this
+    module's own top docstring and `ecc.domains.identity.invitations`' for
+    why a brand-new recipient has no other way to reach an authenticated
+    `/accept` call. `email` must case-insensitively match the invitation's
+    own recipient email; a token for someone else's inbox never lets a
+    caller register their own different address against it.
+    """
     now = datetime.now(UTC)
-    try:
-        with session.begin():
+    token_hash = sha256(token.encode("utf-8")).hexdigest()
+    account_id = uuid4()
+    with session.begin():
+        invitation = (
+            session.execute(
+                text(
+                    """
+                    SELECT id, workspace_id, email, role, invited_by, expires_at,
+                           accepted_at, rejected_at, revoked_at
+                    FROM invitations
+                    WHERE token_hash = :token_hash
+                    FOR UPDATE
+                    """
+                ),
+                {"token_hash": token_hash},
+            )
+            .mappings()
+            .one_or_none()
+        )
+        if invitation is None:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED, detail="INVITATION_TOKEN_INVALID"
+            )
+        if invitation["expires_at"] <= now:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED, detail="INVITATION_EXPIRED"
+            )
+        if (
+            invitation["accepted_at"] is not None
+            or invitation["rejected_at"] is not None
+            or invitation["revoked_at"] is not None
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT, detail="INVITATION_ALREADY_RESOLVED"
+            )
+        if payload.email != invitation["email"]:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN, detail="INVITATION_EMAIL_MISMATCH"
+            )
+
+        try:
             session.execute(
                 text(
                     """
@@ -330,12 +384,67 @@ def create_account_endpoint(payload: AccountCreateRequest, session: SessionDep) 
                     "created_at": now,
                 },
             )
-    except IntegrityError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT, detail="EMAIL_ALREADY_REGISTERED"
-        ) from exc
+        except IntegrityError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT, detail="EMAIL_ALREADY_REGISTERED"
+            ) from exc
+
+        workspace_id = invitation["workspace_id"]
+        users_id = uuid4()
+        session.execute(
+            text(
+                "INSERT INTO users (id, workspace_id, account_id, created_at) "
+                "VALUES (:id, :workspace_id, :account_id, :now)"
+            ),
+            {"id": users_id, "workspace_id": workspace_id, "account_id": account_id, "now": now},
+        )
+        session.execute(
+            text(
+                """
+                INSERT INTO workspace_memberships (
+                    id, workspace_id, account_id, users_id, role, status,
+                    invited_by, created_at, updated_at
+                ) VALUES (
+                    :id, :workspace_id, :account_id, :users_id, :role, 'active',
+                    :invited_by, :now, :now
+                )
+                """
+            ),
+            {
+                "id": uuid4(),
+                "workspace_id": workspace_id,
+                "account_id": account_id,
+                "users_id": users_id,
+                "role": invitation["role"],
+                "invited_by": invitation["invited_by"],
+                "now": now,
+            },
+        )
+        session.execute(
+            text("UPDATE invitations SET accepted_at = :now WHERE id = :id"),
+            {"now": now, "id": invitation["id"]},
+        )
+        _write_identity_audit_event(
+            session,
+            request,
+            workspace_id=workspace_id,
+            actor_users_id=users_id,
+            event_type="invitation.accepted",
+            aggregate_type="invitation",
+            aggregate_id=invitation["id"],
+            now=now,
+        )
+        session_token, csrf_token = _create_session_for(
+            session, workspace_id=workspace_id, users_id=users_id, now=now
+        )
+    _set_session_cookies(response, session_token, csrf_token)
     return AccountResponse(
-        id=account_id, email=payload.email, display_name=payload.display_name, created_at=now
+        id=account_id,
+        email=payload.email,
+        display_name=payload.display_name,
+        created_at=now,
+        workspace_id=workspace_id,
+        role=invitation["role"],
     )
 
 
@@ -470,7 +579,7 @@ def select_workspace_endpoint(
 # ---------------------------------------------------------------------------
 
 
-def _write_workspace_audit(
+def _write_identity_audit_event(
     session: Session,
     request: Request,
     *,
@@ -478,9 +587,18 @@ def _write_workspace_audit(
     actor_users_id: UUID,
     event_type: str,
     aggregate_id: UUID,
-    version: int,
     now: datetime,
+    aggregate_type: str = "workspace",
+    version: int = 1,
 ) -> None:
+    """Shared by every mutation in this `identity` domain package that
+    writes an audit trail entry -- `aggregate_type` defaults to
+    `'workspace'` for this module's own `workspace.created`/`workspace.
+    updated` events, and `ecc.domains.identity.invitations` passes
+    `aggregate_type='invitation'` for its own events rather than this
+    module carrying a second, near-duplicate copy hardcoded to a different
+    aggregate type.
+    """
     try:
         request_id = UUID(request.state.request_id)
         correlation_id = UUID(request.state.correlation_id)
@@ -495,7 +613,7 @@ def _write_workspace_audit(
                     aggregate_version, actor_id, request_id, correlation_id,
                     changed_fields, authorization_result, source, metadata, occurred_at
                 ) VALUES (
-                    :id, :workspace_id, :event_type, 'workspace', :aggregate_id,
+                    :id, :workspace_id, :event_type, :aggregate_type, :aggregate_id,
                     :aggregate_version, :actor_id, :request_id, :correlation_id,
                     ARRAY['*'], 'allowed', 'user', '{}'::jsonb, :occurred_at
                 )
@@ -505,6 +623,7 @@ def _write_workspace_audit(
                 "id": uuid4(),
                 "workspace_id": workspace_id,
                 "event_type": event_type,
+                "aggregate_type": aggregate_type,
                 "aggregate_id": aggregate_id,
                 "aggregate_version": version,
                 "actor_id": actor_users_id,
@@ -672,7 +791,7 @@ def create_workspace_endpoint(
                 "now": now,
             },
         )
-        _write_workspace_audit(
+        _write_identity_audit_event(
             session,
             request,
             workspace_id=new_workspace_id,
@@ -736,7 +855,7 @@ def patch_workspace_endpoint(
                 text(f"UPDATE workspaces SET {set_clause} WHERE id = :workspace_id"),  # noqa: S608
                 {**updates, "workspace_id": workspace_id},
             )
-            _write_workspace_audit(
+            _write_identity_audit_event(
                 session,
                 request,
                 workspace_id=workspace_id,
