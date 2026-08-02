@@ -24,6 +24,7 @@ from ecc.domains.knowledge.embeddings import (
     get_provider,
     vector_literal,
 )
+from ecc.platform import authz
 from ecc.platform.authz import WORKSPACE_ORIGINAL_OWNER_SQL
 
 router = APIRouter(prefix="/api/v1/knowledge", tags=["knowledge-retrieval"])
@@ -254,7 +255,12 @@ def _decode_cursor(cursor: str) -> tuple[float, UUID]:
         raise HTTPException(status_code=400, detail="MALFORMED_CURSOR") from exc
 
 
-_LEXICAL_CANDIDATES_CTE = """
+def _lexical_candidates_cte(visibility_sql: str) -> str:
+    # visibility_sql comes only from authz.visible_resource_filter_sql
+    # (never request-controlled), same trust boundary as every other
+    # f-string-embedded fragment in this module (_SCORE_* constants,
+    # WORKSPACE_ORIGINAL_OWNER_SQL elsewhere) -- safe to splice directly.
+    return f"""
     candidates AS (
         SELECT
             d.entity_type, d.entity_id, d.title, d.body,
@@ -281,6 +287,7 @@ _LEXICAL_CANDIDATES_CTE = """
           ON n.workspace_id = d.workspace_id AND n.id = d.entity_id
         WHERE d.workspace_id = :workspace_id
           AND n.status = 'active'
+          AND {visibility_sql}
           AND (CAST(:kind AS text) IS NULL OR d.entity_type = :kind)
           AND (
               CAST(:updated_from AS timestamptz) IS NULL
@@ -294,12 +301,14 @@ _LEXICAL_CANDIDATES_CTE = """
 """
 
 
-def _run_lexical_query(session: Session, params: dict[str, Any]) -> Sequence[Any]:
+def _run_lexical_query(
+    session: Session, params: dict[str, Any], visibility_sql: str
+) -> Sequence[Any]:
     return (
         session.execute(
             text(
                 f"""
-                WITH {_LEXICAL_CANDIDATES_CTE}, ranked AS (
+                WITH {_lexical_candidates_cte(visibility_sql)}, ranked AS (
                     SELECT *,
                         CASE
                             WHEN normalized_title = :query THEN {_SCORE_EXACT_NAME}
@@ -337,18 +346,27 @@ def _run_lexical_query(session: Session, params: dict[str, Any]) -> Sequence[Any
     )
 
 
-def _run_hybrid_query(session: Session, params: dict[str, Any]) -> Sequence[Any]:
+def _run_hybrid_query(
+    session: Session, params: dict[str, Any], visibility_sql: str
+) -> Sequence[Any]:
     """Fuses lexical candidates with the nearest embedding_projections
     neighbors of the query vector. See the module-level _SCORE_* constants
     for the fusion formula (RETRIEVAL-CONTRACT.md's "versioned deterministic
     method"): a document found lexically gets a small semantic bonus capped
     below the next ranking band up; a document found only semantically is
-    scored from similarity alone, capped below plain lexical relevance."""
+    scored from similarity alone, capped below plain lexical relevance.
+
+    The semantic branch joins retrieval_documents d independently of the
+    shared `candidates` CTE (it starts from embedding_projections, not
+    retrieval_documents), so it needs its own copy of the same visibility
+    filter -- omitting it here would let a document invisible to the caller
+    still surface through pure-semantic recall even though the lexical path
+    correctly excludes it."""
     return (
         session.execute(
             text(
                 f"""
-                WITH {_LEXICAL_CANDIDATES_CTE}, semantic AS (
+                WITH {_lexical_candidates_cte(visibility_sql)}, semantic AS (
                     SELECT
                         d.entity_type, d.entity_id, d.title, d.body,
                         d.source_version, d.updated_at,
@@ -363,6 +381,7 @@ def _run_hybrid_query(session: Session, params: dict[str, Any]) -> Sequence[Any]
                     WHERE e.workspace_id = :workspace_id
                       AND e.model_id = :model_id
                       AND n.status = 'active'
+                      AND {visibility_sql}
                       AND (CAST(:kind AS text) IS NULL OR d.entity_type = :kind)
                       AND (
                           CAST(:updated_from AS timestamptz) IS NULL
@@ -543,6 +562,9 @@ def retrieve(
             degraded_reason = "embedding_generation_failed"
             mode = "lexical"
 
+    visibility_sql, visibility_params = authz.visible_resource_filter_sql(
+        session, auth, resource_type="retrieval_documents", action="read", table_alias="d"
+    )
     cursor_payload = _decode_cursor(cursor) if cursor else None
     params: dict[str, Any] = {
         "workspace_id": auth.workspace_id,
@@ -553,6 +575,7 @@ def retrieve(
         "cursor_score": cursor_payload[0] if cursor_payload else None,
         "cursor_id": cursor_payload[1] if cursor_payload else None,
         "fetch_limit": limit + 1,
+        **visibility_params,
     }
 
     if query_vector is not None:
@@ -564,8 +587,11 @@ def retrieve(
                 "model_id": MODEL_ID,
                 "semantic_candidate_limit": _SEMANTIC_CANDIDATE_LIMIT,
             },
+            visibility_sql,
         )
+        session.rollback()
         return _build_response(rows, query, mode, limit, True, degraded, degraded_reason)
 
-    rows = _run_lexical_query(session, params)
+    rows = _run_lexical_query(session, params, visibility_sql)
+    session.rollback()
     return _build_response(rows, query, mode, limit, False, degraded, degraded_reason)
