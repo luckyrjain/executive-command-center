@@ -85,6 +85,7 @@ def test_existing_seeded_pkos_rows_backfill_to_valid_defaults() -> None:
             text("INSERT INTO workspaces (id, name, created_at) VALUES (:id, :name, :created_at)"),
             {"id": workspace_id, "name": "Reconciliation Backfill Test", "created_at": now},
         )
+        create_identity(connection, workspace_id=workspace_id, user_id=uuid4(), now=now)
         # Deliberately omit the new columns, mirroring a pre-migration insert
         # shape, to prove the server defaults (not application code) supply
         # valid values.
@@ -113,6 +114,14 @@ def test_existing_seeded_pkos_rows_backfill_to_valid_defaults() -> None:
         with engine.begin() as connection:
             connection.execute(
                 text("DELETE FROM pkos_nodes WHERE workspace_id = :workspace_id"),
+                {"workspace_id": workspace_id},
+            )
+            connection.execute(
+                text("DELETE FROM workspace_memberships WHERE workspace_id = :workspace_id"),
+                {"workspace_id": workspace_id},
+            )
+            connection.execute(
+                text("DELETE FROM users WHERE workspace_id = :workspace_id"),
                 {"workspace_id": workspace_id},
             )
             connection.execute(
@@ -531,6 +540,7 @@ def _seed_foreign_workspace_entity() -> tuple[UUID, UUID]:
             text("INSERT INTO workspaces (id, name, created_at) VALUES (:id, :name, :created_at)"),
             {"id": other_workspace_id, "name": "Foreign Workspace", "created_at": now},
         )
+        create_identity(connection, workspace_id=other_workspace_id, user_id=uuid4(), now=now)
         connection.execute(
             text(
                 "INSERT INTO pkos_nodes (id, workspace_id, node_type, canonical_name, "
@@ -547,6 +557,14 @@ def _teardown_foreign_workspace_entity(workspace_id: UUID) -> None:
     with engine.begin() as connection:
         connection.execute(
             text("DELETE FROM pkos_nodes WHERE workspace_id = :workspace_id"),
+            {"workspace_id": workspace_id},
+        )
+        connection.execute(
+            text("DELETE FROM workspace_memberships WHERE workspace_id = :workspace_id"),
+            {"workspace_id": workspace_id},
+        )
+        connection.execute(
+            text("DELETE FROM users WHERE workspace_id = :workspace_id"),
             {"workspace_id": workspace_id},
         )
         connection.execute(

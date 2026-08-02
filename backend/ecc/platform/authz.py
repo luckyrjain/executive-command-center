@@ -89,6 +89,28 @@ Action = Literal["read", "write"]
 ROLES: tuple[Role, ...] = ("owner", "admin", "member", "viewer")
 ACTIONS: tuple[Action, ...] = ("read", "write")
 
+# Migration `0063_phase8_authz_visibility.py`'s own `_ORIGINAL_WORKSPACE_
+# USER_SUBQUERY` formula, quoted verbatim, for callers writing a NEW row
+# into a table that migration added `owner_id` to (its `_NEW_OWNER_FROM_
+# WORKSPACE_ORIGINAL_USER` group) -- the identical formula that migration's
+# own BEFORE INSERT trigger safety net uses when `owner_id` is left NULL
+# (see that migration's own docstring, "Why every new/widened column also
+# gets a DB-level default"). A domain's own INSERT should supply this
+# explicitly, not rely on the trigger, whenever it bulk-inserts many rows
+# in one statement -- a per-row trigger firing thousands of times inside a
+# single bulk `INSERT ... SELECT` measurably regressed `ecc.domains.
+# attention.attention`'s `regenerate` endpoint (a CI-budgeted p95 test
+# caught it) purely from trigger-invocation overhead, even though the
+# underlying subquery itself is cheap. Written as a **non-correlated**
+# subquery (references only `:workspace_id`, never a per-row column of the
+# statement it's embedded in) specifically so Postgres evaluates it once
+# per statement, not once per row, when embedded in a bulk `INSERT ...
+# SELECT`.
+WORKSPACE_ORIGINAL_OWNER_SQL = (
+    "(SELECT u.id FROM users AS u WHERE u.workspace_id = :workspace_id "
+    "ORDER BY u.created_at ASC LIMIT 1)"
+)
+
 # Fixed permission baseline per role for `workspace`-visibility resources
 # (Decision 2's own illustrative baseline, finalized here). Membership/
 # invitation/role management is governed separately (Task 1/2's own

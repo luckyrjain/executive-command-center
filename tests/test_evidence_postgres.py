@@ -209,6 +209,7 @@ def test_cross_workspace_evidence_resolves_as_missing_not_permission_denied(
 ) -> None:
     client, _, _ = evidence_test_context
     other_workspace_id = uuid4()
+    other_user_id = uuid4()
     with engine.begin() as connection:
         connection.execute(
             text(
@@ -219,6 +220,7 @@ def test_cross_workspace_evidence_resolves_as_missing_not_permission_denied(
             ),
             {"id": other_workspace_id, "now": datetime.now(UTC)},
         )
+        create_identity(connection, workspace_id=other_workspace_id, user_id=other_user_id)
     try:
         foreign_evidence_id = _insert_node_and_evidence(
             other_workspace_id, "Foreign Secret", "document", datetime.now(UTC)
@@ -244,6 +246,13 @@ def test_cross_workspace_evidence_resolves_as_missing_not_permission_denied(
             connection.execute(
                 text("DELETE FROM pkos_nodes WHERE workspace_id = :w"),
                 {"w": other_workspace_id},
+            )
+            connection.execute(
+                text("DELETE FROM workspace_memberships WHERE workspace_id = :w"),
+                {"w": other_workspace_id},
+            )
+            connection.execute(
+                text("DELETE FROM users WHERE workspace_id = :w"), {"w": other_workspace_id}
             )
             connection.execute(
                 text("DELETE FROM workspaces WHERE id = :w"),
@@ -370,6 +379,7 @@ def test_delete_evidence_rejects_a_foreign_workspace_evidence_id(
 ) -> None:
     client, _workspace_id, token = evidence_test_context
     other_workspace_id = uuid4()
+    other_user_id = uuid4()
     with engine.begin() as connection:
         connection.execute(
             text(
@@ -380,6 +390,7 @@ def test_delete_evidence_rejects_a_foreign_workspace_evidence_id(
             ),
             {"id": other_workspace_id, "now": datetime.now(UTC)},
         )
+        create_identity(connection, workspace_id=other_workspace_id, user_id=other_user_id)
     try:
         foreign_evidence_id = _insert_node_and_evidence(
             other_workspace_id, "Foreign Contract", "document", datetime.now(UTC)
@@ -407,6 +418,13 @@ def test_delete_evidence_rejects_a_foreign_workspace_evidence_id(
             connection.execute(
                 text("DELETE FROM pkos_nodes WHERE workspace_id = :w"),
                 {"w": other_workspace_id},
+            )
+            connection.execute(
+                text("DELETE FROM workspace_memberships WHERE workspace_id = :w"),
+                {"w": other_workspace_id},
+            )
+            connection.execute(
+                text("DELETE FROM users WHERE workspace_id = :w"), {"w": other_workspace_id}
             )
             connection.execute(
                 text("DELETE FROM workspaces WHERE id = :w"),

@@ -47,6 +47,13 @@ SyncStatus = Literal["succeeded", "failed", "partial"]
 # this with the literal) makes the choice low-stakes in practice -- every
 # active workspace member can already read/write these rows via role
 # permissions regardless of which user happens to hold `owner_id`.
+#
+# Byte-identical to `ecc.platform.authz.WORKSPACE_ORIGINAL_OWNER_SQL` (a
+# second copy, not a shared import) -- this module is deliberately a leaf
+# with no `ecc.*` imports (see its own module docstring); pulling in
+# `authz.py`'s FastAPI/session dependency chain for one string constant
+# was judged worse than the duplication. Both trace back to the identical
+# migration formula, so there is no divergence risk.
 WORKSPACE_ORIGINAL_OWNER_SQL = (
     "(SELECT u.id FROM users AS u WHERE u.workspace_id = :workspace_id "
     "ORDER BY u.created_at ASC LIMIT 1)"

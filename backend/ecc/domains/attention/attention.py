@@ -20,6 +20,7 @@ from ecc.observability import (
     record_idempotency_conflict,
     record_ranking,
 )
+from ecc.platform.authz import WORKSPACE_ORIGINAL_OWNER_SQL
 
 from .policy import AttentionPolicy, get_active_policy
 
@@ -421,16 +422,16 @@ def _upsert_batch(
 
     session.execute(
         text(
-            """
+            f"""
             INSERT INTO attention_items (
                 id, workspace_id, entity_type, entity_id, source_entity_version,
                 score, confidence, factors, explanation, generated_at, expires_at, pinned,
-                policy_version
+                policy_version, owner_id, visibility
             )
             SELECT gen_random_uuid(), :workspace_id, :entity_type,
                    t.entity_id, t.version, t.score, t.confidence,
                    t.factors, t.explanation, :generated_at, :expires_at, t.pinned,
-                   :policy_version
+                   :policy_version, {WORKSPACE_ORIGINAL_OWNER_SQL}, 'workspace'
             FROM jsonb_to_recordset(CAST(:payload AS jsonb)) AS t(
                 entity_id uuid, version bigint, score smallint, confidence numeric,
                 factors jsonb, explanation text, pinned boolean

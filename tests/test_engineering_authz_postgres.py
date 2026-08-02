@@ -251,7 +251,7 @@ def test_incident_create_owner_admin_member_succeed_viewer_and_suspended_denied(
             headers=_headers(actor.token, key=str(uuid4())),
         )
         assert response.status_code == 403, response.text
-        assert response.json()["detail"] == "INSUFFICIENT_ROLE"
+        assert response.json()["error"]["code"] == "INSUFFICIENT_ROLE"
 
 
 def test_incident_resolve_owner_admin_member_succeed_viewer_denied(
@@ -268,7 +268,7 @@ def test_incident_resolve_owner_admin_member_succeed_viewer_denied(
         headers=_headers(viewer.token, key=str(uuid4())),
     )
     assert response.status_code == 403, response.text
-    assert response.json()["detail"] == "INSUFFICIENT_ROLE"
+    assert response.json()["error"]["code"] == "INSUFFICIENT_ROLE"
 
     # owner/admin/member each resolve their own freshly-created incident
     # (workspace visibility + role's own write permission -- not
@@ -327,7 +327,7 @@ def test_connector_create_owner_admin_member_succeed_viewer_denied(
         headers=_headers(viewer.token, key=str(uuid4())),
     )
     assert response.status_code == 403, response.text
-    assert response.json()["detail"] == "INSUFFICIENT_ROLE"
+    assert response.json()["error"]["code"] == "INSUFFICIENT_ROLE"
 
 
 def test_connector_sync_and_disable_viewer_denied_owner_succeeds(
@@ -339,11 +339,11 @@ def test_connector_sync_and_disable_viewer_denied_owner_succeeds(
 
     response = viewer.client.post(
         f"/api/v1/engineering/connectors/{account['id']}/sync",
-        json={"run_type": "backfill", "resource_type": "repositories"},
+        json={"run_type": "backfill", "resource_type": "repository"},
         headers=_headers(viewer.token, key=str(uuid4())),
     )
     assert response.status_code == 403, response.text
-    assert response.json()["detail"] == "INSUFFICIENT_ROLE"
+    assert response.json()["error"]["code"] == "INSUFFICIENT_ROLE"
 
     response = viewer.client.post(
         f"/api/v1/engineering/connectors/{account['id']}/disable",
@@ -353,7 +353,7 @@ def test_connector_sync_and_disable_viewer_denied_owner_succeeds(
 
     response = owner.client.post(
         f"/api/v1/engineering/connectors/{account['id']}/sync",
-        json={"run_type": "backfill", "resource_type": "repositories"},
+        json={"run_type": "backfill", "resource_type": "repository"},
         headers=_headers(owner.token, key=str(uuid4())),
     )
     assert response.status_code == 201, response.text
@@ -415,7 +415,7 @@ def test_idor_incident_id_guessed_from_another_workspace_is_404_not_403(
         headers=_headers(other_workspace_owner.token, key=str(uuid4())),
     )
     assert response.status_code == 404, response.text
-    assert response.json()["detail"] == "INCIDENT_NOT_FOUND"
+    assert response.json()["error"]["code"] == "INCIDENT_NOT_FOUND"
 
 
 def test_idor_connector_id_guessed_from_another_workspace_is_404_not_403(
@@ -426,11 +426,11 @@ def test_idor_connector_id_guessed_from_another_workspace_is_404_not_403(
 
     response = other_workspace_owner.client.post(
         f"/api/v1/engineering/connectors/{account['id']}/sync",
-        json={"run_type": "backfill", "resource_type": "repositories"},
+        json={"run_type": "backfill", "resource_type": "repository"},
         headers=_headers(other_workspace_owner.token, key=str(uuid4())),
     )
     assert response.status_code == 404, response.text
-    assert response.json()["detail"] == "CONNECTOR_NOT_FOUND"
+    assert response.json()["error"]["code"] == "CONNECTOR_NOT_FOUND"
 
     response = other_workspace_owner.client.post(
         f"/api/v1/engineering/connectors/{account['id']}/disable",
@@ -448,8 +448,8 @@ def test_suspending_membership_denies_the_very_next_request(
     workspace_id: UUID = authz_context.workspace_id
     member: _Actor = authz_context.member
 
-    response = member.client.get("/api/v1/engineering/incidents")
-    assert response.status_code == 200, response.text
+    body = _create_incident(member.client, member.token, title="Before suspension")
+    assert body["title"] == "Before suspension"
 
     with engine.begin() as connection:
         connection.execute(
@@ -462,8 +462,20 @@ def test_suspending_membership_denies_the_very_next_request(
 
     # No cache, no sleep -- the very next request on the same still-valid
     # session must now deny (authz.py's own "reads fresh from Postgres,
-    # no cache anywhere" guarantee).
-    response = member.client.get("/api/v1/engineering/incidents")
+    # no cache anywhere" guarantee). Uses a mutate endpoint (`require_role_
+    # action`), not the list endpoint -- `visible_resource_filter_sql`
+    # never 403s an inactive membership on a list endpoint (see the
+    # `test_incident_list_...` test above), so it can't demonstrate denial
+    # via status code the way a mutate endpoint can.
+    response = member.client.post(
+        "/api/v1/engineering/incidents",
+        json={
+            "title": "After suspension",
+            "severity": "low",
+            "detected_at": datetime.now(UTC).isoformat(),
+        },
+        headers=_headers(member.token, key=str(uuid4())),
+    )
     assert response.status_code == 403, response.text
 
 
@@ -495,7 +507,7 @@ def test_revoking_owner_role_denies_the_very_next_create(
         headers=_headers(admin.token, key=str(uuid4())),
     )
     assert response.status_code == 403, response.text
-    assert response.json()["detail"] == "INSUFFICIENT_ROLE"
+    assert response.json()["error"]["code"] == "INSUFFICIENT_ROLE"
 
 
 # --- 4. Background-job re-check ---------------------------------------------
@@ -635,7 +647,7 @@ def test_grant_creation_rejected_for_ungrantable_personal_domain_resource_type(
         headers=_headers(owner.token),
     )
     assert response.status_code == 400, response.text
-    assert response.json()["detail"] == "RESOURCE_TYPE_NOT_GRANTABLE"
+    assert response.json()["error"]["code"] == "RESOURCE_TYPE_NOT_GRANTABLE"
 
     with engine.begin() as connection:
         count = connection.execute(
