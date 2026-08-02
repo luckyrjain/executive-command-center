@@ -20,6 +20,7 @@ from ecc.observability import (
     record_audit_outbox_failure,
     record_idempotency_conflict,
 )
+from ecc.platform import authz
 
 router = APIRouter(prefix="/api/v1/notes", tags=["notes"])
 
@@ -404,6 +405,7 @@ def create_note(
     _csrf: CsrfDep,
     idempotency_key: IdempotencyHeader,
 ) -> NoteResponse:
+    authz.require_role_action(session, auth, "write")
     request_hash = _request_hash(payload, "create")
     request_id, correlation_id = _request_ids(request)
     now = datetime.now(UTC)
@@ -487,8 +489,15 @@ def list_notes(
     cursor: str | None = None,
     limit: int = Query(default=20, ge=1, le=100),
 ) -> NoteListResponse:
-    clauses = ["workspace_id = :workspace_id"]
-    params: dict[str, Any] = {"workspace_id": auth.workspace_id, "limit": limit + 1}
+    visibility_sql, visibility_params = authz.visible_resource_filter_sql(
+        session, auth, resource_type="notes", action="read", table_alias="notes"
+    )
+    clauses = ["workspace_id = :workspace_id", f"({visibility_sql})"]
+    params: dict[str, Any] = {
+        "workspace_id": auth.workspace_id,
+        "limit": limit + 1,
+        **visibility_params,
+    }
     if not include_archived:
         clauses.append("archived_at IS NULL")
     if note_type_filter:
@@ -521,6 +530,7 @@ def list_notes(
         .mappings()
         .all()
     )
+    session.rollback()
     has_more = len(rows) > limit
     page = rows[:limit]
     next_cursor = None
@@ -535,6 +545,12 @@ def list_notes(
 
 @router.get("/{note_id}", response_model=NoteResponse)
 def get_note(note_id: UUID, auth: AuthDep, session: SessionDep) -> NoteResponse:
+    visible = authz.authorize(
+        session, auth, resource_type="notes", resource_id=note_id, action="read"
+    )
+    session.rollback()
+    if not visible:
+        raise HTTPException(status_code=404, detail="NOTE_NOT_FOUND")
     row = _get_row(session, auth, note_id)
     if row is None:
         raise HTTPException(status_code=404, detail="NOTE_NOT_FOUND")
@@ -560,6 +576,14 @@ def update_note(
         cached = _load_cached(session, auth, idempotency_key, request_hash)
         if cached is not None:
             return cached
+        if not authz.authorize(
+            session, auth, resource_type="notes", resource_id=note_id, action="read"
+        ):
+            raise HTTPException(status_code=404, detail="NOTE_NOT_FOUND")
+        if not authz.authorize(
+            session, auth, resource_type="notes", resource_id=note_id, action="write"
+        ):
+            raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
         current = _get_row(session, auth, note_id, for_update=True)
         if current is None:
             raise HTTPException(status_code=404, detail="NOTE_NOT_FOUND")
@@ -655,6 +679,14 @@ def _lifecycle(
         cached = _load_cached(session, auth, idempotency_key, request_hash)
         if cached is not None:
             return cached
+        if not authz.authorize(
+            session, auth, resource_type="notes", resource_id=note_id, action="read"
+        ):
+            raise HTTPException(status_code=404, detail="NOTE_NOT_FOUND")
+        if not authz.authorize(
+            session, auth, resource_type="notes", resource_id=note_id, action="write"
+        ):
+            raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
         current = _get_row(session, auth, note_id, for_update=True)
         if current is None:
             raise HTTPException(status_code=404, detail="NOTE_NOT_FOUND")

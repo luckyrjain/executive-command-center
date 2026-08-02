@@ -501,12 +501,16 @@ def list_relationships(
     preserves this endpoint's original both-directions, every-type
     behavior unchanged.
     """
+    # A cross-workspace/unknown entity_id never 404s here -- this is a
+    # list endpoint, and this module's own established convention (see
+    # the cross-workspace-isolation tests) returns an empty list, not
+    # 404, the same way claims.py's list_claims does.
     visible = authz.authorize(
         session, auth, resource_type="pkos_nodes", resource_id=entity_id, action="read"
     )
     session.rollback()
     if not visible:
-        raise HTTPException(status_code=404, detail="ENTITY_NOT_FOUND")
+        return RelationshipListResponse(items=[])
     if direction == "incoming":
         entity_clause = "e.target_node_id = :entity_id"
     elif direction == "outgoing":

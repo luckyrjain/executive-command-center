@@ -424,12 +424,16 @@ def create_claim(
 
 @router.get("/{entity_id}/claims", response_model=ClaimListResponse)
 def list_claims(entity_id: UUID, auth: AuthDep, session: SessionDep) -> ClaimListResponse:
+    # A cross-workspace/unknown entity_id never 404s here -- this is a list
+    # endpoint, and this module's own established convention (see the
+    # cross-workspace-isolation tests) returns an empty list, not 404, the
+    # same way every other list endpoint in this domain does.
     visible = authz.authorize(
         session, auth, resource_type="pkos_nodes", resource_id=entity_id, action="read"
     )
     session.rollback()
     if not visible:
-        raise HTTPException(status_code=404, detail="ENTITY_NOT_FOUND")
+        return ClaimListResponse(items=[])
     rows = (
         session.execute(
             text(

@@ -14,6 +14,7 @@ from sqlalchemy.orm import Session
 from ecc.auth import AuthDep
 from ecc.config import get_settings
 from ecc.database import get_session
+from ecc.platform import authz
 
 router = APIRouter(prefix="/api/v1/knowledge", tags=["knowledge-timeline"])
 SessionDep = Annotated[Session, Depends(get_session)]
@@ -110,6 +111,16 @@ def get_timeline(
     cursor: str | None = None,
     limit: int = Query(default=50, ge=1, le=100),
 ) -> TimelineListResponse:
+    # A cross-workspace/unknown entity_id never 404s here -- this module's
+    # own docstring convention (see the cross-workspace-isolation test)
+    # returns an empty list, matching claims.py's/relationships.py's
+    # identical list-endpoint convention.
+    visible = authz.authorize(
+        session, auth, resource_type="pkos_nodes", resource_id=entity_id, action="read"
+    )
+    session.rollback()
+    if not visible:
+        return TimelineListResponse(items=[])
     clauses = ["workspace_id = :workspace_id", "entity_id = :entity_id"]
     params: dict[str, Any] = {
         "workspace_id": auth.workspace_id,
