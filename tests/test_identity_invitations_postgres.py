@@ -388,8 +388,15 @@ def test_existing_account_accepts_invitation_to_a_second_workspace(
         assert accept.json()["workspace_id"] == str(workspace_id)
         assert accept.json()["role"] == "admin"
     finally:
+        # Accepting created a *second* `users` row for `existing_account_id`,
+        # in `workspace_id` (owner_context's own workspace) -- scoped by
+        # `other_workspace_id` alone, `_cleanup_workspace` never sees it, so
+        # `_cleanup_account` below would hit `fk_users_account`'s RESTRICT.
+        # `_cleanup_new_member` removes every workspace-scoped row for this
+        # account regardless of which workspace it landed in, so it must
+        # run before deleting the (now-empty) `other_workspace_id` row.
+        _cleanup_new_member(existing_account_id)
         _cleanup_workspace(other_workspace_id)
-        _cleanup_account(existing_account_id)
 
 
 def test_accept_invitation_rejects_wrong_token(
@@ -601,5 +608,9 @@ def test_concurrent_accept_of_same_token_only_one_succeeds(
         statuses = sorted(r.status_code for r in results)
         assert statuses == [200, 409], [r.text for r in results]
     finally:
+        # See test_existing_account_accepts_invitation_to_a_second_
+        # workspace's own comment -- the winning accept created a second
+        # `users` row for `racer_account_id` in `workspace_id`, which
+        # `_cleanup_workspace(other_workspace_id)` alone never reaches.
+        _cleanup_new_member(racer_account_id)
         _cleanup_workspace(other_workspace_id)
-        _cleanup_account(racer_account_id)
