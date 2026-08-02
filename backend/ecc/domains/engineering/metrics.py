@@ -133,6 +133,8 @@ from uuid import UUID, uuid4
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+from .connectors import WORKSPACE_ORIGINAL_OWNER_SQL
+
 MetricKey = Literal[
     "delivery_frequency",
     "lead_time_for_changes",
@@ -521,19 +523,20 @@ def compute_and_store_metrics(session: Session, *, workspace_id: UUID) -> list[d
         row_id = uuid4()
         session.execute(
             text(
-                """
+                f"""
                 INSERT INTO delivery_metric_snapshots (
                     id, workspace_id, metric_key, definition_version, aggregation_scope,
                     window_label, window_start, window_end, population, numerator,
                     denominator, value, details_json, coverage_status, coverage_percentage,
-                    coverage_gap_description, computed_at, created_at
+                    coverage_gap_description, computed_at, created_at, owner_id, visibility
                 ) VALUES (
                     :id, :workspace_id, :metric_key, 1, 'system',
                     :window_label, NULL, NULL, :population, :numerator,
                     :denominator, :value, :details_json, :coverage_status,
-                    :coverage_percentage, :coverage_gap_description, :now, :now
+                    :coverage_percentage, :coverage_gap_description, :now, :now,
+                    {WORKSPACE_ORIGINAL_OWNER_SQL}, 'workspace'
                 )
-                """
+                """  # noqa: S608 -- see github_adapter._upsert_repository's identical note
             ),
             {
                 "id": row_id,

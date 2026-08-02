@@ -69,6 +69,7 @@ from ecc.observability import (
     record_audit_outbox_failure,
     record_idempotency_conflict,
 )
+from ecc.platform import authz
 
 router = APIRouter(prefix="/api/v1/engineering", tags=["engineering"])
 
@@ -263,11 +264,13 @@ def _write_side_effects(
                 INSERT INTO audit_events (
                     id, workspace_id, event_type, aggregate_type, aggregate_id,
                     aggregate_version, actor_id, request_id, correlation_id,
-                    changed_fields, authorization_result, source, metadata, occurred_at
+                    changed_fields, authorization_result, source, metadata, occurred_at,
+                    owner_id, visibility
                 ) VALUES (
                     :id, :workspace_id, :event_type, :aggregate_type, :aggregate_id,
                     :aggregate_version, :actor_id, :request_id, :correlation_id,
-                    ARRAY['*'], 'allowed', 'user', '{}'::jsonb, :occurred_at
+                    ARRAY['*'], 'allowed', 'user', '{}'::jsonb, :occurred_at,
+                    :actor_id, 'workspace'
                 )
                 """
             ),
@@ -419,6 +422,7 @@ def create_incident_endpoint(
     _csrf: CsrfDep,
     idempotency_key: IdempotencyHeader,
 ) -> IncidentResponse:
+    authz.require_role_action(session, auth, "write")
     request_hash = _request_hash(payload, "create_incident")
     now = datetime.now(UTC)
     with session.begin():
@@ -436,10 +440,12 @@ def create_incident_endpoint(
                 """
                 INSERT INTO incidents (
                     id, workspace_id, title, description, severity, status,
-                    detected_at, version, created_by, updated_by, created_at, updated_at
+                    detected_at, version, created_by, updated_by, created_at, updated_at,
+                    owner_id, visibility
                 ) VALUES (
                     :id, :workspace_id, :title, :description, :severity, 'open',
-                    :detected_at, 1, :actor_id, :actor_id, :now, :now
+                    :detected_at, 1, :actor_id, :actor_id, :now, :now,
+                    :actor_id, 'workspace'
                 )
                 """
             ),
@@ -458,8 +464,9 @@ def create_incident_endpoint(
             session.execute(
                 text(
                     "INSERT INTO incident_changes "
-                    "(id, workspace_id, incident_id, change_id, created_at) "
-                    "VALUES (:id, :workspace_id, :incident_id, :change_id, :now)"
+                    "(id, workspace_id, incident_id, change_id, created_at, owner_id, visibility) "
+                    "VALUES (:id, :workspace_id, :incident_id, :change_id, :now, "
+                    ":actor_id, 'workspace')"
                 ),
                 {
                     "id": uuid4(),
@@ -467,6 +474,7 @@ def create_incident_endpoint(
                     "incident_id": incident_id,
                     "change_id": change_id,
                     "now": now,
+                    "actor_id": auth.user_id,
                 },
             )
 
@@ -516,6 +524,10 @@ def resolve_incident_endpoint(
         existing = _get_incident(session, auth.workspace_id, incident_id)
         if existing is None:
             raise HTTPException(status_code=404, detail="INCIDENT_NOT_FOUND")
+        if not authz.authorize(
+            session, auth, resource_type="incidents", resource_id=incident_id, action="write"
+        ):
+            raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
         if existing["status"] == "resolved":
             raise HTTPException(status_code=409, detail="INCIDENT_ALREADY_RESOLVED")
         if payload.resolved_at < existing["detected_at"]:
@@ -580,8 +592,11 @@ def list_incidents_endpoint(
     session: SessionDep,
     status_filter: Annotated[IncidentStatus | None, Query(alias="status")] = None,
 ) -> IncidentListResponse:
+    visibility_sql, visibility_params = authz.visible_resource_filter_sql(
+        session, auth, resource_type="incidents", action="read", table_alias="incidents"
+    )
     clause = "AND status = :status_filter" if status_filter else ""
-    params: dict[str, Any] = {"workspace_id": auth.workspace_id}
+    params: dict[str, Any] = {"workspace_id": auth.workspace_id, **visibility_params}
     if status_filter:
         params["status_filter"] = status_filter
     rows = (
@@ -589,16 +604,17 @@ def list_incidents_endpoint(
             text(
                 "SELECT id, title, description, severity, status, detected_at, "
                 "resolved_at, version, created_at, updated_at FROM incidents "
-                f"WHERE workspace_id = :workspace_id {clause} ORDER BY detected_at DESC"  # noqa: S608
+                f"WHERE workspace_id = :workspace_id AND ({visibility_sql}) "  # noqa: S608
+                f"{clause} ORDER BY detected_at DESC"
             ),
             params,
         )
         .mappings()
         .all()
     )
-    return IncidentListResponse(
-        incidents=[_to_incident_response(session, dict(row)) for row in rows]
-    )
+    incidents = [_to_incident_response(session, dict(row)) for row in rows]
+    session.rollback()
+    return IncidentListResponse(incidents=incidents)
 
 
 @router.post("/decisions", response_model=DecisionResponse, status_code=status.HTTP_201_CREATED)
@@ -610,6 +626,7 @@ def create_decision_endpoint(
     _csrf: CsrfDep,
     idempotency_key: IdempotencyHeader,
 ) -> DecisionResponse:
+    authz.require_role_action(session, auth, "write")
     request_hash = _request_hash(payload, "create_decision")
     now = datetime.now(UTC)
     with session.begin():
@@ -627,10 +644,12 @@ def create_decision_endpoint(
                 """
                 INSERT INTO engineering_decisions (
                     id, workspace_id, title, description, rationale, status,
-                    version, created_by, updated_by, created_at, updated_at
+                    version, created_by, updated_by, created_at, updated_at,
+                    owner_id, visibility
                 ) VALUES (
                     :id, :workspace_id, :title, :description, :rationale, 'proposed',
-                    1, :actor_id, :actor_id, :now, :now
+                    1, :actor_id, :actor_id, :now, :now,
+                    :actor_id, 'workspace'
                 )
                 """
             ),
@@ -648,8 +667,9 @@ def create_decision_endpoint(
             session.execute(
                 text(
                     "INSERT INTO decision_changes "
-                    "(id, workspace_id, decision_id, change_id, created_at) "
-                    "VALUES (:id, :workspace_id, :decision_id, :change_id, :now)"
+                    "(id, workspace_id, decision_id, change_id, created_at, owner_id, visibility) "
+                    "VALUES (:id, :workspace_id, :decision_id, :change_id, :now, "
+                    ":actor_id, 'workspace')"
                 ),
                 {
                     "id": uuid4(),
@@ -657,6 +677,7 @@ def create_decision_endpoint(
                     "decision_id": decision_id,
                     "change_id": change_id,
                     "now": now,
+                    "actor_id": auth.user_id,
                 },
             )
 
@@ -706,6 +727,14 @@ def decide_decision_endpoint(
         existing = _get_decision(session, auth.workspace_id, decision_id)
         if existing is None:
             raise HTTPException(status_code=404, detail="DECISION_NOT_FOUND")
+        if not authz.authorize(
+            session,
+            auth,
+            resource_type="engineering_decisions",
+            resource_id=decision_id,
+            action="write",
+        ):
+            raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
         if existing["status"] != "proposed":
             raise HTTPException(status_code=409, detail="DECISION_NOT_PROPOSED")
         # Mirrors resolve_incident_endpoint's identical `resolved_at <
@@ -771,8 +800,15 @@ def list_decisions_endpoint(
     session: SessionDep,
     status_filter: Annotated[DecisionStatus | None, Query(alias="status")] = None,
 ) -> DecisionListResponse:
+    visibility_sql, visibility_params = authz.visible_resource_filter_sql(
+        session,
+        auth,
+        resource_type="engineering_decisions",
+        action="read",
+        table_alias="engineering_decisions",
+    )
     clause = "AND status = :status_filter" if status_filter else ""
-    params: dict[str, Any] = {"workspace_id": auth.workspace_id}
+    params: dict[str, Any] = {"workspace_id": auth.workspace_id, **visibility_params}
     if status_filter:
         params["status_filter"] = status_filter
     rows = (
@@ -780,13 +816,14 @@ def list_decisions_endpoint(
             text(
                 "SELECT id, title, description, rationale, status, decided_at, "
                 "version, created_at, updated_at FROM engineering_decisions "
-                f"WHERE workspace_id = :workspace_id {clause} ORDER BY created_at DESC"  # noqa: S608
+                f"WHERE workspace_id = :workspace_id AND ({visibility_sql}) "  # noqa: S608
+                f"{clause} ORDER BY created_at DESC"
             ),
             params,
         )
         .mappings()
         .all()
     )
-    return DecisionListResponse(
-        decisions=[_to_decision_response(session, dict(row)) for row in rows]
-    )
+    decisions = [_to_decision_response(session, dict(row)) for row in rows]
+    session.rollback()
+    return DecisionListResponse(decisions=decisions)

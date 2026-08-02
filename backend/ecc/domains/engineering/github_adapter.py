@@ -128,6 +128,7 @@ from sqlalchemy import text
 from ecc.database import SessionFactory
 
 from .connectors import (
+    WORKSPACE_ORIGINAL_OWNER_SQL,
     AdapterAuthorizationError,
     ConnectorAccountContext,
     ConnectorAuthorization,
@@ -221,17 +222,19 @@ def _upsert_repository(
     with SessionFactory() as session:
         session.execute(
             text(
-                """
+                f"""
                 INSERT INTO repositories (
                     id, workspace_id, connector_account_id, provider, external_id,
                     name, source_url, default_branch, permission_state, freshness_state,
                     content_hash, provider_updated_at, observed_at, created_at, updated_at,
-                    suggested_team_name
+                    suggested_team_name, owner_id, visibility
                 ) VALUES (
                     :id, :workspace_id, :connector_account_id, :provider, :external_id,
                     :name, :source_url, :default_branch, 'active', 'fresh',
                     :content_hash, :provider_updated_at, :now, :now, :now,
-                    :suggested_team_name
+                    :suggested_team_name,
+                    {WORKSPACE_ORIGINAL_OWNER_SQL},
+                    'workspace'
                 )
                 ON CONFLICT (workspace_id, connector_account_id, external_id) DO UPDATE SET
                     name = EXCLUDED.name,
@@ -244,7 +247,9 @@ def _upsert_repository(
                     observed_at = EXCLUDED.observed_at,
                     updated_at = EXCLUDED.updated_at,
                     suggested_team_name = EXCLUDED.suggested_team_name
-                """
+                """  # noqa: S608 -- WORKSPACE_ORIGINAL_OWNER_SQL is a fixed
+                # module constant, never request-derived; nothing here is
+                # string-interpolated user input.
             ),
             {
                 "id": uuid4(),
@@ -350,19 +355,21 @@ def _upsert_change(
     with SessionFactory() as session:
         session.execute(
             text(
-                """
+                f"""
                 INSERT INTO changes (
                     id, workspace_id, connector_account_id, repository_id, provider,
                     external_id, provider_number, title, source_url, status,
                     author_external_id, provider_created_at, merged_at,
                     permission_state, freshness_state, content_hash,
-                    provider_updated_at, observed_at, created_at, updated_at
+                    provider_updated_at, observed_at, created_at, updated_at,
+                    owner_id, visibility
                 ) VALUES (
                     :id, :workspace_id, :connector_account_id, :repository_id, :provider,
                     :external_id, :provider_number, :title, :source_url, :status,
                     :author_external_id, :provider_created_at, :merged_at,
                     'active', 'fresh', :content_hash,
-                    :provider_updated_at, :now, :now, :now
+                    :provider_updated_at, :now, :now, :now,
+                    {WORKSPACE_ORIGINAL_OWNER_SQL}, 'workspace'
                 )
                 ON CONFLICT (workspace_id, connector_account_id, external_id) DO UPDATE SET
                     title = EXCLUDED.title,
@@ -375,7 +382,7 @@ def _upsert_change(
                     provider_updated_at = EXCLUDED.provider_updated_at,
                     observed_at = EXCLUDED.observed_at,
                     updated_at = EXCLUDED.updated_at
-                """
+                """  # noqa: S608 -- see _upsert_repository's identical note
             ),
             {
                 "id": uuid4(),
@@ -498,17 +505,19 @@ def _upsert_review(
     with SessionFactory() as session:
         session.execute(
             text(
-                """
+                f"""
                 INSERT INTO reviews (
                     id, workspace_id, connector_account_id, change_id, provider,
                     external_id, source_url, reviewer_external_id, review_state,
                     requested_at, submitted_at, permission_state, freshness_state,
-                    content_hash, provider_updated_at, observed_at, created_at, updated_at
+                    content_hash, provider_updated_at, observed_at, created_at, updated_at,
+                    owner_id, visibility
                 ) VALUES (
                     :id, :workspace_id, :connector_account_id, :change_id, :provider,
                     :external_id, :source_url, :reviewer_external_id, :review_state,
                     :requested_at, :submitted_at, 'active', 'fresh',
-                    :content_hash, :provider_updated_at, :now, :now, :now
+                    :content_hash, :provider_updated_at, :now, :now, :now,
+                    {WORKSPACE_ORIGINAL_OWNER_SQL}, 'workspace'
                 )
                 ON CONFLICT (workspace_id, connector_account_id, external_id) DO UPDATE SET
                     review_state = EXCLUDED.review_state,
@@ -520,7 +529,7 @@ def _upsert_review(
                     provider_updated_at = EXCLUDED.provider_updated_at,
                     observed_at = EXCLUDED.observed_at,
                     updated_at = EXCLUDED.updated_at
-                """
+                """  # noqa: S608 -- see _upsert_repository's identical note
             ),
             {
                 "id": uuid4(),

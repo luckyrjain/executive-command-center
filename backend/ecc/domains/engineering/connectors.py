@@ -33,6 +33,25 @@ from uuid import UUID
 PermissionState = Literal["active", "permission_lost", "deleted"]
 SyncStatus = Literal["succeeded", "failed", "partial"]
 
+# Phase 8 Task 3 (`authz.py`) added a NOT NULL `owner_id` to every synced
+# projection table (`repositories`/`changes`/`reviews`/`engineering_work_
+# items`/`datadog_*`/`delivery_metric_snapshots`) -- rows an adapter
+# upserts from `ConnectorAccountContext` alone, with no acting user in
+# scope (unlike `connector_accounts`/`sync_runs`/`sync_cursors`, created
+# directly inside a request handler that has `auth.user_id`). Migration
+# `0063_phase8_authz_visibility.py` backfilled every pre-existing row in
+# these same tables to "the workspace's oldest-created user" for the
+# identical reason; new rows an adapter inserts reuse that exact subquery
+# so ownership stays consistent with the backfill rather than inventing a
+# second rule. `visibility='workspace'` (this module's INSERTs always pair
+# this with the literal) makes the choice low-stakes in practice -- every
+# active workspace member can already read/write these rows via role
+# permissions regardless of which user happens to hold `owner_id`.
+WORKSPACE_ORIGINAL_OWNER_SQL = (
+    "(SELECT u.id FROM users AS u WHERE u.workspace_id = :workspace_id "
+    "ORDER BY u.created_at ASC LIMIT 1)"
+)
+
 
 @dataclass(frozen=True, slots=True)
 class ConnectorAuthorization:

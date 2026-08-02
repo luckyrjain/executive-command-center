@@ -76,6 +76,7 @@ from ecc.http_security import (
 )
 from ecc.logging import configure_logging
 from ecc.observability import render_metrics, request_observability_middleware
+from ecc.platform.authz import router as authz_router
 from ecc.search import router as search_router
 
 configure_logging()
@@ -128,6 +129,12 @@ app.include_router(knowledge_retrieval_router)
 app.include_router(identity_router)
 app.include_router(identity_accounts_router)
 app.include_router(identity_invitations_router)
+# Phase 8 Task 3: the authorization engine's own direct API -- GET|POST
+# /sharing/grants, DELETE /sharing/grants/{id} (ecc.platform.authz). The
+# authorize() function itself is not an HTTP endpoint; every domain's own
+# list/get/mutate endpoints call it directly, starting with `engineering`
+# in this task, widened to every remaining domain in Task 4.
+app.include_router(authz_router)
 app.include_router(search_router)
 app.include_router(dashboard_briefs_router)
 # Phase 4 Task 1: read-only registry/policy surface (GET /ai/models, GET
