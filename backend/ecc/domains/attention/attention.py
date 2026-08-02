@@ -20,6 +20,7 @@ from ecc.observability import (
     record_idempotency_conflict,
     record_ranking,
 )
+from ecc.platform import authz
 from ecc.platform.authz import WORKSPACE_ORIGINAL_OWNER_SQL
 
 from .policy import AttentionPolicy, get_active_policy
@@ -483,6 +484,14 @@ def _prior_deferred_until(
 
 @router.post("/regenerate", response_model=AttentionList)
 def regenerate_attention(auth: AuthDep, session: SessionDep, _csrf: CsrfDep) -> AttentionList:
+    # A bulk projection rebuild, not a per-item create -- role-gated only,
+    # matching resolution.py's create_candidate role gate shape but without
+    # per-item authorize() calls, the same way _upsert_batch's own
+    # docstring already justifies batching the writes themselves: an
+    # authorize() call per one of potentially 10,000+ eligible entities
+    # would reintroduce exactly the per-row round-trip cost that docstring
+    # describes fixing.
+    authz.require_role_action(session, auth, "write")
     ranking_start = time_module.monotonic()
     now = datetime.now(UTC)
     policy = get_active_policy(1)
@@ -671,6 +680,9 @@ def list_attention(
     auth: AuthDep, session: SessionDep, limit: int = Query(default=50, ge=1, le=100)
 ) -> AttentionList:
     now = datetime.now(UTC)
+    visibility_sql, visibility_params = authz.visible_resource_filter_sql(
+        session, auth, resource_type="attention_items", action="read", table_alias="ai"
+    )
     rows = (
         session.execute(
             text(f"""
@@ -690,6 +702,7 @@ def list_attention(
               AND (ai.dismissed_at IS NULL
                    OR ai.dismissed_entity_version <> ai.source_entity_version)
               AND (ai.deferred_until IS NULL OR ai.deferred_until <= :now)
+              AND ({visibility_sql})
             ORDER BY ai.pinned DESC, ai.score DESC,
               COALESCE(
                 t.due_at,
@@ -710,16 +723,23 @@ def list_attention(
               ai.entity_id ASC
             LIMIT :limit
         """),
-            {"workspace_id": auth.workspace_id, "now": now, "limit": limit},
+            {"workspace_id": auth.workspace_id, "now": now, "limit": limit, **visibility_params},
         )
         .mappings()
         .all()
     )
+    session.rollback()
     return AttentionList(items=[AttentionItem.model_validate(dict(row)) for row in rows])
 
 
 @router.get("/{item_id}", response_model=AttentionItem)
 def get_attention_item(item_id: UUID, auth: AuthDep, session: SessionDep) -> AttentionItem:
+    visible = authz.authorize(
+        session, auth, resource_type="attention_items", resource_id=item_id, action="read"
+    )
+    session.rollback()
+    if not visible:
+        raise HTTPException(status_code=404, detail="ATTENTION_ITEM_NOT_FOUND")
     row = (
         session.execute(
             text(f"""
@@ -747,6 +767,14 @@ def _mutate_attention(
 ) -> AttentionItem:
     now = datetime.now(UTC)
     with session.begin():
+        if not authz.authorize(
+            session, auth, resource_type="attention_items", resource_id=item_id, action="read"
+        ):
+            raise HTTPException(status_code=404, detail="ATTENTION_ITEM_NOT_FOUND")
+        if not authz.authorize(
+            session, auth, resource_type="attention_items", resource_id=item_id, action="write"
+        ):
+            raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
         row = (
             session.execute(
                 text(f"""
@@ -956,6 +984,7 @@ def record_attention_feedback(
     _csrf: CsrfDep,
     idempotency_key: IdempotencyHeader,
 ) -> AttentionFeedback:
+    authz.require_role_action(session, auth, "write")
     request_hash = _feedback_request_hash(payload)
     now = datetime.now(UTC)
     feedback_id = uuid4()
@@ -964,6 +993,16 @@ def record_attention_feedback(
         cached = _load_cached_feedback(session, auth, idempotency_key, request_hash)
         if cached is not None:
             return cached
+        # Feedback has no independent authorization boundary of its own --
+        # it comments on an existing attention_item, so a read-only check
+        # on that parent (matching claims.py's/resolution.py's
+        # parent-authorization-boundary pattern) is what gates creation
+        # here, not a write check on the item itself (recording feedback
+        # never mutates the item).
+        if not authz.authorize(
+            session, auth, resource_type="attention_items", resource_id=item_id, action="read"
+        ):
+            raise HTTPException(status_code=404, detail="ATTENTION_ITEM_NOT_FOUND")
         item = (
             session.execute(
                 text(
@@ -983,10 +1022,10 @@ def record_attention_feedback(
                     """
                     INSERT INTO attention_feedback (
                         id, workspace_id, target_type, target_id, label, reason,
-                        actor_id, policy_version, created_at
+                        actor_id, policy_version, created_at, owner_id, visibility
                     ) VALUES (
                         :id, :workspace_id, 'attention_item', :target_id, :label, :reason,
-                        :actor_id, :policy_version, :created_at
+                        :actor_id, :policy_version, :created_at, :actor_id, 'workspace'
                     )
                     RETURNING id, target_type, target_id, label, reason, policy_version,
                               created_at
