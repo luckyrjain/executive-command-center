@@ -22,6 +22,7 @@ from ecc.observability import (
     record_audit_outbox_failure,
     record_idempotency_conflict,
 )
+from ecc.platform import authz
 
 # Bumped whenever score_candidate's factors or weighting change -- stored on
 # every resolution_candidates row per ENTITY-RESOLUTION-CONTRACT.md's
@@ -591,6 +592,7 @@ def create_candidate(
 ) -> ResolutionCandidateResult:
     if payload.left_entity_id == payload.right_entity_id:
         raise HTTPException(status_code=422, detail="SELF_CANDIDATE_NOT_ALLOWED")
+    authz.require_role_action(session, auth, "write")
     request_hash = _request_hash(payload, "create_candidate")
     now = datetime.now(UTC)
     with session.begin():
@@ -598,6 +600,17 @@ def create_candidate(
         cached = _load_cached_result(session, auth, idempotency_key, request_hash)
         if cached is not None:
             return cached
+
+        # Proposing a review candidate must not let a caller confirm the
+        # existence of an entity they cannot otherwise see -- both sides
+        # are read-authorized before anything else, same as relationships.
+        # py's create_relationship. _candidate_entity's own 404 (entity
+        # genuinely doesn't exist) still applies below as a backstop.
+        for entity_id in (payload.left_entity_id, payload.right_entity_id):
+            if not authz.authorize(
+                session, auth, resource_type="pkos_nodes", resource_id=entity_id, action="read"
+            ):
+                raise HTTPException(status_code=404, detail="ENTITY_NOT_FOUND")
 
         # Normalize pair ordering so (A, B) and (B, A) are always the same
         # candidate row, and so a prior rejection of this unchanged pair is
@@ -630,10 +643,12 @@ def create_candidate(
                     f"""
                     INSERT INTO resolution_candidates (
                         id, workspace_id, left_entity_id, right_entity_id, score,
-                        factors_json, resolver_version, status, created_at
+                        factors_json, resolver_version, status, created_at,
+                        owner_id, visibility
                     ) VALUES (
                         :id, :workspace_id, :left_id, :right_id, :score,
-                        CAST(:factors_json AS jsonb), :resolver_version, 'open', :now
+                        CAST(:factors_json AS jsonb), :resolver_version, 'open', :now,
+                        :actor_id, 'workspace'
                     )
                     RETURNING {_CANDIDATE_FIELDS}
                     """
@@ -654,6 +669,7 @@ def create_candidate(
                     ),
                     "resolver_version": result.resolver_version,
                     "now": now,
+                    "actor_id": auth.user_id,
                 },
             )
             .mappings()
@@ -681,14 +697,23 @@ def list_candidates(
     # filter for attention_items -- defer postpones review, it never
     # changes status, so this is the only place the postponement is
     # actually enforced.
+    visibility_sql, visibility_params = authz.visible_resource_filter_sql(
+        session,
+        auth,
+        resource_type="resolution_candidates",
+        action="read",
+        table_alias="resolution_candidates",
+    )
     clauses = [
         "workspace_id = :workspace_id",
         "(deferred_until IS NULL OR deferred_until <= :now)",
+        f"({visibility_sql})",
     ]
     params: dict[str, Any] = {
         "workspace_id": auth.workspace_id,
         "limit": limit + 1,
         "now": datetime.now(UTC),
+        **visibility_params,
     }
     if status is not None:
         clauses.append("status = :status")
@@ -713,6 +738,7 @@ def list_candidates(
         .mappings()
         .all()
     )
+    session.rollback()
     page = rows[:limit]
     next_cursor = None
     if len(rows) > limit and page:
@@ -759,6 +785,22 @@ def _decide_candidate(
         cached = _load_cached(session, auth, idempotency_key, request_hash)
         if cached is not None:
             return cached
+        if not authz.authorize(
+            session,
+            auth,
+            resource_type="resolution_candidates",
+            resource_id=candidate_id,
+            action="read",
+        ):
+            raise HTTPException(status_code=404, detail="CANDIDATE_NOT_FOUND")
+        if not authz.authorize(
+            session,
+            auth,
+            resource_type="resolution_candidates",
+            resource_id=candidate_id,
+            action="write",
+        ):
+            raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
         current = (
             session.execute(
                 text(
@@ -885,6 +927,22 @@ def defer_candidate(
             return cached
         if payload.deferred_until <= now:
             raise HTTPException(status_code=422, detail="DEFER_UNTIL_MUST_BE_FUTURE")
+        if not authz.authorize(
+            session,
+            auth,
+            resource_type="resolution_candidates",
+            resource_id=candidate_id,
+            action="read",
+        ):
+            raise HTTPException(status_code=404, detail="CANDIDATE_NOT_FOUND")
+        if not authz.authorize(
+            session,
+            auth,
+            resource_type="resolution_candidates",
+            resource_id=candidate_id,
+            action="write",
+        ):
+            raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
         current = (
             session.execute(
                 text(
