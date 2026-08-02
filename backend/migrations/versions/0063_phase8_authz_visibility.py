@@ -126,28 +126,39 @@ and no harm in leaving it in place indefinitely as a defense-in-depth
 backstop.
 
 **The workspace-original-user fallback is only used where no better value
-exists.** 21 tables originally in this group already carry their own
+exists.** 20 tables originally in this group already carry their own
 per-row actor column identifying who actually did the thing (`created_by`
 on `calendar_events`, `meetings`, `recommendations`, `waiting_links`,
 `meeting_participants`, `meeting_packs`, `workflow_definitions`,
 `workflow_versions`, `automation_policies`, `triggers`, `workflow_runs`,
 `connector_accounts`, `incidents`, `engineering_decisions`; `actor_id` on
-`audit_events`, `recommendation_feedback`, `entity_operations`,
-`attention_feedback`, `risk_reviews`, `ai_runs`, `evaluation_runs`) --
-backfilling these from "the workspace's oldest user" instead would be
-silently *wrong* the moment a workspace has more than one member, not
-merely imprecise: `ecc.platform.authz`'s `create_grant_endpoint`/
-`revoke_grant_endpoint` gate on `resource.owner_id == auth.user_id` (else
-require `owner`/`admin` role), so a member who genuinely created one of
-these rows would be unable to grant or revoke access to their own
-resource. These 21 tables get their own `_NEW_OWNER_FROM_CREATED_BY`/
-`_NEW_OWNER_FROM_ACTOR_ID` groups, each with a dedicated trigger function
-that prefers the row's own actor column and only falls back to the
-workspace-original-user formula via `COALESCE` when that column is itself
-`NULL` -- true today only for `audit_events.actor_id` (nullable, for
-`source='system'` events with no human actor; every other listed column is
-`NOT NULL`, so the fallback branch there is dead-code-safety, not a live
-path).
+`audit_events`, `recommendation_feedback`, `attention_feedback`,
+`risk_reviews`, `ai_runs`, `evaluation_runs`) -- backfilling these from
+"the workspace's oldest user" instead would be silently *wrong* the
+moment a workspace has more than one member, not merely imprecise: `ecc.
+platform.authz`'s `create_grant_endpoint`/`revoke_grant_endpoint` gate on
+`resource.owner_id == auth.user_id` (else require `owner`/`admin` role),
+so a member who genuinely created one of these rows would be unable to
+grant or revoke access to their own resource. These 20 tables get their
+own `_NEW_OWNER_FROM_CREATED_BY`/`_NEW_OWNER_FROM_ACTOR_ID` groups, each
+with a dedicated trigger function that prefers the row's own actor column
+and only falls back to the workspace-original-user formula via `COALESCE`
+when that column is itself `NULL` -- true today only for `audit_events.
+actor_id` (nullable, for `source='system'` events with no human actor;
+every other listed column is `NOT NULL`, so the fallback branch there is
+dead-code-safety, not a live path).
+
+**`entity_operations` has an `actor_id` column too, but stays in this
+fallback-only group rather than joining `_NEW_OWNER_FROM_ACTOR_ID`.**
+Unlike every column named above, `entity_operations.actor_id` (migration
+`0013_phase2_resolution.py`) carries no FK to `users` at all -- existing
+callers, and existing test fixtures (this codebase's own foreign-
+workspace-isolation tests deliberately populate it with an unrelated
+`uuid4()`, since what they're testing has nothing to do with who the
+actor is), are free to write any UUID there. Preferring it for
+`owner_id`, a column that DOES carry a strict FK, would turn those
+legitimate writes into foreign-key violations instead of falling back to
+the workspace-original-user formula this table has always used.
 
 **`plan_blocks` needs a third, dedicated formula.** It has no actor column
 of its own, but every row's `plan_id` (`NOT NULL`, FK'd to `plans.id`)
@@ -241,11 +252,20 @@ _NEW_OWNER_FROM_CREATED_BY = (
 )
 
 # Tables with their own `actor_id` actor column -- same reasoning as
-# `_NEW_OWNER_FROM_CREATED_BY` above, different column name.
+# `_NEW_OWNER_FROM_CREATED_BY` above, different column name. `entity_
+# operations` is deliberately NOT here despite having an `actor_id`
+# column: unlike every table actually listed below, its `actor_id`
+# (migration `0013_phase2_resolution.py`) carries no FK to `users` at
+# all -- existing callers (and existing test fixtures, e.g. `tests/
+# test_knowledge_entity_operations_postgres.py`'s foreign-workspace
+# fixtures) are free to populate it with any UUID, including one that
+# names no real user. Preferring it for `owner_id` -- a column that DOES
+# carry a strict `users` FK -- would make those legitimate, pre-existing
+# writes start failing a foreign-key violation instead of falling back to
+# the workspace-original-user formula the way this table always has.
 _NEW_OWNER_FROM_ACTOR_ID = (
     "audit_events",
     "recommendation_feedback",
-    "entity_operations",
     "attention_feedback",
     "risk_reviews",
     "ai_runs",
@@ -269,6 +289,7 @@ _NEW_OWNER_FROM_WORKSPACE_ORIGINAL_USER = (
     "knowledge_claims",
     "timeline_entries",
     "resolution_candidates",
+    "entity_operations",
     "retrieval_documents",
     "embedding_projections",
     "ai_run_steps",
