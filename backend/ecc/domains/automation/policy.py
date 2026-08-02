@@ -102,6 +102,7 @@ from ecc.observability import (
     record_audit_outbox_failure,
     record_idempotency_conflict,
 )
+from ecc.platform import authz
 
 ApprovalMode = Literal["preview_only", "per_run", "bounded_recurring"]
 PolicyLifecycleStatus = Literal["active", "expired", "revoked"]
@@ -218,23 +219,32 @@ def get_policy(session: Session, workspace_id: UUID, policy_id: UUID) -> Automat
 
 
 def list_policies(
-    session: Session, workspace_id: UUID, *, workflow_id: str | None = None
+    session: Session, auth: AuthContext, workspace_id: UUID, *, workflow_id: str | None = None
 ) -> list[AutomationPolicy]:
+    visibility_sql, visibility_params = authz.visible_resource_filter_sql(
+        session,
+        auth,
+        resource_type="automation_policies",
+        action="read",
+        table_alias="automation_policies",
+    )
     clause = "AND workflow_id = :workflow_id" if workflow_id is not None else ""
-    params: dict[str, Any] = {"workspace_id": workspace_id}
+    params: dict[str, Any] = {"workspace_id": workspace_id, **visibility_params}
     if workflow_id is not None:
         params["workflow_id"] = workflow_id
     rows = (
         session.execute(
             text(
                 f"SELECT {_POLICY_FIELDS} FROM automation_policies "
-                f"WHERE workspace_id = :workspace_id {clause} ORDER BY created_at ASC"
+                f"WHERE workspace_id = :workspace_id AND ({visibility_sql}) "
+                f"{clause} ORDER BY created_at ASC"
             ),
             params,
         )
         .mappings()
         .all()
     )
+    session.rollback()
     return [_row_to_policy(dict(row)) for row in rows]
 
 
@@ -282,12 +292,12 @@ def create_policy(
                 id, workspace_id, workflow_id, action_types, data_classes,
                 value_limit, count_limit, rate_limit, schedule, approval_mode,
                 expires_at, revoked_at, version, created_by, updated_by,
-                created_at, updated_at
+                created_at, updated_at, owner_id, visibility
             ) VALUES (
                 :id, :workspace_id, :workflow_id, :action_types, :data_classes,
                 :value_limit, :count_limit, CAST(:rate_limit AS jsonb), :schedule,
                 :approval_mode, :expires_at, NULL, 1, :created_by, :updated_by,
-                :now, :now
+                :now, :now, :created_by, 'workspace'
             )
             """
         ),
@@ -582,7 +592,7 @@ def list_policies_endpoint(
     session: SessionDep,
     workflow_id: Annotated[str | None, Query(max_length=200)] = None,
 ) -> PolicyListResponse:
-    policies = list_policies(session, auth.workspace_id, workflow_id=workflow_id)
+    policies = list_policies(session, auth, auth.workspace_id, workflow_id=workflow_id)
     return PolicyListResponse(policies=[_to_response(policy) for policy in policies])
 
 
@@ -595,6 +605,7 @@ def create_policy_endpoint(
     _csrf: CsrfDep,
     idempotency_key: IdempotencyHeader,
 ) -> PolicyResponse:
+    authz.require_role_action(session, auth, "write")
     request_hash = _request_hash(payload, "create_policy")
     now = datetime.now(UTC)
     with session.begin():
@@ -661,6 +672,19 @@ def revoke_policy_endpoint(
         cached = _load_cached(session, auth, idempotency_key, request_hash)
         if cached is not None:
             return cached
+
+        if not authz.authorize(
+            session, auth, resource_type="automation_policies", resource_id=policy_id, action="read"
+        ):
+            raise HTTPException(status_code=404, detail="POLICY_NOT_FOUND")
+        if not authz.authorize(
+            session,
+            auth,
+            resource_type="automation_policies",
+            resource_id=policy_id,
+            action="write",
+        ):
+            raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
 
         result = revoke_policy(session, auth.workspace_id, auth.user_id, policy_id)
         if isinstance(result, PolicyNotFound):
