@@ -465,6 +465,30 @@ def test_create_workspace_makes_caller_owner(
     _cleanup_workspace(UUID(body["id"]))
 
 
+def test_create_workspace_requires_csrf(
+    workspace_test_context: tuple[TestClient, UUID, UUID, UUID, str],
+) -> None:
+    client, *_rest = workspace_test_context
+    resp = client.post(
+        "/api/v1/identity/workspaces",
+        json={"name": "No CSRF Co", "timezone": "UTC"},
+    )
+    assert resp.status_code == 403, resp.text
+    assert resp.json()["error"]["code"] == "CSRF_TOKEN_REQUIRED"
+
+
+def test_patch_workspace_requires_csrf(
+    workspace_test_context: tuple[TestClient, UUID, UUID, UUID, str],
+) -> None:
+    client, workspace_id, *_rest = workspace_test_context
+    resp = client.patch(
+        f"/api/v1/identity/workspaces/{workspace_id}",
+        json={"name": "Should not apply"},
+    )
+    assert resp.status_code == 403, resp.text
+    assert resp.json()["error"]["code"] == "CSRF_TOKEN_REQUIRED"
+
+
 def test_patch_workspace_requires_owner_or_admin_role(
     workspace_test_context: tuple[TestClient, UUID, UUID, UUID, str],
 ) -> None:
