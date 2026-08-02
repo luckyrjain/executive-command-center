@@ -102,6 +102,7 @@ from ecc.auth import AuthContext, AuthDep, CsrfDep
 from ecc.database import get_session, lock_engine
 from ecc.domains.personal.domains import classification_for, encrypt_record_payload
 from ecc.observability import record_database_failure, record_idempotency_conflict
+from ecc.platform import authz
 
 from .ollama_client import OllamaAdapter
 from .prompts import get_active_prompt
@@ -1264,14 +1265,14 @@ def _persist_evaluation_run(
                 dataset_version, prompt_id, prompt_version, model_id, provider,
                 total_examples, schema_validity_rate, grounding_rate,
                 prohibited_fact_count, latency_p95_seconds, passed, failures,
-                status, started_at, completed_at, created_at
+                status, started_at, completed_at, created_at, owner_id, visibility
             ) VALUES (
                 :id, :workspace_id, :actor_id, :task_type, :evaluation_set_id,
                 :dataset_version, :prompt_id, :prompt_version, :model_id, :provider,
                 :total_examples, :schema_validity_rate, :grounding_rate,
                 :prohibited_fact_count, :latency_p95_seconds, :passed,
                 CAST(:failures AS jsonb), 'completed', :started_at, :completed_at,
-                :completed_at
+                :completed_at, :actor_id, 'workspace'
             )
             """
         ),
@@ -1813,6 +1814,7 @@ def create_evaluation_run(
     response, rather than independently starting its own full 20-example
     evaluation run.
     """
+    authz.require_role_action(session, auth, "write")
     request_hash = _request_hash(payload, "create_evaluation_run")
     now = datetime.now(UTC)
     with _held_idempotency_lock(auth, idempotency_key):
@@ -1859,6 +1861,12 @@ def create_evaluation_run(
 def get_evaluation_run_endpoint(
     run_id: UUID, auth: AuthDep, session: SessionDep
 ) -> EvaluationRunResponse:
+    visible = authz.authorize(
+        session, auth, resource_type="evaluation_runs", resource_id=run_id, action="read"
+    )
+    session.rollback()
+    if not visible:
+        raise HTTPException(status_code=404, detail="EVALUATION_RUN_NOT_FOUND")
     run = get_evaluation_run(session, auth, run_id)
     if run is None:
         raise HTTPException(status_code=404, detail="EVALUATION_RUN_NOT_FOUND")
