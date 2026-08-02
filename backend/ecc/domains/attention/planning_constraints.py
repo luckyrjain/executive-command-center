@@ -31,6 +31,7 @@ from ecc.observability import (
     record_audit_outbox_failure,
     record_idempotency_conflict,
 )
+from ecc.platform import authz
 
 router = APIRouter(prefix="/api/v1/planning", tags=["planning"])
 SessionDep = Annotated[Session, Depends(get_session)]
@@ -106,10 +107,12 @@ def create_constraint(
                 f"""
                 INSERT INTO planning_constraints (
                     id, workspace_id, user_id, kind, source_type, source_id, label,
-                    starts_at, ends_at, hardness, priority, created_at, updated_at, version
+                    starts_at, ends_at, hardness, priority, created_at, updated_at, version,
+                    owner_id, visibility
                 ) VALUES (
                     :id, :workspace_id, :user_id, :kind, :source_type, :source_id, :label,
-                    :starts_at, :ends_at, :hardness, :priority, :now, :now, 1
+                    :starts_at, :ends_at, :hardness, :priority, :now, :now, 1,
+                    :user_id, 'private'
                 )
                 RETURNING {_FIELDS}
                 """
@@ -136,17 +139,31 @@ def create_constraint(
 
 
 def list_active_constraints(session: Session, auth: AuthContext) -> list[PlanningConstraint]:
+    # Phase 8 Task 4: visibility='private' on every create_constraint
+    # INSERT preserves this table's existing owner-only behavior (see
+    # planning.py's fuller rationale, which applies identically here --
+    # migration 0063's group default is 'workspace', which would silently
+    # widen visibility beyond today's per-(workspace, user) behavior if
+    # relied on unchanged) while replacing the ad hoc `user_id =` filter
+    # with the standard visible_resource_filter_sql mechanism.
+    visibility_sql, visibility_params = authz.visible_resource_filter_sql(
+        session,
+        auth,
+        resource_type="planning_constraints",
+        action="read",
+        table_alias="planning_constraints",
+    )
     rows = (
         session.execute(
             text(
                 f"""
                 SELECT {_FIELDS} FROM planning_constraints
-                WHERE workspace_id = :workspace_id AND user_id = :user_id
+                WHERE workspace_id = :workspace_id AND ({visibility_sql})
                   AND archived_at IS NULL
                 ORDER BY starts_at ASC NULLS LAST, priority DESC, created_at ASC
                 """
             ),
-            {"workspace_id": auth.workspace_id, "user_id": auth.user_id},
+            {"workspace_id": auth.workspace_id, **visibility_params},
         )
         .mappings()
         .all()
@@ -157,11 +174,12 @@ def list_active_constraints(session: Session, auth: AuthContext) -> list[Plannin
 def archive_constraint(session: Session, auth: AuthContext, constraint_id: UUID) -> bool:
     """Used by Task 5's replan flow to retire a constraint that no longer
     applies (e.g. its source task was completed). Returns False if the
-    constraint doesn't exist for this workspace/user or is already
-    archived. Scoped by ``user_id`` in addition to ``workspace_id``,
-    matching ``create_constraint``/``list_active_constraints`` -- planning
-    constraints are per-(workspace, user) everywhere else, so a different
-    user in the same workspace must not be able to archive it either.
+    constraint doesn't exist for this workspace or is already archived.
+    No `user_id =` filter here -- `archive_constraint_endpoint` (the only
+    HTTP caller) already authz.authorize()s (read+write) the constraint by
+    id before calling this, so ownership is established there; a
+    different user in the same workspace still can't reach this far
+    without passing that check first.
     """
     now = datetime.now(UTC)
     row = session.execute(
@@ -169,7 +187,7 @@ def archive_constraint(session: Session, auth: AuthContext, constraint_id: UUID)
             """
             UPDATE planning_constraints
             SET archived_at = :now, updated_at = :now, version = version + 1
-            WHERE workspace_id = :workspace_id AND user_id = :user_id
+            WHERE workspace_id = :workspace_id
               AND id = :constraint_id AND archived_at IS NULL
             RETURNING id
             """
@@ -177,7 +195,6 @@ def archive_constraint(session: Session, auth: AuthContext, constraint_id: UUID)
         {
             "now": now,
             "workspace_id": auth.workspace_id,
-            "user_id": auth.user_id,
             "constraint_id": constraint_id,
         },
     ).one_or_none()
@@ -348,7 +365,9 @@ def create_constraint_endpoint(
 
 @router.get("/constraints", response_model=PlanningConstraintList)
 def list_constraints_endpoint(auth: AuthDep, session: SessionDep) -> PlanningConstraintList:
-    return PlanningConstraintList(items=list_active_constraints(session, auth))
+    items = list_active_constraints(session, auth)
+    session.rollback()
+    return PlanningConstraintList(items=items)
 
 
 @router.post("/constraints/{constraint_id}/archive", response_model=PlanningConstraint)
@@ -367,16 +386,30 @@ def archive_constraint_endpoint(
     """
     now = datetime.now(UTC)
     with session.begin():
+        if not authz.authorize(
+            session,
+            auth,
+            resource_type="planning_constraints",
+            resource_id=constraint_id,
+            action="read",
+        ):
+            raise HTTPException(status_code=404, detail="PLANNING_CONSTRAINT_NOT_FOUND")
+        if not authz.authorize(
+            session,
+            auth,
+            resource_type="planning_constraints",
+            resource_id=constraint_id,
+            action="write",
+        ):
+            raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
         current = (
             session.execute(
                 text(
                     f"SELECT {_FIELDS} FROM planning_constraints "
-                    "WHERE workspace_id = :workspace_id AND user_id = :user_id "
-                    "AND id = :id FOR UPDATE"
+                    "WHERE workspace_id = :workspace_id AND id = :id FOR UPDATE"
                 ),
                 {
                     "workspace_id": auth.workspace_id,
-                    "user_id": auth.user_id,
                     "id": constraint_id,
                 },
             )
@@ -393,11 +426,10 @@ def archive_constraint_endpoint(
             session.execute(
                 text(
                     f"SELECT {_FIELDS} FROM planning_constraints "
-                    "WHERE workspace_id = :workspace_id AND user_id = :user_id AND id = :id"
+                    "WHERE workspace_id = :workspace_id AND id = :id"
                 ),
                 {
                     "workspace_id": auth.workspace_id,
-                    "user_id": auth.user_id,
                     "id": constraint_id,
                 },
             )
