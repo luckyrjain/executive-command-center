@@ -1104,6 +1104,7 @@ def _seed_foreign_workspace_merge_operation() -> tuple[UUID, UUID, UUID, UUID]:
             text("INSERT INTO workspaces (id, name, created_at) VALUES (:id, :name, :created_at)"),
             {"id": other_workspace_id, "name": "Foreign Workspace", "created_at": now},
         )
+        create_identity(connection, workspace_id=other_workspace_id, user_id=uuid4(), now=now)
         for entity_id, name, status in (
             (target_id, "Foreign Target", "active"),
             (source_id, "Foreign Source", "redirected"),
@@ -1171,11 +1172,20 @@ def _seed_foreign_workspace_merge_operation() -> tuple[UUID, UUID, UUID, UUID]:
 
 def _teardown_foreign_workspace(workspace_id: UUID) -> None:
     with engine.begin() as connection:
-        for table in ("entity_operations", "resolution_candidates", "pkos_nodes"):
+        for table in (
+            "entity_operations",
+            "resolution_candidates",
+            "pkos_nodes",
+            "workspace_memberships",
+        ):
             connection.execute(
                 text(f"DELETE FROM {table} WHERE workspace_id = :workspace_id"),  # noqa: S608
                 {"workspace_id": workspace_id},
             )
+        connection.execute(
+            text("DELETE FROM users WHERE workspace_id = :workspace_id"),
+            {"workspace_id": workspace_id},
+        )
         connection.execute(
             text("DELETE FROM workspaces WHERE id = :workspace_id"), {"workspace_id": workspace_id}
         )

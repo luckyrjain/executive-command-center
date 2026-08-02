@@ -222,6 +222,7 @@ def test_timeline_never_shows_another_workspaces_entries(
             text("INSERT INTO workspaces (id, name, created_at) VALUES (:id, :name, :created_at)"),
             {"id": other_workspace_id, "name": "Foreign Workspace", "created_at": now},
         )
+        create_identity(connection, workspace_id=other_workspace_id, user_id=uuid4(), now=now)
         connection.execute(
             text(
                 "INSERT INTO pkos_nodes (id, workspace_id, node_type, canonical_name, "
@@ -259,11 +260,15 @@ def test_timeline_never_shows_another_workspaces_entries(
         assert response.json()["items"] == []
     finally:
         with engine.begin() as connection:
-            for table in ("timeline_entries", "pkos_nodes"):
+            for table in ("timeline_entries", "pkos_nodes", "workspace_memberships"):
                 connection.execute(
                     text(f"DELETE FROM {table} WHERE workspace_id = :workspace_id"),  # noqa: S608
                     {"workspace_id": other_workspace_id},
                 )
+            connection.execute(
+                text("DELETE FROM users WHERE workspace_id = :workspace_id"),
+                {"workspace_id": other_workspace_id},
+            )
             connection.execute(
                 text("DELETE FROM workspaces WHERE id = :workspace_id"),
                 {"workspace_id": other_workspace_id},

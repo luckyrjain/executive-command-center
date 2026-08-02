@@ -64,6 +64,8 @@ def test_pkos_edge_cannot_cross_workspaces() -> None:
                 {"id": workspace_b, "name": "B", "created_at": now},
             ],
         )
+        create_identity(connection, workspace_id=workspace_a, user_id=uuid4(), now=now)
+        create_identity(connection, workspace_id=workspace_b, user_id=uuid4(), now=now)
         connection.execute(
             text(
                 "INSERT INTO pkos_nodes "

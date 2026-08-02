@@ -423,8 +423,29 @@ def test_closed_risk_cannot_reopen(
 # measurement, so the single-retry mitigation below wasn't enough -- a real
 # regression and "just a slower runner" both fail both passes on CI. `CI` is
 # the standard GitHub Actions-provided signal, not a repo convention.
+#
+# Widened from 0.8/0.5 (Phase 8 Task 3, migration `0063_phase8_authz_
+# visibility.py`): `attention_items` gained a NOT NULL `owner_id` with a
+# composite FK to `users.(workspace_id, id)`, and this endpoint's bulk
+# `INSERT ... SELECT ... ON CONFLICT DO UPDATE` (`_upsert_batch`) is exactly
+# the kind of hot, 10,000-row-per-call path that FK cost lands on hardest.
+# Root-caused with `EXPLAIN (ANALYZE, BUFFERS)` against a real 10,000-row
+# payload, not assumed: `_upsert_batch` already sets `owner_id`/`visibility`
+# explicitly via a single non-correlated subquery (evaluated once per
+# statement, confirmed as `InitPlan 1` in the plan, not once per row -- the
+# actually-avoidable cost, already eliminated), but two costs remain that
+# cannot be optimized away without weakening the schema's own guarantee:
+# the new `fk_attention_items_workspace_owner` constraint check itself
+# (~62 ms/10,000 rows) and `BEFORE INSERT` trigger dispatch overhead, which
+# Postgres pays per row regardless of the trigger body's own `IF NEW.
+# owner_id IS NULL` short-circuit (~17 ms/10,000 rows) -- together a
+# genuine, permanent ~15-20% floor increase on this one path, not a code
+# inefficiency. Sized from two full CI measurement passes after the fix
+# (retry-pass p95: 815.9 ms and 827.7 ms -- the noise-filtered numbers this
+# test's own retry mechanism exists to surface), with headroom above the
+# worst of those, not merely above the CI budget's old value.
 _IN_CI = os.getenv("CI") is not None
-RANKING_BUDGET_SECONDS = 0.8 if _IN_CI else 0.5
+RANKING_BUDGET_SECONDS = 0.95 if _IN_CI else 0.6
 # More samples than the ~10-15 used elsewhere so the nearest-rank p95 index
 # can discount a couple of worst-case outliers -- with fewer samples, "p95"
 # and "max" are numerically close to identical, which made this specific
@@ -710,12 +731,14 @@ def test_ranking_10000_eligible_entities_under_budget(
     same 10,000 rows' scores each call, no Idempotency-Key required by the
     route), so repeated calls give a legitimate, comparable p95 sample.
 
-    This is the tightest of the seven Phase 1 performance gates (500 ms
-    locally / 800 ms in CI, against a ~350-400 ms typical local
-    measurement), which makes a single measurement pass sensitive to real,
-    transient Postgres background activity (checkpoint writes, autovacuum)
-    that briefly slows one or two calls without reflecting a genuine
-    regression in the ranking code path. A single retry of the *entire*
+    This is the tightest of the seven Phase 1 performance gates (600 ms
+    locally / 950 ms in CI as of Phase 8 Task 3 -- see `RANKING_BUDGET_
+    SECONDS`'s own docstring for why the budget itself moved, against a
+    ~350-400 ms typical local measurement before that migration), which
+    makes a single measurement pass sensitive to real, transient Postgres
+    background activity (checkpoint writes, autovacuum) that briefly slows
+    one or two calls without reflecting a genuine regression in the ranking
+    code path. A single retry of the *entire*
     measurement pass (fresh warm-up, fresh 30 samples, against a
     freshly-minted session so the mutation-route rate limiter's per-session
     window isn't doubled up on the same token) is allowed before failing: a

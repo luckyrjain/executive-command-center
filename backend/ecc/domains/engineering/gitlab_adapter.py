@@ -108,6 +108,7 @@ from sqlalchemy import text
 from ecc.database import SessionFactory
 
 from .connectors import (
+    WORKSPACE_ORIGINAL_OWNER_SQL,
     AdapterAuthorizationError,
     ConnectorAccountContext,
     ConnectorAuthorization,
@@ -196,17 +197,18 @@ def _upsert_repository(
     with SessionFactory() as session:
         session.execute(
             text(
-                """
+                f"""
                 INSERT INTO repositories (
                     id, workspace_id, connector_account_id, provider, external_id,
                     name, source_url, default_branch, permission_state, freshness_state,
                     content_hash, provider_updated_at, observed_at, created_at, updated_at,
-                    suggested_team_name
+                    suggested_team_name, owner_id, visibility
                 ) VALUES (
                     :id, :workspace_id, :connector_account_id, :provider, :external_id,
                     :name, :source_url, :default_branch, 'active', 'fresh',
                     :content_hash, :provider_updated_at, :now, :now, :now,
-                    :suggested_team_name
+                    :suggested_team_name,
+                    {WORKSPACE_ORIGINAL_OWNER_SQL}, 'workspace'
                 )
                 ON CONFLICT (workspace_id, connector_account_id, external_id) DO UPDATE SET
                     name = EXCLUDED.name,
@@ -219,7 +221,7 @@ def _upsert_repository(
                     observed_at = EXCLUDED.observed_at,
                     updated_at = EXCLUDED.updated_at,
                     suggested_team_name = EXCLUDED.suggested_team_name
-                """
+                """  # noqa: S608 -- see github_adapter._upsert_repository's identical note
             ),
             {
                 "id": uuid4(),

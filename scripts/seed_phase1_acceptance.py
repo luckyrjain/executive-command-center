@@ -218,6 +218,11 @@ _WORKSPACE_ID_TABLES: tuple[str, ...] = (
     # own CI run against the invitations table -- a thirteenth occurrence of
     # the identical class of gap).
     "invitations",
+    # Phase 8 Task 3 (migration 0063) -- resource_grants, also workspace-
+    # scoped, same reason as the row above (this exact gap, found on this
+    # same PR's own CI run against the resource_grants table -- a
+    # fourteenth occurrence of the identical class of gap).
+    "resource_grants",
 )
 # `workspaces` is scoped by its own `id`, not a `workspace_id` column.
 _WORKSPACE_TABLE = "workspaces"
@@ -331,6 +336,7 @@ def _fixture_ids(label: str) -> dict[str, UUID]:
         "personal_domain_health": seed_id(label, "personal_domain", "health"),
         "domain_record_health": seed_id(label, "domain_record", "health"),
         "invitation": seed_id(label, "invitation", "acceptance"),
+        "resource_grant": seed_id(label, "resource_grant", "acceptance"),
     }
 
 
@@ -2709,6 +2715,49 @@ def _seed_invitations(cur: psycopg.Cursor[Any], label: str, ids: Mapping[str, UU
     )
 
 
+def _seed_resource_grants(cur: psycopg.Cursor[Any], label: str, ids: Mapping[str, UUID]) -> None:
+    """Phase 8 Task 3 (migration 0063) -- resource_grants, workspace-scoped
+    like every table above. This exact gap (a new workspace-scoped table
+    with no seed row here) was found by this same PR's own CI run, failing
+    ``verify_restore.sh``'s generic workspace-isolation check on
+    ``resource_grants`` -- closed here the same way every prior phase's own
+    identical gap was.
+
+    One still-active grant row per workspace, naming the workspace's own
+    seeded ``incident`` fixture (``_seed_engineering``, already present by
+    the time this runs) as the resource and the workspace's own owner
+    account as both granter and grantee -- ``resource_grants`` has no
+    self-grant restriction at the schema level, and this fixture is never
+    read through the real `authorize()`/`/sharing/grants` endpoints, only
+    needs to prove the table round-trips through backup/restore and stays
+    workspace-isolated, the same reasoning ``_seed_invitations``'s own
+    docstring gives for its placeholder token_hash.
+    """
+    cur.execute(
+        """
+        INSERT INTO resource_grants (
+            id, workspace_id, grantee_account_id, resource_type, resource_id,
+            actions, granted_by, expires_at, revoked_at, created_at
+        ) VALUES (
+            %(id)s, %(workspace_id)s, %(grantee_account_id)s, 'incidents',
+            %(resource_id)s, %(actions)s, %(granted_by)s, %(expires_at)s,
+            NULL, %(created_at)s
+        )
+        ON CONFLICT (id) DO NOTHING
+        """,
+        {
+            "id": ids["resource_grant"],
+            "workspace_id": ids["workspace"],
+            "grantee_account_id": ids["account"],
+            "resource_id": ids["incident"],
+            "actions": ["read"],
+            "granted_by": ids["user"],
+            "expires_at": SEED_EPOCH + timedelta(days=36500),
+            "created_at": SEED_EPOCH,
+        },
+    )
+
+
 def seed(conn: psycopg.Connection[Any]) -> None:
     """Insert deterministic Phase 1 fixtures into every table for both workspaces.
 
@@ -2770,6 +2819,9 @@ def seed(conn: psycopg.Connection[Any]) -> None:
             # on the owner-role users row seeded first inside
             # _seed_workspace itself.
             _seed_invitations(cur, label, ids)
+            # Phase 8 Task 3 (migration 0063) -- resource_grants; depends on
+            # the incident fixture seeded inside _seed_engineering above.
+            _seed_resource_grants(cur, label, ids)
 
 
 def fixture_row_checksums(conn: psycopg.Connection[Any]) -> dict[str, str]:

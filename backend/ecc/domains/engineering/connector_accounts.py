@@ -116,6 +116,7 @@ from ecc.observability import (
     record_audit_outbox_failure,
     record_idempotency_conflict,
 )
+from ecc.platform import authz
 
 from .connectors import (
     AdapterAuthorizationError,
@@ -298,14 +299,27 @@ def get_connector_account(
     return _row_to_account(dict(row)) if row is not None else None
 
 
-def list_connector_accounts(session: Session, workspace_id: UUID) -> list[ConnectorAccount]:
+def list_connector_accounts(
+    session: Session,
+    workspace_id: UUID,
+    *,
+    visibility_sql: str = "TRUE",
+    visibility_params: dict[str, Any] | None = None,
+) -> list[ConnectorAccount]:
+    """`visibility_sql`/`visibility_params` default to no filtering (every
+    row in the workspace) so this stays a plain workspace-scoped list for
+    any caller that doesn't need authz filtering; `list_connectors_
+    endpoint` is this module's own authz-aware caller, passing `ecc.
+    platform.authz.visible_resource_filter_sql`'s own output through.
+    """
     rows = (
         session.execute(
             text(
-                f"SELECT {_ACCOUNT_FIELDS} FROM connector_accounts "
-                "WHERE workspace_id = :workspace_id ORDER BY created_at ASC"
+                f"SELECT {_ACCOUNT_FIELDS} FROM connector_accounts "  # noqa: S608
+                f"WHERE workspace_id = :workspace_id AND ({visibility_sql}) "
+                "ORDER BY created_at ASC"
             ),
-            {"workspace_id": workspace_id},
+            {"workspace_id": workspace_id, **(visibility_params or {})},
         )
         .mappings()
         .all()
@@ -735,11 +749,13 @@ def _write_side_effects(
                 INSERT INTO audit_events (
                     id, workspace_id, event_type, aggregate_type, aggregate_id,
                     aggregate_version, actor_id, request_id, correlation_id,
-                    changed_fields, authorization_result, source, metadata, occurred_at
+                    changed_fields, authorization_result, source, metadata, occurred_at,
+                    owner_id, visibility
                 ) VALUES (
                     :id, :workspace_id, :event_type, 'connector_account', :aggregate_id,
                     :aggregate_version, :actor_id, :request_id, :correlation_id,
-                    ARRAY['*'], 'allowed', 'user', '{}'::jsonb, :occurred_at
+                    ARRAY['*'], 'allowed', 'user', '{}'::jsonb, :occurred_at,
+                    :actor_id, 'workspace'
                 )
                 """
             ),
@@ -784,7 +800,20 @@ def _write_side_effects(
 
 @router.get("/connectors", response_model=ConnectorAccountListResponse)
 def list_connectors_endpoint(auth: AuthDep, session: SessionDep) -> ConnectorAccountListResponse:
-    accounts = list_connector_accounts(session, auth.workspace_id)
+    visibility_sql, visibility_params = authz.visible_resource_filter_sql(
+        session,
+        auth,
+        resource_type="connector_accounts",
+        action="read",
+        table_alias="connector_accounts",
+    )
+    accounts = list_connector_accounts(
+        session,
+        auth.workspace_id,
+        visibility_sql=visibility_sql,
+        visibility_params=visibility_params,
+    )
+    session.rollback()
     return ConnectorAccountListResponse(connectors=[_to_response(a) for a in accounts])
 
 
@@ -837,6 +866,7 @@ def create_connector_endpoint(
     losing retry's conflict gives no such guarantee the winner has finished
     -- that 409 is a genuine "come back later," not a replayable result.
     """
+    authz.require_role_action(session, auth, "write")
     request_hash = _request_hash(payload, "create_connector")
     now = datetime.now(UTC)
 
@@ -891,11 +921,13 @@ def create_connector_endpoint(
                         INSERT INTO connector_accounts (
                             id, workspace_id, provider, external_account_id, display_name,
                             granted_scopes, encrypted_credentials, status, version,
-                            created_by, updated_by, created_at, updated_at
+                            created_by, updated_by, created_at, updated_at,
+                            owner_id, visibility
                         ) VALUES (
                             :id, :workspace_id, :provider, :external_account_id, :display_name,
                             :granted_scopes, :encrypted_credentials, 'active', 1,
-                            :actor_id, :actor_id, :now, :now
+                            :actor_id, :actor_id, :now, :now,
+                            :actor_id, 'workspace'
                         )
                         """
                     ),
@@ -992,6 +1024,24 @@ def sync_connector_endpoint(
     connection between phases" section for why this, not a held lock,
     is what serializes concurrent syncs here.
     """
+    if not authz.authorize(
+        session, auth, resource_type="connector_accounts", resource_id=account_id, action="read"
+    ):
+        session.rollback()
+        raise HTTPException(status_code=404, detail="CONNECTOR_NOT_FOUND")
+    if not authz.authorize(
+        session, auth, resource_type="connector_accounts", resource_id=account_id, action="write"
+    ):
+        session.rollback()
+        raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
+    # `authorize()` never touches transaction state itself (it is also
+    # called from *inside* an open transaction elsewhere in this
+    # codebase) -- these two pre-checks each autobegin their own read-only
+    # transaction, which must be rolled back before phase 1's own `with
+    # session.begin():` below, or SQLAlchemy raises `InvalidRequestError:
+    # A transaction is already begun on this Session`.
+    session.rollback()
+
     request_hash = _request_hash(payload, f"sync:{account_id}")
     now = datetime.now(UTC)
 
@@ -1055,10 +1105,10 @@ def sync_connector_endpoint(
                     """
                     INSERT INTO sync_runs (
                         id, workspace_id, connector_account_id, run_type, status,
-                        items_processed, started_at, created_at
+                        items_processed, started_at, created_at, owner_id, visibility
                     ) VALUES (
                         :id, :workspace_id, :connector_account_id, :run_type, 'running',
-                        0, :started_at, :started_at
+                        0, :started_at, :started_at, :actor_id, 'workspace'
                     )
                     """
                 ),
@@ -1068,6 +1118,7 @@ def sync_connector_endpoint(
                     "connector_account_id": account_id,
                     "run_type": payload.run_type,
                     "started_at": now,
+                    "actor_id": auth.user_id,
                 },
             )
         except IntegrityError as exc:
@@ -1221,10 +1272,10 @@ def sync_connector_endpoint(
                     """
                     INSERT INTO sync_cursors (
                         id, workspace_id, connector_account_id, resource_type,
-                        cursor_value, updated_at
+                        cursor_value, updated_at, owner_id, visibility
                     ) VALUES (
                         :id, :workspace_id, :connector_account_id, :resource_type,
-                        :cursor_value, :now
+                        :cursor_value, :now, :actor_id, 'workspace'
                     )
                     ON CONFLICT (workspace_id, connector_account_id, resource_type)
                     DO UPDATE SET cursor_value = EXCLUDED.cursor_value,
@@ -1238,6 +1289,7 @@ def sync_connector_endpoint(
                     "resource_type": payload.resource_type,
                     "cursor_value": outcome.next_cursor,
                     "now": completed_at,
+                    "actor_id": auth.user_id,
                 },
             )
         audit_version = _finalize_account_version(
@@ -1298,6 +1350,20 @@ def disable_connector_endpoint(
     _csrf: CsrfDep,
     idempotency_key: IdempotencyHeader,
 ) -> ConnectorAccountResponse:
+    if not authz.authorize(
+        session, auth, resource_type="connector_accounts", resource_id=account_id, action="read"
+    ):
+        session.rollback()
+        raise HTTPException(status_code=404, detail="CONNECTOR_NOT_FOUND")
+    if not authz.authorize(
+        session, auth, resource_type="connector_accounts", resource_id=account_id, action="write"
+    ):
+        session.rollback()
+        raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
+    # See sync_connector_endpoint's identical comment -- these pre-checks
+    # must be rolled back before phase 1's own `with session.begin():`.
+    session.rollback()
+
     request_hash = _request_hash(_EmptyBody(), f"disable:{account_id}")
     now = datetime.now(UTC)
     with session.begin():
@@ -1405,8 +1471,11 @@ def list_sync_runs_endpoint(
     session: SessionDep,
     connector_account_id: Annotated[UUID | None, Query()] = None,
 ) -> SyncRunListResponse:
+    visibility_sql, visibility_params = authz.visible_resource_filter_sql(
+        session, auth, resource_type="sync_runs", action="read", table_alias="sync_runs"
+    )
     clause = "AND connector_account_id = :connector_account_id" if connector_account_id else ""
-    params: dict[str, Any] = {"workspace_id": auth.workspace_id}
+    params: dict[str, Any] = {"workspace_id": auth.workspace_id, **visibility_params}
     if connector_account_id:
         params["connector_account_id"] = connector_account_id
     rows = (
@@ -1414,7 +1483,8 @@ def list_sync_runs_endpoint(
             text(
                 "SELECT id, connector_account_id, run_type, status, items_processed, "
                 "error_summary, started_at, completed_at FROM sync_runs "
-                f"WHERE workspace_id = :workspace_id {clause} ORDER BY started_at DESC"
+                f"WHERE workspace_id = :workspace_id AND ({visibility_sql}) "  # noqa: S608
+                f"{clause} ORDER BY started_at DESC"
             ),
             params,
         )
@@ -1454,6 +1524,7 @@ def get_metrics_endpoint(auth: AuthDep, session: SessionDep, _csrf: CsrfDep) -> 
     the same mechanism, not a special case: a plain cross-site navigation
     cannot set a custom header, so it now gets a 403 instead of a write.
     """
+    authz.require_role_action(session, auth, "write")
     snapshots = compute_and_store_metrics(session, workspace_id=auth.workspace_id)
     session.commit()
     return MetricsListResponse(
@@ -1477,8 +1548,11 @@ def list_repositories_endpoint(
     team-scoped-view filter that addition exists to enable -- a plain
     equality match against the confirmed link, never the suggestion.
     """
+    visibility_sql, visibility_params = authz.visible_resource_filter_sql(
+        session, auth, resource_type="repositories", action="read", table_alias="repositories"
+    )
     clauses = []
-    params: dict[str, Any] = {"workspace_id": auth.workspace_id}
+    params: dict[str, Any] = {"workspace_id": auth.workspace_id, **visibility_params}
     if connector_account_id:
         clauses.append("AND connector_account_id = :connector_account_id")
         params["connector_account_id"] = connector_account_id
@@ -1493,7 +1567,8 @@ def list_repositories_endpoint(
                 "observed_at, created_at, updated_at, team_entity_id, suggested_team_name, "
                 "team_assignment_version, team_assignment_updated_by "
                 "FROM repositories "
-                f"WHERE workspace_id = :workspace_id {' '.join(clauses)} ORDER BY name ASC"  # noqa: S608
+                f"WHERE workspace_id = :workspace_id AND ({visibility_sql}) "  # noqa: S608
+                f"{' '.join(clauses)} ORDER BY name ASC"
             ),
             params,
         )
@@ -1521,8 +1596,15 @@ def list_work_items_endpoint(
     cannot honestly enumerate as a closed set. `team_entity_id` mirrors
     `list_repositories_endpoint`'s identical filter.
     """
+    visibility_sql, visibility_params = authz.visible_resource_filter_sql(
+        session,
+        auth,
+        resource_type="engineering_work_items",
+        action="read",
+        table_alias="engineering_work_items",
+    )
     clauses = []
-    params: dict[str, Any] = {"workspace_id": auth.workspace_id}
+    params: dict[str, Any] = {"workspace_id": auth.workspace_id, **visibility_params}
     if connector_account_id:
         clauses.append("AND connector_account_id = :connector_account_id")
         params["connector_account_id"] = connector_account_id
@@ -1541,7 +1623,8 @@ def list_work_items_endpoint(
                 "created_at, updated_at, team_entity_id, suggested_team_name, "
                 "team_assignment_version, team_assignment_updated_by "
                 "FROM engineering_work_items "
-                f"WHERE workspace_id = :workspace_id {' '.join(clauses)} ORDER BY title ASC"  # noqa: S608
+                f"WHERE workspace_id = :workspace_id AND ({visibility_sql}) "  # noqa: S608
+                f"{' '.join(clauses)} ORDER BY title ASC"
             ),
             params,
         )
@@ -1562,8 +1645,15 @@ def list_monitors_endpoint(
     Datadog connector's `datadog_monitors` projection (migration
     `0051_phase6_datadog_connector.py`).
     """
+    visibility_sql, visibility_params = authz.visible_resource_filter_sql(
+        session,
+        auth,
+        resource_type="datadog_monitors",
+        action="read",
+        table_alias="datadog_monitors",
+    )
     clauses = []
-    params: dict[str, Any] = {"workspace_id": auth.workspace_id}
+    params: dict[str, Any] = {"workspace_id": auth.workspace_id, **visibility_params}
     if connector_account_id:
         clauses.append("AND connector_account_id = :connector_account_id")
         params["connector_account_id"] = connector_account_id
@@ -1578,7 +1668,8 @@ def list_monitors_endpoint(
                 "freshness_state, provider_updated_at, observed_at, created_at, "
                 "updated_at, team_entity_id, suggested_team_name "
                 "FROM datadog_monitors "
-                f"WHERE workspace_id = :workspace_id {' '.join(clauses)} ORDER BY name ASC"  # noqa: S608
+                f"WHERE workspace_id = :workspace_id AND ({visibility_sql}) "  # noqa: S608
+                f"{' '.join(clauses)} ORDER BY name ASC"
             ),
             params,
         )
@@ -1598,8 +1689,15 @@ def list_service_definitions_endpoint(
     """Mirrors `list_repositories_endpoint`'s shape exactly, for the
     Datadog connector's `datadog_service_definitions` projection.
     """
+    visibility_sql, visibility_params = authz.visible_resource_filter_sql(
+        session,
+        auth,
+        resource_type="datadog_service_definitions",
+        action="read",
+        table_alias="datadog_service_definitions",
+    )
     clauses = []
-    params: dict[str, Any] = {"workspace_id": auth.workspace_id}
+    params: dict[str, Any] = {"workspace_id": auth.workspace_id, **visibility_params}
     if connector_account_id:
         clauses.append("AND connector_account_id = :connector_account_id")
         params["connector_account_id"] = connector_account_id
@@ -1613,7 +1711,8 @@ def list_service_definitions_endpoint(
                 "name, team, tier, description, permission_state, freshness_state, "
                 "observed_at, created_at, updated_at, team_entity_id, suggested_team_name "
                 "FROM datadog_service_definitions "
-                f"WHERE workspace_id = :workspace_id {' '.join(clauses)} ORDER BY name ASC"  # noqa: S608
+                f"WHERE workspace_id = :workspace_id AND ({visibility_sql}) "  # noqa: S608
+                f"{' '.join(clauses)} ORDER BY name ASC"
             ),
             params,
         )
@@ -1635,8 +1734,15 @@ def list_dashboards_endpoint(
     """Mirrors `list_repositories_endpoint`'s shape exactly, for the
     Datadog connector's `datadog_dashboards` projection.
     """
+    visibility_sql, visibility_params = authz.visible_resource_filter_sql(
+        session,
+        auth,
+        resource_type="datadog_dashboards",
+        action="read",
+        table_alias="datadog_dashboards",
+    )
     clauses = []
-    params: dict[str, Any] = {"workspace_id": auth.workspace_id}
+    params: dict[str, Any] = {"workspace_id": auth.workspace_id, **visibility_params}
     if connector_account_id:
         clauses.append("AND connector_account_id = :connector_account_id")
         params["connector_account_id"] = connector_account_id
@@ -1651,7 +1757,8 @@ def list_dashboards_endpoint(
                 "provider_updated_at, observed_at, created_at, updated_at, "
                 "team_entity_id, suggested_team_name "
                 "FROM datadog_dashboards "
-                f"WHERE workspace_id = :workspace_id {' '.join(clauses)} ORDER BY title ASC"  # noqa: S608
+                f"WHERE workspace_id = :workspace_id AND ({visibility_sql}) "  # noqa: S608
+                f"{' '.join(clauses)} ORDER BY title ASC"
             ),
             params,
         )
@@ -1714,11 +1821,13 @@ def _write_team_assignment_side_effects(
                 INSERT INTO audit_events (
                     id, workspace_id, event_type, aggregate_type, aggregate_id,
                     aggregate_version, actor_id, request_id, correlation_id,
-                    changed_fields, authorization_result, source, metadata, occurred_at
+                    changed_fields, authorization_result, source, metadata, occurred_at,
+                    owner_id, visibility
                 ) VALUES (
                     :id, :workspace_id, :event_type, :aggregate_type, :aggregate_id,
                     :aggregate_version, :actor_id, :request_id, :correlation_id,
-                    ARRAY['team_entity_id'], 'allowed', 'user', '{}'::jsonb, :occurred_at
+                    ARRAY['team_entity_id'], 'allowed', 'user', '{}'::jsonb, :occurred_at,
+                    :actor_id, 'workspace'
                 )
                 """
             ),
@@ -1786,6 +1895,20 @@ def assign_repository_team_endpoint(
     connector_endpoint` already use, and an `audit_events`/`event_outbox`
     write recording who confirmed or cleared the link and when.
     """
+    if not authz.authorize(
+        session, auth, resource_type="repositories", resource_id=repository_id, action="read"
+    ):
+        session.rollback()
+        raise HTTPException(status_code=404, detail="REPOSITORY_NOT_FOUND")
+    if not authz.authorize(
+        session, auth, resource_type="repositories", resource_id=repository_id, action="write"
+    ):
+        session.rollback()
+        raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
+    # See sync_connector_endpoint's identical comment -- these pre-checks
+    # must be rolled back before this endpoint's own `with session.begin():`.
+    session.rollback()
+
     request_hash = _request_hash(payload, f"assign_repository_team:{repository_id}")
     now = datetime.now(UTC)
     with session.begin():
@@ -1869,6 +1992,28 @@ def assign_work_item_team_endpoint(
     """Identical shape and reasoning to `assign_repository_team_endpoint`
     above, for `engineering_work_items`.
     """
+    if not authz.authorize(
+        session,
+        auth,
+        resource_type="engineering_work_items",
+        resource_id=work_item_id,
+        action="read",
+    ):
+        session.rollback()
+        raise HTTPException(status_code=404, detail="WORK_ITEM_NOT_FOUND")
+    if not authz.authorize(
+        session,
+        auth,
+        resource_type="engineering_work_items",
+        resource_id=work_item_id,
+        action="write",
+    ):
+        session.rollback()
+        raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
+    # See sync_connector_endpoint's identical comment -- these pre-checks
+    # must be rolled back before this endpoint's own `with session.begin():`.
+    session.rollback()
+
     request_hash = _request_hash(payload, f"assign_work_item_team:{work_item_id}")
     now = datetime.now(UTC)
     with session.begin():

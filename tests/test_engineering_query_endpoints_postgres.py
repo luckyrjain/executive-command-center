@@ -122,6 +122,7 @@ def _cleanup_workspace(workspace_id: UUID) -> None:
             "audit_events",
             "idempotency_records",
             "sessions",
+            "workspace_memberships",
             "users",
         ):
             connection.execute(
@@ -1288,6 +1289,7 @@ def test_assign_repository_team_rejects_cross_workspace_entity(
             ),
             {"id": other_workspace_id, "now": now},
         )
+        create_identity(connection, workspace_id=other_workspace_id, user_id=uuid4(), now=now)
     try:
         other_team_id = _insert_team_entity(other_workspace_id)
         response = client.post(
@@ -1457,6 +1459,7 @@ def test_assign_work_item_team_rejects_cross_workspace_entity(
             ),
             {"id": other_workspace_id, "now": now},
         )
+        create_identity(connection, workspace_id=other_workspace_id, user_id=uuid4(), now=now)
     try:
         other_team_id = _insert_team_entity(other_workspace_id)
         response = client.post(

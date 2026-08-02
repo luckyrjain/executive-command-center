@@ -272,6 +272,7 @@ def _seed_foreign_workspace_relationship() -> tuple[UUID, UUID, UUID]:
             text("INSERT INTO workspaces (id, name, created_at) VALUES (:id, :name, :created_at)"),
             {"id": other_workspace_id, "name": "Foreign Workspace", "created_at": now},
         )
+        create_identity(connection, workspace_id=other_workspace_id, user_id=uuid4(), now=now)
         for node_id, name in ((node_a, "Foreign A"), (node_b, "Foreign B")):
             connection.execute(
                 text(
@@ -322,11 +323,20 @@ def _seed_foreign_workspace_relationship() -> tuple[UUID, UUID, UUID]:
 
 def _teardown_foreign_workspace_relationship(workspace_id: UUID) -> None:
     with engine.begin() as connection:
-        for table in ("pkos_edges", "pkos_evidence", "pkos_nodes"):
+        for table in (
+            "pkos_edges",
+            "pkos_evidence",
+            "pkos_nodes",
+            "workspace_memberships",
+        ):
             connection.execute(
                 text(f"DELETE FROM {table} WHERE workspace_id = :workspace_id"),  # noqa: S608
                 {"workspace_id": workspace_id},
             )
+        connection.execute(
+            text("DELETE FROM users WHERE workspace_id = :workspace_id"),
+            {"workspace_id": workspace_id},
+        )
         connection.execute(
             text("DELETE FROM workspaces WHERE id = :workspace_id"), {"workspace_id": workspace_id}
         )
@@ -422,6 +432,7 @@ def test_relationship_create_rejects_evidence_from_another_workspace(
             text("INSERT INTO workspaces (id, name, created_at) VALUES (:id, :name, :created_at)"),
             {"id": other_workspace_id, "name": "Other Workspace", "created_at": now},
         )
+        create_identity(connection, workspace_id=other_workspace_id, user_id=uuid4(), now=now)
         connection.execute(
             text(
                 "INSERT INTO pkos_nodes (id, workspace_id, node_type, canonical_name, "
@@ -451,6 +462,14 @@ def test_relationship_create_rejects_evidence_from_another_workspace(
             )
             connection.execute(
                 text("DELETE FROM pkos_nodes WHERE workspace_id = :workspace_id"),
+                {"workspace_id": other_workspace_id},
+            )
+            connection.execute(
+                text("DELETE FROM workspace_memberships WHERE workspace_id = :workspace_id"),
+                {"workspace_id": other_workspace_id},
+            )
+            connection.execute(
+                text("DELETE FROM users WHERE workspace_id = :workspace_id"),
                 {"workspace_id": other_workspace_id},
             )
             connection.execute(

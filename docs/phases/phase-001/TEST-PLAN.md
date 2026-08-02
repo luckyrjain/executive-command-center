@@ -51,7 +51,7 @@ Representative fixture: 10,000 tasks, commitments, risks and events; 50,000 note
 
 - dashboard p95 below 2 seconds;
 - search p95 below 500 ms locally and 800 ms in CI;
-- ranking 10,000 entities below 500 ms;
+- ranking 10,000 entities below 500 ms as originally accepted, widened to below 600 ms local / 950 ms CI by Phase 8 Task 3 (structural FK/trigger overhead from migration `0063_phase8_authz_visibility.py`; see `RANKING_BUDGET_SECONDS` in `tests/test_risks_attention_postgres.py` and `docs/phases/phase-008/IMPLEMENTATION-STATUS.md`'s Task 3 evidence section);
 - task and commitment mutation p95 below 300 ms;
 - deterministic brief generation p95 below 2 seconds;
 - no query above the approved statement timeout.

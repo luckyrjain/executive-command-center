@@ -24,6 +24,7 @@ from ecc.domains.knowledge.embeddings import (
     get_provider,
     vector_literal,
 )
+from ecc.platform.authz import WORKSPACE_ORIGINAL_OWNER_SQL
 
 router = APIRouter(prefix="/api/v1/knowledge", tags=["knowledge-retrieval"])
 SessionDep = Annotated[Session, Depends(get_session)]
@@ -106,17 +107,28 @@ def queue_retrieval_document(
     """Upsert retrieval_documents within the caller's own transaction --
     same reasoning as timeline.py's queue_timeline_entry: a rolled-back
     mutation rolls this write back with it, so no deferred-until-commit
-    machinery is needed for the write itself to never go stale."""
+    machinery is needed for the write itself to never go stale.
+
+    `owner_id` is set explicitly via the non-correlated `WORKSPACE_
+    ORIGINAL_OWNER_SQL` subquery rather than left to `retrieval_documents`'
+    own `BEFORE INSERT` trigger to re-derive per row -- `pkos_nodes` (the
+    only source this table's `rebuild_retrieval_documents` reads from) has
+    no actor column of its own, so the trigger would compute the identical
+    value anyway; setting it explicitly here just avoids paying that
+    per-row trigger-dispatch cost on `rebuild_retrieval_documents`'
+    potentially-large rebuild loop, the same fix `attention.py`'s
+    `_upsert_batch` already applies to its own bulk upsert.
+    """
     body = _build_body(session, workspace_id, entity_id, summary)
     session.execute(
         text(
-            """
+            f"""
             INSERT INTO retrieval_documents (
                 id, workspace_id, entity_type, entity_id, title, body,
-                source_version, updated_at
+                source_version, updated_at, owner_id, visibility
             ) VALUES (
                 gen_random_uuid(), :workspace_id, :entity_type, :entity_id, :title, :body,
-                :source_version, :now
+                :source_version, :now, {WORKSPACE_ORIGINAL_OWNER_SQL}, 'workspace'
             )
             ON CONFLICT (workspace_id, entity_id) DO UPDATE SET
                 entity_type = EXCLUDED.entity_type,

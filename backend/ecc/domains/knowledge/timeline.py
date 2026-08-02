@@ -174,10 +174,25 @@ def rebuild_timeline(session: Session, workspace_id: UUID) -> RebuildReport:
         text("DELETE FROM timeline_entries WHERE workspace_id = :workspace_id"),
         {"workspace_id": workspace_id},
     )
+    # `owner_id` is read straight off each source `audit_events` row (that
+    # migration `0063`'s own `authz_default_owner_from_actor_id` trigger
+    # already resolved correctly -- the real actor, or the workspace-
+    # oldest-user fallback only for actor_id IS NULL system events) rather
+    # than left for `timeline_entries`' own `BEFORE INSERT` trigger to
+    # re-derive. Two reasons, not one: correctness (each timeline entry's
+    # owner should be the actor who caused the underlying event, not
+    # unconditionally the workspace's oldest user -- `timeline_entries` has
+    # no actor column of its own to backfill from, so its trigger can only
+    # ever do the latter), and the same per-row FK-constraint-check +
+    # trigger-dispatch overhead `attention.py`'s `_upsert_batch` was found
+    # to pay on this exact hot bulk-write shape (a full-workspace rebuild
+    # loop, potentially thousands of rows) -- see that function's own
+    # docstring and `RANKING_BUDGET_SECONDS` in
+    # `tests/test_risks_attention_postgres.py`.
     entity_events = session.execute(
         text(
             """
-            SELECT id, aggregate_id AS entity_id, event_type, occurred_at
+            SELECT id, aggregate_id AS entity_id, event_type, occurred_at, owner_id
             FROM audit_events
             WHERE workspace_id = :workspace_id AND aggregate_type = 'knowledge_entity'
             """
@@ -187,7 +202,7 @@ def rebuild_timeline(session: Session, workspace_id: UUID) -> RebuildReport:
     relationship_events = session.execute(
         text(
             """
-            SELECT a.id, e.source_node_id AS entity_id, a.event_type, a.occurred_at
+            SELECT a.id, e.source_node_id AS entity_id, a.event_type, a.occurred_at, a.owner_id
             FROM audit_events a
             JOIN pkos_edges e ON e.workspace_id = a.workspace_id AND e.id = a.aggregate_id
             WHERE a.workspace_id = :workspace_id AND a.aggregate_type = 'relationship'
@@ -196,16 +211,19 @@ def rebuild_timeline(session: Session, workspace_id: UUID) -> RebuildReport:
         {"workspace_id": workspace_id},
     ).all()
     written = 0
-    for event_id, entity_id, event_type, occurred_at in (*entity_events, *relationship_events):
+    for event_id, entity_id, event_type, occurred_at, owner_id in (
+        *entity_events,
+        *relationship_events,
+    ):
         session.execute(
             text(
                 """
                 INSERT INTO timeline_entries (
                     id, workspace_id, entity_id, effective_at, recorded_at,
-                    event_type, source_id, summary
+                    event_type, source_id, summary, owner_id, visibility
                 ) VALUES (
                     :id, :workspace_id, :entity_id, :effective_at, :recorded_at,
-                    :event_type, NULL, :summary
+                    :event_type, NULL, :summary, :owner_id, 'workspace'
                 )
                 """
             ),
@@ -217,6 +235,7 @@ def rebuild_timeline(session: Session, workspace_id: UUID) -> RebuildReport:
                 "recorded_at": occurred_at,
                 "event_type": event_type,
                 "summary": event_type.replace("_", " ").replace(".", " "),
+                "owner_id": owner_id,
             },
         )
         written += 1

@@ -135,6 +135,7 @@ from sqlalchemy import text
 from ecc.database import SessionFactory
 
 from .connectors import (
+    WORKSPACE_ORIGINAL_OWNER_SQL,
     AdapterAuthorizationError,
     ConnectorAccountContext,
     ConnectorAuthorization,
@@ -227,17 +228,19 @@ def _upsert_monitor(
     with SessionFactory() as session:
         session.execute(
             text(
-                """
+                f"""
                 INSERT INTO datadog_monitors (
                     id, workspace_id, connector_account_id, provider, external_id,
                     source_url, permission_state, freshness_state, content_hash,
                     provider_updated_at, observed_at, created_at, updated_at,
-                    suggested_team_name, name, monitor_type, query, overall_state
+                    suggested_team_name, name, monitor_type, query, overall_state,
+                    owner_id, visibility
                 ) VALUES (
                     :id, :workspace_id, :connector_account_id, :provider, :external_id,
                     :source_url, 'active', 'fresh', :content_hash,
                     :provider_updated_at, :now, :now, :now,
-                    :suggested_team_name, :name, :monitor_type, :query, :overall_state
+                    :suggested_team_name, :name, :monitor_type, :query, :overall_state,
+                    {WORKSPACE_ORIGINAL_OWNER_SQL}, 'workspace'
                 )
                 ON CONFLICT (workspace_id, connector_account_id, external_id) DO UPDATE SET
                     source_url = EXCLUDED.source_url,
@@ -252,7 +255,7 @@ def _upsert_monitor(
                     monitor_type = EXCLUDED.monitor_type,
                     query = EXCLUDED.query,
                     overall_state = EXCLUDED.overall_state
-                """
+                """  # noqa: S608 -- see github_adapter._upsert_repository's identical note
             ),
             {
                 "id": uuid4(),
@@ -316,17 +319,19 @@ def _upsert_service_definition(
     with SessionFactory() as session:
         session.execute(
             text(
-                """
+                f"""
                 INSERT INTO datadog_service_definitions (
                     id, workspace_id, connector_account_id, provider, external_id,
                     source_url, permission_state, freshness_state, content_hash,
                     observed_at, created_at, updated_at,
-                    suggested_team_name, name, team, tier, description
+                    suggested_team_name, name, team, tier, description,
+                    owner_id, visibility
                 ) VALUES (
                     :id, :workspace_id, :connector_account_id, :provider, :external_id,
                     :source_url, 'active', 'fresh', :content_hash,
                     :now, :now, :now,
-                    :suggested_team_name, :name, :team, :tier, :description
+                    :suggested_team_name, :name, :team, :tier, :description,
+                    {WORKSPACE_ORIGINAL_OWNER_SQL}, 'workspace'
                 )
                 ON CONFLICT (workspace_id, connector_account_id, external_id) DO UPDATE SET
                     source_url = EXCLUDED.source_url,
@@ -340,7 +345,7 @@ def _upsert_service_definition(
                     team = EXCLUDED.team,
                     tier = EXCLUDED.tier,
                     description = EXCLUDED.description
-                """
+                """  # noqa: S608 -- see github_adapter._upsert_repository's identical note
             ),
             {
                 "id": uuid4(),
@@ -408,17 +413,18 @@ def _upsert_dashboard(
     with SessionFactory() as session:
         session.execute(
             text(
-                """
+                f"""
                 INSERT INTO datadog_dashboards (
                     id, workspace_id, connector_account_id, provider, external_id,
                     source_url, permission_state, freshness_state, content_hash,
                     provider_updated_at, observed_at, created_at, updated_at,
-                    suggested_team_name, title, description
+                    suggested_team_name, title, description, owner_id, visibility
                 ) VALUES (
                     :id, :workspace_id, :connector_account_id, :provider, :external_id,
                     :source_url, 'active', 'fresh', :content_hash,
                     :provider_updated_at, :now, :now, :now,
-                    :suggested_team_name, :title, :description
+                    :suggested_team_name, :title, :description,
+                    {WORKSPACE_ORIGINAL_OWNER_SQL}, 'workspace'
                 )
                 ON CONFLICT (workspace_id, connector_account_id, external_id) DO UPDATE SET
                     source_url = EXCLUDED.source_url,
@@ -431,7 +437,7 @@ def _upsert_dashboard(
                     suggested_team_name = EXCLUDED.suggested_team_name,
                     title = EXCLUDED.title,
                     description = EXCLUDED.description
-                """
+                """  # noqa: S608 -- see github_adapter._upsert_repository's identical note
             ),
             {
                 "id": uuid4(),
