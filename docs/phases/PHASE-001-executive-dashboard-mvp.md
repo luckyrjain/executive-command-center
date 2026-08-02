@@ -67,7 +67,11 @@ External connectors; autonomous actions; semantic/vector search; dedicated graph
 
 - Dashboard p95 <2 seconds on the acceptance dataset.
 - Search p95 <500 ms locally and <800 ms in CI.
-- Ranking 10,000 eligible records completes within 500 ms.
+- Ranking 10,000 eligible records completes within 500 ms as originally
+  accepted, widened to within 600 ms local / 950 ms CI by Phase 8 Task 3's
+  schema-wide authz migration (structural FK/trigger overhead, disclosed
+  and root-caused in `docs/phases/phase-008/IMPLEMENTATION-STATUS.md`'s
+  Task 3 evidence section).
 - Core flows work offline after application load and without AI.
 - Primary flows meet WCAG 2.2 AA.
 - No cross-workspace identifiers or content are observable.

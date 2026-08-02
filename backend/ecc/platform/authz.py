@@ -70,6 +70,7 @@ their role changes afterward.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Annotated, Literal
@@ -241,6 +242,24 @@ class ResourceRef:
     workspace_id: UUID
     owner_id: UUID
     visibility: str
+
+
+_IDENTIFIER_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
+
+
+def require_safe_sql_identifier(value: str, *, label: str) -> None:
+    """Every current `table_alias` caller passes a hardcoded literal (e.g.
+    `"incidents"`), so this is defense-in-depth, not a fix for a live
+    injection path -- but `visible_resource_filter_sql` f-string-
+    interpolates `table_alias` directly, unlike `resource_type` (validated
+    by `require_known_resource_type` against a closed allowlist), so
+    nothing today stops a future caller from building it from
+    request-influenced input. Raising here fails the same way an unknown
+    `resource_type` does: a programmer error to fix at the call site, not
+    a request-shaped error for an endpoint to catch.
+    """
+    if not _IDENTIFIER_RE.match(value):
+        raise UnknownResourceTypeError(f"{label} is not a safe SQL identifier: {value!r}")
 
 
 def require_known_resource_type(resource_type: str) -> None:
@@ -423,9 +442,22 @@ def authorize(
     """Decision 2's six-step function, every branch reachable, none
     implicit. Returns `False` (never raises for an ordinary "no access")
     so callers can uniformly translate a `False` result to `404` for a
-    single-resource `GET`/mutate (never `403` -- an unauthorized caller
-    must not be able to distinguish "does not exist" from "exists but you
-    can't see it") without a try/except at every call site.
+    single-resource `GET` without a try/except at every call site.
+
+    For a mutate endpoint that needs both a read-visibility check and a
+    write-permission check, call this twice -- once with `action="read"`
+    (a `False` result means "doesn't exist, isn't visible to you, or
+    you're not an active member here" -- report `404`), then, only after
+    that has already succeeded, again with `action="write"` (a `False`
+    result here means the resource IS visible to the caller but their role/
+    grant doesn't cover writing to it -- safe to report `403`, since the
+    read check already established the caller can see it, so `403` reveals
+    nothing new). Calling this once with `action="write"` alone and
+    translating a `False` result straight to `403` -- skipping the read
+    check -- lets an unauthorized caller distinguish "does not exist" from
+    "exists but you can't see it" by comparing 404 against 403, exactly the
+    leak this two-call pattern (see `connector_accounts.py`'s call sites
+    for the canonical shape) exists to prevent.
     """
     role = _current_role(session, workspace_id=auth.workspace_id, users_id=auth.user_id)
     if role is None:
@@ -482,10 +514,15 @@ def visible_resource_filter_sql(
     `resource_type`'s own table in that query, and merges `params` into
     their own bind-parameter dict. Every value is a bind parameter; only
     `table_alias`/`resource_type`-derived identifiers are ever
-    interpolated into the SQL text, and `resource_type` is validated
-    first.
+    interpolated into the SQL text, and both are validated first --
+    `resource_type` against the closed `_RESOURCE_TABLES` allowlist,
+    `table_alias` against `require_safe_sql_identifier`'s bare-identifier
+    shape (every current caller passes a hardcoded literal alias, so this
+    is defense-in-depth against a future caller building one dynamically,
+    not a fix for a live injection path).
     """
     require_known_resource_type(resource_type)
+    require_safe_sql_identifier(table_alias, label="table_alias")
     role = _current_role(session, workspace_id=auth.workspace_id, users_id=auth.user_id)
     if role is None:
         # Not an active member -- no row should ever match; a false

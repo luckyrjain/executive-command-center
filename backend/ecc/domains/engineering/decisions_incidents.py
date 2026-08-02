@@ -521,13 +521,28 @@ def resolve_incident_endpoint(
         if cached is not None:
             return IncidentResponse.model_validate(cached)
 
-        existing = _get_incident(session, auth.workspace_id, incident_id)
-        if existing is None:
+        # Two-phase read-then-write authz check (mirrors connector_
+        # accounts.py's identical pattern): a plain membership-unaware
+        # existence lookup followed by a single write-only authorize()
+        # call let a suspended/removed member distinguish 404 (resource
+        # doesn't exist) from 403 (exists, denied) for any incident_id in
+        # their former workspace -- exactly the existence leak authz.
+        # authorize()'s own docstring says must never be observable. The
+        # read check's False result (not an active member, resource
+        # missing, or visibility=private) is uniformly reported as 404;
+        # only once that has already confirmed the caller can see this
+        # incident does a write-check failure reveal anything new via 403.
+        if not authz.authorize(
+            session, auth, resource_type="incidents", resource_id=incident_id, action="read"
+        ):
             raise HTTPException(status_code=404, detail="INCIDENT_NOT_FOUND")
         if not authz.authorize(
             session, auth, resource_type="incidents", resource_id=incident_id, action="write"
         ):
             raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
+        existing = _get_incident(session, auth.workspace_id, incident_id)
+        if existing is None:
+            raise HTTPException(status_code=404, detail="INCIDENT_NOT_FOUND")
         if existing["status"] == "resolved":
             raise HTTPException(status_code=409, detail="INCIDENT_ALREADY_RESOLVED")
         if payload.resolved_at < existing["detected_at"]:
@@ -724,8 +739,16 @@ def decide_decision_endpoint(
         if cached is not None:
             return DecisionResponse.model_validate(cached)
 
-        existing = _get_decision(session, auth.workspace_id, decision_id)
-        if existing is None:
+        # Two-phase read-then-write authz check -- see resolve_incident_
+        # endpoint's identical comment for why plain existence-lookup then
+        # write-only authorize() leaks existence to a suspended member.
+        if not authz.authorize(
+            session,
+            auth,
+            resource_type="engineering_decisions",
+            resource_id=decision_id,
+            action="read",
+        ):
             raise HTTPException(status_code=404, detail="DECISION_NOT_FOUND")
         if not authz.authorize(
             session,
@@ -735,6 +758,9 @@ def decide_decision_endpoint(
             action="write",
         ):
             raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
+        existing = _get_decision(session, auth.workspace_id, decision_id)
+        if existing is None:
+            raise HTTPException(status_code=404, detail="DECISION_NOT_FOUND")
         if existing["status"] != "proposed":
             raise HTTPException(status_code=409, detail="DECISION_NOT_PROPOSED")
         # Mirrors resolve_incident_endpoint's identical `resolved_at <

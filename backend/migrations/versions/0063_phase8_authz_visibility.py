@@ -124,6 +124,63 @@ task's own endpoint starts setting `owner_id` explicitly, the trigger
 simply stops firing for that table -- no migration needed to retire it,
 and no harm in leaving it in place indefinitely as a defense-in-depth
 backstop.
+
+**The workspace-original-user fallback is only used where no better value
+exists.** 21 tables originally in this group already carry their own
+per-row actor column identifying who actually did the thing (`created_by`
+on `calendar_events`, `meetings`, `recommendations`, `waiting_links`,
+`meeting_participants`, `meeting_packs`, `workflow_definitions`,
+`workflow_versions`, `automation_policies`, `triggers`, `workflow_runs`,
+`connector_accounts`, `incidents`, `engineering_decisions`; `actor_id` on
+`audit_events`, `recommendation_feedback`, `entity_operations`,
+`attention_feedback`, `risk_reviews`, `ai_runs`, `evaluation_runs`) --
+backfilling these from "the workspace's oldest user" instead would be
+silently *wrong* the moment a workspace has more than one member, not
+merely imprecise: `ecc.platform.authz`'s `create_grant_endpoint`/
+`revoke_grant_endpoint` gate on `resource.owner_id == auth.user_id` (else
+require `owner`/`admin` role), so a member who genuinely created one of
+these rows would be unable to grant or revoke access to their own
+resource. These 21 tables get their own `_NEW_OWNER_FROM_CREATED_BY`/
+`_NEW_OWNER_FROM_ACTOR_ID` groups, each with a dedicated trigger function
+that prefers the row's own actor column and only falls back to the
+workspace-original-user formula via `COALESCE` when that column is itself
+`NULL` -- true today only for `audit_events.actor_id` (nullable, for
+`source='system'` events with no human actor; every other listed column is
+`NOT NULL`, so the fallback branch there is dead-code-safety, not a live
+path).
+
+**`plan_blocks` needs a third, dedicated formula.** It has no actor column
+of its own, but every row's `plan_id` (`NOT NULL`, FK'd to `plans.id`)
+identifies the `plans` row it belongs to, and `plans.user_id` (`NOT NULL`)
+is exactly the real owner -- the same value `_NEW_OWNER_FROM_USER_ID`'s
+`plans` table itself gets backfilled to. `_NEW_OWNER_FROM_PLAN_USER_ID`'s
+trigger function joins through `plan_id` to read it, with no further
+fallback needed since a `plan_blocks` row can't exist without its `plans`
+row already existing.
+
+**Operational note, disclosed not silently absorbed: this migration runs
+as a single transaction touching ~65 tables, and Postgres does not
+release a DDL statement's lock until that transaction commits.** By the
+last table, every one of the ~65 -- including whichever is largest/hottest
+in a real deployment -- is simultaneously `ACCESS EXCLUSIVE`-locked,
+blocking all reads and writes application-wide for this migration's full
+run time. Against the empty-to-small tables this codebase's CI and every
+environment it has run in so far actually has, that run time is seconds;
+this is a real concern only once any of these ~65 tables holds production-
+scale row counts (the full-table `UPDATE`/`ALTER COLUMN ... SET NOT
+NULL`/`ADD CONSTRAINT` FK-validation sequence each table goes through is
+genuinely O(rows), not O(1)). Splitting this into several sequential
+migrations (reducing simultaneous lock scope, though each individual
+table's own lock duration is unchanged) is the standard mitigation and a
+disclosed follow-up, not attempted here: this file's own logic is already
+verified end to end (upgrade/downgrade/upgrade round-trips, functional
+trigger-correctness checks -- see `IMPLEMENTATION-STATUS.md`'s Task 3
+evidence section), and restructuring it into multiple revision files this
+late, without the same depth of individual verification for each split,
+would trade a documented, deferrable operational risk for an undocumented,
+unverified structural one. Any real (non-CI, non-toy) deployment of this
+migration should run it during a maintenance window, not inline during
+normal request traffic.
 """
 
 import sqlalchemy as sa
@@ -162,45 +219,64 @@ _EXISTING_OWNER_PRIVATE_HARDCODED = (
 # column already means what owner_id would -- backfilled owner_id = user_id.
 _NEW_OWNER_FROM_USER_ID = ("morning_briefs", "capacity_profiles", "planning_constraints", "plans")
 
-# Every other workspace_id-scoped table without owner_id -- backfilled to
-# that workspace's own earliest-created users row.
-_NEW_OWNER_FROM_WORKSPACE_ORIGINAL_USER = (
-    "pkos_nodes",
-    "pkos_edges",
-    "pkos_evidence",
-    "audit_events",
+# Tables with their own `created_by` actor column -- see this module's own
+# docstring ("The workspace-original-user fallback is only used where no
+# better value exists") for why these are backfilled from that column
+# rather than the workspace's oldest user.
+_NEW_OWNER_FROM_CREATED_BY = (
     "calendar_events",
     "meetings",
-    "attention_items",
     "recommendations",
-    "recommendation_feedback",
-    "entity_aliases",
-    "knowledge_claims",
-    "timeline_entries",
-    "resolution_candidates",
-    "entity_operations",
-    "retrieval_documents",
-    "embedding_projections",
-    "attention_feedback",
     "waiting_links",
-    "risk_reviews",
-    "plan_blocks",
     "meeting_participants",
     "meeting_packs",
-    "ai_runs",
-    "ai_run_steps",
-    "evaluation_runs",
-    "generated_artifacts",
     "workflow_definitions",
     "workflow_versions",
     "automation_policies",
     "triggers",
     "workflow_runs",
+    "connector_accounts",
+    "incidents",
+    "engineering_decisions",
+)
+
+# Tables with their own `actor_id` actor column -- same reasoning as
+# `_NEW_OWNER_FROM_CREATED_BY` above, different column name.
+_NEW_OWNER_FROM_ACTOR_ID = (
+    "audit_events",
+    "recommendation_feedback",
+    "entity_operations",
+    "attention_feedback",
+    "risk_reviews",
+    "ai_runs",
+    "evaluation_runs",
+)
+
+# plan_blocks has no actor column of its own -- backfilled by joining
+# through plan_id to plans.user_id. See this module's own docstring
+# ("plan_blocks needs a third, dedicated formula").
+_NEW_OWNER_FROM_PLAN_USER_ID = ("plan_blocks",)
+
+# Every other workspace_id-scoped table without owner_id and without any
+# per-row actor column of its own -- backfilled to that workspace's own
+# earliest-created users row.
+_NEW_OWNER_FROM_WORKSPACE_ORIGINAL_USER = (
+    "pkos_nodes",
+    "pkos_edges",
+    "pkos_evidence",
+    "attention_items",
+    "entity_aliases",
+    "knowledge_claims",
+    "timeline_entries",
+    "resolution_candidates",
+    "retrieval_documents",
+    "embedding_projections",
+    "ai_run_steps",
+    "generated_artifacts",
     "workflow_run_steps",
     "approval_requests",
     "compensation_steps",
     "automation_kill_switches",
-    "connector_accounts",
     "sync_cursors",
     "sync_runs",
     "repositories",
@@ -208,8 +284,6 @@ _NEW_OWNER_FROM_WORKSPACE_ORIGINAL_USER = (
     "changes",
     "reviews",
     "delivery_metric_snapshots",
-    "incidents",
-    "engineering_decisions",
     "incident_changes",
     "decision_changes",
     "datadog_monitors",
@@ -222,11 +296,18 @@ _ORIGINAL_WORKSPACE_USER_SUBQUERY = (
     "ORDER BY u.created_at ASC LIMIT 1)"
 )
 
+_CREATED_BY_WITH_FALLBACK_SQL = f"COALESCE(t.created_by, {_ORIGINAL_WORKSPACE_USER_SUBQUERY})"
+_ACTOR_ID_WITH_FALLBACK_SQL = f"COALESCE(t.actor_id, {_ORIGINAL_WORKSPACE_USER_SUBQUERY})"
+_PLAN_USER_ID_SUBQUERY = "(SELECT p.user_id FROM plans AS p WHERE p.id = t.plan_id)"
+
 # Trigger-function names for the `owner_id` safety net -- see this module's
 # own docstring ("Why every new/widened column also gets a DB-level
 # default"). One function per backfill formula, shared across every table
 # in that formula's group rather than one function per table.
 _TRIGGER_FN_FROM_USER_ID = "authz_default_owner_from_user_id"
+_TRIGGER_FN_FROM_CREATED_BY = "authz_default_owner_from_created_by"
+_TRIGGER_FN_FROM_ACTOR_ID = "authz_default_owner_from_actor_id"
+_TRIGGER_FN_FROM_PLAN_USER_ID = "authz_default_owner_from_plan_user_id"
 _TRIGGER_FN_FROM_WORKSPACE_ORIGINAL_USER = "authz_default_owner_from_workspace_original_user"
 
 
@@ -249,6 +330,15 @@ def _add_owner_and_visibility(table: str, *, backfill_sql: str, trigger_fn: str)
         ["workspace_id", "owner_id"],
         ["workspace_id", "id"],
     )
+    # Postgres never auto-indexes an FK-referencing column. Without this,
+    # `authz.visible_resource_filter_sql`'s `{table_alias}.owner_id =
+    # :__authz_user_id` predicate (and any future "my resources" filter)
+    # sequential-scans this table once a domain's per-row `visibility`
+    # diverges from the uniform 'workspace' default this migration backfills
+    # -- the viewer-role and visibility='private'/'shared_explicitly' paths,
+    # where `visible_resource_filter_sql`'s `TRUE` short-circuit for a
+    # role that already permits workspace-wide access doesn't apply.
+    op.create_index(f"ix_{table}_workspace_owner", table, ["workspace_id", "owner_id"])
     op.execute(
         f"CREATE TRIGGER trg_{table}_default_owner BEFORE INSERT ON {table} "  # noqa: S608
         f"FOR EACH ROW EXECUTE FUNCTION {trigger_fn}()"
@@ -264,6 +354,7 @@ def _drop_visibility(table: str) -> None:
 def _drop_owner_and_visibility(table: str) -> None:
     _drop_visibility(table)
     op.execute(f"DROP TRIGGER trg_{table}_default_owner ON {table}")
+    op.drop_index(f"ix_{table}_workspace_owner", table_name=table)
     op.drop_constraint(f"fk_{table}_workspace_owner", table, type_="foreignkey")
     op.drop_column(table, "owner_id")
 
@@ -306,10 +397,76 @@ def upgrade() -> None:
         $$ LANGUAGE plpgsql
         """
     )
+    # See this module's own docstring ("The workspace-original-user
+    # fallback is only used where no better value exists") -- these two
+    # prefer the row's own actor column, falling back to the same
+    # workspace-original-user formula above via COALESCE only when that
+    # column is itself NULL.
+    op.execute(
+        f"""
+        CREATE FUNCTION {_TRIGGER_FN_FROM_CREATED_BY}() RETURNS trigger AS $$
+        BEGIN
+            IF NEW.owner_id IS NULL THEN
+                NEW.owner_id := NEW.created_by;
+                IF NEW.owner_id IS NULL THEN
+                    SELECT u.id INTO NEW.owner_id FROM users AS u
+                    WHERE u.workspace_id = NEW.workspace_id ORDER BY u.created_at ASC LIMIT 1;
+                END IF;
+            END IF;
+            RETURN NEW;
+        END;
+        $$ LANGUAGE plpgsql
+        """
+    )
+    op.execute(
+        f"""
+        CREATE FUNCTION {_TRIGGER_FN_FROM_ACTOR_ID}() RETURNS trigger AS $$
+        BEGIN
+            IF NEW.owner_id IS NULL THEN
+                NEW.owner_id := NEW.actor_id;
+                IF NEW.owner_id IS NULL THEN
+                    SELECT u.id INTO NEW.owner_id FROM users AS u
+                    WHERE u.workspace_id = NEW.workspace_id ORDER BY u.created_at ASC LIMIT 1;
+                END IF;
+            END IF;
+            RETURN NEW;
+        END;
+        $$ LANGUAGE plpgsql
+        """
+    )
+    # See this module's own docstring ("plan_blocks needs a third,
+    # dedicated formula") -- no fallback needed, plan_id is NOT NULL and
+    # FK'd to plans, whose own user_id is NOT NULL.
+    op.execute(
+        f"""
+        CREATE FUNCTION {_TRIGGER_FN_FROM_PLAN_USER_ID}() RETURNS trigger AS $$
+        BEGIN
+            IF NEW.owner_id IS NULL THEN
+                SELECT p.user_id INTO NEW.owner_id FROM plans AS p WHERE p.id = NEW.plan_id;
+            END IF;
+            RETURN NEW;
+        END;
+        $$ LANGUAGE plpgsql
+        """
+    )
 
     for table in _NEW_OWNER_FROM_USER_ID:
         _add_owner_and_visibility(
             table, backfill_sql="t.user_id", trigger_fn=_TRIGGER_FN_FROM_USER_ID
+        )
+    for table in _NEW_OWNER_FROM_CREATED_BY:
+        _add_owner_and_visibility(
+            table,
+            backfill_sql=_CREATED_BY_WITH_FALLBACK_SQL,
+            trigger_fn=_TRIGGER_FN_FROM_CREATED_BY,
+        )
+    for table in _NEW_OWNER_FROM_ACTOR_ID:
+        _add_owner_and_visibility(
+            table, backfill_sql=_ACTOR_ID_WITH_FALLBACK_SQL, trigger_fn=_TRIGGER_FN_FROM_ACTOR_ID
+        )
+    for table in _NEW_OWNER_FROM_PLAN_USER_ID:
+        _add_owner_and_visibility(
+            table, backfill_sql=_PLAN_USER_ID_SUBQUERY, trigger_fn=_TRIGGER_FN_FROM_PLAN_USER_ID
         )
     for table in _NEW_OWNER_FROM_WORKSPACE_ORIGINAL_USER:
         _add_owner_and_visibility(
@@ -355,9 +512,18 @@ def downgrade() -> None:
 
     for table in reversed(_NEW_OWNER_FROM_WORKSPACE_ORIGINAL_USER):
         _drop_owner_and_visibility(table)
+    for table in reversed(_NEW_OWNER_FROM_PLAN_USER_ID):
+        _drop_owner_and_visibility(table)
+    for table in reversed(_NEW_OWNER_FROM_ACTOR_ID):
+        _drop_owner_and_visibility(table)
+    for table in reversed(_NEW_OWNER_FROM_CREATED_BY):
+        _drop_owner_and_visibility(table)
     for table in reversed(_NEW_OWNER_FROM_USER_ID):
         _drop_owner_and_visibility(table)
 
+    op.execute(f"DROP FUNCTION {_TRIGGER_FN_FROM_PLAN_USER_ID}()")
+    op.execute(f"DROP FUNCTION {_TRIGGER_FN_FROM_ACTOR_ID}()")
+    op.execute(f"DROP FUNCTION {_TRIGGER_FN_FROM_CREATED_BY}()")
     op.execute(f"DROP FUNCTION {_TRIGGER_FN_FROM_WORKSPACE_ORIGINAL_USER}()")
     op.execute(f"DROP FUNCTION {_TRIGGER_FN_FROM_USER_ID}()")
 

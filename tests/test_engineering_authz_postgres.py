@@ -228,6 +228,18 @@ def _create_connector(
     return response.json()  # type: ignore[no-any-return]
 
 
+def _create_decision(
+    client: TestClient, token: str, *, title: str = "Test decision"
+) -> dict[str, Any]:
+    response = client.post(
+        "/api/v1/engineering/decisions",
+        json={"title": title},
+        headers=_headers(token, key=str(uuid4())),
+    )
+    assert response.status_code == 201, response.text
+    return response.json()  # type: ignore[no-any-return]
+
+
 # --- 1a. Role x action matrix -- incidents ----------------------------------
 
 
@@ -378,6 +390,135 @@ def test_connector_list_visible_to_every_active_role(
         assert response.status_code == 200, response.text
         ids = {row["id"] for row in response.json()["connectors"]}
         assert account["id"] in ids
+
+
+# --- 1c. Role x action matrix -- engineering_decisions ----------------------
+#
+# `decisions_incidents.py`'s decisions endpoints had zero authz-specific
+# test coverage before this round -- these mirror the incidents tests
+# above, and specifically exercise the two-phase read-then-write
+# authorize() fix applied to decide_decision_endpoint (see that function's
+# own comment for why a single write-only authorize() call would let a
+# suspended member distinguish 404 from 403).
+
+
+def test_decision_create_owner_admin_member_succeed_viewer_and_suspended_denied(
+    authz_context: _AuthzContext,
+) -> None:
+    for role_name in ("owner", "admin", "member"):
+        actor: _Actor = authz_context.actor(role_name)
+        body = _create_decision(actor.client, actor.token, title=f"Created by {role_name}")
+        assert body["title"] == f"Created by {role_name}"
+
+    for role_name in ("viewer", "suspended"):
+        actor = authz_context.actor(role_name)
+        response = actor.client.post(
+            "/api/v1/engineering/decisions",
+            json={"title": f"Denied for {role_name}"},
+            headers=_headers(actor.token, key=str(uuid4())),
+        )
+        assert response.status_code == 403, response.text
+        assert response.json()["error"]["code"] == "INSUFFICIENT_ROLE"
+
+
+def test_decision_decide_owner_succeeds_viewer_and_suspended_denied(
+    authz_context: _AuthzContext,
+) -> None:
+    owner: _Actor = authz_context.owner
+    viewer: _Actor = authz_context.viewer
+    suspended: _Actor = authz_context.suspended
+
+    # viewer: workspace-visibility read is allowed (existence confirmed via
+    # a prior 200 create), write is not -- 403, not 404.
+    decision = _create_decision(owner.client, owner.token, title="For viewer denial")
+    response = viewer.client.post(
+        f"/api/v1/engineering/decisions/{decision['id']}/decide",
+        json={"decided_at": datetime.now(UTC).isoformat()},
+        headers=_headers(viewer.token, key=str(uuid4())),
+    )
+    assert response.status_code == 403, response.text
+    assert response.json()["error"]["code"] == "INSUFFICIENT_ROLE"
+
+    # suspended: not an active member at all -- the read-phase authorize()
+    # call itself returns False, so this must be 404, not 403 (the exact
+    # existence-leak the two-phase fix on decide_decision_endpoint exists
+    # to prevent -- a suspended member must not be able to tell "this
+    # decision doesn't exist" apart from "it exists but I can't see it").
+    decision2 = _create_decision(owner.client, owner.token, title="For suspended denial")
+    response = suspended.client.post(
+        f"/api/v1/engineering/decisions/{decision2['id']}/decide",
+        json={"decided_at": datetime.now(UTC).isoformat()},
+        headers=_headers(suspended.token, key=str(uuid4())),
+    )
+    assert response.status_code == 404, response.text
+    assert response.json()["error"]["code"] == "DECISION_NOT_FOUND"
+
+    for role_name in ("owner", "admin", "member"):
+        actor: _Actor = authz_context.actor(role_name)
+        decision = _create_decision(owner.client, owner.token, title=f"Decided by {role_name}")
+        response = actor.client.post(
+            f"/api/v1/engineering/decisions/{decision['id']}/decide",
+            json={"decided_at": datetime.now(UTC).isoformat()},
+            headers=_headers(actor.token, key=str(uuid4())),
+        )
+        assert response.status_code == 200, response.text
+        assert response.json()["status"] == "decided"
+
+
+def test_decision_list_visible_to_every_active_role_not_suspended(
+    authz_context: _AuthzContext,
+) -> None:
+    owner: _Actor = authz_context.owner
+    decision = _create_decision(owner.client, owner.token, title="Listed for everyone")
+
+    for role_name in ("owner", "admin", "member", "viewer"):
+        actor: _Actor = authz_context.actor(role_name)
+        response = actor.client.get("/api/v1/engineering/decisions")
+        assert response.status_code == 200, response.text
+        ids = {row["id"] for row in response.json()["decisions"]}
+        assert decision["id"] in ids, f"{role_name} should see workspace-visible decision"
+
+    suspended: _Actor = authz_context.suspended
+    response = suspended.client.get("/api/v1/engineering/decisions")
+    assert response.status_code == 200, response.text
+    assert response.json()["decisions"] == []
+
+
+def test_idor_decision_id_guessed_from_another_workspace_is_404_not_403(
+    authz_context: _AuthzContext, other_workspace_owner: _Actor
+) -> None:
+    owner: _Actor = authz_context.owner
+    decision = _create_decision(owner.client, owner.token, title="Belongs to workspace A")
+
+    response = other_workspace_owner.client.post(
+        f"/api/v1/engineering/decisions/{decision['id']}/decide",
+        json={"decided_at": datetime.now(UTC).isoformat()},
+        headers=_headers(other_workspace_owner.token, key=str(uuid4())),
+    )
+    assert response.status_code == 404, response.text
+    assert response.json()["error"]["code"] == "DECISION_NOT_FOUND"
+
+
+def test_incident_resolve_suspended_membership_is_404_not_403(
+    authz_context: _AuthzContext,
+) -> None:
+    """`resolve_incident_endpoint` got the identical two-phase read-then-
+    write authorize() fix as decide_decision_endpoint above -- this is its
+    own regression test, a suspended member (not merely a lower-privileged
+    active role like viewer) must see 404, not 403, for an incident that
+    genuinely exists in their own (former) workspace.
+    """
+    owner: _Actor = authz_context.owner
+    suspended: _Actor = authz_context.suspended
+    incident = _create_incident(owner.client, owner.token, title="For suspended IDOR-shape check")
+
+    response = suspended.client.post(
+        f"/api/v1/engineering/incidents/{incident['id']}/resolve",
+        json={"resolved_at": datetime.now(UTC).isoformat()},
+        headers=_headers(suspended.token, key=str(uuid4())),
+    )
+    assert response.status_code == 404, response.text
+    assert response.json()["error"]["code"] == "INCIDENT_NOT_FOUND"
 
 
 # --- 2. IDOR / confused-deputy ----------------------------------------------
@@ -630,16 +771,38 @@ def test_shared_explicitly_visibility_requires_matching_active_grant(
     assert incident_id not in {UUID(row["id"]) for row in response.json()["incidents"]}
 
 
-def test_grant_creation_rejected_for_ungrantable_personal_domain_resource_type(
-    authz_context: _AuthzContext,
+@pytest.mark.parametrize(
+    "resource_type",
+    sorted(
+        [
+            "personal_domains",
+            "domain_consents",
+            "domain_sources",
+            "domain_records",
+            "goals",
+            "routines",
+            "check_ins",
+            "personal_insights",
+            "cross_domain_grants",
+            "personal_insight_feedback",
+        ]
+    ),
+)
+def test_grant_creation_rejected_for_every_ungrantable_resource_type(
+    authz_context: _AuthzContext, resource_type: str
 ) -> None:
+    """`authz.UNGRANTABLE_RESOURCE_TYPES`'s full ten-entry frozenset, quoted
+    verbatim here (not imported) so a future accidental removal from that
+    set is still caught by name -- previously only `personal_domains` (1 of
+    10) was exercised.
+    """
     owner: _Actor = authz_context.owner
     viewer: _Actor = authz_context.viewer
 
     response = owner.client.post(
         "/api/v1/sharing/grants",
         json={
-            "resource_type": "personal_domains",
+            "resource_type": resource_type,
             "resource_id": str(uuid4()),
             "grantee_account_id": str(viewer.account_id),
             "actions": ["read"],
@@ -651,7 +814,10 @@ def test_grant_creation_rejected_for_ungrantable_personal_domain_resource_type(
 
     with engine.begin() as connection:
         count = connection.execute(
-            text("SELECT count(*) FROM resource_grants WHERE resource_type = 'personal_domains'")
+            text(
+                "SELECT count(*) FROM resource_grants WHERE resource_type = :resource_type"  # noqa: S608
+            ),
+            {"resource_type": resource_type},
         ).scalar_one()
     assert count == 0
 
@@ -691,3 +857,134 @@ def test_grant_creation_requires_owner_admin_or_resource_owner(
         headers=_headers(viewer.token),
     )
     assert response.status_code == 403, response.text
+
+
+def test_grant_does_not_leak_across_resource_type(authz_context: _AuthzContext) -> None:
+    """A grant is scoped to one specific `(workspace_id, resource_type,
+    resource_id)` triple -- `authz._active_grant_exists`/
+    `visible_resource_filter_sql`'s grant subquery both filter on
+    `resource_type`, not merely `resource_id`. This proves that predicate
+    is actually load-bearing: a grant naming `resource_type="incidents"`
+    for one resource must not incidentally widen visibility of an
+    unrelated `shared_explicitly` decision the same grantee has no grant
+    for, even in the same workspace with the same grantee account.
+    """
+    workspace_id: UUID = authz_context.workspace_id
+    owner: _Actor = authz_context.owner
+    viewer: _Actor = authz_context.viewer
+
+    incident = _create_incident(owner.client, owner.token, title="Grant target")
+    decision = _create_decision(owner.client, owner.token, title="Not granted")
+    decision_id = UUID(decision["id"])
+
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "UPDATE engineering_decisions SET visibility = 'shared_explicitly' "
+                "WHERE id = :id AND workspace_id = :workspace_id"
+            ),
+            {"id": decision_id, "workspace_id": workspace_id},
+        )
+
+    grant_response = owner.client.post(
+        "/api/v1/sharing/grants",
+        json={
+            "resource_type": "incidents",
+            "resource_id": incident["id"],
+            "grantee_account_id": str(viewer.account_id),
+            "actions": ["read"],
+        },
+        headers=_headers(owner.token),
+    )
+    assert grant_response.status_code == 201, grant_response.text
+
+    # viewer can now see the granted incident...
+    response = viewer.client.get("/api/v1/engineering/incidents")
+    assert response.status_code == 200, response.text
+    assert UUID(incident["id"]) in {UUID(row["id"]) for row in response.json()["incidents"]}
+
+    # ...but the incidents grant must not leak into decisions visibility.
+    response = viewer.client.get("/api/v1/engineering/decisions")
+    assert response.status_code == 200, response.text
+    assert decision_id not in {UUID(row["id"]) for row in response.json()["decisions"]}
+
+
+def test_expired_grant_denies_access(authz_context: _AuthzContext) -> None:
+    workspace_id: UUID = authz_context.workspace_id
+    owner: _Actor = authz_context.owner
+    viewer: _Actor = authz_context.viewer
+
+    incident = _create_incident(owner.client, owner.token, title="Expired grant target")
+    incident_id = UUID(incident["id"])
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "UPDATE incidents SET visibility = 'shared_explicitly' "
+                "WHERE id = :id AND workspace_id = :workspace_id"
+            ),
+            {"id": incident_id, "workspace_id": workspace_id},
+        )
+
+    grant_response = owner.client.post(
+        "/api/v1/sharing/grants",
+        json={
+            "resource_type": "incidents",
+            "resource_id": str(incident_id),
+            "grantee_account_id": str(viewer.account_id),
+            "actions": ["read"],
+            "expires_at": (datetime.now(UTC) - timedelta(seconds=1)).isoformat(),
+        },
+        headers=_headers(owner.token),
+    )
+    assert grant_response.status_code == 201, grant_response.text
+
+    response = viewer.client.get("/api/v1/engineering/incidents")
+    assert response.status_code == 200, response.text
+    assert incident_id not in {UUID(row["id"]) for row in response.json()["incidents"]}
+
+
+def test_private_visibility_denies_every_non_owner_workspace_member(
+    authz_context: _AuthzContext,
+) -> None:
+    """`authorize()`'s step 3 (`visibility == "private"` -> `False`, no
+    exception even for `owner`/`admin` roles) had no end-to-end regression
+    test through any engineering endpoint before this round -- every other
+    visibility-branch test in this module exercises `workspace` or
+    `shared_explicitly`.
+    """
+    workspace_id: UUID = authz_context.workspace_id
+    member: _Actor = authz_context.member
+
+    incident = _create_incident(member.client, member.token, title="Private incident")
+    incident_id = UUID(incident["id"])
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "UPDATE incidents SET visibility = 'private' "
+                "WHERE id = :id AND workspace_id = :workspace_id"
+            ),
+            {"id": incident_id, "workspace_id": workspace_id},
+        )
+
+    # The owning member can still see and act on its own private resource
+    # (authorize()'s step 2 -- owner_id match -- runs before step 3).
+    response = member.client.get("/api/v1/engineering/incidents")
+    assert response.status_code == 200, response.text
+    assert incident_id in {UUID(row["id"]) for row in response.json()["incidents"]}
+
+    # Every other role, including owner/admin, is denied -- private means
+    # private, not "workspace roles that can normally see everything."
+    for role_name in ("owner", "admin", "viewer"):
+        actor: _Actor = authz_context.actor(role_name)
+        response = actor.client.get("/api/v1/engineering/incidents")
+        assert response.status_code == 200, response.text
+        assert incident_id not in {UUID(row["id"]) for row in response.json()["incidents"]}, (
+            f"{role_name} must not see another member's private incident"
+        )
+
+        resolve_response = actor.client.post(
+            f"/api/v1/engineering/incidents/{incident_id}/resolve",
+            json={"resolved_at": datetime.now(UTC).isoformat()},
+            headers=_headers(actor.token, key=str(uuid4())),
+        )
+        assert resolve_response.status_code == 404, resolve_response.text

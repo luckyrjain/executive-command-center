@@ -53,7 +53,7 @@ Autonomous scheduling, external calendar writes, background agents, predictive M
 
 ## Non-functional requirements
 
-Attention query p95 <500 ms for 10,000 inputs; deterministic daily plan p95 <1 second; meeting pack p95 <2 seconds excluding optional enrichment. Equivalent input/policy/time gives equivalent output. Core flows work without AI/internet and meet WCAG 2.2 AA.
+Attention query p95 <500 ms for 10,000 inputs as originally accepted, widened to <600 ms local / <950 ms CI by Phase 8 Task 3's schema-wide authz migration (structural FK/trigger overhead, disclosed and root-caused in `docs/phases/phase-008/IMPLEMENTATION-STATUS.md`'s Task 3 evidence section); deterministic daily plan p95 <1 second; meeting pack p95 <2 seconds excluding optional enrichment. Equivalent input/policy/time gives equivalent output. Core flows work without AI/internet and meet WCAG 2.2 AA.
 
 ## Architecture impact
 

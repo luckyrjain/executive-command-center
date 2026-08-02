@@ -21,6 +21,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from ecc.config import get_settings
+from ecc.platform.authz import WORKSPACE_ORIGINAL_OWNER_SQL
 
 MODEL_ID = "sentence-transformers/all-MiniLM-L6-v2"
 # Bump when the model, its normalization, or the content fed to it changes in
@@ -173,15 +174,24 @@ def queue_embedding(
         # effect did.
         return EmbeddingWriteResult(written=False, reason="embedding_generation_failed")
 
+    # `owner_id` is set explicitly via the non-correlated `WORKSPACE_
+    # ORIGINAL_OWNER_SQL` subquery for the same reason retrieval.py's
+    # queue_retrieval_document does -- embedding_projections has no actor
+    # column of its own (derived from retrieval_documents, which has none
+    # either), so its BEFORE INSERT trigger would compute the identical
+    # value; setting it here just avoids the per-row trigger-dispatch cost
+    # on rebuild_embeddings' potentially-large rebuild loop.
     session.execute(
         text(
-            """
+            f"""
             INSERT INTO embedding_projections (
                 id, workspace_id, document_id, model_id, model_version,
-                dimensions, embedding, content_hash, created_at, updated_at
+                dimensions, embedding, content_hash, created_at, updated_at,
+                owner_id, visibility
             ) VALUES (
                 gen_random_uuid(), :workspace_id, :document_id, :model_id, :model_version,
-                :dimensions, CAST(:embedding AS vector), :content_hash, :now, :now
+                :dimensions, CAST(:embedding AS vector), :content_hash, :now, :now,
+                {WORKSPACE_ORIGINAL_OWNER_SQL}, 'workspace'
             )
             ON CONFLICT (workspace_id, document_id, model_id) DO UPDATE SET
                 model_version = EXCLUDED.model_version,
