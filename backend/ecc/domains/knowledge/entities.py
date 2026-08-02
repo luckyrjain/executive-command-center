@@ -23,6 +23,7 @@ from ecc.observability import (
     record_audit_outbox_failure,
     record_idempotency_conflict,
 )
+from ecc.platform import authz
 
 router = APIRouter(prefix="/api/v1/knowledge/entities", tags=["knowledge-entities"])
 
@@ -269,6 +270,7 @@ def create_entity_core(
     docs/domain/DOMAIN-MODEL.md's ownership map but physically the same
     pkos_nodes table every other knowledge entity uses, since PKOS is the
     shared canonical store (see the Phase 2 design doc's Open decision 1)."""
+    authz.require_role_action(session, auth, "write")
     request_hash = _request_hash(payload, "create")
     now = datetime.now(UTC)
     entity_id = uuid4()
@@ -284,10 +286,11 @@ def create_entity_core(
                     f"""
                     INSERT INTO pkos_nodes (
                         id, workspace_id, node_type, canonical_name, attributes,
-                        status, confidence, version, created_at, updated_at
+                        status, confidence, version, created_at, updated_at,
+                        owner_id, visibility
                     ) VALUES (
                         :id, :workspace_id, :kind, :canonical_name, CAST(:attributes AS jsonb),
-                        'active', 1.00, 1, :now, :now
+                        'active', 1.00, 1, :now, :now, :actor_id, 'workspace'
                     )
                     RETURNING {_ENTITY_FIELDS}
                     """
@@ -299,6 +302,7 @@ def create_entity_core(
                     "canonical_name": payload.canonical_name,
                     "attributes": dumps(attributes),
                     "now": now,
+                    "actor_id": auth.user_id,
                 },
             )
             .mappings()
@@ -371,8 +375,15 @@ def list_entities(
     cursor: str | None = None,
     limit: int = Query(default=50, ge=1, le=100),
 ) -> EntityListResponse:
-    clauses = ["workspace_id = :workspace_id"]
-    params: dict[str, Any] = {"workspace_id": auth.workspace_id, "limit": limit + 1}
+    visibility_sql, visibility_params = authz.visible_resource_filter_sql(
+        session, auth, resource_type="pkos_nodes", action="read", table_alias="pkos_nodes"
+    )
+    clauses = ["workspace_id = :workspace_id", f"({visibility_sql})"]
+    params: dict[str, Any] = {
+        "workspace_id": auth.workspace_id,
+        "limit": limit + 1,
+        **visibility_params,
+    }
     if kind is not None:
         clauses.append("node_type = :kind")
         params["kind"] = kind
@@ -399,6 +410,7 @@ def list_entities(
         .mappings()
         .all()
     )
+    session.rollback()
     page = rows[:limit]
     next_cursor = None
     if len(rows) > limit and page:
@@ -412,6 +424,12 @@ def list_entities(
 
 @router.get("/{entity_id}", response_model=EntityResponse)
 def get_entity(entity_id: UUID, auth: AuthDep, session: SessionDep) -> EntityResponse:
+    visible = authz.authorize(
+        session, auth, resource_type="pkos_nodes", resource_id=entity_id, action="read"
+    )
+    session.rollback()
+    if not visible:
+        raise HTTPException(status_code=404, detail="ENTITY_NOT_FOUND")
     row = _get_row(session, auth, entity_id)
     if row is None:
         raise HTTPException(status_code=404, detail="ENTITY_NOT_FOUND")
@@ -422,6 +440,12 @@ def get_entity(entity_id: UUID, auth: AuthDep, session: SessionDep) -> EntityRes
 def list_entity_aliases(
     entity_id: UUID, auth: AuthDep, session: SessionDep
 ) -> EntityAliasListResponse:
+    visible = authz.authorize(
+        session, auth, resource_type="pkos_nodes", resource_id=entity_id, action="read"
+    )
+    session.rollback()
+    if not visible:
+        raise HTTPException(status_code=404, detail="ENTITY_NOT_FOUND")
     if _get_row(session, auth, entity_id) is None:
         raise HTTPException(status_code=404, detail="ENTITY_NOT_FOUND")
     rows = (

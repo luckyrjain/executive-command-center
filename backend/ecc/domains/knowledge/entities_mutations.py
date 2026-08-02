@@ -21,6 +21,7 @@ from ecc.observability import (
     record_audit_outbox_failure,
     record_idempotency_conflict,
 )
+from ecc.platform import authz
 
 router = APIRouter(prefix="/api/v1/knowledge/entities", tags=["knowledge-entities"])
 SessionDep = Annotated[Session, Depends(get_session)]
@@ -253,6 +254,16 @@ def update_entity(
         cached = _load_cached(session, auth, idempotency_key, request_hash)
         if cached is not None:
             return cached
+        # Two-phase read-then-write authz check -- see calendar/events.py's
+        # update_calendar_event for the identical existence-leak reasoning.
+        if not authz.authorize(
+            session, auth, resource_type="pkos_nodes", resource_id=entity_id, action="read"
+        ):
+            raise HTTPException(status_code=404, detail="ENTITY_NOT_FOUND")
+        if not authz.authorize(
+            session, auth, resource_type="pkos_nodes", resource_id=entity_id, action="write"
+        ):
+            raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
         current = _get_row(session, auth, entity_id, for_update=True)
         if current is None:
             raise HTTPException(status_code=404, detail="ENTITY_NOT_FOUND")
@@ -342,6 +353,14 @@ def _transition_action(
         cached = _load_cached(session, auth, idempotency_key, request_hash)
         if cached is not None:
             return cached
+        if not authz.authorize(
+            session, auth, resource_type="pkos_nodes", resource_id=entity_id, action="read"
+        ):
+            raise HTTPException(status_code=404, detail="ENTITY_NOT_FOUND")
+        if not authz.authorize(
+            session, auth, resource_type="pkos_nodes", resource_id=entity_id, action="write"
+        ):
+            raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
         current = _get_row(session, auth, entity_id, for_update=True)
         if current is None:
             raise HTTPException(status_code=404, detail="ENTITY_NOT_FOUND")
