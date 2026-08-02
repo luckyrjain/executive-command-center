@@ -222,11 +222,38 @@ def test_create_account_and_reject_duplicate_email(client: TestClient) -> None:
 
 
 def test_create_account_rejects_short_password(client: TestClient) -> None:
-    resp = client.post(
-        "/api/v1/identity/accounts",
-        json={"email": f"{uuid4()}@example.test", "password": "short", "display_name": "Alex"},
-    )
-    assert resp.status_code == 422, resp.text
+    # `token` is required regardless, so a call missing it would 422 for
+    # that reason alone and prove nothing about password length -- a real,
+    # otherwise-valid invitation isolates the assertion to the password
+    # field specifically.
+    now = datetime.now(UTC)
+    workspace_id = uuid4()
+    inviter_users_id = uuid4()
+    email = f"{uuid4()}@example.test"
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO workspaces (id, name, created_at, timezone) "
+                "VALUES (:id, 'W', :now, 'UTC')"
+            ),
+            {"id": workspace_id, "now": now},
+        )
+        inviter_account_id = create_identity(
+            connection, workspace_id=workspace_id, user_id=inviter_users_id, now=now, role="owner"
+        )
+    token = _seed_invitation(workspace_id, email=email, invited_by=inviter_users_id)
+
+    try:
+        resp = client.post(
+            f"/api/v1/identity/accounts?token={token}",
+            json={"email": email, "password": "short", "display_name": "Alex"},
+        )
+        assert resp.status_code == 422, resp.text
+        violations = resp.json()["error"]["details"]["violations"]
+        assert any("password" in v["loc"] for v in violations), violations
+    finally:
+        _cleanup_workspace(workspace_id)
+        _cleanup_account(inviter_account_id)
 
 
 def test_login_with_single_active_membership_auto_authenticates(client: TestClient) -> None:

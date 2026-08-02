@@ -20,7 +20,7 @@ from uuid import UUID, uuid4
 
 import pytest
 from fastapi.testclient import TestClient
-from identity_fixtures import create_identity
+from identity_fixtures import add_membership, create_identity
 from sqlalchemy import text
 
 from ecc.config import get_settings
@@ -231,6 +231,40 @@ def test_create_invitation_rejects_second_concurrently_pending(
     assert second.json()["error"]["code"] == "INVITATION_ALREADY_PENDING"
 
 
+def test_create_invitation_admin_cannot_invite_as_owner(
+    owner_context: tuple[TestClient, UUID, UUID, UUID, str],
+) -> None:
+    """An `admin` may invite at any role below `owner` -- unrestricted, an
+    admin could unilaterally mint a co-owner with no `owner` ever
+    approving it.
+    """
+    client, workspace_id, _users_id, _account_id, owner_token = owner_context
+    now = datetime.now(UTC)
+    admin_users_id = uuid4()
+    with engine.begin() as connection:
+        create_identity(
+            connection, workspace_id=workspace_id, user_id=admin_users_id, now=now, role="admin"
+        )
+    admin_token = _new_session(workspace_id, admin_users_id, now)
+    with TestClient(app) as admin_client:
+        admin_client.cookies.set("ecc_session", admin_token)
+        resp = admin_client.post(
+            f"/api/v1/identity/workspaces/{workspace_id}/invitations",
+            json={"email": f"{uuid4()}@example.test", "role": "owner"},
+            headers=_headers(admin_token),
+        )
+    assert resp.status_code == 403, resp.text
+    assert resp.json()["error"]["code"] == "INSUFFICIENT_ROLE"
+
+    # The owner's own invitations to owner role still succeed.
+    owner_invite = client.post(
+        f"/api/v1/identity/workspaces/{workspace_id}/invitations",
+        json={"email": f"{uuid4()}@example.test", "role": "owner"},
+        headers=_headers(owner_token),
+    )
+    assert owner_invite.status_code == 201, owner_invite.text
+
+
 def test_list_invitations_requires_owner_or_admin(
     owner_context: tuple[TestClient, UUID, UUID, UUID, str],
 ) -> None:
@@ -251,6 +285,32 @@ def test_list_invitations_requires_owner_or_admin(
             headers=_headers(member_token),
         )
     assert resp.status_code == 403, resp.text
+
+
+def test_list_invitations_returns_created_invitation(
+    owner_context: tuple[TestClient, UUID, UUID, UUID, str],
+) -> None:
+    client, workspace_id, _users_id, _account_id, owner_token = owner_context
+    email = f"{uuid4()}@example.test"
+    created = client.post(
+        f"/api/v1/identity/workspaces/{workspace_id}/invitations",
+        json={"email": email, "role": "member"},
+        headers=_headers(owner_token),
+    )
+    assert created.status_code == 201, created.text
+
+    resp = client.get(
+        f"/api/v1/identity/workspaces/{workspace_id}/invitations", headers=_headers(owner_token)
+    )
+    assert resp.status_code == 200, resp.text
+    invitations = resp.json()["invitations"]
+    matching = [i for i in invitations if i["id"] == created.json()["id"]]
+    assert len(matching) == 1, invitations
+    assert matching[0]["email"] == email
+    assert matching[0]["role"] == "member"
+    assert matching[0]["accepted_at"] is None
+    assert matching[0]["rejected_at"] is None
+    assert matching[0]["revoked_at"] is None
 
 
 def test_new_recipient_registers_and_auto_joins_via_token(
@@ -399,6 +459,67 @@ def test_existing_account_accepts_invitation_to_a_second_workspace(
         _cleanup_workspace(other_workspace_id)
 
 
+def test_accept_invitation_rejects_already_active_member(
+    owner_context: tuple[TestClient, UUID, UUID, UUID, str],
+) -> None:
+    """An account that is already an active member of the target workspace
+    (e.g. via some earlier, separate invitation) hits `ALREADY_MEMBER`
+    rather than silently creating a second membership.
+    """
+    client, workspace_id, _users_id, _account_id, owner_token = owner_context
+    now = datetime.now(UTC)
+    other_workspace_id = _make_workspace("Already Member's WS", now)
+    other_users_id = uuid4()
+    already_member_users_id = uuid4()
+    with engine.begin() as connection:
+        existing_account_id = create_identity(
+            connection, workspace_id=other_workspace_id, user_id=other_users_id, now=now
+        )
+        existing_email = (
+            connection.execute(
+                text("SELECT email FROM accounts WHERE id = :id"), {"id": existing_account_id}
+            )
+            .mappings()
+            .one()["email"]
+        )
+        # Already an active member of `workspace_id` from some earlier,
+        # unrelated invitation -- a genuinely separate workspace for the
+        # same account, so `add_membership` (not `create_identity`) is the
+        # right helper here.
+        add_membership(
+            connection,
+            workspace_id=workspace_id,
+            account_id=existing_account_id,
+            users_id=already_member_users_id,
+            role="viewer",
+            now=now,
+        )
+    existing_token = _new_session(other_workspace_id, other_users_id, now)
+
+    invite = client.post(
+        f"/api/v1/identity/workspaces/{workspace_id}/invitations",
+        json={"email": existing_email, "role": "admin"},
+        headers=_headers(owner_token),
+    )
+    assert invite.status_code == 201, invite.text
+    invite_token = invite.json()["token"]
+    invite_id = invite.json()["id"]
+
+    try:
+        with TestClient(app) as existing_client:
+            existing_client.cookies.set("ecc_session", existing_token)
+            accept = existing_client.post(
+                f"/api/v1/identity/invitations/{invite_id}/accept",
+                json={"token": invite_token},
+                headers=_headers(existing_token),
+            )
+        assert accept.status_code == 409, accept.text
+        assert accept.json()["error"]["code"] == "ALREADY_MEMBER"
+    finally:
+        _cleanup_new_member(existing_account_id)
+        _cleanup_workspace(other_workspace_id)
+
+
 def test_accept_invitation_rejects_wrong_token(
     owner_context: tuple[TestClient, UUID, UUID, UUID, str],
 ) -> None:
@@ -467,6 +588,46 @@ def test_reject_invitation_then_accept_fails(
     finally:
         _cleanup_workspace(other_workspace_id)
         _cleanup_account(rejector_account_id)
+
+
+def test_reject_invitation_rejects_email_mismatch(
+    owner_context: tuple[TestClient, UUID, UUID, UUID, str],
+) -> None:
+    """A caller with a valid session and a valid token, but whose own
+    account email does not match the invitation's recipient email, cannot
+    reject someone else's invitation on their behalf.
+    """
+    client, workspace_id, _users_id, _account_id, owner_token = owner_context
+    now = datetime.now(UTC)
+    other_workspace_id = _make_workspace("Mismatched Caller WS", now)
+    caller_users_id = uuid4()
+    with engine.begin() as connection:
+        caller_account_id = create_identity(
+            connection, workspace_id=other_workspace_id, user_id=caller_users_id, now=now
+        )
+    caller_token = _new_session(other_workspace_id, caller_users_id, now)
+
+    invite = client.post(
+        f"/api/v1/identity/workspaces/{workspace_id}/invitations",
+        json={"email": f"{uuid4()}@example.test", "role": "member"},
+        headers=_headers(owner_token),
+    )
+    invite_id = invite.json()["id"]
+    invite_token = invite.json()["token"]
+
+    try:
+        with TestClient(app) as caller_client:
+            caller_client.cookies.set("ecc_session", caller_token)
+            resp = caller_client.post(
+                f"/api/v1/identity/invitations/{invite_id}/reject",
+                json={"token": invite_token},
+                headers=_headers(caller_token),
+            )
+        assert resp.status_code == 403, resp.text
+        assert resp.json()["error"]["code"] == "INVITATION_EMAIL_MISMATCH"
+    finally:
+        _cleanup_workspace(other_workspace_id)
+        _cleanup_account(caller_account_id)
 
 
 def test_revoke_invitation_by_admin_prevents_later_acceptance(

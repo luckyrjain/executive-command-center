@@ -32,12 +32,13 @@ email)" at the database level.** The design doc's own definition of
 immutable predicate a partial index can express -- Postgres partial-index
 predicates must be IMMUTABLE, and `now()` is only STABLE. The uniqueness
 check is instead enforced procedurally in `ecc.domains.identity.
-invitations.create_invitation_endpoint`, via `SELECT ... FOR UPDATE`
-locking every existing row for the same `(workspace_id, email)` pair
-before evaluating the pending predicate and inserting -- the same
-row-locking discipline `lock_idempotency` already uses elsewhere in this
-codebase for double-submit protection, applied here to serialize
-concurrent invitation-creation attempts for the same recipient instead.
+invitations.create_invitation_endpoint`, via `pg_advisory_xact_lock` on
+the `(workspace_id, email)` pair itself -- not `SELECT ... FOR UPDATE`
+alone, which only locks *existing* rows and would lock nothing at all for
+a brand-new recipient (the common case) -- the same advisory-lock
+discipline `_lock_idempotency` already uses elsewhere in this codebase for
+double-submit protection, applied here to serialize concurrent
+invitation-creation attempts for the same recipient instead.
 """
 
 import sqlalchemy as sa

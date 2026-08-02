@@ -47,6 +47,17 @@ explicitly for the create endpoint. Pending invitee email addresses are
 sensitive enough (who has been invited, and to what role) that this
 module holds every invitation endpoint to the same `owner`/`admin` bar
 except accept/reject, which are recipient-initiated by design.
+
+**An `admin` may not invite someone as `owner`.** Neither the design doc
+nor the implementation plan states a restriction here, but leaving it
+unrestricted would let any `admin` unilaterally mint a co-owner with no
+`owner` ever approving it -- a real privilege-escalation path, caught in
+this PR's own adversarial review round. `create_invitation_endpoint`
+requires the caller to already be an `owner` themselves before a `role:
+"owner"` invitation is accepted; `admin` can still invite at
+`admin`/`member`/`viewer`. This is a minimal, conservative guard ahead of
+Task 3's full authorization/role matrix, disclosed here as a judgment call
+rather than left as a silent gap.
 """
 
 from __future__ import annotations
@@ -54,12 +65,14 @@ from __future__ import annotations
 import secrets
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
+from hmac import compare_digest
 from typing import Annotated
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy import text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from ecc.auth import AuthDep, CsrfDep
@@ -76,7 +89,7 @@ SessionDep = Annotated[Session, Depends(get_session)]
 _INVITATION_MAX_AGE_SECONDS = 7 * 24 * 60 * 60
 
 
-def _require_owner_or_admin(session: Session, *, workspace_id: UUID, users_id: UUID) -> None:
+def _require_owner_or_admin(session: Session, *, workspace_id: UUID, users_id: UUID) -> str:
     membership = (
         session.execute(
             text(
@@ -90,6 +103,7 @@ def _require_owner_or_admin(session: Session, *, workspace_id: UUID, users_id: U
     )
     if membership is None or membership["role"] not in {"owner", "admin"}:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="INSUFFICIENT_ROLE")
+    return str(membership["role"])
 
 
 class InvitationCreateRequest(BaseModel):
@@ -164,7 +178,17 @@ def create_invitation_endpoint(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="WORKSPACE_NOT_FOUND")
     now = datetime.now(UTC)
     with session.begin():
-        _require_owner_or_admin(session, workspace_id=workspace_id, users_id=auth.user_id)
+        caller_role = _require_owner_or_admin(
+            session, workspace_id=workspace_id, users_id=auth.user_id
+        )
+        # An `admin` may invite at any role up to (not including) `owner`
+        # -- unrestricted, an admin could unilaterally mint a co-owner with
+        # no owner ever having approved it. Only an existing `owner` may
+        # invite another `owner`. This is a minimal, conservative guard
+        # ahead of Task 3's full authorization/role matrix, not a
+        # substitute for it.
+        if payload.role == "owner" and caller_role != "owner":
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="INSUFFICIENT_ROLE")
 
         already_member = (
             session.execute(
@@ -186,12 +210,25 @@ def create_invitation_endpoint(
         if already_member is not None:
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="ALREADY_MEMBER")
 
-        # Row-locks every existing invitation for this (workspace_id, email)
-        # pair before evaluating the "still pending" predicate, so two
-        # concurrent create attempts for the same recipient serialize
-        # instead of racing -- `expires_at > now()` cannot be a partial
-        # unique index (see the migration's own docstring), so this is the
-        # procedural equivalent.
+        # `SELECT ... FOR UPDATE` alone only locks *existing* rows -- for a
+        # brand-new recipient (the common case: no invitation has ever been
+        # created for this workspace/email pair) it locks nothing at all,
+        # so two concurrent creates would both see zero rows, both evaluate
+        # `still_pending = False`, and both insert. An advisory lock on the
+        # (workspace_id, email) pair itself, taken before that read,
+        # serializes concurrent creates regardless of whether a row already
+        # exists -- the same `pg_advisory_xact_lock(hashtextextended(...))`
+        # discipline `_lock_idempotency` already uses elsewhere in this
+        # codebase (e.g. `ecc.domains.scheduling.meetings`) for exactly
+        # this "lock a key that may have zero rows" shape.
+        session.execute(
+            text("SELECT pg_advisory_xact_lock(hashtextextended(:lock_key, 0))"),
+            {"lock_key": f"invitation:{workspace_id}:{payload.email}"},
+        )
+        # `FOR UPDATE` below is now belt-and-suspenders (the advisory lock
+        # above already serializes this whole check-then-insert sequence)
+        # but kept since it costs nothing and matches the migration's own
+        # docstring description of the row-locking behavior.
         existing = (
             session.execute(
                 text(
@@ -339,7 +376,7 @@ def accept_invitation_endpoint(
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND, detail="INVITATION_NOT_FOUND"
             )
-        if invitation["token_hash"] != token_hash:
+        if not compare_digest(invitation["token_hash"], token_hash):
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED, detail="INVITATION_TOKEN_INVALID"
             )
@@ -389,29 +426,40 @@ def accept_invitation_endpoint(
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="ALREADY_MEMBER")
 
         new_users_id = uuid4()
-        session.execute(
-            text(
-                "INSERT INTO users (id, workspace_id, account_id, created_at) "
-                "VALUES (:id, :workspace_id, :account_id, :now)"
-            ),
-            {
-                "id": new_users_id,
-                "workspace_id": target_workspace_id,
-                "account_id": account_row["account_id"],
-                "now": now,
-            },
-        )
-        # `invited_by` must be a `users.id` within `target_workspace_id` --
-        # `auth.user_id` is the accepting caller's own users_id, scoped to
-        # whichever *other* workspace their session belongs to (this
-        # endpoint exists precisely because the caller is not yet a member
-        # of `target_workspace_id`), so it can never satisfy
-        # `fk_workspace_memberships_workspace_invited_by`. The invitation's
-        # own `invited_by` (the real inviter, already a member of
-        # `target_workspace_id`) is the only value that can.
-        session.execute(
-            text(
-                """
+        # `already_member` above is a plain read, not `FOR UPDATE` -- it
+        # narrows the common case but cannot itself prevent two concurrent
+        # accepts (e.g. of two separately-created pending invitations for
+        # the same recipient) from both passing it and racing on these two
+        # inserts. `uq_users_workspace_account`/`uq_workspace_memberships_
+        # workspace_account` are the actual backstop; catching the
+        # violation here turns that into the documented `409 ALREADY_
+        # MEMBER` instead of an unhandled 500, matching how `create_
+        # account_endpoint` already handles its own analogous `accounts.
+        # email` race.
+        try:
+            session.execute(
+                text(
+                    "INSERT INTO users (id, workspace_id, account_id, created_at) "
+                    "VALUES (:id, :workspace_id, :account_id, :now)"
+                ),
+                {
+                    "id": new_users_id,
+                    "workspace_id": target_workspace_id,
+                    "account_id": account_row["account_id"],
+                    "now": now,
+                },
+            )
+            # `invited_by` must be a `users.id` within `target_workspace_id`
+            # -- `auth.user_id` is the accepting caller's own users_id,
+            # scoped to whichever *other* workspace their session belongs
+            # to (this endpoint exists precisely because the caller is not
+            # yet a member of `target_workspace_id`), so it can never
+            # satisfy `fk_workspace_memberships_workspace_invited_by`. The
+            # invitation's own `invited_by` (the real inviter, already a
+            # member of `target_workspace_id`) is the only value that can.
+            session.execute(
+                text(
+                    """
                 INSERT INTO workspace_memberships (
                     id, workspace_id, account_id, users_id, role, status,
                     invited_by, created_at, updated_at
@@ -420,17 +468,21 @@ def accept_invitation_endpoint(
                     :invited_by, :now, :now
                 )
                 """
-            ),
-            {
-                "id": uuid4(),
-                "workspace_id": target_workspace_id,
-                "account_id": account_row["account_id"],
-                "users_id": new_users_id,
-                "role": invitation["role"],
-                "invited_by": invitation["invited_by"],
-                "now": now,
-            },
-        )
+                ),
+                {
+                    "id": uuid4(),
+                    "workspace_id": target_workspace_id,
+                    "account_id": account_row["account_id"],
+                    "users_id": new_users_id,
+                    "role": invitation["role"],
+                    "invited_by": invitation["invited_by"],
+                    "now": now,
+                },
+            )
+        except IntegrityError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT, detail="ALREADY_MEMBER"
+            ) from exc
         session.execute(
             text("UPDATE invitations SET accepted_at = :now WHERE id = :id"),
             {"now": now, "id": invitation_id},
@@ -485,7 +537,7 @@ def reject_invitation_endpoint(
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND, detail="INVITATION_NOT_FOUND"
             )
-        if invitation["token_hash"] != token_hash:
+        if not compare_digest(invitation["token_hash"], token_hash):
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED, detail="INVITATION_TOKEN_INVALID"
             )
