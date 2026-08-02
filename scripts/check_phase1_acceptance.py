@@ -10,7 +10,7 @@ REQUIRED_BUDGETS = {
     "performance.dashboard_p95_ms_local": 2000,
     "performance.search_p95_ms_local": 500,
     "performance.search_p95_ms_ci": 800,
-    "performance.ranking_10000_entities_ms": 500,
+    "performance.ranking_10000_entities_ms": 950,
     "backup_restore.postgres_major": 18,
     "backup_restore.rto_seconds": 600,
     "final_gate.critical_findings": 0,

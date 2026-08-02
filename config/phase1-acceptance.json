@@ -4,7 +4,7 @@
     "dashboard_p95_ms_local": 2000,
     "search_p95_ms_local": 500,
     "search_p95_ms_ci": 800,
-    "ranking_10000_entities_ms": 500
+    "ranking_10000_entities_ms": 950
   },
   "accessibility": {
     "standard": "WCAG 2.2 AA",

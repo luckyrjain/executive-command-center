@@ -28,7 +28,7 @@ close PHASE-001: the seven-day daily-use validation
 |---|---|---|
 | Dashboard performance | repeatable PostgreSQL benchmark in the standard test suite | p95 < 2,000 ms |
 | Search performance | `tests/test_search_performance_postgres.py` | p95 < 500 ms local; < 800 ms CI |
-| Priority ranking | `tests/test_risks_attention_postgres.py` with 10,000 entities | < 500 ms |
+| Priority ranking | `tests/test_risks_attention_postgres.py` with 10,000 entities | < 500 ms as originally accepted; **widened to < 600 ms local / < 950 ms CI by Phase 8 Task 3** (`docs/phases/phase-008/IMPLEMENTATION-STATUS.md`'s Task 3 evidence section) — migration `0063_phase8_authz_visibility.py` added a NOT NULL `owner_id` with a composite FK plus a `BEFORE INSERT` trigger to `attention_items`, and `EXPLAIN (ANALYZE, BUFFERS)` against a real 10,000-row payload confirmed the resulting ~15-20% overhead (FK constraint check + trigger dispatch) is structural, not a code inefficiency; see `RANKING_BUDGET_SECONDS` in the test file for the disclosed sizing. `config/phase1-acceptance.json`'s `performance.ranking_10000_entities_ms` was updated to match. |
 | Accessibility | ten named Playwright scenarios (`frontend/e2e/scenarios/`) plus `assertNoSeriousAccessibilityViolations`, orchestrated by `frontend/e2e/run.mjs` (Task 6) | WCAG 2.2 AA core flows, zero serious/critical axe violations |
 | Backup integrity | custom-format PostgreSQL archive and SHA-256 (Task 9) | checksum valid |
 | Restore integrity | clean PostgreSQL 18 restore with the full Task 9 invariant set (see below) | migration head, row counts, constraints and every invariant below match |

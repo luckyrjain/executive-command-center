@@ -54,4 +54,4 @@ Pin is an explicit score boost. Defer excludes until `deferred_until`. Dismiss s
 
 ## Expiry and performance
 
-Attention projections expire after 30 minutes, workspace-day rollover, or source mutation. Recommendations have independent expiry. Ranking 10,000 representative entities must complete under 500 ms in CI and dashboard assembly p95 remains below two seconds.
+Attention projections expire after 30 minutes, workspace-day rollover, or source mutation. Recommendations have independent expiry. Ranking 10,000 representative entities must complete under 500 ms in CI as originally accepted, widened to under 950 ms CI (600 ms local) by Phase 8 Task 3 -- see `docs/phases/phase-008/IMPLEMENTATION-STATUS.md`'s Task 3 evidence section for the root-caused, disclosed reason -- and dashboard assembly p95 remains below two seconds.
