@@ -59,6 +59,8 @@ from ecc.observability import (
     record_database_failure,
     record_idempotency_conflict,
 )
+from ecc.platform import authz
+from ecc.platform.authz import WORKSPACE_ORIGINAL_OWNER_SQL
 
 from . import tools as ai_tools
 from .budgets import (
@@ -849,13 +851,13 @@ def _persist_terminal(
                 policy_version, model_id, provider, prompt_id, prompt_version,
                 input_ref, output, evidence, error_code, prompt_tokens,
                 output_tokens, cost, attempts, started_at, completed_at,
-                created_at, updated_at
+                created_at, updated_at, owner_id, visibility
             ) VALUES (
                 :id, :workspace_id, :actor_id, :task_type, :data_class, :status,
                 :policy_version, :model_id, :provider, :prompt_id, :prompt_version,
                 CAST(:input_ref AS jsonb), CAST(:output AS jsonb), CAST(:evidence AS jsonb),
                 :error_code, :prompt_tokens, :output_tokens, 0.0, :attempts,
-                :started_at, :completed_at, :started_at, :completed_at
+                :started_at, :completed_at, :started_at, :completed_at, :actor_id, 'workspace'
             )
             """
         ),
@@ -885,12 +887,13 @@ def _persist_terminal(
     for step in steps:
         session.execute(
             text(
-                """
+                f"""
                 INSERT INTO ai_run_steps (
-                    id, workspace_id, run_id, sequence, kind, status, trace, created_at
+                    id, workspace_id, run_id, sequence, kind, status, trace, created_at,
+                    owner_id, visibility
                 ) VALUES (
                     :id, :workspace_id, :run_id, :sequence, :kind, :status,
-                    CAST(:trace AS jsonb), :created_at
+                    CAST(:trace AS jsonb), :created_at, {WORKSPACE_ORIGINAL_OWNER_SQL}, 'workspace'
                 )
                 """
             ),
@@ -2100,6 +2103,7 @@ def create_run(
     response, then finds it cached, rather than independently reaching
     `execute_run` and triggering a second real model call.
     """
+    authz.require_role_action(session, auth, "write")
     request_hash = _request_hash(payload, "create_run")
     now = datetime.now(UTC)
     with _held_idempotency_lock(auth, idempotency_key):
@@ -2108,15 +2112,19 @@ def create_run(
         if cached is not None:
             return cached
 
+        # attention_item_id is this run's input, not something it mutates
+        # -- a read-only authorize, matching claims.py's parent-boundary
+        # pattern, collapsed into the same 404 the plain existence check
+        # already raised for a nonexistent/cross-workspace id.
         with session.begin():
-            exists = session.execute(
-                text(
-                    "SELECT 1 FROM attention_items "
-                    "WHERE workspace_id = :workspace_id AND id = :item_id"
-                ),
-                {"workspace_id": auth.workspace_id, "item_id": payload.attention_item_id},
-            ).first()
-        if exists is None:
+            visible = authz.authorize(
+                session,
+                auth,
+                resource_type="attention_items",
+                resource_id=payload.attention_item_id,
+                action="read",
+            )
+        if not visible:
             raise HTTPException(status_code=404, detail="ATTENTION_ITEM_NOT_FOUND")
 
         run = execute_run(
@@ -2150,6 +2158,12 @@ def create_run(
 
 @router.get("/runs/{run_id}", response_model=AiRunResponse)
 def get_run(run_id: UUID, auth: AuthDep, session: SessionDep) -> AiRunResponse:
+    visible = authz.authorize(
+        session, auth, resource_type="ai_runs", resource_id=run_id, action="read"
+    )
+    session.rollback()
+    if not visible:
+        raise HTTPException(status_code=404, detail="AI_RUN_NOT_FOUND")
     row = (
         session.execute(
             text(
@@ -2180,6 +2194,14 @@ def cancel_run(run_id: UUID, auth: AuthDep, session: SessionDep, _csrf: CsrfDep)
     """
     now = datetime.now(UTC)
     with session.begin():
+        if not authz.authorize(
+            session, auth, resource_type="ai_runs", resource_id=run_id, action="read"
+        ):
+            raise HTTPException(status_code=404, detail="AI_RUN_NOT_FOUND")
+        if not authz.authorize(
+            session, auth, resource_type="ai_runs", resource_id=run_id, action="write"
+        ):
+            raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
         updated = (
             session.execute(
                 text(
