@@ -45,6 +45,7 @@ from uuid import UUID, uuid4
 
 import httpx
 import pytest
+from identity_fixtures import create_identity
 from pydantic import ValidationError
 from sqlalchemy import text
 
@@ -94,17 +95,12 @@ def write_actions_test_context() -> Iterator[tuple[UUID, UUID]]:
             ),
             {"id": workspace_id, "now": now},
         )
-        connection.execute(
-            text(
-                "INSERT INTO users (id, workspace_id, email, password_hash, created_at) "
-                "VALUES (:id, :workspace_id, :email, 'test-password-hash', :now)"
-            ),
-            {
-                "id": user_id,
-                "workspace_id": workspace_id,
-                "email": f"{user_id}@example.test",
-                "now": now,
-            },
+        create_identity(
+            connection,
+            workspace_id=workspace_id,
+            user_id=user_id,
+            email=f"{user_id}@example.test",
+            now=now,
         )
     try:
         yield workspace_id, user_id
@@ -307,17 +303,12 @@ def test_load_credential_rejects_connector_account_in_different_workspace(
             ),
             {"id": other_workspace_id, "now": now},
         )
-        connection.execute(
-            text(
-                "INSERT INTO users (id, workspace_id, email, password_hash, created_at) "
-                "VALUES (:id, :workspace_id, :email, 'x', :now)"
-            ),
-            {
-                "id": other_user_id,
-                "workspace_id": other_workspace_id,
-                "email": f"{other_user_id}@example.test",
-                "now": now,
-            },
+        create_identity(
+            connection,
+            workspace_id=other_workspace_id,
+            user_id=other_user_id,
+            email=f"{other_user_id}@example.test",
+            now=now,
         )
     try:
         other_account_id = _insert_connector_account(
@@ -433,17 +424,12 @@ def test_github_add_issue_comment_rejects_connector_account_in_different_workspa
             ),
             {"id": other_workspace_id, "now": now},
         )
-        connection.execute(
-            text(
-                "INSERT INTO users (id, workspace_id, email, password_hash, created_at) "
-                "VALUES (:id, :workspace_id, :email, 'x', :now)"
-            ),
-            {
-                "id": other_user_id,
-                "workspace_id": other_workspace_id,
-                "email": f"{other_user_id}@example.test",
-                "now": now,
-            },
+        create_identity(
+            connection,
+            workspace_id=other_workspace_id,
+            user_id=other_user_id,
+            email=f"{other_user_id}@example.test",
+            now=now,
         )
     try:
         other_account_id = _insert_connector_account(
@@ -758,17 +744,12 @@ def test_gitlab_add_note_rejects_connector_account_in_different_workspace(
             ),
             {"id": other_workspace_id, "now": now},
         )
-        connection.execute(
-            text(
-                "INSERT INTO users (id, workspace_id, email, password_hash, created_at) "
-                "VALUES (:id, :workspace_id, :email, 'x', :now)"
-            ),
-            {
-                "id": other_user_id,
-                "workspace_id": other_workspace_id,
-                "email": f"{other_user_id}@example.test",
-                "now": now,
-            },
+        create_identity(
+            connection,
+            workspace_id=other_workspace_id,
+            user_id=other_user_id,
+            email=f"{other_user_id}@example.test",
+            now=now,
         )
     try:
         other_account_id = _insert_connector_account(
@@ -1098,17 +1079,12 @@ def test_jira_add_comment_rejects_connector_account_in_different_workspace(
             ),
             {"id": other_workspace_id, "now": now},
         )
-        connection.execute(
-            text(
-                "INSERT INTO users (id, workspace_id, email, password_hash, created_at) "
-                "VALUES (:id, :workspace_id, :email, 'x', :now)"
-            ),
-            {
-                "id": other_user_id,
-                "workspace_id": other_workspace_id,
-                "email": f"{other_user_id}@example.test",
-                "now": now,
-            },
+        create_identity(
+            connection,
+            workspace_id=other_workspace_id,
+            user_id=other_user_id,
+            email=f"{other_user_id}@example.test",
+            now=now,
         )
     try:
         other_account_id = _insert_connector_account(

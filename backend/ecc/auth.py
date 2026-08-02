@@ -36,6 +36,11 @@ def require_auth_context(
         )
 
     token_hash = sha256(ecc_session.encode("utf-8")).hexdigest()
+    # Joins through to `accounts` (Phase 8 Task 1) so a disabled account's
+    # already-issued sessions stop working immediately, not just at the next
+    # login -- the same "revocation propagates by construction, no cache to
+    # invalidate" guarantee `docs/superpowers/specs/2026-08-01-phase-8-multi-
+    # user-design.md` Decision 4 makes for every other revocation path.
     row = (
         session.execute(
             text(
@@ -43,9 +48,12 @@ def require_auth_context(
             SELECT s.workspace_id, s.user_id, w.timezone
             FROM sessions AS s
             JOIN workspaces AS w ON w.id = s.workspace_id
+            JOIN users AS u ON u.workspace_id = s.workspace_id AND u.id = s.user_id
+            JOIN accounts AS a ON a.id = u.account_id
             WHERE s.token_hash = :token_hash
               AND s.revoked_at IS NULL
               AND s.expires_at > :now
+              AND a.disabled_at IS NULL
             """
             ),
             {"token_hash": token_hash, "now": datetime.now(UTC)},

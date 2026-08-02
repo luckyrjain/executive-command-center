@@ -42,6 +42,7 @@ from ecc.domains.governance.recommendation_mutations import (
 from ecc.domains.governance.recommendation_queries import router as recommendation_queries_router
 from ecc.domains.governance.risk_mutations import router as risk_mutations_router
 from ecc.domains.governance.risks import router as risks_router
+from ecc.domains.identity.accounts import router as identity_accounts_router
 from ecc.domains.identity.person_organizations import router as identity_router
 from ecc.domains.knowledge.claims import router as knowledge_claims_router
 from ecc.domains.knowledge.entities import router as knowledge_entities_router
@@ -124,6 +125,7 @@ app.include_router(knowledge_resolution_router)
 app.include_router(knowledge_entity_operations_router)
 app.include_router(knowledge_retrieval_router)
 app.include_router(identity_router)
+app.include_router(identity_accounts_router)
 app.include_router(search_router)
 app.include_router(dashboard_briefs_router)
 # Phase 4 Task 1: read-only registry/policy surface (GET /ai/models, GET
@@ -290,15 +292,27 @@ async def response_contract_middleware(
     if body_iterator is None:
         return response
     body = b"".join([chunk async for chunk in body_iterator])
+    # `dict(response.headers)`/a `headers={...}` dict comprehension would
+    # silently collapse repeated header names (e.g. two `set-cookie`
+    # entries, one per cookie) down to whichever value came last --
+    # `Headers.raw`/`MutableHeaders.raw` preserve every entry as a list of
+    # byte-pairs, so building the replacement response's `raw_headers` by
+    # extending that list (rather than passing a `headers=` dict to the
+    # constructor, which is a plain mapping and cannot represent a repeated
+    # key at all) is what keeps every cookie a caller set.
+    preserved_headers = [
+        (key, value)
+        for key, value in response.headers.raw
+        if key.decode("latin-1").lower() not in {"content-length", "content-type"}
+    ]
     try:
         payload = loads(body)
     except (JSONDecodeError, UnicodeDecodeError):
-        return Response(
-            content=body,
-            status_code=response.status_code,
-            headers=dict(response.headers),
-            media_type=response.media_type,
+        fallback_response = Response(
+            content=body, status_code=response.status_code, media_type=response.media_type
         )
+        fallback_response.raw_headers.extend(preserved_headers)
+        return fallback_response
 
     if response.status_code >= 400:
         detail = payload.get("detail") if isinstance(payload, dict) else payload
@@ -307,17 +321,11 @@ async def response_contract_middleware(
         payload["request_id"] = request_id
         payload["correlation_id"] = correlation_id
 
-    headers = {
-        key: value
-        for key, value in response.headers.items()
-        if key.lower() not in {"content-length", "content-type"}
-    }
-    return JSONResponse(
-        content=payload,
-        status_code=response.status_code,
-        headers=headers,
-        background=response.background,
+    json_response = JSONResponse(
+        content=payload, status_code=response.status_code, background=response.background
     )
+    json_response.raw_headers.extend(preserved_headers)
+    return json_response
 
 
 # Registered before CORSMiddleware (below) so it is the second-outermost

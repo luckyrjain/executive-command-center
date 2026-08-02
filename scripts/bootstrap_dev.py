@@ -52,7 +52,8 @@ def _existing_identity(cursor: psycopg.Cursor[tuple[object, ...]]) -> tuple[UUID
         SELECT u.workspace_id, u.id
         FROM users AS u
         JOIN workspaces AS w ON w.id = u.workspace_id
-        WHERE w.name = %s AND u.email = %s
+        JOIN accounts AS a ON a.id = u.account_id
+        WHERE w.name = %s AND a.email = %s
         ORDER BY w.created_at DESC
         LIMIT 1
         """,
@@ -68,7 +69,18 @@ def _create_identity(
     cursor: psycopg.Cursor[tuple[object, ...]],
     now: datetime,
 ) -> tuple[UUID, UUID]:
+    # Phase 8 Task 1 (docs/superpowers/specs/2026-08-01-phase-8-multi-user-
+    # design.md Decision 1): identity is now split across `accounts`
+    # (workspace-independent, what a person authenticates as) and `users`
+    # (unchanged FK anchor, gains account_id) plus `workspace_memberships`
+    # (the mutable role/status this dev identity's own 'owner'/'active' row
+    # records). This dev-only bootstrap account still never gets a real
+    # password login -- `password_hash` stays the same placeholder string
+    # `POST /identity/auth/login` can never verify against, since this
+    # identity is only ever reached through the /dev/bootstrap code-exchange
+    # flow below, not real credentials.
     workspace_id = uuid4()
+    account_id = uuid4()
     user_id = uuid4()
     cursor.execute(
         "INSERT INTO workspaces (id, name, created_at, timezone) VALUES (%s, %s, %s, %s)",
@@ -76,16 +88,28 @@ def _create_identity(
     )
     cursor.execute(
         """
-        INSERT INTO users (id, workspace_id, email, password_hash, created_at)
+        INSERT INTO accounts (id, email, password_hash, display_name, created_at)
         VALUES (%s, %s, %s, %s, %s)
         """,
         (
-            user_id,
-            workspace_id,
+            account_id,
             "local@example.com",
             "development-bootstrap-no-password-login",
+            "Local Development",
             now,
         ),
+    )
+    cursor.execute(
+        "INSERT INTO users (id, workspace_id, account_id, created_at) VALUES (%s, %s, %s, %s)",
+        (user_id, workspace_id, account_id, now),
+    )
+    cursor.execute(
+        """
+        INSERT INTO workspace_memberships (
+            id, workspace_id, account_id, users_id, role, status, invited_by, created_at, updated_at
+        ) VALUES (%s, %s, %s, %s, 'owner', 'active', %s, %s, %s)
+        """,
+        (uuid4(), workspace_id, account_id, user_id, user_id, now, now),
     )
     return workspace_id, user_id
 

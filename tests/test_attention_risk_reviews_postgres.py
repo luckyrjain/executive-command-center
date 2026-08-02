@@ -6,6 +6,7 @@ from uuid import UUID, uuid4
 
 import pytest
 from fastapi.testclient import TestClient
+from identity_fixtures import create_identity
 from sqlalchemy import text
 
 from ecc.config import get_settings
@@ -34,17 +35,12 @@ def risk_review_test_context() -> Iterator[tuple[TestClient, UUID, UUID, str]]:
             ),
             {"id": workspace_id, "created_at": now},
         )
-        connection.execute(
-            text(
-                "INSERT INTO users (id, workspace_id, email, password_hash, created_at) "
-                "VALUES (:id, :workspace_id, :email, 'test-password-hash', :created_at)"
-            ),
-            {
-                "id": user_id,
-                "workspace_id": workspace_id,
-                "email": f"{user_id}@example.test",
-                "created_at": now,
-            },
+        create_identity(
+            connection,
+            workspace_id=workspace_id,
+            user_id=user_id,
+            email=f"{user_id}@example.test",
+            now=now,
         )
         connection.execute(
             text(
@@ -506,17 +502,12 @@ def test_review_queue_hidden_across_workspaces(
             ),
             {"id": other_workspace_id, "now": now},
         )
-        connection.execute(
-            text(
-                "INSERT INTO users (id, workspace_id, email, password_hash, created_at) "
-                "VALUES (:id, :workspace_id, :email, 'hash', :now)"
-            ),
-            {
-                "id": other_user_id,
-                "workspace_id": other_workspace_id,
-                "email": f"{other_user_id}@example.test",
-                "now": now,
-            },
+        create_identity(
+            connection,
+            workspace_id=other_workspace_id,
+            user_id=other_user_id,
+            email=f"{other_user_id}@example.test",
+            now=now,
         )
         connection.execute(
             text(

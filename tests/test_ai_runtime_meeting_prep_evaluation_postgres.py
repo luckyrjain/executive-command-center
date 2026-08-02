@@ -38,6 +38,7 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 from fixtures.phase4_evaluation_meeting_prep import DATASET_VERSION, EXAMPLES, TASK_TYPE
+from identity_fixtures import create_identity
 from sqlalchemy import text
 
 from ecc.auth import AuthContext
@@ -118,17 +119,12 @@ def run_context() -> Iterator[dict]:
             ),
             {"id": workspace_id, "created_at": now},
         )
-        connection.execute(
-            text(
-                "INSERT INTO users (id, workspace_id, email, password_hash, created_at) "
-                "VALUES (:id, :workspace_id, :email, 'hash', :created_at)"
-            ),
-            {
-                "id": user_id,
-                "workspace_id": workspace_id,
-                "email": f"{user_id}@example.test",
-                "created_at": now,
-            },
+        create_identity(
+            connection,
+            workspace_id=workspace_id,
+            user_id=user_id,
+            email=f"{user_id}@example.test",
+            now=now,
         )
         connection.execute(
             text(

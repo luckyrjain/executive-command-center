@@ -23,6 +23,7 @@ from typing import Any
 from uuid import UUID, uuid4
 
 import pytest
+from identity_fixtures import create_identity
 from sqlalchemy import text
 
 from ecc.auth import AuthContext
@@ -53,17 +54,12 @@ def tool_context() -> Iterator[dict]:
             ),
             {"id": workspace_id, "now": now},
         )
-        connection.execute(
-            text(
-                "INSERT INTO users (id, workspace_id, email, password_hash, created_at) "
-                "VALUES (:id, :workspace_id, :email, 'hash', :now)"
-            ),
-            {
-                "id": user_id,
-                "workspace_id": workspace_id,
-                "email": f"{user_id}@example.test",
-                "now": now,
-            },
+        create_identity(
+            connection,
+            workspace_id=workspace_id,
+            user_id=user_id,
+            email=f"{user_id}@example.test",
+            now=now,
         )
 
     yield {

@@ -2,6 +2,7 @@ from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
 import pytest
+from identity_fixtures import create_identity
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 
@@ -21,18 +22,13 @@ def test_session_cannot_reference_user_from_another_workspace() -> None:
                 {"id": workspace_b, "name": "B", "created_at": datetime.now(UTC)},
             ],
         )
-        connection.execute(
-            text(
-                "INSERT INTO users (id, workspace_id, email, password_hash, created_at) "
-                "VALUES (:id, :workspace_id, :email, :password_hash, :created_at)"
-            ),
-            {
-                "id": user_b,
-                "workspace_id": workspace_b,
-                "email": f"{user_b}@example.com",
-                "password_hash": "hash",
-                "created_at": datetime.now(UTC),
-            },
+        create_identity(
+            connection,
+            workspace_id=workspace_b,
+            user_id=user_b,
+            email=f"{user_b}@example.com",
+            now=datetime.now(UTC),
+            password_hash="hash",
         )
 
     with pytest.raises(IntegrityError), engine.begin() as connection:
