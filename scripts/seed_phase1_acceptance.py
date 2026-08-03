@@ -234,6 +234,9 @@ _WORKSPACE_ID_TABLES: tuple[str, ...] = (
     # Phase 8 Task 7 (migration 0065) -- member_notifications, same reason,
     # a sixteenth occurrence of the identical class of gap.
     "member_notifications",
+    # Phase 8 Task 8 (migration 0066) -- ownership_transfers, same reason,
+    # a seventeenth occurrence of the identical class of gap.
+    "ownership_transfers",
 )
 # `workspaces` is scoped by its own `id`, not a `workspace_id` column.
 _WORKSPACE_TABLE = "workspaces"
@@ -359,6 +362,8 @@ def _fixture_ids(label: str) -> dict[str, UUID]:
         "delegation": seed_id(label, "delegation", "acceptance"),
         # Phase 8 Task 7.
         "member_notification": seed_id(label, "member_notification", "acceptance"),
+        # Phase 8 Task 8.
+        "ownership_transfer": seed_id(label, "ownership_transfer", "acceptance"),
     }
 
 
@@ -2909,6 +2914,44 @@ def _seed_member_notifications(
     )
 
 
+def _seed_ownership_transfers(
+    cur: psycopg.Cursor[Any], label: str, ids: Mapping[str, UUID]
+) -> None:
+    """Phase 8 Task 8 (migration 0066) -- ownership_transfers, workspace-
+    scoped like every table above. Names the workspace's own seeded
+    ``incident`` fixture and its two seeded identities (owner as
+    ``from_account_id``, the Task 6 recipient identity as ``to_account_id``)
+    -- a realistic shape, not a synthetic placeholder -- without mutating
+    the incident's own real ``owner_id`` (this row is an audit-trail
+    fixture only, the same ``_seed_delegations``/``_seed_member_
+    notifications`` reasoning: never read through the real
+    ``ecc.platform.authz`` ownership-transfer endpoints, only needs to
+    prove the table round-trips through backup/restore and stays
+    workspace-isolated).
+    """
+    cur.execute(
+        """
+        INSERT INTO ownership_transfers (
+            id, workspace_id, resource_type, resource_id, from_account_id,
+            to_account_id, status, initiated_by, created_at, completed_at
+        ) VALUES (
+            %(id)s, %(workspace_id)s, 'incidents', %(resource_id)s, %(from_account_id)s,
+            %(to_account_id)s, 'completed', %(initiated_by)s, %(created_at)s, %(created_at)s
+        )
+        ON CONFLICT (id) DO NOTHING
+        """,
+        {
+            "id": ids["ownership_transfer"],
+            "workspace_id": ids["workspace"],
+            "resource_id": ids["incident"],
+            "from_account_id": ids["account"],
+            "to_account_id": ids["recipient_account"],
+            "initiated_by": ids["user"],
+            "created_at": SEED_EPOCH,
+        },
+    )
+
+
 def seed(conn: psycopg.Connection[Any]) -> None:
     """Insert deterministic Phase 1 fixtures into every table for both workspaces.
 
@@ -2983,6 +3026,10 @@ def seed(conn: psycopg.Connection[Any]) -> None:
             # depends on the recipient identity and delegation seeded
             # inside _seed_delegations above.
             _seed_member_notifications(cur, label, ids)
+            # Phase 8 Task 8 (migration 0066) -- ownership_transfers;
+            # depends on the incident fixture and the recipient identity
+            # seeded inside _seed_engineering/_seed_delegations above.
+            _seed_ownership_transfers(cur, label, ids)
 
 
 def fixture_row_checksums(conn: psycopg.Connection[Any]) -> dict[str, str]:

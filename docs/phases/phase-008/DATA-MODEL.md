@@ -2,7 +2,7 @@
 id: PHASE-008-DATA-MODEL
 title: Phase 8 Multi-user Data Model
 status: Approved for Implementation
-version: 0.4.0
+version: 0.5.0
 owner: Lucky Jain
 ---
 
@@ -47,3 +47,9 @@ Full endpoint/authorization/state-machine detail is in `API-SCHEMAS.md`'s own "T
 **Shipped.** Migration `0065_phase8_notifications.py` adds `member_notifications` (`id`, `workspace_id`, `account_id`, `notification_type`, `resource_ref`, `read_at`, `created_at`) -- exactly the plan's own literal column list, with `resource_ref` a single text column encoded `f"{resource_type}:{resource_id}"` rather than a widened `(resource_type, resource_id)` pair. No `owner_id`/`visibility` -- a notification is inherently recipient-scoped, `account_id` already answering "who may see this row" more precisely than the generic visibility mechanism, the identical reasoning migration `0064`'s own three tables gave.
 
 `UNIQUE (workspace_id, account_id, notification_type, resource_ref)` is this migration's own answer to the plan's "notification idempotency (a duplicate underlying event does not double-notify)" requirement -- every writer inserts via `INSERT ... ON CONFLICT (...) DO NOTHING`, so the same underlying event recurring produces at most one row per account. `GET /shared/activity` reads the pre-existing `audit_events` table (no new event source), filtered per row through `ecc.platform.authz.authorize()` against each candidate row's live, current resource state -- full detail in `API-SCHEMAS.md`'s own "Task 7 status" section.
+
+## Task 8 status
+
+**Shipped.** Migration `0066_phase8_ownership_transfers.py` adds `ownership_transfers` (`id`, `workspace_id`, `resource_type`, `resource_id`, `from_account_id`, `to_account_id`, `status`, `initiated_by`, `created_at`, `completed_at`) -- exactly the plan's own literal column list. `status` carries no `CHECK` constraint, unlike `delegations.status`'s fully contract-defined state machine -- today it is always written `'completed'` (an immediate, single-step reassignment, `completed_at` always equal to `created_at`), but nothing in this migration's own scope rules out a future task adding a genuine bilateral confirmation step, so the column is deliberately left open rather than narrowed to a single-value enum.
+
+No new migration adds member-removal columns -- `workspace_memberships.removed_at` already existed (Task 1's own migration), unused until this task's `DELETE /identity/workspaces/{id}/members/{user_id}` became the first endpoint to set it. Removal also revokes every live `sessions` row for that membership in the same transaction (`PERMISSION-CONTRACT.md`'s own "second, independent propagation path" line, made concrete for the first time here) and force-transitions any `proposed`/`accepted` `delegations` row naming the removed member to `cancelled` -- migration `0064`'s own docstring reserved that exact value for this exact call site. Full endpoint/authorization detail is in `API-SCHEMAS.md`'s own "Task 8 status" section, not repeated here.

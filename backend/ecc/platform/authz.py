@@ -365,6 +365,81 @@ def _account_id_for(session: Session, *, workspace_id: UUID, users_id: UUID) -> 
     return None if row is None else row["account_id"]
 
 
+def _users_id_for_account(session: Session, *, workspace_id: UUID, account_id: UUID) -> UUID | None:
+    """The inverse of `_account_id_for` -- resolves an `accounts.id` to its
+    `users.id` anchor within one workspace. `owner_id` on every table
+    `_RESOURCE_TABLES` names FKs `users.(workspace_id, id)`, not
+    `accounts.id` (migration `0063_phase8_authz_visibility.py`'s own FK
+    topology), so `create_ownership_transfer_endpoint` needs this to stamp
+    the transferred resource's new `owner_id` from the request's
+    account-scoped `to_account_id`. Read-only -- see `_current_role`'s own
+    docstring for why this never calls `session.rollback()`.
+    """
+    row = (
+        session.execute(
+            text(
+                "SELECT id FROM users "
+                "WHERE workspace_id = :workspace_id AND account_id = :account_id"
+            ),
+            {"workspace_id": workspace_id, "account_id": account_id},
+        )
+        .mappings()
+        .one_or_none()
+    )
+    return None if row is None else row["id"]
+
+
+_UNOWNABLE_FOR_REMOVAL_PURPOSES: frozenset[str] = frozenset({"audit_events"})
+
+
+def owned_resource_summary(
+    session: Session, *, workspace_id: UUID, users_id: UUID
+) -> list[dict[str, object]]:
+    """Every grantable `resource_type` (excluding `UNGRANTABLE_RESOURCE_
+    TYPES` -- Phase 7 personal-domain data is never workspace-transferable,
+    a member-removal decision made once here rather than re-litigated at
+    every call site -- and `audit_events`, see below) this `users_id`
+    currently owns at least one row of, as `[{"resource_type": str, "count":
+    int}]`. This is `ecc.domains.identity.membership_removal.remove_member_
+    endpoint`'s own "records only they own" check -- iterating every table
+    with one `SELECT count(*)` each is the same scanning shape `scripts/
+    verify_restore.sh` already uses across every `workspace_id`-scoped
+    table, acceptable here for the same reason: an administrative,
+    infrequent operation, not a hot path.
+
+    **`audit_events` is excluded, a real bug found and fixed against this
+    function's own first test run, not a design choice made up front.**
+    `audit_events` is itself one of the 63 tables in `_RESOURCE_TABLES`, but
+    `ecc.platform.notifications`'s own `list_shared_activity_endpoint`
+    docstring already established that every domain's `_write_side_effects`-
+    equivalent writes `audit_events.owner_id` as the *acting user's own id*
+    unconditionally, on every single event -- never a meaningful signal of
+    who owns anything. Scanning it here without exclusion meant *any* active
+    member who had ever created or mutated *any* resource (i.e. essentially
+    every member) would show up as "owning" an `audit_events` row, making
+    removal spuriously blocked almost universally -- caught directly by
+    `tests/test_identity_membership_removal_postgres.py`'s own first CI run
+    (`OWNED_RESOURCES_BLOCK_REMOVAL` on `audit_events` after the real,
+    intentionally-owned `incidents` row had already been transferred away).
+
+    Read-only -- see `_current_role`'s own docstring for why this never
+    calls `session.rollback()`.
+    """
+    summary: list[dict[str, object]] = []
+    excluded = UNGRANTABLE_RESOURCE_TYPES | _UNOWNABLE_FOR_REMOVAL_PURPOSES
+    for resource_type in sorted(_RESOURCE_TABLES - excluded):
+        count = session.execute(
+            text(
+                f"SELECT count(*) FROM {resource_type} "  # noqa: S608
+                "WHERE workspace_id = :workspace_id AND owner_id = :users_id"
+            ),
+            {"workspace_id": workspace_id, "users_id": users_id},
+        ).scalar_one()
+        if count:
+            summary.append({"resource_type": resource_type, "count": count})
+    return summary
+
+
 def _load_resource(
     session: Session, *, resource_type: str, resource_id: UUID
 ) -> ResourceRef | None:
@@ -1232,3 +1307,193 @@ def get_effective_permissions_endpoint(
     if result is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="RESOURCE_NOT_FOUND")
     return result
+
+
+# ---------------------------------------------------------------------------
+# Phase 8 Task 8 -- POST|GET /api/v1/ownership/transfers
+# ---------------------------------------------------------------------------
+#
+# Immediate, single-step reassignment of one resource's `owner_id` from one
+# account to another -- the counterpart `ecc.domains.identity.membership_
+# removal.remove_member_endpoint` drives before it will allow removing a
+# member who still owns workspace resources (`owned_resource_summary`
+# above is exactly what that endpoint checks). No bilateral confirmation
+# step exists (unlike `delegations`' own contract-defined state machine) --
+# see migration `0066_phase8_ownership_transfers.py`'s own docstring for
+# why `status` is left open rather than hard-coded to a single value.
+
+ownership_router = APIRouter(prefix="/api/v1/ownership", tags=["ownership"])
+
+
+class OwnershipTransferCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    resource_type: str
+    resource_id: UUID
+    to_account_id: UUID
+
+
+class OwnershipTransferResponse(BaseModel):
+    id: UUID
+    resource_type: str
+    resource_id: UUID
+    from_account_id: UUID
+    to_account_id: UUID
+    status: str
+    initiated_by: UUID
+    created_at: datetime
+    completed_at: datetime | None
+
+
+class OwnershipTransferListResponse(BaseModel):
+    transfers: list[OwnershipTransferResponse]
+
+
+@ownership_router.post(
+    "/transfers", response_model=OwnershipTransferResponse, status_code=status.HTTP_201_CREATED
+)
+def create_ownership_transfer_endpoint(
+    payload: OwnershipTransferCreateRequest,
+    auth: AuthDep,
+    session: SessionDep,
+    _csrf: CsrfDep,
+) -> OwnershipTransferResponse:
+    """Same authorization gate `POST /sharing/grants` already uses (the
+    resource's own current owner, or workspace `owner`/`admin`) -- widening
+    who may reassign a resource's ownership is exactly the kind of
+    consequential decision this codebase already reserves to that same
+    bar, not opened to every member. `require_grantable` (not merely
+    `require_known_resource_type`) rejects `UNGRANTABLE_RESOURCE_TYPES`
+    here too -- a Phase 7 personal-domain resource's ownership can never be
+    reassigned, the identical structural guarantee that keeps it
+    unshareable.
+    """
+    try:
+        require_grantable(payload.resource_type)
+    except UnknownResourceTypeError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="RESOURCE_TYPE_NOT_GRANTABLE"
+        ) from exc
+
+    with session.begin():
+        resource = _load_resource(
+            session, resource_type=payload.resource_type, resource_id=payload.resource_id
+        )
+        if resource is None or resource.workspace_id != auth.workspace_id:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="RESOURCE_NOT_FOUND")
+        _require_owner_admin_or_resource_owner(session, auth, resource)
+
+        to_membership = (
+            session.execute(
+                text(
+                    "SELECT 1 FROM workspace_memberships "
+                    "WHERE workspace_id = :workspace_id AND account_id = :account_id "
+                    "AND status = 'active'"
+                ),
+                {"workspace_id": auth.workspace_id, "account_id": payload.to_account_id},
+            )
+            .mappings()
+            .one_or_none()
+        )
+        if to_membership is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="RECIPIENT_NOT_FOUND")
+
+        to_users_id = _users_id_for_account(
+            session, workspace_id=auth.workspace_id, account_id=payload.to_account_id
+        )
+        assert to_users_id is not None  # active membership implies a users row exists
+
+        from_account_id = _account_id_for(
+            session, workspace_id=auth.workspace_id, users_id=resource.owner_id
+        )
+        assert from_account_id is not None  # every owner_id names a real users row
+
+        session.execute(
+            text(
+                f"UPDATE {payload.resource_type} SET owner_id = :owner_id "  # noqa: S608
+                "WHERE id = :id"
+            ),
+            {"owner_id": to_users_id, "id": payload.resource_id},
+        )
+
+        transfer_id = uuid4()
+        now = datetime.now(UTC)
+        session.execute(
+            text(
+                """
+                INSERT INTO ownership_transfers (
+                    id, workspace_id, resource_type, resource_id, from_account_id,
+                    to_account_id, status, initiated_by, created_at, completed_at
+                ) VALUES (
+                    :id, :workspace_id, :resource_type, :resource_id, :from_account_id,
+                    :to_account_id, 'completed', :initiated_by, :now, :now
+                )
+                """
+            ),
+            {
+                "id": transfer_id,
+                "workspace_id": auth.workspace_id,
+                "resource_type": payload.resource_type,
+                "resource_id": payload.resource_id,
+                "from_account_id": from_account_id,
+                "to_account_id": payload.to_account_id,
+                "initiated_by": auth.user_id,
+                "now": now,
+            },
+        )
+    return OwnershipTransferResponse(
+        id=transfer_id,
+        resource_type=payload.resource_type,
+        resource_id=payload.resource_id,
+        from_account_id=from_account_id,
+        to_account_id=payload.to_account_id,
+        status="completed",
+        initiated_by=auth.user_id,
+        created_at=now,
+        completed_at=now,
+    )
+
+
+@ownership_router.get("/transfers", response_model=OwnershipTransferListResponse)
+def list_ownership_transfers_endpoint(
+    auth: AuthDep, session: SessionDep
+) -> OwnershipTransferListResponse:
+    """`owner`/`admin` see every transfer in the workspace (an audit trail
+    of who reassigned what); every other role sees only transfers naming
+    their own account as either party -- the identical
+    `list_grants_endpoint` split.
+    """
+    role = _current_role(session, workspace_id=auth.workspace_id, users_id=auth.user_id)
+    if role in {"owner", "admin"}:
+        rows = (
+            session.execute(
+                text(
+                    "SELECT id, resource_type, resource_id, from_account_id, to_account_id, "
+                    "status, initiated_by, created_at, completed_at "
+                    "FROM ownership_transfers WHERE workspace_id = :workspace_id "
+                    "ORDER BY created_at DESC"
+                ),
+                {"workspace_id": auth.workspace_id},
+            )
+            .mappings()
+            .all()
+        )
+    else:
+        account_id = _account_id_for(session, workspace_id=auth.workspace_id, users_id=auth.user_id)
+        rows = (
+            session.execute(
+                text(
+                    "SELECT id, resource_type, resource_id, from_account_id, to_account_id, "
+                    "status, initiated_by, created_at, completed_at "
+                    "FROM ownership_transfers WHERE workspace_id = :workspace_id "
+                    "AND (from_account_id = :account_id OR to_account_id = :account_id) "
+                    "ORDER BY created_at DESC"
+                ),
+                {"workspace_id": auth.workspace_id, "account_id": account_id},
+            )
+            .mappings()
+            .all()
+        )
+    session.rollback()
+    return OwnershipTransferListResponse(
+        transfers=[OwnershipTransferResponse(**dict(r)) for r in rows]
+    )

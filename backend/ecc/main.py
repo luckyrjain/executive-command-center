@@ -45,6 +45,7 @@ from ecc.domains.governance.risk_mutations import router as risk_mutations_route
 from ecc.domains.governance.risks import router as risks_router
 from ecc.domains.identity.accounts import router as identity_accounts_router
 from ecc.domains.identity.invitations import router as identity_invitations_router
+from ecc.domains.identity.membership_removal import router as identity_membership_removal_router
 from ecc.domains.identity.person_organizations import router as identity_router
 from ecc.domains.knowledge.claims import router as knowledge_claims_router
 from ecc.domains.knowledge.entities import router as knowledge_entities_router
@@ -77,6 +78,7 @@ from ecc.http_security import (
 )
 from ecc.logging import configure_logging
 from ecc.observability import render_metrics, request_observability_middleware
+from ecc.platform.authz import ownership_router
 from ecc.platform.authz import router as authz_router
 from ecc.platform.notifications import router as notifications_router
 from ecc.search import router as search_router
@@ -143,6 +145,11 @@ app.include_router(collaboration_delegations_router)
 # Phase 8 Task 7: GET /notifications, POST /notifications/{id}/read,
 # GET /shared/activity (ecc.platform.notifications).
 app.include_router(notifications_router)
+# Phase 8 Task 8: POST|GET /ownership/transfers (ecc.platform.authz) and
+# GET /identity/workspaces/{id}/members, PATCH|DELETE .../members/{user_id}
+# (ecc.domains.identity.membership_removal).
+app.include_router(ownership_router)
+app.include_router(identity_membership_removal_router)
 app.include_router(search_router)
 app.include_router(dashboard_briefs_router)
 # Phase 4 Task 1: read-only registry/policy surface (GET /ai/models, GET
