@@ -365,9 +365,7 @@ def _account_id_for(session: Session, *, workspace_id: UUID, users_id: UUID) -> 
     return None if row is None else row["account_id"]
 
 
-def _users_id_for_account(
-    session: Session, *, workspace_id: UUID, account_id: UUID
-) -> UUID | None:
+def _users_id_for_account(session: Session, *, workspace_id: UUID, account_id: UUID) -> UUID | None:
     """The inverse of `_account_id_for` -- resolves an `accounts.id` to its
     `users.id` anchor within one workspace. `owner_id` on every table
     `_RESOURCE_TABLES` names FKs `users.(workspace_id, id)`, not

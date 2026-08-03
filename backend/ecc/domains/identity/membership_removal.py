@@ -133,9 +133,7 @@ class MemberRemovalResponse(BaseModel):
     export: MemberExportSnapshot
 
 
-def _member_row(
-    session: Session, *, workspace_id: UUID, user_id: UUID
-) -> dict[str, Any] | None:
+def _member_row(session: Session, *, workspace_id: UUID, user_id: UUID) -> dict[str, Any] | None:
     row = (
         session.execute(
             text(
@@ -240,10 +238,7 @@ def update_member_role_endpoint(
 
         now = datetime.now(UTC)
         session.execute(
-            text(
-                "UPDATE workspace_memberships SET role = :role, updated_at = :now "
-                "WHERE id = :id"
-            ),
+            text("UPDATE workspace_memberships SET role = :role, updated_at = :now WHERE id = :id"),
             {"role": payload.role, "now": now, "id": member["membership_id"]},
         )
     return MemberResponse(
