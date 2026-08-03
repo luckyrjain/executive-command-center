@@ -61,9 +61,11 @@ def _headers(token: str, key: str | None = None) -> dict[str, str]:
 
 def _cleanup_workspace(workspace_id: UUID) -> None:
     with engine.begin() as connection:
+        # delegation_events/delegation_evidence carry no workspace_id column
+        # of their own (scoped only via delegation_id) -- deleting
+        # delegations cascades to both (migration 0064's own ON DELETE
+        # CASCADE), so neither needs -- or can take -- a direct DELETE here.
         for table in (
-            "delegation_events",
-            "delegation_evidence",
             "delegations",
             "resource_grants",
             "incidents",
