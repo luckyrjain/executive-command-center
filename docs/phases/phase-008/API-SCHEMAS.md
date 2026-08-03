@@ -2,7 +2,7 @@
 id: PHASE-008-API-SCHEMAS
 title: Phase 8 Multi-user API
 status: Approved for Implementation
-version: 0.6.0
+version: 0.7.0
 owner: Lucky Jain
 ---
 
@@ -28,6 +28,7 @@ POST /delegations/{id}/accept|reject|revoke|complete
 GET /notifications
 POST /notifications/{id}/read
 GET /shared/activity
+GET /audit
 POST|GET /ownership/transfers
 ```
 
@@ -89,7 +90,7 @@ Frontend: `frontend/src/features/collaboration/SharingReview.tsx` -- a standalon
 
 **A second disclosed scope boundary: mapping `audit_events.aggregate_type` (each domain's own ad hoc vocabulary, e.g. `"incident"`) to `authz`'s `resource_type` (the table name, e.g. `"incidents"`) uses an explicit, closed dict, not a guessed pluralization rule.** Grepping every `aggregate_type` call site across the ~35 domain files that write `audit_events` found no shared naming convention -- a wrong guess could silently map one resource's events onto an unrelated table with a colliding UUID and leak them, far worse than the safe failure mode. Any `aggregate_type` not in `_AGGREGATE_TYPE_TO_RESOURCE_TYPE` is excluded from the feed entirely (fails closed), never shown unfiltered -- covering today only the `engineering` domain (Task 3's own original reference domain) plus the Phase 7 personal-domain aggregate types (useful precisely because they are `UNGRANTABLE_RESOURCE_TYPES`, the concrete fixture `test_shared_activity_redacts_private_resource_from_other_members` exercises). Widening the map to the remaining ~30 domains is incremental follow-up work requiring no change to the filtering logic itself.
 
-Deliberately narrower than `GET /api/v1/audit` (the unrestricted, workspace-wide admin audit log `ecc.domains.platform.audit_queries` already exposes): `/shared/activity`'s response omits `before`/`after`/`metadata` entirely ("there was activity on this resource," not a field-level diff) and requires active membership but no elevated role. Pagination over-fetches (`limit * 4` candidate rows per query, across up to 5 queries) to try to fill one page despite an unknown fraction being redacted per page -- a bounded best-effort, not a guarantee; a short page with a non-null `next_cursor` means "keep going," not "no more exist."
+Deliberately narrower than `GET /api/v1/audit` (the `owner`/`admin`-only, workspace-wide admin audit log `ecc.domains.platform.audit_queries` already exposes -- role-gated since the second whole-phase review found it had none at all): `/shared/activity`'s response omits `before`/`after`/`metadata` entirely ("there was activity on this resource," not a field-level diff) and requires active membership but no elevated role. Pagination over-fetches (`limit * 4` candidate rows per query, across up to 5 queries) to try to fill one page despite an unknown fraction being redacted per page -- a bounded best-effort, not a guarantee; a short page with a non-null `next_cursor` means "keep going," not "no more exist."
 
 **Test suite** (`tests/test_platform_notifications_postgres.py`, new, 9 tests): the two literal plan requirements (duplicate-event idempotency; private-resource redaction) plus grant/delegation notification wiring end to end, `unread_only` filtering, mark-read idempotency and its "never leak existence" `404` shape, `/shared/activity`'s positive case (a `workspace`-visibility resource is shown), and the disclosed `_AGGREGATE_TYPE_TO_RESOURCE_TYPE` scope boundary (an `invitation` event is excluded, not shown unfiltered).
 

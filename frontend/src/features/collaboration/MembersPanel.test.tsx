@@ -239,6 +239,50 @@ describe('MembersPanel', () => {
     await waitFor(() => expect(document.activeElement).toBe(screen.getByRole('button', { name: 'Remove' })))
   })
 
+  it('does not steal focus to a row about to unmount after a successful removal', async () => {
+    // Regression test for a bug found in the third whole-phase review: the
+    // Cancel-focus-restoration effect above could not tell "cancelled" from
+    // "succeeded" -- both flip confirmRemove back to false -- so it also
+    // refocused the trigger button right after a *successful* removal,
+    // moments before this whole row unmounts once the members refetch drops
+    // it, dropping focus to <body> anyway but only after visibly stealing it
+    // first. `removedSuccessfullyRef` (MembersPanel.tsx) is what now
+    // distinguishes the two paths.
+    const exportSnapshot = {
+      account_id: 'account-1',
+      email: 'a@example.test',
+      display_name: 'Ada',
+      role: 'member',
+      joined_at: '2026-01-01T00:00:00Z',
+      removed_at: '2026-07-01T00:00:00Z',
+    }
+    let removed = false
+    const fetch = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      const method = (init?.method ?? 'GET').toUpperCase()
+      if (url.endsWith('/identity/me')) return response(me())
+      if (url.includes('/identity/workspaces') && !url.includes('/members') && !url.includes('/invitations')) {
+        return response({ workspaces: [workspace()] })
+      }
+      if (method === 'DELETE' && url.includes('/members/user-1')) {
+        removed = true
+        return response({ user_id: 'user-1', export: exportSnapshot })
+      }
+      if (url.includes('/members')) return response({ members: removed ? [] : [member()] })
+      if (url.includes('/invitations')) return response({ invitations: [] })
+      return response({})
+    })
+    vi.stubGlobal('fetch', fetch)
+
+    renderPanel()
+    await screen.findByText('Ada')
+    fireEvent.click(screen.getByRole('button', { name: 'Remove' }))
+    fireEvent.click(await screen.findByRole('button', { name: 'Confirm removal' }))
+
+    await waitFor(() => expect(screen.queryByText('Ada')).toBeNull())
+    expect(document.activeElement).toBe(document.body)
+  })
+
   it('lets a non-manager remove themselves ("leave workspace") and reloads afterward', async () => {
     const reload = vi.fn()
     Object.defineProperty(window, 'location', { value: { ...window.location, reload }, writable: true })

@@ -1776,6 +1776,16 @@ def _validate_team_entity(session: Session, auth: AuthContext, team_entity_id: U
     express "and its `node_type` must be `'team'`"). `None` is valid and
     means "clear the assignment," so this only runs the check when a real
     id was supplied.
+
+    Found missing in the third whole-phase review: the existence check alone
+    let a caller confirm a `pkos_nodes` row's id and assign a repository/work-
+    item to it regardless of that node's own visibility -- `waiting.py`'s own
+    precedent this docstring already claims to mirror re-checks
+    `authz.authorize(..., action="read")` immediately after the raw existence
+    query and folds a denial into the same 404 an outright-missing id
+    returns, so a narrowed-visibility node is indistinguishable from a
+    nonexistent one either way. This was the one call site that dropped that
+    second check while copying the rest of the pattern.
     """
     if team_entity_id is None:
         return
@@ -1787,6 +1797,14 @@ def _validate_team_entity(session: Session, auth: AuthContext, team_entity_id: U
         {"workspace_id": auth.workspace_id, "id": team_entity_id},
     ).one_or_none()
     if row is None:
+        raise HTTPException(status_code=404, detail="TEAM_ENTITY_NOT_FOUND")
+    if not authz.authorize(
+        session,
+        auth,
+        resource_type="pkos_nodes",
+        resource_id=team_entity_id,
+        action="read",
+    ):
         raise HTTPException(status_code=404, detail="TEAM_ENTITY_NOT_FOUND")
     if row[0] != "team":
         raise HTTPException(status_code=422, detail="TEAM_ENTITY_KIND_MISMATCH")

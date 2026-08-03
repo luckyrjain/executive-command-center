@@ -401,6 +401,93 @@ def test_workspace_isolation(
             )
 
 
+def test_narrowing_an_entity_to_private_hides_it_from_other_members_search(
+    retrieval_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    """The one real end-to-end test of `retrieval.py`'s own second whole-
+    phase review fix: `_run_hybrid_query`'s (and the lexical CTE's)
+    `visibility_sql` was repointed from `resource_type="retrieval_documents"`
+    to `resource_type="pkos_nodes", table_alias="n"` specifically so search
+    checks the *live* source node's visibility, not `retrieval_documents`'
+    own copy of it -- before this test, that fix had zero automated
+    coverage; it was hand-verified once, outside pytest, directly against
+    Postgres INSERT/UPDATE/ON CONFLICT statements, and never asserted
+    through the real `GET /api/v1/knowledge/retrieve` endpoint two distinct
+    members actually call.
+    """
+    client, workspace_id, _owner_user_id, owner_token = retrieval_test_context
+    entity_id = _create_entity(client, owner_token, "narrow-entity", "person", "Ada Lovelace")
+
+    member_user_id = uuid4()
+    member_token = f"session-{uuid4()}"
+    now = datetime.now(UTC)
+    with engine.begin() as connection:
+        create_identity(
+            connection,
+            workspace_id=workspace_id,
+            user_id=member_user_id,
+            email=f"{member_user_id}@example.test",
+            now=now,
+            role="member",
+        )
+        connection.execute(
+            text(
+                "INSERT INTO sessions (id, workspace_id, user_id, token_hash, "
+                "expires_at, last_seen_at) VALUES (:id, :workspace_id, :user_id, "
+                ":token_hash, :expires_at, :last_seen_at)"
+            ),
+            {
+                "id": uuid4(),
+                "workspace_id": workspace_id,
+                "user_id": member_user_id,
+                "token_hash": sha256(member_token.encode()).hexdigest(),
+                "expires_at": now + timedelta(hours=1),
+                "last_seen_at": now,
+            },
+        )
+    member_client = TestClient(app)
+    member_client.cookies.set("ecc_session", member_token)
+    try:
+        # Still workspace-visibility (the default): the other member sees it.
+        response = _retrieve(member_client, member_token, "narrow-before", q="Ada Lovelace")
+        assert response.status_code == 200, response.text
+        assert any(item["entity_id"] == str(entity_id) for item in response.json()["items"])
+
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    "UPDATE pkos_nodes SET visibility = 'private' "
+                    "WHERE id = :id AND workspace_id = :workspace_id"
+                ),
+                {"id": entity_id, "workspace_id": workspace_id},
+            )
+
+        # Narrowed to private: the other member's search omits it entirely
+        # -- no title/snippet leak, not merely a redacted/partial result.
+        response = _retrieve(member_client, member_token, "narrow-after", q="Ada Lovelace")
+        assert response.status_code == 200, response.text
+        assert all(item["entity_id"] != str(entity_id) for item in response.json()["items"])
+
+        # The owner can still find their own now-private entity.
+        response = _retrieve(client, owner_token, "narrow-owner", q="Ada Lovelace")
+        assert response.status_code == 200, response.text
+        assert any(item["entity_id"] == str(entity_id) for item in response.json()["items"])
+    finally:
+        member_client.close()
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    "DELETE FROM sessions WHERE workspace_id = :workspace_id "
+                    "AND user_id = :user_id"
+                ),
+                {"workspace_id": workspace_id, "user_id": member_user_id},
+            )
+            connection.execute(
+                text("DELETE FROM users WHERE workspace_id = :workspace_id AND id = :user_id"),
+                {"workspace_id": workspace_id, "user_id": member_user_id},
+            )
+
+
 def test_rebuild_retrieval_documents_reconstructs_after_manual_deletion(
     retrieval_test_context: tuple[TestClient, UUID, UUID, str],
 ) -> None:

@@ -556,6 +556,16 @@ def create_run_endpoint(
                 status_code=409,
                 detail={"code": "KILL_SWITCH_ACTIVE", "workflow_id": result.workflow_id},
             )
+        if isinstance(result, worker_module.ActorMembershipInactive):
+            # Defensive only, not a real reachable path here: `auth.user_id`
+            # already passed `authz.require_role_action`'s own active-
+            # membership check a few lines above, immediately upstream of
+            # this same `enqueue_run` call, so this branch exists purely to
+            # keep every member of `enqueue_run`'s own return-type union
+            # handled explicitly at this call site (`ActorMembershipInactive`
+            # was added in the third whole-phase review specifically for
+            # `scheduler.py`'s fire path -- see that dataclass's docstring).
+            raise HTTPException(status_code=409, detail={"code": "ACTOR_MEMBERSHIP_INACTIVE"})
 
         response = _to_response(result)
         _write_side_effects(

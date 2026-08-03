@@ -465,6 +465,86 @@ def test_evidence_grant_scoped_to_exactly_the_named_resources(
     assert adjacent["id"] not in visible
 
 
+def test_accept_time_reauthorization_skips_evidence_the_delegator_lost_access_to(
+    delegation_context: _DelegationContext,
+) -> None:
+    """Found untested by the third whole-phase review, despite the fix
+    itself landing in the second: `_grant_evidence` re-runs `authorize()`
+    for the *delegator* against each evidence item at accept time, not just
+    once at proposal time, and silently skips (rather than fails) an item
+    that no longer passes. Before this test, that re-check had zero
+    automated coverage -- exercised here by having the resource's owner
+    (`admin`, not the delegator) revoke the delegator's own `resource_grants`
+    access to a `shared_explicitly` evidence item in the window between
+    propose and accept.
+    """
+    ctx = delegation_context
+    obligation = _create_incident(ctx.delegator.client, ctx.delegator.token, title="Obligation")
+    evidence = _create_incident(ctx.admin.client, ctx.admin.token, title="Admin-owned evidence")
+
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "UPDATE incidents SET visibility = 'private' "
+                "WHERE id = :id AND workspace_id = :workspace_id"
+            ),
+            {"id": UUID(obligation["id"]), "workspace_id": ctx.workspace_id},
+        )
+        connection.execute(
+            text(
+                "UPDATE incidents SET visibility = 'shared_explicitly' "
+                "WHERE id = :id AND workspace_id = :workspace_id"
+            ),
+            {"id": UUID(evidence["id"]), "workspace_id": ctx.workspace_id},
+        )
+
+    grant_response = ctx.admin.client.post(
+        "/api/v1/sharing/grants",
+        json={
+            "resource_type": "incidents",
+            "resource_id": evidence["id"],
+            "grantee_account_id": str(ctx.delegator.account_id),
+            "actions": ["read"],
+        },
+        headers=_headers(ctx.admin.token),
+    )
+    assert grant_response.status_code == 201, grant_response.text
+    grant_id = grant_response.json()["id"]
+
+    # The delegator can read the evidence (via the grant) at proposal time.
+    delegation = _propose(
+        ctx.delegator.client,
+        ctx.delegator.token,
+        recipient_account_id=ctx.recipient.account_id,
+        obligation_resource_id=obligation["id"],
+        evidence=[{"resource_type": "incidents", "resource_id": evidence["id"]}],
+    )
+    assert "id" in delegation, delegation
+
+    # The evidence's real owner revokes the delegator's grant before the
+    # recipient ever accepts -- the delegator's own access is now gone.
+    revoke_response = ctx.admin.client.delete(
+        f"/api/v1/sharing/grants/{grant_id}", headers=_headers(ctx.admin.token)
+    )
+    assert revoke_response.status_code == 200, revoke_response.text
+
+    accept = ctx.recipient.client.post(
+        f"/api/v1/delegations/{delegation['id']}/accept",
+        headers=_headers(ctx.recipient.token, key=str(uuid4())),
+    )
+    assert accept.status_code == 200, accept.text
+
+    visible = {
+        row["id"]
+        for row in ctx.recipient.client.get("/api/v1/engineering/incidents").json()["incidents"]
+    }
+    # The obligation is still granted (the delegator's own read access to it
+    # never lapsed) -- but the evidence item is silently omitted, not
+    # granted, since the delegator could no longer read it at accept time.
+    assert obligation["id"] in visible
+    assert evidence["id"] not in visible
+
+
 def test_workspace_and_party_isolation(delegation_context: _DelegationContext) -> None:
     ctx = delegation_context
     incident = _create_incident(ctx.delegator.client, ctx.delegator.token)

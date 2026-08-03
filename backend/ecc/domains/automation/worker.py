@@ -1033,6 +1033,32 @@ class WorkflowKilled:
 
 
 @dataclass(frozen=True, slots=True)
+class ActorMembershipInactive:
+    """`enqueue_run` was asked to start a run attributed to a `users_id`
+    whose workspace membership is no longer `active`.
+
+    Found in the third whole-phase review: `scheduler.py`'s own module
+    docstring already discloses that `run_scheduler_once` has no caller
+    `AuthContext` to re-check per tick, and passes `trigger.created_by`
+    straight through to this function's `actor_id` -- but nothing verified
+    that `users_id` still held active membership, so a `schedule` trigger
+    authored by a since-removed member kept minting fresh runs, attributed
+    to someone no longer in the workspace, on every due tick forever (the
+    second whole-phase review's `cancel_runs_for_removed_member` only
+    force-cancels a removed member's *already-enqueued* non-terminal runs at
+    removal time -- it does nothing about runs a *schedule* trigger keeps
+    creating afterward). Checked here, the same single choke point
+    `WorkflowNotActive`/`WorkflowKilled`/`RunRateLimited` already share
+    (module docstring), so the HTTP path (`runs.py`'s `POST /automations/
+    runs`) never trips this -- `auth.user_id` there already passed
+    `authz.require_role_action`'s own active-membership check immediately
+    upstream of this same call.
+    """
+
+    users_id: UUID
+
+
+@dataclass(frozen=True, slots=True)
 class RunRateLimited:
     """`enqueue_run` was asked to start a run that would exceed the
     authorizing policy's own `rate_limit.runs_per_workflow_per_hour`
@@ -1436,7 +1462,7 @@ def enqueue_run(
     *,
     workflow_id: str,
     trigger_ref: str | None = None,
-) -> WorkflowRun | WorkflowNotActive | WorkflowKilled | RunRateLimited:
+) -> WorkflowRun | WorkflowNotActive | WorkflowKilled | ActorMembershipInactive | RunRateLimited:
     """Creates a `queued` `workflow_runs` row pinned to `workflow_id`'s
     current `active` `workflow_versions` row -- reuses `workflows.
     get_active_workflow_version` (Task 1) rather than re-querying for an
@@ -1453,6 +1479,12 @@ def enqueue_run(
     `scheduler.run_scheduler_once`'s fire path and `runs.py`'s `POST
     /automations/runs` go through, so neither needs its own separate
     kill-switch check (module docstring's "Task 6: kill switches" section).
+
+    **Found in the third whole-phase review.** Also rejects
+    (`ActorMembershipInactive`) if `actor_id`'s workspace membership is no
+    longer `status = 'active'` -- see that dataclass's own docstring for
+    why. Checked at this same choke point for the identical reason the
+    kill-switch check is.
 
     **Rate limiting (`RunRateLimited`).** Also rejects, before any row is
     written, when the authorizing policy's own `rate_limit.runs_per_workflow_
@@ -1476,6 +1508,15 @@ def enqueue_run(
         return WorkflowNotActive(workflow_id=workflow_id)
     if kill_switches.is_workflow_killed(session, workspace_id, workflow_id):
         return WorkflowKilled(workflow_id=workflow_id)
+    actor_membership = session.execute(
+        text(
+            "SELECT 1 FROM workspace_memberships "
+            "WHERE workspace_id = :workspace_id AND users_id = :users_id AND status = 'active'"
+        ),
+        {"workspace_id": workspace_id, "users_id": actor_id},
+    ).one_or_none()
+    if actor_membership is None:
+        return ActorMembershipInactive(users_id=actor_id)
 
     # A workflow with no policy at all (`policy_ref is None`) or one naming a
     # row that no longer resolves is deliberately *not* rate-limited here:

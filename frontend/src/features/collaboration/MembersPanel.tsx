@@ -62,6 +62,16 @@ function MemberRow({
   const [transferForm, setTransferForm] = useState({ resourceType: '', resourceId: '', toAccountId: '' })
   const removeTriggerRef = useRef<HTMLButtonElement>(null)
   const wasConfirmingRef = useRef(false)
+  // Found in the third whole-phase review: `confirmRemove` also flips back
+  // to `false` on the *success* path (`removeMutation`'s own `onSuccess`
+  // below), not only on Cancel -- the effect below could not tell the two
+  // apart and restored focus to the trigger button after a successful
+  // removal too, moments before this entire row unmounts once `onChanged`'s
+  // refetch drops it from the members list, dropping focus to `<body>`.
+  // This ref is the one piece of state that distinguishes them: only the
+  // success path sets it, and the effect clears it again on every run so a
+  // later Cancel is never spuriously suppressed by an earlier removal.
+  const removedSuccessfullyRef = useRef(false)
   // The trigger button (`ref={removeTriggerRef}` below) unmounts the
   // instant `confirmRemove` becomes `true` -- `canRemove && !confirmRemove`
   // guards its own JSX block -- so a plain `removeTriggerRef.current?.
@@ -72,10 +82,11 @@ function MemberRow({
   // runs. Found (and this exact wrong-first-attempt caught) during the
   // second whole-phase review's own frontend fixes.
   useEffect(() => {
-    if (wasConfirmingRef.current && !confirmRemove) {
+    if (wasConfirmingRef.current && !confirmRemove && !removedSuccessfullyRef.current) {
       removeTriggerRef.current?.focus()
     }
     wasConfirmingRef.current = confirmRemove
+    removedSuccessfullyRef.current = false
   }, [confirmRemove])
   const canManage = myRole === 'owner' || myRole === 'admin'
   const isSelf = member.user_id === myUsersId
@@ -123,6 +134,7 @@ function MemberRow({
         window.location.reload()
         return
       }
+      removedSuccessfullyRef.current = true
       setConfirmRemove(false)
       onChanged()
       onRemoved(data.export)

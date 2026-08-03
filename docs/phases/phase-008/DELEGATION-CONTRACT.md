@@ -2,7 +2,7 @@
 id: PHASE-008-DELEGATION
 title: Delegation Contract
 status: Approved for Implementation
-version: 0.3.0
+version: 0.4.0
 owner: Lucky Jain
 ---
 
@@ -11,3 +11,5 @@ owner: Lucky Jain
 Delegation identifies delegator, recipient, obligation/resource, expected outcome, due time, shared evidence and allowed actions. States: `proposed -> accepted|rejected|expired|cancelled`; accepted becomes `completed|revoked|cancelled`. The `proposed -> cancelled` edge is system-initiated only (either party being removed from the workspace force-cancels a still-pending delegation naming them, `ecc.domains.collaboration.delegations.cancel_delegations_for_removed_member`) -- there is no user-initiated way for a delegator to withdraw a still-`proposed` delegation themselves; only wait for the recipient to accept/reject, or for it to expire.
 
 Accountability transfers only on acceptance. The original history remains visible (`delegation_events`, append-only). Revocation does not erase actions already taken. Reassignment creates a new proposal. Notifications are idempotent and respect preferences. A recipient never gains access beyond evidence explicitly required for the delegation -- acceptance creates scoped, read-only `resource_grants` rows (the same mechanism `PERMISSION-CONTRACT.md` defines generally) naming exactly the evidence the delegation itself names, never a broader grant, auto-revoked the moment the delegation reaches any terminal state (`completed`/`revoked`/`cancelled`).
+
+**Disclosed gap, found by the second whole-phase review and still open: `_grant_evidence` re-checks the delegator's own `read` access to each evidence item at accept time (not just once at proposal time), and silently omits an item that no longer passes rather than failing the whole accept.** A delegator can lose access to a named evidence item between proposing and the recipient accepting (e.g. its owner revoked their grant, or transferred ownership away from them) -- when that happens, the recipient's accept still succeeds, but that one evidence item is quietly never granted to them, with no error returned and no notification to either party that anything was omitted. The delegation's own record (`delegation_evidence`) still names the item as evidence; only the corresponding `resource_grants` row is missing. A recipient or delegator inspecting the accepted delegation has no signal from this API surface alone that an evidence item they expected to be shared was not.

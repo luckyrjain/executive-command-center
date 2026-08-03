@@ -257,10 +257,20 @@ _WORKSPACE_TABLE = "workspaces"
 # These two tables have no `workspace_id` column at all; they are scoped by
 # the seeded `event_outbox.event_id` they reference instead.
 _EVENT_SCOPED_TABLES: tuple[str, ...] = ("event_inbox", "event_dead_letters")
+# `delegation_evidence`/`delegation_events` (migration 0064) have no
+# `workspace_id` column either -- scoped by the seeded `delegations.id` they
+# reference instead, the identical reasoning `_EVENT_SCOPED_TABLES` above
+# already gives for `event_outbox.event_id`. Found missing its own scoped
+# checksum loop by the third whole-phase review: present in `_WORKSPACE_ID_
+# TABLES`'s own comment (line ~229 above) as a disclosed exclusion, but that
+# disclosure only explained why `verify_restore.sh`'s generic check can't
+# reach them -- it never added the `_EVENT_SCOPED_TABLES`-style dedicated
+# loop that would actually give them their own restore/isolation coverage.
+_DELEGATION_SCOPED_TABLES: tuple[str, ...] = ("delegation_evidence", "delegation_events")
 
 # Every Phase 1 table, enumerated from backend/migrations/versions/*.py.
 ALL_PHASE1_TABLES: tuple[str, ...] = (
-    (_WORKSPACE_TABLE,) + _WORKSPACE_ID_TABLES + _EVENT_SCOPED_TABLES
+    (_WORKSPACE_TABLE,) + _WORKSPACE_ID_TABLES + _EVENT_SCOPED_TABLES + _DELEGATION_SCOPED_TABLES
 )
 
 
@@ -374,6 +384,14 @@ def _fixture_ids(label: str) -> dict[str, UUID]:
         "recipient_user": seed_id(label, "user", "recipient"),
         "recipient_workspace_membership": seed_id(label, "workspace_membership", "recipient"),
         "delegation": seed_id(label, "delegation", "acceptance"),
+        # Third whole-phase review: a delegation-linked resource_grants row
+        # (delegation_id non-NULL), plus one delegation_evidence and one
+        # delegation_events row -- migration 0067's own delegation_id column
+        # and the two Task 6 tables neither had a seeded row exercising
+        # their own restore/isolation checksum before this.
+        "delegation_resource_grant": seed_id(label, "resource_grant", "delegation"),
+        "delegation_evidence": seed_id(label, "delegation_evidence", "acceptance"),
+        "delegation_event": seed_id(label, "delegation_event", "acceptance"),
         # Phase 8 Task 7.
         "member_notification": seed_id(label, "member_notification", "acceptance"),
         # Phase 8 Task 8.
@@ -2890,6 +2908,68 @@ def _seed_delegations(cur: psycopg.Cursor[Any], label: str, ids: Mapping[str, UU
             "created_at": SEED_EPOCH,
         },
     )
+    # Found in the third whole-phase review: no seed row anywhere gave
+    # ``resource_grants.delegation_id`` (migration 0067), ``delegation_
+    # evidence`` or ``delegation_events`` a restore/isolation checksum --
+    # all three were only ever exercised by real end-to-end pytest runs
+    # against a throwaway workspace, never by this script's own backup-
+    # restore fixture. Naming the same seeded incident as both the
+    # delegation's own evidence and the linked grant's resource, matching
+    # the real shape ``_grant_evidence``/``create_delegation_endpoint``
+    # would produce -- not a synthetic placeholder.
+    cur.execute(
+        """
+        INSERT INTO resource_grants (
+            id, workspace_id, grantee_account_id, resource_type, resource_id,
+            actions, granted_by, expires_at, revoked_at, created_at, delegation_id
+        ) VALUES (
+            %(id)s, %(workspace_id)s, %(grantee_account_id)s, 'incidents',
+            %(resource_id)s, %(actions)s, %(granted_by)s, %(expires_at)s,
+            NULL, %(created_at)s, %(delegation_id)s
+        )
+        ON CONFLICT (id) DO NOTHING
+        """,
+        {
+            "id": ids["delegation_resource_grant"],
+            "workspace_id": ids["workspace"],
+            "grantee_account_id": ids["recipient_account"],
+            "resource_id": ids["incident"],
+            "actions": ["read"],
+            "granted_by": ids["user"],
+            "expires_at": SEED_EPOCH + timedelta(days=36500),
+            "created_at": SEED_EPOCH,
+            "delegation_id": ids["delegation"],
+        },
+    )
+    cur.execute(
+        """
+        INSERT INTO delegation_evidence (id, delegation_id, resource_type, resource_id, created_at)
+        VALUES (%(id)s, %(delegation_id)s, 'incidents', %(resource_id)s, %(created_at)s)
+        ON CONFLICT (id) DO NOTHING
+        """,
+        {
+            "id": ids["delegation_evidence"],
+            "delegation_id": ids["delegation"],
+            "resource_id": ids["incident"],
+            "created_at": SEED_EPOCH,
+        },
+    )
+    cur.execute(
+        """
+        INSERT INTO delegation_events (
+            id, delegation_id, event_type, actor_account_id, occurred_at, detail
+        ) VALUES (
+            %(id)s, %(delegation_id)s, 'proposed', %(actor_account_id)s, %(occurred_at)s, NULL
+        )
+        ON CONFLICT (id) DO NOTHING
+        """,
+        {
+            "id": ids["delegation_event"],
+            "delegation_id": ids["delegation"],
+            "actor_account_id": ids["account"],
+            "occurred_at": SEED_EPOCH,
+        },
+    )
 
 
 def _seed_member_notifications(
@@ -3061,6 +3141,7 @@ def fixture_row_checksums(conn: psycopg.Connection[Any]) -> dict[str, str]:
     """
     workspace_ids = list(WORKSPACE_IDS.values())
     event_ids = [FIXTURE_IDS[label]["outbox_event"] for label in WORKSPACE_LABELS]
+    delegation_ids = [FIXTURE_IDS[label]["delegation"] for label in WORKSPACE_LABELS]
     checksums: dict[str, str] = {}
     with conn.cursor() as cur:
         for table in (_WORKSPACE_TABLE,) + _WORKSPACE_ID_TABLES:
@@ -3091,6 +3172,19 @@ def fixture_row_checksums(conn: psycopg.Connection[Any]) -> dict[str, str]:
                 """
             ).format(table=sql.Identifier(table))
             cur.execute(query, {"ids": event_ids})
+            row = cur.fetchone()
+            checksums[table] = row[0] if row else "empty"
+        for table in _DELEGATION_SCOPED_TABLES:
+            query = sql.SQL(
+                """
+                SELECT coalesce(md5(string_agg(h, ',')), 'empty') FROM (
+                    SELECT md5(t::text) AS h FROM {table} t
+                    WHERE delegation_id = ANY(%(ids)s)
+                    ORDER BY md5(t::text)
+                ) s
+                """
+            ).format(table=sql.Identifier(table))
+            cur.execute(query, {"ids": delegation_ids})
             row = cur.fetchone()
             checksums[table] = row[0] if row else "empty"
     return checksums
