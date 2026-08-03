@@ -40,7 +40,7 @@ import sqlalchemy as sa
 from alembic import op
 from sqlalchemy.dialects import postgresql
 
-revision = "0067_phase8_resource_grants_delegation_link"
+revision = "0067_phase8_grant_delegation_id"
 down_revision = "0066_phase8_ownership_transfers"
 branch_labels = None
 depends_on = None

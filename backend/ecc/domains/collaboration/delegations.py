@@ -545,7 +545,7 @@ def _revoke_evidence_grants(
     same evidence resource (a realistic scenario), matching on resource
     identity alone would revoke the *other*, still-`accepted` delegation's
     own evidence access too. `delegation_id` (migration
-    `0067_phase8_resource_grants_delegation_link.py`) makes each
+    `0067_phase8_grant_delegation_id.py`) makes each
     delegation's own evidence grants independently revocable.
     `recipient_account_id`/`resource_type`/`resource_id` are still checked
     too, defensively -- a delegation should only ever revoke grants that
