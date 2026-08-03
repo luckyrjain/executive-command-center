@@ -22,6 +22,7 @@ from ecc.observability import (
     record_audit_outbox_failure,
     record_idempotency_conflict,
 )
+from ecc.platform import authz
 
 router = APIRouter(prefix="/api/v1/meetings", tags=["meetings"])
 
@@ -419,6 +420,7 @@ def create_meeting(
     _csrf: CsrfDep,
     idempotency_key: IdempotencyHeader,
 ) -> MeetingResponse:
+    authz.require_role_action(session, auth, "write")
     request_hash = _request_hash(payload, "create")
     now = datetime.now(UTC)
     meeting_id = uuid4()
@@ -462,12 +464,12 @@ def create_meeting(
                         id, workspace_id, calendar_event_id, title,
                         standalone_starts_at, standalone_ends_at, standalone_timezone,
                         status, agenda, preparation, notes_summary, created_by,
-                        updated_by, created_at, updated_at, version
+                        updated_by, created_at, updated_at, version, owner_id, visibility
                     ) VALUES (
                         :id, :workspace_id, :calendar_event_id, :title,
                         :starts_at, :ends_at, :timezone, :status, :agenda,
                         :preparation, :notes_summary, :actor_id, :actor_id,
-                        :now, :now, 1
+                        :now, :now, 1, :actor_id, 'workspace'
                     ) RETURNING {_MEETING_FIELDS}
                     """
                 ),
@@ -499,8 +501,15 @@ def list_meetings(
     cursor: str | None = None,
     limit: int = Query(default=50, ge=1, le=100),
 ) -> MeetingListResponse:
-    clauses = ["workspace_id = :workspace_id"]
-    params: dict[str, Any] = {"workspace_id": auth.workspace_id, "limit": limit + 1}
+    visibility_sql, visibility_params = authz.visible_resource_filter_sql(
+        session, auth, resource_type="meetings", action="read", table_alias="meetings"
+    )
+    clauses = ["workspace_id = :workspace_id", f"({visibility_sql})"]
+    params: dict[str, Any] = {
+        "workspace_id": auth.workspace_id,
+        "limit": limit + 1,
+        **visibility_params,
+    }
     if not include_archived:
         clauses.append("archived_at IS NULL")
     if status_filter is not None:
@@ -526,11 +535,18 @@ def list_meetings(
         .mappings()
         .all()
     )
+    session.rollback()
     return MeetingListResponse(items=[_project(session, auth, dict(row)) for row in rows])
 
 
 @router.get("/{meeting_id}", response_model=MeetingResponse)
 def get_meeting(meeting_id: UUID, auth: AuthDep, session: SessionDep) -> MeetingResponse:
+    visible = authz.authorize(
+        session, auth, resource_type="meetings", resource_id=meeting_id, action="read"
+    )
+    session.rollback()
+    if not visible:
+        raise HTTPException(status_code=404, detail="MEETING_NOT_FOUND")
     row = _get_row(session, auth, meeting_id)
     if row is None:
         raise HTTPException(status_code=404, detail="MEETING_NOT_FOUND")
@@ -554,6 +570,16 @@ def update_meeting(
         cached = _load_cached(session, auth, idempotency_key, request_hash)
         if cached is not None:
             return cached
+        # Two-phase read-then-write authz check -- see calendar/events.py's
+        # update_calendar_event for the identical existence-leak reasoning.
+        if not authz.authorize(
+            session, auth, resource_type="meetings", resource_id=meeting_id, action="read"
+        ):
+            raise HTTPException(status_code=404, detail="MEETING_NOT_FOUND")
+        if not authz.authorize(
+            session, auth, resource_type="meetings", resource_id=meeting_id, action="write"
+        ):
+            raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
         current = _get_row(session, auth, meeting_id, for_update=True)
         if current is None:
             raise HTTPException(status_code=404, detail="MEETING_NOT_FOUND")
@@ -669,6 +695,14 @@ def _lifecycle(
         cached = _load_cached(session, auth, idempotency_key, request_hash)
         if cached is not None:
             return cached
+        if not authz.authorize(
+            session, auth, resource_type="meetings", resource_id=meeting_id, action="read"
+        ):
+            raise HTTPException(status_code=404, detail="MEETING_NOT_FOUND")
+        if not authz.authorize(
+            session, auth, resource_type="meetings", resource_id=meeting_id, action="write"
+        ):
+            raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
         current = _get_row(session, auth, meeting_id, for_update=True)
         if current is None:
             raise HTTPException(status_code=404, detail="MEETING_NOT_FOUND")

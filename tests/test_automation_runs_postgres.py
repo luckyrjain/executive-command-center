@@ -30,6 +30,7 @@ from identity_fixtures import create_identity
 from pydantic import BaseModel
 from sqlalchemy import text
 
+from ecc.auth import AuthContext
 from ecc.config import get_settings
 from ecc.database import SessionFactory, engine
 from ecc.domains.automation import policy as automation_policy
@@ -305,8 +306,9 @@ def test_create_run_endpoint_rejects_caller_supplied_policy_id(
     )
     assert response.status_code == 422
 
+    auth = AuthContext(workspace_id=workspace_id, user_id=user_id, timezone="UTC")
     with SessionFactory() as session, session.begin():
-        runs = automation_worker.list_runs(session, workspace_id)
+        runs = automation_worker.list_runs(session, auth, workspace_id)
     assert runs == []
 
 
@@ -359,8 +361,9 @@ def test_create_run_endpoint_rate_limited_is_409(
     assert error["details"]["limit"] == 1
 
     # Rejected *before* any row was written -- exactly one run exists.
+    auth = AuthContext(workspace_id=workspace_id, user_id=user_id, timezone="UTC")
     with SessionFactory() as session, session.begin():
-        runs = automation_worker.list_runs(session, workspace_id)
+        runs = automation_worker.list_runs(session, auth, workspace_id)
     assert len([run for run in runs if run.workflow_id == workflow_id]) == 1
 
 
@@ -410,8 +413,9 @@ def test_create_run_endpoint_idempotency_key_replays_cached_response(
     second_body = {k: v for k, v in second.json().items() if k not in ignored}
     assert first_body == second_body
 
+    auth = AuthContext(workspace_id=workspace_id, user_id=user_id, timezone="UTC")
     with SessionFactory() as session, session.begin():
-        runs = automation_worker.list_runs(session, workspace_id)
+        runs = automation_worker.list_runs(session, auth, workspace_id)
     assert len(runs) == 1  # only one run was ever actually enqueued
 
 

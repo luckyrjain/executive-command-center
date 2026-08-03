@@ -149,6 +149,34 @@ Phase 5 approval-gate item." The word "notifications" in this task's own
 roadmap label ("Schedules, triggers and notifications") does not expand
 this task's actual scope beyond what `DATA-MODEL.md`'s contract text says
 -- no `notifications` row is ever written by this module or by `runs.py`.
+
+**Phase 8 Task 4: deliberately no `ecc.platform.authz` call anywhere in
+this module or in `worker.py`'s claim/dispatch loop.** Every other domain
+Task 4 touches wires `authz.authorize()`/`visible_resource_filter_sql()`
+at the point a caller's own `AuthContext` reaches a resource -- but
+`run_scheduler_once` (this module) and `claim_next_run`/`process_claimed_
+run`/`run_step` (`worker.py`) have no caller in that sense: they are the
+system itself, on a background tick, discovering and dispatching already-
+created rows across potentially every workspace, not answering "should
+*this* caller see/mutate *this* resource" for any one caller. `worker.
+enqueue_run` (the one function on this call path a real `AuthContext` *can*
+reach, from `runs.py`'s `POST /automations/runs`) is exactly where the two
+worlds meet, and it already resolves the row's `owner_id`/`visibility`
+correctly for both entry points: `runs.py` passes `auth.user_id` as
+`enqueue_run`'s `actor_id`, this module passes `trigger.created_by` (the
+human who authored the schedule trigger being fired) -- both are real,
+meaningful users, so `workflow_runs.owner_id` is stamped correctly
+(`created_by`, matching migration `0063`'s own `_NEW_OWNER_FROM_CREATED_BY`
+formula for this table) regardless of which path created the row.
+Everything downstream of that -- claiming, dispatching, retrying,
+compensating -- executes an already-authorized run to completion; it is
+governed by Phase 5's own separate policy/approval/kill-switch authority
+model (`policy.py`/`approvals.py`/`kill_switches.py`, all real controls
+this module and `worker.py` already enforce), not by Task 8's resource-
+visibility model, which is enforced once, at the HTTP boundary, in
+`runs.py`'s own endpoints (`GET /runs`, `GET /runs/{id}`, `POST .../
+cancel|pause|resume`) -- exactly where a human caller's `AuthContext`
+actually exists to check something against.
 """
 
 from __future__ import annotations

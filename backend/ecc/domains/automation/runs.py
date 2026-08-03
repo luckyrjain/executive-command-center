@@ -102,6 +102,7 @@ from ecc.observability import (
     record_audit_outbox_failure,
     record_idempotency_conflict,
 )
+from ecc.platform import authz
 
 from . import worker as worker_module
 from . import workflows as workflows_module
@@ -467,12 +468,19 @@ def list_runs_endpoint(
     session: SessionDep,
     run_status: Annotated[RunStatus | None, Query(alias="status")] = None,
 ) -> RunListResponse:
-    runs = worker_module.list_runs(session, auth.workspace_id, status_filter=run_status)
+    runs = worker_module.list_runs(session, auth, auth.workspace_id, status_filter=run_status)
+    session.rollback()
     return RunListResponse(runs=[_to_response(r) for r in runs])
 
 
 @router.get("/runs/{run_id}", response_model=RunDetailResponse)
 def get_run_endpoint(run_id: UUID, auth: AuthDep, session: SessionDep) -> RunDetailResponse:
+    visible = authz.authorize(
+        session, auth, resource_type="workflow_runs", resource_id=run_id, action="read"
+    )
+    session.rollback()
+    if not visible:
+        raise HTTPException(status_code=404, detail="RUN_NOT_FOUND")
     run = worker_module.get_run(session, auth.workspace_id, run_id)
     if run is None:
         raise HTTPException(status_code=404, detail="RUN_NOT_FOUND")
@@ -491,6 +499,7 @@ def create_run_endpoint(
     _csrf: CsrfDep,
     idempotency_key: IdempotencyHeader,
 ) -> RunResponse:
+    authz.require_role_action(session, auth, "write")
     request_hash = _request_hash(payload, "create_run")
     now = datetime.now(UTC)
     with session.begin():
@@ -596,6 +605,15 @@ def _mutate_run(
         cached = _load_cached(session, auth, idempotency_key, request_hash)
         if cached is not None:
             return cached
+
+        if not authz.authorize(
+            session, auth, resource_type="workflow_runs", resource_id=run_id, action="read"
+        ):
+            raise HTTPException(status_code=404, detail="RUN_NOT_FOUND")
+        if not authz.authorize(
+            session, auth, resource_type="workflow_runs", resource_id=run_id, action="write"
+        ):
+            raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
 
         result = mutate(session, auth.workspace_id, run_id)
         if isinstance(result, WorkflowRunNotFound):

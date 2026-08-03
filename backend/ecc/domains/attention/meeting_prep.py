@@ -71,6 +71,7 @@ from ecc.observability import (
     record_audit_outbox_failure,
     record_idempotency_conflict,
 )
+from ecc.platform import authz
 
 router = APIRouter(prefix="/api/v1/meetings", tags=["meeting-prep"])
 SessionDep = Annotated[Session, Depends(get_session)]
@@ -599,6 +600,30 @@ def _write_event(
 # ---------------------------------------------------------------------------
 # Fetch helpers (impure) -- one per composed domain, workspace-scoped.
 # ---------------------------------------------------------------------------
+
+
+def _require_meeting_read(session: Session, auth: AuthContext, meeting_id: UUID) -> None:
+    """Every endpoint in this module takes a meeting_id path parameter and
+    treats the meeting as the authorization boundary for the child
+    resources it reads or writes (participants, packs) -- the same
+    parent-authorization-boundary pattern claims.py/relationships.py use
+    for pkos_nodes. Collapses into the same MEETING_NOT_FOUND 404 every
+    call site already raises for a nonexistent meeting_id, matching this
+    router's own pre-existing convention (every endpoint here already
+    404s on an unknown meeting, never a 200-empty-list) -- an
+    invisible-but-real meeting must read identically to a nonexistent one.
+    """
+    if not authz.authorize(
+        session, auth, resource_type="meetings", resource_id=meeting_id, action="read"
+    ):
+        raise HTTPException(status_code=404, detail="MEETING_NOT_FOUND")
+
+
+def _require_meeting_write(session: Session, auth: AuthContext, meeting_id: UUID) -> None:
+    if not authz.authorize(
+        session, auth, resource_type="meetings", resource_id=meeting_id, action="write"
+    ):
+        raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
 
 
 def _meeting_row(
@@ -1203,6 +1228,8 @@ def add_participant(
         if cached is not None:
             return ParticipantResponse.model_validate(cached)
 
+        _require_meeting_read(session, auth, meeting_id)
+        _require_meeting_write(session, auth, meeting_id)
         meeting_row = _meeting_row(session, auth, meeting_id)
         if meeting_row is None:
             raise HTTPException(status_code=404, detail="MEETING_NOT_FOUND")
@@ -1238,10 +1265,12 @@ def add_participant(
                         """
                         INSERT INTO meeting_participants (
                             id, workspace_id, meeting_id, entity_id, role,
-                            created_by, updated_by, created_at, updated_at, version
+                            created_by, updated_by, created_at, updated_at, version,
+                            owner_id, visibility
                         ) VALUES (
                             :id, :workspace_id, :meeting_id, :entity_id, :role,
-                            :actor_id, :actor_id, :now, :now, 1
+                            :actor_id, :actor_id, :now, :now, 1,
+                            :actor_id, 'workspace'
                         )
                         """
                     ),
@@ -1288,9 +1317,9 @@ def add_participant(
 
 @router.get("/{meeting_id}/participants", response_model=ParticipantList)
 def list_participants(meeting_id: UUID, auth: AuthDep, session: SessionDep) -> ParticipantList:
-    if _meeting_row(session, auth, meeting_id) is None:
-        raise HTTPException(status_code=404, detail="MEETING_NOT_FOUND")
+    _require_meeting_read(session, auth, meeting_id)
     rows = _fetch_participants(session, auth, meeting_id)
+    session.rollback()
     return ParticipantList(
         items=[
             ParticipantResponse(
@@ -1377,11 +1406,11 @@ def create_prep(
                             INSERT INTO meeting_packs (
                                 id, workspace_id, meeting_id, status, generated_at, stale_at,
                                 source_versions, content, created_by, updated_by,
-                                created_at, updated_at, version
+                                created_at, updated_at, version, owner_id, visibility
                             ) VALUES (
                                 :id, :workspace_id, :meeting_id, 'fresh', :now, :stale_at,
                                 CAST(:source_versions AS jsonb), CAST(:content AS jsonb),
-                                :actor_id, :actor_id, :now, :now, 1
+                                :actor_id, :actor_id, :now, :now, 1, :actor_id, 'workspace'
                             )
                             RETURNING {_PACK_FIELDS}
                             """
@@ -1425,6 +1454,8 @@ def create_prep(
             if cached is not None:
                 return MeetingPack.model_validate(cached)
 
+            _require_meeting_read(session, auth, meeting_id)
+            _require_meeting_write(session, auth, meeting_id)
             meeting_row = _meeting_row(session, auth, meeting_id)
             if meeting_row is None:
                 raise HTTPException(status_code=404, detail="MEETING_NOT_FOUND")
@@ -1446,6 +1477,8 @@ def create_prep(
             return MeetingPack.model_validate(cached)
 
         with session.begin():
+            _require_meeting_read(session, auth, meeting_id)
+            _require_meeting_write(session, auth, meeting_id)
             meeting_row = _meeting_row(session, auth, meeting_id)
             if meeting_row is None:
                 raise HTTPException(status_code=404, detail="MEETING_NOT_FOUND")
@@ -1469,6 +1502,7 @@ def create_prep(
 @router.get("/{meeting_id}/prep", response_model=MeetingPack)
 def get_prep(meeting_id: UUID, auth: AuthDep, session: SessionDep) -> MeetingPack:
     with session.begin():
+        _require_meeting_read(session, auth, meeting_id)
         meeting_row = _meeting_row(session, auth, meeting_id)
         if meeting_row is None:
             raise HTTPException(status_code=404, detail="MEETING_NOT_FOUND")
@@ -1596,11 +1630,11 @@ def refresh_prep(
                     INSERT INTO meeting_packs (
                         id, workspace_id, meeting_id, status, generated_at, stale_at,
                         source_versions, content, created_by, updated_by,
-                        created_at, updated_at, version
+                        created_at, updated_at, version, owner_id, visibility
                     ) VALUES (
                         :id, :workspace_id, :meeting_id, 'fresh', :now, :stale_at,
                         CAST(:source_versions AS jsonb), CAST(:content AS jsonb),
-                        :actor_id, :actor_id, :now, :now, 1
+                        :actor_id, :actor_id, :now, :now, 1, :actor_id, 'workspace'
                     )
                     RETURNING {_PACK_FIELDS}
                     """
@@ -1650,6 +1684,8 @@ def refresh_prep(
                 if cached is not None:
                     return MeetingPack.model_validate(cached)
 
+                _require_meeting_read(session, auth, meeting_id)
+                _require_meeting_write(session, auth, meeting_id)
                 meeting_row = _meeting_row(session, auth, meeting_id)
                 if meeting_row is None:
                     raise HTTPException(status_code=404, detail="MEETING_NOT_FOUND")
@@ -1675,6 +1711,8 @@ def refresh_prep(
             return MeetingPack.model_validate(cached)
 
         with session.begin():
+            _require_meeting_read(session, auth, meeting_id)
+            _require_meeting_write(session, auth, meeting_id)
             meeting_row = _meeting_row(session, auth, meeting_id)
             if meeting_row is None:
                 raise HTTPException(status_code=404, detail="MEETING_NOT_FOUND")

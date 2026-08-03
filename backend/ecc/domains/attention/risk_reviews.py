@@ -17,6 +17,7 @@ from ecc.observability import (
     record_audit_outbox_failure,
     record_idempotency_conflict,
 )
+from ecc.platform import authz
 
 router = APIRouter(prefix="/api/v1/risks", tags=["risks"])
 SessionDep = Annotated[Session, Depends(get_session)]
@@ -189,6 +190,18 @@ def record_risk_review(
         cached = _load_cached(session, auth, idempotency_key, request_hash)
         if cached is not None:
             return cached
+        # A review's authorization boundary is the risk it reviews -- risk_
+        # reviews has no independent ownership meaningful apart from the
+        # risk it's about, matching claims.py's identical parent-boundary
+        # pattern for pkos_nodes.
+        if not authz.authorize(
+            session, auth, resource_type="risks", resource_id=risk_id, action="read"
+        ):
+            raise HTTPException(status_code=404, detail="RISK_NOT_FOUND")
+        if not authz.authorize(
+            session, auth, resource_type="risks", resource_id=risk_id, action="write"
+        ):
+            raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
         risk = (
             session.execute(
                 text(
@@ -231,10 +244,10 @@ def record_risk_review(
                     f"""
                     INSERT INTO risk_reviews (
                         id, workspace_id, risk_id, outcome, notes, evidence_refs,
-                        reviewed_at, next_review_at, actor_id
+                        reviewed_at, next_review_at, actor_id, owner_id, visibility
                     ) VALUES (
                         :id, :workspace_id, :risk_id, :outcome, :notes, :evidence_refs,
-                        :reviewed_at, :next_review_at, :actor_id
+                        :reviewed_at, :next_review_at, :actor_id, :actor_id, 'workspace'
                     )
                     RETURNING {_REVIEW_FIELDS}
                     """
@@ -359,23 +372,28 @@ def list_review_queue(
     auth: AuthDep, session: SessionDep, limit: int = Query(default=50, ge=1, le=100)
 ) -> ReviewQueueList:
     now = datetime.now(UTC)
+    visibility_sql, visibility_params = authz.visible_resource_filter_sql(
+        session, auth, resource_type="risks", action="read", table_alias="risks"
+    )
     rows = (
         session.execute(
             text(
-                """
+                f"""
                 SELECT id, description, status, review_at, version
                 FROM risks
                 WHERE workspace_id = :workspace_id AND archived_at IS NULL
                   AND status <> 'closed' AND review_at IS NOT NULL
+                  AND ({visibility_sql})
                 ORDER BY review_at ASC
                 LIMIT :limit
                 """
             ),
-            {"workspace_id": auth.workspace_id, "limit": limit},
+            {"workspace_id": auth.workspace_id, "limit": limit, **visibility_params},
         )
         .mappings()
         .all()
     )
+    session.rollback()
     items: list[ReviewQueueItem] = []
     for row in rows:
         review_at: datetime = row["review_at"]

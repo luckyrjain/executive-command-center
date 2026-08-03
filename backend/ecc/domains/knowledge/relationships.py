@@ -18,6 +18,7 @@ from ecc.observability import (
     record_audit_outbox_failure,
     record_idempotency_conflict,
 )
+from ecc.platform import authz
 
 router = APIRouter(prefix="/api/v1/knowledge", tags=["knowledge-relationships"])
 SessionDep = Annotated[Session, Depends(get_session)]
@@ -383,6 +384,28 @@ def create_relationship(
         cached = _load_cached(session, auth, idempotency_key, request_hash)
         if cached is not None:
             return cached
+        # A relationship touches two entities -- the source (URL entity_id,
+        # authorized read+write, the same two-phase shape every other
+        # entity-scoped mutation in this domain uses) and the target
+        # (payload.to_entity_id, read-only: creating a relationship must
+        # not let a caller confirm the existence of, or point a new edge
+        # at, a target entity they cannot otherwise see).
+        if not authz.authorize(
+            session, auth, resource_type="pkos_nodes", resource_id=entity_id, action="read"
+        ):
+            raise HTTPException(status_code=404, detail="ENTITY_NOT_FOUND")
+        if not authz.authorize(
+            session, auth, resource_type="pkos_nodes", resource_id=entity_id, action="write"
+        ):
+            raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
+        if not authz.authorize(
+            session,
+            auth,
+            resource_type="pkos_nodes",
+            resource_id=payload.to_entity_id,
+            action="read",
+        ):
+            raise HTTPException(status_code=404, detail="ENTITY_NOT_FOUND")
         source_version = _entity_version(session, auth, entity_id)
         target_status = _entity_status(session, auth, payload.to_entity_id)
         if source_version is None or target_status is None:
@@ -418,10 +441,12 @@ def create_relationship(
                 """
                 INSERT INTO pkos_edges (
                     id, workspace_id, source_node_id, target_node_id, edge_type,
-                    attributes, confidence, evidence_id, valid_from, valid_to, status
+                    attributes, confidence, evidence_id, valid_from, valid_to, status,
+                    owner_id, visibility
                 ) VALUES (
                     :id, :workspace_id, :source, :target, :edge_type,
-                    '{}'::jsonb, :confidence, :evidence_id, :valid_from, :valid_to, 'active'
+                    '{}'::jsonb, :confidence, :evidence_id, :valid_from, :valid_to, 'active',
+                    :actor_id, 'workspace'
                 )
                 """
             ),
@@ -435,6 +460,7 @@ def create_relationship(
                 "evidence_id": payload.evidence_id,
                 "valid_from": payload.valid_from,
                 "valid_to": payload.valid_to,
+                "actor_id": auth.user_id,
             },
         )
         # Fetched separately (not via `RETURNING`) since the join that
@@ -475,6 +501,16 @@ def list_relationships(
     preserves this endpoint's original both-directions, every-type
     behavior unchanged.
     """
+    # A cross-workspace/unknown entity_id never 404s here -- this is a
+    # list endpoint, and this module's own established convention (see
+    # the cross-workspace-isolation tests) returns an empty list, not
+    # 404, the same way claims.py's list_claims does.
+    visible = authz.authorize(
+        session, auth, resource_type="pkos_nodes", resource_id=entity_id, action="read"
+    )
+    session.rollback()
+    if not visible:
+        return RelationshipListResponse(items=[])
     if direction == "incoming":
         entity_clause = "e.target_node_id = :entity_id"
     elif direction == "outgoing":

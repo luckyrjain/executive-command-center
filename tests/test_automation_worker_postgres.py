@@ -54,6 +54,7 @@ from identity_fixtures import create_identity
 from pydantic import BaseModel
 from sqlalchemy import text
 
+from ecc.auth import AuthContext
 from ecc.config import get_settings
 from ecc.database import SessionFactory, engine
 from ecc.domains.automation import approvals as automation_approvals
@@ -564,8 +565,9 @@ def test_eleventh_run_within_an_hour_under_a_ten_per_hour_policy_is_rate_limited
     assert eleventh.limit == 10
     assert eleventh.runs_in_window == 10
 
+    auth = AuthContext(workspace_id=workspace_id, user_id=user_id, timezone="UTC")
     with SessionFactory() as session, session.begin():
-        runs = automation_worker.list_runs(session, workspace_id)
+        runs = automation_worker.list_runs(session, auth, workspace_id)
     assert len([run for run in runs if run.workflow_id == workflow_id]) == 10
 
 
@@ -1806,8 +1808,9 @@ def test_bounded_step_dispatches_without_any_approval_under_usable_policy(
     assert finished.status == "succeeded"
     assert adapter.execute_calls == 1
 
+    auth = AuthContext(workspace_id=workspace_id, user_id=user_id, timezone="UTC")
     with SessionFactory() as session, session.begin():
-        approvals = automation_approvals.list_approvals(session, workspace_id)
+        approvals = automation_approvals.list_approvals(session, auth, workspace_id)
     assert approvals == []
 
 
@@ -1965,8 +1968,9 @@ def test_preview_only_never_dispatches_even_after_an_approved_digest(
 
     # The approval itself survives untouched and stays fully inspectable --
     # an operator's own record of the decision they practised.
+    auth = AuthContext(workspace_id=workspace_id, user_id=user_id, timezone="UTC")
     with SessionFactory() as session, session.begin():
-        approvals_after = automation_approvals.list_approvals(session, workspace_id)
+        approvals_after = automation_approvals.list_approvals(session, auth, workspace_id)
     assert len(approvals_after) == 1
     assert approvals_after[0].status == "approved"
     assert approvals_after[0].decided_by == user_id
@@ -2142,8 +2146,9 @@ def test_bounded_recurring_mode_is_unaffected_by_the_preview_only_block(
         finished = automation_worker.process_claimed_run(session, claimed, registry, "worker-a")
     assert finished.status == "succeeded"
     assert adapter.execute_calls == 2
+    auth = AuthContext(workspace_id=workspace_id, user_id=user_id, timezone="UTC")
     with SessionFactory() as session, session.begin():
-        assert automation_approvals.list_approvals(session, workspace_id) == []
+        assert automation_approvals.list_approvals(session, auth, workspace_id) == []
 
 
 def test_no_policy_blocks_dispatch_as_needs_review(worker_test_context: tuple[UUID, UUID]) -> None:
@@ -2465,10 +2470,11 @@ def test_workspace_isolation_for_approval_requests(
             ),
             {"id": workspace_b, "now": now},
         )
+    auth_b = AuthContext(workspace_id=workspace_b, user_id=user_a, timezone="UTC")
     try:
         with SessionFactory() as session, session.begin():
             assert automation_approvals.get_approval(session, workspace_b, pending.id) is None
-            assert automation_approvals.list_approvals(session, workspace_b) == []
+            assert automation_approvals.list_approvals(session, auth_b, workspace_b) == []
             wrong_workspace_decision = automation_approvals.decide_approval(
                 session,
                 workspace_b,

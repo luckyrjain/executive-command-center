@@ -44,6 +44,7 @@ from ecc.observability import (
     record_audit_outbox_failure,
     record_idempotency_conflict,
 )
+from ecc.platform import authz
 
 _WORKDAY_START = time(9, 0)
 DEFAULT_EFFORT_MINUTES = 30
@@ -332,6 +333,32 @@ def propose_plan(
 # the result. POST /plans always creates a fresh plan in 'proposed' status;
 # Task 6 adds accept/supersede/edit over the same table without a new
 # migration (see the migration's module docstring).
+#
+# Phase 8 Task 4 authz scoping decision: `plans` had a hardcoded
+# `user_id = auth.user_id` filter on every query pre-Task-4, making a plan
+# strictly private to its own creator with no possible override. Unlike
+# capacity.py's capacity_profiles (which has no id-addressable endpoint at
+# all -- there is no URL through which a caller could ever reference
+# another member's profile), `plans` already exposes a real `plan_id` in
+# `get_plan`/`accept_plan`/`supersede_plan`/`replan`/`move_block`/
+# `remove_block`'s URLs, the same shape every other Task-4-wired domain
+# uses. Migration 0063 backfilled `plans.visibility` to the group default
+# of `'workspace'` (`_NEW_OWNER_FROM_USER_ID`'s shared default), which
+# would silently make every member's plan workspace-readable the moment
+# this module started relying on it -- a real, unreviewed privacy
+# regression for what is inherently personal work-planning data, and not
+# something Task 4 (a mechanical widening, not a new design) should
+# introduce silently. So every plan this module creates is stamped
+# `visibility = 'private'` explicitly on INSERT, overriding that group
+# default -- preserving exactly today's owner-only behavior -- while
+# `authz.authorize()`/`visible_resource_filter_sql()` replace the ad hoc
+# `user_id =` filter as the actual enforcement mechanism. This costs
+# nothing today (private visibility still only ever passes for the owner)
+# and means a future Task 5/6 (sharing UX, delegation) can make a specific
+# plan shareable via the existing resource_grants mechanism with no schema
+# change -- exactly the kind of cross-user plan visibility delegation will
+# need, and precisely why every other domain in this session uses this
+# same mechanism rather than a hand-rolled ownership column check.
 # --------------------------------------------------------------------------
 
 router = APIRouter(prefix="/api/v1/plans", tags=["planning"])
@@ -751,11 +778,13 @@ def create_plan(
                     INSERT INTO plans (
                         id, workspace_id, user_id, period_start, period_end, status,
                         policy_version, capacity_minutes, source_versions, conflicts,
-                        unscheduled, created_by, updated_by, created_at, updated_at, version
+                        unscheduled, created_by, updated_by, created_at, updated_at, version,
+                        owner_id, visibility
                     ) VALUES (
                         :id, :workspace_id, :user_id, :period_start, :period_end, 'proposed',
                         1, :capacity_minutes, :source_versions, :conflicts,
-                        :unscheduled, :actor_id, :actor_id, :now, :now, 1
+                        :unscheduled, :actor_id, :actor_id, :now, :now, 1,
+                        :actor_id, 'private'
                     )
                     RETURNING {_PLAN_FIELDS}
                     """
@@ -938,11 +967,14 @@ def list_plans(
     cursor: str | None = None,
     limit: int = Query(default=20, ge=1, le=100),
 ) -> PlanList:
-    clauses = ["workspace_id = :workspace_id", "user_id = :user_id"]
+    visibility_sql, visibility_params = authz.visible_resource_filter_sql(
+        session, auth, resource_type="plans", action="read", table_alias="plans"
+    )
+    clauses = ["workspace_id = :workspace_id", f"({visibility_sql})"]
     params: dict[str, Any] = {
         "workspace_id": auth.workspace_id,
-        "user_id": auth.user_id,
         "limit": limit + 1,
+        **visibility_params,
     }
     if status_filter:
         clauses.append("status = :status")
@@ -994,6 +1026,7 @@ def list_plans(
         _row_to_plan(session, auth, dict(row), blocks=blocks_by_plan.get(row["id"], []))
         for row in page
     ]
+    session.rollback()
     next_cursor = None
     if has_more and page:
         last = page[-1]
@@ -1003,13 +1036,19 @@ def list_plans(
 
 @router.get("/{plan_id}", response_model=Plan)
 def get_plan(plan_id: UUID, auth: AuthDep, session: SessionDep) -> Plan:
+    visible = authz.authorize(
+        session, auth, resource_type="plans", resource_id=plan_id, action="read"
+    )
+    session.rollback()
+    if not visible:
+        raise HTTPException(status_code=404, detail="PLAN_NOT_FOUND")
     row = (
         session.execute(
             text(
                 f"SELECT {_PLAN_FIELDS} FROM plans "
-                "WHERE workspace_id = :workspace_id AND user_id = :user_id AND id = :plan_id"
+                "WHERE workspace_id = :workspace_id AND id = :plan_id"
             ),
-            {"workspace_id": auth.workspace_id, "user_id": auth.user_id, "plan_id": plan_id},
+            {"workspace_id": auth.workspace_id, "plan_id": plan_id},
         )
         .mappings()
         .one_or_none()
@@ -1106,14 +1145,17 @@ def _write_plan_event(
 def _get_plan_for_update(
     session: Session, auth: AuthContext, plan_id: UUID
 ) -> dict[str, Any] | None:
+    # No `user_id =` filter here -- every call site authz.authorize()s the
+    # plan (read+write) immediately before calling this, so ownership is
+    # already established there; this only needs to lock and fetch by id.
     row = (
         session.execute(
             text(
                 f"SELECT {_PLAN_FIELDS} FROM plans "
-                "WHERE workspace_id = :workspace_id AND user_id = :user_id AND id = :plan_id "
+                "WHERE workspace_id = :workspace_id AND id = :plan_id "
                 "FOR UPDATE"
             ),
-            {"workspace_id": auth.workspace_id, "user_id": auth.user_id, "plan_id": plan_id},
+            {"workspace_id": auth.workspace_id, "plan_id": plan_id},
         )
         .mappings()
         .one_or_none()
@@ -1143,6 +1185,15 @@ def accept_plan(
         cached = _load_cached(session, auth, idempotency_key, request_hash)
         if cached is not None:
             return cached
+
+        if not authz.authorize(
+            session, auth, resource_type="plans", resource_id=plan_id, action="read"
+        ):
+            raise HTTPException(status_code=404, detail="PLAN_NOT_FOUND")
+        if not authz.authorize(
+            session, auth, resource_type="plans", resource_id=plan_id, action="write"
+        ):
+            raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
 
         current = _get_plan_for_update(session, auth, plan_id)
         if current is None:
@@ -1209,6 +1260,15 @@ def supersede_plan(
         cached = _load_cached(session, auth, idempotency_key, request_hash)
         if cached is not None:
             return cached
+
+        if not authz.authorize(
+            session, auth, resource_type="plans", resource_id=plan_id, action="read"
+        ):
+            raise HTTPException(status_code=404, detail="PLAN_NOT_FOUND")
+        if not authz.authorize(
+            session, auth, resource_type="plans", resource_id=plan_id, action="write"
+        ):
+            raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
 
         current = _get_plan_for_update(session, auth, plan_id)
         if current is None:
@@ -1337,6 +1397,15 @@ def replan(
         if cached is not None:
             return cached
 
+        if not authz.authorize(
+            session, auth, resource_type="plans", resource_id=plan_id, action="read"
+        ):
+            raise HTTPException(status_code=404, detail="PLAN_NOT_FOUND")
+        if not authz.authorize(
+            session, auth, resource_type="plans", resource_id=plan_id, action="write"
+        ):
+            raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
+
         old = _get_plan_for_update(session, auth, plan_id)
         if old is None:
             raise HTTPException(status_code=404, detail="PLAN_NOT_FOUND")
@@ -1370,11 +1439,13 @@ def replan(
                     INSERT INTO plans (
                         id, workspace_id, user_id, period_start, period_end, status,
                         policy_version, capacity_minutes, source_versions, conflicts,
-                        unscheduled, created_by, updated_by, created_at, updated_at, version
+                        unscheduled, created_by, updated_by, created_at, updated_at, version,
+                        owner_id, visibility
                     ) VALUES (
                         :id, :workspace_id, :user_id, :period_start, :period_end, 'proposed',
                         1, :capacity_minutes, :source_versions, :conflicts,
-                        :unscheduled, :actor_id, :actor_id, :now, :now, 1
+                        :unscheduled, :actor_id, :actor_id, :now, :now, 1,
+                        :actor_id, 'private'
                     )
                     RETURNING {_PLAN_FIELDS}
                     """
@@ -1571,6 +1642,15 @@ def move_block(
         if cached is not None:
             return cached
 
+        if not authz.authorize(
+            session, auth, resource_type="plans", resource_id=plan_id, action="read"
+        ):
+            raise HTTPException(status_code=404, detail="PLAN_NOT_FOUND")
+        if not authz.authorize(
+            session, auth, resource_type="plans", resource_id=plan_id, action="write"
+        ):
+            raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
+
         current = _get_plan_for_update(session, auth, plan_id)
         if current is None:
             raise HTTPException(status_code=404, detail="PLAN_NOT_FOUND")
@@ -1697,6 +1777,15 @@ def remove_block(
         cached = _load_cached(session, auth, idempotency_key, request_hash)
         if cached is not None:
             return cached
+
+        if not authz.authorize(
+            session, auth, resource_type="plans", resource_id=plan_id, action="read"
+        ):
+            raise HTTPException(status_code=404, detail="PLAN_NOT_FOUND")
+        if not authz.authorize(
+            session, auth, resource_type="plans", resource_id=plan_id, action="write"
+        ):
+            raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
 
         current = _get_plan_for_update(session, auth, plan_id)
         if current is None:

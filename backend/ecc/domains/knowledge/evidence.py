@@ -19,6 +19,7 @@ from ecc.observability import (
     record_audit_outbox_failure,
     record_idempotency_conflict,
 )
+from ecc.platform import authz
 
 router = APIRouter(prefix="/api/v1/evidence", tags=["evidence"])
 SessionDep = Annotated[Session, Depends(get_session)]
@@ -97,6 +98,17 @@ def resolve_evidence(
     items: list[EvidenceItem] = []
     for evidence_id in requested:
         row = found.get(evidence_id)
+        # A row that exists in this workspace but that authz says the
+        # caller cannot see collapses into the exact same "missing" bucket
+        # as a genuinely nonexistent or cross-workspace id -- one more
+        # case joining this endpoint's own already-established collapse,
+        # not a new distinguishable status (which would leak "it exists,
+        # you just can't see it" the same way a 403-instead-of-404 would
+        # for a single-resource endpoint).
+        if row is not None and not authz.authorize(
+            session, auth, resource_type="pkos_evidence", resource_id=evidence_id, action="read"
+        ):
+            row = None
         if row is None:
             # Row genuinely doesn't exist, or belongs to a different
             # workspace (the WHERE clause above already scopes to
@@ -129,6 +141,7 @@ def resolve_evidence(
                     captured_at=row["captured_at"],
                 )
             )
+    session.rollback()
     return EvidenceListResponse(items=items)
 
 
@@ -330,6 +343,15 @@ def delete_evidence(
         cached = _load_cached(session, auth, idempotency_key, request_hash)
         if cached is not None:
             return cached
+
+        if not authz.authorize(
+            session, auth, resource_type="pkos_evidence", resource_id=evidence_id, action="read"
+        ):
+            raise HTTPException(status_code=404, detail="EVIDENCE_NOT_FOUND")
+        if not authz.authorize(
+            session, auth, resource_type="pkos_evidence", resource_id=evidence_id, action="write"
+        ):
+            raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
 
         current = (
             session.execute(

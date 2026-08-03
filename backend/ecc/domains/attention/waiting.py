@@ -20,6 +20,7 @@ from ecc.observability import (
     record_audit_outbox_failure,
     record_idempotency_conflict,
 )
+from ecc.platform import authz
 
 router = APIRouter(prefix="/api/v1/waiting", tags=["waiting"])
 SessionDep = Annotated[Session, Depends(get_session)]
@@ -179,6 +180,17 @@ def _store_idempotency(
     )
 
 
+# Subject-type -> the authz resource_type it maps to, for the read-only
+# existence-and-visibility check create_waiting_link runs before creating a
+# link -- a waiting_link never mutates its subject/counterparty, so both
+# get a read-only authorize (matching resolution.py's create_candidate,
+# not relationships.py's create_relationship, which does mutate its source).
+_SUBJECT_RESOURCE_TYPES: dict[str, str] = {
+    "task": "tasks",
+    "commitment": "commitments",
+    "knowledge_entity": "pkos_nodes",
+}
+
 _SUBJECT_EXISTENCE_QUERIES: dict[str, Any] = {
     "task": text(
         "SELECT 1 FROM tasks WHERE workspace_id = :workspace_id AND id = :subject_id "
@@ -299,6 +311,7 @@ def create_waiting_link(
     _csrf: CsrfDep,
     idempotency_key: IdempotencyHeader,
 ) -> WaitingLink:
+    authz.require_role_action(session, auth, "write")
     request_hash = _request_hash(payload, "create")
     now = datetime.now(UTC)
     link_id = uuid4()
@@ -309,8 +322,24 @@ def create_waiting_link(
             return cached
         if not _subject_exists(session, auth, payload.subject_type, payload.subject_id):
             raise HTTPException(status_code=404, detail="WAITING_SUBJECT_NOT_FOUND")
+        if not authz.authorize(
+            session,
+            auth,
+            resource_type=_SUBJECT_RESOURCE_TYPES[payload.subject_type],
+            resource_id=payload.subject_id,
+            action="read",
+        ):
+            raise HTTPException(status_code=404, detail="WAITING_SUBJECT_NOT_FOUND")
         node_type = _counterparty_node_type(session, auth, payload.counterparty_entity_id)
         if node_type is None:
+            raise HTTPException(status_code=404, detail="WAITING_COUNTERPARTY_NOT_FOUND")
+        if not authz.authorize(
+            session,
+            auth,
+            resource_type="pkos_nodes",
+            resource_id=payload.counterparty_entity_id,
+            action="read",
+        ):
             raise HTTPException(status_code=404, detail="WAITING_COUNTERPARTY_NOT_FOUND")
         if node_type not in ("person", "organization"):
             raise HTTPException(status_code=422, detail="INVALID_WAITING_DIRECTION")
@@ -331,11 +360,13 @@ def create_waiting_link(
                     INSERT INTO waiting_links (
                         id, workspace_id, subject_type, subject_id, counterparty_entity_id,
                         direction, status, note, since_at, expected_at,
-                        created_by, updated_by, created_at, updated_at, version
+                        created_by, updated_by, created_at, updated_at, version,
+                        owner_id, visibility
                     ) VALUES (
                         :id, :workspace_id, :subject_type, :subject_id, :counterparty_entity_id,
                         :direction, 'open', :note, :since_at, :expected_at,
-                        :actor_id, :actor_id, :now, :now, 1
+                        :actor_id, :actor_id, :now, :now, 1,
+                        :actor_id, 'workspace'
                     )
                     RETURNING {_FIELDS}
                     """
@@ -459,8 +490,15 @@ def list_waiting_links(
     cursor: str | None = None,
     limit: int = Query(default=20, ge=1, le=100),
 ) -> WaitingLinkList:
-    clauses = ["workspace_id = :workspace_id"]
-    params: dict[str, Any] = {"workspace_id": auth.workspace_id, "limit": limit + 1}
+    visibility_sql, visibility_params = authz.visible_resource_filter_sql(
+        session, auth, resource_type="waiting_links", action="read", table_alias="waiting_links"
+    )
+    clauses = ["workspace_id = :workspace_id", f"({visibility_sql})"]
+    params: dict[str, Any] = {
+        "workspace_id": auth.workspace_id,
+        "limit": limit + 1,
+        **visibility_params,
+    }
     if status_filter:
         clauses.append("status = :status")
         params["status"] = status_filter
@@ -488,6 +526,7 @@ def list_waiting_links(
         .mappings()
         .all()
     )
+    session.rollback()
     has_more = len(rows) > limit
     page = rows[:limit]
     items = [WaitingLink.model_validate(dict(row)) for row in page]
@@ -515,6 +554,12 @@ def _get_row(session: Session, auth: AuthContext, link_id: UUID) -> dict[str, An
 
 @router.get("/{link_id}", response_model=WaitingLink)
 def get_waiting_link(link_id: UUID, auth: AuthDep, session: SessionDep) -> WaitingLink:
+    visible = authz.authorize(
+        session, auth, resource_type="waiting_links", resource_id=link_id, action="read"
+    )
+    session.rollback()
+    if not visible:
+        raise HTTPException(status_code=404, detail="WAITING_LINK_NOT_FOUND")
     row = _get_row(session, auth, link_id)
     if row is None:
         raise HTTPException(status_code=404, detail="WAITING_LINK_NOT_FOUND")
@@ -544,6 +589,14 @@ def patch_waiting_link(
         cached = _load_cached(session, auth, idempotency_key, request_hash)
         if cached is not None:
             return cached
+        if not authz.authorize(
+            session, auth, resource_type="waiting_links", resource_id=link_id, action="read"
+        ):
+            raise HTTPException(status_code=404, detail="WAITING_LINK_NOT_FOUND")
+        if not authz.authorize(
+            session, auth, resource_type="waiting_links", resource_id=link_id, action="write"
+        ):
+            raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
         current = (
             session.execute(
                 text(
@@ -584,12 +637,12 @@ def patch_waiting_link(
                             id, workspace_id, subject_type, subject_id,
                             counterparty_entity_id, direction, status, note,
                             since_at, expected_at, created_by, updated_by,
-                            created_at, updated_at, version
+                            created_at, updated_at, version, owner_id, visibility
                         ) VALUES (
                             :id, :workspace_id, :subject_type, :subject_id,
                             :counterparty_entity_id, :direction, 'open',
                             :note, :since_at, :expected_at, :actor_id, :actor_id,
-                            :now, :now, 1
+                            :now, :now, 1, :actor_id, 'workspace'
                         )
                         RETURNING {_FIELDS}
                         """
@@ -684,6 +737,14 @@ def _terminate(
 ) -> WaitingLink:
     now = datetime.now(UTC)
     with session.begin():
+        if not authz.authorize(
+            session, auth, resource_type="waiting_links", resource_id=link_id, action="read"
+        ):
+            raise HTTPException(status_code=404, detail="WAITING_LINK_NOT_FOUND")
+        if not authz.authorize(
+            session, auth, resource_type="waiting_links", resource_id=link_id, action="write"
+        ):
+            raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
         current = (
             session.execute(
                 text(

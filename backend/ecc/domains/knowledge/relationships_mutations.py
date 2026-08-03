@@ -19,6 +19,7 @@ from ecc.domains.knowledge.relationships import (
     _write_side_effects,
 )
 from ecc.domains.knowledge.timeline import queue_timeline_entry
+from ecc.platform import authz
 
 router = APIRouter(prefix="/api/v1/knowledge/relationships", tags=["knowledge-relationships"])
 SessionDep = Annotated[Session, Depends(get_session)]
@@ -57,6 +58,22 @@ def invalidate_relationship(
         cached = _load_cached(session, auth, idempotency_key, request_hash)
         if cached is not None:
             return cached
+        if not authz.authorize(
+            session,
+            auth,
+            resource_type="pkos_edges",
+            resource_id=relationship_id,
+            action="read",
+        ):
+            raise HTTPException(status_code=404, detail="RELATIONSHIP_NOT_FOUND")
+        if not authz.authorize(
+            session,
+            auth,
+            resource_type="pkos_edges",
+            resource_id=relationship_id,
+            action="write",
+        ):
+            raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
         current = (
             session.execute(
                 text(

@@ -50,6 +50,7 @@ import pytest
 from identity_fixtures import create_identity
 from sqlalchemy import text
 
+from ecc.auth import AuthContext
 from ecc.config import get_settings
 from ecc.database import SessionFactory, engine
 from ecc.domains.automation import policy as automation_policy
@@ -387,6 +388,7 @@ def test_due_schedule_trigger_fires_exactly_once_and_sets_trigger_ref(
     scheduler_test_context: tuple[UUID, UUID],
 ) -> None:
     workspace_id, user_id = scheduler_test_context
+    auth = AuthContext(workspace_id=workspace_id, user_id=user_id, timezone="UTC")
     workflow_id = f"test.sched-fire.{uuid4().hex}"
     _publish_workflow(workspace_id, user_id, workflow_id)
     trigger = _create_schedule_trigger(
@@ -403,7 +405,7 @@ def test_due_schedule_trigger_fires_exactly_once_and_sets_trigger_ref(
     assert any(o.trigger_id == trigger.id for o in fired)
 
     with SessionFactory() as session, session.begin():
-        runs = automation_worker.list_runs(session, workspace_id)
+        runs = automation_worker.list_runs(session, auth, workspace_id)
     matching = [r for r in runs if r.trigger_ref == f"schedule:{trigger.id}"]
     assert len(matching) == 1
     assert matching[0].status == "queued"
@@ -415,7 +417,7 @@ def test_due_schedule_trigger_fires_exactly_once_and_sets_trigger_ref(
     fired_again = [o for o in outcomes_again if isinstance(o, automation_scheduler.TriggerFired)]
     assert not any(o.trigger_id == trigger.id for o in fired_again)
     with SessionFactory() as session, session.begin():
-        runs_after = automation_worker.list_runs(session, workspace_id)
+        runs_after = automation_worker.list_runs(session, auth, workspace_id)
     matching_after = [r for r in runs_after if r.trigger_ref == f"schedule:{trigger.id}"]
     assert len(matching_after) == 1  # still exactly one, not two
 
@@ -467,6 +469,7 @@ def test_misfire_backlog_fires_exactly_once_not_once_per_missed_window(
     scheduler_test_context: tuple[UUID, UUID],
 ) -> None:
     workspace_id, user_id = scheduler_test_context
+    auth = AuthContext(workspace_id=workspace_id, user_id=user_id, timezone="UTC")
     workflow_id = f"test.sched-misfire.{uuid4().hex}"
     _publish_workflow(workspace_id, user_id, workflow_id)
     trigger = _create_schedule_trigger(
@@ -482,7 +485,7 @@ def test_misfire_backlog_fires_exactly_once_not_once_per_missed_window(
     assert len([o for o in fired if o.trigger_id == trigger.id]) == 1
 
     with SessionFactory() as session, session.begin():
-        runs = automation_worker.list_runs(session, workspace_id)
+        runs = automation_worker.list_runs(session, auth, workspace_id)
     matching = [r for r in runs if r.trigger_ref == f"schedule:{trigger.id}"]
     assert len(matching) == 1  # exactly one run, not six
 
@@ -491,6 +494,7 @@ def test_skip_missed_true_does_not_catch_up_the_backlog(
     scheduler_test_context: tuple[UUID, UUID],
 ) -> None:
     workspace_id, user_id = scheduler_test_context
+    auth = AuthContext(workspace_id=workspace_id, user_id=user_id, timezone="UTC")
     workflow_id = f"test.sched-skip-missed.{uuid4().hex}"
     _publish_workflow(workspace_id, user_id, workflow_id)
     trigger = _create_schedule_trigger(
@@ -509,7 +513,7 @@ def test_skip_missed_true_does_not_catch_up_the_backlog(
     assert any(o.trigger_id == trigger.id for o in skipped)
 
     with SessionFactory() as session, session.begin():
-        runs = automation_worker.list_runs(session, workspace_id)
+        runs = automation_worker.list_runs(session, auth, workspace_id)
     matching = [r for r in runs if r.trigger_ref == f"schedule:{trigger.id}"]
     assert matching == []  # no catch-up fire at all
 
@@ -520,7 +524,7 @@ def test_skip_missed_true_does_not_catch_up_the_backlog(
     fired_next = [o for o in outcomes_next if isinstance(o, automation_scheduler.TriggerFired)]
     assert any(o.trigger_id == trigger.id for o in fired_next)
     with SessionFactory() as session, session.begin():
-        runs_after = automation_worker.list_runs(session, workspace_id)
+        runs_after = automation_worker.list_runs(session, auth, workspace_id)
     matching_after = [r for r in runs_after if r.trigger_ref == f"schedule:{trigger.id}"]
     assert len(matching_after) == 1
 
@@ -535,6 +539,7 @@ def test_event_trigger_never_auto_fired_by_scheduler_tick(
     created or how "due" a naive reading of its own fields might suggest.
     """
     workspace_id, user_id = scheduler_test_context
+    auth = AuthContext(workspace_id=workspace_id, user_id=user_id, timezone="UTC")
     workflow_id = f"test.sched-event-ignored.{uuid4().hex}"
     _publish_workflow(workspace_id, user_id, workflow_id)
     with SessionFactory() as session, session.begin():
@@ -562,7 +567,7 @@ def test_event_trigger_never_auto_fired_by_scheduler_tick(
     assert manual_trigger.id not in outcome_ids
 
     with SessionFactory() as session, session.begin():
-        runs = automation_worker.list_runs(session, workspace_id)
+        runs = automation_worker.list_runs(session, auth, workspace_id)
     assert runs == []
 
 
@@ -643,6 +648,7 @@ def test_rate_limited_scheduled_fire_advances_the_anchor_and_reports_its_own_out
     identical reasoning -- and (c) leave no extra `workflow_runs` row.
     """
     workspace_id, user_id = scheduler_test_context
+    auth = AuthContext(workspace_id=workspace_id, user_id=user_id, timezone="UTC")
     workflow_id = f"test.sched-rate-limit.{uuid4().hex}"
     _publish_workflow(
         workspace_id, user_id, workflow_id, rate_limit={"runs_per_workflow_per_hour": 1}
@@ -683,7 +689,7 @@ def test_rate_limited_scheduled_fire_advances_the_anchor_and_reports_its_own_out
     assert refreshed.last_fired_at == tick_now
 
     with SessionFactory() as session, session.begin():
-        runs = automation_worker.list_runs(session, workspace_id)
+        runs = automation_worker.list_runs(session, auth, workspace_id)
     assert len([run for run in runs if run.workflow_id == workflow_id]) == 1
 
 
@@ -713,6 +719,7 @@ def test_crash_between_enqueue_and_anchor_advance_rolls_back_atomically(
     docstring's durability section).
     """
     workspace_id, user_id = scheduler_test_context
+    auth = AuthContext(workspace_id=workspace_id, user_id=user_id, timezone="UTC")
     workflow_id = f"test.sched-crash.{uuid4().hex}"
     _publish_workflow(workspace_id, user_id, workflow_id)
     trigger = _create_schedule_trigger(
@@ -729,7 +736,7 @@ def test_crash_between_enqueue_and_anchor_advance_rolls_back_atomically(
         automation_scheduler.run_scheduler_once(SessionFactory, now=tick_now)
 
     with SessionFactory() as session, session.begin():
-        runs = automation_worker.list_runs(session, workspace_id)
+        runs = automation_worker.list_runs(session, auth, workspace_id)
         refreshed = automation_triggers.get_trigger(session, workspace_id, trigger.id)
     matching = [r for r in runs if r.trigger_ref == f"schedule:{trigger.id}"]
     assert matching == []  # the enqueue_run INSERT was rolled back too
@@ -743,7 +750,7 @@ def test_crash_between_enqueue_and_anchor_advance_rolls_back_atomically(
     fired = [o for o in outcomes if isinstance(o, automation_scheduler.TriggerFired)]
     assert any(o.trigger_id == trigger.id for o in fired)
     with SessionFactory() as session, session.begin():
-        runs_after = automation_worker.list_runs(session, workspace_id)
+        runs_after = automation_worker.list_runs(session, auth, workspace_id)
     matching_after = [r for r in runs_after if r.trigger_ref == f"schedule:{trigger.id}"]
     assert len(matching_after) == 1
 
@@ -833,6 +840,7 @@ def test_two_concurrent_ticks_racing_the_same_due_trigger_fire_exactly_once(
     most one `TriggerFired`, at most one `workflow_runs` row, ever.
     """
     workspace_id, user_id = scheduler_test_context
+    auth = AuthContext(workspace_id=workspace_id, user_id=user_id, timezone="UTC")
     workflow_id = f"test.sched-race.{uuid4().hex}"
     _publish_workflow(workspace_id, user_id, workflow_id)
     trigger = _create_schedule_trigger(
@@ -865,7 +873,7 @@ def test_two_concurrent_ticks_racing_the_same_due_trigger_fire_exactly_once(
     )
 
     with SessionFactory() as session, session.begin():
-        runs = automation_worker.list_runs(session, workspace_id)
+        runs = automation_worker.list_runs(session, auth, workspace_id)
     matching = [r for r in runs if r.trigger_ref == f"schedule:{trigger.id}"]
     assert len(matching) == 1  # exactly one workflow_runs row, not two
 
@@ -882,6 +890,7 @@ def test_scheduler_never_writes_a_run_into_the_wrong_workspace(
     scheduler_test_context: tuple[UUID, UUID],
 ) -> None:
     workspace_a, user_a = scheduler_test_context
+    auth_a = AuthContext(workspace_id=workspace_a, user_id=user_a, timezone="UTC")
     workflow_id = f"test.sched-isolation.{uuid4().hex}"
     _publish_workflow(workspace_a, user_a, workflow_id)
     trigger = _create_schedule_trigger(
@@ -899,16 +908,20 @@ def test_scheduler_never_writes_a_run_into_the_wrong_workspace(
             ),
             {"id": workspace_b, "now": now},
         )
+    # No user was ever created as a member of this peer workspace -- reuse
+    # user_a. A non-member's visibility query simply returns an empty set,
+    # which is exactly what this isolation test asserts for workspace_b.
+    auth_b = AuthContext(workspace_id=workspace_b, user_id=user_a, timezone="UTC")
     try:
         tick_now = datetime(2026, 3, 1, 1, 30, tzinfo=UTC)
         automation_scheduler.run_scheduler_once(SessionFactory, now=tick_now)
 
         with SessionFactory() as session, session.begin():
-            runs_b = automation_worker.list_runs(session, workspace_b)
+            runs_b = automation_worker.list_runs(session, auth_b, workspace_b)
         assert runs_b == []
 
         with SessionFactory() as session, session.begin():
-            runs_a = automation_worker.list_runs(session, workspace_a)
+            runs_a = automation_worker.list_runs(session, auth_a, workspace_a)
         assert any(r.trigger_ref == f"schedule:{trigger.id}" for r in runs_a)
     finally:
         with engine.begin() as connection:

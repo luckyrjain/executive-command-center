@@ -155,6 +155,8 @@ from ecc.observability import (
     record_audit_outbox_failure,
     record_idempotency_conflict,
 )
+from ecc.platform import authz
+from ecc.platform.authz import WORKSPACE_ORIGINAL_OWNER_SQL
 
 from .adapters import ActionAdapter
 from .policy import AutomationPolicy
@@ -306,17 +308,29 @@ def get_approval(session: Session, workspace_id: UUID, approval_id: UUID) -> App
 
 
 def list_approvals(
-    session: Session, workspace_id: UUID, *, status_filter: StoredStatus | None = None
+    session: Session,
+    auth: AuthContext,
+    workspace_id: UUID,
+    *,
+    status_filter: StoredStatus | None = None,
 ) -> list[ApprovalRequest]:
+    visibility_sql, visibility_params = authz.visible_resource_filter_sql(
+        session,
+        auth,
+        resource_type="approval_requests",
+        action="read",
+        table_alias="approval_requests",
+    )
     clause = "AND status = :status_filter" if status_filter is not None else ""
-    params: dict[str, Any] = {"workspace_id": workspace_id}
+    params: dict[str, Any] = {"workspace_id": workspace_id, **visibility_params}
     if status_filter is not None:
         params["status_filter"] = status_filter
     rows = (
         session.execute(
             text(
                 f"SELECT {_APPROVAL_FIELDS} FROM approval_requests "
-                f"WHERE workspace_id = :workspace_id {clause} ORDER BY requested_at ASC"
+                f"WHERE workspace_id = :workspace_id AND ({visibility_sql}) "
+                f"{clause} ORDER BY requested_at ASC"
             ),
             params,
         )
@@ -397,14 +411,15 @@ def create_approval_request(
     approval_id = uuid4()
     session.execute(
         text(
-            """
+            f"""
             INSERT INTO approval_requests (
                 id, workspace_id, run_id, step_index, action_digest,
                 high_impact_categories, status, requested_at, expires_at,
-                created_at, updated_at
+                created_at, updated_at, owner_id, visibility
             ) VALUES (
                 :id, :workspace_id, :run_id, :step_index, :action_digest,
-                :high_impact_categories, 'pending', :now, :expires_at, :now, :now
+                :high_impact_categories, 'pending', :now, :expires_at, :now, :now,
+                {WORKSPACE_ORIGINAL_OWNER_SQL}, 'workspace'
             )
             """
         ),
@@ -818,14 +833,15 @@ def _advance_run_after_decision(
     if decision == "rejected":
         session.execute(
             text(
-                """
+                f"""
                 INSERT INTO workflow_run_steps (
                     id, workspace_id, run_id, step_index, step_type, status,
                     action_digest, input, started_at, finished_at, error_class,
-                    created_at, updated_at
+                    created_at, updated_at, owner_id, visibility
                 ) VALUES (
                     :id, :workspace_id, :run_id, :step_index, 'action', 'failed',
-                    :action_digest, '{}'::jsonb, :now, :now, :error_class, :now, :now
+                    :action_digest, '{{}}'::jsonb, :now, :now, :error_class, :now, :now,
+                    {WORKSPACE_ORIGINAL_OWNER_SQL}, 'workspace'
                 )
                 ON CONFLICT ON CONSTRAINT uq_workflow_run_steps_run_step_index DO UPDATE SET
                     status = 'failed', error_class = :error_class,
@@ -857,7 +873,8 @@ def list_approvals_endpoint(
     session: SessionDep,
     approval_status: Annotated[StoredStatus | None, Query(alias="status")] = None,
 ) -> ApprovalListResponse:
-    approvals = list_approvals(session, auth.workspace_id, status_filter=approval_status)
+    approvals = list_approvals(session, auth, auth.workspace_id, status_filter=approval_status)
+    session.rollback()
     return ApprovalListResponse(approvals=[_to_response(a) for a in approvals])
 
 
@@ -878,6 +895,19 @@ def approve_endpoint(
         cached = _load_cached(session, auth, idempotency_key, request_hash)
         if cached is not None:
             return cached
+
+        if not authz.authorize(
+            session, auth, resource_type="approval_requests", resource_id=approval_id, action="read"
+        ):
+            raise HTTPException(status_code=404, detail="APPROVAL_NOT_FOUND")
+        if not authz.authorize(
+            session,
+            auth,
+            resource_type="approval_requests",
+            resource_id=approval_id,
+            action="write",
+        ):
+            raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
 
         result = decide_approval(
             session,
@@ -942,6 +972,19 @@ def reject_endpoint(
         cached = _load_cached(session, auth, idempotency_key, request_hash)
         if cached is not None:
             return cached
+
+        if not authz.authorize(
+            session, auth, resource_type="approval_requests", resource_id=approval_id, action="read"
+        ):
+            raise HTTPException(status_code=404, detail="APPROVAL_NOT_FOUND")
+        if not authz.authorize(
+            session,
+            auth,
+            resource_type="approval_requests",
+            resource_id=approval_id,
+            action="write",
+        ):
+            raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
 
         result = decide_approval(
             session,

@@ -463,9 +463,15 @@ def test_waiting_link_rejects_deep_circular_blocked_by_chain(
     # (chain_length - 1 of them) plus setup queries; the recursive-CTE
     # rewrite does the whole graph traversal in a single round-trip, so
     # total queries for this request must stay far below the chain depth.
-    assert query_count < chain_length, (
-        f"expected O(1) queries for cycle detection, got {query_count} for "
-        f"a {chain_length}-node chain"
+    # The fixed baseline itself (role check, idempotency lock/cache, Task 4's
+    # authz.authorize() visibility checks on the subject and counterparty,
+    # the advisory lock, the recursive CTE) is a small constant well under
+    # 20 regardless of chain depth -- 20 gives headroom above that baseline
+    # while still catching a real per-hop regression (which would blow past
+    # it quickly as chain_length grows).
+    assert query_count < 20, (
+        f"expected a bounded, constant number of queries regardless of chain "
+        f"depth, got {query_count} for a {chain_length}-node chain"
     )
 
 

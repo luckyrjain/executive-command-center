@@ -21,6 +21,7 @@ from ecc.observability import (
     record_audit_outbox_failure,
     record_idempotency_conflict,
 )
+from ecc.platform import authz
 
 router = APIRouter(prefix="/api/v1/calendar/events", tags=["calendar-events"])
 
@@ -346,6 +347,7 @@ def create_calendar_event(
     _csrf: CsrfDep,
     idempotency_key: IdempotencyHeader,
 ) -> CalendarEventResponse:
+    authz.require_role_action(session, auth, "write")
     request_hash = _request_hash(payload, "create")
     now = datetime.now(UTC)
     event_id = uuid4()
@@ -362,11 +364,12 @@ def create_calendar_event(
                         id, workspace_id, external_source, external_id, title,
                         starts_at, ends_at, all_day, timezone, location, description,
                         status, source_authoritative, created_by, updated_by,
-                        created_at, updated_at, version
+                        created_at, updated_at, version, owner_id, visibility
                     ) VALUES (
                         :id, :workspace_id, 'local', :external_id, :title,
                         :starts_at, :ends_at, :all_day, :timezone, :location, :description,
-                        :status, true, :actor_id, :actor_id, :now, :now, 1
+                        :status, true, :actor_id, :actor_id, :now, :now, 1,
+                        :actor_id, 'workspace'
                     ) RETURNING {_SELECT_FIELDS}
                     """
                 ),
@@ -399,8 +402,19 @@ def list_calendar_events(
     cursor: str | None = None,
     limit: int = Query(default=20, ge=1, le=100),
 ) -> CalendarEventListResponse:
-    clauses = ["workspace_id = :workspace_id"]
-    params: dict[str, Any] = {"workspace_id": auth.workspace_id, "limit": limit + 1}
+    visibility_sql, visibility_params = authz.visible_resource_filter_sql(
+        session,
+        auth,
+        resource_type="calendar_events",
+        action="read",
+        table_alias="calendar_events",
+    )
+    clauses = ["workspace_id = :workspace_id", f"({visibility_sql})"]
+    params: dict[str, Any] = {
+        "workspace_id": auth.workspace_id,
+        "limit": limit + 1,
+        **visibility_params,
+    }
     if not include_archived:
         clauses.append("archived_at IS NULL")
     if day is not None:
@@ -430,6 +444,7 @@ def list_calendar_events(
         .mappings()
         .all()
     )
+    session.rollback()
     page = rows[:limit]
     next_cursor = None
     if len(rows) > limit and page:
@@ -447,6 +462,12 @@ def get_calendar_event(
     auth: AuthDep,
     session: SessionDep,
 ) -> CalendarEventResponse:
+    visible = authz.authorize(
+        session, auth, resource_type="calendar_events", resource_id=event_id, action="read"
+    )
+    session.rollback()
+    if not visible:
+        raise HTTPException(status_code=404, detail="CALENDAR_EVENT_NOT_FOUND")
     row = _get_row(session, auth, event_id)
     if row is None:
         raise HTTPException(status_code=404, detail="CALENDAR_EVENT_NOT_FOUND")
@@ -470,6 +491,19 @@ def update_calendar_event(
         cached = _load_cached(session, auth, idempotency_key, request_hash)
         if cached is not None:
             return cached
+        # Two-phase read-then-write authz check: a plain existence lookup
+        # then a write-only authorize() call would let a suspended member
+        # distinguish 404 from 403 for an event id in their former
+        # workspace. See decisions_incidents.py's resolve_incident_
+        # endpoint for the identical reasoning.
+        if not authz.authorize(
+            session, auth, resource_type="calendar_events", resource_id=event_id, action="read"
+        ):
+            raise HTTPException(status_code=404, detail="CALENDAR_EVENT_NOT_FOUND")
+        if not authz.authorize(
+            session, auth, resource_type="calendar_events", resource_id=event_id, action="write"
+        ):
+            raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
         current = _get_row(session, auth, event_id, for_update=True)
         if current is None:
             raise HTTPException(status_code=404, detail="CALENDAR_EVENT_NOT_FOUND")
@@ -549,6 +583,14 @@ def _lifecycle(
         cached = _load_cached(session, auth, idempotency_key, request_hash)
         if cached is not None:
             return cached
+        if not authz.authorize(
+            session, auth, resource_type="calendar_events", resource_id=event_id, action="read"
+        ):
+            raise HTTPException(status_code=404, detail="CALENDAR_EVENT_NOT_FOUND")
+        if not authz.authorize(
+            session, auth, resource_type="calendar_events", resource_id=event_id, action="write"
+        ):
+            raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
         current = _get_row(session, auth, event_id, for_update=True)
         if current is None:
             raise HTTPException(status_code=404, detail="CALENDAR_EVENT_NOT_FOUND")

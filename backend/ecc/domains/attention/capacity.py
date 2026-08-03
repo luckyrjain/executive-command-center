@@ -269,6 +269,14 @@ def _current_profile(
 
 @router.get("/capacity", response_model=CapacityProfile)
 def get_capacity_profile(auth: AuthDep, session: SessionDep) -> CapacityProfile:
+    # Deliberately no authz.authorize()/visible_resource_filter_sql call in
+    # this module. Every query here is scoped to `user_id = auth.user_id`
+    # -- there is no resource_id path parameter through which a caller
+    # could ever address another member's profile, unlike every other
+    # domain Task 4 wires (which all expose a resource_id a caller could
+    # substitute to probe someone else's row). `visibility = 'private'` on
+    # the INSERT below documents the same fact for anyone reading the
+    # schema directly, it isn't load-bearing for access control here.
     return _current_profile(session, auth.workspace_id, auth.user_id)
 
 
@@ -329,10 +337,12 @@ def put_capacity_profile(
                 """
                 INSERT INTO capacity_profiles (
                     id, workspace_id, user_id, weekday, available_minutes,
-                    focus_minutes, timezone, version, created_at, updated_at
+                    focus_minutes, timezone, version, created_at, updated_at,
+                    owner_id, visibility
                 ) VALUES (
                     :id, :workspace_id, :user_id, :weekday, :available_minutes,
-                    :focus_minutes, :timezone, :version, :now, :now
+                    :focus_minutes, :timezone, :version, :now, :now,
+                    :user_id, 'private'
                 )
                 """
             ),

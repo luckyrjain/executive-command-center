@@ -63,8 +63,9 @@ from pydantic import BaseModel
 from sqlalchemy import CursorResult, text
 from sqlalchemy.orm import Session
 
-from ecc.auth import AuthDep
+from ecc.auth import AuthContext, AuthDep
 from ecc.database import get_session
+from ecc.platform import authz
 
 TriggerType = Literal["manual", "event", "schedule"]
 
@@ -126,23 +127,28 @@ def get_trigger(session: Session, workspace_id: UUID, trigger_id: UUID) -> Trigg
 
 
 def list_triggers(
-    session: Session, workspace_id: UUID, *, workflow_id: str | None = None
+    session: Session, auth: AuthContext, workspace_id: UUID, *, workflow_id: str | None = None
 ) -> list[Trigger]:
+    visibility_sql, visibility_params = authz.visible_resource_filter_sql(
+        session, auth, resource_type="triggers", action="read", table_alias="triggers"
+    )
     clause = "AND workflow_id = :workflow_id" if workflow_id is not None else ""
-    params: dict[str, Any] = {"workspace_id": workspace_id}
+    params: dict[str, Any] = {"workspace_id": workspace_id, **visibility_params}
     if workflow_id is not None:
         params["workflow_id"] = workflow_id
     rows = (
         session.execute(
             text(
                 f"SELECT {_TRIGGER_FIELDS} FROM triggers "
-                f"WHERE workspace_id = :workspace_id {clause} ORDER BY created_at ASC"
+                f"WHERE workspace_id = :workspace_id AND ({visibility_sql}) "
+                f"{clause} ORDER BY created_at ASC"
             ),
             params,
         )
         .mappings()
         .all()
     )
+    session.rollback()
     return [_row_to_trigger(dict(row)) for row in rows]
 
 
@@ -189,11 +195,11 @@ def create_trigger(
             INSERT INTO triggers (
                 id, workspace_id, workflow_id, trigger_type, event_type_filter,
                 schedule_expression, timezone, skip_missed, created_by, updated_by,
-                created_at, updated_at
+                created_at, updated_at, owner_id, visibility
             ) VALUES (
                 :id, :workspace_id, :workflow_id, :trigger_type, :event_type_filter,
                 :schedule_expression, :timezone, :skip_missed, :created_by, :updated_by,
-                :now, :now
+                :now, :now, :created_by, 'workspace'
             )
             """
         ),
@@ -371,5 +377,5 @@ def list_triggers_endpoint(
     manually; a later task adding a computed "next fire" field would be a
     natural, small extension of this same endpoint.
     """
-    triggers = list_triggers(session, auth.workspace_id, workflow_id=workflow_id)
+    triggers = list_triggers(session, auth, auth.workspace_id, workflow_id=workflow_id)
     return TriggerListResponse(triggers=[_to_response(trigger) for trigger in triggers])

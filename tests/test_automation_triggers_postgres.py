@@ -17,6 +17,7 @@ from identity_fixtures import create_identity
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 
+from ecc.auth import AuthContext
 from ecc.config import get_settings
 from ecc.database import SessionFactory, engine
 from ecc.domains.automation import triggers as automation_triggers
@@ -199,8 +200,11 @@ def test_list_triggers_filters_by_workflow_id(trigger_test_context: tuple[UUID, 
                 session, workspace_id, user_id, workflow_id=workflow_b, trigger_type="manual"
             )
 
+    auth = AuthContext(workspace_id=workspace_id, user_id=user_id, timezone="UTC")
     with SessionFactory() as session:
-        results = automation_triggers.list_triggers(session, workspace_id, workflow_id=workflow_a)
+        results = automation_triggers.list_triggers(
+            session, auth, workspace_id, workflow_id=workflow_a
+        )
     assert [t.workflow_id for t in results] == [workflow_a]
 
 

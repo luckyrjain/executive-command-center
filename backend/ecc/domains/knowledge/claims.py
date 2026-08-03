@@ -20,6 +20,7 @@ from ecc.observability import (
     record_audit_outbox_failure,
     record_idempotency_conflict,
 )
+from ecc.platform import authz
 
 router = APIRouter(prefix="/api/v1/knowledge/entities", tags=["knowledge-claims"])
 SessionDep = Annotated[Session, Depends(get_session)]
@@ -303,10 +304,12 @@ def _insert_claim(
                 f"""
                 INSERT INTO knowledge_claims (
                     id, workspace_id, subject_id, predicate, value_json, source_id,
-                    confidence, valid_from, valid_to, version, created_at, updated_at
+                    confidence, valid_from, valid_to, version, created_at, updated_at,
+                    owner_id, visibility
                 ) VALUES (
                     :id, :workspace_id, :subject_id, :predicate, CAST(:value_json AS jsonb),
-                    :source_id, :confidence, :valid_from, :valid_to, 1, :now, :now
+                    :source_id, :confidence, :valid_from, :valid_to, 1, :now, :now,
+                    :actor_id, 'workspace'
                 )
                 RETURNING {_CLAIM_FIELDS}
                 """
@@ -322,6 +325,7 @@ def _insert_claim(
                 "valid_from": payload.valid_from,
                 "valid_to": payload.valid_to,
                 "now": now,
+                "actor_id": auth.user_id,
             },
         )
         .mappings()
@@ -348,6 +352,19 @@ def create_claim(
         cached = _load_cached(session, auth, idempotency_key, request_hash)
         if cached is not None:
             return cached
+        # A claim's authorization boundary is its subject entity -- claims
+        # have no independent ownership/visibility meaningful apart from
+        # the entity they're claims about, so the two-phase check runs
+        # against pkos_nodes (entity_id), the same as every other entity-
+        # scoped child-resource endpoint in this domain.
+        if not authz.authorize(
+            session, auth, resource_type="pkos_nodes", resource_id=entity_id, action="read"
+        ):
+            raise HTTPException(status_code=404, detail="ENTITY_NOT_FOUND")
+        if not authz.authorize(
+            session, auth, resource_type="pkos_nodes", resource_id=entity_id, action="write"
+        ):
+            raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
         entity_version = _entity_version(session, auth, entity_id)
         if entity_version is None:
             raise HTTPException(status_code=404, detail="ENTITY_NOT_FOUND")
@@ -407,6 +424,16 @@ def create_claim(
 
 @router.get("/{entity_id}/claims", response_model=ClaimListResponse)
 def list_claims(entity_id: UUID, auth: AuthDep, session: SessionDep) -> ClaimListResponse:
+    # A cross-workspace/unknown entity_id never 404s here -- this is a list
+    # endpoint, and this module's own established convention (see the
+    # cross-workspace-isolation tests) returns an empty list, not 404, the
+    # same way every other list endpoint in this domain does.
+    visible = authz.authorize(
+        session, auth, resource_type="pkos_nodes", resource_id=entity_id, action="read"
+    )
+    session.rollback()
+    if not visible:
+        return ClaimListResponse(items=[])
     rows = (
         session.execute(
             text(
@@ -447,6 +474,14 @@ def supersede_claim(
         cached = _load_cached(session, auth, idempotency_key, request_hash)
         if cached is not None:
             return cached
+        if not authz.authorize(
+            session, auth, resource_type="pkos_nodes", resource_id=entity_id, action="read"
+        ):
+            raise HTTPException(status_code=404, detail="ENTITY_NOT_FOUND")
+        if not authz.authorize(
+            session, auth, resource_type="pkos_nodes", resource_id=entity_id, action="write"
+        ):
+            raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
         current = (
             session.execute(
                 text(
