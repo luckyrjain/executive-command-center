@@ -56,6 +56,7 @@ from ecc.observability import (
     record_audit_outbox_failure,
     record_idempotency_conflict,
 )
+from ecc.platform import authz
 
 from .tools import (
     ToolDefinition,
@@ -553,7 +554,20 @@ def activate_policy(
     `prompt_id_or_tool_name` is resolved server-side against both tables
     (`_resolve_policy_kind`) -- the caller never declares which table it
     means, closing off a caller-supplied-kind bypass of that resolution.
+
+    `prompt_versions`/`tool_definitions` are global, workspace-independent
+    platform data (this module's own top-of-file docstring), so there is
+    no per-resource `owner_id`/`visibility` for `authz.authorize()` to
+    decide against here -- the docstring's own "requires local-owner
+    authority" claim is enforced the same way `require_role_action` gates
+    every other create-a-new-thing endpoint in this codebase: role alone,
+    `owner`/`admin` only, matching the bar this codebase already reserves
+    for every other cross-workspace-impacting action (inviting an
+    `owner`, changing a member's role to `owner`).
     """
+    role = authz.require_active_role(session, auth)
+    if role not in {"owner", "admin"}:
+        raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
     request_hash = _request_hash(payload, f"activate:{prompt_id_or_tool_name}")
     now = datetime.now(UTC)
     with session.begin():

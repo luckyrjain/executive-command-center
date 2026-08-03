@@ -114,6 +114,10 @@ describe('MembersPanel', () => {
     })
     renderPanel()
     await screen.findByText('Ada')
+    // account_id must be visible somewhere -- it's the only value the
+    // ownership-transfer form (used when removal is blocked) accepts as
+    // its "transfer to" target.
+    expect(screen.getByText(/account-1/)).toBeTruthy()
 
     fireEvent.change(screen.getByLabelText('Role for Ada'), { target: { value: 'admin' } })
     await waitFor(() => expect(fetch).toHaveBeenCalledWith(
@@ -152,7 +156,10 @@ describe('MembersPanel', () => {
     expect(screen.getByRole('button', { name: 'Transfer ownership' })).toBeTruthy()
   })
 
-  it('lets a non-manager remove themselves ("leave workspace")', async () => {
+  it('lets a non-manager remove themselves ("leave workspace") and reloads afterward', async () => {
+    const reload = vi.fn()
+    Object.defineProperty(window, 'location', { value: { ...window.location, reload }, writable: true })
+
     const fetch = stubFetch({
       workspaces: [workspace({ role: 'member' })],
       members: [member()],
@@ -171,6 +178,10 @@ describe('MembersPanel', () => {
       expect.stringContaining('/members/user-1'),
       expect.objectContaining({ method: 'DELETE' }),
     ))
+    // Self-removal revokes the caller's own session server-side, so the
+    // component reloads the page instead of trying to refetch through an
+    // already-dead session.
+    await waitFor(() => expect(reload).toHaveBeenCalled())
   })
 
   it('does not show the role selector as editable, or the invitations section, for a non-manager role', async () => {

@@ -222,6 +222,13 @@ def update_member_role_endpoint(
     role = authz.require_active_role(session, auth)
     if role not in {"owner", "admin"}:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="INSUFFICIENT_ROLE")
+    # Mirrors `invitations.py`'s own `create_invitation_endpoint` guard: an
+    # `admin` may change a member's role to anything up to (not including)
+    # `owner` -- unrestricted, an admin could unilaterally promote
+    # themselves (or anyone) to co-owner with no existing owner ever having
+    # approved it. Only an existing `owner` may set `role: "owner"`.
+    if payload.role == "owner" and role != "owner":
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="INSUFFICIENT_ROLE")
 
     with session.begin():
         member = _member_row(session, workspace_id=auth.workspace_id, user_id=user_id)

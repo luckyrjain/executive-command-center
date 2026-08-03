@@ -35,6 +35,7 @@ from ecc.domains.governance.recommendation_targets import (
     target_version,
     validate_action,
 )
+from ecc.platform import authz
 
 router = APIRouter(prefix="/api/v1/recommendations", tags=["recommendations"])
 SessionDep = Annotated[Session, Depends(get_session)]
@@ -63,6 +64,7 @@ def generate_recommendation(
     session: SessionDep,
     idempotency_key: IdempotencyHeader,
 ) -> RecommendationResponse:
+    authz.require_role_action(session, auth, "write")
     validate_action(payload.target_type, payload.proposed_action)
     digest = request_hash(payload, "generate")
     cached = _start(session, auth, idempotency_key, digest)
@@ -203,6 +205,18 @@ def _transition(
     cached = _start(session, auth, idempotency_key, digest)
     if cached is not None:
         return cached
+    if not authz.authorize(
+        session, auth, resource_type="recommendations", resource_id=recommendation_id, action="read"
+    ):
+        raise HTTPException(status_code=404, detail="RECOMMENDATION_NOT_FOUND")
+    if not authz.authorize(
+        session,
+        auth,
+        resource_type="recommendations",
+        resource_id=recommendation_id,
+        action="write",
+    ):
+        raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
     row = expire_if_needed(
         session,
         auth,
@@ -384,6 +398,18 @@ def confirm_recommendation(
     cached = _start(session, auth, idempotency_key, digest)
     if cached is not None:
         return cached
+    if not authz.authorize(
+        session, auth, resource_type="recommendations", resource_id=recommendation_id, action="read"
+    ):
+        raise HTTPException(status_code=404, detail="RECOMMENDATION_NOT_FOUND")
+    if not authz.authorize(
+        session,
+        auth,
+        resource_type="recommendations",
+        resource_id=recommendation_id,
+        action="write",
+    ):
+        raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
     row = expire_if_needed(
         session,
         auth,

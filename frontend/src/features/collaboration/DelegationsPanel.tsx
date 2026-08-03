@@ -163,11 +163,18 @@ export default function DelegationsPanel() {
       {delegations.isError ? <div role="alert" className="inline-status error-panel">{collaborationErrorMessage(delegations.error)}</div> : null}
       {delegations.data && items.length === 0 ? <p className="empty-state">No delegations yet.</p> : null}
 
-      <ul className="work-list">
-        {items.map((delegation) => (
-          <DelegationRow key={delegation.id} delegation={delegation} myAccountId={me.data?.account_id ?? ''} onChanged={onChanged} />
-        ))}
-      </ul>
+      {/* Gated on `me.data` too, not just `delegations.data` -- every row
+          below needs `myAccountId` to decide which actions to show
+          (Accept/Reject vs. Revoke vs. nothing); rendering the list while
+          `me` is still loading would briefly show every row with no
+          actions at all, alongside its own "Loading delegations…" status. */}
+      {me.data ? (
+        <ul className="work-list">
+          {items.map((delegation) => (
+            <DelegationRow key={delegation.id} delegation={delegation} myAccountId={me.data.account_id} onChanged={onChanged} />
+          ))}
+        </ul>
+      ) : null}
     </section>
   )
 }

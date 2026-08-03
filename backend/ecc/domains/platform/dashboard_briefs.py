@@ -12,7 +12,7 @@ from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
-from ecc.auth import AuthDep, CsrfDep
+from ecc.auth import AuthContext, AuthDep, CsrfDep
 from ecc.database import get_session
 from ecc.observability import (
     queue_brief_generated,
@@ -21,6 +21,7 @@ from ecc.observability import (
     record_brief_stale,
     record_idempotency_conflict,
 )
+from ecc.platform import authz
 
 router = APIRouter(prefix="/api/v1", tags=["dashboard", "briefs"])
 SessionDep = Annotated[Session, Depends(get_session)]
@@ -81,22 +82,55 @@ def _entity_ref(entity_type: str, row: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _namespaced_visibility_filter(
+    session: Session,
+    auth: AuthContext,
+    *,
+    resource_type: str,
+    table_alias: str,
+    suffix: str,
+) -> tuple[str, dict[str, Any]]:
+    """`authz.visible_resource_filter_sql` always binds the same literal
+    parameter names (`__authz_user_id` etc.), which is fine for every
+    other call site in this codebase -- each embeds exactly one visibility
+    filter into its own query. The `waiting` section below is the one
+    place in this file that needs two, in a single `UNION ALL` query (one
+    per branch's own table) -- merging two identically-named parameter
+    dicts into one query's params would silently let the second call's
+    values clobber the first's. This wraps the shared helper and
+    suffixes every bind parameter (`__authz_user_id_suffix`, ...) so two
+    calls can coexist in the same statement.
+    """
+    sql, params = authz.visible_resource_filter_sql(
+        session, auth, resource_type=resource_type, action="read", table_alias=table_alias
+    )
+    renamed_params = {f"{key}{suffix}": value for key, value in params.items()}
+    renamed_sql = sql
+    for key in params:
+        renamed_sql = renamed_sql.replace(f":{key}", f":{key}{suffix}")
+    return renamed_sql, renamed_params
+
+
 def _build_sections(
     session: Session,
-    workspace_id: UUID,
+    auth: AuthContext,
     day: date,
     timezone: str,
 ) -> tuple[dict[str, Any], dict[str, int], list[UUID]]:
+    workspace_id = auth.workspace_id
     start, end = _bounds(day, timezone)
     now = datetime.now(UTC)
     seen: set[tuple[str, UUID]] = set()
     versions: dict[str, int] = {}
     evidence_ids: set[UUID] = set()
 
+    meetings_visibility_sql, meetings_visibility_params = authz.visible_resource_filter_sql(
+        session, auth, resource_type="meetings", action="read", table_alias="m"
+    )
     schedule_rows = (
         session.execute(
             text(
-                """
+                f"""
                 SELECT m.id, m.title, m.status, m.version,
                        ce.id AS calendar_event_id,
                        ce.version AS calendar_event_version,
@@ -108,6 +142,7 @@ def _build_sections(
                   ON ce.workspace_id = m.workspace_id
                  AND ce.id = m.calendar_event_id
                 WHERE m.workspace_id = :workspace_id
+                  AND ({meetings_visibility_sql})
                   AND m.archived_at IS NULL
                   AND coalesce(ce.starts_at, m.standalone_starts_at) < :end_at
                   AND coalesce(ce.ends_at, m.standalone_ends_at) > :start_at
@@ -115,7 +150,12 @@ def _build_sections(
                 LIMIT 8
                 """
             ),
-            {"workspace_id": workspace_id, "start_at": start, "end_at": end},
+            {
+                "workspace_id": workspace_id,
+                "start_at": start,
+                "end_at": end,
+                **meetings_visibility_params,
+            },
         )
         .mappings()
         .all()
@@ -181,10 +221,13 @@ def _build_sections(
         if len(priorities) == 7:
             break
 
+    commitments_visibility_sql, commitments_visibility_params = authz.visible_resource_filter_sql(
+        session, auth, resource_type="commitments", action="read", table_alias="c"
+    )
     commitment_rows = (
         session.execute(
             text(
-                """
+                f"""
                 SELECT c.id, c.summary, c.status, c.direction, c.importance,
                        c.due_date, c.due_at, c.version, c.evidence_id,
                        ai.score AS attention_score
@@ -194,6 +237,7 @@ def _build_sections(
                  AND ai.entity_type = 'commitment'
                  AND ai.entity_id = c.id
                 WHERE c.workspace_id = :workspace_id
+                  AND ({commitments_visibility_sql})
                   AND c.archived_at IS NULL
                   AND c.status IN ('detected', 'confirmed', 'active', 'broken')
                   AND ((c.due_at IS NOT NULL AND c.due_at < :start_at)
@@ -204,7 +248,12 @@ def _build_sections(
                 LIMIT 20
                 """
             ),
-            {"workspace_id": workspace_id, "day": day, "start_at": start},
+            {
+                "workspace_id": workspace_id,
+                "day": day,
+                "start_at": start,
+                **commitments_visibility_params,
+            },
         )
         .mappings()
         .all()
@@ -235,15 +284,22 @@ def _build_sections(
         if len(overdue) == 5:
             break
 
+    waiting_commitments_sql, waiting_commitments_params = _namespaced_visibility_filter(
+        session, auth, resource_type="commitments", table_alias="commitments", suffix="_wc"
+    )
+    waiting_tasks_sql, waiting_tasks_params = _namespaced_visibility_filter(
+        session, auth, resource_type="tasks", table_alias="tasks", suffix="_wt"
+    )
     waiting_rows = (
         session.execute(
             text(
-                """
+                f"""
                 SELECT 'commitment' AS entity_type, id, summary AS title,
                        status, version, due_date, due_at,
                        NULL::text AS blocked_reason
                 FROM commitments
                 WHERE workspace_id = :workspace_id
+                  AND ({waiting_commitments_sql})
                   AND archived_at IS NULL
                   AND direction = 'made_to_me'
                   AND status IN ('detected', 'confirmed', 'active', 'broken')
@@ -252,6 +308,7 @@ def _build_sections(
                        due_date, due_at, blocked_reason
                 FROM tasks
                 WHERE workspace_id = :workspace_id
+                  AND ({waiting_tasks_sql})
                   AND archived_at IS NULL
                   AND status = 'blocked'
                   AND blocked_on_person_id IS NOT NULL
@@ -259,7 +316,11 @@ def _build_sections(
                 LIMIT 20
                 """
             ),
-            {"workspace_id": workspace_id},
+            {
+                "workspace_id": workspace_id,
+                **waiting_commitments_params,
+                **waiting_tasks_params,
+            },
         )
         .mappings()
         .all()
@@ -284,14 +345,18 @@ def _build_sections(
         if len(waiting) == 5:
             break
 
+    risks_visibility_sql, risks_visibility_params = authz.visible_resource_filter_sql(
+        session, auth, resource_type="risks", action="read", table_alias="risks"
+    )
     risk_rows = (
         session.execute(
             text(
-                """
+                f"""
                 SELECT id, description, probability, impact, status,
                        review_at, version
                 FROM risks
                 WHERE workspace_id = :workspace_id
+                  AND ({risks_visibility_sql})
                   AND archived_at IS NULL
                   AND status <> 'closed'
                 ORDER BY probability * impact DESC,
@@ -300,7 +365,7 @@ def _build_sections(
                 LIMIT 10
                 """
             ),
-            {"workspace_id": workspace_id},
+            {"workspace_id": workspace_id, **risks_visibility_params},
         )
         .mappings()
         .all()
@@ -473,7 +538,7 @@ def _generate(
     )
     sections, source_versions, evidence_ids = _build_sections(
         session,
-        workspace_id,
+        AuthContext(workspace_id=workspace_id, user_id=user_id, timezone=timezone),
         day,
         timezone,
     )
@@ -599,7 +664,7 @@ def dashboard_today(
     target = _target_date(day, auth.timezone)
     sections, _, _ = _build_sections(
         session,
-        auth.workspace_id,
+        auth,
         target,
         auth.timezone,
     )

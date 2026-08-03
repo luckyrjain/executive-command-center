@@ -20,6 +20,7 @@ from ecc.observability import (
     record_audit_outbox_failure,
     record_idempotency_conflict,
 )
+from ecc.platform import authz
 
 router = APIRouter(prefix="/api/v1/commitments", tags=["commitments"])
 
@@ -429,6 +430,7 @@ def create_commitment(
     _csrf: CsrfDep,
     idempotency_key: IdempotencyHeader,
 ) -> CommitmentResponse:
+    authz.require_role_action(session, auth, "write")
     request_hash = _request_hash(payload, "create")
     request_id, correlation_id = _request_ids(request)
     now = datetime.now(UTC)
@@ -532,10 +534,14 @@ def list_commitments(
     cursor: str | None = None,
     limit: int = Query(default=20, ge=1, le=100),
 ) -> CommitmentListResponse:
-    clauses = ["workspace_id = :workspace_id"]
+    visibility_sql, visibility_params = authz.visible_resource_filter_sql(
+        session, auth, resource_type="commitments", action="read", table_alias="commitments"
+    )
+    clauses = ["workspace_id = :workspace_id", f"({visibility_sql})"]
     params: dict[str, Any] = {
         "workspace_id": auth.workspace_id,
         "limit": limit + 1,
+        **visibility_params,
     }
     if not include_archived:
         clauses.append("archived_at IS NULL")
@@ -596,6 +602,12 @@ def get_commitment(
     auth: AuthDep,
     session: SessionDep,
 ) -> CommitmentResponse:
+    visible = authz.authorize(
+        session, auth, resource_type="commitments", resource_id=commitment_id, action="read"
+    )
+    session.rollback()
+    if not visible:
+        raise HTTPException(status_code=404, detail="COMMITMENT_NOT_FOUND")
     row = _get_row(session, auth, commitment_id)
     if row is None:
         raise HTTPException(status_code=404, detail="COMMITMENT_NOT_FOUND")
@@ -638,6 +650,14 @@ def _mutate_commitment(
         cached = _load_cached(session, auth, idempotency_key, request_hash)
         if cached is not None:
             return cached
+        if not authz.authorize(
+            session, auth, resource_type="commitments", resource_id=commitment_id, action="read"
+        ):
+            raise HTTPException(status_code=404, detail="COMMITMENT_NOT_FOUND")
+        if not authz.authorize(
+            session, auth, resource_type="commitments", resource_id=commitment_id, action="write"
+        ):
+            raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
         current = _get_row(session, auth, commitment_id, for_update=True)
         if current is None:
             raise HTTPException(status_code=404, detail="COMMITMENT_NOT_FOUND")
@@ -734,6 +754,14 @@ def _lifecycle(
         cached = _load_cached(session, auth, idempotency_key, request_hash)
         if cached is not None:
             return cached
+        if not authz.authorize(
+            session, auth, resource_type="commitments", resource_id=commitment_id, action="read"
+        ):
+            raise HTTPException(status_code=404, detail="COMMITMENT_NOT_FOUND")
+        if not authz.authorize(
+            session, auth, resource_type="commitments", resource_id=commitment_id, action="write"
+        ):
+            raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
         current = _get_row(session, auth, commitment_id, for_update=True)
         if current is None:
             raise HTTPException(status_code=404, detail="COMMITMENT_NOT_FOUND")

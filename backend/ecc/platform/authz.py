@@ -409,7 +409,7 @@ def owned_resource_summary(
 
     **`audit_events` is excluded, a real bug found and fixed against this
     function's own first test run, not a design choice made up front.**
-    `audit_events` is itself one of the 63 tables in `_RESOURCE_TABLES`, but
+    `audit_events` is itself one of the 69 tables in `_RESOURCE_TABLES`, but
     `ecc.platform.notifications`'s own `list_shared_activity_endpoint`
     docstring already established that every domain's `_write_side_effects`-
     equivalent writes `audit_events.owner_id` as the *acting user's own id*
@@ -1382,6 +1382,24 @@ def create_ownership_transfer_endpoint(
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="RESOURCE_NOT_FOUND")
         _require_owner_admin_or_resource_owner(session, auth, resource)
 
+        # `_load_resource` above is a plain, unlocked read (by design -- it
+        # is also called from `authorize()`'s own read-only path, which
+        # must never hold a row lock). Two concurrent transfers of the
+        # same resource would otherwise both pass the check above against
+        # the same stale `owner_id`, both apply their own `UPDATE`, and
+        # both insert a `'completed'` `ownership_transfers` row -- the
+        # second row's own `from_account_id` would then misrepresent who
+        # actually owned the resource at that instant. Locking the
+        # specific row here (resource_type already validated against
+        # `_RESOURCE_TABLES` via `require_grantable` above, safe to
+        # interpolate) and re-reading `owner_id` from the locked row
+        # serializes concurrent transfers and keeps `from_account_id`
+        # accurate.
+        locked_owner_id = session.execute(
+            text(f"SELECT owner_id FROM {payload.resource_type} WHERE id = :id FOR UPDATE"),  # noqa: S608
+            {"id": payload.resource_id},
+        ).scalar_one()
+
         to_membership = (
             session.execute(
                 text(
@@ -1403,7 +1421,7 @@ def create_ownership_transfer_endpoint(
         assert to_users_id is not None  # active membership implies a users row exists
 
         from_account_id = _account_id_for(
-            session, workspace_id=auth.workspace_id, users_id=resource.owner_id
+            session, workspace_id=auth.workspace_id, users_id=locked_owner_id
         )
         assert from_account_id is not None  # every owner_id names a real users row
 

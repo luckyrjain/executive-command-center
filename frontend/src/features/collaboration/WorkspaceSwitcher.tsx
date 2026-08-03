@@ -1,4 +1,4 @@
-import { useMutation, useQueryClient } from '@tanstack/react-query'
+import { useMutation } from '@tanstack/react-query'
 
 import { apiRequest } from '../../api/client'
 import { collaborationErrorMessage } from './errors'
@@ -17,7 +17,6 @@ import { currentWorkspace, useWorkspaces } from './useWorkspaces'
  * rather than trying to invalidate every query key in the tree by hand.
  */
 export default function WorkspaceSwitcher() {
-  const queryClient = useQueryClient()
   const workspaces = useWorkspaces()
   const workspace = currentWorkspace(workspaces.data)
 
@@ -28,7 +27,13 @@ export default function WorkspaceSwitcher() {
         body: { workspace_id: workspaceId },
       }),
     onSuccess: () => {
-      void queryClient.invalidateQueries()
+      // The immediate `window.location.reload()` below discards the
+      // entire JS runtime (and its query cache) before any refetch
+      // triggered by `invalidateQueries()` could ever be observed -- a
+      // leftover call from an earlier draft that had no effect. The
+      // reload itself is this component's own real mechanism for getting
+      // every already-mounted component to refetch under the new
+      // session (see this file's own top-of-file docstring).
       window.location.reload()
     },
   })
