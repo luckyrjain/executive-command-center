@@ -448,6 +448,45 @@ def _expire_due(
         )
 
 
+def cancel_delegations_for_removed_member(
+    session: Session, *, workspace_id: UUID, account_id: UUID, now: datetime
+) -> None:
+    """Phase 8 Task 8's own call site -- `ecc.domains.identity.membership_
+    removal.remove_member_endpoint` calls this before finalizing a member's
+    removal. Force-transitions every `proposed`/`accepted` delegation
+    naming `account_id` as either party to `cancelled` -- migration
+    `0064_phase8_delegations.py`'s own docstring reserved exactly this
+    value for exactly this call site, unreachable from any user-facing
+    endpoint in this module. Bulk, not one `UPDATE` per row -- the same
+    N+1-avoidance shape `_expire_due` already established. An `accepted`
+    delegation's evidence grants are revoked exactly like `revoke`/
+    `complete` already do (`_revoke_evidence_grants`, defined below); a
+    `proposed` one never had any to revoke.
+    """
+    rows = (
+        session.execute(
+            text(
+                "UPDATE delegations SET status = 'cancelled', updated_at = :now "
+                "WHERE workspace_id = :workspace_id AND status IN ('proposed', 'accepted') "
+                "AND (delegator_account_id = :account_id OR recipient_account_id = :account_id) "
+                "RETURNING id, recipient_account_id, status"
+            ),
+            {"workspace_id": workspace_id, "account_id": account_id, "now": now},
+        )
+        .mappings()
+        .all()
+    )
+    for row in rows:
+        _write_event(session, row["id"], "cancelled", None, now)
+        _revoke_evidence_grants(
+            session,
+            workspace_id=workspace_id,
+            delegation_id=row["id"],
+            recipient_account_id=row["recipient_account_id"],
+            now=now,
+        )
+
+
 def _grant_evidence(
     session: Session,
     *,
