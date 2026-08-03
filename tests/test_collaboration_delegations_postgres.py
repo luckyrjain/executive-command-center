@@ -69,6 +69,13 @@ def _cleanup_workspace(workspace_id: UUID) -> None:
             "delegations",
             "resource_grants",
             "incidents",
+            # _create_incident (the real create_incident_endpoint) also
+            # writes audit_events/event_outbox/idempotency_records --
+            # audit_events.fk_audit_workspace_actor references users, so it
+            # must be deleted before users or that FK blocks the delete.
+            "event_outbox",
+            "audit_events",
+            "idempotency_records",
             "sessions",
             "workspace_memberships",
             "users",
