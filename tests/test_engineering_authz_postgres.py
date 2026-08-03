@@ -1137,9 +1137,12 @@ def test_grant_preview_on_workspace_visible_resource_reports_narrowing_and_loser
     assert viewer.account_id not in losers
     assert owner.account_id not in losers
 
-    # A preview mutates nothing.
-    response = viewer.client.get("/api/v1/engineering/incidents")
-    assert incident_id not in {UUID(row["id"]) for row in response.json()["incidents"]}
+    # A preview mutates nothing: visibility is still `workspace`, so member
+    # (one of the previewed narrowing's own would-be losers) still has
+    # today's default role-based access, not yet narrowed away.
+    response = member.client.get(f"/api/v1/sharing/resources/incidents/{incident_id}")
+    assert response.status_code == 200, response.text
+    assert response.json()["via"] == "workspace_role"
     with engine.begin() as connection:
         visibility = connection.execute(
             text("SELECT visibility FROM incidents WHERE id = :id"), {"id": incident_id}
