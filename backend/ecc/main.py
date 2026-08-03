@@ -78,6 +78,7 @@ from ecc.http_security import (
 from ecc.logging import configure_logging
 from ecc.observability import render_metrics, request_observability_middleware
 from ecc.platform.authz import router as authz_router
+from ecc.platform.notifications import router as notifications_router
 from ecc.search import router as search_router
 
 configure_logging()
@@ -139,6 +140,9 @@ app.include_router(authz_router)
 # Phase 8 Task 6: delegation -- GET|POST /delegations, POST /delegations/
 # {id}/accept|reject|revoke|complete (ecc.domains.collaboration.delegations).
 app.include_router(collaboration_delegations_router)
+# Phase 8 Task 7: GET /notifications, POST /notifications/{id}/read,
+# GET /shared/activity (ecc.platform.notifications).
+app.include_router(notifications_router)
 app.include_router(search_router)
 app.include_router(dashboard_briefs_router)
 # Phase 4 Task 1: read-only registry/policy surface (GET /ai/models, GET
