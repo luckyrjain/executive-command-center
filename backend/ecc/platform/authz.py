@@ -389,24 +389,45 @@ def _users_id_for_account(session: Session, *, workspace_id: UUID, account_id: U
     return None if row is None else row["id"]
 
 
+_UNOWNABLE_FOR_REMOVAL_PURPOSES: frozenset[str] = frozenset({"audit_events"})
+
+
 def owned_resource_summary(
     session: Session, *, workspace_id: UUID, users_id: UUID
 ) -> list[dict[str, object]]:
     """Every grantable `resource_type` (excluding `UNGRANTABLE_RESOURCE_
     TYPES` -- Phase 7 personal-domain data is never workspace-transferable,
     a member-removal decision made once here rather than re-litigated at
-    every call site) this `users_id` currently owns at least one row of, as
-    `[{"resource_type": str, "count": int}]`. This is
-    `ecc.domains.identity.membership_removal.remove_member_endpoint`'s own
-    "records only they own" check -- iterating every table with one `SELECT
-    count(*)` each is the same scanning shape `scripts/verify_restore.sh`
-    already uses across every `workspace_id`-scoped table, acceptable here
-    for the same reason: an administrative, infrequent operation, not a hot
-    path. Read-only -- see `_current_role`'s own docstring for why this
-    never calls `session.rollback()`.
+    every call site -- and `audit_events`, see below) this `users_id`
+    currently owns at least one row of, as `[{"resource_type": str, "count":
+    int}]`. This is `ecc.domains.identity.membership_removal.remove_member_
+    endpoint`'s own "records only they own" check -- iterating every table
+    with one `SELECT count(*)` each is the same scanning shape `scripts/
+    verify_restore.sh` already uses across every `workspace_id`-scoped
+    table, acceptable here for the same reason: an administrative,
+    infrequent operation, not a hot path.
+
+    **`audit_events` is excluded, a real bug found and fixed against this
+    function's own first test run, not a design choice made up front.**
+    `audit_events` is itself one of the 63 tables in `_RESOURCE_TABLES`, but
+    `ecc.platform.notifications`'s own `list_shared_activity_endpoint`
+    docstring already established that every domain's `_write_side_effects`-
+    equivalent writes `audit_events.owner_id` as the *acting user's own id*
+    unconditionally, on every single event -- never a meaningful signal of
+    who owns anything. Scanning it here without exclusion meant *any* active
+    member who had ever created or mutated *any* resource (i.e. essentially
+    every member) would show up as "owning" an `audit_events` row, making
+    removal spuriously blocked almost universally -- caught directly by
+    `tests/test_identity_membership_removal_postgres.py`'s own first CI run
+    (`OWNED_RESOURCES_BLOCK_REMOVAL` on `audit_events` after the real,
+    intentionally-owned `incidents` row had already been transferred away).
+
+    Read-only -- see `_current_role`'s own docstring for why this never
+    calls `session.rollback()`.
     """
     summary: list[dict[str, object]] = []
-    for resource_type in sorted(_RESOURCE_TABLES - UNGRANTABLE_RESOURCE_TYPES):
+    excluded = UNGRANTABLE_RESOURCE_TYPES | _UNOWNABLE_FOR_REMOVAL_PURPOSES
+    for resource_type in sorted(_RESOURCE_TABLES - excluded):
         count = session.execute(
             text(
                 f"SELECT count(*) FROM {resource_type} "  # noqa: S608
