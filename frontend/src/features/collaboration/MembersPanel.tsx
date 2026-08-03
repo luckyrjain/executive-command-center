@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
 import { apiRequest, ApiError } from '../../api/client'
@@ -10,6 +10,7 @@ import type {
   InvitationCreateResponse,
   InvitationListResponse,
   Member,
+  MemberExportSnapshot,
   MemberListResponse,
   MemberRemovalResponse,
   OwnedResourceSummaryItem,
@@ -47,19 +48,43 @@ function MemberRow({
   myRole,
   myUsersId,
   onChanged,
+  onRemoved,
 }: {
   member: Member
   workspaceId: string
   myRole: string
   myUsersId: string | undefined
   onChanged: () => void
+  onRemoved: (snapshot: MemberExportSnapshot) => void
 }) {
   const queryClient = useQueryClient()
   const [confirmRemove, setConfirmRemove] = useState(false)
   const [transferForm, setTransferForm] = useState({ resourceType: '', resourceId: '', toAccountId: '' })
+  const removeTriggerRef = useRef<HTMLButtonElement>(null)
+  const wasConfirmingRef = useRef(false)
+  // The trigger button (`ref={removeTriggerRef}` below) unmounts the
+  // instant `confirmRemove` becomes `true` -- `canRemove && !confirmRemove`
+  // guards its own JSX block -- so a plain `removeTriggerRef.current?.
+  // focus()` call made from the Cancel button's own onClick (still inside
+  // the *old*, about-to-unmount confirm block) would find `current` already
+  // `null`. Waiting for the post-render effect below means the trigger
+  // button has already remounted and populated the ref by the time this
+  // runs. Found (and this exact wrong-first-attempt caught) during the
+  // second whole-phase review's own frontend fixes.
+  useEffect(() => {
+    if (wasConfirmingRef.current && !confirmRemove) {
+      removeTriggerRef.current?.focus()
+    }
+    wasConfirmingRef.current = confirmRemove
+  }, [confirmRemove])
   const canManage = myRole === 'owner' || myRole === 'admin'
   const isSelf = member.user_id === myUsersId
   const canRemove = canManage || isSelf
+  // Mirrors `update_member_role_endpoint`'s own owner-only-can-grant-owner
+  // guard (`membership_removal.py`) -- an admin selecting "owner" here
+  // would only ever get a 403 back, so the option is hidden rather than
+  // offered and rejected.
+  const selectableRoles = myRole === 'owner' ? ROLES : ROLES.filter((role) => role !== 'owner')
 
   const roleMutation = useMutation({
     mutationFn: (role: Role) =>
@@ -87,7 +112,7 @@ function MemberRow({
         `/api/v1/identity/workspaces/${workspaceId}/members/${member.user_id}`,
         { method: 'DELETE' },
       ),
-    onSuccess: () => {
+    onSuccess: (data) => {
       // Removing myself revokes my own session in the same backend
       // transaction (`membership_removal.py`'s own "second, independent
       // propagation path" for session revocation) -- the very
@@ -100,6 +125,7 @@ function MemberRow({
       }
       setConfirmRemove(false)
       onChanged()
+      onRemoved(data.export)
     },
   })
 
@@ -113,9 +139,17 @@ function MemberRow({
           to_account_id: variables.toAccountId.trim(),
         },
       }),
+    // Deliberately does NOT call `removeMutation.reset()` -- a real bug
+    // found in the second whole-phase review: `blocked` (below) is derived
+    // from `removeMutation.error`, so resetting it here immediately made
+    // `blocked` `null` and the entire owned-resources panel -- including
+    // this success message -- unmount in the same render, before the user
+    // ever saw it. `removeMutation`'s own next `.mutate()` call (from
+    // clicking "Confirm removal" again) already transitions it into a
+    // fresh attempt and clears the stale error on its own; nothing here
+    // needs to force that early.
     onSuccess: () => {
       setTransferForm({ resourceType: '', resourceId: '', toAccountId: '' })
-      removeMutation.reset()
     },
   })
 
@@ -135,14 +169,14 @@ function MemberRow({
           disabled={!canManage || roleMutation.isPending}
           onChange={(event) => roleMutation.mutate(event.target.value as Role)}
         >
-          {ROLES.map((role) => <option key={role} value={role}>{role}</option>)}
+          {selectableRoles.map((role) => <option key={role} value={role}>{role}</option>)}
         </select>
       </label>
       {roleMutation.isError ? <div role="alert" className="inline-status error-panel">{collaborationErrorMessage(roleMutation.error)}</div> : null}
 
       {canRemove && !confirmRemove ? (
         <div className="work-actions">
-          <button type="button" onClick={() => setConfirmRemove(true)}>
+          <button type="button" ref={removeTriggerRef} onClick={() => setConfirmRemove(true)}>
             {isSelf ? 'Leave workspace' : 'Remove'}
           </button>
         </div>
@@ -159,7 +193,15 @@ function MemberRow({
             <button type="button" disabled={removeMutation.isPending} onClick={() => removeMutation.mutate()}>
               {removeMutation.isPending ? 'Removing…' : 'Confirm removal'}
             </button>
-            <button type="button" onClick={() => { setConfirmRemove(false); removeMutation.reset() }}>Cancel</button>
+            <button
+              type="button"
+              onClick={() => {
+                setConfirmRemove(false)
+                removeMutation.reset()
+              }}
+            >
+              Cancel
+            </button>
           </div>
         </div>
       ) : null}
@@ -296,6 +338,13 @@ export default function MembersPanel() {
   const canManage = myRole === 'owner' || myRole === 'admin'
   const [inviteForm, setInviteForm] = useState(EMPTY_INVITE_FORM)
   const [lastInvite, setLastInvite] = useState<InvitationCreateResponse | null>(null)
+  // `membership_removal.py`'s own docstring: `MemberRemovalResponse.export`
+  // exists specifically so the removing admin gets an administrative
+  // record of who was removed, in the same response that finalizes
+  // removal -- the one chance to see it, since the row is gone from the
+  // members list the moment this refetches. Found discarded (fetched,
+  // never rendered) in the second whole-phase review.
+  const [removedSnapshots, setRemovedSnapshots] = useState<MemberExportSnapshot[]>([])
 
   const members = useQuery({
     queryKey: ['identity', 'members', workspaceId],
@@ -356,6 +405,23 @@ export default function MembersPanel() {
       {members.isError ? <div role="alert" className="inline-status error-panel">{collaborationErrorMessage(members.error)}</div> : null}
       {members.data && memberItems.length === 0 ? <p className="empty-state">No active members.</p> : null}
 
+      {removedSnapshots.map((snapshot) => (
+        <div key={`${snapshot.account_id}-${snapshot.removed_at}`} role="status" className="inline-status">
+          <p>
+            Removed {snapshot.display_name} ({snapshot.email}) -- was {snapshot.role} since{' '}
+            {formatTimestamp(snapshot.joined_at)}, removed {formatTimestamp(snapshot.removed_at)}.
+          </p>
+          <button
+            type="button"
+            onClick={() =>
+              setRemovedSnapshots((current) => current.filter((s) => s !== snapshot))
+            }
+          >
+            Dismiss
+          </button>
+        </div>
+      ))}
+
       <ul className="work-list" aria-label="Members">
         {memberItems.map((member) => (
           <MemberRow
@@ -365,6 +431,7 @@ export default function MembersPanel() {
             myRole={myRole}
             myUsersId={me.data?.users_id}
             onChanged={refreshMembers}
+            onRemoved={(snapshot) => setRemovedSnapshots((current) => [...current, snapshot])}
           />
         ))}
       </ul>

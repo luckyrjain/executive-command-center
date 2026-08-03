@@ -13,6 +13,7 @@ from sqlalchemy.orm import Session
 from ecc.auth import AuthDep
 from ecc.config import get_settings
 from ecc.database import get_session
+from ecc.platform import authz
 
 router = APIRouter(prefix="/api/v1/audit", tags=["audit"])
 SessionDep = Annotated[Session, Depends(get_session)]
@@ -95,6 +96,22 @@ def list_audit_events(
     cursor: str | None = None,
     limit: int = Query(default=20, ge=1, le=100),
 ) -> AuditListResponse:
+    # Found in Phase 8's second whole-phase review: this endpoint predates
+    # Phase 8 entirely (Phase 1's original, single-implicit-user "immutable
+    # audit query API") and never got a role gate when Phase 8 introduced
+    # `private`/`shared_explicitly` resource visibility as a real security
+    # boundary. `notifications.py`'s own module docstring already
+    # characterizes this as "the unrestricted, workspace-wide admin audit
+    # log" -- the reason `/shared/activity` exists as a redacted,
+    # per-row-`authorize()`-checked alternative for ordinary members -- but
+    # nothing here ever enforced the "admin" half of that description.
+    # Without this gate, any active member of any role, including
+    # `viewer`, could read every domain's full `before`/`after` diff for
+    # any resource, including a `private` one they're denied direct read
+    # access to, simply by querying this endpoint by `aggregate_id`.
+    role = authz.require_active_role(session, auth)
+    if role not in {"owner", "admin"}:
+        raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
     _validate_range(occurred_from, occurred_to)
     conditions = ["workspace_id = :workspace_id"]
     params: dict[str, Any] = {"workspace_id": auth.workspace_id, "limit": limit + 1}

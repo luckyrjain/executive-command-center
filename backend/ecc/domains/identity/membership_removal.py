@@ -92,6 +92,7 @@ from sqlalchemy.orm import Session
 
 from ecc.auth import AuthDep, CsrfDep
 from ecc.database import get_session
+from ecc.domains.automation.worker import cancel_runs_for_removed_member
 from ecc.domains.collaboration.delegations import cancel_delegations_for_removed_member
 from ecc.platform import authz
 
@@ -234,6 +235,14 @@ def update_member_role_endpoint(
         member = _member_row(session, workspace_id=auth.workspace_id, user_id=user_id)
         if member is None or member["status"] != "active":
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="MEMBER_NOT_FOUND")
+        # Found in the second whole-phase review: the `payload.role ==
+        # "owner"` guard above only stops an admin from *promoting* someone
+        # to owner. Nothing stopped an admin from *demoting* an existing
+        # owner instead -- the same trust boundary applied asymmetrically.
+        # An owner may always change another owner's role (including their
+        # own); an admin may never change an owner's role at all.
+        if member["role"] == "owner" and role != "owner":
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="INSUFFICIENT_ROLE")
         if (
             member["role"] == "owner"
             and payload.role != "owner"
@@ -283,6 +292,15 @@ def remove_member_endpoint(
         member = _member_row(session, workspace_id=auth.workspace_id, user_id=user_id)
         if member is None or member["status"] != "active":
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="MEMBER_NOT_FOUND")
+        # Symmetric with `update_member_role_endpoint`'s own admin-cannot-
+        # touch-an-owner guard, found in the same second-review pass: an
+        # admin removing an owner is just as much an unapproved strip of
+        # that owner's authority as demoting them would be. Self-removal is
+        # unaffected -- `role` here is the caller's own current role, which
+        # equals `member["role"]` whenever `is_self`, so an owner can always
+        # still leave on their own.
+        if member["role"] == "owner" and role != "owner":
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="INSUFFICIENT_ROLE")
         if member["role"] == "owner" and _is_sole_active_owner(
             session, workspace_id=auth.workspace_id, users_id=user_id
         ):
@@ -303,6 +321,14 @@ def remove_member_endpoint(
         cancel_delegations_for_removed_member(
             session, workspace_id=auth.workspace_id, account_id=member["account_id"], now=now
         )
+        # Found in the second whole-phase review, mirroring the delegation
+        # cascade immediately above: `worker.py`'s own docstring already
+        # discloses that a run is authorized once, at enqueue, and never
+        # re-checks `created_by`'s live membership -- without this, a
+        # removed member's still-running (or paused/awaiting-approval)
+        # automation kept right on executing real side effects attributed
+        # to someone no longer in the workspace.
+        cancel_runs_for_removed_member(session, workspace_id=auth.workspace_id, users_id=user_id)
         session.execute(
             text(
                 "UPDATE sessions SET revoked_at = :now "

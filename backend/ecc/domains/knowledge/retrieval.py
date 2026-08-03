@@ -25,7 +25,6 @@ from ecc.domains.knowledge.embeddings import (
     vector_literal,
 )
 from ecc.platform import authz
-from ecc.platform.authz import WORKSPACE_ORIGINAL_OWNER_SQL
 
 router = APIRouter(prefix="/api/v1/knowledge", tags=["knowledge-retrieval"])
 SessionDep = Annotated[Session, Depends(get_session)]
@@ -110,33 +109,50 @@ def queue_retrieval_document(
     mutation rolls this write back with it, so no deferred-until-commit
     machinery is needed for the write itself to never go stale.
 
-    `owner_id` is set explicitly via the non-correlated `WORKSPACE_
-    ORIGINAL_OWNER_SQL` subquery rather than left to `retrieval_documents`'
-    own `BEFORE INSERT` trigger to re-derive per row -- `pkos_nodes` (the
-    only source this table's `rebuild_retrieval_documents` reads from) has
-    no actor column of its own, so the trigger would compute the identical
-    value anyway; setting it explicitly here just avoids paying that
-    per-row trigger-dispatch cost on `rebuild_retrieval_documents`'
-    potentially-large rebuild loop, the same fix `attention.py`'s
-    `_upsert_batch` already applies to its own bulk upsert.
+    **`owner_id`/`visibility` are read live from the source `pkos_nodes`
+    row on every upsert, found and fixed in the second whole-phase review.**
+    This function's own prior docstring claimed `pkos_nodes` "has no actor
+    column of its own" and set both fields to a permanent placeholder
+    (`WORKSPACE_ORIGINAL_OWNER_SQL`'s "workspace's first user", hardcoded
+    `'workspace'` visibility) -- that claim was simply wrong: `pkos_nodes`
+    has carried a real, per-row `owner_id` (the creating member) and a real
+    `visibility` column since it was created, exactly like every other
+    Phase 8-wired resource table. Because this function never read either
+    real value, `GET .../search` kept returning a narrowed (`shared_
+    explicitly`) or otherwise-private entity's title and body snippet to
+    every active member indefinitely after `POST /sharing/grants`'s own
+    narrowing flip -- the entity's own direct `GET` endpoint correctly
+    404s post-narrowing, but search never reflected it, defeating Task 5's
+    whole narrowing-confirmation UX for every entity ever narrowed. Both
+    fields are now correlated subqueries against the same `pkos_nodes` row
+    `entity_id` already names, refreshed on every upsert (including the
+    `ON CONFLICT` branch, so an entity mutation after a grant/transfer also
+    catches up) -- not merely set once at creation.
     """
     body = _build_body(session, workspace_id, entity_id, summary)
     session.execute(
         text(
-            f"""
+            """
+            WITH source_node AS (
+                SELECT owner_id, visibility FROM pkos_nodes
+                WHERE workspace_id = :workspace_id AND id = :entity_id
+            )
             INSERT INTO retrieval_documents (
                 id, workspace_id, entity_type, entity_id, title, body,
                 source_version, updated_at, owner_id, visibility
-            ) VALUES (
-                gen_random_uuid(), :workspace_id, :entity_type, :entity_id, :title, :body,
-                :source_version, :now, {WORKSPACE_ORIGINAL_OWNER_SQL}, 'workspace'
             )
+            SELECT
+                gen_random_uuid(), :workspace_id, :entity_type, :entity_id, :title, :body,
+                :source_version, :now, source_node.owner_id, source_node.visibility
+            FROM source_node
             ON CONFLICT (workspace_id, entity_id) DO UPDATE SET
                 entity_type = EXCLUDED.entity_type,
                 title = EXCLUDED.title,
                 body = EXCLUDED.body,
                 source_version = EXCLUDED.source_version,
-                updated_at = EXCLUDED.updated_at
+                updated_at = EXCLUDED.updated_at,
+                owner_id = EXCLUDED.owner_id,
+                visibility = EXCLUDED.visibility
             """
         ),
         {
@@ -258,8 +274,8 @@ def _decode_cursor(cursor: str) -> tuple[float, UUID]:
 def _lexical_candidates_cte(visibility_sql: str) -> str:
     # visibility_sql comes only from authz.visible_resource_filter_sql
     # (never request-controlled), same trust boundary as every other
-    # f-string-embedded fragment in this module (_SCORE_* constants,
-    # WORKSPACE_ORIGINAL_OWNER_SQL elsewhere) -- safe to splice directly.
+    # f-string-embedded fragment in this module (_SCORE_* constants) --
+    # safe to splice directly.
     return f"""
     candidates AS (
         SELECT
@@ -562,8 +578,20 @@ def retrieve(
             degraded_reason = "embedding_generation_failed"
             mode = "lexical"
 
+    # Checked against `pkos_nodes` (alias `n`, already joined by both
+    # `_lexical_candidates_cte` and `_run_hybrid_query`'s own semantic
+    # branch) rather than `retrieval_documents` (alias `d`) itself. Found
+    # in the second whole-phase review: `retrieval_documents.owner_id`/
+    # `.visibility` are a projection, refreshed by `queue_retrieval_
+    # document` on every entity mutation -- but a `POST /sharing/grants`
+    # narrowing or an ownership transfer changes `pkos_nodes` directly and
+    # triggers no entity mutation of its own, so the projection could still
+    # lag the real, current value until the next unrelated edit. Reading
+    # `pkos_nodes` live here (matching the entity's own direct `GET`
+    # endpoint, which already reads pkos_nodes' current row) closes that
+    # window entirely rather than merely narrowing it.
     visibility_sql, visibility_params = authz.visible_resource_filter_sql(
-        session, auth, resource_type="retrieval_documents", action="read", table_alias="d"
+        session, auth, resource_type="pkos_nodes", action="read", table_alias="n"
     )
     cursor_payload = _decode_cursor(cursor) if cursor else None
     params: dict[str, Any] = {

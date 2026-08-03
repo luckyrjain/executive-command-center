@@ -462,6 +462,48 @@ def _load_resource(
     )
 
 
+def _load_resource_for_update(
+    session: Session, *, resource_type: str, resource_id: UUID
+) -> ResourceRef | None:
+    """Locked variant of `_load_resource`, for any endpoint that both
+    authorizes against AND then mutates the same resource row in one
+    transaction. Never call this from `authorize()`'s own read-only path
+    (`_load_resource`'s own docstring explains why that path must stay
+    unlocked).
+
+    **Found in Phase 8's second whole-phase review, not the first.** The
+    first review's fix to `create_ownership_transfer_endpoint` added a
+    `SELECT ... FOR UPDATE` *after* `_require_owner_admin_or_resource_owner`
+    had already run against an earlier, unlocked `_load_resource` read --
+    it made `from_account_id` accurate against the locked value but never
+    re-ran the authorization decision itself against that value. A
+    non-owner/admin caller who owns a resource at the moment of their own
+    unlocked read, but no longer owns it by the time their transaction's
+    mutation actually commits (because a concurrent transfer or grant beat
+    them to it), still passed the check. Locking first and authorizing
+    against the *locked* row -- what every call site below now does --
+    closes that: the authorization decision and the mutation always see
+    the same, serialized value.
+    """
+    require_known_resource_type(resource_type)
+    row = (
+        session.execute(
+            text(
+                f"SELECT workspace_id, owner_id, visibility FROM {resource_type} "  # noqa: S608
+                "WHERE id = :id FOR UPDATE"
+            ),
+            {"id": resource_id},
+        )
+        .mappings()
+        .one_or_none()
+    )
+    if row is None:
+        return None
+    return ResourceRef(
+        workspace_id=row["workspace_id"], owner_id=row["owner_id"], visibility=row["visibility"]
+    )
+
+
 def _active_grant_exists(
     session: Session,
     *,
@@ -930,7 +972,14 @@ def create_grant_endpoint(
         ) from exc
 
     with session.begin():
-        resource = _load_resource(
+        # Locked first, authorized against the locked value second -- see
+        # `_load_resource_for_update`'s own docstring. Without this, a
+        # concurrent ownership transfer away from this caller (a non-
+        # owner/admin member) between their own unlocked read and this
+        # transaction's `UPDATE ... SET visibility` could let them force a
+        # visibility change and grant on a resource they no longer own by
+        # the time this commits.
+        resource = _load_resource_for_update(
             session, resource_type=payload.resource_type, resource_id=payload.resource_id
         )
         if resource is None or resource.workspace_id != auth.workspace_id:
@@ -1107,7 +1156,12 @@ def revoke_grant_endpoint(
             )
 
         if grant["granted_by"] != auth.user_id:
-            resource = _load_resource(
+            # Locked, consistent with `create_grant_endpoint`'s own fix --
+            # the grant row itself is already locked above, so this
+            # additionally serializes against a concurrent ownership
+            # transfer of the underlying resource while this revoke is in
+            # flight.
+            resource = _load_resource_for_update(
                 session, resource_type=grant["resource_type"], resource_id=grant["resource_id"]
             )
             role = _current_role(session, workspace_id=auth.workspace_id, users_id=auth.user_id)
@@ -1375,30 +1429,20 @@ def create_ownership_transfer_endpoint(
         ) from exc
 
     with session.begin():
-        resource = _load_resource(
+        # Locked FIRST, authorized against the locked value second -- see
+        # `_load_resource_for_update`'s own docstring. Two concurrent
+        # transfers of the same resource are now fully serialized: the
+        # second transaction to reach this lock sees the first transaction's
+        # already-committed `owner_id`, so its own authorization decision
+        # (not merely its `from_account_id` bookkeeping) reflects who
+        # actually owns the resource at that instant.
+        resource = _load_resource_for_update(
             session, resource_type=payload.resource_type, resource_id=payload.resource_id
         )
         if resource is None or resource.workspace_id != auth.workspace_id:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="RESOURCE_NOT_FOUND")
         _require_owner_admin_or_resource_owner(session, auth, resource)
-
-        # `_load_resource` above is a plain, unlocked read (by design -- it
-        # is also called from `authorize()`'s own read-only path, which
-        # must never hold a row lock). Two concurrent transfers of the
-        # same resource would otherwise both pass the check above against
-        # the same stale `owner_id`, both apply their own `UPDATE`, and
-        # both insert a `'completed'` `ownership_transfers` row -- the
-        # second row's own `from_account_id` would then misrepresent who
-        # actually owned the resource at that instant. Locking the
-        # specific row here (resource_type already validated against
-        # `_RESOURCE_TABLES` via `require_grantable` above, safe to
-        # interpolate) and re-reading `owner_id` from the locked row
-        # serializes concurrent transfers and keeps `from_account_id`
-        # accurate.
-        locked_owner_id = session.execute(
-            text(f"SELECT owner_id FROM {payload.resource_type} WHERE id = :id FOR UPDATE"),  # noqa: S608
-            {"id": payload.resource_id},
-        ).scalar_one()
+        locked_owner_id = resource.owner_id
 
         to_membership = (
             session.execute(

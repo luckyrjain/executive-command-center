@@ -349,6 +349,78 @@ def test_full_lifecycle_propose_accept_revoke(delegation_context: _DelegationCon
     assert revoked_at is not None
 
 
+def test_revoking_one_delegation_does_not_revoke_a_second_delegations_grant_on_same_evidence(
+    delegation_context: _DelegationContext,
+) -> None:
+    """Found untested by the second whole-phase review, despite the fix
+    itself landing in the first: `_revoke_evidence_grants` used to match
+    only on `(workspace_id, resource_type, resource_id, granted_to)` --
+    with no column linking a `resource_grants` row back to the delegation
+    that created it, revoking delegation A also silently revoked
+    delegation B's still-`accepted` grant on the same evidence resource.
+    Migration `0067_phase8_grant_delegation_id.py`'s new `delegation_id`
+    column, and `_revoke_evidence_grants`'s own filter on it, are what
+    this exercises: two separate delegations from the same delegator to
+    the same recipient, both naming the same evidence incident; revoking
+    one must not touch the other's still-active grant."""
+    ctx = delegation_context
+    obligation_a = _create_incident(ctx.delegator.client, ctx.delegator.token, title="Obligation A")
+    obligation_b = _create_incident(ctx.delegator.client, ctx.delegator.token, title="Obligation B")
+    shared_evidence = _create_incident(
+        ctx.delegator.client, ctx.delegator.token, title="Shared evidence"
+    )
+
+    with engine.begin() as connection:
+        for incident_id in (obligation_a["id"], obligation_b["id"], shared_evidence["id"]):
+            connection.execute(
+                text(
+                    "UPDATE incidents SET visibility = 'private' "
+                    "WHERE id = :id AND workspace_id = :workspace_id"
+                ),
+                {"id": UUID(incident_id), "workspace_id": ctx.workspace_id},
+            )
+
+    delegation_a = _propose(
+        ctx.delegator.client,
+        ctx.delegator.token,
+        recipient_account_id=ctx.recipient.account_id,
+        obligation_resource_id=obligation_a["id"],
+        evidence=[{"resource_type": "incidents", "resource_id": shared_evidence["id"]}],
+    )
+    delegation_b = _propose(
+        ctx.delegator.client,
+        ctx.delegator.token,
+        recipient_account_id=ctx.recipient.account_id,
+        obligation_resource_id=obligation_b["id"],
+        evidence=[{"resource_type": "incidents", "resource_id": shared_evidence["id"]}],
+    )
+
+    for delegation in (delegation_a, delegation_b):
+        accept = ctx.recipient.client.post(
+            f"/api/v1/delegations/{delegation['id']}/accept",
+            headers=_headers(ctx.recipient.token, key=str(uuid4())),
+        )
+        assert accept.status_code == 200, accept.text
+
+    revoke = ctx.delegator.client.post(
+        f"/api/v1/delegations/{delegation_a['id']}/revoke",
+        headers=_headers(ctx.delegator.token, key=str(uuid4())),
+    )
+    assert revoke.status_code == 200, revoke.text
+
+    visible = {
+        row["id"]
+        for row in ctx.recipient.client.get("/api/v1/engineering/incidents").json()["incidents"]
+    }
+    # Delegation A's own grants (obligation_a and its copy of the shared
+    # evidence grant) are gone -- but delegation B is still `accepted`, so
+    # its own grant on the same shared evidence resource, and on its own
+    # obligation, must both survive.
+    assert obligation_a["id"] not in visible
+    assert shared_evidence["id"] in visible
+    assert obligation_b["id"] in visible
+
+
 def test_evidence_grant_scoped_to_exactly_the_named_resources(
     delegation_context: _DelegationContext,
 ) -> None:

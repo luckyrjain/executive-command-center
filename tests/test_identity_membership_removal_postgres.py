@@ -263,6 +263,50 @@ def test_patch_role_blocked_for_last_active_owner(membership_context: _Membershi
     assert response.json()["error"]["code"] == "LAST_OWNER_CANNOT_BE_DEMOTED"
 
 
+def test_admin_cannot_promote_a_member_to_owner(membership_context: _MembershipContext) -> None:
+    """Found untested by the second whole-phase review, despite the guard
+    itself being fixed during the first: an `admin` promoting someone to
+    `owner` unilaterally is the exact privilege-escalation gap that round
+    closed."""
+    ctx = membership_context
+    response = ctx.admin.client.patch(
+        f"/api/v1/identity/workspaces/{ctx.workspace_id}/members/{ctx.member_a.user_id}",
+        json={"role": "owner"},
+        headers=_headers(ctx.admin.token),
+    )
+    assert response.status_code == 403, response.text
+    assert response.json()["error"]["code"] == "INSUFFICIENT_ROLE"
+
+
+def test_owner_can_promote_a_member_to_owner(membership_context: _MembershipContext) -> None:
+    ctx = membership_context
+    response = ctx.owner.client.patch(
+        f"/api/v1/identity/workspaces/{ctx.workspace_id}/members/{ctx.member_a.user_id}",
+        json={"role": "owner"},
+        headers=_headers(ctx.owner.token),
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["role"] == "owner"
+
+
+def test_admin_cannot_demote_an_owner(membership_context: _MembershipContext) -> None:
+    """Second whole-phase review: the promotion guard above only stopped an
+    `admin` from *promoting* someone to `owner` -- nothing stopped them
+    from *demoting* an existing owner instead, the same trust boundary
+    applied asymmetrically. This must 403 before ever reaching the
+    separate `LAST_OWNER_CANNOT_BE_DEMOTED` 409 check (`ctx.owner` is the
+    workspace's only owner here, so that check would otherwise fire
+    first -- this proves the role guard is checked first)."""
+    ctx = membership_context
+    response = ctx.admin.client.patch(
+        f"/api/v1/identity/workspaces/{ctx.workspace_id}/members/{ctx.owner.user_id}",
+        json={"role": "member"},
+        headers=_headers(ctx.admin.token),
+    )
+    assert response.status_code == 403, response.text
+    assert response.json()["error"]["code"] == "INSUFFICIENT_ROLE"
+
+
 def test_remove_member_blocked_by_owned_resources_then_succeeds_after_transfer(
     membership_context: _MembershipContext,
 ) -> None:
@@ -337,6 +381,20 @@ def test_remove_member_blocked_for_last_active_owner(
     )
     assert response.status_code == 409, response.text
     assert response.json()["error"]["code"] == "LAST_OWNER_CANNOT_BE_REMOVED"
+
+
+def test_admin_cannot_remove_an_owner(membership_context: _MembershipContext) -> None:
+    """Symmetric with `test_admin_cannot_demote_an_owner` -- an admin
+    removing an owner is just as much an unapproved strip of that owner's
+    authority as demoting them. Must 403 before the separate
+    `LAST_OWNER_CANNOT_BE_REMOVED` 409 check (same single-owner fixture)."""
+    ctx = membership_context
+    response = ctx.admin.client.delete(
+        f"/api/v1/identity/workspaces/{ctx.workspace_id}/members/{ctx.owner.user_id}",
+        headers=_headers(ctx.admin.token),
+    )
+    assert response.status_code == 403, response.text
+    assert response.json()["error"]["code"] == "INSUFFICIENT_ROLE"
 
 
 def test_remove_member_self_removal_allowed(membership_context: _MembershipContext) -> None:

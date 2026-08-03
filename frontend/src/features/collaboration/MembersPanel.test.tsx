@@ -156,6 +156,89 @@ describe('MembersPanel', () => {
     expect(screen.getByRole('button', { name: 'Transfer ownership' })).toBeTruthy()
   })
 
+  it('shows the transfer-success message without losing the owned-resources context', async () => {
+    // Regression test for a bug found in the second whole-phase review:
+    // transferMutation's onSuccess used to call removeMutation.reset(),
+    // which cleared the error `blocked` is derived from and unmounted the
+    // entire owned-resources panel -- this success message included --
+    // before the user ever saw it.
+    stubFetch({
+      members: [member()],
+      onDelete: (input) =>
+        String(input).includes('/members/user-1')
+          ? Promise.resolve(new Response(
+              JSON.stringify({ error: { code: 'OWNED_RESOURCES_BLOCK_REMOVAL', details: { owned_resources: [{ resource_type: 'incidents', count: 2 }] } } }),
+              { status: 409, headers: { 'Content-Type': 'application/json' } },
+            ))
+          : undefined,
+      onPost: (input) => (String(input).endsWith('/ownership/transfers') ? response({}) : undefined),
+    })
+    renderPanel()
+    await screen.findByText('Ada')
+    fireEvent.click(screen.getByRole('button', { name: 'Remove' }))
+    fireEvent.click(await screen.findByRole('button', { name: 'Confirm removal' }))
+    await screen.findByText('2 × incidents')
+
+    fireEvent.change(screen.getByLabelText('Resource type to transfer'), { target: { value: 'incidents' } })
+    fireEvent.change(screen.getByLabelText('Resource ID to transfer'), { target: { value: 'res-1' } })
+    fireEvent.change(screen.getByLabelText('Transfer to account ID'), { target: { value: 'account-2' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Transfer ownership' }))
+
+    expect(await screen.findByText('Transferred. Try removal again.')).toBeTruthy()
+    expect(screen.getByText('2 × incidents')).toBeTruthy()
+  })
+
+  it('shows a dismissible export snapshot after removing a non-self member', async () => {
+    const exportSnapshot = {
+      account_id: 'account-1',
+      email: 'a@example.test',
+      display_name: 'Ada',
+      role: 'member',
+      joined_at: '2026-01-01T00:00:00Z',
+      removed_at: '2026-07-01T00:00:00Z',
+    }
+    stubFetch({
+      members: [member()],
+      onDelete: (input) =>
+        String(input).includes('/members/user-1') ? response({ user_id: 'user-1', export: exportSnapshot }) : undefined,
+    })
+    renderPanel()
+    await screen.findByText('Ada')
+    fireEvent.click(screen.getByRole('button', { name: 'Remove' }))
+    fireEvent.click(await screen.findByRole('button', { name: 'Confirm removal' }))
+
+    expect(await screen.findByText(/Removed Ada/)).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: 'Dismiss' }))
+    expect(screen.queryByText(/Removed Ada/)).toBeNull()
+  })
+
+  it('hides the "owner" role option from a non-owner manager', async () => {
+    stubFetch({ workspaces: [workspace({ role: 'admin' })], members: [member()] })
+    renderPanel()
+    await screen.findByText('Ada')
+    const select = screen.getByLabelText('Role for Ada') as HTMLSelectElement
+    const optionValues = Array.from(select.options).map((option) => option.value)
+    expect(optionValues).not.toContain('owner')
+  })
+
+  it('offers the "owner" role option to an owner', async () => {
+    stubFetch({ members: [member()] })
+    renderPanel()
+    await screen.findByText('Ada')
+    const select = screen.getByLabelText('Role for Ada') as HTMLSelectElement
+    const optionValues = Array.from(select.options).map((option) => option.value)
+    expect(optionValues).toContain('owner')
+  })
+
+  it('returns focus to the Remove button after cancelling the confirmation', async () => {
+    stubFetch({ members: [member()] })
+    renderPanel()
+    await screen.findByText('Ada')
+    fireEvent.click(screen.getByRole('button', { name: 'Remove' }))
+    fireEvent.click(await screen.findByRole('button', { name: 'Cancel' }))
+    await waitFor(() => expect(document.activeElement).toBe(screen.getByRole('button', { name: 'Remove' })))
+  })
+
   it('lets a non-manager remove themselves ("leave workspace") and reloads afterward', async () => {
     const reload = vi.fn()
     Object.defineProperty(window, 'location', { value: { ...window.location, reload }, writable: true })

@@ -2,7 +2,7 @@
 id: PHASE-008-DATA-MODEL
 title: Phase 8 Multi-user Data Model
 status: Approved for Implementation
-version: 0.5.0
+version: 0.6.0
 owner: Lucky Jain
 ---
 
@@ -41,6 +41,8 @@ Resources retain workspace and accountable owner. Visibility is `private|shared_
 **Shipped.** Migration `0064_phase8_delegations.py` adds `delegations` (`id`, `workspace_id`, `delegator_account_id`, `recipient_account_id`, `obligation_type`, `obligation_resource_id`, `expected_outcome`, `due_at`, `status`, `created_at`, `updated_at`), `delegation_events` (append-only: `id`, `delegation_id`, `event_type`, `actor_account_id` nullable, `occurred_at`, `detail`), and `delegation_evidence` (`id`, `delegation_id`, `resource_type`, `resource_id`, `created_at` -- a real addition beyond the plan's own literal migration bullet, disclosed in that migration's own docstring and `API-SCHEMAS.md`'s "Task 6 status"). None of the three carries `owner_id`/`visibility` -- a delegation's own `delegator_account_id`/`recipient_account_id` columns already express a precise, inherently bilateral access model, more specific than the generic mechanism those columns exist to answer for every other table.
 
 Full endpoint/authorization/state-machine detail is in `API-SCHEMAS.md`'s own "Task 6 status" section, not repeated here.
+
+**`resource_grants.delegation_id`** (migration `0067_phase8_grant_delegation_id.py`, added by the second whole-phase review, nullable `uuid`, `FOREIGN KEY ... REFERENCES delegations(id) ON DELETE SET NULL`): a real correctness fix, not a Task 6 addition -- `_grant_evidence`/`_revoke_evidence_grants` originally matched a delegation-created `resource_grants` row only on `(workspace_id, grantee_account_id, resource_type, resource_id, revoked_at IS NULL)`, so two independent delegations to the same recipient naming the same evidence resource would have one delegation's revoke silently revoke the other's still-active grant too. `SET NULL` rather than `CASCADE`/`RESTRICT`: `delegations` rows are never deleted by any code path today (Task 6's own state-machine-only lifecycle has no delete), so this is defensive -- if a `delegations` row were ever removed by some future path, the grant it created should outlive it as an ordinary, now-unlinked grant, not be deleted itself or block the delete.
 
 ## Task 7 status
 

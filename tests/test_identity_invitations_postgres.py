@@ -346,6 +346,94 @@ def test_new_recipient_registers_and_auto_joins_via_token(
     _cleanup_new_member(UUID(body["id"]))
 
 
+def test_accept_invitation_reactivates_removed_membership(
+    owner_context: tuple[TestClient, UUID, UUID, UUID, str],
+) -> None:
+    """Found untested by the second whole-phase review, despite the fix
+    itself landing in the first: `accept_invitation_endpoint` used to
+    always `INSERT` a fresh `workspace_memberships` row -- but
+    `remove_member_endpoint` never deletes a removed member's row (only
+    flips `status`), and `uq_users_workspace_account`/`uq_workspace_
+    memberships_workspace_account` (migration `0061_phase8_accounts_
+    memberships.py`) are both unconditional unique constraints, so a
+    second unconditional `INSERT` for a returning member was guaranteed to
+    violate them and 500. This exercises the full lifecycle the fix
+    actually closes: join, get removed, get re-invited, accept again --
+    and asserts the SAME `users_id` is reactivated rather than a new one
+    (or a crash)."""
+    client, workspace_id, _owner_users_id, _owner_account_id, owner_token = owner_context
+    email = f"{uuid4()}@example.test"
+
+    first_invite = client.post(
+        f"/api/v1/identity/workspaces/{workspace_id}/invitations",
+        json={"email": email, "role": "member"},
+        headers=_headers(owner_token),
+    )
+    assert first_invite.status_code == 201, first_invite.text
+
+    with TestClient(app) as new_client:
+        joined = new_client.post(
+            f"/api/v1/identity/accounts?token={first_invite.json()['token']}",
+            json={"email": email, "password": "a brand new password", "display_name": "Returning"},
+        )
+        assert joined.status_code == 201, joined.text
+        account_id = UUID(joined.json()["id"])
+
+    with engine.begin() as connection:
+        original_users_id = connection.execute(
+            text(
+                "SELECT users_id FROM workspace_memberships "
+                "WHERE workspace_id = :workspace_id AND account_id = :account_id"
+            ),
+            {"workspace_id": workspace_id, "account_id": account_id},
+        ).scalar_one()
+
+    remove = client.delete(
+        f"/api/v1/identity/workspaces/{workspace_id}/members/{original_users_id}",
+        headers=_headers(owner_token),
+    )
+    assert remove.status_code == 200, remove.text
+
+    second_invite = client.post(
+        f"/api/v1/identity/workspaces/{workspace_id}/invitations",
+        json={"email": email, "role": "admin"},
+        headers=_headers(owner_token),
+    )
+    assert second_invite.status_code == 201, second_invite.text
+
+    # `remove_member_endpoint` revoked every session tied to the removed
+    # `users_id` -- a fresh one is required to call `accept` as that same
+    # returning person.
+    returning_token = _new_session(workspace_id, original_users_id, datetime.now(UTC))
+    with TestClient(app) as returning_client:
+        returning_client.cookies.set("ecc_session", returning_token)
+        accept = returning_client.post(
+            f"/api/v1/identity/invitations/{second_invite.json()['id']}/accept",
+            json={"token": second_invite.json()["token"]},
+            headers=_headers(returning_token),
+        )
+    assert accept.status_code == 200, accept.text
+    assert accept.json()["role"] == "admin"
+
+    with engine.begin() as connection:
+        row = (
+            connection.execute(
+                text(
+                    "SELECT users_id, status, role FROM workspace_memberships "
+                    "WHERE workspace_id = :workspace_id AND account_id = :account_id"
+                ),
+                {"workspace_id": workspace_id, "account_id": account_id},
+            )
+            .mappings()
+            .one()
+        )
+    assert row["users_id"] == original_users_id
+    assert row["status"] == "active"
+    assert row["role"] == "admin"
+
+    _cleanup_new_member(account_id)
+
+
 def test_account_creation_rejects_invalid_token(client: TestClient) -> None:
     resp = client.post(
         "/api/v1/identity/accounts?token=not-a-real-token",

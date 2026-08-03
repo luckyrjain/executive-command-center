@@ -3375,6 +3375,54 @@ def cancel_run(
     return result
 
 
+def cancel_runs_for_removed_member(session: Session, *, workspace_id: UUID, users_id: UUID) -> None:
+    """Phase 8's second whole-phase review found and closed a real gap:
+    `ecc.domains.identity.membership_removal.remove_member_endpoint`
+    already force-cancels the removed member's pending/accepted
+    delegations (`ecc.domains.collaboration.delegations.
+    cancel_delegations_for_removed_member`) but, before this, cascaded
+    nothing into automation at all -- despite this module's own docstring
+    disclosing that a run is authorized once, at enqueue, and never
+    re-checks `run.created_by`'s live membership on any later dispatch.
+    Without this, a removed member's still-running (or merely paused/
+    awaiting-approval/needs-review) automation kept right on executing
+    real, external side effects attributed to someone no longer in the
+    workspace at all -- exactly the "mid-run revocation" gap `PERMISSION-
+    CONTRACT.md` otherwise promises is closed everywhere else.
+
+    This does not by itself close the *demotion* half of that gap (a
+    member merely demoted to a lower role, not removed, still keeps their
+    in-flight runs' original authority) -- that would require this
+    module's dispatch loop itself to re-check live membership per step,
+    a materially larger change than this review's own scope. Removal is
+    the more urgent, more contained case (mirroring why
+    `cancel_delegations_for_removed_member` itself only fires on
+    removal), and is what this closes.
+
+    Bulk-selects ids first, then calls `cancel_run` (already idempotent,
+    already correctly distinguishes immediately-cancellable statuses from
+    claimed/lease-bearing ones needing its own next-checkpoint stop) per
+    row, rather than reimplementing its status-branching logic here.
+    """
+    run_ids = (
+        session.execute(
+            text(
+                "SELECT id FROM workflow_runs WHERE workspace_id = :workspace_id "
+                "AND created_by = :users_id AND NOT (status = ANY(:terminal_statuses))"
+            ),
+            {
+                "workspace_id": workspace_id,
+                "users_id": users_id,
+                "terminal_statuses": list(_TERMINAL_RUN_STATUSES),
+            },
+        )
+        .scalars()
+        .all()
+    )
+    for run_id in run_ids:
+        cancel_run(session, workspace_id, run_id)
+
+
 # ---------------------------------------------------------------------------
 # Task 4: user-initiated pause/resume (module docstring's own section has
 # the full reasoning for why these are distinct from Task 3's private
