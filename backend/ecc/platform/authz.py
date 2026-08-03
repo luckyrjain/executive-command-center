@@ -388,6 +388,202 @@ def _active_grant_exists(
     return row is not None
 
 
+def _active_grant_actions_for(
+    session: Session,
+    *,
+    workspace_id: UUID,
+    account_id: UUID,
+    resource_type: str,
+    resource_id: UUID,
+    now: datetime,
+) -> frozenset[Action]:
+    """The union of `actions` across every currently-active grant naming
+    `account_id` on this exact resource -- deliberately a union over *all*
+    matching rows, not just the newest one, because nothing stops two
+    separate grants (e.g. an earlier `read`-only grant, a later `write`
+    grant layered on top without revoking the first) from coexisting.
+    `_active_grant_exists` above stays a single-action, single-query
+    `EXISTS`-shaped check for `authorize()`'s own hot path; this is the
+    richer read `effective_permissions`/the sharing-review preview need
+    and is not on `authorize()`'s call path, so the extra aggregation cost
+    here never touches it. Read-only -- see `_current_role`'s own
+    docstring for why this never calls `session.rollback()`.
+    """
+    rows = (
+        session.execute(
+            text(
+                """
+                SELECT actions FROM resource_grants
+                WHERE workspace_id = :workspace_id AND grantee_account_id = :account_id
+                  AND resource_type = :resource_type AND resource_id = :resource_id
+                  AND revoked_at IS NULL
+                  AND (expires_at IS NULL OR expires_at > :now)
+                """
+            ),
+            {
+                "workspace_id": workspace_id,
+                "account_id": account_id,
+                "resource_type": resource_type,
+                "resource_id": resource_id,
+                "now": now,
+            },
+        )
+        .mappings()
+        .all()
+    )
+    combined: set[Action] = set()
+    for row in rows:
+        combined.update(row["actions"])
+    return frozenset(combined)
+
+
+def _members_losing_default_access(
+    session: Session,
+    *,
+    workspace_id: UUID,
+    resource_owner_id: UUID,
+    grantee_account_id: UUID,
+    resource_type: str,
+    resource_id: UUID,
+    now: datetime,
+) -> list[UUID]:
+    """Every active member's `account_id` in this workspace -- other than
+    the resource's own owner (always allowed, `authorize()` step 2) and the
+    prospective grantee (covered by the new grant instead) -- who does not
+    already hold their own active explicit grant on this exact resource:
+    the set that would lose today's default `workspace`-visibility access
+    the instant this resource narrows to `shared_explicitly`. The concrete
+    answer to the *losing* half of `UX-STATES.md`'s "sharing previews
+    exactly what becomes visible" -- the gaining half (the grantee) is
+    already the request's own subject.
+    """
+    rows = (
+        session.execute(
+            text(
+                """
+                SELECT wm.account_id
+                FROM workspace_memberships wm
+                JOIN users u ON u.workspace_id = wm.workspace_id AND u.id = wm.users_id
+                WHERE wm.workspace_id = :workspace_id AND wm.status = 'active'
+                  AND u.id != :resource_owner_id
+                  AND wm.account_id != :grantee_account_id
+                  AND NOT EXISTS (
+                      SELECT 1 FROM resource_grants rg
+                      WHERE rg.workspace_id = :workspace_id
+                        AND rg.grantee_account_id = wm.account_id
+                        AND rg.resource_type = :resource_type
+                        AND rg.resource_id = :resource_id
+                        AND rg.revoked_at IS NULL
+                        AND (rg.expires_at IS NULL OR rg.expires_at > :now)
+                  )
+                """
+            ),
+            {
+                "workspace_id": workspace_id,
+                "resource_owner_id": resource_owner_id,
+                "grantee_account_id": grantee_account_id,
+                "resource_type": resource_type,
+                "resource_id": resource_id,
+                "now": now,
+            },
+        )
+        .mappings()
+        .all()
+    )
+    return [r["account_id"] for r in rows]
+
+
+class EffectivePermissions(BaseModel):
+    """`API-SCHEMAS.md`'s "resource responses expose effective permissions
+    (which visibility tier and, where relevant, which grant is why the
+    caller can see this resource)" requirement, made concrete. No field
+    shape is spec'd anywhere else in the design doc/contracts -- this is
+    the one shape every domain response embeds or every caller fetches
+    standalone via `GET /sharing/resources/{resource_type}/{resource_id}`.
+    """
+
+    resource_type: str
+    resource_id: UUID
+    visibility: str
+    owner_id: UUID
+    is_owner: bool
+    role: Role
+    via: Literal["owner", "workspace_role", "resource_grant"]
+    granted_actions: list[Action]
+
+
+def effective_permissions(
+    session: Session, auth: AuthContext, *, resource_type: str, resource_id: UUID
+) -> EffectivePermissions | None:
+    """The richer, response-shaped counterpart to `authorize()`'s plain
+    `bool` -- same six-step decision (kept in the same order deliberately,
+    so the two are easy to eyeball against each other and never drift),
+    but returns *why* access is allowed and exactly which actions it
+    covers, rather than a single action's pass/fail. Returns `None` under
+    the identical conditions `authorize()` returns `False` for -- no active
+    membership, unknown/cross-workspace/nonexistent resource, `private`
+    and not the owner, or `shared_explicitly` with no active grant -- so
+    every caller translates `None` to `404` exactly like every other
+    single-resource route already does, never a different failure shape
+    that could itself leak existence.
+    """
+    role = _current_role(session, workspace_id=auth.workspace_id, users_id=auth.user_id)
+    if role is None:
+        return None
+    resource = _load_resource(session, resource_type=resource_type, resource_id=resource_id)
+    if resource is None or resource.workspace_id != auth.workspace_id:
+        return None
+    if resource.owner_id == auth.user_id:
+        return EffectivePermissions(
+            resource_type=resource_type,
+            resource_id=resource_id,
+            visibility=resource.visibility,
+            owner_id=resource.owner_id,
+            is_owner=True,
+            role=role,
+            via="owner",
+            granted_actions=list(ACTIONS),
+        )
+    if resource.visibility == "private":
+        return None
+    if resource.visibility == "shared_explicitly":
+        account_id = _account_id_for(session, workspace_id=auth.workspace_id, users_id=auth.user_id)
+        if account_id is None:
+            return None
+        actions = _active_grant_actions_for(
+            session,
+            workspace_id=auth.workspace_id,
+            account_id=account_id,
+            resource_type=resource_type,
+            resource_id=resource_id,
+            now=datetime.now(UTC),
+        )
+        if not actions:
+            return None
+        return EffectivePermissions(
+            resource_type=resource_type,
+            resource_id=resource_id,
+            visibility=resource.visibility,
+            owner_id=resource.owner_id,
+            is_owner=False,
+            role=role,
+            via="resource_grant",
+            granted_actions=sorted(actions),
+        )
+    if resource.visibility == "workspace":
+        return EffectivePermissions(
+            resource_type=resource_type,
+            resource_id=resource_id,
+            visibility=resource.visibility,
+            owner_id=resource.owner_id,
+            is_owner=False,
+            role=role,
+            via="workspace_role",
+            granted_actions=sorted(_ROLE_PERMISSIONS[role]),
+        )
+    return None
+
+
 def require_active_role(session: Session, auth: AuthContext) -> Role:
     """Returns the caller's current active role, or raises `403
     INSUFFICIENT_ROLE` if they hold no active membership in
@@ -570,6 +766,7 @@ class GrantCreateRequest(BaseModel):
     grantee_account_id: UUID
     actions: list[Action] = Field(min_length=1)
     expires_at: datetime | None = None
+    narrow_visibility: bool = False
 
     @field_validator("actions")
     @classmethod
@@ -640,6 +837,42 @@ def create_grant_endpoint(
         )
         if grantee_membership is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="GRANTEE_NOT_FOUND")
+
+        # A grant is only ever load-bearing when the resource's own
+        # visibility is `shared_explicitly` -- `authorize()`'s step 5 never
+        # consults `resource_grants` for a `workspace`-visibility resource
+        # (every active member already reads it via their role), and step 3
+        # denies a `private` resource unconditionally regardless of any
+        # grant. Without this block, `POST /grants` would happily insert a
+        # row that changes nothing -- confirmed by grep: before this task,
+        # no endpoint anywhere ever transitioned a resource's `visibility`,
+        # so every grant ever created was inert. Two cases:
+        #  - `private` -> `shared_explicitly` is a strict widening (only the
+        #    owner could see it before; now the owner plus named grantees
+        #    can) and is applied automatically -- the owner's act of
+        #    granting IS the deliberate confirmation `PERMISSION-CONTRACT.md`
+        #    asks for.
+        #  - `workspace` -> `shared_explicitly` is a *narrowing* for every
+        #    OTHER active member (they lose their current default,
+        #    role-based access the instant this flips, unless they also
+        #    hold their own explicit grant) -- too consequential to happen
+        #    as a side effect of an ordinary grant, so it requires the
+        #    caller to have already reviewed `POST /grants/preview`'s
+        #    `members_losing_default_access` and opted in via
+        #    `narrow_visibility=True`; otherwise this 409s rather than
+        #    silently locking other members out.
+        if resource.visibility == "workspace" and not payload.narrow_visibility:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT, detail="GRANT_REQUIRES_NARROW_VISIBILITY"
+            )
+        if resource.visibility != "shared_explicitly":
+            session.execute(
+                text(
+                    f"UPDATE {payload.resource_type} SET visibility = 'shared_explicitly' "  # noqa: S608
+                    "WHERE id = :id"
+                ),
+                {"id": payload.resource_id},
+            )
 
         grant_id = uuid4()
         now = datetime.now(UTC)
@@ -778,3 +1011,177 @@ def revoke_grant_endpoint(
         revoked_at=now,
         created_at=grant["created_at"],
     )
+
+
+# ---------------------------------------------------------------------------
+# POST /sharing/grants/preview, GET /sharing/resources/{type}/{id}
+# ---------------------------------------------------------------------------
+
+
+class GrantPreviewRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    resource_type: str
+    resource_id: UUID
+    grantee_account_id: UUID
+    actions: list[Action] = Field(min_length=1)
+
+    @field_validator("actions")
+    @classmethod
+    def _dedupe(cls, value: list[Action]) -> list[Action]:
+        return sorted(set(value))
+
+
+class GrantPreviewResponse(BaseModel):
+    resource_type: str
+    resource_id: UUID
+    grantee_account_id: UUID
+    current_visibility: str
+    proposed_visibility: str
+    requires_narrow_visibility_confirmation: bool
+    members_losing_default_access: list[UUID]
+    grantee_already_has_access: bool
+    grantee_gains_actions: list[Action]
+
+
+@router.post("/grants/preview", response_model=GrantPreviewResponse)
+def preview_grant_endpoint(
+    payload: GrantPreviewRequest, auth: AuthDep, session: SessionDep, _csrf: CsrfDep
+) -> GrantPreviewResponse:
+    """Read-only dry run of `POST /grants` -- `UX-STATES.md`'s "Sharing
+    previews exactly what becomes visible" requirement, computed from the
+    exact same tables `authorize()`/`create_grant_endpoint` read, never a
+    client-side approximation. `PERMISSION-CONTRACT.md`'s "checks occur in
+    service and query boundaries... UI hiding is not security" applies
+    equally to a preview: an inaccurate one is worse than none, since the
+    sharing-review screen exists specifically so it can be trusted.
+
+    Same authorization gate as `POST /grants` itself (only the resource's
+    owner or workspace `owner`/`admin` may preview a grant on it) --
+    otherwise this would let any member probe another member's workspace
+    membership existence via `GRANTEE_NOT_FOUND`, or discover a resource's
+    current visibility tier, neither of which they're entitled to learn
+    about a resource they don't control sharing for.
+
+    Mutates nothing -- `CsrfDep` but no `Idempotency-Key`, the identical
+    reasoning `simulate_workflow_endpoint`'s own docstring gives for a
+    mutating-method route with no state change to replay-protect.
+    """
+    try:
+        require_grantable(payload.resource_type)
+    except UnknownResourceTypeError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="RESOURCE_TYPE_NOT_GRANTABLE"
+        ) from exc
+
+    resource = _load_resource(
+        session, resource_type=payload.resource_type, resource_id=payload.resource_id
+    )
+    if resource is None or resource.workspace_id != auth.workspace_id:
+        session.rollback()
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="RESOURCE_NOT_FOUND")
+    _require_owner_admin_or_resource_owner(session, auth, resource)
+
+    grantee_membership = (
+        session.execute(
+            text(
+                "SELECT 1 FROM workspace_memberships "
+                "WHERE workspace_id = :workspace_id AND account_id = :account_id "
+                "AND status = 'active'"
+            ),
+            {"workspace_id": auth.workspace_id, "account_id": payload.grantee_account_id},
+        )
+        .mappings()
+        .one_or_none()
+    )
+    if grantee_membership is None:
+        session.rollback()
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="GRANTEE_NOT_FOUND")
+
+    now = datetime.now(UTC)
+    existing_grant_actions = _active_grant_actions_for(
+        session,
+        workspace_id=auth.workspace_id,
+        account_id=payload.grantee_account_id,
+        resource_type=payload.resource_type,
+        resource_id=payload.resource_id,
+        now=now,
+    )
+
+    if resource.visibility == "workspace":
+        # Resolve the grantee's *actual* role for the precise current-access
+        # answer, rather than assuming every role's shared baseline.
+        grantee_role = (
+            session.execute(
+                text(
+                    "SELECT role FROM workspace_memberships "
+                    "WHERE workspace_id = :workspace_id AND account_id = :account_id "
+                    "AND status = 'active'"
+                ),
+                {"workspace_id": auth.workspace_id, "account_id": payload.grantee_account_id},
+            )
+            .mappings()
+            .one()
+        )["role"]
+        current_access = _ROLE_PERMISSIONS[grantee_role]
+        requires_narrowing = True
+        members_losing_default_access = _members_losing_default_access(
+            session,
+            workspace_id=auth.workspace_id,
+            resource_owner_id=resource.owner_id,
+            grantee_account_id=payload.grantee_account_id,
+            resource_type=payload.resource_type,
+            resource_id=payload.resource_id,
+            now=now,
+        )
+    elif resource.visibility == "shared_explicitly":
+        current_access = existing_grant_actions
+        requires_narrowing = False
+        members_losing_default_access = []
+    else:  # private
+        current_access = frozenset()
+        requires_narrowing = False
+        members_losing_default_access = []
+
+    session.rollback()
+    grantee_gains = sorted(set(payload.actions) - current_access)
+    return GrantPreviewResponse(
+        resource_type=payload.resource_type,
+        resource_id=payload.resource_id,
+        grantee_account_id=payload.grantee_account_id,
+        current_visibility=resource.visibility,
+        proposed_visibility="shared_explicitly",
+        requires_narrow_visibility_confirmation=requires_narrowing,
+        members_losing_default_access=members_losing_default_access,
+        grantee_already_has_access=set(payload.actions) <= current_access,
+        grantee_gains_actions=grantee_gains,
+    )
+
+
+@router.get(
+    "/resources/{resource_type}/{resource_id}",
+    response_model=EffectivePermissions,
+)
+def get_effective_permissions_endpoint(
+    resource_type: str, resource_id: UUID, auth: AuthDep, session: SessionDep
+) -> EffectivePermissions:
+    """The standalone, resource-type-generic counterpart to embedding
+    `EffectivePermissions` directly into a domain's own response model --
+    always available for any of the 59 grantable `resource_type`s even
+    before a given domain's own endpoints are updated to embed it inline,
+    so "a viewer always knows why they can see it" (`API-SCHEMAS.md`) holds
+    universally from the moment this ships, not only for the domains
+    mechanically updated first.
+    """
+    try:
+        require_known_resource_type(resource_type)
+    except UnknownResourceTypeError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="UNKNOWN_RESOURCE_TYPE"
+        ) from exc
+    result = effective_permissions(
+        session, auth, resource_type=resource_type, resource_id=resource_id
+    )
+    session.rollback()
+    if result is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="RESOURCE_NOT_FOUND")
+    return result

@@ -123,6 +123,15 @@ class IncidentResponse(BaseModel):
     version: int
     created_at: datetime
     updated_at: datetime
+    # Task 5's `API-SCHEMAS.md` "resource responses expose effective
+    # permissions" requirement, proven here in this reference domain first
+    # (mirrors Task 3's own "one reference domain, then breadth" framing).
+    # Always populated for a row the caller is looking at (it was either
+    # just created/mutated by them, or already passed `visible_resource_
+    # filter_sql`'s own visibility check to appear in a list at all) --
+    # `None` only as a defensive fallback `_to_incident_response` never
+    # actually expects to hit.
+    sharing: authz.EffectivePermissions | None
 
 
 class IncidentListResponse(BaseModel):
@@ -154,6 +163,8 @@ class DecisionResponse(BaseModel):
     version: int
     created_at: datetime
     updated_at: datetime
+    # See IncidentResponse.sharing's own docstring comment.
+    sharing: authz.EffectivePermissions | None
 
 
 class DecisionListResponse(BaseModel):
@@ -405,12 +416,26 @@ def _get_decision(session: Session, workspace_id: UUID, decision_id: UUID) -> di
     return dict(row) if row is not None else None
 
 
-def _to_incident_response(session: Session, row: dict[str, Any]) -> IncidentResponse:
-    return IncidentResponse(**row, change_ids=_incident_change_ids(session, row["id"]))
+def _to_incident_response(
+    session: Session, auth: AuthContext, row: dict[str, Any]
+) -> IncidentResponse:
+    sharing = authz.effective_permissions(
+        session, auth, resource_type="incidents", resource_id=row["id"]
+    )
+    return IncidentResponse(
+        **row, change_ids=_incident_change_ids(session, row["id"]), sharing=sharing
+    )
 
 
-def _to_decision_response(session: Session, row: dict[str, Any]) -> DecisionResponse:
-    return DecisionResponse(**row, change_ids=_decision_change_ids(session, row["id"]))
+def _to_decision_response(
+    session: Session, auth: AuthContext, row: dict[str, Any]
+) -> DecisionResponse:
+    sharing = authz.effective_permissions(
+        session, auth, resource_type="engineering_decisions", resource_id=row["id"]
+    )
+    return DecisionResponse(
+        **row, change_ids=_decision_change_ids(session, row["id"]), sharing=sharing
+    )
 
 
 @router.post("/incidents", response_model=IncidentResponse, status_code=status.HTTP_201_CREATED)
@@ -480,7 +505,7 @@ def create_incident_endpoint(
 
         row = _get_incident(session, auth.workspace_id, incident_id)
         assert row is not None  # just inserted, same transaction
-        response = _to_incident_response(session, row)
+        response = _to_incident_response(session, auth, row)
         _write_side_effects(
             session,
             auth,
@@ -584,7 +609,7 @@ def resolve_incident_endpoint(
         new_version = int(updated["version"])
         row = _get_incident(session, auth.workspace_id, incident_id)
         assert row is not None
-        response = _to_incident_response(session, row)
+        response = _to_incident_response(session, auth, row)
         _write_side_effects(
             session,
             auth,
@@ -627,7 +652,7 @@ def list_incidents_endpoint(
         .mappings()
         .all()
     )
-    incidents = [_to_incident_response(session, dict(row)) for row in rows]
+    incidents = [_to_incident_response(session, auth, dict(row)) for row in rows]
     session.rollback()
     return IncidentListResponse(incidents=incidents)
 
@@ -698,7 +723,7 @@ def create_decision_endpoint(
 
         row = _get_decision(session, auth.workspace_id, decision_id)
         assert row is not None
-        response = _to_decision_response(session, row)
+        response = _to_decision_response(session, auth, row)
         _write_side_effects(
             session,
             auth,
@@ -803,7 +828,7 @@ def decide_decision_endpoint(
         new_version = int(updated["version"])
         row = _get_decision(session, auth.workspace_id, decision_id)
         assert row is not None
-        response = _to_decision_response(session, row)
+        response = _to_decision_response(session, auth, row)
         _write_side_effects(
             session,
             auth,
@@ -850,6 +875,6 @@ def list_decisions_endpoint(
         .mappings()
         .all()
     )
-    decisions = [_to_decision_response(session, dict(row)) for row in rows]
+    decisions = [_to_decision_response(session, auth, dict(row)) for row in rows]
     session.rollback()
     return DecisionListResponse(decisions=decisions)
