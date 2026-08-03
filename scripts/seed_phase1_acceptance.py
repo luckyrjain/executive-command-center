@@ -231,6 +231,9 @@ _WORKSPACE_ID_TABLES: tuple[str, ...] = (
     # column (both are scoped indirectly via delegation_id), so verify_
     # restore.sh's generic workspace_id-column discovery never reaches them.
     "delegations",
+    # Phase 8 Task 7 (migration 0065) -- member_notifications, same reason,
+    # a sixteenth occurrence of the identical class of gap.
+    "member_notifications",
 )
 # `workspaces` is scoped by its own `id`, not a `workspace_id` column.
 _WORKSPACE_TABLE = "workspaces"
@@ -354,6 +357,8 @@ def _fixture_ids(label: str) -> dict[str, UUID]:
         "recipient_user": seed_id(label, "user", "recipient"),
         "recipient_workspace_membership": seed_id(label, "workspace_membership", "recipient"),
         "delegation": seed_id(label, "delegation", "acceptance"),
+        # Phase 8 Task 7.
+        "member_notification": seed_id(label, "member_notification", "acceptance"),
     }
 
 
@@ -2868,6 +2873,42 @@ def _seed_delegations(cur: psycopg.Cursor[Any], label: str, ids: Mapping[str, UU
     )
 
 
+def _seed_member_notifications(
+    cur: psycopg.Cursor[Any], label: str, ids: Mapping[str, UUID]
+) -> None:
+    """Phase 8 Task 7 (migration 0065) -- member_notifications, workspace-
+    scoped like every table above. Addressed to the workspace's own seeded
+    recipient identity (``_seed_delegations``, already present by the time
+    this runs), naming the delegation that identity is party to as its
+    ``resource_ref`` -- a realistic shape (this is exactly the notification
+    ``ecc.domains.collaboration.delegations.create_delegation_endpoint``
+    itself would have written), not a synthetic placeholder. Never read
+    through the real ``ecc.platform.notifications`` endpoints, only needs to
+    prove the table round-trips through backup/restore and stays
+    workspace-isolated -- the same reasoning ``_seed_delegations``'s own
+    docstring gives.
+    """
+    cur.execute(
+        """
+        INSERT INTO member_notifications (
+            id, workspace_id, account_id, notification_type, resource_ref, created_at
+        ) VALUES (
+            %(id)s, %(workspace_id)s, %(account_id)s, %(notification_type)s,
+            %(resource_ref)s, %(created_at)s
+        )
+        ON CONFLICT (id) DO NOTHING
+        """,
+        {
+            "id": ids["member_notification"],
+            "workspace_id": ids["workspace"],
+            "account_id": ids["recipient_account"],
+            "notification_type": "delegation.proposed",
+            "resource_ref": f"delegations:{ids['delegation']}",
+            "created_at": SEED_EPOCH,
+        },
+    )
+
+
 def seed(conn: psycopg.Connection[Any]) -> None:
     """Insert deterministic Phase 1 fixtures into every table for both workspaces.
 
@@ -2938,6 +2979,10 @@ def seed(conn: psycopg.Connection[Any]) -> None:
             # workspace (delegator) -- seeds its own second, distinct
             # recipient identity first.
             _seed_delegations(cur, label, ids)
+            # Phase 8 Task 7 (migration 0065) -- member_notifications;
+            # depends on the recipient identity and delegation seeded
+            # inside _seed_delegations above.
+            _seed_member_notifications(cur, label, ids)
 
 
 def fixture_row_checksums(conn: psycopg.Connection[Any]) -> dict[str, str]:

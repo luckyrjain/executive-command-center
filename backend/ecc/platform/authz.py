@@ -228,6 +228,45 @@ _RESOURCE_TABLES: frozenset[str] = frozenset(
 )
 
 
+def _notify_member(
+    session: Session,
+    *,
+    workspace_id: UUID,
+    account_id: UUID,
+    notification_type: str,
+    resource_ref: str,
+    now: datetime,
+) -> None:
+    """Private, duplicated per-module rather than imported from
+    `ecc.platform.notifications` -- see that module's own docstring for why
+    (importing it here would create a circular import, since it needs
+    `authz` right back for `/shared/activity`). `ON CONFLICT DO NOTHING`
+    against `uq_member_notifications_dedup` is this helper's own answer to
+    "a duplicate underlying event does not double-notify" -- Task 7's own
+    migration docstring has the full rationale.
+    """
+    session.execute(
+        text(
+            """
+            INSERT INTO member_notifications (
+                id, workspace_id, account_id, notification_type, resource_ref, created_at
+            ) VALUES (
+                :id, :workspace_id, :account_id, :notification_type, :resource_ref, :now
+            )
+            ON CONFLICT (workspace_id, account_id, notification_type, resource_ref) DO NOTHING
+            """
+        ),
+        {
+            "id": uuid4(),
+            "workspace_id": workspace_id,
+            "account_id": account_id,
+            "notification_type": notification_type,
+            "resource_ref": resource_ref,
+            "now": now,
+        },
+    )
+
+
 class UnknownResourceTypeError(ValueError):
     """Raised when `resource_type` is not one of `_RESOURCE_TABLES` --
     programmer error (a typo'd or unregistered resource_type), not a
@@ -899,6 +938,14 @@ def create_grant_endpoint(
                 "expires_at": payload.expires_at,
                 "now": now,
             },
+        )
+        _notify_member(
+            session,
+            workspace_id=auth.workspace_id,
+            account_id=payload.grantee_account_id,
+            notification_type="grant.created",
+            resource_ref=f"resource_grants:{grant_id}",
+            now=now,
         )
     return GrantResponse(
         id=grant_id,

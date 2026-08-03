@@ -318,6 +318,68 @@ def _write_event(
     )
 
 
+def _notify_member(
+    session: Session,
+    *,
+    workspace_id: UUID,
+    account_id: UUID,
+    notification_type: str,
+    resource_ref: str,
+    now: datetime,
+) -> None:
+    """Private, duplicated per-module rather than imported from
+    `ecc.platform.notifications` -- see that module's own docstring for the
+    layering reason (and `ecc.platform.authz`'s identical copy, the same
+    per-module-duplication convention this file's own idempotency helpers
+    already follow).
+    """
+    session.execute(
+        text(
+            """
+            INSERT INTO member_notifications (
+                id, workspace_id, account_id, notification_type, resource_ref, created_at
+            ) VALUES (
+                :id, :workspace_id, :account_id, :notification_type, :resource_ref, :now
+            )
+            ON CONFLICT (workspace_id, account_id, notification_type, resource_ref) DO NOTHING
+            """
+        ),
+        {
+            "id": uuid4(),
+            "workspace_id": workspace_id,
+            "account_id": account_id,
+            "notification_type": notification_type,
+            "resource_ref": resource_ref,
+            "now": now,
+        },
+    )
+
+
+def _notify_expired(
+    session: Session, *, workspace_id: UUID, delegation: dict[str, Any], now: datetime
+) -> None:
+    """Both parties, not just one -- unlike every other transition (each
+    caused by one specific party's own action, so only the *other* party
+    needs telling), expiry is system-initiated and equally news to both.
+    Also this module's own concrete test fixture for the migration's
+    "duplicate underlying event does not double-notify" guarantee: two
+    concurrent requests racing `_maybe_expire_single`/`_expire_due` on the
+    same overdue delegation only ever produce one `delegation.expired`
+    notification per party, via `member_notifications`'s own `ON CONFLICT
+    DO NOTHING`, not this function taking any lock itself.
+    """
+    ref = f"delegations:{delegation['id']}"
+    for account_id in (delegation["delegator_account_id"], delegation["recipient_account_id"]):
+        _notify_member(
+            session,
+            workspace_id=workspace_id,
+            account_id=account_id,
+            notification_type="delegation.expired",
+            resource_ref=ref,
+            now=now,
+        )
+
+
 def _maybe_expire_single(
     session: Session, *, workspace_id: UUID, delegation: dict[str, Any], now: datetime
 ) -> dict[str, Any]:
@@ -341,6 +403,7 @@ def _maybe_expire_single(
         assert refreshed is not None  # the row cannot vanish, only change status
         return refreshed
     _write_event(session, delegation["id"], "expired", None, now)
+    _notify_expired(session, workspace_id=workspace_id, delegation=dict(updated), now=now)
     return dict(updated)
 
 
@@ -359,20 +422,30 @@ def _expire_due(
     params: dict[str, Any] = {"workspace_id": workspace_id, "now": now}
     if account_id is not None:
         params["account_id"] = account_id
-    expired_ids = (
+    expired_rows = (
         session.execute(
             text(
                 "UPDATE delegations SET status = 'expired', updated_at = :now "
                 "WHERE workspace_id = :workspace_id AND status = 'proposed' AND due_at < :now "
-                f"{clause}RETURNING id"
+                f"{clause}RETURNING id, delegator_account_id, recipient_account_id"
             ),
             params,
         )
-        .scalars()
+        .mappings()
         .all()
     )
-    for delegation_id in expired_ids:
-        _write_event(session, delegation_id, "expired", None, now)
+    for row in expired_rows:
+        _write_event(session, row["id"], "expired", None, now)
+        _notify_expired(
+            session,
+            workspace_id=workspace_id,
+            delegation={
+                "id": row["id"],
+                "delegator_account_id": row["delegator_account_id"],
+                "recipient_account_id": row["recipient_account_id"],
+            },
+            now=now,
+        )
 
 
 def _grant_evidence(
@@ -571,6 +644,14 @@ def create_delegation_endpoint(
             )
 
         _write_event(session, delegation_id, "proposed", delegator_account_id, now)
+        _notify_member(
+            session,
+            workspace_id=auth.workspace_id,
+            account_id=payload.recipient_account_id,
+            notification_type="delegation.proposed",
+            resource_ref=f"delegations:{delegation_id}",
+            now=now,
+        )
 
         row = _get_delegation(session, auth.workspace_id, delegation_id)
         assert row is not None
@@ -693,6 +774,14 @@ def accept_delegation_endpoint(
             now=now,
         )
         _write_event(session, delegation_id, "accepted", account_id, now)
+        _notify_member(
+            session,
+            workspace_id=auth.workspace_id,
+            account_id=row["delegator_account_id"],
+            notification_type="delegation.accepted",
+            resource_ref=f"delegations:{delegation_id}",
+            now=now,
+        )
 
         response = _to_response(session, dict(updated))
         _store_idempotency(
@@ -745,6 +834,14 @@ def reject_delegation_endpoint(
             raise HTTPException(status_code=409, detail="DELEGATION_NOT_PROPOSED")
 
         _write_event(session, delegation_id, "rejected", account_id, now)
+        _notify_member(
+            session,
+            workspace_id=auth.workspace_id,
+            account_id=row["delegator_account_id"],
+            notification_type="delegation.rejected",
+            resource_ref=f"delegations:{delegation_id}",
+            now=now,
+        )
 
         response = _to_response(session, dict(updated))
         _store_idempotency(
@@ -806,6 +903,14 @@ def revoke_delegation_endpoint(
             now=now,
         )
         _write_event(session, delegation_id, "revoked", account_id, now)
+        _notify_member(
+            session,
+            workspace_id=auth.workspace_id,
+            account_id=row["recipient_account_id"],
+            notification_type="delegation.revoked",
+            resource_ref=f"delegations:{delegation_id}",
+            now=now,
+        )
 
         response = _to_response(session, dict(updated))
         _store_idempotency(
@@ -864,6 +969,14 @@ def complete_delegation_endpoint(
             now=now,
         )
         _write_event(session, delegation_id, "completed", account_id, now)
+        _notify_member(
+            session,
+            workspace_id=auth.workspace_id,
+            account_id=row["delegator_account_id"],
+            notification_type="delegation.completed",
+            resource_ref=f"delegations:{delegation_id}",
+            now=now,
+        )
 
         response = _to_response(session, dict(updated))
         _store_idempotency(

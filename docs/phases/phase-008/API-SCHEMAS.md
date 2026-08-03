@@ -2,7 +2,7 @@
 id: PHASE-008-API-SCHEMAS
 title: Phase 8 Multi-user API
 status: Approved for Implementation
-version: 0.3.0
+version: 0.4.0
 owner: Lucky Jain
 ---
 
@@ -24,6 +24,8 @@ POST /sharing/grants/preview
 GET /sharing/resources/{resource_type}/{resource_id}
 GET|POST /delegations
 POST /delegations/{id}/accept|reject|revoke|complete
+GET /notifications
+POST /notifications/{id}/read
 GET /shared/activity
 ```
 
@@ -68,3 +70,23 @@ Frontend: `frontend/src/features/collaboration/SharingReview.tsx` -- a standalon
 **Lazy expiry, no background job** -- `_maybe_expire_single`/`_expire_due` transition an overdue `proposed` delegation to `expired` the moment any endpoint next reads or mutates it; `GET /delegations` bulk-expires every overdue delegation visible to the caller in one statement rather than one `UPDATE` per row, deliberately avoiding the exact N+1 query shape a Task 4 CI failure already caught in a different domain.
 
 **"Idempotent notifications" (the plan's own fifth named test requirement for this task) is not tested here, disclosed rather than silently dropped** -- no notification mechanism exists yet; `member_notifications` is Task 7's own scope. Deferred to that task's test suite once the mechanism exists to observe.
+
+## Task 7 status
+
+**Shipped**, under `ecc.platform.notifications` (`APIRouter(prefix="/api/v1")`, migration `0065_phase8_notifications.py`): `GET /notifications`, `POST /notifications/{id}/read`, `GET /shared/activity`.
+
+**No shared `notify()` helper across modules -- a disclosed, deliberate layering decision, not an oversight.** Writing a `member_notifications` row is a two-line `INSERT ... ON CONFLICT DO NOTHING`; having `ecc.platform.authz` (which needs to write one from `create_grant_endpoint`) import `ecc.platform.notifications` would require that module to import `authz` right back for `/shared/activity`'s own use of `authorize()` -- a real circular import. Each writer (`authz.py`'s `create_grant_endpoint`; `ecc.domains.collaboration.delegations`'s six transition endpoints, plus its own lazy-expiry paths) carries its own private `_notify_member` helper instead -- the identical per-module-duplication convention this codebase already uses for the idempotency helpers (`_lock_idempotency`/`_load_cached`/`_store_idempotency`, reimplemented in every domain rather than shared).
+
+**Notification coverage is a disclosed scope boundary, not every mutation in the app.** This task wires notification writes into the two collaboration surfaces with unambiguous, bilateral "this directly concerns a specific other account" semantics: `resource_grants` creation (`grant.created`, notifying the grantee) and every `delegations` state transition (`delegation.proposed|accepted|rejected|revoked|completed|expired`, notifying whichever party didn't cause it -- `expired` notifies both, since it is system-initiated and equally news to each). Widening notification triggers to other domains' own mutations is real, incremental follow-up work -- adding one requires only a call to that domain's own private `_notify_member` copy, no change to the mechanism itself.
+
+**Notification idempotency is a schema-level guarantee, not an application-level check.** `member_notifications` carries `UNIQUE (workspace_id, account_id, notification_type, resource_ref)`; every writer inserts via `ON CONFLICT (...) DO NOTHING`, so the same underlying event recurring (`ecc.domains.collaboration.delegations`'s own lazy-expiry race between two concurrent requests both transitioning the same overdue `proposed` delegation is the concrete case) produces at most one row per account, not two -- verified directly by forcing that exact transition to fire twice (`tests/test_platform_notifications_postgres.py::test_delegation_expiry_duplicate_event_does_not_double_notify`).
+
+`GET /notifications` is always scoped to the caller's own `account_id` -- unlike `authz.list_grants_endpoint`/`delegations.list_delegations_endpoint`, there is no `owner`/`admin` "see everyone's" broadening, since a notification is inherently addressed to one account, not a workspace resource an administrator oversees. Supports `unread_only` and cursor pagination (the identical HMAC-signed opaque-cursor shape `ecc.domains.platform.audit_queries` already uses, duplicated rather than imported per this module's own layering note above). `POST /notifications/{id}/read` is idempotent (marking an already-read notification read again returns the same response, not a `409`) and scopes its lookup by `account_id` in the same `WHERE` clause as the fetch itself, so a notification addressed to a different account `404`s exactly like a nonexistent id -- never a separate ownership check after the fact that could leak existence.
+
+**`GET /shared/activity` is `PERMISSION-CONTRACT.md`'s "affected members see redacted audit/activity without private-content leakage" made concrete, built directly on `authz.authorize()` re-run fresh per candidate row -- never on `audit_events.owner_id`/`visibility` directly.** Migration `0063` gave `audit_events` those two columns like every other table it covers, but every domain's own `_write_side_effects`-equivalent writes them as the *actor's own id* and the literal string `'workspace'`, unconditionally, on every event -- a placeholder satisfying that migration's `NOT NULL` backfill, never a meaningful per-event copy of the real resource's visibility. Filtering on them directly would have made every event visible to every active member regardless of the underlying resource's real, current visibility -- exactly the leak this endpoint exists to prevent, and exactly why it re-derives the answer from `authorize()` fresh instead, against the resource's live state.
+
+**A second disclosed scope boundary: mapping `audit_events.aggregate_type` (each domain's own ad hoc vocabulary, e.g. `"incident"`) to `authz`'s `resource_type` (the table name, e.g. `"incidents"`) uses an explicit, closed dict, not a guessed pluralization rule.** Grepping every `aggregate_type` call site across the ~35 domain files that write `audit_events` found no shared naming convention -- a wrong guess could silently map one resource's events onto an unrelated table with a colliding UUID and leak them, far worse than the safe failure mode. Any `aggregate_type` not in `_AGGREGATE_TYPE_TO_RESOURCE_TYPE` is excluded from the feed entirely (fails closed), never shown unfiltered -- covering today only the `engineering` domain (Task 3's own original reference domain) plus the Phase 7 personal-domain aggregate types (useful precisely because they are `UNGRANTABLE_RESOURCE_TYPES`, the concrete fixture `test_shared_activity_redacts_private_resource_from_other_members` exercises). Widening the map to the remaining ~30 domains is incremental follow-up work requiring no change to the filtering logic itself.
+
+Deliberately narrower than `GET /api/v1/audit` (the unrestricted, workspace-wide admin audit log `ecc.domains.platform.audit_queries` already exposes): `/shared/activity`'s response omits `before`/`after`/`metadata` entirely ("there was activity on this resource," not a field-level diff) and requires active membership but no elevated role. Pagination over-fetches (`limit * 4` candidate rows per query, across up to 5 queries) to try to fill one page despite an unknown fraction being redacted per page -- a bounded best-effort, not a guarantee; a short page with a non-null `next_cursor` means "keep going," not "no more exist."
+
+**Test suite** (`tests/test_platform_notifications_postgres.py`, new, 9 tests): the two literal plan requirements (duplicate-event idempotency; private-resource redaction) plus grant/delegation notification wiring end to end, `unread_only` filtering, mark-read idempotency and its "never leak existence" `404` shape, `/shared/activity`'s positive case (a `workspace`-visibility resource is shown), and the disclosed `_AGGREGATE_TYPE_TO_RESOURCE_TYPE` scope boundary (an `invitation` event is excluded, not shown unfiltered).

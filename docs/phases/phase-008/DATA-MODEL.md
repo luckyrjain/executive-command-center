@@ -2,7 +2,7 @@
 id: PHASE-008-DATA-MODEL
 title: Phase 8 Multi-user Data Model
 status: Approved for Implementation
-version: 0.3.0
+version: 0.4.0
 owner: Lucky Jain
 ---
 
@@ -41,3 +41,9 @@ Resources retain workspace and accountable owner. Visibility is `private|shared_
 **Shipped.** Migration `0064_phase8_delegations.py` adds `delegations` (`id`, `workspace_id`, `delegator_account_id`, `recipient_account_id`, `obligation_type`, `obligation_resource_id`, `expected_outcome`, `due_at`, `status`, `created_at`, `updated_at`), `delegation_events` (append-only: `id`, `delegation_id`, `event_type`, `actor_account_id` nullable, `occurred_at`, `detail`), and `delegation_evidence` (`id`, `delegation_id`, `resource_type`, `resource_id`, `created_at` -- a real addition beyond the plan's own literal migration bullet, disclosed in that migration's own docstring and `API-SCHEMAS.md`'s "Task 6 status"). None of the three carries `owner_id`/`visibility` -- a delegation's own `delegator_account_id`/`recipient_account_id` columns already express a precise, inherently bilateral access model, more specific than the generic mechanism those columns exist to answer for every other table.
 
 Full endpoint/authorization/state-machine detail is in `API-SCHEMAS.md`'s own "Task 6 status" section, not repeated here.
+
+## Task 7 status
+
+**Shipped.** Migration `0065_phase8_notifications.py` adds `member_notifications` (`id`, `workspace_id`, `account_id`, `notification_type`, `resource_ref`, `read_at`, `created_at`) -- exactly the plan's own literal column list, with `resource_ref` a single text column encoded `f"{resource_type}:{resource_id}"` rather than a widened `(resource_type, resource_id)` pair. No `owner_id`/`visibility` -- a notification is inherently recipient-scoped, `account_id` already answering "who may see this row" more precisely than the generic visibility mechanism, the identical reasoning migration `0064`'s own three tables gave.
+
+`UNIQUE (workspace_id, account_id, notification_type, resource_ref)` is this migration's own answer to the plan's "notification idempotency (a duplicate underlying event does not double-notify)" requirement -- every writer inserts via `INSERT ... ON CONFLICT (...) DO NOTHING`, so the same underlying event recurring produces at most one row per account. `GET /shared/activity` reads the pre-existing `audit_events` table (no new event source), filtered per row through `ecc.platform.authz.authorize()` against each candidate row's live, current resource state -- full detail in `API-SCHEMAS.md`'s own "Task 7 status" section.
