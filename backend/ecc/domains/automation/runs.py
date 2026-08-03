@@ -469,6 +469,7 @@ def list_runs_endpoint(
     run_status: Annotated[RunStatus | None, Query(alias="status")] = None,
 ) -> RunListResponse:
     runs = worker_module.list_runs(session, auth, auth.workspace_id, status_filter=run_status)
+    session.rollback()
     return RunListResponse(runs=[_to_response(r) for r in runs])
 
 

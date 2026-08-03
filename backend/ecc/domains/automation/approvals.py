@@ -337,7 +337,6 @@ def list_approvals(
         .mappings()
         .all()
     )
-    session.rollback()
     return [_row_to_approval(dict(row)) for row in rows]
 
 
@@ -875,6 +874,7 @@ def list_approvals_endpoint(
     approval_status: Annotated[StoredStatus | None, Query(alias="status")] = None,
 ) -> ApprovalListResponse:
     approvals = list_approvals(session, auth, auth.workspace_id, status_filter=approval_status)
+    session.rollback()
     return ApprovalListResponse(approvals=[_to_response(a) for a in approvals])
 
 

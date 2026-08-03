@@ -1303,7 +1303,6 @@ def list_runs(
         .mappings()
         .all()
     )
-    session.rollback()
     return [_row_to_run(dict(row)) for row in rows]
 
 
