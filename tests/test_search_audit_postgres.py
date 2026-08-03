@@ -357,8 +357,7 @@ def test_audit_endpoint_is_owner_admin_only(
         with engine.begin() as connection:
             connection.execute(
                 text(
-                    "DELETE FROM sessions WHERE workspace_id = :workspace_id "
-                    "AND user_id = :user_id"
+                    "DELETE FROM sessions WHERE workspace_id = :workspace_id AND user_id = :user_id"
                 ),
                 {"workspace_id": workspace_id, "user_id": member_user_id},
             )

@@ -477,8 +477,7 @@ def test_narrowing_an_entity_to_private_hides_it_from_other_members_search(
         with engine.begin() as connection:
             connection.execute(
                 text(
-                    "DELETE FROM sessions WHERE workspace_id = :workspace_id "
-                    "AND user_id = :user_id"
+                    "DELETE FROM sessions WHERE workspace_id = :workspace_id AND user_id = :user_id"
                 ),
                 {"workspace_id": workspace_id, "user_id": member_user_id},
             )
