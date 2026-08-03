@@ -1,22 +1,22 @@
 ---
 id: PHASE-008-IMPLEMENTATION-STATUS
 title: Phase 8 Implementation Status
-status: Task 1 (account/membership/session framework), Task 2 (invitations), Task 3 (authorization engine, schema-wide migration, engineering reference domain), Task 4 (authorization widened to every remaining domain) and Task 5 (sharing-review UX and effective permissions) complete
-version: 0.5.0
+status: Task 1 (account/membership/session framework), Task 2 (invitations), Task 3 (authorization engine, schema-wide migration, engineering reference domain), Task 4 (authorization widened to every remaining domain), Task 5 (sharing-review UX and effective permissions) and Task 6 (delegation) complete
+version: 0.6.0
 owner: Lucky Jain
 updated: 2026-08-03
 ---
 
 # Phase 8 Implementation Status
 
-Design pass, Task 1, Task 2, Task 3, Task 4 and Task 5 delivered per `docs/superpowers/plans/2026-08-01-phase-8-multi-user.md`.
+Design pass, Task 1, Task 2, Task 3, Task 4, Task 5 and Task 6 delivered per `docs/superpowers/plans/2026-08-01-phase-8-multi-user.md`.
 
 | Slice | Status |
 |---|---|
 | User identity, membership and invitations | Done -- account/membership/session framework (Task 1) and invitations (Task 2) |
 | Roles, grants and authorization engine | Done -- `ecc.platform.authz`, schema-wide `owner_id`/`visibility` migration, `engineering` wired end to end (Task 3), then mechanically repeated across knowledge/attention/automation/AI-runtime/calendar-scheduling (Task 4) |
 | Resource visibility and sharing | Done -- sharing-review preview, the grant-creation visibility-flip fix, effective-permissions endpoint, and the standalone `SharingReview.tsx` UI (Task 5; not yet wired into an app shell -- that's Task 9) |
-| Delegation and acceptance | Not started |
+| Delegation and acceptance | Done -- `ecc.domains.collaboration.delegations`, full `proposed/accepted/rejected/expired/completed/revoked` lifecycle, evidence-scoped read-only grants auto-revoked on completion/revocation (Task 6) |
 | Notifications and shared activity | Not started |
 | Removal, transfer and retention | Not started |
 | Multi-identity browser acceptance | Not started |
@@ -86,3 +86,13 @@ Design pass, Task 1, Task 2, Task 3, Task 4 and Task 5 delivered per `docs/super
 **Frontend not yet wired into an app shell**, disclosed rather than silently incomplete: there is no workspace-level navigation surface yet for `SharingReview.tsx` to live in -- the members/invitations panel, workspace switcher and this screen all land together in Task 9 per the implementation plan's own sequencing (mirrors Phase 7's identical Task 8/Task 9-shaped split for `PersonalWorkspace`). The component also has no member-picker (`GET /workspaces/{id}/members` does not exist yet); the grantee's `account_id` is entered directly, disclosed inline in the component's own copy.
 
 **Verified.** `ruff check`/`ruff format --check`/`mypy backend` clean on every touched backend file. `tsc --noEmit` clean; the full frontend `vitest` suite (46 files, 391 tests, including the 9 new `SharingReview.test.tsx` cases covering preview accuracy for both the narrowing and non-narrowing branches, the stale-preview-invalidated-by-edit guard, grant creation, and revocation) passes locally. The new backend tests (`test_engineering_authz_postgres.py`: grant-creation visibility-flip gate for both the `private` and `workspace` branches, sharing-review preview accuracy including the exact `members_losing_default_access` account-id set, the effective-permissions endpoint's three `via` branches plus its `404` cases, and the embedded `sharing` field on incident responses) could not run in this sandbox for the same pre-existing, documented Python-version reason as every other `TestClient`-based file in this activation; dynamic verification happens in CI, watched and driven to green the same way every prior PR in this activation has been.
+
+## Task 6 evidence
+
+**Complete.** `docs/superpowers/plans/2026-08-01-phase-8-multi-user.md`'s Task 6: migration `0064_phase8_delegations.py` (`delegations`, `delegation_evidence`, `delegation_events`) and `ecc.domains.collaboration.delegations` (`GET|POST /delegations`, `POST /delegations/{id}/accept|reject|revoke|complete`). Full detail in `API-SCHEMAS.md`'s and `DATA-MODEL.md`'s own "Task 6 status" sections.
+
+**A real correctness bug caught by self-review before this ever reached CI, not by CI itself.** `_grant_evidence` (called from `accept_delegation_endpoint`, where the caller is the *recipient*) initially stamped the new `resource_grants` rows' `granted_by` with `auth.user_id` -- the recipient's own `users_id`, meaning the audit trail would show the recipient granting themselves access, and `revoke_grant_endpoint`'s "the original granter may always revoke" rule would misattribute grant authority to the wrong party. Fixed by resolving the *delegator's* `users_id` from their `account_id` (a new `_users_id_for_account` helper, the literal inverse of the module's own `_account_id_for`) and stamping that instead -- caught during this task's own build-then-review pass, verified by re-reading the fix against `resource_grants`' own FK contract (`granted_by` -> `users.(workspace_id, id)`, not `accounts.id`).
+
+**Two design decisions beyond the plan's own literal text, both disclosed in the code and in `API-SCHEMAS.md`'s "Task 6 status":** (1) `delegation_evidence`, a child table the plan's own migration bullet doesn't name but the contract's "naming exactly the evidence the delegation itself names" requires somewhere to live. (2) `revoke` is reachable only from `accepted`, exactly as `DELEGATION-CONTRACT.md`'s own diagram states -- leaving a delegator with no way to withdraw a still-`proposed` delegation before the recipient acts, since inventing a `proposed -> revoked` transition the diagram doesn't list would have been scope creep beyond "state machine exactly as the contract names."
+
+**Verified.** `ruff check`/`ruff format --check`/`mypy backend` (172 source files) clean. `python -m compileall` clean across `backend/ecc`, `backend/migrations`, `tests` and `scripts`. The new test suite (`tests/test_collaboration_delegations_postgres.py`, 11 tests: full lifecycle propose->accept->complete/propose->reject/propose->accept->revoke, evidence-grant scoping verified against an adjacent un-named resource staying invisible, auto-revocation of evidence grants on completion and on revocation, workspace/party isolation with `owner`/`admin` oversight visibility, `viewer` role-gating on propose, self-delegation rejection, due-date-in-the-past rejection, lazy expiry blocking a subsequent accept, recipient-must-be-an-active-member, and `Idempotency-Key` replay) could not run in this sandbox for the same pre-existing, documented Python-version reason as every other `TestClient`-based file in this activation; dynamic verification happens in CI, watched and driven to green the same way every prior PR has been. "Idempotent notifications" (the plan's own fifth named test requirement) is explicitly not covered -- see this module's own docstring and `API-SCHEMAS.md`'s "Task 6 status" for why (no notification mechanism exists until Task 7).

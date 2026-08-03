@@ -223,6 +223,14 @@ _WORKSPACE_ID_TABLES: tuple[str, ...] = (
     # same PR's own CI run against the resource_grants table -- a
     # fourteenth occurrence of the identical class of gap).
     "resource_grants",
+    # Phase 8 Task 6 (migration 0064) -- delegations, also workspace-scoped,
+    # same reason as the row above (this exact gap, found on this same PR's
+    # own CI run against the delegations table -- a fifteenth occurrence of
+    # the identical class of gap). delegation_evidence/delegation_events are
+    # deliberately absent from this tuple: neither carries a workspace_id
+    # column (both are scoped indirectly via delegation_id), so verify_
+    # restore.sh's generic workspace_id-column discovery never reaches them.
+    "delegations",
 )
 # `workspaces` is scoped by its own `id`, not a `workspace_id` column.
 _WORKSPACE_TABLE = "workspaces"
@@ -337,6 +345,15 @@ def _fixture_ids(label: str) -> dict[str, UUID]:
         "domain_record_health": seed_id(label, "domain_record", "health"),
         "invitation": seed_id(label, "invitation", "acceptance"),
         "resource_grant": seed_id(label, "resource_grant", "acceptance"),
+        # Phase 8 Task 6 -- delegations.ck_delegations_not_self forbids a
+        # self-delegation, unlike resource_grants above (no such
+        # restriction there), so this needs a second, genuinely distinct
+        # identity within the same workspace rather than reusing "account"/
+        # "user" as both parties.
+        "recipient_account": seed_id(label, "account", "recipient"),
+        "recipient_user": seed_id(label, "user", "recipient"),
+        "recipient_workspace_membership": seed_id(label, "workspace_membership", "recipient"),
+        "delegation": seed_id(label, "delegation", "acceptance"),
     }
 
 
@@ -2758,6 +2775,99 @@ def _seed_resource_grants(cur: psycopg.Cursor[Any], label: str, ids: Mapping[str
     )
 
 
+def _seed_delegations(cur: psycopg.Cursor[Any], label: str, ids: Mapping[str, UUID]) -> None:
+    """Phase 8 Task 6 (migration 0064) -- delegations, workspace-scoped like
+    every table above. This exact gap (a new workspace-scoped table with no
+    seed row here) was found by this same PR's own CI run, failing
+    ``verify_restore.sh``'s generic workspace-isolation check on
+    ``delegations`` -- closed here the same way every prior phase's own
+    identical gap was.
+
+    Unlike ``_seed_resource_grants`` (which reuses the workspace's own
+    single seeded owner identity as both granter and grantee, since
+    ``resource_grants`` has no self-grant restriction), ``delegations.
+    ck_delegations_not_self`` forbids delegator and recipient from being the
+    same account -- so this seeds a genuinely second identity (``member``
+    role, active) first, then one still-``proposed`` delegation row naming
+    the workspace's own seeded ``incident`` fixture (``_seed_engineering``,
+    already present by the time this runs) as the obligation. Never read
+    through the real ``ecc.domains.collaboration.delegations`` endpoints,
+    only needs to prove the table round-trips through backup/restore and
+    stays workspace-isolated -- the same reasoning ``_seed_resource_grants``'s
+    own docstring gives.
+    """
+    cur.execute(
+        """
+        INSERT INTO accounts (id, email, password_hash, display_name, created_at)
+        VALUES (%(id)s, %(email)s, %(password_hash)s, %(display_name)s, %(created_at)s)
+        ON CONFLICT (id) DO NOTHING
+        """,
+        {
+            "id": ids["recipient_account"],
+            "email": f"phase1-seed-{label}-recipient@example.test",
+            "password_hash": "phase1-seed-fixture-no-login",
+            "display_name": f"Phase1 Seed {label.capitalize()} Recipient",
+            "created_at": SEED_EPOCH,
+        },
+    )
+    cur.execute(
+        """
+        INSERT INTO users (id, workspace_id, account_id, created_at)
+        VALUES (%(id)s, %(workspace_id)s, %(account_id)s, %(created_at)s)
+        ON CONFLICT (id) DO NOTHING
+        """,
+        {
+            "id": ids["recipient_user"],
+            "workspace_id": ids["workspace"],
+            "account_id": ids["recipient_account"],
+            "created_at": SEED_EPOCH,
+        },
+    )
+    cur.execute(
+        """
+        INSERT INTO workspace_memberships (
+            id, workspace_id, account_id, users_id, role, status, invited_by, created_at, updated_at
+        ) VALUES (
+            %(id)s, %(workspace_id)s, %(account_id)s, %(users_id)s, 'member', 'active',
+            %(invited_by)s, %(created_at)s, %(created_at)s
+        )
+        ON CONFLICT (id) DO NOTHING
+        """,
+        {
+            "id": ids["recipient_workspace_membership"],
+            "workspace_id": ids["workspace"],
+            "account_id": ids["recipient_account"],
+            "users_id": ids["recipient_user"],
+            "invited_by": ids["user"],
+            "created_at": SEED_EPOCH,
+        },
+    )
+    cur.execute(
+        """
+        INSERT INTO delegations (
+            id, workspace_id, delegator_account_id, recipient_account_id,
+            obligation_type, obligation_resource_id, expected_outcome, due_at,
+            status, created_at, updated_at
+        ) VALUES (
+            %(id)s, %(workspace_id)s, %(delegator_account_id)s, %(recipient_account_id)s,
+            'incidents', %(obligation_resource_id)s, %(expected_outcome)s, %(due_at)s,
+            'proposed', %(created_at)s, %(created_at)s
+        )
+        ON CONFLICT (id) DO NOTHING
+        """,
+        {
+            "id": ids["delegation"],
+            "workspace_id": ids["workspace"],
+            "delegator_account_id": ids["account"],
+            "recipient_account_id": ids["recipient_account"],
+            "obligation_resource_id": ids["incident"],
+            "expected_outcome": "Resolve the seeded acceptance incident",
+            "due_at": SEED_EPOCH + timedelta(days=36500),
+            "created_at": SEED_EPOCH,
+        },
+    )
+
+
 def seed(conn: psycopg.Connection[Any]) -> None:
     """Insert deterministic Phase 1 fixtures into every table for both workspaces.
 
@@ -2822,6 +2932,12 @@ def seed(conn: psycopg.Connection[Any]) -> None:
             # Phase 8 Task 3 (migration 0063) -- resource_grants; depends on
             # the incident fixture seeded inside _seed_engineering above.
             _seed_resource_grants(cur, label, ids)
+            # Phase 8 Task 6 (migration 0064) -- delegations; depends on the
+            # incident fixture (obligation) seeded inside _seed_engineering
+            # above and the owner-role users row seeded inside _seed_
+            # workspace (delegator) -- seeds its own second, distinct
+            # recipient identity first.
+            _seed_delegations(cur, label, ids)
 
 
 def fixture_row_checksums(conn: psycopg.Connection[Any]) -> dict[str, str]:

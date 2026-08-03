@@ -31,6 +31,7 @@ from ecc.domains.automation.runs import router as automation_runs_router
 from ecc.domains.automation.triggers import router as automation_triggers_router
 from ecc.domains.automation.workflows import router as automation_workflows_router
 from ecc.domains.calendar.events import router as calendar_events_router
+from ecc.domains.collaboration.delegations import router as collaboration_delegations_router
 from ecc.domains.communication.commitments import router as commitments_router
 from ecc.domains.engineering.connector_accounts import router as engineering_connectors_router
 from ecc.domains.engineering.decisions_incidents import (
@@ -135,6 +136,9 @@ app.include_router(identity_invitations_router)
 # list/get/mutate endpoints call it directly, starting with `engineering`
 # in this task, widened to every remaining domain in Task 4.
 app.include_router(authz_router)
+# Phase 8 Task 6: delegation -- GET|POST /delegations, POST /delegations/
+# {id}/accept|reject|revoke|complete (ecc.domains.collaboration.delegations).
+app.include_router(collaboration_delegations_router)
 app.include_router(search_router)
 app.include_router(dashboard_briefs_router)
 # Phase 4 Task 1: read-only registry/policy surface (GET /ai/models, GET
