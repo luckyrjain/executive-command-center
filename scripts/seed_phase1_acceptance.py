@@ -237,6 +237,20 @@ _WORKSPACE_ID_TABLES: tuple[str, ...] = (
     # Phase 8 Task 8 (migration 0066) -- ownership_transfers, same reason,
     # a seventeenth occurrence of the identical class of gap.
     "ownership_transfers",
+    # Phase 8 Task 1 (migration 0061) -- workspace_memberships, found and
+    # closed in the second whole-phase review: present since Phase 8's very
+    # first migration and seeded with real, mutable content (`role`,
+    # `status`, `removed_at`) since, but never added here despite every
+    # later Phase 8 table getting the same treatment on landing. Without
+    # it, a restore that silently corrupted a column value on an existing
+    # row (e.g. `role` downgraded from `'owner'` to `'viewer'`, or `status`
+    # flipped from `'active'` to `'removed'` -- both directly changing who
+    # authz treats as an active owner/admin) would produce identical row
+    # counts and identical workspace-isolation presence, so `verify_
+    # restore.sh`'s own generic checks would both still pass, with nothing
+    # left to catch the corruption -- an eighteenth occurrence of the
+    # identical class of gap.
+    "workspace_memberships",
 )
 # `workspaces` is scoped by its own `id`, not a `workspace_id` column.
 _WORKSPACE_TABLE = "workspaces"

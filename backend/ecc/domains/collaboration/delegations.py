@@ -496,8 +496,37 @@ def _grant_evidence(
     granted_by: UUID,
     now: datetime,
 ) -> None:
+    """`create_delegation_endpoint` already checked the delegator's own
+    `read` access to every evidence item once, at proposal time -- but
+    `proposed` can sit for however long `due_at` allows, and nothing
+    re-checks that access before this function (called from
+    `accept_delegation_endpoint`, potentially much later) actually grants
+    it to the recipient. Found in the second whole-phase review: without
+    this re-check, a delegator who loses access to an evidence resource
+    between proposing and the recipient accepting (e.g. its ownership was
+    transferred away from them in the interim) would still have that
+    resource silently granted to the recipient, `granted_by` stamped with
+    the now-access-less delegator -- the recipient ending up with read
+    access neither the delegator nor the resource's real current owner
+    ever actually approved. `authorize()` is re-run per item against a
+    fresh `AuthContext` for the delegator (not the recipient calling this
+    endpoint); an item that no longer passes is silently skipped rather
+    than failing the whole accept, since the delegation's other evidence
+    and its underlying obligation may still be perfectly valid.
+    """
+    # `timezone` is a placeholder -- `authorize()`'s six-step decision never
+    # reads it, so fetching the delegator's real one would be a wasted query.
+    delegator_auth = AuthContext(workspace_id=workspace_id, user_id=granted_by, timezone="UTC")
     for item in _evidence_for(session, delegation_id):
         authz.require_known_resource_type(item.resource_type)  # defense in depth
+        if not authz.authorize(
+            session,
+            delegator_auth,
+            resource_type=item.resource_type,
+            resource_id=item.resource_id,
+            action="read",
+        ):
+            continue
         session.execute(
             text(
                 f"UPDATE {item.resource_type} SET visibility = 'shared_explicitly' "  # noqa: S608

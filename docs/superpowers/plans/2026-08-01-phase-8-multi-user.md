@@ -47,7 +47,7 @@ Companion to `docs/superpowers/specs/2026-08-01-phase-8-multi-user-design.md` (t
 ## Task 8 — Ownership transfer and member removal
 
 - Migration: `ownership_transfers` (`id`, `workspace_id`, `resource_type`, `resource_id`, `from_account_id`, `to_account_id`, `status`, `initiated_by`, `created_at`, `completed_at`).
-- Member removal flow: resolves active delegations (auto-reject/expire pending ones the removed member proposed or was recipient of), reassigns or blocks removal pending ownership resolution for records only they own, offers export before finalizing, sets `workspace_memberships.status = 'removed'` (never deletes the `users` row, per Decision 1).
+- Member removal flow: resolves active delegations (force-cancels -- a distinct `cancelled` status, never `rejected`/`expired` -- pending/accepted ones the removed member proposed or was recipient of; see `DELEGATION-CONTRACT.md`'s own state-summary line, corrected to match this during the second whole-phase review), reassigns or blocks removal pending ownership resolution for records only they own, offers export before finalizing, sets `workspace_memberships.status = 'removed'` (never deletes the `users` row, per Decision 1).
 - Tests: removal blocked while unresolved sole-ownership exists, removal proceeds after transfer/export, active delegations correctly resolved on removal, historical `owner_id`/`created_by` attribution survives removal unchanged.
 
 ## Task 9 — Executive UX and multi-identity browser acceptance
