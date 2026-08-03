@@ -260,6 +260,24 @@ class TriggerFireFailedWorkflowKilled:
 
 
 @dataclass(frozen=True, slots=True)
+class TriggerFireFailedActorInactive:
+    """Found in the third whole-phase review: the trigger fired (its
+    schedule was due), but `worker.enqueue_run` rejected it -- `trigger.
+    created_by`'s workspace membership is no longer `active` (removed, most
+    likely). Mirrors `TriggerFireFailedWorkflowNotActive`'s identical
+    reasoning: the anchor still advances to `now`, so a trigger authored by
+    a since-removed member does not get re-evaluated as "due" on every tick
+    forever -- it simply keeps producing this same outcome each real
+    occurrence until someone either reassigns/removes the trigger itself or
+    the member is restored.
+    """
+
+    trigger_id: UUID
+    workflow_id: str
+    users_id: UUID
+
+
+@dataclass(frozen=True, slots=True)
 class TriggerFireFailedRateLimited:
     """The trigger fired (its schedule was due), but `worker.enqueue_run`
     rejected it -- this workflow has already used its authorizing policy's
@@ -319,6 +337,7 @@ TriggerEvaluationOutcome = (
     | TriggerFired
     | TriggerFireFailedWorkflowNotActive
     | TriggerFireFailedWorkflowKilled
+    | TriggerFireFailedActorInactive
     | TriggerFireFailedRateLimited
     | TriggerMisfireSkipped
     | TriggerRaceLost
@@ -538,6 +557,17 @@ def run_scheduler_once(
             outcomes.append(
                 TriggerFireFailedWorkflowKilled(
                     trigger_id=trigger.id, workflow_id=trigger.workflow_id
+                )
+            )
+        elif isinstance(run, worker_module.ActorMembershipInactive):
+            # Found in the third whole-phase review: `trigger.created_by`
+            # no longer holds active membership (removed, most likely) --
+            # see `TriggerFireFailedActorInactive`'s own docstring.
+            outcomes.append(
+                TriggerFireFailedActorInactive(
+                    trigger_id=trigger.id,
+                    workflow_id=trigger.workflow_id,
+                    users_id=run.users_id,
                 )
             )
         elif isinstance(run, worker_module.RunRateLimited):

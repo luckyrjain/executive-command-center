@@ -85,7 +85,7 @@ from datetime import UTC, datetime
 from typing import Annotated, Any
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import text
 from sqlalchemy.orm import Session
@@ -94,6 +94,7 @@ from ecc.auth import AuthDep, CsrfDep
 from ecc.database import get_session
 from ecc.domains.automation.worker import cancel_runs_for_removed_member
 from ecc.domains.collaboration.delegations import cancel_delegations_for_removed_member
+from ecc.domains.identity.accounts import _write_identity_audit_event
 from ecc.platform import authz
 
 router = APIRouter(prefix="/api/v1/identity", tags=["identity"])
@@ -214,6 +215,7 @@ def update_member_role_endpoint(
     workspace_id: UUID,
     user_id: UUID,
     payload: MemberRoleUpdateRequest,
+    request: Request,
     auth: AuthDep,
     session: SessionDep,
     _csrf: CsrfDep,
@@ -232,6 +234,20 @@ def update_member_role_endpoint(
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="INSUFFICIENT_ROLE")
 
     with session.begin():
+        # Found in the third whole-phase review: `_is_sole_active_owner`'s own
+        # count and this endpoint's `UPDATE` are two separate statements with
+        # no row lock spanning them, so two concurrent demotions of two
+        # *different* owners (when exactly two are active) could each see
+        # "an owner other than me still exists" and both proceed, leaving
+        # zero. Serializing every membership mutation for one workspace
+        # behind a single advisory lock -- the same `pg_advisory_xact_lock`
+        # technique `attention.py`'s `regenerate_attention` already uses for
+        # its own cross-statement race -- closes it without a `SELECT ...
+        # FOR UPDATE` across an unbounded number of owner rows.
+        session.execute(
+            text("SELECT pg_advisory_xact_lock(hashtextextended(:lock_key, 0))"),
+            {"lock_key": f"membership-mutation:{auth.workspace_id}"},
+        )
         member = _member_row(session, workspace_id=auth.workspace_id, user_id=user_id)
         if member is None or member["status"] != "active":
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="MEMBER_NOT_FOUND")
@@ -257,6 +273,23 @@ def update_member_role_endpoint(
             text("UPDATE workspace_memberships SET role = :role, updated_at = :now WHERE id = :id"),
             {"role": payload.role, "now": now, "id": member["membership_id"]},
         )
+        # Found in the third whole-phase review: this endpoint wrote zero
+        # audit trail -- every other identity mutation in this package
+        # (`invitations.py`/`accounts.py`) already calls this same shared
+        # helper. `aggregate_type="workspace_membership"` is new here, not
+        # yet wired into `notifications.py`'s own `_AGGREGATE_TYPE_TO_
+        # RESOURCE_TYPE` map -- see that module's own docstring note on why
+        # this one is disclosed rather than wired up in the same pass.
+        _write_identity_audit_event(
+            session,
+            request,
+            workspace_id=auth.workspace_id,
+            actor_users_id=auth.user_id,
+            event_type="member.role_changed",
+            aggregate_type="workspace_membership",
+            aggregate_id=member["membership_id"],
+            now=now,
+        )
     return MemberResponse(
         user_id=user_id,
         account_id=member["account_id"],
@@ -273,6 +306,7 @@ def update_member_role_endpoint(
 def remove_member_endpoint(
     workspace_id: UUID,
     user_id: UUID,
+    request: Request,
     auth: AuthDep,
     session: SessionDep,
     _csrf: CsrfDep,
@@ -289,6 +323,12 @@ def remove_member_endpoint(
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="INSUFFICIENT_ROLE")
 
     with session.begin():
+        # See `update_member_role_endpoint`'s own comment on this same lock:
+        # closes the identical concurrent-owner-removal race for `DELETE`.
+        session.execute(
+            text("SELECT pg_advisory_xact_lock(hashtextextended(:lock_key, 0))"),
+            {"lock_key": f"membership-mutation:{auth.workspace_id}"},
+        )
         member = _member_row(session, workspace_id=auth.workspace_id, user_id=user_id)
         if member is None or member["status"] != "active":
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="MEMBER_NOT_FOUND")
@@ -342,6 +382,17 @@ def remove_member_endpoint(
                 "updated_at = :now WHERE id = :id"
             ),
             {"now": now, "id": member["membership_id"]},
+        )
+        # See `update_member_role_endpoint`'s own comment on this same call.
+        _write_identity_audit_event(
+            session,
+            request,
+            workspace_id=auth.workspace_id,
+            actor_users_id=auth.user_id,
+            event_type="member.removed",
+            aggregate_type="workspace_membership",
+            aggregate_id=member["membership_id"],
+            now=now,
         )
     return MemberRemovalResponse(
         user_id=user_id,

@@ -21,7 +21,6 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from ecc.config import get_settings
-from ecc.platform.authz import WORKSPACE_ORIGINAL_OWNER_SQL
 
 MODEL_ID = "sentence-transformers/all-MiniLM-L6-v2"
 # Bump when the model, its normalization, or the content fed to it changes in
@@ -138,7 +137,7 @@ def queue_embedding(
     row = (
         session.execute(
             text(
-                "SELECT id, title, body FROM retrieval_documents "
+                "SELECT id, title, body, owner_id, visibility FROM retrieval_documents "
                 "WHERE workspace_id = :workspace_id AND entity_id = :entity_id"
             ),
             {"workspace_id": workspace_id, "entity_id": entity_id},
@@ -174,16 +173,25 @@ def queue_embedding(
         # effect did.
         return EmbeddingWriteResult(written=False, reason="embedding_generation_failed")
 
-    # `owner_id` is set explicitly via the non-correlated `WORKSPACE_
-    # ORIGINAL_OWNER_SQL` subquery for the same reason retrieval.py's
-    # queue_retrieval_document does -- embedding_projections has no actor
-    # column of its own (derived from retrieval_documents, which has none
-    # either), so its BEFORE INSERT trigger would compute the identical
-    # value; setting it here just avoids the per-row trigger-dispatch cost
-    # on rebuild_embeddings' potentially-large rebuild loop.
+    # `owner_id`/`visibility` are copied straight from the `retrieval_
+    # documents` row already read above -- embedding_projections has no
+    # actor column of its own (derived entirely from retrieval_documents,
+    # which has none either). Found in the third whole-phase review: this
+    # used to stamp the non-correlated `WORKSPACE_ORIGINAL_OWNER_SQL`
+    # placeholder and a hardcoded `'workspace'` at INSERT time and never
+    # refresh either on conflict -- the identical stale-visibility-mirror
+    # bug class fixed for `retrieval_documents` itself (`retrieval.py`'s own
+    # `queue_retrieval_document`) and for `attention_items`
+    # (`attention.py`'s `_upsert_batch`) elsewhere in this same round. Not
+    # currently read-exploitable in practice -- `retrieval.py`'s own
+    # `_run_hybrid_query` joins live `pkos_nodes`/`retrieval_documents` for
+    # its own visibility check rather than trusting these two columns -- but
+    # fixing the write path here rather than special-casing this table into
+    # `_UNOWNABLE_FOR_REMOVAL_PURPOSES` keeps one fewer place a future reader
+    # of these columns could be silently misled by a stale value.
     session.execute(
         text(
-            f"""
+            """
             INSERT INTO embedding_projections (
                 id, workspace_id, document_id, model_id, model_version,
                 dimensions, embedding, content_hash, created_at, updated_at,
@@ -191,14 +199,16 @@ def queue_embedding(
             ) VALUES (
                 gen_random_uuid(), :workspace_id, :document_id, :model_id, :model_version,
                 :dimensions, CAST(:embedding AS vector), :content_hash, :now, :now,
-                {WORKSPACE_ORIGINAL_OWNER_SQL}, 'workspace'
+                :owner_id, :visibility
             )
             ON CONFLICT (workspace_id, document_id, model_id) DO UPDATE SET
                 model_version = EXCLUDED.model_version,
                 dimensions = EXCLUDED.dimensions,
                 embedding = EXCLUDED.embedding,
                 content_hash = EXCLUDED.content_hash,
-                updated_at = EXCLUDED.updated_at
+                updated_at = EXCLUDED.updated_at,
+                owner_id = EXCLUDED.owner_id,
+                visibility = EXCLUDED.visibility
             """
         ),
         {
@@ -210,6 +220,8 @@ def queue_embedding(
             "embedding": vector_literal(vector),
             "content_hash": content_hash,
             "now": now,
+            "owner_id": row["owner_id"],
+            "visibility": row["visibility"],
         },
     )
     return EmbeddingWriteResult(written=True)

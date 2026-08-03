@@ -63,6 +63,9 @@ def test_seed_populates_every_phase1_table(seeded_connection: psycopg.Connection
     event_ids = [
         seed_module.FIXTURE_IDS[label]["outbox_event"] for label in seed_module.WORKSPACE_LABELS
     ]
+    delegation_ids = [
+        seed_module.FIXTURE_IDS[label]["delegation"] for label in seed_module.WORKSPACE_LABELS
+    ]
     with seeded_connection.cursor() as cur:
         for table in _all_seeded_tables():
             if table == "workspaces":
@@ -74,6 +77,11 @@ def test_seed_populates_every_phase1_table(seeded_connection: psycopg.Connection
                 cur.execute(
                     f"SELECT count(*) FROM {table} WHERE event_id = ANY(%s)",  # noqa: S608
                     (event_ids,),
+                )
+            elif table in ("delegation_evidence", "delegation_events"):
+                cur.execute(
+                    f"SELECT count(*) FROM {table} WHERE delegation_id = ANY(%s)",  # noqa: S608
+                    (delegation_ids,),
                 )
             else:
                 cur.execute(

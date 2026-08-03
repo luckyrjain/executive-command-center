@@ -518,6 +518,38 @@ def test_enqueue_run_pins_active_version_and_is_queued(
     assert run.leased_by is None
 
 
+def test_cancel_runs_for_removed_member_cancels_a_non_terminal_run(
+    worker_test_context: tuple[UUID, UUID],
+) -> None:
+    """Found untested by the third whole-phase review, despite the fix
+    itself landing in the second: `membership_removal.remove_member_
+    endpoint` calls this after a removal to force-cancel the removed
+    member's own still-`queued` (or otherwise non-terminal) runs, but no
+    test exercised `cancel_runs_for_removed_member` itself directly against
+    a real `workflow_runs` row.
+    """
+    workspace_id, user_id = worker_test_context
+    workflow_id = f"test.cancel-removed.{uuid4().hex}"
+    graph = _chained_graph(_action_step("s1", "test.echo"))
+    _publish_workflow(workspace_id, user_id, workflow_id, graph)
+
+    with SessionFactory() as session, session.begin():
+        run = automation_worker.enqueue_run(session, workspace_id, user_id, workflow_id=workflow_id)
+    assert isinstance(run, automation_worker.WorkflowRun)
+    assert run.status == "queued"
+
+    with SessionFactory() as session, session.begin():
+        automation_worker.cancel_runs_for_removed_member(
+            session, workspace_id=workspace_id, users_id=user_id
+        )
+
+    with SessionFactory() as session:
+        status = session.execute(
+            text("SELECT status FROM workflow_runs WHERE id = :id"), {"id": run.id}
+        ).scalar_one()
+    assert status == "cancelled"
+
+
 # ---------------------------------------------------------------------------
 # 1b. enqueue_run's rate limit (`APPROVAL-POLICY.md`'s "Runs per workflow per
 # hour | 10 (policy default, overridable per policy) | Next run past the

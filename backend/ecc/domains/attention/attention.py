@@ -21,7 +21,6 @@ from ecc.observability import (
     record_ranking,
 )
 from ecc.platform import authz
-from ecc.platform.authz import WORKSPACE_ORIGINAL_OWNER_SQL
 
 from .policy import AttentionPolicy, get_active_policy
 
@@ -416,6 +415,8 @@ def _upsert_batch(
                     "; ".join(item["label"] for item in factors) or "No active priority factors"
                 ),
                 "pinned": bool(row["pinned"]),
+                "owner_id": str(row["owner_id"]),
+                "visibility": row["visibility"],
             }
             for row, (score, confidence, factors) in zip(rows, scored, strict=True)
         ]
@@ -423,7 +424,7 @@ def _upsert_batch(
 
     session.execute(
         text(
-            f"""
+            """
             INSERT INTO attention_items (
                 id, workspace_id, entity_type, entity_id, source_entity_version,
                 score, confidence, factors, explanation, generated_at, expires_at, pinned,
@@ -432,10 +433,11 @@ def _upsert_batch(
             SELECT gen_random_uuid(), :workspace_id, :entity_type,
                    t.entity_id, t.version, t.score, t.confidence,
                    t.factors, t.explanation, :generated_at, :expires_at, t.pinned,
-                   :policy_version, {WORKSPACE_ORIGINAL_OWNER_SQL}, 'workspace'
+                   :policy_version, t.owner_id, t.visibility
             FROM jsonb_to_recordset(CAST(:payload AS jsonb)) AS t(
                 entity_id uuid, version bigint, score smallint, confidence numeric,
-                factors jsonb, explanation text, pinned boolean
+                factors jsonb, explanation text, pinned boolean,
+                owner_id uuid, visibility text
             )
             ON CONFLICT (workspace_id, entity_type, entity_id) DO UPDATE SET
                 source_entity_version = EXCLUDED.source_entity_version,
@@ -447,6 +449,8 @@ def _upsert_batch(
                 expires_at = EXCLUDED.expires_at,
                 pinned = EXCLUDED.pinned,
                 policy_version = EXCLUDED.policy_version,
+                owner_id = EXCLUDED.owner_id,
+                visibility = EXCLUDED.visibility,
                 dismissed_at = CASE
                     WHEN attention_items.dismissed_entity_version = EXCLUDED.source_entity_version
                     THEN attention_items.dismissed_at ELSE NULL END,
@@ -506,7 +510,8 @@ def regenerate_attention(auth: AuthDep, session: SessionDep, _csrf: CsrfDep) -> 
             session.execute(
                 text("""
                 SELECT id, version, manual_priority, due_date, due_at, status,
-                       blocked_on_person_id, pinned, updated_at, created_at
+                       blocked_on_person_id, pinned, updated_at, created_at,
+                       owner_id, visibility
                 FROM tasks
                 WHERE workspace_id = :workspace_id AND archived_at IS NULL
                   AND status NOT IN ('completed','cancelled')
@@ -520,7 +525,8 @@ def regenerate_attention(auth: AuthDep, session: SessionDep, _csrf: CsrfDep) -> 
             session.execute(
                 text("""
                 SELECT id, version, importance, direction, due_date, due_at,
-                       confidence, pinned, updated_at, created_at
+                       confidence, pinned, updated_at, created_at,
+                       owner_id, visibility
                 FROM commitments
                 WHERE workspace_id = :workspace_id AND archived_at IS NULL
                   AND status NOT IN ('fulfilled','cancelled')
@@ -534,7 +540,7 @@ def regenerate_attention(auth: AuthDep, session: SessionDep, _csrf: CsrfDep) -> 
             session.execute(
                 text("""
                 SELECT id, version, probability, impact, review_at, pinned, updated_at,
-                       created_at
+                       created_at, owner_id, visibility
                 FROM risks
                 WHERE workspace_id = :workspace_id AND archived_at IS NULL
                   AND status <> 'closed'
@@ -547,7 +553,8 @@ def regenerate_attention(auth: AuthDep, session: SessionDep, _csrf: CsrfDep) -> 
         waiting_links = (
             session.execute(
                 text("""
-                SELECT id, version, direction, since_at, expected_at, updated_at, created_at
+                SELECT id, version, direction, since_at, expected_at, updated_at, created_at,
+                       owner_id, visibility
                 FROM waiting_links
                 WHERE workspace_id = :workspace_id AND status = 'open'
             """),

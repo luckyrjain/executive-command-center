@@ -299,3 +299,69 @@ def test_audit_filters_pagination_redaction_and_isolation(
     malformed = client.get("/api/v1/audit", params={"cursor": "invalid"})
     assert malformed.status_code == 400
     assert malformed.json()["error"]["code"] == "INVALID_CURSOR"
+
+
+def test_audit_endpoint_is_owner_admin_only(
+    search_audit_context: tuple[TestClient, UUID, UUID, UUID],
+) -> None:
+    """Found in the third whole-phase review: `list_audit_events`'s own
+    `owner`/`admin`-only role gate (added in the second whole-phase review)
+    had zero test coverage anywhere -- `search_audit_context`'s own single
+    identity always defaults to `create_identity`'s own `role="owner"`, so
+    every other test in this file only ever exercises the allowed path.
+    """
+    client, workspace_id, _other_workspace_id, _user_id = search_audit_context
+    now = datetime.now(UTC)
+
+    member_user_id = uuid4()
+    member_token = f"session-{uuid4()}"
+    with engine.begin() as connection:
+        create_identity(
+            connection,
+            workspace_id=workspace_id,
+            user_id=member_user_id,
+            email=f"{member_user_id}@example.test",
+            now=now,
+            role="viewer",
+        )
+        connection.execute(
+            text(
+                """
+                INSERT INTO sessions (
+                    id, workspace_id, user_id, token_hash, expires_at, last_seen_at
+                ) VALUES (
+                    :id, :workspace_id, :user_id, :token_hash, :expires_at, :last_seen_at
+                )
+                """
+            ),
+            {
+                "id": uuid4(),
+                "workspace_id": workspace_id,
+                "user_id": member_user_id,
+                "token_hash": sha256(member_token.encode()).hexdigest(),
+                "expires_at": now + timedelta(hours=1),
+                "last_seen_at": now,
+            },
+        )
+    viewer_client = TestClient(app)
+    viewer_client.cookies.set("ecc_session", member_token)
+    try:
+        denied = viewer_client.get("/api/v1/audit")
+        assert denied.status_code == 403, denied.text
+        assert denied.json()["error"]["code"] == "INSUFFICIENT_ROLE"
+
+        allowed = client.get("/api/v1/audit")
+        assert allowed.status_code == 200, allowed.text
+    finally:
+        viewer_client.close()
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    "DELETE FROM sessions WHERE workspace_id = :workspace_id AND user_id = :user_id"
+                ),
+                {"workspace_id": workspace_id, "user_id": member_user_id},
+            )
+            connection.execute(
+                text("DELETE FROM users WHERE workspace_id = :workspace_id AND id = :user_id"),
+                {"workspace_id": workspace_id, "user_id": member_user_id},
+            )

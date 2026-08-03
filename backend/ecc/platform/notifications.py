@@ -255,6 +255,24 @@ def mark_notification_read_endpoint(
 # here requires no change to the filtering logic itself, only one more
 # dict entry once that domain's own `aggregate_type` convention is
 # confirmed.
+#
+# **`workspace_membership` (added in the third whole-phase review's
+# `membership_removal.py` audit-trail fix) is deliberately excluded here,
+# unlike every other entry.** Every other row in this map names a
+# `resource_type` this same value already exists in `authz.py`'s
+# `_RESOURCE_TABLES` -- a real, generically ownable/grantable resource this
+# map's `authz.authorize(resource_type=..., action="read")` check can
+# evaluate. `workspace_memberships` is identity infrastructure with no
+# entry in `_RESOURCE_TABLES` at all (`membership_removal.py`'s own
+# docstring: "`GET .../members` is readable by any active member,"
+# unconditionally, not gated by ownership/visibility/grants the way every
+# resource in this map is) -- reusing this map's generic authorize()-based
+# filter for it would either reject every row (no matching resource_type
+# ever authorizes) or require a special-cased always-visible-to-any-active-
+# member rule this map's own closed, uniform contract does not have a slot
+# for. Surfacing `member.role_changed`/`member.removed` through `/shared/
+# activity` remains a real, disclosed gap -- closing it needs a small
+# extension to this filtering mechanism, not just one more dict entry.
 _AGGREGATE_TYPE_TO_RESOURCE_TYPE: dict[str, str] = {
     "incident": "incidents",
     "engineering_decision": "engineering_decisions",
@@ -339,9 +357,10 @@ def list_shared_activity_endpoint(
     why this re-derives the answer from `authorize()` fresh per row
     instead.
 
-    Deliberately narrower than `GET /api/v1/audit` (the unrestricted,
+    Deliberately narrower than `GET /api/v1/audit` (the `owner`/`admin`-only,
     workspace-wide admin audit log `ecc.domains.platform.audit_queries`
-    already exposes): this response omits `before`/`after`/`metadata`
+    already exposes -- role-gated since the second whole-phase review found
+    it had none at all): this response omits `before`/`after`/`metadata`
     entirely -- "there was activity on this resource," not a field-level
     diff -- and only ever returns rows whose `aggregate_type` is in
     `_AGGREGATE_TYPE_TO_RESOURCE_TYPE` and whose underlying resource the

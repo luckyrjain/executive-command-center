@@ -771,6 +771,59 @@ def test_shared_explicitly_visibility_requires_matching_active_grant(
     assert incident_id not in {UUID(row["id"]) for row in response.json()["incidents"]}
 
 
+def test_revoke_grant_endpoint_resource_owner_branch_rejects_a_non_owner_non_granter(
+    authz_context: _AuthzContext,
+) -> None:
+    """Found untested by the third whole-phase review: `revoke_grant_
+    endpoint`'s own `role not in {"owner", "admin"} and not is_resource_owner`
+    guard -- the branch that runs whenever the caller isn't the grant's own
+    `granted_by` -- had no test exercising the reject path, only ever the
+    allow paths (the granter revoking their own grant, or an owner/admin
+    revoking someone else's).
+    """
+    member: _Actor = authz_context.member
+    viewer: _Actor = authz_context.viewer
+    owner: _Actor = authz_context.owner
+
+    incident = _create_incident(member.client, member.token, title="Member-owned, shared")
+    incident_id = UUID(incident["id"])
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "UPDATE incidents SET visibility = 'shared_explicitly' "
+                "WHERE id = :id AND workspace_id = :workspace_id"
+            ),
+            {"id": incident_id, "workspace_id": authz_context.workspace_id},
+        )
+
+    grant_response = member.client.post(
+        "/api/v1/sharing/grants",
+        json={
+            "resource_type": "incidents",
+            "resource_id": str(incident_id),
+            "grantee_account_id": str(viewer.account_id),
+            "actions": ["read"],
+        },
+        headers=_headers(member.token),
+    )
+    assert grant_response.status_code == 201, grant_response.text
+    grant_id = grant_response.json()["id"]
+
+    # viewer: not the granter, not owner/admin, not the resource owner.
+    denied = viewer.client.delete(
+        f"/api/v1/sharing/grants/{grant_id}", headers=_headers(viewer.token)
+    )
+    assert denied.status_code == 403, denied.text
+    assert denied.json()["error"]["code"] == "INSUFFICIENT_ROLE"
+
+    # owner: not the granter and not the resource owner either, but the
+    # role-based branch of the same guard still allows it.
+    allowed = owner.client.delete(
+        f"/api/v1/sharing/grants/{grant_id}", headers=_headers(owner.token)
+    )
+    assert allowed.status_code == 200, allowed.text
+
+
 @pytest.mark.parametrize(
     "resource_type",
     sorted(

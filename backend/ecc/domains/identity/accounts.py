@@ -375,6 +375,32 @@ def create_account_endpoint(
                 status_code=status.HTTP_403_FORBIDDEN, detail="INVITATION_EMAIL_MISMATCH"
             )
 
+        # See `invitations.py`'s own `accept_invitation_endpoint` for why:
+        # found in the third whole-phase review, the identical stale-
+        # authority gap exists on this brand-new-recipient path too -- an
+        # `owner`-role invitation is never re-verified against its inviter's
+        # current membership at this, the *other* accept call site.
+        if invitation["role"] == "owner":
+            inviter_membership = (
+                session.execute(
+                    text(
+                        "SELECT role FROM workspace_memberships "
+                        "WHERE workspace_id = :workspace_id AND users_id = :users_id "
+                        "AND status = 'active'"
+                    ),
+                    {
+                        "workspace_id": invitation["workspace_id"],
+                        "users_id": invitation["invited_by"],
+                    },
+                )
+                .mappings()
+                .one_or_none()
+            )
+            if inviter_membership is None or inviter_membership["role"] != "owner":
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT, detail="INVITER_NO_LONGER_AUTHORIZED"
+                )
+
         try:
             session.execute(
                 text(
