@@ -453,7 +453,7 @@ def test_mark_notification_read_404s_for_a_different_account(
         f"/api/v1/notifications/{notification_id}/read", headers=_headers(ctx.other_member.token)
     )
     assert denied.status_code == 404, denied.text
-    assert denied.json()["detail"] == "NOTIFICATION_NOT_FOUND"
+    assert denied.json()["error"]["code"] == "NOTIFICATION_NOT_FOUND"
 
 
 # ---------------------------------------------------------------------------
