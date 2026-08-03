@@ -301,6 +301,13 @@ class WorkspaceResponse(BaseModel):
     timezone: str
     role: str
     created_at: datetime
+    # Phase 8 Task 9's own addition -- `GET /workspaces` is the only call a
+    # multi-workspace account's frontend can make to discover its own
+    # `auth.workspace_id` (no `/me`/`/whoami` endpoint exists, and every
+    # other Task 9 panel's URL needs that id). Computed server-side by
+    # comparing each row's own `id` against the session's `auth.workspace_id`
+    # -- never trust a client-supplied value for "which one is current."
+    current: bool
 
 
 class WorkspaceListResponse(BaseModel):
@@ -664,6 +671,47 @@ def _write_identity_audit_event(
     queue_lifecycle_event(session, "identity", event_type, "allowed")
 
 
+class MeResponse(BaseModel):
+    account_id: UUID
+    users_id: UUID
+    workspace_id: UUID
+    email: str
+    display_name: str
+
+
+@router.get("/me", response_model=MeResponse)
+def get_me_endpoint(auth: AuthDep, session: SessionDep) -> MeResponse:
+    """Phase 8 Task 9's own addition -- the frontend has no other way to
+    learn the logged-in account's own `account_id` (needed by `Delegations
+    Panel.tsx` to tell delegator from recipient, since `Delegation`
+    responses only ever name both parties by `account_id`, never "is this
+    me"). No prior task needed this: every earlier Phase 8 UI surface
+    either has no notion of "which party am I" (`SharingReview.tsx`) or
+    only needs the coarser `workspace_id`/`role` `WorkspaceResponse.current`
+    already carries.
+    """
+    row = (
+        session.execute(
+            text(
+                "SELECT u.account_id, a.email, a.display_name FROM users u "
+                "JOIN accounts a ON a.id = u.account_id "
+                "WHERE u.workspace_id = :workspace_id AND u.id = :users_id"
+            ),
+            {"workspace_id": auth.workspace_id, "users_id": auth.user_id},
+        )
+        .mappings()
+        .one()
+    )
+    session.rollback()
+    return MeResponse(
+        account_id=row["account_id"],
+        users_id=auth.user_id,
+        workspace_id=auth.workspace_id,
+        email=row["email"],
+        display_name=row["display_name"],
+    )
+
+
 @router.get("/workspaces", response_model=WorkspaceListResponse)
 def list_workspaces_endpoint(auth: AuthDep, session: SessionDep) -> WorkspaceListResponse:
     account_id_row = (
@@ -694,7 +742,11 @@ def list_workspaces_endpoint(auth: AuthDep, session: SessionDep) -> WorkspaceLis
         .all()
     )
     session.rollback()
-    return WorkspaceListResponse(workspaces=[WorkspaceResponse(**dict(r)) for r in rows])
+    return WorkspaceListResponse(
+        workspaces=[
+            WorkspaceResponse(**dict(r), current=(r["id"] == auth.workspace_id)) for r in rows
+        ]
+    )
 
 
 @router.get("/workspaces/{workspace_id}", response_model=WorkspaceResponse)
@@ -721,7 +773,7 @@ def get_workspace_endpoint(
     session.rollback()
     if row is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="WORKSPACE_NOT_FOUND")
-    return WorkspaceResponse(**dict(row))
+    return WorkspaceResponse(**dict(row), current=True)
 
 
 @router.post("/workspaces", response_model=WorkspaceResponse, status_code=status.HTTP_201_CREATED)
@@ -812,6 +864,10 @@ def create_workspace_endpoint(
         timezone=payload.timezone,
         role="owner",
         created_at=now,
+        # The caller's session stays scoped to their existing
+        # `auth.workspace_id` -- creating a workspace does not switch to it;
+        # `POST /auth/select-workspace` is the only thing that does.
+        current=False,
     )
 
 
@@ -885,4 +941,4 @@ def patch_workspace_endpoint(
             .mappings()
             .one()
         )
-    return WorkspaceResponse(**dict(row))
+    return WorkspaceResponse(**dict(row), current=True)

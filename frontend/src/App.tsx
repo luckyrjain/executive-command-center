@@ -23,6 +23,8 @@ import MeetingPrep from './features/attention/MeetingPrep'
 import AutomationWorkspace from './features/automation/AutomationWorkspace'
 import EngineeringWorkspace from './features/engineering/EngineeringWorkspace'
 import PersonalWorkspace from './features/personal/PersonalWorkspace'
+import CollaborationWorkspace from './features/collaboration/CollaborationWorkspace'
+import WorkspaceSwitcher from './features/collaboration/WorkspaceSwitcher'
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:8000'
 
@@ -136,6 +138,10 @@ export default function App() {
 
   return (
     <main id="workspace-main" className="app-shell">
+      {/* Mounted globally, above the tab list -- which company workspace an
+          account is viewing applies to every tab, not just the
+          collaboration one; see WorkspaceSwitcher.tsx's own docstring. */}
+      <WorkspaceSwitcher />
       <WorkspaceNavigation currentView={currentView} onNavigate={setCurrentView} />
       <div id="workspace-panel" role="tabpanel" aria-labelledby={`workspace-tab-${currentView}`}>
         {currentView === 'work' ? (
@@ -171,6 +177,7 @@ export default function App() {
         : currentView === 'automation' ? <AutomationWorkspace />
         : currentView === 'engineering' ? <EngineeringWorkspace />
         : currentView === 'personal' ? <PersonalWorkspace />
+        : currentView === 'collaboration' ? <CollaborationWorkspace />
         : <><header className="topbar">
           <div>
             <p className="eyebrow">EXECUTIVE COMMAND CENTER</p>

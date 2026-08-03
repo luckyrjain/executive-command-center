@@ -43,6 +43,7 @@ describe('WorkspaceNavigation', () => {
     expect(markup).toContain('Automation')
     expect(markup).toContain('Engineering')
     expect(markup).toContain('Personal')
+    expect(markup).toContain('Team')
     expect(markup.match(/aria-selected="true"/g)).toHaveLength(1)
   })
 
@@ -72,16 +73,16 @@ describe('WorkspaceNavigation', () => {
     expect(tabs[0].tabIndex).toBe(-1)
 
     expect(fireEvent.keyDown(tabs[1], { key: 'End' })).toBe(false)
-    expect(document.activeElement).toBe(tabs[13])
-    expect(tabs[13].getAttribute('aria-selected')).toBe('true')
+    expect(document.activeElement).toBe(tabs[14])
+    expect(tabs[14].getAttribute('aria-selected')).toBe('true')
 
-    expect(fireEvent.keyDown(tabs[13], { key: 'Home' })).toBe(false)
+    expect(fireEvent.keyDown(tabs[14], { key: 'Home' })).toBe(false)
     expect(document.activeElement).toBe(tabs[0])
     expect(tabs[0].getAttribute('aria-selected')).toBe('true')
 
     expect(fireEvent.keyDown(tabs[0], { key: 'ArrowLeft' })).toBe(false)
-    expect(document.activeElement).toBe(tabs[13])
-    expect(tabs[13].tabIndex).toBe(0)
+    expect(document.activeElement).toBe(tabs[14])
+    expect(tabs[14].tabIndex).toBe(0)
     expect(tabs.filter((tab) => tab.getAttribute('aria-selected') === 'true')).toHaveLength(1)
   })
 

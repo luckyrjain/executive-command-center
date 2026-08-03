@@ -28,6 +28,12 @@ const WORKSPACES: ReadonlyArray<{ view: WorkspaceView; label: string }> = [
   { view: 'automation', label: 'Automation' },
   { view: 'engineering', label: 'Engineering' },
   { view: 'personal', label: 'Personal' },
+  // Labeled "Team", not "Workspace" -- Playwright's `getByRole(...,
+  // {name})` substring-matches by default, and "Workspace" would match
+  // (and break) every existing scenario's `getByRole('tab', {name:
+  // 'Work'})` call (tasks.mjs, commitments.mjs), since "Work" is a
+  // substring of "Workspace".
+  { view: 'collaboration', label: 'Team' },
 ]
 
 export function nextWorkspaceIndex(current: number, key: string, count: number): number {

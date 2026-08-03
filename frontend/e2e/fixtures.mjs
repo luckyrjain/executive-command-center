@@ -1201,6 +1201,262 @@ const PERSONAL_CLASSIFICATION_BY_DOMAIN = {
 }
 
 /**
+ * Shared in-memory backing store for Phase 8's `/api/v1/identity`,
+ * `/api/v1/sharing`, `/api/v1/delegations`, `/api/v1/shared/activity` and
+ * `/api/v1/ownership` surfaces. Unlike every other `make*Api` in this file,
+ * `makeCollaborationApi` does NOT copy its seed arrays -- it is designed to
+ * be constructed once per scenario via `createCollaborationStore` and then
+ * handed, BY REFERENCE, to two (or more) separate `createFixtureApi` calls
+ * (one per `browser.newContext()`, i.e. one per simulated identity), which
+ * is what makes a fixture-level "identity A invites identity B, identity B
+ * accepts" scenario possible at all: an invitation `push`ed by A's
+ * dispatcher must be the exact same array entry B's dispatcher reads.
+ */
+export function createCollaborationStore(seed = {}) {
+  return {
+    workspaces: seed.workspaces ?? [],
+    memberships: seed.memberships ?? [],
+    accounts: seed.accounts ?? [],
+    invitations: seed.invitations ?? [],
+    delegations: seed.delegations ?? [],
+    grants: seed.grants ?? [],
+    activity: seed.activity ?? [],
+    ownershipTransfers: seed.ownershipTransfers ?? [],
+  }
+}
+
+/**
+ * One identity's view onto a shared `store` (see `createCollaborationStore`
+ * above). `self` names which account this browser context is signed in as
+ * (`{accountId, usersId, email, displayName}`) -- every endpoint that in
+ * the real backend derives its actor from the session (`AuthDep`) derives
+ * it from `self` here instead. `self.workspaceId` seeds which workspace
+ * this identity's session starts in; `POST .../auth/select-workspace`
+ * mutates it exactly like the real endpoint mutates the session row.
+ */
+function makeCollaborationApi({ store, self }) {
+  let currentWorkspaceId = self.workspaceId
+  let nextId = 1
+  const genId = (prefix) => `${prefix}-${nextId++}`
+
+  if (!store.accounts.some((a) => a.account_id === self.accountId)) {
+    store.accounts.push({ account_id: self.accountId, email: self.email, display_name: self.displayName })
+  }
+
+  function accountInfo(accountId) {
+    return store.accounts.find((a) => a.account_id === accountId)
+      ?? { account_id: accountId, email: 'unknown@example.test', display_name: 'Unknown' }
+  }
+
+  function activeMembership(workspaceId, accountId) {
+    return store.memberships.find((m) => m.workspace_id === workspaceId && m.account_id === accountId && m.status === 'active')
+  }
+
+  function myMembership() {
+    return activeMembership(currentWorkspaceId, self.accountId)
+  }
+
+  function recordActivity(eventType, aggregateType, aggregateId) {
+    store.activity.unshift({
+      id: genId('event'),
+      event_type: eventType,
+      aggregate_type: aggregateType,
+      aggregate_id: aggregateId,
+      actor_id: self.usersId,
+      occurred_at: nowIso(),
+      workspace_id: currentWorkspaceId,
+    })
+  }
+
+  function dispatch(pathname, method, body, queryString) {
+    if (pathname === '/api/v1/identity/me' && method === 'GET') {
+      return { status: 200, body: { account_id: self.accountId, users_id: self.usersId, workspace_id: currentWorkspaceId, email: self.email, display_name: self.displayName } }
+    }
+
+    if (pathname === '/api/v1/identity/workspaces' && method === 'GET') {
+      const mine = store.memberships.filter((m) => m.account_id === self.accountId && m.status === 'active')
+      const items = mine.map((m) => {
+        const workspace = store.workspaces.find((w) => w.id === m.workspace_id)
+        return { ...workspace, role: m.role, current: m.workspace_id === currentWorkspaceId }
+      })
+      return { status: 200, body: { workspaces: items } }
+    }
+
+    if (pathname === '/api/v1/identity/auth/select-workspace' && method === 'POST') {
+      const membership = activeMembership(body.workspace_id, self.accountId)
+      if (!membership) return { status: 404, body: { error: { code: 'WORKSPACE_NOT_FOUND', message: 'Not found' } } }
+      currentWorkspaceId = body.workspace_id
+      return { status: 200, body: { status: 'authenticated', workspace_id: currentWorkspaceId } }
+    }
+
+    const membersMatch = pathname.match(/^\/api\/v1\/identity\/workspaces\/([^/]+)\/members$/)
+    if (membersMatch && method === 'GET') {
+      if (membersMatch[1] !== currentWorkspaceId) return { status: 404, body: { error: { code: 'WORKSPACE_NOT_FOUND', message: 'Not found' } } }
+      const items = store.memberships
+        .filter((m) => m.workspace_id === currentWorkspaceId && m.status === 'active')
+        .map((m) => ({ user_id: m.users_id, account_id: m.account_id, ...accountInfo(m.account_id), role: m.role, status: m.status, created_at: m.created_at, removed_at: null }))
+      return { status: 200, body: { members: items } }
+    }
+
+    const memberMatch = pathname.match(/^\/api\/v1\/identity\/workspaces\/([^/]+)\/members\/([^/]+)$/)
+    if (memberMatch && (method === 'PATCH' || method === 'DELETE')) {
+      if (memberMatch[1] !== currentWorkspaceId) return { status: 404, body: { error: { code: 'WORKSPACE_NOT_FOUND', message: 'Not found' } } }
+      const membership = store.memberships.find((m) => m.workspace_id === currentWorkspaceId && m.users_id === memberMatch[2] && m.status === 'active')
+      if (!membership) return { status: 404, body: { error: { code: 'MEMBER_NOT_FOUND', message: 'Not found' } } }
+      if (method === 'PATCH') {
+        membership.role = body.role
+        return { status: 200, body: { user_id: membership.users_id, account_id: membership.account_id, ...accountInfo(membership.account_id), role: membership.role, status: membership.status, created_at: membership.created_at, removed_at: null } }
+      }
+      const now = nowIso()
+      membership.status = 'removed'
+      recordActivity('member.removed', 'membership', membership.users_id)
+      return {
+        status: 200,
+        body: {
+          user_id: membership.users_id,
+          export: { account_id: membership.account_id, ...accountInfo(membership.account_id), role: membership.role, joined_at: membership.created_at, removed_at: now },
+        },
+      }
+    }
+
+    const invitationsMatch = pathname.match(/^\/api\/v1\/identity\/workspaces\/([^/]+)\/invitations$/)
+    if (invitationsMatch && method === 'GET') {
+      if (invitationsMatch[1] !== currentWorkspaceId) return { status: 404, body: { error: { code: 'WORKSPACE_NOT_FOUND', message: 'Not found' } } }
+      const items = store.invitations.filter((i) => i.workspace_id === currentWorkspaceId)
+      return { status: 200, body: { invitations: items.map(({ token: _token, ...rest }) => rest) } }
+    }
+    if (invitationsMatch && method === 'POST') {
+      if (invitationsMatch[1] !== currentWorkspaceId) return { status: 404, body: { error: { code: 'WORKSPACE_NOT_FOUND', message: 'Not found' } } }
+      const now = nowIso()
+      const invitation = {
+        id: genId('invitation'), workspace_id: currentWorkspaceId, email: body.email, role: body.role,
+        token: genId('token'), expires_at: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString(),
+        accepted_at: null, rejected_at: null, revoked_at: null, created_at: now,
+      }
+      store.invitations.push(invitation)
+      return { status: 201, body: invitation }
+    }
+
+    const acceptMatch = pathname.match(/^\/api\/v1\/identity\/invitations\/([^/]+)\/accept$/)
+    if (acceptMatch && method === 'POST') {
+      const invitation = store.invitations.find((i) => i.id === acceptMatch[1])
+      if (!invitation) return { status: 404, body: { error: { code: 'INVITATION_NOT_FOUND', message: 'Not found' } } }
+      if (invitation.token !== body.token) return { status: 401, body: { error: { code: 'INVITATION_TOKEN_INVALID', message: 'Invalid token' } } }
+      if (invitation.accepted_at || invitation.rejected_at || invitation.revoked_at) {
+        return { status: 409, body: { error: { code: 'INVITATION_ALREADY_RESOLVED', message: 'Already resolved' } } }
+      }
+      if (invitation.email !== self.email) return { status: 403, body: { error: { code: 'INVITATION_EMAIL_MISMATCH', message: 'Email mismatch' } } }
+      const now = nowIso()
+      invitation.accepted_at = now
+      store.memberships.push({
+        workspace_id: invitation.workspace_id, account_id: self.accountId, users_id: genId('users'),
+        role: invitation.role, status: 'active', created_at: now,
+      })
+      return { status: 200, body: { id: invitation.id, status: 'accepted', workspace_id: invitation.workspace_id, role: invitation.role } }
+    }
+
+    const revokeMatch = pathname.match(/^\/api\/v1\/identity\/invitations\/([^/]+)\/revoke$/)
+    if (revokeMatch && method === 'POST') {
+      const invitation = store.invitations.find((i) => i.id === revokeMatch[1])
+      if (!invitation) return { status: 404, body: { error: { code: 'INVITATION_NOT_FOUND', message: 'Not found' } } }
+      invitation.revoked_at = nowIso()
+      return { status: 200, body: { id: invitation.id, status: 'revoked', workspace_id: invitation.workspace_id, role: invitation.role } }
+    }
+
+    if (pathname === '/api/v1/delegations' && method === 'GET') {
+      const items = store.delegations.filter((d) => d.workspace_id === currentWorkspaceId)
+      return { status: 200, body: { delegations: items } }
+    }
+    if (pathname === '/api/v1/delegations' && method === 'POST') {
+      const now = nowIso()
+      const delegation = {
+        id: genId('delegation'), workspace_id: currentWorkspaceId,
+        delegator_account_id: self.accountId, recipient_account_id: body.recipient_account_id,
+        obligation_type: body.obligation_type, obligation_resource_id: body.obligation_resource_id,
+        expected_outcome: body.expected_outcome, due_at: body.due_at, status: 'proposed', evidence: [],
+        created_at: now, updated_at: now,
+      }
+      store.delegations.push(delegation)
+      recordActivity('delegation.proposed', 'delegation', delegation.id)
+      return { status: 201, body: delegation }
+    }
+    const delegationActionMatch = pathname.match(/^\/api\/v1\/delegations\/([^/]+)\/(accept|reject|revoke|complete)$/)
+    if (delegationActionMatch && method === 'POST') {
+      const delegation = store.delegations.find((d) => d.id === delegationActionMatch[1])
+      if (!delegation) return { status: 404, body: { error: { code: 'DELEGATION_NOT_FOUND', message: 'Not found' } } }
+      const nextStatus = { accept: 'accepted', reject: 'rejected', revoke: 'revoked', complete: 'completed' }[delegationActionMatch[2]]
+      delegation.status = nextStatus
+      delegation.updated_at = nowIso()
+      recordActivity(`delegation.${delegationActionMatch[2]}ed`, 'delegation', delegation.id)
+      return { status: 200, body: delegation }
+    }
+
+    if (pathname === '/api/v1/sharing/grants' && method === 'GET') {
+      const items = store.grants.filter((g) => g.workspace_id === currentWorkspaceId)
+      return { status: 200, body: { grants: items } }
+    }
+    if (pathname === '/api/v1/sharing/grants' && method === 'POST') {
+      const now = nowIso()
+      const grant = {
+        id: genId('grant'), workspace_id: currentWorkspaceId, resource_type: body.resource_type, resource_id: body.resource_id,
+        grantee_account_id: body.grantee_account_id, actions: body.actions, granted_by: self.accountId,
+        expires_at: body.expires_at ?? null, revoked_at: null, created_at: now,
+      }
+      store.grants.push(grant)
+      recordActivity('grant.created', grant.resource_type, grant.resource_id)
+      return { status: 201, body: grant }
+    }
+    if (pathname === '/api/v1/sharing/grants/preview' && method === 'POST') {
+      return {
+        status: 200,
+        body: {
+          resource_type: body.resource_type, resource_id: body.resource_id, grantee_account_id: body.grantee_account_id,
+          current_visibility: 'owner', proposed_visibility: 'restricted', requires_narrow_visibility_confirmation: false,
+          members_losing_default_access: [], grantee_already_has_access: false, grantee_gains_actions: body.actions ?? [],
+        },
+      }
+    }
+    const revokeGrantMatch = pathname.match(/^\/api\/v1\/sharing\/grants\/([^/]+)$/)
+    if (revokeGrantMatch && method === 'DELETE') {
+      const grant = store.grants.find((g) => g.id === revokeGrantMatch[1])
+      if (!grant) return { status: 404, body: { error: { code: 'RESOURCE_NOT_FOUND', message: 'Not found' } } }
+      grant.revoked_at = nowIso()
+      recordActivity('grant.revoked', grant.resource_type, grant.resource_id)
+      return { status: 200, body: grant }
+    }
+
+    if (pathname === '/api/v1/shared/activity' && method === 'GET') {
+      const params = new URLSearchParams(queryString)
+      const cursor = params.get('cursor')
+      const pageSize = 20
+      const items = store.activity.filter((a) => a.workspace_id === currentWorkspaceId)
+      const start = cursor ? Number(cursor) : 0
+      const page = items.slice(start, start + pageSize)
+      const nextIndex = start + pageSize
+      return { status: 200, body: { items: page, next_cursor: nextIndex < items.length ? String(nextIndex) : null } }
+    }
+
+    if (pathname === '/api/v1/ownership/transfers' && method === 'POST') {
+      const now = nowIso()
+      const transfer = {
+        id: genId('transfer'), resource_type: body.resource_type, resource_id: body.resource_id,
+        from_account_id: self.accountId, to_account_id: body.to_account_id, status: 'completed',
+        initiated_by: self.accountId, created_at: now, completed_at: now,
+      }
+      store.ownershipTransfers.push(transfer)
+      return { status: 201, body: transfer }
+    }
+    if (pathname === '/api/v1/ownership/transfers' && method === 'GET') {
+      return { status: 200, body: { transfers: store.ownershipTransfers } }
+    }
+
+    return null
+  }
+
+  return { store, self, myMembership, dispatch }
+}
+
+/**
  * Fake of Phase 7's `/api/v1/personal/*` surface (`ecc.domains.personal.
  * {domains,habits,grants,export_deletion,ai_insights}`) -- domains, records,
  * insights, cross-domain grants and export/delete, mirroring `make
@@ -1422,10 +1678,33 @@ function makePersonalApi(overrides = {}) {
  * fine. A single catch-all pattern removed the race entirely across dozens
  * of repeated runs.
  */
+// `WorkspaceSwitcher.tsx` is mounted globally in `App.tsx`, so every
+// scenario now fetches `GET /api/v1/identity/workspaces` on first render --
+// not just the ones that care about collaboration. Seeding exactly one
+// workspace/membership by default (below) keeps `workspaces.length <= 1`,
+// which is `WorkspaceSwitcher`'s own render-nothing case, so the other two
+// dozen scenarios in this directory see no new DOM and need no changes.
+// `overrides.collaborationStore`/`collaborationSelf` let a scenario replace
+// both wholesale -- the multi-identity scenario is the one that does.
+const DEFAULT_COLLABORATION_WORKSPACE_ID = 'workspace-default'
+
 export async function createFixtureApi(page, overrides = {}) {
   await page.context().addCookies([{ name: 'ecc_csrf', value: 'csrf-token', url: 'http://127.0.0.1:4173' }])
 
   const requests = []
+
+  const collaborationStore = overrides.collaborationStore ?? createCollaborationStore({
+    workspaces: [{ id: DEFAULT_COLLABORATION_WORKSPACE_ID, name: 'Acme Co', timezone: 'UTC', created_at: '2026-01-01T00:00:00Z' }],
+    memberships: [{
+      workspace_id: DEFAULT_COLLABORATION_WORKSPACE_ID, account_id: 'account-default', users_id: 'users-default',
+      role: 'owner', status: 'active', created_at: '2026-01-01T00:00:00Z',
+    }],
+  })
+  const collaborationSelf = overrides.collaborationSelf ?? {
+    accountId: 'account-default', usersId: 'users-default', email: 'me@example.test', displayName: 'Me',
+    workspaceId: DEFAULT_COLLABORATION_WORKSPACE_ID,
+  }
+  const collaboration = makeCollaborationApi({ store: collaborationStore, self: collaborationSelf })
 
   const tasks = createCollection(overrides.tasks ?? [])
   const commitments = createCollection(overrides.commitments ?? [])
@@ -1651,6 +1930,12 @@ export async function createFixtureApi(page, overrides = {}) {
       const result = personal.dispatch(pathname, method, body, queryString)
       if (result) return result
     }
+    if (pathname.startsWith('/api/v1/identity') || pathname.startsWith('/api/v1/sharing')
+      || pathname.startsWith('/api/v1/delegations') || pathname.startsWith('/api/v1/shared/activity')
+      || pathname.startsWith('/api/v1/ownership')) {
+      const result = collaboration.dispatch(pathname, method, body, queryString)
+      if (result) return result
+    }
     for (const resource of resources) {
       const result = resource(pathname, method, body, queryString)
       if (result) return result
@@ -1677,6 +1962,7 @@ export async function createFixtureApi(page, overrides = {}) {
     requests,
     collections: { tasks, commitments, notes, calendarEvents, meetings, risks, recommendations },
     knowledge,
+    collaboration,
     attention,
     aiRuntime,
     automation,
