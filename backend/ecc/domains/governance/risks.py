@@ -20,6 +20,7 @@ from ecc.observability import (
     record_audit_outbox_failure,
     record_idempotency_conflict,
 )
+from ecc.platform import authz
 
 router = APIRouter(prefix="/api/v1/risks", tags=["risks"])
 
@@ -345,6 +346,7 @@ def create_risk(
     _csrf: CsrfDep,
     idempotency_key: IdempotencyHeader,
 ) -> RiskResponse:
+    authz.require_role_action(session, auth, "write")
     request_hash = _request_hash(payload, "create")
     now = datetime.now(UTC)
     risk_id = uuid4()
@@ -425,8 +427,15 @@ def list_risks(
     cursor: str | None = None,
     limit: int = Query(default=50, ge=1, le=100),
 ) -> RiskListResponse:
-    clauses = ["workspace_id = :workspace_id"]
-    params: dict[str, Any] = {"workspace_id": auth.workspace_id, "limit": limit + 1}
+    visibility_sql, visibility_params = authz.visible_resource_filter_sql(
+        session, auth, resource_type="risks", action="read", table_alias="risks"
+    )
+    clauses = ["workspace_id = :workspace_id", f"({visibility_sql})"]
+    params: dict[str, Any] = {
+        "workspace_id": auth.workspace_id,
+        "limit": limit + 1,
+        **visibility_params,
+    }
     if not include_archived:
         clauses.append("archived_at IS NULL")
     if status_filter is not None:
@@ -465,6 +474,12 @@ def list_risks(
 
 @router.get("/{risk_id}", response_model=RiskResponse)
 def get_risk(risk_id: UUID, auth: AuthDep, session: SessionDep) -> RiskResponse:
+    visible = authz.authorize(
+        session, auth, resource_type="risks", resource_id=risk_id, action="read"
+    )
+    session.rollback()
+    if not visible:
+        raise HTTPException(status_code=404, detail="RISK_NOT_FOUND")
     row = _get_row(session, auth, risk_id)
     if row is None:
         raise HTTPException(status_code=404, detail="RISK_NOT_FOUND")

@@ -510,10 +510,10 @@ def _grant_evidence(
                 """
                 INSERT INTO resource_grants (
                     id, workspace_id, grantee_account_id, resource_type, resource_id,
-                    actions, granted_by, expires_at, created_at
+                    actions, granted_by, expires_at, created_at, delegation_id
                 ) VALUES (
                     :id, :workspace_id, :grantee_account_id, :resource_type, :resource_id,
-                    :actions, :granted_by, NULL, :now
+                    :actions, :granted_by, NULL, :now, :delegation_id
                 )
                 """
             ),
@@ -526,6 +526,7 @@ def _grant_evidence(
                 "actions": ["read"],
                 "granted_by": granted_by,
                 "now": now,
+                "delegation_id": delegation_id,
             },
         )
 
@@ -538,13 +539,26 @@ def _revoke_evidence_grants(
     recipient_account_id: UUID,
     now: datetime,
 ) -> None:
+    """Scoped by `delegation_id`, not merely by
+    `(grantee_account_id, resource_type, resource_id)` -- if the same
+    recipient is delegated two different obligations that both name the
+    same evidence resource (a realistic scenario), matching on resource
+    identity alone would revoke the *other*, still-`accepted` delegation's
+    own evidence access too. `delegation_id` (migration
+    `0067_phase8_resource_grants_delegation_link.py`) makes each
+    delegation's own evidence grants independently revocable.
+    `recipient_account_id`/`resource_type`/`resource_id` are still checked
+    too, defensively -- a delegation should only ever revoke grants that
+    are actually its own and actually name its own evidence, not merely
+    trust `delegation_id` alone.
+    """
     for item in _evidence_for(session, delegation_id):
         session.execute(
             text(
                 "UPDATE resource_grants SET revoked_at = :now "
                 "WHERE workspace_id = :workspace_id AND grantee_account_id = :account_id "
                 "AND resource_type = :resource_type AND resource_id = :resource_id "
-                "AND revoked_at IS NULL"
+                "AND delegation_id = :delegation_id AND revoked_at IS NULL"
             ),
             {
                 "now": now,
@@ -552,6 +566,7 @@ def _revoke_evidence_grants(
                 "account_id": recipient_account_id,
                 "resource_type": item.resource_type,
                 "resource_id": item.resource_id,
+                "delegation_id": delegation_id,
             },
         )
 

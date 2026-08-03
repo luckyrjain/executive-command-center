@@ -54,10 +54,12 @@ function MemberRow({
   myUsersId: string | undefined
   onChanged: () => void
 }) {
+  const queryClient = useQueryClient()
   const [confirmRemove, setConfirmRemove] = useState(false)
   const [transferForm, setTransferForm] = useState({ resourceType: '', resourceId: '', toAccountId: '' })
   const canManage = myRole === 'owner' || myRole === 'admin'
-  const canRemove = canManage || member.user_id === myUsersId
+  const isSelf = member.user_id === myUsersId
+  const canRemove = canManage || isSelf
 
   const roleMutation = useMutation({
     mutationFn: (role: Role) =>
@@ -65,7 +67,18 @@ function MemberRow({
         method: 'PATCH',
         body: { role },
       }),
-    onSuccess: onChanged,
+    onSuccess: () => {
+      onChanged()
+      // A role change to my own row can flip `canManage` (e.g. an owner
+      // demoting themselves) -- `myRole` is derived from the separate
+      // `['identity','workspaces']` query, which `onChanged` (scoped to
+      // `['identity','members', workspaceId]`) never touches. Without
+      // this, the panel would keep offering admin-only actions (the
+      // Invitations section, other rows' Role selects) to someone who no
+      // longer holds that role until an unrelated refetch happened to
+      // occur.
+      if (isSelf) void queryClient.invalidateQueries({ queryKey: ['identity', 'workspaces'] })
+    },
   })
 
   const removeMutation = useMutation({
@@ -75,6 +88,16 @@ function MemberRow({
         { method: 'DELETE' },
       ),
     onSuccess: () => {
+      // Removing myself revokes my own session in the same backend
+      // transaction (`membership_removal.py`'s own "second, independent
+      // propagation path" for session revocation) -- the very
+      // `onChanged()` refetch below would otherwise run against an
+      // already-dead session and surface as a confusing 401, rather than
+      // taking the user back to a real, logged-out-looking state.
+      if (isSelf) {
+        window.location.reload()
+        return
+      }
       setConfirmRemove(false)
       onChanged()
     },
@@ -102,7 +125,7 @@ function MemberRow({
     <li>
       <div>
         <strong>{member.display_name}</strong>
-        <small> · {member.email}</small>
+        <small> · {member.email} · account {member.account_id}</small>
       </div>
       <label>
         Role
@@ -120,7 +143,7 @@ function MemberRow({
       {canRemove && !confirmRemove ? (
         <div className="work-actions">
           <button type="button" onClick={() => setConfirmRemove(true)}>
-            {member.user_id === myUsersId ? 'Leave workspace' : 'Remove'}
+            {isSelf ? 'Leave workspace' : 'Remove'}
           </button>
         </div>
       ) : null}
@@ -128,7 +151,7 @@ function MemberRow({
       {confirmRemove ? (
         <div className="degraded-panel" role="group" aria-label={`Confirm removing ${member.display_name}`}>
           <p>
-            {member.user_id === myUsersId
+            {isSelf
               ? 'Leaving ends your access immediately and revokes your active sessions. This cannot be undone.'
               : `Removing ${member.display_name} ends their access immediately and revokes their active sessions. This cannot be undone.`}
           </p>
@@ -319,6 +342,15 @@ export default function MembersPanel() {
 
       {workspaces.isLoading ? <p role="status">Loading workspace…</p> : null}
       {workspaces.isError ? <div role="alert" className="inline-status error-panel">{collaborationErrorMessage(workspaces.error)}</div> : null}
+
+      {/* `me` feeds every row's self-removal affordance (`myUsersId`
+          below) -- surfacing its own loading/error state, rather than
+          letting a failed `GET /identity/me` silently leave every row's
+          "Leave workspace" button permanently unreachable with no
+          explanation, matches DelegationsPanel.tsx's identical `useMe()`
+          usage. */}
+      {me.isLoading ? <p role="status">Loading your account…</p> : null}
+      {me.isError ? <div role="alert" className="inline-status error-panel">{collaborationErrorMessage(me.error)}</div> : null}
 
       {members.isLoading ? <p role="status">Loading members…</p> : null}
       {members.isError ? <div role="alert" className="inline-status error-panel">{collaborationErrorMessage(members.error)}</div> : null}

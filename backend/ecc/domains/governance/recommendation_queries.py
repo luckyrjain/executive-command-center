@@ -18,6 +18,7 @@ from ecc.domains.governance.recommendation_models import (
     RecommendationStatus,
 )
 from ecc.domains.governance.recommendation_storage import FIELDS, expire_if_needed, get_row, project
+from ecc.platform import authz
 
 router = APIRouter(prefix="/api/v1/recommendations", tags=["recommendations"])
 SessionDep = Annotated[Session, Depends(get_session)]
@@ -57,12 +58,16 @@ def list_recommendations(
     cursor_id: UUID | None = None
     if cursor:
         cursor_created, cursor_id = _decode_cursor(cursor)
+    visibility_sql, visibility_params = authz.visible_resource_filter_sql(
+        session, auth, resource_type="recommendations", action="read", table_alias="recommendations"
+    )
     rows = (
         session.execute(
             text(
                 f"""
                 SELECT {FIELDS} FROM recommendations
                 WHERE workspace_id=:workspace_id
+                  AND ({visibility_sql})
                   AND (:include_archived OR archived_at IS NULL)
                   AND (
                     CAST(:statuses AS text[]) IS NULL
@@ -86,6 +91,7 @@ def list_recommendations(
                 "cursor_created": cursor_created,
                 "cursor_id": cursor_id,
                 "fetch_limit": limit + 1,
+                **visibility_params,
             },
         )
         .mappings()
@@ -107,6 +113,12 @@ def get_recommendation(
     auth: AuthDep,
     session: SessionDep,
 ) -> RecommendationResponse:
+    visible = authz.authorize(
+        session, auth, resource_type="recommendations", resource_id=recommendation_id, action="read"
+    )
+    session.rollback()
+    if not visible:
+        raise HTTPException(status_code=404, detail="RECOMMENDATION_NOT_FOUND")
     row = expire_if_needed(
         session, auth, get_row(session, auth, recommendation_id), request=request
     )

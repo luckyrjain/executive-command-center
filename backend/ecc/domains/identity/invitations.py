@@ -411,74 +411,113 @@ def accept_invitation_endpoint(
             )
 
         target_workspace_id = invitation["workspace_id"]
-        already_member = (
+        # Scoped to `status = 'active'` deliberately -- `membership_removal.
+        # py`'s own `remove_member_endpoint` never deletes a workspace_
+        # memberships row, only flips it to `status = 'removed'` (Decision
+        # 1: "never deletes the `users` row"). An unscoped check here would
+        # make a removed member's own stale row permanently block them from
+        # ever being re-invited and re-accepting, even though nothing about
+        # `ALREADY_MEMBER`'s own meaning ("you already hold active
+        # membership") applies to them anymore.
+        existing_membership = (
             session.execute(
                 text(
-                    "SELECT 1 FROM workspace_memberships "
-                    "WHERE workspace_id = :workspace_id AND account_id = :account_id"
+                    "SELECT id, status, users_id FROM workspace_memberships "
+                    "WHERE workspace_id = :workspace_id AND account_id = :account_id "
+                    "FOR UPDATE"
                 ),
                 {"workspace_id": target_workspace_id, "account_id": account_row["account_id"]},
             )
             .mappings()
             .one_or_none()
         )
-        if already_member is not None:
+        if existing_membership is not None and existing_membership["status"] == "active":
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="ALREADY_MEMBER")
 
-        new_users_id = uuid4()
-        # `already_member` above is a plain read, not `FOR UPDATE` -- it
-        # narrows the common case but cannot itself prevent two concurrent
-        # accepts (e.g. of two separately-created pending invitations for
-        # the same recipient) from both passing it and racing on these two
-        # inserts. `uq_users_workspace_account`/`uq_workspace_memberships_
-        # workspace_account` are the actual backstop; catching the
-        # violation here turns that into the documented `409 ALREADY_
-        # MEMBER` instead of an unhandled 500, matching how `create_
-        # account_endpoint` already handles its own analogous `accounts.
-        # email` race.
+        # A prior membership (now `removed`) also means a `users` row for
+        # this exact (workspace_id, account_id) pair already exists --
+        # `uq_users_workspace_account` would reject a second `INSERT` for
+        # it, and it is the same identity's own history, not a stranger's,
+        # so reusing it (rather than minting a new `users.id`) is correct,
+        # not merely constraint-driven.
+        if existing_membership is not None:
+            new_users_id = existing_membership["users_id"]
+        else:
+            new_users_id = uuid4()
+        # The read above is `FOR UPDATE` (narrows the common case and
+        # serializes a concurrent reactivation of the *same* prior
+        # membership row), but cannot itself prevent two concurrent
+        # accepts of two separately-created pending invitations for a
+        # recipient with no prior membership at all from both passing it
+        # and racing on the inserts below. `uq_users_workspace_account`/
+        # `uq_workspace_memberships_workspace_account` are the actual
+        # backstop for that case; catching the violation here turns it
+        # into the documented `409 ALREADY_MEMBER` instead of an unhandled
+        # 500, matching how `create_account_endpoint` already handles its
+        # own analogous `accounts.email` race.
         try:
-            session.execute(
-                text(
-                    "INSERT INTO users (id, workspace_id, account_id, created_at) "
-                    "VALUES (:id, :workspace_id, :account_id, :now)"
-                ),
-                {
-                    "id": new_users_id,
-                    "workspace_id": target_workspace_id,
-                    "account_id": account_row["account_id"],
-                    "now": now,
-                },
-            )
+            if existing_membership is None:
+                session.execute(
+                    text(
+                        "INSERT INTO users (id, workspace_id, account_id, created_at) "
+                        "VALUES (:id, :workspace_id, :account_id, :now)"
+                    ),
+                    {
+                        "id": new_users_id,
+                        "workspace_id": target_workspace_id,
+                        "account_id": account_row["account_id"],
+                        "now": now,
+                    },
+                )
             # `invited_by` must be a `users.id` within `target_workspace_id`
             # -- `auth.user_id` is the accepting caller's own users_id,
             # scoped to whichever *other* workspace their session belongs
             # to (this endpoint exists precisely because the caller is not
-            # yet a member of `target_workspace_id`), so it can never
-            # satisfy `fk_workspace_memberships_workspace_invited_by`. The
-            # invitation's own `invited_by` (the real inviter, already a
-            # member of `target_workspace_id`) is the only value that can.
-            session.execute(
-                text(
-                    """
-                INSERT INTO workspace_memberships (
-                    id, workspace_id, account_id, users_id, role, status,
-                    invited_by, created_at, updated_at
-                ) VALUES (
-                    :id, :workspace_id, :account_id, :users_id, :role, 'active',
-                    :invited_by, :now, :now
+            # yet an *active* member of `target_workspace_id`), so it can
+            # never satisfy `fk_workspace_memberships_workspace_invited_by`.
+            # The invitation's own `invited_by` (the real inviter, already
+            # a member of `target_workspace_id`) is the only value that
+            # can.
+            if existing_membership is not None:
+                session.execute(
+                    text(
+                        """
+                        UPDATE workspace_memberships
+                        SET status = 'active', role = :role, invited_by = :invited_by,
+                            removed_at = NULL, updated_at = :now
+                        WHERE id = :id
+                        """
+                    ),
+                    {
+                        "id": existing_membership["id"],
+                        "role": invitation["role"],
+                        "invited_by": invitation["invited_by"],
+                        "now": now,
+                    },
                 )
-                """
-                ),
-                {
-                    "id": uuid4(),
-                    "workspace_id": target_workspace_id,
-                    "account_id": account_row["account_id"],
-                    "users_id": new_users_id,
-                    "role": invitation["role"],
-                    "invited_by": invitation["invited_by"],
-                    "now": now,
-                },
-            )
+            else:
+                session.execute(
+                    text(
+                        """
+                    INSERT INTO workspace_memberships (
+                        id, workspace_id, account_id, users_id, role, status,
+                        invited_by, created_at, updated_at
+                    ) VALUES (
+                        :id, :workspace_id, :account_id, :users_id, :role, 'active',
+                        :invited_by, :now, :now
+                    )
+                    """
+                    ),
+                    {
+                        "id": uuid4(),
+                        "workspace_id": target_workspace_id,
+                        "account_id": account_row["account_id"],
+                        "users_id": new_users_id,
+                        "role": invitation["role"],
+                        "invited_by": invitation["invited_by"],
+                        "now": now,
+                    },
+                )
         except IntegrityError as exc:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT, detail="ALREADY_MEMBER"
