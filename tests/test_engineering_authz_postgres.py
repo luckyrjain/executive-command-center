@@ -830,6 +830,12 @@ def test_grant_creation_requires_owner_admin_or_resource_owner(
     owner: _Actor = authz_context.owner
 
     # member creates an incident it owns -- member itself may grant on it...
+    # A freshly-created incident defaults to `workspace` visibility, so
+    # `narrow_visibility: true` is required for the grant to take effect
+    # (Task 5's own gate against silently narrowing everyone else's
+    # default access) -- this test's own subject is the owner/admin/
+    # resource-owner authorization gate, not the visibility-narrowing
+    # confirmation, so it opts in rather than exercising that gate here.
     incident = _create_incident(member.client, member.token, title="Owned by member")
     response = member.client.post(
         "/api/v1/sharing/grants",
@@ -838,6 +844,7 @@ def test_grant_creation_requires_owner_admin_or_resource_owner(
             "resource_id": incident["id"],
             "grantee_account_id": str(viewer.account_id),
             "actions": ["read"],
+            "narrow_visibility": True,
         },
         headers=_headers(member.token),
     )
@@ -893,6 +900,10 @@ def test_grant_does_not_leak_across_resource_type(authz_context: _AuthzContext) 
             "resource_id": incident["id"],
             "grantee_account_id": str(viewer.account_id),
             "actions": ["read"],
+            # incident is still default `workspace` visibility (never
+            # pre-flipped, unlike decision above) -- opt into narrowing so
+            # the grant actually takes effect, per Task 5's own gate.
+            "narrow_visibility": True,
         },
         headers=_headers(owner.token),
     )
@@ -988,3 +999,324 @@ def test_private_visibility_denies_every_non_owner_workspace_member(
             headers=_headers(actor.token, key=str(uuid4())),
         )
         assert resolve_response.status_code == 404, resolve_response.text
+
+
+# --- Task 5: grant creation's visibility-flip gate --------------------------
+
+
+def test_grant_on_workspace_visible_resource_requires_narrow_visibility_confirmation(
+    authz_context: _AuthzContext,
+) -> None:
+    """A freshly-created incident defaults to `workspace` visibility, where
+    a grant would otherwise be silently inert (`authorize()` never
+    consults `resource_grants` for a `workspace`-visibility resource) --
+    Task 5 makes `POST /grants` 409 rather than insert a no-op row, until
+    the caller opts into narrowing visibility via `narrow_visibility:
+    true`, and proves narrowing actually changes who has default access.
+    """
+    owner: _Actor = authz_context.owner
+    admin: _Actor = authz_context.admin
+    viewer: _Actor = authz_context.viewer
+
+    incident = _create_incident(owner.client, owner.token, title="Workspace visible")
+    incident_id = UUID(incident["id"])
+
+    response = owner.client.post(
+        "/api/v1/sharing/grants",
+        json={
+            "resource_type": "incidents",
+            "resource_id": str(incident_id),
+            "grantee_account_id": str(viewer.account_id),
+            "actions": ["read"],
+        },
+        headers=_headers(owner.token),
+    )
+    assert response.status_code == 409, response.text
+    assert response.json()["error"]["code"] == "GRANT_REQUIRES_NARROW_VISIBILITY"
+
+    # admin can still see it via ordinary workspace-role access before narrowing.
+    response = admin.client.get("/api/v1/engineering/incidents")
+    assert incident_id in {UUID(row["id"]) for row in response.json()["incidents"]}
+
+    response = owner.client.post(
+        "/api/v1/sharing/grants",
+        json={
+            "resource_type": "incidents",
+            "resource_id": str(incident_id),
+            "grantee_account_id": str(viewer.account_id),
+            "actions": ["read"],
+            "narrow_visibility": True,
+        },
+        headers=_headers(owner.token),
+    )
+    assert response.status_code == 201, response.text
+
+    # Narrowing took effect: admin (no grant of its own) lost default
+    # access, viewer (the grantee) gained it.
+    response = admin.client.get("/api/v1/engineering/incidents")
+    assert incident_id not in {UUID(row["id"]) for row in response.json()["incidents"]}
+    response = viewer.client.get("/api/v1/engineering/incidents")
+    assert incident_id in {UUID(row["id"]) for row in response.json()["incidents"]}
+
+
+def test_grant_on_private_resource_auto_widens_visibility_without_confirmation(
+    authz_context: _AuthzContext,
+) -> None:
+    workspace_id: UUID = authz_context.workspace_id
+    owner: _Actor = authz_context.owner
+    viewer: _Actor = authz_context.viewer
+
+    incident = _create_incident(owner.client, owner.token, title="Private then shared")
+    incident_id = UUID(incident["id"])
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "UPDATE incidents SET visibility = 'private' "
+                "WHERE id = :id AND workspace_id = :workspace_id"
+            ),
+            {"id": incident_id, "workspace_id": workspace_id},
+        )
+
+    # private -> shared_explicitly is a strict widening: no confirmation
+    # flag required, unlike the workspace -> shared_explicitly narrowing.
+    response = owner.client.post(
+        "/api/v1/sharing/grants",
+        json={
+            "resource_type": "incidents",
+            "resource_id": str(incident_id),
+            "grantee_account_id": str(viewer.account_id),
+            "actions": ["read"],
+        },
+        headers=_headers(owner.token),
+    )
+    assert response.status_code == 201, response.text
+
+    response = viewer.client.get("/api/v1/engineering/incidents")
+    assert incident_id in {UUID(row["id"]) for row in response.json()["incidents"]}
+
+    with engine.begin() as connection:
+        visibility = connection.execute(
+            text("SELECT visibility FROM incidents WHERE id = :id"), {"id": incident_id}
+        ).scalar_one()
+    assert visibility == "shared_explicitly"
+
+
+# --- Task 5: sharing-review preview -----------------------------------------
+
+
+def test_grant_preview_on_workspace_visible_resource_reports_narrowing_and_losers(
+    authz_context: _AuthzContext,
+) -> None:
+    owner: _Actor = authz_context.owner
+    admin: _Actor = authz_context.admin
+    member: _Actor = authz_context.member
+    viewer: _Actor = authz_context.viewer
+
+    incident = _create_incident(owner.client, owner.token, title="Preview target")
+    incident_id = UUID(incident["id"])
+
+    response = owner.client.post(
+        "/api/v1/sharing/grants/preview",
+        json={
+            "resource_type": "incidents",
+            "resource_id": str(incident_id),
+            "grantee_account_id": str(viewer.account_id),
+            "actions": ["read"],
+        },
+        headers=_headers(owner.token),
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["current_visibility"] == "workspace"
+    assert body["proposed_visibility"] == "shared_explicitly"
+    assert body["requires_narrow_visibility_confirmation"] is True
+    assert body["grantee_already_has_access"] is True  # viewer already reads via role
+    assert body["grantee_gains_actions"] == []  # viewer already has read
+    losers = {UUID(a) for a in body["members_losing_default_access"]}
+    assert losers == {admin.account_id, member.account_id}
+    assert viewer.account_id not in losers
+    assert owner.account_id not in losers
+
+    # A preview mutates nothing.
+    response = viewer.client.get("/api/v1/engineering/incidents")
+    assert incident_id not in {UUID(row["id"]) for row in response.json()["incidents"]}
+    with engine.begin() as connection:
+        visibility = connection.execute(
+            text("SELECT visibility FROM incidents WHERE id = :id"), {"id": incident_id}
+        ).scalar_one()
+        grant_count = connection.execute(
+            text("SELECT count(*) FROM resource_grants WHERE resource_id = :id"),
+            {"id": incident_id},
+        ).scalar_one()
+    assert visibility == "workspace"
+    assert grant_count == 0
+
+
+def test_grant_preview_on_private_resource_reports_no_narrowing(
+    authz_context: _AuthzContext,
+) -> None:
+    workspace_id: UUID = authz_context.workspace_id
+    owner: _Actor = authz_context.owner
+    viewer: _Actor = authz_context.viewer
+
+    incident = _create_incident(owner.client, owner.token, title="Private preview target")
+    incident_id = UUID(incident["id"])
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "UPDATE incidents SET visibility = 'private' "
+                "WHERE id = :id AND workspace_id = :workspace_id"
+            ),
+            {"id": incident_id, "workspace_id": workspace_id},
+        )
+
+    response = owner.client.post(
+        "/api/v1/sharing/grants/preview",
+        json={
+            "resource_type": "incidents",
+            "resource_id": str(incident_id),
+            "grantee_account_id": str(viewer.account_id),
+            "actions": ["read", "write"],
+        },
+        headers=_headers(owner.token),
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["current_visibility"] == "private"
+    assert body["requires_narrow_visibility_confirmation"] is False
+    assert body["members_losing_default_access"] == []
+    assert body["grantee_already_has_access"] is False
+    assert sorted(body["grantee_gains_actions"]) == ["read", "write"]
+
+
+def test_grant_preview_requires_owner_admin_or_resource_owner(
+    authz_context: _AuthzContext,
+) -> None:
+    owner: _Actor = authz_context.owner
+    viewer: _Actor = authz_context.viewer
+    member: _Actor = authz_context.member
+
+    incident = _create_incident(owner.client, owner.token, title="Not viewer's to preview")
+    response = viewer.client.post(
+        "/api/v1/sharing/grants/preview",
+        json={
+            "resource_type": "incidents",
+            "resource_id": incident["id"],
+            "grantee_account_id": str(member.account_id),
+            "actions": ["read"],
+        },
+        headers=_headers(viewer.token),
+    )
+    assert response.status_code == 403, response.text
+
+
+# --- Task 5: effective-permissions endpoint ---------------------------------
+
+
+def test_effective_permissions_endpoint_owner_workspace_role_and_grant(
+    authz_context: _AuthzContext,
+) -> None:
+    workspace_id: UUID = authz_context.workspace_id
+    owner: _Actor = authz_context.owner
+    member: _Actor = authz_context.member
+    viewer: _Actor = authz_context.viewer
+
+    incident = _create_incident(owner.client, owner.token, title="Effective perms target")
+    incident_id = UUID(incident["id"])
+
+    # Owner: via="owner", full actions, regardless of visibility.
+    response = owner.client.get(f"/api/v1/sharing/resources/incidents/{incident_id}")
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["is_owner"] is True
+    assert body["via"] == "owner"
+    assert sorted(body["granted_actions"]) == ["read", "write"]
+    assert body["visibility"] == "workspace"
+
+    # Another active member: via="workspace_role", baseline actions for
+    # their own role.
+    response = member.client.get(f"/api/v1/sharing/resources/incidents/{incident_id}")
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["is_owner"] is False
+    assert body["via"] == "workspace_role"
+    assert body["role"] == "member"
+    assert sorted(body["granted_actions"]) == ["read", "write"]
+
+    # Narrow to shared_explicitly and grant viewer read-only: via="resource_grant".
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "UPDATE incidents SET visibility = 'shared_explicitly' "
+                "WHERE id = :id AND workspace_id = :workspace_id"
+            ),
+            {"id": incident_id, "workspace_id": workspace_id},
+        )
+    grant_response = owner.client.post(
+        "/api/v1/sharing/grants",
+        json={
+            "resource_type": "incidents",
+            "resource_id": str(incident_id),
+            "grantee_account_id": str(viewer.account_id),
+            "actions": ["read"],
+        },
+        headers=_headers(owner.token),
+    )
+    assert grant_response.status_code == 201, grant_response.text
+
+    response = viewer.client.get(f"/api/v1/sharing/resources/incidents/{incident_id}")
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["is_owner"] is False
+    assert body["via"] == "resource_grant"
+    assert body["granted_actions"] == ["read"]
+
+    # member no longer has default access now that it's narrowed.
+    response = member.client.get(f"/api/v1/sharing/resources/incidents/{incident_id}")
+    assert response.status_code == 404, response.text
+
+
+def test_effective_permissions_endpoint_404_for_private_non_owner_and_unknown_resource(
+    authz_context: _AuthzContext,
+) -> None:
+    workspace_id: UUID = authz_context.workspace_id
+    owner: _Actor = authz_context.owner
+    member: _Actor = authz_context.member
+
+    incident = _create_incident(owner.client, owner.token, title="Private effective perms")
+    incident_id = UUID(incident["id"])
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "UPDATE incidents SET visibility = 'private' "
+                "WHERE id = :id AND workspace_id = :workspace_id"
+            ),
+            {"id": incident_id, "workspace_id": workspace_id},
+        )
+
+    response = member.client.get(f"/api/v1/sharing/resources/incidents/{incident_id}")
+    assert response.status_code == 404, response.text
+    assert response.json()["error"]["code"] == "RESOURCE_NOT_FOUND"
+
+    response = owner.client.get(f"/api/v1/sharing/resources/incidents/{uuid4()}")
+    assert response.status_code == 404, response.text
+
+
+# --- Task 5: `sharing` field embedded in engineering domain responses ------
+
+
+def test_incident_response_embeds_sharing_field(authz_context: _AuthzContext) -> None:
+    owner: _Actor = authz_context.owner
+    member: _Actor = authz_context.member
+
+    incident = _create_incident(owner.client, owner.token, title="Embedded sharing field")
+    assert incident["sharing"]["via"] == "owner"
+    assert incident["sharing"]["is_owner"] is True
+    assert sorted(incident["sharing"]["granted_actions"]) == ["read", "write"]
+
+    response = member.client.get("/api/v1/engineering/incidents")
+    assert response.status_code == 200, response.text
+    [row] = [r for r in response.json()["incidents"] if r["id"] == incident["id"]]
+    assert row["sharing"]["via"] == "workspace_role"
+    assert row["sharing"]["is_owner"] is False
+    assert row["sharing"]["role"] == "member"
