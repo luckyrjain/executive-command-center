@@ -1,8 +1,8 @@
 ---
 id: PHASE-010
 title: Gmail Connector
-status: Draft
-version: 0.1.0
+status: Approved for Implementation
+version: 0.2.0
 owner: Lucky Jain
 depends_on:
   - PHASE-001
@@ -18,6 +18,12 @@ depends_on:
 ---
 
 # PHASE-010 — Gmail Connector
+
+## Approved decisions
+
+Status moved from Draft after resolving `docs/superpowers/specs/2026-08-04-phase-10-gmail-connector-design.md`'s five decisions (connector mechanics/Protocol extension; privacy/consent model; OAuth scope, verification reality and rollout gating; `recommendations` create-path extension and AI-tool safety rubric; attention/knowledge integration), reached through direct discussion with the repository owner. In summary: the `ConnectorAdapter` Protocol gains its first OAuth2-authorization-code-grant shape (`get_authorization_url`/`handle_oauth_callback`) and its first re-invocable windowed `backfill`, composing Phase 6's connector mechanics with Phase 7's consent/encryption/deletion framework for the first time; a new `email` `personal_domains` entry at the `high_stakes` tier owns dedicated `email_threads`/`email_messages` tables, encrypted with Phase 7's existing personal-data key while the OAuth token itself uses Phase 6's existing connector-token key; shipping is restricted to an application-enforced internal-user allowlist, which is the actual mechanism keeping this phase outside Google's CASA security-assessment requirement (verified directly against Google's own OAuth verification docs, not assumed); `recommendations`' `execute_target()` gains a `"create"` operation reusing the existing per-resource `Create` models, giving the long-unused `source="ai"` field its first real populator; and email-derived attention items reuse Phase 3's existing deterministic ingestion path, not a new AI-runtime task type. Implementation plan: `docs/superpowers/plans/2026-08-04-phase-10-gmail-connector.md`. Delivery status: not yet started.
+
+**Disclosed, not yet resolved, per the design doc's own "not yet decided" note:** incremental-sync transport (polling assumed, Cloud Pub/Sub push not yet committed to) and whether `httpx` alone (vs. Google's official client library) suffices are both defaults carried into the implementation plan, not explicit repository-owner sign-off in the same form as the five decisions above.
 
 ## Objective
 
