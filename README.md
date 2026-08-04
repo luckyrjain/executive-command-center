@@ -8,8 +8,8 @@ Executive Command Center (ECC) is a specification-driven platform for helping ex
 
 **Foundation specification:** Phase 0 baseline approved  
 **Implementation:** Phase 1 engineering delivery is complete on `feature/phase-1-production-hardening` — backend domain slices, the executive frontend, and production hardening (security/config validation, structured observability, verified backup/restore, representative-scale performance gates, dependency/container/secret scanning) are all implemented and independently reviewed (`.superpowers/sdd/progress.md`). Phase 1 is not yet closed: it exits only after the seven-day daily-use validation (`docs/runbooks/PHASE-1-DAILY-USE.md`) and human change-review sign-off, both still open — see [Phase 1 Implementation Status](docs/phases/phase-001/IMPLEMENTATION-STATUS.md) and [Phase 1 Final Acceptance](docs/phases/phase-001/FINAL-ACCEPTANCE.md).  
-**Current delivery phase:** Phase 1 — Executive Dashboard MVP  
-**Published specifications:** Phases 0–9; Phases 2–9 remain Draft / Planned
+**Current delivery phase:** engineering delivery has proceeded, with repository-owner-authorized parallel-start exceptions, through Phase 8 — Phases 2-6 each have engineering delivery complete or substantially complete with their own exit gates still open, Phase 7 (Personal Intelligence) is complete through Task 8 plus a merged whole-phase review round, and Phase 8 (Multi-user Workspaces) is complete through Task 9 of 9 plus three whole-phase review rounds with a fourth in progress. None of Phases 1-8 has a promotion/exit decision made yet; see [Roadmap](docs/ROADMAP.md) for the authoritative, phase-by-phase status.  
+**Published specifications:** Phases 0–9; Phase 9 remains Draft / Planned, Phases 0-8 are Approved for Implementation
 
 ## Quick start
 

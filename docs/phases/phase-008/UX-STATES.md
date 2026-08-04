@@ -2,7 +2,7 @@
 id: PHASE-008-UX-STATES
 title: Phase 8 Multi-user UX States
 status: Approved for Implementation
-version: 0.3.0
+version: 0.4.0
 owner: Lucky Jain
 ---
 
@@ -27,7 +27,7 @@ Every required state is covered, or its absence is disclosed:
 - **Access revoked**: `SharingReview`'s `Revoke` button (Task 5, unchanged) is now reachable through this task's own navigation; `MembersPanel`'s member removal is the workspace-membership-level equivalent, both requiring the confirmation pattern below.
 - **Delegation awaiting acceptance**: `DelegationsPanel`'s `proposed` status shows Accept/Reject to the recipient and an explicit disclosure to the delegator ("There is no way to withdraw a still-pending delegation..."), naming the same `DELEGATION-CONTRACT.md`-driven backend gap Task 6 already disclosed (`revoke` is reachable only from `accepted`) rather than inventing a `proposed -> revoked` transition the contract's own diagram does not list.
 - **Ownership conflict**: **not implemented, deliberately.** `POST /ownership/transfers` always resolves to `status: 'completed'` in the same request that creates it -- migration `0066`'s own docstring: "no bilateral confirmation step exists... `status` is left open rather than hard-coded," a design decision made in Task 8, not an omission here. There is consequently no state in which two transfers, or a transfer and a concurrent removal, are ever left in visible conflict for a user to resolve; the closest real state this system produces is the next item.
-- **Member removal blocked**: `MembersPanel`'s `OWNED_RESOURCES_BLOCK_REMOVAL` handling (409) shows the exact resource-type/count breakdown from the error's own `details.owned_resources` payload plus an inline ownership-transfer form scoped to unblocking that specific removal, retried automatically once a transfer succeeds.
+- **Member removal blocked**: `MembersPanel`'s `OWNED_RESOURCES_BLOCK_REMOVAL` handling (409) shows the exact resource-type/count breakdown from the error's own `details.owned_resources` payload plus an inline ownership-transfer form scoped to unblocking that specific removal. **Corrected by the fourth whole-phase review: removal is not retried automatically once a transfer succeeds** -- this line's own pre-implementation phrasing claimed it was, but `transferMutation`'s `onSuccess` only clears the transfer form and shows "Transferred. Try removal again." (verified against both the component and its own test asserting that exact copy); the user must click "Confirm removal" a second time themselves. The owned-resources panel is not automatically refreshed either, so a multi-resource block still shows the pre-transfer count/list until the next removal attempt re-fetches it.
 
 **Sharing previews exactly what becomes visible** (Task 5's own guarantee, reachable here for the first time): `SharingReview`'s `Confirm and share` button only ever appears once the *current* form has actually been previewed, gated on a signature match so a stale preview of an already-edited form can never be confirmed by accident.
 

@@ -230,6 +230,38 @@ describe('MembersPanel', () => {
     expect(optionValues).toContain('owner')
   })
 
+  it('disables the sole active owner\'s own role select and hides their Leave button', async () => {
+    // Regression test for a bug found in the fourth whole-phase review:
+    // `membership_removal.py`'s own `_is_sole_active_owner` guard
+    // unconditionally rejects a sole active owner's own role change or
+    // removal (409), but the UI let them attempt both anyway.
+    stubFetch({
+      members: [member({ user_id: 'me-user-id', role: 'owner' })],
+      me: me({ users_id: 'me-user-id' }),
+    })
+    renderPanel()
+    await screen.findByText('Ada')
+    const select = screen.getByLabelText('Role for Ada') as HTMLSelectElement
+    expect(select.disabled).toBe(true)
+    expect(screen.queryByRole('button', { name: 'Leave workspace' })).toBeNull()
+    expect(screen.getByText(/only owner/)).toBeTruthy()
+  })
+
+  it('does not disable a role select or hide the Leave button when a second owner exists', async () => {
+    stubFetch({
+      members: [
+        member({ user_id: 'me-user-id', role: 'owner' }),
+        member({ user_id: 'user-2', role: 'owner', display_name: 'Bea', email: 'b@example.test' }),
+      ],
+      me: me({ users_id: 'me-user-id' }),
+    })
+    renderPanel()
+    await screen.findByText('Ada')
+    const select = screen.getByLabelText('Role for Ada') as HTMLSelectElement
+    expect(select.disabled).toBe(false)
+    expect(screen.getByRole('button', { name: 'Leave workspace' })).toBeTruthy()
+  })
+
   it('returns focus to the Remove button after cancelling the confirmation', async () => {
     stubFetch({ members: [member()] })
     renderPanel()
