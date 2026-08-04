@@ -158,8 +158,6 @@ def test_is_private_address_allows_public_addresses() -> None:
 
 
 def test_reject_private_host_raises_for_resolved_private_address() -> None:
-    from ecc.domains.engineering.connectors import AdapterAuthorizationError
-
     adapter = GitLabAdapter(resolve_host=lambda host: ["169.254.169.254"])
     with pytest.raises(AdapterAuthorizationError, match="private/internal"):
         adapter._reject_private_host("gitlab-internal.example.com")
@@ -171,8 +169,6 @@ def test_reject_private_host_allows_public_address() -> None:
 
 
 def test_reject_private_host_raises_for_unresolvable_host() -> None:
-    from ecc.domains.engineering.connectors import AdapterAuthorizationError
-
     def _fail(host: str) -> list[str]:
         raise AdapterAuthorizationError("GitLab host could not be resolved: nxdomain")
 

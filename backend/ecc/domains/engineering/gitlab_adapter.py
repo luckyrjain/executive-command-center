@@ -330,7 +330,10 @@ class GitLabAdapter:
         sleep: Callable[[float], None] = time.sleep,
         resolve_host: Callable[[str], list[str]] = _default_resolve_host,
     ) -> None:
-        client_kwargs: dict[str, Any] = {"timeout": timeout_seconds}
+        client_kwargs: dict[str, Any] = {
+            "base_url": GITLAB_API_BASE_URL,
+            "timeout": timeout_seconds,
+        }
         if transport is not None:
             client_kwargs["transport"] = transport
         self._client = httpx.Client(**client_kwargs)
@@ -341,11 +344,11 @@ class GitLabAdapter:
         return {"PRIVATE-TOKEN": credential, "Accept": "application/json"}
 
     def _reject_private_host(self, host: str) -> None:
-        """Connect-time SSRF guard, called once from `authorize()` only --
-        see the design doc's Security section for why this cannot use
-        Jira's fixed-suffix-allowlist approach (GitLab self-managed hosts
-        are arbitrary customer domains), and for the disclosed DNS-
-        rebinding limitation of a connect-time-only check.
+        """Connect-time SSRF guard, intended to be called once from `authorize()`
+        (wired in a later task) — never from a sync call. See the design doc's
+        Security section for why this cannot use Jira's fixed-suffix-allowlist
+        approach (GitLab self-managed hosts are arbitrary customer domains), and
+        for the disclosed DNS-rebinding limitation of a connect-time-only check.
         """
         for ip_str in self._resolve_host(host):
             if _is_private_address(ip_str):
