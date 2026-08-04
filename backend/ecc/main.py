@@ -34,6 +34,7 @@ from ecc.domains.calendar.events import router as calendar_events_router
 from ecc.domains.collaboration.delegations import router as collaboration_delegations_router
 from ecc.domains.communication.commitments import router as commitments_router
 from ecc.domains.engineering.connector_accounts import router as engineering_connectors_router
+from ecc.domains.engineering.connectors import registry as engineering_connector_registry
 from ecc.domains.engineering.decisions_incidents import (
     router as engineering_decisions_incidents_router,
 )
@@ -65,6 +66,8 @@ from ecc.domains.knowledge.timeline import router as knowledge_timeline_router
 from ecc.domains.personal.ai_insights import router as personal_ai_insights_router
 from ecc.domains.personal.domains import router as personal_domains_router
 from ecc.domains.personal.export_deletion import router as personal_export_deletion_router
+from ecc.domains.personal.gmail_adapter import GmailAdapter
+from ecc.domains.personal.gmail_oauth import router as personal_gmail_oauth_router
 from ecc.domains.personal.grants import router as personal_grants_router
 from ecc.domains.personal.habits import router as personal_habits_router
 from ecc.domains.planning.tasks import router as tasks_router
@@ -86,6 +89,17 @@ from ecc.search import router as search_router
 configure_logging()
 settings = get_settings()
 validate_production_settings(settings)
+# Phase 10 Gmail Connector Task 1: the sixth provider registered into the
+# shared connector registry, alongside `sandbox`/`github`/`gitlab`/`jira`/
+# `datadog` (each registered inside `ecc.domains.engineering.connectors`
+# itself, a same-package relative import). `GmailAdapter` cannot be
+# registered there the same way -- it lives in `ecc.domains.personal`,
+# which already imports `ecc.domains.engineering.connectors` for the
+# `ConnectorAdapter`/`OAuth2ConnectorAdapter` Protocols and `Connector
+# Authorization`/etc.; importing back the other direction from `connectors.
+# py` would be a circular import. Registered here instead -- this module is
+# the composition root every router/adapter is already wired through.
+engineering_connector_registry.register(GmailAdapter())
 app = FastAPI(title="Executive Command Center", version="0.2.0")
 # The dev-bootstrap router is only ever functional in development (each of
 # its routes calls _require_development() and 404s otherwise) -- but
@@ -239,6 +253,12 @@ app.include_router(personal_habits_router)
 app.include_router(personal_export_deletion_router)
 app.include_router(personal_grants_router)
 app.include_router(personal_ai_insights_router)
+# Phase 10 Gmail Connector Task 1: POST /personal/gmail/oauth/start, GET
+# .../oauth/callback (ecc.domains.personal.gmail_oauth) -- the only two
+# Gmail-specific routes; GET|POST /engineering/connectors and friends
+# (already registered above) handle everything else for a `provider=
+# 'gmail'` connector account, same as any other provider.
+app.include_router(personal_gmail_oauth_router)
 app.middleware("http")(rejected_mutation_audit_middleware)
 # Pure-ASGI body size guard: registered via add_middleware (not the
 # "http" dispatch helper) so it can intercept the raw receive() channel and

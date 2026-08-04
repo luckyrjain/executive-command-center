@@ -74,6 +74,14 @@ class ConnectorAuthorization:
     external_account_id: str
     display_name: str
     granted_scopes: frozenset[str]
+    # Phase 10 Gmail Connector Task 1 (design doc Decision 1): populated
+    # only by `OAuth2ConnectorAdapter.handle_oauth_callback` -- the OAuth
+    # grant (access/refresh token, adapter-serialized) it just exchanged a
+    # code for, which no caller has seen before this call returns. Every
+    # PAT-based `ConnectorAdapter.authorize()` leaves this `None`; the
+    # caller there already holds the original credential string it passed
+    # in, so there is nothing new for `authorize` to hand back.
+    credential: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
