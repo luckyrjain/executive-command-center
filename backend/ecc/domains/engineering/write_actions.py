@@ -143,6 +143,9 @@ import ecc.domains.engineering.connectors  # noqa: F401
 from ecc.database import SessionFactory
 from ecc.domains.engineering.crypto import decrypt_credential
 from ecc.domains.engineering.github_adapter import GITHUB_API_BASE_URL, _safe_repo_path_segment
+from ecc.domains.engineering.gitlab_adapter import (
+    _InvalidCredentialError as _InvalidGitLabCredentialError,
+)
 from ecc.domains.engineering.gitlab_adapter import _parse_credential as _parse_gitlab_credential
 from ecc.domains.engineering.jira_adapter import _parse_credential as _parse_jira_credential
 
@@ -440,7 +443,23 @@ class GitLabAddNoteAdapter:
                 connector_account_id=action_input.connector_account_id,
                 expected_provider="gitlab",
             )
-        host, token = _parse_gitlab_credential(credential)
+        # `_InvalidCredentialError` is `gitlab_adapter.py`'s own private
+        # exception class -- letting it escape would surface to the caller
+        # (and into `workflow_run_steps.error`) as the raw private class
+        # name, bypassing this module's own established error boundary.
+        # A credential this adapter cannot parse is a data problem with
+        # the stored connection, never a transient one, so
+        # `WriteActionRejected` (this module's "not retry-safe, land the
+        # step at 'failed'" type) is the right surface -- the same
+        # classification `_load_credential`'s own wrong-provider/inactive/
+        # cross-workspace failures already get.
+        try:
+            host, token = _parse_gitlab_credential(credential)
+        except _InvalidGitLabCredentialError as exc:
+            raise WriteActionRejected(
+                f"connector_account_id {action_input.connector_account_id} has a stored "
+                f"credential this adapter cannot parse: {exc}"
+            ) from exc
         headers = {"PRIVATE-TOKEN": token, "Accept": "application/json"}
         encoded_project = quote(action_input.project_path, safe="")
         try:

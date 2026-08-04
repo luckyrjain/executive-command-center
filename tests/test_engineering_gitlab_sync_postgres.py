@@ -166,6 +166,21 @@ def test_is_private_address_flags_loopback_link_local_and_rfc1918() -> None:
     assert _is_private_address("::1") is True
 
 
+def test_is_private_address_flags_rfc6598_cgnat_range() -> None:
+    """`ipaddress.ip_address(...).is_private` does not cover `100.64.0.0/10`
+    (RFC 6598 carrier-grade NAT), but it is a real internal address range
+    in cloud/carrier environments and therefore a legitimate SSRF target --
+    `_is_private_address` checks it explicitly. `100.63.255.255` and
+    `100.128.0.0` sit immediately outside the range on either side, proving
+    the check is the actual `/10` boundary and not a looser `100.*` match.
+    """
+    assert _is_private_address("100.64.0.1") is True
+    assert _is_private_address("100.100.50.7") is True
+    assert _is_private_address("100.127.255.255") is True
+    assert _is_private_address("100.63.255.255") is False
+    assert _is_private_address("100.128.0.0") is False
+
+
 def test_is_private_address_allows_public_addresses() -> None:
     assert _is_private_address("8.8.8.8") is False
     assert _is_private_address("140.82.112.3") is False

@@ -204,9 +204,19 @@ def _parse_credential(credential: str) -> tuple[str, str]:
     return host, token
 
 
+# RFC 6598 carrier-grade NAT. `ipaddress.ip_address(...).is_private` does
+# not cover this range, but it is a real internal address range in cloud
+# and carrier environments -- and therefore a legitimate SSRF target -- so
+# `_is_private_address` checks it explicitly alongside `is_private`/
+# `is_loopback`/`is_link_local`.
+_CGNAT_NETWORK = ipaddress.ip_network("100.64.0.0/10")
+
+
 def _is_private_address(ip_str: str) -> bool:
     ip = ipaddress.ip_address(ip_str)
-    return ip.is_private or ip.is_loopback or ip.is_link_local
+    if ip.is_private or ip.is_loopback or ip.is_link_local:
+        return True
+    return isinstance(ip, ipaddress.IPv4Address) and ip in _CGNAT_NETWORK
 
 
 def _default_resolve_host(host: str) -> list[str]:
@@ -387,8 +397,12 @@ class GitLabAdapter:
         self._sleep = sleep
         self._resolve_host = resolve_host
 
-    def _headers(self, credential: str) -> dict[str, str]:
-        return {"PRIVATE-TOKEN": credential, "Accept": "application/json"}
+    def _headers(self, token: str) -> dict[str, str]:
+        """`token` is the *parsed* token half of the credential (`_parse_
+        credential`'s second return value), never the raw stored
+        `host|token` string -- every call site parses first.
+        """
+        return {"PRIVATE-TOKEN": token, "Accept": "application/json"}
 
     def _reject_private_host(self, host: str) -> None:
         """Connect-time SSRF guard, called once from `authorize()` -- never
@@ -407,16 +421,21 @@ class GitLabAdapter:
     def _request_with_rate_limit_retry(
         self,
         method: str,
-        path: str,
+        url: str,
         *,
         headers: dict[str, str],
         params: dict[str, Any] | None = None,
     ) -> httpx.Response | None:
         """Returns `None` only when rate-limited beyond the bounded wait --
         callers treat that as "give up for now, resume next sync call."
+
+        `url` is an absolute URL built from the credential's own parsed
+        host, not a path relative to a fixed base -- this client is
+        constructed without a `base_url` precisely because the host varies
+        per credential (self-managed instances).
         """
         try:
-            response = self._client.request(method, path, headers=headers, params=params)
+            response = self._client.request(method, url, headers=headers, params=params)
         except httpx.HTTPError as exc:
             raise RuntimeError(f"GitLab request failed: {exc}") from exc
 
@@ -428,7 +447,7 @@ class GitLabAdapter:
             return None
         self._sleep(wait_seconds)
         try:
-            retry_response = self._client.request(method, path, headers=headers, params=params)
+            retry_response = self._client.request(method, url, headers=headers, params=params)
         except httpx.HTTPError as exc:
             raise RuntimeError(f"GitLab request failed: {exc}") from exc
 
