@@ -1,8 +1,8 @@
 ---
 id: GITLAB-SELF-MANAGED-DESIGN
 title: GitLab Self-Managed Instance Support — Design
-status: Draft
-version: 0.2.0
+status: Implemented
+version: 1.0.0
 owner: Lucky Jain
 depends_on:
   - PHASE-006
