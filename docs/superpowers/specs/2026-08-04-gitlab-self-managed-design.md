@@ -2,7 +2,7 @@
 id: GITLAB-SELF-MANAGED-DESIGN
 title: GitLab Self-Managed Instance Support — Design
 status: Draft
-version: 0.1.0
+version: 0.2.0
 owner: Lucky Jain
 depends_on:
   - PHASE-006
@@ -39,6 +39,8 @@ Considered and rejected. Would give a first-class, directly-queryable field, but
 
 **`gitlab_adapter.py`:**
 - Add `_parse_credential(credential: str) -> tuple[str, str]` returning `(host, token)`, mirroring `jira_adapter.py:161`'s `_parse_credential` shape. Validate `host` against a generic hostname pattern (RFC 1035 label rules — GitLab self-managed hosts are arbitrary customer domains, unlike Jira's `*.atlassian.net`-locked `_JIRA_SITE_PATTERN`); reject anything containing a scheme, path, or whitespace. The adapter always builds `https://{host}/...` itself — the credential never supplies a scheme.
+- Add `_reject_private_host(host: str) -> None`, called once from `authorize()` only (not from every sync call — see Security section above for why connect-time-only is this activation's accepted scope): resolves `host` via `socket.getaddrinfo` and raises `AdapterAuthorizationError` if any resolved address is private/loopback/link-local per `ipaddress`.
+- **`GitLabAdapter` is a single shared instance across every workspace and host** (`registry.register(GitLabAdapter())`, `connectors.py:249`) — its `httpx.Client`'s `base_url` is fixed once at construction, so it cannot vary per call. Every request this adapter makes must pass a full absolute URL (`f"https://{host}/api/v4/..."`) to `self._client.get(...)`/`.request(...)` instead of today's relative paths (`"/personal_access_tokens/self"`) — httpx uses an absolute URL as-is and ignores `base_url` when one is given, so this requires no `httpx.Client` construction change, only building the full URL string at each call site instead of a bare path.
 - Remove the two module-level constants as fixed values. Every method that currently reads `GITLAB_API_BASE_URL`/`_GITLAB_WEB_BASE_URL` (`authorize`, `backfill`, `incremental_sync`, `refresh_permissions`, `disconnect`, `_safe_source_url`) derives `api_base_url`/`web_base_url` from the parsed host instead — each of these already receives the credential (directly, or via `ConnectorAccountContext.credential`, already decrypted per-call, identical to how `jira_adapter.py:410/524/540` already re-parse their own credential per method).
 - `_safe_source_url` takes `web_base_url` as a parameter instead of closing over the module constant.
 - `authorize()` builds `external_account_id=f"{host}:{body['id']}"`.
@@ -55,7 +57,11 @@ None. Reuses `credential`/`encrypted_credentials` (opaque) and `external_account
 
 ## Security
 
-The host is a member-supplied value the backend makes outbound server-side HTTP calls to — the same shape Jira's `site` field already has today (accepted, precedented risk, not new). Enforced: the adapter always constructs the URL itself with a fixed `https://` scheme; the credential can never inject a scheme, port override, or path. No SSRF allowlist is added — matching Jira's own current posture exactly, disclosed here rather than silently assumed. Broader SSRF hardening across all host-accepting connectors, if ever needed, is a separate, larger cross-cutting task, not scoped to this one.
+**Correction from an earlier draft of this document:** this section originally claimed GitLab could adopt "the same posture as Jira today (no SSRF allowlist)." That was wrong. `jira_adapter.py:150-158`'s `_JIRA_SITE_PATTERN` is not just format validation — its own comment states it "closes an otherwise-real SSRF risk where an operator-supplied `site` could point this adapter's outbound request at an arbitrary internal host." Jira can enforce this with a simple regex because every Jira Cloud site is `{subdomain}.atlassian.net` — a fixed suffix Jira itself controls. GitLab self-managed cannot use that trick: the entire point is an arbitrary customer-controlled domain (`gitlab-ee.mpokket.org` is not a suffix ECC can allowlist in advance).
+
+**Mitigation for this activation:** at `authorize()` time (before any sync ever runs), resolve `host` and reject it if any resolved IP falls in a private/reserved range — loopback (`127.0.0.0/8`, `::1`), link-local (`169.254.0.0/16`, including the `169.254.169.254` cloud-metadata address, and `fe80::/10`), and RFC 1918 private ranges (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`). Python's `ipaddress.ip_address(...).is_private`/`.is_link_local`/`.is_loopback` cover this directly given a resolved address from `socket.getaddrinfo`.
+
+**Disclosed limitation, matching this codebase's own convention of naming what a fix does not cover (see `CONNECTOR-CONTRACT.md`'s "Accepted limitation" sections throughout):** this check happens once, at connect time — it does not eliminate DNS rebinding (a host resolving to a public IP at `authorize()` time, then repointed to an internal IP before a later `/sync` call). Closing that fully would mean re-resolving and re-checking on every outbound call, or pinning the resolved IP at connect time and requiring reconnection on any DNS change — real additional complexity, disclosed here as explicitly out of scope for this activation rather than silently unhandled. The connect-time check still blocks the low-effort, high-likelihood case (a member pointing the connector at `169.254.169.254` or an internal service directly) while leaving the narrower rebinding case for a later hardening pass if it's ever needed.
 
 ## Scope
 
@@ -72,4 +78,5 @@ The host is a member-supplied value the backend makes outbound server-side HTTP 
 Extend `tests/test_engineering_gitlab_sync_postgres.py`:
 - A self-managed-host `authorize()`/`backfill` case parallel to the existing gitlab.com case (fake HTTP responses keyed by host, not a live network call — matching this suite's existing fake-adapter-response convention).
 - Malformed-host credential rejection (scheme included, whitespace, empty host).
+- Private/loopback/link-local host rejection at `authorize()` (e.g. `169.254.169.254`, `127.0.0.1`, `10.0.0.5`) — `AdapterAuthorizationError`, connection never created.
 - Cross-host non-collision: two connector accounts with the identical numeric GitLab user ID but different hosts both connect successfully in the same workspace.
