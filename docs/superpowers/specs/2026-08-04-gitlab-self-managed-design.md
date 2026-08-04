@@ -53,7 +53,11 @@ Considered and rejected. Would give a first-class, directly-queryable field, but
 
 ## Migration
 
-None. Reuses `credential`/`encrypted_credentials` (opaque) and `external_account_id` (already free text) exactly as they exist today.
+**No schema migration, and no data migration either.** Reuses `credential`/`encrypted_credentials` (opaque) and `external_account_id` (already free text) exactly as they exist today.
+
+The data-migration half is worth stating explicitly rather than leaving implied, because it is not free — it is bought by a deliberate backward-compatible fallback in `_parse_credential`. Every `connector_accounts` row for provider `gitlab` written before this change holds a **bare token**, not `host|token`, and that stored value is parsed on every `/sync`, `handle_webhook`, `refresh_permissions`, `disconnect`, and `gitlab.add_note` call. A strict `host|token` parser would therefore break every pre-existing GitLab connection the moment this lands (`/sync` failing and driving the connector to `status='error'`, write-action steps failing permanently as non-retryable), with no remediation path: there is no endpoint to update a stored credential in place, so the only fix available would be disable + reconnect, which mints a *new* `external_account_id` (`gitlab.com:555` instead of the legacy bare `555`) and orphans references to the old `connector_account_id`.
+
+Instead, `_parse_credential` treats a credential containing no `|` as a legacy gitlab.com credential — `(host, token) = ("gitlab.com", credential)` — which is correct by construction, since a bare token could only ever have been issued by gitlab.com (the only host reachable before this change). A credential containing at least one `|` is parsed strictly as `host|token` with the host validated, unchanged, so a malformed new-format credential is still rejected rather than silently misread. Existing stored credentials therefore keep working as-is, and no backfill job, no operator reconnection, and no `connector_accounts` rewrite is needed.
 
 ## Security
 

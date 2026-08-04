@@ -116,9 +116,23 @@ def test_parse_credential_splits_host_and_token() -> None:
     )
 
 
-def test_parse_credential_rejects_missing_pipe() -> None:
-    with pytest.raises(_InvalidCredentialError, match="host\\|token"):
-        _parse_credential("glpat_test")
+def test_parse_credential_reads_a_bare_token_as_a_legacy_gitlab_com_credential() -> None:
+    """Backward compatibility, not laxity: every `connector_accounts` row
+    for provider `gitlab` written before self-managed support shipped holds
+    a bare personal access token, and there is no endpoint to rewrite a
+    stored credential in place. Rejecting those rows would break `/sync`,
+    `refresh_permissions`, `disconnect`, and `gitlab.add_note` for every
+    existing gitlab.com connection with no remediation short of
+    disconnect + reconnect (which mints a new `external_account_id`). A
+    bare token could only ever have been issued by gitlab.com, since that
+    was the sole reachable host before the `host|token` format existed.
+    """
+    assert _parse_credential("glpat-legacy-bare-token") == ("gitlab.com", "glpat-legacy-bare-token")
+
+
+def test_parse_credential_rejects_empty_credential() -> None:
+    with pytest.raises(_InvalidCredentialError):
+        _parse_credential("")
 
 
 def test_parse_credential_rejects_empty_host_or_token() -> None:
@@ -296,6 +310,31 @@ def test_gitlab_adapter_authorize_success_self_managed_host() -> None:
     authorization = adapter.authorize("gitlab-ee.mpokket.org|glpat_private")
     assert authorization.external_account_id == "gitlab-ee.mpokket.org:7"
     assert authorization.display_name == "priya"
+
+
+def test_gitlab_adapter_authorize_accepts_a_legacy_bare_token_credential() -> None:
+    """A `connector_accounts` row written before self-managed support
+    shipped holds a bare token with no `|`. `authorize()` must read it as a
+    gitlab.com credential rather than raising -- and still emit the new
+    `host:user_id` `external_account_id`, since `authorize()` only ever
+    runs at connect time (an already-connected legacy row's stored bare
+    `external_account_id` is never re-derived from a fresh call, so there
+    is nothing to stay bit-compatible with here).
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.host == "gitlab.com"
+        assert request.headers["PRIVATE-TOKEN"] == "glpat-legacy-bare"
+        if request.url.path == "/api/v4/personal_access_tokens/self":
+            return _json_response(_token_self_response(scopes=["read_api", "read_repository"]))
+        return _json_response({"id": 555, "username": "legacy-user"})
+
+    adapter = GitLabAdapter(
+        transport=httpx.MockTransport(handler), resolve_host=lambda host: ["140.82.112.3"]
+    )
+    authorization = adapter.authorize("glpat-legacy-bare")
+    assert authorization.external_account_id == "gitlab.com:555"
+    assert authorization.display_name == "legacy-user"
 
 
 def test_gitlab_adapter_authorize_rejects_private_host_end_to_end() -> None:

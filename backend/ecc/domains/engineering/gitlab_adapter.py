@@ -135,6 +135,11 @@ class _InvalidCredentialError(Exception):
     pass
 
 
+# The host a credential with no `|` is assumed to point at -- see
+# `_parse_credential`'s own docstring for why that assumption is safe.
+_LEGACY_GITLAB_HOST = "gitlab.com"
+
+
 # GitLab self-managed hosts are arbitrary customer domains -- unlike Jira's
 # `_JIRA_SITE_PATTERN` (locked to `*.atlassian.net`, a suffix Jira itself
 # controls), this only enforces "looks like a bare hostname" (RFC 1035
@@ -150,10 +155,47 @@ _GITLAB_HOST_PATTERN = re.compile(
 
 
 def _parse_credential(credential: str) -> tuple[str, str]:
-    parts = credential.split("|", 1)
-    if len(parts) != 2 or not all(parts):
+    """Parses a stored GitLab credential into `(host, token)`.
+
+    **A credential containing no `|` is a pre-self-managed-support legacy
+    credential, and is read as `("gitlab.com", credential)` rather than
+    rejected.** This compatibility fallback is load-bearing, not cosmetic:
+    every `connector_accounts` row for provider `gitlab` written before
+    this feature shipped holds a bare personal access token (e.g.
+    `glpat-xxxx`), and this function is called on that stored value by
+    `/sync` (`_sync_repositories`), `handle_webhook`, `refresh_
+    permissions`, `disconnect`, and `write_actions.GitLabAddNoteAdapter`.
+    Raising for those rows would break every existing gitlab.com
+    connection at once, with no remediation path short of disconnect +
+    reconnect -- which mints a *new* `external_account_id` and orphans
+    every reference to the old `connector_account_id`. There is no
+    endpoint to rewrite a stored credential in place, so "just re-enter
+    it in the new format" is not an option a workspace actually has.
+    Assuming `gitlab.com` is correct for those rows by construction: a
+    bare token could only ever have been issued by gitlab.com, since
+    gitlab.com was the sole host this adapter could reach before the
+    `host|token` format existed.
+
+    A credential containing at least one `|` is parsed strictly as
+    `host|token`, with the host validated against `_GITLAB_HOST_PATTERN`
+    -- unchanged behavior, so a malformed *new*-format credential is
+    still rejected rather than silently misread as a legacy token.
+
+    Note this deliberately does not extend to `authorize()`'s own
+    `external_account_id`, which is `f"{host}:{user_id}"` for legacy and
+    new credentials alike. `authorize()` runs only at connect time, never
+    per-sync, so an existing row's stored bare-`user_id`
+    `external_account_id` is never re-derived or compared against a fresh
+    `authorize()` call -- preserving the bare format for new connections
+    would only defeat the `host:user_id` collision-avoidance design.
+    """
+    if "|" not in credential:
+        if not credential:
+            raise _InvalidCredentialError("GitLab credential must not be empty")
+        return _LEGACY_GITLAB_HOST, credential
+    host, token = credential.split("|", 1)
+    if not host or not token:
         raise _InvalidCredentialError("GitLab credential must be in the form 'host|token'")
-    host, token = parts
     if not _GITLAB_HOST_PATTERN.match(host):
         raise _InvalidCredentialError(
             "GitLab credential's host must be a bare hostname (e.g. 'gitlab.com' or "
@@ -413,11 +455,14 @@ class GitLabAdapter:
         identity). Raises `AdapterAuthorizationError` for an invalid,
         revoked, inactive, or under-scoped token.
 
-        `credential` is `host|token` (Task 1's `_parse_credential`) --
-        `host` is connect-time SSRF-checked (`_reject_private_host`) before
-        any request is made, and every request goes to that parsed host's
-        own absolute URL rather than a fixed `gitlab.com` base, so this
-        adapter also authorizes self-managed GitLab instances.
+        `credential` is `host|token` (`_parse_credential`; a bare token
+        with no `|` is read as a legacy gitlab.com credential, see that
+        function's own docstring) -- `host` is connect-time SSRF-checked
+        (`_reject_private_host`) before any request is made, and every
+        request goes to that parsed host's own absolute URL rather than a
+        fixed `gitlab.com` base, so this adapter also authorizes
+        self-managed GitLab instances. `external_account_id` is
+        `f"{host}:{user_id}"` for both credential forms.
         """
         try:
             host, token = _parse_credential(credential)
