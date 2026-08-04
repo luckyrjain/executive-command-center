@@ -51,7 +51,7 @@ dependencies = [
   # encryption, so it cannot serve this need. `cryptography` (pyca) is the
   # standard, widely-audited Python crypto library; only its `Fernet`
   # recipe is used.
-  "cryptography==49.0.0",
+  "cryptography==50.0.0",
 ]
 
 [project.optional-dependencies]
