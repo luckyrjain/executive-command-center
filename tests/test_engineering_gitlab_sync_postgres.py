@@ -36,7 +36,7 @@ Task 2's own GitHub scope):
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from hmac import new
@@ -189,8 +189,8 @@ def test_gitlab_adapter_authorize_success() -> None:
         return _json_response({"id": 555, "username": "octocat"})
 
     adapter = GitLabAdapter(transport=httpx.MockTransport(handler))
-    authorization = adapter.authorize("glpat_test")
-    assert authorization.external_account_id == "555"
+    authorization = adapter.authorize("gitlab.com|glpat_test")
+    assert authorization.external_account_id == "gitlab.com:555"
     assert authorization.display_name == "octocat"
     assert authorization.granted_scopes == frozenset({"read_api", "read_repository"})
 
@@ -201,7 +201,7 @@ def test_gitlab_adapter_authorize_rejects_missing_required_scope() -> None:
 
     adapter = GitLabAdapter(transport=httpx.MockTransport(handler))
     with pytest.raises(AdapterAuthorizationError, match="read_api"):
-        adapter.authorize("token-missing-scopes")
+        adapter.authorize("gitlab.com|token-missing-scopes")
 
 
 def test_gitlab_adapter_authorize_rejects_revoked_token() -> None:
@@ -212,7 +212,7 @@ def test_gitlab_adapter_authorize_rejects_revoked_token() -> None:
 
     adapter = GitLabAdapter(transport=httpx.MockTransport(handler))
     with pytest.raises(AdapterAuthorizationError, match="revoked"):
-        adapter.authorize("revoked-token")
+        adapter.authorize("gitlab.com|revoked-token")
 
 
 def test_gitlab_adapter_authorize_rejects_inactive_token() -> None:
@@ -223,7 +223,7 @@ def test_gitlab_adapter_authorize_rejects_inactive_token() -> None:
 
     adapter = GitLabAdapter(transport=httpx.MockTransport(handler))
     with pytest.raises(AdapterAuthorizationError, match="active"):
-        adapter.authorize("inactive-token")
+        adapter.authorize("gitlab.com|inactive-token")
 
 
 def test_gitlab_adapter_authorize_rejects_401() -> None:
@@ -232,7 +232,7 @@ def test_gitlab_adapter_authorize_rejects_401() -> None:
 
     adapter = GitLabAdapter(transport=httpx.MockTransport(handler))
     with pytest.raises(AdapterAuthorizationError):
-        adapter.authorize("bad-token")
+        adapter.authorize("gitlab.com|bad-token")
 
 
 def test_gitlab_adapter_authorize_rejects_non_200() -> None:
@@ -241,7 +241,7 @@ def test_gitlab_adapter_authorize_rejects_non_200() -> None:
 
     adapter = GitLabAdapter(transport=httpx.MockTransport(handler))
     with pytest.raises(AdapterAuthorizationError):
-        adapter.authorize("token")
+        adapter.authorize("gitlab.com|token")
 
 
 def test_gitlab_adapter_authorize_rejects_network_error() -> None:
@@ -250,7 +250,7 @@ def test_gitlab_adapter_authorize_rejects_network_error() -> None:
 
     adapter = GitLabAdapter(transport=httpx.MockTransport(handler))
     with pytest.raises(AdapterAuthorizationError):
-        adapter.authorize("token")
+        adapter.authorize("gitlab.com|token")
 
 
 def test_gitlab_adapter_authorize_rejects_second_call_non_200() -> None:
@@ -267,7 +267,7 @@ def test_gitlab_adapter_authorize_rejects_second_call_non_200() -> None:
 
     adapter = GitLabAdapter(transport=httpx.MockTransport(handler))
     with pytest.raises(AdapterAuthorizationError):
-        adapter.authorize("token")
+        adapter.authorize("gitlab.com|token")
 
 
 def test_gitlab_adapter_authorize_rejects_second_call_network_error() -> None:
@@ -278,7 +278,58 @@ def test_gitlab_adapter_authorize_rejects_second_call_network_error() -> None:
 
     adapter = GitLabAdapter(transport=httpx.MockTransport(handler))
     with pytest.raises(AdapterAuthorizationError):
-        adapter.authorize("token")
+        adapter.authorize("gitlab.com|token")
+
+
+def test_gitlab_adapter_authorize_success_self_managed_host() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.host == "gitlab-ee.mpokket.org"
+        if request.url.path == "/api/v4/personal_access_tokens/self":
+            return _json_response(_token_self_response(scopes=["read_api", "read_repository"]))
+        assert request.url.path == "/api/v4/user"
+        return _json_response({"id": 7, "username": "priya"})
+
+    adapter = GitLabAdapter(
+        transport=httpx.MockTransport(handler),
+        resolve_host=lambda host: ["3.3.3.3"],
+    )
+    authorization = adapter.authorize("gitlab-ee.mpokket.org|glpat_private")
+    assert authorization.external_account_id == "gitlab-ee.mpokket.org:7"
+    assert authorization.display_name == "priya"
+
+
+def test_gitlab_adapter_authorize_rejects_private_host_end_to_end() -> None:
+    from ecc.domains.engineering.connectors import AdapterAuthorizationError
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError("must not make an HTTP call once the host is rejected")
+
+    adapter = GitLabAdapter(
+        transport=httpx.MockTransport(handler),
+        resolve_host=lambda host: ["169.254.169.254"],
+    )
+    with pytest.raises(AdapterAuthorizationError, match="private/internal"):
+        adapter.authorize("gitlab-internal.example.com|glpat_test")
+
+
+def test_gitlab_adapter_two_hosts_same_numeric_user_id_do_not_collide() -> None:
+    def handler_for(user_id: int) -> Callable[[httpx.Request], httpx.Response]:
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path == "/api/v4/personal_access_tokens/self":
+                return _json_response(_token_self_response(scopes=["read_api", "read_repository"]))
+            return _json_response({"id": user_id, "username": f"user{user_id}"})
+
+        return handler
+
+    cloud_adapter = GitLabAdapter(transport=httpx.MockTransport(handler_for(42)))
+    self_managed_adapter = GitLabAdapter(
+        transport=httpx.MockTransport(handler_for(42)), resolve_host=lambda host: ["3.3.3.3"]
+    )
+    cloud_auth = cloud_adapter.authorize("gitlab.com|token-a")
+    self_managed_auth = self_managed_adapter.authorize("gitlab-ee.mpokket.org|token-b")
+    assert cloud_auth.external_account_id == "gitlab.com:42"
+    assert self_managed_auth.external_account_id == "gitlab-ee.mpokket.org:42"
+    assert cloud_auth.external_account_id != self_managed_auth.external_account_id
 
 
 # --- unit-level: repository sync (no database) ------------------------------
@@ -294,8 +345,8 @@ def _account_context() -> ConnectorAccountContext:
     return ConnectorAccountContext(
         workspace_id=uuid4(),
         connector_account_id=uuid4(),
-        external_account_id="555",
-        credential="glpat_test",
+        external_account_id="gitlab.com:555",
+        credential="gitlab.com|glpat_test",
     )
 
 
@@ -342,7 +393,7 @@ def seeded_account_context() -> Iterator[ConnectorAccountContext]:
             {
                 "id": account_id,
                 "workspace_id": workspace_id,
-                "encrypted": encrypt_credential("glpat_test"),
+                "encrypted": encrypt_credential("gitlab.com|glpat_test"),
                 "actor_id": user_id,
                 "now": now,
             },
@@ -352,7 +403,7 @@ def seeded_account_context() -> Iterator[ConnectorAccountContext]:
             workspace_id=workspace_id,
             connector_account_id=account_id,
             external_account_id="gl-unit-test",
-            credential="glpat_test",
+            credential="gitlab.com|glpat_test",
         )
     finally:
         with engine.begin() as connection:
@@ -972,7 +1023,7 @@ def _headers(token: str, key: str | None = None) -> dict[str, str]:
 
 
 def _insert_gitlab_connector_account(
-    workspace_id: UUID, user_id: UUID, *, credential: str = "glpat_fixture"
+    workspace_id: UUID, user_id: UUID, *, credential: str = "gitlab.com|glpat_fixture"
 ) -> UUID:
     account_id = uuid4()
     now = datetime.now(UTC)
