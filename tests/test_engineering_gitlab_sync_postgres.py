@@ -202,7 +202,16 @@ def test_gitlab_adapter_authorize_success() -> None:
         assert request.url.path == "/api/v4/user"
         return _json_response({"id": 555, "username": "octocat"})
 
-    adapter = GitLabAdapter(transport=httpx.MockTransport(handler))
+    # `resolve_host` is injected on every `authorize()` test in this file,
+    # including the gitlab.com ones: `authorize()` runs `_reject_private_
+    # host` before any HTTP call, so without it the default `_default_
+    # resolve_host` would perform a real `socket.getaddrinfo("gitlab.com")`
+    # -- a live DNS dependency in a suite that uses `httpx.MockTransport`
+    # precisely to avoid the network. `140.82.112.3` is an obviously-public
+    # address, so the SSRF guard passes without resolving anything.
+    adapter = GitLabAdapter(
+        transport=httpx.MockTransport(handler), resolve_host=lambda host: ["140.82.112.3"]
+    )
     authorization = adapter.authorize("gitlab.com|glpat_test")
     assert authorization.external_account_id == "gitlab.com:555"
     assert authorization.display_name == "octocat"
@@ -213,7 +222,9 @@ def test_gitlab_adapter_authorize_rejects_missing_required_scope() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return _json_response(_token_self_response(scopes=["read_user"]))
 
-    adapter = GitLabAdapter(transport=httpx.MockTransport(handler))
+    adapter = GitLabAdapter(
+        transport=httpx.MockTransport(handler), resolve_host=lambda host: ["140.82.112.3"]
+    )
     with pytest.raises(AdapterAuthorizationError, match="read_api"):
         adapter.authorize("gitlab.com|token-missing-scopes")
 
@@ -224,7 +235,9 @@ def test_gitlab_adapter_authorize_rejects_revoked_token() -> None:
             _token_self_response(scopes=["read_api", "read_repository"], revoked=True)
         )
 
-    adapter = GitLabAdapter(transport=httpx.MockTransport(handler))
+    adapter = GitLabAdapter(
+        transport=httpx.MockTransport(handler), resolve_host=lambda host: ["140.82.112.3"]
+    )
     with pytest.raises(AdapterAuthorizationError, match="revoked"):
         adapter.authorize("gitlab.com|revoked-token")
 
@@ -235,7 +248,9 @@ def test_gitlab_adapter_authorize_rejects_inactive_token() -> None:
             _token_self_response(scopes=["read_api", "read_repository"], active=False)
         )
 
-    adapter = GitLabAdapter(transport=httpx.MockTransport(handler))
+    adapter = GitLabAdapter(
+        transport=httpx.MockTransport(handler), resolve_host=lambda host: ["140.82.112.3"]
+    )
     with pytest.raises(AdapterAuthorizationError, match="active"):
         adapter.authorize("gitlab.com|inactive-token")
 
@@ -244,7 +259,9 @@ def test_gitlab_adapter_authorize_rejects_401() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return _json_response({"message": "401 Unauthorized"}, status_code=401)
 
-    adapter = GitLabAdapter(transport=httpx.MockTransport(handler))
+    adapter = GitLabAdapter(
+        transport=httpx.MockTransport(handler), resolve_host=lambda host: ["140.82.112.3"]
+    )
     with pytest.raises(AdapterAuthorizationError):
         adapter.authorize("gitlab.com|bad-token")
 
@@ -253,7 +270,9 @@ def test_gitlab_adapter_authorize_rejects_non_200() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return _json_response({"message": "Server error"}, status_code=500)
 
-    adapter = GitLabAdapter(transport=httpx.MockTransport(handler))
+    adapter = GitLabAdapter(
+        transport=httpx.MockTransport(handler), resolve_host=lambda host: ["140.82.112.3"]
+    )
     with pytest.raises(AdapterAuthorizationError):
         adapter.authorize("gitlab.com|token")
 
@@ -262,7 +281,9 @@ def test_gitlab_adapter_authorize_rejects_network_error() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         raise httpx.ConnectError("connection refused")
 
-    adapter = GitLabAdapter(transport=httpx.MockTransport(handler))
+    adapter = GitLabAdapter(
+        transport=httpx.MockTransport(handler), resolve_host=lambda host: ["140.82.112.3"]
+    )
     with pytest.raises(AdapterAuthorizationError):
         adapter.authorize("gitlab.com|token")
 
@@ -279,7 +300,9 @@ def test_gitlab_adapter_authorize_rejects_second_call_non_200() -> None:
             return _json_response(_token_self_response(scopes=["read_api", "read_repository"]))
         return _json_response({"message": "Server error"}, status_code=500)
 
-    adapter = GitLabAdapter(transport=httpx.MockTransport(handler))
+    adapter = GitLabAdapter(
+        transport=httpx.MockTransport(handler), resolve_host=lambda host: ["140.82.112.3"]
+    )
     with pytest.raises(AdapterAuthorizationError):
         adapter.authorize("gitlab.com|token")
 
@@ -290,7 +313,9 @@ def test_gitlab_adapter_authorize_rejects_second_call_network_error() -> None:
             return _json_response(_token_self_response(scopes=["read_api", "read_repository"]))
         raise httpx.ConnectError("connection refused")
 
-    adapter = GitLabAdapter(transport=httpx.MockTransport(handler))
+    adapter = GitLabAdapter(
+        transport=httpx.MockTransport(handler), resolve_host=lambda host: ["140.82.112.3"]
+    )
     with pytest.raises(AdapterAuthorizationError):
         adapter.authorize("gitlab.com|token")
 
@@ -360,7 +385,9 @@ def test_gitlab_adapter_two_hosts_same_numeric_user_id_do_not_collide() -> None:
 
         return handler
 
-    cloud_adapter = GitLabAdapter(transport=httpx.MockTransport(handler_for(42)))
+    cloud_adapter = GitLabAdapter(
+        transport=httpx.MockTransport(handler_for(42)), resolve_host=lambda host: ["140.82.112.3"]
+    )
     self_managed_adapter = GitLabAdapter(
         transport=httpx.MockTransport(handler_for(42)), resolve_host=lambda host: ["3.3.3.3"]
     )
