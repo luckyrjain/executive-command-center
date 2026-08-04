@@ -59,7 +59,12 @@ from ecc.domains.engineering.connectors import (
     ConnectorRegistry,
 )
 from ecc.domains.engineering.crypto import encrypt_credential
-from ecc.domains.engineering.gitlab_adapter import GitLabAdapter
+from ecc.domains.engineering.gitlab_adapter import (
+    GitLabAdapter,
+    _InvalidCredentialError,
+    _is_private_address,
+    _parse_credential,
+)
 from ecc.main import app
 
 settings = get_settings()
@@ -98,6 +103,82 @@ def _token_self_response(
     *, scopes: list[str], active: bool = True, revoked: bool = False
 ) -> dict[str, Any]:
     return {"id": 1, "scopes": scopes, "active": active, "revoked": revoked, "user_id": 555}
+
+
+# --- unit-level: credential parsing and SSRF host guard --------------------
+
+
+def test_parse_credential_splits_host_and_token() -> None:
+    assert _parse_credential("gitlab.com|glpat_test") == ("gitlab.com", "glpat_test")
+    assert _parse_credential("gitlab-ee.mpokket.org|glpat-xyz") == (
+        "gitlab-ee.mpokket.org",
+        "glpat-xyz",
+    )
+
+
+def test_parse_credential_rejects_missing_pipe() -> None:
+    with pytest.raises(_InvalidCredentialError, match="host\\|token"):
+        _parse_credential("glpat_test")
+
+
+def test_parse_credential_rejects_empty_host_or_token() -> None:
+    with pytest.raises(_InvalidCredentialError):
+        _parse_credential("|glpat_test")
+    with pytest.raises(_InvalidCredentialError):
+        _parse_credential("gitlab.com|")
+
+
+def test_parse_credential_rejects_scheme_in_host() -> None:
+    with pytest.raises(_InvalidCredentialError):
+        _parse_credential("https://gitlab.com|glpat_test")
+
+
+def test_parse_credential_rejects_path_in_host() -> None:
+    with pytest.raises(_InvalidCredentialError):
+        _parse_credential("gitlab.com/api|glpat_test")
+
+
+def test_parse_credential_rejects_whitespace_in_host() -> None:
+    with pytest.raises(_InvalidCredentialError):
+        _parse_credential("gitlab.com |glpat_test")
+
+
+def test_is_private_address_flags_loopback_link_local_and_rfc1918() -> None:
+    assert _is_private_address("127.0.0.1") is True
+    assert _is_private_address("169.254.169.254") is True
+    assert _is_private_address("10.0.0.5") is True
+    assert _is_private_address("172.16.0.1") is True
+    assert _is_private_address("192.168.1.1") is True
+    assert _is_private_address("::1") is True
+
+
+def test_is_private_address_allows_public_addresses() -> None:
+    assert _is_private_address("8.8.8.8") is False
+    assert _is_private_address("140.82.112.3") is False
+
+
+def test_reject_private_host_raises_for_resolved_private_address() -> None:
+    from ecc.domains.engineering.connectors import AdapterAuthorizationError
+
+    adapter = GitLabAdapter(resolve_host=lambda host: ["169.254.169.254"])
+    with pytest.raises(AdapterAuthorizationError, match="private/internal"):
+        adapter._reject_private_host("gitlab-internal.example.com")
+
+
+def test_reject_private_host_allows_public_address() -> None:
+    adapter = GitLabAdapter(resolve_host=lambda host: ["140.82.112.3"])
+    adapter._reject_private_host("gitlab.com")  # must not raise
+
+
+def test_reject_private_host_raises_for_unresolvable_host() -> None:
+    from ecc.domains.engineering.connectors import AdapterAuthorizationError
+
+    def _fail(host: str) -> list[str]:
+        raise AdapterAuthorizationError("GitLab host could not be resolved: nxdomain")
+
+    adapter = GitLabAdapter(resolve_host=_fail)
+    with pytest.raises(AdapterAuthorizationError, match="could not be resolved"):
+        adapter._reject_private_host("does-not-exist.invalid")
 
 
 # --- unit-level: GitLabAdapter.authorize ------------------------------------

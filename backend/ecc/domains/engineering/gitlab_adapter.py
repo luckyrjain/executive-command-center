@@ -94,6 +94,9 @@ any `disconnect()` failure as best-effort, never blocking disconnection.
 
 from __future__ import annotations
 
+import ipaddress
+import re
+import socket
 import time
 from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
@@ -128,6 +131,50 @@ _PAGE_SIZE = 100
 # resumes across multiple `/sync` calls via the cursor.
 _MAX_PAGES_PER_CALL = 10
 _RATE_LIMIT_MAX_WAIT_SECONDS = 5.0
+
+
+class _InvalidCredentialError(Exception):
+    pass
+
+
+# GitLab self-managed hosts are arbitrary customer domains -- unlike Jira's
+# `_JIRA_SITE_PATTERN` (locked to `*.atlassian.net`, a suffix Jira itself
+# controls), this only enforces "looks like a bare hostname" (RFC 1035
+# label rules, dot-separated), never a fixed suffix. It exists to reject a
+# scheme/port/path/whitespace smuggled into the credential, not to
+# allowlist specific domains -- `_reject_private_host` below is the actual
+# SSRF defense (see design doc's Security section for why a hostname regex
+# alone cannot be one for an arbitrary domain).
+_GITLAB_HOST_PATTERN = re.compile(
+    r"\A[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
+    r"(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*\Z"
+)
+
+
+def _parse_credential(credential: str) -> tuple[str, str]:
+    parts = credential.split("|", 1)
+    if len(parts) != 2 or not all(parts):
+        raise _InvalidCredentialError("GitLab credential must be in the form 'host|token'")
+    host, token = parts
+    if not _GITLAB_HOST_PATTERN.match(host):
+        raise _InvalidCredentialError(
+            "GitLab credential's host must be a bare hostname (e.g. 'gitlab.com' or "
+            "'gitlab-ee.example.com') -- no scheme, port, path, or whitespace"
+        )
+    return host, token
+
+
+def _is_private_address(ip_str: str) -> bool:
+    ip = ipaddress.ip_address(ip_str)
+    return ip.is_private or ip.is_loopback or ip.is_link_local
+
+
+def _default_resolve_host(host: str) -> list[str]:
+    try:
+        addr_info = socket.getaddrinfo(host, None)
+    except OSError as exc:
+        raise AdapterAuthorizationError(f"GitLab host could not be resolved: {exc}") from exc
+    return [str(info[4][0]) for info in addr_info]
 
 
 def _safe_source_url(raw_url: str | None, *, fallback: str) -> str:
@@ -281,18 +328,31 @@ class GitLabAdapter:
         transport: httpx.BaseTransport | None = None,
         timeout_seconds: float = 10.0,
         sleep: Callable[[float], None] = time.sleep,
+        resolve_host: Callable[[str], list[str]] = _default_resolve_host,
     ) -> None:
-        client_kwargs: dict[str, Any] = {
-            "base_url": GITLAB_API_BASE_URL,
-            "timeout": timeout_seconds,
-        }
+        client_kwargs: dict[str, Any] = {"timeout": timeout_seconds}
         if transport is not None:
             client_kwargs["transport"] = transport
         self._client = httpx.Client(**client_kwargs)
         self._sleep = sleep
+        self._resolve_host = resolve_host
 
     def _headers(self, credential: str) -> dict[str, str]:
         return {"PRIVATE-TOKEN": credential, "Accept": "application/json"}
+
+    def _reject_private_host(self, host: str) -> None:
+        """Connect-time SSRF guard, called once from `authorize()` only --
+        see the design doc's Security section for why this cannot use
+        Jira's fixed-suffix-allowlist approach (GitLab self-managed hosts
+        are arbitrary customer domains), and for the disclosed DNS-
+        rebinding limitation of a connect-time-only check.
+        """
+        for ip_str in self._resolve_host(host):
+            if _is_private_address(ip_str):
+                raise AdapterAuthorizationError(
+                    f"GitLab host '{host}' resolves to a private/internal address; "
+                    "refusing to connect"
+                )
 
     def _request_with_rate_limit_retry(
         self,
