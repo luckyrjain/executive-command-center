@@ -102,6 +102,30 @@ class Settings(BaseSettings):
     personal_ai_insight_generation_enabled: bool = Field(
         default=False, validation_alias="ECC_PERSONAL_AI_INSIGHT_GENERATION_ENABLED"
     )
+    # Phase 10 Gmail Connector Task 1 (design doc Decision 1/3): the OAuth2
+    # client credentials Google Cloud Console issues for this application's
+    # registered app. Empty by default -- `GmailAdapter.get_authorization_url`
+    # raises `AdapterAuthorizationError` (not a startup failure) if these are
+    # unset, since a Gmail connection is opt-in per deployment, unlike
+    # `session_secret`/the encryption keys, which every deployment needs
+    # regardless of whether anyone ever connects Gmail.
+    gmail_oauth_client_id: str = Field(default="", validation_alias="ECC_GMAIL_OAUTH_CLIENT_ID")
+    gmail_oauth_client_secret: str = Field(
+        default="", validation_alias="ECC_GMAIL_OAUTH_CLIENT_SECRET"
+    )
+    gmail_oauth_redirect_uri: str = Field(
+        default="", validation_alias="ECC_GMAIL_OAUTH_REDIRECT_URI"
+    )
+    # Design doc Decision 3: the internal-user allowlist that keeps this
+    # phase within Google's OAuth test-user cap (no CASA security
+    # assessment required) -- a comma-separated list of Google account
+    # emails, deliberately a setting, not a database table, since this gate
+    # is explicitly temporary (`PHASE-010-gmail-connector.md`'s own
+    # "Deferred backlog": non-internal users). Empty by default, meaning no
+    # account may connect until explicitly configured -- fails closed, the
+    # same "no implicit access" default every other allowlist-shaped
+    # setting in this codebase uses.
+    gmail_oauth_allowlist: str = Field(default="", validation_alias="ECC_GMAIL_OAUTH_ALLOWLIST")
 
     @property
     def cors_origin_list(self) -> list[str]:
