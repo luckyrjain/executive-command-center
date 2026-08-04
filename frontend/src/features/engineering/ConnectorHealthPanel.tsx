@@ -12,6 +12,17 @@ import type {
 } from './types'
 
 const PROVIDERS: ReadonlyArray<ConnectorProvider> = ['github', 'gitlab', 'jira', 'datadog', 'sandbox']
+
+// Only GitLab's credential shape (`host|token`, `connector_accounts.
+// ConnectorCreateRequest`'s own docstring) is non-obvious from a bare
+// password-style input -- self-managed GitLab support means "just paste a
+// token" is no longer correct for this provider specifically. GitHub/Jira/
+// Datadog/sandbox get no placeholder: GitHub's is a bare token (nothing to
+// hint), and Jira/Datadog's own multi-part shapes are out of scope for this
+// hint-text pass.
+const CREDENTIAL_PLACEHOLDER: Partial<Record<ConnectorProvider, string>> = {
+  gitlab: 'host|token, e.g. gitlab.com|glpat-xxxx or gitlab-ee.example.com|glpat-xxxx',
+}
 const RESOURCE_TYPES = [
   'repository', 'work_item', 'change', 'review', 'deployment', 'incident',
   'monitor', 'service_definition', 'dashboard',
@@ -243,7 +254,14 @@ export default function ConnectorHealthPanel() {
           </select>
         </label>
         <label>Credential
-          <input aria-label="Credential" type="password" value={credential} onChange={(e) => setCredential(e.target.value)} autoComplete="off" />
+          <input
+            aria-label="Credential"
+            type="password"
+            value={credential}
+            onChange={(e) => setCredential(e.target.value)}
+            autoComplete="off"
+            placeholder={CREDENTIAL_PLACEHOLDER[provider]}
+          />
         </label>
         <div className="work-actions">
           <button type="submit" disabled={createMutation.isPending || !credential.trim()}>Connect</button>

@@ -375,6 +375,19 @@ IdempotencyHeader = Annotated[
 
 
 class ConnectorCreateRequest(BaseModel):
+    """`credential`'s shape is provider-defined and opaque to this layer
+    (`connector_accounts.encrypted_credentials` stores it as-is, encrypted).
+    GitHub: a bare token (`github_adapter.py`'s `_headers`, `Bearer
+    {credential}`). Jira: `site|email|api_token` (`site` a bare
+    `{subdomain}.atlassian.net` hostname -- `jira_adapter.py`'s own
+    `_parse_credential`). GitLab: `host|token` (`host` a bare hostname --
+    `gitlab.com` or a self-managed instance, e.g. `gitlab-ee.example.com`;
+    never a scheme/port/path -- `gitlab_adapter.py`'s own `_parse_
+    credential`). Datadog: `site|api_key|app_key` (`site` one of Datadog's
+    documented regional API hosts, e.g. `api.datadoghq.com` --
+    `datadog_adapter.py`'s own `_parse_credential`).
+    """
+
     model_config = ConfigDict(extra="forbid")
     provider: str = Field(min_length=1, max_length=20)
     credential: str = Field(min_length=1, max_length=4096)
