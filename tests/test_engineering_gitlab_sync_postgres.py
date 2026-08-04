@@ -49,6 +49,7 @@ import pytest
 from fastapi.testclient import TestClient
 from identity_fixtures import create_identity
 from sqlalchemy import text
+from sqlalchemy.exc import IntegrityError
 
 from ecc.config import get_settings
 from ecc.database import engine
@@ -413,6 +414,81 @@ def test_gitlab_adapter_two_hosts_same_numeric_user_id_do_not_collide() -> None:
     assert cloud_auth.external_account_id != self_managed_auth.external_account_id
 
 
+def test_two_hosts_same_numeric_user_id_both_insert_under_the_real_unique_constraint(
+    seeded_account_context: ConnectorAccountContext,
+) -> None:
+    """The string-level test above proves only that `authorize()` builds two
+    different strings -- true by construction, and no evidence at all about
+    the database. The design's actual claim is that both connections can
+    coexist **in one workspace** without violating `uq_connector_accounts_
+    workspace_provider_external_id` `(workspace_id, provider,
+    external_account_id)`. That is a Postgres fact, so it is asserted
+    against Postgres: two real `connector_accounts` inserts, same workspace,
+    same provider, same numeric GitLab user id (42), different hosts.
+
+    The second half is what makes the first half meaningful -- re-inserting
+    `gitlab.com:42` *does* raise `IntegrityError`, proving the constraint is
+    genuinely present and enforcing, so the two successful inserts above
+    passed because of the host prefix rather than because nothing was
+    checking.
+    """
+    workspace_id = seeded_account_context.workspace_id
+    with engine.begin() as connection:
+        actor_id = connection.execute(
+            text("SELECT created_by FROM connector_accounts WHERE workspace_id = :workspace_id"),
+            {"workspace_id": workspace_id},
+        ).scalar_one()
+
+    def _insert(external_account_id: str) -> None:
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO connector_accounts (
+                        id, workspace_id, provider, external_account_id, display_name,
+                        granted_scopes, encrypted_credentials, status, version,
+                        created_by, updated_by, created_at, updated_at
+                    ) VALUES (
+                        :id, :workspace_id, 'gitlab', :ext, 'Cross-host collision test',
+                        ARRAY['read_api', 'read_repository'], :encrypted, 'active', 1,
+                        :actor_id, :actor_id, :now, :now
+                    )
+                    """
+                ),
+                {
+                    "id": uuid4(),
+                    "workspace_id": workspace_id,
+                    "ext": external_account_id,
+                    "encrypted": encrypt_credential(f"{external_account_id.split(':')[0]}|glpat-x"),
+                    "actor_id": actor_id,
+                    "now": datetime.now(UTC),
+                },
+            )
+
+    _insert("gitlab.com:42")
+    _insert("gitlab-ee.mpokket.org:42")
+
+    with engine.begin() as connection:
+        stored = (
+            connection.execute(
+                text(
+                    "SELECT external_account_id FROM connector_accounts "
+                    "WHERE workspace_id = :workspace_id AND external_account_id LIKE :pattern"
+                ),
+                # Bound, not inlined -- a literal ':42' in the SQL string is
+                # parsed by SQLAlchemy's `text()` as a bind parameter named
+                # "42", not as part of the LIKE pattern.
+                {"workspace_id": workspace_id, "pattern": "%:42"},
+            )
+            .scalars()
+            .all()
+        )
+    assert set(stored) == {"gitlab.com:42", "gitlab-ee.mpokket.org:42"}
+
+    with pytest.raises(IntegrityError):
+        _insert("gitlab.com:42")
+
+
 # --- unit-level: repository sync (no database) ------------------------------
 
 
@@ -514,6 +590,123 @@ def test_backfill_single_page(seeded_account_context: ConnectorAccountContext) -
     assert outcome.status == "succeeded"
     assert outcome.items_processed == 2
     assert outcome.next_cursor == "2024-01-03T00:00:00Z"
+
+
+def test_backfill_against_a_self_managed_host_writes_host_scoped_source_urls(
+    seeded_account_context: ConnectorAccountContext,
+) -> None:
+    """The end-to-end case the shipped feature actually exists for -- the
+    design doc's Testing section asked for a self-managed-host `backfill`
+    parallel to the gitlab.com one, and only `authorize()` had ever got
+    one. Asserts both halves of what "host-aware sync" means:
+
+    1. The request genuinely goes to the self-managed host (not a
+       hardcoded `gitlab.com` base URL), authenticated with the parsed
+       token half of the credential.
+    2. `repositories.source_url` is derived correctly through `_safe_
+       source_url`'s allow-list, which this feature rewired from a fixed
+       `https://gitlab.com` constant to the per-credential host. Project 1
+       returns a `web_url` on the self-managed host's own origin and is
+       accepted verbatim; project 2 returns a `web_url` on a completely
+       different origin (the shape a compromised or malicious connected
+       instance could return, and exactly what the allow-list exists to
+       stop being rendered as a clickable link) and must fall back to the
+       safe server-constructed default on the credential's own host. That
+       fallback had no `source_url` assertion anywhere in this file before,
+       for either host.
+    """
+    with engine.begin() as connection:
+        connection.execute(
+            text("UPDATE connector_accounts SET encrypted_credentials = :encrypted WHERE id = :id"),
+            {
+                "encrypted": encrypt_credential("gitlab-ee.mpokket.org|glpat-private"),
+                "id": seeded_account_context.connector_account_id,
+            },
+        )
+    account = ConnectorAccountContext(
+        workspace_id=seeded_account_context.workspace_id,
+        connector_account_id=seeded_account_context.connector_account_id,
+        external_account_id="gitlab-ee.mpokket.org:7",
+        credential="gitlab-ee.mpokket.org|glpat-private",
+    )
+    projects = [
+        {
+            "id": 1,
+            "path_with_namespace": "platform/on-host",
+            "web_url": "https://gitlab-ee.mpokket.org/platform/on-host",
+            "default_branch": "main",
+            "last_activity_at": "2024-01-03T00:00:00Z",
+        },
+        {
+            "id": 2,
+            "path_with_namespace": "platform/off-host",
+            "web_url": "https://evil.example.com/phishing/off-host",
+            "default_branch": "main",
+            "last_activity_at": "2024-01-02T00:00:00Z",
+        },
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.host == "gitlab-ee.mpokket.org"
+        assert request.url.path == "/api/v4/projects"
+        assert request.headers["PRIVATE-TOKEN"] == "glpat-private"
+        return _json_response(projects)
+
+    adapter = GitLabAdapter(transport=httpx.MockTransport(handler))
+    outcome = adapter.backfill(account, "repository")
+    assert outcome.status == "succeeded"
+    assert outcome.items_processed == 2
+
+    with engine.begin() as connection:
+        rows = dict(
+            connection.execute(
+                text(
+                    "SELECT external_id, source_url FROM repositories "
+                    "WHERE workspace_id = :workspace_id"
+                ),
+                {"workspace_id": account.workspace_id},
+            ).all()
+        )
+    # Same-origin `web_url`: trusted verbatim.
+    assert rows["1"] == "https://gitlab-ee.mpokket.org/platform/on-host"
+    # Off-origin `web_url`: rejected, replaced by the server-constructed
+    # default on the credential's own host -- never the provider's string.
+    assert rows["2"] == "https://gitlab-ee.mpokket.org/platform/off-host"
+    assert "evil.example.com" not in rows["2"]
+
+
+def test_backfill_with_a_legacy_bare_token_credential_syncs_against_gitlab_com(
+    seeded_account_context: ConnectorAccountContext,
+) -> None:
+    """The `/sync` path for a `connector_accounts` row that predates this
+    feature: the stored credential is a bare token with no `|`, and the
+    sync must reach gitlab.com and write gitlab.com-scoped `source_url`s
+    rather than raising (which would fail the sync and drive the connector
+    to `status='error'`).
+    """
+    account = ConnectorAccountContext(
+        workspace_id=seeded_account_context.workspace_id,
+        connector_account_id=seeded_account_context.connector_account_id,
+        external_account_id="555",
+        credential="glpat-legacy-bare",
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.host == "gitlab.com"
+        assert request.headers["PRIVATE-TOKEN"] == "glpat-legacy-bare"
+        return _json_response([_project(1, path="acme/a", updated_at="2024-01-03T00:00:00Z")])
+
+    adapter = GitLabAdapter(transport=httpx.MockTransport(handler))
+    outcome = adapter.backfill(account, "repository")
+    assert outcome.status == "succeeded"
+    assert outcome.items_processed == 1
+
+    with engine.begin() as connection:
+        source_url = connection.execute(
+            text("SELECT source_url FROM repositories WHERE workspace_id = :workspace_id"),
+            {"workspace_id": account.workspace_id},
+        ).scalar_one()
+    assert source_url == "https://gitlab.com/acme/a"
 
 
 def test_backfill_populates_suggested_team_name_from_namespace_object(
