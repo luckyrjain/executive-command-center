@@ -684,18 +684,31 @@ def _meeting_input(session: Session, auth: AuthContext, row: dict[str, Any]) -> 
 def _fetch_participants(
     session: Session, auth: AuthContext, meeting_id: UUID
 ) -> list[ParticipantRow]:
+    # Found in the fourth whole-phase review: this used to join `pkos_
+    # nodes` for `canonical_name` with no visibility filter on it at all --
+    # `add_participant`'s own write-time authz check (see that endpoint's
+    # own fix) only stops a NEW link to an invisible entity; it does
+    # nothing for a participant entity narrowed to `private`/`shared_
+    # explicitly` *after* being linked, which this read path would keep
+    # leaking regardless. Filtering the live `pkos_nodes` row here, the
+    # same "check the live source at read time" pattern `retrieval.py`'s
+    # own search fix already established, closes both cases at once.
+    visibility_sql, visibility_params = authz.visible_resource_filter_sql(
+        session, auth, resource_type="pkos_nodes", action="read", table_alias="n"
+    )
     rows = (
         session.execute(
             text(
-                """
+                f"""
                 SELECT mp.id, mp.entity_id, mp.role, n.canonical_name
                 FROM meeting_participants mp
                 JOIN pkos_nodes n ON n.workspace_id = mp.workspace_id AND n.id = mp.entity_id
                 WHERE mp.workspace_id = :workspace_id AND mp.meeting_id = :meeting_id
+                  AND ({visibility_sql})
                 ORDER BY mp.created_at, mp.id
                 """
             ),
-            {"workspace_id": auth.workspace_id, "meeting_id": meeting_id},
+            {"workspace_id": auth.workspace_id, "meeting_id": meeting_id, **visibility_params},
         )
         .mappings()
         .all()
@@ -1245,6 +1258,19 @@ def add_participant(
             .one_or_none()
         )
         if entity is None:
+            raise HTTPException(status_code=404, detail="ENTITY_NOT_FOUND")
+        # Found in the fourth whole-phase review: the existence check above
+        # let any caller who can write to the *meeting* link an arbitrary
+        # `pkos_nodes` id into it regardless of that entity's own
+        # visibility, immediately disclosing its `canonical_name` in this
+        # endpoint's own 201 response and (until `_fetch_participants`'
+        # sibling fix) every later read of the meeting's participants and
+        # generated prep packs. Same existence-then-authorize pattern
+        # `waiting.py`'s own precedent already established, folded into the
+        # same 404 a nonexistent entity returns.
+        if not authz.authorize(
+            session, auth, resource_type="pkos_nodes", resource_id=payload.entity_id, action="read"
+        ):
             raise HTTPException(status_code=404, detail="ENTITY_NOT_FOUND")
 
         if _participant_already_linked(session, auth, meeting_id, payload.entity_id):

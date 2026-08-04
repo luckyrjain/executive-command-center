@@ -2,7 +2,7 @@
 id: PHASE-008-API-SCHEMAS
 title: Phase 8 Multi-user API
 status: Approved for Implementation
-version: 0.7.0
+version: 0.8.0
 owner: Lucky Jain
 ---
 
@@ -17,8 +17,8 @@ GET|PATCH /workspaces/{id}
 GET|POST /workspaces/{id}/invitations
 POST /invitations/{id}/accept|reject|revoke
 GET /identity/me
-GET /workspaces/{id}/members
-PATCH|DELETE /workspaces/{id}/members/{user_id}
+GET /identity/workspaces/{id}/members
+PATCH|DELETE /identity/workspaces/{id}/members/{user_id}
 GET|POST /sharing/grants
 DELETE /sharing/grants/{id}
 POST /sharing/grants/preview

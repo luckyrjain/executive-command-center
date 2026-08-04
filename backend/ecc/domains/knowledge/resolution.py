@@ -704,32 +704,96 @@ def list_candidates(
         action="read",
         table_alias="resolution_candidates",
     )
+    # Found in the fourth whole-phase review: the filter above only checks
+    # `resolution_candidates`' own visibility, set once at creation and
+    # never revisited -- it never re-checks that the caller can still read
+    # the two `pkos_nodes` entities the candidate actually names, unlike
+    # `create_candidate`'s own proposal-time check. An entity narrowed to
+    # `private`/`shared_explicitly` after a candidate naming it was created
+    # would otherwise keep leaking through this list (its id, name-derived
+    # match factors) to a caller who can no longer read it directly. Same
+    # "checked once at proposal time, never re-verified at use time" class
+    # already fixed for delegation evidence (second review) and invitation
+    # authority (third review) -- fixed here by joining the live source
+    # rows and filtering on those too, additive to the candidate's own
+    # filter above.
+    left_visibility_sql, entity_visibility_params = authz.visible_resource_filter_sql(
+        session, auth, resource_type="pkos_nodes", action="read", table_alias="left_entity"
+    )
+    right_visibility_sql, _ = authz.visible_resource_filter_sql(
+        session, auth, resource_type="pkos_nodes", action="read", table_alias="right_entity"
+    )
+    # `entity_visibility_params`'s `__authz_resource_type` binds to
+    # `"pkos_nodes"`, which collides under the identical bind name with
+    # `visibility_params`' own `__authz_resource_type` (`"resolution_candidates"`)
+    # -- unlike `relationships.py`'s `list_relationships` (two calls sharing
+    # one `resource_type`, genuinely safe to reuse one params dict verbatim,
+    # per `visible_resource_filter_sql`'s own docstring), this query combines
+    # fragments from *two different* `resource_type` values, so merging both
+    # params dicts under the shared key would silently let one clobber the
+    # other. Renamed here rather than merged verbatim, after this exact
+    # collision was caught by hand-verification against a real Postgres
+    # database: an entity visible to the caller only through an explicit
+    # `pkos_nodes` grant (not ownership) was silently hidden, because the
+    # grant subquery ended up checking `resource_type = 'resolution_candidates'`
+    # instead of `'pkos_nodes'`.
+    left_visibility_sql = left_visibility_sql.replace(
+        ":__authz_resource_type", ":__authz_entity_resource_type"
+    )
+    right_visibility_sql = right_visibility_sql.replace(
+        ":__authz_resource_type", ":__authz_entity_resource_type"
+    )
+    entity_visibility_params["__authz_entity_resource_type"] = entity_visibility_params.pop(
+        "__authz_resource_type"
+    )
     clauses = [
-        "workspace_id = :workspace_id",
-        "(deferred_until IS NULL OR deferred_until <= :now)",
+        "resolution_candidates.workspace_id = :workspace_id",
+        "(resolution_candidates.deferred_until IS NULL "
+        "OR resolution_candidates.deferred_until <= :now)",
         f"({visibility_sql})",
+        f"({left_visibility_sql})",
+        f"({right_visibility_sql})",
     ]
     params: dict[str, Any] = {
         "workspace_id": auth.workspace_id,
         "limit": limit + 1,
         "now": datetime.now(UTC),
         **visibility_params,
+        **entity_visibility_params,
     }
     if status is not None:
-        clauses.append("status = :status")
+        clauses.append("resolution_candidates.status = :status")
         params["status"] = status
     if cursor is not None:
         created_at, cursor_id = _decode_cursor(cursor)
-        clauses.append("(created_at, id) < (:cursor_created_at, :cursor_id)")
+        clauses.append(
+            "(resolution_candidates.created_at, resolution_candidates.id) "
+            "< (:cursor_created_at, :cursor_id)"
+        )
         params.update({"cursor_created_at": created_at, "cursor_id": cursor_id})
+    # `_CANDIDATE_FIELDS` is deliberately not reused here: it is bare
+    # (unqualified) column names, safe for `_existing_candidate`/`create_candidate`'s
+    # single-table queries but ambiguous once joined against `pkos_nodes`,
+    # which also has its own `id`/`status`/`created_at` columns -- confirmed
+    # by hand-verification against a real Postgres database, which raised
+    # `column reference "id" is ambiguous` before this qualification was added.
+    qualified_fields = ", ".join(
+        f"resolution_candidates.{field.strip()}" for field in _CANDIDATE_FIELDS.strip().split(",")
+    )
     rows = (
         session.execute(
             text(
                 f"""
-                SELECT {_CANDIDATE_FIELDS}
+                SELECT {qualified_fields}
                 FROM resolution_candidates
+                JOIN pkos_nodes left_entity
+                  ON left_entity.workspace_id = resolution_candidates.workspace_id
+                 AND left_entity.id = resolution_candidates.left_entity_id
+                JOIN pkos_nodes right_entity
+                  ON right_entity.workspace_id = resolution_candidates.workspace_id
+                 AND right_entity.id = resolution_candidates.right_entity_id
                 WHERE {" AND ".join(clauses)}
-                ORDER BY created_at DESC, id DESC
+                ORDER BY resolution_candidates.created_at DESC, resolution_candidates.id DESC
                 LIMIT :limit
                 """
             ),
@@ -818,6 +882,18 @@ def _decide_candidate(
         )
         if current is None:
             raise HTTPException(status_code=404, detail="CANDIDATE_NOT_FOUND")
+        # Found in the fourth whole-phase review: re-verify the caller can
+        # still read both entities this candidate names, not just once at
+        # `create_candidate`'s own proposal time -- see `list_candidates`'
+        # identical fix above for the full reasoning. Folded into the same
+        # 404 a genuinely-missing candidate returns, matching `create_
+        # candidate`'s own "must not let a caller confirm the existence of
+        # an entity they cannot otherwise see" convention.
+        for entity_id in (current["left_entity_id"], current["right_entity_id"]):
+            if not authz.authorize(
+                session, auth, resource_type="pkos_nodes", resource_id=entity_id, action="read"
+            ):
+                raise HTTPException(status_code=404, detail="CANDIDATE_NOT_FOUND")
         # Confirm/reject are idempotent per the contract: deciding an
         # already-decided candidate the same way returns the existing
         # record rather than erroring.
@@ -960,6 +1036,13 @@ def defer_candidate(
         )
         if current is None:
             raise HTTPException(status_code=404, detail="CANDIDATE_NOT_FOUND")
+        # See `_decide_candidate`'s identical re-check for the full
+        # reasoning (fourth whole-phase review).
+        for entity_id in (current["left_entity_id"], current["right_entity_id"]):
+            if not authz.authorize(
+                session, auth, resource_type="pkos_nodes", resource_id=entity_id, action="read"
+            ):
+                raise HTTPException(status_code=404, detail="CANDIDATE_NOT_FOUND")
         if current["status"] != "open":
             raise HTTPException(status_code=409, detail="CANDIDATE_NOT_OPEN")
         if current["deferred_until"] == payload.deferred_until:

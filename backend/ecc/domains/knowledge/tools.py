@@ -26,6 +26,7 @@ from sqlalchemy.orm import Session
 
 from ecc.auth import AuthContext
 from ecc.domains.ai_runtime.tools import ToolNotFound, ToolResult
+from ecc.platform import authz
 
 # Decision 6: "knowledge.get_entity truncates claims/evidence lists to a
 # fixed page size" -- the size bound this tool's own output schema requires
@@ -39,6 +40,18 @@ _MAX_EVIDENCE = 20
 def get_entity_tool(
     session: Session, auth: AuthContext, entity_id: UUID
 ) -> ToolResult | ToolNotFound:
+    # Found in the fourth whole-phase review: this handler's own docstring
+    # above claims workspace-scoped parity with `entities.py:get_entity`,
+    # but that HTTP endpoint has called `authz.authorize()` since Phase 8
+    # Task 4 wired the knowledge domain into the authorization model, and
+    # this handler -- reachable from runtime.py's own model-controlled
+    # second tool-dispatch path even while unwired from any evaluated task
+    # today -- never picked up the same check. See attention/tools.py's
+    # identical fix for the full reasoning.
+    if not authz.authorize(
+        session, auth, resource_type="pkos_nodes", resource_id=entity_id, action="read"
+    ):
+        return ToolNotFound(tool="knowledge.get_entity")
     entity_row = (
         session.execute(
             text(
