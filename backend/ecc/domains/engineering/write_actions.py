@@ -416,21 +416,26 @@ class GitLabAddNoteAdapter:
         self._client = httpx.Client(**client_kwargs)
 
     def simulate(self, action_input: BaseModel) -> BaseModel:
+        """Purely in-memory, with **no database round-trip** -- identical to
+        `JiraAddCommentAdapter.simulate` below, and to every other
+        `simulate()` in this module. An earlier revision looked the
+        connector account's credential up here to render a host-accurate
+        preview `source_url` for a self-managed instance; reverted, because
+        the accuracy was not worth what it cost: it made this the only
+        `simulate()` in the codebase to open a pooled connection (nested
+        inside `workflows._simulate_steps`' own per-step loop), it
+        falsified `workflows.py`'s documented "there is no code path here
+        that opens a transaction" invariant for the simulate endpoint, and
+        it gave `simulate()` a real error surface (nonexistent, inactive,
+        cross-workspace, or wrong-provider account) where a preview
+        previously always rendered. `source_url=""` is Jira's own answer to
+        the same "the real link is not knowable without a lookup" problem.
+        """
         assert isinstance(action_input, GitLabAddNoteInput)
-        with SessionFactory() as session:
-            credential = _load_credential(
-                session,
-                workspace_id=action_input.workspace_id,
-                connector_account_id=action_input.connector_account_id,
-                expected_provider="gitlab",
-            )
-        host, _token = _parse_gitlab_credential(credential)
         return GitLabAddNoteOutput(
             workspace_id=action_input.workspace_id,
             note_external_id="preview",
-            source_url=(
-                f"https://{host}/{action_input.project_path}/-/issues/{action_input.issue_iid}"
-            ),
+            source_url="",
             created_at=datetime.now(UTC),
         )
 
