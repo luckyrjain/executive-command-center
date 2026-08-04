@@ -143,7 +143,7 @@ import ecc.domains.engineering.connectors  # noqa: F401
 from ecc.database import SessionFactory
 from ecc.domains.engineering.crypto import decrypt_credential
 from ecc.domains.engineering.github_adapter import GITHUB_API_BASE_URL, _safe_repo_path_segment
-from ecc.domains.engineering.gitlab_adapter import GITLAB_API_BASE_URL
+from ecc.domains.engineering.gitlab_adapter import _parse_credential as _parse_gitlab_credential
 from ecc.domains.engineering.jira_adapter import _parse_credential as _parse_jira_credential
 
 # `TransientAdapterError` is deliberately imported inside `_classify_and_
@@ -407,21 +407,26 @@ class GitLabAddNoteAdapter:
     def __init__(
         self, *, transport: httpx.BaseTransport | None = None, timeout_seconds: float = 10.0
     ) -> None:
-        client_kwargs: dict[str, Any] = {
-            "base_url": GITLAB_API_BASE_URL,
-            "timeout": timeout_seconds,
-        }
+        client_kwargs: dict[str, Any] = {"timeout": timeout_seconds}
         if transport is not None:
             client_kwargs["transport"] = transport
         self._client = httpx.Client(**client_kwargs)
 
     def simulate(self, action_input: BaseModel) -> BaseModel:
         assert isinstance(action_input, GitLabAddNoteInput)
+        with SessionFactory() as session:
+            credential = _load_credential(
+                session,
+                workspace_id=action_input.workspace_id,
+                connector_account_id=action_input.connector_account_id,
+                expected_provider="gitlab",
+            )
+        host, _token = _parse_gitlab_credential(credential)
         return GitLabAddNoteOutput(
             workspace_id=action_input.workspace_id,
             note_external_id="preview",
             source_url=(
-                f"https://gitlab.com/{action_input.project_path}/-/issues/{action_input.issue_iid}"
+                f"https://{host}/{action_input.project_path}/-/issues/{action_input.issue_iid}"
             ),
             created_at=datetime.now(UTC),
         )
@@ -435,11 +440,13 @@ class GitLabAddNoteAdapter:
                 connector_account_id=action_input.connector_account_id,
                 expected_provider="gitlab",
             )
-        headers = {"PRIVATE-TOKEN": credential, "Accept": "application/json"}
+        host, token = _parse_gitlab_credential(credential)
+        headers = {"PRIVATE-TOKEN": token, "Accept": "application/json"}
         encoded_project = quote(action_input.project_path, safe="")
         try:
             response = self._client.post(
-                f"/projects/{encoded_project}/issues/{action_input.issue_iid}/notes",
+                f"https://{host}/api/v4/projects/{encoded_project}/issues/"
+                f"{action_input.issue_iid}/notes",
                 headers=headers,
                 json={"body": action_input.body},
             )
@@ -452,7 +459,7 @@ class GitLabAddNoteAdapter:
             workspace_id=action_input.workspace_id,
             note_external_id=str(payload["id"]),
             source_url=(
-                f"https://gitlab.com/{action_input.project_path}/-/issues/"
+                f"https://{host}/{action_input.project_path}/-/issues/"
                 f"{action_input.issue_iid}#note_{payload['id']}"
             ),
             created_at=datetime.now(UTC),
