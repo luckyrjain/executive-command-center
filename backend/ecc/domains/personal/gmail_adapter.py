@@ -294,12 +294,20 @@ class GmailAdapter:
             # already is: a non-string truthy value (a JSON number) passes
             # the bare `if not access_token:` check the same way a non-
             # string `emailAddress` did.
+            # `isinstance(expires_in, bool)`: round 9 review -- `bool` is a
+            # subtype of `int` in Python, so `"expires_in": true/false`
+            # would otherwise pass both `is None` and the later
+            # `float(expires_in)` coercion silently (`float(True) == 1.0`),
+            # storing a credential that claims to expire in ~1 second/
+            # immediately instead of being rejected the way every other
+            # truthy-but-wrong-type value in this response body now is.
             if (
                 not isinstance(access_token, str)
                 or not access_token
                 or not isinstance(refresh_token, str)
                 or not refresh_token
                 or expires_in is None
+                or isinstance(expires_in, bool)
             ):
                 raise AdapterAuthorizationError(
                     "Gmail token exchange response missing access_token/refresh_token/"

@@ -109,6 +109,11 @@ multi-round adversarial review found and required real coverage for:
     for consistency (this pair never actually crashed anywhere in the
     method, unlike those two -- a non-string value would just be silently
     embedded in the `Bearer` header and persisted credential).
+18. `"expires_in": true`/`false` -- round 9: `bool` is a subtype of `int`
+    in Python, so a JSON boolean passed both the presence check and
+    `float(expires_in)`'s coercion silently, the one field in this
+    response body still not actually rejecting a wrong-but-truthy type
+    after rounds 7-8 closed the others.
 """
 
 from __future__ import annotations
@@ -493,6 +498,40 @@ def test_handle_oauth_callback_rejects_non_string_refresh_token(
         adapter = GmailAdapter(transport=httpx.MockTransport(handler))
         with pytest.raises(AdapterAuthorizationError):
             adapter.handle_oauth_callback("auth-code", "state-value")
+    finally:
+        get_settings.cache_clear()
+
+
+def test_handle_oauth_callback_rejects_boolean_expires_in(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`bool` is a subtype of `int` in Python -- `"expires_in": true/false`
+    would otherwise pass both the presence check and `float(expires_in)`
+    silently (`float(True) == 1.0`), storing a credential that claims to
+    expire in ~1 second/immediately rather than being rejected the way
+    every other truthy-but-wrong-type field in this response body now is.
+    Round 9 review found this exact gap.
+    """
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_CLIENT_ID", "cid")
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_CLIENT_SECRET", "csecret")
+    get_settings.cache_clear()
+    revoked_tokens: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/token":
+            body = _token_response()
+            body["expires_in"] = True
+            return _json_response(body)
+        if request.url.path == "/revoke":
+            revoked_tokens.append(request.content.decode().removeprefix("token="))
+            return httpx.Response(200)
+        raise AssertionError(f"unexpected request to {request.url}")
+
+    try:
+        adapter = GmailAdapter(transport=httpx.MockTransport(handler))
+        with pytest.raises(AdapterAuthorizationError):
+            adapter.handle_oauth_callback("auth-code", "state-value")
+        assert revoked_tokens == ["refresh-1"]
     finally:
         get_settings.cache_clear()
 
