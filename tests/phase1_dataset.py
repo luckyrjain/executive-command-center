@@ -1,11 +1,15 @@
-"""Deterministic, batched PostgreSQL fixture generation for Phase 1 performance tests.
+"""Deterministic, set-based PostgreSQL fixture generation for Phase 1 performance tests.
 
 This module has exactly one responsibility: generate the documented
 representative-scale dataset (see
 ``docs/superpowers/specs/2026-07-16-phase-1-completion-design.md`` and
 ``docs/phases/phase-001/TEST-PLAN.md``) inside an already-provisioned
-workspace, using batched ``INSERT ... SELECT FROM generate_series`` calls --
-never per-row round trips.
+workspace, using one set-based ``INSERT ... SELECT FROM generate_series``
+statement per table -- a single round trip that expands to every row
+server-side, never a per-row round trip. (These are *not* chunked into
+multiple smaller batches -- each table's full row count is produced by one
+statement. Say so plainly here rather than call this "batched," which
+previously read as if the inserts were split into multiple smaller batches.)
 
 It is distinct in purpose from ``scripts/seed_phase1_acceptance.py``:
 
@@ -79,6 +83,35 @@ def seed_phase1_dataset(
     """
     actor = actor_id if actor_id is not None else owner_id
     now = datetime.now(UTC)
+
+    # This one-time, per-test-run bulk load is a fundamentally different
+    # concern from the 5-second `statement_timeout` configured app-wide in
+    # `ecc/database.py::_set_statement_timeout` -- that setting is a
+    # production safety net bounding *real query latency on the request
+    # path*, not fixture setup. The six INSERTs below run inside the
+    # caller's own transaction (this function never opens its own), so
+    # `SET LOCAL` scopes the relaxed budget to just that transaction --
+    # it is unset again the moment the caller's `engine.begin()` block
+    # commits or rolls back, and never leaks into the real, timed
+    # application-endpoint calls or search/brief queries the calling test
+    # makes afterward on a fresh connection. This mirrors the identical
+    # `SET LOCAL statement_timeout` convention already used for other
+    # representative-scale `generate_series` bulk-inserts and bulk-deletes
+    # elsewhere in this suite (see e.g.
+    # test_knowledge_retrieval_performance_postgres.py's fixture and
+    # teardown). 60s is a generous, explicit ceiling -- not "unlimited" --
+    # so a genuinely runaway statement still gets cut off rather than
+    # hanging a CI job forever.
+    #
+    # Without this, the notes insert below -- the only one of these six
+    # tables with two GIN indexes (a generated tsvector column and a
+    # trigram index on the lowercased title) needing per-row index
+    # maintenance, far more expensive than the plain btree indexes on the
+    # other five tables -- can intermittently cross the production 5s
+    # budget on a loaded CI runner and raise
+    # `psycopg.errors.QueryCanceled: canceling statement due to statement
+    # timeout`, even though no real application query was ever slow.
+    connection.execute(text("SET LOCAL statement_timeout = '60s'"))
 
     connection.execute(
         text(
