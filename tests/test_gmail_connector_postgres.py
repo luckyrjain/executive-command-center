@@ -193,6 +193,33 @@ multi-round adversarial review found and required real coverage for:
     directly -- `backfill`/`incremental_sync` are reachable through that
     already-shipped, fully generic route for any registered provider
     today, `gmail` included.
+23. The `IntegrityError` handler's every `_adapter.disconnect(...)` call
+    used to run while `create_session`'s transaction -- and, for the
+    `active`-row and reactivation branches, its `FOR UPDATE` row lock --
+    was still open -- round 23: `GmailAdapter.disconnect()` is the first
+    `disconnect()` in this registry to make a real, blocking outbound
+    HTTPS call, so this held a pooled DB connection and, on the two
+    mainline reconnect paths, a row lock for up to `timeout_seconds=10.0`.
+    Closed by deferring every revoke to a `pending_revokes` list drained
+    in a `finally` block after the transaction closes.
+    `test_oauth_callback_releases_pool_connection_and_row_lock_before_
+    revoking` dynamically proves the `active`-row branch's release: a
+    concurrent raw `SELECT ... FOR UPDATE NOWAIT` on the same row succeeds
+    while the losing consent's revoke is blocked on an `Event`, rather
+    than raising `LockNotAvailable`.
+24. Round 24: the reactivation branch queues a *different* credential
+    (the row's own prior grant, not the newly exchanged one) into the
+    same `pending_revokes` list as item 23's `active`-row branch -- a
+    structurally distinct call site the round-23 test above never
+    exercised. Mutation-confirmed the gap was real: reverting just this
+    branch's `pending_revokes.append(...)` to an inline `disconnect()`
+    call left the whole then-existing suite passing. Closed with
+    `test_oauth_callback_reactivation_releases_pool_connection_and_row_
+    lock_before_revoking`, the same repro shape, asserting the *old*
+    credential -- not the new grant -- is what gets revoked.
+
+See `docs/phases/phase-010/IMPLEMENTATION-STATUS.md`'s own round-23/24
+paragraphs for the full account of both fixes.
 
 Rounds 10-12 each found and closed one more unguarded statement in
 `gmail_oauth_callback_endpoint`'s revoke-on-failure coverage (a real
