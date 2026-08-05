@@ -99,6 +99,7 @@ from __future__ import annotations
 import time
 from collections.abc import Callable, Mapping
 from datetime import UTC, datetime, timedelta
+from email.headerregistry import HeaderRegistry
 from email.utils import getaddresses, parseaddr
 from hashlib import sha256
 from json import dumps, loads
@@ -189,6 +190,32 @@ _EMAIL_ALIAS_TYPE = "email"
 # address-less header -- found by review, not part of the original
 # implementation.
 _MAX_EMAIL_ADDRESS_LENGTH = 320
+
+# `email_messages.recipients` is an unbounded `postgresql.ARRAY(VARCHAR(320))`
+# (migration `0069`) -- storing an enormous array is not itself a crash
+# risk the way an individual oversized address is (see `_MAX_EMAIL_
+# ADDRESS_LENGTH`'s own comment, a per-element bound this one doesn't
+# duplicate). The actual cost is `_resolve_or_create_person`: it opens its
+# own independent `SessionFactory` transaction -- a real, synchronous,
+# per-participant round trip to Postgres, not merely an in-memory parse --
+# for every distinct sender/recipient `_process_message` hands it. Gmail
+# forwards a sender's raw `To` header verbatim and RFC 5322 places no
+# upper bound on how many addresses it may list; nothing before this guard
+# bounded that count. `_MAX_MESSAGES_PER_CALL` already bounds total
+# messages fetched in one `backfill`/`incremental_sync` call, but nothing
+# bounded work *within* a single message -- a single crafted message with
+# an extreme recipient count could still make one call do an effectively
+# unbounded amount of synchronous DB work (and open that many short-lived
+# connections) before ever finishing that one message, regardless of how
+# small `_MAX_MESSAGES_PER_CALL` itself is -- found by review, a resource-
+# exhaustion angle distinct from every prior malformed-input crash/
+# corruption finding in this file. 500 matches Gmail's own documented
+# per-message recipient limit for a consumer account (a generous cap
+# genuine mail essentially never approaches); a header exceeding it keeps
+# only the first this many valid recipients, in header order, rather than
+# rejecting the whole message -- the same "degrade gracefully instead of
+# failing outright" spirit as every other bound in this file.
+_MAX_RECIPIENTS_PER_MESSAGE = 500
 
 
 def _pack_credential(access_token: str, refresh_token: str, expires_at: datetime) -> str:
@@ -426,16 +453,20 @@ def _getaddresses_resilient(to_header: str) -> list[tuple[str, str]]:
     `getaddresses` only via well-formed and quoted-comma headers, never a
     trailing-comma one).
 
-    Retrying once, with exactly one bare trailing comma (plus any
-    trailing whitespace around it) stripped, recovers this case without
-    touching `getaddresses`' actual protection: a header with no comma at
-    all to strip is returned unchanged (still correctly rejected, e.g. the
-    `alice@x.com<bob@y.com>` spoofing shape above -- that case has no
-    trailing comma, so the retry is a no-op and the sentinel stands), and
-    a quoted display name's own internal comma is never touched (only a
-    comma that is the header's own trailing character, outside any
-    quote/angle-bracket construct by construction -- a valid one must
-    already be closed before the string ends -- is ever stripped).
+    Retrying, with every bare trailing comma (plus any trailing whitespace
+    interspersed among them) stripped, recovers this case without touching
+    `getaddresses`' actual protection: a header with no comma at all to
+    strip is returned unchanged (still correctly rejected for the specific
+    no-comma string, e.g. the `alice@x.com<bob@y.com>` spoofing shape
+    above -- that case has no trailing comma, so the retry is a no-op and
+    the sentinel stands; see `_to_header_has_grammar_defect`'s own
+    docstring for why a comma-*appended* variant of that same shape is a
+    materially different, separately-guarded case, not covered by this
+    reasoning), and a quoted display name's own internal comma is never
+    touched (only a comma that is the header's own trailing character,
+    outside any quote/angle-bracket construct by construction -- a valid
+    one must already be closed before the string ends -- is ever
+    stripped).
     """
     parsed = getaddresses([to_header])
     if parsed != [("", "")]:
@@ -448,6 +479,93 @@ def _getaddresses_resilient(to_header: str) -> list[tuple[str, str]]:
     if not trimmed_any or not stripped:
         return parsed
     return getaddresses([stripped])
+
+
+# `getaddresses(strict=True)`'s own address-count check (see `_getaddresses_
+# resilient`'s own docstring for the full mechanism) compares only the
+# *aggregate* parsed-address count against `1 + top-level-comma-count` --
+# never that each individual comma-delimited field parses to exactly one
+# address. `HeaderRegistry` -- a from-scratch RFC 5322 grammar parser, not
+# a count heuristic -- is used only as a defect cross-check on top of the
+# existing `getaddresses`-based parse (see `_to_header_has_grammar_defect`'s
+# own docstring for why this collision can't be closed by post-processing
+# `getaddresses`' own return value any further).
+_TO_HEADER_REGISTRY = HeaderRegistry()
+
+
+def _to_header_has_grammar_defect(to_header: str) -> bool:
+    """`_getaddresses_resilient`'s own trailing-comma fix (round 3 review)
+    closed one failure mode of `getaddresses(strict=True)`'s aggregate
+    `1 + comma_count` address-count check -- round 4 review found the
+    identical check can be fooled in the *opposite*, more consequential
+    direction. `getaddresses(['bob@example.test<carol@example.test>'])` --
+    the exact ambiguous, no-comma "one field parses into two addresses"
+    shape `strict=True` exists to reject (see `_getaddresses_resilient`'s
+    own docstring, and this module's `test_to_header_ambiguous_no_comma_
+    address_is_still_safely_dropped`) -- correctly returns the `[("",
+    "")]` sentinel. Append exactly one trailing comma --
+    `'bob@example.test<carol@example.test>,'`, the identical benign
+    artifact `_getaddresses_resilient`'s own fix exists to recover real
+    recipients from -- and the aggregate arithmetic flips: the one
+    top-level comma raises the expected count to 2; the malformed field
+    alone still parses (via the legacy non-strict `_AddressList` grammar
+    both strict and non-strict modes share internally) into exactly two
+    addresses, `bob@example.test` and `carol@example.test`; the empty
+    trailing field contributes zero; `2 == 2` satisfies the check.
+    `getaddresses` returns `[('', 'bob@example.test'), ('',
+    'carol@example.test')]` as if they were two genuine, distinct
+    recipients -- no sentinel, no error, not even routed through
+    `_getaddresses_resilient`'s own retry path (the very first, un-retried
+    `getaddresses` call already returns this non-sentinel result). Both
+    fabricated addresses pass every existing guard (`_validate_address`'s
+    length/NUL/surrogate checks, neither of which this collision leaves
+    any trace for) and would get written to `email_messages.recipients`
+    and resolved into two real `pkos_nodes` person entities -- the
+    identical "attacker-controlled `To` header silently corrupts the
+    entity graph" impact round 2 already fixed once for the naive-split
+    comma-in-display-name case, here via a different mechanism (a
+    comma-count collision, not a naive split), and reachable at the same
+    one-character attacker cost (append a comma) `_getaddresses_
+    resilient`'s own round-3 bug report used for the *opposite* direction
+    -- a real Gmail sender fully controls their own `To` header.
+
+    `getaddresses`' own count-based heuristic cannot distinguish this
+    collision from a genuine two-recipient list -- by construction, both
+    produce the same total count -- so no amount of further post-
+    processing of `getaddresses`' own return value can recover the
+    distinction; this needs an independently-derived signal.
+    `email.headerregistry.HeaderRegistry` parses the same RFC 5322 grammar
+    per-token rather than by aggregate count, and surfaces the malformed
+    field as an explicit, non-empty `.defects` tuple
+    (`InvalidHeaderDefect('invalid address in address-list')`) for the
+    comma-appended collision case, while reporting an empty `.defects` for
+    every legitimate multi-address shape this module already accepts (a
+    plain comma-separated list, the quoted-comma display name, and
+    `_getaddresses_resilient`'s own trailing-comma recovery case --
+    independently confirmed against all three, plus an oversized address,
+    before relying on this check). Used here only as a yes/no cross-check
+    layered on top of the existing `getaddresses`-based parse, not a
+    replacement for it -- swapping the primary parser this late in an
+    already-reviewed, already-tested mechanism is a materially larger,
+    riskier change for the same fix.
+
+    Wrapped in a narrow `except` -- `HeaderRegistry` itself raises an
+    uncaught `UnicodeEncodeError` for a header carrying an unpaired UTF-16
+    surrogate (the same underlying encode failure `_contains_unpaired_
+    surrogate` exists to catch elsewhere in this file, reachable here one
+    call earlier), which would otherwise reintroduce the exact
+    uncaught-crash failure class round 2 already closed for this module.
+    Returning `False` (no defect found) on any such exception is safe, not
+    merely convenient: it defers entirely to `_getaddresses_resilient`'s
+    own existing parse and `_validate_address`'s own NUL/surrogate checks
+    on whatever addresses that produces, rather than this cross-check
+    taking responsibility for a failure class it isn't needed for and was
+    never meant to guard.
+    """
+    try:
+        return bool(_TO_HEADER_REGISTRY("To", to_header).defects)
+    except (UnicodeEncodeError, ValueError, TypeError, LookupError, IndexError):
+        return False
 
 
 def _resolve_or_create_person(
@@ -1522,7 +1640,21 @@ class GmailAdapter:
 
         recipients: list[str] = []
         recipient_names: dict[str, str] = {}
-        if to_header:
+        # `to_header and not _to_header_has_grammar_defect(to_header)` --
+        # round 4 review: `_to_header_has_grammar_defect` (see its own
+        # docstring) catches a header shape `getaddresses`' own aggregate
+        # address-count check cannot -- an ambiguous, single malformed
+        # field whose comma-count coincidentally matches its own bogus
+        # multi-address parse, which `getaddresses` (and by extension
+        # `_getaddresses_resilient`, whose retry path this never even
+        # reaches) accepts as if it were genuine. Checked once, ahead of
+        # the whole loop, rather than per-parsed-address -- a defect
+        # anywhere in the header taints every address `getaddresses`
+        # claims to have found in it, not just the malformed field's own
+        # share, the same "can't make sense of it -> treat as zero
+        # recipients" contract `_validate_address`'s own docstring already
+        # establishes for a single bad field.
+        if to_header and not _to_header_has_grammar_defect(to_header):
             # `email.utils.getaddresses` (not a naive `to_header.split(",")`)
             # -- round 2 review found the naive split mis-parses a `To`
             # header whose display name itself legitimately contains a
@@ -1552,7 +1684,16 @@ class GmailAdapter:
             # docstring for a *different* silent-data-loss failure mode
             # `getaddresses`' own `strict=True` default introduces for a
             # bare trailing comma.
+            #
+            # `if len(recipients) >= _MAX_RECIPIENTS_PER_MESSAGE: break` --
+            # see that constant's own comment. Checked before validating
+            # each next address (not after appending it) so the loop
+            # actually stops opening no more than `_MAX_RECIPIENTS_PER_
+            # MESSAGE` entity-resolution transactions below, rather than
+            # merely stopping storage one iteration too late.
             for name, address in _getaddresses_resilient(to_header):
+                if len(recipients) >= _MAX_RECIPIENTS_PER_MESSAGE:
+                    break
                 parsed = _validate_address(name, address)
                 if parsed is not None:
                     valid_name, valid_address = parsed

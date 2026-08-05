@@ -64,6 +64,36 @@ Covers, per this task's own scope:
     naive `to_header.split(",")` -- the naive split silently lost the
     real address and fabricated a non-email "recipient" from the
     fragment, corrupting the entity graph -- found by round 2 review.
+14. An extreme recipient count in one message's `To` header is capped to
+    `_MAX_RECIPIENTS_PER_MESSAGE` rather than making a single message do
+    an unbounded amount of synchronous per-recipient entity-resolution DB
+    work -- a resource-exhaustion angle found by round 4 review, distinct
+    from every prior malformed-input crash/corruption finding.
+15. A `To` header ending in a bare trailing comma
+    (`"alice@x.test, bob@x.test,"`) recovers both real recipients instead
+    of the whole message silently vanishing -- `_getaddresses_resilient`,
+    round 3 review's own fix, this item added by round 4 review since it
+    had never had a "Covers" entry of its own despite always having its
+    own dedicated tests (below); paired with a companion test proving the
+    genuinely ambiguous no-comma shape `getaddresses(strict=True)` exists
+    to reject is still correctly dropped, not weakened by this recovery.
+16. The same ambiguous no-comma shape item 15's companion test covers
+    (`'bob@example.test<carol@example.test>'`) is *not* still safely
+    dropped once a trailing comma is appended to it
+    (`'bob@example.test<carol@example.test>,'`) -- `getaddresses`' own
+    aggregate `1 + comma_count` address-count check (see
+    `_getaddresses_resilient`'s own docstring) cannot tell that shape
+    apart from a genuine two-recipient list, so it silently accepts both
+    fabricated addresses as real recipients, resolving each into its own
+    `pkos_nodes` person entity -- found by round 4 review, the same
+    "attacker-controlled `To` header corrupts the entity graph" impact
+    item 13 already closed once, reached here via a different mechanism
+    (a comma-count collision, not a naive split). Closed with
+    `_to_header_has_grammar_defect` (an `email.headerregistry`-based
+    cross-check `getaddresses`' own count heuristic cannot provide from
+    within itself), applied ahead of `_getaddresses_resilient` so a
+    defect anywhere in the header drops the whole `To` header rather than
+    only the colliding field.
 """
 
 from __future__ import annotations
@@ -1335,6 +1365,132 @@ def test_to_header_ambiguous_no_comma_address_is_still_safely_dropped(
     assert _threads_and_messages(context.workspace_id) == []
     assert _resolved_person(context.workspace_id, "bob@example.test") is None
     assert _resolved_person(context.workspace_id, "carol@example.test") is None
+
+
+def test_to_header_ambiguous_address_with_trailing_comma_is_still_safely_dropped(
+    seeded_gmail_account: tuple[ConnectorAccountContext, UUID],
+) -> None:
+    """Round 4 review: a second companion to `test_to_header_trailing_
+    comma_does_not_drop_the_whole_message` above, this one proving the
+    *opposite* direction of `test_to_header_ambiguous_no_comma_address_
+    is_still_safely_dropped`'s own claim doesn't silently break. That test
+    proves the ambiguous, no-comma shape
+    (`'bob@example.test<carol@example.test>'`) is safely dropped because
+    `getaddresses(strict=True)`'s aggregate `1 + comma_count` address-count
+    check doesn't match (0 commas expected 1 address, actual parse yields
+    2) -- but append exactly one trailing comma to that same ambiguous
+    shape and the arithmetic flips: 1 comma expects 2 addresses, the
+    malformed field alone still parses into exactly 2 (the same two
+    addresses as before), and `2 == 2` satisfies the check.
+    `getaddresses` -- and, since this collision is resolved on the very
+    first, un-retried call, `_getaddresses_resilient` too -- would accept
+    `bob@example.test`/`carol@example.test` as two genuine recipients,
+    each resolved into its own `pkos_nodes` person entity, from what is
+    still exactly the same ambiguous, spoofing-shaped header the no-comma
+    companion test proves must be rejected. `_to_header_has_grammar_
+    defect` (see its own docstring) closes this via an independent,
+    grammar-based cross-check `getaddresses`' own count heuristic cannot
+    provide from within itself: the message is still dropped entirely,
+    same as the no-comma case, not two fabricated recipients.
+    """
+    context, _owner_id = seeded_gmail_account
+    now_ms = int(datetime.now(UTC).timestamp() * 1000)
+    body = _message_body(
+        message_id="msg-ambiguous-to-trailing-comma",
+        thread_id="thread-ambiguous-to-trailing-comma",
+        from_addr="alice@example.test",
+        to_addrs=["ignored -- overridden by raw_to below"],
+        internal_date_ms=now_ms,
+    )
+    body["payload"]["headers"] = [
+        {"name": "From", "value": "alice@example.test"},
+        {"name": "To", "value": "bob@example.test<carol@example.test>,"},
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/gmail/v1/users/me/messages":
+            return _json_response({"messages": [{"id": "msg-ambiguous-to-trailing-comma"}]})
+        if request.url.path.startswith("/gmail/v1/users/me/messages/"):
+            return _json_response(body)
+        if request.url.path == "/gmail/v1/users/me/profile":
+            return _json_response({"historyId": 1})
+        raise AssertionError(f"unexpected request to {request.url}")
+
+    adapter = GmailAdapter(transport=httpx.MockTransport(handler))
+    outcome = adapter.backfill(context, "message", since=datetime.now(UTC) - timedelta(days=1))
+    assert outcome.status == "succeeded"
+    assert outcome.items_processed == 1
+    assert _threads_and_messages(context.workspace_id) == []
+    assert _resolved_person(context.workspace_id, "bob@example.test") is None
+    assert _resolved_person(context.workspace_id, "carol@example.test") is None
+
+
+def test_to_header_recipient_count_is_capped_to_bound_entity_resolution_work(
+    seeded_gmail_account: tuple[ConnectorAccountContext, UUID],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`email_messages.recipients` is an unbounded `ARRAY(VARCHAR(320))`
+    (migration `0069`) -- nothing previously bounded how many addresses a
+    single `To` header could carry, and each *distinct* one makes
+    `_resolve_or_create_person` open its own independent `SessionFactory`
+    transaction: a real, synchronous, per-participant round trip to
+    Postgres, not merely an in-memory parse. Gmail forwards a sender's raw
+    `To` header verbatim and RFC 5322 places no upper bound on how many
+    addresses it may list. `_MAX_MESSAGES_PER_CALL` already bounds total
+    messages fetched in one `backfill`/`incremental_sync` call, but
+    nothing bounded work *within* a single message -- a single crafted
+    message with an extreme recipient count could still make one call do
+    an effectively unbounded amount of synchronous DB work (and open that
+    many short-lived sessions) before that one message ever finishes,
+    regardless of how small `_MAX_MESSAGES_PER_CALL` itself is -- found by
+    review, a resource-exhaustion angle distinct from every prior
+    malformed-input crash/corruption finding in this file.
+    `_MAX_RECIPIENTS_PER_MESSAGE` caps it, keeping only the first N valid
+    recipients (in header order) rather than rejecting the whole message
+    or doing unbounded work. Monkeypatches the constant down to 3 (rather
+    than sending 500+ real addresses through real Postgres transactions)
+    to exercise the cap itself, matching this file's own established
+    `_MAX_MESSAGES_PER_CALL` monkeypatch precedent above.
+    """
+    import ecc.domains.personal.gmail_adapter as gmail_adapter_module
+
+    monkeypatch.setattr(gmail_adapter_module, "_MAX_RECIPIENTS_PER_MESSAGE", 3)
+
+    context, _owner_id = seeded_gmail_account
+    now_ms = int(datetime.now(UTC).timestamp() * 1000)
+    to_addrs = [f"recipient{i}@example.test" for i in range(5)]
+    body = _message_body(
+        message_id="msg-recipient-flood",
+        thread_id="thread-recipient-flood",
+        from_addr="alice@example.test",
+        to_addrs=to_addrs,
+        internal_date_ms=now_ms,
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/gmail/v1/users/me/messages":
+            return _json_response({"messages": [{"id": "msg-recipient-flood"}]})
+        if request.url.path.startswith("/gmail/v1/users/me/messages/"):
+            return _json_response(body)
+        raise AssertionError(f"unexpected request to {request.url}")
+
+    adapter = GmailAdapter(transport=httpx.MockTransport(handler))
+    outcome = adapter.backfill(context, "message", since=datetime.now(UTC) - timedelta(days=1))
+    assert outcome.status == "succeeded"
+    assert outcome.items_processed == 1
+
+    rows = _threads_and_messages(context.workspace_id)
+    assert len(rows) == 1
+    # Only the first 3 (header order) recipients are kept, not all 5.
+    assert rows[0]["recipients"] == to_addrs[:3]
+
+    # The capped-out recipients must never reach entity resolution either
+    # -- proving the cap actually bounds the expensive per-participant DB
+    # work, not merely the stored array's own length.
+    for kept in to_addrs[:3]:
+        assert _resolved_person(context.workspace_id, kept) is not None
+    for dropped in to_addrs[3:]:
+        assert _resolved_person(context.workspace_id, dropped) is None
 
 
 # --- per-call message budget hit mid-page -------------------------------------
