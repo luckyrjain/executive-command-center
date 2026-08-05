@@ -175,6 +175,24 @@ multi-round adversarial review found and required real coverage for:
     still worth a message-specific test" situation round 19 found for
     `email_address`. Closed with `test_handle_oauth_callback_rejects_
     missing_expires_in`, asserting the guard's own specific message.
+22. `GmailAdapter.backfill`/`incremental_sync`/`handle_webhook` -- round 22:
+    these three stub methods (Task 2's own scope) had no test at all,
+    direct or indirect, unlike every sibling adapter's identical
+    "documented no-op" stub methods (`test_sandbox_adapter_handle_webhook`,
+    `test_handle_webhook_is_a_documented_no_op` (datadog),
+    `test_handle_webhook_ignores_non_repository_events` (github),
+    `test_handle_webhook_ignores_non_push_hook_events` (gitlab) -- each
+    with its own dedicated test). Closed with `test_backfill_is_a_
+    documented_stub`/`test_backfill_ignores_since`/`test_incremental_
+    sync_is_a_documented_stub`/`test_handle_webhook_is_a_documented_stub`,
+    plus `test_sync_endpoint_reused_as_is_for_a_gmail_account`, which for
+    the first time proves this module's own docstring claim that `sync`
+    (like `list`/`disable`) "reuses ... existing generic endpoints as-is"
+    by calling the real `POST /connectors/{id}/sync` route end to end
+    against a real `gmail`-provider account, not just the adapter method
+    directly -- `backfill`/`incremental_sync` are reachable through that
+    already-shipped, fully generic route for any registered provider
+    today, `gmail` included.
 
 Rounds 10-12 each found and closed one more unguarded statement in
 `gmail_oauth_callback_endpoint`'s revoke-on-failure coverage (a real
@@ -1267,6 +1285,67 @@ def test_handle_oauth_callback_rejects_empty_email_address(
         get_settings.cache_clear()
 
 
+# --- GmailAdapter.backfill / incremental_sync / handle_webhook (stubs) -----
+#
+# Round 22 review: unlike every sibling adapter's own identical "documented
+# no-op" stub methods (`test_sandbox_adapter_handle_webhook`,
+# `test_handle_webhook_is_a_documented_no_op` (datadog),
+# `test_handle_webhook_ignores_non_repository_events` (github),
+# `test_handle_webhook_ignores_non_push_hook_events` (gitlab) -- every one
+# of them has at least one dedicated test), `GmailAdapter.backfill`/
+# `incremental_sync`/`handle_webhook` had no test at all, direct or
+# indirect, anywhere in this suite -- confirmed by `grep -n "backfill\|
+# incremental_sync\|handle_webhook" tests/test_gmail_connector_postgres.py`
+# returning nothing before this section was added. This is not merely a
+# style gap: `backfill`/`incremental_sync` are reachable *today* through the
+# already-shipped, fully generic `POST /api/v1/engineering/connectors/
+# {account_id}/sync` endpoint (`connector_accounts.py`'s `sync_connector_
+# endpoint`, which dispatches to `adapter.backfill`/`incremental_sync` for
+# *any* registered provider, `gmail` included) -- yet no test, here or in
+# `test_engineering_connectors_postgres.py`, had ever called `/sync` against
+# a `gmail`-provider account, despite `gmail_oauth.py`'s own module
+# docstring explicitly claiming "every other `connector_accounts` operation
+# (list, sync, disable) reuses ... existing generic endpoints as-is" -- a
+# claim item 5/6's tests below prove for list, `test_sync_*_gmail_account`
+# now proves for sync (`disable` has no dedicated gmail test either, but is
+# lower-value to add: unlike `sync`, `disable_connector_endpoint` is
+# provider-agnostic and calls only `adapter.disconnect`, which already has
+# its own direct `GmailAdapter.disconnect` coverage above).
+
+
+def test_backfill_is_a_documented_stub() -> None:
+    adapter = GmailAdapter()
+    outcome = adapter.backfill(_account_context("irrelevant"), "thread")
+    assert outcome.resource_type == "thread"
+    assert outcome.items_processed == 0
+    assert outcome.status == "succeeded"
+    assert outcome.next_cursor is None
+
+
+def test_backfill_ignores_since() -> None:
+    adapter = GmailAdapter()
+    outcome = adapter.backfill(_account_context("irrelevant"), "thread", since=datetime.now(UTC))
+    assert outcome.status == "succeeded"
+    assert outcome.items_processed == 0
+
+
+def test_incremental_sync_is_a_documented_stub() -> None:
+    adapter = GmailAdapter()
+    outcome = adapter.incremental_sync(_account_context("irrelevant"), "thread", "some-cursor")
+    assert outcome.resource_type == "thread"
+    assert outcome.items_processed == 0
+    assert outcome.status == "succeeded"
+    assert outcome.next_cursor is None
+
+
+def test_handle_webhook_is_a_documented_stub() -> None:
+    adapter = GmailAdapter()
+    outcome = adapter.handle_webhook(_account_context("irrelevant"), b'{"anything": true}', {})
+    assert outcome.resource_type == "thread"
+    assert outcome.items_processed == 0
+    assert outcome.status == "succeeded"
+
+
 # --- GmailAdapter.refresh_permissions / disconnect --------------------------
 
 
@@ -1468,9 +1547,12 @@ def _cleanup_workspace(workspace_id: UUID, account_id: UUID | None = None) -> No
             connection.execute(text("DELETE FROM accounts WHERE id = :id"), {"id": account_id})
 
 
-def _headers(token: str) -> dict[str, str]:
+def _headers(token: str, key: str | None = None) -> dict[str, str]:
     csrf = new(settings.session_secret.encode(), token.encode(), "sha256").hexdigest()
-    return {"X-CSRF-Token": csrf, "X-Correlation-ID": str(uuid4())}
+    headers = {"X-CSRF-Token": csrf, "X-Correlation-ID": str(uuid4())}
+    if key is not None:
+        headers["Idempotency-Key"] = key
+    return headers
 
 
 # --- _verify_state (mirrors test_identity_invitations_postgres.py's own
@@ -1772,6 +1854,64 @@ def test_oauth_callback_creates_connector_account_and_is_workspace_isolated(
                 other_client.close()
         finally:
             _cleanup_workspace(other_workspace_id, other_account_id)
+    finally:
+        get_settings.cache_clear()
+
+
+def test_sync_endpoint_reused_as_is_for_a_gmail_account(
+    gmail_test_context: tuple[TestClient, UUID, UUID, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`gmail_oauth.py`'s own module docstring claims "every other
+    `connector_accounts` operation (list, sync, disable) reuses ...
+    existing generic endpoints as-is" -- list is proven by
+    `test_oauth_callback_creates_connector_account_and_is_workspace_
+    isolated` above, but round 22 review found no test anywhere ever
+    exercised the real `POST /api/v1/engineering/connectors/{id}/sync`
+    route against a `gmail`-provider account, despite that route being
+    fully generic and already dispatching to `GmailAdapter.backfill`/
+    `incremental_sync` (both real, stubbed-but-real methods, not mocked
+    away) for any registered provider today. `resource_type="repository"`
+    below is semantically meaningless for Gmail (Task 2 has not yet added
+    a Gmail-appropriate value to `connector_accounts.ResourceType`/
+    `ck_sync_cursors_resource_type`) but is the only way to exercise this
+    route at all right now, since the stub ignores `resource_type`
+    entirely -- proving the route itself, not yet a real Gmail sync.
+    """
+    client, _workspace_id, _user_id, token = gmail_test_context
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_ALLOWLIST", _ALLOWED_EMAIL)
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_CLIENT_ID", "cid")
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_CLIENT_SECRET", "csecret")
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_REDIRECT_URI", "https://ecc.example.test/callback")
+    get_settings.cache_clear()
+    monkeypatch.setattr(gmail_oauth_module, "_adapter", GmailAdapter(transport=_oauth_transport()))
+    try:
+        start_response = client.post("/api/v1/personal/gmail/oauth/start", headers=_headers(token))
+        state = httpx.URL(start_response.json()["authorization_url"]).params["state"]
+        callback_response = client.get(
+            "/api/v1/personal/gmail/oauth/callback",
+            params={"code": "auth-code", "state": state},
+        )
+        assert callback_response.status_code == 200
+        account_id = callback_response.json()["id"]
+
+        backfill = client.post(
+            f"/api/v1/engineering/connectors/{account_id}/sync",
+            json={"run_type": "backfill", "resource_type": "repository"},
+            headers=_headers(token, key=str(uuid4())),
+        )
+        assert backfill.status_code == 201, backfill.text
+        assert backfill.json()["status"] == "succeeded"
+        assert backfill.json()["items_processed"] == 0
+
+        incremental = client.post(
+            f"/api/v1/engineering/connectors/{account_id}/sync",
+            json={"run_type": "incremental", "resource_type": "repository"},
+            headers=_headers(token, key=str(uuid4())),
+        )
+        assert incremental.status_code == 201, incremental.text
+        assert incremental.json()["status"] == "succeeded"
+        assert incremental.json()["items_processed"] == 0
     finally:
         get_settings.cache_clear()
 
