@@ -1433,8 +1433,10 @@ class GmailAdapter:
                 # `next_cursor=None`, not `str(highest_history_id)` --
                 # found by round 11 review, see this method's own
                 # `get_response is None` branch below for the full
-                # mechanism (identical bug, identical fix, this is simply
-                # the earlier of the two sites where it can fire).
+                # mechanism (identical bug, identical fix, applied at
+                # three sites total in this method -- this is the first
+                # of them; the second is the mid-loop consent-revocation
+                # check just below, in the same `for` loop).
                 return SyncOutcome(
                     resource_type="message",
                     items_processed=items_processed,
@@ -1613,11 +1615,10 @@ class GmailAdapter:
                 # report, so `next_cursor` stays `None` for anything short
                 # of a full, uninterrupted pass -- see this method's own
                 # `partial`-branch returns above, none of which set it
-                # (round 11 review: two of the three actually did, until
-                # fixed -- see the `get_response is None` branch's own
-                # long comment above for the full mechanism; this
-                # docstring's claim was aspirational, not yet true, before
-                # that fix).
+                # (round 11 review: all three of them did, until fixed --
+                # see the `get_response is None` branch's own long comment
+                # above for the full mechanism; this docstring's claim was
+                # aspirational, not yet true, before that fix).
                 if highest_history_id is None:
                     # Zero messages found in `query`'s window -- no
                     # historyId was ever observed to seed a cursor from.
@@ -1674,6 +1675,17 @@ class GmailAdapter:
         page_token: str | None = None
         calls_made = 0
         seen_message_ids: set[str] = set()
+        # Round 12 review: the historyId of the last *fully processed*
+        # `history[]` record (every one of its own `messagesAdded` entries
+        # actually fetched and written) seen so far in this call, across
+        # every page walked -- `None` until the first record completes.
+        # Every partial-return site below now resumes from this instead of
+        # unconditionally pinning `next_cursor` at `start_history_id` --
+        # see this variable's own first read site (the `history_response is
+        # None` branch just below) for the full mechanism and why the
+        # unconditional-pin behavior was itself a bug, not merely
+        # suboptimal.
+        resumable_history_id: int | None = None
 
         while calls_made < _MAX_MESSAGES_PER_CALL:
             history_response = self._request_with_rate_limit_retry(
@@ -1692,11 +1704,35 @@ class GmailAdapter:
                 },
             )
             if history_response is None:
+                # `next_cursor=str(resumable_history_id) if resumable_
+                # history_id is not None else start_history_id` -- round 12
+                # review: previously unconditionally `start_history_id`,
+                # even when an *earlier* page in this same multi-page call
+                # had already fully processed one or more history records.
+                # `history.list(startHistoryId=X)` walks records in
+                # strictly ascending `id` order (the same guarantee round
+                # 11's own fix already relies on for `_sync_history`'s
+                # sibling branches, and the reason this method -- unlike
+                # `_sync_messages`' unordered `messages.list` -- can safely
+                # compute a resume point mid-walk at all): re-listing from
+                # `start_history_id` after this page's own rate limit would
+                # have discarded that earlier progress and re-fetched
+                # (relatively harmlessly, `ON CONFLICT DO NOTHING` makes it
+                # idempotent) the very same already-processed records
+                # again, but at the identical cost to this call's own
+                # budget as fetching anything new -- see this function's
+                # own budget-exhausted `for` loop below for the more severe
+                # instance of the same underlying gap (that one loses
+                # forward progress *permanently*, not merely once).
                 return SyncOutcome(
                     resource_type="message",
                     items_processed=items_processed,
                     status="partial",
-                    next_cursor=start_history_id,
+                    next_cursor=(
+                        str(resumable_history_id)
+                        if resumable_history_id is not None
+                        else start_history_id
+                    ),
                     error_summary=_RATE_LIMIT_ERROR_SUMMARY,
                 )
             if history_response.status_code == 404:
@@ -1731,82 +1767,146 @@ class GmailAdapter:
             history_entries = history_body.get("history")
             if not isinstance(history_entries, list):
                 history_entries = []
-            message_ids: list[str] = []
-            for entry in history_entries:
-                added = entry.get("messagesAdded") if isinstance(entry, dict) else None
-                if not isinstance(added, list):
-                    continue
-                for item in added:
-                    message = item.get("message") if isinstance(item, dict) else None
-                    message_id = message.get("id") if isinstance(message, dict) else None
-                    if (
-                        isinstance(message_id, str)
-                        and message_id
-                        and message_id not in seen_message_ids
-                    ):
-                        seen_message_ids.add(message_id)
-                        message_ids.append(message_id)
 
+            # Round 12 review: processed one `history[]` record at a time
+            # (not flattened into one page-wide `message_ids` list first,
+            # the original shape) so that hitting `_MAX_MESSAGES_PER_CALL`
+            # mid-page can still tell *which* records were fully finished
+            # before the budget ran out. `history.list`'s own records are
+            # walked in strictly ascending `id` order (see `resumable_
+            # history_id`'s own comment above) -- a message-count bound
+            # that stops mid-record still leaves every *earlier* record in
+            # this same page (and every prior page in this same call)
+            # genuinely, safely resumable from.
             budget_exhausted = False
-            for message_id in message_ids:
-                if calls_made >= _MAX_MESSAGES_PER_CALL:
-                    # Round 1 review: same fix as `_sync_messages`'
-                    # identical loop shape -- this page's own `message_
-                    # ids` still had unprocessed entries when the shared
-                    # budget ran out. Without this flag, a bound hit on
-                    # Gmail's own last history page (no `nextPageToken`)
-                    # would fall through to the "fully caught up" branch
-                    # below and report `status="succeeded"` despite these
-                    # remaining messages never having been fetched.
-                    budget_exhausted = True
-                    break
-                calls_made += 1
+            for entry in history_entries:
+                if not isinstance(entry, dict):
+                    continue
+                record_history_id = _coerce_int(entry.get("id"))
+                added = entry.get("messagesAdded")
+                record_message_ids: list[str] = []
+                if isinstance(added, list):
+                    for item in added:
+                        message = item.get("message") if isinstance(item, dict) else None
+                        message_id = message.get("id") if isinstance(message, dict) else None
+                        if (
+                            isinstance(message_id, str)
+                            and message_id
+                            and message_id not in seen_message_ids
+                        ):
+                            seen_message_ids.add(message_id)
+                            record_message_ids.append(message_id)
 
-                with SessionFactory() as session, session.begin():
-                    if not _email_consent_active(session, account.workspace_id, owner_id):
+                record_fully_processed = True
+                for message_id in record_message_ids:
+                    if calls_made >= _MAX_MESSAGES_PER_CALL:
+                        # Round 1 review: this page's own record still had
+                        # unprocessed entries when the shared budget ran
+                        # out. Without this flag, a bound hit on Gmail's
+                        # own last history page (no `nextPageToken`) would
+                        # fall through to the "fully caught up" branch
+                        # below and report `status="succeeded"` despite
+                        # these remaining messages never having been
+                        # fetched.
+                        #
+                        # `record_fully_processed = False` -- round 12
+                        # review, added alongside the pre-existing
+                        # `budget_exhausted` flag: this specific record
+                        # must NOT advance `resumable_history_id` below,
+                        # since it was interrupted partway through, not
+                        # completed. Before this fix, hitting this exact
+                        # branch reported `next_cursor=start_history_id`
+                        # unconditionally regardless of how many earlier
+                        # records this call (or an earlier page within it)
+                        # had already fully finished -- and since `history.
+                        # list(startHistoryId=X)` deterministically returns
+                        # the identical records in the identical order for
+                        # the identical `X`, every subsequent
+                        # `incremental_sync` call resuming from that same,
+                        # never-advanced `start_history_id` re-walked from
+                        # page 1 and re-hit this exact same budget boundary
+                        # on the exact same records -- permanently,
+                        # regardless of how many retries. Reproduced
+                        # directly against real Postgres (not merely
+                        # reasoned about): four history records behind one
+                        # `historyId=100` cursor, budget monkeypatched to 2
+                        # -- five consecutive `incremental_sync("100")`
+                        # calls each processed only the same first two
+                        # records and reported `next_cursor="100"` every
+                        # time; the third and fourth records were never
+                        # written by any of them. `resumable_history_id`
+                        # closes this: a subsequent call resumes past every
+                        # record this call *did* finish, making genuine
+                        # forward progress each time instead of livelocking
+                        # on the same records forever.
+                        budget_exhausted = True
+                        record_fully_processed = False
+                        break
+                    calls_made += 1
+
+                    with SessionFactory() as session, session.begin():
+                        if not _email_consent_active(session, account.workspace_id, owner_id):
+                            return SyncOutcome(
+                                resource_type="message",
+                                items_processed=items_processed,
+                                status="partial",
+                                next_cursor=(
+                                    str(resumable_history_id)
+                                    if resumable_history_id is not None
+                                    else start_history_id
+                                ),
+                                error_summary="email domain consent was revoked mid-sync",
+                            )
+
+                    get_response = self._request_with_rate_limit_retry(
+                        "GET",
+                        f"/gmail/v1/users/me/messages/{message_id}",
+                        headers=headers,
+                        params={
+                            "format": "metadata",
+                            "metadataHeaders": ["From", "To", "Subject"],
+                        },
+                    )
+                    if get_response is None:
                         return SyncOutcome(
                             resource_type="message",
                             items_processed=items_processed,
                             status="partial",
-                            next_cursor=start_history_id,
-                            error_summary="email domain consent was revoked mid-sync",
+                            next_cursor=(
+                                str(resumable_history_id)
+                                if resumable_history_id is not None
+                                else start_history_id
+                            ),
+                            error_summary=_RATE_LIMIT_ERROR_SUMMARY,
+                        )
+                    if get_response.status_code != 200:
+                        raise RuntimeError(
+                            f"Gmail message fetch failed with status {get_response.status_code}"
+                        )
+                    try:
+                        message_body = get_response.json()
+                    except ValueError as exc:
+                        raise RuntimeError(
+                            f"Gmail message fetch returned a non-JSON response body: {exc}"
+                        ) from exc
+                    if not isinstance(message_body, dict):
+                        raise RuntimeError(
+                            "Gmail message fetch returned a non-object response body"
                         )
 
-                get_response = self._request_with_rate_limit_retry(
-                    "GET",
-                    f"/gmail/v1/users/me/messages/{message_id}",
-                    headers=headers,
-                    params={"format": "metadata", "metadataHeaders": ["From", "To", "Subject"]},
-                )
-                if get_response is None:
-                    return SyncOutcome(
-                        resource_type="message",
-                        items_processed=items_processed,
-                        status="partial",
-                        next_cursor=start_history_id,
-                        error_summary=_RATE_LIMIT_ERROR_SUMMARY,
+                    self._process_message(
+                        message_body,
+                        workspace_id=account.workspace_id,
+                        owner_id=owner_id,
+                        connector_account_id=account.connector_account_id,
+                        now=now,
                     )
-                if get_response.status_code != 200:
-                    raise RuntimeError(
-                        f"Gmail message fetch failed with status {get_response.status_code}"
-                    )
-                try:
-                    message_body = get_response.json()
-                except ValueError as exc:
-                    raise RuntimeError(
-                        f"Gmail message fetch returned a non-JSON response body: {exc}"
-                    ) from exc
-                if not isinstance(message_body, dict):
-                    raise RuntimeError("Gmail message fetch returned a non-object response body")
+                    items_processed += 1
 
-                self._process_message(
-                    message_body,
-                    workspace_id=account.workspace_id,
-                    owner_id=owner_id,
-                    connector_account_id=account.connector_account_id,
-                    now=now,
-                )
-                items_processed += 1
+                if budget_exhausted:
+                    break
+                if record_fully_processed and record_history_id is not None:
+                    resumable_history_id = record_history_id
 
             if budget_exhausted:
                 break
@@ -1820,11 +1920,24 @@ class GmailAdapter:
                     next_cursor=str(latest_history_id) if latest_history_id else start_history_id,
                 )
 
+        # `next_cursor=str(resumable_history_id) if resumable_history_id is
+        # not None else start_history_id` -- round 12 review, the same fix
+        # as this method's other partial-return sites above (see `resumable_
+        # history_id`'s own comment for the full mechanism): this is the
+        # `while calls_made < _MAX_MESSAGES_PER_CALL` loop's own natural
+        # exit, reached when the budget ran out exactly on a page boundary
+        # (every record on the just-finished page completed, but the next
+        # page was never fetched) rather than mid-record -- still requires
+        # this fix, since a subsequent call resuming from `start_history_id`
+        # unconditionally would re-walk and re-pay for every already-
+        # completed page all over again, identically every time.
         return SyncOutcome(
             resource_type="message",
             items_processed=items_processed,
             status="partial",
-            next_cursor=start_history_id,
+            next_cursor=(
+                str(resumable_history_id) if resumable_history_id is not None else start_history_id
+            ),
             error_summary=(
                 f"Gmail history sync hit the {_MAX_MESSAGES_PER_CALL}-message per-call bound "
                 "with more messages remaining; sync paused, will resume next call"

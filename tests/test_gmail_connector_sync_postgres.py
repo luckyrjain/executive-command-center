@@ -181,7 +181,9 @@ Covers, per this task's own scope:
     chronological order, so a naive unconditional `EXCLUDED.*` overwrite
     would have produced the identical result and gone unnoticed.
     Mutation-confirmed (replacing both clauses with a plain `EXCLUDED.*`
-    overwrite left the file's then-161 tests passing). Gmail's own
+    overwrite left the combined suite's then-161 tests -- across this
+    file, `test_gmail_connector_postgres.py`, and `test_engineering_
+    connectors_postgres.py` -- passing). Gmail's own
     `messages.list` returns messages newest-first, so this task's own
     sync loop processes a thread's newest message *before* its older
     ones -- without `GREATEST`, `last_message_at` would regress backward
@@ -211,6 +213,41 @@ Covers, per this task's own scope:
     method and `_sync_history`'s own sibling partial branches (which
     always return `next_cursor=start_history_id` unconditionally, never a
     value updated mid-walk).
+26. `_sync_history`'s own `partial`-status returns (budget-exhausted mid-
+    page, rate-limited, consent-revoked mid-loop) previously reported
+    `next_cursor=start_history_id` unconditionally, regardless of how many
+    `history[]` records this call had already fully processed before
+    returning. Since `history.list(startHistoryId=X)` deterministically
+    returns the identical records in the identical order for the identical
+    `X`, a subsequent `incremental_sync` call resuming from that same,
+    never-advanced cursor re-walked from page 1 and re-hit the identical
+    budget boundary on the identical records every time -- a livelock, not
+    merely delayed progress: any message past position `_MAX_MESSAGES_
+    PER_CALL` in that cursor's own ascending-`historyId` ordering was
+    silently, permanently unreachable no matter how many times
+    `incremental_sync` was retried -- found by round 12 review's security/
+    correctness lens, the very question round 11's own fix (item 25 above)
+    opened: whether *other* cursor computations in this file shared its
+    ordering-assumption flaw. `_sync_messages`' own equivalent gap (a fresh
+    `backfill` restarting at `messages.list`'s own newest-first page 1 on
+    every retry, permanently unable to reach the tail of a backfill window
+    larger than `_MAX_MESSAGES_PER_CALL`) was investigated the same round
+    and found to be real but not safely fixable the same way: `messages.
+    list` carries no ordering guarantee `next_cursor` could safely resume
+    from mid-walk (the exact fact round 11's own fix already established),
+    so closing it fully needs a resume-state channel wider than this
+    module's single historyId-shaped `next_cursor` string -- disclosed as a
+    follow-up, not fixed this round. `_sync_history` itself has the
+    ordering guarantee `_sync_messages` lacks (`history.list` walks
+    strictly ascending by record `id`), so it does have a fix within the
+    existing cursor contract: `resumable_history_id` tracks the last fully-
+    processed record's own `id` and every partial-return site resumes from
+    it instead of `start_history_id`. Reproduced directly against real
+    Postgres before the fix: four history records behind one cursor,
+    budget monkeypatched to 2 -- five consecutive `incremental_sync` calls
+    each processed only the same first two records and reported the same
+    cursor back every time; the remaining two were never written by any of
+    them.
 """
 
 from __future__ import annotations
@@ -535,8 +572,10 @@ def test_backfill_thread_upsert_keeps_latest_last_message_at_and_first_subject(
     `EXCLUDED.last_message_at`/`EXCLUDED.subject` overwrite (no `GREATEST`/
     `COALESCE` at all) would produce byte-identical results and pass
     unnoticed. Mutation-confirmed: replacing both clauses with a plain
-    `EXCLUDED.*` overwrite left the entire file's 161 then-existing tests
-    passing.
+    `EXCLUDED.*` overwrite left the combined suite's 161 then-existing
+    tests -- across this file, `test_gmail_connector_postgres.py`, and
+    `test_engineering_connectors_postgres.py` -- passing (this file alone
+    had 49 of those 161 at the time).
 
     Gmail's own `messages.list` returns messages newest-first by default,
     so `_sync_messages`'/`_sync_history`'s own per-page loop processes a
@@ -863,10 +902,12 @@ def test_backfill_halts_when_consent_is_revoked_mid_window(
     the second message must never be fetched or written.
 
     `next_cursor is None` -- round 11 review: this partial branch is the
-    third of the three sites that previously handed out an unsafe
-    `next_cursor` computed from `msg-1`'s own `historyId`, which a
-    still-unprocessed `msg-2` could easily have a *lower* `historyId`
-    than (see `test_backfill_partial_next_cursor_does_not_skip_a_lower_
+    second of the three sites (in call order: `list_response is None`,
+    then this mid-loop consent-revocation check, then `get_response is
+    None`) that previously handed out an unsafe `next_cursor` computed
+    from `msg-1`'s own `historyId`, which a still-unprocessed `msg-2`
+    could easily have a *lower* `historyId` than (see
+    `test_backfill_partial_next_cursor_does_not_skip_a_lower_
     history_id_message`'s own docstring for the full mechanism); this
     test's own scenario doesn't control `msg-2`'s `historyId` at all
     (it's never fetched), so `next_cursor is None` is the only value this
@@ -2557,6 +2598,109 @@ def test_incremental_sync_paginates_across_multiple_history_list_pages(
 
     rows = _threads_and_messages(context.workspace_id)
     assert rows[0]["external_message_id"] == "hist-page2-msg"
+
+
+def test_incremental_sync_makes_forward_progress_across_repeated_budget_exhausted_calls(
+    seeded_gmail_account: tuple[ConnectorAccountContext, UUID],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 12 review: `_sync_history`'s own budget-exhausted `partial`
+    returns previously reported `next_cursor=start_history_id`
+    unconditionally -- the cursor the call *started* from, never advanced,
+    regardless of how many `history[]` records this call had already fully
+    processed before the budget ran out. Since `history.list(startHistoryId=
+    X)` deterministically returns the identical records in the identical
+    order for the identical `X` (a stronger ordering guarantee than
+    `messages.list`'s own, which is exactly why `_sync_messages`' sibling
+    fix -- round 11 -- had to fall back to `next_cursor=None` instead), a
+    subsequent `incremental_sync` call resuming from that same, never-
+    advanced cursor re-walked `history.list` from page 1 and re-hit the
+    identical budget boundary on the identical records every single time:
+    every message past position `_MAX_MESSAGES_PER_CALL` (in this cursor's
+    own ascending-`historyId` ordering) was silently, permanently
+    unreachable, no matter how many times `incremental_sync` was retried
+    with the cursor it kept handing back -- a livelock, not merely delayed
+    progress. Reproduced directly against real Postgres (not merely
+    reasoned about) before this fix: four history records behind one
+    `historyId=100` cursor, budget monkeypatched to 2 -- five consecutive
+    `incremental_sync("100")` calls each processed only the same first two
+    records (`hist-0`/`hist-1`) and reported `next_cursor="100"` every
+    time; `hist-2`/`hist-3` were never written by any of them. Fixed by
+    tracking the historyId of the last *fully processed* history record
+    (`resumable_history_id`) and resuming from it instead of `start_
+    history_id` on every partial-return site in this method -- this test
+    proves two repeated calls, each hitting the same monkeypatched budget,
+    together make genuine forward progress and eventually cover every
+    message, unlike the identical two calls before this fix (which would
+    have processed `hist-0`/`hist-1` twice over and never reached `hist-2`/
+    `hist-3` at all).
+    """
+    import ecc.domains.personal.gmail_adapter as gmail_adapter_module
+
+    monkeypatch.setattr(gmail_adapter_module, "_MAX_MESSAGES_PER_CALL", 2)
+
+    context, _owner_id = seeded_gmail_account
+    now_ms = int(datetime.now(UTC).timestamp() * 1000)
+    message_ids = [f"hist-{i}" for i in range(4)]
+    bodies = {
+        message_id: _message_body(
+            message_id=message_id,
+            thread_id=f"thread-{message_id}",
+            from_addr="carol@example.test",
+            to_addrs=[_OWNER_EMAIL],
+            internal_date_ms=now_ms + i,
+        )
+        for i, message_id in enumerate(message_ids)
+    }
+    # One record per message, strictly ascending `id` -- the ordering
+    # `history.list` itself guarantees and this fix's own correctness
+    # depends on (see `resumable_history_id`'s own comment in
+    # `gmail_adapter.py`).
+    history_records = [
+        {"id": 101 + i, "messagesAdded": [{"message": {"id": m}}]}
+        for i, m in enumerate(message_ids)
+    ]
+    seen_start_history_ids: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/gmail/v1/users/me/history":
+            start = int(request.url.params["startHistoryId"])
+            seen_start_history_ids.append(start)
+            # Real Gmail semantics: only records with `id` strictly greater
+            # than `startHistoryId` are ever returned -- a mock that
+            # (incorrectly) always returned every record regardless of
+            # `startHistoryId` would not actually exercise whether
+            # `next_cursor` makes genuine forward progress across repeated
+            # calls, which is exactly what this test needs to prove.
+            visible = [r for r in history_records if r["id"] > start]
+            return _json_response({"history": visible, "historyId": 999})
+        if request.url.path.startswith("/gmail/v1/users/me/messages/"):
+            message_id = request.url.path.rsplit("/", 1)[-1]
+            return _json_response(bodies[message_id])
+        raise AssertionError(f"unexpected request to {request.url}")
+
+    adapter = GmailAdapter(transport=httpx.MockTransport(handler))
+
+    outcome_1 = adapter.incremental_sync(context, "message", "100")
+    assert outcome_1.status == "partial"
+    assert outcome_1.items_processed == 2
+    # Not "100" (the old, buggy, unconditional-pin behavior) -- advanced to
+    # `hist-1`'s own record id, the last one fully processed before the
+    # budget ran out.
+    assert outcome_1.next_cursor == "102"
+
+    outcome_2 = adapter.incremental_sync(context, "message", outcome_1.next_cursor)
+    assert outcome_2.status == "succeeded"
+    assert outcome_2.items_processed == 2
+    assert outcome_2.next_cursor == "999"
+
+    # The two calls' own `startHistoryId` values prove the second call
+    # actually resumed past the first's progress rather than re-listing
+    # from scratch.
+    assert seen_start_history_ids == [100, 102]
+
+    rows = _threads_and_messages(context.workspace_id)
+    assert {row["external_message_id"] for row in rows} == set(message_ids)
 
 
 # --- _process_message guard clauses: skip gracefully, never crash ------------
