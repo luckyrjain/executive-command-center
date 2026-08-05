@@ -105,6 +105,7 @@ Open the one-time bootstrap URL printed by `scripts/bootstrap_dev.py`. After the
 - global Search
 - immutable Audit history
 - Phase 1 task, commitment, note, calendar, meeting, risk, and attention APIs
+- Phase 8 collaboration workspace: workspace switcher, members/invitations, sharing review, delegation inbox, and shared activity feed (`frontend/src/features/collaboration/`) -- reachable once you have a real account (see "Registration and login" below); the one-time bootstrap flow above remains the fastest way to get a local session for everyday development
 
 ## Tests and quality gates
 
@@ -190,7 +191,7 @@ Check `http://localhost:8000/health/ready`, confirm `VITE_API_BASE_URL`, and res
 
 ## Current limitations
 
-- Production registration and login are not implemented in Phase 1.
+- Production registration and login are real and implemented (Phase 8 account/membership/session framework) rather than absent, but the one-time bootstrap flow above is still the fastest way to get a local development session and is what these instructions default to.
 - The bootstrap utility and `/dev/bootstrap` exchange are development-only.
 - External Gmail, Google Calendar, GitHub, and Jira connectors are deferred.
 - AI enrichment is optional and disabled by default; deterministic features remain available.

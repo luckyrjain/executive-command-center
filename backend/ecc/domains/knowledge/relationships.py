@@ -517,8 +517,26 @@ def list_relationships(
         entity_clause = "e.source_node_id = :entity_id"
     else:
         entity_clause = "(e.source_node_id = :entity_id OR e.target_node_id = :entity_id)"
-    clauses = [entity_clause]
-    params: dict[str, Any] = {"workspace_id": auth.workspace_id, "entity_id": entity_id}
+    # Found in the fourth whole-phase review: `entity_id` itself is
+    # authorized above, but the *other* side of every relationship row
+    # (`src`/`tgt`, whichever isn't `entity_id`) never was -- this returned
+    # a linked entity's real `canonical_name`/`node_type` regardless of
+    # that entity's own current visibility. Checking both sides (one of
+    # which is always `entity_id`, already known visible) is simpler than
+    # branching on `direction` to single out "the other one" and has the
+    # identical effect.
+    src_visibility_sql, src_visibility_params = authz.visible_resource_filter_sql(
+        session, auth, resource_type="pkos_nodes", action="read", table_alias="src"
+    )
+    tgt_visibility_sql, _ = authz.visible_resource_filter_sql(
+        session, auth, resource_type="pkos_nodes", action="read", table_alias="tgt"
+    )
+    clauses = [entity_clause, f"({src_visibility_sql})", f"({tgt_visibility_sql})"]
+    params: dict[str, Any] = {
+        "workspace_id": auth.workspace_id,
+        "entity_id": entity_id,
+        **src_visibility_params,
+    }
     if relationship_type is not None:
         clauses.append("e.edge_type = :relationship_type")
         params["relationship_type"] = relationship_type

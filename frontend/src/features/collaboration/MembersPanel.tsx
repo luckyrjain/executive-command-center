@@ -47,6 +47,7 @@ function MemberRow({
   workspaceId,
   myRole,
   myUsersId,
+  isSoleActiveOwner,
   onChanged,
   onRemoved,
 }: {
@@ -54,6 +55,7 @@ function MemberRow({
   workspaceId: string
   myRole: string
   myUsersId: string | undefined
+  isSoleActiveOwner: boolean
   onChanged: () => void
   onRemoved: (snapshot: MemberExportSnapshot) => void
 }) {
@@ -96,6 +98,17 @@ function MemberRow({
   // would only ever get a 403 back, so the option is hidden rather than
   // offered and rejected.
   const selectableRoles = myRole === 'owner' ? ROLES : ROLES.filter((role) => role !== 'owner')
+  // Found in the fourth whole-phase review: `membership_removal.py`'s own
+  // `_is_sole_active_owner` guard unconditionally rejects a sole active
+  // owner's own role change or removal (409 `LAST_OWNER_CANNOT_BE_
+  // DEMOTED`/`LAST_OWNER_CANNOT_BE_REMOVED`) -- this can only ever be a
+  // self-targeting case (if there is exactly one active owner and the
+  // caller holds the `owner` role, that owner IS the caller). The role
+  // select and the remove/leave trigger below both disable themselves for
+  // this one row rather than let the user hit a guaranteed 409, mirroring
+  // `selectableRoles`' own established discipline of not offering an
+  // action the backend will definitely reject.
+  const isSelfSoleActiveOwner = isSelf && isSoleActiveOwner
 
   const roleMutation = useMutation({
     mutationFn: (role: Role) =>
@@ -178,7 +191,7 @@ function MemberRow({
         <select
           aria-label={`Role for ${member.display_name}`}
           value={member.role}
-          disabled={!canManage || roleMutation.isPending}
+          disabled={!canManage || roleMutation.isPending || isSelfSoleActiveOwner}
           onChange={(event) => roleMutation.mutate(event.target.value as Role)}
         >
           {selectableRoles.map((role) => <option key={role} value={role}>{role}</option>)}
@@ -186,7 +199,11 @@ function MemberRow({
       </label>
       {roleMutation.isError ? <div role="alert" className="inline-status error-panel">{collaborationErrorMessage(roleMutation.error)}</div> : null}
 
-      {canRemove && !confirmRemove ? (
+      {isSelfSoleActiveOwner ? (
+        <p className="inline-status">You're the only owner, so you can't leave or change your own role. Promote another member to owner first.</p>
+      ) : null}
+
+      {canRemove && !confirmRemove && !isSelfSoleActiveOwner ? (
         <div className="work-actions">
           <button type="button" ref={removeTriggerRef} onClick={() => setConfirmRemove(true)}>
             {isSelf ? 'Leave workspace' : 'Remove'}
@@ -395,6 +412,13 @@ export default function MembersPanel() {
 
   const memberItems = members.data?.members ?? []
   const invitationItems = invitations.data?.invitations ?? []
+  // Found in the fourth whole-phase review: feeds `MemberRow`'s own
+  // `isSoleActiveOwner` guard (see that component's comment for the full
+  // reasoning) -- `memberItems` only ever contains `active` memberships
+  // (`list_members_endpoint`'s own `WHERE wm.status = 'active'`), so this
+  // is exactly the same count `membership_removal.py`'s own `_is_sole_
+  // active_owner` computes server-side.
+  const activeOwnerCount = memberItems.filter((member) => member.role === 'owner').length
 
   return (
     <section className="work-panel" aria-labelledby="members-title">
@@ -442,6 +466,7 @@ export default function MembersPanel() {
             workspaceId={workspaceId ?? ''}
             myRole={myRole}
             myUsersId={me.data?.users_id}
+            isSoleActiveOwner={member.role === 'owner' && activeOwnerCount === 1}
             onChanged={refreshMembers}
             onRemoved={(snapshot) => setRemovedSnapshots((current) => [...current, snapshot])}
           />

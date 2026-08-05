@@ -529,7 +529,12 @@ class GitLabAdapter:
             granted_scopes=granted,
         )
 
-    def backfill(self, account: ConnectorAccountContext, resource_type: str) -> SyncOutcome:
+    def backfill(
+        self,
+        account: ConnectorAccountContext,
+        resource_type: str,
+        since: datetime | None = None,
+    ) -> SyncOutcome:
         if resource_type != "repository":
             return SyncOutcome(
                 resource_type=resource_type, items_processed=0, status="succeeded", next_cursor=None

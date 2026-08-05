@@ -77,7 +77,7 @@ from ecc.observability import (
     record_idempotency_conflict,
 )
 
-DomainKey = Literal["habits", "learning", "travel", "relationships", "health", "finance"]
+DomainKey = Literal["habits", "learning", "travel", "relationships", "health", "finance", "email"]
 Classification = Literal["standard", "sensitive", "high_stakes"]
 
 # Design doc Decision 1 -- server-owned, not a request-supplied field. Only
@@ -93,6 +93,10 @@ _CLASSIFICATION_BY_DOMAIN: dict[str, Classification] = {
     "relationships": "sensitive",
     "health": "high_stakes",
     "finance": "high_stakes",
+    # Phase 10 Gmail Connector design doc Decision 2: the same tier
+    # `health`/`finance` use -- synced mail is at least as sensitive as
+    # either.
+    "email": "high_stakes",
 }
 # Retention nudge cadence by classification (design doc Decision 1) -- not
 # yet enforced by any scheduled job in this task (no scheduler exists in

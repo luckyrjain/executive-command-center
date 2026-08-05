@@ -251,6 +251,13 @@ _WORKSPACE_ID_TABLES: tuple[str, ...] = (
     # left to catch the corruption -- an eighteenth occurrence of the
     # identical class of gap.
     "workspace_memberships",
+    # Phase 10 Gmail Connector Task 1 (migration 0069) -- email_threads/
+    # email_messages, also workspace-scoped; seeded here from day one for
+    # the same reason, closing this exact gap before it repeats a
+    # nineteenth time (this exact class of gap was found on this same
+    # PR's own CI run against the email_messages table).
+    "email_threads",
+    "email_messages",
 )
 # `workspaces` is scoped by its own `id`, not a `workspace_id` column.
 _WORKSPACE_TABLE = "workspaces"
@@ -373,6 +380,13 @@ def _fixture_ids(label: str) -> dict[str, UUID]:
         "domain_record_relationships": seed_id(label, "domain_record", "relationships"),
         "personal_domain_health": seed_id(label, "personal_domain", "health"),
         "domain_record_health": seed_id(label, "domain_record", "health"),
+        # Phase 10 Gmail Connector Task 1 (migration 0069) -- personal_
+        # domain "email" (high_stakes) plus one email_threads/email_
+        # messages pair, the same "close the gap on landing" reason as
+        # every table above.
+        "personal_domain_email": seed_id(label, "personal_domain", "email"),
+        "email_thread": seed_id(label, "email_thread", "acceptance"),
+        "email_message": seed_id(label, "email_message", "acceptance"),
         "invitation": seed_id(label, "invitation", "acceptance"),
         "resource_grant": seed_id(label, "resource_grant", "acceptance"),
         # Phase 8 Task 6 -- delegations.ck_delegations_not_self forbids a
@@ -2430,6 +2444,16 @@ def _seed_personal(cur: psycopg.Cursor[Any], label: str, ids: Mapping[str, UUID]
     thoroughly proven by ``tests/test_personal_relationships_postgres.py``/
     ``tests/test_personal_health_postgres.py``'s own direct-SQL
     verification -- this script was never the right place for that.
+
+    Also: one ``personal_domains``/``email_threads``/``email_messages``
+    triple for ``email`` (``high_stakes``, Phase 10 Gmail Connector Task 1,
+    migration 0069) -- closing the identical gap on landing, one call
+    later, for the first domain governed by both the Phase 6 connector
+    framework and this Phase 7 privacy framework at once. ``email_threads``
+    reuses the ``sandbox``-provider ``connector_accounts`` row
+    ``_seed_engineering`` already seeded (called before this function),
+    rather than seeding a second, ``gmail``-provider row purely for this
+    FK.
     """
     cur.execute(
         """
@@ -2728,6 +2752,84 @@ def _seed_personal(cur: psycopg.Cursor[Any], label: str, ids: Mapping[str, UUID]
             "workspace_id": ids["workspace"],
             "owner_id": ids["user"],
             "actor": ids["user"],
+            "now": SEED_EPOCH,
+        },
+    )
+
+    # `email` (`high_stakes`, Phase 10 Gmail Connector Task 1, migration
+    # 0069) -- one `personal_domains` row plus one `email_threads`/
+    # `email_messages` pair, closing this exact gap on landing for the same
+    # reason `relationships`/`health` were closed above. `email_threads`'
+    # own FK to `connector_accounts(workspace_id, id)` reuses the
+    # `sandbox`-provider row `_seed_engineering` already seeded (called
+    # before this function in `seed()`'s own ordering) -- any connector
+    # account satisfies that FK structurally, and this fixture has no need
+    # for a second, `gmail`-provider connector_accounts row purely to prove
+    # email_threads/email_messages round-trip through backup/restore.
+    # `snippet`/`body` follow the identical "shaped like a real Fernet
+    # token, not actually produced by encrypt_field" placeholder convention
+    # `relationships`/`health` use above.
+    cur.execute(
+        """
+        INSERT INTO personal_domains (
+            id, workspace_id, owner_id, domain_key, classification,
+            enabled, enabled_at, created_by, updated_by, created_at, updated_at, version
+        ) VALUES (
+            %(id)s, %(workspace_id)s, %(owner_id)s, 'email', 'high_stakes',
+            true, %(now)s, %(actor)s, %(actor)s, %(now)s, %(now)s, 1
+        )
+        ON CONFLICT (id) DO NOTHING
+        """,
+        {
+            "id": ids["personal_domain_email"],
+            "workspace_id": ids["workspace"],
+            "owner_id": ids["user"],
+            "actor": ids["user"],
+            "now": SEED_EPOCH,
+        },
+    )
+    cur.execute(
+        """
+        INSERT INTO email_threads (
+            id, workspace_id, owner_id, domain_key, connector_account_id,
+            external_thread_id, subject, last_message_at, created_at, updated_at
+        ) VALUES (
+            %(id)s, %(workspace_id)s, %(owner_id)s, 'email', %(connector_account_id)s,
+            %(external_thread_id)s, 'Phase 1 acceptance seed thread', %(now)s, %(now)s, %(now)s
+        )
+        ON CONFLICT (id) DO NOTHING
+        """,
+        {
+            "id": ids["email_thread"],
+            "workspace_id": ids["workspace"],
+            "owner_id": ids["user"],
+            "connector_account_id": ids["connector_account"],
+            "external_thread_id": f"acceptance-thread-{label}",
+            "now": SEED_EPOCH,
+        },
+    )
+    cur.execute(
+        """
+        INSERT INTO email_messages (
+            id, workspace_id, owner_id, thread_id, external_message_id,
+            sender, recipients, sent_at, direction, snippet, body,
+            body_fetched_at, created_at, updated_at
+        ) VALUES (
+            %(id)s, %(workspace_id)s, %(owner_id)s, %(thread_id)s, %(external_message_id)s,
+            %(sender)s, %(recipients)s, %(now)s, 'inbound',
+            'gAAAAABphase1acceptanceplaceholdernotrealciphertext03==', NULL,
+            NULL, %(now)s, %(now)s
+        )
+        ON CONFLICT (id) DO NOTHING
+        """,
+        {
+            "id": ids["email_message"],
+            "workspace_id": ids["workspace"],
+            "owner_id": ids["user"],
+            "thread_id": ids["email_thread"],
+            "external_message_id": f"acceptance-message-{label}",
+            "sender": f"sender-{label}@example.test",
+            "recipients": [f"{label}@example.test"],
             "now": SEED_EPOCH,
         },
     )

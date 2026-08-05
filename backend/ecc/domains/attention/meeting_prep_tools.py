@@ -38,12 +38,27 @@ from sqlalchemy.orm import Session
 from ecc.auth import AuthContext
 from ecc.domains.ai_runtime.tools import ToolNotFound, ToolResult
 
-from .meeting_prep import _generate_pack, _meeting_row
+from .meeting_prep import _generate_pack, _meeting_row, _require_meeting_read
 
 
 def get_prep_pack_tool(
     session: Session, auth: AuthContext, meeting_id: UUID
 ) -> ToolResult | ToolNotFound:
+    # Found in the fourth whole-phase review: every real call site in
+    # meeting_prep.py calls `_require_meeting_read` before `_meeting_row` --
+    # this handler called `_meeting_row` alone, skipping the authz check
+    # that helper exists specifically to add. Reachable from runtime.py's
+    # own model-controlled second tool-dispatch path, same class of gap as
+    # attention/tools.py's and knowledge/tools.py's identical fixes.
+    # `_require_meeting_read` raises HTTPException(404) rather than
+    # returning a bool, so it folds into the same catch-and-translate-to-
+    # ToolNotFound discipline this handler already uses for the 409
+    # LINKED_CALENDAR_EVENT_MISSING case below.
+    try:
+        _require_meeting_read(session, auth, meeting_id)
+    except HTTPException:
+        return ToolNotFound(tool="meeting.get_prep_pack")
+
     meeting_row = _meeting_row(session, auth, meeting_id)
     if meeting_row is None:
         return ToolNotFound(tool="meeting.get_prep_pack")

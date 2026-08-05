@@ -121,6 +121,7 @@ from ecc.platform import authz
 from .connectors import (
     AdapterAuthorizationError,
     ConnectorAccountContext,
+    ConnectorAdapter,
     SyncOutcome,
 )
 from .connectors import (
@@ -1379,6 +1380,20 @@ def disable_connector_endpoint(
 
     request_hash = _request_hash(_EmptyBody(), f"disable:{account_id}")
     now = datetime.now(UTC)
+    # Round 23 review: `adapter.disconnect(...)` used to be called from
+    # *inside* this transaction, while still holding the `FOR UPDATE` lock
+    # taken below -- fine for every adapter registered up to this point
+    # (an in-process no-op), but `GmailAdapter.disconnect()` is the first
+    # `disconnect()` in this registry that makes a real, blocking outbound
+    # HTTPS call (Google's `/revoke`, up to `timeout_seconds=10.0`
+    # default), so disabling a `gmail`-provider account held a pooled
+    # connection *and* a row lock across that call -- dynamically proven
+    # via a real Postgres `LockNotAvailable`/`pg_stat_activity: idle in
+    # transaction` repro. `pending_revoke` below defers the actual network
+    # call to after the transaction commits and `session` releases its
+    # connection, mirroring `sync_connector_endpoint`'s own established
+    # phase split for the identical class of risk.
+    pending_revoke: tuple[ConnectorAdapter, ConnectorAccountContext] | None = None
     with session.begin():
         _lock_idempotency(session, auth, idempotency_key)
         cached = _load_cached(session, auth, idempotency_key, request_hash)
@@ -1394,31 +1409,35 @@ def disable_connector_endpoint(
         if account.status != "disconnected":
             adapter = connector_registry.get(account.provider)
             if adapter is not None:
-                # Decryption and the adapter's own revocation call are both
-                # best-effort here, deliberately in the same try/except --
-                # a revocation attempt must never leave a connector stuck
-                # unable to disconnect. Concretely: if `ECC_CONNECTOR_TOKEN_
-                # ENCRYPTION_KEY` was rotated without re-encrypting stored
-                # credentials, `decrypt_credential` raises `cryptography.
-                # fernet.InvalidToken` -- previously that propagated
-                # unhandled out of this block (decrypt happened *outside*
-                # the try/except), 500ing the request and leaving the
-                # connector permanently stuck in its prior status with no
-                # way through this API to disconnect it. Folding decrypt
-                # into the same best-effort block means "cannot even
-                # attempt revocation" degrades exactly like "attempted
-                # revocation and it failed" -- both still disconnect.
+                # Decryption failure is folded into the same best-effort
+                # treatment as revocation itself: a revocation attempt
+                # must never leave a connector stuck unable to disconnect.
+                # Concretely: if `ECC_CONNECTOR_TOKEN_ENCRYPTION_KEY` was
+                # rotated without re-encrypting stored credentials,
+                # `decrypt_credential` raises `cryptography.fernet.
+                # InvalidToken` -- previously that propagated unhandled
+                # out of this block (decrypt happened *outside* the try/
+                # except), 500ing the request and leaving the connector
+                # permanently stuck in its prior status with no way
+                # through this API to disconnect it. "Cannot even attempt
+                # revocation" degrades exactly like "attempted revocation
+                # and it failed" -- both still disconnect. The actual
+                # `adapter.disconnect(...)` call itself is deferred (see
+                # above); only decryption -- a fast, local, no-network
+                # operation -- runs here, inside the transaction.
                 try:
                     encrypted = _get_encrypted_credential(session, auth.workspace_id, account_id)
-                    context = ConnectorAccountContext(
-                        workspace_id=auth.workspace_id,
-                        connector_account_id=account_id,
-                        external_account_id=account.external_account_id,
-                        credential=decrypt_credential(encrypted),
+                    pending_revoke = (
+                        adapter,
+                        ConnectorAccountContext(
+                            workspace_id=auth.workspace_id,
+                            connector_account_id=account_id,
+                            external_account_id=account.external_account_id,
+                            credential=decrypt_credential(encrypted),
+                        ),
                     )
-                    adapter.disconnect(context)
-                except Exception:  # noqa: BLE001 -- best-effort revocation, never blocks disconnect
-                    pass
+                except Exception:  # noqa: BLE001 -- best-effort, never blocks disconnect
+                    pending_revoke = None
 
             session.execute(
                 text(
@@ -1475,7 +1494,19 @@ def disable_connector_endpoint(
         _store_idempotency(
             session, auth, idempotency_key, request_hash, response.model_dump(mode="json"), now
         )
-        return response
+
+    # Transaction above has committed. Release `session`'s pooled
+    # connection before `adapter.disconnect()`'s potentially slow,
+    # blocking network call -- see this function's own module-level
+    # comment above for why (round 23 review).
+    session.close()
+    if pending_revoke is not None:
+        adapter, context = pending_revoke
+        try:
+            adapter.disconnect(context)
+        except Exception:  # noqa: BLE001 -- best-effort revocation, never blocks disconnect
+            pass
+    return response
 
 
 @router.get("/sync-runs", response_model=SyncRunListResponse)

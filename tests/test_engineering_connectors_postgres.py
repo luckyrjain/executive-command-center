@@ -222,6 +222,52 @@ class _RaisingDisconnectAdapter(_SpyDisconnectAdapter):
 
 
 @dataclass
+class _SlowDisconnectAdapter:
+    """Blocks inside `disconnect()` until released -- round 23 review found
+    `disable_connector_endpoint` used to call `adapter.disconnect(...)`
+    *inside* its own transaction, while still holding the `FOR UPDATE` lock
+    taken on the account row; every adapter registered up to Phase 10 had
+    an in-process no-op `disconnect()`, so this was never observable until
+    `GmailAdapter.disconnect()` became the first one to make a real,
+    blocking outbound HTTPS call. This fake reproduces that shape for the
+    provider-agnostic `sandbox` adapter so the fix can be proven without
+    depending on Gmail's own OAuth machinery.
+    """
+
+    provider: str = "sandbox"
+    required_scopes: frozenset[str] = field(default_factory=lambda: frozenset({"contents:read"}))
+    entered_disconnect: threading.Event = field(default_factory=threading.Event)
+    release: threading.Event = field(default_factory=threading.Event)
+
+    def authorize(self, credential: str) -> ConnectorAuthorization:
+        return ConnectorAuthorization(
+            external_account_id="slow-disconnect-account",
+            display_name="Slow disconnect fake",
+            granted_scopes=self.required_scopes,
+        )
+
+    def backfill(self, account: ConnectorAccountContext, resource_type: str) -> SyncOutcome:
+        raise NotImplementedError
+
+    def incremental_sync(
+        self, account: ConnectorAccountContext, resource_type: str, cursor: str | None
+    ) -> SyncOutcome:
+        raise NotImplementedError
+
+    def handle_webhook(
+        self, account: ConnectorAccountContext, payload: bytes, headers: object
+    ) -> SyncOutcome:
+        raise NotImplementedError
+
+    def refresh_permissions(self, account: ConnectorAccountContext) -> str:
+        return "active"
+
+    def disconnect(self, account: ConnectorAccountContext) -> None:
+        self.entered_disconnect.set()
+        self.release.wait(timeout=5)
+
+
+@dataclass
 class _SlowAdapter:
     """Blocks inside `backfill`/`incremental_sync` (phase 2, no pooled
     connection held) until released -- lets a test hold a real `/sync`
@@ -1122,6 +1168,61 @@ def test_disable_succeeds_when_credential_cannot_be_decrypted(
         f"/api/v1/engineering/connectors/{account_id}/disable",
         headers=_headers(token, key=str(uuid4())),
     )
+    assert response.status_code == 200
+    assert response.json()["status"] == "disconnected"
+
+
+def test_disable_releases_pool_connection_and_row_lock_before_disconnect_call(
+    engineering_test_context: tuple[TestClient, UUID, UUID, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 23 review: `disable_connector_endpoint` used to call
+    `adapter.disconnect(...)` while still holding both a pooled DB
+    connection and the `FOR UPDATE` lock taken on the account row --
+    invisible until `GmailAdapter.disconnect()` became the first real,
+    blocking outbound call any adapter's `disconnect()` ever made.
+    Reproduced here for the provider-agnostic `sandbox` adapter via
+    `_SlowDisconnectAdapter`: while a `/disable` request is genuinely
+    blocked inside `disconnect()`, a concurrent raw `SELECT ... FOR UPDATE
+    NOWAIT` on the same row must succeed immediately -- if the connection/
+    lock were still held, it would raise `LockNotAvailable` instead.
+    """
+    client, workspace_id, user_id, token = engineering_test_context
+    slow_adapter = _SlowDisconnectAdapter()
+    monkeypatch.setattr(
+        connector_accounts_module, "connector_registry", _registry_with(slow_adapter)
+    )
+    account_id = _insert_connector_account(workspace_id, user_id)
+
+    def _disable() -> Any:
+        return client.post(
+            f"/api/v1/engineering/connectors/{account_id}/disable",
+            headers=_headers(token, key=str(uuid4())),
+        )
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(_disable)
+        assert slow_adapter.entered_disconnect.wait(timeout=5), "disconnect() never entered"
+
+        with engine.connect() as probe:
+            probe.execution_options(isolation_level="AUTOCOMMIT")
+            probe.execute(text("SET statement_timeout = '2s'"))
+            row = (
+                probe.execute(
+                    text(
+                        "SELECT id, status FROM connector_accounts WHERE id = :id FOR UPDATE NOWAIT"
+                    ),
+                    {"id": account_id},
+                )
+                .mappings()
+                .one()
+            )
+            assert row["id"] == account_id
+            probe.rollback()
+
+        slow_adapter.release.set()
+        response = future.result(timeout=5)
+
     assert response.status_code == 200
     assert response.json()["status"] == "disconnected"
 

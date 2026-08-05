@@ -20,6 +20,7 @@ Phase 5's identical precedent.
 
 from __future__ import annotations
 
+from datetime import datetime
 from hashlib import sha256
 
 from .connectors import (
@@ -68,7 +69,12 @@ class SandboxGithubAdapter:
             granted_scopes=_REQUIRED_SCOPES,
         )
 
-    def backfill(self, account: ConnectorAccountContext, resource_type: str) -> SyncOutcome:
+    def backfill(
+        self,
+        account: ConnectorAccountContext,
+        resource_type: str,
+        since: datetime | None = None,
+    ) -> SyncOutcome:
         return SyncOutcome(
             resource_type=resource_type,
             items_processed=_ITEMS_PER_BACKFILL,

@@ -29,6 +29,7 @@ from sqlalchemy.orm import Session
 
 from ecc.auth import AuthContext
 from ecc.domains.ai_runtime.tools import ToolNotFound, ToolResult
+from ecc.platform import authz
 
 # Decision 6: "knowledge.get_entity truncates claims/evidence lists to a
 # fixed page size" -- the same size-bounding rule applied here to factors,
@@ -42,6 +43,24 @@ _MAX_FACTORS = 20
 def get_item_tool(
     session: Session, auth: AuthContext, attention_item_id: UUID
 ) -> ToolResult | ToolNotFound:
+    # Found in the fourth whole-phase review: this handler's own docstring
+    # above claims "identical WHERE-clause scoping to attention.py:get_
+    # attention_item" -- true of the plain workspace_id scoping, but that
+    # HTTP endpoint has called `authz.authorize()` since Phase 8 Task 4
+    # wired the attention domain into the authorization model, and this
+    # handler, reachable from runtime.py's own model-controlled second
+    # tool-dispatch path (a prompt-injected "call attention.get_item on
+    # <id>" response), never picked up the same check -- a real gap in the
+    # "one closed decision function every domain calls" doctrine
+    # PERMISSION-CONTRACT.md states.
+    if not authz.authorize(
+        session,
+        auth,
+        resource_type="attention_items",
+        resource_id=attention_item_id,
+        action="read",
+    ):
+        return ToolNotFound(tool="attention.get_item")
     row = (
         session.execute(
             text(

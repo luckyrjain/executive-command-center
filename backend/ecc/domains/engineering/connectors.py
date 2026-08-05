@@ -27,6 +27,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Literal, Protocol, runtime_checkable
 from uuid import UUID
 
@@ -73,6 +74,14 @@ class ConnectorAuthorization:
     external_account_id: str
     display_name: str
     granted_scopes: frozenset[str]
+    # Phase 10 Gmail Connector Task 1 (design doc Decision 1): populated
+    # only by `OAuth2ConnectorAdapter.handle_oauth_callback` -- the OAuth
+    # grant (access/refresh token, adapter-serialized) it just exchanged a
+    # code for, which no caller has seen before this call returns. Every
+    # PAT-based `ConnectorAdapter.authorize()` leaves this `None`; the
+    # caller there already holds the original credential string it passed
+    # in, so there is nothing new for `authorize` to hand back.
+    credential: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -117,8 +126,8 @@ class ConnectorAdapter(Protocol):
     """Structural contract every registered connector adapter satisfies.
     `provider` is the stable slug stored in `connector_accounts.provider`
     (the `ck_connector_accounts_provider` CHECK constraint's closed set:
-    `github`, `gitlab`, `jira`, `sandbox`, `datadog`) and doubles as this
-    registry's lookup key.
+    `github`, `gitlab`, `jira`, `sandbox`, `datadog`, `gmail`) and doubles
+    as this registry's lookup key.
     """
 
     provider: str
@@ -129,15 +138,38 @@ class ConnectorAdapter(Protocol):
         adapter, an in-memory fake) and return the account identity/scopes
         it resolves to. Raises `AdapterAuthorizationError` on rejection --
         never partially registers an account.
+
+        Every adapter through Phase 6 is PAT-based: `credential` is an
+        already-obtained token string, pasted by the caller. An adapter
+        needing true OAuth2 (no such thing as a personal access token for
+        its provider) additionally implements `OAuth2ConnectorAdapter`
+        below *instead of* relying on this method -- `authorize` itself is
+        then simply never called for that adapter's provider.
         """
         ...
 
-    def backfill(self, account: ConnectorAccountContext, resource_type: str) -> SyncOutcome:
+    def backfill(
+        self,
+        account: ConnectorAccountContext,
+        resource_type: str,
+        since: datetime | None = None,
+    ) -> SyncOutcome:
         """Full historical sync for one resource type, from no prior
         cursor. `CONNECTOR-CONTRACT.md`: "Backfill resumes without
         duplicate projections" -- an adapter implementing real pagination
         must itself be resumable if interrupted mid-backfill; this task's
         sandbox adapter is small enough to complete in one call.
+
+        `since` (Phase 10 Gmail Connector Task 1, design doc Decision 1):
+        an optional lower bound on how far back this call should sync.
+        Every adapter through Phase 6 accepts and ignores this parameter
+        (full backfill regardless, matching their existing one-shot-at-
+        connect-time behavior -- `isinstance`-based Protocol conformance
+        does not check method signatures, only attribute presence, so
+        widening this signature does not itself require touching any
+        existing adapter) -- `GmailAdapter` is the first to act on it,
+        re-invoked with a narrower or wider window on an explicit "expand
+        history" request rather than only once at connect time.
         """
         ...
 
@@ -179,6 +211,72 @@ class ConnectorAdapter(Protocol):
         "provider does not support revocation" (that is an expected,
         non-error outcome for some providers/PAT-based auth, only a real
         revocation-attempt failure should raise).
+        """
+        ...
+
+
+@runtime_checkable
+class OAuth2ConnectorAdapter(Protocol):
+    """Phase 10 Gmail Connector Task 1 (design doc Decision 1): the first
+    true OAuth2-authorization-code-grant shape any adapter in this
+    registry has used. A **separate** Protocol from `ConnectorAdapter`
+    above, not two more required methods added to it -- `@runtime_
+    checkable` Protocol `isinstance()` checks require every declared
+    member to be *present* on the concrete object (verified directly:
+    `isinstance` returns `False` for an object missing even one declared
+    method, regardless of whether that method has a real body in the
+    Protocol itself). Adding these two methods to `ConnectorAdapter`
+    directly would have broken `ConnectorRegistry.register`'s own
+    `isinstance` check for every existing adapter (`github`/`gitlab`/
+    `jira`/`sandbox`/`datadog`), none of which define them. An adapter
+    needing this flow (only `GmailAdapter` in this activation) implements
+    both `ConnectorAdapter` and this Protocol on the same class --
+    structural typing means no explicit multiple inheritance is needed,
+    only both method sets actually existing on the object.
+
+    `gmail_oauth.py`, not `connector_accounts.py`, is the one caller of
+    this pair -- `POST /api/v1/engineering/connectors` (PAT-only) has no
+    reason to know this Protocol exists.
+    """
+
+    def get_authorization_url(self, state: str) -> str:
+        """Returns the provider's own consent-screen URL the caller
+        redirects a browser to; `state` is an opaque, caller-generated
+        anti-CSRF token this adapter must embed in the URL unchanged and
+        `handle_oauth_callback` must verify unchanged.
+
+        Design doc Decision 3's internal-allowlist rejection ("before any
+        redirect URL is even generated") does not necessarily happen
+        *inside* this method -- this method's own fixed signature carries
+        no account/email argument to check an allowlist against (the
+        provider account is not known pre-redirect at all for a 3-legged
+        OAuth2 flow). `GmailAdapter`, this Protocol's sole implementer,
+        performs that check in its caller (`gmail_oauth.py`'s router, via
+        the Gmail-specific `is_account_allowed` method) immediately before
+        calling this method -- see that adapter's own module docstring for
+        why. This method itself may still raise `AdapterAuthorizationError`
+        for its own reason (e.g. an unconfigured OAuth client).
+        """
+        ...
+
+    def handle_oauth_callback(self, code: str, state: str) -> ConnectorAuthorization:
+        """Exchanges `code` (the provider's own authorization code,
+        returned to the caller's redirect URI) for the account identity/
+        scopes this connection resolves to, mirroring `ConnectorAdapter.
+        authorize`'s own return shape exactly. Raises `AdapterAuthorization
+        Error` on a rejected/expired code.
+
+        `state` is accepted for symmetry with `get_authorization_url` and
+        so an implementer *could* re-verify it here, but is not required
+        to: the caller must never persist a connector account from a
+        callback whose `state` it cannot verify, and nothing prevents that
+        verification from happening entirely on the caller's own side
+        (`GmailAdapter`, this Protocol's sole implementer, does exactly
+        that -- see its own module docstring for why a per-request adapter
+        instance has no way to independently re-derive what a *separate*,
+        earlier `get_authorization_url` call issued). Whichever side
+        verifies it, the caller must never persist a connector account
+        without that verification having happened first.
         """
         ...
 
