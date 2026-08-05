@@ -173,6 +173,44 @@ Covers, per this task's own scope:
     itself is not permanently lost -- a later message naming the same
     participant still resolves them normally) rather than cascading into
     every other message and account still queued in the same call.
+24. `_upsert_thread`'s `ON CONFLICT DO UPDATE` clause's own SQL --
+    `GREATEST(...)` for `last_message_at`, `COALESCE(...)` for `subject`
+    -- is exercised (structurally) by every multi-message-per-thread test
+    above, but none of them ever assert on the *values* it produces:
+    every one of them happens to process its messages in ascending
+    chronological order, so a naive unconditional `EXCLUDED.*` overwrite
+    would have produced the identical result and gone unnoticed.
+    Mutation-confirmed (replacing both clauses with a plain `EXCLUDED.*`
+    overwrite left the file's then-161 tests passing). Gmail's own
+    `messages.list` returns messages newest-first, so this task's own
+    sync loop processes a thread's newest message *before* its older
+    ones -- without `GREATEST`, `last_message_at` would regress backward
+    once an older same-thread message is processed second; without
+    `COALESCE`, `subject` would flip to whichever message happens to be
+    processed last instead of staying pinned to the thread's original
+    subject -- found by round 11 review's architecture/quality lens.
+25. `_sync_messages`' own rate-limited/consent-revoked `partial` returns
+    (the `list_response is None`/`get_response is None`/mid-loop
+    consent-check branches) previously handed `incremental_sync` a
+    `next_cursor` computed as `max()` over every `historyId` already
+    processed *this call* -- safe only if Gmail's `messages.list` returns
+    results in strictly ascending `historyId` order, which it does not
+    (its default, and this task's own, sort is newest-received-first, and
+    `historyId` does not track receipt order closely enough to guarantee
+    monotonicity either). A message still queued behind the one that
+    triggered the partial return, but with a *lower* `historyId` than the
+    cursor just handed out, is silently, permanently unreachable by any
+    subsequent `incremental_sync` call: `history.list(startHistoryId=...)`
+    only ever returns entries with a strictly greater `historyId` than the
+    cursor -- found by round 11 review's security/correctness lens, a
+    cursor-value-correctness bug distinct from every prior finding in this
+    file (none of which touched whether a *given* cursor value was itself
+    safe, only whether a `partial` result should hand one out at all).
+    Fixed by returning `next_cursor=None` from all three sites, matching
+    the already-correct `budget_exhausted` partial return in this same
+    method and `_sync_history`'s own sibling partial branches (which
+    always return `next_cursor=start_history_id` unconditionally, never a
+    value updated mid-walk).
 """
 
 from __future__ import annotations
@@ -361,7 +399,7 @@ def _threads_and_messages(workspace_id: UUID) -> list[dict[str, Any]]:
             connection.execute(
                 text(
                     "SELECT m.external_message_id, m.sender, m.recipients, m.direction, "
-                    "t.external_thread_id, t.subject "
+                    "t.external_thread_id, t.subject, t.last_message_at "
                     "FROM email_messages m JOIN email_threads t ON t.id = m.thread_id "
                     "WHERE m.workspace_id = :workspace_id ORDER BY m.sent_at"
                 ),
@@ -483,6 +521,83 @@ def test_backfill_writes_messages_and_resolves_participants(
             {"workspace_id": context.workspace_id},
         ).scalar_one()
     assert count == 1
+
+
+def test_backfill_thread_upsert_keeps_latest_last_message_at_and_first_subject(
+    seeded_gmail_account: tuple[ConnectorAccountContext, UUID],
+) -> None:
+    """`_upsert_thread`'s `ON CONFLICT DO UPDATE` clause is exercised by
+    every multi-message-per-thread test in this file (e.g. `test_backfill_
+    writes_messages_and_resolves_participants`), but none of them actually
+    assert on the *values* that clause's own `GREATEST(...)`/`COALESCE(...)`
+    SQL produces -- every existing such test happens to process its
+    messages in ascending chronological order, so a naive unconditional
+    `EXCLUDED.last_message_at`/`EXCLUDED.subject` overwrite (no `GREATEST`/
+    `COALESCE` at all) would produce byte-identical results and pass
+    unnoticed. Mutation-confirmed: replacing both clauses with a plain
+    `EXCLUDED.*` overwrite left the entire file's 161 then-existing tests
+    passing.
+
+    Gmail's own `messages.list` returns messages newest-first by default,
+    so `_sync_messages`'/`_sync_history`'s own per-page loop processes a
+    thread's newest message before its older ones -- the exact ordering
+    this test reproduces (`msg-newer` before `msg-older` in the mocked
+    `messages.list` response), the opposite of the existing tests' own
+    ordering. Without `GREATEST`, `email_threads.last_message_at` would
+    regress to the *older* message's timestamp once it's processed second,
+    corrupting the exact column `attention_items`/thread-list ordering
+    (a later task's own scope) would rely on to mean "this thread's most
+    recent activity." Without `COALESCE`, `subject` would be silently
+    overwritten by whichever message happens to be processed last, instead
+    of staying pinned to the thread's own original subject line.
+    """
+    context, _owner_id = seeded_gmail_account
+    now_ms = int(datetime.now(UTC).timestamp() * 1000)
+    older_ms = now_ms - 86_400_000
+    bodies = {
+        "msg-newer": _message_body(
+            message_id="msg-newer",
+            thread_id="thread-order",
+            from_addr="alice@example.test",
+            to_addrs=["owner@example.test"],
+            internal_date_ms=now_ms,
+            subject="Newest Subject",
+            history_id=201,
+        ),
+        "msg-older": _message_body(
+            message_id="msg-older",
+            thread_id="thread-order",
+            from_addr="alice@example.test",
+            to_addrs=["owner@example.test"],
+            internal_date_ms=older_ms,
+            subject="Older Subject",
+            history_id=200,
+        ),
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/gmail/v1/users/me/messages":
+            # Newest-first, matching Gmail's own real `messages.list` order.
+            return _json_response({"messages": [{"id": "msg-newer"}, {"id": "msg-older"}]})
+        if request.url.path.startswith("/gmail/v1/users/me/messages/"):
+            message_id = request.url.path.rsplit("/", 1)[-1]
+            return _json_response(bodies[message_id])
+        raise AssertionError(f"unexpected request to {request.url}")
+
+    adapter = GmailAdapter(transport=httpx.MockTransport(handler))
+    outcome = adapter.backfill(context, "message", since=datetime.now(UTC) - timedelta(days=2))
+
+    assert outcome.status == "succeeded"
+    assert outcome.items_processed == 2
+
+    rows = _threads_and_messages(context.workspace_id)
+    assert len(rows) == 2
+    assert all(row["external_thread_id"] == "thread-order" for row in rows)
+    # Both rows share one `email_threads` row -- both must agree.
+    assert {row["subject"] for row in rows} == {"Newest Subject"}
+    expected_last_message_at = datetime.fromtimestamp(now_ms / 1000, tz=UTC)
+    for row in rows:
+        assert row["last_message_at"] == expected_last_message_at
 
 
 def test_backfill_uses_since_as_the_gmail_query_lower_bound(
@@ -746,6 +861,17 @@ def test_backfill_halts_when_consent_is_revoked_mid_window(
     """Plan Task 2: "a revoked-mid-window consent halts the call." Revokes
     consent as a side effect of fetching the *first* message's metadata --
     the second message must never be fetched or written.
+
+    `next_cursor is None` -- round 11 review: this partial branch is the
+    third of the three sites that previously handed out an unsafe
+    `next_cursor` computed from `msg-1`'s own `historyId`, which a
+    still-unprocessed `msg-2` could easily have a *lower* `historyId`
+    than (see `test_backfill_partial_next_cursor_does_not_skip_a_lower_
+    history_id_message`'s own docstring for the full mechanism); this
+    test's own scenario doesn't control `msg-2`'s `historyId` at all
+    (it's never fetched), so `next_cursor is None` is the only value this
+    assertion can safely require, but it's exactly the value the round 11
+    fix guarantees regardless of what that unseen `historyId` might be.
     """
     context, owner_id = seeded_gmail_account
     now_ms = int(datetime.now(UTC).timestamp() * 1000)
@@ -781,6 +907,7 @@ def test_backfill_halts_when_consent_is_revoked_mid_window(
     assert outcome.status == "partial"
     assert outcome.error_summary is not None and "revoked" in outcome.error_summary
     assert outcome.items_processed == 1
+    assert outcome.next_cursor is None
 
     rows = _threads_and_messages(context.workspace_id)
     assert len(rows) == 1
@@ -860,6 +987,115 @@ def test_a_genuine_403_is_not_treated_as_rate_limiting(
     adapter = GmailAdapter(transport=httpx.MockTransport(handler))
     with pytest.raises(RuntimeError, match="status 403"):
         adapter.backfill(context, "message", since=datetime.now(UTC) - timedelta(days=1))
+
+
+def test_backfill_partial_next_cursor_does_not_skip_a_lower_history_id_message(
+    seeded_gmail_account: tuple[ConnectorAccountContext, UUID],
+) -> None:
+    """Round 11 review: a `partial` result from a rate-limited `messages.
+    get` call previously handed `incremental_sync` a `next_cursor` computed
+    as `max()` over every `historyId` already processed *this call* -- safe
+    only if `messages.list`'s own ordering guaranteed ascending `historyId`,
+    which it does not (Gmail's default sort is newest-received-first, and
+    `historyId` does not track receipt order closely enough to guarantee
+    monotonicity). Here, `msg-newer` (`historyId=2000`) is listed and
+    processed first; `msg-older` (`historyId=500`, deliberately *lower* --
+    an older message Gmail's own newest-first ordering can and does place
+    behind a newer, higher-`historyId` one) is listed second and is
+    rate-limited on its own `messages.get` call, past the bounded retry.
+    Before the fix, `next_cursor` came back `"2000"` -- a value a real
+    `history.list(startHistoryId=2000)` call would never surface
+    `msg-older` (historyId 500) through again, silently and permanently
+    losing it from the synced entity graph despite the sync call itself
+    reporting real, if partial, progress. Fixed by returning `next_cursor=
+    None` from every `partial` branch in `_sync_messages` that isn't the
+    already-correct `budget_exhausted` one, so a subsequent
+    `incremental_sync` call falls back to a fresh `backfill` instead of
+    trusting an unsafe cursor.
+    """
+    context, _owner_id = seeded_gmail_account
+    now_ms = int(datetime.now(UTC).timestamp() * 1000)
+    newer_body = _message_body(
+        message_id="msg-newer",
+        thread_id="thread-newer",
+        from_addr="alice@example.test",
+        to_addrs=[_OWNER_EMAIL],
+        internal_date_ms=now_ms,
+        history_id=2000,
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/gmail/v1/users/me/messages":
+            # Newest-first, matching Gmail's own real `messages.list`
+            # order -- `msg-older` (the lower-`historyId` message) is
+            # listed *after* `msg-newer`, so it's still unprocessed when
+            # its own `messages.get` call gets rate-limited below.
+            return _json_response({"messages": [{"id": "msg-newer"}, {"id": "msg-older"}]})
+        if request.url.path == "/gmail/v1/users/me/messages/msg-newer":
+            return _json_response(newer_body)
+        if request.url.path == "/gmail/v1/users/me/messages/msg-older":
+            return httpx.Response(
+                429, json={"error": {"errors": [{"reason": "rateLimitExceeded"}]}}
+            )
+        raise AssertionError(f"unexpected request to {request.url}")
+
+    adapter = GmailAdapter(transport=httpx.MockTransport(handler), sleep=lambda _seconds: None)
+    outcome = adapter.backfill(context, "message", since=datetime.now(UTC) - timedelta(days=2))
+
+    assert outcome.status == "partial"
+    assert outcome.items_processed == 1
+    assert outcome.next_cursor is None
+
+    rows = _threads_and_messages(context.workspace_id)
+    assert {row["external_message_id"] for row in rows} == {"msg-newer"}
+
+
+def test_backfill_partial_next_cursor_is_none_when_list_call_rate_limited_across_pages(
+    seeded_gmail_account: tuple[ConnectorAccountContext, UUID],
+) -> None:
+    """Same finding as `test_backfill_partial_next_cursor_does_not_skip_a_
+    lower_history_id_message` above, at the sibling `list_response is None`
+    partial-return site instead of `get_response is None`: page 1's own
+    message is fully processed (seeding a non-zero `highest_history_id`)
+    before page 2's own `messages.list` call -- which could easily be
+    listing further, still-unprocessed, potentially lower-`historyId`
+    messages -- gets rate-limited past the bounded retry.
+    """
+    context, _owner_id = seeded_gmail_account
+    now_ms = int(datetime.now(UTC).timestamp() * 1000)
+    page1_body = _message_body(
+        message_id="page1-msg",
+        thread_id="thread-page1",
+        from_addr="alice@example.test",
+        to_addrs=[_OWNER_EMAIL],
+        internal_date_ms=now_ms,
+        history_id=2000,
+    )
+    calls = {"list": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/gmail/v1/users/me/messages":
+            calls["list"] += 1
+            if calls["list"] == 1:
+                return _json_response(
+                    {"messages": [{"id": "page1-msg"}], "nextPageToken": "page-2"}
+                )
+            return httpx.Response(
+                429, json={"error": {"errors": [{"reason": "rateLimitExceeded"}]}}
+            )
+        if request.url.path == "/gmail/v1/users/me/messages/page1-msg":
+            return _json_response(page1_body)
+        raise AssertionError(f"unexpected request to {request.url}")
+
+    adapter = GmailAdapter(transport=httpx.MockTransport(handler), sleep=lambda _seconds: None)
+    outcome = adapter.backfill(context, "message", since=datetime.now(UTC) - timedelta(days=2))
+
+    assert outcome.status == "partial"
+    assert outcome.items_processed == 1
+    assert outcome.next_cursor is None
+
+    rows = _threads_and_messages(context.workspace_id)
+    assert {row["external_message_id"] for row in rows} == {"page1-msg"}
 
 
 # --- idempotent re-sync --------------------------------------------------------

@@ -1430,11 +1430,16 @@ class GmailAdapter:
                 },
             )
             if list_response is None:
+                # `next_cursor=None`, not `str(highest_history_id)` --
+                # found by round 11 review, see this method's own
+                # `get_response is None` branch below for the full
+                # mechanism (identical bug, identical fix, this is simply
+                # the earlier of the two sites where it can fire).
                 return SyncOutcome(
                     resource_type="message",
                     items_processed=items_processed,
                     status="partial",
-                    next_cursor=str(highest_history_id) if highest_history_id else None,
+                    next_cursor=None,
                     error_summary=_RATE_LIMIT_ERROR_SUMMARY,
                 )
             if list_response.status_code != 200:
@@ -1492,7 +1497,7 @@ class GmailAdapter:
                             resource_type="message",
                             items_processed=items_processed,
                             status="partial",
-                            next_cursor=str(highest_history_id) if highest_history_id else None,
+                            next_cursor=None,
                             error_summary="email domain consent was revoked mid-sync",
                         )
 
@@ -1503,11 +1508,71 @@ class GmailAdapter:
                     params={"format": "metadata", "metadataHeaders": ["From", "To", "Subject"]},
                 )
                 if get_response is None:
+                    # `next_cursor=None`, not `str(highest_history_id) if
+                    # highest_history_id else None` -- found by round 11
+                    # review, a cursor-regression data-loss bug distinct
+                    # from every prior finding in this file (none of which
+                    # touched cursor *value* correctness, only whether one
+                    # was handed out at all). `messages.list` -- unlike
+                    # `history.list`'s own strictly historyId-ordered
+                    # walk -- has no documented ordering guarantee tying
+                    # list position to `historyId`, and Gmail's default
+                    # sort is newest-received-first, which does not imply
+                    # ascending `historyId` either (an older message can
+                    # still have a *lower* `historyId` than one listed
+                    # ahead of it in this same page). `highest_history_id`
+                    # is a `max()` over every message *already* processed
+                    # this call, seeded here by whichever earlier refs in
+                    # this same page-or-run happened to have the largest
+                    # `historyId` -- not by whichever ref is closest to
+                    # `message_id`, the one this branch is about to skip.
+                    # Handing that `max()` out as `next_cursor` when this
+                    # message (and everything still queued behind it) was
+                    # never reached is unsafe: `_sync_history`'s own
+                    # `history.list(startHistoryId=...)` call only ever
+                    # returns entries with a strictly *greater* `historyId`
+                    # than the cursor it's given, so a subsequent
+                    # `incremental_sync` using this `next_cursor` would
+                    # never see `message_id` (or any other still-unfetched
+                    # message whose own `historyId` happens to be at or
+                    # below it) again -- silently, permanently, with the
+                    # sync call itself still reporting real, if partial,
+                    # progress (`items_processed` > 0, no error masking
+                    # anything). Reproduced directly against real Postgres
+                    # (not merely reasoned about): two messages in one
+                    # `messages.list` page, the first with `historyId=2000`
+                    # processed successfully, the second (`historyId=500`,
+                    # deliberately lower -- an older message Gmail's own
+                    # default newest-first list ordering can and does
+                    # place behind a newer, higher-`historyId` one)
+                    # rate-limited on its own `messages.get` call; before
+                    # this fix, `next_cursor` came back `"2000"` with the
+                    # `historyId=500` message never written, a cursor a
+                    # real `history.list(startHistoryId=2000)` call would
+                    # never surface it through again. This method's sibling
+                    # `_sync_history` never had this bug -- its own partial
+                    # branches all correctly return `next_cursor=
+                    # start_history_id` (the cursor this call *started*
+                    # from, unconditionally, not a value updated mid-walk),
+                    # and the "no further pages" branch below this loop
+                    # already carried a comment claiming every partial
+                    # branch above it left `next_cursor` unset -- true of
+                    # `_sync_history`, not of this method until this fix,
+                    # the discrepancy itself a signal something here didn't
+                    # match its own documented invariant. Matches the
+                    # already-correct `budget_exhausted` partial return at
+                    # the bottom of this method (which has always used
+                    # `next_cursor=None` unconditionally) rather than
+                    # inventing a third convention; a `None` cursor simply
+                    # means the next `incremental_sync` call falls back to
+                    # a fresh `backfill`, which safely re-covers this
+                    # message (and everything behind it) rather than
+                    # silently orphaning it.
                     return SyncOutcome(
                         resource_type="message",
                         items_processed=items_processed,
                         status="partial",
-                        next_cursor=str(highest_history_id) if highest_history_id else None,
+                        next_cursor=None,
                         error_summary=_RATE_LIMIT_ERROR_SUMMARY,
                     )
                 if get_response.status_code != 200:
@@ -1547,7 +1612,12 @@ class GmailAdapter:
                 # be older than whatever historyId a partial result would
                 # report, so `next_cursor` stays `None` for anything short
                 # of a full, uninterrupted pass -- see this method's own
-                # `partial`-branch returns above, none of which set it.
+                # `partial`-branch returns above, none of which set it
+                # (round 11 review: two of the three actually did, until
+                # fixed -- see the `get_response is None` branch's own
+                # long comment above for the full mechanism; this
+                # docstring's claim was aspirational, not yet true, before
+                # that fix).
                 if highest_history_id is None:
                     # Zero messages found in `query`'s window -- no
                     # historyId was ever observed to seed a cursor from.
