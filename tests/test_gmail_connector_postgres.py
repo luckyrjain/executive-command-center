@@ -1360,7 +1360,14 @@ def test_handle_oauth_callback_rejects_empty_email_address(
 # its own direct `GmailAdapter.disconnect` coverage above).
 
 
-def test_backfill_is_a_documented_stub() -> None:
+def test_backfill_no_ops_for_a_resource_type_other_than_message() -> None:
+    """Task 2 made `backfill` real for `resource_type="message"` (see
+    `tests/test_gmail_connector_sync_postgres.py`) -- every other value
+    (this test uses the same semantically-meaningless `"thread"` round 22
+    originally picked, before `ResourceType` had any Gmail-appropriate
+    value to test with at all) still zero-item-succeeds, matching every
+    other adapter's "not-yet-implemented resource type" contract.
+    """
     adapter = GmailAdapter()
     outcome = adapter.backfill(_account_context("irrelevant"), "thread")
     assert outcome.resource_type == "thread"
@@ -1369,20 +1376,23 @@ def test_backfill_is_a_documented_stub() -> None:
     assert outcome.next_cursor is None
 
 
-def test_backfill_ignores_since() -> None:
+def test_backfill_ignores_since_for_a_resource_type_other_than_message() -> None:
     adapter = GmailAdapter()
     outcome = adapter.backfill(_account_context("irrelevant"), "thread", since=datetime.now(UTC))
     assert outcome.status == "succeeded"
     assert outcome.items_processed == 0
 
 
-def test_incremental_sync_is_a_documented_stub() -> None:
+def test_incremental_sync_no_ops_for_a_resource_type_other_than_message() -> None:
+    """See `test_backfill_no_ops_for_a_resource_type_other_than_message`'s
+    own docstring -- same Task 2 change, same reasoning.
+    """
     adapter = GmailAdapter()
     outcome = adapter.incremental_sync(_account_context("irrelevant"), "thread", "some-cursor")
     assert outcome.resource_type == "thread"
     assert outcome.items_processed == 0
     assert outcome.status == "succeeded"
-    assert outcome.next_cursor is None
+    assert outcome.next_cursor == "some-cursor"
 
 
 def test_handle_webhook_is_a_documented_stub() -> None:

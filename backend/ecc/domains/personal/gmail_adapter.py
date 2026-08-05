@@ -73,25 +73,46 @@ docstring), and only invokes `handle_oauth_callback` once its own
 verification has already passed; this method does not re-derive or
 re-check `state` itself, since it has no way to.
 
-**`backfill`/`incremental_sync`/`handle_webhook` are stubbed this task**
-(Task 2's own scope, design doc Decision 1) -- each returns a zero-item
-`succeeded` outcome rather than raising, matching `github_adapter.py`'s own
-"an unimplemented resource type no-op-succeeds rather than raises" contract
-interpretation for a not-yet-implemented feature.
+**`backfill`/`incremental_sync` are real as of Task 2** (`handle_webhook`
+remains stubbed -- push-notification-based sync is still explicitly
+deferred, see that method's own docstring). Both sync `gmail.metadata`
+(headers only -- `From`/`To`/`Subject`; `email_messages.body`/`snippet`
+stay `NULL` until a future task's `gmail.readonly` fetch) into `email_
+threads`/`email_messages`, and resolve each message's sender/recipients
+into `pkos_nodes` via entity-resolution match hierarchy level 3 (`docs/
+phases/phase-002/ENTITY-RESOLUTION-CONTRACT.md`: "exact normalized
+workspace-scoped identifier such as verified email") -- see `_resolve_or_
+create_person`'s own docstring. `backfill` covers a `since`-bounded window
+(default the last 30 days) via Gmail's `messages.list`/`q=after:...`;
+`incremental_sync` resumes from a Gmail `historyId` cursor via `history.
+list`, falling back to a fresh `backfill` both when `cursor` is `None`
+(the Protocol's own contract) and when Gmail reports the cursor has
+expired (a 404 -- see `_sync_history`'s own docstring for why this
+fallback is a disclosed design decision, not something the plan document
+named explicitly). Every resource type other than `"message"` still
+zero-item-succeeds, matching `github_adapter.py`'s own "an unimplemented
+resource type no-op-succeeds rather than raises" contract interpretation.
 """
 
 from __future__ import annotations
 
 import time
 from collections.abc import Callable, Mapping
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
+from email.utils import parseaddr
+from hashlib import sha256
 from json import dumps, loads
-from typing import Any
+from typing import Any, cast
 from urllib.parse import urlencode
+from uuid import UUID, uuid4
 
 import httpx
+from sqlalchemy import text
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session
 
 from ecc.config import get_settings
+from ecc.database import SessionFactory
 from ecc.domains.engineering.connectors import (
     AdapterAuthorizationError,
     ConnectorAccountContext,
@@ -117,6 +138,35 @@ REQUIRED_SCOPES: frozenset[str] = frozenset(
         "https://www.googleapis.com/auth/gmail.readonly",
     }
 )
+
+
+# Task 2 sync tuning -- mirrors `github_adapter.py`'s own `_PAGE_SIZE`/
+# `_MAX_PAGES_PER_CALL`/`_RATE_LIMIT_MAX_WAIT_SECONDS` bounds, adapted to
+# Gmail's one-list-call-plus-N-per-message-get-calls shape rather than
+# GitHub's single paginated list. `_MAX_MESSAGES_PER_CALL` bounds total
+# `messages.get` calls (the dominant cost) across every page fetched in one
+# `backfill`/`incremental_sync` invocation, not `_MESSAGE_PAGE_SIZE` alone.
+_MESSAGE_PAGE_SIZE = 50
+_MAX_MESSAGES_PER_CALL = 200
+_RATE_LIMIT_MAX_WAIT_SECONDS = 5.0
+_DEFAULT_BACKFILL_WINDOW = timedelta(days=30)
+
+# Gmail's own quota-error shape (`{"error": {"errors": [{"reason": ...}]}}`)
+# distinguishes rate limiting from every other 403 (insufficient scope,
+# account suspended, ...) only by `reason` -- treating every 403 as
+# rate-limited would misreport a real, non-transient failure as `partial`
+# (retry later, this will resolve itself) instead of raising, silently
+# masking a problem that will never clear on its own without ever
+# surfacing to the caller as anything worse than a stalled sync.
+_RATE_LIMIT_REASONS = frozenset({"rateLimitExceeded", "userRateLimitExceeded", "quotaExceeded"})
+_RATE_LIMIT_ERROR_SUMMARY = "Gmail rate limit exceeded; sync paused, will resume next call"
+
+# `entity_aliases.alias_type` is a free-form `VARCHAR(50)` with no CHECK
+# constraint (unlike `connector_accounts.provider`/`personal_domains.
+# domain_key`'s closed sets) -- no migration is needed to introduce a new
+# value here, matching every other alias_type this codebase already
+# writes without a schema change.
+_EMAIL_ALIAS_TYPE = "email"
 
 
 def _pack_credential(access_token: str, refresh_token: str, expires_at: datetime) -> str:
@@ -147,6 +197,335 @@ def _unpack_credential(credential: str) -> dict[str, str]:
             f"Gmail credential JSON must decode to an object, got {type(data).__name__}"
         )
     return data
+
+
+# -- Task 2: DB helpers shared by `backfill`/`incremental_sync` --------------
+#
+# `ConnectorAccountContext` (the argument every `ConnectorAdapter` method
+# receives) carries no `owner_id` -- Phase 6's connector model is
+# workspace-shared, not per-owner. Gmail's own `connector_accounts` row does
+# have one, though (`gmail_oauth.py`'s `gmail_oauth_callback_endpoint` sets
+# it to the connecting user, `auth.user_id`, at INSERT time -- see that
+# module's own INSERT), so `_owner_id_for_account` below reads it back
+# directly rather than requiring `owner_id` to be threaded through a wider
+# Protocol change every other adapter would need to accept and ignore.
+
+
+def _owner_id_for_account(
+    session: Session, workspace_id: UUID, connector_account_id: UUID
+) -> UUID | None:
+    row = session.execute(
+        text(
+            "SELECT owner_id FROM connector_accounts "
+            "WHERE workspace_id = :workspace_id AND id = :connector_account_id"
+        ),
+        {"workspace_id": workspace_id, "connector_account_id": connector_account_id},
+    ).one_or_none()
+    return row[0] if row is not None else None
+
+
+def _email_consent_active(session: Session, workspace_id: UUID, owner_id: UUID) -> bool:
+    """Plan Task 2: "each re-invocation re-verifies the `email` domain's
+    `domain_consents` row is still active at call time, not merely at
+    original connect time" -- called both before a sync call starts
+    fetching anything, and again before writing each message it fetches
+    (see `_sync_messages`), so a consent revoked mid-call halts further
+    writes rather than only being checked once at the top.
+    """
+    row = session.execute(
+        text(
+            "SELECT 1 FROM domain_consents WHERE workspace_id = :workspace_id "
+            "AND owner_id = :owner_id AND domain_key = 'email' AND revoked_at IS NULL"
+        ),
+        {"workspace_id": workspace_id, "owner_id": owner_id},
+    ).one_or_none()
+    return row is not None
+
+
+def _normalize_email(value: str) -> str:
+    return value.strip().casefold()
+
+
+def _parse_address(header_value: str) -> tuple[str, str] | None:
+    """`From`/`To` header values are `"Display Name <addr@example.com>"` or
+    a bare `addr@example.com` -- `email.utils.parseaddr` (stdlib, not a
+    hand-rolled regex) handles both, plus the quoted-display-name and
+    comment-syntax edge cases a naive `<...>` split would mis-parse.
+    Returns `(display_name, address)` (`display_name` `""` when the header
+    carried no name portion), or `None` for a header this adapter cannot
+    make sense of (empty, or an address-less comment-only value) rather
+    than a placeholder a caller might mistake for a real, resolvable
+    identity.
+    """
+    display_name, address = parseaddr(header_value)
+    if not address:
+        return None
+    return display_name, address
+
+
+def _resolve_or_create_person(
+    *,
+    workspace_id: UUID,
+    owner_id: UUID,
+    email: str,
+    display_name: str,
+    source_ref: str,
+    now: datetime,
+) -> UUID:
+    """Entity-resolution match hierarchy level 3 (`docs/phases/phase-002/
+    ENTITY-RESOLUTION-CONTRACT.md`: "Exact normalized workspace-scoped
+    identifier such as verified email") -- deterministic, so this always
+    either attaches to an existing entity or creates a new one outright;
+    it never creates a `resolution_candidates` row (that machinery is for
+    *fuzzy* level-5 matches this exact-identifier case never needs).
+
+    Opens and commits its own short transaction rather than reusing a
+    caller-supplied `Session` -- keeping entity resolution independent of
+    whatever transaction (if any) writes the `email_messages` row that
+    triggered it means a resolution race (two messages in the same sync
+    call, or two concurrent sync calls, naming the same participant for
+    the first time) only ever risks re-running *this* function, never
+    rolling back an unrelated message write alongside it.
+    """
+    normalized = _normalize_email(email)
+    with SessionFactory() as session, session.begin():
+        existing = session.execute(
+            text(
+                "SELECT entity_id FROM entity_aliases WHERE workspace_id = :workspace_id "
+                "AND alias_type = :alias_type AND normalized_value = :normalized_value"
+            ),
+            {
+                "workspace_id": workspace_id,
+                "alias_type": _EMAIL_ALIAS_TYPE,
+                "normalized_value": normalized,
+            },
+        ).one_or_none()
+        if existing is not None:
+            return cast(UUID, existing[0])
+
+        node_id = uuid4()
+        evidence_id = uuid4()
+        canonical_name = display_name.strip() or email
+        try:
+            session.execute(
+                text(
+                    """
+                    INSERT INTO pkos_nodes (
+                        id, workspace_id, node_type, canonical_name, attributes,
+                        status, confidence, version, created_at, updated_at,
+                        owner_id, visibility
+                    ) VALUES (
+                        :id, :workspace_id, 'person', :canonical_name, '{}'::jsonb,
+                        'active', 1.00, 1, :now, :now, :owner_id, 'workspace'
+                    )
+                    """
+                ),
+                {
+                    "id": node_id,
+                    "workspace_id": workspace_id,
+                    "canonical_name": canonical_name,
+                    "now": now,
+                    "owner_id": owner_id,
+                },
+            )
+            session.execute(
+                text(
+                    """
+                    INSERT INTO pkos_evidence (
+                        id, workspace_id, node_id, source_type, source_ref, sha256,
+                        captured_at, evidence_state
+                    ) VALUES (
+                        :id, :workspace_id, :node_id, 'gmail_sync', :source_ref, :sha256,
+                        :now, 'available'
+                    )
+                    """
+                ),
+                {
+                    "id": evidence_id,
+                    "workspace_id": workspace_id,
+                    "node_id": node_id,
+                    "source_ref": source_ref,
+                    "sha256": sha256(source_ref.encode()).hexdigest(),
+                    "now": now,
+                },
+            )
+            session.execute(
+                text(
+                    """
+                    INSERT INTO entity_aliases (
+                        id, workspace_id, entity_id, alias_type, normalized_value,
+                        source_id, confidence, created_at
+                    ) VALUES (
+                        :id, :workspace_id, :entity_id, :alias_type, :normalized_value,
+                        :source_id, 1.00, :now
+                    )
+                    """
+                ),
+                {
+                    "id": uuid4(),
+                    "workspace_id": workspace_id,
+                    "entity_id": node_id,
+                    "alias_type": _EMAIL_ALIAS_TYPE,
+                    "normalized_value": normalized,
+                    "source_id": evidence_id,
+                    "now": now,
+                },
+            )
+        except IntegrityError:
+            # Lost a race against a concurrent resolution of the same
+            # email (`uq_entity_aliases_workspace_type_value`) -- the
+            # winner's row is authoritative; use it rather than raising.
+            session.rollback()
+            with SessionFactory() as retry_session, retry_session.begin():
+                winner = retry_session.execute(
+                    text(
+                        "SELECT entity_id FROM entity_aliases WHERE workspace_id = :workspace_id "
+                        "AND alias_type = :alias_type AND normalized_value = :normalized_value"
+                    ),
+                    {
+                        "workspace_id": workspace_id,
+                        "alias_type": _EMAIL_ALIAS_TYPE,
+                        "normalized_value": normalized,
+                    },
+                ).one()
+                return cast(UUID, winner[0])
+        return node_id
+
+
+def _upsert_thread(
+    session: Session,
+    *,
+    workspace_id: UUID,
+    owner_id: UUID,
+    connector_account_id: UUID,
+    external_thread_id: str,
+    subject: str | None,
+    last_message_at: datetime,
+    now: datetime,
+) -> UUID:
+    row = session.execute(
+        text(
+            """
+            INSERT INTO email_threads (
+                id, workspace_id, owner_id, domain_key, connector_account_id,
+                external_thread_id, subject, last_message_at, created_at, updated_at
+            ) VALUES (
+                :id, :workspace_id, :owner_id, 'email', :connector_account_id,
+                :external_thread_id, :subject, :last_message_at, :now, :now
+            )
+            ON CONFLICT (workspace_id, connector_account_id, external_thread_id) DO UPDATE SET
+                last_message_at = GREATEST(email_threads.last_message_at, EXCLUDED.last_message_at),
+                subject = COALESCE(email_threads.subject, EXCLUDED.subject),
+                updated_at = :now
+            RETURNING id
+            """
+        ),
+        {
+            "id": uuid4(),
+            "workspace_id": workspace_id,
+            "owner_id": owner_id,
+            "connector_account_id": connector_account_id,
+            "external_thread_id": external_thread_id,
+            "subject": subject,
+            "last_message_at": last_message_at,
+            "now": now,
+        },
+    ).one()
+    return cast(UUID, row[0])
+
+
+def _insert_message_if_new(
+    session: Session,
+    *,
+    workspace_id: UUID,
+    owner_id: UUID,
+    thread_id: UUID,
+    external_message_id: str,
+    sender: str,
+    recipients: list[str],
+    sent_at: datetime,
+    direction: str,
+    now: datetime,
+) -> UUID | None:
+    """`ON CONFLICT DO NOTHING` -- a re-synced message (backfill re-run,
+    incremental/backfill overlap) is a silent no-op, matching `CONNECTOR-
+    CONTRACT.md`'s "Backfill resumes without duplicate projections."
+    Returns `None` when the row already existed, so the caller can skip
+    entity resolution for an already-processed message's participants.
+    """
+    row = session.execute(
+        text(
+            """
+            INSERT INTO email_messages (
+                id, workspace_id, owner_id, thread_id, external_message_id,
+                sender, recipients, sent_at, direction, snippet, body,
+                body_fetched_at, created_at, updated_at
+            ) VALUES (
+                :id, :workspace_id, :owner_id, :thread_id, :external_message_id,
+                :sender, :recipients, :sent_at, :direction, NULL, NULL,
+                NULL, :now, :now
+            )
+            ON CONFLICT (workspace_id, thread_id, external_message_id) DO NOTHING
+            RETURNING id
+            """
+        ),
+        {
+            "id": uuid4(),
+            "workspace_id": workspace_id,
+            "owner_id": owner_id,
+            "thread_id": thread_id,
+            "external_message_id": external_message_id,
+            "sender": sender,
+            "recipients": recipients,
+            "sent_at": sent_at,
+            "direction": direction,
+            "now": now,
+        },
+    ).one_or_none()
+    return row[0] if row is not None else None
+
+
+def _is_rate_limited(response: httpx.Response) -> bool:
+    if response.status_code == 429:
+        return True
+    if response.status_code != 403:
+        return False
+    try:
+        body = response.json()
+    except ValueError:
+        return False
+    if not isinstance(body, dict):
+        return False
+    error = body.get("error")
+    if not isinstance(error, dict):
+        return False
+    errors = error.get("errors")
+    if not isinstance(errors, list):
+        return False
+    return any(
+        isinstance(item, dict) and item.get("reason") in _RATE_LIMIT_REASONS for item in errors
+    )
+
+
+def _bearer_headers(credential: str) -> dict[str, str]:
+    access_token = _unpack_credential(credential).get("access_token", "")
+    return {"Authorization": f"Bearer {access_token}"}
+
+
+def _coerce_int(value: Any) -> int | None:
+    """`dict.get(...)`'s return type (`Any | None`) does not narrow to a
+    plain `Any` for a bare `int(...)` call the way it does once assigned
+    to a locally-typed variable first -- every Gmail response field this
+    adapter converts to an `int` (a `historyId`, `internalDate`) funnels
+    through here rather than repeating the same `is None` guard at each
+    call site.
+    """
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 class GmailAdapter:
@@ -435,22 +814,538 @@ class GmailAdapter:
         resource_type: str,
         since: datetime | None = None,
     ) -> SyncOutcome:
-        """Stubbed -- Task 2's own scope (design doc Decision 1, plan Task
-        2). Returns a zero-item success rather than raising, matching
-        `github_adapter.py`'s identical "not-yet-implemented resource type"
-        contract interpretation.
+        """`message` is the only resource type `gmail` accounts ever sync
+        (see `connector_accounts.py`'s `ResourceType` widening); any other
+        value zero-item-succeeds, matching every other adapter's
+        "not-yet-implemented resource type" contract interpretation.
+
+        `since` defaults to `_DEFAULT_BACKFILL_WINDOW` (30 days) per plan
+        Task 2 -- explicit callers (the "expand history" UI, not built this
+        task) pass a real value for a wider or narrower window.
         """
-        return SyncOutcome(
-            resource_type=resource_type, items_processed=0, status="succeeded", next_cursor=None
-        )
+        if resource_type != "message":
+            return SyncOutcome(
+                resource_type=resource_type, items_processed=0, status="succeeded", next_cursor=None
+            )
+        window_start = since or (datetime.now(UTC) - _DEFAULT_BACKFILL_WINDOW)
+        query = f"after:{int(window_start.timestamp())}"
+        return self._sync_messages(account, query=query)
 
     def incremental_sync(
         self, account: ConnectorAccountContext, resource_type: str, cursor: str | None
     ) -> SyncOutcome:
-        """Stubbed -- Task 2's own scope. See `backfill`'s identical note."""
+        """`cursor` is a Gmail `historyId` (a string-encoded integer, per
+        `ConnectorAdapter.incremental_sync`'s own "resumes from cursor, or
+        behaves like a fresh backfill if cursor is None" contract).
+        """
+        if resource_type != "message":
+            return SyncOutcome(
+                resource_type=resource_type,
+                items_processed=0,
+                status="succeeded",
+                next_cursor=cursor,
+            )
+        if cursor is None:
+            return self.backfill(account, resource_type, since=None)
+        return self._sync_history(account, start_history_id=cursor)
+
+    def _request_with_rate_limit_retry(
+        self,
+        method: str,
+        path: str,
+        *,
+        headers: dict[str, str],
+        params: dict[str, Any] | None = None,
+    ) -> httpx.Response | None:
+        """Mirrors `github_adapter.py`'s identically-named method -- one
+        bounded wait, one retry; a still-rate-limited retry gives up rather
+        than being trusted as a normal response (that adapter's own round-4
+        review finding, applied here from the start rather than rediscovered
+        a second time). Returns `None` only when rate-limited beyond the
+        bounded wait -- callers treat that as "give up for now, resume next
+        sync call."
+        """
+        try:
+            response = self._gmail_client.request(method, path, headers=headers, params=params)
+        except httpx.HTTPError as exc:
+            raise RuntimeError(f"Gmail request failed: {exc}") from exc
+        if not _is_rate_limited(response):
+            return response
+
+        wait_seconds = self._rate_limit_wait_seconds(response)
+        if wait_seconds > _RATE_LIMIT_MAX_WAIT_SECONDS:
+            return None
+        self._sleep(wait_seconds)
+        try:
+            retry_response = self._gmail_client.request(
+                method, path, headers=headers, params=params
+            )
+        except httpx.HTTPError as exc:
+            raise RuntimeError(f"Gmail request failed: {exc}") from exc
+        if _is_rate_limited(retry_response):
+            return None
+        return retry_response
+
+    def _rate_limit_wait_seconds(self, response: httpx.Response) -> float:
+        retry_after = response.headers.get("Retry-After")
+        if retry_after is not None:
+            try:
+                return max(0.0, float(retry_after))
+            except ValueError:
+                pass
+        # Gmail's own quota errors rarely send `Retry-After` (unlike
+        # GitHub's `X-RateLimit-Reset`, Gmail has no equivalent header) --
+        # a short fixed backoff still gives a per-second quota window a
+        # real chance to reset before this call's own bounded-wait budget
+        # is spent, matching `_RATE_LIMIT_MAX_WAIT_SECONDS`'s own "long
+        # enough to ride out a short reset window inline" framing.
+        return 1.0
+
+    def _sync_messages(self, account: ConnectorAccountContext, *, query: str) -> SyncOutcome:
+        with SessionFactory() as session, session.begin():
+            owner_id = _owner_id_for_account(
+                session, account.workspace_id, account.connector_account_id
+            )
+        if owner_id is None:
+            raise RuntimeError("Gmail connector account has no owner_id on record")
+        with SessionFactory() as session, session.begin():
+            if not _email_consent_active(session, account.workspace_id, owner_id):
+                raise RuntimeError("email domain consent is not active")
+
+        headers = _bearer_headers(account.credential)
+        now = datetime.now(UTC)
+        items_processed = 0
+        highest_history_id: int | None = None
+        page_token: str | None = None
+        calls_made = 0
+
+        while calls_made < _MAX_MESSAGES_PER_CALL:
+            list_response = self._request_with_rate_limit_retry(
+                "GET",
+                "/gmail/v1/users/me/messages",
+                headers=headers,
+                params={
+                    k: v
+                    for k, v in {
+                        "q": query,
+                        "maxResults": _MESSAGE_PAGE_SIZE,
+                        "pageToken": page_token,
+                    }.items()
+                    if v is not None
+                },
+            )
+            if list_response is None:
+                return SyncOutcome(
+                    resource_type="message",
+                    items_processed=items_processed,
+                    status="partial",
+                    next_cursor=str(highest_history_id) if highest_history_id else None,
+                    error_summary=_RATE_LIMIT_ERROR_SUMMARY,
+                )
+            if list_response.status_code != 200:
+                raise RuntimeError(
+                    f"Gmail message list failed with status {list_response.status_code}"
+                )
+            try:
+                list_body = list_response.json()
+            except ValueError as exc:
+                raise RuntimeError(
+                    f"Gmail message list returned a non-JSON response body: {exc}"
+                ) from exc
+            if not isinstance(list_body, dict):
+                raise RuntimeError("Gmail message list returned a non-object response body")
+
+            message_refs = list_body.get("messages")
+            if not isinstance(message_refs, list):
+                message_refs = []
+
+            for ref in message_refs:
+                if calls_made >= _MAX_MESSAGES_PER_CALL:
+                    break
+                message_id = ref.get("id") if isinstance(ref, dict) else None
+                if not isinstance(message_id, str) or not message_id:
+                    continue
+                calls_made += 1
+
+                # Re-checked per message, not merely once at the top of this
+                # call -- plan Task 2: "a revoked-mid-window consent halts
+                # the call." A long backfill can span the time it takes a
+                # user to revoke consent mid-call; this bounds how much
+                # further syncing happens after that, to one message's
+                # worth of lag rather than the whole remaining call.
+                with SessionFactory() as session, session.begin():
+                    if not _email_consent_active(session, account.workspace_id, owner_id):
+                        return SyncOutcome(
+                            resource_type="message",
+                            items_processed=items_processed,
+                            status="partial",
+                            next_cursor=str(highest_history_id) if highest_history_id else None,
+                            error_summary="email domain consent was revoked mid-sync",
+                        )
+
+                get_response = self._request_with_rate_limit_retry(
+                    "GET",
+                    f"/gmail/v1/users/me/messages/{message_id}",
+                    headers=headers,
+                    params={"format": "metadata", "metadataHeaders": ["From", "To", "Subject"]},
+                )
+                if get_response is None:
+                    return SyncOutcome(
+                        resource_type="message",
+                        items_processed=items_processed,
+                        status="partial",
+                        next_cursor=str(highest_history_id) if highest_history_id else None,
+                        error_summary=_RATE_LIMIT_ERROR_SUMMARY,
+                    )
+                if get_response.status_code != 200:
+                    raise RuntimeError(
+                        f"Gmail message fetch failed with status {get_response.status_code}"
+                    )
+                try:
+                    message_body = get_response.json()
+                except ValueError as exc:
+                    raise RuntimeError(
+                        f"Gmail message fetch returned a non-JSON response body: {exc}"
+                    ) from exc
+                if not isinstance(message_body, dict):
+                    raise RuntimeError("Gmail message fetch returned a non-object response body")
+
+                observed_history_id = self._process_message(
+                    message_body,
+                    workspace_id=account.workspace_id,
+                    owner_id=owner_id,
+                    connector_account_id=account.connector_account_id,
+                    now=now,
+                )
+                items_processed += 1
+                if observed_history_id is not None:
+                    highest_history_id = max(highest_history_id or 0, observed_history_id)
+
+            page_token = list_body.get("nextPageToken")
+            if not isinstance(page_token, str) or not page_token:
+                # No further pages -- fully caught up to `query`. Only now
+                # is it safe to hand a cursor to `incremental_sync`: a
+                # `partial` result (rate-limited, or the page-token loop
+                # exiting below with more pages still remaining) means
+                # historical mail this call hasn't reached yet could still
+                # be older than whatever historyId a partial result would
+                # report, so `next_cursor` stays `None` for anything short
+                # of a full, uninterrupted pass -- see this method's own
+                # `partial`-branch returns above, none of which set it.
+                if highest_history_id is None:
+                    # Zero messages found in `query`'s window -- no
+                    # historyId was ever observed to seed a cursor from.
+                    # Falls back to `users.getProfile`, the only other Gmail
+                    # endpoint that reports the mailbox's current historyId,
+                    # so a subsequent `incremental_sync` call still has a
+                    # real cursor to resume from instead of permanently
+                    # deferring back to `backfill` every time.
+                    profile_response = self._request_with_rate_limit_retry(
+                        "GET", "/gmail/v1/users/me/profile", headers=headers
+                    )
+                    if profile_response is not None and profile_response.status_code == 200:
+                        try:
+                            profile_body = profile_response.json()
+                        except ValueError:
+                            profile_body = None
+                        if isinstance(profile_body, dict):
+                            highest_history_id = _coerce_int(profile_body.get("historyId"))
+                return SyncOutcome(
+                    resource_type="message",
+                    items_processed=items_processed,
+                    status="succeeded",
+                    next_cursor=str(highest_history_id) if highest_history_id else None,
+                )
+
         return SyncOutcome(
-            resource_type=resource_type, items_processed=0, status="succeeded", next_cursor=None
+            resource_type="message",
+            items_processed=items_processed,
+            status="partial",
+            next_cursor=None,
+            error_summary=(
+                f"Gmail message sync hit the {_MAX_MESSAGES_PER_CALL}-message per-call bound "
+                "with more messages remaining; sync paused, will resume next call"
+            ),
         )
+
+    def _sync_history(
+        self, account: ConnectorAccountContext, *, start_history_id: str
+    ) -> SyncOutcome:
+        with SessionFactory() as session, session.begin():
+            owner_id = _owner_id_for_account(
+                session, account.workspace_id, account.connector_account_id
+            )
+        if owner_id is None:
+            raise RuntimeError("Gmail connector account has no owner_id on record")
+        with SessionFactory() as session, session.begin():
+            if not _email_consent_active(session, account.workspace_id, owner_id):
+                raise RuntimeError("email domain consent is not active")
+
+        headers = _bearer_headers(account.credential)
+        now = datetime.now(UTC)
+        items_processed = 0
+        latest_history_id: int | None = None
+        page_token: str | None = None
+        calls_made = 0
+        seen_message_ids: set[str] = set()
+
+        while calls_made < _MAX_MESSAGES_PER_CALL:
+            history_response = self._request_with_rate_limit_retry(
+                "GET",
+                "/gmail/v1/users/me/history",
+                headers=headers,
+                params={
+                    k: v
+                    for k, v in {
+                        "startHistoryId": start_history_id,
+                        "historyTypes": "messageAdded",
+                        "maxResults": _MESSAGE_PAGE_SIZE,
+                        "pageToken": page_token,
+                    }.items()
+                    if v is not None
+                },
+            )
+            if history_response is None:
+                return SyncOutcome(
+                    resource_type="message",
+                    items_processed=items_processed,
+                    status="partial",
+                    next_cursor=start_history_id,
+                    error_summary=_RATE_LIMIT_ERROR_SUMMARY,
+                )
+            if history_response.status_code == 404:
+                # `startHistoryId` has expired (Gmail retains history for a
+                # rolling window, not indefinitely) -- the only correct
+                # recovery is a fresh backfill; there is no partial-history
+                # replay possible once the server has dropped the record.
+                # Disclosed design decision (plan Task 2 names only
+                # "polling-based ... via historyId cursor," not this
+                # fallback): a real Gmail deployment will eventually hit
+                # this on any long-idle connector account, and silently
+                # raising instead would strand that account requiring
+                # manual disconnect/reconnect to recover.
+                return self.backfill(account, "message", since=None)
+            if history_response.status_code != 200:
+                raise RuntimeError(
+                    f"Gmail history fetch failed with status {history_response.status_code}"
+                )
+            try:
+                history_body = history_response.json()
+            except ValueError as exc:
+                raise RuntimeError(
+                    f"Gmail history fetch returned a non-JSON response body: {exc}"
+                ) from exc
+            if not isinstance(history_body, dict):
+                raise RuntimeError("Gmail history fetch returned a non-object response body")
+
+            observed_history_id = _coerce_int(history_body.get("historyId"))
+            if observed_history_id is not None:
+                latest_history_id = observed_history_id
+
+            history_entries = history_body.get("history")
+            if not isinstance(history_entries, list):
+                history_entries = []
+            message_ids: list[str] = []
+            for entry in history_entries:
+                added = entry.get("messagesAdded") if isinstance(entry, dict) else None
+                if not isinstance(added, list):
+                    continue
+                for item in added:
+                    message = item.get("message") if isinstance(item, dict) else None
+                    message_id = message.get("id") if isinstance(message, dict) else None
+                    if (
+                        isinstance(message_id, str)
+                        and message_id
+                        and message_id not in seen_message_ids
+                    ):
+                        seen_message_ids.add(message_id)
+                        message_ids.append(message_id)
+
+            for message_id in message_ids:
+                if calls_made >= _MAX_MESSAGES_PER_CALL:
+                    break
+                calls_made += 1
+
+                with SessionFactory() as session, session.begin():
+                    if not _email_consent_active(session, account.workspace_id, owner_id):
+                        return SyncOutcome(
+                            resource_type="message",
+                            items_processed=items_processed,
+                            status="partial",
+                            next_cursor=start_history_id,
+                            error_summary="email domain consent was revoked mid-sync",
+                        )
+
+                get_response = self._request_with_rate_limit_retry(
+                    "GET",
+                    f"/gmail/v1/users/me/messages/{message_id}",
+                    headers=headers,
+                    params={"format": "metadata", "metadataHeaders": ["From", "To", "Subject"]},
+                )
+                if get_response is None:
+                    return SyncOutcome(
+                        resource_type="message",
+                        items_processed=items_processed,
+                        status="partial",
+                        next_cursor=start_history_id,
+                        error_summary=_RATE_LIMIT_ERROR_SUMMARY,
+                    )
+                if get_response.status_code != 200:
+                    raise RuntimeError(
+                        f"Gmail message fetch failed with status {get_response.status_code}"
+                    )
+                try:
+                    message_body = get_response.json()
+                except ValueError as exc:
+                    raise RuntimeError(
+                        f"Gmail message fetch returned a non-JSON response body: {exc}"
+                    ) from exc
+                if not isinstance(message_body, dict):
+                    raise RuntimeError("Gmail message fetch returned a non-object response body")
+
+                self._process_message(
+                    message_body,
+                    workspace_id=account.workspace_id,
+                    owner_id=owner_id,
+                    connector_account_id=account.connector_account_id,
+                    now=now,
+                )
+                items_processed += 1
+
+            page_token = history_body.get("nextPageToken")
+            if not isinstance(page_token, str) or not page_token:
+                return SyncOutcome(
+                    resource_type="message",
+                    items_processed=items_processed,
+                    status="succeeded",
+                    next_cursor=str(latest_history_id) if latest_history_id else start_history_id,
+                )
+
+        return SyncOutcome(
+            resource_type="message",
+            items_processed=items_processed,
+            status="partial",
+            next_cursor=start_history_id,
+            error_summary=(
+                f"Gmail history sync hit the {_MAX_MESSAGES_PER_CALL}-message per-call bound "
+                "with more messages remaining; sync paused, will resume next call"
+            ),
+        )
+
+    def _process_message(
+        self,
+        body: dict[str, Any],
+        *,
+        workspace_id: UUID,
+        owner_id: UUID,
+        connector_account_id: UUID,
+        now: datetime,
+    ) -> int | None:
+        """Writes the thread/message rows and resolves participant
+        entities for one already-fetched `messages.get(format=metadata)`
+        response body. Returns the message's own `historyId` (Gmail
+        includes it on every message resource) when present and
+        well-formed, so callers can track the highest historyId seen
+        across a sync call.
+
+        A malformed/incomplete response shape is skipped (this message
+        contributes to `items_processed` in the caller but writes nothing)
+        rather than raising -- unlike `handle_oauth_callback`'s revoke-on-
+        reject guard, there is no live grant or rejection consequence a
+        skip needs to protect here, and every other message in the same
+        sync call is unaffected by one bad one.
+        """
+        message_id = body.get("id")
+        external_thread_id = body.get("threadId")
+        if not isinstance(message_id, str) or not message_id:
+            return None
+        if not isinstance(external_thread_id, str) or not external_thread_id:
+            return None
+
+        payload = body.get("payload")
+        raw_headers = payload.get("headers") if isinstance(payload, dict) else None
+        header_map: dict[str, str] = {}
+        if isinstance(raw_headers, list):
+            for entry in raw_headers:
+                if (
+                    isinstance(entry, dict)
+                    and isinstance(entry.get("name"), str)
+                    and isinstance(entry.get("value"), str)
+                ):
+                    header_map.setdefault(entry["name"].casefold(), entry["value"])
+
+        from_header = header_map.get("from")
+        to_header = header_map.get("to")
+        sender_parsed = _parse_address(from_header) if from_header else None
+        if sender_parsed is None:
+            return None
+        sender_name, sender_email = sender_parsed
+
+        recipients: list[str] = []
+        recipient_names: dict[str, str] = {}
+        if to_header:
+            for raw_address in to_header.split(","):
+                parsed = _parse_address(raw_address)
+                if parsed is not None:
+                    name, address = parsed
+                    recipients.append(address)
+                    recipient_names.setdefault(address, name)
+        if not recipients:
+            return None
+
+        internal_date_ms = _coerce_int(body.get("internalDate"))
+        if internal_date_ms is None:
+            return None
+        try:
+            sent_at = datetime.fromtimestamp(internal_date_ms / 1000, tz=UTC)
+        except (OverflowError, OSError, ValueError):
+            return None
+
+        label_ids = body.get("labelIds")
+        direction = "outbound" if isinstance(label_ids, list) and "SENT" in label_ids else "inbound"
+
+        history_id = _coerce_int(body.get("historyId"))
+
+        subject = header_map.get("subject")
+
+        with SessionFactory() as session, session.begin():
+            thread_id = _upsert_thread(
+                session,
+                workspace_id=workspace_id,
+                owner_id=owner_id,
+                connector_account_id=connector_account_id,
+                external_thread_id=external_thread_id,
+                subject=subject,
+                last_message_at=sent_at,
+                now=now,
+            )
+            inserted_id = _insert_message_if_new(
+                session,
+                workspace_id=workspace_id,
+                owner_id=owner_id,
+                thread_id=thread_id,
+                external_message_id=message_id,
+                sender=sender_email,
+                recipients=recipients,
+                sent_at=sent_at,
+                direction=direction,
+                now=now,
+            )
+
+        if inserted_id is not None:
+            source_ref = f"gmail:{message_id}"
+            participants: dict[str, str] = {sender_email: sender_name, **recipient_names}
+            for participant_email, participant_name in participants.items():
+                _resolve_or_create_person(
+                    workspace_id=workspace_id,
+                    owner_id=owner_id,
+                    email=participant_email,
+                    display_name=participant_name,
+                    source_ref=source_ref,
+                    now=now,
+                )
+
+        return history_id
 
     def handle_webhook(
         self, account: ConnectorAccountContext, payload: bytes, headers: Mapping[str, str]
