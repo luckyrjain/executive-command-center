@@ -229,7 +229,7 @@ def test_allows_todays_development_defaults() -> None:
 
 
 def test_settings_is_actually_constructible_in_development_with_no_session_secret(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """Regression test for a real CI failure: pydantic-settings validates a
     field's constraints against its *resolved* value regardless of whether
@@ -244,9 +244,23 @@ def test_settings_is_actually_constructible_in_development_with_no_session_secre
     import time, not at the intended validate_production_settings check.
     Uses the real constructor (not model_construct) and clears every env var
     Settings reads, so this only passes if the empty default is genuinely
-    unconstrained at the pydantic layer."""
+    unconstrained at the pydantic layer.
+
+    Clearing process env vars is not sufficient on its own:
+    `Settings.model_config` sets `env_file=".env"` (`ecc/config.py`), which
+    pydantic-settings reads directly off disk relative to the current
+    working directory -- entirely independent of `os.environ`. A repo
+    checkout with a real local `.env` (every contributor's normal dev setup)
+    would silently repopulate `ECC_SESSION_SECRET` from that file, passing
+    this test for the wrong reason locally while still catching the real
+    regression in a fresh CI checkout with no `.env` present. `monkeypatch.
+    chdir(tmp_path)` makes the relative `.env` path resolve to an empty,
+    guaranteed-`.env`-free directory, so this test is hermetic regardless of
+    what's sitting in the real working directory.
+    """
     import ecc.config as config_module
 
+    monkeypatch.chdir(tmp_path)
     for var in ("ECC_ENV", "ECC_DATABASE_URL", "ECC_SESSION_SECRET", "ECC_CORS_ORIGINS"):
         monkeypatch.delenv(var, raising=False)
     monkeypatch.setenv("ECC_ENV", "development")
