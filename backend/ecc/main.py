@@ -99,7 +99,22 @@ validate_production_settings(settings)
 # Authorization`/etc.; importing back the other direction from `connectors.
 # py` would be a circular import. Registered here instead -- this module is
 # the composition root every router/adapter is already wired through.
-engineering_connector_registry.register(GmailAdapter())
+#
+# Guarded, unlike `connectors.py`'s own five `registry.register(...)` calls
+# -- those run exactly once (that module is never reloaded by anything in
+# this codebase), but `tests/test_production_security.py`'s `_reload_main`
+# calls `importlib.reload(ecc.main)` to re-exercise this module's own
+# environment-dependent router wiring, which re-executes every top-level
+# statement here, including this one, against the *same* persistent
+# `registry` object (`ecc.domains.engineering.connectors` itself is never
+# reloaded). An unguarded second call raised `AdapterAlreadyRegistered` and
+# failed every test in that file (found by this PR's own CI run) --
+# checking membership first makes this statement idempotent under reload,
+# matching `ConnectorRegistry.register`'s own docstring ("a registration-
+# time programming error, not a runtime condition any caller input can
+# trigger") by construction rather than by never being called twice.
+if "gmail" not in engineering_connector_registry:
+    engineering_connector_registry.register(GmailAdapter())
 app = FastAPI(title="Executive Command Center", version="0.2.0")
 # The dev-bootstrap router is only ever functional in development (each of
 # its routes calls _require_development() and 404s otherwise) -- but

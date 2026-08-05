@@ -245,10 +245,17 @@ class OAuth2ConnectorAdapter(Protocol):
         anti-CSRF token this adapter must embed in the URL unchanged and
         `handle_oauth_callback` must verify unchanged.
 
-        Raises `AdapterAuthorizationError` for a caller this adapter's own
-        internal allowlist rejects (design doc Decision 3) -- before any
-        redirect URL is even generated, not merely before the callback is
-        trusted.
+        Design doc Decision 3's internal-allowlist rejection ("before any
+        redirect URL is even generated") does not necessarily happen
+        *inside* this method -- this method's own fixed signature carries
+        no account/email argument to check an allowlist against (the
+        provider account is not known pre-redirect at all for a 3-legged
+        OAuth2 flow). `GmailAdapter`, this Protocol's sole implementer,
+        performs that check in its caller (`gmail_oauth.py`'s router, via
+        the Gmail-specific `is_account_allowed` method) immediately before
+        calling this method -- see that adapter's own module docstring for
+        why. This method itself may still raise `AdapterAuthorizationError`
+        for its own reason (e.g. an unconfigured OAuth client).
         """
         ...
 

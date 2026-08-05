@@ -1,0 +1,40 @@
+---
+id: PHASE-010-IMPLEMENTATION-STATUS
+title: Phase 10 Implementation Status
+status: Task 1 (OAuth2 connector framework extension, Gmail connector skeleton, internal allowlist) complete
+version: 0.1.0
+owner: Lucky Jain
+updated: 2026-08-05
+---
+
+# Phase 10 Implementation Status
+
+Design pass and Task 1 delivered per `docs/superpowers/plans/2026-08-04-phase-10-gmail-connector.md`.
+
+| Slice | Status |
+|---|---|
+| OAuth2 connector framework extension | Done -- `OAuth2ConnectorAdapter` Protocol (additive, separate from `ConnectorAdapter`), `backfill(since=)` widened across every adapter (Task 1) |
+| Gmail connector skeleton | Done -- `GmailAdapter`'s OAuth methods real against Google's endpoints; `backfill`/`incremental_sync`/`handle_webhook` stubbed (Task 2) |
+| Schema | Done -- `email_threads`/`email_messages`, `connector_accounts.provider`/`personal_domains.domain_key` widened for `gmail`/`email` (migration `0069`) |
+| Internal allowlist | Done -- two-layer check (pre-redirect against the caller's own account email, authoritative post-callback against the actual Google account), the mechanism keeping this phase within Google's OAuth test-user cap and out of CASA-assessment scope |
+| Backfill/incremental sync, entity linking | Not started (Task 2) |
+| Deterministic attention integration | Not started (Task 3) |
+| `recommendations` create-path extension | Not started (Task 4) |
+| AI-runtime action-detection tool | Not started (Task 5) |
+| On-demand thread reading/caching | Not started (Task 6) |
+| Consent revocation cascade | Not started (Task 7) |
+| Executive UX and browser acceptance | Not started (Task 8) |
+
+## Task 1 evidence
+
+**Complete.** `docs/superpowers/plans/2026-08-04-phase-10-gmail-connector.md`'s Task 1: `OAuth2ConnectorAdapter` Protocol extension (`ecc.domains.engineering.connectors`), `GmailAdapter` (`ecc.domains.personal.gmail_adapter`), the OAuth initiate/callback endpoints (`ecc.domains.personal.gmail_oauth`), migration `0069_phase10_gmail_connector.py`, and `email` added to `ecc.domains.personal.domains`'s `DomainKey`/classification map at `high_stakes`.
+
+**Protocol split, not a widened shared Protocol.** Adding `get_authorization_url`/`handle_oauth_callback` directly to the existing `ConnectorAdapter` Protocol would have broken `ConnectorRegistry.register`'s own `isinstance()` check for every already-registered adapter (`github`/`gitlab`/`jira`/`sandbox`/`datadog`), none of which implement OAuth2 -- confirmed with a live Python test before proceeding, not merely assumed from Protocol semantics. `OAuth2ConnectorAdapter` is instead a separate, additive Protocol only `GmailAdapter` satisfies. Widening `backfill()` with an optional `since` parameter is signature-sensitive under mypy's static Protocol structural typing (unlike `isinstance`'s presence-only check), so all five existing adapters' `backfill` signatures were mechanically updated to accept and ignore it.
+
+**Registration composition-root workaround, disclosed.** `GmailAdapter` cannot be registered inside `connectors.py` itself the way every other adapter is (a same-package relative import) -- it lives in `ecc.domains.personal`, which already imports `ecc.domains.engineering.connectors`; registering the other direction would be a circular import. Registered from `main.py` instead, guarded by a membership check (`if "gmail" not in engineering_connector_registry:`) so `tests/test_production_security.py`'s `importlib.reload(ecc.main)` -- which re-executes this module's top-level code against the same persistent, never-reloaded registry singleton -- doesn't raise `AdapterAlreadyRegistered` on a second reload. Found by this task's own first CI run, not by review alone.
+
+**Reconnecting a disconnected account reactivates it, rather than silently discarding a freshly obtained credential.** `uq_connector_accounts_workspace_provider_external_id` means a second real OAuth consent for the same Google account after a `disable`/`disconnected`/`permission_lost`/`error` state hits the callback's own `IntegrityError` handler. A naive "already connected, return the existing row" response for every conflict would silently discard the just-exchanged, allowlist-checked, valid credential -- for a `disconnected` row specifically, one whose old refresh token `GmailAdapter.disconnect()` already revoked at Google, permanently stranding the account with no reactivate/PATCH endpoint anywhere in `connector_accounts.py` to recover it. Found by a dedicated adversarial review pass (not the original implementation), fixed by branching on the existing row's `status`: an `active` row still returns as-is (the genuine passive-replay case); any other status is `UPDATE`d with the new credential, scopes and display name, `status` reset to `active`, and a `connector_account.reconnected` audit event is written. Verified directly against real Postgres via a standalone script (connect, disconnect, reconnect with a second, distinct token pair, confirm the stored credential is the new one and exactly one `reconnected` audit event exists) -- this sandbox's Python environments cannot run the `TestClient`-based test suite itself (see below).
+
+**Verified.** `mypy --config-file pyproject.toml backend` clean (181 source files). `ruff check`/`ruff format --check` clean across `backend/`, `scripts/` and `tests/`. Migration `0069` upgrade/downgrade/re-upgrade round-trip verified against real local Postgres 16, plus a real end-to-end insert through `connector_accounts` -> `personal_domains` -> `email_threads` -> `email_messages` confirming every FK/CHECK constraint. `scripts/seed_phase1_acceptance.py` extended with an `email` domain/thread/message fixture triple for both seeded workspaces -- found missing by this task's own first `backup-restore` CI run (`verify_restore.sh`'s generic workspace-isolation check discovers every `workspace_id`-bearing table, including the two this task added, and failed with `alpha=0 bravo=0` until seeded), a nineteenth occurrence of the identical "new workspace-scoped table, no seed row" gap class every phase since Phase 3 has hit at least once. `tests/test_gmail_connector_postgres.py` (allowlist rejection at both layers, authorization-URL generation, callback/code-exchange success and every distinct failure branch against a mocked token/profile endpoint, refresh-token renewal including the fail-open network-error case, disconnect's malformed-credential case, CSRF-state wrong-signature/expired/cross-session rejection, the 422 not-configured path at both the adapter and router level, the reconnect-reactivation path, audit-event presence on first-connect and absence of a duplicate on replay, encrypted-field-never-returned-in-list-view, workspace isolation) could not run in this sandbox's Python environments -- both independently broken for anything importing `ecc.main` (a pre-existing, unrelated `budgets.py`/pydantic incompatibility, documented across this repository's prior phase status files) -- but every new/changed branch of `gmail_adapter.py`'s and `gmail_oauth.py`'s own logic (the CSRF-state signing/verification, every `handle_oauth_callback`/`refresh_permissions`/`disconnect` branch, the full first-connect/replay/reactivate HTTP flow against real Postgres) was independently re-verified via standalone scripts run directly against this sandbox's working Python 3.11 environment (which can import these two modules and a minimal `FastAPI()` app around them, just not the full `ecc.main` import chain), confirming the same assertions the test file itself makes; full dynamic verification of the test file as written is deferred to CI, watched and driven to green the same way every prior PR in this repository has been.
+
+**Deferred, disclosed rather than silently dropped.** `backfill`/`incremental_sync`/`handle_webhook` are stubbed (Task 2's own scope). The `GmailAdapter.__init__` `sleep` constructor parameter is currently unused (Task 2's rate-limit-retry mechanism, reusing `github_adapter.py`'s identical pattern, needs it; kept rather than added back later since Task 2 is the very next task in this activation).

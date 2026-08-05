@@ -21,6 +21,7 @@ Covers, per the implementation plan's own Task 1 test list
 
 from __future__ import annotations
 
+from base64 import urlsafe_b64encode
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
@@ -36,6 +37,7 @@ from identity_fixtures import create_identity
 from sqlalchemy import text
 
 import ecc.domains.personal.gmail_oauth as gmail_oauth_module
+from ecc.auth import AuthContext
 from ecc.config import get_settings
 from ecc.database import engine
 from ecc.domains.engineering.connectors import AdapterAuthorizationError, ConnectorAccountContext
@@ -252,6 +254,98 @@ def test_handle_oauth_callback_rejects_non_allowlisted_account(
         get_settings.cache_clear()
 
 
+def test_handle_oauth_callback_rejects_when_not_configured(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_CLIENT_ID", "")
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_CLIENT_SECRET", "")
+    get_settings.cache_clear()
+    try:
+        adapter = GmailAdapter(transport=_oauth_transport())
+        with pytest.raises(AdapterAuthorizationError):
+            adapter.handle_oauth_callback("auth-code", "state-value")
+    finally:
+        get_settings.cache_clear()
+
+
+def test_handle_oauth_callback_rejects_missing_access_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_CLIENT_ID", "cid")
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_CLIENT_SECRET", "csecret")
+    get_settings.cache_clear()
+    try:
+        adapter = GmailAdapter(
+            transport=_oauth_transport(token_body=_token_response(access_token=""))
+        )
+        with pytest.raises(AdapterAuthorizationError):
+            adapter.handle_oauth_callback("auth-code", "state-value")
+    finally:
+        get_settings.cache_clear()
+
+
+def test_handle_oauth_callback_rejects_non_numeric_expires_in(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_CLIENT_ID", "cid")
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_CLIENT_SECRET", "csecret")
+    get_settings.cache_clear()
+    try:
+        body = _token_response()
+        body["expires_in"] = "not-a-number"
+        adapter = GmailAdapter(transport=_oauth_transport(token_body=body))
+        with pytest.raises(AdapterAuthorizationError):
+            adapter.handle_oauth_callback("auth-code", "state-value")
+    finally:
+        get_settings.cache_clear()
+
+
+def test_handle_oauth_callback_rejects_profile_lookup_error_status(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_CLIENT_ID", "cid")
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_CLIENT_SECRET", "csecret")
+    get_settings.cache_clear()
+    try:
+        adapter = GmailAdapter(transport=_oauth_transport(profile_status=500))
+        with pytest.raises(AdapterAuthorizationError):
+            adapter.handle_oauth_callback("auth-code", "state-value")
+    finally:
+        get_settings.cache_clear()
+
+
+def test_handle_oauth_callback_rejects_missing_email_address(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_CLIENT_ID", "cid")
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_CLIENT_SECRET", "csecret")
+    get_settings.cache_clear()
+    try:
+        adapter = GmailAdapter(transport=_oauth_transport(profile_email=None))
+        with pytest.raises(AdapterAuthorizationError):
+            adapter.handle_oauth_callback("auth-code", "state-value")
+    finally:
+        get_settings.cache_clear()
+
+
+def test_handle_oauth_callback_rejects_token_endpoint_network_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_CLIENT_ID", "cid")
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_CLIENT_SECRET", "csecret")
+    get_settings.cache_clear()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("boom", request=request)
+
+    try:
+        adapter = GmailAdapter(transport=httpx.MockTransport(handler))
+        with pytest.raises(AdapterAuthorizationError):
+            adapter.handle_oauth_callback("auth-code", "state-value")
+    finally:
+        get_settings.cache_clear()
+
+
 # --- GmailAdapter.refresh_permissions / disconnect --------------------------
 
 
@@ -288,6 +382,34 @@ def test_refresh_permissions_permission_lost_on_invalid_grant() -> None:
 def test_refresh_permissions_permission_lost_on_malformed_credential() -> None:
     adapter = GmailAdapter()
     assert adapter.refresh_permissions(_account_context("not-json")) == "permission_lost"
+
+
+def test_refresh_permissions_fails_open_on_network_error() -> None:
+    """Mirrors `test_engineering_datadog_sync_postgres.py`'s identical
+    `test_refresh_permissions_fails_open_on_network_error` -- a transient
+    network failure while checking permission state must never be
+    misreported as `permission_lost` (which would incorrectly surface a
+    healthy connection as broken); `refresh_permissions`'s own docstring
+    already documents this fail-open choice, this locks it down.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("boom", request=request)
+
+    adapter = GmailAdapter(transport=httpx.MockTransport(handler))
+    credential = dumps(
+        {
+            "access_token": "old",
+            "refresh_token": "refresh-1",
+            "expires_at": "2020-01-01T00:00:00+00:00",
+        }
+    )
+    assert adapter.refresh_permissions(_account_context(credential)) == "active"
+
+
+def test_disconnect_returns_none_for_malformed_credential() -> None:
+    adapter = GmailAdapter()
+    assert adapter.disconnect(_account_context("not-json")) is None
 
 
 def test_disconnect_never_raises_on_network_error() -> None:
@@ -375,6 +497,45 @@ def _headers(token: str) -> dict[str, str]:
     return {"X-CSRF-Token": csrf, "X-Correlation-ID": str(uuid4())}
 
 
+# --- _verify_state (mirrors test_identity_invitations_postgres.py's own
+# "expired" vs. "wrong/tampered" separation for its structurally identical
+# signed/expiring token check) ------------------------------------------
+
+
+def test_verify_state_rejects_wrong_signature() -> None:
+    # Structurally well-formed (decodes, splits into nonce/expires_at/
+    # signature cleanly, not expired) but a signature that was never
+    # produced by `_sign_state` for this `(nonce, expires_at)` pair -- the
+    # genuine CSRF-forgery case, distinct from a merely-malformed value.
+    auth = AuthContext(workspace_id=uuid4(), user_id=uuid4(), timezone="UTC")
+    nonce = "fixed-nonce"
+    expires_at = int(datetime.now(UTC).timestamp()) + 600
+    wrong_signature = "0" * 64
+    raw = f"{nonce}.{expires_at}.{wrong_signature}"
+    state = urlsafe_b64encode(raw.encode("utf-8")).decode("ascii")
+    assert gmail_oauth_module._verify_state(auth, state) is False
+
+
+def test_verify_state_rejects_expired_state() -> None:
+    auth = AuthContext(workspace_id=uuid4(), user_id=uuid4(), timezone="UTC")
+    nonce = "fixed-nonce"
+    expired_at = int(datetime.now(UTC).timestamp()) - 1
+    signature = gmail_oauth_module._sign_state(auth, nonce, expired_at)
+    raw = f"{nonce}.{expired_at}.{signature}"
+    state = urlsafe_b64encode(raw.encode("utf-8")).decode("ascii")
+    # Correctly signed for this exact (nonce, expires_at) pair -- proves
+    # this is the expiry check failing, not the signature check.
+    assert gmail_oauth_module._verify_state(auth, state) is False
+
+
+def test_verify_state_rejects_state_minted_for_a_different_session() -> None:
+    minting_auth = AuthContext(workspace_id=uuid4(), user_id=uuid4(), timezone="UTC")
+    other_auth = AuthContext(workspace_id=uuid4(), user_id=uuid4(), timezone="UTC")
+    state = gmail_oauth_module._encode_state(minting_auth)
+    assert gmail_oauth_module._verify_state(other_auth, state) is False
+    assert gmail_oauth_module._verify_state(minting_auth, state) is True
+
+
 def test_oauth_start_rejects_non_allowlisted_caller(
     gmail_test_context: tuple[TestClient, UUID, UUID, str],
     monkeypatch: pytest.MonkeyPatch,
@@ -385,7 +546,7 @@ def test_oauth_start_rejects_non_allowlisted_caller(
     try:
         response = client.post("/api/v1/personal/gmail/oauth/start", headers=_headers(token))
         assert response.status_code == 403
-        assert response.json()["detail"] == "GMAIL_ACCOUNT_NOT_ALLOWLISTED"
+        assert response.json()["error"]["code"] == "GMAIL_ACCOUNT_NOT_ALLOWLISTED"
     finally:
         get_settings.cache_clear()
 
@@ -410,6 +571,27 @@ def test_oauth_start_returns_authorization_url_when_allowlisted(
         get_settings.cache_clear()
 
 
+def test_oauth_start_returns_422_when_not_configured(
+    gmail_test_context: tuple[TestClient, UUID, UUID, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Allowlisted (passes the pre-redirect check), but no Gmail OAuth
+    client configured -- `get_authorization_url`'s own `AdapterAuthorization
+    Error` must surface as a 422 at the router, not an unhandled 500.
+    """
+    client, _workspace_id, _user_id, token = gmail_test_context
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_ALLOWLIST", _ALLOWED_EMAIL)
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_CLIENT_ID", "")
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_REDIRECT_URI", "")
+    get_settings.cache_clear()
+    try:
+        response = client.post("/api/v1/personal/gmail/oauth/start", headers=_headers(token))
+        assert response.status_code == 422
+        assert response.json()["error"]["code"] == "GMAIL_OAUTH_NOT_CONFIGURED"
+    finally:
+        get_settings.cache_clear()
+
+
 def test_oauth_callback_rejects_invalid_state(
     gmail_test_context: tuple[TestClient, UUID, UUID, str],
 ) -> None:
@@ -419,7 +601,33 @@ def test_oauth_callback_rejects_invalid_state(
         params={"code": "auth-code", "state": "tampered-state"},
     )
     assert response.status_code == 403
-    assert response.json()["detail"] == "GMAIL_OAUTH_STATE_INVALID"
+    assert response.json()["error"]["code"] == "GMAIL_OAUTH_STATE_INVALID"
+
+
+def test_oauth_callback_returns_422_with_error_envelope_on_google_rejection(
+    gmail_test_context: tuple[TestClient, UUID, UUID, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, _workspace_id, _user_id, token = gmail_test_context
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_ALLOWLIST", _ALLOWED_EMAIL)
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_CLIENT_ID", "cid")
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_CLIENT_SECRET", "csecret")
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_REDIRECT_URI", "https://ecc.example.test/callback")
+    get_settings.cache_clear()
+    monkeypatch.setattr(
+        gmail_oauth_module, "_adapter", GmailAdapter(transport=_oauth_transport(token_status=400))
+    )
+    try:
+        start_response = client.post("/api/v1/personal/gmail/oauth/start", headers=_headers(token))
+        state = httpx.URL(start_response.json()["authorization_url"]).params["state"]
+        response = client.get(
+            "/api/v1/personal/gmail/oauth/callback",
+            params={"code": "auth-code", "state": state},
+        )
+        assert response.status_code == 422
+        assert response.json()["error"]["code"] == "GMAIL_OAUTH_FAILED"
+    finally:
+        get_settings.cache_clear()
 
 
 def test_oauth_callback_creates_connector_account_and_is_workspace_isolated(
@@ -463,14 +671,39 @@ def test_oauth_callback_creates_connector_account_and_is_workspace_isolated(
         assert stored["access_token"] == "access-1"
         assert stored["refresh_token"] == "refresh-1"
 
+        # A first connect writes exactly one audit event for this account.
+        with engine.begin() as connection:
+            audit_count = connection.execute(
+                text(
+                    "SELECT count(*) FROM audit_events WHERE workspace_id = :workspace_id "
+                    "AND aggregate_id = :aggregate_id AND event_type = 'connector_account.created'"
+                ),
+                {"workspace_id": workspace_id, "aggregate_id": UUID(body["id"])},
+            ).scalar_one()
+        assert audit_count == 1
+
         # A reloaded callback (same code/state) must not error -- returns
-        # the already-connected account instead of a hard failure.
+        # the already-connected account instead of a hard failure, and does
+        # not write a second audit event (the SAVEPOINT-inside-one-
+        # transaction guarantee `create_connector_endpoint` also relies on:
+        # a losing IntegrityError proves the winner's own transaction,
+        # including its audit write, already committed -- there is nothing
+        # new to record for a passive replay).
         replay_response = client.get(
             "/api/v1/personal/gmail/oauth/callback",
             params={"code": "auth-code", "state": state},
         )
         assert replay_response.status_code == 200
         assert replay_response.json()["id"] == body["id"]
+        with engine.begin() as connection:
+            audit_count_after_replay = connection.execute(
+                text(
+                    "SELECT count(*) FROM audit_events WHERE workspace_id = :workspace_id "
+                    "AND aggregate_id = :aggregate_id"
+                ),
+                {"workspace_id": workspace_id, "aggregate_id": UUID(body["id"])},
+            ).scalar_one()
+        assert audit_count_after_replay == 1
 
         # Workspace isolation: a second workspace's session must not see
         # this connector account via the generic list endpoint.
@@ -520,5 +753,95 @@ def test_oauth_callback_creates_connector_account_and_is_workspace_isolated(
                 other_client.close()
         finally:
             _cleanup_workspace(other_workspace_id)
+    finally:
+        get_settings.cache_clear()
+
+
+def test_oauth_callback_reactivates_disconnected_account(
+    gmail_test_context: tuple[TestClient, UUID, UUID, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A `disconnected` row (e.g. via `POST /engineering/connectors/{id}/
+    disable`, which for a real `gmail` account also revokes the old
+    refresh token at Google) must not permanently strand the account the
+    next time its owner completes a real Google consent flow -- silently
+    returning the stale, disconnected row (as a naive "already connected"
+    IntegrityError handler would) discards a freshly obtained, valid
+    credential with no way to recover it. See `gmail_oauth_callback_
+    endpoint`'s own IntegrityError-handling docstring.
+    """
+    client, workspace_id, _user_id, token = gmail_test_context
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_ALLOWLIST", _ALLOWED_EMAIL)
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_CLIENT_ID", "cid")
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_CLIENT_SECRET", "csecret")
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_REDIRECT_URI", "https://ecc.example.test/callback")
+    get_settings.cache_clear()
+    monkeypatch.setattr(gmail_oauth_module, "_adapter", GmailAdapter(transport=_oauth_transport()))
+    try:
+        start_response = client.post("/api/v1/personal/gmail/oauth/start", headers=_headers(token))
+        state = httpx.URL(start_response.json()["authorization_url"]).params["state"]
+        first_response = client.get(
+            "/api/v1/personal/gmail/oauth/callback",
+            params={"code": "auth-code", "state": state},
+        )
+        assert first_response.status_code == 200
+        account_id = first_response.json()["id"]
+
+        now = datetime.now(UTC)
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    "UPDATE connector_accounts SET status = 'disconnected', "
+                    "disconnected_at = :now, updated_at = :now WHERE id = :id"
+                ),
+                {"id": account_id, "now": now},
+            )
+
+        # A second, real consent flow -- Google returns a genuinely new
+        # token pair this time.
+        monkeypatch.setattr(
+            gmail_oauth_module,
+            "_adapter",
+            GmailAdapter(
+                transport=_oauth_transport(
+                    token_body=_token_response(access_token="access-2", refresh_token="refresh-2")
+                )
+            ),
+        )
+        second_start = client.post("/api/v1/personal/gmail/oauth/start", headers=_headers(token))
+        second_state = httpx.URL(second_start.json()["authorization_url"]).params["state"]
+        second_response = client.get(
+            "/api/v1/personal/gmail/oauth/callback",
+            params={"code": "auth-code-2", "state": second_state},
+        )
+        assert second_response.status_code == 200
+        body = second_response.json()
+        assert body["id"] == account_id
+        assert body["status"] == "active"
+
+        with engine.begin() as connection:
+            row = connection.execute(
+                text(
+                    "SELECT encrypted_credentials, status, disconnected_at "
+                    "FROM connector_accounts WHERE id = :id"
+                ),
+                {"id": account_id},
+            ).one()
+        assert row[1] == "active"
+        assert row[2] is None
+        stored = loads(decrypt_credential(row[0]))
+        assert stored["access_token"] == "access-2"
+        assert stored["refresh_token"] == "refresh-2"
+
+        with engine.begin() as connection:
+            reconnected_count = connection.execute(
+                text(
+                    "SELECT count(*) FROM audit_events WHERE workspace_id = :workspace_id "
+                    "AND aggregate_id = :aggregate_id "
+                    "AND event_type = 'connector_account.reconnected'"
+                ),
+                {"workspace_id": workspace_id, "aggregate_id": UUID(account_id)},
+            ).scalar_one()
+        assert reconnected_count == 1
     finally:
         get_settings.cache_clear()

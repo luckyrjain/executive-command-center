@@ -145,6 +145,15 @@ def upgrade() -> None:
             "direction IN ('inbound', 'outbound')", name="ck_email_messages_direction"
         ),
         sa.ForeignKeyConstraint(["workspace_id"], ["workspaces.id"], ondelete="CASCADE"),
+        # Direct `(workspace_id, owner_id) -> users` FK -- strictly redundant
+        # with the transitive integrity `email_threads`' own FK to
+        # `personal_domains(workspace_id, owner_id, domain_key)` already
+        # provides (the same shape `domain_records`, this migration's own
+        # docstring's cited precedent, relies on alone with no direct FK to
+        # `users`). Kept as an extra, harmless belt-and-suspenders
+        # constraint specifically on `email_messages` -- disclosed here
+        # rather than left as an unexplained asymmetry between these two
+        # sibling tables' own constraint sets.
         sa.ForeignKeyConstraint(
             ["workspace_id", "owner_id"], ["users.workspace_id", "users.id"], ondelete="CASCADE"
         ),
