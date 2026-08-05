@@ -115,51 +115,27 @@ multi-round adversarial review found and required real coverage for:
     response body still not actually rejecting a wrong-but-truthy type
     after rounds 7-8 closed the others.
 
-Rounds 10-12 all found and closed instances of the same "obtained but
-never revoked" gap in `gmail_oauth_callback_endpoint` specifically, at
-different statements within it. Round 10: a non-`IntegrityError` failure
-during the `connector_accounts` `INSERT` itself -- closed with a sibling
-`except Exception:` alongside `except IntegrityError:` (also closed, same
-round: `session.rollback()` before `handle_oauth_callback`'s two slow
-outbound Google HTTP calls held a pooled connection idle for that whole
-window instead of releasing it, unlike `create_connector_endpoint`'s own
-documented, identical fix for the same risk -- replaced with `session.
-close()`). Round 11: a failure raised from *inside* the `except
-IntegrityError:` block's own reactivation-branch write sequence is never
-caught by round 10's sibling `except Exception:` (Python's except-clause
-matching only applies to exceptions raised in the associated `try:` body)
--- closed with a nested `try/except` scoped to that sequence. Round 12: the
-same gap in two more places round 11's narrower nested guard still didn't
-reach -- the `IntegrityError` handler's own initial re-`SELECT ... FOR
-UPDATE` (runs before any branch, so nothing has revoked anything yet), and
-the plain first-time-connect success path's own `get_connector_account`/
-`_write_side_effects` tail (a sibling of the whole `try`/`except`
-construct, guarded by neither). Round 12 restructured the `IntegrityError`
-handler into one wide `try` wrapping everything from the re-`SELECT`
-through every branch (closing the whole class at once rather than
-patching one more statement, since three rounds of "found one more
-unprotected statement" is itself evidence that approach doesn't converge),
-and added a matching guard around the success-path tail.
-
-`test_oauth_callback_revokes_new_grant_when_insert_raises_unexpected_error`,
-`test_oauth_callback_revokes_new_grant_when_integrity_error_handler_
-reselect_raises`, and `test_oauth_callback_revokes_new_grant_when_
-reactivation_update_raises` below give the round-10/11/12 `INSERT`-, re-
-`SELECT`-, and reactivation-`UPDATE`-failure paths real pytest coverage via
+Rounds 10-12 each found and closed one more unguarded statement in
+`gmail_oauth_callback_endpoint`'s revoke-on-failure coverage (a real
+Google grant obtained but never revoked on an unexpected DB failure) --
+see `docs/phases/phase-010/IMPLEMENTATION-STATUS.md`'s own round-10/11/12
+paragraphs for the full account of each gap and fix, and each of the four
+`test_oauth_callback_revokes_new_grant_when_*_raises` tests below for the
+specific statement and scenario it covers. Round 10 also fixed a separate
+connection-pool-release issue (`session.close()` before `handle_oauth_
+callback`'s slow outbound calls, replacing a `session.rollback()` that
+left a pooled connection held idle) -- verified via a standalone script
+against real Postgres rather than a dedicated pytest test, since a real
+proof needs a blocking-adapter-plus-concurrency test (the `_SlowAdapter`/
+`threading.Event` pattern `test_engineering_connectors_postgres.py`
+already establishes) that would add real timing-flakiness risk to this CI
+environment's already-observed sensitivity to timing-based tests -- a
+deliberate trade-off, not an absence of a viable pattern. The other three
+`INSERT`/re-`SELECT`/`UPDATE` failure paths, plus the plain success path's
+own audit-write failure, all have real pytest coverage via
 `_fail_next_matching_execute` (a `monkeypatch.setattr` on `sqlalchemy.orm.
 Session.execute` -- the same module-level-swap idiom this file already
-uses repeatedly for `_adapter`, just applied one layer lower) -- round 12
-review found the original "not practically testable" disclosure for these
-overstated once this idiom was applied. Only the `session.close()`
-connection-pool-release fix (and the now-guarded plain-success-path tail,
-which needs no synthetic failure test of its own beyond what the other
-three already exercise of the same guard shape) remains verified solely
-via a standalone script against real Postgres: a real pytest proof would
-need a blocking-adapter-plus-concurrency test (the `_SlowAdapter`/
-`threading.Event` pattern `test_engineering_connectors_postgres.py`
-already establishes) that adds real timing-flakiness risk to this CI
-environment's already-observed sensitivity to timing-based tests -- a
-deliberate trade-off, not an absence of a viable pattern.
+uses repeatedly for `_adapter`, just applied one layer lower).
 """
 
 from __future__ import annotations
@@ -1758,6 +1734,59 @@ def test_oauth_callback_revokes_new_grant_when_insert_raises_unexpected_error(
         state = httpx.URL(start_response.json()["authorization_url"]).params["state"]
 
         _fail_next_matching_execute(monkeypatch, "INSERT INTO connector_accounts")
+        with pytest.raises(Exception):  # noqa: B017, PT011 -- the real, unhandled 500
+            client.get(
+                "/api/v1/personal/gmail/oauth/callback",
+                params={"code": "auth-code", "state": state},
+            )
+
+        assert revoked_tokens == ["refresh-1"]
+        with engine.begin() as connection:
+            count = connection.execute(
+                text("SELECT count(*) FROM connector_accounts WHERE workspace_id = :workspace_id"),
+                {"workspace_id": workspace_id},
+            ).scalar_one()
+        assert count == 0
+    finally:
+        get_settings.cache_clear()
+
+
+def test_oauth_callback_revokes_new_grant_when_success_path_tail_raises(
+    gmail_test_context: tuple[TestClient, UUID, UUID, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 12's fourth guard: the plain first-time-connect success
+    path's own tail (`get_connector_account` + `_write_side_effects`,
+    run only when the `INSERT` succeeds with no `IntegrityError` at all)
+    is a sibling of the whole `try`/`except` construct, guarded by
+    neither -- unlike the reactivation branch's structurally identical
+    "persist a row, build a response, write an audit event" shape, which
+    round 11 already gave its own guard. Round 13 review found this
+    fourth guard was the one round-12 fix left without a dedicated test,
+    despite the infrastructure (`_fail_next_matching_execute`) already
+    existing and having just been used three times for the same pattern.
+    Fails `_write_side_effects`'s own `INSERT INTO audit_events` --
+    unique to this path among the four guards tested here, since only
+    the reactivation and plain-success paths ever call it, and each test
+    exercises only one of the two.
+    """
+    client, workspace_id, _user_id, token = gmail_test_context
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_ALLOWLIST", _ALLOWED_EMAIL)
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_CLIENT_ID", "cid")
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_CLIENT_SECRET", "csecret")
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_REDIRECT_URI", "https://ecc.example.test/callback")
+    get_settings.cache_clear()
+    revoked_tokens: list[str] = []
+    monkeypatch.setattr(
+        gmail_oauth_module,
+        "_adapter",
+        GmailAdapter(transport=_oauth_transport(revoked_tokens=revoked_tokens)),
+    )
+    try:
+        start_response = client.post("/api/v1/personal/gmail/oauth/start", headers=_headers(token))
+        state = httpx.URL(start_response.json()["authorization_url"]).params["state"]
+
+        _fail_next_matching_execute(monkeypatch, "INSERT INTO audit_events")
         with pytest.raises(Exception):  # noqa: B017, PT011 -- the real, unhandled 500
             client.get(
                 "/api/v1/personal/gmail/oauth/callback",
