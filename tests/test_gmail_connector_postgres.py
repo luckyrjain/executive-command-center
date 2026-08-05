@@ -32,7 +32,8 @@ multi-round adversarial review found and required real coverage for:
    client id/secret) and at `POST /oauth/start`/`GET /oauth/callback`
    router level.
 9. `disconnect`'s malformed-credential case (returns `None` rather than
-   raising) and its real provider-side revocation call.
+   raising), its real provider-side revocation call, and the network-error
+   case (never raises).
 10. Revoke-on-rejection: every post-token-exchange rejection branch in
     `handle_oauth_callback` (see item 3's list) revokes the just-obtained,
     never-to-be-persisted Google grant via `/revoke` before raising --
@@ -44,7 +45,12 @@ multi-round adversarial review found and required real coverage for:
     existing `connector_accounts` row with the new credential (rather
     than the naive "conflict means already connected" response silently
     discarding it), including the `connector_account.reconnected` audit
-    event this writes.
+    event this writes, and revokes the credential being overwritten
+    (round 4: the same revoke-on-discard gap as item 10, relocated to
+    `gmail_oauth_callback_endpoint`'s own `IntegrityError` handler --
+    covers both its `active`-row branch, discarding the just-obtained new
+    grant, and its reactivate branch, discarding the row's prior stored
+    grant).
 12. Audit-event dedup: a replayed callback (same code/state) returns the
     same row without writing a second `connector_account.created` event.
 """
@@ -441,6 +447,43 @@ def test_handle_oauth_callback_rejects_token_endpoint_network_error(
         get_settings.cache_clear()
 
 
+def test_handle_oauth_callback_rejects_profile_lookup_network_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The `httpx.HTTPError` branch of the profile lookup (distinct from
+    `test_handle_oauth_callback_rejects_profile_lookup_error_status`'s
+    non-200-response branch) -- round 4 review found this specific branch
+    was undocumented-as-tested despite the module docstring and
+    IMPLEMENTATION-STATUS.md both already claiming "profile-lookup network
+    error or non-200 status" coverage. Production code was never actually
+    at risk (the single `try/except Exception` in `handle_oauth_callback`
+    covers this branch exactly like every other), but the claim needed a
+    real test to back it, not just structural coverage by construction.
+    """
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_CLIENT_ID", "cid")
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_CLIENT_SECRET", "csecret")
+    get_settings.cache_clear()
+    revoked_tokens: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/token":
+            return _json_response(_token_response())
+        if request.url.path == "/gmail/v1/users/me/profile":
+            raise httpx.ConnectError("boom", request=request)
+        if request.url.path == "/revoke":
+            revoked_tokens.append(request.content.decode().removeprefix("token="))
+            return httpx.Response(200)
+        raise AssertionError(f"unexpected request to {request.url}")
+
+    try:
+        adapter = GmailAdapter(transport=httpx.MockTransport(handler))
+        with pytest.raises(AdapterAuthorizationError):
+            adapter.handle_oauth_callback("auth-code", "state-value")
+        assert revoked_tokens == ["refresh-1"]
+    finally:
+        get_settings.cache_clear()
+
+
 # --- GmailAdapter.refresh_permissions / disconnect --------------------------
 
 
@@ -516,6 +559,31 @@ def test_disconnect_never_raises_on_network_error() -> None:
         {"access_token": "a", "refresh_token": "r", "expires_at": "2020-01-01T00:00:00+00:00"}
     )
     assert adapter.disconnect(_account_context(credential)) is None
+
+
+def test_disconnect_revokes_the_stored_refresh_token() -> None:
+    """The success path `test_disconnect_returns_none_for_malformed_credential`/
+    `test_disconnect_never_raises_on_network_error` don't cover -- a
+    well-formed credential's `refresh_token` must be the one extracted and
+    POSTed to `/revoke`, not, say, the access token or an empty string.
+    """
+    revoked_tokens: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/revoke"
+        revoked_tokens.append(request.content.decode().removeprefix("token="))
+        return httpx.Response(200)
+
+    adapter = GmailAdapter(transport=httpx.MockTransport(handler))
+    credential = dumps(
+        {
+            "access_token": "access-1",
+            "refresh_token": "refresh-1",
+            "expires_at": "2020-01-01T00:00:00+00:00",
+        }
+    )
+    assert adapter.disconnect(_account_context(credential)) is None
+    assert revoked_tokens == ["refresh-1"]
 
 
 # --- integration: POST /oauth/start, GET /oauth/callback -------------------
@@ -861,6 +929,77 @@ def test_oauth_callback_creates_connector_account_and_is_workspace_isolated(
         get_settings.cache_clear()
 
 
+def test_oauth_callback_revokes_the_discarded_grant_when_racing_an_active_row(
+    gmail_test_context: tuple[TestClient, UUID, UUID, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Two distinct, successfully-exchanged consent completions racing each
+    other while the row is still `active` (the module docstring's own
+    scenario -- a literal same-code replay can never reach this branch,
+    since Google's own authorization codes are single-use) means the
+    *losing* request holds a real, freshly obtained, never-to-be-persisted
+    Google grant with its own distinct token pair. Round 4 review found
+    the router's `IntegrityError` handler silently discarded that grant
+    without revoking it at Google -- the same "obtained but never revoked"
+    bug class rounds 2-3 closed inside `handle_oauth_callback` itself,
+    relocated to this router branch. This asserts the *new* grant's own
+    refresh token is revoked, and that the originally stored credential is
+    left untouched.
+    """
+    client, workspace_id, _user_id, token = gmail_test_context
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_ALLOWLIST", _ALLOWED_EMAIL)
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_CLIENT_ID", "cid")
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_CLIENT_SECRET", "csecret")
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_REDIRECT_URI", "https://ecc.example.test/callback")
+    get_settings.cache_clear()
+    monkeypatch.setattr(gmail_oauth_module, "_adapter", GmailAdapter(transport=_oauth_transport()))
+    try:
+        start_response = client.post("/api/v1/personal/gmail/oauth/start", headers=_headers(token))
+        state = httpx.URL(start_response.json()["authorization_url"]).params["state"]
+        first_response = client.get(
+            "/api/v1/personal/gmail/oauth/callback",
+            params={"code": "auth-code", "state": state},
+        )
+        assert first_response.status_code == 200
+        account_id = first_response.json()["id"]
+
+        # The "losing" request: a distinct consent completion for the same
+        # Google account, with its own distinct token pair, while the row
+        # above is still `active`.
+        revoked_tokens: list[str] = []
+        monkeypatch.setattr(
+            gmail_oauth_module,
+            "_adapter",
+            GmailAdapter(
+                transport=_oauth_transport(
+                    token_body=_token_response(access_token="access-3", refresh_token="refresh-3"),
+                    revoked_tokens=revoked_tokens,
+                )
+            ),
+        )
+        second_start = client.post("/api/v1/personal/gmail/oauth/start", headers=_headers(token))
+        second_state = httpx.URL(second_start.json()["authorization_url"]).params["state"]
+        second_response = client.get(
+            "/api/v1/personal/gmail/oauth/callback",
+            params={"code": "auth-code-3", "state": second_state},
+        )
+        assert second_response.status_code == 200
+        assert second_response.json()["id"] == account_id
+
+        assert revoked_tokens == ["refresh-3"]
+
+        with engine.begin() as connection:
+            row = connection.execute(
+                text("SELECT encrypted_credentials FROM connector_accounts WHERE id = :id"),
+                {"id": account_id},
+            ).one()
+        stored = loads(decrypt_credential(row[0]))
+        assert stored["access_token"] == "access-1"
+        assert stored["refresh_token"] == "refresh-1"
+    finally:
+        get_settings.cache_clear()
+
+
 def test_oauth_callback_reactivates_disconnected_account(
     gmail_test_context: tuple[TestClient, UUID, UUID, str],
     monkeypatch: pytest.MonkeyPatch,
@@ -903,12 +1042,14 @@ def test_oauth_callback_reactivates_disconnected_account(
 
         # A second, real consent flow -- Google returns a genuinely new
         # token pair this time.
+        revoked_tokens: list[str] = []
         monkeypatch.setattr(
             gmail_oauth_module,
             "_adapter",
             GmailAdapter(
                 transport=_oauth_transport(
-                    token_body=_token_response(access_token="access-2", refresh_token="refresh-2")
+                    token_body=_token_response(access_token="access-2", refresh_token="refresh-2"),
+                    revoked_tokens=revoked_tokens,
                 )
             ),
         )
@@ -936,6 +1077,13 @@ def test_oauth_callback_reactivates_disconnected_account(
         stored = loads(decrypt_credential(row[0]))
         assert stored["access_token"] == "access-2"
         assert stored["refresh_token"] == "refresh-2"
+
+        # The replaced `refresh-1` credential is a real, still-possibly-live
+        # Google grant this reactivation is about to overwrite -- round 4
+        # review found the router discarded it here without revoking,
+        # exactly the same "obtained but never revoked" bug class rounds
+        # 2-3 closed inside `handle_oauth_callback` itself.
+        assert revoked_tokens == ["refresh-1"]
 
         with engine.begin() as connection:
             reconnected_count = connection.execute(

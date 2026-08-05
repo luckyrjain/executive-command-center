@@ -75,8 +75,8 @@ from ecc.domains.engineering.connector_accounts import (
     _write_side_effects,
     get_connector_account,
 )
-from ecc.domains.engineering.connectors import AdapterAuthorizationError
-from ecc.domains.engineering.crypto import encrypt_credential
+from ecc.domains.engineering.connectors import AdapterAuthorizationError, ConnectorAccountContext
+from ecc.domains.engineering.crypto import decrypt_credential, encrypt_credential
 from ecc.domains.personal.gmail_adapter import GmailAdapter
 from ecc.platform import authz
 
@@ -240,10 +240,21 @@ def gmail_oauth_callback_endpoint(
             # stored state match what was just proven valid," which is
             # exactly what an UPDATE does for a non-`active` row and a
             # harmless no-op-equivalent read for an already-`active` one.
+            #
+            # Either way, `authorization.credential` (case 1) or the row's
+            # own pre-update `encrypted_credentials` (case 2) is a real,
+            # live Google grant this handler is about to discard/overwrite
+            # without ever persisting it as the account's current
+            # credential -- round 4 review found this is exactly the same
+            # "obtained but never revoked" bug class rounds 2-3 closed
+            # inside `handle_oauth_callback` itself, just relocated to this
+            # router branch. `_adapter.disconnect(...)` (best-effort, never
+            # raises) is called on whichever credential is being dropped in
+            # each case before returning/overwriting.
             existing = (
                 create_session.execute(
                     text(
-                        "SELECT id, status FROM connector_accounts "
+                        "SELECT id, status, encrypted_credentials FROM connector_accounts "
                         "WHERE workspace_id = :workspace_id "
                         "AND provider = 'gmail' AND external_account_id = :external_account_id "
                         "FOR UPDATE"
@@ -261,9 +272,31 @@ def gmail_oauth_callback_endpoint(
                     status_code=409, detail="GMAIL_ACCOUNT_ALREADY_CONNECTED"
                 ) from None
             if existing["status"] == "active":
+                _adapter.disconnect(
+                    ConnectorAccountContext(
+                        workspace_id=auth.workspace_id,
+                        connector_account_id=existing["id"],
+                        external_account_id=authorization.external_account_id,
+                        credential=authorization.credential,
+                    )
+                )
                 account = get_connector_account(create_session, auth.workspace_id, existing["id"])
                 assert account is not None
                 return _to_response(account)
+
+            try:
+                old_credential = decrypt_credential(existing["encrypted_credentials"])
+            except Exception:  # noqa: BLE001 -- best-effort, never blocks reactivation
+                old_credential = None
+            if old_credential is not None:
+                _adapter.disconnect(
+                    ConnectorAccountContext(
+                        workspace_id=auth.workspace_id,
+                        connector_account_id=existing["id"],
+                        external_account_id=authorization.external_account_id,
+                        credential=old_credential,
+                    )
+                )
 
             create_session.execute(
                 text(

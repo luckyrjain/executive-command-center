@@ -126,8 +126,8 @@ class ConnectorAdapter(Protocol):
     """Structural contract every registered connector adapter satisfies.
     `provider` is the stable slug stored in `connector_accounts.provider`
     (the `ck_connector_accounts_provider` CHECK constraint's closed set:
-    `github`, `gitlab`, `jira`, `sandbox`, `datadog`) and doubles as this
-    registry's lookup key.
+    `github`, `gitlab`, `jira`, `sandbox`, `datadog`, `gmail`) and doubles
+    as this registry's lookup key.
     """
 
     provider: str
