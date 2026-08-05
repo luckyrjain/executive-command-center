@@ -162,6 +162,19 @@ multi-round adversarial review found and required real coverage for:
     `test_handle_oauth_callback_rejects_when_only_client_id_missing`/
     `..._only_client_secret_missing`, each setting exactly one field empty
     and its sibling non-empty.
+21. `expires_in` entirely absent from the token response (`body.get(
+    "expires_in")` returning `None`) -- round 21: the big six-sub-condition
+    guard's `expires_in is None` operand was the one sub-condition, across
+    all six, no test exercised independently; every other `expires_in`-
+    adjacent test (items 16/18 above) is present-but-wrong-type, never
+    absent. Mutation-confirmed: removing this operand left all 61
+    then-existing tests passing, not because the branch is unreachable but
+    because `float(None)` a few lines later raises `TypeError`, caught by
+    that call's own separate `except` and re-raised as the same exception
+    type via a different message -- the identical "redundant-but-harmless,
+    still worth a message-specific test" situation round 19 found for
+    `email_address`. Closed with `test_handle_oauth_callback_rejects_
+    missing_expires_in`, asserting the guard's own specific message.
 
 Rounds 10-12 each found and closed one more unguarded statement in
 `gmail_oauth_callback_endpoint`'s revoke-on-failure coverage (a real
@@ -710,6 +723,59 @@ def test_handle_oauth_callback_rejects_empty_refresh_token(
         # revoke -- the same harmless-no-op contract already asserted for
         # `..._rejects_missing_refresh_token` (`refresh_token=None`).
         assert revoked_tokens == [""]
+    finally:
+        get_settings.cache_clear()
+
+
+def test_handle_oauth_callback_rejects_missing_expires_in(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The guard's `expires_in is None` sub-condition -- the key entirely
+    absent from Google's token response, or present with a JSON `null` --
+    had no dedicated test: every other `expires_in`-adjacent test below
+    (`..._rejects_boolean_expires_in`, `..._rejects_non_numeric_expires_in`,
+    `..._rejects_infinite_expires_in`, `..._rejects_huge_expires_in`)
+    exercises a *present-but-wrong-type* value, never an *absent* one.
+    Found by round 21 review's exhaustive per-operand sweep of this guard's
+    six sub-conditions (access_token x2, refresh_token x2, expires_in x2),
+    the first round to check `expires_in`'s own two sub-conditions
+    independently rather than only as a group with the others.
+
+    Confirmed by mutation: removing `or expires_in is None` from the guard
+    left all 61 then-existing tests passing -- not because the branch is
+    unreachable, but because the resulting `expires_in=None` still fails a
+    few lines later at `float(expires_in)` (`float(None)` raises
+    `TypeError`), caught by that call's own separate `except (TypeError,
+    ValueError)` and re-raised as the same `AdapterAuthorizationError`
+    type, just via a different message and the already-tested `..._rejects_
+    non_numeric_expires_in` code path -- the identical "redundant-but-
+    harmless, still worth a message-specific test" situation round 19 found
+    for `email_address`. Asserting the specific message this guard raises
+    (not just the exception type) is what actually distinguishes this
+    branch firing from the fallback path silently masking its removal.
+    """
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_CLIENT_ID", "cid")
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_CLIENT_SECRET", "csecret")
+    get_settings.cache_clear()
+    revoked_tokens: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/token":
+            body = _token_response()
+            del body["expires_in"]
+            return _json_response(body)
+        if request.url.path == "/revoke":
+            revoked_tokens.append(request.content.decode().removeprefix("token="))
+            return httpx.Response(200)
+        raise AssertionError(f"unexpected request to {request.url}")
+
+    try:
+        adapter = GmailAdapter(transport=httpx.MockTransport(handler))
+        with pytest.raises(
+            AdapterAuthorizationError, match="missing access_token/refresh_token/expires_in"
+        ):
+            adapter.handle_oauth_callback("auth-code", "state-value")
+        assert revoked_tokens == ["refresh-1"]
     finally:
         get_settings.cache_clear()
 
