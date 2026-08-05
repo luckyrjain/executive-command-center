@@ -285,7 +285,22 @@ class GmailAdapter:
             access_token = body.get("access_token")
             refresh_token = body.get("refresh_token")
             expires_in = body.get("expires_in")
-            if not access_token or not refresh_token or expires_in is None:
+            # Round 8 review: unlike `scope`/`emailAddress` (round 7), a
+            # non-string `access_token`/`refresh_token` doesn't crash
+            # anywhere in this method -- it would just get silently
+            # embedded in the `Bearer` header and JSON-serialized into the
+            # persisted credential via `_pack_credential`. Guarded anyway,
+            # for the same reason every other field in this response body
+            # already is: a non-string truthy value (a JSON number) passes
+            # the bare `if not access_token:` check the same way a non-
+            # string `emailAddress` did.
+            if (
+                not isinstance(access_token, str)
+                or not access_token
+                or not isinstance(refresh_token, str)
+                or not refresh_token
+                or expires_in is None
+            ):
                 raise AdapterAuthorizationError(
                     "Gmail token exchange response missing access_token/refresh_token/"
                     "expires_in -- a repeat consent without a fresh refresh_token, or a "

@@ -103,6 +103,12 @@ multi-round adversarial review found and required real coverage for:
     path *after* the revoke-on-reject guard already exited -- skipping
     revocation for the just-obtained grant entirely, not merely escaping
     the error envelope.
+17. A non-string `access_token`/`refresh_token` -- round 8: the only two
+    fields in the token-response body still checked only for truthiness
+    rather than type, matching `scope`/`emailAddress`'s round-7 treatment
+    for consistency (this pair never actually crashed anywhere in the
+    method, unlike those two -- a non-string value would just be silently
+    embedded in the `Bearer` header and persisted credential).
 """
 
 from __future__ import annotations
@@ -432,6 +438,61 @@ def test_handle_oauth_callback_rejects_missing_access_token(
         with pytest.raises(AdapterAuthorizationError):
             adapter.handle_oauth_callback("auth-code", "state-value")
         assert revoked_tokens == ["refresh-1"]
+    finally:
+        get_settings.cache_clear()
+
+
+def test_handle_oauth_callback_rejects_non_string_access_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A non-string truthy `access_token` (a JSON number here) would pass
+    a bare `if not access_token:` check -- round 8 review, same shape as
+    the `scope`/`emailAddress` gaps round 7 fixed, though this one never
+    actually crashed anywhere in the method (it just gets silently
+    embedded in the `Bearer` header and the persisted credential).
+    """
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_CLIENT_ID", "cid")
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_CLIENT_SECRET", "csecret")
+    get_settings.cache_clear()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/token":
+            body = _token_response()
+            body["access_token"] = 12345
+            return _json_response(body)
+        if request.url.path == "/revoke":
+            return httpx.Response(200)
+        raise AssertionError(f"unexpected request to {request.url}")
+
+    try:
+        adapter = GmailAdapter(transport=httpx.MockTransport(handler))
+        with pytest.raises(AdapterAuthorizationError):
+            adapter.handle_oauth_callback("auth-code", "state-value")
+    finally:
+        get_settings.cache_clear()
+
+
+def test_handle_oauth_callback_rejects_non_string_refresh_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Companion to the non-string `access_token` case above."""
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_CLIENT_ID", "cid")
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_CLIENT_SECRET", "csecret")
+    get_settings.cache_clear()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/token":
+            body = _token_response()
+            body["refresh_token"] = 67890
+            return _json_response(body)
+        if request.url.path == "/revoke":
+            return httpx.Response(200)
+        raise AssertionError(f"unexpected request to {request.url}")
+
+    try:
+        adapter = GmailAdapter(transport=httpx.MockTransport(handler))
+        with pytest.raises(AdapterAuthorizationError):
+            adapter.handle_oauth_callback("auth-code", "state-value")
     finally:
         get_settings.cache_clear()
 
