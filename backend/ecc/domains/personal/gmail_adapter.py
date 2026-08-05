@@ -221,46 +221,72 @@ class GmailAdapter:
         access_token = body.get("access_token")
         refresh_token = body.get("refresh_token")
         expires_in = body.get("expires_in")
-        if not access_token or not refresh_token or expires_in is None:
-            raise AdapterAuthorizationError(
-                "Gmail token exchange response missing access_token/refresh_token/expires_in "
-                "-- a repeat consent without a fresh refresh_token, or a malformed response"
-            )
-        granted_scope_str = body.get("scope", "")
-        granted = frozenset(s for s in granted_scope_str.split() if s)
-        if not REQUIRED_SCOPES.issubset(granted):
-            missing = ", ".join(sorted(REQUIRED_SCOPES - granted))
-            self._revoke_best_effort(refresh_token)
-            raise AdapterAuthorizationError(f"Gmail grant is missing required scope(s): {missing}")
-
+        # Every rejection from here on happens *after* a real, successful
+        # token exchange -- Google has already granted something, whether
+        # this method goes on to accept or reject it (even the very next
+        # check, "response missing a field," can't rule out a real
+        # `refresh_token` having come back alongside a missing/empty
+        # `access_token`). A bare per-branch `self._revoke_best_effort(...)`
+        # before each individual `raise` (this method's own first-round
+        # fix) only covers whichever branches someone remembered to add it
+        # to -- review found a real gap that shape left behind (a Gmail
+        # profile-lookup 5xx, or any other branch added here later, would
+        # have leaked a live, ECC-unrecorded grant just like the branches
+        # that *were* covered). Wrapping the whole remainder in one
+        # try/except instead makes revoke-on-reject the rule the code
+        # itself enforces, not a per-branch reminder -- no future rejection
+        # branch added inside this block can silently skip it. `refresh_
+        # token or ""` below: `_revoke_best_effort` only ever needs a
+        # non-empty token to do anything real: Google's own `/revoke` call
+        # with an empty token is a harmless, swallowed-by-design no-op
+        # (see that method's own docstring), matching the "always safe to
+        # call, only useful when there was something to revoke" contract
+        # this whole guard already relies on.
         try:
-            expires_in_seconds = float(expires_in)
-        except (TypeError, ValueError) as exc:
-            raise AdapterAuthorizationError(
-                f"Gmail token exchange returned a non-numeric expires_in: {expires_in!r}"
-            ) from exc
-        expires_at = datetime.now(UTC).timestamp() + expires_in_seconds
+            if not access_token or not refresh_token or expires_in is None:
+                raise AdapterAuthorizationError(
+                    "Gmail token exchange response missing access_token/refresh_token/"
+                    "expires_in -- a repeat consent without a fresh refresh_token, or a "
+                    "malformed response"
+                )
+            granted_scope_str = body.get("scope", "")
+            granted = frozenset(s for s in granted_scope_str.split() if s)
+            if not REQUIRED_SCOPES.issubset(granted):
+                missing = ", ".join(sorted(REQUIRED_SCOPES - granted))
+                raise AdapterAuthorizationError(
+                    f"Gmail grant is missing required scope(s): {missing}"
+                )
 
-        try:
-            profile_response = self._gmail_client.get(
-                "/gmail/v1/users/me/profile",
-                headers={"Authorization": f"Bearer {access_token}"},
-            )
-        except httpx.HTTPError as exc:
-            raise AdapterAuthorizationError(f"Gmail profile lookup failed: {exc}") from exc
-        if profile_response.status_code != 200:
-            raise AdapterAuthorizationError(
-                f"Gmail profile lookup failed with status {profile_response.status_code}"
-            )
-        email_address = profile_response.json().get("emailAddress")
-        if not email_address:
-            raise AdapterAuthorizationError("Gmail profile response missing emailAddress")
+            try:
+                expires_in_seconds = float(expires_in)
+            except (TypeError, ValueError) as exc:
+                raise AdapterAuthorizationError(
+                    f"Gmail token exchange returned a non-numeric expires_in: {expires_in!r}"
+                ) from exc
+            expires_at = datetime.now(UTC).timestamp() + expires_in_seconds
 
-        if not self.is_account_allowed(email_address):
-            self._revoke_best_effort(refresh_token)
-            raise AdapterAuthorizationError(
-                f"Gmail account {email_address!r} is not on the internal allowlist"
-            )
+            try:
+                profile_response = self._gmail_client.get(
+                    "/gmail/v1/users/me/profile",
+                    headers={"Authorization": f"Bearer {access_token}"},
+                )
+            except httpx.HTTPError as exc:
+                raise AdapterAuthorizationError(f"Gmail profile lookup failed: {exc}") from exc
+            if profile_response.status_code != 200:
+                raise AdapterAuthorizationError(
+                    f"Gmail profile lookup failed with status {profile_response.status_code}"
+                )
+            email_address = profile_response.json().get("emailAddress")
+            if not email_address:
+                raise AdapterAuthorizationError("Gmail profile response missing emailAddress")
+
+            if not self.is_account_allowed(email_address):
+                raise AdapterAuthorizationError(
+                    f"Gmail account {email_address!r} is not on the internal allowlist"
+                )
+        except Exception:
+            self._revoke_best_effort(refresh_token or "")
+            raise
 
         credential = _pack_credential(
             access_token, refresh_token, datetime.fromtimestamp(expires_at, tz=UTC)
@@ -376,17 +402,20 @@ class GmailAdapter:
         self._revoke_best_effort(credential.get("refresh_token", ""))
 
     def _revoke_best_effort(self, refresh_token: str) -> None:
-        """Shared by `disconnect` and `handle_oauth_callback`'s own two
-        post-token-exchange rejection branches (missing required scope,
-        non-allowlisted account) -- both obtain a real, live Google grant
-        before discovering the rejection, and neither ever persists a
-        `connector_accounts` row for it, so `disconnect` (which needs one)
-        can never be reached to clean it up otherwise. Without this, a
-        rejected callback would leave a standing, ECC-unrecorded OAuth
-        grant for `gmail.metadata`/`gmail.readonly` at Google that only the
-        account owner manually visiting Google's own third-party-app
-        permissions page could end -- found by review, not the original
-        implementation.
+        """Shared by `disconnect` and the single `try/except` guarding
+        every post-token-exchange rejection branch inside `handle_oauth_
+        callback` (see that method's own comment) -- each obtains a real,
+        live Google grant before discovering the rejection, and none of
+        them ever persists a `connector_accounts` row for it, so
+        `disconnect` (which needs one) can never be reached to clean it up
+        otherwise. Without this, a rejected callback would leave a
+        standing, ECC-unrecorded OAuth grant for `gmail.metadata`/`gmail.
+        readonly` at Google that only the account owner manually visiting
+        Google's own third-party-app permissions page could end -- found
+        by review (an initial fix covering only two of the six actual
+        rejection branches individually was itself a second review-found
+        gap, closed by switching to the single-guard shape instead), not
+        the original implementation.
         """
         try:
             self._oauth_client.post("/revoke", data={"token": refresh_token})

@@ -2,7 +2,9 @@
 gmail_adapter.py`, `backend/ecc/domains/personal/gmail_oauth.py`).
 
 Covers, per the implementation plan's own Task 1 test list
-(`docs/superpowers/plans/2026-08-04-phase-10-gmail-connector.md`):
+(`docs/superpowers/plans/2026-08-04-phase-10-gmail-connector.md`), plus
+several branches the plan's own list didn't enumerate but that a
+multi-round adversarial review found and required real coverage for:
 
 1. Allowlist rejects a non-listed account before any Google call
    (`GmailAdapter.is_account_allowed`, and `POST /oauth/start`'s own
@@ -10,13 +12,41 @@ Covers, per the implementation plan's own Task 1 test list
 2. Authorization-URL generation (`GmailAdapter.get_authorization_url`).
 3. Callback/code-exchange against a mocked token-endpoint response
    (`GmailAdapter.handle_oauth_callback`, and the real `GET /oauth/
-   callback` route end to end).
-4. Refresh-token renewal (`GmailAdapter.refresh_permissions`).
+   callback` route end to end), including every distinct post-exchange
+   rejection branch (missing access/refresh token, non-numeric
+   `expires_in`, missing required scope, profile-lookup network error or
+   non-200 status, missing `emailAddress`, non-allowlisted account) --
+   each asserting both the raised error and that the callback's `GET`
+   route surfaces it through the app's real error envelope
+   (`json()["error"]["code"]`, not FastAPI's bare `detail` shape).
+4. Refresh-token renewal (`GmailAdapter.refresh_permissions`), including
+   the fail-open-on-network-error case.
 5. Encrypted-field-never-returned-in-list-view (`ConnectorAccountResponse`
    never carries `encrypted_credentials`, for a `gmail` row exactly like
    any other provider).
 6. Workspace isolation (a `gmail` connector account created in one
    workspace is invisible to a session in a different workspace).
+7. CSRF `state` verification (`_verify_state`): rejects a wrong signature,
+   an expired state, and a state minted for a different session.
+8. The 422 not-configured path, both at `GmailAdapter` (missing OAuth
+   client id/secret) and at `POST /oauth/start`/`GET /oauth/callback`
+   router level.
+9. `disconnect`'s malformed-credential case (returns `None` rather than
+   raising) and its real provider-side revocation call.
+10. Revoke-on-rejection: every post-token-exchange rejection branch in
+    `handle_oauth_callback` (see item 3's list) revokes the just-obtained,
+    never-to-be-persisted Google grant via `/revoke` before raising --
+    closing a real gap review found where an incomplete, per-branch-only
+    version of this fix left 4 of 6 rejection branches leaking a live,
+    ECC-unrecorded OAuth grant. Asserted via the mocked transport's own
+    `revoked_tokens` capture, not merely "no exception raised."
+11. Reconnecting a previously disconnected/errored account reactivates the
+    existing `connector_accounts` row with the new credential (rather
+    than the naive "conflict means already connected" response silently
+    discarding it), including the `connector_account.reconnected` audit
+    event this writes.
+12. Audit-event dedup: a replayed callback (same code/state) returns the
+    same row without writing a second `connector_account.created` event.
 """
 
 from __future__ import annotations
@@ -199,16 +229,26 @@ def test_handle_oauth_callback_success(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_handle_oauth_callback_rejects_missing_refresh_token(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """No real `refresh_token` came back, so `_revoke_best_effort` is still
+    called (the revoke-on-reject guard covers this branch too -- see
+    `handle_oauth_callback`'s own comment) but with an empty string, a
+    harmless no-op at Google's end -- there is nothing to revoke, and
+    nothing crashes trying.
+    """
     monkeypatch.setenv("ECC_GMAIL_OAUTH_CLIENT_ID", "cid")
     monkeypatch.setenv("ECC_GMAIL_OAUTH_CLIENT_SECRET", "csecret")
     monkeypatch.setenv("ECC_GMAIL_OAUTH_ALLOWLIST", _ALLOWED_EMAIL)
     get_settings.cache_clear()
+    revoked_tokens: list[str] = []
     try:
         adapter = GmailAdapter(
-            transport=_oauth_transport(token_body=_token_response(refresh_token=None))
+            transport=_oauth_transport(
+                token_body=_token_response(refresh_token=None), revoked_tokens=revoked_tokens
+            )
         )
         with pytest.raises(AdapterAuthorizationError):
             adapter.handle_oauth_callback("auth-code", "state-value")
+        assert revoked_tokens == [""]
     finally:
         get_settings.cache_clear()
 
@@ -299,15 +339,25 @@ def test_handle_oauth_callback_rejects_when_not_configured(
 def test_handle_oauth_callback_rejects_missing_access_token(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """`refresh_token` did come back for real even though `access_token`
+    didn't -- confirms the revoke-on-reject guard uses the real refresh
+    token here, not an empty one (round 3 review's own scenario: the
+    guard must cover every post-token-exchange rejection, including this
+    one, which an earlier fix shape left out entirely).
+    """
     monkeypatch.setenv("ECC_GMAIL_OAUTH_CLIENT_ID", "cid")
     monkeypatch.setenv("ECC_GMAIL_OAUTH_CLIENT_SECRET", "csecret")
     get_settings.cache_clear()
+    revoked_tokens: list[str] = []
     try:
         adapter = GmailAdapter(
-            transport=_oauth_transport(token_body=_token_response(access_token=""))
+            transport=_oauth_transport(
+                token_body=_token_response(access_token=""), revoked_tokens=revoked_tokens
+            )
         )
         with pytest.raises(AdapterAuthorizationError):
             adapter.handle_oauth_callback("auth-code", "state-value")
+        assert revoked_tokens == ["refresh-1"]
     finally:
         get_settings.cache_clear()
 
@@ -318,12 +368,16 @@ def test_handle_oauth_callback_rejects_non_numeric_expires_in(
     monkeypatch.setenv("ECC_GMAIL_OAUTH_CLIENT_ID", "cid")
     monkeypatch.setenv("ECC_GMAIL_OAUTH_CLIENT_SECRET", "csecret")
     get_settings.cache_clear()
+    revoked_tokens: list[str] = []
     try:
         body = _token_response()
         body["expires_in"] = "not-a-number"
-        adapter = GmailAdapter(transport=_oauth_transport(token_body=body))
+        adapter = GmailAdapter(
+            transport=_oauth_transport(token_body=body, revoked_tokens=revoked_tokens)
+        )
         with pytest.raises(AdapterAuthorizationError):
             adapter.handle_oauth_callback("auth-code", "state-value")
+        assert revoked_tokens == ["refresh-1"]
     finally:
         get_settings.cache_clear()
 
@@ -331,13 +385,22 @@ def test_handle_oauth_callback_rejects_non_numeric_expires_in(
 def test_handle_oauth_callback_rejects_profile_lookup_error_status(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """The round-3-review-found gap this whole guard restructure exists to
+    close: a Gmail profile-lookup 5xx is a realistic, non-adversarial
+    failure mode (arguably more likely in production than a scope
+    mismatch), and the original per-branch revoke calls never covered it.
+    """
     monkeypatch.setenv("ECC_GMAIL_OAUTH_CLIENT_ID", "cid")
     monkeypatch.setenv("ECC_GMAIL_OAUTH_CLIENT_SECRET", "csecret")
     get_settings.cache_clear()
+    revoked_tokens: list[str] = []
     try:
-        adapter = GmailAdapter(transport=_oauth_transport(profile_status=500))
+        adapter = GmailAdapter(
+            transport=_oauth_transport(profile_status=500, revoked_tokens=revoked_tokens)
+        )
         with pytest.raises(AdapterAuthorizationError):
             adapter.handle_oauth_callback("auth-code", "state-value")
+        assert revoked_tokens == ["refresh-1"]
     finally:
         get_settings.cache_clear()
 
@@ -348,10 +411,14 @@ def test_handle_oauth_callback_rejects_missing_email_address(
     monkeypatch.setenv("ECC_GMAIL_OAUTH_CLIENT_ID", "cid")
     monkeypatch.setenv("ECC_GMAIL_OAUTH_CLIENT_SECRET", "csecret")
     get_settings.cache_clear()
+    revoked_tokens: list[str] = []
     try:
-        adapter = GmailAdapter(transport=_oauth_transport(profile_email=None))
+        adapter = GmailAdapter(
+            transport=_oauth_transport(profile_email=None, revoked_tokens=revoked_tokens)
+        )
         with pytest.raises(AdapterAuthorizationError):
             adapter.handle_oauth_callback("auth-code", "state-value")
+        assert revoked_tokens == ["refresh-1"]
     finally:
         get_settings.cache_clear()
 

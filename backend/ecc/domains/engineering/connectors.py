@@ -264,10 +264,19 @@ class OAuth2ConnectorAdapter(Protocol):
         returned to the caller's redirect URI) for the account identity/
         scopes this connection resolves to, mirroring `ConnectorAdapter.
         authorize`'s own return shape exactly. Raises `AdapterAuthorization
-        Error` on a rejected/expired code or a `state` value that does not
-        match what `get_authorization_url` issued -- the caller must never
-        persist a connector account from a callback whose `state` it
-        cannot verify.
+        Error` on a rejected/expired code.
+
+        `state` is accepted for symmetry with `get_authorization_url` and
+        so an implementer *could* re-verify it here, but is not required
+        to: the caller must never persist a connector account from a
+        callback whose `state` it cannot verify, and nothing prevents that
+        verification from happening entirely on the caller's own side
+        (`GmailAdapter`, this Protocol's sole implementer, does exactly
+        that -- see its own module docstring for why a per-request adapter
+        instance has no way to independently re-derive what a *separate*,
+        earlier `get_authorization_url` call issued). Whichever side
+        verifies it, the caller must never persist a connector account
+        without that verification having happened first.
         """
         ...
 
