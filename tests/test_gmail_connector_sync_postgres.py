@@ -278,6 +278,32 @@ Covers, per this task's own scope:
     `resumable_history_id` -- a bare historyId cursor (a fully-caught-up
     record boundary, or a cursor from before this fix) still parses
     correctly as the plain, no-skip case.
+28. `_parse_history_cursor` (item 27) had never had a direct unit test of
+    its own -- found by round 14 review's architecture/quality lens, the
+    same "newest, least-reviewed logic" pattern item 27 itself names, this
+    time a coverage gap rather than a livelock. Closed with seven direct
+    tests (no HTTP mocking or DB fixture, mirroring this file's own
+    `_process_message`-guard-clause tests below) covering the plain-cursor
+    case, a well-formed compound cursor, and every documented malformed-
+    state fallback. Writing them surfaced a real, if narrow, discrepancy
+    between `_parse_history_cursor`'s own docstring (malformed state --
+    "the wrong number of `:`-separated fields, or a non-integer/negative
+    record id or skip count" -- degrades to the plain-cursor fallback) and
+    its actual guard, which checked `skip_count < 0` but not the symmetric
+    `record_id < 0`: `_parse_history_cursor("100:-5:3")` returned `("100",
+    -5, 3)` as a live compound parse rather than degrading. Harmless in
+    practice (a real Gmail `history[]` record id is never negative, so a
+    negative `pending_stuck_record_id` could only come from already-
+    corrupted persisted state, and would then simply never match any real
+    record `_sync_history` walks -- equivalent in effect, though not in the
+    `list_start_history_id` value handed to `history.list`, to the
+    documented fallback), but a genuine contract violation, not merely a
+    hypothetical one. Fixed by adding the missing `record_id < 0` check.
+    Mutation-confirmed: reverting just that one condition reproduces
+    `("100", -5, 3)` and fails the new negative-record-id test for exactly
+    that reason; the other six new tests are unaffected by the same
+    revert, confirming they document already-correct behavior rather than
+    padding the count.
 """
 
 from __future__ import annotations
@@ -297,7 +323,11 @@ from ecc.config import get_settings
 from ecc.database import engine
 from ecc.domains.engineering.connectors import ConnectorAccountContext
 from ecc.domains.engineering.crypto import encrypt_credential
-from ecc.domains.personal.gmail_adapter import GmailAdapter, _pack_credential
+from ecc.domains.personal.gmail_adapter import (
+    GmailAdapter,
+    _pack_credential,
+    _parse_history_cursor,
+)
 
 settings = get_settings()
 pytestmark = pytest.mark.skipif(
@@ -1280,7 +1310,12 @@ def test_incremental_sync_falls_back_to_backfill_when_history_id_expired(
     """Gmail retains `history` for a rolling window, not indefinitely -- a
     `startHistoryId` older than that window 404s, and the only correct
     recovery is a fresh `backfill` (disclosed design decision, see
-    `_sync_history`'s own docstring)."""
+    `_sync_history`'s own `history_response.status_code == 404` branch
+    comment -- not a docstring; neither `_sync_history` nor `_sync_messages`
+    has ever had one. Round 13 review fixed this identical stale
+    cross-reference in `gmail_adapter.py`'s own module docstring (present
+    since the original Task 2 commit) but missed this file's own copy of
+    it, left stale until round 14 review)."""
     context, _owner_id = seeded_gmail_account
     calls: list[str] = []
 
@@ -2834,6 +2869,72 @@ def test_incremental_sync_makes_forward_progress_through_a_single_oversized_hist
 
     rows = _threads_and_messages(context.workspace_id)
     assert {row["external_message_id"] for row in rows} == set(message_ids)
+
+
+# --- `_parse_history_cursor`: malformed compound state degrades safely -------
+#
+# Round 14 review: `_parse_history_cursor`'s own docstring -- and its
+# module-level comment above the function -- had never had a single direct
+# unit test of its own, unlike this file's established "call the guard
+# function directly, no HTTP mocking needed" pattern already used below for
+# `_process_message`. The full-`_sync_history` integration test above
+# (`test_incremental_sync_makes_forward_progress_through_a_single_oversized_
+# history_record`) only ever exercises the well-formed compound cursor
+# `_build_history_cursor` itself produces -- never a malformed one, since
+# nothing in that test's own mocked Gmail responses can produce one. These
+# tests close that gap and, in doing so, found the docstring's own claim
+# ("a non-integer/negative record id or skip count" degrades to the plain-
+# cursor fallback) was only half true: `skip_count < 0` was checked, but the
+# symmetric `record_id < 0` case was not -- `_parse_history_cursor("100:-5:
+# 3")` returned `("100", -5, 3)` as if it were a well-formed compound
+# cursor, not the documented degrade-to-plain fallback. Harmless in
+# practice today (a real Gmail `history[]` record `id`, parsed via
+# `_coerce_int` the same way this function's own `record_id` is, is never
+# negative, so a negative `pending_stuck_record_id` could only ever
+# originate from corrupted persisted state and would then simply never
+# match any real record -- equivalent in effect, not in the `list_start_
+# history_id` value handed to `history.list`, to the documented fallback),
+# but a real, mutation-testable gap between this function's own documented
+# contract and what it actually did -- found by round 14 review. Fixed by
+# adding the missing `record_id < 0` check, symmetric with the pre-existing
+# `skip_count < 0` one.
+
+
+def test_parse_history_cursor_returns_the_plain_no_skip_case_for_a_bare_historyid() -> None:
+    assert _parse_history_cursor("12345") == ("12345", None, 0)
+
+
+def test_parse_history_cursor_parses_a_well_formed_compound_cursor() -> None:
+    assert _parse_history_cursor("100:101:2") == ("100", 101, 2)
+
+
+def test_parse_history_cursor_degrades_wrong_field_count_to_a_plain_cursor() -> None:
+    assert _parse_history_cursor("100:101") == ("100:101", None, 0)
+    assert _parse_history_cursor("100:101:2:3") == ("100:101:2:3", None, 0)
+
+
+def test_parse_history_cursor_degrades_a_non_integer_record_id_to_a_plain_cursor() -> None:
+    assert _parse_history_cursor("100:abc:2") == ("100:abc:2", None, 0)
+
+
+def test_parse_history_cursor_degrades_a_non_integer_skip_count_to_a_plain_cursor() -> None:
+    assert _parse_history_cursor("100:101:xyz") == ("100:101:xyz", None, 0)
+
+
+def test_parse_history_cursor_degrades_a_negative_skip_count_to_a_plain_cursor() -> None:
+    assert _parse_history_cursor("100:101:-2") == ("100:101:-2", None, 0)
+
+
+def test_parse_history_cursor_degrades_a_negative_record_id_to_a_plain_cursor() -> None:
+    """Round 14 review: previously returned `("100", -5, 3)` -- a live
+    (if never Gmail-reachable) `record_id`/`skip_count` pair, not the
+    documented plain-cursor fallback -- see this section's own module-level
+    comment for the full mechanism and why this is safe-in-practice but a
+    real contract violation. Mutation-confirmed: reverting the fix (dropping
+    `record_id < 0` from `_parse_history_cursor`'s own guard) makes this
+    test fail with `("100", -5, 3)` instead of the expected degraded tuple.
+    """
+    assert _parse_history_cursor("100:-5:3") == ("100:-5:3", None, 0)
 
 
 # --- _process_message guard clauses: skip gracefully, never crash ------------

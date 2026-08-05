@@ -1088,7 +1088,7 @@ def _parse_history_cursor(cursor: str) -> tuple[str, int | None, int]:
     list_start_history_id, record_id_str, skip_count_str = parts
     record_id = _coerce_int(record_id_str)
     skip_count = _coerce_int(skip_count_str)
-    if record_id is None or skip_count is None or skip_count < 0:
+    if record_id is None or record_id < 0 or skip_count is None or skip_count < 0:
         return cursor, None, 0
     return list_start_history_id, record_id, skip_count
 
