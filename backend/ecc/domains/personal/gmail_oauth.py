@@ -269,6 +269,28 @@ def gmail_oauth_callback_endpoint(
                 .one_or_none()
             )
             if existing is None:
+                # The row that caused the `IntegrityError` disappeared
+                # between the failed INSERT and this re-`SELECT`, inside
+                # the same transaction -- not currently reachable (nothing
+                # in this codebase hard-deletes a `connector_accounts` row,
+                # and Postgres guarantees the conflicting row's own
+                # transaction already committed before the `IntegrityError`
+                # fires, so the row should always still be here). Still,
+                # `authorization.credential` is a real, freshly obtained
+                # Google grant that this 409 is about to drop without ever
+                # persisting it -- round 7 review found this was the one
+                # branch of this handler not revoking the credential it
+                # discards, unlike its two siblings below. `connector_
+                # account_id` is a throwaway value: `GmailAdapter.
+                # disconnect` only reads `credential`.
+                _adapter.disconnect(
+                    ConnectorAccountContext(
+                        workspace_id=auth.workspace_id,
+                        connector_account_id=uuid4(),
+                        external_account_id=authorization.external_account_id,
+                        credential=authorization.credential,
+                    )
+                )
                 raise HTTPException(
                     status_code=409, detail="GMAIL_ACCOUNT_ALREADY_CONNECTED"
                 ) from None
