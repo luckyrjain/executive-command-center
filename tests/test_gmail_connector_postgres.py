@@ -115,36 +115,51 @@ multi-round adversarial review found and required real coverage for:
     response body still not actually rejecting a wrong-but-truthy type
     after rounds 7-8 closed the others.
 
-Round 10 found and fixed two issues outside this test file's own reach
-(see `docs/phases/phase-010/IMPLEMENTATION-STATUS.md`'s round-10 paragraph
-for the full account, since neither is reproducible through pytest's
-synchronous `TestClient` without a novel mocking pattern this codebase
-doesn't otherwise use):
-- `gmail_oauth_callback_endpoint` held its `SessionDep`'s pooled connection
-  idle across `handle_oauth_callback`'s two slow outbound Google HTTP
-  calls, unlike `create_connector_endpoint`'s own documented, identical
-  fix for the same risk -- closed with `session.close()`.
-- A non-`IntegrityError` failure during the `connector_accounts` `INSERT`
-  (a dropped connection, a deadlock, a `statement_timeout`) would have
-  orphaned the just-obtained Google grant without revoking it -- closed
-  with a sibling `except Exception:` alongside the existing `except
-  IntegrityError:`, verified via a standalone script that monkeypatches
-  `Session.execute` to raise `OperationalError` mid-transaction against
-  real Postgres.
+Rounds 10-12 all found and closed instances of the same "obtained but
+never revoked" gap in `gmail_oauth_callback_endpoint` specifically, at
+different statements within it. Round 10: a non-`IntegrityError` failure
+during the `connector_accounts` `INSERT` itself -- closed with a sibling
+`except Exception:` alongside `except IntegrityError:` (also closed, same
+round: `session.rollback()` before `handle_oauth_callback`'s two slow
+outbound Google HTTP calls held a pooled connection idle for that whole
+window instead of releasing it, unlike `create_connector_endpoint`'s own
+documented, identical fix for the same risk -- replaced with `session.
+close()`). Round 11: a failure raised from *inside* the `except
+IntegrityError:` block's own reactivation-branch write sequence is never
+caught by round 10's sibling `except Exception:` (Python's except-clause
+matching only applies to exceptions raised in the associated `try:` body)
+-- closed with a nested `try/except` scoped to that sequence. Round 12: the
+same gap in two more places round 11's narrower nested guard still didn't
+reach -- the `IntegrityError` handler's own initial re-`SELECT ... FOR
+UPDATE` (runs before any branch, so nothing has revoked anything yet), and
+the plain first-time-connect success path's own `get_connector_account`/
+`_write_side_effects` tail (a sibling of the whole `try`/`except`
+construct, guarded by neither). Round 12 restructured the `IntegrityError`
+handler into one wide `try` wrapping everything from the re-`SELECT`
+through every branch (closing the whole class at once rather than
+patching one more statement, since three rounds of "found one more
+unprotected statement" is itself evidence that approach doesn't converge),
+and added a matching guard around the success-path tail.
 
-Round 11 found the same "obtained but never revoked" gap survived in one
-more surface round 10's own fix didn't reach: the reactivation branch's
-own `UPDATE`/re-`SELECT`/audit-write sequence, which persists the *new*
-credential after the *old* one is already revoked -- a failure anywhere in
-that sequence is raised from inside the `except IntegrityError:` block
-itself, so it is never caught by the round-10 `except Exception:` sibling
-(Python's except-clause matching only applies to exceptions raised in the
-associated `try:` body). Closed with its own nested `try/except` around
-just that sequence. Also verified via a standalone script (same monkeypatch
-technique, this time failing the reactivation `UPDATE`) against real
-Postgres: the new grant is revoked, the old grant is still correctly
-revoked too, and the row rolls back cleanly to its prior state rather than
-being left half-updated.
+`test_oauth_callback_revokes_new_grant_when_insert_raises_unexpected_error`,
+`test_oauth_callback_revokes_new_grant_when_integrity_error_handler_
+reselect_raises`, and `test_oauth_callback_revokes_new_grant_when_
+reactivation_update_raises` below give the round-10/11/12 `INSERT`-, re-
+`SELECT`-, and reactivation-`UPDATE`-failure paths real pytest coverage via
+`_fail_next_matching_execute` (a `monkeypatch.setattr` on `sqlalchemy.orm.
+Session.execute` -- the same module-level-swap idiom this file already
+uses repeatedly for `_adapter`, just applied one layer lower) -- round 12
+review found the original "not practically testable" disclosure for these
+overstated once this idiom was applied. Only the `session.close()`
+connection-pool-release fix (and the now-guarded plain-success-path tail,
+which needs no synthetic failure test of its own beyond what the other
+three already exercise of the same guard shape) remains verified solely
+via a standalone script against real Postgres: a real pytest proof would
+need a blocking-adapter-plus-concurrency test (the `_SlowAdapter`/
+`threading.Event` pattern `test_engineering_connectors_postgres.py`
+already establishes) that adds real timing-flakiness risk to this CI
+environment's already-observed sensitivity to timing-based tests -- a
+deliberate trade-off, not an absence of a viable pattern.
 """
 
 from __future__ import annotations
@@ -1684,5 +1699,207 @@ def test_oauth_callback_reactivates_even_when_prior_credential_cannot_be_decrypt
             ).one()
         stored = loads(decrypt_credential(row[0]))
         assert stored["refresh_token"] == "refresh-2"
+    finally:
+        get_settings.cache_clear()
+
+
+def _fail_next_matching_execute(monkeypatch: pytest.MonkeyPatch, sql_fragment: str) -> None:
+    """Round 12 review found rounds 10-11's revoke-on-unexpected-failure
+    fixes were disclosed as "not practically testable through pytest's
+    synchronous `TestClient`" -- overstated: `monkeypatch.setattr` on a
+    SQLAlchemy internal is the exact same idiom this file already uses
+    (repeatedly) for swapping `gmail_oauth_module._adapter`, just applied
+    one layer lower. Patches `Session.execute` so the *first* call whose
+    SQL text contains `sql_fragment` raises `OperationalError`, then
+    restores real execution for everything else -- `monkeypatch`'s own
+    teardown reverts this automatically at the end of the test.
+    """
+    from sqlalchemy.exc import OperationalError
+    from sqlalchemy.orm import Session as OrmSession
+
+    original_execute = OrmSession.execute
+    state = {"raised": False}
+
+    def flaky_execute(
+        self: OrmSession, statement: object, *args: object, **kwargs: object
+    ) -> object:
+        if not state["raised"] and sql_fragment in str(statement):
+            state["raised"] = True
+            raise OperationalError("statement", {}, Exception("simulated connection drop"))
+        return original_execute(self, statement, *args, **kwargs)
+
+    monkeypatch.setattr(OrmSession, "execute", flaky_execute)
+
+
+def test_oauth_callback_revokes_new_grant_when_insert_raises_unexpected_error(
+    gmail_test_context: tuple[TestClient, UUID, UUID, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 10's fix: a non-`IntegrityError` failure during the
+    `connector_accounts` `INSERT` (a dropped connection, a deadlock, a
+    `statement_timeout`) must still revoke the just-obtained Google grant
+    rather than orphaning it. Simulates that failure directly via
+    `_fail_next_matching_execute`.
+    """
+    client, workspace_id, _user_id, token = gmail_test_context
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_ALLOWLIST", _ALLOWED_EMAIL)
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_CLIENT_ID", "cid")
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_CLIENT_SECRET", "csecret")
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_REDIRECT_URI", "https://ecc.example.test/callback")
+    get_settings.cache_clear()
+    revoked_tokens: list[str] = []
+    monkeypatch.setattr(
+        gmail_oauth_module,
+        "_adapter",
+        GmailAdapter(transport=_oauth_transport(revoked_tokens=revoked_tokens)),
+    )
+    try:
+        start_response = client.post("/api/v1/personal/gmail/oauth/start", headers=_headers(token))
+        state = httpx.URL(start_response.json()["authorization_url"]).params["state"]
+
+        _fail_next_matching_execute(monkeypatch, "INSERT INTO connector_accounts")
+        with pytest.raises(Exception):  # noqa: B017, PT011 -- the real, unhandled 500
+            client.get(
+                "/api/v1/personal/gmail/oauth/callback",
+                params={"code": "auth-code", "state": state},
+            )
+
+        assert revoked_tokens == ["refresh-1"]
+        with engine.begin() as connection:
+            count = connection.execute(
+                text("SELECT count(*) FROM connector_accounts WHERE workspace_id = :workspace_id"),
+                {"workspace_id": workspace_id},
+            ).scalar_one()
+        assert count == 0
+    finally:
+        get_settings.cache_clear()
+
+
+def test_oauth_callback_revokes_new_grant_when_integrity_error_handler_reselect_raises(
+    gmail_test_context: tuple[TestClient, UUID, UUID, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 12's fix: the `IntegrityError` handler's own re-`SELECT ...
+    FOR UPDATE` -- the very first statement inside it, before any of its
+    three branches runs -- had no revoke-on-failure guard even after
+    rounds 10-11's fixes (both scoped to statements *after* this one).
+    Simulates that failure directly. A genuinely distinct second consent
+    races an already-`active` row, so the `INSERT` really does conflict
+    and the `IntegrityError` handler really does run.
+    """
+    client, workspace_id, _user_id, token = gmail_test_context
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_ALLOWLIST", _ALLOWED_EMAIL)
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_CLIENT_ID", "cid")
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_CLIENT_SECRET", "csecret")
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_REDIRECT_URI", "https://ecc.example.test/callback")
+    get_settings.cache_clear()
+    monkeypatch.setattr(gmail_oauth_module, "_adapter", GmailAdapter(transport=_oauth_transport()))
+    try:
+        start_response = client.post("/api/v1/personal/gmail/oauth/start", headers=_headers(token))
+        state = httpx.URL(start_response.json()["authorization_url"]).params["state"]
+        first_response = client.get(
+            "/api/v1/personal/gmail/oauth/callback",
+            params={"code": "auth-code", "state": state},
+        )
+        assert first_response.status_code == 200
+
+        revoked_tokens: list[str] = []
+        monkeypatch.setattr(
+            gmail_oauth_module,
+            "_adapter",
+            GmailAdapter(
+                transport=_oauth_transport(
+                    token_body=_token_response(access_token="access-3", refresh_token="refresh-3"),
+                    revoked_tokens=revoked_tokens,
+                )
+            ),
+        )
+        second_start = client.post("/api/v1/personal/gmail/oauth/start", headers=_headers(token))
+        second_state = httpx.URL(second_start.json()["authorization_url"]).params["state"]
+
+        _fail_next_matching_execute(
+            monkeypatch, "SELECT id, status, encrypted_credentials FROM connector_accounts"
+        )
+        with pytest.raises(Exception):  # noqa: B017, PT011 -- the real, unhandled 500
+            client.get(
+                "/api/v1/personal/gmail/oauth/callback",
+                params={"code": "auth-code-3", "state": second_state},
+            )
+
+        assert revoked_tokens == ["refresh-3"]
+    finally:
+        get_settings.cache_clear()
+
+
+def test_oauth_callback_revokes_new_grant_when_reactivation_update_raises(
+    gmail_test_context: tuple[TestClient, UUID, UUID, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 11's fix: the reactivation branch's own `UPDATE`/re-`SELECT`/
+    audit-write sequence -- which persists the *new* credential after the
+    *old* one is already revoked -- had no revoke-on-failure guard of its
+    own, since a failure raised from inside `except IntegrityError:` is
+    never caught by round 10's `except Exception:` sibling. Simulates that
+    failure directly.
+    """
+    client, workspace_id, _user_id, token = gmail_test_context
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_ALLOWLIST", _ALLOWED_EMAIL)
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_CLIENT_ID", "cid")
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_CLIENT_SECRET", "csecret")
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_REDIRECT_URI", "https://ecc.example.test/callback")
+    get_settings.cache_clear()
+    monkeypatch.setattr(gmail_oauth_module, "_adapter", GmailAdapter(transport=_oauth_transport()))
+    try:
+        start_response = client.post("/api/v1/personal/gmail/oauth/start", headers=_headers(token))
+        state = httpx.URL(start_response.json()["authorization_url"]).params["state"]
+        first_response = client.get(
+            "/api/v1/personal/gmail/oauth/callback",
+            params={"code": "auth-code", "state": state},
+        )
+        assert first_response.status_code == 200
+        account_id = first_response.json()["id"]
+
+        now = datetime.now(UTC)
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    "UPDATE connector_accounts SET status = 'disconnected', "
+                    "disconnected_at = :now, updated_at = :now WHERE id = :id"
+                ),
+                {"id": account_id, "now": now},
+            )
+
+        revoked_tokens: list[str] = []
+        monkeypatch.setattr(
+            gmail_oauth_module,
+            "_adapter",
+            GmailAdapter(
+                transport=_oauth_transport(
+                    token_body=_token_response(access_token="access-2", refresh_token="refresh-2"),
+                    revoked_tokens=revoked_tokens,
+                )
+            ),
+        )
+        second_start = client.post("/api/v1/personal/gmail/oauth/start", headers=_headers(token))
+        second_state = httpx.URL(second_start.json()["authorization_url"]).params["state"]
+
+        _fail_next_matching_execute(monkeypatch, "UPDATE connector_accounts SET")
+        with pytest.raises(Exception):  # noqa: B017, PT011 -- the real, unhandled 500
+            client.get(
+                "/api/v1/personal/gmail/oauth/callback",
+                params={"code": "auth-code-2", "state": second_state},
+            )
+
+        # `refresh-1`: the old stored credential (correct, round 4/7).
+        # `refresh-2`: the new grant orphaned by the failed UPDATE (round
+        # 11 fix).
+        assert revoked_tokens == ["refresh-1", "refresh-2"]
+
+        with engine.begin() as connection:
+            row = connection.execute(
+                text("SELECT status FROM connector_accounts WHERE id = :id"),
+                {"id": account_id},
+            ).one()
+        assert row[0] == "disconnected"
     finally:
         get_settings.cache_clear()

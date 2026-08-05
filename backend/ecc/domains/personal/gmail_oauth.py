@@ -262,92 +262,91 @@ def gmail_oauth_callback_endpoint(
             # router branch. `_adapter.disconnect(...)` (best-effort, never
             # raises) is called on whichever credential is being dropped in
             # each case before returning/overwriting.
-            existing = (
-                create_session.execute(
-                    text(
-                        "SELECT id, status, encrypted_credentials FROM connector_accounts "
-                        "WHERE workspace_id = :workspace_id "
-                        "AND provider = 'gmail' AND external_account_id = :external_account_id "
-                        "FOR UPDATE"
-                    ),
-                    {
-                        "workspace_id": auth.workspace_id,
-                        "external_account_id": authorization.external_account_id,
-                    },
-                )
-                .mappings()
-                .one_or_none()
-            )
-            if existing is None:
-                # The row that caused the `IntegrityError` disappeared
-                # between the failed INSERT and this re-`SELECT`, inside
-                # the same transaction -- not currently reachable (nothing
-                # in this codebase hard-deletes a `connector_accounts` row,
-                # and Postgres guarantees the conflicting row's own
-                # transaction already committed before the `IntegrityError`
-                # fires, so the row should always still be here). Still,
-                # `authorization.credential` is a real, freshly obtained
-                # Google grant that this 409 is about to drop without ever
-                # persisting it -- round 7 review found this was the one
-                # branch of this handler not revoking the credential it
-                # discards, unlike its two siblings below. `connector_
-                # account_id` is a throwaway value: `GmailAdapter.
-                # disconnect` only reads `credential`.
-                _adapter.disconnect(
-                    ConnectorAccountContext(
-                        workspace_id=auth.workspace_id,
-                        connector_account_id=uuid4(),
-                        external_account_id=authorization.external_account_id,
-                        credential=authorization.credential,
-                    )
-                )
-                raise HTTPException(
-                    status_code=409, detail="GMAIL_ACCOUNT_ALREADY_CONNECTED"
-                ) from None
-            if existing["status"] == "active":
-                _adapter.disconnect(
-                    ConnectorAccountContext(
-                        workspace_id=auth.workspace_id,
-                        connector_account_id=existing["id"],
-                        external_account_id=authorization.external_account_id,
-                        credential=authorization.credential,
-                    )
-                )
-                account = get_connector_account(create_session, auth.workspace_id, existing["id"])
-                assert account is not None
-                return _to_response(account)
-
+            #
+            # Everything below -- the re-`SELECT`, and every branch's own
+            # further work -- is wrapped in one more `try`, closing with a
+            # single `except Exception:` that revokes `authorization.
+            # credential` before re-raising (round 12 review). This is
+            # deliberately one wide guard, not per-statement ones: rounds
+            # 7/10/11 each closed a *specific* unprotected statement here
+            # (the re-`SELECT` failing entirely still had no guard even
+            # after round 11's fix, since that fix only wrapped the
+            # reactivation branch's own follow-on writes) -- the same
+            # "found one more unprotected statement" pattern recurring
+            # three times over is itself evidence that patching statement-
+            # by-statement doesn't converge. A single guard around the
+            # whole branch closes the entire class at once: any exception
+            # raised anywhere below, before or after any branch's own more
+            # specific revoke call, still ends here. A redundant revoke
+            # call (e.g. the `active`/reactivate branches' own revokes,
+            # immediately followed by this same credential revoked again
+            # if something later in the same branch then fails) is a
+            # harmless no-op per `_revoke_best_effort`'s own contract, not
+            # a correctness concern.
             try:
-                old_credential = decrypt_credential(existing["encrypted_credentials"])
-            except Exception:  # noqa: BLE001 -- best-effort, never blocks reactivation
-                old_credential = None
-            if old_credential is not None:
-                _adapter.disconnect(
-                    ConnectorAccountContext(
-                        workspace_id=auth.workspace_id,
-                        connector_account_id=existing["id"],
-                        external_account_id=authorization.external_account_id,
-                        credential=old_credential,
+                existing = (
+                    create_session.execute(
+                        text(
+                            "SELECT id, status, encrypted_credentials FROM connector_accounts "
+                            "WHERE workspace_id = :workspace_id "
+                            "AND provider = 'gmail' AND external_account_id = :external_account_id "
+                            "FOR UPDATE"
+                        ),
+                        {
+                            "workspace_id": auth.workspace_id,
+                            "external_account_id": authorization.external_account_id,
+                        },
                     )
+                    .mappings()
+                    .one_or_none()
                 )
+                if existing is None:
+                    # The row that caused the `IntegrityError` disappeared
+                    # between the failed INSERT and this re-`SELECT`,
+                    # inside the same transaction -- not currently
+                    # reachable (nothing in this codebase hard-deletes a
+                    # `connector_accounts` row, and Postgres guarantees the
+                    # conflicting row's own transaction already committed
+                    # before the `IntegrityError` fires, so the row should
+                    # always still be here). Still, `authorization.
+                    # credential` is a real, freshly obtained Google grant
+                    # that this 409 is about to drop without ever
+                    # persisting it -- round 7 review found this was the
+                    # one branch of this handler not revoking the
+                    # credential it discards, unlike its two siblings
+                    # below.
+                    raise HTTPException(
+                        status_code=409, detail="GMAIL_ACCOUNT_ALREADY_CONNECTED"
+                    ) from None
+                if existing["status"] == "active":
+                    _adapter.disconnect(
+                        ConnectorAccountContext(
+                            workspace_id=auth.workspace_id,
+                            connector_account_id=existing["id"],
+                            external_account_id=authorization.external_account_id,
+                            credential=authorization.credential,
+                        )
+                    )
+                    account = get_connector_account(
+                        create_session, auth.workspace_id, existing["id"]
+                    )
+                    assert account is not None
+                    return _to_response(account)
 
-            # Round 11 review: this nested `try` is its own revoke-on-
-            # failure guard, distinct from the outer `except Exception:`
-            # below. Python's except-clause matching only applies to
-            # exceptions raised in the *associated* `try:` body -- once
-            # `except IntegrityError:` above started executing, nothing
-            # raised from within it (including everything below) is ever
-            # re-matched against that outer `except Exception:` sibling.
-            # Without a guard here, a failure in the `UPDATE`/re-`SELECT`/
-            # audit-write below (a dropped connection, a deadlock with a
-            # concurrent `/disable` or `/sync` holding a lock on this same
-            # row, a `statement_timeout`) would orphan `authorization.
-            # credential` -- the just-consented, valid new Google grant
-            # this whole reactivation exists to persist -- leaking it
-            # exactly like every other instance of this bug class this
-            # file has closed, in the one surface round 10's own fix
-            # didn't reach.
-            try:
+                try:
+                    old_credential = decrypt_credential(existing["encrypted_credentials"])
+                except Exception:  # noqa: BLE001 -- best-effort, never blocks reactivation
+                    old_credential = None
+                if old_credential is not None:
+                    _adapter.disconnect(
+                        ConnectorAccountContext(
+                            workspace_id=auth.workspace_id,
+                            connector_account_id=existing["id"],
+                            external_account_id=authorization.external_account_id,
+                            credential=old_credential,
+                        )
+                    )
+
                 create_session.execute(
                     text(
                         """
@@ -389,7 +388,7 @@ def gmail_oauth_callback_endpoint(
                 _adapter.disconnect(
                     ConnectorAccountContext(
                         workspace_id=auth.workspace_id,
-                        connector_account_id=existing["id"],
+                        connector_account_id=account_id,
                         external_account_id=authorization.external_account_id,
                         credential=authorization.credential,
                     )
@@ -416,16 +415,38 @@ def gmail_oauth_callback_endpoint(
             )
             raise
 
-        created = get_connector_account(create_session, auth.workspace_id, account_id)
-        assert created is not None
-        response = _to_response(created)
-        _write_side_effects(
-            create_session,
-            auth,
-            request,
-            event_type="connector_account.created",
-            aggregate_id=created.id,
-            version=created.version,
-            now=now,
-        )
-        return response
+        # Round 12 review: the `INSERT` above committed, but the row is
+        # only actually usable once the response is built and the audit
+        # event is written -- both still inside this same outer
+        # transaction. A failure in any of the four statements below
+        # (the identical dropped-connection/deadlock/`statement_timeout`
+        # classes named throughout this function) rolls the whole
+        # transaction back, undoing the `INSERT` -- the same "obtained
+        # but never revoked" bug class this whole function has closed
+        # everywhere else, reopened here because this is the one path
+        # that *persists* `authorization.credential` rather than
+        # discarding it, so nothing upstream already revoked it.
+        try:
+            created = get_connector_account(create_session, auth.workspace_id, account_id)
+            assert created is not None
+            response = _to_response(created)
+            _write_side_effects(
+                create_session,
+                auth,
+                request,
+                event_type="connector_account.created",
+                aggregate_id=created.id,
+                version=created.version,
+                now=now,
+            )
+            return response
+        except Exception:
+            _adapter.disconnect(
+                ConnectorAccountContext(
+                    workspace_id=auth.workspace_id,
+                    connector_account_id=account_id,
+                    external_account_id=authorization.external_account_id,
+                    credential=authorization.credential,
+                )
+            )
+            raise
