@@ -131,6 +131,20 @@ doesn't otherwise use):
   IntegrityError:`, verified via a standalone script that monkeypatches
   `Session.execute` to raise `OperationalError` mid-transaction against
   real Postgres.
+
+Round 11 found the same "obtained but never revoked" gap survived in one
+more surface round 10's own fix didn't reach: the reactivation branch's
+own `UPDATE`/re-`SELECT`/audit-write sequence, which persists the *new*
+credential after the *old* one is already revoked -- a failure anywhere in
+that sequence is raised from inside the `except IntegrityError:` block
+itself, so it is never caught by the round-10 `except Exception:` sibling
+(Python's except-clause matching only applies to exceptions raised in the
+associated `try:` body). Closed with its own nested `try/except` around
+just that sequence. Also verified via a standalone script (same monkeypatch
+technique, this time failing the reactivation `UPDATE`) against real
+Postgres: the new grant is revoked, the old grant is still correctly
+revoked too, and the row rolls back cleanly to its prior state rather than
+being left half-updated.
 """
 
 from __future__ import annotations

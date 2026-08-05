@@ -331,41 +331,70 @@ def gmail_oauth_callback_endpoint(
                     )
                 )
 
-            create_session.execute(
-                text(
-                    """
-                    UPDATE connector_accounts SET
-                        display_name = :display_name,
-                        granted_scopes = :granted_scopes,
-                        encrypted_credentials = :encrypted_credentials,
-                        status = 'active', status_detail = NULL, last_error = NULL,
-                        disconnected_at = NULL, updated_by = :actor_id, updated_at = :now,
-                        version = version + 1
-                    WHERE id = :id
-                    """
-                ),
-                {
-                    "id": existing["id"],
-                    "display_name": authorization.display_name,
-                    "granted_scopes": list(authorization.granted_scopes),
-                    "encrypted_credentials": encrypt_credential(authorization.credential),
-                    "actor_id": auth.user_id,
-                    "now": now,
-                },
-            )
-            reactivated = get_connector_account(create_session, auth.workspace_id, existing["id"])
-            assert reactivated is not None
-            response = _to_response(reactivated)
-            _write_side_effects(
-                create_session,
-                auth,
-                request,
-                event_type="connector_account.reconnected",
-                aggregate_id=reactivated.id,
-                version=reactivated.version,
-                now=now,
-            )
-            return response
+            # Round 11 review: this nested `try` is its own revoke-on-
+            # failure guard, distinct from the outer `except Exception:`
+            # below. Python's except-clause matching only applies to
+            # exceptions raised in the *associated* `try:` body -- once
+            # `except IntegrityError:` above started executing, nothing
+            # raised from within it (including everything below) is ever
+            # re-matched against that outer `except Exception:` sibling.
+            # Without a guard here, a failure in the `UPDATE`/re-`SELECT`/
+            # audit-write below (a dropped connection, a deadlock with a
+            # concurrent `/disable` or `/sync` holding a lock on this same
+            # row, a `statement_timeout`) would orphan `authorization.
+            # credential` -- the just-consented, valid new Google grant
+            # this whole reactivation exists to persist -- leaking it
+            # exactly like every other instance of this bug class this
+            # file has closed, in the one surface round 10's own fix
+            # didn't reach.
+            try:
+                create_session.execute(
+                    text(
+                        """
+                        UPDATE connector_accounts SET
+                            display_name = :display_name,
+                            granted_scopes = :granted_scopes,
+                            encrypted_credentials = :encrypted_credentials,
+                            status = 'active', status_detail = NULL, last_error = NULL,
+                            disconnected_at = NULL, updated_by = :actor_id, updated_at = :now,
+                            version = version + 1
+                        WHERE id = :id
+                        """
+                    ),
+                    {
+                        "id": existing["id"],
+                        "display_name": authorization.display_name,
+                        "granted_scopes": list(authorization.granted_scopes),
+                        "encrypted_credentials": encrypt_credential(authorization.credential),
+                        "actor_id": auth.user_id,
+                        "now": now,
+                    },
+                )
+                reactivated = get_connector_account(
+                    create_session, auth.workspace_id, existing["id"]
+                )
+                assert reactivated is not None
+                response = _to_response(reactivated)
+                _write_side_effects(
+                    create_session,
+                    auth,
+                    request,
+                    event_type="connector_account.reconnected",
+                    aggregate_id=reactivated.id,
+                    version=reactivated.version,
+                    now=now,
+                )
+                return response
+            except Exception:
+                _adapter.disconnect(
+                    ConnectorAccountContext(
+                        workspace_id=auth.workspace_id,
+                        connector_account_id=existing["id"],
+                        external_account_id=authorization.external_account_id,
+                        credential=authorization.credential,
+                    )
+                )
+                raise
         except Exception:
             # Anything other than `IntegrityError` here (a dropped
             # connection, a deadlock, the app's own `statement_timeout`
