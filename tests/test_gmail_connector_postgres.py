@@ -1760,7 +1760,7 @@ def test_oauth_callback_returns_422_with_error_envelope_on_missing_scope(
         get_settings.cache_clear()
 
 
-def test_oauth_callback_creates_connector_account_and_is_workspace_isolated(
+def test_oauth_callback_creates_connector_account(
     gmail_test_context: tuple[TestClient, UUID, UUID, str],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1811,14 +1811,41 @@ def test_oauth_callback_creates_connector_account_and_is_workspace_isolated(
                 {"workspace_id": workspace_id, "aggregate_id": UUID(body["id"])},
             ).scalar_one()
         assert audit_count == 1
+    finally:
+        get_settings.cache_clear()
 
-        # A reloaded callback (same code/state) must not error -- returns
-        # the already-connected account instead of a hard failure, and does
-        # not write a second audit event (the SAVEPOINT-inside-one-
-        # transaction guarantee `create_connector_endpoint` also relies on:
-        # a losing IntegrityError proves the winner's own transaction,
-        # including its audit write, already committed -- there is nothing
-        # new to record for a passive replay).
+
+def test_oauth_callback_replay_does_not_duplicate_audit_event(
+    gmail_test_context: tuple[TestClient, UUID, UUID, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A reloaded callback (same code/state) must not error -- returns the
+    already-connected account instead of a hard failure, and does not
+    write a second audit event (the SAVEPOINT-inside-one-transaction
+    guarantee `create_connector_endpoint` also relies on: a losing
+    `IntegrityError` proves the winner's own transaction, including its
+    audit write, already committed -- there is nothing new to record for a
+    passive replay).
+    """
+    client, workspace_id, _user_id, token = gmail_test_context
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_ALLOWLIST", _ALLOWED_EMAIL)
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_CLIENT_ID", "cid")
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_CLIENT_SECRET", "csecret")
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_REDIRECT_URI", "https://ecc.example.test/callback")
+    get_settings.cache_clear()
+    monkeypatch.setattr(gmail_oauth_module, "_adapter", GmailAdapter(transport=_oauth_transport()))
+    try:
+        start_response = client.post("/api/v1/personal/gmail/oauth/start", headers=_headers(token))
+        assert start_response.status_code == 200
+        state = httpx.URL(start_response.json()["authorization_url"]).params["state"]
+
+        callback_response = client.get(
+            "/api/v1/personal/gmail/oauth/callback",
+            params={"code": "auth-code", "state": state},
+        )
+        assert callback_response.status_code == 200
+        body = callback_response.json()
+
         replay_response = client.get(
             "/api/v1/personal/gmail/oauth/callback",
             params={"code": "auth-code", "state": state},
@@ -1834,9 +1861,35 @@ def test_oauth_callback_creates_connector_account_and_is_workspace_isolated(
                 {"workspace_id": workspace_id, "aggregate_id": UUID(body["id"])},
             ).scalar_one()
         assert audit_count_after_replay == 1
+    finally:
+        get_settings.cache_clear()
 
-        # Workspace isolation: a second workspace's session must not see
-        # this connector account via the generic list endpoint.
+
+def test_oauth_callback_is_workspace_isolated(
+    gmail_test_context: tuple[TestClient, UUID, UUID, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A second workspace's session must not see a connected account via
+    the generic list endpoint."""
+    client, _workspace_id, _user_id, token = gmail_test_context
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_ALLOWLIST", _ALLOWED_EMAIL)
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_CLIENT_ID", "cid")
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_CLIENT_SECRET", "csecret")
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_REDIRECT_URI", "https://ecc.example.test/callback")
+    get_settings.cache_clear()
+    monkeypatch.setattr(gmail_oauth_module, "_adapter", GmailAdapter(transport=_oauth_transport()))
+    try:
+        start_response = client.post("/api/v1/personal/gmail/oauth/start", headers=_headers(token))
+        assert start_response.status_code == 200
+        state = httpx.URL(start_response.json()["authorization_url"]).params["state"]
+
+        callback_response = client.get(
+            "/api/v1/personal/gmail/oauth/callback",
+            params={"code": "auth-code", "state": state},
+        )
+        assert callback_response.status_code == 200
+        body = callback_response.json()
+
         other_workspace_id = uuid4()
         other_user_id = uuid4()
         other_token = f"session-{uuid4()}"
