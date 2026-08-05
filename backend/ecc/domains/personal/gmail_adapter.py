@@ -218,6 +218,52 @@ _MAX_EMAIL_ADDRESS_LENGTH = 320
 # failing outright" spirit as every other bound in this file.
 _MAX_RECIPIENTS_PER_MESSAGE = 500
 
+# `_MAX_RECIPIENTS_PER_MESSAGE` bounds *downstream* cost -- the DB work
+# `_resolve_or_create_person` does per parsed recipient -- but nothing
+# before this guard bounded the cost of *parsing* the header in the first
+# place, and that parse is not free: `_to_header_has_grammar_defect`'s own
+# `HeaderRegistry` cross-check (see that function's own docstring) is a
+# from-scratch recursive-descent parser (`email._header_value_parser`)
+# that reslices its remaining input on every token consumed rather than
+# tracking an index into it -- independently profiled (`cProfile` against
+# `HeaderRegistry()("To", ...)` directly): parse time grows roughly
+# quadratically with the number of comma-separated fields in the header,
+# not merely the `RecursionError` stack-depth hazard round 6 already
+# closed for deeply *nested* comment syntax. A 2,000-address `To` header
+# costs ~0.1s of pure CPU in a single call; 8,000 addresses ~2.4s; 16,000
+# ~10s -- no crash, no exception to catch, nothing downstream of this call
+# ever runs to bound it. The same quadratic-ish cost shows up for other,
+# comma-free shapes too (a single mailbox with an extremely long
+# many-word display name, or an extremely long dot-atom domain) --
+# independently confirmed -- so a comma-count heuristic alone would not
+# close every avenue; a length cap on the whole raw header does, since
+# every shape that costs this much CPU necessarily costs that much
+# *string*. Gmail forwards a sender's raw `To` header verbatim and RFC
+# 5322 places no upper bound on a header's length; a sender fully
+# controls their own outgoing headers -- the identical "single crafted
+# message reaches unbounded synchronous cost, stalling the whole sync
+# call" resource-exhaustion class `_MAX_RECIPIENTS_PER_MESSAGE`'s own
+# comment already documents for entity-resolution DB work, found here one
+# call earlier, in the parse itself -- found by round 7 review. 50,000
+# characters is deliberately generous relative to `_MAX_RECIPIENTS_PER_
+# MESSAGE`'s own 500-recipient cap (~100 characters per recipient entry,
+# well above a typical `"Name" <address>, ` entry's real length, and still
+# well under `_MAX_EMAIL_ADDRESS_LENGTH`'s own 320-character *address*
+# bound times 500) -- no genuine message this adapter needs to parse
+# correctly is expected to approach it -- while bounding the worst
+# measured shape's cost at that length to well under a second (~0.64s,
+# independently measured) rather than leaving it unbounded. A header
+# exceeding it is treated the same as any other header this adapter
+# "can't make sense of" (see `_getaddresses_resilient`'s/`_to_header_has_
+# grammar_defect`'s own docstrings for that established contract): zero
+# recipients, dropping the message via `_process_message`'s own `if not
+# recipients: return None`, rather than spending unbounded CPU trying.
+_MAX_TO_HEADER_LENGTH = 50_000
+
+
+def _to_header_exceeds_length_limit(to_header: str) -> bool:
+    return len(to_header) > _MAX_TO_HEADER_LENGTH
+
 
 def _pack_credential(access_token: str, refresh_token: str, expires_at: datetime) -> str:
     return dumps(
@@ -664,10 +710,50 @@ def _to_header_has_grammar_defect(to_header: str) -> bool:
     recipients -- not a bypass of this cross-check's protection, since the
     collision this function guards against has no comment-nesting shape of
     its own to hide behind a `RecursionError` return value.
+
+    `AttributeError` added to the caught tuple by round 7 review -- a
+    distinct, previously-uncaught crash in the same `HeaderRegistry`
+    call, unrelated to any of the above. RFC 5322's `group` syntax
+    (`"group-name: member@example.test, other@example.test;"`) is valid
+    grammar `HeaderRegistry` otherwise parses cleanly (returning a
+    `Group` object with no member `local_part`, unlike an ordinary
+    `Mailbox` address), but a `To` header consisting of two such groups
+    -- or a group immediately followed by a bare address -- with no
+    comma between them (invalid grammar `HeaderRegistry`'s own legacy
+    `_AddressList` fallback still attempts to recover from rather than
+    reject outright) makes that recovery path treat the second group/
+    address as an errant trailing component of the first and try to read
+    `.local_part` off it, raising an uncaught `AttributeError: 'Group'
+    object has no attribute 'local_part'` from inside `HeaderRegistry.
+    __call__` itself -- independently confirmed in a standalone
+    interpreter, reproducible with as little as `"g:a@x.test;b@x.test"`
+    (no nesting, no nonstandard characters, nothing exotic). None of the
+    six exception types already caught above are raised for this input;
+    Gmail forwards a sender's raw `To` header verbatim and a sender fully
+    controls their own outgoing headers, including this syntax -- the
+    identical "single crafted message reaches an uncaught crash, aborting
+    the entire sync call, and for `incremental_sync` wedging that account
+    permanently since the cursor never advances past it" failure class
+    every other guard in this file exists to close, reached here via a
+    stdlib construction-time `AttributeError` rather than a length/NUL/
+    surrogate check or a `RecursionError`. Returning `False` here is safe
+    for the identical reason the pre-existing catches already are: it
+    defers to `_getaddresses_resilient`'s own independent parse of the
+    same header (which handles this exact group-syntax input without
+    raising -- confirmed separately -- rather than sharing this crash),
+    not a bypass of this cross-check's own protection.
     """
     try:
         defects = _TO_HEADER_REGISTRY("To", to_header).defects
-    except (UnicodeEncodeError, ValueError, TypeError, LookupError, IndexError, RecursionError):
+    except (
+        UnicodeEncodeError,
+        ValueError,
+        TypeError,
+        LookupError,
+        IndexError,
+        RecursionError,
+        AttributeError,
+    ):
         return False
     return any(isinstance(defect, InvalidHeaderDefect) for defect in defects)
 
@@ -1744,6 +1830,12 @@ class GmailAdapter:
 
         recipients: list[str] = []
         recipient_names: dict[str, str] = {}
+        # `not _to_header_exceeds_length_limit(to_header)` -- round 7
+        # review, checked first (see that function's own comment): a
+        # header long enough to trip this never reaches either parser
+        # below, closing the unbounded-CPU angle before it starts rather
+        # than after paying for it.
+        #
         # `to_header and not _to_header_has_grammar_defect(to_header)` --
         # round 4 review: `_to_header_has_grammar_defect` (see its own
         # docstring) catches a header shape `getaddresses`' own aggregate
@@ -1758,7 +1850,11 @@ class GmailAdapter:
         # share, the same "can't make sense of it -> treat as zero
         # recipients" contract `_validate_address`'s own docstring already
         # establishes for a single bad field.
-        if to_header and not _to_header_has_grammar_defect(to_header):
+        if (
+            to_header
+            and not _to_header_exceeds_length_limit(to_header)
+            and not _to_header_has_grammar_defect(to_header)
+        ):
             # `email.utils.getaddresses` (not a naive `to_header.split(",")`)
             # -- round 2 review found the naive split mis-parses a `To`
             # header whose display name itself legitimately contains a

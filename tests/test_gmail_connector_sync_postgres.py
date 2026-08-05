@@ -136,6 +136,25 @@ Covers, per this task's own scope:
     round 6 review's architecture/quality lens, mutation-confirmed by
     narrowing the guard's `except` tuple down to `RecursionError` alone
     and observing this was the only test in the file that then failed.
+21. A `To` header built of two adjacent RFC 5322 `group` constructs (or a
+    group immediately followed by a bare address) with no comma between
+    them -- invalid grammar `HeaderRegistry`'s own legacy fallback still
+    tries to recover from -- previously reached `_to_header_has_grammar_
+    defect` uncaught as an `AttributeError: 'Group' object has no
+    attribute 'local_part'`, a distinct crash from every prior stdlib
+    hazard this file has closed on this same call (not `RecursionError`,
+    not `UnicodeEncodeError`, not any of the other five caught types) --
+    found by round 7 review, dropped like any other unparseable `To`
+    header rather than crashing the whole sync call.
+22. A `To` header long enough (`_MAX_TO_HEADER_LENGTH`, 50,000 characters)
+    to make `_to_header_has_grammar_defect`'s own `HeaderRegistry`
+    cross-check cost multiple seconds of pure CPU per message (independently
+    profiled: roughly quadratic in the number of comma-separated fields,
+    reaching ~10s at 16,000 addresses) is rejected by one cheap `len(...)`
+    check before either expensive parser ever runs on it -- a resource-
+    exhaustion angle distinct from `_MAX_RECIPIENTS_PER_MESSAGE`'s own
+    downstream-DB-cost guard (which only ever runs *after* this parse would
+    already have paid its cost), found by round 7 review.
 """
 
 from __future__ import annotations
@@ -1774,6 +1793,126 @@ def test_to_header_unpaired_surrogate_does_not_crash_the_grammar_defect_check(
     assert outcome.status == "succeeded"
     assert outcome.items_processed == 1
     assert _threads_and_messages(context.workspace_id) == []
+
+
+def test_to_header_group_syntax_collision_does_not_crash_the_grammar_defect_check(
+    seeded_gmail_account: tuple[ConnectorAccountContext, UUID],
+) -> None:
+    """Round 7 review: RFC 5322's `group` syntax (`"name: member@x.test;"`)
+    is grammar `HeaderRegistry` otherwise parses cleanly, but a `To` header
+    made of two such groups -- or a group immediately followed by a bare
+    address -- with no comma between them (invalid grammar `HeaderRegistry`'s
+    own legacy fallback still attempts to recover from) makes that recovery
+    path try to read `.local_part` off a `Group` object, which doesn't have
+    one, raising an uncaught `AttributeError: 'Group' object has no
+    attribute 'local_part'` from inside `HeaderRegistry.__call__` itself --
+    independently confirmed in a standalone interpreter, reproducible with
+    as little as `"g:a@x.test;b@x.test"`. None of the six exception types
+    `_to_header_has_grammar_defect`'s `except` clause already caught
+    (`UnicodeEncodeError`/`ValueError`/`TypeError`/`LookupError`/
+    `IndexError`/`RecursionError`) are raised for this input -- the
+    identical "single crafted message reaches an uncaught crash, aborting
+    the entire sync call, and for `incremental_sync` wedging that account
+    permanently since the cursor never advances past it" failure class
+    every other guard in this file exists to close, reached here via a
+    stdlib construction-time `AttributeError` instead. Gmail forwards a
+    sender's raw `To` header verbatim and a sender fully controls their own
+    outgoing headers, including this syntax. `email.utils.getaddresses`
+    (`_getaddresses_resilient`'s own underlying call) handles this same
+    input without raising, returning its `("", "")` sentinel -- so with
+    `AttributeError` added to the caught tuple, this message ends up with
+    zero valid recipients and is safely dropped entirely, the same "can't
+    make sense of it -> treat as zero recipients" contract every other
+    unparseable-`To`-header test in this file already establishes, not a
+    crash.
+    """
+    context, _owner_id = seeded_gmail_account
+    now_ms = int(datetime.now(UTC).timestamp() * 1000)
+    body = _message_body(
+        message_id="msg-group-syntax-to",
+        thread_id="thread-group-syntax-to",
+        from_addr="alice@example.test",
+        to_addrs=["ignored -- overridden by raw_to below"],
+        internal_date_ms=now_ms,
+    )
+    body["payload"]["headers"] = [
+        {"name": "From", "value": "alice@example.test"},
+        {"name": "To", "value": "g:bob@example.test;carol@example.test"},
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/gmail/v1/users/me/messages":
+            return _json_response({"messages": [{"id": "msg-group-syntax-to"}]})
+        if request.url.path.startswith("/gmail/v1/users/me/messages/"):
+            return _json_response(body)
+        if request.url.path == "/gmail/v1/users/me/profile":
+            return _json_response({"historyId": 1})
+        raise AssertionError(f"unexpected request to {request.url}")
+
+    adapter = GmailAdapter(transport=httpx.MockTransport(handler))
+    outcome = adapter.backfill(context, "message", since=datetime.now(UTC) - timedelta(days=1))
+    assert outcome.status == "succeeded"
+    assert outcome.items_processed == 1
+    assert _threads_and_messages(context.workspace_id) == []
+    assert _resolved_person(context.workspace_id, "bob@example.test") is None
+    assert _resolved_person(context.workspace_id, "carol@example.test") is None
+
+
+def test_to_header_exceeding_length_limit_is_dropped_not_a_cpu_stall(
+    seeded_gmail_account: tuple[ConnectorAccountContext, UUID],
+) -> None:
+    """Round 7 review: `_to_header_has_grammar_defect`'s `HeaderRegistry`
+    cross-check is a from-scratch recursive-descent parser that reslices
+    its remaining input on every token consumed -- independently profiled
+    (`cProfile` against `HeaderRegistry()("To", ...)` directly) to cost
+    roughly *quadratic* CPU time in the number of comma-separated fields in
+    the header, not merely the `RecursionError` stack-depth hazard round 6
+    already closed for deeply *nested* comment syntax: a 2,000-address `To`
+    header costs ~0.1s of pure CPU in a single call, an 8,000-address one
+    ~2.4s, a 16,000-address one ~10s -- no crash, no exception, nothing
+    downstream (including `_MAX_RECIPIENTS_PER_MESSAGE`'s own cap, applied
+    only *after* this call already returned) bounds it. `_MAX_TO_HEADER_
+    LENGTH` rejects a header whose raw length already exceeds what any
+    genuine `_MAX_RECIPIENTS_PER_MESSAGE`-sized message could plausibly
+    need, via one cheap `len(...)` comparison, before either expensive
+    parser ever runs on it. This builds a `To` header of ~3,000 short,
+    individually well-formed addresses (comfortably over `_MAX_TO_HEADER_
+    LENGTH`'s 50,000-character bound, and, not incidentally, also over
+    `_MAX_RECIPIENTS_PER_MESSAGE` itself) -- with the guard, this message is
+    safely dropped (zero recipients, same "can't make sense of it" contract
+    every other unparseable-`To`-header test in this file establishes)
+    rather than the call spending unbounded CPU time parsing it. This test
+    completing at all inside pytest's own default timeout is itself part of
+    what it demonstrates.
+    """
+    context, _owner_id = seeded_gmail_account
+    now_ms = int(datetime.now(UTC).timestamp() * 1000)
+    huge_to_addrs = [f"recipient{i}@example.test" for i in range(3000)]
+    body = _message_body(
+        message_id="msg-oversized-to",
+        thread_id="thread-oversized-to",
+        from_addr="alice@example.test",
+        to_addrs=huge_to_addrs,
+        internal_date_ms=now_ms,
+    )
+    raw_to_header = ", ".join(huge_to_addrs)
+    assert len(raw_to_header) > 50_000
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/gmail/v1/users/me/messages":
+            return _json_response({"messages": [{"id": "msg-oversized-to"}]})
+        if request.url.path.startswith("/gmail/v1/users/me/messages/"):
+            return _json_response(body)
+        if request.url.path == "/gmail/v1/users/me/profile":
+            return _json_response({"historyId": 1})
+        raise AssertionError(f"unexpected request to {request.url}")
+
+    adapter = GmailAdapter(transport=httpx.MockTransport(handler))
+    outcome = adapter.backfill(context, "message", since=datetime.now(UTC) - timedelta(days=1))
+    assert outcome.status == "succeeded"
+    assert outcome.items_processed == 1
+    assert _threads_and_messages(context.workspace_id) == []
+    assert _resolved_person(context.workspace_id, "recipient0@example.test") is None
 
 
 # --- per-call message budget hit mid-page -------------------------------------
