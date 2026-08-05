@@ -14,6 +14,7 @@ from sqlalchemy.orm import Session
 
 from ecc.auth import AuthContext, AuthDep, CsrfDep
 from ecc.database import get_session
+from ecc.domains.personal.gmail_adapter import _normalize_email
 from ecc.observability import (
     queue_lifecycle_event,
     record_audit_outbox_failure,
@@ -632,11 +633,11 @@ def regenerate_attention(auth: AuthDep, session: SessionDep, _csrf: CsrfDep) -> 
         # create_person` performs at write time (re-run here at read time,
         # matching `_normalize_email`'s `.strip().casefold()` via
         # `LOWER(TRIM(...))`).
-        email_threads = (
+        email_thread_candidates = (
             session.execute(
                 text("""
                 SELECT et.id, et.owner_id, et.created_at, et.updated_at,
-                       lm.sent_at AS last_inbound_sent_at
+                       lm.sent_at AS last_inbound_sent_at, lm.sender AS last_inbound_sender
                 FROM email_threads et
                 JOIN personal_domains pd
                   ON pd.workspace_id = et.workspace_id AND pd.owner_id = et.owner_id
@@ -655,17 +656,28 @@ def regenerate_attention(auth: AuthDep, session: SessionDep, _csrf: CsrfDep) -> 
                       WHERE dc.workspace_id = et.workspace_id AND dc.owner_id = et.owner_id
                         AND dc.domain_key = 'email' AND dc.revoked_at IS NULL
                   )
-                  AND EXISTS (
-                      SELECT 1 FROM entity_aliases ea
-                      WHERE ea.workspace_id = et.workspace_id AND ea.alias_type = 'email'
-                        AND ea.normalized_value = LOWER(TRIM(lm.sender))
-                  )
             """),
                 {"workspace_id": auth.workspace_id},
             )
             .mappings()
             .all()
         )
+        known_email_aliases = {
+            row[0]
+            for row in session.execute(
+                text(
+                    "SELECT normalized_value FROM entity_aliases "
+                    "WHERE workspace_id = :workspace_id AND alias_type = 'email'"
+                ),
+                {"workspace_id": auth.workspace_id},
+            ).all()
+        }
+        email_threads = [
+            row
+            for row in email_thread_candidates
+            if _normalize_email(row["last_inbound_sender"]) in known_email_aliases
+        ]
+        eligible_email_thread_ids = [row["id"] for row in email_threads]
         session.execute(
             text(
                 """
@@ -694,35 +706,16 @@ def regenerate_attention(auth: AuthDep, session: SessionDep, _csrf: CsrfDep) -> 
                         WHERE wl.workspace_id = ai.workspace_id AND wl.id = ai.entity_id
                           AND wl.status = 'open'
                     ))
-                    OR (ai.entity_type = 'email_thread' AND NOT EXISTS (
-                        SELECT 1 FROM email_threads et
-                        JOIN personal_domains pd
-                          ON pd.workspace_id = et.workspace_id AND pd.owner_id = et.owner_id
-                          AND pd.domain_key = 'email' AND pd.enabled = true
-                        JOIN LATERAL (
-                            SELECT sender, direction
-                            FROM email_messages em
-                            WHERE em.workspace_id = et.workspace_id AND em.thread_id = et.id
-                            ORDER BY sent_at DESC
-                            LIMIT 1
-                        ) lm ON true
-                        WHERE et.workspace_id = ai.workspace_id AND et.id = ai.entity_id
-                          AND lm.direction = 'inbound'
-                          AND EXISTS (
-                              SELECT 1 FROM domain_consents dc
-                              WHERE dc.workspace_id = et.workspace_id AND dc.owner_id = et.owner_id
-                                AND dc.domain_key = 'email' AND dc.revoked_at IS NULL
-                          )
-                          AND EXISTS (
-                              SELECT 1 FROM entity_aliases ea
-                              WHERE ea.workspace_id = et.workspace_id AND ea.alias_type = 'email'
-                                AND ea.normalized_value = LOWER(TRIM(lm.sender))
-                          )
+                    OR (ai.entity_type = 'email_thread' AND NOT (
+                        ai.entity_id = ANY(CAST(:eligible_email_thread_ids AS uuid[]))
                     ))
                   )
                 """
             ),
-            {"workspace_id": auth.workspace_id},
+            {
+                "workspace_id": auth.workspace_id,
+                "eligible_email_thread_ids": eligible_email_thread_ids,
+            },
         )
         eligible_entity_types: tuple[EntityType, EntityType, EntityType] = (
             "task",

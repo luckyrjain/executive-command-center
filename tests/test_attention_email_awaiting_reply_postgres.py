@@ -25,6 +25,24 @@ Covers, per the implementation plan's own Task 3 scope:
    `test_attention_waiting_postgres.py`'s own
    `test_waiting_link_surfaces_in_attention_queue_and_ages` verifies for
    `waiting_link`.
+7. A sender whose email address contains a character where Postgres's
+   `LOWER()` and Python's `_normalize_email` (`.strip().casefold()`) do
+   not agree (the German sharp s, `ß`, which `.casefold()` expands to
+   `ss` but Postgres's `LOWER()` leaves untouched) still surfaces as
+   awaiting reply -- round 1 review finding: the eligibility query used
+   to compare `entity_aliases.normalized_value` against
+   `LOWER(TRIM(sender))` computed in SQL, which silently failed to match
+   for exactly this kind of address even though the sender genuinely
+   resolves to a known contact.
+8. A dismissed `email_thread` item stays dismissed across a subsequent
+   `regenerate_attention` call where the underlying thread hasn't
+   changed -- round 1 review finding: no existing test, for any entity
+   type, exercised `_upsert_batch`'s dismissed-state-preservation logic
+   end to end, and `email_thread`'s own `source_entity_version` is a
+   derived proxy (`email_threads.updated_at`, not a real column) rather
+   than the real optimistic-concurrency `version` every other entity
+   type has, making this the one place a bug in that derivation would
+   show up as a spurious un-dismiss.
 """
 
 from collections.abc import Iterator
@@ -519,3 +537,102 @@ def test_awaiting_reply_thread_is_pruned_once_replied(
     regenerate_again = client.post("/api/v1/attention/regenerate", headers=_headers(token), json={})
     assert regenerate_again.status_code == 200, regenerate_again.text
     assert all(i["entity_id"] != str(thread_id) for i in regenerate_again.json()["items"])
+
+
+def test_dismissed_email_thread_stays_dismissed_across_an_unchanged_regenerate(
+    email_attention_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    """`_upsert_batch`'s dismissed-state-preservation logic (shared by
+    every entity type) keeps an item dismissed only if `dismissed_
+    entity_version` still matches the freshly-recomputed `source_entity_
+    version` on the next `regenerate_attention` call -- otherwise it
+    silently un-dismisses. `email_thread` rows don't have a real
+    optimistic-concurrency `version` column to supply that value (`email_
+    threads` has none, per migration `0069`'s own deliberate design,
+    unlike `tasks`/`commitments`/`risks`/`waiting_links`), so `attention.
+    py` derives one from `email_threads.updated_at` instead -- this is
+    the one place a bug in that derivation (e.g. if it were non-
+    deterministic, or recomputed differently between calls) would show up
+    as a dismissed item spuriously reappearing. No existing test, for any
+    entity type, exercises this specific "dismiss, then regenerate again
+    with nothing changed" lifecycle -- round 1 review finding.
+    """
+    client, workspace_id, owner_id, token = email_attention_test_context
+    now = datetime.now(UTC)
+    sender = "known.contact@example.test"
+    _resolve_sender(workspace_id, sender)
+    thread_id = _seed_thread(workspace_id, owner_id, "Please dismiss me", now)
+    _seed_message(
+        workspace_id, owner_id, thread_id, sender=sender, direction="inbound", sent_at=now
+    )
+
+    regenerate = client.post("/api/v1/attention/regenerate", headers=_headers(token), json={})
+    assert regenerate.status_code == 200, regenerate.text
+    item = next(i for i in regenerate.json()["items"] if i["entity_id"] == str(thread_id))
+
+    dismiss = client.post(
+        f"/api/v1/attention/{item['id']}/dismiss", headers=_headers(token), json={}
+    )
+    assert dismiss.status_code == 200, dismiss.text
+    assert dismiss.json()["dismissed_at"] is not None
+
+    regenerate_again = client.post("/api/v1/attention/regenerate", headers=_headers(token), json={})
+    assert regenerate_again.status_code == 200, regenerate_again.text
+    assert all(i["entity_id"] != str(thread_id) for i in regenerate_again.json()["items"])
+
+    with engine.begin() as connection:
+        row = (
+            connection.execute(
+                text(
+                    "SELECT dismissed_at, dismissed_entity_version, source_entity_version "
+                    "FROM attention_items WHERE workspace_id = :workspace_id "
+                    "AND entity_type = 'email_thread' AND entity_id = :entity_id"
+                ),
+                {"workspace_id": workspace_id, "entity_id": thread_id},
+            )
+            .mappings()
+            .one()
+        )
+    assert row["dismissed_at"] is not None
+    assert row["dismissed_entity_version"] == row["source_entity_version"]
+
+
+def test_inbound_thread_from_casefold_divergent_sender_surfaces_as_awaiting_reply(
+    email_attention_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    """Round 1 review finding: `regenerate_attention`'s own eligibility
+    query used to resolve the last inbound message's sender against
+    `entity_aliases` via SQL `ea.normalized_value = LOWER(TRIM(lm.sender))`
+    -- but Postgres's `LOWER()` and Python's `_normalize_email`
+    (`.strip().casefold()`, what actually wrote every `entity_aliases.
+    normalized_value` row) are not the same function. `'straße@example.
+    test'.strip().casefold()` expands the German sharp s to `'strasse@
+    example.test'` (Unicode full case folding's own special-cased
+    mapping); Postgres's `LOWER('straße@example.test')` leaves the ß
+    unchanged, confirmed directly against this database's own collation
+    (`SELECT LOWER('ß')` = `'ß'`, not `'ss'`). A real contact who has
+    already been resolved into `pkos_nodes` (their normalized alias is
+    `'strasse@example.test'`, exactly as `_resolve_or_create_person`
+    would have written it) sending a message from the literal address
+    `'straße@example.test'` must still surface as awaiting reply --
+    before the fix, the SQL-side `LOWER(TRIM(...))` comparison silently
+    failed to match, and this thread never appeared.
+    """
+    client, workspace_id, owner_id, token = email_attention_test_context
+    now = datetime.now(UTC)
+    resolved_email = "straße@example.test"
+    _resolve_sender(workspace_id, resolved_email)
+    thread_id = _seed_thread(workspace_id, owner_id, "Unicode sender", now)
+    # Same raw address as resolved above, sent verbatim as the message's own
+    # `sender` -- exactly as `gmail_adapter.py` would store the parsed
+    # `From` header's email address, unnormalized.
+    _seed_message(
+        workspace_id, owner_id, thread_id, sender=resolved_email, direction="inbound", sent_at=now
+    )
+
+    regenerate = client.post("/api/v1/attention/regenerate", headers=_headers(token), json={})
+    assert regenerate.status_code == 200, regenerate.text
+    item = next(i for i in regenerate.json()["items"] if i["entity_id"] == str(thread_id))
+    assert item["entity_type"] == "email_thread"
+    factor_codes = {f["code"] for f in item["factors"]}
+    assert "awaiting_reply" in factor_codes
