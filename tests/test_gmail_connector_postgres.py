@@ -219,8 +219,10 @@ uses repeatedly for `_adapter`, just applied one layer lower).
 
 from __future__ import annotations
 
+import threading
 from base64 import urlsafe_b64encode
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from hmac import new
@@ -1983,6 +1985,101 @@ def test_oauth_callback_revokes_the_discarded_grant_when_racing_an_active_row(
         stored = loads(decrypt_credential(row[0]))
         assert stored["access_token"] == "access-1"
         assert stored["refresh_token"] == "refresh-1"
+    finally:
+        get_settings.cache_clear()
+
+
+def test_oauth_callback_releases_pool_connection_and_row_lock_before_revoking(
+    gmail_test_context: tuple[TestClient, UUID, UUID, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 23 review: every `_adapter.disconnect(...)` call inside
+    `gmail_oauth_callback_endpoint`'s `IntegrityError` handler used to run
+    while `create_session`'s transaction was still open -- for the
+    `active`-row branch below, specifically while still holding the
+    re-`SELECT ... FOR UPDATE` lock taken on the row. `GmailAdapter.
+    disconnect()` is the first `disconnect()` in this registry to make a
+    real, blocking outbound HTTPS call, so this held both a pooled
+    connection and a row lock for up to `timeout_seconds=10.0` on the
+    exact "two browser tabs" race `test_oauth_callback_revokes_the_
+    discarded_grant_when_racing_an_active_row` above already proves
+    correct -- just never checked for *how long* it held the lock while
+    doing so. Reproduces that same scenario, but with the losing
+    consent's `/revoke` call blocked on an `Event`: while blocked, a
+    concurrent raw `SELECT ... FOR UPDATE NOWAIT` on the same row must
+    succeed immediately (proving `create_session` already closed) rather
+    than raise `LockNotAvailable`.
+    """
+    client, _workspace_id, _user_id, token = gmail_test_context
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_ALLOWLIST", _ALLOWED_EMAIL)
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_CLIENT_ID", "cid")
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_CLIENT_SECRET", "csecret")
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_REDIRECT_URI", "https://ecc.example.test/callback")
+    get_settings.cache_clear()
+    monkeypatch.setattr(gmail_oauth_module, "_adapter", GmailAdapter(transport=_oauth_transport()))
+    try:
+        start_response = client.post("/api/v1/personal/gmail/oauth/start", headers=_headers(token))
+        state = httpx.URL(start_response.json()["authorization_url"]).params["state"]
+        first_response = client.get(
+            "/api/v1/personal/gmail/oauth/callback",
+            params={"code": "auth-code", "state": state},
+        )
+        assert first_response.status_code == 200
+        account_id = first_response.json()["id"]
+
+        entered_disconnect = threading.Event()
+        unblock = threading.Event()
+
+        class _BlockingAdapter(GmailAdapter):
+            def disconnect(self, account: ConnectorAccountContext) -> None:
+                entered_disconnect.set()
+                unblock.wait(timeout=5)
+                super().disconnect(account)
+
+        revoked_tokens: list[str] = []
+        monkeypatch.setattr(
+            gmail_oauth_module,
+            "_adapter",
+            _BlockingAdapter(
+                transport=_oauth_transport(
+                    token_body=_token_response(access_token="access-4", refresh_token="refresh-4"),
+                    revoked_tokens=revoked_tokens,
+                )
+            ),
+        )
+        second_start = client.post("/api/v1/personal/gmail/oauth/start", headers=_headers(token))
+        second_state = httpx.URL(second_start.json()["authorization_url"]).params["state"]
+
+        def _second_callback() -> Any:
+            return client.get(
+                "/api/v1/personal/gmail/oauth/callback",
+                params={"code": "auth-code-4", "state": second_state},
+            )
+
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(_second_callback)
+            assert entered_disconnect.wait(timeout=5), "disconnect() never entered"
+
+            with engine.connect() as probe:
+                probe.execution_options(isolation_level="AUTOCOMMIT")
+                probe.execute(text("SET statement_timeout = '2s'"))
+                row = (
+                    probe.execute(
+                        text("SELECT id FROM connector_accounts WHERE id = :id FOR UPDATE NOWAIT"),
+                        {"id": UUID(account_id)},
+                    )
+                    .mappings()
+                    .one()
+                )
+                assert str(row["id"]) == account_id
+                probe.rollback()
+
+            unblock.set()
+            second_response = future.result(timeout=5)
+
+        assert second_response.status_code == 200
+        assert second_response.json()["id"] == account_id
+        assert revoked_tokens == ["refresh-4"]
     finally:
         get_settings.cache_clear()
 
