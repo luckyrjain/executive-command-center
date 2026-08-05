@@ -291,8 +291,19 @@ class GmailAdapter:
                     "expires_in -- a repeat consent without a fresh refresh_token, or a "
                     "malformed response"
                 )
-            granted_scope_str = body.get("scope", "")
-            granted = frozenset(s for s in granted_scope_str.split() if s)
+            # `body.get("scope", "")`'s default only applies when the key is
+            # *absent* -- a response with `"scope": null` (key present,
+            # value `None`) would still reach `.split()` and raise an
+            # uncaught `AttributeError` (round 7 review: the same "shape
+            # trusted without validation" gap rounds 5-6 closed for
+            # `_unpack_credential` and the response bodies themselves, one
+            # field deeper).
+            raw_scope = body.get("scope")
+            if raw_scope is not None and not isinstance(raw_scope, str):
+                raise AdapterAuthorizationError(
+                    f"Gmail token exchange returned a non-string scope: {raw_scope!r}"
+                )
+            granted = frozenset(s for s in (raw_scope or "").split() if s)
             if not REQUIRED_SCOPES.issubset(granted):
                 missing = ", ".join(sorted(REQUIRED_SCOPES - granted))
                 raise AdapterAuthorizationError(
@@ -330,7 +341,11 @@ class GmailAdapter:
                     f"{type(profile_body).__name__}"
                 )
             email_address = profile_body.get("emailAddress")
-            if not email_address:
+            # A non-string truthy value (e.g. a JSON number) would pass a
+            # bare `if not email_address:` check and then raise an uncaught
+            # `AttributeError` inside `is_account_allowed`'s own `.strip()`
+            # call below -- round 7 review, same gap class as `scope` above.
+            if not isinstance(email_address, str) or not email_address:
                 raise AdapterAuthorizationError("Gmail profile response missing emailAddress")
 
             if not self.is_account_allowed(email_address):

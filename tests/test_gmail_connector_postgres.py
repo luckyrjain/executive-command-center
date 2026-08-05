@@ -63,13 +63,27 @@ multi-round adversarial review found and required real coverage for:
     trusted without validation, ahead of the revoke-on-reject guard for
     the token response specifically, so an atypical 200 body would have
     both skipped revocation and escaped as an uncaught exception type the
-    router's `AdapterAuthorizationError`-only catch does not handle.
+    router's `AdapterAuthorizationError`-only catch does not handle. All
+    four cells of the {non-JSON, non-object} x {token, profile} matrix are
+    covered (round 7 review found the non-JSON-profile cell was actually
+    still missing despite this item's own "either endpoint" claim at the
+    time -- added, closing the gap between what this docstring said and
+    what the file actually tested).
 14. `authorize`'s unconditional raise (never called in production --
     `gmail` connects exclusively through `get_authorization_url`/
     `handle_oauth_callback`); `_unpack_credential`'s shape-validation
     `TypeError` branch (round 5) reached through `refresh_permissions`/
     `disconnect`, not just the raw function in isolation -- both round 6:
     self-evidently-correct code that had no test at all before.
+15. A `"scope": null` token-exchange response, and a non-string
+    `emailAddress` in the profile response -- round 7: two fields that,
+    unlike every sibling field in the same two response bodies, had no
+    type guard before use (`body.get("scope", "")`'s default only applies
+    when the key is *absent*, not when present with a `null` value; a
+    bare `if not email_address:` passes a non-empty non-string value like
+    a JSON number). Both previously raised an uncaught `AttributeError`
+    on the very next line (`.split()`, `is_account_allowed`'s `.strip()`)
+    instead of the intended `AdapterAuthorizationError`.
 """
 
 from __future__ import annotations
@@ -597,6 +611,109 @@ def test_handle_oauth_callback_rejects_non_object_profile_response(
             return _json_response(_token_response())
         if request.url.path == "/gmail/v1/users/me/profile":
             return _json_response(None)
+        if request.url.path == "/revoke":
+            revoked_tokens.append(request.content.decode().removeprefix("token="))
+            return httpx.Response(200)
+        raise AssertionError(f"unexpected request to {request.url}")
+
+    try:
+        adapter = GmailAdapter(transport=httpx.MockTransport(handler))
+        with pytest.raises(AdapterAuthorizationError):
+            adapter.handle_oauth_callback("auth-code", "state-value")
+        assert revoked_tokens == ["refresh-1"]
+    finally:
+        get_settings.cache_clear()
+
+
+def test_handle_oauth_callback_rejects_non_json_profile_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The fourth cell of the {non-JSON, non-object} x {token, profile}
+    response-shape matrix -- round 6 added the other three
+    (`test_handle_oauth_callback_rejects_non_json_token_response`,
+    `..._non_object_token_response`, `..._non_object_profile_response`)
+    but round 7 review found this one was missing despite the module
+    docstring and IMPLEMENTATION-STATUS.md both already claiming "either
+    Google endpoint" was covered. The code itself was already correct
+    (`gmail_adapter.py`'s profile-lookup body parsing wraps `ValueError`
+    exactly like the token response does) -- this closes the doc/test-
+    completeness gap, not a functional bug.
+    """
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_CLIENT_ID", "cid")
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_CLIENT_SECRET", "csecret")
+    get_settings.cache_clear()
+    revoked_tokens: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/token":
+            return _json_response(_token_response())
+        if request.url.path == "/gmail/v1/users/me/profile":
+            return httpx.Response(
+                status_code=200, headers={"content-type": "application/json"}, content=b"not json"
+            )
+        if request.url.path == "/revoke":
+            revoked_tokens.append(request.content.decode().removeprefix("token="))
+            return httpx.Response(200)
+        raise AssertionError(f"unexpected request to {request.url}")
+
+    try:
+        adapter = GmailAdapter(transport=httpx.MockTransport(handler))
+        with pytest.raises(AdapterAuthorizationError):
+            adapter.handle_oauth_callback("auth-code", "state-value")
+        assert revoked_tokens == ["refresh-1"]
+    finally:
+        get_settings.cache_clear()
+
+
+def test_handle_oauth_callback_rejects_null_scope(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`body.get("scope", "")`'s default only applies when the key is
+    absent -- a `"scope": null` response (key present, value `None`)
+    previously reached `.split()` and raised an uncaught `AttributeError`.
+    Round 7 review found this exact gap.
+    """
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_CLIENT_ID", "cid")
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_CLIENT_SECRET", "csecret")
+    get_settings.cache_clear()
+    revoked_tokens: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/token":
+            body = _token_response()
+            body["scope"] = None
+            return _json_response(body)
+        if request.url.path == "/revoke":
+            revoked_tokens.append(request.content.decode().removeprefix("token="))
+            return httpx.Response(200)
+        raise AssertionError(f"unexpected request to {request.url}")
+
+    try:
+        adapter = GmailAdapter(transport=httpx.MockTransport(handler))
+        with pytest.raises(AdapterAuthorizationError):
+            adapter.handle_oauth_callback("auth-code", "state-value")
+        assert revoked_tokens == ["refresh-1"]
+    finally:
+        get_settings.cache_clear()
+
+
+def test_handle_oauth_callback_rejects_non_string_email_address(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A non-string truthy `emailAddress` (a JSON number here) would pass
+    a bare `if not email_address:` check and then raise an uncaught
+    `AttributeError` inside `is_account_allowed`'s own `.strip()` call.
+    Round 7 review found this exact gap, the same shape as the `scope`
+    case above.
+    """
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_CLIENT_ID", "cid")
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_CLIENT_SECRET", "csecret")
+    get_settings.cache_clear()
+    revoked_tokens: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/token":
+            return _json_response(_token_response())
+        if request.url.path == "/gmail/v1/users/me/profile":
+            return _json_response({"emailAddress": 12345})
         if request.url.path == "/revoke":
             revoked_tokens.append(request.content.decode().removeprefix("token="))
             return httpx.Response(200)
