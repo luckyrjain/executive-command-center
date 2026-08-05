@@ -83,6 +83,7 @@ def _oauth_transport(
     token_status: int = 200,
     profile_email: str | None = _ALLOWED_EMAIL,
     profile_status: int = 200,
+    revoked_tokens: list[str] | None = None,
 ) -> httpx.MockTransport:
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/token":
@@ -92,6 +93,12 @@ def _oauth_transport(
             if profile_status != 200:
                 return _json_response({}, status_code=profile_status)
             return _json_response({"emailAddress": profile_email})
+        if request.url.path == "/revoke":
+            if revoked_tokens is not None:
+                # POSTed as a urlencoded form body (`token=...`), not query
+                # params -- parse the same way the real endpoint receives it.
+                revoked_tokens.append(request.content.decode().removeprefix("token="))
+            return httpx.Response(200)
         raise AssertionError(f"unexpected request to {request.url}")
 
     return httpx.MockTransport(handler)
@@ -209,18 +216,27 @@ def test_handle_oauth_callback_rejects_missing_refresh_token(
 def test_handle_oauth_callback_rejects_missing_required_scope(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Also asserts the just-exchanged token is revoked rather than left as
+    a standing, ECC-unrecorded grant at Google -- this rejection happens
+    only after a real, successful token exchange, so nothing else would
+    ever clean it up (`disconnect` requires a `connector_accounts` row,
+    which a rejected callback never creates). Found by review.
+    """
     monkeypatch.setenv("ECC_GMAIL_OAUTH_CLIENT_ID", "cid")
     monkeypatch.setenv("ECC_GMAIL_OAUTH_CLIENT_SECRET", "csecret")
     monkeypatch.setenv("ECC_GMAIL_OAUTH_ALLOWLIST", _ALLOWED_EMAIL)
     get_settings.cache_clear()
+    revoked_tokens: list[str] = []
     try:
         adapter = GmailAdapter(
             transport=_oauth_transport(
-                token_body=_token_response(scope="https://www.googleapis.com/auth/gmail.metadata")
+                token_body=_token_response(scope="https://www.googleapis.com/auth/gmail.metadata"),
+                revoked_tokens=revoked_tokens,
             )
         )
         with pytest.raises(AdapterAuthorizationError):
             adapter.handle_oauth_callback("auth-code", "state-value")
+        assert revoked_tokens == ["refresh-1"]
     finally:
         get_settings.cache_clear()
 
@@ -242,14 +258,26 @@ def test_handle_oauth_callback_rejects_token_endpoint_error(
 def test_handle_oauth_callback_rejects_non_allowlisted_account(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Also asserts the just-exchanged token is revoked -- see the
+    identical note on `test_handle_oauth_callback_rejects_missing_
+    required_scope`. This is the more realistic trigger of the two: the
+    two-layer allowlist design (design doc Decision 3) exists specifically
+    to catch an ECC-allowlisted caller who authorizes a *different*,
+    non-allowlisted Google account at the consent screen -- exactly the
+    scenario this test exercises.
+    """
     monkeypatch.setenv("ECC_GMAIL_OAUTH_CLIENT_ID", "cid")
     monkeypatch.setenv("ECC_GMAIL_OAUTH_CLIENT_SECRET", "csecret")
     monkeypatch.setenv("ECC_GMAIL_OAUTH_ALLOWLIST", "someone-else@example.test")
     get_settings.cache_clear()
+    revoked_tokens: list[str] = []
     try:
-        adapter = GmailAdapter(transport=_oauth_transport(profile_email=_ALLOWED_EMAIL))
+        adapter = GmailAdapter(
+            transport=_oauth_transport(profile_email=_ALLOWED_EMAIL, revoked_tokens=revoked_tokens)
+        )
         with pytest.raises(AdapterAuthorizationError):
             adapter.handle_oauth_callback("auth-code", "state-value")
+        assert revoked_tokens == ["refresh-1"]
     finally:
         get_settings.cache_clear()
 

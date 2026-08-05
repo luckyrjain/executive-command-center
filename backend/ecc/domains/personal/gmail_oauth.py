@@ -38,11 +38,16 @@ login implies).
 a browser-driven OAuth redirect cannot attach a custom request header, and
 Google's own authorization `code` is single-use regardless (a genuine
 client-side retry-with-same-key scenario, the mechanism `Idempotency-Key`
-exists for, cannot occur here the same way). A reloaded/duplicated callback
-request (e.g. browser back-button) instead hits `uq_connector_accounts_
-workspace_provider_external_id` and is handled by returning the
-already-connected account's own current state rather than a hard `409` --
-appropriate for a passive page-reload, not a client retry protocol.
+exists for, cannot occur here the same way -- a literal same-`code` replay,
+e.g. a browser back-button reload, fails earlier, at Google's own token
+endpoint, and never reaches the `INSERT` below at all). What *does* reach
+`uq_connector_accounts_workspace_provider_external_id` is two genuinely
+distinct, successfully-exchanged consent completions for the same Google
+account racing each other (two browser tabs; a reconnect attempt started
+before a prior one's response arrived) -- handled by returning the
+already-connected account's own current state rather than a hard `409`
+(see the `IntegrityError` handler's own docstring below for the second,
+non-`active`-status case this same branch also handles).
 """
 
 from __future__ import annotations
@@ -215,10 +220,12 @@ def gmail_oauth_callback_endpoint(
         except IntegrityError:
             # `uq_connector_accounts_workspace_provider_external_id` already
             # has a row for this exact Google account -- two real cases,
-            # not one. (1) A reloaded/duplicated callback request for a
-            # still-`active` row (see module docstring): a passive
-            # page-reload, not a client retry that "earned" a fresh
-            # response -- return the existing row's current state as-is.
+            # not one. (1) Two distinct, successfully-exchanged consent
+            # completions for the same account racing each other (see
+            # module docstring for why a literal same-`code` replay cannot
+            # reach here at all) while the row is still `active`: return
+            # the existing row's current state as-is -- there is nothing
+            # new to record.
             # (2) The row is `disconnected`/`permission_lost`/`error`/
             # `rate_limited` -- the user just completed a real Google
             # consent flow and `authorization` above holds a freshly

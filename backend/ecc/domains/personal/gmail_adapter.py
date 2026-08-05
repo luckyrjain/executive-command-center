@@ -230,6 +230,7 @@ class GmailAdapter:
         granted = frozenset(s for s in granted_scope_str.split() if s)
         if not REQUIRED_SCOPES.issubset(granted):
             missing = ", ".join(sorted(REQUIRED_SCOPES - granted))
+            self._revoke_best_effort(refresh_token)
             raise AdapterAuthorizationError(f"Gmail grant is missing required scope(s): {missing}")
 
         try:
@@ -256,6 +257,7 @@ class GmailAdapter:
             raise AdapterAuthorizationError("Gmail profile response missing emailAddress")
 
         if not self.is_account_allowed(email_address):
+            self._revoke_best_effort(refresh_token)
             raise AdapterAuthorizationError(
                 f"Gmail account {email_address!r} is not on the internal allowlist"
             )
@@ -371,8 +373,23 @@ class GmailAdapter:
             credential = _unpack_credential(account.credential)
         except (ValueError, TypeError):
             return None
+        self._revoke_best_effort(credential.get("refresh_token", ""))
+
+    def _revoke_best_effort(self, refresh_token: str) -> None:
+        """Shared by `disconnect` and `handle_oauth_callback`'s own two
+        post-token-exchange rejection branches (missing required scope,
+        non-allowlisted account) -- both obtain a real, live Google grant
+        before discovering the rejection, and neither ever persists a
+        `connector_accounts` row for it, so `disconnect` (which needs one)
+        can never be reached to clean it up otherwise. Without this, a
+        rejected callback would leave a standing, ECC-unrecorded OAuth
+        grant for `gmail.metadata`/`gmail.readonly` at Google that only the
+        account owner manually visiting Google's own third-party-app
+        permissions page could end -- found by review, not the original
+        implementation.
+        """
         try:
-            self._oauth_client.post("/revoke", data={"token": credential.get("refresh_token", "")})
+            self._oauth_client.post("/revoke", data={"token": refresh_token})
         except httpx.HTTPError:
             pass
         return None
