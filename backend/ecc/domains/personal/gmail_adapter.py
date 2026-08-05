@@ -1964,14 +1964,60 @@ class GmailAdapter:
             source_ref = f"gmail:{message_id}"
             participants: dict[str, str] = {sender_email: sender_name, **recipient_names}
             for participant_email, participant_name in participants.items():
-                _resolve_or_create_person(
-                    workspace_id=workspace_id,
-                    owner_id=owner_id,
-                    email=participant_email,
-                    display_name=participant_name,
-                    source_ref=source_ref,
-                    now=now,
-                )
+                # `except Exception` -- round 9 review: `_insert_message_if_new`
+                # above already committed the `email_messages`/`email_threads`
+                # write in its own transaction, closed before this loop even
+                # starts (see `_resolve_or_create_person`'s own docstring for
+                # why entity resolution is deliberately a *separate*
+                # transaction per participant, not reused from that write).
+                # An uncaught failure here -- a transient one (a deadlock, a
+                # dropped connection, the app's own `statement_timeout` under
+                # load; none of this requires a malformed message, unlike
+                # every other guard in this file) as much as an unexpected
+                # one -- previously propagated straight out of
+                # `_process_message`, uncaught by either call site in `_sync_
+                # messages`/`_sync_history`, aborting the *entire* sync call:
+                # every message still queued behind this one in the same
+                # call, not merely this one message's own remaining
+                # participants, went unprocessed -- and for `incremental_
+                # sync`, since no `return` past this point was ever reached,
+                # `next_cursor` never advanced, so the identical failure
+                # would repeat on every subsequent call, wedging that
+                # connector account exactly like every uncaught-crash finding
+                # in this file's own review history. Worse than those: once
+                # the transient condition clears and a retry succeeds in
+                # reaching this message again, `_insert_message_if_new`'s own
+                # `ON CONFLICT DO NOTHING` returns `None` (the row already
+                # exists from the *first*, crashed attempt) -- so this whole
+                # `if inserted_id is not None:` block, including every
+                # participant that failed to resolve the first time, is
+                # skipped on every future call, forever. The message row
+                # exists, `sync` reports `"succeeded"`, and nothing anywhere
+                # signals that one of its participants was never linked into
+                # `pkos_nodes` -- silent, permanent data loss in the entity
+                # graph, indistinguishable from a message with a genuinely
+                # sender-only/no-op participant set, found by review (not
+                # part of the original implementation). Caught the same way
+                # every other single-item failure in this file is: skip only
+                # this one participant's link and keep going, isolating the
+                # blast radius to "this message-participant pair is missing
+                # from the entity graph" (the person themselves still gets
+                # resolved the next time *any* other message names them, so
+                # this is not a permanent loss of the entity, only of this
+                # one message's own evidence of them) rather than the crash
+                # cascading into every other message and account still
+                # waiting in this call.
+                try:
+                    _resolve_or_create_person(
+                        workspace_id=workspace_id,
+                        owner_id=owner_id,
+                        email=participant_email,
+                        display_name=participant_name,
+                        source_ref=source_ref,
+                        now=now,
+                    )
+                except Exception:
+                    continue
 
         return history_id
 

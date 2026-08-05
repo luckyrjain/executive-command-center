@@ -155,6 +155,24 @@ Covers, per this task's own scope:
     exhaustion angle distinct from `_MAX_RECIPIENTS_PER_MESSAGE`'s own
     downstream-DB-cost guard (which only ever runs *after* this parse would
     already have paid its cost), found by round 7 review.
+23. A failure resolving one participant into `pkos_nodes`
+    (`_resolve_or_create_person` raising -- realistically a transient DB
+    error, not malformed input; unlike every prior finding in this file,
+    reachable with no crafted header at all) previously propagated
+    uncaught out of `_process_message`, aborting the entire sync call --
+    stranding every message still queued behind it in the same call, and
+    for `incremental_sync`, wedging that connector account permanently
+    since the cursor never advanced past it. Worse: because `_insert_
+    message_if_new`'s `ON CONFLICT DO NOTHING` had already committed the
+    message row in its own, separate transaction before the failure, a
+    later retry found the message already existed and silently skipped
+    entity resolution for it entirely -- permanent, silent data loss in
+    the entity graph, with the sync call itself reporting `"succeeded"`.
+    Found by round 9 review; caught per-participant so one failure is
+    isolated to that one message-participant pair (the person entity
+    itself is not permanently lost -- a later message naming the same
+    participant still resolves them normally) rather than cascading into
+    every other message and account still queued in the same call.
 """
 
 from __future__ import annotations
@@ -536,6 +554,173 @@ def test_backfill_empty_window_seeds_next_cursor_from_profile(
     assert outcome.status == "succeeded"
     assert outcome.items_processed == 0
     assert outcome.next_cursor == "555"
+
+
+# --- entity resolution: one participant's failure must not crash the call ----
+
+
+def test_participant_resolution_failure_does_not_crash_the_sync_call(
+    seeded_gmail_account: tuple[ConnectorAccountContext, UUID],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 9 review: `_insert_message_if_new` commits the `email_
+    messages`/`email_threads` write in its own transaction, closed before
+    `_process_message`'s participant-resolution loop even starts (`_resolve_
+    or_create_person` deliberately opens a separate transaction per
+    participant -- see that function's own docstring). Previously, an
+    uncaught exception from *any* participant's `_resolve_or_create_person`
+    call -- a transient one (a deadlock, a dropped connection, the app's own
+    `statement_timeout`; unlike every other guard in this file, this needs
+    no malformed input at all) as much as an unexpected one -- propagated
+    straight out of `_process_message`, aborting the *entire* sync call:
+    every message still queued behind this one in the same call went
+    unprocessed, not merely this one message's own remaining participants.
+
+    This test proves the narrower, message-scoped half: a mid-loop failure
+    resolving one participant of one message must not prevent a *second*,
+    independent message (with entirely different participants) processed
+    later in the *same* call from being written and resolved normally --
+    `msg-2`'s handler raises `AssertionError` if it is ever skipped, so a
+    regression to the pre-fix uncaught-crash behavior fails this test with
+    that assertion rather than merely an unmet post-condition.
+    `test_participant_resolution_failure_still_resolves_other_participants_
+    of_the_same_message` (below) covers the second half: the *other*
+    participants of the *same* message as the failing one are still
+    resolved, not dropped alongside it.
+    """
+    import ecc.domains.personal.gmail_adapter as gmail_adapter_module
+
+    context, _owner_id = seeded_gmail_account
+    now_ms = int(datetime.now(UTC).timestamp() * 1000)
+    first_body = _message_body(
+        message_id="msg-1",
+        thread_id="thread-1",
+        from_addr="Bob Flaky <bob@example.test>",
+        to_addrs=["owner@example.test"],
+        internal_date_ms=now_ms,
+    )
+    second_body = _message_body(
+        message_id="msg-2",
+        thread_id="thread-2",
+        from_addr="Carol Fine <carol@example.test>",
+        to_addrs=["owner@example.test"],
+        internal_date_ms=now_ms + 1000,
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/gmail/v1/users/me/messages":
+            return _json_response({"messages": [{"id": "msg-1"}, {"id": "msg-2"}]})
+        if request.url.path == "/gmail/v1/users/me/messages/msg-1":
+            return _json_response(first_body)
+        if request.url.path == "/gmail/v1/users/me/messages/msg-2":
+            return _json_response(second_body)
+        raise AssertionError(f"unexpected request to {request.url}")
+
+    real_resolve = gmail_adapter_module._resolve_or_create_person
+
+    def flaky_resolve(*, email: str, **kwargs: Any) -> UUID:
+        if email == "bob@example.test":
+            raise RuntimeError("simulated transient DB failure resolving bob")
+        return real_resolve(email=email, **kwargs)  # type: ignore[no-any-return]
+
+    monkeypatch.setattr(gmail_adapter_module, "_resolve_or_create_person", flaky_resolve)
+
+    adapter = GmailAdapter(transport=httpx.MockTransport(handler))
+    # Must not raise -- the pre-fix behavior let bob's RuntimeError escape
+    # uncaught here, which pytest would report as an unhandled exception
+    # from this call rather than a normal return.
+    outcome = adapter.backfill(context, "message", since=datetime.now(UTC) - timedelta(days=1))
+    assert outcome.status == "succeeded"
+    # Both messages were reached -- msg-2 was not stranded behind msg-1's
+    # participant-resolution failure the way an uncaught exception would
+    # have stranded it.
+    assert outcome.items_processed == 2
+
+    rows = _threads_and_messages(context.workspace_id)
+    assert {row["external_message_id"] for row in rows} == {"msg-1", "msg-2"}
+    # carol (msg-2's sender) is unaffected by bob's (msg-1's sender) failure.
+    assert _resolved_person(context.workspace_id, "carol@example.test") is not None
+
+
+def test_participant_resolution_failure_still_resolves_other_participants_of_the_same_message(
+    seeded_gmail_account: tuple[ConnectorAccountContext, UUID],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The other half of the round-9 fix: within *one* message that has
+    multiple participants, a resolution failure for one of them (here, the
+    `To` header's `bob@example.test`) must not prevent the *other*
+    participants of that same message (the sender, `alice@example.test`,
+    and the second recipient, `carol@example.test`) from being resolved --
+    the fix isolates the failure to just the one participant that raised,
+    not the whole message's own participant set.
+    """
+    import ecc.domains.personal.gmail_adapter as gmail_adapter_module
+
+    context, _owner_id = seeded_gmail_account
+    now_ms = int(datetime.now(UTC).timestamp() * 1000)
+    body = _message_body(
+        message_id="msg-1",
+        thread_id="thread-1",
+        from_addr="Alice Sender <alice@example.test>",
+        to_addrs=["Bob Flaky <bob@example.test>", "Carol Fine <carol@example.test>"],
+        internal_date_ms=now_ms,
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/gmail/v1/users/me/messages":
+            return _json_response({"messages": [{"id": "msg-1"}]})
+        if request.url.path == "/gmail/v1/users/me/messages/msg-1":
+            return _json_response(body)
+        raise AssertionError(f"unexpected request to {request.url}")
+
+    real_resolve = gmail_adapter_module._resolve_or_create_person
+
+    def flaky_resolve(*, email: str, **kwargs: Any) -> UUID:
+        if email == "bob@example.test":
+            raise RuntimeError("simulated transient DB failure resolving bob")
+        return real_resolve(email=email, **kwargs)  # type: ignore[no-any-return]
+
+    monkeypatch.setattr(gmail_adapter_module, "_resolve_or_create_person", flaky_resolve)
+
+    adapter = GmailAdapter(transport=httpx.MockTransport(handler))
+    outcome = adapter.backfill(context, "message", since=datetime.now(UTC) - timedelta(days=1))
+    assert outcome.status == "succeeded"
+    assert outcome.items_processed == 1
+
+    rows = _threads_and_messages(context.workspace_id)
+    assert len(rows) == 1
+    assert set(rows[0]["recipients"]) == {"bob@example.test", "carol@example.test"}
+
+    # alice (sender) and carol (the non-failing recipient) are resolved
+    # despite bob's failure; bob himself is not resolved for this message.
+    assert _resolved_person(context.workspace_id, "alice@example.test") is not None
+    assert _resolved_person(context.workspace_id, "carol@example.test") is not None
+    assert _resolved_person(context.workspace_id, "bob@example.test") is None
+
+    # The person is not permanently lost, though -- a *later* message
+    # naming bob still resolves him normally, once the transient failure
+    # has cleared (proving the failure is isolated to this one message's
+    # own evidence of bob, not a permanent block on ever resolving him).
+    monkeypatch.setattr(gmail_adapter_module, "_resolve_or_create_person", real_resolve)
+    second_body = _message_body(
+        message_id="msg-2",
+        thread_id="thread-2",
+        from_addr="bob@example.test",
+        to_addrs=["owner@example.test"],
+        internal_date_ms=now_ms + 1000,
+    )
+
+    def handler2(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/gmail/v1/users/me/messages":
+            return _json_response({"messages": [{"id": "msg-2"}]})
+        if request.url.path == "/gmail/v1/users/me/messages/msg-2":
+            return _json_response(second_body)
+        raise AssertionError(f"unexpected request to {request.url}")
+
+    adapter2 = GmailAdapter(transport=httpx.MockTransport(handler2))
+    outcome2 = adapter2.backfill(context, "message", since=datetime.now(UTC) - timedelta(days=1))
+    assert outcome2.status == "succeeded"
+    assert _resolved_person(context.workspace_id, "bob@example.test") is not None
 
 
 # --- consent re-verification -------------------------------------------------
