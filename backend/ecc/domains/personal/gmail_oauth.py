@@ -175,7 +175,17 @@ def gmail_oauth_callback_endpoint(
     authz.require_role_action(session, auth, "write")
     if not _verify_state(auth, state):
         raise HTTPException(status_code=403, detail="GMAIL_OAUTH_STATE_INVALID")
-    session.rollback()
+    # Release `session`'s pooled connection before the slow, sequential
+    # outbound HTTPS calls inside `handle_oauth_callback` (Google's token
+    # endpoint, then its profile endpoint -- up to ~20s combined) --
+    # mirrors `create_connector_endpoint`'s own identical, documented fix
+    # (`connector_accounts.py`): holding a pooled connection idle across a
+    # slow adapter call reintroduces the same app-wide pool-exhaustion risk
+    # `/sync` was restructured to avoid (round 10 review found this
+    # endpoint had never adopted that established pattern). `session` is
+    # not referenced again below -- everything after this call uses its
+    # own fresh `create_session`.
+    session.close()
 
     try:
         authorization = _adapter.handle_oauth_callback(code, state)
@@ -356,6 +366,26 @@ def gmail_oauth_callback_endpoint(
                 now=now,
             )
             return response
+        except Exception:
+            # Anything other than `IntegrityError` here (a dropped
+            # connection, a deadlock, the app's own `statement_timeout`
+            # firing under transient load -- round 10 review) means the
+            # `INSERT` above never committed, so `authorization.credential`
+            # -- a real, successfully-exchanged Google grant -- is about to
+            # be silently orphaned: never persisted to `connector_accounts`,
+            # never revoked, the same "obtained but never revoked" bug
+            # class closed everywhere else in this flow. Best-effort,
+            # idempotent-if-redundant with whatever revoke this exception's
+            # own `IntegrityError` branch may have already issued.
+            _adapter.disconnect(
+                ConnectorAccountContext(
+                    workspace_id=auth.workspace_id,
+                    connector_account_id=account_id,
+                    external_account_id=authorization.external_account_id,
+                    credential=authorization.credential,
+                )
+            )
+            raise
 
         created = get_connector_account(create_session, auth.workspace_id, account_id)
         assert created is not None

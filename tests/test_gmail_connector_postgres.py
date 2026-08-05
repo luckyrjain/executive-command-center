@@ -114,6 +114,23 @@ multi-round adversarial review found and required real coverage for:
     `float(expires_in)`'s coercion silently, the one field in this
     response body still not actually rejecting a wrong-but-truthy type
     after rounds 7-8 closed the others.
+
+Round 10 found and fixed two issues outside this test file's own reach
+(see `docs/phases/phase-010/IMPLEMENTATION-STATUS.md`'s round-10 paragraph
+for the full account, since neither is reproducible through pytest's
+synchronous `TestClient` without a novel mocking pattern this codebase
+doesn't otherwise use):
+- `gmail_oauth_callback_endpoint` held its `SessionDep`'s pooled connection
+  idle across `handle_oauth_callback`'s two slow outbound Google HTTP
+  calls, unlike `create_connector_endpoint`'s own documented, identical
+  fix for the same risk -- closed with `session.close()`.
+- A non-`IntegrityError` failure during the `connector_accounts` `INSERT`
+  (a dropped connection, a deadlock, a `statement_timeout`) would have
+  orphaned the just-obtained Google grant without revoking it -- closed
+  with a sibling `except Exception:` alongside the existing `except
+  IntegrityError:`, verified via a standalone script that monkeypatches
+  `Session.execute` to raise `OperationalError` mid-transaction against
+  real Postgres.
 """
 
 from __future__ import annotations
