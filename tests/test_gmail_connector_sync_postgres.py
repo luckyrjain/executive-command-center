@@ -94,6 +94,30 @@ Covers, per this task's own scope:
     within itself), applied ahead of `_getaddresses_resilient` so a
     defect anywhere in the header drops the whole `To` header rather than
     only the colliding field.
+17. A `To` header with a benign interior double comma
+    (`"bob@example.test,,carol@example.test"`) recovers both real
+    recipients rather than the whole message silently vanishing --
+    `_to_header_has_grammar_defect`'s own first cut (item 16) gated the
+    recipient loop on *any* `HeaderRegistry` defect, not specifically the
+    `InvalidHeaderDefect` the round 4 collision actually raises, so a
+    harmless `ObsoleteHeaderDefect`-only shape (an interior double comma,
+    a comma-plus-whitespace empty entry) was wrongly treated the same as
+    a genuine collision -- found by round 5 review, a false-positive
+    regression in round 4's own fix. Narrowed to `InvalidHeaderDefect`
+    specifically; item 16's collision case is unaffected (still raises
+    `InvalidHeaderDefect`, independently confirmed).
+18. An embedded NUL byte (`\\x00`, from a JSON `\\u0000` escape in Gmail's
+    own response body) in a `From` address, a `From` display name, or a
+    `Subject` header is dropped/skips the message the same way an
+    oversized address already does, not left to crash the sync call with
+    an uncaught `psycopg.DataError` -- found by round 1 review's security/
+    correctness lens, the same review pass that added item 7's oversized-
+    address coverage, this item added by round 5 review since it had never
+    had a "Covers" entry of its own despite always having its own three
+    dedicated tests (`test_nul_byte_in_from_address_is_skipped_not_a_crash`,
+    `test_nul_byte_in_from_display_name_is_skipped_not_a_crash`,
+    `test_nul_byte_in_subject_is_dropped_but_message_still_syncs`) since
+    round 1.
 """
 
 from __future__ import annotations
@@ -1423,6 +1447,72 @@ def test_to_header_ambiguous_address_with_trailing_comma_is_still_safely_dropped
     assert _threads_and_messages(context.workspace_id) == []
     assert _resolved_person(context.workspace_id, "bob@example.test") is None
     assert _resolved_person(context.workspace_id, "carol@example.test") is None
+
+
+def test_to_header_interior_double_comma_recovers_recipients_not_dropped_by_grammar_check(
+    seeded_gmail_account: tuple[ConnectorAccountContext, UUID],
+) -> None:
+    """Round 5 review: `_to_header_has_grammar_defect` (round 4's own fix,
+    above) gated the entire recipient loop on `bool(HeaderRegistry(...)
+    .defects)` -- any defect at all, not specifically the
+    `InvalidHeaderDefect` the round 4 collision case actually raises. A
+    `To` header with a benign interior double comma or a comma-plus-
+    whitespace empty entry (`"bob@example.test,,carol@example.test"` --
+    real mail-merge tooling and forwarded headers produce this; Gmail
+    forwards a sender's raw header verbatim) parses via `getaddresses`
+    into the two real addresses plus a spurious `("", "")` entry
+    `_validate_address` already drops on its own -- the exact same benign
+    shape `_getaddresses_resilient`'s own trailing-comma recovery (see
+    that test above) exists to handle -- but `HeaderRegistry` reports this
+    shape as `ObsoleteHeaderDefect('empty element in address-list')`, a
+    genuinely harmless, backward-compatibility-only defect class, never
+    `InvalidHeaderDefect` (independently confirmed in a standalone
+    interpreter alongside every other legitimate multi-recipient shape
+    this module already accepts). `bool(.defects)` could not tell that
+    apart from the genuine `InvalidHeaderDefect` the round 4 collision
+    raises, so it gated the recipient loop off entirely and silently
+    dropped the *whole message* -- sender, subject, thread, all of it,
+    via `_process_message`'s own `if not recipients: return None` -- over
+    a header that was never actually ambiguous: the identical "one comma
+    away from an otherwise well-formed message vanishing with no error"
+    impact `_getaddresses_resilient`'s own round 3 fix closed for a
+    *different* comma placement, reintroduced here by round 4's own fix
+    for a different one. Narrowing the check to `InvalidHeaderDefect`
+    specifically (this round's fix) recovers both real recipients here
+    without reopening the round 4 collision (see the companion test
+    above, still passing unchanged).
+    """
+    context, _owner_id = seeded_gmail_account
+    now_ms = int(datetime.now(UTC).timestamp() * 1000)
+    body = _message_body(
+        message_id="msg-interior-double-comma",
+        thread_id="thread-interior-double-comma",
+        from_addr="alice@example.test",
+        to_addrs=["ignored -- overridden by raw_to below"],
+        internal_date_ms=now_ms,
+    )
+    body["payload"]["headers"] = [
+        {"name": "From", "value": "alice@example.test"},
+        {"name": "To", "value": "bob@example.test,,carol@example.test"},
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/gmail/v1/users/me/messages":
+            return _json_response({"messages": [{"id": "msg-interior-double-comma"}]})
+        if request.url.path.startswith("/gmail/v1/users/me/messages/"):
+            return _json_response(body)
+        raise AssertionError(f"unexpected request to {request.url}")
+
+    adapter = GmailAdapter(transport=httpx.MockTransport(handler))
+    outcome = adapter.backfill(context, "message", since=datetime.now(UTC) - timedelta(days=1))
+    assert outcome.status == "succeeded"
+    assert outcome.items_processed == 1
+
+    rows = _threads_and_messages(context.workspace_id)
+    assert len(rows) == 1
+    assert sorted(rows[0]["recipients"]) == ["bob@example.test", "carol@example.test"]
+    assert _resolved_person(context.workspace_id, "bob@example.test") is not None
+    assert _resolved_person(context.workspace_id, "carol@example.test") is not None
 
 
 def test_to_header_recipient_count_is_capped_to_bound_entity_resolution_work(

@@ -99,6 +99,7 @@ from __future__ import annotations
 import time
 from collections.abc import Callable, Mapping
 from datetime import UTC, datetime, timedelta
+from email.errors import InvalidHeaderDefect
 from email.headerregistry import HeaderRegistry
 from email.utils import getaddresses, parseaddr
 from hashlib import sha256
@@ -561,11 +562,47 @@ def _to_header_has_grammar_defect(to_header: str) -> bool:
     on whatever addresses that produces, rather than this cross-check
     taking responsibility for a failure class it isn't needed for and was
     never meant to guard.
+
+    Checks specifically for an `InvalidHeaderDefect` among `.defects`, not
+    `bool(.defects)` against the tuple as a whole -- found by round 5
+    review, a false-positive gap in this same function's own first cut.
+    `HeaderRegistry` reports several unrelated, genuinely benign defect
+    classes on headers this module already accepts and correctly recovers
+    real recipients from without this cross-check's help: an interior
+    double comma or a comma-plus-whitespace empty entry (`"alice@x.test,
+    , bob@x.test"`, `"alice@x.test,,bob@x.test"` -- both produce only
+    `ObsoleteHeaderDefect('address-list entry with no content')`/
+    `ObsoleteHeaderDefect('empty element in address-list')`, never
+    `InvalidHeaderDefect`, independently confirmed in a standalone
+    interpreter) parse via `getaddresses` into the two real addresses plus
+    a spurious `("", "")` entry `_validate_address` already drops on its
+    own -- exactly the same benign shape `_getaddresses_resilient`'s own
+    trailing-comma case is. A real Gmail sender's mail-merge tool or a
+    stray extra separator in a forwarded header can produce this. `bool(
+    .defects)` treated that non-empty-but-harmless tuple identically to
+    the genuine `InvalidHeaderDefect('invalid address in address-list')`
+    the round 4 collision case raises, gating the entire recipient loop
+    off and silently dropping the whole message (sender, subject, thread,
+    all of it, via `_process_message`'s own `if not recipients: return
+    None`) over a header that was never actually ambiguous -- the
+    identical "one comma away from vanishing an otherwise well-formed
+    message" impact `_getaddresses_resilient`'s own round 3 fix closed for
+    a different comma placement, reintroduced here by round 4's own fix
+    for yet another comma placement. Every collision variant this
+    function exists to catch (`_to_header_has_grammar_defect`'s own
+    docstring above, plus a wider fuzz pass across `<...>`-adjacent
+    phrase/comment/local-part variations, all re-verified in a standalone
+    interpreter before relying on this) raises `InvalidHeaderDefect`
+    specifically, alongside whatever incidental `ObsoleteHeaderDefect`s the
+    same malformed field also triggers -- narrowing the check to that one
+    defect class closes the false-positive gap without reopening the
+    collision this function was written for.
     """
     try:
-        return bool(_TO_HEADER_REGISTRY("To", to_header).defects)
+        defects = _TO_HEADER_REGISTRY("To", to_header).defects
     except (UnicodeEncodeError, ValueError, TypeError, LookupError, IndexError):
         return False
+    return any(isinstance(defect, InvalidHeaderDefect) for defect in defects)
 
 
 def _resolve_or_create_person(
