@@ -183,7 +183,7 @@ class MaxBodySizeMiddleware:
 _MUTATION_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 _MUTATION_PATH_PREFIX = "/api/v1"
 
-# `GET /api/v1/engineering/metrics` is the one documented exception to the
+# `GET /api/v1/engineering/metrics` is a documented exception to the
 # "reads are free" reasoning above: it deliberately writes seven new
 # `delivery_metric_snapshots` rows on every call, a departure from pure
 # REST semantics disclosed in `metrics.py`'s module docstring and
@@ -193,7 +193,24 @@ _MUTATION_PATH_PREFIX = "/api/v1"
 # that table without bound (final Phase 6 review finding) -- an explicit,
 # narrow allow-list here rather than broadening the method-based rule,
 # since every other GET in this API genuinely is a pure, unlimited read.
-_MUTATING_GET_PATHS = frozenset({"/api/v1/engineering/metrics"})
+#
+# `GET /api/v1/personal/gmail/oauth/callback` (Phase 10 Gmail Connector
+# Task 1) is the second such exception, the identical bug class reopened
+# rather than a new one: it's a browser-redirect-driven `GET` (Google's
+# own OAuth2 authorization-code-grant flow leaves no other option -- there
+# is no way to make the provider redirect via `POST`), but it writes/
+# updates a real `connector_accounts` row, an `audit_events` row, and an
+# `event_outbox` row, and makes two real outbound HTTPS calls to Google
+# per invocation. `_verify_state` checks signature and expiry but never
+# marks a `state` value consumed (states aren't single-use, only Google's
+# own `code` is), so a same-origin, authenticated, Gmail-allowlisted
+# caller holding one still-valid `state` could otherwise loop this
+# endpoint unbounded -- found by round 15 review, the same "mutating GET
+# invisible to the mutation rate limiter" gap the metrics endpoint above
+# was already fixed for once.
+_MUTATING_GET_PATHS = frozenset(
+    {"/api/v1/engineering/metrics", "/api/v1/personal/gmail/oauth/callback"}
+)
 
 # Window/threshold: the largest observed sequential mutation-call count in a
 # single existing test fixture is 17 (tests/test_calendar_meetings_postgres.py,
