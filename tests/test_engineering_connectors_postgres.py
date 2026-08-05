@@ -81,6 +81,23 @@ batch's own fixes found:
     concurrent requests the same way as item 22, and closed by re-
     checking the idempotency cache after an `IntegrityError` rather than
     unconditionally returning `409 CONNECTOR_ALREADY_CONNECTED`.
+
+Plus one item closing a gap Phase 10 Gmail Connector Task 2's own round 1
+review found in this module's territory (`sync_cursors.resource_type`'s
+CHECK constraint, not Gmail's own adapter code -- see `tests/test_gmail_
+connector_sync_postgres.py` for Task 2's own dedicated test file):
+
+25. `test_sync_persists_a_message_resource_type_cursor`: migration `0069`
+    widened `ck_connector_accounts_provider`/`ck_personal_domains_domain_
+    key` for `gmail`/`email` but missed `ck_sync_cursors_resource_type`,
+    so a real `/sync` call for a `gmail` account that made progress raised
+    an uncaught `IntegrityError` and 500 instead of `201`. Proven end to
+    end through the real HTTP endpoint (not a direct-SQL probe) via
+    `_MessageCursorAdapter`, a fake registered under the real `"gmail"`
+    provider slug -- migration `0069` already widened `ck_connector_
+    accounts_provider` to allow it, unlike the `_RaisingAdapter`/
+    `_SpyDisconnectAdapter` family above, which stay on `"sandbox"` for
+    that reason. Fixed by migration `0070_gmail_sync_cursor_type.py`.
 """
 
 import threading
@@ -368,6 +385,52 @@ def _registry_with(adapter: Any) -> ConnectorRegistry:
     registry = ConnectorRegistry()
     registry.register(adapter)
     return registry
+
+
+@dataclass
+class _MessageCursorAdapter:
+    """`provider = "gmail"` -- unlike the `_RaisingAdapter`/`_SpyDisconnect
+    Adapter` family above (stuck on `"sandbox"` because `ck_connector_
+    accounts_provider` didn't allow anything else), migration `0069`
+    already widened that constraint to include `'gmail'`, so this fake can
+    register under the real provider slug `sync_connector_endpoint`
+    dispatches `resource_type='message'` requests for. Always returns a
+    non-`None` `next_cursor` -- the exact condition that drives `/sync`'s
+    own `sync_cursors` INSERT, which is what `ck_sync_cursors_resource_
+    type` needs to actually accept `'message'` for (migration
+    `0070_gmail_sync_cursor_type`, found by review: `0069` widened the
+    other two provider/resource closed sets this task touches but missed
+    this one).
+    """
+
+    provider: str = "gmail"
+    required_scopes: frozenset[str] = field(default_factory=frozenset)
+
+    def authorize(self, credential: str) -> ConnectorAuthorization:
+        raise NotImplementedError
+
+    def backfill(self, account: ConnectorAccountContext, resource_type: str) -> SyncOutcome:
+        return SyncOutcome(
+            resource_type=resource_type, items_processed=1, status="succeeded", next_cursor="12345"
+        )
+
+    def incremental_sync(
+        self, account: ConnectorAccountContext, resource_type: str, cursor: str | None
+    ) -> SyncOutcome:
+        return SyncOutcome(
+            resource_type=resource_type, items_processed=1, status="succeeded", next_cursor="12346"
+        )
+
+    def handle_webhook(
+        self, account: ConnectorAccountContext, payload: bytes, headers: object
+    ) -> SyncOutcome:
+        raise NotImplementedError
+
+    def refresh_permissions(self, account: ConnectorAccountContext) -> str:
+        return "active"
+
+    def disconnect(self, account: ConnectorAccountContext) -> None:
+        return None
 
 
 # --- unit-level: sandbox adapter / registry / crypto (no database) ---------
@@ -1089,6 +1152,52 @@ def test_sync_cursors_and_sync_runs_check_constraints_reject_invalid_values(
                 },
             )
     assert isinstance(excinfo.value.orig, CheckViolation)
+
+
+def test_sync_persists_a_message_resource_type_cursor(
+    engineering_test_context: tuple[TestClient, UUID, UUID, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`ResourceType` (`connector_accounts.py`) was widened to accept
+    `"message"` in Phase 10 Task 2, but migration `0069` -- which widened
+    `ck_connector_accounts_provider`/`ck_personal_domains_domain_key` for
+    that same task -- never widened `ck_sync_cursors_resource_type` to
+    match. `/sync`'s own `sync_cursors` INSERT (phase 3, this module's own
+    docstring) writes `resource_type = payload.resource_type` whenever
+    `SyncOutcome.next_cursor` is not `None` -- true for essentially every
+    successful `gmail`/`"message"` sync -- so without migration `0070_
+    gmail_sync_cursor_type`, that INSERT unconditionally violated the
+    CHECK constraint, raising an uncaught `IntegrityError` inside the same
+    transaction as `sync_runs`' own success-status `UPDATE` (rolling that
+    back too) and returning an unhandled 500 instead of `201`. Found by
+    review -- this test drives the real HTTP endpoint (not a direct-SQL
+    probe) with a fake adapter registered under the real `"gmail"`
+    provider slug so it exercises the actual code path that was broken,
+    end to end.
+    """
+    client, workspace_id, user_id, token = engineering_test_context
+    monkeypatch.setattr(
+        connector_accounts_module, "connector_registry", _registry_with(_MessageCursorAdapter())
+    )
+    account_id = _insert_connector_account(workspace_id, user_id, provider="gmail")
+
+    response = client.post(
+        f"/api/v1/engineering/connectors/{account_id}/sync",
+        json={"run_type": "backfill", "resource_type": "message"},
+        headers=_headers(token, key=str(uuid4())),
+    )
+    assert response.status_code == 201, response.text
+    assert response.json()["status"] == "succeeded"
+
+    with engine.begin() as connection:
+        cursor_value = connection.execute(
+            text(
+                "SELECT cursor_value FROM sync_cursors WHERE workspace_id = :workspace_id "
+                "AND connector_account_id = :account_id AND resource_type = 'message'"
+            ),
+            {"workspace_id": workspace_id, "account_id": account_id},
+        ).scalar_one()
+    assert cursor_value == "12345"
 
 
 def test_sync_rejects_invalid_run_type_and_resource_type(

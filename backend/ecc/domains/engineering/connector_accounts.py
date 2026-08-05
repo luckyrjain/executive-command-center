@@ -166,6 +166,13 @@ ResourceType = Literal[
     "monitor",
     "service_definition",
     "dashboard",
+    # Phase 10 Gmail Connector Task 2: the only resource type `gmail`
+    # accounts ever sync against this generic endpoint -- threads are
+    # upserted implicitly as a side effect of syncing the messages within
+    # them (see `gmail_adapter.py`'s own module docstring), matching this
+    # Literal's existing convention of naming the leaf resource a caller
+    # actually requests, not every table a sync call happens to write to.
+    "message",
 ]
 
 _MAX_ADAPTER_ERROR_LENGTH = 300

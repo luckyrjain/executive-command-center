@@ -192,7 +192,19 @@ multi-round adversarial review found and required real coverage for:
     against a real `gmail`-provider account, not just the adapter method
     directly -- `backfill`/`incremental_sync` are reachable through that
     already-shipped, fully generic route for any registered provider
-    today, `gmail` included.
+    today, `gmail` included. Phase 10 Task 2's own commit later made
+    `backfill`/`incremental_sync` real (no longer stubs) and renamed three
+    of this item's four tests to match -- `test_backfill_is_a_documented_
+    stub` -> `test_backfill_no_ops_for_a_resource_type_other_than_message`,
+    `test_backfill_ignores_since` -> `test_backfill_ignores_since_for_a_
+    resource_type_other_than_message`, `test_incremental_sync_is_a_
+    documented_stub` -> `test_incremental_sync_no_ops_for_a_resource_type_
+    other_than_message` (`test_handle_webhook_is_a_documented_stub` is
+    unchanged -- `handle_webhook` alone is still a stub) -- present since
+    that same commit, missed by every round-1-through-5 doc-drift pass
+    across this file (each checked `tests/test_gmail_connector_sync_
+    postgres.py`'s own "Covers" list repeatedly but never re-swept this
+    sibling file's), found and corrected by round 6 review.
 23. The `IntegrityError` handler's every `_adapter.disconnect(...)` call
     used to run while `create_session`'s transaction -- and, for the
     `active`-row and reactivation branches, its `FOR UPDATE` row lock --
@@ -1360,7 +1372,14 @@ def test_handle_oauth_callback_rejects_empty_email_address(
 # its own direct `GmailAdapter.disconnect` coverage above).
 
 
-def test_backfill_is_a_documented_stub() -> None:
+def test_backfill_no_ops_for_a_resource_type_other_than_message() -> None:
+    """Task 2 made `backfill` real for `resource_type="message"` (see
+    `tests/test_gmail_connector_sync_postgres.py`) -- every other value
+    (this test uses the same semantically-meaningless `"thread"` round 22
+    originally picked, before `ResourceType` had any Gmail-appropriate
+    value to test with at all) still zero-item-succeeds, matching every
+    other adapter's "not-yet-implemented resource type" contract.
+    """
     adapter = GmailAdapter()
     outcome = adapter.backfill(_account_context("irrelevant"), "thread")
     assert outcome.resource_type == "thread"
@@ -1369,20 +1388,23 @@ def test_backfill_is_a_documented_stub() -> None:
     assert outcome.next_cursor is None
 
 
-def test_backfill_ignores_since() -> None:
+def test_backfill_ignores_since_for_a_resource_type_other_than_message() -> None:
     adapter = GmailAdapter()
     outcome = adapter.backfill(_account_context("irrelevant"), "thread", since=datetime.now(UTC))
     assert outcome.status == "succeeded"
     assert outcome.items_processed == 0
 
 
-def test_incremental_sync_is_a_documented_stub() -> None:
+def test_incremental_sync_no_ops_for_a_resource_type_other_than_message() -> None:
+    """See `test_backfill_no_ops_for_a_resource_type_other_than_message`'s
+    own docstring -- same Task 2 change, same reasoning.
+    """
     adapter = GmailAdapter()
     outcome = adapter.incremental_sync(_account_context("irrelevant"), "thread", "some-cursor")
     assert outcome.resource_type == "thread"
     assert outcome.items_processed == 0
     assert outcome.status == "succeeded"
-    assert outcome.next_cursor is None
+    assert outcome.next_cursor == "some-cursor"
 
 
 def test_handle_webhook_is_a_documented_stub() -> None:
