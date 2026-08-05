@@ -64,6 +64,12 @@ multi-round adversarial review found and required real coverage for:
     the token response specifically, so an atypical 200 body would have
     both skipped revocation and escaped as an uncaught exception type the
     router's `AdapterAuthorizationError`-only catch does not handle.
+14. `authorize`'s unconditional raise (never called in production --
+    `gmail` connects exclusively through `get_authorization_url`/
+    `handle_oauth_callback`); `_unpack_credential`'s shape-validation
+    `TypeError` branch (round 5) reached through `refresh_permissions`/
+    `disconnect`, not just the raw function in isolation -- both round 6:
+    self-evidently-correct code that had no test at all before.
 """
 
 from __future__ import annotations
@@ -184,6 +190,24 @@ def test_is_account_allowed_matches_case_insensitively(monkeypatch: pytest.Monke
         assert adapter.is_account_allowed("") is False
     finally:
         get_settings.cache_clear()
+
+
+# --- GmailAdapter.authorize --------------------------------------------------
+
+
+def test_authorize_always_raises() -> None:
+    """`gmail` accounts connect exclusively through `get_authorization_url`/
+    `handle_oauth_callback` -- `gmail_oauth.py` never calls `authorize`, and
+    this method's own unconditional raise documents that this path is
+    genuinely unreachable in production (`ConnectorAdapter` still declares
+    it; `authorize`'s own docstring covers why an `OAuth2ConnectorAdapter`
+    implementer relies on the other two methods instead). Round 6 review
+    found this single-line, self-evidently-correct method had zero test
+    coverage of any kind.
+    """
+    adapter = GmailAdapter()
+    with pytest.raises(AdapterAuthorizationError):
+        adapter.authorize("some-credential")
 
 
 # --- GmailAdapter.get_authorization_url -------------------------------------
@@ -625,6 +649,18 @@ def test_refresh_permissions_permission_lost_on_malformed_credential() -> None:
     assert adapter.refresh_permissions(_account_context("not-json")) == "permission_lost"
 
 
+def test_refresh_permissions_permission_lost_on_non_object_credential() -> None:
+    """Distinct from the malformed-JSON case above -- valid JSON that isn't
+    an object (round 5's `_unpack_credential` shape-validation fix) reaches
+    this same `except (ValueError, TypeError)` via the `TypeError` branch,
+    not `ValueError`. Round 6 review found this specific branch had no
+    test exercising it through a real caller, only the raw function in
+    isolation.
+    """
+    adapter = GmailAdapter()
+    assert adapter.refresh_permissions(_account_context("[1, 2, 3]")) == "permission_lost"
+
+
 def test_refresh_permissions_fails_open_on_network_error() -> None:
     """Mirrors `test_engineering_datadog_sync_postgres.py`'s identical
     `test_refresh_permissions_fails_open_on_network_error` -- a transient
@@ -651,6 +687,15 @@ def test_refresh_permissions_fails_open_on_network_error() -> None:
 def test_disconnect_returns_none_for_malformed_credential() -> None:
     adapter = GmailAdapter()
     assert adapter.disconnect(_account_context("not-json")) is None
+
+
+def test_disconnect_returns_none_for_non_object_credential() -> None:
+    """Companion to `test_refresh_permissions_permission_lost_on_non_object_
+    credential` -- same round-5 `_unpack_credential` `TypeError` branch,
+    reached through `disconnect` instead.
+    """
+    adapter = GmailAdapter()
+    assert adapter.disconnect(_account_context("[1, 2, 3]")) is None
 
 
 def test_disconnect_never_raises_on_network_error() -> None:

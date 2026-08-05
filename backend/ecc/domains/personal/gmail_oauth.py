@@ -71,6 +71,7 @@ from ecc.config import get_settings
 from ecc.database import SessionFactory, get_session
 from ecc.domains.engineering.connector_accounts import (
     ConnectorAccountResponse,
+    _sanitize_adapter_error,
     _to_response,
     _write_side_effects,
     get_connector_account,
@@ -181,7 +182,7 @@ def gmail_oauth_callback_endpoint(
     except AdapterAuthorizationError as exc:
         raise HTTPException(
             status_code=422,
-            detail={"code": "GMAIL_OAUTH_FAILED", "error": str(exc)[:500]},
+            detail={"code": "GMAIL_OAUTH_FAILED", "error": _sanitize_adapter_error(str(exc))},
         ) from exc
     assert authorization.credential is not None  # handle_oauth_callback always sets it
 
