@@ -43,6 +43,28 @@ Covers, per the implementation plan's own Task 3 scope:
    than the real optimistic-concurrency `version` every other entity
    type has, making this the one place a bug in that derivation would
    show up as a spurious un-dismiss.
+9. Two messages in the same thread with an identical `sent_at` -- one
+   inbound, one outbound -- resolve deterministically by `id`, not by
+   Postgres's own unspecified tie order -- round 2 review finding: the
+   eligibility query's own `LATERAL` subquery picking a thread's "last"
+   message had no tiebreaker at all.
+10. A thread owned by a member whose `workspace_memberships.status` is
+    no longer `'active'` (removed from the workspace) is not eligible,
+    and is pruned from `attention_items` if already present -- round 2
+    review finding: `email_threads.owner_id` can never be reassigned
+    the way every other scored entity type's owner_id can via `POST
+    /ownership/transfers`, so without this check a removed member's
+    still-unanswered thread would be recomputed and rewritten forever,
+    permanently unreachable by anyone (hardcoded `visibility='private'`,
+    and the removed member can never again pass `authz.authorize`'s own
+    active-membership check).
+11. `known_email_aliases` is bounded to the workspace's own candidate
+    senders, not every resolved contact the workspace has ever
+    accumulated -- round 2 review finding: an unconditional fetch of
+    every `entity_aliases` row scales with total resolved-contact count,
+    not with how many threads are actually awaiting reply. This test
+    confirms the narrowed fetch still matches correctly (not just that
+    it's smaller).
 """
 
 from collections.abc import Iterator
@@ -259,8 +281,9 @@ def _seed_message(
     sender: str,
     direction: str,
     sent_at: datetime,
+    message_id: UUID | None = None,
 ) -> UUID:
-    message_id = uuid4()
+    message_id = message_id if message_id is not None else uuid4()
     now = datetime.now(UTC)
     with engine.begin() as connection:
         connection.execute(
@@ -628,6 +651,227 @@ def test_inbound_thread_from_casefold_divergent_sender_surfaces_as_awaiting_repl
     # `From` header's email address, unnormalized.
     _seed_message(
         workspace_id, owner_id, thread_id, sender=resolved_email, direction="inbound", sent_at=now
+    )
+
+    regenerate = client.post("/api/v1/attention/regenerate", headers=_headers(token), json={})
+    assert regenerate.status_code == 200, regenerate.text
+    item = next(i for i in regenerate.json()["items"] if i["entity_id"] == str(thread_id))
+    assert item["entity_type"] == "email_thread"
+    factor_codes = {f["code"] for f in item["factors"]}
+    assert "awaiting_reply" in factor_codes
+
+
+def test_identical_sent_at_tie_resolves_deterministically_by_id(
+    email_attention_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    """Round 2 review finding: the eligibility query's `LATERAL` subquery
+    picks a thread's "last" message via `ORDER BY sent_at DESC, id DESC
+    LIMIT 1` -- before this round, plain `ORDER BY sent_at DESC LIMIT 1`
+    had no tiebreaker at all, so two messages with an identical `sent_at`
+    (one inbound, one outbound) resolved to whichever row Postgres's own
+    query plan happened to visit first, an unspecified choice with no SQL
+    guarantee of being stable across repeated calls against the same
+    data. `id` can't determine which message was genuinely sent last (it's
+    an application-assigned `uuid4()`, unrelated to send order) -- but it
+    does turn an unspecified tie into a real, fixed total order, so this
+    test asserts the *documented, predictable* consequence of that
+    ordering rather than "which one is correct" (unknowable for a genuine
+    tie): the message with the lexicographically greater `id` wins,
+    deciding the thread's own eligibility.
+
+    Two independent threads cover both directions, so this isn't merely
+    "whichever direction happens to also be Postgres's own untamed
+    default" -- one thread's inbound message has the greater id, the
+    other's outbound message does, and both are asserted precisely.
+    """
+    client, workspace_id, owner_id, token = email_attention_test_context
+    now = datetime.now(UTC)
+    sender = "known.contact@example.test"
+    _resolve_sender(workspace_id, sender)
+
+    low_id, high_id = sorted([uuid4(), uuid4()])
+
+    # Thread A: the inbound message has the *greater* id -- it should win
+    # the tie, so the thread surfaces as awaiting reply.
+    thread_a = _seed_thread(workspace_id, owner_id, "Inbound wins the tie", now)
+    _seed_message(
+        workspace_id,
+        owner_id,
+        thread_a,
+        sender=f"{owner_id}@example.test",
+        direction="outbound",
+        sent_at=now,
+        message_id=low_id,
+    )
+    _seed_message(
+        workspace_id,
+        owner_id,
+        thread_a,
+        sender=sender,
+        direction="inbound",
+        sent_at=now,
+        message_id=high_id,
+    )
+
+    low_id_b, high_id_b = sorted([uuid4(), uuid4()])
+
+    # Thread B: the outbound message has the *greater* id -- it should
+    # win the tie, so the thread does NOT surface.
+    thread_b = _seed_thread(workspace_id, owner_id, "Outbound wins the tie", now)
+    _seed_message(
+        workspace_id,
+        owner_id,
+        thread_b,
+        sender=sender,
+        direction="inbound",
+        sent_at=now,
+        message_id=low_id_b,
+    )
+    _seed_message(
+        workspace_id,
+        owner_id,
+        thread_b,
+        sender=f"{owner_id}@example.test",
+        direction="outbound",
+        sent_at=now,
+        message_id=high_id_b,
+    )
+
+    regenerate = client.post("/api/v1/attention/regenerate", headers=_headers(token), json={})
+    assert regenerate.status_code == 200, regenerate.text
+    entity_ids = {i["entity_id"] for i in regenerate.json()["items"]}
+    assert str(thread_a) in entity_ids
+    assert str(thread_b) not in entity_ids
+
+
+def test_removed_member_owned_thread_is_pruned_from_attention(
+    email_attention_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    """Round 2 review finding: `email_threads.owner_id` -- unlike every
+    other scored entity_type's own owner_id -- can never be reassigned
+    via `POST /ownership/transfers` (Phase 7 personal-domain data, never
+    a member of `authz.py`'s grantable resource-table model), so nothing
+    stops a member from being removed from the workspace while still
+    "owning" an unanswered thread. Without an active-membership check,
+    every future `regenerate_attention` call (by any other active member)
+    would keep recomputing and rewriting that thread's derived attention
+    item forever, even though it is permanently unreachable by anyone --
+    the removed member can never again pass `authz.authorize`'s own
+    active-membership check, and the row's hardcoded `visibility` is
+    `'private'`, so no one else's "the owner is always allowed" step can
+    fire for it either.
+
+    Drives the underlying mechanism directly (`UPDATE workspace_
+    memberships SET status = 'removed'`), the same way `test_disabled_
+    email_domain_does_not_surface_awaiting_reply` drives `personal_
+    domains.enabled` directly, rather than the real `DELETE .../members/
+    {user_id}` endpoint and its own separate ownership-transfer
+    prerequisites (out of this test file's own scope; independently
+    confirmed by hand against the real endpoint that a member owning an
+    `email_thread`-derived `attention_items` row is initially blocked from
+    removal by `authz.owned_resource_summary`, and that a manual `POST
+    /ownership/transfers` "resolution" of that specific block is silently
+    reverted by the very next `regenerate_attention` call for exactly the
+    reason this test's own docstring gives -- a real, disclosed, but
+    separate gap in `ecc/platform/authz.py`, outside this task's own
+    primary files).
+    """
+    client, workspace_id, owner_id, token = email_attention_test_context
+    now = datetime.now(UTC)
+    sender = "known.contact@example.test"
+    _resolve_sender(workspace_id, sender)
+    thread_id = _seed_thread(workspace_id, owner_id, "Owner about to be removed", now)
+    _seed_message(
+        workspace_id, owner_id, thread_id, sender=sender, direction="inbound", sent_at=now
+    )
+
+    regenerate = client.post("/api/v1/attention/regenerate", headers=_headers(token), json={})
+    assert regenerate.status_code == 200, regenerate.text
+    item = next(i for i in regenerate.json()["items"] if i["entity_id"] == str(thread_id))
+    assert item["entity_type"] == "email_thread"
+
+    # A second, still-active workspace member -- required since the
+    # fixture's own single user is the one about to be "removed" below,
+    # and `regenerate_attention` itself requires an active `write` role.
+    admin_id = uuid4()
+    admin_token = f"session-{uuid4()}"
+    admin_now = datetime.now(UTC)
+    with engine.begin() as connection:
+        create_identity(
+            connection,
+            workspace_id=workspace_id,
+            user_id=admin_id,
+            email=f"{admin_id}@example.test",
+            now=admin_now,
+            role="admin",
+        )
+        connection.execute(
+            text(
+                "INSERT INTO sessions (id, workspace_id, user_id, token_hash, "
+                "expires_at, last_seen_at) "
+                "VALUES (:id, :workspace_id, :user_id, :token_hash, :expires_at, :last_seen_at)"
+            ),
+            {
+                "id": uuid4(),
+                "workspace_id": workspace_id,
+                "user_id": admin_id,
+                "token_hash": sha256(admin_token.encode()).hexdigest(),
+                "expires_at": admin_now + timedelta(hours=1),
+                "last_seen_at": admin_now,
+            },
+        )
+        connection.execute(
+            text(
+                "UPDATE workspace_memberships SET status = 'removed' "
+                "WHERE workspace_id = :workspace_id AND users_id = :owner_id"
+            ),
+            {"workspace_id": workspace_id, "owner_id": owner_id},
+        )
+
+    client.cookies.set("ecc_session", admin_token)
+    regenerate_again = client.post(
+        "/api/v1/attention/regenerate", headers=_headers(admin_token), json={}
+    )
+    assert regenerate_again.status_code == 200, regenerate_again.text
+
+    with engine.begin() as connection:
+        row = (
+            connection.execute(
+                text(
+                    "SELECT 1 FROM attention_items WHERE workspace_id = :workspace_id "
+                    "AND entity_type = 'email_thread' AND entity_id = :entity_id"
+                ),
+                {"workspace_id": workspace_id, "entity_id": thread_id},
+            )
+            .mappings()
+            .one_or_none()
+        )
+    assert row is None
+
+
+def test_known_email_aliases_bounded_to_candidate_senders_still_matches(
+    email_attention_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    """Round 2 review finding: `known_email_aliases` is fetched bounded to
+    `ANY(:candidate_senders)` (the normalized senders of only the
+    structurally-eligible candidate threads), not every `entity_aliases`
+    row the workspace has ever accumulated -- otherwise this fetch scales
+    with total resolved-contact count, not with how many threads are
+    actually awaiting reply. This test seeds a number of resolved
+    contacts *unrelated* to the one real candidate sender, then confirms
+    the real candidate still correctly surfaces -- proving the bounded
+    fetch narrows the *candidate set checked*, not the correctness of the
+    match itself.
+    """
+    client, workspace_id, owner_id, token = email_attention_test_context
+    now = datetime.now(UTC)
+    sender = "known.contact@example.test"
+    _resolve_sender(workspace_id, sender)
+    for i in range(25):
+        _resolve_sender(workspace_id, f"unrelated-contact-{i}@example.test")
+    thread_id = _seed_thread(workspace_id, owner_id, "Needle in a haystack of aliases", now)
+    _seed_message(
+        workspace_id, owner_id, thread_id, sender=sender, direction="inbound", sent_at=now
     )
 
     regenerate = client.post("/api/v1/attention/regenerate", headers=_headers(token), json={})
