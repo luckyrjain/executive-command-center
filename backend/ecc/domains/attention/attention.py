@@ -33,8 +33,12 @@ IdempotencyHeader = Annotated[
 # waiting_link/risk_review/meeting are scored starting Task 2/3/7 (Phase 3);
 # widened here per Task 1 so `attention_items.entity_type` (an unconstrained
 # String(32), verified against migration 0006 -- no CHECK to change) accepts
-# them without a later migration.
-EntityType = Literal["task", "commitment", "risk", "waiting_link", "risk_review", "meeting"]
+# them without a later migration. `email_thread` (Phase 10 Task 3) reuses
+# the identical no-migration-needed widening -- same unconstrained column,
+# same precedent `risk_review`/`meeting` already established.
+EntityType = Literal[
+    "task", "commitment", "risk", "waiting_link", "risk_review", "meeting", "email_thread"
+]
 FeedbackTargetType = Literal["attention_item"]
 FeedbackLabel = Literal["useful", "not_useful", "incorrect"]
 
@@ -351,6 +355,59 @@ def _score_waiting(
     return score, 1.0, factors
 
 
+def _score_awaiting_reply(
+    row: dict[str, Any], now: datetime, policy: AttentionPolicy
+) -> tuple[int, float, list[dict[str, Any]]]:
+    """Phase 10 Task 3: the fifth scored ``entity_type``, ``email_thread``
+    -- the "awaiting reply" heuristic from the implementation plan
+    (Task 3): last message in a thread is inbound, no outbound reply
+    since, and the sender resolves to a known `pkos_nodes` contact.
+
+    Eligibility is entirely enforced by `regenerate_attention`'s own
+    `email_threads` query (the inbound-last-message check, the sender
+    resolution `EXISTS` against `entity_aliases`, and the owner's `email`
+    domain being enabled/consented) -- every row reaching this function is,
+    by construction, "awaiting reply," so unlike `_score_task`/`_score_
+    risk` there is no separate eligibility gate re-checked here. No pin
+    concept for email threads (no `pinned` column on `email_threads`, the
+    same reasoning `_score_waiting`'s own docstring gives for
+    `waiting_links`), so the cap is always the unpinned one, and (also
+    like `_score_waiting`) no `_recency_and_deferral_factors` call --
+    `email_threads` has no `prior_deferred_until`-shaped eligibility
+    input, and "recently created" isn't a meaningful signal for a thread
+    that may be arbitrarily old but only just became unanswered.
+    """
+    factors = [
+        _factor(
+            "awaiting_reply",
+            "Awaiting your reply",
+            policy.awaiting_reply_points,
+            "direction",
+        )
+    ]
+    age = now - row["last_inbound_sent_at"]
+    if age >= timedelta(days=14):
+        factors.append(
+            _factor(
+                "stale_14d",
+                "Awaiting reply for 14+ days",
+                policy.stale_14d_points,
+                "last_inbound_sent_at",
+            )
+        )
+    elif age >= timedelta(days=7):
+        factors.append(
+            _factor(
+                "stale_7d",
+                "Awaiting reply for 7+ days",
+                policy.stale_7d_points,
+                "last_inbound_sent_at",
+            )
+        )
+    score = min(policy.cap_unpinned, max(0, sum(item["points"] for item in factors)))
+    return score, 1.0, factors
+
+
 def _upsert_batch(
     session: Session,
     auth: AuthContext,
@@ -563,6 +620,52 @@ def regenerate_attention(auth: AuthDep, session: SessionDep, _csrf: CsrfDep) -> 
             .mappings()
             .all()
         )
+        # Phase 10 Task 3's "awaiting reply" heuristic: the thread's own
+        # last message (by sent_at) is inbound, the owner's `email`
+        # personal domain is enabled and its consent is still active (a
+        # defensive re-check -- Task 7, not yet built, is what actually
+        # purges `email_threads`/`email_messages` on revocation; until
+        # then this keeps a revoked-but-not-yet-purged domain's threads
+        # from surfacing new attention items), and the last message's
+        # sender resolves to a known `pkos_nodes` contact via the same
+        # `entity_aliases` lookup `gmail_adapter.py`'s own `_resolve_or_
+        # create_person` performs at write time (re-run here at read time,
+        # matching `_normalize_email`'s `.strip().casefold()` via
+        # `LOWER(TRIM(...))`).
+        email_threads = (
+            session.execute(
+                text("""
+                SELECT et.id, et.owner_id, et.created_at, et.updated_at,
+                       lm.sent_at AS last_inbound_sent_at
+                FROM email_threads et
+                JOIN personal_domains pd
+                  ON pd.workspace_id = et.workspace_id AND pd.owner_id = et.owner_id
+                  AND pd.domain_key = 'email' AND pd.enabled = true
+                JOIN LATERAL (
+                    SELECT sender, sent_at, direction
+                    FROM email_messages em
+                    WHERE em.workspace_id = et.workspace_id AND em.thread_id = et.id
+                    ORDER BY sent_at DESC
+                    LIMIT 1
+                ) lm ON true
+                WHERE et.workspace_id = :workspace_id
+                  AND lm.direction = 'inbound'
+                  AND EXISTS (
+                      SELECT 1 FROM domain_consents dc
+                      WHERE dc.workspace_id = et.workspace_id AND dc.owner_id = et.owner_id
+                        AND dc.domain_key = 'email' AND dc.revoked_at IS NULL
+                  )
+                  AND EXISTS (
+                      SELECT 1 FROM entity_aliases ea
+                      WHERE ea.workspace_id = et.workspace_id AND ea.alias_type = 'email'
+                        AND ea.normalized_value = LOWER(TRIM(lm.sender))
+                  )
+            """),
+                {"workspace_id": auth.workspace_id},
+            )
+            .mappings()
+            .all()
+        )
         session.execute(
             text(
                 """
@@ -590,6 +693,31 @@ def regenerate_attention(auth: AuthDep, session: SessionDep, _csrf: CsrfDep) -> 
                         SELECT 1 FROM waiting_links wl
                         WHERE wl.workspace_id = ai.workspace_id AND wl.id = ai.entity_id
                           AND wl.status = 'open'
+                    ))
+                    OR (ai.entity_type = 'email_thread' AND NOT EXISTS (
+                        SELECT 1 FROM email_threads et
+                        JOIN personal_domains pd
+                          ON pd.workspace_id = et.workspace_id AND pd.owner_id = et.owner_id
+                          AND pd.domain_key = 'email' AND pd.enabled = true
+                        JOIN LATERAL (
+                            SELECT sender, direction
+                            FROM email_messages em
+                            WHERE em.workspace_id = et.workspace_id AND em.thread_id = et.id
+                            ORDER BY sent_at DESC
+                            LIMIT 1
+                        ) lm ON true
+                        WHERE et.workspace_id = ai.workspace_id AND et.id = ai.entity_id
+                          AND lm.direction = 'inbound'
+                          AND EXISTS (
+                              SELECT 1 FROM domain_consents dc
+                              WHERE dc.workspace_id = et.workspace_id AND dc.owner_id = et.owner_id
+                                AND dc.domain_key = 'email' AND dc.revoked_at IS NULL
+                          )
+                          AND EXISTS (
+                              SELECT 1 FROM entity_aliases ea
+                              WHERE ea.workspace_id = et.workspace_id AND ea.alias_type = 'email'
+                                AND ea.normalized_value = LOWER(TRIM(lm.sender))
+                          )
                     ))
                   )
                 """
@@ -627,6 +755,39 @@ def regenerate_attention(auth: AuthDep, session: SessionDep, _csrf: CsrfDep) -> 
         # False here rather than making pinned optional across every
         # scorer for one entity_type's sake.
         waiting_rows = [{**dict(raw), "pinned": False} for raw in waiting_links]
+        # email_threads has neither a `pinned` column (see waiting_rows'
+        # own comment above for the identical reasoning) nor an
+        # optimistic-concurrency `version` column (migration 0069's own
+        # docstring: it deliberately isn't a member of `ecc.platform.
+        # authz`'s workspace-visible resource-table model, unlike tasks/
+        # commitments/risks/waiting_links, all four of which do have one).
+        # `_upsert_batch`'s dismissed-state-preservation logic only needs
+        # *some* monotonically-changing value per row to detect "has the
+        # underlying entity changed since this item was dismissed" -- the
+        # thread's own `updated_at` (bumped to `now()` by `gmail_adapter.
+        # py`'s `_upsert_thread` on every write that touches this thread,
+        # including a new message arriving) serves that role, converted to
+        # microsecond-epoch so it round-trips as the `bigint` `_upsert_
+        # batch`'s `source_entity_version` column expects. `visibility` is
+        # likewise not a real `email_threads` column (see above) --
+        # `attention_items.visibility` is fixed to `'private'` for every
+        # email_thread row rather than read from the source table, since
+        # `authz.authorize()`'s own step 2 ("the owner is always allowed")
+        # already makes this row visible to its `owner_id` regardless of
+        # `visibility`'s value, and Phase 7's per-owner personal-domain
+        # model (migration 0069's own docstring) never intends a `high_
+        # stakes`-classified domain's derived data to default to
+        # workspace-wide visibility the way a `task`/`commitment`/`risk`
+        # row's own `visibility` column can.
+        email_thread_rows = [
+            {
+                **dict(raw),
+                "pinned": False,
+                "visibility": "private",
+                "version": int(raw["updated_at"].timestamp() * 1_000_000),
+            }
+            for raw in email_threads
+        ]
         _upsert_batch(
             session,
             auth,
@@ -667,9 +828,19 @@ def regenerate_attention(auth: AuthDep, session: SessionDep, _csrf: CsrfDep) -> 
             expires_at,
             policy.version,
         )
+        _upsert_batch(
+            session,
+            auth,
+            "email_thread",
+            email_thread_rows,
+            [_score_awaiting_reply(row, now, policy) for row in email_thread_rows],
+            now,
+            expires_at,
+            policy.version,
+        )
     record_ranking(
         time_module.monotonic() - ranking_start,
-        len(tasks) + len(commitments) + len(risks) + len(waiting_links),
+        len(tasks) + len(commitments) + len(risks) + len(waiting_links) + len(email_threads),
     )
     return list_attention(auth, session, 50)
 
@@ -704,6 +875,8 @@ def list_attention(
                 AND r.workspace_id = ai.workspace_id AND r.id = ai.entity_id
             LEFT JOIN waiting_links wl ON ai.entity_type = 'waiting_link'
                 AND wl.workspace_id = ai.workspace_id AND wl.id = ai.entity_id
+            LEFT JOIN email_threads eth ON ai.entity_type = 'email_thread'
+                AND eth.workspace_id = ai.workspace_id AND eth.id = ai.entity_id
             WHERE ai.workspace_id = :workspace_id
               AND ai.expires_at > :now
               AND (ai.dismissed_at IS NULL
@@ -726,7 +899,7 @@ def list_attention(
                 WHEN t.manual_priority = 'low' THEN 1
                 ELSE 0
               END DESC,
-              COALESCE(t.created_at, c.created_at, r.created_at, wl.created_at) ASC,
+              COALESCE(t.created_at, c.created_at, r.created_at, wl.created_at, eth.created_at) ASC,
               ai.entity_id ASC
             LIMIT :limit
         """),
