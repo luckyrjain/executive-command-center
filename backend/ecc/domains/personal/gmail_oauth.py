@@ -202,9 +202,15 @@ def gmail_oauth_callback_endpoint(
     # run *inside* `create_session`'s open transaction, several of them
     # (the `active`-row and reactivation branches) while still holding the
     # re-`SELECT ... FOR UPDATE` row lock taken below -- `GmailAdapter.
-    # disconnect()` is the first `disconnect()` in this registry that
-    # makes a real, blocking outbound HTTPS call (Google's `/revoke`, up
-    # to `timeout_seconds=10.0`), so this held a pooled connection *and* a
+    # disconnect()` makes a real, blocking outbound HTTPS call (Google's
+    # `/revoke`, up to `timeout_seconds=10.0`; round 27 review: not
+    # actually the first in this registry to do so -- `gitlab_adapter.py`'s
+    # `disconnect()` already does via `/personal_access_tokens/self`, and
+    # benefits from this same fix via `disable_connector_endpoint`'s own
+    # generic, provider-agnostic phase split -- but this was still the
+    # first *reconnect*-path call site, the only one holding a row lock
+    # rather than just a pooled connection), so this held a pooled
+    # connection *and* a
     # row lock across that call on the two most mainline paths through
     # this branch (a racing reconnect, and any ordinary reconnect of a
     # previously-disconnected account) -- dynamically proven via a real
