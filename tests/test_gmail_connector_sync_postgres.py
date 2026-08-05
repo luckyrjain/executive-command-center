@@ -210,9 +210,15 @@ Covers, per this task's own scope:
     safe, only whether a `partial` result should hand one out at all).
     Fixed by returning `next_cursor=None` from all three sites, matching
     the already-correct `budget_exhausted` partial return in this same
-    method and `_sync_history`'s own sibling partial branches (which
-    always return `next_cursor=start_history_id` unconditionally, never a
-    value updated mid-walk).
+    method and (at the time) `_sync_history`'s own sibling partial
+    branches, which returned `next_cursor=start_history_id`
+    unconditionally -- since revised by round 12 review (item 26 below) to
+    resume from `resumable_history_id` once available instead, safe there
+    only because `history.list`'s own strictly-ascending record order
+    gives it a resume point this method's unordered `messages.list` has no
+    equivalent for -- found stale by round 13 review, this paragraph
+    previously still described `_sync_history`'s pre-round-12 behavior as
+    current.
 26. `_sync_history`'s own `partial`-status returns (budget-exhausted mid-
     page, rate-limited, consent-revoked mid-loop) previously reported
     `next_cursor=start_history_id` unconditionally, regardless of how many
@@ -248,6 +254,30 @@ Covers, per this task's own scope:
     each processed only the same first two records and reported the same
     cursor back every time; the remaining two were never written by any of
     them.
+27. `resumable_history_id` (item 26) only resumes `_sync_history` at
+    `history[]` *record* granularity -- a single record whose own
+    `messagesAdded` list by itself exceeds `_MAX_MESSAGES_PER_CALL` could
+    still never finish, no matter how many retries, since `history.
+    list(startHistoryId=X)` has no way to return that one record
+    partially, only ever whole again for the identical `X` -- found by
+    round 13 review's security/correctness lens, the newest,
+    least-reviewed logic in the file (round 12's own restructuring) not
+    yet scrutinized past its own author. Reproduced directly against real
+    Postgres: one record with five `messagesAdded` entries, budget
+    monkeypatched to 2 -- six consecutive `incremental_sync` calls each
+    processed only the same first two messages and reported the same
+    `next_cursor` every time; the remaining three were never written by
+    any of them. Closed by extending `next_cursor` to optionally carry
+    "and skip the first N messages of record M" as a compound string
+    (`_parse_history_cursor`/`_build_history_cursor`), safe for the same
+    reason `resumable_history_id` itself is: `history.list` walks
+    strictly ascending by record `id` for a fixed `startHistoryId`, and a
+    `messagesAdded` list is itself a fixed, already-happened fact, so both
+    a record's own position and its own message list are stable and
+    replayable across retries. Layers on top of, not instead of,
+    `resumable_history_id` -- a bare historyId cursor (a fully-caught-up
+    record boundary, or a cursor from before this fix) still parses
+    correctly as the plain, no-skip case.
 """
 
 from __future__ import annotations
@@ -2698,6 +2728,109 @@ def test_incremental_sync_makes_forward_progress_across_repeated_budget_exhauste
     # actually resumed past the first's progress rather than re-listing
     # from scratch.
     assert seen_start_history_ids == [100, 102]
+
+    rows = _threads_and_messages(context.workspace_id)
+    assert {row["external_message_id"] for row in rows} == set(message_ids)
+
+
+def test_incremental_sync_makes_forward_progress_through_a_single_oversized_history_record(
+    seeded_gmail_account: tuple[ConnectorAccountContext, UUID],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 13 review: round 12's own `resumable_history_id` fix (see the
+    test immediately above) resumes at `history[]` *record* granularity --
+    it closes the livelock for *many small records* spanning more than one
+    budget's worth of messages, but does nothing for a *single* record
+    whose own `messagesAdded` list by itself exceeds `_MAX_MESSAGES_PER_
+    CALL`: `history.list(startHistoryId=X)` has no way to return that one
+    record partially, only ever whole again for the identical `X`, so
+    before this fix every retry re-walked it from its own first message
+    and re-hit the identical budget boundary every single time --
+    `resumable_history_id` never advances past it (it never *finishes*),
+    so `next_cursor` never changes either. Reproduced directly against
+    real Postgres before this fix: one history record with five
+    `messagesAdded` entries, budget monkeypatched to 2 -- six consecutive
+    `incremental_sync("100")` calls each processed only the same first two
+    messages (`big-0`/`big-1`) and reported `next_cursor="100"` every
+    time; `big-2`/`big-3`/`big-4` were never written by any of them.
+
+    Fixed by `_parse_history_cursor`/`_build_history_cursor`: a compound
+    `next_cursor` (`"{list_start_history_id}:{record_id}:{skip_count}"`)
+    carries "and skip the first N messages of this specific record" across
+    calls, on top of the existing `resumable_history_id` mechanism -- this
+    test proves three successive calls, each hitting the same
+    monkeypatched budget, together cover every message in the oversized
+    record without ever re-fetching one already written by an earlier
+    call (`fetch_counts` below asserts each message is fetched exactly
+    once total, not merely that all five eventually land in Postgres).
+    """
+    import ecc.domains.personal.gmail_adapter as gmail_adapter_module
+
+    monkeypatch.setattr(gmail_adapter_module, "_MAX_MESSAGES_PER_CALL", 2)
+
+    context, _owner_id = seeded_gmail_account
+    now_ms = int(datetime.now(UTC).timestamp() * 1000)
+    message_ids = [f"big-{i}" for i in range(5)]
+    bodies = {
+        message_id: _message_body(
+            message_id=message_id,
+            thread_id=f"thread-{message_id}",
+            from_addr="carol@example.test",
+            to_addrs=[_OWNER_EMAIL],
+            internal_date_ms=now_ms + i,
+        )
+        for i, message_id in enumerate(message_ids)
+    }
+    # ONE record, with all five messages -- more than the (monkeypatched)
+    # budget of 2, unlike the many-small-records shape the test above
+    # covers.
+    history_records = [
+        {"id": 101, "messagesAdded": [{"message": {"id": m}} for m in message_ids]},
+    ]
+    seen_start_history_ids: list[int] = []
+    fetch_counts: dict[str, int] = {message_id: 0 for message_id in message_ids}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/gmail/v1/users/me/history":
+            start = int(request.url.params["startHistoryId"])
+            seen_start_history_ids.append(start)
+            visible = [r for r in history_records if r["id"] > start]
+            return _json_response({"history": visible, "historyId": 999})
+        if request.url.path.startswith("/gmail/v1/users/me/messages/"):
+            message_id = request.url.path.rsplit("/", 1)[-1]
+            fetch_counts[message_id] += 1
+            return _json_response(bodies[message_id])
+        raise AssertionError(f"unexpected request to {request.url}")
+
+    adapter = GmailAdapter(transport=httpx.MockTransport(handler))
+
+    outcome_1 = adapter.incremental_sync(context, "message", "100")
+    assert outcome_1.status == "partial"
+    assert outcome_1.items_processed == 2
+    # Not "100" (the pre-fix, never-advancing behavior) -- a compound
+    # cursor recording "record 101, 2 of its own messages already done."
+    assert outcome_1.next_cursor == "100:101:2"
+
+    outcome_2 = adapter.incremental_sync(context, "message", outcome_1.next_cursor)
+    assert outcome_2.status == "partial"
+    assert outcome_2.items_processed == 2
+    assert outcome_2.next_cursor == "100:101:4"
+
+    outcome_3 = adapter.incremental_sync(context, "message", outcome_2.next_cursor)
+    assert outcome_3.status == "succeeded"
+    assert outcome_3.items_processed == 1
+    assert outcome_3.next_cursor == "999"
+
+    # Every `history.list` call resumes from the same `startHistoryId=100`
+    # (the record itself, `id=101`, is only ever returned by asking for
+    # everything *after* 100) -- proving the compound cursor's own
+    # `list_start_history_id` component round-trips correctly across all
+    # three calls, not just its skip-count component.
+    assert seen_start_history_ids == [100, 100, 100]
+    # Each message is fetched exactly once, total, across all three calls
+    # -- the skip mechanism actually avoids re-fetching, not merely
+    # re-fetching-but-idempotently-no-op-ing on the DB write.
+    assert fetch_counts == {message_id: 1 for message_id in message_ids}
 
     rows = _threads_and_messages(context.workspace_id)
     assert {row["external_message_id"] for row in rows} == set(message_ids)
