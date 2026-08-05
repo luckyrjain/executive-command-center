@@ -29,6 +29,23 @@ Covers, per this task's own scope:
 6. `ResourceType` widened to accept `"message"`; every other resource
    type still zero-item-succeeds for a `gmail` account, matching every
    other adapter's "not-yet-implemented resource type" contract.
+7. An oversized `From`/`To` address (`_MAX_EMAIL_ADDRESS_LENGTH`) is
+   dropped like any other unparseable header, not left to crash the sync
+   call on `email_messages.sender`/`.recipients`' own `VARCHAR(320)`
+   bound -- found by round 1 review's security/correctness lens.
+8. `_MAX_MESSAGES_PER_CALL` hit mid-page (not merely mid-multi-page-walk)
+   correctly reports `status="partial"`, not a false `"succeeded"` that
+   would silently strand the page's own unfetched messages -- found by
+   round 1 review's architecture lens; both `_sync_messages`/`_sync_
+   history`'s structurally identical loops are covered.
+9. `messages.list`/`history.list` pagination genuinely walks a real
+   multi-page response (every test above 8 uses a single page) -- round 1
+   review coverage gap, closed.
+10. `_process_message`'s own guard clauses (missing `id`/`threadId`/
+    `From` header/recipients, non-numeric `internalDate`) each skip that
+    one message gracefully rather than raising, called directly rather
+    than only exercised incidentally -- round 1 review coverage gap,
+    closed.
 """
 
 from __future__ import annotations
@@ -714,3 +731,555 @@ def test_owner_id_is_populated_from_created_by(
             {"id": context.connector_account_id},
         ).one()
     assert row[0] == owner_id
+
+
+# --- malformed message shape --------------------------------------------------
+
+
+def test_nul_byte_in_from_address_is_skipped_not_a_crash(
+    seeded_gmail_account: tuple[ConnectorAccountContext, UUID],
+) -> None:
+    """A JSON-escaped `\\u0000` in Gmail's own response body decodes to a
+    real NUL character in the parsed `From` address -- Postgres `text`/
+    `varchar` columns can never store `0x00` (a distinct constraint from
+    `_MAX_EMAIL_ADDRESS_LENGTH`'s column-width check above), so this
+    previously reached the `email_messages` INSERT uncaught (`psycopg.
+    DataError`), crashing the whole sync call the same way an over-length
+    address did -- found by the same review pass. Must degrade to a
+    skipped message, not a crash.
+    """
+    context, _owner_id = seeded_gmail_account
+    now_ms = int(datetime.now(UTC).timestamp() * 1000)
+    body = _message_body(
+        message_id="msg-nul",
+        thread_id="thread-nul",
+        from_addr="weird\x00addr@example.test",
+        to_addrs=[_OWNER_EMAIL],
+        internal_date_ms=now_ms,
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/gmail/v1/users/me/messages":
+            return _json_response({"messages": [{"id": "msg-nul"}]})
+        if request.url.path.startswith("/gmail/v1/users/me/messages/"):
+            return _json_response(body)
+        if request.url.path == "/gmail/v1/users/me/profile":
+            return _json_response({"historyId": 1})
+        raise AssertionError(f"unexpected request to {request.url}")
+
+    adapter = GmailAdapter(transport=httpx.MockTransport(handler))
+    outcome = adapter.backfill(context, "message", since=datetime.now(UTC) - timedelta(days=1))
+    assert outcome.status == "succeeded"
+    assert outcome.items_processed == 1
+    assert _threads_and_messages(context.workspace_id) == []
+
+
+def test_nul_byte_in_from_display_name_is_skipped_not_a_crash(
+    seeded_gmail_account: tuple[ConnectorAccountContext, UUID],
+) -> None:
+    """Same NUL-byte hazard as the address case above, but in the display-
+    name half of the header -- `parseaddr` keeps it separate from the
+    address, and it flows to `pkos_nodes.canonical_name` (also `text`)
+    via `_resolve_or_create_person`, not `email_messages.sender`. A valid
+    address alongside a NUL-carrying display name must still be treated
+    as unparseable as a whole (matching `_parse_address`'s own "can't
+    make sense of it" contract), not silently truncate/strip just the
+    display name and resolve a person from the rest.
+    """
+    context, _owner_id = seeded_gmail_account
+    now_ms = int(datetime.now(UTC).timestamp() * 1000)
+    body = _message_body(
+        message_id="msg-nul-name",
+        thread_id="thread-nul-name",
+        from_addr="Weird\x00Name <alice@example.test>",
+        to_addrs=[_OWNER_EMAIL],
+        internal_date_ms=now_ms,
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/gmail/v1/users/me/messages":
+            return _json_response({"messages": [{"id": "msg-nul-name"}]})
+        if request.url.path.startswith("/gmail/v1/users/me/messages/"):
+            return _json_response(body)
+        if request.url.path == "/gmail/v1/users/me/profile":
+            return _json_response({"historyId": 1})
+        raise AssertionError(f"unexpected request to {request.url}")
+
+    adapter = GmailAdapter(transport=httpx.MockTransport(handler))
+    outcome = adapter.backfill(context, "message", since=datetime.now(UTC) - timedelta(days=1))
+    assert outcome.status == "succeeded"
+    assert outcome.items_processed == 1
+    assert _threads_and_messages(context.workspace_id) == []
+    assert _resolved_person(context.workspace_id, "alice@example.test") is None
+
+
+def test_nul_byte_in_subject_is_dropped_but_message_still_syncs(
+    seeded_gmail_account: tuple[ConnectorAccountContext, UUID],
+) -> None:
+    """`email_threads.subject` is nullable, so a NUL-carrying `Subject`
+    header only drops that one field rather than the whole message --
+    unlike a NUL in the sender/recipient address, nothing else about the
+    message depends on it.
+    """
+    context, _owner_id = seeded_gmail_account
+    now_ms = int(datetime.now(UTC).timestamp() * 1000)
+    body = _message_body(
+        message_id="msg-nul-subject",
+        thread_id="thread-nul-subject",
+        from_addr="alice@example.test",
+        to_addrs=[_OWNER_EMAIL],
+        internal_date_ms=now_ms,
+        subject="Weird\x00Subject",
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/gmail/v1/users/me/messages":
+            return _json_response({"messages": [{"id": "msg-nul-subject"}]})
+        if request.url.path.startswith("/gmail/v1/users/me/messages/"):
+            return _json_response(body)
+        raise AssertionError(f"unexpected request to {request.url}")
+
+    adapter = GmailAdapter(transport=httpx.MockTransport(handler))
+    outcome = adapter.backfill(context, "message", since=datetime.now(UTC) - timedelta(days=1))
+    assert outcome.status == "succeeded"
+    assert outcome.items_processed == 1
+
+    rows = _threads_and_messages(context.workspace_id)
+    assert len(rows) == 1
+    assert rows[0]["subject"] is None
+
+
+def test_oversized_from_address_is_skipped_not_a_crash(
+    seeded_gmail_account: tuple[ConnectorAccountContext, UUID],
+) -> None:
+    """`email_messages.sender`/`.recipients` are `VARCHAR(320)` (migration
+    `0069`); `email.utils.parseaddr` has no length limit of its own, so a
+    `From` header whose address portion exceeds that column width
+    previously reached Postgres uncaught (`StringDataRightTruncation`),
+    aborting the entire sync call instead of skipping just this one
+    malformed message -- found by review. A real Gmail sender fully
+    controls their own `From` header value; this must degrade the same
+    way any other malformed message already does (skipped, contributing
+    to `items_processed` but writing nothing -- see `_process_message`'s
+    own docstring), not crash the call.
+    """
+    context, _owner_id = seeded_gmail_account
+    now_ms = int(datetime.now(UTC).timestamp() * 1000)
+    long_addr = "x" * 400 + "@example.test"
+    body = _message_body(
+        message_id="msg-oversized",
+        thread_id="thread-oversized",
+        from_addr=f"Attacker <{long_addr}>",
+        to_addrs=[_OWNER_EMAIL],
+        internal_date_ms=now_ms,
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/gmail/v1/users/me/messages":
+            return _json_response({"messages": [{"id": "msg-oversized"}]})
+        if request.url.path.startswith("/gmail/v1/users/me/messages/"):
+            return _json_response(body)
+        if request.url.path == "/gmail/v1/users/me/profile":
+            return _json_response({"historyId": 1})
+        raise AssertionError(f"unexpected request to {request.url}")
+
+    adapter = GmailAdapter(transport=httpx.MockTransport(handler))
+    outcome = adapter.backfill(context, "message", since=datetime.now(UTC) - timedelta(days=1))
+    assert outcome.status == "succeeded"
+    assert outcome.items_processed == 1
+    assert _threads_and_messages(context.workspace_id) == []
+
+
+def test_oversized_recipient_address_is_dropped_but_message_still_syncs(
+    seeded_gmail_account: tuple[ConnectorAccountContext, UUID],
+) -> None:
+    """Same bound as the `From` case above, but on one `To` address among
+    several -- only the oversized recipient is dropped (matching how any
+    other individually-unparseable recipient is already handled), the
+    message itself still syncs with its remaining, well-formed recipients.
+    """
+    context, _owner_id = seeded_gmail_account
+    now_ms = int(datetime.now(UTC).timestamp() * 1000)
+    long_addr = "y" * 400 + "@example.test"
+    body = _message_body(
+        message_id="msg-partial-recipients",
+        thread_id="thread-partial-recipients",
+        from_addr="alice@example.test",
+        to_addrs=[_OWNER_EMAIL, f"Oversized <{long_addr}>"],
+        internal_date_ms=now_ms,
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/gmail/v1/users/me/messages":
+            return _json_response({"messages": [{"id": "msg-partial-recipients"}]})
+        if request.url.path.startswith("/gmail/v1/users/me/messages/"):
+            return _json_response(body)
+        raise AssertionError(f"unexpected request to {request.url}")
+
+    adapter = GmailAdapter(transport=httpx.MockTransport(handler))
+    outcome = adapter.backfill(context, "message", since=datetime.now(UTC) - timedelta(days=1))
+    assert outcome.status == "succeeded"
+    assert outcome.items_processed == 1
+
+    rows = _threads_and_messages(context.workspace_id)
+    assert len(rows) == 1
+    assert rows[0]["recipients"] == [_OWNER_EMAIL]
+
+
+# --- per-call message budget hit mid-page -------------------------------------
+
+
+def test_backfill_reports_partial_not_succeeded_when_budget_exhausted_mid_page(
+    seeded_gmail_account: tuple[ConnectorAccountContext, UUID],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 1 review: `_MAX_MESSAGES_PER_CALL` bounds total `messages.get`
+    calls across every page fetched in one call -- but the per-page `for`
+    loop that enforces it previously fell straight through to the
+    `nextPageToken` check once the budget ran out, rather than returning
+    early. When the bound-hitting page also happened to be Gmail's own
+    *last* page (no `nextPageToken`), that meant this method reported
+    `status="succeeded"` -- and handed `incremental_sync` a `next_cursor`
+    implying nothing older remained -- despite some of that very page's
+    own `messages` never having been fetched or written at all: silent
+    data loss reported as success. This monkeypatches `_MAX_MESSAGES_PER_
+    CALL` down to 3 against a single five-message page (no `nextPageToken`
+    at all) to exercise exactly that shape without needing 200+ messages
+    in a test fixture. Mutation-confirmed: reverting `gmail_adapter.py`'s
+    `budget_exhausted` fix reproduces `status="succeeded"` with only 3 of
+    5 messages ever written -- silently incomplete, not merely capped.
+    """
+    import ecc.domains.personal.gmail_adapter as gmail_adapter_module
+
+    monkeypatch.setattr(gmail_adapter_module, "_MAX_MESSAGES_PER_CALL", 3)
+
+    context, _owner_id = seeded_gmail_account
+    now_ms = int(datetime.now(UTC).timestamp() * 1000)
+    message_ids = [f"msg-{i}" for i in range(5)]
+    bodies = {
+        message_id: _message_body(
+            message_id=message_id,
+            thread_id=f"thread-{message_id}",
+            from_addr="alice@example.test",
+            to_addrs=[_OWNER_EMAIL],
+            internal_date_ms=now_ms + i,
+        )
+        for i, message_id in enumerate(message_ids)
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/gmail/v1/users/me/messages":
+            # A single page, no `nextPageToken` -- this is Gmail's own
+            # last (and only) page for this query, with more refs than
+            # the (monkeypatched) budget allows.
+            return _json_response({"messages": [{"id": m} for m in message_ids]})
+        if request.url.path.startswith("/gmail/v1/users/me/messages/"):
+            message_id = request.url.path.rsplit("/", 1)[-1]
+            return _json_response(bodies[message_id])
+        raise AssertionError(f"unexpected request to {request.url}")
+
+    adapter = GmailAdapter(transport=httpx.MockTransport(handler))
+    outcome = adapter.backfill(context, "message", since=datetime.now(UTC) - timedelta(days=1))
+
+    assert outcome.status == "partial"
+    assert outcome.items_processed == 3
+    assert outcome.next_cursor is None
+    assert outcome.error_summary is not None and "per-call bound" in outcome.error_summary
+
+    rows = _threads_and_messages(context.workspace_id)
+    assert len(rows) == 3
+
+
+def test_incremental_sync_reports_partial_not_succeeded_when_budget_exhausted_mid_page(
+    seeded_gmail_account: tuple[ConnectorAccountContext, UUID],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Same bug, same fix, in `_sync_history`'s identical loop shape --
+    see `test_backfill_reports_partial_not_succeeded_when_budget_exhausted_
+    mid_page`'s own docstring for the full mechanism.
+    """
+    import ecc.domains.personal.gmail_adapter as gmail_adapter_module
+
+    monkeypatch.setattr(gmail_adapter_module, "_MAX_MESSAGES_PER_CALL", 2)
+
+    context, _owner_id = seeded_gmail_account
+    now_ms = int(datetime.now(UTC).timestamp() * 1000)
+    message_ids = [f"hist-{i}" for i in range(4)]
+    bodies = {
+        message_id: _message_body(
+            message_id=message_id,
+            thread_id=f"thread-{message_id}",
+            from_addr="carol@example.test",
+            to_addrs=[_OWNER_EMAIL],
+            internal_date_ms=now_ms + i,
+        )
+        for i, message_id in enumerate(message_ids)
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/gmail/v1/users/me/history":
+            return _json_response(
+                {
+                    "history": [{"messagesAdded": [{"message": {"id": m}}]} for m in message_ids],
+                    "historyId": 999,
+                }
+            )
+        if request.url.path.startswith("/gmail/v1/users/me/messages/"):
+            message_id = request.url.path.rsplit("/", 1)[-1]
+            return _json_response(bodies[message_id])
+        raise AssertionError(f"unexpected request to {request.url}")
+
+    adapter = GmailAdapter(transport=httpx.MockTransport(handler))
+    outcome = adapter.incremental_sync(context, "message", "100")
+
+    assert outcome.status == "partial"
+    assert outcome.items_processed == 2
+    assert outcome.next_cursor == "100"
+    assert outcome.error_summary is not None and "per-call bound" in outcome.error_summary
+
+    rows = _threads_and_messages(context.workspace_id)
+    assert len(rows) == 2
+
+
+# --- pagination across multiple messages.list/history.list pages -------------
+
+
+def test_backfill_paginates_across_multiple_messages_list_pages(
+    seeded_gmail_account: tuple[ConnectorAccountContext, UUID],
+) -> None:
+    """Every other `backfill` test in this file exercises a single
+    `messages.list` page (`nextPageToken` absent) -- this is the only test
+    proving the `while`/`pageToken` loop that walks a real multi-page
+    `messages.list` response actually advances page-to-page rather than
+    only ever having been exercised with one page.
+    """
+    context, _owner_id = seeded_gmail_account
+    now_ms = int(datetime.now(UTC).timestamp() * 1000)
+    body_1 = _message_body(
+        message_id="page1-msg",
+        thread_id="thread-page1",
+        from_addr="alice@example.test",
+        to_addrs=[_OWNER_EMAIL],
+        internal_date_ms=now_ms,
+        history_id=201,
+    )
+    body_2 = _message_body(
+        message_id="page2-msg",
+        thread_id="thread-page2",
+        from_addr="bob@example.test",
+        to_addrs=[_OWNER_EMAIL],
+        internal_date_ms=now_ms + 1000,
+        history_id=202,
+    )
+    seen_page_tokens: list[str | None] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/gmail/v1/users/me/messages":
+            page_token = request.url.params.get("pageToken")
+            seen_page_tokens.append(page_token)
+            if page_token is None:
+                return _json_response(
+                    {"messages": [{"id": "page1-msg"}], "nextPageToken": "page-2"}
+                )
+            assert page_token == "page-2"
+            return _json_response({"messages": [{"id": "page2-msg"}]})
+        if request.url.path == "/gmail/v1/users/me/messages/page1-msg":
+            return _json_response(body_1)
+        if request.url.path == "/gmail/v1/users/me/messages/page2-msg":
+            return _json_response(body_2)
+        raise AssertionError(f"unexpected request to {request.url}")
+
+    adapter = GmailAdapter(transport=httpx.MockTransport(handler))
+    outcome = adapter.backfill(context, "message", since=datetime.now(UTC) - timedelta(days=1))
+
+    assert outcome.status == "succeeded"
+    assert outcome.items_processed == 2
+    assert outcome.next_cursor == "202"
+    assert seen_page_tokens == [None, "page-2"]
+
+    rows = _threads_and_messages(context.workspace_id)
+    assert {row["external_message_id"] for row in rows} == {"page1-msg", "page2-msg"}
+
+
+def test_incremental_sync_paginates_across_multiple_history_list_pages(
+    seeded_gmail_account: tuple[ConnectorAccountContext, UUID],
+) -> None:
+    """Same coverage gap as the `backfill` test above, for `_sync_history`'s
+    own `history.list` pagination loop.
+    """
+    context, _owner_id = seeded_gmail_account
+    now_ms = int(datetime.now(UTC).timestamp() * 1000)
+    body = _message_body(
+        message_id="hist-page2-msg",
+        thread_id="thread-hist-page2",
+        from_addr="dave@example.test",
+        to_addrs=[_OWNER_EMAIL],
+        internal_date_ms=now_ms,
+    )
+    seen_page_tokens: list[str | None] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/gmail/v1/users/me/history":
+            page_token = request.url.params.get("pageToken")
+            seen_page_tokens.append(page_token)
+            if page_token is None:
+                return _json_response(
+                    {"history": [], "historyId": 300, "nextPageToken": "hist-page-2"}
+                )
+            assert page_token == "hist-page-2"
+            return _json_response(
+                {
+                    "history": [{"messagesAdded": [{"message": {"id": "hist-page2-msg"}}]}],
+                    "historyId": 310,
+                }
+            )
+        if request.url.path == "/gmail/v1/users/me/messages/hist-page2-msg":
+            return _json_response(body)
+        raise AssertionError(f"unexpected request to {request.url}")
+
+    adapter = GmailAdapter(transport=httpx.MockTransport(handler))
+    outcome = adapter.incremental_sync(context, "message", "100")
+
+    assert outcome.status == "succeeded"
+    assert outcome.items_processed == 1
+    assert outcome.next_cursor == "310"
+    assert seen_page_tokens == [None, "hist-page-2"]
+
+    rows = _threads_and_messages(context.workspace_id)
+    assert rows[0]["external_message_id"] == "hist-page2-msg"
+
+
+# --- _process_message guard clauses: skip gracefully, never crash ------------
+#
+# `_process_message`'s own docstring: "A malformed/incomplete response
+# shape is skipped ... rather than raising." Every branch below was
+# previously only exercised indirectly (or not at all) through the
+# happy-path tests above -- these call `_process_message` directly (no
+# HTTP mocking needed, it takes an already-parsed response body) to prove
+# each guard clause actually returns `None`/skips rather than raising,
+# per this file's own review-round-1 coverage sweep.
+
+
+def test_process_message_skips_when_thread_id_missing(
+    seeded_gmail_account: tuple[ConnectorAccountContext, UUID],
+) -> None:
+    context, owner_id = seeded_gmail_account
+    adapter = GmailAdapter()
+    body = _message_body(
+        message_id="msg-no-thread",
+        thread_id="irrelevant",
+        from_addr="alice@example.test",
+        to_addrs=[_OWNER_EMAIL],
+        internal_date_ms=int(datetime.now(UTC).timestamp() * 1000),
+    )
+    del body["threadId"]
+
+    result = adapter._process_message(
+        body,
+        workspace_id=context.workspace_id,
+        owner_id=owner_id,
+        connector_account_id=context.connector_account_id,
+        now=datetime.now(UTC),
+    )
+    assert result is None
+    assert _threads_and_messages(context.workspace_id) == []
+
+
+def test_process_message_skips_when_from_header_missing(
+    seeded_gmail_account: tuple[ConnectorAccountContext, UUID],
+) -> None:
+    context, owner_id = seeded_gmail_account
+    adapter = GmailAdapter()
+    body = _message_body(
+        message_id="msg-no-from",
+        thread_id="thread-no-from",
+        from_addr="irrelevant@example.test",
+        to_addrs=[_OWNER_EMAIL],
+        internal_date_ms=int(datetime.now(UTC).timestamp() * 1000),
+    )
+    body["payload"]["headers"] = [h for h in body["payload"]["headers"] if h["name"] != "From"]
+
+    result = adapter._process_message(
+        body,
+        workspace_id=context.workspace_id,
+        owner_id=owner_id,
+        connector_account_id=context.connector_account_id,
+        now=datetime.now(UTC),
+    )
+    assert result is None
+    assert _threads_and_messages(context.workspace_id) == []
+
+
+def test_process_message_skips_when_no_recipients(
+    seeded_gmail_account: tuple[ConnectorAccountContext, UUID],
+) -> None:
+    context, owner_id = seeded_gmail_account
+    adapter = GmailAdapter()
+    body = _message_body(
+        message_id="msg-no-to",
+        thread_id="thread-no-to",
+        from_addr="alice@example.test",
+        to_addrs=["irrelevant@example.test"],
+        internal_date_ms=int(datetime.now(UTC).timestamp() * 1000),
+    )
+    body["payload"]["headers"] = [h for h in body["payload"]["headers"] if h["name"] != "To"]
+
+    result = adapter._process_message(
+        body,
+        workspace_id=context.workspace_id,
+        owner_id=owner_id,
+        connector_account_id=context.connector_account_id,
+        now=datetime.now(UTC),
+    )
+    assert result is None
+    assert _threads_and_messages(context.workspace_id) == []
+
+
+def test_process_message_skips_when_internal_date_is_non_numeric(
+    seeded_gmail_account: tuple[ConnectorAccountContext, UUID],
+) -> None:
+    context, owner_id = seeded_gmail_account
+    adapter = GmailAdapter()
+    body = _message_body(
+        message_id="msg-bad-date",
+        thread_id="thread-bad-date",
+        from_addr="alice@example.test",
+        to_addrs=[_OWNER_EMAIL],
+        internal_date_ms=0,
+    )
+    body["internalDate"] = "not-a-number"
+
+    result = adapter._process_message(
+        body,
+        workspace_id=context.workspace_id,
+        owner_id=owner_id,
+        connector_account_id=context.connector_account_id,
+        now=datetime.now(UTC),
+    )
+    assert result is None
+    assert _threads_and_messages(context.workspace_id) == []
+
+
+def test_process_message_skips_when_message_id_missing(
+    seeded_gmail_account: tuple[ConnectorAccountContext, UUID],
+) -> None:
+    context, owner_id = seeded_gmail_account
+    adapter = GmailAdapter()
+    body = _message_body(
+        message_id="irrelevant",
+        thread_id="thread-no-id",
+        from_addr="alice@example.test",
+        to_addrs=[_OWNER_EMAIL],
+        internal_date_ms=int(datetime.now(UTC).timestamp() * 1000),
+    )
+    del body["id"]
+
+    result = adapter._process_message(
+        body,
+        workspace_id=context.workspace_id,
+        owner_id=owner_id,
+        connector_account_id=context.connector_account_id,
+        now=datetime.now(UTC),
+    )
+    assert result is None
+    assert _threads_and_messages(context.workspace_id) == []

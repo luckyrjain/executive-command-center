@@ -168,6 +168,28 @@ _RATE_LIMIT_ERROR_SUMMARY = "Gmail rate limit exceeded; sync paused, will resume
 # writes without a schema change.
 _EMAIL_ALIAS_TYPE = "email"
 
+# `email_messages.sender`/`.recipients` are `VARCHAR(320)` (migration
+# `0069`) -- `email.utils.parseaddr` itself has no length limit, and a
+# `From`/`To` header with no `<...>` delimiter (or one whose "address"
+# portion is itself absurdly long) parses successfully into an `address`
+# of whatever length the header happened to be. Gmail forwards a sender's
+# raw header verbatim; an attacker-controlled sender crafting an
+# oversized `From` address previously reached Postgres uncaught as a
+# `StringDataRightTruncation` `DataError` -- not caught anywhere between
+# `_process_message` and its two call sites in `_sync_messages`/`_sync_
+# history`, so it escaped that message's own "malformed input is skipped,
+# not raised" contract (see `_process_message`'s own docstring) and
+# aborted the *entire* sync call instead of just that one message. Worse
+# for `incremental_sync`: since the call never reaches a `return` that
+# advances `next_cursor` past this message, the identical oversized
+# message is fetched and crashes again on every subsequent call --
+# permanently wedging that connector account's sync until manual
+# intervention, from a single crafted email. `_parse_address` below
+# rejects an over-length address the same way it already rejects an
+# address-less header -- found by review, not part of the original
+# implementation.
+_MAX_EMAIL_ADDRESS_LENGTH = 320
+
 
 def _pack_credential(access_token: str, refresh_token: str, expires_at: datetime) -> str:
     return dumps(
@@ -246,6 +268,25 @@ def _normalize_email(value: str) -> str:
     return value.strip().casefold()
 
 
+def _contains_nul(value: str) -> bool:
+    """Postgres `text`/`varchar` columns can never store a `0x00` byte, at
+    all, regardless of column width -- a distinct constraint from
+    `_MAX_EMAIL_ADDRESS_LENGTH`'s column-width check, and one no valid RFC
+    5322 header value should ever trigger, but Gmail forwards a sender's
+    raw header verbatim and `json.loads` happily decodes a `\\u0000`
+    escape in Gmail's own response body into a real NUL character in the
+    resulting Python string -- reaching this adapter no differently than
+    any other header byte. Every one of `sender`/`recipients`/`canonical_
+    name`/`subject` is a plain `text`/`varchar` column (migrations `0069`/
+    `0001`); an unguarded NUL previously reached Postgres uncaught
+    (`psycopg.DataError: PostgreSQL text fields cannot contain NUL (0x00)
+    bytes`), aborting the entire sync call for a single malformed message
+    -- the identical failure class `_MAX_EMAIL_ADDRESS_LENGTH` already
+    closed for over-length addresses, found by the same review pass.
+    """
+    return "\x00" in value
+
+
 def _parse_address(header_value: str) -> tuple[str, str] | None:
     """`From`/`To` header values are `"Display Name <addr@example.com>"` or
     a bare `addr@example.com` -- `email.utils.parseaddr` (stdlib, not a
@@ -253,12 +294,20 @@ def _parse_address(header_value: str) -> tuple[str, str] | None:
     comment-syntax edge cases a naive `<...>` split would mis-parse.
     Returns `(display_name, address)` (`display_name` `""` when the header
     carried no name portion), or `None` for a header this adapter cannot
-    make sense of (empty, or an address-less comment-only value) rather
-    than a placeholder a caller might mistake for a real, resolvable
-    identity.
+    make sense of (empty, an address-less comment-only value, an address
+    longer than `email_messages.sender`/`.recipients` can ever store --
+    see `_MAX_EMAIL_ADDRESS_LENGTH`'s own comment -- or either half
+    containing a NUL byte no `text`/`varchar` column can ever store, see
+    `_contains_nul`'s own comment) rather than a placeholder a caller
+    might mistake for a real, resolvable identity.
     """
     display_name, address = parseaddr(header_value)
-    if not address:
+    if (
+        not address
+        or len(address) > _MAX_EMAIL_ADDRESS_LENGTH
+        or _contains_nul(address)
+        or _contains_nul(display_name)
+    ):
         return None
     return display_name, address
 
@@ -959,8 +1008,26 @@ class GmailAdapter:
             if not isinstance(message_refs, list):
                 message_refs = []
 
+            budget_exhausted = False
             for ref in message_refs:
                 if calls_made >= _MAX_MESSAGES_PER_CALL:
+                    # Round 1 review: this page's own `message_refs` still
+                    # had unprocessed entries when the shared budget ran
+                    # out. Falling through to the `nextPageToken` check
+                    # below unconditionally is only correct when there
+                    # *is* a next page (the outer `while` then exits on
+                    # its own condition and the bottom-of-function
+                    # `partial` return fires); when this same page happens
+                    # to be Gmail's own *last* page (no `nextPageToken`),
+                    # that check would otherwise take the "fully caught
+                    # up" branch and report `status="succeeded"` despite
+                    # these remaining refs never having been fetched --
+                    # silent data loss reported as success, and a
+                    # `next_cursor` an `incremental_sync` caller would
+                    # trust as "nothing older remains." `budget_exhausted`
+                    # forces the same bounded partial outcome the
+                    # multiple-page case already gets correctly.
+                    budget_exhausted = True
                     break
                 message_id = ref.get("id") if isinstance(ref, dict) else None
                 if not isinstance(message_id, str) or not message_id:
@@ -1020,6 +1087,9 @@ class GmailAdapter:
                 items_processed += 1
                 if observed_history_id is not None:
                     highest_history_id = max(highest_history_id or 0, observed_history_id)
+
+            if budget_exhausted:
+                break
 
             page_token = list_body.get("nextPageToken")
             if not isinstance(page_token, str) or not page_token:
@@ -1161,8 +1231,18 @@ class GmailAdapter:
                         seen_message_ids.add(message_id)
                         message_ids.append(message_id)
 
+            budget_exhausted = False
             for message_id in message_ids:
                 if calls_made >= _MAX_MESSAGES_PER_CALL:
+                    # Round 1 review: same fix as `_sync_messages`'
+                    # identical loop shape -- this page's own `message_
+                    # ids` still had unprocessed entries when the shared
+                    # budget ran out. Without this flag, a bound hit on
+                    # Gmail's own last history page (no `nextPageToken`)
+                    # would fall through to the "fully caught up" branch
+                    # below and report `status="succeeded"` despite these
+                    # remaining messages never having been fetched.
+                    budget_exhausted = True
                     break
                 calls_made += 1
 
@@ -1211,6 +1291,9 @@ class GmailAdapter:
                     now=now,
                 )
                 items_processed += 1
+
+            if budget_exhausted:
+                break
 
             page_token = history_body.get("nextPageToken")
             if not isinstance(page_token, str) or not page_token:
@@ -1306,7 +1389,20 @@ class GmailAdapter:
 
         history_id = _coerce_int(body.get("historyId"))
 
-        subject = header_map.get("subject")
+        # `email_threads.subject` is nullable (a "no Subject header" and a
+        # "Subject header this adapter can't store" both already mean "no
+        # subject on record" to any reader of that column) -- unlike a
+        # NUL-containing sender/recipient address (which makes the whole
+        # message unresolvable and is treated as fully malformed, see
+        # `_parse_address`), a NUL-containing `Subject` doesn't prevent
+        # resolving who the message is from/to, so only this one field is
+        # dropped rather than skipping the entire message over a header
+        # nothing else here depends on. See `_contains_nul`'s own comment
+        # for why this guard exists at all.
+        raw_subject = header_map.get("subject")
+        subject = (
+            raw_subject if raw_subject is not None and not _contains_nul(raw_subject) else None
+        )
 
         with SessionFactory() as session, session.begin():
             thread_id = _upsert_thread(
