@@ -93,7 +93,15 @@ multi-round adversarial review found and required real coverage for:
     bare `if not email_address:` passes a non-empty non-string value like
     a JSON number). Both previously raised an uncaught `AttributeError`
     on the very next line (`.split()`, `is_account_allowed`'s `.strip()`)
-    instead of the intended `AdapterAuthorizationError`.
+    instead of the intended `AdapterAuthorizationError`. Round 18 review
+    found the null-scope test alone left the guard's *other* branch
+    untested: `raw_scope is None` skips the `isinstance` check by design
+    (falling through to "missing required scope" instead), so a truthy,
+    non-string `scope` (a JSON number/array) -- the actual case the
+    `isinstance(raw_scope, str)` check exists to catch -- had no test at
+    all, unlike `access_token`/`refresh_token`/`emailAddress`'s own
+    dedicated `rejects_non_string_*` siblings. Closed with
+    `test_handle_oauth_callback_rejects_non_string_scope`.
 16. An infinite (`float("inf")`, which `json.loads` accepts by default) or
     merely huge (an ordinary large integer, no exotic JSON literal needed)
     `expires_in` -- round 8: `float(expires_in)` accepts both cleanly, but
@@ -881,6 +889,50 @@ def test_handle_oauth_callback_rejects_null_scope(monkeypatch: pytest.MonkeyPatc
     try:
         adapter = GmailAdapter(transport=httpx.MockTransport(handler))
         with pytest.raises(AdapterAuthorizationError):
+            adapter.handle_oauth_callback("auth-code", "state-value")
+        assert revoked_tokens == ["refresh-1"]
+    finally:
+        get_settings.cache_clear()
+
+
+def test_handle_oauth_callback_rejects_non_string_scope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Companion to `test_handle_oauth_callback_rejects_null_scope` above,
+    covering the isinstance check's *other* branch: that test only
+    exercises `raw_scope is None` (which skips the `isinstance` check
+    entirely by design and falls through to the "missing required scope"
+    rejection instead), so the actual `raw_scope is not None and not
+    isinstance(raw_scope, str)` guard -- the one that raises "Gmail token
+    exchange returned a non-string scope" -- had no test exercising a
+    truthy, non-string, non-null value (a JSON number here), unlike every
+    sibling field in this response body (`access_token`/`refresh_token`/
+    `emailAddress` each have their own dedicated `rejects_non_string_*`
+    test). Found by round 18 review: a regression to this specific guard
+    (e.g. the `isinstance` check being dropped or inverted) would not have
+    failed any existing test -- `(raw_scope or "").split()` on a non-string
+    truthy value like an int raises an uncaught `AttributeError` that
+    escapes the router's `AdapterAuthorizationError`-only catch, the same
+    envelope-bypass bug class rounds 5-7 closed elsewhere in this method.
+    """
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_CLIENT_ID", "cid")
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_CLIENT_SECRET", "csecret")
+    get_settings.cache_clear()
+    revoked_tokens: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/token":
+            body = _token_response()
+            body["scope"] = 12345
+            return _json_response(body)
+        if request.url.path == "/revoke":
+            revoked_tokens.append(request.content.decode().removeprefix("token="))
+            return httpx.Response(200)
+        raise AssertionError(f"unexpected request to {request.url}")
+
+    try:
+        adapter = GmailAdapter(transport=httpx.MockTransport(handler))
+        with pytest.raises(AdapterAuthorizationError, match="non-string scope"):
             adapter.handle_oauth_callback("auth-code", "state-value")
         assert revoked_tokens == ["refresh-1"]
     finally:
