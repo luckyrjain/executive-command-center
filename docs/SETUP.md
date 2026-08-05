@@ -9,6 +9,7 @@ This guide gets Executive Command Center running locally with PostgreSQL, FastAP
 - `uv`
 - Node.js 22
 - `pnpm` 10.12.4
+- [Ollama](https://ollama.com), running (`ollama serve`), for AI enrichment features (optional, off by default -- see step 3)
 
 ## 1. Configure the repository
 
@@ -49,6 +50,14 @@ uv run python scripts/bootstrap_dev.py
 ```
 
 The bootstrap utility runs only when `ECC_ENV=development` and refuses non-local database hosts by default. Running it again reuses the existing local identity, revokes previous active sessions, and prints a fresh one-time URL that expires after 15 minutes.
+
+It also checks, non-fatally, that every Ollama model the `model_definitions` catalog requires (Phase 4 AI Runtime) is pulled locally. To run that check on its own:
+
+```bash
+uv run python scripts/check_ollama_models.py
+```
+
+It reports any missing model with its exact `ollama pull` command. AI enrichment (meeting prep summaries, attention explanations, personal insights) is opt-in and off by default (`ECC_MEETING_PREP_AI_ENRICHMENT_ENABLED` and friends, `backend/ecc/config.py`) -- the deterministic core works with no Ollama install at all.
 
 Start the backend, then open the printed URL. The URL carries the one-time code in its fragment so it is not sent in HTTP access logs. The backend rotates the code into an opaque `HttpOnly`, `SameSite=Lax` session cookie with a seven-day absolute lifetime, sets the readable CSRF cookie, and redirects to the frontend.
 

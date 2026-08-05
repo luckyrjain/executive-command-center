@@ -94,6 +94,9 @@ any `disconnect()` failure as best-effort, never blocking disconnection.
 
 from __future__ import annotations
 
+import ipaddress
+import re
+import socket
 import time
 from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
@@ -116,8 +119,6 @@ from .connectors import (
     SyncOutcome,
 )
 
-GITLAB_API_BASE_URL = "https://gitlab.com/api/v4"
-_GITLAB_WEB_BASE_URL = "https://gitlab.com"
 # `CONNECTOR-CONTRACT.md`'s resolved GitLab read scopes -- unlike GitHub's
 # `repo`, these are real GitLab OAuth/PAT scope names, and (see module
 # docstring) always checkable via `GET /personal_access_tokens/self`.
@@ -130,7 +131,103 @@ _MAX_PAGES_PER_CALL = 10
 _RATE_LIMIT_MAX_WAIT_SECONDS = 5.0
 
 
-def _safe_source_url(raw_url: str | None, *, fallback: str) -> str:
+class _InvalidCredentialError(Exception):
+    pass
+
+
+# The host a credential with no `|` is assumed to point at -- see
+# `_parse_credential`'s own docstring for why that assumption is safe.
+_LEGACY_GITLAB_HOST = "gitlab.com"
+
+
+# GitLab self-managed hosts are arbitrary customer domains -- unlike Jira's
+# `_JIRA_SITE_PATTERN` (locked to `*.atlassian.net`, a suffix Jira itself
+# controls), this only enforces "looks like a bare hostname" (RFC 1035
+# label rules, dot-separated), never a fixed suffix. It exists to reject a
+# scheme/port/path/whitespace smuggled into the credential, not to
+# allowlist specific domains -- `_reject_private_host` below is the actual
+# SSRF defense (see design doc's Security section for why a hostname regex
+# alone cannot be one for an arbitrary domain).
+_GITLAB_HOST_PATTERN = re.compile(
+    r"\A[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
+    r"(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*\Z"
+)
+
+
+def _parse_credential(credential: str) -> tuple[str, str]:
+    """Parses a stored GitLab credential into `(host, token)`.
+
+    **A credential containing no `|` is a pre-self-managed-support legacy
+    credential, and is read as `("gitlab.com", credential)` rather than
+    rejected.** This compatibility fallback is load-bearing, not cosmetic:
+    every `connector_accounts` row for provider `gitlab` written before
+    this feature shipped holds a bare personal access token (e.g.
+    `glpat-xxxx`), and this function is called on that stored value by
+    `/sync` (`_sync_repositories`), `handle_webhook`, `refresh_
+    permissions`, `disconnect`, and `write_actions.GitLabAddNoteAdapter`.
+    Raising for those rows would break every existing gitlab.com
+    connection at once, with no remediation path short of disconnect +
+    reconnect -- which mints a *new* `external_account_id` and orphans
+    every reference to the old `connector_account_id`. There is no
+    endpoint to rewrite a stored credential in place, so "just re-enter
+    it in the new format" is not an option a workspace actually has.
+    Assuming `gitlab.com` is correct for those rows by construction: a
+    bare token could only ever have been issued by gitlab.com, since
+    gitlab.com was the sole host this adapter could reach before the
+    `host|token` format existed.
+
+    A credential containing at least one `|` is parsed strictly as
+    `host|token`, with the host validated against `_GITLAB_HOST_PATTERN`
+    -- unchanged behavior, so a malformed *new*-format credential is
+    still rejected rather than silently misread as a legacy token.
+
+    Note this deliberately does not extend to `authorize()`'s own
+    `external_account_id`, which is `f"{host}:{user_id}"` for legacy and
+    new credentials alike. `authorize()` runs only at connect time, never
+    per-sync, so an existing row's stored bare-`user_id`
+    `external_account_id` is never re-derived or compared against a fresh
+    `authorize()` call -- preserving the bare format for new connections
+    would only defeat the `host:user_id` collision-avoidance design.
+    """
+    if "|" not in credential:
+        if not credential:
+            raise _InvalidCredentialError("GitLab credential must not be empty")
+        return _LEGACY_GITLAB_HOST, credential
+    host, token = credential.split("|", 1)
+    if not host or not token:
+        raise _InvalidCredentialError("GitLab credential must be in the form 'host|token'")
+    if not _GITLAB_HOST_PATTERN.match(host):
+        raise _InvalidCredentialError(
+            "GitLab credential's host must be a bare hostname (e.g. 'gitlab.com' or "
+            "'gitlab-ee.example.com') -- no scheme, port, path, or whitespace"
+        )
+    return host, token
+
+
+# RFC 6598 carrier-grade NAT. `ipaddress.ip_address(...).is_private` does
+# not cover this range, but it is a real internal address range in cloud
+# and carrier environments -- and therefore a legitimate SSRF target -- so
+# `_is_private_address` checks it explicitly alongside `is_private`/
+# `is_loopback`/`is_link_local`.
+_CGNAT_NETWORK = ipaddress.ip_network("100.64.0.0/10")
+
+
+def _is_private_address(ip_str: str) -> bool:
+    ip = ipaddress.ip_address(ip_str)
+    if ip.is_private or ip.is_loopback or ip.is_link_local:
+        return True
+    return isinstance(ip, ipaddress.IPv4Address) and ip in _CGNAT_NETWORK
+
+
+def _default_resolve_host(host: str) -> list[str]:
+    try:
+        addr_info = socket.getaddrinfo(host, None)
+    except OSError as exc:
+        raise AdapterAuthorizationError(f"GitLab host could not be resolved: {exc}") from exc
+    return [str(info[4][0]) for info in addr_info]
+
+
+def _safe_source_url(raw_url: str | None, *, fallback: str, web_base_url: str) -> str:
     """Same allow-list defense `datadog_adapter.py`'s `_upsert_dashboard`
     already applies to its own provider-returned `url` field, and
     `github_adapter.py`'s identical `_safe_source_url` applies to
@@ -139,9 +236,12 @@ def _safe_source_url(raw_url: str | None, *, fallback: str) -> str:
     trusted verbatim -- it could be `javascript:`/`data:`/an arbitrary
     external host if the connected GitLab instance were compromised or
     malicious -- falling back to a safe, server-constructed default
-    instead of rendering it as a clickable link.
+    instead of rendering it as a clickable link. `web_base_url` is the
+    parsed-per-credential host's own web origin (e.g.
+    `https://gitlab-ee.example.com`), not a fixed constant -- self-managed
+    hosts each have their own web origin to allow-list against.
     """
-    if raw_url and raw_url.startswith(f"{_GITLAB_WEB_BASE_URL}/"):
+    if raw_url and raw_url.startswith(f"{web_base_url}/"):
         return raw_url
     return fallback
 
@@ -184,7 +284,12 @@ def _suggested_team_name(project: Mapping[str, Any]) -> str | None:
 
 
 def _upsert_repository(
-    *, workspace_id: Any, connector_account_id: Any, provider: str, project: Mapping[str, Any]
+    *,
+    workspace_id: Any,
+    connector_account_id: Any,
+    provider: str,
+    project: Mapping[str, Any],
+    web_base_url: str,
 ) -> None:
     """Opens and commits its own session -- identical discipline to
     `github_adapter._upsert_repository`'s own (see that function's
@@ -233,9 +338,9 @@ def _upsert_repository(
                 "source_url": _safe_source_url(
                     project.get("web_url"),
                     fallback=(
-                        f"{_GITLAB_WEB_BASE_URL}/"
-                        f"{project.get('path_with_namespace') or project['id']}"
+                        f"{web_base_url}/{project.get('path_with_namespace') or project['id']}"
                     ),
+                    web_base_url=web_base_url,
                 ),
                 "default_branch": project.get("default_branch"),
                 "content_hash": _content_hash(project),
@@ -281,32 +386,56 @@ class GitLabAdapter:
         transport: httpx.BaseTransport | None = None,
         timeout_seconds: float = 10.0,
         sleep: Callable[[float], None] = time.sleep,
+        resolve_host: Callable[[str], list[str]] = _default_resolve_host,
     ) -> None:
         client_kwargs: dict[str, Any] = {
-            "base_url": GITLAB_API_BASE_URL,
             "timeout": timeout_seconds,
         }
         if transport is not None:
             client_kwargs["transport"] = transport
         self._client = httpx.Client(**client_kwargs)
         self._sleep = sleep
+        self._resolve_host = resolve_host
 
-    def _headers(self, credential: str) -> dict[str, str]:
-        return {"PRIVATE-TOKEN": credential, "Accept": "application/json"}
+    def _headers(self, token: str) -> dict[str, str]:
+        """`token` is the *parsed* token half of the credential (`_parse_
+        credential`'s second return value), never the raw stored
+        `host|token` string -- every call site parses first.
+        """
+        return {"PRIVATE-TOKEN": token, "Accept": "application/json"}
+
+    def _reject_private_host(self, host: str) -> None:
+        """Connect-time SSRF guard, called once from `authorize()` -- never
+        from a sync call. See the design doc's Security section for why
+        this cannot use Jira's fixed-suffix-allowlist approach (GitLab
+        self-managed hosts are arbitrary customer domains), and for the
+        disclosed DNS-rebinding limitation of a connect-time-only check.
+        """
+        for ip_str in self._resolve_host(host):
+            if _is_private_address(ip_str):
+                raise AdapterAuthorizationError(
+                    f"GitLab host '{host}' resolves to a private/internal address; "
+                    "refusing to connect"
+                )
 
     def _request_with_rate_limit_retry(
         self,
         method: str,
-        path: str,
+        url: str,
         *,
         headers: dict[str, str],
         params: dict[str, Any] | None = None,
     ) -> httpx.Response | None:
         """Returns `None` only when rate-limited beyond the bounded wait --
         callers treat that as "give up for now, resume next sync call."
+
+        `url` is an absolute URL built from the credential's own parsed
+        host, not a path relative to a fixed base -- this client is
+        constructed without a `base_url` precisely because the host varies
+        per credential (self-managed instances).
         """
         try:
-            response = self._client.request(method, path, headers=headers, params=params)
+            response = self._client.request(method, url, headers=headers, params=params)
         except httpx.HTTPError as exc:
             raise RuntimeError(f"GitLab request failed: {exc}") from exc
 
@@ -318,7 +447,7 @@ class GitLabAdapter:
             return None
         self._sleep(wait_seconds)
         try:
-            retry_response = self._client.request(method, path, headers=headers, params=params)
+            retry_response = self._client.request(method, url, headers=headers, params=params)
         except httpx.HTTPError as exc:
             raise RuntimeError(f"GitLab request failed: {exc}") from exc
 
@@ -344,10 +473,27 @@ class GitLabAdapter:
         real `scopes` here, see module docstring) and `GET /user` (account
         identity). Raises `AdapterAuthorizationError` for an invalid,
         revoked, inactive, or under-scoped token.
+
+        `credential` is `host|token` (`_parse_credential`; a bare token
+        with no `|` is read as a legacy gitlab.com credential, see that
+        function's own docstring) -- `host` is connect-time SSRF-checked
+        (`_reject_private_host`) before any request is made, and every
+        request goes to that parsed host's own absolute URL rather than a
+        fixed `gitlab.com` base, so this adapter also authorizes
+        self-managed GitLab instances. `external_account_id` is
+        `f"{host}:{user_id}"` for both credential forms.
         """
-        headers = self._headers(credential)
         try:
-            token_response = self._client.get("/personal_access_tokens/self", headers=headers)
+            host, token = _parse_credential(credential)
+        except _InvalidCredentialError as exc:
+            raise AdapterAuthorizationError(str(exc)) from exc
+        self._reject_private_host(host)
+        api_base_url = f"https://{host}/api/v4"
+        headers = self._headers(token)
+        try:
+            token_response = self._client.get(
+                f"{api_base_url}/personal_access_tokens/self", headers=headers
+            )
         except httpx.HTTPError as exc:
             raise AdapterAuthorizationError(f"GitLab authorization request failed: {exc}") from exc
         if token_response.status_code == 401:
@@ -368,7 +514,7 @@ class GitLabAdapter:
             raise AdapterAuthorizationError(f"GitLab token is missing required scope(s): {missing}")
 
         try:
-            user_response = self._client.get("/user", headers=headers)
+            user_response = self._client.get(f"{api_base_url}/user", headers=headers)
         except httpx.HTTPError as exc:
             raise AdapterAuthorizationError(f"GitLab authorization request failed: {exc}") from exc
         if user_response.status_code != 200:
@@ -378,7 +524,7 @@ class GitLabAdapter:
         user_body = user_response.json()
 
         return ConnectorAuthorization(
-            external_account_id=str(user_body["id"]),
+            external_account_id=f"{host}:{user_body['id']}",
             display_name=user_body.get("username") or f"gitlab-{user_body['id']}",
             granted_scopes=granted,
         )
@@ -410,7 +556,13 @@ class GitLabAdapter:
     def _sync_repositories(
         self, account: ConnectorAccountContext, *, since_cursor: str | None
     ) -> SyncOutcome:
-        headers = self._headers(account.credential)
+        try:
+            host, token = _parse_credential(account.credential)
+        except _InvalidCredentialError as exc:
+            raise RuntimeError(str(exc)) from exc
+        api_base_url = f"https://{host}/api/v4"
+        web_base_url = f"https://{host}"
+        headers = self._headers(token)
         items_processed = 0
         newest_updated_at = since_cursor
         page = 1
@@ -419,7 +571,7 @@ class GitLabAdapter:
         while page <= _MAX_PAGES_PER_CALL:
             response = self._request_with_rate_limit_retry(
                 "GET",
-                "/projects",
+                f"{api_base_url}/projects",
                 headers=headers,
                 params={
                     "membership": "true",
@@ -458,6 +610,7 @@ class GitLabAdapter:
                     connector_account_id=account.connector_account_id,
                     provider=self.provider,
                     project=project,
+                    web_base_url=web_base_url,
                 )
                 items_processed += 1
                 if newest_updated_at is None or (updated_at and updated_at > newest_updated_at):
@@ -509,11 +662,16 @@ class GitLabAdapter:
             return SyncOutcome(
                 resource_type="repository", items_processed=0, status="succeeded", next_cursor=None
             )
+        try:
+            host, _token = _parse_credential(account.credential)
+        except _InvalidCredentialError as exc:
+            raise RuntimeError(str(exc)) from exc
         _upsert_repository(
             workspace_id=account.workspace_id,
             connector_account_id=account.connector_account_id,
             provider=self.provider,
             project=_with_push_event_activity_timestamp(project, body),
+            web_base_url=f"https://{host}",
         )
         return SyncOutcome(
             resource_type="repository", items_processed=1, status="succeeded", next_cursor=None
@@ -531,8 +689,12 @@ class GitLabAdapter:
         adapter can only ever distinguish `active` from `permission_lost`.
         """
         try:
+            host, token = _parse_credential(account.credential)
+        except _InvalidCredentialError:
+            return "active"
+        try:
             response = self._client.get(
-                "/personal_access_tokens/self", headers=self._headers(account.credential)
+                f"https://{host}/api/v4/personal_access_tokens/self", headers=self._headers(token)
             )
         except httpx.HTTPError:
             return "active"
@@ -554,8 +716,12 @@ class GitLabAdapter:
         never silently absorbed at this layer.
         """
         try:
+            host, token = _parse_credential(account.credential)
+        except _InvalidCredentialError as exc:
+            raise RuntimeError(str(exc)) from exc
+        try:
             response = self._client.delete(
-                "/personal_access_tokens/self", headers=self._headers(account.credential)
+                f"https://{host}/api/v4/personal_access_tokens/self", headers=self._headers(token)
             )
         except httpx.HTTPError as exc:
             raise RuntimeError(f"GitLab token revocation request failed: {exc}") from exc

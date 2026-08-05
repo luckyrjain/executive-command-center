@@ -181,6 +181,28 @@ describe('ConnectorHealthPanel', () => {
     expect(options).toEqual(['github', 'gitlab', 'jira', 'datadog', 'sandbox'])
   })
 
+  it('shows the host|token credential hint when GitLab is selected', async () => {
+    const fetch = vi.fn(() => response({ connectors: [] }))
+    vi.stubGlobal('fetch', fetch)
+    renderPanel()
+
+    await screen.findByText('No connectors are configured for this workspace yet.')
+    fireEvent.change(screen.getByLabelText('Provider'), { target: { value: 'gitlab' } })
+    expect((screen.getByLabelText('Credential') as HTMLInputElement).placeholder).toBe(
+      'host|token, e.g. gitlab.com|glpat-xxxx or gitlab-ee.example.com|glpat-xxxx',
+    )
+  })
+
+  it('has no credential placeholder for a provider with a bare-token credential', async () => {
+    const fetch = vi.fn(() => response({ connectors: [] }))
+    vi.stubGlobal('fetch', fetch)
+    renderPanel()
+
+    await screen.findByText('No connectors are configured for this workspace yet.')
+    fireEvent.change(screen.getByLabelText('Provider'), { target: { value: 'github' } })
+    expect((screen.getByLabelText('Credential') as HTMLInputElement).placeholder).toBe('')
+  })
+
   it('offers the Datadog resource types (monitor/service_definition/dashboard) for starting a sync', async () => {
     const fetch = vi.fn((input: RequestInfo | URL) => {
       const url = String(input)

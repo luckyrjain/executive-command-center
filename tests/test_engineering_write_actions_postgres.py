@@ -647,7 +647,7 @@ def test_gitlab_add_note_success_excludes_body_from_output(
 ) -> None:
     workspace_id, user_id = write_actions_test_context
     account_id = _insert_connector_account(
-        workspace_id, user_id, provider="gitlab", credential="glpat-x"
+        workspace_id, user_id, provider="gitlab", credential="gitlab.com|glpat-x"
     )
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -673,6 +673,168 @@ def test_gitlab_add_note_success_excludes_body_from_output(
     assert output.note_external_id == "99"
     assert "note_99" in output.source_url
     assert "shouldnotleak" not in output.model_dump_json()
+
+
+def test_gitlab_add_note_execute_self_managed_host(
+    write_actions_test_context: tuple[UUID, UUID],
+) -> None:
+    workspace_id, user_id = write_actions_test_context
+    account_id = _insert_connector_account(
+        workspace_id, user_id, provider="gitlab", credential="gitlab-ee.mpokket.org|glpat-private"
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.host == "gitlab-ee.mpokket.org"
+        assert request.headers["PRIVATE-TOKEN"] == "glpat-private"
+        return _json_response(201, {"id": 99})
+
+    adapter = GitLabAddNoteAdapter(transport=httpx.MockTransport(handler))
+    result = adapter.execute(
+        GitLabAddNoteInput(
+            workspace_id=workspace_id,
+            actor_id=user_id,
+            connector_account_id=account_id,
+            project_path="acme/widgets",
+            issue_iid=12,
+            body="test note",
+        )
+    )
+    assert isinstance(result, GitLabAddNoteOutput)
+    assert result.note_external_id == "99"
+    assert result.source_url.startswith("https://gitlab-ee.mpokket.org/acme/widgets/-/issues/12")
+
+
+def test_gitlab_add_note_execute_with_a_legacy_bare_token_credential(
+    write_actions_test_context: tuple[UUID, UUID],
+) -> None:
+    """A `connector_accounts` row written before self-managed support
+    shipped stores a bare token with no `|`. `gitlab.add_note` must keep
+    working against it -- `gitlab_adapter._parse_credential`'s backward-
+    compatible fallback reads it as a gitlab.com credential, so the request
+    goes to gitlab.com with the whole stored value as the token. Without
+    that fallback this step would fail permanently (a plain, non-retryable
+    exception) for every pre-existing GitLab connection.
+    """
+    workspace_id, user_id = write_actions_test_context
+    account_id = _insert_connector_account(
+        workspace_id, user_id, provider="gitlab", credential="glpat-legacy-bare"
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.host == "gitlab.com"
+        assert request.headers["PRIVATE-TOKEN"] == "glpat-legacy-bare"
+        return _json_response(201, {"id": 77})
+
+    adapter = GitLabAddNoteAdapter(transport=httpx.MockTransport(handler))
+    result = adapter.execute(
+        GitLabAddNoteInput(
+            workspace_id=workspace_id,
+            actor_id=user_id,
+            connector_account_id=account_id,
+            project_path="acme/widgets",
+            issue_iid=3,
+            body="test note",
+        )
+    )
+    assert isinstance(result, GitLabAddNoteOutput)
+    assert result.note_external_id == "77"
+    assert result.source_url == "https://gitlab.com/acme/widgets/-/issues/3#note_77"
+
+
+def test_gitlab_add_note_execute_surfaces_an_unparseable_credential_as_write_action_rejected(
+    write_actions_test_context: tuple[UUID, UUID],
+) -> None:
+    """`_parse_gitlab_credential` raises `gitlab_adapter.py`'s own private
+    `_InvalidCredentialError`. Letting it escape would surface the raw
+    private class name to the caller (and into `workflow_run_steps.error`)
+    instead of this module's own error boundary type. A credential this
+    adapter cannot parse is a data problem with the stored connection, not
+    a transient one, so it must be `WriteActionRejected` -- which
+    `worker.run_step` lands at `'failed'` rather than retrying.
+    """
+    workspace_id, user_id = write_actions_test_context
+    account_id = _insert_connector_account(
+        workspace_id, user_id, provider="gitlab", credential="https://gitlab.com|glpat-x"
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError("must not make a network call with an unparseable credential")
+
+    adapter = GitLabAddNoteAdapter(transport=httpx.MockTransport(handler))
+    action_input = GitLabAddNoteInput(
+        workspace_id=workspace_id,
+        actor_id=user_id,
+        connector_account_id=account_id,
+        project_path="acme/widgets",
+        issue_iid=1,
+        body="x",
+    )
+    with pytest.raises(WriteActionRejected, match="cannot parse"):
+        adapter.execute(action_input)
+
+
+def test_gitlab_add_note_simulate_returns_an_empty_source_url(
+    write_actions_test_context: tuple[UUID, UUID],
+) -> None:
+    """`simulate()` is DB-free, exactly like `JiraAddCommentAdapter.
+    simulate` and every other `simulate()` in this module -- so it cannot
+    know the connector account's host, and returns `source_url=""` rather
+    than a host-accurate preview link. An earlier revision did the
+    credential lookup to render the real self-managed host; reverted,
+    because it made this the only `simulate()` to open a pooled connection
+    (nested inside `workflows._simulate_steps`' per-step loop), falsified
+    `workflows.py`'s documented "no code path here opens a transaction"
+    invariant, and gave `simulate()` an error surface where a preview
+    previously always rendered.
+
+    Asserted here for a *self-managed* account specifically: the account
+    exists and its credential names a non-gitlab.com host, and the result
+    is still `""` -- proving the empty value is the deliberate contract,
+    not an artifact of a missing or gitlab.com-hosted account.
+    """
+    workspace_id, user_id = write_actions_test_context
+    account_id = _insert_connector_account(
+        workspace_id, user_id, provider="gitlab", credential="gitlab-ee.mpokket.org|glpat-private"
+    )
+    adapter = GitLabAddNoteAdapter()
+    result = adapter.simulate(
+        GitLabAddNoteInput(
+            workspace_id=workspace_id,
+            actor_id=user_id,
+            connector_account_id=account_id,
+            project_path="acme/widgets",
+            issue_iid=12,
+            body="test note",
+        )
+    )
+    assert isinstance(result, GitLabAddNoteOutput)
+    assert result.source_url == ""
+    assert result.note_external_id == "preview"
+
+
+def test_gitlab_add_note_simulate_does_not_touch_the_database(
+    write_actions_test_context: tuple[UUID, UUID],
+) -> None:
+    """The stronger form of the test above: `simulate()` renders a preview
+    for a `connector_account_id` that does not exist at all. `execute()`
+    would raise `WriteActionRejected` for the same input -- `simulate()`
+    must not, because it performs no `_load_credential` lookup. This is the
+    property `workflows.py`'s simulate-endpoint invariant depends on.
+    """
+    workspace_id, user_id = write_actions_test_context
+    adapter = GitLabAddNoteAdapter()
+    result = adapter.simulate(
+        GitLabAddNoteInput(
+            workspace_id=workspace_id,
+            actor_id=user_id,
+            connector_account_id=uuid4(),
+            project_path="acme/widgets",
+            issue_iid=12,
+            body="test note",
+        )
+    )
+    assert isinstance(result, GitLabAddNoteOutput)
+    assert result.source_url == ""
 
 
 @pytest.mark.parametrize("project_path", ["..", ".", "acme/..", "../widgets", "acme//widgets"])
@@ -753,7 +915,10 @@ def test_gitlab_add_note_rejects_connector_account_in_different_workspace(
         )
     try:
         other_account_id = _insert_connector_account(
-            other_workspace_id, other_user_id, provider="gitlab", credential="glpat-other"
+            other_workspace_id,
+            other_user_id,
+            provider="gitlab",
+            credential="gitlab.com|glpat-other",
         )
 
         def handler(request: httpx.Request) -> httpx.Response:
@@ -803,7 +968,11 @@ def test_gitlab_add_note_rejects_disconnected_connector_account(
 ) -> None:
     workspace_id, user_id = write_actions_test_context
     account_id = _insert_connector_account(
-        workspace_id, user_id, provider="gitlab", credential="glpat-x", status="disconnected"
+        workspace_id,
+        user_id,
+        provider="gitlab",
+        credential="gitlab.com|glpat-x",
+        status="disconnected",
     )
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -827,7 +996,7 @@ def test_gitlab_add_note_connection_failure_is_transient(
 ) -> None:
     workspace_id, user_id = write_actions_test_context
     account_id = _insert_connector_account(
-        workspace_id, user_id, provider="gitlab", credential="glpat-x"
+        workspace_id, user_id, provider="gitlab", credential="gitlab.com|glpat-x"
     )
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -851,7 +1020,7 @@ def test_gitlab_add_note_read_timeout_is_not_transient(
 ) -> None:
     workspace_id, user_id = write_actions_test_context
     account_id = _insert_connector_account(
-        workspace_id, user_id, provider="gitlab", credential="glpat-x"
+        workspace_id, user_id, provider="gitlab", credential="gitlab.com|glpat-x"
     )
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -875,7 +1044,7 @@ def test_gitlab_add_note_rate_limited_is_transient(
 ) -> None:
     workspace_id, user_id = write_actions_test_context
     account_id = _insert_connector_account(
-        workspace_id, user_id, provider="gitlab", credential="glpat-x"
+        workspace_id, user_id, provider="gitlab", credential="gitlab.com|glpat-x"
     )
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -899,7 +1068,7 @@ def test_gitlab_add_note_4xx_is_not_transient(
 ) -> None:
     workspace_id, user_id = write_actions_test_context
     account_id = _insert_connector_account(
-        workspace_id, user_id, provider="gitlab", credential="glpat-x"
+        workspace_id, user_id, provider="gitlab", credential="gitlab.com|glpat-x"
     )
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -921,7 +1090,14 @@ def test_gitlab_add_note_4xx_is_not_transient(
 def test_gitlab_add_note_simulate_makes_no_network_call(
     write_actions_test_context: tuple[UUID, UUID],
 ) -> None:
+    # `simulate()` must never reach out over HTTP -- the transport's mock
+    # handler below asserts that by raising if it is ever invoked. It is
+    # also DB-free (see `test_gitlab_add_note_simulate_does_not_touch_the_
+    # database`), matching every other `simulate()` in this module.
     workspace_id, user_id = write_actions_test_context
+    account_id = _insert_connector_account(
+        workspace_id, user_id, provider="gitlab", credential="gitlab.com|glpat-x"
+    )
 
     def handler(request: httpx.Request) -> httpx.Response:
         raise AssertionError("simulate() must never make a network call")
@@ -930,7 +1106,7 @@ def test_gitlab_add_note_simulate_makes_no_network_call(
     action_input = GitLabAddNoteInput(
         workspace_id=workspace_id,
         actor_id=user_id,
-        connector_account_id=uuid4(),
+        connector_account_id=account_id,
         project_path="acme/widgets",
         issue_iid=1,
         body="x",
@@ -953,7 +1129,7 @@ def test_gitlab_add_note_no_containment_check_by_design(
     """
     workspace_id, user_id = write_actions_test_context
     account_id = _insert_connector_account(
-        workspace_id, user_id, provider="gitlab", credential="glpat-x"
+        workspace_id, user_id, provider="gitlab", credential="gitlab.com|glpat-x"
     )
 
     def handler(request: httpx.Request) -> httpx.Response:

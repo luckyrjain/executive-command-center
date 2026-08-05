@@ -143,7 +143,10 @@ import ecc.domains.engineering.connectors  # noqa: F401
 from ecc.database import SessionFactory
 from ecc.domains.engineering.crypto import decrypt_credential
 from ecc.domains.engineering.github_adapter import GITHUB_API_BASE_URL, _safe_repo_path_segment
-from ecc.domains.engineering.gitlab_adapter import GITLAB_API_BASE_URL
+from ecc.domains.engineering.gitlab_adapter import (
+    _InvalidCredentialError as _InvalidGitLabCredentialError,
+)
+from ecc.domains.engineering.gitlab_adapter import _parse_credential as _parse_gitlab_credential
 from ecc.domains.engineering.jira_adapter import _parse_credential as _parse_jira_credential
 
 # `TransientAdapterError` is deliberately imported inside `_classify_and_
@@ -407,22 +410,32 @@ class GitLabAddNoteAdapter:
     def __init__(
         self, *, transport: httpx.BaseTransport | None = None, timeout_seconds: float = 10.0
     ) -> None:
-        client_kwargs: dict[str, Any] = {
-            "base_url": GITLAB_API_BASE_URL,
-            "timeout": timeout_seconds,
-        }
+        client_kwargs: dict[str, Any] = {"timeout": timeout_seconds}
         if transport is not None:
             client_kwargs["transport"] = transport
         self._client = httpx.Client(**client_kwargs)
 
     def simulate(self, action_input: BaseModel) -> BaseModel:
+        """Purely in-memory, with **no database round-trip** -- identical to
+        `JiraAddCommentAdapter.simulate` below, and to every other
+        `simulate()` in this module. An earlier revision looked the
+        connector account's credential up here to render a host-accurate
+        preview `source_url` for a self-managed instance; reverted, because
+        the accuracy was not worth what it cost: it made this the only
+        `simulate()` in the codebase to open a pooled connection (nested
+        inside `workflows._simulate_steps`' own per-step loop), it
+        falsified `workflows.py`'s documented "there is no code path here
+        that opens a transaction" invariant for the simulate endpoint, and
+        it gave `simulate()` a real error surface (nonexistent, inactive,
+        cross-workspace, or wrong-provider account) where a preview
+        previously always rendered. `source_url=""` is Jira's own answer to
+        the same "the real link is not knowable without a lookup" problem.
+        """
         assert isinstance(action_input, GitLabAddNoteInput)
         return GitLabAddNoteOutput(
             workspace_id=action_input.workspace_id,
             note_external_id="preview",
-            source_url=(
-                f"https://gitlab.com/{action_input.project_path}/-/issues/{action_input.issue_iid}"
-            ),
+            source_url="",
             created_at=datetime.now(UTC),
         )
 
@@ -435,11 +448,29 @@ class GitLabAddNoteAdapter:
                 connector_account_id=action_input.connector_account_id,
                 expected_provider="gitlab",
             )
-        headers = {"PRIVATE-TOKEN": credential, "Accept": "application/json"}
+        # `_InvalidCredentialError` is `gitlab_adapter.py`'s own private
+        # exception class -- letting it escape would surface to the caller
+        # (and into `workflow_run_steps.error`) as the raw private class
+        # name, bypassing this module's own established error boundary.
+        # A credential this adapter cannot parse is a data problem with
+        # the stored connection, never a transient one, so
+        # `WriteActionRejected` (this module's "not retry-safe, land the
+        # step at 'failed'" type) is the right surface -- the same
+        # classification `_load_credential`'s own wrong-provider/inactive/
+        # cross-workspace failures already get.
+        try:
+            host, token = _parse_gitlab_credential(credential)
+        except _InvalidGitLabCredentialError as exc:
+            raise WriteActionRejected(
+                f"connector_account_id {action_input.connector_account_id} has a stored "
+                f"credential this adapter cannot parse: {exc}"
+            ) from exc
+        headers = {"PRIVATE-TOKEN": token, "Accept": "application/json"}
         encoded_project = quote(action_input.project_path, safe="")
         try:
             response = self._client.post(
-                f"/projects/{encoded_project}/issues/{action_input.issue_iid}/notes",
+                f"https://{host}/api/v4/projects/{encoded_project}/issues/"
+                f"{action_input.issue_iid}/notes",
                 headers=headers,
                 json={"body": action_input.body},
             )
@@ -452,7 +483,7 @@ class GitLabAddNoteAdapter:
             workspace_id=action_input.workspace_id,
             note_external_id=str(payload["id"]),
             source_url=(
-                f"https://gitlab.com/{action_input.project_path}/-/issues/"
+                f"https://{host}/{action_input.project_path}/-/issues/"
                 f"{action_input.issue_iid}#note_{payload['id']}"
             ),
             created_at=datetime.now(UTC),

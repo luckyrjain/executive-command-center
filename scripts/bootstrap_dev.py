@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import os
 import secrets
+import subprocess
+import sys
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
+from pathlib import Path
 from urllib.parse import quote, urlsplit
 from uuid import UUID, uuid4
 
@@ -169,6 +172,18 @@ def main() -> None:
     print("\nStart the backend, then open this one-time URL within 15 minutes:\n")
     print(bootstrap_url)
     print("\nThe backend will exchange the code for an HttpOnly seven-day session cookie.")
+
+    print("\n--- AI runtime prerequisite check ---")
+    # Subprocess, not import: keeps check_ollama_models.py's own standalone-
+    # script shape (see its docstring) and sidesteps mypy_path=backend not
+    # covering scripts/-to-scripts/ imports. Non-fatal either way -- AI
+    # enrichment is opt-in and off by default (ECC_MEETING_PREP_AI_
+    # ENRICHMENT_ENABLED etc., ecc/config.py), so a missing/unreachable
+    # Ollama install must not block bootstrap of the deterministic core.
+    sys.stdout.flush()
+    subprocess.run(
+        [sys.executable, str(Path(__file__).parent / "check_ollama_models.py")], check=False
+    )
 
 
 if __name__ == "__main__":

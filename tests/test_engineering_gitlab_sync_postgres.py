@@ -36,7 +36,7 @@ Task 2's own GitHub scope):
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from hmac import new
@@ -49,6 +49,7 @@ import pytest
 from fastapi.testclient import TestClient
 from identity_fixtures import create_identity
 from sqlalchemy import text
+from sqlalchemy.exc import IntegrityError
 
 from ecc.config import get_settings
 from ecc.database import engine
@@ -59,7 +60,12 @@ from ecc.domains.engineering.connectors import (
     ConnectorRegistry,
 )
 from ecc.domains.engineering.crypto import encrypt_credential
-from ecc.domains.engineering.gitlab_adapter import GitLabAdapter
+from ecc.domains.engineering.gitlab_adapter import (
+    GitLabAdapter,
+    _InvalidCredentialError,
+    _is_private_address,
+    _parse_credential,
+)
 from ecc.main import app
 
 settings = get_settings()
@@ -100,6 +106,107 @@ def _token_self_response(
     return {"id": 1, "scopes": scopes, "active": active, "revoked": revoked, "user_id": 555}
 
 
+# --- unit-level: credential parsing and SSRF host guard --------------------
+
+
+def test_parse_credential_splits_host_and_token() -> None:
+    assert _parse_credential("gitlab.com|glpat_test") == ("gitlab.com", "glpat_test")
+    assert _parse_credential("gitlab-ee.mpokket.org|glpat-xyz") == (
+        "gitlab-ee.mpokket.org",
+        "glpat-xyz",
+    )
+
+
+def test_parse_credential_reads_a_bare_token_as_a_legacy_gitlab_com_credential() -> None:
+    """Backward compatibility, not laxity: every `connector_accounts` row
+    for provider `gitlab` written before self-managed support shipped holds
+    a bare personal access token, and there is no endpoint to rewrite a
+    stored credential in place. Rejecting those rows would break `/sync`,
+    `refresh_permissions`, `disconnect`, and `gitlab.add_note` for every
+    existing gitlab.com connection with no remediation short of
+    disconnect + reconnect (which mints a new `external_account_id`). A
+    bare token could only ever have been issued by gitlab.com, since that
+    was the sole reachable host before the `host|token` format existed.
+    """
+    assert _parse_credential("glpat-legacy-bare-token") == ("gitlab.com", "glpat-legacy-bare-token")
+
+
+def test_parse_credential_rejects_empty_credential() -> None:
+    with pytest.raises(_InvalidCredentialError):
+        _parse_credential("")
+
+
+def test_parse_credential_rejects_empty_host_or_token() -> None:
+    with pytest.raises(_InvalidCredentialError):
+        _parse_credential("|glpat_test")
+    with pytest.raises(_InvalidCredentialError):
+        _parse_credential("gitlab.com|")
+
+
+def test_parse_credential_rejects_scheme_in_host() -> None:
+    with pytest.raises(_InvalidCredentialError):
+        _parse_credential("https://gitlab.com|glpat_test")
+
+
+def test_parse_credential_rejects_path_in_host() -> None:
+    with pytest.raises(_InvalidCredentialError):
+        _parse_credential("gitlab.com/api|glpat_test")
+
+
+def test_parse_credential_rejects_whitespace_in_host() -> None:
+    with pytest.raises(_InvalidCredentialError):
+        _parse_credential("gitlab.com |glpat_test")
+
+
+def test_is_private_address_flags_loopback_link_local_and_rfc1918() -> None:
+    assert _is_private_address("127.0.0.1") is True
+    assert _is_private_address("169.254.169.254") is True
+    assert _is_private_address("10.0.0.5") is True
+    assert _is_private_address("172.16.0.1") is True
+    assert _is_private_address("192.168.1.1") is True
+    assert _is_private_address("::1") is True
+
+
+def test_is_private_address_flags_rfc6598_cgnat_range() -> None:
+    """`ipaddress.ip_address(...).is_private` does not cover `100.64.0.0/10`
+    (RFC 6598 carrier-grade NAT), but it is a real internal address range
+    in cloud/carrier environments and therefore a legitimate SSRF target --
+    `_is_private_address` checks it explicitly. `100.63.255.255` and
+    `100.128.0.0` sit immediately outside the range on either side, proving
+    the check is the actual `/10` boundary and not a looser `100.*` match.
+    """
+    assert _is_private_address("100.64.0.1") is True
+    assert _is_private_address("100.100.50.7") is True
+    assert _is_private_address("100.127.255.255") is True
+    assert _is_private_address("100.63.255.255") is False
+    assert _is_private_address("100.128.0.0") is False
+
+
+def test_is_private_address_allows_public_addresses() -> None:
+    assert _is_private_address("8.8.8.8") is False
+    assert _is_private_address("140.82.112.3") is False
+
+
+def test_reject_private_host_raises_for_resolved_private_address() -> None:
+    adapter = GitLabAdapter(resolve_host=lambda host: ["169.254.169.254"])
+    with pytest.raises(AdapterAuthorizationError, match="private/internal"):
+        adapter._reject_private_host("gitlab-internal.example.com")
+
+
+def test_reject_private_host_allows_public_address() -> None:
+    adapter = GitLabAdapter(resolve_host=lambda host: ["140.82.112.3"])
+    adapter._reject_private_host("gitlab.com")  # must not raise
+
+
+def test_reject_private_host_raises_for_unresolvable_host() -> None:
+    def _fail(host: str) -> list[str]:
+        raise AdapterAuthorizationError("GitLab host could not be resolved: nxdomain")
+
+    adapter = GitLabAdapter(resolve_host=_fail)
+    with pytest.raises(AdapterAuthorizationError, match="could not be resolved"):
+        adapter._reject_private_host("does-not-exist.invalid")
+
+
 # --- unit-level: GitLabAdapter.authorize ------------------------------------
 
 
@@ -111,9 +218,18 @@ def test_gitlab_adapter_authorize_success() -> None:
         assert request.url.path == "/api/v4/user"
         return _json_response({"id": 555, "username": "octocat"})
 
-    adapter = GitLabAdapter(transport=httpx.MockTransport(handler))
-    authorization = adapter.authorize("glpat_test")
-    assert authorization.external_account_id == "555"
+    # `resolve_host` is injected on every `authorize()` test in this file,
+    # including the gitlab.com ones: `authorize()` runs `_reject_private_
+    # host` before any HTTP call, so without it the default `_default_
+    # resolve_host` would perform a real `socket.getaddrinfo("gitlab.com")`
+    # -- a live DNS dependency in a suite that uses `httpx.MockTransport`
+    # precisely to avoid the network. `140.82.112.3` is an obviously-public
+    # address, so the SSRF guard passes without resolving anything.
+    adapter = GitLabAdapter(
+        transport=httpx.MockTransport(handler), resolve_host=lambda host: ["140.82.112.3"]
+    )
+    authorization = adapter.authorize("gitlab.com|glpat_test")
+    assert authorization.external_account_id == "gitlab.com:555"
     assert authorization.display_name == "octocat"
     assert authorization.granted_scopes == frozenset({"read_api", "read_repository"})
 
@@ -122,9 +238,11 @@ def test_gitlab_adapter_authorize_rejects_missing_required_scope() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return _json_response(_token_self_response(scopes=["read_user"]))
 
-    adapter = GitLabAdapter(transport=httpx.MockTransport(handler))
+    adapter = GitLabAdapter(
+        transport=httpx.MockTransport(handler), resolve_host=lambda host: ["140.82.112.3"]
+    )
     with pytest.raises(AdapterAuthorizationError, match="read_api"):
-        adapter.authorize("token-missing-scopes")
+        adapter.authorize("gitlab.com|token-missing-scopes")
 
 
 def test_gitlab_adapter_authorize_rejects_revoked_token() -> None:
@@ -133,9 +251,11 @@ def test_gitlab_adapter_authorize_rejects_revoked_token() -> None:
             _token_self_response(scopes=["read_api", "read_repository"], revoked=True)
         )
 
-    adapter = GitLabAdapter(transport=httpx.MockTransport(handler))
+    adapter = GitLabAdapter(
+        transport=httpx.MockTransport(handler), resolve_host=lambda host: ["140.82.112.3"]
+    )
     with pytest.raises(AdapterAuthorizationError, match="revoked"):
-        adapter.authorize("revoked-token")
+        adapter.authorize("gitlab.com|revoked-token")
 
 
 def test_gitlab_adapter_authorize_rejects_inactive_token() -> None:
@@ -144,36 +264,44 @@ def test_gitlab_adapter_authorize_rejects_inactive_token() -> None:
             _token_self_response(scopes=["read_api", "read_repository"], active=False)
         )
 
-    adapter = GitLabAdapter(transport=httpx.MockTransport(handler))
+    adapter = GitLabAdapter(
+        transport=httpx.MockTransport(handler), resolve_host=lambda host: ["140.82.112.3"]
+    )
     with pytest.raises(AdapterAuthorizationError, match="active"):
-        adapter.authorize("inactive-token")
+        adapter.authorize("gitlab.com|inactive-token")
 
 
 def test_gitlab_adapter_authorize_rejects_401() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return _json_response({"message": "401 Unauthorized"}, status_code=401)
 
-    adapter = GitLabAdapter(transport=httpx.MockTransport(handler))
+    adapter = GitLabAdapter(
+        transport=httpx.MockTransport(handler), resolve_host=lambda host: ["140.82.112.3"]
+    )
     with pytest.raises(AdapterAuthorizationError):
-        adapter.authorize("bad-token")
+        adapter.authorize("gitlab.com|bad-token")
 
 
 def test_gitlab_adapter_authorize_rejects_non_200() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return _json_response({"message": "Server error"}, status_code=500)
 
-    adapter = GitLabAdapter(transport=httpx.MockTransport(handler))
+    adapter = GitLabAdapter(
+        transport=httpx.MockTransport(handler), resolve_host=lambda host: ["140.82.112.3"]
+    )
     with pytest.raises(AdapterAuthorizationError):
-        adapter.authorize("token")
+        adapter.authorize("gitlab.com|token")
 
 
 def test_gitlab_adapter_authorize_rejects_network_error() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         raise httpx.ConnectError("connection refused")
 
-    adapter = GitLabAdapter(transport=httpx.MockTransport(handler))
+    adapter = GitLabAdapter(
+        transport=httpx.MockTransport(handler), resolve_host=lambda host: ["140.82.112.3"]
+    )
     with pytest.raises(AdapterAuthorizationError):
-        adapter.authorize("token")
+        adapter.authorize("gitlab.com|token")
 
 
 def test_gitlab_adapter_authorize_rejects_second_call_non_200() -> None:
@@ -188,9 +316,11 @@ def test_gitlab_adapter_authorize_rejects_second_call_non_200() -> None:
             return _json_response(_token_self_response(scopes=["read_api", "read_repository"]))
         return _json_response({"message": "Server error"}, status_code=500)
 
-    adapter = GitLabAdapter(transport=httpx.MockTransport(handler))
+    adapter = GitLabAdapter(
+        transport=httpx.MockTransport(handler), resolve_host=lambda host: ["140.82.112.3"]
+    )
     with pytest.raises(AdapterAuthorizationError):
-        adapter.authorize("token")
+        adapter.authorize("gitlab.com|token")
 
 
 def test_gitlab_adapter_authorize_rejects_second_call_network_error() -> None:
@@ -199,9 +329,164 @@ def test_gitlab_adapter_authorize_rejects_second_call_network_error() -> None:
             return _json_response(_token_self_response(scopes=["read_api", "read_repository"]))
         raise httpx.ConnectError("connection refused")
 
-    adapter = GitLabAdapter(transport=httpx.MockTransport(handler))
+    adapter = GitLabAdapter(
+        transport=httpx.MockTransport(handler), resolve_host=lambda host: ["140.82.112.3"]
+    )
     with pytest.raises(AdapterAuthorizationError):
-        adapter.authorize("token")
+        adapter.authorize("gitlab.com|token")
+
+
+def test_gitlab_adapter_authorize_success_self_managed_host() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.host == "gitlab-ee.mpokket.org"
+        if request.url.path == "/api/v4/personal_access_tokens/self":
+            return _json_response(_token_self_response(scopes=["read_api", "read_repository"]))
+        assert request.url.path == "/api/v4/user"
+        return _json_response({"id": 7, "username": "priya"})
+
+    adapter = GitLabAdapter(
+        transport=httpx.MockTransport(handler),
+        resolve_host=lambda host: ["3.3.3.3"],
+    )
+    authorization = adapter.authorize("gitlab-ee.mpokket.org|glpat_private")
+    assert authorization.external_account_id == "gitlab-ee.mpokket.org:7"
+    assert authorization.display_name == "priya"
+
+
+def test_gitlab_adapter_authorize_accepts_a_legacy_bare_token_credential() -> None:
+    """A `connector_accounts` row written before self-managed support
+    shipped holds a bare token with no `|`. `authorize()` must read it as a
+    gitlab.com credential rather than raising -- and still emit the new
+    `host:user_id` `external_account_id`, since `authorize()` only ever
+    runs at connect time (an already-connected legacy row's stored bare
+    `external_account_id` is never re-derived from a fresh call, so there
+    is nothing to stay bit-compatible with here).
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.host == "gitlab.com"
+        assert request.headers["PRIVATE-TOKEN"] == "glpat-legacy-bare"
+        if request.url.path == "/api/v4/personal_access_tokens/self":
+            return _json_response(_token_self_response(scopes=["read_api", "read_repository"]))
+        return _json_response({"id": 555, "username": "legacy-user"})
+
+    adapter = GitLabAdapter(
+        transport=httpx.MockTransport(handler), resolve_host=lambda host: ["140.82.112.3"]
+    )
+    authorization = adapter.authorize("glpat-legacy-bare")
+    assert authorization.external_account_id == "gitlab.com:555"
+    assert authorization.display_name == "legacy-user"
+
+
+def test_gitlab_adapter_authorize_rejects_private_host_end_to_end() -> None:
+    from ecc.domains.engineering.connectors import AdapterAuthorizationError
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError("must not make an HTTP call once the host is rejected")
+
+    adapter = GitLabAdapter(
+        transport=httpx.MockTransport(handler),
+        resolve_host=lambda host: ["169.254.169.254"],
+    )
+    with pytest.raises(AdapterAuthorizationError, match="private/internal"):
+        adapter.authorize("gitlab-internal.example.com|glpat_test")
+
+
+def test_gitlab_adapter_two_hosts_same_numeric_user_id_do_not_collide() -> None:
+    def handler_for(user_id: int) -> Callable[[httpx.Request], httpx.Response]:
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path == "/api/v4/personal_access_tokens/self":
+                return _json_response(_token_self_response(scopes=["read_api", "read_repository"]))
+            return _json_response({"id": user_id, "username": f"user{user_id}"})
+
+        return handler
+
+    cloud_adapter = GitLabAdapter(
+        transport=httpx.MockTransport(handler_for(42)), resolve_host=lambda host: ["140.82.112.3"]
+    )
+    self_managed_adapter = GitLabAdapter(
+        transport=httpx.MockTransport(handler_for(42)), resolve_host=lambda host: ["3.3.3.3"]
+    )
+    cloud_auth = cloud_adapter.authorize("gitlab.com|token-a")
+    self_managed_auth = self_managed_adapter.authorize("gitlab-ee.mpokket.org|token-b")
+    assert cloud_auth.external_account_id == "gitlab.com:42"
+    assert self_managed_auth.external_account_id == "gitlab-ee.mpokket.org:42"
+    assert cloud_auth.external_account_id != self_managed_auth.external_account_id
+
+
+def test_two_hosts_same_numeric_user_id_both_insert_under_the_real_unique_constraint(
+    seeded_account_context: ConnectorAccountContext,
+) -> None:
+    """The string-level test above proves only that `authorize()` builds two
+    different strings -- true by construction, and no evidence at all about
+    the database. The design's actual claim is that both connections can
+    coexist **in one workspace** without violating `uq_connector_accounts_
+    workspace_provider_external_id` `(workspace_id, provider,
+    external_account_id)`. That is a Postgres fact, so it is asserted
+    against Postgres: two real `connector_accounts` inserts, same workspace,
+    same provider, same numeric GitLab user id (42), different hosts.
+
+    The second half is what makes the first half meaningful -- re-inserting
+    `gitlab.com:42` *does* raise `IntegrityError`, proving the constraint is
+    genuinely present and enforcing, so the two successful inserts above
+    passed because of the host prefix rather than because nothing was
+    checking.
+    """
+    workspace_id = seeded_account_context.workspace_id
+    with engine.begin() as connection:
+        actor_id = connection.execute(
+            text("SELECT created_by FROM connector_accounts WHERE workspace_id = :workspace_id"),
+            {"workspace_id": workspace_id},
+        ).scalar_one()
+
+    def _insert(external_account_id: str) -> None:
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO connector_accounts (
+                        id, workspace_id, provider, external_account_id, display_name,
+                        granted_scopes, encrypted_credentials, status, version,
+                        created_by, updated_by, created_at, updated_at
+                    ) VALUES (
+                        :id, :workspace_id, 'gitlab', :ext, 'Cross-host collision test',
+                        ARRAY['read_api', 'read_repository'], :encrypted, 'active', 1,
+                        :actor_id, :actor_id, :now, :now
+                    )
+                    """
+                ),
+                {
+                    "id": uuid4(),
+                    "workspace_id": workspace_id,
+                    "ext": external_account_id,
+                    "encrypted": encrypt_credential(f"{external_account_id.split(':')[0]}|glpat-x"),
+                    "actor_id": actor_id,
+                    "now": datetime.now(UTC),
+                },
+            )
+
+    _insert("gitlab.com:42")
+    _insert("gitlab-ee.mpokket.org:42")
+
+    with engine.begin() as connection:
+        stored = (
+            connection.execute(
+                text(
+                    "SELECT external_account_id FROM connector_accounts "
+                    "WHERE workspace_id = :workspace_id AND external_account_id LIKE :pattern"
+                ),
+                # Bound, not inlined -- a literal ':42' in the SQL string is
+                # parsed by SQLAlchemy's `text()` as a bind parameter named
+                # "42", not as part of the LIKE pattern.
+                {"workspace_id": workspace_id, "pattern": "%:42"},
+            )
+            .scalars()
+            .all()
+        )
+    assert set(stored) == {"gitlab.com:42", "gitlab-ee.mpokket.org:42"}
+
+    with pytest.raises(IntegrityError):
+        _insert("gitlab.com:42")
 
 
 # --- unit-level: repository sync (no database) ------------------------------
@@ -217,8 +502,8 @@ def _account_context() -> ConnectorAccountContext:
     return ConnectorAccountContext(
         workspace_id=uuid4(),
         connector_account_id=uuid4(),
-        external_account_id="555",
-        credential="glpat_test",
+        external_account_id="gitlab.com:555",
+        credential="gitlab.com|glpat_test",
     )
 
 
@@ -265,7 +550,7 @@ def seeded_account_context() -> Iterator[ConnectorAccountContext]:
             {
                 "id": account_id,
                 "workspace_id": workspace_id,
-                "encrypted": encrypt_credential("glpat_test"),
+                "encrypted": encrypt_credential("gitlab.com|glpat_test"),
                 "actor_id": user_id,
                 "now": now,
             },
@@ -275,7 +560,7 @@ def seeded_account_context() -> Iterator[ConnectorAccountContext]:
             workspace_id=workspace_id,
             connector_account_id=account_id,
             external_account_id="gl-unit-test",
-            credential="glpat_test",
+            credential="gitlab.com|glpat_test",
         )
     finally:
         with engine.begin() as connection:
@@ -305,6 +590,123 @@ def test_backfill_single_page(seeded_account_context: ConnectorAccountContext) -
     assert outcome.status == "succeeded"
     assert outcome.items_processed == 2
     assert outcome.next_cursor == "2024-01-03T00:00:00Z"
+
+
+def test_backfill_against_a_self_managed_host_writes_host_scoped_source_urls(
+    seeded_account_context: ConnectorAccountContext,
+) -> None:
+    """The end-to-end case the shipped feature actually exists for -- the
+    design doc's Testing section asked for a self-managed-host `backfill`
+    parallel to the gitlab.com one, and only `authorize()` had ever got
+    one. Asserts both halves of what "host-aware sync" means:
+
+    1. The request genuinely goes to the self-managed host (not a
+       hardcoded `gitlab.com` base URL), authenticated with the parsed
+       token half of the credential.
+    2. `repositories.source_url` is derived correctly through `_safe_
+       source_url`'s allow-list, which this feature rewired from a fixed
+       `https://gitlab.com` constant to the per-credential host. Project 1
+       returns a `web_url` on the self-managed host's own origin and is
+       accepted verbatim; project 2 returns a `web_url` on a completely
+       different origin (the shape a compromised or malicious connected
+       instance could return, and exactly what the allow-list exists to
+       stop being rendered as a clickable link) and must fall back to the
+       safe server-constructed default on the credential's own host. That
+       fallback had no `source_url` assertion anywhere in this file before,
+       for either host.
+    """
+    with engine.begin() as connection:
+        connection.execute(
+            text("UPDATE connector_accounts SET encrypted_credentials = :encrypted WHERE id = :id"),
+            {
+                "encrypted": encrypt_credential("gitlab-ee.mpokket.org|glpat-private"),
+                "id": seeded_account_context.connector_account_id,
+            },
+        )
+    account = ConnectorAccountContext(
+        workspace_id=seeded_account_context.workspace_id,
+        connector_account_id=seeded_account_context.connector_account_id,
+        external_account_id="gitlab-ee.mpokket.org:7",
+        credential="gitlab-ee.mpokket.org|glpat-private",
+    )
+    projects = [
+        {
+            "id": 1,
+            "path_with_namespace": "platform/on-host",
+            "web_url": "https://gitlab-ee.mpokket.org/platform/on-host",
+            "default_branch": "main",
+            "last_activity_at": "2024-01-03T00:00:00Z",
+        },
+        {
+            "id": 2,
+            "path_with_namespace": "platform/off-host",
+            "web_url": "https://evil.example.com/phishing/off-host",
+            "default_branch": "main",
+            "last_activity_at": "2024-01-02T00:00:00Z",
+        },
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.host == "gitlab-ee.mpokket.org"
+        assert request.url.path == "/api/v4/projects"
+        assert request.headers["PRIVATE-TOKEN"] == "glpat-private"
+        return _json_response(projects)
+
+    adapter = GitLabAdapter(transport=httpx.MockTransport(handler))
+    outcome = adapter.backfill(account, "repository")
+    assert outcome.status == "succeeded"
+    assert outcome.items_processed == 2
+
+    with engine.begin() as connection:
+        rows = dict(
+            connection.execute(
+                text(
+                    "SELECT external_id, source_url FROM repositories "
+                    "WHERE workspace_id = :workspace_id"
+                ),
+                {"workspace_id": account.workspace_id},
+            ).all()
+        )
+    # Same-origin `web_url`: trusted verbatim.
+    assert rows["1"] == "https://gitlab-ee.mpokket.org/platform/on-host"
+    # Off-origin `web_url`: rejected, replaced by the server-constructed
+    # default on the credential's own host -- never the provider's string.
+    assert rows["2"] == "https://gitlab-ee.mpokket.org/platform/off-host"
+    assert "evil.example.com" not in rows["2"]
+
+
+def test_backfill_with_a_legacy_bare_token_credential_syncs_against_gitlab_com(
+    seeded_account_context: ConnectorAccountContext,
+) -> None:
+    """The `/sync` path for a `connector_accounts` row that predates this
+    feature: the stored credential is a bare token with no `|`, and the
+    sync must reach gitlab.com and write gitlab.com-scoped `source_url`s
+    rather than raising (which would fail the sync and drive the connector
+    to `status='error'`).
+    """
+    account = ConnectorAccountContext(
+        workspace_id=seeded_account_context.workspace_id,
+        connector_account_id=seeded_account_context.connector_account_id,
+        external_account_id="555",
+        credential="glpat-legacy-bare",
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.host == "gitlab.com"
+        assert request.headers["PRIVATE-TOKEN"] == "glpat-legacy-bare"
+        return _json_response([_project(1, path="acme/a", updated_at="2024-01-03T00:00:00Z")])
+
+    adapter = GitLabAdapter(transport=httpx.MockTransport(handler))
+    outcome = adapter.backfill(account, "repository")
+    assert outcome.status == "succeeded"
+    assert outcome.items_processed == 1
+
+    with engine.begin() as connection:
+        source_url = connection.execute(
+            text("SELECT source_url FROM repositories WHERE workspace_id = :workspace_id"),
+            {"workspace_id": account.workspace_id},
+        ).scalar_one()
+    assert source_url == "https://gitlab.com/acme/a"
 
 
 def test_backfill_populates_suggested_team_name_from_namespace_object(
@@ -895,7 +1297,7 @@ def _headers(token: str, key: str | None = None) -> dict[str, str]:
 
 
 def _insert_gitlab_connector_account(
-    workspace_id: UUID, user_id: UUID, *, credential: str = "glpat_fixture"
+    workspace_id: UUID, user_id: UUID, *, credential: str = "gitlab.com|glpat_fixture"
 ) -> UUID:
     account_id = uuid4()
     now = datetime.now(UTC)
