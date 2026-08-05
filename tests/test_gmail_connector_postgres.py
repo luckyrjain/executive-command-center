@@ -56,6 +56,14 @@ multi-round adversarial review found and required real coverage for:
     identical, already-covered case).
 12. Audit-event dedup: a replayed callback (same code/state) returns the
     same row without writing a second `connector_account.created` event.
+13. A 200 response body that isn't valid JSON, or is valid JSON that isn't
+    an object, from either Google endpoint `handle_oauth_callback` calls
+    (`/token`, `/gmail/v1/users/me/profile`) is rejected the same way any
+    other malformed response is -- round 6: this shape was previously
+    trusted without validation, ahead of the revoke-on-reject guard for
+    the token response specifically, so an atypical 200 body would have
+    both skipped revocation and escaped as an uncaught exception type the
+    router's `AdapterAuthorizationError`-only catch does not handle.
 """
 
 from __future__ import annotations
@@ -473,6 +481,98 @@ def test_handle_oauth_callback_rejects_profile_lookup_network_error(
             return _json_response(_token_response())
         if request.url.path == "/gmail/v1/users/me/profile":
             raise httpx.ConnectError("boom", request=request)
+        if request.url.path == "/revoke":
+            revoked_tokens.append(request.content.decode().removeprefix("token="))
+            return httpx.Response(200)
+        raise AssertionError(f"unexpected request to {request.url}")
+
+    try:
+        adapter = GmailAdapter(transport=httpx.MockTransport(handler))
+        with pytest.raises(AdapterAuthorizationError):
+            adapter.handle_oauth_callback("auth-code", "state-value")
+        assert revoked_tokens == ["refresh-1"]
+    finally:
+        get_settings.cache_clear()
+
+
+def test_handle_oauth_callback_rejects_non_json_token_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 6 review found `response.json()`/`body.get(...)` previously sat
+    *ahead* of the revoke-on-reject guard -- a 200 response with a non-JSON
+    body (`response.json()` raising `json.JSONDecodeError`, a `ValueError`)
+    would have escaped uncaught past both the guard and the router's
+    `AdapterAuthorizationError`-only catch. Now inside the guard and
+    converted to the app's own error type.
+    """
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_CLIENT_ID", "cid")
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_CLIENT_SECRET", "csecret")
+    get_settings.cache_clear()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/token":
+            return httpx.Response(
+                status_code=200, headers={"content-type": "application/json"}, content=b"not json"
+            )
+        if request.url.path == "/revoke":
+            # `refresh_token` was never assigned (the failure is ahead of
+            # that line) -- `_revoke_best_effort("")` is still called per
+            # its own "always safe, only useful when there's something to
+            # revoke" contract.
+            return httpx.Response(200)
+        raise AssertionError(f"unexpected request to {request.url}")
+
+    try:
+        adapter = GmailAdapter(transport=httpx.MockTransport(handler))
+        with pytest.raises(AdapterAuthorizationError):
+            adapter.handle_oauth_callback("auth-code", "state-value")
+    finally:
+        get_settings.cache_clear()
+
+
+def test_handle_oauth_callback_rejects_non_object_token_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Companion to the non-JSON case above -- valid JSON that isn't an
+    object (a list here) previously reached `body.get(...)` and raised an
+    uncaught `AttributeError` instead.
+    """
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_CLIENT_ID", "cid")
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_CLIENT_SECRET", "csecret")
+    get_settings.cache_clear()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/token":
+            return _json_response([1, 2, 3])
+        if request.url.path == "/revoke":
+            return httpx.Response(200)
+        raise AssertionError(f"unexpected request to {request.url}")
+
+    try:
+        adapter = GmailAdapter(transport=httpx.MockTransport(handler))
+        with pytest.raises(AdapterAuthorizationError):
+            adapter.handle_oauth_callback("auth-code", "state-value")
+    finally:
+        get_settings.cache_clear()
+
+
+def test_handle_oauth_callback_rejects_non_object_profile_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Same shape-validation gap as the token-response tests above, for the
+    profile lookup's response body -- a real token was already exchanged by
+    this point, so this must revoke it.
+    """
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_CLIENT_ID", "cid")
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_CLIENT_SECRET", "csecret")
+    get_settings.cache_clear()
+    revoked_tokens: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/token":
+            return _json_response(_token_response())
+        if request.url.path == "/gmail/v1/users/me/profile":
+            return _json_response(None)
         if request.url.path == "/revoke":
             revoked_tokens.append(request.content.decode().removeprefix("token="))
             return httpx.Response(200)

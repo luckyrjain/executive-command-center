@@ -232,10 +232,6 @@ class GmailAdapter:
             raise AdapterAuthorizationError(
                 f"Gmail token exchange failed with status {response.status_code}"
             )
-        body = response.json()
-        access_token = body.get("access_token")
-        refresh_token = body.get("refresh_token")
-        expires_in = body.get("expires_in")
         # Every rejection from here on happens *after* a real, successful
         # token exchange -- Google has already granted something, whether
         # this method goes on to accept or reject it (even the very next
@@ -257,7 +253,38 @@ class GmailAdapter:
         # (see that method's own docstring), matching the "always safe to
         # call, only useful when there was something to revoke" contract
         # this whole guard already relies on.
+        #
+        # `response.json()`/`body.get(...)` are inside this same guard, not
+        # ahead of it -- round 6 review found a 200 response whose body
+        # isn't valid JSON (`response.json()` raises `json.JSONDecodeError`,
+        # a `ValueError`) or decodes to something other than an object (a
+        # list/`null`/number, `body.get(...)` then raising `AttributeError`)
+        # previously escaped uncaught *before* this guard began, both
+        # defeating the router's `AdapterAuthorizationError`-only catch
+        # (surfacing as an unhandled 500 outside the app's structured error
+        # envelope) and, for the same reason every branch inside this guard
+        # exists, skipping revoke-on-reject entirely -- the same "shape
+        # trusted without validation" bug class as `_unpack_credential`
+        # (see that function's own docstring), just one call earlier.
+        # `refresh_token` is pre-initialized so the `except` clause below
+        # has a value to revoke (empty, if parsing failed before assignment
+        # -- a harmless no-op per the same contract noted above).
+        refresh_token: str | None = None
         try:
+            try:
+                body = response.json()
+            except ValueError as exc:
+                raise AdapterAuthorizationError(
+                    f"Gmail token exchange returned a non-JSON response body: {exc}"
+                ) from exc
+            if not isinstance(body, dict):
+                raise AdapterAuthorizationError(
+                    "Gmail token exchange returned a non-object response body: "
+                    f"{type(body).__name__}"
+                )
+            access_token = body.get("access_token")
+            refresh_token = body.get("refresh_token")
+            expires_in = body.get("expires_in")
             if not access_token or not refresh_token or expires_in is None:
                 raise AdapterAuthorizationError(
                     "Gmail token exchange response missing access_token/refresh_token/"
@@ -291,7 +318,18 @@ class GmailAdapter:
                 raise AdapterAuthorizationError(
                     f"Gmail profile lookup failed with status {profile_response.status_code}"
                 )
-            email_address = profile_response.json().get("emailAddress")
+            try:
+                profile_body = profile_response.json()
+            except ValueError as exc:
+                raise AdapterAuthorizationError(
+                    f"Gmail profile lookup returned a non-JSON response body: {exc}"
+                ) from exc
+            if not isinstance(profile_body, dict):
+                raise AdapterAuthorizationError(
+                    "Gmail profile lookup returned a non-object response body: "
+                    f"{type(profile_body).__name__}"
+                )
+            email_address = profile_body.get("emailAddress")
             if not email_address:
                 raise AdapterAuthorizationError("Gmail profile response missing emailAddress")
 
