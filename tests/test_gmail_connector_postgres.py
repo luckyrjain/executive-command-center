@@ -2084,6 +2084,116 @@ def test_oauth_callback_releases_pool_connection_and_row_lock_before_revoking(
         get_settings.cache_clear()
 
 
+def test_oauth_callback_reactivation_releases_pool_connection_and_row_lock_before_revoking(
+    gmail_test_context: tuple[TestClient, UUID, UUID, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 24 review: `test_oauth_callback_releases_pool_connection_and_
+    row_lock_before_revoking` above only proves the lock/connection are
+    released before the `active`-row branch's deferred revoke of the *new*
+    grant. The reactivation branch (a `disconnected` row reconnecting) is
+    a structurally distinct branch that queues a *different* credential --
+    the row's own *old*, pre-update one -- into the same `pending_revokes`
+    list, and this codebase's own precedent (rounds 13/16) is that proving
+    a shared mechanism correct for one call site does not prove it is
+    correctly wired at a sibling site. Confirmed by mutation: temporarily
+    reverting just the reactivation branch's `pending_revokes.append(...)`
+    to an inline `_adapter.disconnect(...)` call (reintroducing the exact
+    round-23 bug for this one branch only) left the entire existing test
+    file passing -- this test is what closes that gap. Same repro shape as
+    the `active`-row sibling: the losing consent's `/revoke` call is
+    blocked on an `Event`, and a concurrent raw `SELECT ... FOR UPDATE
+    NOWAIT` on the same row must succeed immediately while blocked.
+    """
+    client, _workspace_id, _user_id, token = gmail_test_context
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_ALLOWLIST", _ALLOWED_EMAIL)
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_CLIENT_ID", "cid")
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_CLIENT_SECRET", "csecret")
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_REDIRECT_URI", "https://ecc.example.test/callback")
+    get_settings.cache_clear()
+    monkeypatch.setattr(gmail_oauth_module, "_adapter", GmailAdapter(transport=_oauth_transport()))
+    try:
+        start_response = client.post("/api/v1/personal/gmail/oauth/start", headers=_headers(token))
+        state = httpx.URL(start_response.json()["authorization_url"]).params["state"]
+        first_response = client.get(
+            "/api/v1/personal/gmail/oauth/callback",
+            params={"code": "auth-code", "state": state},
+        )
+        assert first_response.status_code == 200
+        account_id = first_response.json()["id"]
+
+        now = datetime.now(UTC)
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    "UPDATE connector_accounts SET status = 'disconnected', "
+                    "disconnected_at = :now, updated_at = :now WHERE id = :id"
+                ),
+                {"id": account_id, "now": now},
+            )
+
+        entered_disconnect = threading.Event()
+        unblock = threading.Event()
+
+        class _BlockingAdapter(GmailAdapter):
+            def disconnect(self, account: ConnectorAccountContext) -> None:
+                entered_disconnect.set()
+                unblock.wait(timeout=5)
+                super().disconnect(account)
+
+        revoked_tokens: list[str] = []
+        monkeypatch.setattr(
+            gmail_oauth_module,
+            "_adapter",
+            _BlockingAdapter(
+                transport=_oauth_transport(
+                    token_body=_token_response(access_token="access-5", refresh_token="refresh-5"),
+                    revoked_tokens=revoked_tokens,
+                )
+            ),
+        )
+        second_start = client.post("/api/v1/personal/gmail/oauth/start", headers=_headers(token))
+        second_state = httpx.URL(second_start.json()["authorization_url"]).params["state"]
+
+        def _second_callback() -> Any:
+            return client.get(
+                "/api/v1/personal/gmail/oauth/callback",
+                params={"code": "auth-code-5", "state": second_state},
+            )
+
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(_second_callback)
+            assert entered_disconnect.wait(timeout=5), "disconnect() never entered"
+
+            with engine.connect() as probe:
+                probe.execution_options(isolation_level="AUTOCOMMIT")
+                probe.execute(text("SET statement_timeout = '2s'"))
+                row = (
+                    probe.execute(
+                        text("SELECT id FROM connector_accounts WHERE id = :id FOR UPDATE NOWAIT"),
+                        {"id": UUID(account_id)},
+                    )
+                    .mappings()
+                    .one()
+                )
+                assert str(row["id"]) == account_id
+                probe.rollback()
+
+            unblock.set()
+            second_response = future.result(timeout=5)
+
+        assert second_response.status_code == 200
+        body = second_response.json()
+        assert body["id"] == account_id
+        assert body["status"] == "active"
+        # The *old* (pre-reactivation) credential is what gets revoked here,
+        # not the newly exchanged one -- the reactivation branch's whole
+        # point is to persist the new grant, not discard it.
+        assert revoked_tokens == ["refresh-1"]
+    finally:
+        get_settings.cache_clear()
+
+
 def test_oauth_callback_reactivates_disconnected_account(
     gmail_test_context: tuple[TestClient, UUID, UUID, str],
     monkeypatch: pytest.MonkeyPatch,
