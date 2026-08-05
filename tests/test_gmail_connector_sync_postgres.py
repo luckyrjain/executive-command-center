@@ -118,6 +118,24 @@ Covers, per this task's own scope:
     `test_nul_byte_in_from_display_name_is_skipped_not_a_crash`,
     `test_nul_byte_in_subject_is_dropped_but_message_still_syncs`) since
     round 1.
+19. A `From`/`To` header built of deeply nested RFC 5322 `(...)` comments
+    around an otherwise ordinary address is dropped/skips the message the
+    same way an oversized address already does, not left to crash the sync
+    call with an uncaught `RecursionError` -- `parseaddr`/`getaddresses`/
+    `HeaderRegistry` all share the same recursive RFC 5322 grammar with no
+    depth cap of its own -- found by round 6 review, the same "single
+    crafted message reaches an uncaught crash and permanently wedges
+    `incremental_sync`" failure class every guard above closes for its own
+    failure mode, reached here via stdlib recursion depth instead.
+20. `_to_header_has_grammar_defect`'s own narrow `except` (round 4's fix,
+    catching `UnicodeEncodeError` among others) had never actually been
+    exercised by a surrogate-carrying `To` header -- every existing
+    surrogate test puts the surrogate in `From`/`Subject`/`id`/`threadId`
+    instead, none of which reach this function at all. Not a live bug (the
+    guard has been correct since round 4), a coverage gap only -- found by
+    round 6 review's architecture/quality lens, mutation-confirmed by
+    narrowing the guard's `except` tuple down to `RecursionError` alone
+    and observing this was the only test in the file that then failed.
 """
 
 from __future__ import annotations
@@ -1581,6 +1599,181 @@ def test_to_header_recipient_count_is_capped_to_bound_entity_resolution_work(
         assert _resolved_person(context.workspace_id, kept) is not None
     for dropped in to_addrs[3:]:
         assert _resolved_person(context.workspace_id, dropped) is None
+
+
+def _comment_nesting_bomb(address: str) -> str:
+    """RFC 5322 permits arbitrarily nested `(...)` comments inside an
+    address; `email.utils.parseaddr`/`getaddresses` and `email.
+    headerregistry.HeaderRegistry` all share the same underlying
+    `_AddressList`/`_parseaddr` grammar, which recurses one Python stack
+    frame per nesting level with no depth cap of its own. 497 levels
+    (independently confirmed against the installed Python's default
+    recursion limit in a standalone interpreter -- the minimum that
+    reliably crashes, with headroom) produces ~1KB total -- comfortably
+    within Gmail API response body limits, and irrelevant to RFC 5322's
+    998-byte *unfolded line* guidance either way, since this module reads
+    an already-decoded JSON string field, never raw SMTP line-folded
+    bytes.
+    """
+    depth = 497
+    return "(" * depth + address + ")" * depth
+
+
+def test_from_header_comment_nesting_bomb_is_skipped_not_a_crash(
+    seeded_gmail_account: tuple[ConnectorAccountContext, UUID],
+) -> None:
+    """Round 6 review: a `From` header built entirely of deeply nested
+    RFC 5322 `(...)` comments around an otherwise ordinary address
+    previously reached `email.utils.parseaddr` (`_parse_address`)
+    uncaught as a `RecursionError` -- not any exception type this module
+    already anticipated (`ValueError`/`TypeError`/`UnicodeEncodeError`/
+    Postgres `DataError`) -- aborting the entire sync call for a single
+    malformed message, and for `incremental_sync` permanently wedging that
+    connector account's sync since the call never reaches a `return` that
+    advances `next_cursor` past it: the identical "single crafted message
+    crashes the whole call" failure class `_MAX_EMAIL_ADDRESS_LENGTH`/
+    `_contains_nul`/`_contains_unpaired_surrogate` already closed for their
+    own failure classes. Gmail forwards a sender's raw `From` header
+    verbatim and a sender fully controls their own outgoing headers. Must
+    degrade to a skipped message, not a crash.
+    """
+    context, _owner_id = seeded_gmail_account
+    now_ms = int(datetime.now(UTC).timestamp() * 1000)
+    body = _message_body(
+        message_id="msg-comment-bomb-from",
+        thread_id="thread-comment-bomb-from",
+        from_addr=_comment_nesting_bomb("a@example.test"),
+        to_addrs=[_OWNER_EMAIL],
+        internal_date_ms=now_ms,
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/gmail/v1/users/me/messages":
+            return _json_response({"messages": [{"id": "msg-comment-bomb-from"}]})
+        if request.url.path.startswith("/gmail/v1/users/me/messages/"):
+            return _json_response(body)
+        if request.url.path == "/gmail/v1/users/me/profile":
+            return _json_response({"historyId": 1})
+        raise AssertionError(f"unexpected request to {request.url}")
+
+    adapter = GmailAdapter(transport=httpx.MockTransport(handler))
+    outcome = adapter.backfill(context, "message", since=datetime.now(UTC) - timedelta(days=1))
+    assert outcome.status == "succeeded"
+    assert outcome.items_processed == 1
+    assert _threads_and_messages(context.workspace_id) == []
+
+
+def test_to_header_comment_nesting_bomb_is_safely_dropped_not_a_crash(
+    seeded_gmail_account: tuple[ConnectorAccountContext, UUID],
+) -> None:
+    """Same hazard as the `From`-header case above, reached via two
+    separate call sites on the `To`-header parsing chain instead of one:
+    `_to_header_has_grammar_defect` (`email.headerregistry.HeaderRegistry`,
+    which runs *first* in `_process_message` and independently shares the
+    same recursive grammar -- so this module's very first parse of a
+    comment-nesting `To` header would have crashed here even before
+    `_getaddresses_resilient` ever ran) and `_getaddresses_resilient`
+    (`email.utils.getaddresses`) itself. Both now catch `RecursionError`
+    and treat the header as unparseable rather than raising, the same
+    "zero valid recipients -> whole message safely dropped, not a crash"
+    contract `test_to_header_ambiguous_no_comma_address_is_still_safely_
+    dropped` above already establishes for a different unparseable-`To`-
+    header shape -- not a regression to a naive per-recipient drop this
+    file has never actually implemented for a whole-header parse failure.
+    """
+    context, _owner_id = seeded_gmail_account
+    now_ms = int(datetime.now(UTC).timestamp() * 1000)
+    body = _message_body(
+        message_id="msg-comment-bomb-to",
+        thread_id="thread-comment-bomb-to",
+        from_addr="alice@example.test",
+        to_addrs=["ignored -- overridden by raw_to below"],
+        internal_date_ms=now_ms,
+    )
+    body["payload"]["headers"] = [
+        {"name": "From", "value": "alice@example.test"},
+        {"name": "To", "value": _comment_nesting_bomb("bob@example.test")},
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/gmail/v1/users/me/messages":
+            return _json_response({"messages": [{"id": "msg-comment-bomb-to"}]})
+        if request.url.path.startswith("/gmail/v1/users/me/messages/"):
+            return _json_response(body)
+        if request.url.path == "/gmail/v1/users/me/profile":
+            return _json_response({"historyId": 1})
+        raise AssertionError(f"unexpected request to {request.url}")
+
+    adapter = GmailAdapter(transport=httpx.MockTransport(handler))
+    outcome = adapter.backfill(context, "message", since=datetime.now(UTC) - timedelta(days=1))
+    assert outcome.status == "succeeded"
+    assert outcome.items_processed == 1
+    assert _threads_and_messages(context.workspace_id) == []
+    assert _resolved_person(context.workspace_id, "bob@example.test") is None
+
+
+def test_to_header_unpaired_surrogate_does_not_crash_the_grammar_defect_check(
+    seeded_gmail_account: tuple[ConnectorAccountContext, UUID],
+) -> None:
+    """Round 6 review, architecture/quality lens: `_to_header_has_grammar_
+    defect` (round 4's own fix) parses the raw `To` header through `email.
+    headerregistry.HeaderRegistry` *before* `_getaddresses_resilient`/
+    `_validate_address` ever run (see `_process_message`'s own call site) --
+    but that parse itself raises an uncaught `UnicodeEncodeError` for a
+    header carrying an unpaired UTF-16 surrogate escape, the identical
+    encode failure `_contains_unpaired_surrogate` exists to catch
+    elsewhere in this file, reached here one call earlier and via a
+    different stdlib entry point. The guard's own docstring has described
+    this exact hazard and a narrow `except (UnicodeEncodeError, ...)`
+    since round 4, and it is not in doubt that the guard is correct (a
+    standalone interpreter reproduces the raw crash directly against
+    `HeaderRegistry`) -- but until this test, no test in this file actually
+    drove a surrogate-carrying `To` header through `_to_header_has_grammar_
+    defect` itself: every existing surrogate test (`test_unpaired_
+    surrogate_in_from_display_name_is_skipped_not_a_crash` and its
+    siblings) puts the surrogate in `From`/`Subject`/`id`/`threadId`
+    instead, none of which ever reach this function at all. Mutation-
+    confirmed: narrowing the `except` clause down to `RecursionError` only
+    (removing `UnicodeEncodeError`/`ValueError`/`TypeError`/`LookupError`/
+    `IndexError`, i.e. reverting to before round 4's own fix) left every
+    other test in this file passing -- this was the only test that failed,
+    with the same raw, uncaught `UnicodeEncodeError` the guard exists to
+    prevent. Uses the same `_surrogate_json_response` marker-substitution
+    helper the `From`/`Subject`/`id` surrogate tests already establish, this
+    time on the `To` header's own address portion; the lone surrogate
+    recipient has no other valid recipient alongside it, so the message
+    ends up with zero valid recipients and is safely dropped entirely --
+    the same "can't make sense of it -> treat as zero recipients" contract
+    `_validate_address`'s own docstring establishes, not a crash.
+    """
+    context, _owner_id = seeded_gmail_account
+    now_ms = int(datetime.now(UTC).timestamp() * 1000)
+    body = _message_body(
+        message_id="msg-to-surrogate",
+        thread_id="thread-to-surrogate",
+        from_addr="alice@example.test",
+        to_addrs=["ignored -- overridden by raw_to below"],
+        internal_date_ms=now_ms,
+    )
+    body["payload"]["headers"] = [
+        {"name": "From", "value": "alice@example.test"},
+        {"name": "To", "value": "bob__SURROGATE__@example.test"},
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/gmail/v1/users/me/messages":
+            return _json_response({"messages": [{"id": "msg-to-surrogate"}]})
+        if request.url.path.startswith("/gmail/v1/users/me/messages/"):
+            return _surrogate_json_response(body, marker_replacement=r"\ud800")
+        if request.url.path == "/gmail/v1/users/me/profile":
+            return _json_response({"historyId": 1})
+        raise AssertionError(f"unexpected request to {request.url}")
+
+    adapter = GmailAdapter(transport=httpx.MockTransport(handler))
+    outcome = adapter.backfill(context, "message", since=datetime.now(UTC) - timedelta(days=1))
+    assert outcome.status == "succeeded"
+    assert outcome.items_processed == 1
+    assert _threads_and_messages(context.workspace_id) == []
 
 
 # --- per-call message budget hit mid-page -------------------------------------

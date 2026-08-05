@@ -412,8 +412,34 @@ def _parse_address(header_value: str) -> tuple[str, str] | None:
     for the (always single-address) `From` header; see `_validate_
     address`'s own docstring for the multi-address `To` case and what
     `None` here means.
+
+    Wrapped in `try`/`except RecursionError` -- round 6 review: RFC 5322
+    permits arbitrarily nested `(...)` comments inside an address, and
+    `parseaddr`'s underlying `_AddressList`/`_parseaddr` grammar recurses
+    one stack frame per nesting level with no depth cap of its own.
+    Independently confirmed in a standalone interpreter: a `From` header of
+    only ~500 nested, *matched* parens around an otherwise ordinary address
+    (`"(" * 497 + "a@example.test" + ")" * 497`, 1008 bytes total -- just
+    over a single RFC 5322 unfolded header line's 998-byte *recommended*
+    limit, which is advisory, not a hard cutoff any parser enforces, and
+    moot here regardless since this module receives Gmail's response as an
+    already-decoded JSON string field, never raw SMTP line-folded bytes)
+    raises an uncaught `RecursionError`, not any exception type this
+    module already anticipated. Gmail forwards a sender's raw `From`
+    header verbatim and a
+    sender fully controls their own outgoing headers -- the identical
+    "single crafted message reaches an uncaught crash, aborting the entire
+    sync call, and for `incremental_sync` wedging that account permanently
+    since the cursor never advances past it" failure class every guard
+    above this one exists to close (see `_MAX_EMAIL_ADDRESS_LENGTH`'s own
+    comment), reached here via a stdlib recursion depth rather than a
+    length/NUL/surrogate check. Treated as unparseable, the same as any
+    other header `parseaddr` can't make sense of.
     """
-    display_name, address = parseaddr(header_value)
+    try:
+        display_name, address = parseaddr(header_value)
+    except RecursionError:
+        return None
     return _validate_address(display_name, address)
 
 
@@ -468,8 +494,28 @@ def _getaddresses_resilient(to_header: str) -> list[tuple[str, str]]:
     outside any quote/angle-bracket construct by construction -- a valid
     one must already be closed before the string ends -- is ever
     stripped).
+
+    Both `getaddresses` calls are wrapped in `try`/`except RecursionError`
+    -- round 6 review, the identical unbounded-comment-nesting hazard
+    `_parse_address`'s own docstring documents for `parseaddr` (the two
+    share the same underlying `_AddressList`/`_parseaddr` grammar, and
+    independently confirmed to crash the same way here: `getaddresses(["("
+    * 497 + "a@example.test" + ")" * 497])` raises an uncaught
+    `RecursionError` (see `_parse_address`'s own docstring for why the
+    exact byte count here doesn't matter to this module either way). A
+    `To` header is exactly as attacker-controlled as `From`, so
+    treating a `RecursionError` here as "unparseable" -- returning the same
+    `[("", "")]` sentinel `_validate_address` already discards downstream,
+    same as the existing no-comma-to-strip return path -- keeps this
+    function's contract intact (an un-recoverable header yields no
+    recipients, dropping the message via `_process_message`'s own `if not
+    recipients: return None`, rather than crashing the whole sync call and
+    permanently wedging `incremental_sync` behind it).
     """
-    parsed = getaddresses([to_header])
+    try:
+        parsed = getaddresses([to_header])
+    except RecursionError:
+        return [("", "")]
     if parsed != [("", "")]:
         return parsed
     stripped = to_header.rstrip()
@@ -479,7 +525,10 @@ def _getaddresses_resilient(to_header: str) -> list[tuple[str, str]]:
         trimmed_any = True
     if not trimmed_any or not stripped:
         return parsed
-    return getaddresses([stripped])
+    try:
+        return getaddresses([stripped])
+    except RecursionError:
+        return [("", "")]
 
 
 # `getaddresses(strict=True)`'s own address-count check (see `_getaddresses_
@@ -597,10 +646,28 @@ def _to_header_has_grammar_defect(to_header: str) -> bool:
     same malformed field also triggers -- narrowing the check to that one
     defect class closes the false-positive gap without reopening the
     collision this function was written for.
+
+    `RecursionError` added to the caught tuple by round 6 review, alongside
+    the pre-existing `UnicodeEncodeError`/etc. -- `HeaderRegistry` parses
+    the identical RFC 5322 grammar `getaddresses`/`parseaddr` do and
+    recurses the same way on unbounded `(...)` comment nesting (see
+    `_parse_address`'s own docstring for the full mechanism and the
+    concrete reproduction; independently confirmed to crash `HeaderRegistry`
+    at the same nesting depth). Reachable here even when this function runs
+    *before* `_getaddresses_resilient` ever does (see this function's own
+    call site in `_process_message`), so this module's very first parse of
+    a comment-nesting-bomb `To` header would otherwise still be this one.
+    Returning `False` here is safe for the same reason the existing
+    catches already are (see this function's own docstring above): it
+    defers to `_getaddresses_resilient`'s own parse, which independently
+    catches the identical `RecursionError` on the same input and yields no
+    recipients -- not a bypass of this cross-check's protection, since the
+    collision this function guards against has no comment-nesting shape of
+    its own to hide behind a `RecursionError` return value.
     """
     try:
         defects = _TO_HEADER_REGISTRY("To", to_header).defects
-    except (UnicodeEncodeError, ValueError, TypeError, LookupError, IndexError):
+    except (UnicodeEncodeError, ValueError, TypeError, LookupError, IndexError, RecursionError):
         return False
     return any(isinstance(defect, InvalidHeaderDefect) for defect in defects)
 
