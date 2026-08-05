@@ -217,8 +217,48 @@ def gmail_oauth_callback_endpoint(
     # was consulted for what to persist, so deferring it changes nothing
     # about correctness, only when the network call happens relative to
     # the transaction.
+    #
+    # Round 26 review: **not every queued credential is safe to revoke
+    # unconditionally on rollback.** `pending_revokes` below is for a
+    # credential that is *definitely* being discarded no matter how this
+    # request ends -- the `active`-row branch's just-exchanged new grant
+    # (the existing row is only ever read, never written, so nothing
+    # about a later failure changes the fact this grant was never going
+    # to be persisted), and every catch-all `except Exception:` queuing
+    # `authorization.credential` when the `INSERT`/success-path tail
+    # itself fails outright (nothing was ever persisted either way, so
+    # revoking the grant that would have been is correct regardless of
+    # commit/rollback -- rounds 4/7/10/11/12's own reasoning). The
+    # reactivation branch's *old* credential is different in kind: it is
+    # only supposed to be discarded *because* the `UPDATE` a few lines
+    # below is about to replace it with the new grant -- a revoke that is
+    # correct if and only if that `UPDATE` (and the rest of this
+    # transaction) actually commits. Queuing it into the same
+    # unconditional-drain list as everything else meant a transient,
+    # wholly unrelated failure later in the same branch (a dropped
+    # connection, a deadlock, `statement_timeout`) rolled the `UPDATE`
+    # back -- leaving the row's stored credential exactly as it was
+    # before this request -- while still revoking that same credential at
+    # Google, since the round-23 `finally` block below drains
+    # unconditionally "whether the transaction committed or rolled back."
+    # Dynamically confirmed: reactivating a non-`disconnected` row (e.g.
+    # `error`/`rate_limited`/`permission_lost` -- states where, unlike
+    # `disconnected`, nothing has necessarily already revoked the stored
+    # credential at Google) whose credential is still genuinely live, then
+    # failing a later statement in the same branch so the `UPDATE` rolls
+    # back, left the row still reporting its old, pre-request status with
+    # its old credential still stored -- but that stored credential had
+    # already been revoked at Google by this same failed request, with no
+    # local signal anything was wrong. `pending_revokes_on_commit` holds
+    # exactly this one class of entry, drained only if the whole
+    # transaction actually commits (`committed` below) -- every other
+    # queue entry in this function remains in the always-drain
+    # `pending_revokes` list, matching rounds 4-12's original reasoning,
+    # which was correct for all of them except this one.
     pending_revokes: list[ConnectorAccountContext] = []
+    pending_revokes_on_commit: list[ConnectorAccountContext] = []
     response: ConnectorAccountResponse | None = None
+    committed = False
     try:
         with SessionFactory() as create_session, create_session.begin():
             try:
@@ -368,7 +408,13 @@ def gmail_oauth_callback_endpoint(
                         except Exception:  # noqa: BLE001 -- best-effort, never blocks reactivation
                             old_credential = None
                         if old_credential is not None:
-                            pending_revokes.append(
+                            # Commit-contingent (see the block comment
+                            # above `pending_revokes`'s own declaration):
+                            # this credential is only actually being
+                            # discarded if the `UPDATE` immediately below
+                            # -- and the rest of this transaction -- goes
+                            # on to commit.
+                            pending_revokes_on_commit.append(
                                 ConnectorAccountContext(
                                     workspace_id=auth.workspace_id,
                                     connector_account_id=existing["id"],
@@ -481,15 +527,30 @@ def gmail_oauth_callback_endpoint(
                         )
                     )
                     raise
+        # Reached only if the `with` block above exited normally -- no
+        # exception propagated past it, so `create_session`'s transaction
+        # actually committed. Guards `pending_revokes_on_commit`'s drain
+        # below (round 26 review; see the block comment above that list's
+        # declaration for why its entries specifically must not be
+        # revoked on a rollback the way every other queued entry safely
+        # can be).
+        committed = True
     finally:
         # `create_session` is fully closed by this point (the `with` block
         # above has already exited) -- no pooled connection or row lock is
-        # held during any of these calls. Runs whether the transaction
-        # committed or rolled back, and whether or not an exception is
-        # about to propagate past this `finally` (Python re-raises it
-        # automatically afterward).
+        # held during any of these calls. `pending_revokes` runs whether
+        # the transaction committed or rolled back, and whether or not an
+        # exception is about to propagate past this `finally` (Python
+        # re-raises it automatically afterward) -- every entry in it is a
+        # credential that was never going to be persisted either way.
+        # `pending_revokes_on_commit` only runs if `committed` -- its
+        # entries are only actually being discarded when this request's
+        # own replacement write for them landed for real.
         for pending_context in pending_revokes:
             _adapter.disconnect(pending_context)
+        if committed:
+            for pending_context in pending_revokes_on_commit:
+                _adapter.disconnect(pending_context)
 
     assert response is not None
     return response

@@ -217,9 +217,27 @@ multi-round adversarial review found and required real coverage for:
     `test_oauth_callback_reactivation_releases_pool_connection_and_row_
     lock_before_revoking`, the same repro shape, asserting the *old*
     credential -- not the new grant -- is what gets revoked.
+25. Round 26: the reactivation branch's queued *old* credential (item 24)
+    was drained unconditionally, the same as every other queued entry --
+    correct for every other entry (each one is a credential that was
+    never going to be persisted regardless of commit/rollback), but wrong
+    for this one specifically: it is only actually being discarded if the
+    `UPDATE` that replaces it goes on to commit. Dynamically confirmed:
+    reactivating a non-`disconnected` row (`error`, where nothing has
+    necessarily already revoked the stored credential, unlike
+    `disconnected`) whose credential is still genuinely live, then failing
+    a later statement so the whole transaction rolls back, revoked that
+    still-good credential at Google while leaving the DB row completely
+    unchanged. Fixed with `pending_revokes_on_commit`, drained only if the
+    transaction actually commits. `test_oauth_callback_revokes_new_grant_
+    when_reactivation_update_raises`'s own assertion updated to match
+    (the old credential is no longer expected to be revoked when its own
+    replacing `UPDATE` fails); `test_oauth_callback_reactivation_failure_
+    preserves_still_live_credential_of_error_row` added for the `error`-
+    status case specifically.
 
-See `docs/phases/phase-010/IMPLEMENTATION-STATUS.md`'s own round-23/24
-paragraphs for the full account of both fixes.
+See `docs/phases/phase-010/IMPLEMENTATION-STATUS.md`'s own round-23/24/26
+paragraphs for the full account of these fixes.
 
 Rounds 10-12 each found and closed one more unguarded statement in
 `gmail_oauth_callback_endpoint`'s revoke-on-failure coverage (a real
@@ -2639,11 +2657,29 @@ def test_oauth_callback_revokes_new_grant_when_reactivation_update_raises(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Round 11's fix: the reactivation branch's own `UPDATE`/re-`SELECT`/
-    audit-write sequence -- which persists the *new* credential after the
-    *old* one is already revoked -- had no revoke-on-failure guard of its
-    own, since a failure raised from inside `except IntegrityError:` is
-    never caught by round 10's `except Exception:` sibling. Simulates that
-    failure directly.
+    audit-write sequence -- which persists the *new* credential -- had no
+    revoke-on-failure guard of its own, since a failure raised from inside
+    `except IntegrityError:` is never caught by round 10's `except
+    Exception:` sibling. Simulates that failure directly.
+
+    Round 26 review: the *old* credential is deliberately NOT expected in
+    `revoked_tokens` here anymore -- round 11/12's original version of this
+    test asserted `["refresh-1", "refresh-2"]`, revoking the old credential
+    unconditionally even though the `UPDATE` that was supposed to replace
+    it never committed (the whole transaction rolled back, so the row's
+    stored credential is still the old one). That was harmless by
+    coincidence in this test's own setup (a `disconnected` row, whose
+    credential this codebase already treats as presumed-dead), but the
+    same code path also runs for `error`/`rate_limited`/`permission_lost`
+    rows, where the stored credential can still be genuinely live --
+    dynamically confirmed to revoke a still-good credential at Google
+    while leaving the DB row completely unchanged (still `error`, still
+    pointing at the now-dead credential, no local signal anything
+    happened). Fixed by only revoking the reactivation branch's old
+    credential if the transaction actually commits (`pending_revokes_on_
+    commit`, gated on `committed` in `gmail_oauth.py`'s own `finally`
+    block) -- the new grant is still always revoked, since it was never
+    going to be persisted either way once this branch is reached at all.
     """
     client, workspace_id, _user_id, token = gmail_test_context
     monkeypatch.setenv("ECC_GMAIL_OAUTH_ALLOWLIST", _ALLOWED_EMAIL)
@@ -2693,16 +2729,115 @@ def test_oauth_callback_revokes_new_grant_when_reactivation_update_raises(
                 params={"code": "auth-code-2", "state": second_state},
             )
 
-        # `refresh-1`: the old stored credential (correct, round 4/7).
-        # `refresh-2`: the new grant orphaned by the failed UPDATE (round
-        # 11 fix).
-        assert revoked_tokens == ["refresh-1", "refresh-2"]
+        # `refresh-2`: the new grant, orphaned by the failed UPDATE (round
+        # 11 fix) -- always revoked, since it was never persisted either
+        # way. `refresh-1` (the row's own prior credential) is deliberately
+        # NOT revoked here (round 26 fix): the `UPDATE` meant to replace it
+        # never committed, so revoking it would kill a credential the row
+        # still actually depends on -- see this test's own docstring.
+        assert revoked_tokens == ["refresh-2"]
 
         with engine.begin() as connection:
             row = connection.execute(
-                text("SELECT status FROM connector_accounts WHERE id = :id"),
+                text("SELECT status, encrypted_credentials FROM connector_accounts WHERE id = :id"),
                 {"id": account_id},
             ).one()
         assert row[0] == "disconnected"
+        # The row's stored credential is untouched by the failed
+        # reactivation attempt -- still the original `refresh-1`.
+        assert "refresh-1" in decrypt_credential(row[1])
+    finally:
+        get_settings.cache_clear()
+
+
+def test_oauth_callback_reactivation_failure_preserves_still_live_credential_of_error_row(
+    gmail_test_context: tuple[TestClient, UUID, UUID, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 26 review: the sibling scenario the test above's original
+    (`disconnected`-only) setup could not distinguish from a correctness
+    bug. The reactivation branch also runs for `error`/`rate_limited`/
+    `permission_lost` rows -- unlike `disconnected`, nothing has
+    necessarily already revoked those rows' stored credential at Google
+    (an `error` status here means an unrelated sync failure, e.g. a
+    transient adapter exception -- not necessarily a bad credential).
+    Dynamically confirmed pre-fix: reactivating such a row, then failing a
+    later statement in the same branch (here, the branch's own re-`SELECT`
+    that builds the response after a successful `UPDATE`) so the whole
+    transaction rolls back, revoked the row's still-genuinely-live old
+    credential at Google while leaving the DB completely unchanged (still
+    `error`, still pointing at what is now a dead credential) -- silently
+    turning a recoverable, working connection into a permanently broken
+    one over an unrelated DB hiccup, with no local signal anything was
+    wrong. Fixed by `pending_revokes_on_commit` (see `gmail_oauth.py`).
+    """
+    client, workspace_id, _user_id, token = gmail_test_context
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_ALLOWLIST", _ALLOWED_EMAIL)
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_CLIENT_ID", "cid")
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_CLIENT_SECRET", "csecret")
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_REDIRECT_URI", "https://ecc.example.test/callback")
+    get_settings.cache_clear()
+    monkeypatch.setattr(gmail_oauth_module, "_adapter", GmailAdapter(transport=_oauth_transport()))
+    try:
+        start_response = client.post("/api/v1/personal/gmail/oauth/start", headers=_headers(token))
+        state = httpx.URL(start_response.json()["authorization_url"]).params["state"]
+        first_response = client.get(
+            "/api/v1/personal/gmail/oauth/callback",
+            params={"code": "auth-code", "state": state},
+        )
+        assert first_response.status_code == 200
+        account_id = first_response.json()["id"]
+
+        # A non-disconnected failure status -- e.g. an unrelated transient
+        # sync failure via sync_connector_endpoint's own failure branch.
+        # refresh-1 has never been revoked; it is still fully live.
+        now = datetime.now(UTC)
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    "UPDATE connector_accounts SET status = 'error', "
+                    "last_error = 'transient sync failure', updated_at = :now WHERE id = :id"
+                ),
+                {"id": account_id, "now": now},
+            )
+
+        revoked_tokens: list[str] = []
+        monkeypatch.setattr(
+            gmail_oauth_module,
+            "_adapter",
+            GmailAdapter(
+                transport=_oauth_transport(
+                    token_body=_token_response(access_token="access-2", refresh_token="refresh-2"),
+                    revoked_tokens=revoked_tokens,
+                )
+            ),
+        )
+        second_start = client.post("/api/v1/personal/gmail/oauth/start", headers=_headers(token))
+        second_state = httpx.URL(second_start.json()["authorization_url"]).params["state"]
+
+        # Fail a statement *after* the reactivation UPDATE has already run
+        # inside the same transaction (the re-SELECT that builds the
+        # response), not the UPDATE itself -- proving this isn't merely
+        # the same case the sibling test above already covers.
+        _fail_next_matching_execute(
+            monkeypatch, "granted_scopes, status, status_detail, last_synced_at, last_error,"
+        )
+        with pytest.raises(Exception):  # noqa: B017, PT011 -- the real, unhandled 500
+            client.get(
+                "/api/v1/personal/gmail/oauth/callback",
+                params={"code": "auth-code-2", "state": second_state},
+            )
+
+        # Only the new, never-persisted grant is revoked -- the row's own
+        # still-live credential is preserved.
+        assert revoked_tokens == ["refresh-2"]
+
+        with engine.begin() as connection:
+            row = connection.execute(
+                text("SELECT status, encrypted_credentials FROM connector_accounts WHERE id = :id"),
+                {"id": account_id},
+            ).one()
+        assert row[0] == "error"
+        assert "refresh-1" in decrypt_credential(row[1])
     finally:
         get_settings.cache_clear()
