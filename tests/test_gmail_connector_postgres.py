@@ -50,7 +50,10 @@ multi-round adversarial review found and required real coverage for:
     `gmail_oauth_callback_endpoint`'s own `IntegrityError` handler --
     covers both its `active`-row branch, discarding the just-obtained new
     grant, and its reactivate branch, discarding the row's prior stored
-    grant).
+    grant) -- including that branch's best-effort fallback when the row's
+    prior credential itself cannot be decrypted (round 5: reactivation
+    must still succeed, matching `disable_connector_endpoint`'s own
+    identical, already-covered case).
 12. Audit-event dedup: a replayed callback (same code/state) returns the
     same row without writing a second `connector_account.created` event.
 """
@@ -1095,5 +1098,85 @@ def test_oauth_callback_reactivates_disconnected_account(
                 {"workspace_id": workspace_id, "aggregate_id": UUID(account_id)},
             ).scalar_one()
         assert reconnected_count == 1
+    finally:
+        get_settings.cache_clear()
+
+
+def test_oauth_callback_reactivates_even_when_prior_credential_cannot_be_decrypted(
+    gmail_test_context: tuple[TestClient, UUID, UUID, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 5 review found this exact scenario -- `disable_connector_
+    endpoint`'s own identical case (`test_disable_succeeds_when_credential_
+    cannot_be_decrypted`, `tests/test_engineering_connectors_postgres.py`)
+    already has dedicated coverage; the reactivate branch's `try:
+    decrypt_credential(...) except Exception: old_credential = None`
+    fallback (added alongside the revoke-on-discard fix) had none. A
+    malformed/undecryptable stored credential (e.g. after a key rotation
+    without re-encryption) must never block reactivation -- the best-effort
+    revoke of the old, unreadable credential is simply skipped, and the
+    fresh, valid, allowlist-checked new credential is still persisted.
+    """
+    client, workspace_id, _user_id, token = gmail_test_context
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_ALLOWLIST", _ALLOWED_EMAIL)
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_CLIENT_ID", "cid")
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_CLIENT_SECRET", "csecret")
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_REDIRECT_URI", "https://ecc.example.test/callback")
+    get_settings.cache_clear()
+    monkeypatch.setattr(gmail_oauth_module, "_adapter", GmailAdapter(transport=_oauth_transport()))
+    try:
+        start_response = client.post("/api/v1/personal/gmail/oauth/start", headers=_headers(token))
+        state = httpx.URL(start_response.json()["authorization_url"]).params["state"]
+        first_response = client.get(
+            "/api/v1/personal/gmail/oauth/callback",
+            params={"code": "auth-code", "state": state},
+        )
+        assert first_response.status_code == 200
+        account_id = first_response.json()["id"]
+
+        now = datetime.now(UTC)
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    "UPDATE connector_accounts SET status = 'disconnected', "
+                    "disconnected_at = :now, updated_at = :now, "
+                    "encrypted_credentials = :bad_credentials WHERE id = :id"
+                ),
+                {"id": account_id, "now": now, "bad_credentials": b"not-a-valid-fernet-token"},
+            )
+
+        revoked_tokens: list[str] = []
+        monkeypatch.setattr(
+            gmail_oauth_module,
+            "_adapter",
+            GmailAdapter(
+                transport=_oauth_transport(
+                    token_body=_token_response(access_token="access-2", refresh_token="refresh-2"),
+                    revoked_tokens=revoked_tokens,
+                )
+            ),
+        )
+        second_start = client.post("/api/v1/personal/gmail/oauth/start", headers=_headers(token))
+        second_state = httpx.URL(second_start.json()["authorization_url"]).params["state"]
+        second_response = client.get(
+            "/api/v1/personal/gmail/oauth/callback",
+            params={"code": "auth-code-2", "state": second_state},
+        )
+        assert second_response.status_code == 200
+        body = second_response.json()
+        assert body["id"] == account_id
+        assert body["status"] == "active"
+
+        # The undecryptable old credential was never a real token to
+        # revoke -- best-effort skips it silently, no `/revoke` call.
+        assert revoked_tokens == []
+
+        with engine.begin() as connection:
+            row = connection.execute(
+                text("SELECT encrypted_credentials FROM connector_accounts WHERE id = :id"),
+                {"id": account_id},
+            ).one()
+        stored = loads(decrypt_credential(row[0]))
+        assert stored["refresh_token"] == "refresh-2"
     finally:
         get_settings.cache_clear()

@@ -130,7 +130,22 @@ def _pack_credential(access_token: str, refresh_token: str, expires_at: datetime
 
 
 def _unpack_credential(credential: str) -> dict[str, str]:
-    data: dict[str, str] = loads(credential)
+    """Every caller (`refresh_permissions`, `disconnect`) catches only
+    `(ValueError, TypeError)` around this call -- `loads` itself only ever
+    raises `ValueError` (malformed JSON), but valid JSON that isn't an
+    object (a list, `null`, a bare number) would decode successfully and
+    silently violate this function's own `dict[str, str]` return
+    annotation, surfacing later as an uncaught `AttributeError` on the
+    caller's first `.get(...)` instead -- found by round 5 review. Raising
+    `TypeError` here instead keeps both callers' existing narrow `except`
+    sufficient, rather than requiring every call site to separately guard
+    against a shape violation this function itself is responsible for.
+    """
+    data = loads(credential)
+    if not isinstance(data, dict):
+        raise TypeError(
+            f"Gmail credential JSON must decode to an object, got {type(data).__name__}"
+        )
     return data
 
 
