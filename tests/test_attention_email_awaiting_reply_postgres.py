@@ -562,6 +562,47 @@ def test_awaiting_reply_thread_is_pruned_once_replied(
     assert all(i["entity_id"] != str(thread_id) for i in regenerate_again.json()["items"])
 
 
+def test_inbound_thread_from_casefold_divergent_sender_surfaces_as_awaiting_reply(
+    email_attention_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    """Round 1 review finding: `regenerate_attention`'s own eligibility
+    query used to resolve the last inbound message's sender against
+    `entity_aliases` via SQL `ea.normalized_value = LOWER(TRIM(lm.sender))`
+    -- but Postgres's `LOWER()` and Python's `_normalize_email`
+    (`.strip().casefold()`, what actually wrote every `entity_aliases.
+    normalized_value` row) are not the same function. `'straße@example.
+    test'.strip().casefold()` expands the German sharp s to `'strasse@
+    example.test'` (Unicode full case folding's own special-cased
+    mapping); Postgres's `LOWER('straße@example.test')` leaves the ß
+    unchanged, confirmed directly against this database's own collation
+    (`SELECT LOWER('ß')` = `'ß'`, not `'ss'`). A real contact who has
+    already been resolved into `pkos_nodes` (their normalized alias is
+    `'strasse@example.test'`, exactly as `_resolve_or_create_person`
+    would have written it) sending a message from the literal address
+    `'straße@example.test'` must still surface as awaiting reply --
+    before the fix, the SQL-side `LOWER(TRIM(...))` comparison silently
+    failed to match, and this thread never appeared.
+    """
+    client, workspace_id, owner_id, token = email_attention_test_context
+    now = datetime.now(UTC)
+    resolved_email = "straße@example.test"
+    _resolve_sender(workspace_id, resolved_email)
+    thread_id = _seed_thread(workspace_id, owner_id, "Unicode sender", now)
+    # Same raw address as resolved above, sent verbatim as the message's own
+    # `sender` -- exactly as `gmail_adapter.py` would store the parsed
+    # `From` header's email address, unnormalized.
+    _seed_message(
+        workspace_id, owner_id, thread_id, sender=resolved_email, direction="inbound", sent_at=now
+    )
+
+    regenerate = client.post("/api/v1/attention/regenerate", headers=_headers(token), json={})
+    assert regenerate.status_code == 200, regenerate.text
+    item = next(i for i in regenerate.json()["items"] if i["entity_id"] == str(thread_id))
+    assert item["entity_type"] == "email_thread"
+    factor_codes = {f["code"] for f in item["factors"]}
+    assert "awaiting_reply" in factor_codes
+
+
 def test_dismissed_email_thread_stays_dismissed_across_an_unchanged_regenerate(
     email_attention_test_context: tuple[TestClient, UUID, UUID, str],
 ) -> None:
@@ -618,47 +659,6 @@ def test_dismissed_email_thread_stays_dismissed_across_an_unchanged_regenerate(
         )
     assert row["dismissed_at"] is not None
     assert row["dismissed_entity_version"] == row["source_entity_version"]
-
-
-def test_inbound_thread_from_casefold_divergent_sender_surfaces_as_awaiting_reply(
-    email_attention_test_context: tuple[TestClient, UUID, UUID, str],
-) -> None:
-    """Round 1 review finding: `regenerate_attention`'s own eligibility
-    query used to resolve the last inbound message's sender against
-    `entity_aliases` via SQL `ea.normalized_value = LOWER(TRIM(lm.sender))`
-    -- but Postgres's `LOWER()` and Python's `_normalize_email`
-    (`.strip().casefold()`, what actually wrote every `entity_aliases.
-    normalized_value` row) are not the same function. `'straße@example.
-    test'.strip().casefold()` expands the German sharp s to `'strasse@
-    example.test'` (Unicode full case folding's own special-cased
-    mapping); Postgres's `LOWER('straße@example.test')` leaves the ß
-    unchanged, confirmed directly against this database's own collation
-    (`SELECT LOWER('ß')` = `'ß'`, not `'ss'`). A real contact who has
-    already been resolved into `pkos_nodes` (their normalized alias is
-    `'strasse@example.test'`, exactly as `_resolve_or_create_person`
-    would have written it) sending a message from the literal address
-    `'straße@example.test'` must still surface as awaiting reply --
-    before the fix, the SQL-side `LOWER(TRIM(...))` comparison silently
-    failed to match, and this thread never appeared.
-    """
-    client, workspace_id, owner_id, token = email_attention_test_context
-    now = datetime.now(UTC)
-    resolved_email = "straße@example.test"
-    _resolve_sender(workspace_id, resolved_email)
-    thread_id = _seed_thread(workspace_id, owner_id, "Unicode sender", now)
-    # Same raw address as resolved above, sent verbatim as the message's own
-    # `sender` -- exactly as `gmail_adapter.py` would store the parsed
-    # `From` header's email address, unnormalized.
-    _seed_message(
-        workspace_id, owner_id, thread_id, sender=resolved_email, direction="inbound", sent_at=now
-    )
-
-    regenerate = client.post("/api/v1/attention/regenerate", headers=_headers(token), json={})
-    assert regenerate.status_code == 200, regenerate.text
-    item = next(i for i in regenerate.json()["items"] if i["entity_id"] == str(thread_id))
-    assert item["entity_type"] == "email_thread"
-    factor_codes = {f["code"] for f in item["factors"]}
-    assert "awaiting_reply" in factor_codes
 
 
 def test_identical_sent_at_tie_resolves_deterministically_by_id(
