@@ -284,7 +284,7 @@ from sqlalchemy import text
 import ecc.domains.personal.gmail_oauth as gmail_oauth_module
 from ecc.auth import AuthContext
 from ecc.config import get_settings
-from ecc.database import engine
+from ecc.database import STATEMENT_TIMEOUT_MS, engine
 from ecc.domains.engineering.connectors import AdapterAuthorizationError, ConnectorAccountContext
 from ecc.domains.engineering.crypto import decrypt_credential
 from ecc.domains.personal.gmail_adapter import REQUIRED_SCOPES, GmailAdapter
@@ -2171,6 +2171,19 @@ def test_oauth_callback_releases_pool_connection_and_row_lock_before_revoking(
                 )
                 assert str(row["id"]) == account_id
                 probe.rollback()
+                # `SET` (not `SET LOCAL`) under AUTOCOMMIT is session-scoped,
+                # and this physical connection returns to the pool when this
+                # `with` block exits -- `probe.rollback()` above only ends
+                # the SELECT's own micro-transaction, never a plain
+                # session-level `SET`. Explicitly restore the connection's
+                # established baseline before checkin so a later test
+                # drawing this same pooled connection doesn't inherit the 2s
+                # override. (`RESET statement_timeout` does NOT work here:
+                # it reverts to Postgres's boot-time/config default --
+                # verified empirically to be `0` in this environment -- not
+                # to the value `_set_statement_timeout` committed when the
+                # connection was first created.)
+                probe.execute(text(f"SET statement_timeout = {STATEMENT_TIMEOUT_MS}"))
 
             unblock.set()
             second_response = future.result(timeout=5)
@@ -2276,6 +2289,19 @@ def test_oauth_callback_reactivation_releases_pool_connection_and_row_lock_befor
                 )
                 assert str(row["id"]) == account_id
                 probe.rollback()
+                # `SET` (not `SET LOCAL`) under AUTOCOMMIT is session-scoped,
+                # and this physical connection returns to the pool when this
+                # `with` block exits -- `probe.rollback()` above only ends
+                # the SELECT's own micro-transaction, never a plain
+                # session-level `SET`. Explicitly restore the connection's
+                # established baseline before checkin so a later test
+                # drawing this same pooled connection doesn't inherit the 2s
+                # override. (`RESET statement_timeout` does NOT work here:
+                # it reverts to Postgres's boot-time/config default --
+                # verified empirically to be `0` in this environment -- not
+                # to the value `_set_statement_timeout` committed when the
+                # connection was first created.)
+                probe.execute(text(f"SET statement_timeout = {STATEMENT_TIMEOUT_MS}"))
 
             unblock.set()
             second_response = future.result(timeout=5)
