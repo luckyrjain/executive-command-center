@@ -144,6 +144,24 @@ multi-round adversarial review found and required real coverage for:
     the same mutation. Closed with `test_handle_oauth_callback_rejects_
     empty_refresh_token` and `test_handle_oauth_callback_rejects_empty_
     email_address`.
+20. `get_authorization_url`/`handle_oauth_callback`'s own "OAuth client not
+    configured" guards (`not client_id or not redirect_uri`; `not client_id
+    or not client_secret`) -- round 20: a different-shaped instance of the
+    same asymmetric-branch-coverage bug class rounds 18-19 closed for the
+    `isinstance(x, str) or not x` guards, found by broadening the search to
+    every multi-sub-condition guard in the module rather than re-checking
+    only that one shape a third time. Both existing "not configured" tests
+    set *both* fields empty simultaneously, never proving each `or` operand
+    independently gates the raise -- mutation-confirmed by flipping each
+    guard's `or` to `and` (a plausible refactor-time typo) and observing
+    all 57 then-existing tests still pass, meaning a partially-configured
+    deployment (e.g. `client_secret` set, `client_id` blank) would silently
+    proceed instead of being rejected. Closed with
+    `test_get_authorization_url_raises_when_only_client_id_missing`/
+    `..._only_redirect_uri_missing` and
+    `test_handle_oauth_callback_rejects_when_only_client_id_missing`/
+    `..._only_client_secret_missing`, each setting exactly one field empty
+    and its sibling non-empty.
 
 Rounds 10-12 each found and closed one more unguarded statement in
 `gmail_oauth_callback_endpoint`'s revoke-on-failure coverage (a real
@@ -321,6 +339,46 @@ def test_get_authorization_url_raises_when_not_configured(monkeypatch: pytest.Mo
         get_settings.cache_clear()
 
 
+def test_get_authorization_url_raises_when_only_client_id_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The guard (`not client_id or not redirect_uri`) has two independent
+    sub-conditions, but the sibling test above only ever exercises them
+    together (`client_id=""` *and* `redirect_uri=""`) -- unable to tell
+    apart "either missing rejects" (the intended `or` semantics) from a
+    weaker "only rejects when both are missing" (`and`) regression. Found
+    by round 20 review, mutation-confirmed: changing this guard's `or` to
+    `and` left all 57 then-existing tests passing. `redirect_uri` is set
+    here and `client_id` alone is missing.
+    """
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_CLIENT_ID", "")
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_REDIRECT_URI", "https://ecc.example.test/oauth/callback")
+    get_settings.cache_clear()
+    try:
+        adapter = GmailAdapter()
+        with pytest.raises(AdapterAuthorizationError):
+            adapter.get_authorization_url("some-state")
+    finally:
+        get_settings.cache_clear()
+
+
+def test_get_authorization_url_raises_when_only_redirect_uri_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Companion to the `client_id`-only case above: `client_id` is set and
+    `redirect_uri` alone is missing.
+    """
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_CLIENT_ID", "test-client-id")
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_REDIRECT_URI", "")
+    get_settings.cache_clear()
+    try:
+        adapter = GmailAdapter()
+        with pytest.raises(AdapterAuthorizationError):
+            adapter.get_authorization_url("some-state")
+    finally:
+        get_settings.cache_clear()
+
+
 def test_get_authorization_url_builds_expected_url(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("ECC_GMAIL_OAUTH_CLIENT_ID", "test-client-id")
     monkeypatch.setenv("ECC_GMAIL_OAUTH_CLIENT_SECRET", "test-client-secret")
@@ -468,6 +526,57 @@ def test_handle_oauth_callback_rejects_when_not_configured(
     try:
         adapter = GmailAdapter(transport=_oauth_transport())
         with pytest.raises(AdapterAuthorizationError):
+            adapter.handle_oauth_callback("auth-code", "state-value")
+    finally:
+        get_settings.cache_clear()
+
+
+def test_handle_oauth_callback_rejects_when_only_client_id_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Same asymmetric-coverage gap as `get_authorization_url`'s sibling
+    guard (`not client_id or not client_secret`), found by round 20 review:
+    the existing "not configured" test above only exercises both fields
+    empty together, unable to distinguish the intended `or` ("either
+    missing rejects") from a weaker `and` ("only rejects when both are
+    missing") regression -- mutation-confirmed by flipping this guard's
+    `or` to `and` and observing all 57 then-existing tests still pass.
+    `client_secret` is set here and `client_id` alone is missing. The
+    allowlist is deliberately configured to allow the transport's own
+    account through: without it, a naive version of this test would still
+    raise `AdapterAuthorizationError` under the `and` mutation too (via the
+    unrelated allowlist-rejection branch further down the same method),
+    masking the exact regression this test exists to catch -- asserting
+    the specific "not configured" message (not just the exception type)
+    is what actually distinguishes the two.
+    """
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_CLIENT_ID", "")
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_CLIENT_SECRET", "csecret")
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_ALLOWLIST", _ALLOWED_EMAIL)
+    get_settings.cache_clear()
+    try:
+        adapter = GmailAdapter(transport=_oauth_transport())
+        with pytest.raises(AdapterAuthorizationError, match="not configured"):
+            adapter.handle_oauth_callback("auth-code", "state-value")
+    finally:
+        get_settings.cache_clear()
+
+
+def test_handle_oauth_callback_rejects_when_only_client_secret_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Companion to the `client_id`-only case above: `client_id` is set and
+    `client_secret` alone is missing. See that test's own docstring for why
+    the allowlist is configured and the error message is asserted
+    specifically.
+    """
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_CLIENT_ID", "cid")
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_CLIENT_SECRET", "")
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_ALLOWLIST", _ALLOWED_EMAIL)
+    get_settings.cache_clear()
+    try:
+        adapter = GmailAdapter(transport=_oauth_transport())
+        with pytest.raises(AdapterAuthorizationError, match="not configured"):
             adapter.handle_oauth_callback("auth-code", "state-value")
     finally:
         get_settings.cache_clear()
