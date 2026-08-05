@@ -122,6 +122,28 @@ multi-round adversarial review found and required real coverage for:
     `float(expires_in)`'s coercion silently, the one field in this
     response body still not actually rejecting a wrong-but-truthy type
     after rounds 7-8 closed the others.
+19. An empty-but-correctly-typed `refresh_token`/`emailAddress` -- round
+    19: the `not isinstance(x, str) or not x` guard shape appears three
+    times in `handle_oauth_callback` (`access_token`/`refresh_token`,
+    `email_address`); `access_token` already had dedicated tests for both
+    its sub-conditions (`..._rejects_missing_access_token` uses `""` for
+    `not x`, `..._rejects_non_string_access_token` uses a JSON number for
+    `not isinstance`), but `refresh_token` and `email_address` each only
+    had tests tripping the `not isinstance` half (`None`/a JSON number) --
+    the `not x` half, an empty string, was untested for both. Confirmed by
+    mutation: removing `or not refresh_token`/the `or not email_address`
+    clause left all 55 then-existing tests passing. For `refresh_token`
+    this is a real behavioral gap, not just a coverage gap -- without the
+    clause, `handle_oauth_callback` *succeeds* on an empty refresh token,
+    persisting a credential that can never be refreshed once its access
+    token expires (verified directly via a standalone script); for
+    `email_address` the outcome is unchanged either way (`is_account_
+    allowed("")` already rejects), so that test asserts the specific
+    error message rather than just the exception type, since a bare
+    `pytest.raises(AdapterAuthorizationError)` there would not have caught
+    the same mutation. Closed with `test_handle_oauth_callback_rejects_
+    empty_refresh_token` and `test_handle_oauth_callback_rejects_empty_
+    email_address`.
 
 Rounds 10-12 each found and closed one more unguarded statement in
 `gmail_oauth_callback_endpoint`'s revoke-on-failure coverage (a real
@@ -528,6 +550,57 @@ def test_handle_oauth_callback_rejects_non_string_refresh_token(
         adapter = GmailAdapter(transport=httpx.MockTransport(handler))
         with pytest.raises(AdapterAuthorizationError):
             adapter.handle_oauth_callback("auth-code", "state-value")
+    finally:
+        get_settings.cache_clear()
+
+
+def test_handle_oauth_callback_rejects_empty_refresh_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The guard's `not isinstance(refresh_token, str) or not refresh_token`
+    shape has two independent sub-conditions, mirroring `access_token`'s own
+    (which has dedicated tests for both: `..._rejects_missing_access_token`
+    uses `access_token=""` for the falsy-but-str branch, `..._rejects_non_
+    string_access_token` uses a JSON number for the wrong-type branch).
+    `refresh_token`'s two existing tests (`..._rejects_missing_refresh_
+    token` uses `None`, `..._rejects_non_string_refresh_token` uses a JSON
+    number) both trip the `not isinstance(...)` half of the condition --
+    neither exercises `not refresh_token` on a correctly-typed-but-empty
+    string, unlike `access_token`. Found by round 19 review, the identical
+    asymmetric-branch-coverage bug class round 18 closed for `scope`, one
+    field over: confirmed by removing `or not refresh_token` from the guard
+    and re-running the full suite -- all 55 prior tests still passed, and
+    (verified via a standalone script, not merely inferred) the callback
+    then *succeeds*, returning a `ConnectorAuthorization` whose packed
+    credential embeds `"refresh_token": ""` -- a persisted Gmail connection
+    that can never actually refresh its access token once it expires,
+    accepted rather than rejected, and never revoked since it isn't treated
+    as a rejection at all.
+    """
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_CLIENT_ID", "cid")
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_CLIENT_SECRET", "csecret")
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_ALLOWLIST", _ALLOWED_EMAIL)
+    get_settings.cache_clear()
+    revoked_tokens: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/token":
+            body = _token_response()
+            body["refresh_token"] = ""
+            return _json_response(body)
+        if request.url.path == "/revoke":
+            revoked_tokens.append(request.content.decode().removeprefix("token="))
+            return httpx.Response(200)
+        raise AssertionError(f"unexpected request to {request.url}")
+
+    try:
+        adapter = GmailAdapter(transport=httpx.MockTransport(handler))
+        with pytest.raises(AdapterAuthorizationError):
+            adapter.handle_oauth_callback("auth-code", "state-value")
+        # An empty refresh_token means there was never anything real to
+        # revoke -- the same harmless-no-op contract already asserted for
+        # `..._rejects_missing_refresh_token` (`refresh_token=None`).
+        assert revoked_tokens == [""]
     finally:
         get_settings.cache_clear()
 
@@ -966,6 +1039,53 @@ def test_handle_oauth_callback_rejects_non_string_email_address(
     try:
         adapter = GmailAdapter(transport=httpx.MockTransport(handler))
         with pytest.raises(AdapterAuthorizationError):
+            adapter.handle_oauth_callback("auth-code", "state-value")
+        assert revoked_tokens == ["refresh-1"]
+    finally:
+        get_settings.cache_clear()
+
+
+def test_handle_oauth_callback_rejects_empty_email_address(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Companion to `test_handle_oauth_callback_rejects_empty_refresh_
+    token` above -- `emailAddress`'s guard has the identical two-sub-
+    condition shape (`not isinstance(email_address, str) or not
+    email_address`), and its two existing tests (`..._rejects_missing_
+    email_address` uses `profile_email=None`, `..._rejects_non_string_
+    email_address` uses a JSON number) both trip the `not isinstance(...)`
+    half, leaving `not email_address` on a correctly-typed-but-empty string
+    untested -- found by round 19 review, the same asymmetry as
+    `refresh_token`. Unlike that case, removing this specific sub-condition
+    does not change the ultimate accept/reject outcome: an empty
+    `email_address` falls through to `is_account_allowed("")`, which
+    already rejects on empty/blank per its own docstring -- so this test
+    asserts the *specific* rejection reason (`match=`) rather than merely
+    `AdapterAuthorizationError`, since a bare `pytest.raises` here would
+    keep passing even with the `not email_address` guard removed (verified
+    directly: the mutation still raises, just via the allowlist-rejection
+    message instead of "missing emailAddress" -- a real but lower-severity
+    gap than the refresh_token case, closed here for the same completeness
+    reason rather than because production behavior was ever actually wrong).
+    """
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_CLIENT_ID", "cid")
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_CLIENT_SECRET", "csecret")
+    get_settings.cache_clear()
+    revoked_tokens: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/token":
+            return _json_response(_token_response())
+        if request.url.path == "/gmail/v1/users/me/profile":
+            return _json_response({"emailAddress": ""})
+        if request.url.path == "/revoke":
+            revoked_tokens.append(request.content.decode().removeprefix("token="))
+            return httpx.Response(200)
+        raise AssertionError(f"unexpected request to {request.url}")
+
+    try:
+        adapter = GmailAdapter(transport=httpx.MockTransport(handler))
+        with pytest.raises(AdapterAuthorizationError, match="missing emailAddress"):
             adapter.handle_oauth_callback("auth-code", "state-value")
         assert revoked_tokens == ["refresh-1"]
     finally:
