@@ -47,11 +47,12 @@ Covers, per this task's own scope:
     than only exercised incidentally -- round 1 review coverage gap,
     closed.
 11. An unpaired UTF-16 surrogate (valid JSON, but not `.encode("utf-8")`-
-    able -- distinct from an embedded NUL byte) in a `From`/`Subject`
-    header or in Gmail's own `id` field is dropped/skips the message the
-    same way an oversized address or an embedded NUL already does, not
-    left to crash the sync call with an uncaught `UnicodeEncodeError` --
-    found by round 2 review's security/correctness lens.
+    able -- distinct from an embedded NUL byte) in a `From` display name,
+    a `Subject` header, or Gmail's own `id`/`threadId` fields is dropped/
+    skips the message the same way an oversized address or an embedded
+    NUL already does, not left to crash the sync call with an uncaught
+    `UnicodeEncodeError` -- found by round 2 review's security/
+    correctness lens.
 12. Gmail's own `id`/`threadId` fields are length/NUL/surrogate-validated
     before reaching `email_threads.external_thread_id`/`email_messages.
     external_message_id`'s `VARCHAR(255)` bound, the same way `sender`/
@@ -1055,6 +1056,83 @@ def test_unpaired_surrogate_in_message_id_is_skipped_not_a_crash(
     assert _resolved_person(context.workspace_id, "alice@example.test") is None
 
 
+def test_unpaired_surrogate_in_subject_is_dropped_but_message_still_syncs(
+    seeded_gmail_account: tuple[ConnectorAccountContext, UUID],
+) -> None:
+    """Same hazard as `test_unpaired_surrogate_in_from_display_name_is_
+    skipped_not_a_crash` above, but in `Subject` -- and, like `test_nul_
+    byte_in_subject_is_dropped_but_message_still_syncs`, `email_threads.
+    subject` is nullable, so this drops only that one field rather than
+    the whole message (unlike the `From`/`id` cases, nothing else about
+    the message depends on `Subject`). Must not crash and must not leave
+    the unencodable value on the stored row.
+    """
+    context, _owner_id = seeded_gmail_account
+    now_ms = int(datetime.now(UTC).timestamp() * 1000)
+    body = _message_body(
+        message_id="msg-surrogate-subject",
+        thread_id="thread-surrogate-subject",
+        from_addr="alice@example.test",
+        to_addrs=[_OWNER_EMAIL],
+        internal_date_ms=now_ms,
+        subject="Weird__SURROGATE__Subject",
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/gmail/v1/users/me/messages":
+            return _json_response({"messages": [{"id": "msg-surrogate-subject"}]})
+        if request.url.path.startswith("/gmail/v1/users/me/messages/"):
+            return _surrogate_json_response(body, marker_replacement=r"\ud800")
+        raise AssertionError(f"unexpected request to {request.url}")
+
+    adapter = GmailAdapter(transport=httpx.MockTransport(handler))
+    outcome = adapter.backfill(context, "message", since=datetime.now(UTC) - timedelta(days=1))
+    assert outcome.status == "succeeded"
+    assert outcome.items_processed == 1
+
+    rows = _threads_and_messages(context.workspace_id)
+    assert len(rows) == 1
+    assert rows[0]["subject"] is None
+
+
+def test_unpaired_surrogate_in_thread_id_is_skipped_not_a_crash(
+    seeded_gmail_account: tuple[ConnectorAccountContext, UUID],
+) -> None:
+    """Same hazard as `test_unpaired_surrogate_in_message_id_is_skipped_
+    not_a_crash` above, but in Gmail's own `threadId` field rather than
+    `id` -- `_is_valid_external_id` (see its own comment) guards both
+    `email_messages.external_message_id` and `email_threads.external_
+    thread_id` identically; this covers the second of that pair, which
+    `test_oversized_message_id_is_skipped_not_a_crash` below covers only
+    for length, not for an unpaired surrogate.
+    """
+    context, _owner_id = seeded_gmail_account
+    now_ms = int(datetime.now(UTC).timestamp() * 1000)
+    body = _message_body(
+        message_id="msg-surrogate-thread",
+        thread_id="thread-__SURROGATE__-id",
+        from_addr="alice@example.test",
+        to_addrs=[_OWNER_EMAIL],
+        internal_date_ms=now_ms,
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/gmail/v1/users/me/messages":
+            return _json_response({"messages": [{"id": "msg-surrogate-thread"}]})
+        if request.url.path.startswith("/gmail/v1/users/me/messages/"):
+            return _surrogate_json_response(body, marker_replacement=r"\ud800")
+        if request.url.path == "/gmail/v1/users/me/profile":
+            return _json_response({"historyId": 1})
+        raise AssertionError(f"unexpected request to {request.url}")
+
+    adapter = GmailAdapter(transport=httpx.MockTransport(handler))
+    outcome = adapter.backfill(context, "message", since=datetime.now(UTC) - timedelta(days=1))
+    assert outcome.status == "succeeded"
+    assert outcome.items_processed == 1
+    assert _threads_and_messages(context.workspace_id) == []
+    assert _resolved_person(context.workspace_id, "alice@example.test") is None
+
+
 def test_oversized_message_id_is_skipped_not_a_crash(
     seeded_gmail_account: tuple[ConnectorAccountContext, UUID],
 ) -> None:
@@ -1151,6 +1229,112 @@ def test_to_header_display_name_with_comma_does_not_corrupt_recipients(
     # must never have been resolved as if they were real participants.
     assert _resolved_person(context.workspace_id, "doe") is None
     assert _resolved_person(context.workspace_id, "john") is None
+
+
+def test_to_header_trailing_comma_does_not_drop_the_whole_message(
+    seeded_gmail_account: tuple[ConnectorAccountContext, UUID],
+) -> None:
+    """Round 3 review: `email.utils.getaddresses` (round 2's own fix,
+    above) defaults to `strict=True`, which validates a header's parsed
+    address count against `1 + (top-level comma count)` and, on a
+    mismatch, discards the *entire* result as a single `("", "")`
+    sentinel rather than only the offending part -- CPython's own defense
+    against a *different* spoofing shape (`'alice@x.test<bob@y.test>'`,
+    no comma, one field ambiguously parsing into two addresses). A `To`
+    header ending in a bare trailing comma (`"alice@x.test, bob@x.test,"`
+    -- real mail systems produce this, and Gmail forwards a sender's raw
+    header verbatim) is consumed without leaving a padding empty tuple
+    behind, so the actual parsed count comes in one short of the formula's
+    expectation and every real recipient gets discarded by that same
+    all-or-nothing sentinel -- `recipients` ends up `[]`, and
+    `_process_message`'s own `if not recipients: return None` then drops
+    the *entire* message (sender, subject, thread -- not just the
+    trailing-comma artifact) with no error and no `error_summary`. An
+    attacker who wants a message to never appear in the synced entity
+    graph needs only append one comma to their own `To` header.
+    `_getaddresses_resilient` (see its own docstring) retries once with
+    the bare trailing comma stripped, recovering both real recipients
+    here without weakening `getaddresses`' actual protection (see the
+    companion test below).
+    """
+    context, _owner_id = seeded_gmail_account
+    now_ms = int(datetime.now(UTC).timestamp() * 1000)
+    body = _message_body(
+        message_id="msg-trailing-comma",
+        thread_id="thread-trailing-comma",
+        from_addr="alice@example.test",
+        to_addrs=["ignored -- overridden by raw_to below"],
+        internal_date_ms=now_ms,
+    )
+    body["payload"]["headers"] = [
+        {"name": "From", "value": "alice@example.test"},
+        {"name": "To", "value": "bob@example.test, carol@example.test,"},
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/gmail/v1/users/me/messages":
+            return _json_response({"messages": [{"id": "msg-trailing-comma"}]})
+        if request.url.path.startswith("/gmail/v1/users/me/messages/"):
+            return _json_response(body)
+        raise AssertionError(f"unexpected request to {request.url}")
+
+    adapter = GmailAdapter(transport=httpx.MockTransport(handler))
+    outcome = adapter.backfill(context, "message", since=datetime.now(UTC) - timedelta(days=1))
+    assert outcome.status == "succeeded"
+    assert outcome.items_processed == 1
+
+    rows = _threads_and_messages(context.workspace_id)
+    assert len(rows) == 1
+    assert sorted(rows[0]["recipients"]) == ["bob@example.test", "carol@example.test"]
+    assert _resolved_person(context.workspace_id, "bob@example.test") is not None
+    assert _resolved_person(context.workspace_id, "carol@example.test") is not None
+
+
+def test_to_header_ambiguous_no_comma_address_is_still_safely_dropped(
+    seeded_gmail_account: tuple[ConnectorAccountContext, UUID],
+) -> None:
+    """Companion to `test_to_header_trailing_comma_does_not_drop_the_whole_
+    message` above -- `_getaddresses_resilient`'s trailing-comma retry
+    must not weaken `getaddresses(strict=True)`'s real protection. A `To`
+    header with no comma at all that itself parses ambiguously into two
+    addresses (`'alice@example.test<bob@example.test>'` -- the shape
+    `strict=True` exists to reject, e.g. CPython's own fixed spoofing
+    case) has no trailing comma for the retry to strip, so the retry is a
+    no-op and `getaddresses`' own `("", "")` sentinel stands: this message
+    still has zero valid recipients and is still safely dropped entirely,
+    exactly as before this round's fix -- not a regression that starts
+    trusting an ambiguous header as two real recipients.
+    """
+    context, _owner_id = seeded_gmail_account
+    now_ms = int(datetime.now(UTC).timestamp() * 1000)
+    body = _message_body(
+        message_id="msg-ambiguous-to",
+        thread_id="thread-ambiguous-to",
+        from_addr="alice@example.test",
+        to_addrs=["ignored -- overridden by raw_to below"],
+        internal_date_ms=now_ms,
+    )
+    body["payload"]["headers"] = [
+        {"name": "From", "value": "alice@example.test"},
+        {"name": "To", "value": "bob@example.test<carol@example.test>"},
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/gmail/v1/users/me/messages":
+            return _json_response({"messages": [{"id": "msg-ambiguous-to"}]})
+        if request.url.path.startswith("/gmail/v1/users/me/messages/"):
+            return _json_response(body)
+        if request.url.path == "/gmail/v1/users/me/profile":
+            return _json_response({"historyId": 1})
+        raise AssertionError(f"unexpected request to {request.url}")
+
+    adapter = GmailAdapter(transport=httpx.MockTransport(handler))
+    outcome = adapter.backfill(context, "message", since=datetime.now(UTC) - timedelta(days=1))
+    assert outcome.status == "succeeded"
+    assert outcome.items_processed == 1
+    assert _threads_and_messages(context.workspace_id) == []
+    assert _resolved_person(context.workspace_id, "bob@example.test") is None
+    assert _resolved_person(context.workspace_id, "carol@example.test") is None
 
 
 # --- per-call message budget hit mid-page -------------------------------------

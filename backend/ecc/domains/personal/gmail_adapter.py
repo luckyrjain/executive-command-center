@@ -389,6 +389,67 @@ def _parse_address(header_value: str) -> tuple[str, str] | None:
     return _validate_address(display_name, address)
 
 
+def _getaddresses_resilient(to_header: str) -> list[tuple[str, str]]:
+    """`_process_message`'s `To`-header call site for `getaddresses`
+    (round 2 review's fix for the naive-`split(",")` comma-in-display-name
+    corruption bug, see `_validate_address`'s own docstring) -- but
+    `getaddresses` itself defaults to `strict=True` (CPython's own fix for
+    a *different* header-spoofing class, e.g. `getaddresses(['alice@x.com
+    <bob@y.com>'])` -- no comma at all, one field that parses ambiguously
+    into two addresses): it counts each fieldvalue's own top-level,
+    outside-quotes commas, and if the number of addresses it actually
+    parsed doesn't match `1 + comma_count`, it discards the *entire*
+    parse and returns a single `[("", "")]` sentinel -- not just the
+    offending part.
+
+    That counting formula silently miscounts one common, entirely benign
+    case: a header ending in a bare trailing comma (`"alice@x.test,
+    bob@x.test,"` -- real mail systems produce this; Gmail forwards a
+    sender's raw header verbatim, and a sender fully controls their own
+    outgoing headers). A trailing comma is consumed without leaving a
+    padding empty tuple behind (unlike a *leading* or *internal* stray
+    comma, both of which parse to an explicit `("", "")` entry that keeps
+    the count formula satisfied and are already handled correctly, without
+    needing this function at all, since `_validate_address` drops that
+    empty entry same as it drops any other invalid one) -- so the parsed
+    count comes in one short of expected, and `getaddresses` treats the
+    whole header as unparseable. Every real recipient in an otherwise
+    perfectly well-formed `To` header is silently discarded, `recipients`
+    ends up empty, and `_process_message`'s own `if not recipients: return
+    None` drops the *entire* message -- sender, subject, thread, all of
+    it -- with no error, no `error_summary`, nothing in `items_processed`
+    to distinguish it from a message that was never fetched at all. An
+    attacker who wants a message to their target's connected inbox to
+    never appear in the synced entity graph needs only append one comma
+    to their own `To` header -- found by round 3 review, a new failure
+    mode introduced by round 2's own fix (round 2's test suite exercises
+    `getaddresses` only via well-formed and quoted-comma headers, never a
+    trailing-comma one).
+
+    Retrying once, with exactly one bare trailing comma (plus any
+    trailing whitespace around it) stripped, recovers this case without
+    touching `getaddresses`' actual protection: a header with no comma at
+    all to strip is returned unchanged (still correctly rejected, e.g. the
+    `alice@x.com<bob@y.com>` spoofing shape above -- that case has no
+    trailing comma, so the retry is a no-op and the sentinel stands), and
+    a quoted display name's own internal comma is never touched (only a
+    comma that is the header's own trailing character, outside any
+    quote/angle-bracket construct by construction -- a valid one must
+    already be closed before the string ends -- is ever stripped).
+    """
+    parsed = getaddresses([to_header])
+    if parsed != [("", "")]:
+        return parsed
+    stripped = to_header.rstrip()
+    trimmed_any = False
+    while stripped.endswith(","):
+        stripped = stripped[:-1].rstrip()
+        trimmed_any = True
+    if not trimmed_any or not stripped:
+        return parsed
+    return getaddresses([stripped])
+
+
 def _resolve_or_create_person(
     *,
     workspace_id: UUID,
@@ -1486,8 +1547,12 @@ class GmailAdapter:
             # RFC 5322 parser `parseaddr` itself is built on) is the
             # correct API for a comma-separated address list and handles
             # the quoted-comma case, an empty header, and a header that is
-            # only commas identically to before.
-            for name, address in getaddresses([to_header]):
+            # only commas identically to before. `_getaddresses_resilient`
+            # (round 3 review), not `getaddresses` directly -- see its own
+            # docstring for a *different* silent-data-loss failure mode
+            # `getaddresses`' own `strict=True` default introduces for a
+            # bare trailing comma.
+            for name, address in _getaddresses_resilient(to_header):
                 parsed = _validate_address(name, address)
                 if parsed is not None:
                     valid_name, valid_address = parsed
