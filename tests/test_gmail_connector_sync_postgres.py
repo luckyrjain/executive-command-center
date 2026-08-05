@@ -304,6 +304,31 @@ Covers, per this task's own scope:
     that reason; the other six new tests are unaffected by the same
     revert, confirming they document already-correct behavior rather than
     padding the count.
+29. `_sync_messages`'s/`_sync_history`'s "fully caught up" success returns
+    each computed `next_cursor` via a bare truthiness check on an `int |
+    None` (`if highest_history_id else None` / `if latest_history_id else
+    list_start_history_id`) rather than `is not None` -- found by round 16
+    review. `_coerce_int` (what both variables are ultimately assigned
+    from -- a message's own `historyId` field, the `users.getProfile`
+    fallback, or `history.list`'s own page-level `historyId` field) can
+    return `0`, which is falsy in Python; a `historyId` of exactly `0` was
+    silently treated identically to "no historyId was ever observed at
+    all," discarding a real cursor value (`_sync_messages`) or falling back
+    to the stale starting cursor instead of the fresh value Gmail actually
+    returned (`_sync_history`) on an otherwise genuinely `"succeeded"`,
+    fully-caught-up sync. Real Gmail `historyId` values are not documented
+    as ever being exactly `0` in practice -- the same "confirmed harmless
+    today, but a real, mutation-testable contract violation" framing item
+    28 above used for `_parse_history_cursor`'s own `record_id < 0` gap --
+    but nothing on the read side validates that assumption, and every
+    sibling check on these same two variables elsewhere in the same
+    methods already uses `is None`/`is not None` correctly. Fixed by
+    switching both sites to `is not None`. Closed with
+    `test_backfill_reports_next_cursor_zero_not_none_when_history_id_is_zero`
+    and
+    `test_incremental_sync_reports_next_cursor_zero_not_the_stale_start_when_history_id_is_zero`,
+    each mutation-confirmed against the corresponding site reverted to a
+    bare truthiness check.
 """
 
 from __future__ import annotations
@@ -2869,6 +2894,95 @@ def test_incremental_sync_makes_forward_progress_through_a_single_oversized_hist
 
     rows = _threads_and_messages(context.workspace_id)
     assert {row["external_message_id"] for row in rows} == set(message_ids)
+
+
+# --- next_cursor's own `0`-vs-`None` boundary --------------------------------
+#
+# Round 16 review: `_sync_messages`'s/`_sync_history`'s "fully caught up"
+# success returns each computed `next_cursor` via a bare truthiness check
+# (`if highest_history_id else None` / `if latest_history_id else list_
+# start_history_id`) rather than `is not None`, unlike every other read of
+# either variable in the same two methods. `_coerce_int` -- what both
+# variables are ultimately assigned from, whether from a message's own
+# `historyId` field, the `users.getProfile` fallback, or `history.list`'s
+# own page-level `historyId` field -- can return `0`, and `0` is falsy in
+# Python. Before this fix, a `historyId` of exactly `0` was silently
+# treated identically to "no historyId was ever observed at all": `_sync_
+# messages` would discard a real cursor value (`next_cursor=None` on an
+# otherwise genuinely `"succeeded"`, fully-caught-up sync) and `_sync_
+# history` would fall back to the *stale* starting cursor it was given
+# instead of the fresh value Gmail actually returned. Real Gmail `historyId`
+# values are not documented as ever being exactly `0` in practice, so this
+# is latent rather than a live production bug -- the same "confirmed
+# harmless in practice today, but a real, mutation-testable contract
+# violation" framing round 14 review used for `_parse_history_cursor`'s own
+# `record_id < 0` gap -- but nothing in this adapter validates that
+# assumption on the read side, and every sibling check on these same two
+# variables elsewhere in the same methods (e.g. `_sync_messages`'s own `if
+# highest_history_id is None:` a few lines above its own fix site) already
+# gets this right; this was the one remaining truthiness-shortcut. Fixed by
+# switching both sites to `is not None`.
+
+
+def test_backfill_reports_next_cursor_zero_not_none_when_history_id_is_zero(
+    seeded_gmail_account: tuple[ConnectorAccountContext, UUID],
+) -> None:
+    """`_sync_messages`'s own "fully caught up" success branch -- a single
+    message whose own `historyId` is exactly `0` (never realistic for a
+    real Gmail account, but nothing on the read side rules it out) must
+    still be handed back as `next_cursor="0"`, not discarded as if no
+    `historyId` had ever been observed. Mutation-confirmed: reverting the
+    `is not None` fix back to a bare truthiness check makes this fail with
+    `next_cursor is None` instead of `"0"`.
+    """
+    context, _owner_id = seeded_gmail_account
+    now_ms = int(datetime.now(UTC).timestamp() * 1000)
+    body = _message_body(
+        message_id="zero-history-msg",
+        thread_id="thread-zero-history",
+        from_addr="zero@example.test",
+        to_addrs=[_OWNER_EMAIL],
+        internal_date_ms=now_ms,
+        history_id=0,
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/gmail/v1/users/me/messages":
+            return _json_response({"messages": [{"id": "zero-history-msg"}]})
+        if request.url.path == "/gmail/v1/users/me/messages/zero-history-msg":
+            return _json_response(body)
+        raise AssertionError(f"unexpected request to {request.url}")
+
+    adapter = GmailAdapter(transport=httpx.MockTransport(handler))
+    outcome = adapter.backfill(context, "message", since=datetime.now(UTC) - timedelta(days=1))
+    assert outcome.status == "succeeded"
+    assert outcome.items_processed == 1
+    assert outcome.next_cursor == "0"
+
+
+def test_incremental_sync_reports_next_cursor_zero_not_the_stale_start_when_history_id_is_zero(
+    seeded_gmail_account: tuple[ConnectorAccountContext, UUID],
+) -> None:
+    """`_sync_history`'s own "fully caught up" success branch -- Gmail's
+    own page-level `historyId` field reported as exactly `0` must still be
+    handed back as `next_cursor="0"`, not silently replaced with the stale
+    `list_start_history_id` this call started from. Mutation-confirmed:
+    reverting the `is not None` fix back to a bare truthiness check makes
+    this fail with `next_cursor == "100"` (the stale starting cursor)
+    instead of `"0"`.
+    """
+    context, _owner_id = seeded_gmail_account
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/gmail/v1/users/me/history":
+            return _json_response({"history": [], "historyId": 0})
+        raise AssertionError(f"unexpected request to {request.url}")
+
+    adapter = GmailAdapter(transport=httpx.MockTransport(handler))
+    outcome = adapter.incremental_sync(context, "message", "100")
+    assert outcome.status == "succeeded"
+    assert outcome.items_processed == 0
+    assert outcome.next_cursor == "0"
 
 
 # --- `_parse_history_cursor`: malformed compound state degrades safely -------

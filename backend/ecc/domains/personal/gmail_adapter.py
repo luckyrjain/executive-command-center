@@ -1750,7 +1750,31 @@ class GmailAdapter:
                     resource_type="message",
                     items_processed=items_processed,
                     status="succeeded",
-                    next_cursor=str(highest_history_id) if highest_history_id else None,
+                    # `is not None`, not a bare truthiness check -- round 16
+                    # review: `highest_history_id` is an `int | None`, and
+                    # `0` is a value `_coerce_int` can legitimately return
+                    # (from either a message's own `historyId` field, line
+                    # ~1710 above, or the `users.getProfile` fallback just
+                    # above) but is falsy in Python. `if highest_history_id
+                    # else None` previously treated an observed `historyId`
+                    # of exactly `0` identically to "nothing was ever
+                    # observed at all," silently discarding a real cursor
+                    # value on an otherwise fully-caught-up `"succeeded"`
+                    # sync -- the same `bool`-vs-`int` confusion round 9
+                    # review closed for `expires_in` in `handle_oauth_
+                    # callback` (`isinstance(expires_in, bool)`), here via
+                    # truthiness rather than `bool`'s own `int` subtyping.
+                    # Nothing before this fix validated Gmail's own
+                    # `historyId` fields can never be exactly `0` (unlike,
+                    # say, `_parse_history_cursor`'s own `record_id < 0`
+                    # check, added by round 14 review for a value this
+                    # module itself never produces but also never rules
+                    # out on the read side) -- every other `is None`/`is
+                    # not None` check on this same variable earlier in this
+                    # method (e.g. `if highest_history_id is None:` just
+                    # above) already gets this right; this was the one
+                    # remaining truthiness-shortcut site.
+                    next_cursor=str(highest_history_id) if highest_history_id is not None else None,
                 )
 
         return SyncOutcome(
@@ -2055,8 +2079,25 @@ class GmailAdapter:
                     resource_type="message",
                     items_processed=items_processed,
                     status="succeeded",
+                    # `is not None`, not a bare truthiness check -- round 16
+                    # review: the identical `0`-is-falsy-but-legitimate gap
+                    # this method's sibling `_sync_messages` had for its own
+                    # `highest_history_id` (see that method's own comment on
+                    # its analogous return, just above this one in file
+                    # order) -- `latest_history_id` is set directly from
+                    # `history.list`'s own page-level `historyId` field
+                    # (`_coerce_int`, which can return `0`) a few lines
+                    # above. `if latest_history_id else list_start_
+                    # history_id` previously fell back to the *stale*
+                    # starting cursor on a genuinely fully-caught-up
+                    # `"succeeded"` sync whenever Gmail's own reported
+                    # `historyId` happened to be exactly `0`, discarding
+                    # the real (if implausible) value Gmail actually
+                    # returned.
                     next_cursor=(
-                        str(latest_history_id) if latest_history_id else list_start_history_id
+                        str(latest_history_id)
+                        if latest_history_id is not None
+                        else list_start_history_id
                     ),
                 )
 
