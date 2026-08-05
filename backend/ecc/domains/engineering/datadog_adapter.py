@@ -568,7 +568,12 @@ class DatadogAdapter:
             granted_scopes=frozenset(),
         )
 
-    def backfill(self, account: ConnectorAccountContext, resource_type: str) -> SyncOutcome:
+    def backfill(
+        self,
+        account: ConnectorAccountContext,
+        resource_type: str,
+        since: datetime | None = None,
+    ) -> SyncOutcome:
         return self._sync(account, resource_type)
 
     def incremental_sync(

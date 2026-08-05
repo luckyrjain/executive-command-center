@@ -659,6 +659,45 @@ def test_engineering_metrics_get_is_mutation_rate_limited(
         assert client.get("/api/v1/widgets").status_code == 200
 
 
+def test_gmail_oauth_callback_get_is_mutation_rate_limited(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`GET /api/v1/personal/gmail/oauth/callback` is the second documented
+    exception to "reads are free" (round 15 review) -- it writes/updates a
+    `connector_accounts` row plus `audit_events`/`event_outbox` rows and
+    makes real outbound calls to Google on every invocation, so it must be
+    rate-limited like a real mutation even though it's a GET. Mirrors
+    `test_engineering_metrics_get_is_mutation_rate_limited` above for the
+    sibling `_MUTATING_GET_PATHS` entry -- without a test like this one,
+    nothing in the suite would fail if that entry were ever dropped."""
+    import ecc.http_security as http_security
+
+    limiter = http_security._MutationRateLimiter(window_seconds=60.0, max_requests=1)
+    monkeypatch.setattr(http_security, "_mutation_rate_limiter", limiter)
+    app = FastAPI()
+    app.middleware("http")(http_security.mutation_rate_limit_middleware)
+
+    @app.get("/api/v1/personal/gmail/oauth/callback")
+    def gmail_oauth_callback() -> dict:
+        return {"ok": True}
+
+    @app.get("/api/v1/widgets")
+    def list_widgets() -> dict:
+        return {"items": []}
+
+    client = TestClient(app)
+    client.cookies.set("ecc_session", "same-session-token")
+
+    first = client.get("/api/v1/personal/gmail/oauth/callback?code=x&state=y")
+    second = client.get("/api/v1/personal/gmail/oauth/callback?code=x&state=y")
+    assert first.status_code == 200
+    assert second.status_code == 429
+    assert int(second.headers["Retry-After"]) >= 1
+
+    for _ in range(5):
+        assert client.get("/api/v1/widgets").status_code == 200
+
+
 def test_health_check_unaffected_by_mutation_rate_limit(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -163,6 +163,17 @@ Tenant isolation, SSO/SCIM, policy administration, keys/residency, retention/leg
 
 Specification: [PHASE-009](phases/PHASE-009-enterprise.md)
 
+## Phase 10 — Gmail Connector
+
+**Status:** Approved for Implementation; contracts moved from Draft after resolving `docs/superpowers/specs/2026-08-04-phase-10-gmail-connector-design.md`'s five named decisions (connector mechanics/Protocol extension, privacy/consent model and encryption, OAuth scope/verification reality/rollout gating, `recommendations` create-path extension and AI-tool safety rubric, attention/knowledge integration), resolved in `PHASE-010-gmail-connector.md`'s own "Approved decisions" section. Unlike Phase 6-9, Phase 10 was never part of the original Phase 0-9 set `docs/phases/PHASE-REVIEW.md` reviewed -- its spec and design doc were written together as this phase's own first artifacts. **Engineering delivery is complete through Task 1 of 8** (OAuth2 connector framework extension -- a new, additive `OAuth2ConnectorAdapter` Protocol alongside the existing PAT-based `ConnectorAdapter`; `GmailAdapter`'s OAuth methods real against Google's endpoints, sync methods stubbed; the internal-allowlist-gated OAuth initiate/callback endpoints; `email_threads`/`email_messages` via migration `0069`) -- see `docs/phases/phase-010/IMPLEMENTATION-STATUS.md` for full task-by-task evidence. Tasks 2-8 (backfill/incremental sync and entity linking, deterministic attention integration, the `recommendations` create-path extension, the AI-runtime action-detection tool, on-demand thread reading, consent revocation cascade, and executive UX) are not yet started.
+
+A Gmail connector composing Phase 6's connector/OAuth/sync framework with Phase 7's consent/encryption/deletion framework for the first time, gated by an internal-user allowlist that keeps this phase outside Google's CASA security-assessment requirement.
+
+Specification: [PHASE-010](phases/PHASE-010-gmail-connector.md)  
+Design doc: [Phase 10 Gmail Connector Design](superpowers/specs/2026-08-04-phase-10-gmail-connector-design.md)  
+Implementation plan: [Phase 10 Gmail Connector Implementation Plan](superpowers/plans/2026-08-04-phase-10-gmail-connector.md)  
+Implementation status: [Phase 10 Implementation Status](phases/phase-010/IMPLEMENTATION-STATUS.md)
+
 ## Approval gates
 
 Before a Draft phase becomes Approved for Implementation:

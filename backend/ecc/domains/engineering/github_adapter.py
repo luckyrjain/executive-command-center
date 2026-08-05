@@ -697,7 +697,12 @@ class GitHubAdapter:
             granted_scopes=granted,
         )
 
-    def backfill(self, account: ConnectorAccountContext, resource_type: str) -> SyncOutcome:
+    def backfill(
+        self,
+        account: ConnectorAccountContext,
+        resource_type: str,
+        since: datetime | None = None,
+    ) -> SyncOutcome:
         if resource_type == "repository":
             return self._sync_repositories(account, since_cursor=None)
         if resource_type == "change":
