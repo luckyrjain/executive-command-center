@@ -317,6 +317,30 @@ class GmailAdapter:
                     f"Gmail token exchange returned a non-numeric expires_in: {expires_in!r}"
                 ) from exc
             expires_at = datetime.now(UTC).timestamp() + expires_in_seconds
+            try:
+                # Round 8 review: `float(expires_in)` accepts `inf`/`nan`
+                # (real risk, not exotic -- Python's `json.loads` itself
+                # accepts the non-strict `Infinity`/`NaN` literals by
+                # default) and any huge-but-ordinary integer; either one
+                # makes `datetime.fromtimestamp(expires_at, ...)` raise
+                # `OverflowError`/`OSError`/`ValueError` -- a type this
+                # guard doesn't otherwise anticipate. That call itself only
+                # happens later, on the success path *after* this guard
+                # already exits (`credential = _pack_credential(...)`
+                # below) -- so without this check here, that failure would
+                # both skip revoke-on-reject for the just-obtained grant
+                # and escape uncaught past the router's `AdapterAuthorization
+                # Error`-only catch, the same envelope-bypass bug class
+                # rounds 5-7 closed elsewhere. Performing the exact same
+                # conversion here, inside the guard, means a bad value is
+                # caught here and the real one below is guaranteed to
+                # succeed -- not a different, hand-picked bound that could
+                # itself drift out of sync with what `fromtimestamp` accepts.
+                datetime.fromtimestamp(expires_at, tz=UTC)
+            except (OverflowError, OSError, ValueError) as exc:
+                raise AdapterAuthorizationError(
+                    f"Gmail token exchange returned an out-of-range expires_in: {expires_in!r}"
+                ) from exc
 
             try:
                 profile_response = self._gmail_client.get(

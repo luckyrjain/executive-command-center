@@ -11,11 +11,21 @@ multi-round adversarial review found and required real coverage for:
    pre-redirect check).
 2. Authorization-URL generation (`GmailAdapter.get_authorization_url`).
 3. Callback/code-exchange against a mocked token-endpoint response
-   (`GmailAdapter.handle_oauth_callback`, and the real `GET /oauth/
-   callback` route end to end), including every distinct post-exchange
-   rejection branch (missing access/refresh token, non-numeric
-   `expires_in`, missing required scope, profile-lookup network error or
-   non-200 status, missing `emailAddress`, non-allowlisted account) --
+   (`GmailAdapter.handle_oauth_callback`, at the adapter level for every
+   distinct post-exchange rejection branch -- missing access/refresh
+   token, non-numeric/infinite/out-of-range `expires_in`, missing required
+   scope, profile-lookup network error or non-200 status, missing
+   `emailAddress`, non-allowlisted account -- plus the real `GET /oauth/
+   callback` route end to end for a representative sample of these
+   (the token-exchange-HTTP-status-failure case, and one post-exchange
+   case, missing required scope) proving the router's `except
+   AdapterAuthorizationError` clause -- generic, not branch-specific --
+   correctly surfaces the app's structured error envelope; round 8 review
+   found the docstring here previously implied every one of these branches
+   had its own dedicated route-level test, which was never true and isn't
+   the intent -- the router-level mechanism only needs proving once per
+   rejection *class* (pre-exchange vs. post-exchange), not once per
+   branch) --
    each asserting both the raised error and that the callback's `GET`
    route surfaces it through the app's real error envelope
    (`json()["error"]["code"]`, not FastAPI's bare `detail` shape).
@@ -84,6 +94,15 @@ multi-round adversarial review found and required real coverage for:
     a JSON number). Both previously raised an uncaught `AttributeError`
     on the very next line (`.split()`, `is_account_allowed`'s `.strip()`)
     instead of the intended `AdapterAuthorizationError`.
+16. An infinite (`float("inf")`, which `json.loads` accepts by default) or
+    merely huge (an ordinary large integer, no exotic JSON literal needed)
+    `expires_in` -- round 8: `float(expires_in)` accepts both cleanly, but
+    the resulting Unix timestamp made `datetime.fromtimestamp(...)` raise
+    `OverflowError`/`ValueError` at `_pack_credential`'s call site, which
+    (unlike every other field this method validates) sat on the success
+    path *after* the revoke-on-reject guard already exited -- skipping
+    revocation for the just-obtained grant entirely, not merely escaping
+    the error envelope.
 """
 
 from __future__ import annotations
@@ -427,6 +446,57 @@ def test_handle_oauth_callback_rejects_non_numeric_expires_in(
     try:
         body = _token_response()
         body["expires_in"] = "not-a-number"
+        adapter = GmailAdapter(
+            transport=_oauth_transport(token_body=body, revoked_tokens=revoked_tokens)
+        )
+        with pytest.raises(AdapterAuthorizationError):
+            adapter.handle_oauth_callback("auth-code", "state-value")
+        assert revoked_tokens == ["refresh-1"]
+    finally:
+        get_settings.cache_clear()
+
+
+def test_handle_oauth_callback_rejects_infinite_expires_in(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`float("inf")` (a real risk, not exotic -- `json.loads` accepts the
+    non-strict `Infinity` literal by default) passes `float(expires_in)`
+    cleanly, but `datetime.fromtimestamp` on the resulting timestamp raises
+    `OverflowError` -- a type the original guard didn't anticipate, and
+    (before this fix) a call that only happened *after* the guard had
+    already exited, on the success path, skipping revoke-on-reject
+    entirely for the just-obtained grant. Round 8 review found this exact
+    gap.
+    """
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_CLIENT_ID", "cid")
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_CLIENT_SECRET", "csecret")
+    get_settings.cache_clear()
+    revoked_tokens: list[str] = []
+    try:
+        body = _token_response()
+        body["expires_in"] = float("inf")
+        adapter = GmailAdapter(
+            transport=_oauth_transport(token_body=body, revoked_tokens=revoked_tokens)
+        )
+        with pytest.raises(AdapterAuthorizationError):
+            adapter.handle_oauth_callback("auth-code", "state-value")
+        assert revoked_tokens == ["refresh-1"]
+    finally:
+        get_settings.cache_clear()
+
+
+def test_handle_oauth_callback_rejects_huge_expires_in(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Companion to the infinite case above -- an ordinary, syntactically
+    valid huge integer (no exotic JSON literal needed) hits the exact same
+    `OverflowError` once added to the current Unix timestamp.
+    """
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_CLIENT_ID", "cid")
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_CLIENT_SECRET", "csecret")
+    get_settings.cache_clear()
+    revoked_tokens: list[str] = []
+    try:
+        body = _token_response()
+        body["expires_in"] = 999999999999999999999
         adapter = GmailAdapter(
             transport=_oauth_transport(token_body=body, revoked_tokens=revoked_tokens)
         )
@@ -1053,6 +1123,49 @@ def test_oauth_callback_returns_422_with_error_envelope_on_google_rejection(
     get_settings.cache_clear()
     monkeypatch.setattr(
         gmail_oauth_module, "_adapter", GmailAdapter(transport=_oauth_transport(token_status=400))
+    )
+    try:
+        start_response = client.post("/api/v1/personal/gmail/oauth/start", headers=_headers(token))
+        state = httpx.URL(start_response.json()["authorization_url"]).params["state"]
+        response = client.get(
+            "/api/v1/personal/gmail/oauth/callback",
+            params={"code": "auth-code", "state": state},
+        )
+        assert response.status_code == 422
+        assert response.json()["error"]["code"] == "GMAIL_OAUTH_FAILED"
+    finally:
+        get_settings.cache_clear()
+
+
+def test_oauth_callback_returns_422_with_error_envelope_on_missing_scope(
+    gmail_test_context: tuple[TestClient, UUID, UUID, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`test_oauth_callback_returns_422_with_error_envelope_on_google_rejection`
+    exercises the token-exchange-HTTP-status-failure case (`token_status=
+    400`) end to end -- round 8 review found the module docstring's item 3
+    overclaimed that every distinct *post*-exchange rejection branch
+    (missing required scope among them) also had an end-to-end test
+    proving the router's error envelope, when in fact only the adapter-
+    level `test_handle_oauth_callback_rejects_missing_required_scope` did.
+    This closes that gap for one representative, security-relevant branch
+    -- the router's `except AdapterAuthorizationError` clause is generic
+    (not branch-specific), so this and the token-status-400 test together
+    are sufficient to prove the envelope mechanism works for both the
+    pre-guard and post-guard rejection classes; the remaining adapter-
+    level-only branches are not independently re-asserted at the route
+    level (redundant coverage of the same generic `except` clause).
+    """
+    client, _workspace_id, _user_id, token = gmail_test_context
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_ALLOWLIST", _ALLOWED_EMAIL)
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_CLIENT_ID", "cid")
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_CLIENT_SECRET", "csecret")
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_REDIRECT_URI", "https://ecc.example.test/callback")
+    get_settings.cache_clear()
+    monkeypatch.setattr(
+        gmail_oauth_module,
+        "_adapter",
+        GmailAdapter(transport=_oauth_transport(token_body=_token_response(scope=""))),
     )
     try:
         start_response = client.post("/api/v1/personal/gmail/oauth/start", headers=_headers(token))
