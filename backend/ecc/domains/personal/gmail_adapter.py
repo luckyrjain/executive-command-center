@@ -99,7 +99,7 @@ from __future__ import annotations
 import time
 from collections.abc import Callable, Mapping
 from datetime import UTC, datetime, timedelta
-from email.utils import parseaddr
+from email.utils import getaddresses, parseaddr
 from hashlib import sha256
 from json import dumps, loads
 from typing import Any, cast
@@ -287,29 +287,106 @@ def _contains_nul(value: str) -> bool:
     return "\x00" in value
 
 
-def _parse_address(header_value: str) -> tuple[str, str] | None:
-    """`From`/`To` header values are `"Display Name <addr@example.com>"` or
-    a bare `addr@example.com` -- `email.utils.parseaddr` (stdlib, not a
-    hand-rolled regex) handles both, plus the quoted-display-name and
-    comment-syntax edge cases a naive `<...>` split would mis-parse.
-    Returns `(display_name, address)` (`display_name` `""` when the header
-    carried no name portion), or `None` for a header this adapter cannot
-    make sense of (empty, an address-less comment-only value, an address
-    longer than `email_messages.sender`/`.recipients` can ever store --
-    see `_MAX_EMAIL_ADDRESS_LENGTH`'s own comment -- or either half
-    containing a NUL byte no `text`/`varchar` column can ever store, see
-    `_contains_nul`'s own comment) rather than a placeholder a caller
-    might mistake for a real, resolvable identity.
+def _contains_unpaired_surrogate(value: str) -> bool:
+    """A second, orthogonal way a `str` that survived `json.loads` cleanly
+    can still be unwritable to Postgres -- found by round 2 review, a
+    distinct failure class from both `_contains_nul` and `_MAX_EMAIL_
+    ADDRESS_LENGTH` above (neither of which catches this). Strict JSON
+    grammar (RFC 8259) specifies `\\uXXXX` as a raw UTF-16 code unit, not
+    a validated Unicode scalar value, so a lone (unpaired) surrogate
+    escape -- e.g. `\\ud800` with no following low surrogate -- is valid
+    JSON text; Python's `json.loads` decodes it without complaint into a
+    `str` that LOOKS like any other string but cannot be encoded to UTF-8
+    (`str.encode("utf-8")` itself raises `UnicodeEncodeError: 'utf-8'
+    codec can't encode character '\\ud800' ... surrogates not allowed`).
+    psycopg needs exactly that encoding to put a text parameter on the
+    wire, so this reaches the database driver as an uncaught, un-typed
+    Python `UnicodeEncodeError` -- not even a DB-side `DataError` the way
+    an oversized address or an embedded NUL byte would be -- aborting the
+    entire sync call for a single malformed message, permanently wedging
+    `incremental_sync` the same way `_MAX_EMAIL_ADDRESS_LENGTH`'s own
+    comment describes for its own failure class. A real Gmail sender can
+    plausibly trigger this via a malformed RFC 2047 encoded-word header
+    (`=?UTF-16?B?...?=`) that Gmail's own header decoder resolves
+    leniently into surrogate-carrying text rather than rejecting outright
+    -- reachable input, not merely a hypothetical one. Every guard below
+    that already checks `_contains_nul` on Gmail-sourced text checks this
+    too, for the same reason.
     """
-    display_name, address = parseaddr(header_value)
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        return True
+    return False
+
+
+# `email_threads.external_thread_id`/`email_messages.external_message_id`
+# are `VARCHAR(255)` (migration `0069`) -- Gmail's own `id`/`threadId`
+# fields are, in every documented and observed case, short opaque hex
+# strings the Gmail backend itself assigns (not attacker-supplied header
+# content the way `From`/`To` are), but nothing in this adapter -- or in
+# Gmail's own JSON response contract -- actually guarantees that shape.
+# `_process_message` already treats every other field pulled from this
+# same response body as untrusted-until-validated (type-checked, `None`-
+# checked); an oversized or NUL-/surrogate-carrying `id`/`threadId` would
+# reach these two bounded columns the same unguarded way `sender`/
+# `recipients` did before round 1's fix, for the identical uncaught-
+# DataError/UnicodeEncodeError, whole-call-aborting, cursor-never-
+# advances failure class -- found by round 2 review. Matches
+# `_MAX_EMAIL_ADDRESS_LENGTH`'s own column-width bound in spirit, sized to
+# this pair of columns instead.
+_MAX_EXTERNAL_ID_LENGTH = 255
+
+
+def _is_valid_external_id(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and bool(value)
+        and len(value) <= _MAX_EXTERNAL_ID_LENGTH
+        and not _contains_nul(value)
+        and not _contains_unpaired_surrogate(value)
+    )
+
+
+def _validate_address(display_name: str, address: str) -> tuple[str, str] | None:
+    """Shared validation for an already-split `(display_name, address)`
+    pair -- factored out of `_parse_address` (round 2 review) so
+    `_process_message`'s recipient loop can apply the identical guard to
+    each result of `email.utils.getaddresses` (which is comma-list-aware,
+    see that call site's own comment) without re-parsing an already-parsed
+    pair back through `parseaddr`.
+
+    `None` for a pair this adapter cannot make sense of (no address, an
+    address longer than `email_messages.sender`/`.recipients` can ever
+    store -- see `_MAX_EMAIL_ADDRESS_LENGTH`'s own comment -- or either
+    half containing a NUL byte or an unpaired UTF-16 surrogate no
+    `text`/`varchar` column can ever store, see `_contains_nul`'s/
+    `_contains_unpaired_surrogate`'s own comments) rather than a
+    placeholder a caller might mistake for a real, resolvable identity.
+    """
     if (
         not address
         or len(address) > _MAX_EMAIL_ADDRESS_LENGTH
         or _contains_nul(address)
         or _contains_nul(display_name)
+        or _contains_unpaired_surrogate(address)
+        or _contains_unpaired_surrogate(display_name)
     ):
         return None
     return display_name, address
+
+
+def _parse_address(header_value: str) -> tuple[str, str] | None:
+    """`From`/`To` header values are `"Display Name <addr@example.com>"` or
+    a bare `addr@example.com` -- `email.utils.parseaddr` (stdlib, not a
+    hand-rolled regex) handles both, plus the quoted-display-name and
+    comment-syntax edge cases a naive `<...>` split would mis-parse. Used
+    for the (always single-address) `From` header; see `_validate_
+    address`'s own docstring for the multi-address `To` case and what
+    `None` here means.
+    """
+    display_name, address = parseaddr(header_value)
+    return _validate_address(display_name, address)
 
 
 def _resolve_or_create_person(
@@ -1338,12 +1415,30 @@ class GmailAdapter:
         skip needs to protect here, and every other message in the same
         sync call is unaffected by one bad one.
         """
+        # `_is_valid_external_id` (length/NUL/unpaired-surrogate, see its
+        # own comment) -- round 2 review: previously only type/emptiness
+        # were checked here, unlike every other Gmail-sourced string this
+        # method handles. Gmail's own `id`/`threadId` values are not
+        # attacker-influenced the way `From`/`To` header content is, but
+        # nothing about this response body's *contract* actually
+        # guarantees that shape, and both flow straight into `VARCHAR(255)`
+        # columns (`email_threads.external_thread_id`/`email_messages.
+        # external_message_id`, migration `0069`) -- an oversized or
+        # unwritable value here would hit the identical uncaught-crash,
+        # cursor-never-advances failure class `_MAX_EMAIL_ADDRESS_LENGTH`
+        # closed for `sender`/`recipients`. `message_id` doubly matters
+        # here: it also seeds `source_ref = f"gmail:{message_id}"` below,
+        # which is `.encode()`-d for its `sha256` in `_resolve_or_create_
+        # person` -- an unpaired surrogate there raises the exact
+        # `UnicodeEncodeError` `_contains_unpaired_surrogate`'s own
+        # comment describes, uncaught, from a call this function's own
+        # docstring promises never raises for a malformed message.
         message_id = body.get("id")
         external_thread_id = body.get("threadId")
-        if not isinstance(message_id, str) or not message_id:
+        if not _is_valid_external_id(message_id) or not _is_valid_external_id(external_thread_id):
             return None
-        if not isinstance(external_thread_id, str) or not external_thread_id:
-            return None
+        assert isinstance(message_id, str)
+        assert isinstance(external_thread_id, str)
 
         payload = body.get("payload")
         raw_headers = payload.get("headers") if isinstance(payload, dict) else None
@@ -1367,12 +1462,37 @@ class GmailAdapter:
         recipients: list[str] = []
         recipient_names: dict[str, str] = {}
         if to_header:
-            for raw_address in to_header.split(","):
-                parsed = _parse_address(raw_address)
+            # `email.utils.getaddresses` (not a naive `to_header.split(",")`)
+            # -- round 2 review found the naive split mis-parses a `To`
+            # header whose display name itself legitimately contains a
+            # comma (`'"Doe, John" <john@example.com>, jane@example.com'`):
+            # it breaks that single, valid address into two fragments
+            # (`'"Doe'`, `' John" <john@example.com>'`), and `parseaddr`
+            # on each fragment separately silently *loses* the real
+            # address entirely -- `' John" <john@example.com>'` parses to
+            # `('', 'John')`, an address of `"John"`, not
+            # `john@example.com` -- while the other fragment (`'"Doe'`)
+            # parses to a bogus address of `"Doe"`. Both bogus fragments
+            # pass `_validate_address` (non-empty, no NUL, under the
+            # length bound) and would each get written to `email_messages.
+            # recipients` and resolved into a real `pkos_nodes` person
+            # with a fake "email" -- silent entity-graph corruption from a
+            # single crafted header, not a crash, but the identical
+            # "attacker-controlled `To` header reaches storage unvalidated"
+            # class the NUL/length guards elsewhere in this file already
+            # close. A real Gmail sender fully controls their own `To`
+            # header, including any legitimate-looking quoted display
+            # name. `getaddresses` (stdlib, comma-list-aware, the same
+            # RFC 5322 parser `parseaddr` itself is built on) is the
+            # correct API for a comma-separated address list and handles
+            # the quoted-comma case, an empty header, and a header that is
+            # only commas identically to before.
+            for name, address in getaddresses([to_header]):
+                parsed = _validate_address(name, address)
                 if parsed is not None:
-                    name, address = parsed
-                    recipients.append(address)
-                    recipient_names.setdefault(address, name)
+                    valid_name, valid_address = parsed
+                    recipients.append(valid_address)
+                    recipient_names.setdefault(valid_address, valid_name)
         if not recipients:
             return None
 
@@ -1398,10 +1518,16 @@ class GmailAdapter:
         # resolving who the message is from/to, so only this one field is
         # dropped rather than skipping the entire message over a header
         # nothing else here depends on. See `_contains_nul`'s own comment
-        # for why this guard exists at all.
+        # for why this guard exists at all; `_contains_unpaired_surrogate`
+        # (round 2 review) closes the same class of gap for `Subject` that
+        # it closes for `sender`/`recipients` elsewhere in this function.
         raw_subject = header_map.get("subject")
         subject = (
-            raw_subject if raw_subject is not None and not _contains_nul(raw_subject) else None
+            raw_subject
+            if raw_subject is not None
+            and not _contains_nul(raw_subject)
+            and not _contains_unpaired_surrogate(raw_subject)
+            else None
         )
 
         with SessionFactory() as session, session.begin():

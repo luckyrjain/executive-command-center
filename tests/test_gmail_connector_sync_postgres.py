@@ -46,12 +46,30 @@ Covers, per this task's own scope:
     one message gracefully rather than raising, called directly rather
     than only exercised incidentally -- round 1 review coverage gap,
     closed.
+11. An unpaired UTF-16 surrogate (valid JSON, but not `.encode("utf-8")`-
+    able -- distinct from an embedded NUL byte) in a `From`/`Subject`
+    header or in Gmail's own `id` field is dropped/skips the message the
+    same way an oversized address or an embedded NUL already does, not
+    left to crash the sync call with an uncaught `UnicodeEncodeError` --
+    found by round 2 review's security/correctness lens.
+12. Gmail's own `id`/`threadId` fields are length/NUL/surrogate-validated
+    before reaching `email_threads.external_thread_id`/`email_messages.
+    external_message_id`'s `VARCHAR(255)` bound, the same way `sender`/
+    `recipients` already are -- found by round 2 review (previously
+    entirely unguarded).
+13. A `To` header whose display name legitimately contains a comma
+    (`'"Doe, John" <john@example.com>'`) is parsed as one recipient via
+    `email.utils.getaddresses`, not split into two bogus fragments by a
+    naive `to_header.split(",")` -- the naive split silently lost the
+    real address and fabricated a non-email "recipient" from the
+    fragment, corrupting the entity graph -- found by round 2 review.
 """
 
 from __future__ import annotations
 
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
+from json import dumps as json_dumps
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -924,6 +942,215 @@ def test_oversized_recipient_address_is_dropped_but_message_still_syncs(
     rows = _threads_and_messages(context.workspace_id)
     assert len(rows) == 1
     assert rows[0]["recipients"] == [_OWNER_EMAIL]
+
+
+def _surrogate_json_response(body: dict[str, Any], *, marker_replacement: str) -> httpx.Response:
+    """Builds an httpx `Response` whose raw body bytes carry a literal
+    `\\ud800`-style JSON escape (an unpaired UTF-16 surrogate) at every
+    `"__SURROGATE__"` marker in `body` -- round 2 review's
+    `_contains_unpaired_surrogate` finding. This can't be built via
+    `httpx.Response(json=...)`/`_json_response` above: constructing an
+    actual Python `str` containing a real surrogate character first (as
+    `test_nul_byte_in_from_address_is_skipped_not_a_crash` does for
+    `\\x00`) and handing it to `json=` fails *at response-construction
+    time* (httpx's own `encode_json` calls `.encode("utf-8")` on the
+    dumped JSON text, which raises the very `UnicodeEncodeError` this
+    test means to reproduce, one layer too early -- before the response
+    even exists to send). The real Gmail wire response never contains a
+    raw surrogate *byte*; it contains the literal six-character ASCII
+    escape sequence `\\ud800`, which `json.dumps` on an ordinary marker
+    string followed by a text substitution reproduces exactly, and which
+    `json.loads` (inside `response.json()`, same as this adapter's own
+    call) then decodes into a real unpaired-surrogate `str` -- the
+    identical shape `json.loads` would produce from a genuine Gmail
+    response.
+    """
+    return httpx.Response(
+        status_code=200,
+        content=json_dumps(body).replace("__SURROGATE__", marker_replacement).encode("utf-8"),
+        headers={"content-type": "application/json"},
+    )
+
+
+def test_unpaired_surrogate_in_from_display_name_is_skipped_not_a_crash(
+    seeded_gmail_account: tuple[ConnectorAccountContext, UUID],
+) -> None:
+    """A lone (unpaired) UTF-16 surrogate escape in Gmail's own response
+    JSON (e.g. from a malformed RFC 2047 encoded-word header Gmail's own
+    decoder resolved leniently) decodes cleanly via `json.loads` into a
+    Python `str` that *looks* like any other string but cannot be
+    `.encode("utf-8")`-d -- required for psycopg to put it on the wire.
+    Previously this reached the `pkos_nodes.canonical_name` INSERT
+    uncaught as a raw `UnicodeEncodeError` (not even a DB-side
+    `DataError`), aborting the entire sync call for one malformed message
+    -- the same failure class `_contains_nul` already closed for an
+    embedded NUL byte, but distinct and previously unguarded. Must
+    degrade to a skipped message, not a crash.
+    """
+    context, _owner_id = seeded_gmail_account
+    now_ms = int(datetime.now(UTC).timestamp() * 1000)
+    body = _message_body(
+        message_id="msg-surrogate",
+        thread_id="thread-surrogate",
+        from_addr="Weird__SURROGATE__Name <alice@example.test>",
+        to_addrs=[_OWNER_EMAIL],
+        internal_date_ms=now_ms,
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/gmail/v1/users/me/messages":
+            return _json_response({"messages": [{"id": "msg-surrogate"}]})
+        if request.url.path.startswith("/gmail/v1/users/me/messages/"):
+            return _surrogate_json_response(body, marker_replacement=r"\ud800")
+        if request.url.path == "/gmail/v1/users/me/profile":
+            return _json_response({"historyId": 1})
+        raise AssertionError(f"unexpected request to {request.url}")
+
+    adapter = GmailAdapter(transport=httpx.MockTransport(handler))
+    outcome = adapter.backfill(context, "message", since=datetime.now(UTC) - timedelta(days=1))
+    assert outcome.status == "succeeded"
+    assert outcome.items_processed == 1
+    assert _threads_and_messages(context.workspace_id) == []
+    assert _resolved_person(context.workspace_id, "alice@example.test") is None
+
+
+def test_unpaired_surrogate_in_message_id_is_skipped_not_a_crash(
+    seeded_gmail_account: tuple[ConnectorAccountContext, UUID],
+) -> None:
+    """Same hazard as the display-name case above, but in Gmail's own `id`
+    field rather than attacker-influenced header content -- `message_id`
+    seeds `source_ref = f"gmail:{message_id}"`, which `_resolve_or_create_
+    person` `.encode()`s for its `sha256`; an unpaired surrogate there
+    raised the identical uncaught `UnicodeEncodeError` one call deeper,
+    from a response shape this adapter's own docstring already treats
+    every other field of as untrusted-until-validated. `external_thread_
+    id`/`external_message_id` are also `VARCHAR(255)` -- `_is_valid_
+    external_id` closes both the surrogate and the (previously entirely
+    unguarded) length/NUL gap for this pair of fields in one guard.
+    """
+    context, _owner_id = seeded_gmail_account
+    now_ms = int(datetime.now(UTC).timestamp() * 1000)
+    body = _message_body(
+        message_id="msg-__SURROGATE__-id",
+        thread_id="thread-surrogate-id",
+        from_addr="alice@example.test",
+        to_addrs=[_OWNER_EMAIL],
+        internal_date_ms=now_ms,
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/gmail/v1/users/me/messages":
+            return _json_response({"messages": [{"id": "msg-surrogate-id"}]})
+        if request.url.path.startswith("/gmail/v1/users/me/messages/"):
+            return _surrogate_json_response(body, marker_replacement=r"\ud800")
+        if request.url.path == "/gmail/v1/users/me/profile":
+            return _json_response({"historyId": 1})
+        raise AssertionError(f"unexpected request to {request.url}")
+
+    adapter = GmailAdapter(transport=httpx.MockTransport(handler))
+    outcome = adapter.backfill(context, "message", since=datetime.now(UTC) - timedelta(days=1))
+    assert outcome.status == "succeeded"
+    assert outcome.items_processed == 1
+    assert _threads_and_messages(context.workspace_id) == []
+    assert _resolved_person(context.workspace_id, "alice@example.test") is None
+
+
+def test_oversized_message_id_is_skipped_not_a_crash(
+    seeded_gmail_account: tuple[ConnectorAccountContext, UUID],
+) -> None:
+    """`email_messages.external_message_id` is `VARCHAR(255)` (migration
+    `0069`) -- previously nothing checked `body["id"]`'s length before
+    the INSERT, unlike `sender`/`recipients`' own `_MAX_EMAIL_ADDRESS_
+    LENGTH` bound. `_is_valid_external_id` closes it the same way.
+    """
+    context, _owner_id = seeded_gmail_account
+    now_ms = int(datetime.now(UTC).timestamp() * 1000)
+    long_id = "m" * 300
+    body = _message_body(
+        message_id=long_id,
+        thread_id="thread-oversized-id",
+        from_addr="alice@example.test",
+        to_addrs=[_OWNER_EMAIL],
+        internal_date_ms=now_ms,
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/gmail/v1/users/me/messages":
+            return _json_response({"messages": [{"id": long_id}]})
+        if request.url.path.startswith("/gmail/v1/users/me/messages/"):
+            return _json_response(body)
+        if request.url.path == "/gmail/v1/users/me/profile":
+            return _json_response({"historyId": 1})
+        raise AssertionError(f"unexpected request to {request.url}")
+
+    adapter = GmailAdapter(transport=httpx.MockTransport(handler))
+    outcome = adapter.backfill(context, "message", since=datetime.now(UTC) - timedelta(days=1))
+    assert outcome.status == "succeeded"
+    assert outcome.items_processed == 1
+    assert _threads_and_messages(context.workspace_id) == []
+
+
+def test_to_header_display_name_with_comma_does_not_corrupt_recipients(
+    seeded_gmail_account: tuple[ConnectorAccountContext, UUID],
+) -> None:
+    """`To: "Doe, John" <john@example.test>, jane@example.test` is a
+    single, valid recipient (`john@example.test`) plus a second
+    (`jane@example.test`) -- a naive `to_header.split(",")` (the previous
+    implementation) breaks the quoted display name's own comma into two
+    bogus fragments (`'"Doe'`, `' John" <john@example.test>'`); `parseaddr`
+    on each fragment separately does not merely mis-format the name, it
+    silently *loses the real address* (`' John" <john@example.test>'`
+    parses to address `'John'`, not `'john@example.test'`) while
+    fabricating a second bogus "recipient" (address `'Doe'`) that isn't
+    an email address at all. Both bogus fragments pass length/NUL
+    validation and previously reached `email_messages.recipients` and a
+    real `pkos_nodes` person with a fake "email" -- silent entity-graph
+    corruption from a header any real Gmail sender fully controls, found
+    by round 2 review. `email.utils.getaddresses` (comma-list-aware)
+    parses this correctly instead: two recipients, the quoted comma kept
+    inside the display name, `john@example.test`'s address intact.
+    """
+    context, _owner_id = seeded_gmail_account
+    now_ms = int(datetime.now(UTC).timestamp() * 1000)
+    body = _message_body(
+        message_id="msg-quoted-comma",
+        thread_id="thread-quoted-comma",
+        from_addr="alice@example.test",
+        to_addrs=["ignored -- overridden by raw_to below"],
+        internal_date_ms=now_ms,
+    )
+    body["payload"]["headers"] = [
+        {"name": "From", "value": "alice@example.test"},
+        {
+            "name": "To",
+            "value": '"Doe, John" <john@example.test>, jane@example.test',
+        },
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/gmail/v1/users/me/messages":
+            return _json_response({"messages": [{"id": "msg-quoted-comma"}]})
+        if request.url.path.startswith("/gmail/v1/users/me/messages/"):
+            return _json_response(body)
+        raise AssertionError(f"unexpected request to {request.url}")
+
+    adapter = GmailAdapter(transport=httpx.MockTransport(handler))
+    outcome = adapter.backfill(context, "message", since=datetime.now(UTC) - timedelta(days=1))
+    assert outcome.status == "succeeded"
+    assert outcome.items_processed == 1
+
+    rows = _threads_and_messages(context.workspace_id)
+    assert len(rows) == 1
+    assert sorted(rows[0]["recipients"]) == ["jane@example.test", "john@example.test"]
+
+    john = _resolved_person(context.workspace_id, "john@example.test")
+    assert john is not None
+    assert john["canonical_name"] == "Doe, John"
+
+    # The bogus fragment-addresses a naive comma-split previously produced
+    # must never have been resolved as if they were real participants.
+    assert _resolved_person(context.workspace_id, "doe") is None
+    assert _resolved_person(context.workspace_id, "john") is None
 
 
 # --- per-call message budget hit mid-page -------------------------------------

@@ -81,6 +81,23 @@ batch's own fixes found:
     concurrent requests the same way as item 22, and closed by re-
     checking the idempotency cache after an `IntegrityError` rather than
     unconditionally returning `409 CONNECTOR_ALREADY_CONNECTED`.
+
+Plus one item closing a gap Phase 10 Gmail Connector Task 2's own round 1
+review found in this module's territory (`sync_cursors.resource_type`'s
+CHECK constraint, not Gmail's own adapter code -- see `tests/test_gmail_
+connector_sync_postgres.py` for Task 2's own dedicated test file):
+
+25. `test_sync_persists_a_message_resource_type_cursor`: migration `0069`
+    widened `ck_connector_accounts_provider`/`ck_personal_domains_domain_
+    key` for `gmail`/`email` but missed `ck_sync_cursors_resource_type`,
+    so a real `/sync` call for a `gmail` account that made progress raised
+    an uncaught `IntegrityError` and 500 instead of `201`. Proven end to
+    end through the real HTTP endpoint (not a direct-SQL probe) via
+    `_MessageCursorAdapter`, a fake registered under the real `"gmail"`
+    provider slug -- migration `0069` already widened `ck_connector_
+    accounts_provider` to allow it, unlike the `_RaisingAdapter`/
+    `_SpyDisconnectAdapter` family above, which stay on `"sandbox"` for
+    that reason. Fixed by migration `0070_gmail_sync_cursor_type.py`.
 """
 
 import threading
