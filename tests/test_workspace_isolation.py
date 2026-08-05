@@ -6,7 +6,14 @@ from identity_fixtures import create_identity
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 
+from ecc.config import get_settings
 from ecc.database import engine
+
+settings = get_settings()
+pytestmark = pytest.mark.skipif(
+    not settings.database_url.startswith("postgresql"),
+    reason="PostgreSQL integration test",
+)
 
 
 def test_session_cannot_reference_user_from_another_workspace() -> None:
