@@ -56,7 +56,7 @@ Any Gmail write action (compose, reply, send, archive, label-modify) this phase.
 ## Functional requirements
 
 - Gmail sync of any kind requires an active `domain_consents` row for the `email` domain; revoking it halts sync, disconnects the OAuth grant and deletes synced content.
-- Only an account on the internal allowlist (config-driven, checked in `authorize()`/`get_authorization_url()`) may initiate the Gmail OAuth flow at all.
+- Only an account on the internal allowlist (config-driven) may initiate the Gmail OAuth flow at all. As built: `authorize()` is never called for `gmail` at all, and `get_authorization_url()`'s own fixed signature carries no account/email argument to check -- the caller-side allowlist check lives in `gmail_oauth.py`'s router (pre-redirect, against the caller's own account email) and again, authoritatively, inside `handle_oauth_callback` (post-exchange, against the actual Google account).
 - Every synced message body is Fernet-encrypted at rest using the existing `ECC_PERSONAL_DATA_ENCRYPTION_KEY` (Phase 7); the Gmail OAuth access/refresh tokens themselves use the existing `ECC_CONNECTOR_TOKEN_ENCRYPTION_KEY` (Phase 6) — two already-approved keys used for their already-established purposes, no new key.
 - Every AI-proposed task/commitment/risk requires explicit human confirmation via the extended `recommendations` flow before any row is created; nothing is written automatically.
 - Every AI-proposed action must cite the synced email it was derived from as `pkos_evidence`, schema-enforced (a proposal with no grounded evidence fails validation, mirroring `attention.explain_item`'s existing fail-closed shape).

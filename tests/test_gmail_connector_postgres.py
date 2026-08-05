@@ -441,7 +441,7 @@ def gmail_test_context() -> Iterator[tuple[TestClient, UUID, UUID, str]]:
             ),
             {"id": workspace_id, "now": now},
         )
-        create_identity(
+        account_id = create_identity(
             connection,
             workspace_id=workspace_id,
             user_id=user_id,
@@ -470,10 +470,10 @@ def gmail_test_context() -> Iterator[tuple[TestClient, UUID, UUID, str]]:
         yield client, workspace_id, user_id, token
     finally:
         client.close()
-        _cleanup_workspace(workspace_id)
+        _cleanup_workspace(workspace_id, account_id)
 
 
-def _cleanup_workspace(workspace_id: UUID) -> None:
+def _cleanup_workspace(workspace_id: UUID, account_id: UUID | None = None) -> None:
     with engine.begin() as connection:
         for table in (
             "connector_accounts",
@@ -490,6 +490,15 @@ def _cleanup_workspace(workspace_id: UUID) -> None:
         connection.execute(
             text("DELETE FROM workspaces WHERE id = :workspace_id"), {"workspace_id": workspace_id}
         )
+        # `accounts.email` is globally unique (not scoped per workspace) --
+        # left uncleaned, every test reusing the same literal `_ALLOWED_
+        # EMAIL`/`"other-owner@example.test"` fixture identity would
+        # collide with the previous test's still-present `accounts` row on
+        # its own `create_identity` call (found by this PR's own CI run:
+        # every fixture-using test after the first errored with
+        # `UniqueViolation` on `accounts_email_key`).
+        if account_id is not None:
+            connection.execute(text("DELETE FROM accounts WHERE id = :id"), {"id": account_id})
 
 
 def _headers(token: str) -> dict[str, str]:
@@ -719,7 +728,7 @@ def test_oauth_callback_creates_connector_account_and_is_workspace_isolated(
                 ),
                 {"id": other_workspace_id, "now": now},
             )
-            create_identity(
+            other_account_id = create_identity(
                 connection,
                 workspace_id=other_workspace_id,
                 user_id=other_user_id,
@@ -752,7 +761,7 @@ def test_oauth_callback_creates_connector_account_and_is_workspace_isolated(
             finally:
                 other_client.close()
         finally:
-            _cleanup_workspace(other_workspace_id)
+            _cleanup_workspace(other_workspace_id, other_account_id)
     finally:
         get_settings.cache_clear()
 

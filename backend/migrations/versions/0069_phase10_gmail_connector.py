@@ -145,15 +145,21 @@ def upgrade() -> None:
             "direction IN ('inbound', 'outbound')", name="ck_email_messages_direction"
         ),
         sa.ForeignKeyConstraint(["workspace_id"], ["workspaces.id"], ondelete="CASCADE"),
-        # Direct `(workspace_id, owner_id) -> users` FK -- strictly redundant
-        # with the transitive integrity `email_threads`' own FK to
-        # `personal_domains(workspace_id, owner_id, domain_key)` already
-        # provides (the same shape `domain_records`, this migration's own
-        # docstring's cited precedent, relies on alone with no direct FK to
-        # `users`). Kept as an extra, harmless belt-and-suspenders
-        # constraint specifically on `email_messages` -- disclosed here
-        # rather than left as an unexplained asymmetry between these two
-        # sibling tables' own constraint sets.
+        # Direct `(workspace_id, owner_id) -> users` FK -- NOT redundant
+        # with `email_threads`' own FK to `personal_domains`, despite an
+        # earlier draft of this comment claiming otherwise (caught by
+        # review): that chain only constrains `email_threads.owner_id`
+        # itself. Nothing ties a given `email_messages` row's *own*
+        # `owner_id` to its parent thread's `owner_id` for the same
+        # `thread_id` -- no FK, composite or otherwise, links the two --
+        # so this direct FK is the *only* integrity constraint on `email_
+        # messages.owner_id` at all, not a belt-and-suspenders extra.
+        # `domain_records` (this migration's own cited precedent) differs
+        # in exactly this respect: its `owner_id` has a *direct* 3-column
+        # FK to `personal_domains(workspace_id, owner_id, domain_key)`, a
+        # genuinely non-transitive constraint `email_messages` cannot
+        # reuse verbatim (it has no `domain_key` column of its own to
+        # complete that triple), hence the different shape here.
         sa.ForeignKeyConstraint(
             ["workspace_id", "owner_id"], ["users.workspace_id", "users.id"], ondelete="CASCADE"
         ),
