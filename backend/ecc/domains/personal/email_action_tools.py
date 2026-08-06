@@ -122,7 +122,7 @@ def get_thread_content_tool(
                     SELECT id, sender, sent_at, direction, body FROM email_messages
                     WHERE workspace_id = :workspace_id AND owner_id = :owner_id
                       AND thread_id = :thread_id AND body IS NOT NULL
-                      AND (:trigger_message_id::uuid IS NULL OR id <> :trigger_message_id)
+                      AND (CAST(:trigger_message_id AS uuid) IS NULL OR id <> :trigger_message_id)
                     ORDER BY sent_at DESC
                     LIMIT :limit
                 ) AS most_recent
