@@ -1218,6 +1218,35 @@ def _insert_synthetic_email_thread(
     batched shape would leak across examples the way `meeting.prep_
     summary`'s own `risks` section does.
     """
+    # `email_threads` has a 3-column FK to `personal_domains(workspace_id,
+    # owner_id, domain_key)` (migration `0069`) -- inserted with `ON
+    # CONFLICT DO NOTHING` (keyed off that same FK's own unique
+    # constraint) since `_delete_synthetic_email_thread` below always
+    # removes it again after this example is scored, so a fresh insert
+    # per example is the common case, not a genuine conflict.
+    domain_id = uuid4()
+    session.execute(
+        text(
+            """
+            INSERT INTO personal_domains (
+                id, workspace_id, owner_id, domain_key, classification,
+                enabled, enabled_at, created_by, updated_by, created_at, updated_at, version
+            ) VALUES (
+                :id, :workspace_id, :owner_id, 'email', 'high_stakes',
+                true, :now, :actor_id, :actor_id, :now, :now, 1
+            )
+            ON CONFLICT (workspace_id, owner_id, domain_key) DO NOTHING
+            """
+        ),
+        {
+            "id": domain_id,
+            "workspace_id": auth.workspace_id,
+            "owner_id": auth.user_id,
+            "actor_id": auth.user_id,
+            "now": now,
+        },
+    )
+
     connector_account_id = uuid4()
     session.execute(
         text(
@@ -1327,6 +1356,13 @@ def _delete_synthetic_email_thread(
     session.execute(
         text("DELETE FROM email_threads WHERE workspace_id = :workspace_id AND id = :id"),
         {"workspace_id": auth.workspace_id, "id": thread_id},
+    )
+    session.execute(
+        text(
+            "DELETE FROM personal_domains WHERE workspace_id = :workspace_id "
+            "AND owner_id = :owner_id AND domain_key = 'email'"
+        ),
+        {"workspace_id": auth.workspace_id, "owner_id": auth.user_id},
     )
     session.execute(
         text("DELETE FROM connector_accounts WHERE workspace_id = :workspace_id AND id = :id"),
