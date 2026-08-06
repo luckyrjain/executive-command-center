@@ -577,7 +577,7 @@ def _fetch_deadline_constraints(
 def _fetch_candidates(
     session: Session, auth: AuthContext, now: datetime
 ) -> list[CandidateItemInput]:
-    """Same visibility filter as ``attention.py:list_attention`` (non-expired,
+    """Same eligibility filter as ``attention.py:list_attention`` (non-expired,
     non-dismissed, non-deferred) -- since ``expires_at`` is set at generation
     time, this is also how Step 1's "source freshness" is honored: a
     candidate whose attention score hasn't been regenerated recently simply
@@ -585,6 +585,17 @@ def _fetch_candidates(
     needed. Only entity_types that represent schedulable, doable work are
     candidates; risk/risk_review/meeting are attention-queue items but not
     something you block time to "do".
+
+    Also applies the same ``authz.visible_resource_filter_sql`` visibility
+    check ``list_attention`` applies -- found missing here during Phase 10
+    Task 3's own review (the class of bug that review found live in
+    ``dashboard_briefs.py``'s sibling `attention_items` read): without it, a
+    `visibility='private'` task/commitment/waiting_link owned by a *different*
+    workspace member surfaced as a schedulable candidate (and, if placed, a
+    visible block with that item's own label) in every other active member's
+    own daily plan, not just the owner's -- this table's own docstring above
+    already claimed "same visibility filter as `list_attention`" without
+    that actually being true.
 
     Deliberately unbounded (no LIMIT): unlike a "top N most relevant" read
     such as meeting_prep.py's bounded fetches, propose_plan (Step 5/6 below)
@@ -603,9 +614,12 @@ def _fetch_candidates(
     workspaces are observed to have a candidate count large enough to make
     this fetch itself the bottleneck.
     """
+    visibility_sql, visibility_params = authz.visible_resource_filter_sql(
+        session, auth, resource_type="attention_items", action="read", table_alias="ai"
+    )
     rows = session.execute(
         text(
-            """
+            f"""
             SELECT ai.entity_type, ai.entity_id, ai.score, ai.pinned,
                    COALESCE(t.title, c.summary, 'Waiting: ' || wl.direction) AS label,
                    COALESCE(
@@ -626,10 +640,11 @@ def _fetch_candidates(
               AND (ai.dismissed_at IS NULL
                    OR ai.dismissed_entity_version <> ai.source_entity_version)
               AND (ai.deferred_until IS NULL OR ai.deferred_until <= :now)
+              AND ({visibility_sql})
             ORDER BY ai.score DESC, ai.entity_id ASC
             """
         ),
-        {"workspace_id": auth.workspace_id, "now": now, "tz": auth.timezone},
+        {"workspace_id": auth.workspace_id, "now": now, "tz": auth.timezone, **visibility_params},
     ).all()
     return [
         CandidateItemInput(

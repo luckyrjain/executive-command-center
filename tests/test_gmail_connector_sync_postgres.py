@@ -329,6 +329,26 @@ Covers, per this task's own scope:
     `test_incremental_sync_reports_next_cursor_zero_not_the_stale_start_when_history_id_is_zero`,
     each mutation-confirmed against the corresponding site reverted to a
     bare truthiness check.
+30. `_upsert_thread`'s `ON CONFLICT DO UPDATE` bumped `email_threads.
+    updated_at` unconditionally, even on the exact no-op resync item 5's
+    own `test_backfill_rerun_over_an_overlapping_window_does_not_
+    duplicate_rows` already exercises -- that test only ever asserted row
+    *counts*, never `updated_at` itself, so it passed both before and
+    after this bug existed and never caught it. `attention.py`'s Phase 10
+    Task 3 code (a separate task, reviewed under its own "Loop 2" round
+    numbering, not this file's rounds 1-29 above) derives `attention_
+    items.source_entity_version` for `email_thread` rows directly from
+    this column (`email_threads` has no real optimistic-concurrency
+    `version` column of its own), so the unconditional bump silently
+    un-dismissed a dismissed `email_thread` attention item on the next
+    `regenerate_attention` call after an ordinary backfill re-run or
+    incremental/backfill overlap touched the thread with zero new
+    content -- found by that task's own Loop 2 round 6 review, fixed
+    here since the bug lives in this file's own `gmail_adapter.py`, not
+    `attention.py`. Closed with `test_backfill_rerun_over_an_overlapping_
+    window_does_not_bump_thread_updated_at`, asserting `updated_at` is
+    byte-for-byte unchanged across an identical re-sync of the same
+    single message.
 """
 
 from __future__ import annotations
@@ -1266,6 +1286,68 @@ def test_backfill_rerun_over_an_overlapping_window_does_not_duplicate_rows(
             {"workspace_id": context.workspace_id},
         ).scalar_one()
     assert alias_count == 1
+
+
+def test_backfill_rerun_over_an_overlapping_window_does_not_bump_thread_updated_at(
+    seeded_gmail_account: tuple[ConnectorAccountContext, UUID],
+) -> None:
+    """This round's own review finding: `_upsert_thread`'s `ON CONFLICT DO
+    UPDATE` previously set `updated_at = :now` unconditionally, even on the
+    exact no-op re-sync this file's sibling test above (`..._does_not_
+    duplicate_rows`) already exercises -- that test only asserts row
+    *counts*, never `email_threads.updated_at` itself, so it passed both
+    before and after this fix and never caught the gap.
+
+    `updated_at` matters beyond bookkeeping: `attention.py`'s own
+    `email_thread_rows` derives `attention_items.source_entity_version`
+    directly from it (`email_threads` has no real optimistic-concurrency
+    `version` column of its own, per migration 0069). A `regenerate_
+    attention` call after a no-op `updated_at` bump saw a "changed"
+    version and un-dismissed any `email_thread` item the user had already
+    dismissed for that thread -- even though nothing about the thread's
+    real content moved. This test asserts the fix directly at the
+    `GmailAdapter.backfill` level: an identical re-sync of the same single
+    message must leave `email_threads.updated_at` unchanged.
+    """
+    context, _owner_id = seeded_gmail_account
+    now_ms = int(datetime.now(UTC).timestamp() * 1000)
+    body = _message_body(
+        message_id="msg-1",
+        thread_id="thread-1",
+        from_addr="alice@example.test",
+        to_addrs=["owner@example.test"],
+        internal_date_ms=now_ms,
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/gmail/v1/users/me/messages":
+            return _json_response({"messages": [{"id": "msg-1"}]})
+        if request.url.path == "/gmail/v1/users/me/messages/msg-1":
+            return _json_response(body)
+        raise AssertionError(f"unexpected request to {request.url}")
+
+    adapter = GmailAdapter(transport=httpx.MockTransport(handler))
+    since = datetime.now(UTC) - timedelta(days=1)
+    first = adapter.backfill(context, "message", since=since)
+    assert first.status == "succeeded"
+
+    def _thread_updated_at() -> datetime:
+        with engine.begin() as connection:
+            return connection.execute(
+                text(
+                    "SELECT updated_at FROM email_threads "
+                    "WHERE workspace_id = :workspace_id AND external_thread_id = 'thread-1'"
+                ),
+                {"workspace_id": context.workspace_id},
+            ).scalar_one()
+
+    updated_at_after_first = _thread_updated_at()
+
+    second = adapter.backfill(context, "message", since=since)
+    assert second.status == "succeeded"
+    assert second.items_processed == 1
+
+    assert _thread_updated_at() == updated_at_after_first
 
 
 # --- incremental_sync ----------------------------------------------------------

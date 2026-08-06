@@ -548,6 +548,76 @@ def test_stale_attention_items_excluded_from_plan_candidates(
     assert created.json()["blocks"] == []
 
 
+def test_another_members_private_attention_item_excluded_from_plan_candidates(
+    planning_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    """Round 5 review finding (Phase 10 Task 3's own review loop, PR #120):
+    `_fetch_candidates`'s own docstring claimed "same visibility filter as
+    `attention.py:list_attention`" but never actually applied `authz.
+    visible_resource_filter_sql` -- a `visibility='private'` `attention_
+    items` row owned by a *different* workspace member surfaced as a
+    schedulable candidate (and, if placed, a visible plan block carrying
+    that item's own label) in every other active member's own `POST
+    /api/v1/plans` call, not just the owner's. This is the same class of
+    bug round 4's own review found and fixed in `dashboard_briefs.py`'s
+    sibling `attention_items` read -- pre-existing here, not introduced by
+    Task 3 (this candidate query excludes `email_thread` entirely), but
+    found via this same review loop's own systematic sweep of every other
+    direct `attention_items` reader in the backend.
+    """
+    client, workspace_id, user_id, token = planning_test_context
+    _set_full_week_capacity(client, token)
+
+    other_owner_id = uuid4()
+    now = datetime.now(UTC)
+    with engine.begin() as connection:
+        create_identity(
+            connection,
+            workspace_id=workspace_id,
+            user_id=other_owner_id,
+            email=f"{other_owner_id}@example.test",
+            now=now,
+        )
+    other_task_id = _seed_task(workspace_id, other_owner_id, "Someone else's private task")
+    with engine.begin() as connection:
+        connection.execute(
+            text("UPDATE tasks SET visibility = 'private' WHERE id = :id"),
+            {"id": other_task_id},
+        )
+        connection.execute(
+            text(
+                """
+                INSERT INTO attention_items (
+                    id, workspace_id, entity_type, entity_id, source_entity_version,
+                    score, confidence, factors, explanation, generated_at, expires_at,
+                    pinned, policy_version, owner_id, visibility
+                ) VALUES (
+                    :id, :workspace_id, 'task', :entity_id, 1,
+                    90, 1.0, '[]'::jsonb, 'private task owned by someone else',
+                    :now, :expires_at, false, 1, :owner_id, 'private'
+                )
+                """
+            ),
+            {
+                "id": uuid4(),
+                "workspace_id": workspace_id,
+                "entity_id": other_task_id,
+                "now": now,
+                "expires_at": now + timedelta(minutes=30),
+                "owner_id": other_owner_id,
+            },
+        )
+
+    period_start, period_end = _next_period()
+    created = client.post(
+        "/api/v1/plans",
+        headers=_headers(token, "create-plan-private-other-owner"),
+        json={"period_start": period_start.isoformat(), "period_end": period_end.isoformat()},
+    )
+    assert created.status_code == 201, created.text
+    assert created.json()["blocks"] == []
+
+
 def test_list_plans_signed_cursor_pagination_and_tamper_rejection(
     planning_test_context: tuple[TestClient, UUID, UUID, str],
 ) -> None:

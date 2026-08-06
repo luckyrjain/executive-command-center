@@ -62,6 +62,9 @@ describe('groupOf', () => {
     expect(groupOf(item({ entity_type: 'task' }))).toBe('needs_action')
     expect(groupOf(item({ entity_type: 'commitment' }))).toBe('needs_action')
   })
+  it('groups email_thread items as needs action (awaiting your own reply)', () => {
+    expect(groupOf(item({ entity_type: 'email_thread' }))).toBe('needs_action')
+  })
 })
 
 describe('AttentionQueue', () => {

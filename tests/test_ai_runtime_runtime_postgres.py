@@ -198,7 +198,21 @@ def run_context() -> Iterator[dict]:
         )
 
 
-def _insert_attention_item(workspace_id: UUID, *, factors: list[dict]) -> UUID:
+def _insert_attention_item(
+    workspace_id: UUID, *, factors: list[dict], entity_type: str = "task"
+) -> UUID:
+    """``entity_type`` defaults to ``'task'`` (every pre-existing call site
+    relies on this default unchanged) -- widened for Phase 10 Task 3's own
+    ``email_thread`` coverage below, following the same "no scorer needs to
+    exist for `explain_item` coverage to be meaningful" precedent
+    `tests/fixtures/phase4_evaluation_attention_explain.py`'s own
+    ``risk_review``/``meeting`` synthetic rows already established:
+    `attention.get_item`/`attention.explain_item`'s own code path never
+    branches on `entity_type` at all (see `attention/tools.py:get_item_tool`),
+    so a syntactically valid `attention_items` row is sufficient regardless
+    of whether `regenerate_attention` has ever actually produced one with
+    this `entity_type`.
+    """
     item_id = uuid4()
     now = datetime.now(UTC)
     with engine.begin() as connection:
@@ -210,7 +224,7 @@ def _insert_attention_item(workspace_id: UUID, *, factors: list[dict]) -> UUID:
                     score, confidence, factors, explanation, generated_at, expires_at,
                     pinned, policy_version
                 ) VALUES (
-                    :id, :workspace_id, 'task', :entity_id, 1, 62, 0.900,
+                    :id, :workspace_id, :entity_type, :entity_id, 1, 62, 0.900,
                     CAST(:factors AS jsonb), 'because reasons', :now, :expires_at, false, 1
                 )
                 """
@@ -218,6 +232,7 @@ def _insert_attention_item(workspace_id: UUID, *, factors: list[dict]) -> UUID:
             {
                 "id": item_id,
                 "workspace_id": workspace_id,
+                "entity_type": entity_type,
                 "entity_id": uuid4(),
                 "factors": dumps(factors),
                 "now": now,
@@ -510,6 +525,56 @@ def test_execute_run_end_to_end_happy_path_persists_completed_run(run_context: d
     assert [s["kind"] for s in steps] == ["tool_call", "model_call"]
     assert steps[0]["status"] == "succeeded"
     assert steps[1]["status"] == "succeeded"
+
+
+def test_execute_run_explain_item_handles_an_email_thread_sourced_item(
+    run_context: dict,
+) -> None:
+    """Phase 10 Task 3: `attention.explain_item` extended to handle a
+    Gmail-sourced item's `entity_type` (`'email_thread'`, widened onto
+    `attention.py`'s own `EntityType` Literal). Per `attention/tools.py:
+    get_item_tool`'s own docstring and this file's own `_insert_attention_
+    item` comment above, neither that tool handler nor the prompt template
+    (`"Item type: {{ entity_type }}"`, a plain string substitution) branches
+    on `entity_type` at all -- so this end-to-end run, using `_score_
+    awaiting_reply`'s own real factor-code vocabulary (`awaiting_reply`,
+    `stale_7d`) rather than `_DEFAULT_FACTORS`' task-shaped codes, is
+    expected to succeed identically to the `'task'`-typed happy path above.
+    """
+    factors = [
+        {
+            "code": "awaiting_reply",
+            "label": "Awaiting your reply",
+            "points": 12,
+            "source_field": "last_inbound_sender",
+        },
+        {
+            "code": "stale_7d",
+            "label": "Awaiting reply for 7+ days",
+            "points": 4,
+            "source_field": "last_inbound_sent_at",
+        },
+    ]
+    item_id = _insert_attention_item(
+        run_context["workspace_id"], factors=factors, entity_type="email_thread"
+    )
+    adapter = _adapter_with_responses(_valid_output(["awaiting_reply", "stale_7d"]))
+
+    with SessionFactory() as session:
+        run = execute_run(
+            "attention.explain_item",
+            "sensitive",
+            {"attention_item_id": str(item_id)},
+            session=session,
+            auth=run_context["auth"],
+            ollama_adapter=adapter,
+        )
+
+    assert run.status == "completed"
+    assert run.error_code is None
+    assert set(run.evidence) == {"awaiting_reply", "stale_7d"}
+    assert run.output is not None
+    assert run.output["cited_factor_codes"] == ["awaiting_reply", "stale_7d"]
 
 
 # ---------------------------------------------------------------------------

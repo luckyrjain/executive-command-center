@@ -342,7 +342,19 @@ def _email_consent_active(session: Session, workspace_id: UUID, owner_id: UUID) 
     return row is not None
 
 
-def _normalize_email(value: str) -> str:
+# Not underscore-prefixed: `ecc.domains.attention.attention` (a different
+# domain package) imports this directly to reproduce the exact same
+# `entity_aliases.normalized_value` normalization when matching a thread's
+# last-inbound sender against a resolved contact (see that module's own
+# `_score_awaiting_reply`/`regenerate_attention` comments for why the match
+# has to happen in Python rather than SQL). Every other private-helper
+# import elsewhere in this codebase (`identity/invitations.py` <-
+# `identity/accounts.py`, `engineering/write_actions.py` <-
+# `engineering/{gitlab,jira}_adapter.py`) is between sibling modules in the
+# *same* domain package and keeps the leading underscore; this is the one
+# cross-domain case, so it gets a real public name instead of reaching past
+# another domain's underscore.
+def normalize_email(value: str) -> str:
     return value.strip().casefold()
 
 
@@ -786,7 +798,7 @@ def _resolve_or_create_person(
     the first time) only ever risks re-running *this* function, never
     rolling back an unrelated message write alongside it.
     """
-    normalized = _normalize_email(email)
+    normalized = normalize_email(email)
     with SessionFactory() as session, session.begin():
         existing = session.execute(
             text(
@@ -902,6 +914,35 @@ def _upsert_thread(
     last_message_at: datetime,
     now: datetime,
 ) -> UUID:
+    # `updated_at = CASE ... END`, not an unconditional `:now` (found this
+    # round of review): `_process_message` calls this function once per
+    # message *returned by Gmail*, including a message this thread has
+    # already stored -- `_insert_message_if_new`'s own docstring names
+    # exactly this as an expected, not exceptional, case ("a re-synced
+    # message (backfill re-run, incremental/backfill overlap) is a silent
+    # no-op"). An unconditional `updated_at = :now` on every ON CONFLICT
+    # branch bumped this row's `updated_at` on that no-op resync too, with
+    # no change to `last_message_at`/`subject`/any other observable
+    # column. `attention.py`'s own `email_thread_rows` comment stakes the
+    # dismissed-state-preservation invariant on `updated_at` changing "on
+    # every write that touches this thread, including a new message
+    # arriving" -- true, but it also changed on a write that touched the
+    # thread *without* a new message arriving, which silently broke that
+    # exact invariant: dismissing an `email_thread` attention item,
+    # followed by an ordinary backfill re-run or incremental/backfill
+    # overlap touching the same thread with zero new content, un-dismissed
+    # it on the next `regenerate_attention` call. Reproduced directly
+    # against real Postgres before this fix (dismiss, then an `email_
+    # threads` write identical to the one `_upsert_thread`'s own ON
+    # CONFLICT branch performs for a duplicate message, then regenerate --
+    # the dismissed item reappeared); confirmed absent after. Only bump
+    # `updated_at` when this call's own inputs actually move the row's
+    # observable state forward -- `last_message_at` advances (a genuinely
+    # newer message, matching the `GREATEST` above) or `subject` is being
+    # filled in for the first time (matching the `COALESCE` above) -- so a
+    # true no-op resync leaves both `updated_at` and the derived
+    # `attention_items` version untouched, exactly like every other scored
+    # entity_type's real `version` column already behaves.
     row = session.execute(
         text(
             """
@@ -915,7 +956,12 @@ def _upsert_thread(
             ON CONFLICT (workspace_id, connector_account_id, external_thread_id) DO UPDATE SET
                 last_message_at = GREATEST(email_threads.last_message_at, EXCLUDED.last_message_at),
                 subject = COALESCE(email_threads.subject, EXCLUDED.subject),
-                updated_at = :now
+                updated_at = CASE
+                    WHEN EXCLUDED.last_message_at > email_threads.last_message_at
+                      OR (email_threads.subject IS NULL AND EXCLUDED.subject IS NOT NULL)
+                    THEN :now
+                    ELSE email_threads.updated_at
+                END
             RETURNING id
             """
         ),

@@ -483,3 +483,99 @@ def test_concurrent_lazy_brief_generation_creates_exactly_one_brief(
 
     assert brief_count == 1
     assert outbox_count == 1
+
+
+def test_top_priorities_excludes_another_members_private_attention_item(
+    dashboard_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    """Round 4 (architecture/quality) review finding, Phase 10 Task 3:
+    `_build_sections`'s `top_priorities` query is the one section in this
+    function that never applied `attention_items`' own visibility filter --
+    every other section (`today_schedule`/`overdue_commitments`/
+    `waiting_on`/`risks`) embeds `authz.visible_resource_filter_sql`, but
+    this query only ever scoped by `workspace_id`. Most Phase 1-3 entity
+    types default `visibility` to `'workspace'` (migration `0063`), which
+    kept this latent, but Task 3's `email_thread` rows are unconditionally
+    `'private'` (`attention.py`'s own `email_thread_rows`), the first
+    entity_type where this gap is a guaranteed, not merely possible,
+    cross-member leak of another executive's derived data. Reproduced
+    directly against real Postgres before the fix (the seeded
+    `visibility='private'` item, owned by `owner_id`, appeared in
+    `member_id`'s own `GET /api/v1/dashboard/today` response); this test
+    asserts it does not.
+    """
+    client, workspace_id, owner_id, token = dashboard_context
+    member_id = uuid4()
+    member_token = f"session-{uuid4()}"
+    now = datetime.now(UTC)
+    item_id = uuid4()
+
+    with engine.begin() as connection:
+        create_identity(
+            connection,
+            workspace_id=workspace_id,
+            user_id=member_id,
+            email=f"{member_id}@example.test",
+            now=now,
+            role="admin",
+        )
+        connection.execute(
+            text(
+                """
+                INSERT INTO sessions (
+                    id, workspace_id, user_id, token_hash, expires_at, last_seen_at
+                ) VALUES (
+                    :id, :workspace_id, :user_id, :token_hash, :expires_at, :last_seen_at
+                )
+                """
+            ),
+            {
+                "id": uuid4(),
+                "workspace_id": workspace_id,
+                "user_id": member_id,
+                "token_hash": sha256(member_token.encode()).hexdigest(),
+                "expires_at": now + timedelta(hours=2),
+                "last_seen_at": now,
+            },
+        )
+        connection.execute(
+            text(
+                """
+                INSERT INTO attention_items (
+                    id, workspace_id, entity_type, entity_id, source_entity_version,
+                    score, confidence, factors, explanation, generated_at, expires_at,
+                    pinned, policy_version, owner_id, visibility
+                ) VALUES (
+                    :id, :workspace_id, 'task', :entity_id, 1, 90, 1.0,
+                    '[]'::jsonb, 'Private item owned by someone else', :now, :expires_at,
+                    false, 1, :owner_id, 'private'
+                )
+                """
+            ),
+            {
+                "id": item_id,
+                "workspace_id": workspace_id,
+                "entity_id": uuid4(),
+                "now": now,
+                "expires_at": now + timedelta(minutes=30),
+                "owner_id": owner_id,
+            },
+        )
+
+    member_client = TestClient(app)
+    member_client.cookies.set("ecc_session", member_token)
+    try:
+        resp = member_client.get("/api/v1/dashboard/today")
+        assert resp.status_code == 200, resp.text
+        priorities = resp.json()["sections"].get("top_priorities", [])
+        assert all(p.get("why") != "Private item owned by someone else" for p in priorities)
+    finally:
+        member_client.close()
+
+    # The owner themselves must still see their own private item -- this
+    # is a visibility fix, not a regression that silently drops the row
+    # for everyone.
+    owner_resp = client.get("/api/v1/dashboard/today")
+    assert owner_resp.status_code == 200, owner_resp.text
+    owner_priorities = owner_resp.json()["sections"].get("top_priorities", [])
+    assert any(p.get("why") == "Private item owned by someone else" for p in owner_priorities)

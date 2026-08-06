@@ -40,7 +40,14 @@ export type AttentionFactor = { code: string; label: string; points: number; sou
 
 export type AttentionItem = {
   id: string
-  entity_type: 'task' | 'commitment' | 'risk' | 'waiting_link' | 'risk_review' | 'meeting'
+  entity_type:
+    | 'task'
+    | 'commitment'
+    | 'risk'
+    | 'waiting_link'
+    | 'risk_review'
+    | 'meeting'
+    | 'email_thread'
   entity_id: string
   source_entity_version: number
   score: number
@@ -79,6 +86,12 @@ export function groupOf(item: AttentionItem): Group {
   if (item.entity_type === 'waiting_link') return 'waiting_on_others'
   if (item.entity_type === 'risk' || item.entity_type === 'risk_review') return 'risks'
   if (item.entity_type === 'meeting') return 'upcoming_meetings'
+  // 'task' | 'commitment' | 'email_thread' all fall through to here.
+  // email_thread (Phase 10 Task 3) is deliberately not its own branch: the
+  // backend only ever surfaces one whose last message is inbound and
+  // unanswered by its owner -- the reply is the owner's own next action,
+  // the same "it's on you" shape task/commitment already have, not
+  // something someone else is blocking on (that would be waiting_on_others).
   return 'needs_action'
 }
 

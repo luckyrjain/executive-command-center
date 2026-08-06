@@ -74,6 +74,18 @@ class AttentionPolicy:
     meeting_weight_cap: int = field(default=15)
     importance_weight_cap: int = field(default=20)
 
+    # New in Phase 10 Task 3: the base points for the "awaiting reply"
+    # email-thread heuristic (`ecc.domains.attention.attention._score_
+    # awaiting_reply`) -- every row reaching that scorer is, by
+    # construction, awaiting a reply (eligibility is enforced entirely by
+    # `regenerate_attention`'s own query, not by this scorer), so this is
+    # a flat base contribution rather than a graded weight like `task_
+    # priority_points`/`commitment_importance_points`. Staleness on top of
+    # it reuses the existing generic `stale_7d_points`/`stale_14d_points`
+    # fields `_score_waiting` already shares, rather than adding a second
+    # set of duplicate thresholds.
+    awaiting_reply_points: int = field(default=12)
+
 
 def _frozen_points(points: dict[str, int]) -> Mapping[str, int]:
     """Wrap a points table in a read-only view -- see ``AttentionPolicy``'s

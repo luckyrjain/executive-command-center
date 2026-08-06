@@ -179,22 +179,45 @@ def _build_sections(
             }
         )
 
+    # Round 4 (architecture/quality) review finding: this was the one
+    # section in this function that never applied `attention_items`' own
+    # visibility filter -- every other section here (`meetings`/
+    # `commitments`/`waiting`/`risks`) embeds `authz.visible_resource_
+    # filter_sql`/`_namespaced_visibility_filter`, but this query only ever
+    # scoped by `workspace_id`, so a `visibility='private'` row owned by
+    # any *other* member (matching `attention.py`'s own `list_attention`
+    # endpoint's identical filter, which this brief's own "top priorities"
+    # section is meant to mirror) was returned to every active member, not
+    # just its owner. Most Phase 1-3 entity types default `visibility` to
+    # `'workspace'` (migration `0063`), which is why this stayed latent,
+    # but Phase 10 Task 3's `email_thread` rows are *unconditionally*
+    # `'private'` (`attention.py`'s own `email_thread_rows` comment) -- the
+    # first entity_type where every single row hits this gap, turning a
+    # dormant bug into a guaranteed cross-member leak of another
+    # executive's Gmail "awaiting reply" summaries. Reproduced directly
+    # against real Postgres before this fix (a `visibility='private'` item
+    # owned by user A appeared in user B's own `GET /api/v1/dashboard/
+    # today` response); confirmed absent after.
+    attention_visibility_sql, attention_visibility_params = authz.visible_resource_filter_sql(
+        session, auth, resource_type="attention_items", action="read", table_alias="ai"
+    )
     attention_rows = (
         session.execute(
             text(
-                """
-                SELECT entity_type, entity_id, source_entity_version, score,
-                       confidence, factors, explanation, pinned
-                FROM attention_items
-                WHERE workspace_id = :workspace_id
-                  AND expires_at > :now
-                  AND dismissed_at IS NULL
-                  AND (deferred_until IS NULL OR deferred_until <= :now)
-                ORDER BY pinned DESC, score DESC, entity_type ASC, entity_id ASC
+                f"""
+                SELECT ai.entity_type, ai.entity_id, ai.source_entity_version, ai.score,
+                       ai.confidence, ai.factors, ai.explanation, ai.pinned
+                FROM attention_items ai
+                WHERE ai.workspace_id = :workspace_id
+                  AND ai.expires_at > :now
+                  AND ai.dismissed_at IS NULL
+                  AND (ai.deferred_until IS NULL OR ai.deferred_until <= :now)
+                  AND ({attention_visibility_sql})
+                ORDER BY ai.pinned DESC, ai.score DESC, ai.entity_type ASC, ai.entity_id ASC
                 LIMIT 20
                 """
             ),
-            {"workspace_id": workspace_id, "now": now},
+            {"workspace_id": workspace_id, "now": now, **attention_visibility_params},
         )
         .mappings()
         .all()
