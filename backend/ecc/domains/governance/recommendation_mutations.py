@@ -66,29 +66,39 @@ def generate_recommendation(
 ) -> RecommendationResponse:
     authz.require_role_action(session, auth, "write")
     validate_action(payload.target_type, payload.proposed_action)
+    is_create = payload.proposed_action.get("operation") == "create"
     digest = request_hash(payload, "generate")
     cached = _start(session, auth, idempotency_key, digest)
     if cached is not None:
         return cached
-    session.execute(
-        text("SELECT pg_advisory_xact_lock(hashtextextended(:key, 0))"),
-        {
-            "key": (
-                f"recommendation-target:{auth.workspace_id}:"
-                f"{payload.target_type}:{payload.target_id}"
-            )
-        },
-    )
-    current_version = target_version(
-        session,
-        auth.workspace_id,
-        payload.target_type,
-        payload.target_id,
-    )
-    if current_version is None:
-        raise HTTPException(status_code=404, detail="TARGET_NOT_FOUND")
-    if current_version != payload.expected_version:
-        raise HTTPException(status_code=409, detail="TARGET_VERSION_CONFLICT")
+    if not is_create:
+        # `operation="create"` proposes a brand-new row -- there is no
+        # existing target to serialize concurrent generation against or
+        # to check a version for (`target_id`/`expected_version` are both
+        # `None`, enforced by `RecommendationCreate`'s own model
+        # validator), so this whole block is skipped for it. The
+        # validator also guarantees both are set here; the local `target_id`
+        # narrows the type for mypy without weakening that guarantee.
+        target_id = payload.target_id
+        assert target_id is not None
+        session.execute(
+            text("SELECT pg_advisory_xact_lock(hashtextextended(:key, 0))"),
+            {
+                "key": (
+                    f"recommendation-target:{auth.workspace_id}:{payload.target_type}:{target_id}"
+                )
+            },
+        )
+        current_version = target_version(
+            session,
+            auth.workspace_id,
+            payload.target_type,
+            target_id,
+        )
+        if current_version is None:
+            raise HTTPException(status_code=404, detail="TARGET_NOT_FOUND")
+        if current_version != payload.expected_version:
+            raise HTTPException(status_code=409, detail="TARGET_VERSION_CONFLICT")
     now = datetime.now(UTC)
     superseded = (
         session.execute(
@@ -133,14 +143,15 @@ def generate_recommendation(
                 f"""
             INSERT INTO recommendations (
                 id, workspace_id, recommendation_type, target_type, target_id,
-                proposed_action, expected_version, rationale, confidence, status,
-                evidence_ids, expires_at, source, pinned, created_by, updated_by,
-                created_at, updated_at, version
+                proposed_action, proposed_fields, expected_version, rationale,
+                confidence, status, evidence_ids, expires_at, source, pinned,
+                created_by, updated_by, created_at, updated_at, version
             ) VALUES (
                 :id, :workspace_id, :recommendation_type, :target_type, :target_id,
-                CAST(:proposed_action AS jsonb), :expected_version, :rationale,
-                :confidence, 'proposed', :evidence_ids, :expires_at, :source,
-                false, :actor_id, :actor_id, :created_at, :created_at, 1
+                CAST(:proposed_action AS jsonb), CAST(:proposed_fields AS jsonb),
+                :expected_version, :rationale, :confidence, 'proposed',
+                :evidence_ids, :expires_at, :source, false, :actor_id, :actor_id,
+                :created_at, :created_at, 1
             ) RETURNING {FIELDS}
             """
             ),
@@ -151,6 +162,9 @@ def generate_recommendation(
                 "target_type": payload.target_type,
                 "target_id": payload.target_id,
                 "proposed_action": dumps(payload.proposed_action),
+                "proposed_fields": (
+                    dumps(payload.proposed_fields) if payload.proposed_fields is not None else None
+                ),
                 "expected_version": payload.expected_version,
                 "rationale": payload.rationale,
                 "confidence": payload.confidence,
@@ -417,8 +431,19 @@ def confirm_recommendation(
         request=request,
     )
     check_version(row, payload.expected_version)
-    if payload.target_expected_version != int(row["expected_version"]):
-        raise HTTPException(status_code=409, detail="TARGET_VERSION_CONFLICT")
+    is_create = row["proposed_action"].get("operation") == "create"
+    if is_create:
+        # No existing target to have a version of -- `RecommendationCreate`'s
+        # own model validator already guarantees `row["expected_version"]`
+        # is `None` for this row, so there is nothing for the caller to
+        # echo back.
+        if payload.target_expected_version is not None:
+            raise HTTPException(status_code=422, detail="TARGET_EXPECTED_VERSION_NOT_ALLOWED")
+    else:
+        if payload.target_expected_version is None:
+            raise HTTPException(status_code=422, detail="TARGET_EXPECTED_VERSION_REQUIRED")
+        if payload.target_expected_version != int(row["expected_version"]):
+            raise HTTPException(status_code=409, detail="TARGET_VERSION_CONFLICT")
     if row["status"] != "pending_confirmation":
         raise HTTPException(status_code=409, detail="INVALID_RECOMMENDATION_STATE")
     if row["deferred_until"] is not None and row["deferred_until"] > datetime.now(UTC):
@@ -459,10 +484,13 @@ def confirm_recommendation(
     execution_result = execute_target(
         session,
         auth,
+        request,
+        recommendation_id,
         row["target_type"],
         row["target_id"],
         row["proposed_action"],
-        int(row["expected_version"]),
+        int(row["expected_version"]) if row["expected_version"] is not None else None,
+        row["proposed_fields"],
     )
     executed_at = datetime.now(UTC)
     executed = (

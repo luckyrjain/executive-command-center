@@ -421,6 +421,95 @@ def _check_version(row: dict[str, Any], expected_version: int) -> None:
         raise HTTPException(status_code=409, detail="VERSION_CONFLICT")
 
 
+def insert_commitment(
+    session: Session,
+    auth: AuthContext,
+    payload: CommitmentCreate,
+    *,
+    request_id: UUID,
+    correlation_id: UUID,
+    idempotency_key: str,
+    now: datetime,
+) -> CommitmentResponse:
+    """The actual row-write + audit/outbox emission behind `POST /api/v1/commitments`,
+    split out so `ecc.domains.governance.recommendation_targets.execute_target`'s
+    `operation="create"` branch can call the identical path a manual creation
+    uses -- no second insert path -- rather than duplicating this INSERT.
+    Deliberately excludes `session.begin()`/idempotency-key locking/replay
+    (both callers already run inside their own already-open transaction and
+    idempotency scheme; nesting a second `session.begin()` here would raise).
+    """
+    commitment_id = uuid4()
+    initial_status = payload.status
+    _validate_references(session, auth, payload.counterparty_person_id, payload.evidence_id)
+    row = (
+        session.execute(
+            text(
+                f"""
+                INSERT INTO commitments (
+                    id, workspace_id, owner_id, summary, description,
+                    direction, counterparty_person_id, counterparty_name,
+                    status, due_date, due_at, importance, evidence_id,
+                    confidence, pinned, created_by, updated_by,
+                    created_at, updated_at, version
+                ) VALUES (
+                    :id, :workspace_id, :owner_id, :summary, :description,
+                    :direction, :counterparty_person_id, :counterparty_name,
+                    :status, :due_date, :due_at, :importance, :evidence_id,
+                    :confidence, :pinned, :actor_id, :actor_id,
+                    :now, :now, 1
+                ) RETURNING {_SELECT_FIELDS}
+                """
+            ),
+            {
+                "id": commitment_id,
+                "workspace_id": auth.workspace_id,
+                "owner_id": auth.user_id,
+                "actor_id": auth.user_id,
+                "now": now,
+                **payload.model_dump(),
+            },
+        )
+        .mappings()
+        .one()
+    )
+    response = _to_response(dict(row))
+    after = response.model_dump(mode="json")
+    _write_audit(
+        session,
+        auth,
+        "commitment.created",
+        commitment_id,
+        1,
+        request_id,
+        correlation_id,
+        idempotency_key,
+        None,
+        after,
+        ["*"],
+        now,
+    )
+    event_type = (
+        "commitment.detected.v1" if initial_status == "detected" else "commitment.created.v1"
+    )
+    _write_outbox(
+        session,
+        auth,
+        event_type,
+        commitment_id,
+        1,
+        correlation_id,
+        {
+            "direction": payload.direction,
+            "importance": payload.importance,
+            "evidence_id": str(payload.evidence_id) if payload.evidence_id else None,
+            "confidence": payload.confidence,
+        },
+        now,
+    )
+    return response
+
+
 @router.post("", response_model=CommitmentResponse, status_code=status.HTTP_201_CREATED)
 def create_commitment(
     payload: CommitmentCreate,
@@ -434,79 +523,20 @@ def create_commitment(
     request_hash = _request_hash(payload, "create")
     request_id, correlation_id = _request_ids(request)
     now = datetime.now(UTC)
-    commitment_id = uuid4()
-    initial_status = payload.status
 
     with session.begin():
         _lock_idempotency(session, auth, idempotency_key)
         cached = _load_cached(session, auth, idempotency_key, request_hash)
         if cached is not None:
             return cached
-        _validate_references(session, auth, payload.counterparty_person_id, payload.evidence_id)
-        row = (
-            session.execute(
-                text(
-                    f"""
-                    INSERT INTO commitments (
-                        id, workspace_id, owner_id, summary, description,
-                        direction, counterparty_person_id, counterparty_name,
-                        status, due_date, due_at, importance, evidence_id,
-                        confidence, pinned, created_by, updated_by,
-                        created_at, updated_at, version
-                    ) VALUES (
-                        :id, :workspace_id, :owner_id, :summary, :description,
-                        :direction, :counterparty_person_id, :counterparty_name,
-                        :status, :due_date, :due_at, :importance, :evidence_id,
-                        :confidence, :pinned, :actor_id, :actor_id,
-                        :now, :now, 1
-                    ) RETURNING {_SELECT_FIELDS}
-                    """
-                ),
-                {
-                    "id": commitment_id,
-                    "workspace_id": auth.workspace_id,
-                    "owner_id": auth.user_id,
-                    "actor_id": auth.user_id,
-                    "now": now,
-                    **payload.model_dump(),
-                },
-            )
-            .mappings()
-            .one()
-        )
-        response = _to_response(dict(row))
-        after = response.model_dump(mode="json")
-        _write_audit(
+        response = insert_commitment(
             session,
             auth,
-            "commitment.created",
-            commitment_id,
-            1,
-            request_id,
-            correlation_id,
-            idempotency_key,
-            None,
-            after,
-            ["*"],
-            now,
-        )
-        event_type = (
-            "commitment.detected.v1" if initial_status == "detected" else "commitment.created.v1"
-        )
-        _write_outbox(
-            session,
-            auth,
-            event_type,
-            commitment_id,
-            1,
-            correlation_id,
-            {
-                "direction": payload.direction,
-                "importance": payload.importance,
-                "evidence_id": str(payload.evidence_id) if payload.evidence_id else None,
-                "confidence": payload.confidence,
-            },
-            now,
+            payload,
+            request_id=request_id,
+            correlation_id=correlation_id,
+            idempotency_key=idempotency_key,
+            now=now,
         )
         _store_cached(
             session,

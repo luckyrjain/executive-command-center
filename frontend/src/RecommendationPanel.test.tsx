@@ -9,6 +9,7 @@ import RecommendationPanel, {
   actionPayload,
   actionSummary,
   confidenceLabel,
+  isCreateRecommendation,
   recommendationErrorMessage,
   type Recommendation,
 } from './RecommendationPanel'
@@ -53,6 +54,21 @@ describe('recommendation action payloads', () => {
       defer_until: '2026-07-16T09:00:00.000Z',
     })
     vi.useRealTimers()
+  })
+
+  it('omits target_expected_version for a create-type recommendation, which has no target to have a version of', () => {
+    const createRecommendation: Recommendation = {
+      ...recommendation,
+      target_id: null,
+      expected_version: null,
+      proposed_action: { operation: 'create' },
+      proposed_fields: { title: 'Follow up with vendor' },
+    }
+    expect(isCreateRecommendation(createRecommendation)).toBe(true)
+    expect(actionPayload(createRecommendation, 'confirm')).toEqual({
+      expected_version: 3,
+      target_expected_version: null,
+    })
   })
 })
 
@@ -238,6 +254,42 @@ describe('recommendation preview (rendered)', () => {
     expect(invalidatedKeys).toContainEqual(['recommendations', 'review'])
     expect(invalidatedKeys).toContainEqual(['dashboard', 'today'])
     expect(invalidatedKeys).toContainEqual(['brief', 'morning'])
+  })
+
+  it('renders a create-type recommendation with its proposed fields and an enabled confirm button', async () => {
+    const createRecommendation = {
+      id: 'rec-create-1',
+      recommendation_type: 'task_detected',
+      target_type: 'task',
+      target_id: null,
+      proposed_action: { operation: 'create' },
+      proposed_fields: { title: 'Send the signed contract back' },
+      expected_version: null,
+      rationale: 'Detected from an email thread requiring action.',
+      confidence: 0.87,
+      status: 'pending_confirmation',
+      evidence_ids: [],
+      expires_at: null,
+      confirmed_by: null,
+      confirmed_at: null,
+      execution_result: null,
+      source: 'ai',
+      pinned: false,
+      deferred_until: null,
+      version: 1,
+    }
+    vi.stubGlobal('fetch', vi.fn(() => jsonResponse({ items: [createRecommendation], next_cursor: null })))
+    renderPanel()
+
+    await screen.findByText('task detected')
+    const fields = await screen.findByLabelText('Proposed new task')
+    expect(fields.textContent).toContain('Send the signed contract back')
+    // Unlike an update-type recommendation, a create-type one has no
+    // `expected_version` at all (nothing to have a version of) -- the
+    // confirm button must not be disabled just because it's null.
+    expect(
+      (screen.getByRole('button', { name: 'Confirm and execute' }) as HTMLButtonElement).disabled,
+    ).toBe(false)
   })
 
   it('invalidates the dashboard and morning brief caches for non-executing actions too', async () => {
