@@ -1,0 +1,177 @@
+"""Team suggestions review page (`docs/superpowers/specs/2026-08-06-team-
+suggestions-review-page-design.md`) -- `GET /api/v1/engineering/team-
+suggestions` aggregation, `POST .../confirm`, `POST .../dismiss`.
+"""
+
+from __future__ import annotations
+
+from datetime import UTC, datetime, timedelta
+from hashlib import sha256
+from hmac import new
+from uuid import UUID, uuid4
+
+import pytest
+from fastapi.testclient import TestClient
+from identity_fixtures import create_identity
+from sqlalchemy import text
+
+from ecc.config import get_settings
+from ecc.database import engine
+from ecc.main import app
+
+settings = get_settings()
+
+
+@pytest.fixture
+def suggestions_context():
+    workspace_id = uuid4()
+    user_id = uuid4()
+    token = f"session-{uuid4()}"
+    now = datetime.now(UTC)
+
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO workspaces (id, name, timezone, created_at) "
+                "VALUES (:id, 'Team Suggestions Test', 'UTC', :now)"
+            ),
+            {"id": workspace_id, "now": now},
+        )
+        create_identity(
+            connection, workspace_id=workspace_id, user_id=user_id,
+            email=f"{user_id}@example.test", now=now,
+        )
+        connection.execute(
+            text(
+                "INSERT INTO sessions (id, workspace_id, user_id, token_hash, "
+                "expires_at, last_seen_at) "
+                "VALUES (:id, :workspace_id, :user_id, :token_hash, :expires_at, :now)"
+            ),
+            {
+                "id": uuid4(), "workspace_id": workspace_id, "user_id": user_id,
+                "token_hash": sha256(token.encode()).hexdigest(),
+                "expires_at": now + timedelta(hours=1), "now": now,
+            },
+        )
+
+    client = TestClient(app)
+    client.cookies.set("ecc_session", token)
+    try:
+        yield client, workspace_id, user_id, token
+    finally:
+        client.close()
+        with engine.begin() as connection:
+            for table in (
+                "repositories", "engineering_work_items", "connector_accounts",
+                "event_outbox", "audit_events", "idempotency_records",
+                "pkos_nodes", "sessions", "users",
+            ):
+                connection.execute(
+                    text(f"DELETE FROM {table} WHERE workspace_id = :workspace_id"),  # noqa: S608
+                    {"workspace_id": workspace_id},
+                )
+            connection.execute(
+                text("DELETE FROM workspaces WHERE id = :workspace_id"),
+                {"workspace_id": workspace_id},
+            )
+
+
+def _headers(token: str, key: str | None = None) -> dict[str, str]:
+    csrf = new(settings.session_secret.encode(), token.encode(), "sha256").hexdigest()
+    headers = {"X-CSRF-Token": csrf, "X-Correlation-ID": str(uuid4())}
+    if key is not None:
+        headers["Idempotency-Key"] = key
+    return headers
+
+
+def _insert_connector_account(workspace_id: UUID, user_id: UUID, *, provider: str = "github") -> UUID:
+    account_id = uuid4()
+    now = datetime.now(UTC)
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO connector_accounts (id, workspace_id, provider, "
+                "external_account_id, display_name, granted_scopes, encrypted_credentials, "
+                "status, version, created_at, updated_at, created_by, updated_by, owner_id, visibility) "
+                "VALUES (:id, :workspace_id, :provider, 'ext-1', 'Acct', '{}', "
+                "'encrypted', 'active', 1, :now, :now, :user_id, :user_id, :user_id, 'workspace')"
+            ),
+            {"id": account_id, "workspace_id": workspace_id, "provider": provider, "now": now, "user_id": user_id},
+        )
+    return account_id
+
+
+def _insert_repository(
+    workspace_id: UUID, connector_account_id: UUID, owner_id: UUID, *,
+    name: str, suggested_team_name: str | None,
+    team_entity_id: UUID | None = None, dismissed: bool = False,
+) -> UUID:
+    repo_id = uuid4()
+    now = datetime.now(UTC)
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO repositories (id, workspace_id, connector_account_id, "
+                "provider, external_id, name, source_url, permission_state, "
+                "freshness_state, observed_at, created_at, updated_at, "
+                "suggested_team_name, team_entity_id, team_suggestion_dismissed_at, "
+                "owner_id, visibility) "
+                "VALUES (:id, :workspace_id, :connector_account_id, 'github', :ext_id, "
+                ":name, :source_url, 'active', 'fresh', :now, :now, :now, "
+                ":suggested_team_name, :team_entity_id, :dismissed_at, :owner_id, 'workspace')"
+            ),
+            {
+                "id": repo_id, "workspace_id": workspace_id,
+                "connector_account_id": connector_account_id,
+                "ext_id": str(repo_id), "name": name,
+                "source_url": f"https://github.com/{name}", "now": now,
+                "suggested_team_name": suggested_team_name, "team_entity_id": team_entity_id,
+                "dismissed_at": now if dismissed else None, "owner_id": owner_id,
+            },
+        )
+    return repo_id
+
+
+def _insert_pkos_team(workspace_id: UUID, *, name: str = "Platform") -> UUID:
+    team_id = uuid4()
+    now = datetime.now(UTC)
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO pkos_nodes (id, workspace_id, node_type, canonical_name, "
+                "status, confidence, version, created_at, updated_at) "
+                "VALUES (:id, :workspace_id, 'team', :name, 'active', 1.0, 1, :now, :now)"
+            ),
+            {"id": team_id, "workspace_id": workspace_id, "name": name, "now": now},
+        )
+    return team_id
+
+
+def test_team_suggestions_groups_by_suggested_name_across_resource_types(suggestions_context) -> None:
+    client, workspace_id, user_id, token = suggestions_context
+    account_id = _insert_connector_account(workspace_id, user_id)
+    _insert_repository(workspace_id, account_id, user_id, name="acme/a", suggested_team_name="Platform")
+    _insert_repository(workspace_id, account_id, user_id, name="acme/b", suggested_team_name="Platform")
+    _insert_repository(workspace_id, account_id, user_id, name="acme/c", suggested_team_name="Growth")
+
+    response = client.get("/api/v1/engineering/team-suggestions", headers=_headers(token))
+    assert response.status_code == 200
+    items = {item["suggested_team_name"]: item for item in response.json()["items"]}
+    assert items["Platform"]["repository_count"] == 2
+    assert items["Platform"]["work_item_count"] == 0
+    assert items["Growth"]["repository_count"] == 1
+    assert len(items["Platform"]["sample_items"]) == 2
+
+
+def test_team_suggestions_excludes_confirmed_dismissed_and_null_names(suggestions_context) -> None:
+    client, workspace_id, user_id, token = suggestions_context
+    account_id = _insert_connector_account(workspace_id, user_id)
+    team_id = _insert_pkos_team(workspace_id)
+    _insert_repository(workspace_id, account_id, user_id, name="acme/confirmed", suggested_team_name="Platform", team_entity_id=team_id)
+    _insert_repository(workspace_id, account_id, user_id, name="acme/dismissed", suggested_team_name="Growth", dismissed=True)
+    _insert_repository(workspace_id, account_id, user_id, name="acme/no-suggestion", suggested_team_name=None)
+    _insert_repository(workspace_id, account_id, user_id, name="acme/pending", suggested_team_name="Infra")
+
+    response = client.get("/api/v1/engineering/team-suggestions", headers=_headers(token))
+    names = {item["suggested_team_name"] for item in response.json()["items"]}
+    assert names == {"Infra"}

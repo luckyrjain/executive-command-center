@@ -543,6 +543,46 @@ class WorkItemListResponse(BaseModel):
     work_items: list[WorkItemResponse]
 
 
+# --- Team suggestions review (docs/superpowers/specs/2026-08-06-team-
+# suggestions-review-page-design.md) --------------------------------------
+
+
+class TeamSuggestionSampleItem(BaseModel):
+    id: UUID
+    resource_type: Literal["repository", "work_item"]
+    name: str
+
+
+class TeamSuggestionGroup(BaseModel):
+    suggested_team_name: str
+    repository_count: int
+    work_item_count: int
+    sample_items: list[TeamSuggestionSampleItem]
+
+
+class TeamSuggestionListResponse(BaseModel):
+    items: list[TeamSuggestionGroup]
+
+
+class TeamSuggestionConfirmRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    suggested_team_name: str = Field(min_length=1)
+    team_entity_id: UUID
+
+
+class TeamSuggestionDismissRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    suggested_team_name: str = Field(min_length=1)
+
+
+class TeamSuggestionActionResponse(BaseModel):
+    updated: list[UUID]
+    skipped_unauthorized: list[UUID]
+
+
+_TEAM_SUGGESTION_SAMPLE_CAP = 5
+
+
 # --- Datadog projections (monitors/service definitions/dashboards) -----
 # Migration `0051_phase6_datadog_connector.py`'s own three new tables --
 # deliberately no `team_assignment_version`/`team_assignment_updated_by`
@@ -1683,6 +1723,87 @@ def list_work_items_endpoint(
         .all()
     )
     return WorkItemListResponse(work_items=[WorkItemResponse(**dict(row)) for row in rows])
+
+
+@router.get("/team-suggestions", response_model=TeamSuggestionListResponse)
+def list_team_suggestions_endpoint(auth: AuthDep, session: SessionDep) -> TeamSuggestionListResponse:
+    """Grouped, read-only view of every unconfirmed, undismissed
+    `suggested_team_name` across `repositories` and `engineering_work_
+    items` -- see the design doc's "Backend endpoints" section. Runs two
+    separate visibility-filtered queries (one per table) rather than a
+    single `UNION ALL`, because `authz.visible_resource_filter_sql` binds
+    its own fixed parameter names (`__authz_resource_type` etc.) per call
+    -- merging two calls' params into one query text would make both
+    subqueries silently share whichever `resource_type` value won the
+    dict merge. Grouping by `suggested_team_name` happens in Python
+    instead, over what are already small, pre-filtered row sets.
+    """
+    visibility_sql_repo, visibility_params_repo = authz.visible_resource_filter_sql(
+        session, auth, resource_type="repositories", action="read", table_alias="repositories"
+    )
+    repo_rows = (
+        session.execute(
+            text(
+                "SELECT id, name, suggested_team_name FROM repositories "
+                f"WHERE workspace_id = :workspace_id AND ({visibility_sql_repo}) "  # noqa: S608
+                "AND team_entity_id IS NULL AND team_suggestion_dismissed_at IS NULL "
+                "AND suggested_team_name IS NOT NULL"
+            ),
+            {"workspace_id": auth.workspace_id, **visibility_params_repo},
+        )
+        .mappings()
+        .all()
+    )
+
+    visibility_sql_wi, visibility_params_wi = authz.visible_resource_filter_sql(
+        session, auth, resource_type="engineering_work_items", action="read",
+        table_alias="engineering_work_items",
+    )
+    work_item_rows = (
+        session.execute(
+            text(
+                "SELECT id, title AS name, suggested_team_name FROM engineering_work_items "
+                f"WHERE workspace_id = :workspace_id AND ({visibility_sql_wi}) "  # noqa: S608
+                "AND team_entity_id IS NULL AND team_suggestion_dismissed_at IS NULL "
+                "AND suggested_team_name IS NOT NULL"
+            ),
+            {"workspace_id": auth.workspace_id, **visibility_params_wi},
+        )
+        .mappings()
+        .all()
+    )
+
+    groups: dict[str, dict[str, Any]] = {}
+    for row in repo_rows:
+        group = groups.setdefault(
+            row["suggested_team_name"],
+            {"repository_count": 0, "work_item_count": 0, "sample_items": []},
+        )
+        group["repository_count"] += 1
+        if len(group["sample_items"]) < _TEAM_SUGGESTION_SAMPLE_CAP:
+            group["sample_items"].append(
+                {"id": row["id"], "resource_type": "repository", "name": row["name"]}
+            )
+    for row in work_item_rows:
+        group = groups.setdefault(
+            row["suggested_team_name"],
+            {"repository_count": 0, "work_item_count": 0, "sample_items": []},
+        )
+        group["work_item_count"] += 1
+        if len(group["sample_items"]) < _TEAM_SUGGESTION_SAMPLE_CAP:
+            group["sample_items"].append(
+                {"id": row["id"], "resource_type": "work_item", "name": row["name"]}
+            )
+
+    items = [
+        TeamSuggestionGroup(suggested_team_name=name, **data)
+        for name, data in sorted(
+            groups.items(),
+            key=lambda kv: kv[1]["repository_count"] + kv[1]["work_item_count"],
+            reverse=True,
+        )
+    ]
+    return TeamSuggestionListResponse(items=items)
 
 
 @router.get("/monitors", response_model=MonitorListResponse)
