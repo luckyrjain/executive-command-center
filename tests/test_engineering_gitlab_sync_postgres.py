@@ -207,6 +207,36 @@ def test_reject_private_host_raises_for_unresolvable_host() -> None:
         adapter._reject_private_host("does-not-exist.invalid")
 
 
+def test_reject_private_host_allows_allowlisted_private_host(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`ECC_GITLAB_PRIVATE_HOST_ALLOWLIST` is the operator-controlled escape
+    hatch for a deployment's own legitimate internal GitLab -- an exact,
+    case-insensitive hostname match bypasses the private-address check
+    entirely (never resolving the host at all).
+    """
+    monkeypatch.setenv("ECC_GITLAB_PRIVATE_HOST_ALLOWLIST", "Gitlab-EE.mpokket.org, other.example")
+    get_settings.cache_clear()
+    try:
+        adapter = GitLabAdapter(resolve_host=lambda host: ["10.0.0.5"])
+        adapter._reject_private_host("gitlab-ee.mpokket.org")  # must not raise
+    finally:
+        get_settings.cache_clear()
+
+
+def test_reject_private_host_still_rejects_non_allowlisted_private_host(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ECC_GITLAB_PRIVATE_HOST_ALLOWLIST", "other.example")
+    get_settings.cache_clear()
+    try:
+        adapter = GitLabAdapter(resolve_host=lambda host: ["10.0.0.5"])
+        with pytest.raises(AdapterAuthorizationError, match="private/internal"):
+            adapter._reject_private_host("gitlab-ee.mpokket.org")
+    finally:
+        get_settings.cache_clear()
+
+
 # --- unit-level: GitLabAdapter.authorize ------------------------------------
 
 

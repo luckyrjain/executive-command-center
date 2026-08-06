@@ -108,6 +108,7 @@ from uuid import uuid4
 import httpx
 from sqlalchemy import text
 
+from ecc.config import get_settings
 from ecc.database import SessionFactory
 
 from .connectors import (
@@ -410,7 +411,21 @@ class GitLabAdapter:
         this cannot use Jira's fixed-suffix-allowlist approach (GitLab
         self-managed hosts are arbitrary customer domains), and for the
         disclosed DNS-rebinding limitation of a connect-time-only check.
+
+        `ECC_GITLAB_PRIVATE_HOST_ALLOWLIST` (`Settings.gitlab_private_host_
+        allowlist`) is an operator-controlled, exact-hostname escape hatch
+        for a deployment's own legitimate internal GitLab -- never settable
+        by the connector UI itself, and empty by default (fails closed, no
+        host trusted until named). Checked before resolution even runs, so
+        an allowlisted host never needs a resolvable/mockable DNS answer.
         """
+        allowlist = {
+            entry.strip().casefold()
+            for entry in get_settings().gitlab_private_host_allowlist.split(",")
+            if entry.strip()
+        }
+        if host.casefold() in allowlist:
+            return
         for ip_str in self._resolve_host(host):
             if _is_private_address(ip_str):
                 raise AdapterAuthorizationError(

@@ -127,6 +127,22 @@ class Settings(BaseSettings):
     # setting in this codebase uses.
     gmail_oauth_allowlist: str = Field(default="", validation_alias="ECC_GMAIL_OAUTH_ALLOWLIST")
 
+    # Self-managed GitLab instances on a private network (on-prem, VPN-only,
+    # internal DNS) resolve to RFC 1918/loopback/link-local/CGNAT addresses
+    # by design -- `gitlab_adapter.py`'s `_reject_private_host` SSRF guard
+    # rejects those unconditionally, which is correct for an attacker-
+    # supplied host but also blocks a deployment's own legitimate internal
+    # GitLab. This is a deliberate, operator-controlled escape hatch: a
+    # comma-separated list of exact hostnames (not CIDR ranges -- narrower,
+    # and irrelevant to the guard's own disclosed DNS-rebinding limitation
+    # either way) that bypass the private-address check. Empty by default,
+    # same fail-closed default as `gmail_oauth_allowlist` -- no host is
+    # trusted until an operator explicitly names it here, never settable
+    # through the connector UI itself.
+    gitlab_private_host_allowlist: str = Field(
+        default="", validation_alias="ECC_GITLAB_PRIVATE_HOST_ALLOWLIST"
+    )
+
     @property
     def cors_origin_list(self) -> list[str]:
         return [origin.strip() for origin in self.cors_origins.split(",") if origin.strip()]
