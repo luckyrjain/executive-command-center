@@ -77,7 +77,7 @@ _ID_PATTERN = re.compile(r'id="([0-9a-fA-F-]{36})"')
 
 
 def _seed_base_rows(
-    *, account_display_name: str, thread_subject: str
+    *, workspace_name: str, account_display_name: str, thread_subject: str
 ) -> tuple[UUID, UUID, UUID, UUID, bytes, datetime]:
     """Shared setup for `detection_context`/`backlog_context`: a workspace,
     identity, active `gmail` connector account, enabled `email` domain with
@@ -86,6 +86,13 @@ def _seed_base_rows(
     `email_messages` rows against `thread_id` (`detection_context` seeds
     one; `backlog_context` seeds `_MAX_ACTION_DETECTIONS_PER_CALL + 2`),
     since that is the one part of each fixture's setup that is not shared.
+    `workspace_name`/`account_display_name`/`thread_subject` are the three
+    values each caller supplies its own distinct string for -- round 5
+    review found the original extraction dropped the workspace name as a
+    fourth, undisclosed difference (silently collapsing both fixtures onto
+    one hardcoded name); no test asserts on it, but a distinct name per
+    fixture is restored here for parity with the other two parameters and
+    to match this docstring's own claim about what differs between callers.
     """
     workspace_id = uuid4()
     owner_id = uuid4()
@@ -98,9 +105,9 @@ def _seed_base_rows(
         connection.execute(
             text(
                 "INSERT INTO workspaces (id, name, timezone, created_at) "
-                "VALUES (:id, 'Gmail Action Detection Test', 'UTC', :now)"
+                "VALUES (:id, :workspace_name, 'UTC', :now)"
             ),
-            {"id": workspace_id, "now": now},
+            {"id": workspace_id, "workspace_name": workspace_name, "now": now},
         )
         create_identity(
             connection, workspace_id=workspace_id, user_id=owner_id, email=_OWNER_EMAIL, now=now
@@ -226,6 +233,7 @@ def _reset_breakers() -> Iterator[None]:
 @pytest.fixture
 def detection_context() -> Iterator[dict]:
     workspace_id, owner_id, account_id, thread_id, credential, now = _seed_base_rows(
+        workspace_name="Gmail Action Detection Test",
         account_display_name="Detection test account",
         thread_subject="Signed contract needed by Friday",
     )
@@ -586,7 +594,9 @@ def backlog_context() -> Iterator[dict]:
     second call rather than being lost.
     """
     workspace_id, owner_id, account_id, thread_id, credential, now = _seed_base_rows(
-        account_display_name="Backlog test account", thread_subject="Backlog thread"
+        workspace_name="Gmail Action Detection Backlog Test",
+        account_display_name="Backlog test account",
+        thread_subject="Backlog thread",
     )
     message_count = _MAX_ACTION_DETECTIONS_PER_CALL + 2
     message_ids = [uuid4() for _ in range(message_count)]

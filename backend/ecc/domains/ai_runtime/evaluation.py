@@ -1191,7 +1191,7 @@ def _delete_synthetic_personal_insight_sources(
 
 def _insert_synthetic_email_thread(
     session: Session, auth: AuthContext, example: dict[str, Any], *, now: datetime
-) -> tuple[UUID, UUID, list[UUID]]:
+) -> tuple[UUID, UUID, list[UUID], UUID | None]:
     """Inserts one synthetic `email_threads` row and its `email_messages`
     -- bodies encrypted via `ecc.domains.personal.crypto.encrypt_field`
     exactly like Task 5's own `gmail_adapter.py:detect_actions_since`
@@ -1206,8 +1206,22 @@ def _insert_synthetic_email_thread(
     exercises (`get_thread_content_tool` only ever reads `email_threads`/
     `email_messages`), so a placeholder value is sufficient.
 
-    Returns `(connector_account_id, thread_id, message_ids)` for
-    `_delete_synthetic_email_thread` below. Not context-managed -- see
+    Returns `(connector_account_id, thread_id, message_ids, inserted_domain_
+    id)` for `_delete_synthetic_email_thread` below -- `inserted_domain_id`
+    is `None` when the `personal_domains` insert below hit its own `ON
+    CONFLICT DO NOTHING` (a real, pre-existing `email` personal-domain row
+    for this caller), never the id of that pre-existing row. Round 5
+    review found this distinction was previously dropped entirely -- the
+    original return signature never surfaced whether this call actually
+    created the row it inserted, and `_delete_synthetic_email_thread`
+    deleted `personal_domains` by `(workspace_id, owner_id, domain_key)`
+    alone, which matches and deletes a real pre-existing row exactly as
+    readily as a synthetic one this function created, cascading (`email_
+    threads`' own FK, `ondelete=\"CASCADE\"`) to permanently delete that
+    caller's entire real Gmail sync history plus their `domain_consents`
+    row (also `CASCADE`-linked) the first time this evaluation harness runs
+    for a caller who has already connected Gmail and enabled the `email`
+    personal domain. Not context-managed -- see
     `_insert_synthetic_item`'s identical rationale (this session's
     transaction may already be autobegun by `run_evaluation`'s preceding
     reads). Per-example (not batched, like `attention.explain_item`'s
@@ -1221,11 +1235,26 @@ def _insert_synthetic_email_thread(
     # `email_threads` has a 3-column FK to `personal_domains(workspace_id,
     # owner_id, domain_key)` (migration `0069`) -- inserted with `ON
     # CONFLICT DO NOTHING` (keyed off that same FK's own unique
-    # constraint) since `_delete_synthetic_email_thread` below always
-    # removes it again after this example is scored, so a fresh insert
-    # per example is the common case, not a genuine conflict.
+    # constraint) since a real, pre-existing `email` personal-domain row
+    # for this caller (they have already connected Gmail and enabled the
+    # domain themselves) must be left untouched, not clobbered.
+    #
+    # `RETURNING id`: round 5 review found that the original code discarded
+    # this insert's own success/conflict outcome entirely, so `_delete_
+    # synthetic_email_thread` below had no way to tell "this call created
+    # the row" apart from "a real row already existed" -- it deleted `
+    # personal_domains` by `(workspace_id, owner_id, domain_key)` alone,
+    # which matches and deletes a real pre-existing row exactly as readily
+    # as a synthetic one, cascading (that same FK, `ondelete="CASCADE"`) to
+    # permanently delete that caller's entire real Gmail sync history plus
+    # their `domain_consents` row (also `CASCADE`-linked to `personal_
+    # domains`, migration `0054`) the first time this harness runs for a
+    # caller who already uses the real feature. `.scalar_one_or_none()` is
+    # `None` exactly when the `ON CONFLICT` branch fired -- the row already
+    # existed and this call inserted nothing -- never the id of that
+    # pre-existing row.
     domain_id = uuid4()
-    session.execute(
+    inserted_domain_id = session.execute(
         text(
             """
             INSERT INTO personal_domains (
@@ -1236,6 +1265,7 @@ def _insert_synthetic_email_thread(
                 true, :now, :actor_id, :actor_id, :now, :now, 1
             )
             ON CONFLICT (workspace_id, owner_id, domain_key) DO NOTHING
+            RETURNING id
             """
         ),
         {
@@ -1245,7 +1275,7 @@ def _insert_synthetic_email_thread(
             "actor_id": auth.user_id,
             "now": now,
         },
-    )
+    ).scalar_one_or_none()
 
     connector_account_id = uuid4()
     session.execute(
@@ -1327,7 +1357,7 @@ def _insert_synthetic_email_thread(
             },
         )
     session.commit()
-    return connector_account_id, thread_id, message_ids
+    return connector_account_id, thread_id, message_ids, inserted_domain_id
 
 
 def _delete_synthetic_email_thread(
@@ -1336,6 +1366,7 @@ def _delete_synthetic_email_thread(
     connector_account_id: UUID,
     thread_id: UUID,
     message_ids: list[UUID],
+    domain_id: UUID | None,
 ) -> None:
     """Deletes everything `_insert_synthetic_email_thread` created for one
     example, immediately after that example is scored -- see that
@@ -1345,6 +1376,21 @@ def _delete_synthetic_email_thread(
     already handle -- explicit, not relying on cascade, matching `_delete_
     synthetic_personal_insight_sources`'s identical discipline. Not
     context-managed -- see `_insert_synthetic_item`'s identical rationale.
+
+    `domain_id`: `_insert_synthetic_email_thread`'s own `inserted_domain_
+    id` -- `None` means that call's `personal_domains` insert hit its own
+    `ON CONFLICT DO NOTHING` (a real, pre-existing row for this caller
+    already exists), in which case `personal_domains` is left untouched
+    entirely, matching `ON CONFLICT DO NOTHING`'s own "don't touch what
+    was already there" intent. When not `None`, the delete below is scoped
+    by that specific `id`, never by `(workspace_id, owner_id, domain_key)`
+    alone -- round 5 review found the original, id-less delete matched and
+    destroyed a real pre-existing row exactly as readily as a synthetic
+    one this function created, cascading to that caller's entire real
+    Gmail sync history and `domain_consents` row (see `_insert_synthetic_
+    email_thread`'s own docstring for the full mechanism). Mirrors `_delete_
+    synthetic_personal_insight_sources`'s own `id = ANY(:ids)`-scoped
+    `personal_domains` delete, which never had this gap.
     """
     if message_ids:
         session.execute(
@@ -1357,13 +1403,11 @@ def _delete_synthetic_email_thread(
         text("DELETE FROM email_threads WHERE workspace_id = :workspace_id AND id = :id"),
         {"workspace_id": auth.workspace_id, "id": thread_id},
     )
-    session.execute(
-        text(
-            "DELETE FROM personal_domains WHERE workspace_id = :workspace_id "
-            "AND owner_id = :owner_id AND domain_key = 'email'"
-        ),
-        {"workspace_id": auth.workspace_id, "owner_id": auth.user_id},
-    )
+    if domain_id is not None:
+        session.execute(
+            text("DELETE FROM personal_domains WHERE workspace_id = :workspace_id AND id = :id"),
+            {"workspace_id": auth.workspace_id, "id": domain_id},
+        )
     session.execute(
         text("DELETE FROM connector_accounts WHERE workspace_id = :workspace_id AND id = :id"),
         {"workspace_id": auth.workspace_id, "id": connector_account_id},
@@ -1709,8 +1753,8 @@ def run_evaluation(
                     run_input = {"source_domain_keys": source_domain_keys}
                     source_versions = {"source_domain_keys": source_domain_keys}
                 elif task_type == "email.detect_action":
-                    connector_account_id, thread_id, message_ids = _insert_synthetic_email_thread(
-                        session, auth, example, now=now
+                    connector_account_id, thread_id, message_ids, email_domain_id = (
+                        _insert_synthetic_email_thread(session, auth, example, now=now)
                     )
                     run_input = {"thread_id": str(thread_id)}
                     source_versions = {"thread_id": str(thread_id)}
@@ -1796,7 +1840,12 @@ def run_evaluation(
                         if session.in_transaction():
                             session.rollback()
                         _delete_synthetic_email_thread(
-                            session, auth, connector_account_id, thread_id, message_ids
+                            session,
+                            auth,
+                            connector_account_id,
+                            thread_id,
+                            message_ids,
+                            email_domain_id,
                         )
         finally:
             # Guard against a leftover open transaction from a mid-loop

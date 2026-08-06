@@ -63,9 +63,12 @@ def _fernet() -> Fernet:
 
 
 def encrypt_field(plaintext: str) -> str:
-    """`plaintext` is a single `domain_records.payload` field's value.
-    Returns Fernet's own URL-safe-base64 ciphertext token as a `str`, the
-    exact value stored in place of the plaintext within the JSONB payload.
+    """`plaintext` is a single field's value -- a `domain_records.payload`
+    field for this module's original caller, or (since Phase 10 Task 5) a
+    Gmail message body stored directly in `email_messages.body`; see this
+    module's own docstring for both callers. Returns Fernet's own
+    URL-safe-base64 ciphertext token as a `str`, the exact value stored in
+    place of the plaintext in either column.
     """
     return _fernet().encrypt(plaintext.encode("utf-8")).decode("ascii")
 

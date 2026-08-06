@@ -10,8 +10,15 @@ own docstring establishes for every other read tool in this runtime);
 body decryption (the tool's own output must be the real plaintext, not
 the Fernet ciphertext actually stored); a message whose `body` is still
 `NULL` (never fetched) is omitted from the output entirely, not rendered
-as an empty string; and messages are returned oldest-first (`sent_at
-ASC`).
+as an empty string; a message whose `body` is the empty-string sentinel
+(round 4's `gmail_adapter.py` fix for a message with no extractable
+`text/plain` part) is rendered as an empty message, not omitted -- the
+opposite of the `NULL` case, and the exact distinction this module's own
+docstring documents (round 5 review finding: previously untested); a
+message whose stored `body` fails to decrypt under the current key falls
+back to a fixed placeholder string rather than raising (round 5 review
+finding: previously untested); and messages are returned oldest-first
+(`sent_at ASC`).
 """
 
 from collections.abc import Iterator
@@ -198,7 +205,17 @@ def _insert_message(
     sender: str,
     sent_at: datetime,
     body: str | None,
+    raw_body: str | None = None,
 ) -> UUID:
+    """`body`, when not `None` (including `""`, the round-4 empty-string
+    sentinel), is encrypted via `encrypt_field` exactly as a real fetch
+    would store it. `raw_body`, when given, is written to the `body`
+    column verbatim instead -- bypassing `encrypt_field` entirely -- so a
+    test can simulate a row whose stored ciphertext is not a valid Fernet
+    token for the currently configured key (e.g. a rotated key without
+    re-encryption), which `encrypt_field` itself can never produce.
+    Mutually exclusive with `body`; callers pass exactly one.
+    """
     message_id = uuid4()
     with engine.begin() as connection:
         connection.execute(
@@ -224,8 +241,10 @@ def _insert_message(
                 "sender": sender,
                 "recipients": ["owner@tool-test.test"],
                 "sent_at": sent_at,
-                "body": encrypt_field(body) if body is not None else None,
-                "body_fetched_at": sent_at if body is not None else None,
+                "body": raw_body
+                if raw_body is not None
+                else (encrypt_field(body) if body is not None else None),
+                "body_fetched_at": sent_at if (body is not None or raw_body is not None) else None,
             },
         )
     return message_id
@@ -339,3 +358,76 @@ def test_message_with_no_fetched_body_is_omitted_not_rendered_empty(tool_context
     messages = result.output["messages"]
     assert len(messages) == 1
     assert messages[0]["sender"] == "fetched@partner-co.test"
+
+
+def test_message_with_empty_string_body_is_rendered_as_an_empty_message_not_omitted(
+    tool_context: dict,
+) -> None:
+    """Round 4's `gmail_adapter.py` fix writes an empty-string body
+    sentinel for a message whose Gmail response parsed successfully but
+    had no extractable `text/plain` part -- this module's own docstring
+    distinguishes that ("genuinely empty") from `NULL` ("not yet
+    fetched"): `body IS NOT NULL` alone selects it, so it must render as
+    an empty message, the opposite of the previous test's `NULL` case.
+    Round 5 review found this distinction had no test coverage.
+    """
+    thread_id = _insert_thread(
+        workspace_id=tool_context["workspace_id"],
+        owner_id=tool_context["user_id"],
+        connector_account_id=tool_context["connector_account_id"],
+        subject="Thread with an HTML-only message",
+        now=tool_context["now"],
+    )
+    now = tool_context["now"]
+    _insert_message(
+        workspace_id=tool_context["workspace_id"],
+        owner_id=tool_context["user_id"],
+        thread_id=thread_id,
+        sender="html-only@partner-co.test",
+        sent_at=now,
+        body="",
+    )
+
+    with SessionFactory() as session:
+        result = get_thread_content_tool(session, tool_context["auth"], thread_id=thread_id)
+
+    assert isinstance(result, ToolResult)
+    messages = result.output["messages"]
+    assert len(messages) == 1
+    assert messages[0]["sender"] == "html-only@partner-co.test"
+    assert messages[0]["body"] == ""
+
+
+def test_message_body_that_fails_to_decrypt_renders_fallback_text(tool_context: dict) -> None:
+    """A stored `body` that is not a valid Fernet token for the currently
+    configured key (e.g. `ECC_PERSONAL_DATA_ENCRYPTION_KEY` rotated
+    without re-encrypting stored rows) must not raise out of the tool --
+    `get_thread_content_tool`'s own `InvalidToken` fallback branch,
+    previously untested per round 5 review.
+    """
+    thread_id = _insert_thread(
+        workspace_id=tool_context["workspace_id"],
+        owner_id=tool_context["user_id"],
+        connector_account_id=tool_context["connector_account_id"],
+        subject="Thread with an undecryptable message",
+        now=tool_context["now"],
+    )
+    now = tool_context["now"]
+    _insert_message(
+        workspace_id=tool_context["workspace_id"],
+        owner_id=tool_context["user_id"],
+        thread_id=thread_id,
+        sender="undecryptable@partner-co.test",
+        sent_at=now,
+        body=None,
+        raw_body="not-a-valid-fernet-token",
+    )
+
+    with SessionFactory() as session:
+        result = get_thread_content_tool(session, tool_context["auth"], thread_id=thread_id)
+
+    assert isinstance(result, ToolResult)
+    messages = result.output["messages"]
+    assert len(messages) == 1
+    assert messages[0]["sender"] == "undecryptable@partner-co.test"
+    assert messages[0]["body"] == "[unable to decrypt -- contact support]"

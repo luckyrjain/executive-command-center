@@ -23,9 +23,15 @@ Covers:
    shape`'s own conditional-shape enforcement, not a post-schema check.
 3. Ephemeral synthetic `connector_accounts`/`email_threads`/`email_
    messages` rows are cleaned up after a run.
-4. `POST /ai/evaluations/runs` accepts `task_type="email.detect_action"`
+4. A real, pre-existing `personal_domains` row for this caller (and its
+   real `email_threads`/`email_messages` data) survives a run untouched
+   -- round 5 review found the original cleanup deleted `personal_domains`
+   by `(workspace_id, owner_id, domain_key)` alone, matching and
+   cascade-destroying a real caller's entire Gmail sync history the first
+   time this harness ran for them.
+5. `POST /ai/evaluations/runs` accepts `task_type="email.detect_action"`
    (the widened `EvaluationRunCreateRequest.task_type` Literal).
-5. The promotion-floor gate now also covers `email.detect_action.v1`
+6. The promotion-floor gate now also covers `email.detect_action.v1`
    (`prompts.py`'s `_GATED_PROMPT_IDS`).
 
 Real `email_messages` ids are random `uuid4()`s assigned at insertion
@@ -405,6 +411,159 @@ def test_run_evaluation_cleans_up_every_synthetic_table(run_context: dict) -> No
                 {"workspace_id": run_context["workspace_id"]},
             ).scalar_one()
             assert count == 0, f"synthetic {table} rows must be cleaned up after the run"
+
+
+def test_run_evaluation_does_not_delete_a_pre_existing_real_personal_domain_or_its_data(
+    run_context: dict,
+) -> None:
+    """Round 5 review CRITICAL finding: `_delete_synthetic_email_thread`
+    (`evaluation.py`) used to delete `personal_domains` by `(workspace_id,
+    owner_id, domain_key)` alone -- matching and destroying a real,
+    pre-existing `email` personal-domain row for this caller exactly as
+    readily as the harness's own synthetic one, and cascading
+    (`ondelete="CASCADE"`) to permanently delete every `email_threads`/
+    `email_messages`/`domain_consents` row hanging off it. This would have
+    fired the first time this evaluation harness ran (including as a side
+    effect of the `email.detect_action.v1` prompt-promotion gate) for any
+    caller who had already connected Gmail and enabled the `email`
+    personal domain -- exactly the caller this feature is built for.
+    Fixed by tracking whether `_insert_synthetic_email_thread`'s own
+    insert actually created the row (`ON CONFLICT DO NOTHING RETURNING
+    id`) and scoping the delete to that specific id, never the shared
+    triple, mirroring `_delete_synthetic_personal_insight_sources`'s own
+    id-scoped delete (which never had this gap).
+
+    This test seeds a real, pre-existing `personal_domains` row plus a
+    real `email_threads`/`email_messages` row under it -- exactly what a
+    caller who already uses Gmail sync would have on disk -- runs the
+    evaluation harness for `email.detect_action`, and asserts every one of
+    those real rows survives, while the run itself still completes and
+    passes normally (the harness's own synthetic rows are still created,
+    scored, and cleaned up around this untouched real data).
+    """
+    workspace_id = run_context["workspace_id"]
+    owner_id = run_context["user_id"]
+    now = datetime.now(UTC)
+    real_domain_id = uuid4()
+    real_connector_account_id = uuid4()
+    real_thread_id = uuid4()
+    real_message_id = uuid4()
+
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                """
+                INSERT INTO personal_domains (
+                    id, workspace_id, owner_id, domain_key, classification,
+                    enabled, enabled_at, created_by, updated_by, created_at, updated_at, version
+                ) VALUES (
+                    :id, :workspace_id, :owner_id, 'email', 'high_stakes',
+                    true, :now, :owner_id, :owner_id, :now, :now, 1
+                )
+                """
+            ),
+            {"id": real_domain_id, "workspace_id": workspace_id, "owner_id": owner_id, "now": now},
+        )
+        connection.execute(
+            text(
+                """
+                INSERT INTO connector_accounts (
+                    id, workspace_id, provider, external_account_id, display_name,
+                    granted_scopes, encrypted_credentials, status, version,
+                    created_by, updated_by, created_at, updated_at, owner_id, visibility
+                ) VALUES (
+                    :id, :workspace_id, 'gmail', 'real-gmail-account', 'Real Gmail account',
+                    '{}', :encrypted_credentials, 'active', 1,
+                    :owner_id, :owner_id, :now, :now, :owner_id, 'workspace'
+                )
+                """
+            ),
+            {
+                "id": real_connector_account_id,
+                "workspace_id": workspace_id,
+                "encrypted_credentials": b"",
+                "owner_id": owner_id,
+                "now": now,
+            },
+        )
+        connection.execute(
+            text(
+                """
+                INSERT INTO email_threads (
+                    id, workspace_id, owner_id, domain_key, connector_account_id,
+                    external_thread_id, subject, last_message_at, created_at, updated_at
+                ) VALUES (
+                    :id, :workspace_id, :owner_id, 'email', :connector_account_id,
+                    'real-thread', 'A real, already-synced thread', :now, :now, :now
+                )
+                """
+            ),
+            {
+                "id": real_thread_id,
+                "workspace_id": workspace_id,
+                "owner_id": owner_id,
+                "connector_account_id": real_connector_account_id,
+                "now": now,
+            },
+        )
+        connection.execute(
+            text(
+                """
+                INSERT INTO email_messages (
+                    id, workspace_id, owner_id, thread_id, external_message_id,
+                    sender, recipients, sent_at, direction, snippet, body,
+                    body_fetched_at, created_at, updated_at
+                ) VALUES (
+                    :id, :workspace_id, :owner_id, :thread_id, 'real-message',
+                    'real-sender@example.test', ARRAY['owner@example.test'], :now, 'inbound',
+                    NULL, NULL, NULL, :now, :now
+                )
+                """
+            ),
+            {
+                "id": real_message_id,
+                "workspace_id": workspace_id,
+                "owner_id": owner_id,
+                "thread_id": real_thread_id,
+                "now": now,
+            },
+        )
+
+    adapter = _adapter_with_grounded_responses()
+    with SessionFactory() as session:
+        run = run_evaluation(
+            TASK_TYPE,
+            1,
+            _SEEDED_MODEL_ID,
+            session=session,
+            auth=run_context["auth"],
+            ollama_adapter=adapter,
+        )
+
+    assert run.failures == []
+    assert check_promotion_floors(run) is True
+
+    with engine.connect() as connection:
+        assert (
+            connection.execute(
+                text("SELECT count(*) FROM personal_domains WHERE id = :id"),
+                {"id": real_domain_id},
+            ).scalar_one()
+            == 1
+        ), "the real, pre-existing personal_domains row must survive the evaluation run"
+        assert (
+            connection.execute(
+                text("SELECT count(*) FROM email_threads WHERE id = :id"), {"id": real_thread_id}
+            ).scalar_one()
+            == 1
+        ), "a real email_threads row must not be cascade-deleted"
+        assert (
+            connection.execute(
+                text("SELECT count(*) FROM email_messages WHERE id = :id"),
+                {"id": real_message_id},
+            ).scalar_one()
+            == 1
+        ), "a real email_messages row must not be cascade-deleted"
 
 
 # ---------------------------------------------------------------------------
