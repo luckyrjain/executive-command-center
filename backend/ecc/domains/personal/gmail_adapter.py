@@ -121,6 +121,7 @@ from sqlalchemy.orm import Session
 from ecc.auth import AuthContext
 from ecc.config import get_settings
 from ecc.database import SessionFactory
+from ecc.domains.ai_runtime.ollama_client import OllamaAdapter
 from ecc.domains.ai_runtime.runtime import execute_run
 from ecc.domains.engineering.connectors import (
     AdapterAuthorizationError,
@@ -2620,7 +2621,13 @@ class GmailAdapter:
     # own explicit `account.provider == "gmail"` branch" shape as `is_
     # account_allowed` above. --
 
-    def detect_actions_since(self, context: ConnectorAccountContext, *, since: datetime) -> None:
+    def detect_actions_since(
+        self,
+        context: ConnectorAccountContext,
+        *,
+        since: datetime,
+        ollama_adapter: OllamaAdapter | None = None,
+    ) -> None:
         """Called from `connector_accounts.sync_connector_endpoint`'s phase
         3, after a successful `backfill`/`incremental_sync` (see that
         module's own call-site comment). Feature-flagged off by default
@@ -2649,6 +2656,12 @@ class GmailAdapter:
         the connected account's own owner (`_owner_id_for_account`),
         regardless of which user's own request happened to trigger this
         particular sync call.
+
+        `ollama_adapter`: `None` in production (`execute_run`'s own
+        default, a real network-hitting `OllamaAdapter()`) -- threaded
+        through only so tests can inject a mocked transport, the same
+        `OllamaAdapterDep`-style dependency-injection shape `ai_insights.py`'s
+        own HTTP endpoint already uses for the identical purpose.
         """
         if not get_settings().email_action_detection_enabled:
             return
@@ -2701,6 +2714,7 @@ class GmailAdapter:
                     external_message_id=row["external_message_id"],
                     sender=row["sender"],
                     headers=headers,
+                    ollama_adapter=ollama_adapter,
                 )
             except Exception:  # noqa: BLE001 -- one message's failure never stops the batch
                 continue
@@ -2715,6 +2729,7 @@ class GmailAdapter:
         external_message_id: str,
         sender: str,
         headers: dict[str, str],
+        ollama_adapter: OllamaAdapter | None,
     ) -> None:
         get_response = self._request_with_rate_limit_retry(
             "GET",
@@ -2794,6 +2809,7 @@ class GmailAdapter:
                 {"thread_id": str(thread_id)},
                 session=session,
                 auth=auth,
+                ollama_adapter=ollama_adapter,
             )
             if run.status != "completed" or run.output is None:
                 return
