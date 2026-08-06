@@ -616,6 +616,8 @@ class EmailDetectActionOutput(BaseModel):
                 raise ValueError("operation must be omitted when has_action is false")
             if self.proposed_fields is not None:
                 raise ValueError("proposed_fields must be omitted when has_action is false")
+            if self.cited_message_ids:
+                raise ValueError("cited_message_ids must be empty when has_action is false")
         return self
 
 

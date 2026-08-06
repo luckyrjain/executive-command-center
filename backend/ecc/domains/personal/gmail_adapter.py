@@ -2654,15 +2654,33 @@ class GmailAdapter:
         (`config.py:email_action_detection_enabled`) -- Task 1-4's own
         sync/OAuth/create-path machinery is unaffected either way.
 
-        For every inbound message newly written by this sync call
-        (`email_messages.created_at >= since`, still `body IS NULL` --
-        `gmail.metadata`-only sync never populates it) in this account's
-        own threads: fetches the full body (`gmail.readonly`, `format=
-        full`), stores it encrypted, registers it as `pkos_evidence`, and
-        runs it through the `email.detect_action` AI task type. A `has_
-        action: true` result becomes a `source="ai"` recommendation via
-        Task 4's create-path (`create_recommendation`) -- this method
-        never writes a `tasks`/`commitments`/`risks` row directly.
+        For up to `_MAX_ACTION_DETECTIONS_PER_CALL` inbound messages still
+        `body IS NULL` (`gmail.metadata`-only sync never populates it) in
+        this account's own threads: fetches the full body (`gmail.
+        readonly`, `format=full`), stores it encrypted, registers it as
+        `pkos_evidence`, and runs it through the `email.detect_action` AI
+        task type. A `has_action: true` result becomes a `source="ai"`
+        recommendation via Task 4's create-path (`create_recommendation`)
+        -- this method never writes a `tasks`/`commitments`/`risks` row
+        directly.
+
+        `body IS NULL`, not `created_at >= since`, is the eligibility
+        filter -- `since` only orders which eligible messages this call
+        prioritizes (this call's own newly-synced messages first, via
+        `ORDER BY (created_at >= since) DESC`), never which ones it
+        excludes. Round 2 review's own smaller `_MAX_ACTION_DETECTIONS_
+        PER_CALL` bound made a latent bug in the original `created_at >=
+        since` *filter* design certain to hit in ordinary use, found by
+        round 3 review: any candidate left over after one call (more
+        eligible messages existed than the bound allowed) would have its
+        `created_at` permanently fall behind every later call's own,
+        strictly-later `since` -- silently and permanently excluding it
+        from every future call, not merely delaying it, with no error or
+        trace anywhere. `body IS NULL` never regresses once a message's
+        body is actually fetched, so using it alone as the filter (with
+        `since` demoted to an ordering hint) makes a message's eligibility
+        durable across calls: a backlog beyond one call's own bound is
+        worked down over subsequent calls instead of being lost.
 
         Best-effort per message: one message's failure (a transient Gmail
         API error, a malformed response, a grounding-check rejection)
@@ -2720,8 +2738,7 @@ class GmailAdapter:
                         WHERE m.workspace_id = :workspace_id AND m.owner_id = :owner_id
                           AND t.connector_account_id = :connector_account_id
                           AND m.direction = 'inbound' AND m.body IS NULL
-                          AND m.created_at >= :since
-                        ORDER BY m.sent_at ASC
+                        ORDER BY (m.created_at >= :since) DESC, m.sent_at ASC
                         LIMIT :limit
                         """
                     ),
