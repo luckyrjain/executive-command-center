@@ -845,11 +845,19 @@ def regenerate_attention(auth: AuthDep, session: SessionDep, _csrf: CsrfDep) -> 
         # `_upsert_batch`'s dismissed-state-preservation logic only needs
         # *some* monotonically-changing value per row to detect "has the
         # underlying entity changed since this item was dismissed" -- the
-        # thread's own `updated_at` (bumped to `now()` by `gmail_adapter.
-        # py`'s `_upsert_thread` on every write that touches this thread,
-        # including a new message arriving) serves that role, converted to
+        # thread's own `updated_at` serves that role, converted to
         # microsecond-epoch so it round-trips as the `bigint` `_upsert_
-        # batch`'s `source_entity_version` column expects. `visibility` is
+        # batch`'s `source_entity_version` column expects. `gmail_adapter.
+        # py`'s `_upsert_thread` only bumps it when a write actually
+        # advances the thread's observable state (a genuinely newer
+        # `last_message_at`, or `subject` filled in for the first time) --
+        # this round's own review found and fixed an earlier unconditional
+        # `updated_at = :now` on every `ON CONFLICT` write, which bumped it
+        # even on a no-op duplicate-message resync (`_insert_message_if_
+        # new`'s own docstring names this an expected case, not an edge
+        # case) and silently un-dismissed a dismissed `email_thread` item
+        # on the next `regenerate_attention` call with nothing having
+        # actually changed. `visibility` is
         # likewise not a real `email_threads` column (see above) --
         # `attention_items.visibility` is fixed to `'private'` for every
         # email_thread row rather than read from the source table, since

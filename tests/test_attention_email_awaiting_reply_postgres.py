@@ -855,6 +855,39 @@ def test_removed_member_owned_thread_is_pruned_from_attention(
     assert row is None
 
 
+def test_known_email_aliases_bounded_to_candidate_senders_still_matches(
+    email_attention_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    """Round 2 review finding: `known_email_aliases` is fetched bounded to
+    `ANY(:candidate_senders)` (the normalized senders of only the
+    structurally-eligible candidate threads), not every `entity_aliases`
+    row the workspace has ever accumulated -- otherwise this fetch scales
+    with total resolved-contact count, not with how many threads are
+    actually awaiting reply. This test seeds a number of resolved
+    contacts *unrelated* to the one real candidate sender, then confirms
+    the real candidate still correctly surfaces -- proving the bounded
+    fetch narrows the *candidate set checked*, not the correctness of the
+    match itself.
+    """
+    client, workspace_id, owner_id, token = email_attention_test_context
+    now = datetime.now(UTC)
+    sender = "known.contact@example.test"
+    _resolve_sender(workspace_id, sender)
+    for i in range(25):
+        _resolve_sender(workspace_id, f"unrelated-contact-{i}@example.test")
+    thread_id = _seed_thread(workspace_id, owner_id, "Needle in a haystack of aliases", now)
+    _seed_message(
+        workspace_id, owner_id, thread_id, sender=sender, direction="inbound", sent_at=now
+    )
+
+    regenerate = client.post("/api/v1/attention/regenerate", headers=_headers(token), json={})
+    assert regenerate.status_code == 200, regenerate.text
+    item = next(i for i in regenerate.json()["items"] if i["entity_id"] == str(thread_id))
+    assert item["entity_type"] == "email_thread"
+    factor_codes = {f["code"] for f in item["factors"]}
+    assert "awaiting_reply" in factor_codes
+
+
 def test_email_thread_item_not_visible_to_another_workspace_member(
     email_attention_test_context: tuple[TestClient, UUID, UUID, str],
 ) -> None:
@@ -929,36 +962,3 @@ def test_email_thread_item_not_visible_to_another_workspace_member(
     owner_listed = client.get("/api/v1/attention", headers=_headers(token))
     assert owner_listed.status_code == 200, owner_listed.text
     assert any(i["entity_id"] == str(thread_id) for i in owner_listed.json()["items"])
-
-
-def test_known_email_aliases_bounded_to_candidate_senders_still_matches(
-    email_attention_test_context: tuple[TestClient, UUID, UUID, str],
-) -> None:
-    """Round 2 review finding: `known_email_aliases` is fetched bounded to
-    `ANY(:candidate_senders)` (the normalized senders of only the
-    structurally-eligible candidate threads), not every `entity_aliases`
-    row the workspace has ever accumulated -- otherwise this fetch scales
-    with total resolved-contact count, not with how many threads are
-    actually awaiting reply. This test seeds a number of resolved
-    contacts *unrelated* to the one real candidate sender, then confirms
-    the real candidate still correctly surfaces -- proving the bounded
-    fetch narrows the *candidate set checked*, not the correctness of the
-    match itself.
-    """
-    client, workspace_id, owner_id, token = email_attention_test_context
-    now = datetime.now(UTC)
-    sender = "known.contact@example.test"
-    _resolve_sender(workspace_id, sender)
-    for i in range(25):
-        _resolve_sender(workspace_id, f"unrelated-contact-{i}@example.test")
-    thread_id = _seed_thread(workspace_id, owner_id, "Needle in a haystack of aliases", now)
-    _seed_message(
-        workspace_id, owner_id, thread_id, sender=sender, direction="inbound", sent_at=now
-    )
-
-    regenerate = client.post("/api/v1/attention/regenerate", headers=_headers(token), json={})
-    assert regenerate.status_code == 200, regenerate.text
-    item = next(i for i in regenerate.json()["items"] if i["entity_id"] == str(thread_id))
-    assert item["entity_type"] == "email_thread"
-    factor_codes = {f["code"] for f in item["factors"]}
-    assert "awaiting_reply" in factor_codes
