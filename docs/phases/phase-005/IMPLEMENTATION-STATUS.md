@@ -1,7 +1,7 @@
 ---
 id: PHASE-005-IMPLEMENTATION-STATUS
 title: Phase 5 Implementation Status
-status: Task 0 (design pass), Task 1 (workflow schema, policy model, triggers), Task 2 (durable local worker and crash recovery), Task 3 (approval inbox and policy-driven revocation enforcement), Task 4 (schedule triggers, pause/resume, run management HTTP surface), Task 5 (connector action adapters and sandbox tests), Task 6 (compensation, observability and kill switches), Task 7a (simulate, kill-switch status, compensation ledger in run detail) and Task 7 (frontend surface, browser acceptance, staged dogfood runbook) complete; docs-vs-code audit fix (`preview_only` dispatch block, `rate_limit` enforcement) complete; run-state audit fix (lease-ownership guard, unactionable-run cancellation, rejection-triggers-compensation, kill-switch parking) complete; docs reconciliation of the remaining contract-vs-code mismatches complete
+status: Active
 version: 0.12.0
 owner: Lucky Jain
 updated: 2026-07-26

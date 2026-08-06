@@ -2,9 +2,9 @@
 id: ADR-0011
 title: Hybrid Retrieval Embeddings
 status: Accepted
+version: 1.0.0
 date: 2026-07-22
-owners:
-  - Lucky Jain
+owner: Lucky Jain
 related:
   - RFC-005
   - ADR-0003

@@ -59,6 +59,8 @@ uv run python scripts/check_ollama_models.py
 
 It reports any missing model with its exact `ollama pull` command. AI enrichment (meeting prep summaries, attention explanations, personal insights) is opt-in and off by default (`ECC_MEETING_PREP_AI_ENRICHMENT_ENABLED` and friends, `backend/ecc/config.py`) -- the deterministic core works with no Ollama install at all.
 
+Optional embeddings and both AI-enrichment paths are explicitly disabled in `.env.example`. Phase 10 Gmail OAuth also remains inert until all `ECC_GMAIL_OAUTH_*` values are configured and the user is in the internal allowlist. Never place real secrets in `.env.example` or commit `.env`.
+
 Start the backend, then open the printed URL. The URL carries the one-time code in its fragment so it is not sent in HTTP access logs. The backend rotates the code into an opaque `HttpOnly`, `SameSite=Lax` session cookie with a seven-day absolute lifetime, sets the readable CSRF cookie, and redirects to the frontend.
 
 For an isolated remote development database only, explicitly set:
@@ -106,12 +108,14 @@ Open the one-time bootstrap URL printed by `scripts/bootstrap_dev.py`. After the
 - immutable Audit history
 - Phase 1 task, commitment, note, calendar, meeting, risk, and attention APIs
 - Phase 8 collaboration workspace: workspace switcher, members/invitations, sharing review, delegation inbox, and shared activity feed (`frontend/src/features/collaboration/`) -- reachable once you have a real account (see "Registration and login" below); the one-time bootstrap flow above remains the fastest way to get a local session for everyday development
+- Phase 10 Tasks 1–2: internal-allowlist Gmail OAuth plus manual 30-day metadata backfill/incremental sync and person-entity linking; message bodies, attention/recommendation/AI integration, consent-revocation cascade, and Gmail frontend remain unimplemented
 
 ## Tests and quality gates
 
 Backend:
 
 ```bash
+make docs-check
 uv run ruff check backend tests scripts
 uv run ruff format --check backend tests scripts
 uv run mypy backend
@@ -193,5 +197,7 @@ Check `http://localhost:8000/health/ready`, confirm `VITE_API_BASE_URL`, and res
 
 - Production registration and login are real and implemented (Phase 8 account/membership/session framework) rather than absent, but the one-time bootstrap flow above is still the fastest way to get a local development session and is what these instructions default to.
 - The bootstrap utility and `/dev/bootstrap` exchange are development-only.
-- External Gmail, Google Calendar, GitHub, and Jira connectors are deferred.
+- GitHub, GitLab, Jira, Datadog, and the Phase 10 Gmail metadata connector have implemented development paths; there is no Google Calendar connector, connector scheduler, or push sync.
+- Gmail access is internal-allowlist only. Tasks 3–8 are open, including body fetch, attention/recommendation integration, consent-revocation cascade, and executive UX.
+- Production provisioning, account recovery/MFA, key rotation, real connector recovery, personal-data recovery, and automated post-deploy smoke remain blockers; see [Production Readiness](operations/PRODUCTION-READINESS.md).
 - AI enrichment is optional and disabled by default; deterministic features remain available.

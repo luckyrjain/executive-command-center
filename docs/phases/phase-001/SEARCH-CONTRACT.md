@@ -1,7 +1,7 @@
 ---
 id: PHASE-001-SEARCH-CONTRACT
 title: Phase 1 Search Contract
-status: Approved
+status: Approved for Implementation
 version: 1.0.1
 owner: Lucky Jain
 ---

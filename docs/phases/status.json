@@ -1,0 +1,198 @@
+{
+  "schema_version": 1,
+  "phases": [
+    {
+      "id": "PHASE-000",
+      "number": 0,
+      "name": "Repository Foundation",
+      "specification": "docs/phases/PHASE-000-repository-foundation.md",
+      "specification_status": "approved_for_implementation",
+      "engineering_status": "engineering_complete",
+      "engineering_summary": "Foundation implemented",
+      "validation_status": "passed",
+      "promotion_status": "promoted",
+      "open_gates": [],
+      "implementation_status": null,
+      "last_verified_commit": "0919ca4fd7a5fbd6c2199606a61652cdc3ff9ade"
+    },
+    {
+      "id": "PHASE-001",
+      "number": 1,
+      "name": "Executive Dashboard MVP",
+      "specification": "docs/phases/PHASE-001-executive-dashboard-mvp.md",
+      "specification_status": "approved_for_implementation",
+      "engineering_status": "engineering_complete",
+      "engineering_summary": "Tasks 1-11 delivered",
+      "validation_status": "in_progress",
+      "promotion_status": "blocked",
+      "open_gates": [
+        "seven-day daily-use validation",
+        "human change-review sign-off"
+      ],
+      "implementation_status": "docs/phases/phase-001/IMPLEMENTATION-STATUS.md",
+      "last_verified_commit": "0919ca4fd7a5fbd6c2199606a61652cdc3ff9ade"
+    },
+    {
+      "id": "PHASE-002",
+      "number": 2,
+      "name": "Knowledge Platform",
+      "specification": "docs/phases/PHASE-002-knowledge-platform.md",
+      "specification_status": "approved_for_implementation",
+      "engineering_status": "engineering_complete",
+      "engineering_summary": "Slices 1-8 delivered",
+      "validation_status": "not_started",
+      "promotion_status": "blocked",
+      "open_gates": [
+        "product validation",
+        "human change review",
+        "Phase 1 predecessor exit accepted only by parallel-start exception"
+      ],
+      "implementation_status": "docs/phases/phase-002/IMPLEMENTATION-STATUS.md",
+      "last_verified_commit": "0919ca4fd7a5fbd6c2199606a61652cdc3ff9ade"
+    },
+    {
+      "id": "PHASE-003",
+      "number": 3,
+      "name": "Human Attention Engine",
+      "specification": "docs/phases/PHASE-003-human-attention-engine.md",
+      "specification_status": "approved_for_implementation",
+      "engineering_status": "engineering_complete",
+      "engineering_summary": "Slices 1-8 delivered",
+      "validation_status": "in_progress",
+      "promotion_status": "blocked",
+      "open_gates": [
+        "two-week dogfood validation",
+        "human change review",
+        "predecessor exits accepted only by parallel-start exception"
+      ],
+      "implementation_status": "docs/phases/phase-003/IMPLEMENTATION-STATUS.md",
+      "last_verified_commit": "0919ca4fd7a5fbd6c2199606a61652cdc3ff9ade"
+    },
+    {
+      "id": "PHASE-004",
+      "number": 4,
+      "name": "AI Runtime",
+      "specification": "docs/phases/PHASE-004-ai-runtime.md",
+      "specification_status": "approved_for_implementation",
+      "engineering_status": "engineering_complete",
+      "engineering_summary": "First activation slice delivered",
+      "validation_status": "accepted_with_limitations",
+      "promotion_status": "blocked",
+      "open_gates": [
+        "real-model re-verification of recorded limitations",
+        "repository-owner independent review",
+        "promotion decision"
+      ],
+      "implementation_status": "docs/phases/phase-004/IMPLEMENTATION-STATUS.md",
+      "last_verified_commit": "0919ca4fd7a5fbd6c2199606a61652cdc3ff9ade"
+    },
+    {
+      "id": "PHASE-005",
+      "number": 5,
+      "name": "Automation",
+      "specification": "docs/phases/PHASE-005-automation.md",
+      "specification_status": "approved_for_implementation",
+      "engineering_status": "engineering_complete",
+      "engineering_summary": "Tasks 1-7 delivered",
+      "validation_status": "in_progress",
+      "promotion_status": "blocked",
+      "open_gates": [
+        "14-day staged dogfood record",
+        "human change review",
+        "promotion decision"
+      ],
+      "implementation_status": "docs/phases/phase-005/IMPLEMENTATION-STATUS.md",
+      "last_verified_commit": "0919ca4fd7a5fbd6c2199606a61652cdc3ff9ade"
+    },
+    {
+      "id": "PHASE-006",
+      "number": 6,
+      "name": "Engineering Workspace",
+      "specification": "docs/phases/PHASE-006-engineering-workspace.md",
+      "specification_status": "approved_for_implementation",
+      "engineering_status": "engineering_complete",
+      "engineering_summary": "Tasks 1-8 delivered with disclosed partial scope",
+      "validation_status": "in_progress",
+      "promotion_status": "blocked",
+      "open_gates": [
+        "real connector-account recovery evidence",
+        "production-readiness review",
+        "independent change review and promotion decision"
+      ],
+      "implementation_status": "docs/phases/phase-006/IMPLEMENTATION-STATUS.md",
+      "last_verified_commit": "0919ca4fd7a5fbd6c2199606a61652cdc3ff9ade"
+    },
+    {
+      "id": "PHASE-007",
+      "number": 7,
+      "name": "Personal Intelligence",
+      "specification": "docs/phases/PHASE-007-personal-intelligence.md",
+      "specification_status": "approved_for_implementation",
+      "engineering_status": "engineering_complete",
+      "engineering_summary": "Tasks 1-8 delivered",
+      "validation_status": "not_started",
+      "promotion_status": "blocked",
+      "open_gates": [
+        "personal-data export deletion and restore evidence",
+        "encryption-key rotation decision",
+        "independent change review and promotion decision"
+      ],
+      "implementation_status": "docs/phases/phase-007/IMPLEMENTATION-STATUS.md",
+      "last_verified_commit": "0919ca4fd7a5fbd6c2199606a61652cdc3ff9ade"
+    },
+    {
+      "id": "PHASE-008",
+      "number": 8,
+      "name": "Multi-user Workspaces",
+      "specification": "docs/phases/PHASE-008-multi-user.md",
+      "specification_status": "approved_for_implementation",
+      "engineering_status": "engineering_complete",
+      "engineering_summary": "Tasks 1-9 delivered",
+      "validation_status": "not_started",
+      "promotion_status": "blocked",
+      "open_gates": [
+        "first production owner provisioning",
+        "account recovery and MFA or step-up decision",
+        "independent change review and promotion decision"
+      ],
+      "implementation_status": "docs/phases/phase-008/IMPLEMENTATION-STATUS.md",
+      "last_verified_commit": "0919ca4fd7a5fbd6c2199606a61652cdc3ff9ade"
+    },
+    {
+      "id": "PHASE-009",
+      "number": 9,
+      "name": "Enterprise",
+      "specification": "docs/phases/PHASE-009-enterprise.md",
+      "specification_status": "draft",
+      "engineering_status": "not_started",
+      "engineering_summary": "No engineering delivery started",
+      "validation_status": "not_started",
+      "promotion_status": "not_promoted",
+      "open_gates": [
+        "specification approval",
+        "predecessor production-readiness and promotion decisions"
+      ],
+      "implementation_status": "docs/phases/phase-009/IMPLEMENTATION-STATUS.md",
+      "last_verified_commit": "0919ca4fd7a5fbd6c2199606a61652cdc3ff9ade"
+    },
+    {
+      "id": "PHASE-010",
+      "number": 10,
+      "name": "Gmail Connector",
+      "specification": "docs/phases/PHASE-010-gmail-connector.md",
+      "specification_status": "approved_for_implementation",
+      "engineering_status": "in_progress",
+      "engineering_summary": "Tasks 1-5 of 8 complete",
+      "validation_status": "not_started",
+      "promotion_status": "not_promoted",
+      "open_gates": [
+        "Tasks 6-8",
+        "real Gmail account verification",
+        "backup and restore verification",
+        "independent change review"
+      ],
+      "implementation_status": "docs/phases/phase-010/IMPLEMENTATION-STATUS.md",
+      "last_verified_commit": "d6eb91906b98cf96d71e2b2f4a44cc238f33b1b3"
+    }
+  ]
+}

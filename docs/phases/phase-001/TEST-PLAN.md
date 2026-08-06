@@ -1,7 +1,7 @@
 ---
 id: PHASE-001-TEST-PLAN
 title: Phase 1 Test Plan
-status: Approved
+status: Approved for Implementation
 version: 1.0.3
 owner: Lucky Jain
 ---

@@ -758,17 +758,27 @@ def regenerate_attention(auth: AuthDep, session: SessionDep, _csrf: CsrfDep) -> 
         candidate_senders = list(
             {normalize_email(row["last_inbound_sender"]) for row in email_thread_candidates}
         )
-        known_email_aliases = {
-            row[0]
-            for row in session.execute(
-                text(
-                    "SELECT normalized_value FROM entity_aliases "
-                    "WHERE workspace_id = :workspace_id AND alias_type = 'email' "
-                    "AND normalized_value = ANY(CAST(:candidate_senders AS text[]))"
-                ),
-                {"workspace_id": auth.workspace_id, "candidate_senders": candidate_senders},
-            ).all()
-        }
+        # Skip the round-trip entirely when there are no structurally-eligible
+        # candidates (the common case for every workspace that hasn't
+        # connected Gmail, and for every `regenerate_attention` call in
+        # between actual new inbound messages) -- an empty `ANY(...)` array
+        # always returns zero rows, so this is a pure latency win, not a
+        # behavior change.
+        known_email_aliases: set[str] = (
+            {
+                row[0]
+                for row in session.execute(
+                    text(
+                        "SELECT normalized_value FROM entity_aliases "
+                        "WHERE workspace_id = :workspace_id AND alias_type = 'email' "
+                        "AND normalized_value = ANY(CAST(:candidate_senders AS text[]))"
+                    ),
+                    {"workspace_id": auth.workspace_id, "candidate_senders": candidate_senders},
+                ).all()
+            }
+            if candidate_senders
+            else set()
+        )
         email_threads = [
             row
             for row in email_thread_candidates

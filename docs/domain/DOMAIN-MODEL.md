@@ -1,7 +1,7 @@
 ---
 id: DOMAIN-MODEL
 title: Executive Command Center Canonical Domain Model
-status: Accepted
+status: Approved
 version: 1.1.2
 owner: Lucky Jain
 related:

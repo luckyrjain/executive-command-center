@@ -14,18 +14,38 @@ This is the canonical index for phase-wise product, architecture, API, data, UX,
 
 ## Status
 
-| Phase | Name | Specification | Delivery status |
-|---:|---|---|---|
-| 0 | Repository Foundation | Approved baseline | Implemented |
-| 1 | Executive Dashboard MVP | Approved for implementation | Engineering delivery complete; exit gates open |
-| 2 | Knowledge Platform | Approved for implementation | In progress |
-| 3 | Human Attention Engine | Approved for implementation | In progress |
-| 4 | AI Runtime | Approved for implementation | Engineering delivery complete; exit gates open, known limitations accepted |
-| 5 | Automation | Approved for implementation | Task 0 design pass complete; implementation not started |
-| 6 | Engineering Workspace | Draft | Not started |
-| 7 | Personal Intelligence | Draft | Not started |
-| 8 | Multi-user Workspaces | Draft | Not started |
-| 9 | Enterprise | Draft | Not started |
+<!-- BEGIN GENERATED PHASE STATUS -->
+**Current engineering phase:** Phase 10 — Gmail Connector (In progress; Tasks 1-5 of 8 complete).
+
+| Phase | Name | Engineering | Validation | Promotion |
+|---:|---|---|---|---|
+| 0 | Repository Foundation | Engineering complete | Passed | Promoted |
+| 1 | Executive Dashboard MVP | Engineering complete | In progress | Blocked |
+| 2 | Knowledge Platform | Engineering complete | Not started | Blocked |
+| 3 | Human Attention Engine | Engineering complete | In progress | Blocked |
+| 4 | AI Runtime | Engineering complete | Accepted with limitations | Blocked |
+| 5 | Automation | Engineering complete | In progress | Blocked |
+| 6 | Engineering Workspace | Engineering complete | In progress | Blocked |
+| 7 | Personal Intelligence | Engineering complete | Not started | Blocked |
+| 8 | Multi-user Workspaces | Engineering complete | Not started | Blocked |
+| 9 | Enterprise | Not started | Not started | Not promoted |
+| 10 | Gmail Connector | In progress | Not started | Not promoted |
+
+**Open gates:**
+
+- Phase 1: seven-day daily-use validation; human change-review sign-off.
+- Phase 2: product validation; human change review; Phase 1 predecessor exit accepted only by parallel-start exception.
+- Phase 3: two-week dogfood validation; human change review; predecessor exits accepted only by parallel-start exception.
+- Phase 4: real-model re-verification of recorded limitations; repository-owner independent review; promotion decision.
+- Phase 5: 14-day staged dogfood record; human change review; promotion decision.
+- Phase 6: real connector-account recovery evidence; production-readiness review; independent change review and promotion decision.
+- Phase 7: personal-data export deletion and restore evidence; encryption-key rotation decision; independent change review and promotion decision.
+- Phase 8: first production owner provisioning; account recovery and MFA or step-up decision; independent change review and promotion decision.
+- Phase 9: specification approval; predecessor production-readiness and promotion decisions.
+- Phase 10: Tasks 6-8; real Gmail account verification; backup and restore verification; independent change review.
+
+Source: [`docs/phases/status.json`](status.json). Specification approval, engineering completion, validation, and promotion are independent states.
+<!-- END GENERATED PHASE STATUS -->
 
 ## Phase 0 — Repository Foundation
 
@@ -134,7 +154,18 @@ This is the canonical index for phase-wise product, architecture, API, data, UX,
 - [TEST PLAN](./phase-009/TEST-PLAN.md)
 - [IMPLEMENTATION STATUS](./phase-009/IMPLEMENTATION-STATUS.md)
 
-## Dependency sequence
+## Phase 10 — Gmail Connector
+
+- [Primary phase specification](./PHASE-010-gmail-connector.md)
+- [DATA MODEL](./phase-010/DATA-MODEL.md)
+- [API SCHEMAS](./phase-010/API-SCHEMAS.md)
+- [SYNC CONTRACT](./phase-010/SYNC-CONTRACT.md)
+- [PRIVACY AND CONSENT CONTRACT](./phase-010/PRIVACY-CONSENT-CONTRACT.md)
+- [UX STATES](./phase-010/UX-STATES.md)
+- [TEST PLAN](./phase-010/TEST-PLAN.md)
+- [IMPLEMENTATION STATUS](./phase-010/IMPLEMENTATION-STATUS.md)
+
+## Capability sequence and dependency policy
 
 ```text
 Phase 0 Foundation
@@ -147,9 +178,18 @@ Phase 0 Foundation
   -> Phase 7 Personal Intelligence
   -> Phase 8 Multi-user
   -> Phase 9 Enterprise
+
+Cross-cutting: Phase 10 Gmail Connector
+  depends on Phases 1, 2, 3, 4, 6, and 7; not Phase 9
 ```
 
-Implementation begins only after dependencies meet exit criteria and the phase is explicitly Approved for Implementation.
+The arrows show the intended capability sequence, not current promotion state.
+Normally, implementation begins after declared dependencies meet exit criteria and
+the phase is explicitly Approved for Implementation. A repository-owner-approved
+parallel-start exception may allow engineering work while predecessor validation or
+promotion gates remain open; the exception must be recorded in the phase/roadmap and
+never counts as closing those gates. The canonical registry above records current
+engineering, validation, and promotion independently.
 
 ## Standard layout
 

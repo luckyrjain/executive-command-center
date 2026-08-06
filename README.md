@@ -6,10 +6,38 @@ Executive Command Center (ECC) is a specification-driven platform for helping ex
 
 ## Current status
 
-**Foundation specification:** Phase 0 baseline approved  
-**Implementation:** Phase 1 engineering delivery is complete on `feature/phase-1-production-hardening` — backend domain slices, the executive frontend, and production hardening (security/config validation, structured observability, verified backup/restore, representative-scale performance gates, dependency/container/secret scanning) are all implemented and independently reviewed (`.superpowers/sdd/progress.md`). Phase 1 is not yet closed: it exits only after the seven-day daily-use validation (`docs/runbooks/PHASE-1-DAILY-USE.md`) and human change-review sign-off, both still open — see [Phase 1 Implementation Status](docs/phases/phase-001/IMPLEMENTATION-STATUS.md) and [Phase 1 Final Acceptance](docs/phases/phase-001/FINAL-ACCEPTANCE.md).  
-**Current delivery phase:** engineering delivery has proceeded, with repository-owner-authorized parallel-start exceptions, through Phase 8 — Phases 2-6 each have engineering delivery complete or substantially complete with their own exit gates still open, Phase 7 (Personal Intelligence) is complete through Task 8 plus a merged whole-phase review round, and Phase 8 (Multi-user Workspaces) is complete through Task 9 of 9 plus three whole-phase review rounds with a fourth in progress. None of Phases 1-8 has a promotion/exit decision made yet; see [Roadmap](docs/ROADMAP.md) for the authoritative, phase-by-phase status.  
-**Published specifications:** Phases 0–9; Phase 9 remains Draft / Planned, Phases 0-8 are Approved for Implementation
+<!-- BEGIN GENERATED PHASE STATUS -->
+**Current engineering phase:** Phase 10 — Gmail Connector (In progress; Tasks 1-5 of 8 complete).
+
+| Phase | Name | Engineering | Validation | Promotion |
+|---:|---|---|---|---|
+| 0 | Repository Foundation | Engineering complete | Passed | Promoted |
+| 1 | Executive Dashboard MVP | Engineering complete | In progress | Blocked |
+| 2 | Knowledge Platform | Engineering complete | Not started | Blocked |
+| 3 | Human Attention Engine | Engineering complete | In progress | Blocked |
+| 4 | AI Runtime | Engineering complete | Accepted with limitations | Blocked |
+| 5 | Automation | Engineering complete | In progress | Blocked |
+| 6 | Engineering Workspace | Engineering complete | In progress | Blocked |
+| 7 | Personal Intelligence | Engineering complete | Not started | Blocked |
+| 8 | Multi-user Workspaces | Engineering complete | Not started | Blocked |
+| 9 | Enterprise | Not started | Not started | Not promoted |
+| 10 | Gmail Connector | In progress | Not started | Not promoted |
+
+**Open gates:**
+
+- Phase 1: seven-day daily-use validation; human change-review sign-off.
+- Phase 2: product validation; human change review; Phase 1 predecessor exit accepted only by parallel-start exception.
+- Phase 3: two-week dogfood validation; human change review; predecessor exits accepted only by parallel-start exception.
+- Phase 4: real-model re-verification of recorded limitations; repository-owner independent review; promotion decision.
+- Phase 5: 14-day staged dogfood record; human change review; promotion decision.
+- Phase 6: real connector-account recovery evidence; production-readiness review; independent change review and promotion decision.
+- Phase 7: personal-data export deletion and restore evidence; encryption-key rotation decision; independent change review and promotion decision.
+- Phase 8: first production owner provisioning; account recovery and MFA or step-up decision; independent change review and promotion decision.
+- Phase 9: specification approval; predecessor production-readiness and promotion decisions.
+- Phase 10: Tasks 6-8; real Gmail account verification; backup and restore verification; independent change review.
+
+Source: [`docs/phases/status.json`](docs/phases/status.json). Specification approval, engineering completion, validation, and promotion are independent states.
+<!-- END GENERATED PHASE STATUS -->
 
 ## Quick start
 
@@ -85,7 +113,9 @@ Read the documents in this order:
 22. [Phase Documentation Index](docs/phases/README.md)
 23. [Phase 0–9 Documentation Review](docs/phases/PHASE-REVIEW.md)
 24. [Roadmap](docs/ROADMAP.md)
-25. [Contributing](docs/CONTRIBUTING.md)
+25. [Production Readiness and Blocker Register](docs/operations/PRODUCTION-READINESS.md)
+26. [Product KPI Contract](docs/product/KPI-CONTRACT.md)
+27. [Contributing](docs/CONTRIBUTING.md)
 
 ## Architecture decisions
 
@@ -101,6 +131,9 @@ The accepted Phase 0 decisions are recorded under [`docs/adr`](docs/adr/):
 - ADR-0008 — Authentication and Workspace Identity
 - ADR-0009 — Connector Synchronization
 - ADR-0010 — Deployment Strategy
+- ADR-0011 — Hybrid Retrieval Embeddings
+- ADR-0012 — Ollama Local Inference
+- ADR-0013 — Durable Workflow Execution
 
 ## Phase 0 technology boundary
 
@@ -145,7 +178,17 @@ RFC-004 is split into independently reviewable chapters under [`docs/architectur
 - [PHASE-007 — Personal Intelligence](docs/phases/PHASE-007-personal-intelligence.md)
 - [PHASE-008 — Multi-user Workspaces](docs/phases/PHASE-008-multi-user.md)
 - [PHASE-009 — Enterprise](docs/phases/PHASE-009-enterprise.md)
+- [PHASE-010 — Gmail Connector](docs/phases/PHASE-010-gmail-connector.md)
 - [Canonical Phase Index and Supporting Contracts](docs/phases/README.md)
+
+## Operations and measurement
+
+- [Production readiness and blocker register](docs/operations/PRODUCTION-READINESS.md)
+- [Product KPI contract](docs/product/KPI-CONTRACT.md)
+- [Phase 6 connector recovery](docs/runbooks/PHASE-6-CONNECTOR-RECOVERY.md)
+- [Phase 7 personal-data recovery](docs/runbooks/PHASE-7-PERSONAL-DATA-RECOVERY.md)
+- [Phase 8 identity recovery](docs/runbooks/PHASE-8-IDENTITY-RECOVERY.md)
+- [Phase 10 Gmail recovery](docs/runbooks/PHASE-10-GMAIL-RECOVERY.md)
 
 ## Repository rule
 
