@@ -1076,6 +1076,21 @@ def _extract_plain_text_body(payload: dict[str, Any]) -> str | None:
     treat that as "nothing to store," the same "malformed input is
     skipped, not raised" contract `_process_message` already documents
     for this file's other Gmail-response parsing.
+
+    Recurses one stack frame per `parts` nesting level with no depth cap
+    of its own -- round 9 review: a maliciously deep `multipart/mixed`
+    nesting (each part wrapping exactly one child part, hundreds of levels
+    deep) drives this past the interpreter's recursion limit and raises an
+    uncaught `RecursionError`, the same failure class `_parse_address`'s
+    own docstring already covers for stdlib header parsing, reached here
+    via this function's own recursion instead. A sender fully controls
+    their outgoing MIME structure the same way they control their
+    headers -- the identical "single crafted message reaches an uncaught
+    crash" failure class every guard in this file exists to close. Guarded
+    at the caller (`_detect_action_for_message` wraps this call in
+    `try`/`except RecursionError`), the same "guard at the point of use,
+    not inside the recursive walk itself" shape as every `RecursionError`
+    guard elsewhere in this module.
     """
     mime_type = payload.get("mimeType")
     body = payload.get("body")
@@ -2840,13 +2855,53 @@ class GmailAdapter:
         try:
             body_json = get_response.json()
         except ValueError:
+            # Malformed/truncated JSON -- presumed a transient response
+            # glitch (a proxy cutting the body short, say), not a property
+            # of the message itself, so this stays a silent `return`
+            # (`body IS NULL`, retried next call) like the non-200/missing-
+            # `payload` cases below.
             return
-        if not isinstance(body_json, dict):
-            return
-        payload = body_json.get("payload")
-        if not isinstance(payload, dict):
-            return
-        plain_text = _extract_plain_text_body(payload)
+        except RecursionError:
+            # Round 9 review: `httpx.Response.json()` calls `json.loads`
+            # directly, whose own recursive-descent parser has no depth cap
+            # either -- a sufficiently deep JSON array/object nesting in
+            # Gmail's response raises `RecursionError` here, not `ValueError`
+            # (`json.JSONDecodeError`'s own base class), the same "not any
+            # exception type this module already anticipated" gap
+            # `_parse_address`'s docstring describes for stdlib header
+            # parsing. Unlike a `ValueError`, this is *not* presumed
+            # transient: Gmail generates `messages.get`'s response
+            # deterministically from this specific message's own stored
+            # MIME structure, so a response nested this deeply is a
+            # permanent property of the message, not a passing glitch --
+            # the same "genuinely won't change on retry" reasoning the
+            # round-4 comment below gives for a structurally-parsed message
+            # with no `text/plain` part. Falls through to that same empty-
+            # string sentinel path (`plain_text = None`, same as "nothing
+            # extractable") rather than `return`ing, precisely so this
+            # message is marked handled once and for all -- returning here
+            # instead would leave `body IS NULL` forever, reopening the
+            # round-4-fixed "poison message" failure class through this
+            # new trigger.
+            plain_text = None
+        else:
+            if not isinstance(body_json, dict):
+                return
+            payload = body_json.get("payload")
+            if not isinstance(payload, dict):
+                return
+            try:
+                plain_text = _extract_plain_text_body(payload)
+            except RecursionError:
+                # See `_extract_plain_text_body`'s own docstring: a
+                # maliciously deep `parts` nesting drives its recursive walk
+                # past the interpreter's recursion limit -- the identical
+                # "deterministic property of this message, not a transient
+                # glitch" reasoning as the `except RecursionError` above,
+                # just reached one step further down, after the response
+                # parsed as JSON but its MIME tree couldn't be walked. Falls
+                # through to the same sentinel path for the same reason.
+                plain_text = None
         now = datetime.now(UTC)
         # Round 4 review finding: `plain_text` being falsy (HTML-only mail
         # with no `text/plain` part, or a `payload` with no extractable
@@ -2859,11 +2914,15 @@ class GmailAdapter:
         # valid JSON, a dict body, a dict `payload`) that genuinely has no
         # `text/plain` part is a fact about the message itself that will
         # not change on retry -- Gmail message content is immutable --
-        # unlike the non-200/malformed-response/missing-`payload` cases
-        # above, which stay silent `return`s (still `body IS NULL`, still
-        # eligible next call) because those genuinely are transient or
-        # indicate a response this method could not make sense of, not a
-        # property of the message. The empty-string sentinel written below
+        # unlike the non-200/malformed-JSON (`ValueError`)/missing-
+        # `payload` cases above, which stay silent `return`s (still `body
+        # IS NULL`, still eligible next call) because those genuinely are
+        # transient or indicate a response this method could not make
+        # sense of, not a property of the message. (The two `except
+        # RecursionError` branches above are deliberately *not* in that
+        # group, despite also being reached while parsing the response --
+        # see their own comments for why they instead join this branch.)
+        # The empty-string sentinel written below
         # is exactly `email_action_tools.py`'s own "genuinely empty" case
         # (that module's docstring): its `get_thread_content_tool` renders
         # `body = ''` as an empty message rather than omitting it, which is

@@ -118,6 +118,16 @@ detection_sync_postgres.py` for Task 5's own dedicated test file):
     future call-site drift raises the identical `TypeError` and fails
     this test loudly instead of being swallowed. Fixed by dropping the
     stray `auth=auth` keyword from the call site.
+27. `test_sync_invokes_proactive_action_detection_even_when_this_calls_
+    own_items_processed_is_zero`: round 4 review found the call site's
+    `outcome.items_processed > 0` gate silently defeated `detect_actions_
+    since`'s own "a backlog beyond one call's own bound is worked down
+    over subsequent calls" guarantee -- a call that itself synced zero new
+    messages (e.g. a poll that found nothing new) never re-ran detection
+    against an existing backlog either, even though the backlog is
+    unrelated to this call's own `items_processed` count. Proven by
+    asserting the hook still fires when `_ActionDetectionSpyAdapter`'s own
+    `items_processed` is `0`.
 """
 
 import threading

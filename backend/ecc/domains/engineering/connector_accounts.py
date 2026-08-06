@@ -1385,8 +1385,17 @@ def sync_connector_endpoint(
     # surface like `is_account_allowed` is deliberately not part of either
     # Protocol) -- this also avoids `connector_accounts.py` (engineering
     # domain) importing `gmail_adapter.py` (personal domain) at module
-    # level, which would cycle back through `gmail_adapter.py`'s own
-    # `from ecc.domains.engineering.connectors import ...`. Best-effort:
+    # level, which would be a domain-layering back-reference (engineering
+    # depending on personal, on top of personal already depending on
+    # engineering's own `connectors` module for its Protocol types) rather
+    # than a clean one-directional dependency. Round 9 review: not an
+    # actual circular import -- `ecc.domains.engineering.connectors`
+    # itself imports neither `connector_accounts.py` nor `gmail_adapter.py`
+    # (verified against its own import list), so this specific `getattr`
+    # would not raise `ImportError` even at module level. Kept duck-typed
+    # regardless, for the layering reason above and to keep
+    # `connector_accounts.py` provider-agnostic the way it already is for
+    # GitHub/GitLab/Jira/Datadog. Best-effort:
     # any failure here (a transient Gmail API error, a malformed body) is
     # swallowed rather than failing a sync response that has already fully
     # succeeded and been recorded -- the next sync call's own newly-

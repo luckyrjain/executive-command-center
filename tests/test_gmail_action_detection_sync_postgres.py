@@ -37,6 +37,11 @@ Covers:
    repeated the same per-write consent recheck `_sync_messages`/`_sync_
    history` already do, despite `SYNC-CONTRACT.md`'s own general contract
    covering this write path too.
+8. A maliciously deep MIME `parts` nesting (`_extract_plain_text_body`'s
+   recursive walk raising `RecursionError`) is marked handled with an
+   empty-string body sentinel, not left eligible forever -- the identical
+   "poison message" failure class item 5 covers, reached through a new
+   trigger found by round 9 review.
 """
 
 from __future__ import annotations
@@ -526,6 +531,109 @@ def _gmail_transport_html_only(external_message_id: str) -> httpx.MockTransport:
         )
 
     return httpx.MockTransport(handler)
+
+
+def _build_deeply_nested_mime_payload_json(depth: int) -> bytes:
+    """The raw JSON *text* (not a Python `dict`) for a `multipart/mixed`
+    `payload` wrapping a single child part, `depth` levels deep -- built by
+    string concatenation, deliberately never as a nested Python `dict`
+    passed through `json.dumps`/`httpx.Response(json=...)`, since building
+    (and later re-encoding) a `depth`-deep nested `dict` the ordinary way
+    is itself just as recursive as decoding one, and would raise
+    `RecursionError` here, in the test's own mock-server setup, before the
+    code under test ever runs. `depth` deep enough to exceed the
+    interpreter's default recursion limit (1000) for a per-object-level
+    recursive walk (`_extract_plain_text_body`'s own), and, independently,
+    Python's own pure-Python JSON decoder fallback if the C accelerator
+    isn't in play -- whichever of the two `RecursionError`s this
+    environment hits first, both are guarded in `_detect_action_for_
+    message` and this test doesn't care which one actually fires. The
+    innermost part is `text/plain` with real content, precisely so a
+    successful (non-crashing) walk *would* find it -- proving the failure
+    is a crash, not merely "found nothing."
+    """
+    inner_data = base64.urlsafe_b64encode(b"unreachable").decode().rstrip("=")
+    innermost = f'{{"mimeType":"text/plain","body":{{"data":"{inner_data}"}}}}'
+    payload_json = '{"mimeType":"multipart/mixed","parts":[' * depth + innermost + "]}" * depth
+    return payload_json.encode("utf-8")
+
+
+def _gmail_transport_deeply_nested_mime(external_message_id: str) -> httpx.MockTransport:
+    """A message whose `payload.parts` MIME tree is nested far deeper than
+    `_extract_plain_text_body`'s recursive walk (or, depending on this
+    environment's JSON decoder, `get_response.json()` itself) can traverse
+    without raising `RecursionError` -- round 9 review: a sender fully
+    controls their outgoing MIME structure the same way they control their
+    headers, so a crafted, deeply-nested `multipart/mixed` message is a
+    realistic attacker input, not merely a synthetic edge case.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == f"/gmail/v1/users/me/messages/{external_message_id}"
+        body = b'{"id":"%s","payload":%s}' % (
+            external_message_id.encode("ascii"),
+            _build_deeply_nested_mime_payload_json(5000),
+        )
+        return httpx.Response(200, content=body, headers={"content-type": "application/json"})
+
+    return httpx.MockTransport(handler)
+
+
+def test_recursion_error_extracting_body_is_marked_handled_not_retried_forever(
+    detection_context: dict, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round 9 review finding: `_extract_plain_text_body`'s recursive
+    `parts` walk has no depth cap, so a maliciously deep MIME nesting
+    raises an uncaught `RecursionError` -- which, before this fix, was not
+    caught anywhere between that walk and `_detect_action_for_message`'s
+    outer `except Exception: continue` in `detect_actions_since`'s batch
+    loop, so the body-UPDATE that marks a message handled never ran,
+    reopening the exact "poison message, permanent retry" failure class
+    round 4 already fixed once (see `test_no_extractable_plain_text_is_
+    marked_handled_not_retried_forever`, immediately above) via a new
+    trigger. Proven with the same two-call shape that test uses: a first
+    call that fetches the deeply-nested message, then a second call whose
+    Gmail transport raises on any request -- if the message were still
+    eligible (`body IS NULL`), this second call would hit it again.
+    """
+    monkeypatch.setenv("ECC_EMAIL_ACTION_DETECTION_ENABLED", "true")
+    get_settings.cache_clear()
+    try:
+        workspace_id = detection_context["workspace_id"]
+        message_id = detection_context["message_id"]
+        external_message_id = detection_context["external_message_id"]
+
+        first_adapter = GmailAdapter(
+            transport=_gmail_transport_deeply_nested_mime(external_message_id)
+        )
+        first_adapter.detect_actions_since(
+            detection_context["context"],
+            since=detection_context["since"],
+            ollama_adapter=_ollama_adapter(has_action=False),
+        )
+
+        assert _recommendations(workspace_id) == []
+        body, fetched_at = _message_body(workspace_id, message_id)
+        assert body is not None
+        assert fetched_at is not None
+        assert decrypt_field(body) == ""
+
+        def _unexpected_gmail_call(request: httpx.Request) -> httpx.Response:
+            raise AssertionError(
+                f"unexpected Gmail request to {request.url}: message should no longer be "
+                "eligible (body is no longer NULL)"
+            )
+
+        second_adapter = GmailAdapter(transport=httpx.MockTransport(_unexpected_gmail_call))
+        second_adapter.detect_actions_since(
+            detection_context["context"],
+            since=datetime.now(UTC),
+            ollama_adapter=_ollama_adapter(has_action=False),
+        )
+
+        assert _recommendations(workspace_id) == []
+    finally:
+        get_settings.cache_clear()
 
 
 def test_no_extractable_plain_text_is_marked_handled_not_retried_forever(
