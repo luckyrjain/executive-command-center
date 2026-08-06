@@ -2,7 +2,7 @@
 id: PHASE-010-SYNC-CONTRACT
 title: Phase 10 Gmail Sync Contract
 status: Approved for Implementation
-version: 1.0.0
+version: 1.1.0
 owner: Lucky Jain
 depends_on:
   - PHASE-010
@@ -11,10 +11,22 @@ depends_on:
 
 # Phase 10 Gmail Sync Contract
 
-## Current behavior (Task 2)
+## Current behavior (Tasks 2-5)
 
 Gmail sync is pull-based and manually invoked through the existing connector
 sync endpoint. No scheduler or Pub/Sub push consumer is shipped.
+
+Task 3 adds a deterministic "awaiting reply" attention projection computed
+from already-synced thread/message data (`attention.py:regenerate_
+attention`'s own `email_thread` branch), not a sync-path change of its own.
+Task 5 adds controlled body retrieval: `gmail_adapter.py:detect_actions_
+since`, called from the sync pipeline's own success path, fetches one newly-
+eligible message's full body (`gmail.readonly`, `format=full`), stores it
+encrypted, and (via `email.detect_action`) may create a `source="ai"`
+recommendation plus its own evidence row -- never a direct `tasks`/
+`commitments`/`risks` write. Feature-flagged off by default (`ECC_EMAIL_
+ACTION_DETECTION_ENABLED`). See `IMPLEMENTATION-STATUS.md`'s own Task 3/5
+evidence sections for the full detail this summary intentionally omits.
 
 ### Backfill
 
@@ -61,13 +73,14 @@ lengths, recipient count, parsing complexity, invalid timestamps, duplicate
 IDs, and response shapes are bounded or rejected so one malformed email does
 not wedge the account cursor.
 
-## Planned behavior (Tasks 3-8)
+## Planned behavior (Tasks 6-8)
 
-- deterministic awaiting-reply attention projection;
-- controlled body retrieval using `gmail.readonly`;
-- recommendation/evidence creation;
 - consent-revocation disconnect and purge;
 - executive sync state and retry UI.
+
+Deterministic awaiting-reply attention projection (Task 3), controlled body
+retrieval using `gmail.readonly` (Task 5), and recommendation/evidence
+creation (Task 5) have shipped -- see "Current behavior" above.
 
 ## Polling and push decision
 
@@ -80,3 +93,4 @@ Pub/Sub push is explicitly deferred and `handle_webhook` remains a no-op.
 | Version | Date | Summary | Author |
 |---|---|---|---|
 | 1.0.0 | 2026-08-06 | Documented Task 2 backfill and history-cursor behavior | Lucky Jain |
+| 1.1.0 | 2026-08-06 | Task 5 review (Loop 2 round 16): moved shipped Task 3/5 behavior (attention projection, body retrieval, recommendation/evidence creation) from "Planned" to "Current"; this document had gone stale after Tasks 3-5 shipped without a contract-version update | Lucky Jain |

@@ -2,7 +2,7 @@
 id: PHASE-010-DATA-MODEL
 title: Phase 10 Gmail Data Model
 status: Approved for Implementation
-version: 1.0.0
+version: 1.1.0
 owner: Lucky Jain
 depends_on:
   - PHASE-010
@@ -14,11 +14,14 @@ depends_on:
 
 ## Delivery boundary
 
-- **Current (Tasks 1-2):** OAuth connector account, 30-day metadata
+- **Current (Tasks 1-2, 5):** OAuth connector account, 30-day metadata
   backfill, Gmail-history incremental sync, thread/message projections,
-  and sender/recipient entity linking.
-- **Planned (Tasks 3-8):** attention projections, recommendation creation,
-  body retrieval/caching, consent-revocation purge, and executive UX.
+  sender/recipient entity linking, and (Task 5) controlled body retrieval
+  and caching for a message that triggers `email.detect_action`.
+  Attention projections (Task 3) and recommendation creation (Task 4) also
+  shipped, but through tables this document does not own (`attention_items`,
+  `recommendations`) rather than a change to the tables below.
+- **Planned (Tasks 6-8):** consent-revocation purge and executive UX.
 
 ## Current tables
 
@@ -54,12 +57,20 @@ queries. `(workspace_id, id)` is unique for the message composite FK.
 | `external_message_id` | Unique within workspace/thread; deduplication key |
 | `sender`, `recipients` | Normalized plaintext addresses, each at most 320 characters |
 | `sent_at`, `direction` | UTC time and `inbound` or `outbound` |
-| `snippet`, `body` | Nullable narrative fields reserved for Fernet ciphertext |
-| `body_fetched_at` | Null until body retrieval is implemented |
+| `snippet`, `body` | Nullable narrative fields; `body` holds Fernet ciphertext (`ECC_PERSONAL_DATA_ENCRYPTION_KEY`) once fetched |
+| `body_fetched_at` | Null until Task 5's own body fetch populates it |
 | `created_at`, `updated_at` | UTC lifecycle timestamps |
 
 Task 2 writes `snippet`, `body`, and `body_fetched_at` as `NULL`; it fetches
-headers only. Index `ix_email_messages_thread_sent` supports thread chronology.
+headers only. Task 5's `gmail_adapter.py:_detect_action_for_message` fetches
+one message's full body (`gmail.readonly`, `format=full`) the first time it
+becomes eligible for `email.detect_action`, encrypts it with `crypto.
+encrypt_field`, and writes `body`/`body_fetched_at` together in the same
+`UPDATE ... WHERE body IS NULL` -- every other message in a thread keeps
+`body IS NULL` until its own turn. Index `ix_email_messages_thread_sent`
+supports thread chronology; the partial index `ix_email_messages_detect_
+action_eligible` (`workspace_id, owner_id, direction WHERE body IS NULL`,
+migration `0074`) supports Task 5's own eligibility scan.
 
 ### `sync_cursors` and `sync_runs`
 
@@ -87,13 +98,13 @@ claim consent revocation already purges Gmail data.
 
 ## Planned model changes
 
-Tasks 3-8 may add email-derived attention/evidence links and the
-recommendation create-path fields already approved by PHASE-010. They require
-their own migration and contract-version update; this document does not
-describe those rows as present.
+Tasks 6-8 may add further schema for consent-revocation purge and executive
+UX. They require their own migration and contract-version update; this
+document does not describe those rows as present.
 
 ## Changelog
 
 | Version | Date | Summary | Author |
 |---|---|---|---|
 | 1.0.0 | 2026-08-06 | Documented the Task 1-2 Gmail persistence contract | Lucky Jain |
+| 1.1.0 | 2026-08-06 | Task 5 review (Loop 2 round 16): documented body/body_fetched_at now populated by `email.detect_action`'s own body fetch, and the new `ix_email_messages_detect_action_eligible` partial index (migration `0074`); this document had gone stale after Tasks 3-5 shipped without a contract-version update | Lucky Jain |
