@@ -2982,7 +2982,12 @@ class GmailAdapter:
             run = execute_run(
                 "email.detect_action",
                 "restricted",
-                {"thread_id": str(thread_id)},
+                # `message_id` (round 14 review): the specific message this
+                # whole call exists to evaluate -- threaded through so
+                # `email.get_thread_content`'s own cap can never silently
+                # exclude it from an oversized thread (see that tool's own
+                # docstring for the mechanism this closes).
+                {"thread_id": str(thread_id), "message_id": str(message_id)},
                 session=session,
                 auth=auth,
                 ollama_adapter=ollama_adapter,

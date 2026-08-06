@@ -45,15 +45,36 @@ an organically long-running thread (a support/notification/reply-all
 thread, whose message count an external sender fully controls simply by
 replying into it) would otherwise decrypt and render every historical
 message every single time any new message in that thread became eligible,
-paid before `execute_run`'s own token-budget check even runs. The
-`LIMIT` alone, ordered `sent_at ASC` like the rest of this query, would
-silently drop the *newest* messages first on an oversized thread --
-exactly backwards, since the newest message is normally the one that
-triggered this call in the first place. Selects the most recent `_MAX_
-THREAD_MESSAGES` messages (by `sent_at DESC LIMIT`), then re-sorts that
-capped set back to the same oldest-first order documented above, so a
-thread within the cap is unaffected and one over the cap still keeps its
-most recent (most relevant) messages, in the same reading order.
+paid before `execute_run`'s own token-budget check even runs. Selects the
+most recent `_MAX_THREAD_MESSAGES` messages (by `sent_at DESC LIMIT`),
+then re-sorts that capped set back to the same oldest-first order
+documented above, so a thread within the cap is unaffected and one over
+the cap still keeps its most recent (most relevant) messages, in the same
+reading order.
+
+`trigger_message_id`, when given, is always included in the capped set,
+never counted against it as "just another message" -- round 14 review
+found that "most recent `_MAX_THREAD_MESSAGES` by `sent_at`" alone (round
+13's original fix) can silently exclude the specific message that
+triggered this call: `detect_actions_since`'s own eligibility query
+(`gmail_adapter.py`) orders `(created_at >= since) DESC, sent_at ASC`,
+deliberately prioritizing an account's freshly-synced messages over older
+same-thread backlog (the round 3/4 "backlog worked down over subsequent
+calls, not lost" design) -- so on a busy, long-running thread, an old
+backlog message can still be waiting its turn long after 50+ *newer*
+messages in that same thread have already had their bodies fetched (and
+thus already occupy every slot the cap allows) by the time it's finally
+processed. Without this guarantee, `_detect_action_for_message` would run
+the model over thread content that never includes the very email the run
+exists to evaluate -- and if grounding then passes on some other, visible
+message, the created recommendation's own evidence (which cites the
+triggering message specifically, per `_register_message_evidence`) would
+point at a message the model was never actually shown. Reserves one slot
+for it (`_MAX_THREAD_MESSAGES - 1` from the ordinary "most recent" pool,
+excluding the trigger from that pool so it is never counted twice) rather
+than appending it as message `_MAX_THREAD_MESSAGES + 1`, so the *total*
+size bound this cap exists to enforce is never itself violated by the
+guarantee meant to fix a different bug.
 """
 
 from typing import Any
@@ -75,7 +96,7 @@ _MAX_THREAD_MESSAGES = 50
 
 
 def get_thread_content_tool(
-    session: Session, auth: AuthContext, thread_id: UUID
+    session: Session, auth: AuthContext, thread_id: UUID, trigger_message_id: UUID | None = None
 ) -> ToolResult | ToolNotFound:
     thread_row = session.execute(
         text(
@@ -87,6 +108,12 @@ def get_thread_content_tool(
     if thread_row is None:
         return ToolNotFound(tool="email.get_thread_content")
 
+    # `trigger_message_id` reserves one of `_MAX_THREAD_MESSAGES`'s own
+    # slots for itself (see this module's own docstring) -- the "most
+    # recent" pool is capped one lower and explicitly excludes it, so the
+    # `UNION ALL` below can never double-count it or push the total past
+    # the cap this whole mechanism exists to enforce.
+    most_recent_limit = _MAX_THREAD_MESSAGES - (1 if trigger_message_id is not None else 0)
     rows = (
         session.execute(
             text(
@@ -95,9 +122,15 @@ def get_thread_content_tool(
                     SELECT id, sender, sent_at, direction, body FROM email_messages
                     WHERE workspace_id = :workspace_id AND owner_id = :owner_id
                       AND thread_id = :thread_id AND body IS NOT NULL
+                      AND (:trigger_message_id::uuid IS NULL OR id <> :trigger_message_id)
                     ORDER BY sent_at DESC
                     LIMIT :limit
                 ) AS most_recent
+                UNION ALL
+                SELECT id, sender, sent_at, direction, body FROM email_messages
+                WHERE workspace_id = :workspace_id AND owner_id = :owner_id
+                  AND thread_id = :thread_id AND body IS NOT NULL
+                  AND id = :trigger_message_id
                 ORDER BY sent_at ASC
                 """
             ),
@@ -105,7 +138,8 @@ def get_thread_content_tool(
                 "workspace_id": auth.workspace_id,
                 "owner_id": auth.user_id,
                 "thread_id": thread_id,
-                "limit": _MAX_THREAD_MESSAGES,
+                "trigger_message_id": trigger_message_id,
+                "limit": most_recent_limit,
             },
         )
         .mappings()

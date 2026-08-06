@@ -373,6 +373,10 @@ class _PersonalGetInsightSourcesOutput(BaseModel):
 class _EmailGetThreadContentInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
     thread_id: UUID
+    # Optional (round 14 review) -- see `_prepare_email_detect_action_
+    # request`'s own docstring and `email_action_tools.get_thread_content_
+    # tool`'s own docstring for why this needs to reach the tool at all.
+    trigger_message_id: UUID | None = None
 
 
 class _EmailMessageOut(BaseModel):
@@ -1490,13 +1494,25 @@ def _prepare_email_detect_action_request(
     insight_request`'s exact allowlist-gated pattern, fetching one Gmail
     thread's own messages (`email.get_thread_content`) instead of
     cross-domain personal records.
+
+    `input.get("message_id")`, when the real sync-triggered call path
+    supplies it (round 14 review; the evaluation harness's own synthetic
+    runs never do, since there is no single "triggering message" for a
+    labelled-example run), is threaded straight through as `email.get_
+    thread_content`'s own `trigger_message_id` -- see that tool's own
+    docstring for the "otherwise silently excluded from an oversized
+    thread's own capped output" bug this exists to close.
     """
     raw_thread_id = input.get("thread_id")
+    raw_message_id = input.get("message_id")
+    tool_input: dict[str, Any] = {"thread_id": str(raw_thread_id)}
+    if raw_message_id is not None:
+        tool_input["trigger_message_id"] = str(raw_message_id)
     dispatch = _dispatch_tool(
         session,
         auth,
         tool_name="email.get_thread_content",
-        tool_input={"thread_id": str(raw_thread_id)},
+        tool_input=tool_input,
         eligible_tools=port.eligible_tools,
     )
     steps.append(_tool_step(1, dispatch))

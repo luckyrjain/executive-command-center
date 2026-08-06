@@ -22,7 +22,13 @@ finding: previously untested); messages are returned oldest-first
 eligible messages returns only the most recent `_MAX_THREAD_MESSAGES` of
 them, still in oldest-first order, rather than every message the thread
 has ever accumulated (round 13 review finding: previously unbounded,
-unlike every sibling deterministic tool in this runtime).
+unlike every sibling deterministic tool in this runtime); and passing a
+`trigger_message_id` guarantees that specific message survives the cap
+even when it would not otherwise be among the most recent `_MAX_THREAD_
+MESSAGES` (round 14 review finding: round 13's own cap alone could
+silently exclude the very message a real call is triggered for, on a
+thread where an old backlog message is processed long after many newer
+same-thread messages already occupy the cap).
 """
 
 from collections.abc import Iterator
@@ -378,6 +384,69 @@ def test_thread_with_more_than_the_cap_returns_only_the_most_recent_messages_in_
     # The newest message (the one that would realistically have triggered
     # this call) is always present.
     assert messages[-1]["body"] == f"message-{total_messages - 1}"
+
+
+def test_trigger_message_id_is_always_included_even_when_older_than_the_cap_window(
+    tool_context: dict,
+) -> None:
+    """Round 14 review finding: round 13's own cap alone -- "most recent
+    `_MAX_THREAD_MESSAGES` by `sent_at`" -- can silently exclude the
+    specific message that triggered this call. `detect_actions_since`'s
+    own eligibility query prioritizes an account's freshly-synced messages
+    over older same-thread backlog (`ORDER BY (created_at >= since) DESC,
+    sent_at ASC`), so on a busy, long-running thread an old backlog
+    message can still be waiting its turn long after `_MAX_THREAD_
+    MESSAGES` *newer* messages in that same thread already have non-null
+    bodies -- by the time it's finally processed, it would fall outside
+    the "most recent N" window entirely, and the model would never see
+    the very email the run exists to evaluate. Simulates exactly that:
+    the oldest message in a `_MAX_THREAD_MESSAGES + 10`-message thread is
+    the one this call is triggered for; without the `trigger_message_id`
+    guarantee, this exact message would be the *first* one the cap drops
+    (proven by the sibling test above, whose own oldest-10-dropped
+    assertion this test's own message-0 is one of).
+    """
+    thread_id = _insert_thread(
+        workspace_id=tool_context["workspace_id"],
+        owner_id=tool_context["user_id"],
+        connector_account_id=tool_context["connector_account_id"],
+        subject="Long-running thread, old backlog message",
+        now=tool_context["now"],
+    )
+    now = tool_context["now"]
+    total_messages = _MAX_THREAD_MESSAGES + 10
+    message_ids: list[UUID] = []
+    for i in range(total_messages):
+        message_id = _insert_message(
+            workspace_id=tool_context["workspace_id"],
+            owner_id=tool_context["user_id"],
+            thread_id=thread_id,
+            sender=f"sender-{i}@partner-co.test",
+            sent_at=now + timedelta(minutes=i),
+            body=f"message-{i}",
+        )
+        message_ids.append(message_id)
+    trigger_id = message_ids[0]
+
+    with SessionFactory() as session:
+        result = get_thread_content_tool(
+            session, tool_context["auth"], thread_id=thread_id, trigger_message_id=trigger_id
+        )
+
+    assert isinstance(result, ToolResult)
+    messages = result.output["messages"]
+    # Still capped at _MAX_THREAD_MESSAGES total -- the guarantee reserves
+    # a slot for the trigger rather than appending a 51st message.
+    assert len(messages) == _MAX_THREAD_MESSAGES
+    # The trigger (message-0, the oldest) is present, first in the still-
+    # oldest-first output, even though it would not otherwise have
+    # survived the cap.
+    assert messages[0]["body"] == "message-0"
+    # The 49 most-recent other messages (message-11..message-59) fill the
+    # remaining slots, still in oldest-first order.
+    rest_start = total_messages - (_MAX_THREAD_MESSAGES - 1)
+    expected_rest = [f"message-{i}" for i in range(rest_start, total_messages)]
+    assert [m["body"] for m in messages[1:]] == expected_rest
 
 
 def test_message_with_no_fetched_body_is_omitted_not_rendered_empty(tool_context: dict) -> None:

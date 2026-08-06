@@ -11,9 +11,13 @@ precedent for wiring on a new task type:
 
 1. `tool_definitions`: `email.get_thread_content` (`scopes=["read:email"]`),
    handler `ecc.domains.personal.email_action_tools:get_thread_content_tool`
-   (new module) -- reads every fetched (`body IS NOT NULL`) message in the
-   requested thread, decrypted, scoped to the caller's own workspace/owner
-   (that module's own docstring has the full detail).
+   (new module) -- reads up to the most recent `_MAX_THREAD_MESSAGES`
+   fetched (`body IS NOT NULL`) messages in the requested thread (Loop 2
+   round 13 review: this tool originally had no cap at all; round 14
+   added a guarantee that the specific message which triggered the call is
+   always included, never pushed out by the cap), decrypted, scoped to the
+   caller's own workspace/owner (that module's own docstring has the full
+   detail).
 2. `prompt_versions`: `email.detect_action.v1`, version 1, active. The
    template's own instructions restate this task's own "propose a new
    row, never assume an existing one" scope in plain language --
