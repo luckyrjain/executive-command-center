@@ -1,27 +1,28 @@
+---
+id: PHASE-1-RELEASE-GATE
+title: Phase 1 Production Release Gate
+status: Open
+version: 1.0.0
+owner: Lucky Jain
+---
+
 # Phase 1 Production Release Gate
 
-**Status:** In progress — 26 of 27 engineering checks below are evidenced. 1 check remains explicitly open, a genuine gap rather than merely an undocumented one: post-deployment smoke checks are documented and manually exercised but not yet wired into an automated pipeline, because Phase 1 has no hosted environment yet. The previously-open dependency/secret/container/SBOM-scan check is now closed: `feature/phase-1-production-hardening` was merged into `main` as commit `1f1dfe9` (PR #15), and its final pre-merge commit `c79afb3` was independently confirmed via live GitHub Actions CI — all 8 required checks passing (`backend`, `frontend`, `containers`, `security`, `acceptance-contract`, `accessibility-smoke`, `performance-acceptance`, `backup-restore`), including a real HIGH/CRITICAL Trivy scan of both built container images and `pnpm audit --audit-level=high`/`pip-audit` runs, not merely a local or simulated pass. Two real bugs surfaced and were fixed by that live CI run before it went green: a `pydantic-settings` validation defect that made the backend container fail to boot with `ECC_ENV=development` and no `ECC_SESSION_SECRET` set (commit `10c8418`), and a `statement_timeout` configuration bug where the 5-second query timeout silently reverted to the PostgreSQL default after a pooled connection was reused, plus an unrelated test-ordering defect in the backup/restore evidence test (commit `c79afb3`) — see the PR #15 description for full detail. This document governs engineering release readiness only — it does NOT close Phase 1: the seven-day daily-use gate (`docs/runbooks/PHASE-1-DAILY-USE.md`, 0 of 7 days recorded) and human change review remain separately open regardless of this checklist's state.
+**Status:** In progress — 25 of 27 engineering checks below have durable evidence. Automated post-deployment smoke and durable Critical/High/Medium review-closure evidence remain open. The dependency/secret/container/SBOM check is backed by the immutable PR #15 baseline and named successful GitHub Actions runs below. This document governs engineering release readiness only — it does NOT close Phase 1: the seven-day daily-use gate (`docs/runbooks/PHASE-1-DAILY-USE.md`, 0 of 7 days recorded) and human change review remain separately open regardless of this checklist's state.
 **Scope:** Executive Command Center Phase 1
 **Baseline:** Merged into `main` as commit `1f1dfe9` (squash merge of PR #15, final branch commit `c79afb3`). Every commit-SHA-anchored claim below describes this merged state.
 
-> **Citation note:** this document and `docs/phases/phase-001/FINAL-ACCEPTANCE.md`
-> cite `.superpowers/sdd/progress.md`, `task-*-review.md`, `task-12-report.md`,
-> and `task-ci-secret-fix-report.md` throughout as the backing evidence for
-> individual line items. That directory does not exist anywhere in this
-> repository (tracked or untracked) — only the unrelated `docs/superpowers/`
-> (plans/specs) does. Treat every such citation as an unverifiable dead
-> pointer: it does not mean the underlying claim is false, only that this
-> document's stated evidence for it cannot currently be inspected. The
-> dependency/secret/container/SBOM-scan item's citation is the one exception:
-> it points to a GitHub Actions run ID on this repository, which is
-> independently inspectable by anyone with repository access, unlike every
-> `.superpowers/sdd/*` pointer.
+> **Evidence note:** historical local-agent review reports cited by earlier
+> versions were never committed and are not durable evidence. Claims backed
+> only by those reports are unverified. The immutable commit and GitHub Actions
+> run references below remain inspectable evidence; other checks must be rerun
+> before they are used for a release decision.
 
 ## Required release checks
 
 ### Application correctness
 
-- [x] Backend Ruff, formatting, mypy, Alembic and PostgreSQL tests pass. (Task 12 re-run: Ruff, format, mypy and `alembic upgrade head` all pass cleanly. Task 12 discovered the full `pytest` suite deterministically failed 11 tests with CSRF 403s when `ECC_SESSION_SECRET` was set to the value CI's `ci.yml` actually configures — root cause: `tests/test_production_security.py`'s `restore_main_module` fixture teardown hardcoded `os.environ["ECC_SESSION_SECRET"]` to a literal instead of restoring the prior value, permanently reloading `ecc.main` with a different secret than the rest of the process started with. This directly contradicted `task-9-review.md`'s "resolved as a non-issue" conclusion, which was reached without testing against CI's actual configured secret value. Fixed in commit `87e12b2` (snapshot-and-restore of the true pre-test environment state, including "was absent," rather than a hardcoded literal) and independently re-reviewed: `ECC_SESSION_SECRET=ci-secret-value-that-is-at-least-32-characters uv run pytest -q` now passes with only the pre-existing, disclosed ranking-test flake (Task 10), matching the default-secret run — no regression to the file's CORS/dev-bootstrap/body-size tests. See `.superpowers/sdd/task-ci-secret-fix-report.md`.)
+- [x] Backend Ruff, formatting, mypy, Alembic and PostgreSQL tests pass. (Task 12 baseline: commit `87e12b2` contains the CSRF test-environment restoration fix discovered during that work. The later local Task 12 rerun report was never committed, so it is not additional durable evidence; rerun the current suite before a new release decision.)
 - [x] Frontend typecheck, unit tests, production build and Chromium acceptance pass. (Task 6: `frontend/e2e/scenarios/*`, `task-6-review.md`; re-run locally in Task 12)
 - [x] All lifecycle mutations preserve optimistic version checks, idempotency, CSRF and workspace isolation. (Tasks 1-5, 9: `task-1-review.md` through `task-5-review.md`; a CSRF cache-pollution concern was investigated in `task-9-review.md` and initially judged a non-defect, but that conclusion was itself found incomplete by Task 12 — the actual test-isolation defect and its fix are recorded in the item above)
 - [x] Search, Audit, Today, Morning Brief, Recommendations and Work Actions pass acceptance coverage. (Tasks 5-6: `task-5-review.md`, `task-6-review.md` — ten named Playwright scenarios)
@@ -62,7 +63,7 @@
 - [x] Database migration rollback limitations are explicit. (Task 12: `docs/runbooks/PHASE-1-DEPLOYMENT.md`'s "Rollback" section)
 - [x] Environment variables and secret ownership are documented. (Task 12: `docs/runbooks/PHASE-1-DEPLOYMENT.md`'s "Environment variables" section)
 - [ ] Post-deployment smoke checks are automated. (Task 12: exact smoke-check commands are documented in `docs/runbooks/PHASE-1-DEPLOYMENT.md` and were manually run in Task 12's full-proof section, but no CI/CD pipeline exists yet to run them automatically against a live deployment — Phase 1 has no hosted environment. Remains open.)
-- [x] Critical, High and Medium review findings are zero before merge. (Tasks 1-11: every task review in `.superpowers/sdd/task-1-review.md` through `task-11-review.md` records zero Critical and zero Important/High findings at closure — only disclosed Minor notes carried forward — per `.superpowers/sdd/progress.md`)
+- [ ] Critical, High and Medium review findings are zero before release. (Task 12 gap: historical local-agent review reports were never committed, so their claimed closure is unverified. A new durable human or automated review record must classify and close findings against the release candidate.)
 
 ## Exit criteria
 

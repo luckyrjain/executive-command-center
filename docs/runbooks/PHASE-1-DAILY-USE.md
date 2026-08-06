@@ -1,3 +1,11 @@
+---
+id: PHASE-1-DAILY-USE
+title: Phase 1 Daily-Use Validation Record
+status: Open
+version: 1.0.0
+owner: Lucky Jain
+---
+
 # Phase 1 Daily-Use Validation Record
 
 ## Purpose

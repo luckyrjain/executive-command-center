@@ -1,0 +1,36 @@
+---
+id: PRODUCTION-READINESS
+title: Production Readiness and Blocker Register
+status: Active
+version: 1.0.0
+owner: Lucky Jain
+updated: 2026-08-06
+---
+
+# Production Readiness and Blocker Register
+
+ECC is not approved for production use. Engineering completion, validation, and promotion are separate states; the canonical state is in [`../phases/status.json`](../phases/status.json). This register prevents an implemented development capability from being mistaken for an operable production service.
+
+`Open — production blocker` means the affected scope must not be promoted. A blocker closes only when the required behavior, automated tests, operator runbook, and durable evidence are reviewed together. Local development and synthetic evaluation may continue when the safe behavior below is observed.
+
+## Blockers
+
+| ID | Status | Affected capability | Current safe behavior | Evidence required to close | Owner | Blocking scope |
+|---|---|---|---|---|---|---|
+| PR-001 | Open — production blocker | First production owner provisioning | Use development-only `scripts/bootstrap_dev.py` only with `ECC_ENV=development` and a local database; do not use it to provision production identities. | Reviewed, auditable first-owner ceremony; negative tests proving it cannot be replayed or used by a non-owner; successful clean-environment exercise. | Lucky Jain | Phase 8 and any production deployment |
+| PR-002 | Open — production blocker | Password reset and account recovery | No self-service recovery is offered. Preserve the account and stop; do not alter identity rows directly. | Recovery design and implementation; enumeration-resistant responses; session revocation; rate limits; end-to-end recovery exercise. | Lucky Jain | Phase 8 and any production deployment |
+| PR-003 | Open — production blocker | MFA or risk-based step-up | Do not expose high-risk production account actions. Existing authentication is not evidence of step-up protection. | Approved factor/recovery policy; enrollment and challenge tests; recovery-code handling; step-up tests for ownership and security-sensitive actions. | Lucky Jain | Phase 8 and any multi-user production deployment |
+| PR-004 | Open — production blocker | Connector credential-key rotation and re-encryption | Keep `ECC_CONNECTOR_TOKEN_ENCRYPTION_KEY` stable and access-controlled. A changed key can make stored credentials unreadable; stop sync, disconnect locally when possible, and revoke at the provider. Phase 6 has no supported credential replacement/reactivation path. | Supported dual-key or staged re-encryption workflow; rollback; mixed-key fixtures; rotation/restart/recovery exercise. | Lucky Jain | Phases 6 and 10 connector promotion |
+| PR-005 | Open — production blocker | Personal-data key rotation and re-encryption | Keep `ECC_PERSONAL_DATA_ENCRYPTION_KEY` stable and separate from the connector key. Stop access to unreadable records; do not replace ciphertext or keys manually. | Supported rotation/re-encryption workflow; rollback; sensitive and high-stakes fixtures; export and restore verification after rotation. | Lucky Jain | Phase 7 and Gmail data promotion |
+| PR-006 | Open — production blocker | Connector revoke and sync recovery | Manual disable and manual sync exist. Disable is locally authoritative and provider revocation is best effort; no operator reconciliation proves remote revocation or safe recovery from every partial sync. | Real GitHub/GitLab/Jira/Datadog/Gmail accounts; revoke verification at each provider; cursor/backfill retry evidence; partial failure and rate-limit exercises using the applicable recovery runbook. | Lucky Jain | Phases 6 and 10 promotion |
+| PR-007 | Open — production blocker | Personal export, deletion, backup, and restore | Per-domain JSON export and transactional deletion exist. General PostgreSQL backup/restore exists; no production deletion window or restored personal-data acceptance record is approved. | Real encrypted-record export/delete test; backup taken before deletion; disclosed backup-expiry behavior; clean restore with integrity and post-restore authorization checks. | Lucky Jain | Phase 7 and personal-data production use |
+| PR-008 | Open — production blocker | Gmail consent revocation cascade | A consent check stops further fetch/write work, and connector disable can revoke the Google grant best effort. Revoking email consent does not yet disconnect the connector or purge Gmail projections. | Phase 10 Task 7 implementation; mid-sync revocation; token revocation; projection/derived-data deletion; audit and backup-window evidence. | Lucky Jain | Phase 10 promotion |
+| PR-009 | Open — production blocker | Automated post-deploy smoke | Health endpoints and test suites exist, but no deployment workflow automatically proves authentication, migration state, a read path, and a safe write path after deployment. | Non-destructive smoke command; CI/deployment invocation; failure rollback signal; durable successful deployment artifact. | Lucky Jain | Any production deployment |
+| PR-010 | Open — validation blocker | Phase 1 human daily-use and review gates | Keep Phase 1 unpromoted. The human record is open and cannot be synthesized by tests or documentation changes. | Seven real usage days and independent human sign-off in [`../runbooks/PHASE-1-DAILY-USE.md`](../runbooks/PHASE-1-DAILY-USE.md). | Lucky Jain | Phase 1 promotion |
+| PR-011 | Open — validation blocker | Phase 3 dogfood and review gates | Keep Phase 3 unpromoted; automated scenario tests do not replace real dogfood. | Two-week record meeting the approved thresholds and independent human review in [`../runbooks/PHASE-3-DOGFOOD.md`](../runbooks/PHASE-3-DOGFOOD.md). | Lucky Jain | Phase 3 promotion |
+| PR-012 | Open — validation blocker | Phase 5 staged dogfood and review gates | Keep automation bounded to preview or explicitly approved dogfood. | Fourteen-day staged record meeting every threshold and independent human review in [`../runbooks/PHASE-5-DOGFOOD.md`](../runbooks/PHASE-5-DOGFOOD.md). | Lucky Jain | Phase 5 promotion |
+| PR-013 | Open — promotion blocker | Phase 6–10 independent review and promotion | Engineering status documents are evidence inputs, not promotion decisions. Phase 9 is not implemented; Phase 10 Tasks 3–8 remain open. | Phase-specific validation, recovery, privacy/security, backup/restore, and independent change-review evidence; explicit promotion decision recorded in the canonical registry. | Lucky Jain | Phases 6, 7, 8, 9, and 10 |
+
+## Review rule
+
+Review this register before any release candidate or phase-promotion decision. Closing an entry requires a version increment and links to durable repository or CI evidence; a local agent transcript, uncommitted file, or verbal confirmation is not evidence. New production-affecting gaps are added here before rollout continues.

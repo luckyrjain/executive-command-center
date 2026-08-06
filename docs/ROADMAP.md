@@ -2,11 +2,40 @@
 
 ## Current status
 
-**Foundation:** Phase 0 baseline approved and implemented  
-**Current delivery:** [Phase 1 — Executive Dashboard MVP](phases/PHASE-001-executive-dashboard-mvp.md) — engineering delivery complete on `feature/phase-1-production-hardening` (Tasks 1-11 of `superpowers/plans/2026-07-16-phase-1-completion.md`, each independently reviewed with zero Critical or Important findings); Phase 1 exit remains open pending the seven-day daily-use validation gate and human change review — see [Phase 1 Implementation Status](phases/phase-001/IMPLEMENTATION-STATUS.md)  
-**Future specifications:** Phase 2 Approved for Implementation and in progress (parallel to Phase 1's open exit gates); Phase 3 Approved for Implementation and beginning (parallel-start exception granted, same as Phase 2's); Phase 4 engineering delivery complete, exit gates open (known-limitation floor misses accepted, parallel-start exception granted, same as Phase 2's and Phase 3's); Phase 5 engineering delivery complete through Task 7 (parallel-start exception granted, same as Phase 2/3/4's), exit gate open pending `docs/runbooks/PHASE-5-DOGFOOD.md`'s real, human-operator-driven staged dogfood record (0 of 14 required days logged); Phase 6 Approved for Implementation, engineering delivery complete through Task 8 (connector framework, GitHub/GitLab read sync, Jira work-item sync, delivery/reliability metrics, decisions/incidents and change-correlation, approved write actions, and the executive UX/browser-acceptance frontend surface -- partial scope disclosed on several tasks; parallel-start exception granted, same as Phase 2/3/4/5's), proceeding alongside Phase 5's own still-open exit gate, entering its own final cross-task review; Phase 7 Approved for Implementation, engineering delivery complete through Task 8 across all six domains plus a whole-phase deep-review-and-fix round (`luckyrjain/executive-command-center#99`, merged, zero open findings on re-review), proceeding alongside Phase 6's own still-open exit gate -- no promotion/exit decision made yet; Phase 8 Approved for Implementation, engineering delivery complete through Task 9 of 9 (account/membership/session framework, invitations, authorization engine, workspace-wide authorization, sharing-review UX, delegation, notifications/shared activity, ownership transfer/member removal, and the executive UX/multi-identity browser-acceptance frontend -- parallel-start exception granted, same as Phase 2/3/4/5/6/7's), plus three whole-phase deep-review-and-fix rounds complete with a fourth in progress, proceeding alongside Phase 7's own not-yet-made exit/promotion decision; Phase 9 published as Draft / Planned
+<!-- BEGIN GENERATED PHASE STATUS -->
+**Current engineering phase:** Phase 10 — Gmail Connector (In progress; Tasks 1-4 of 8 complete).
 
-The [canonical phase index](phases/README.md) lists every primary specification and supporting contract. The [Phase 0–9 documentation review](phases/PHASE-REVIEW.md) records completeness findings and approval gates.
+| Phase | Name | Engineering | Validation | Promotion |
+|---:|---|---|---|---|
+| 0 | Repository Foundation | Engineering complete | Passed | Promoted |
+| 1 | Executive Dashboard MVP | Engineering complete | In progress | Blocked |
+| 2 | Knowledge Platform | Engineering complete | Not started | Blocked |
+| 3 | Human Attention Engine | Engineering complete | In progress | Blocked |
+| 4 | AI Runtime | Engineering complete | Accepted with limitations | Blocked |
+| 5 | Automation | Engineering complete | In progress | Blocked |
+| 6 | Engineering Workspace | Engineering complete | In progress | Blocked |
+| 7 | Personal Intelligence | Engineering complete | Not started | Blocked |
+| 8 | Multi-user Workspaces | Engineering complete | Not started | Blocked |
+| 9 | Enterprise | Not started | Not started | Not promoted |
+| 10 | Gmail Connector | In progress | Not started | Not promoted |
+
+**Open gates:**
+
+- Phase 1: seven-day daily-use validation; human change-review sign-off.
+- Phase 2: product validation; human change review; Phase 1 predecessor exit accepted only by parallel-start exception.
+- Phase 3: two-week dogfood validation; human change review; predecessor exits accepted only by parallel-start exception.
+- Phase 4: real-model re-verification of recorded limitations; repository-owner independent review; promotion decision.
+- Phase 5: 14-day staged dogfood record; human change review; promotion decision.
+- Phase 6: real connector-account recovery evidence; production-readiness review; independent change review and promotion decision.
+- Phase 7: personal-data export deletion and restore evidence; encryption-key rotation decision; independent change review and promotion decision.
+- Phase 8: first production owner provisioning; account recovery and MFA or step-up decision; independent change review and promotion decision.
+- Phase 9: specification approval; predecessor production-readiness and promotion decisions.
+- Phase 10: Tasks 5-8; real Gmail account verification; backup and restore verification; independent change review.
+
+Source: [`docs/phases/status.json`](phases/status.json). Specification approval, engineering completion, validation, and promotion are independent states.
+<!-- END GENERATED PHASE STATUS -->
+
+The [canonical phase index](phases/README.md) lists every primary specification and supporting contract. The archived [Phase 0–9 documentation review](phases/PHASE-REVIEW.md) records findings as of its stated review date; it is not current phase status. The [production-readiness register](operations/PRODUCTION-READINESS.md) tracks release blockers, and the [product KPI contract](product/KPI-CONTRACT.md) defines measurement state without assuming telemetry exists.
 
 ## Delivery principles
 
@@ -18,25 +47,14 @@ Every phase must:
 - preserve architecture, privacy and authorization boundaries
 - define measurable acceptance and exit criteria before implementation
 - identify rollback and deferred scope
-- receive explicit approval after all dependency exit gates pass
+- receive explicit approval after dependency exit gates pass, or record an explicit repository-owner parallel-start exception without closing those gates
 - avoid implementation outside the approved phase
 
 ## Delivery sequence
 
-```text
-Phase 0 — Repository Foundation         [Implemented]
-  -> Phase 1 — Executive Dashboard MVP [Engineering delivery complete; exit gates open]
-  -> Phase 2 — Knowledge Platform      [Approved for Implementation; in progress, parallel to open Phase 1 exit gates]
-  -> Phase 3 — Human Attention Engine  [Approved for Implementation; in progress, parallel-start exception granted]
-  -> Phase 4 — AI Runtime              [Engineering delivery complete; exit gates open, known limitations accepted]
-  -> Phase 5 — Automation              [Engineering delivery complete through Task 7; exit gate open pending staged dogfood]
-  -> Phase 6 — Engineering Workspace   [Approved for Implementation; engineering delivery complete through Task 8]
-  -> Phase 7 — Personal Intelligence   [Approved for Implementation; engineering delivery complete through Task 8 + review round]
-  -> Phase 8 — Multi-user Workspaces   [Approved for Implementation; engineering delivery complete through Task 9 of 9 + three review rounds, fourth in progress]
-  -> Phase 9 — Enterprise              [Draft]
-```
+The generated table above is the only summary of current phase state. Detailed sections below provide historical and scope context; when prose conflicts with [`phases/status.json`](phases/status.json), the registry wins.
 
-A later phase may be designed or reviewed early, but implementation begins only after its dependencies satisfy exit criteria and its status is changed to Approved for Implementation.
+A later phase may be designed or reviewed early. Implementation normally begins after its declared dependencies satisfy exit criteria and its status is changed to Approved for Implementation. A documented repository-owner parallel-start exception may permit engineering work while predecessor validation/promotion remains open; it never closes or bypasses those gates.
 
 ## Phase 0 — Repository Foundation
 
@@ -77,7 +95,7 @@ Daily-use validation record: [Phase 1 Daily-Use Validation Record](runbooks/PHAS
 
 **Status:** Approved for Implementation; contracts moved from Draft after resolving the PKOS-reconciliation decision in `docs/superpowers/specs/2026-07-21-phase-2-knowledge-platform-design.md` (extend the existing `pkos_nodes`/`pkos_edges`/`pkos_evidence` tables rather than fork independent ones). Implementation began by explicit repository-owner authorization to proceed in parallel with Phase 1's still-open exit gates (seven-day daily-use validation, human change review) — a deliberate exception to this document's own "implementation begins only after dependencies satisfy exit criteria" principle above, not a claim that Phase 1 has exited.
 
-Tasks 1-6 and 8 (entities/claims/provenance, typed relationships, timeline, resolution, reversible merge/split, lexical retrieval, and the executive knowledge UX consuming all of it) are implemented. **Task 7 (optional embeddings and hybrid fusion), the design doc's Open decision 2, is now also authorized by the repository owner to proceed**, closing that decision's "repository owner decides embeddings are worth pursuing" precondition. This authorization covers starting the work, not the RFC-005/ADR gate itself — `RFC-005.md`'s "Retrieval benchmark and ADR" activation requirement for `pgvector` is satisfied separately, by RFC-005 v1.2.0's amendment and ADR-0011, both produced as part of this same authorization.
+All eight slices are implemented, including Task 7's optional embeddings and hybrid fusion. The `pgvector`/`sentence-transformers` activation is governed by RFC-005 v1.2.0 and ADR-0011. Product validation, the Phase 1 predecessor exit, and a promotion decision remain open; engineering completion does not close those gates.
 
 Persistent entities, claims, relationships, entity resolution, reversible merge/split, timelines and lexical-first hybrid retrieval, now extended with optional local embeddings for semantic recall.
 
@@ -86,7 +104,7 @@ Implementation plan: [Phase 2 Knowledge Platform Implementation Plan](superpower
 
 ## Phase 3 — Human Attention Engine
 
-**Status:** Approved for Implementation; contracts moved from Draft after resolving the `attention_items`-reconciliation decision in `docs/superpowers/specs/2026-07-22-phase-3-human-attention-engine-design.md` (extend Phase 1's shipped `attention_items` table rather than fork a new one plus a separate `attention_overrides` table). The three named approval gates (attention policy weights/caps, critical-item definition, dogfood success thresholds) are resolved in `phase-003/ATTENTION-MODEL.md` and `PHASE-003-human-attention-engine.md`. Implementation begins by explicit repository-owner authorization to proceed in parallel with Phase 1/2's own open exit gates — the same kind of exception Phase 2 received.
+**Status:** Engineering delivery is complete for the approved eight-slice scope. Contracts resolved the `attention_items` reconciliation, policy weights/caps, critical-item definition, and dogfood thresholds. Delivery proceeded under a parallel-start exception; the two-week dogfood, predecessor exits, independent review, and promotion decision remain open.
 
 Explainable attention, waiting direction, risk review, capacity-aware planning and evidence-backed meeting preparation.
 
@@ -97,9 +115,9 @@ Implementation plan: [Phase 3 Human Attention Engine Implementation Plan](superp
 
 **Status:** Approved for Implementation; contracts moved from Draft after the repository owner reviewed and accepted `docs/superpowers/specs/2026-07-23-phase-4-ai-runtime-design.md`'s proposed resolution for the first activation (local model: Ollama serving `qwen2.5:1.5b-instruct-q4_K_M`, no remote provider registered; deterministic routing algorithm; immutable prompt/tool versioning; Pydantic-based structured-output validation; two read-only first tools; concrete budget/timeout/circuit-breaker numbers; a 20-example first evaluation dataset for `attention.explain_item`) and the four named approval gates (approved local/remote models and providers, data-class egress matrix, evaluation floors, trace retention), resolved in `PHASE-004-ai-runtime.md`'s "Approved models, providers and evaluation floors" section. Ollama's RFC-005 technology-activation gate ("AI-runtime phase specification and ADR review") is satisfied by this design doc plus `docs/adr/ADR-0012-ollama-local-inference.md` and `docs/RFC-005.md` v1.3.0. Implementation begins by explicit repository-owner authorization to proceed in parallel with Phase 3's own open exit gate (the two-week dogfood window is still open) -- the same kind of exception Phase 2 and Phase 3 each received. This authorization does not itself close Phase 3's dogfood gate.
 
-Implementation has landed through Task 19 of the first activation slice (post-launch audit fixes and closure) -- see `phase-004/IMPLEMENTATION-STATUS.md`. The originally scoped first activation was deliberately narrow: one local model, no remote provider, two read-only tools, one evaluated task type. Two parts of that scope have since been explicitly reopened and repository-owner-approved within this same activation, not silently inherited: a second local model and a second evaluated task type, `meeting.prep_summary` (`PHASE-004-ai-runtime.md`'s "Approved models, providers and evaluation floors" section has the current detail). A remote provider and any mutating tool remain explicitly deferred to a later Phase 4 slice this design pass did not schedule.
+Engineering delivery is complete for the first activation and its documented follow-up fixes; see `phase-004/IMPLEMENTATION-STATUS.md`. The activation now includes two local models and two evaluated task types. A remote provider and mutating tools remain deferred.
 
-Phase 4's own exit gate remains open, by repository-owner acceptance rather than by oversight: two evaluation-floor misses (`attention.explain_item`'s stable `prohibited_fact` count, `meeting.prep_summary`'s p95 latency) are documented, evidence-backed known limitations of this activation's small local model, not pursued further as of 2026-07-25, and no promotion decision has been made for either task type (`PHASE-004-ai-runtime.md`'s "Phase 4 exit status and Phase 5 parallel-start" section has the full detail). The repository owner's own independent full-repo re-verification, also named in Phase 4's exit criteria, has not yet been performed.
+Phase 4's exit gate remains open. The two previously missed evaluation floors were later cleared in two live-model confirmation runs, but the contract requires further repeat evidence and the repository owner's independent full-repository re-verification before any promotion decision. No task type has been promoted.
 
 Specification: [PHASE-004](phases/PHASE-004-ai-runtime.md)  
 Design doc: [Phase 4 AI Runtime Design](superpowers/specs/2026-07-23-phase-4-ai-runtime-design.md)  
@@ -146,7 +164,7 @@ Implementation status: [Phase 7 Implementation Status](phases/phase-007/IMPLEMEN
 
 ## Phase 8 — Multi-user Workspaces
 
-**Status:** Approved for Implementation; contracts moved from Draft after resolving `docs/phases/PHASE-REVIEW.md:139`'s four named approval-gate items (identity migration, complete authorization matrix, invitation verification, revocation propagation SLO) in `docs/superpowers/specs/2026-08-01-phase-8-multi-user-design.md`, per that document's Decision 1-4 sections, resolved in `PHASE-008-multi-user.md`'s "Approved decisions" section. Implementation began with Task 1 (account/membership/session framework) once Phase 7's own whole-phase review round converged with zero open findings -- the same kind of repository-owner-directed sequencing every phase 2-7 transition has used; this did not itself make Phase 7's own promotion/exit decision. **Engineering delivery is now complete through Task 9 of 9** (`docs/phases/phase-008/IMPLEMENTATION-STATUS.md` has the full task-by-task evidence: Task 2 invitations, Task 3 the authorization engine plus a schema-wide migration and the engineering reference domain, Task 4 authorization widened to every remaining domain, Task 5 sharing-review UX and effective permissions, Task 6 delegation, Task 7 notifications and shared activity, Task 8 ownership transfer and member removal, Task 9 the executive UX and multi-identity browser-acceptance frontend), followed by three whole-phase deep-review-and-fix rounds (each finding and fixing real issues before the next round starts clean) with a fourth in progress -- no promotion/exit decision has been made for Phase 8 itself yet.
+**Status:** Engineering delivery is complete through Task 9 of 9, followed by four whole-phase review-and-fix rounds recorded in `docs/phases/phase-008/IMPLEMENTATION-STATUS.md`. First production owner provisioning, account recovery and MFA/step-up decisions, independent promotion review, and the promotion decision remain open.
 
 Membership, invitations, least-privilege permissions, explicit sharing, delegation acceptance, ownership transfer and privacy-preserving collaboration.
 
@@ -165,7 +183,7 @@ Specification: [PHASE-009](phases/PHASE-009-enterprise.md)
 
 ## Phase 10 — Gmail Connector
 
-**Status:** Approved for Implementation; contracts moved from Draft after resolving `docs/superpowers/specs/2026-08-04-phase-10-gmail-connector-design.md`'s five named decisions (connector mechanics/Protocol extension, privacy/consent model and encryption, OAuth scope/verification reality/rollout gating, `recommendations` create-path extension and AI-tool safety rubric, attention/knowledge integration), resolved in `PHASE-010-gmail-connector.md`'s own "Approved decisions" section. Unlike Phase 6-9, Phase 10 was never part of the original Phase 0-9 set `docs/phases/PHASE-REVIEW.md` reviewed -- its spec and design doc were written together as this phase's own first artifacts. **Engineering delivery is complete through Task 1 of 8** (OAuth2 connector framework extension -- a new, additive `OAuth2ConnectorAdapter` Protocol alongside the existing PAT-based `ConnectorAdapter`; `GmailAdapter`'s OAuth methods real against Google's endpoints, sync methods stubbed; the internal-allowlist-gated OAuth initiate/callback endpoints; `email_threads`/`email_messages` via migration `0069`) -- see `docs/phases/phase-010/IMPLEMENTATION-STATUS.md` for full task-by-task evidence. Tasks 2-8 (backfill/incremental sync and entity linking, deterministic attention integration, the `recommendations` create-path extension, the AI-runtime action-detection tool, on-demand thread reading, consent revocation cascade, and executive UX) are not yet started.
+**Status:** Approved for Implementation; contracts moved from Draft after resolving `docs/superpowers/specs/2026-08-04-phase-10-gmail-connector-design.md`'s five named decisions (connector mechanics/Protocol extension, privacy/consent model and encryption, OAuth scope/verification reality/rollout gating, `recommendations` create-path extension and AI-tool safety rubric, attention/knowledge integration), resolved in `PHASE-010-gmail-connector.md`'s own "Approved decisions" section. Unlike Phase 6-9, Phase 10 was never part of the original Phase 0-9 set `docs/phases/PHASE-REVIEW.md` reviewed -- its spec and design doc were written together as this phase's own first artifacts. **Engineering delivery is complete through Tasks 1–4 of 8**: internal-allowlist OAuth, manual 30-day metadata backfill/incremental history sync, deduplication, person-entity linking, deterministic awaiting-reply attention integration, and the governed recommendations create path. Tasks 5–8 (AI-runtime action detection, on-demand thread reading, consent revocation cascade, and executive UX) remain open. See `docs/phases/phase-010/IMPLEMENTATION-STATUS.md` for task-level evidence.
 
 A Gmail connector composing Phase 6's connector/OAuth/sync framework with Phase 7's consent/encryption/deletion framework for the first time, gated by an internal-user allowlist that keeps this phase outside Google's CASA security-assessment requirement.
 

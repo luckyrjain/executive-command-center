@@ -1,3 +1,11 @@
+---
+id: PHASE-0-SECURITY-BASELINE
+title: Phase 0 Security Baseline
+status: Approved
+version: 1.0.0
+owner: Lucky Jain
+---
+
 # Phase 0 Security Baseline
 
 ## Scope

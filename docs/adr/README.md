@@ -2,7 +2,7 @@
 
 Architecture Decision Records capture decisions that materially affect system structure, technology, data ownership, security boundaries, deployment or long-term maintainability.
 
-## Accepted Phase 0 decisions
+## Accepted decisions
 
 1. [ADR-0001 — Repository Layout](ADR-0001-repository-layout.md)
 2. [ADR-0002 — Local-First Architecture](ADR-0002-local-first-architecture.md)
@@ -14,6 +14,9 @@ Architecture Decision Records capture decisions that materially affect system st
 8. [ADR-0008 — Authentication and Workspace Identity](ADR-0008-authentication.md)
 9. [ADR-0009 — Connector Synchronization](ADR-0009-synchronization.md)
 10. [ADR-0010 — Deployment Strategy](ADR-0010-deployment-strategy.md)
+11. [ADR-0011 — Hybrid Retrieval Embeddings](ADR-0011-hybrid-retrieval-embeddings.md)
+12. [ADR-0012 — Ollama Local Inference](ADR-0012-ollama-local-inference.md)
+13. [ADR-0013 — Durable Workflow Execution](ADR-0013-durable-workflow-execution.md)
 
 ## Naming
 

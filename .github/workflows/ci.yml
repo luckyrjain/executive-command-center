@@ -32,6 +32,10 @@ jobs:
       ECC_DATABASE_URL: postgresql+psycopg://ecc:ecc@localhost:5432/ecc
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Check documentation governance
+        run: |
+          python scripts/docs_status.py check
+          python scripts/check_docs.py
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: 3.14.6

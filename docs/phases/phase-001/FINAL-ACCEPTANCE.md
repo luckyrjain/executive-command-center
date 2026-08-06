@@ -1,3 +1,11 @@
+---
+id: PHASE-1-FINAL-ACCEPTANCE
+title: Phase 1 Final Acceptance
+status: Open
+version: 1.0.0
+owner: Lucky Jain
+---
+
 # Phase 1 Final Acceptance
 
 ## Purpose
@@ -5,22 +13,16 @@
 This document records the executable evidence required to close PHASE-001.
 All Phase 1 product slices, including the executive frontend and the
 production-hardening work of `docs/superpowers/plans/2026-07-16-phase-1-completion.md`
-(Tasks 1-11, each independently reviewed with zero Critical or Important
-findings — `.superpowers/sdd/progress.md`), are implemented on
+(Tasks 1-11), are implemented on
 `feature/phase-1-production-hardening`. This document does not by itself
 close PHASE-001: the seven-day daily-use validation
 (`docs/runbooks/PHASE-1-DAILY-USE.md`) and human change review remain open
 — see "Product validation outside the merge gate" below.
 
-> **Citation note:** this document and `docs/runbooks/PHASE-1-RELEASE-GATE.md`
-> cite `.superpowers/sdd/progress.md`, `task-*-review.md`, `task-12-report.md`,
-> and `task-ci-secret-fix-report.md` throughout as the backing evidence for
-> individual line items. That directory does not exist anywhere in this
-> repository (tracked or untracked) — only the unrelated `docs/superpowers/`
-> (plans/specs) does. Treat every such citation as an unverifiable dead
-> pointer: it does not mean the underlying claim is false, only that this
-> document's stated evidence for it cannot currently be inspected. Re-derive
-> or re-run the actual check before relying on a citation-only claim.
+> **Evidence note:** historical local-agent review reports cited by earlier
+> versions were never committed and are not durable evidence. Claims backed
+> only by those reports are unverified. Re-run the named check or use committed
+> tests, source references, immutable commits, pull requests, or Actions runs.
 
 ## Automated gates
 
@@ -32,7 +34,7 @@ close PHASE-001: the seven-day daily-use validation
 | Accessibility | ten named Playwright scenarios (`frontend/e2e/scenarios/`) plus `assertNoSeriousAccessibilityViolations`, orchestrated by `frontend/e2e/run.mjs` (Task 6) | WCAG 2.2 AA core flows, zero serious/critical axe violations |
 | Backup integrity | custom-format PostgreSQL archive and SHA-256 (Task 9) | checksum valid |
 | Restore integrity | clean PostgreSQL 18 restore with the full Task 9 invariant set (see below) | migration head, row counts, constraints and every invariant below match |
-| Security | HIGH+CRITICAL Trivy filesystem and container-image scanning, `pnpm audit --audit-level=high`, gitleaks secret scanning and SBOM generation in standard CI (Task 11); `pip-audit` in the backend CI job | zero HIGH or CRITICAL findings required; **status unverified as of this branch's current commit, not "not currently met" as previously recorded here.** An earlier scan against an older commit on this branch found real findings (`pip-audit` clean; Trivy filesystem HIGH findings in `react-router`; `pnpm audit` findings including `react-router`/`vite`; Trivy image findings in both base images, mostly OS-package). Since that scan ran, this branch has separately bumped `react-router` to `7.18.1` and `vite`/other frontend deps (commit `c4ca876`, above the `>=7.15.0` fix threshold the earlier scan itself cited for the `react-router` finding) and switched the backend base image from `python:3.14.6-slim` to `python:3.14.6-alpine` with an explicit `apk upgrade` step specifically to clear OS-package CVEs (commit `8ebb32d`). Neither change has been re-scanned, so the actual current HIGH/CRITICAL finding count is unknown — do not treat either the old failing numbers or an assumption that the bumps fully resolved it as current evidence. Re-run the `containers`/`security`/`frontend` CI jobs against this branch's current HEAD to get a real answer before treating this gate as open or closed. (The `.superpowers/sdd/task-12-report.md` this row previously cited for detail does not exist anywhere in this repository — there is no `.superpowers/` directory at all, tracked or untracked — so that citation was already dead regardless of the staleness above.) |
+| Security | HIGH+CRITICAL Trivy filesystem and container-image scanning, `pnpm audit --audit-level=high`, gitleaks secret scanning and SBOM generation in standard CI (Task 11); `pip-audit` in the backend CI job | zero HIGH or CRITICAL findings required; **current release-candidate status is unverified.** PR #15's immutable baseline has named successful runs, but later dependency/base-image changes require fresh `containers`/`security`/`frontend` CI evidence before this gate can be closed for a new release. The historical Task 12 local report was never committed and is not evidence. |
 | Review closure | specification and code review | Critical 0, High 0, Medium 0 |
 
 The normative machine-readable budgets and evidence paths are stored in `config/phase1-acceptance.json` and validated by `scripts/check_phase1_acceptance.py`, including result-aware validation of recorded backup/restore, performance, and container-scan artifacts (Task 11) — not just evidence-file existence.
@@ -55,7 +57,7 @@ The acceptance workflow (`scripts/seed_phase1_acceptance.py`, `scripts/backup.sh
 12. enforces the 600-second recovery time objective, measured against real elapsed time (`$SECONDS`);
 13. generates a timestamped JSON+Markdown evidence report (`scripts/phase1_evidence.py`) containing only table names, row counts, checksums, revisions, and booleans — never seeded content.
 
-The scripts remain usable outside CI. `PG_CLIENT_IMAGE=postgres:18.0` provides a portable matching client; without it, locally installed PostgreSQL tools are used. Task 12 re-ran this drill live — see `.superpowers/sdd/task-12-report.md`.
+The scripts remain usable outside CI. `PG_CLIENT_IMAGE=postgres:18.0` provides a portable matching client; without it, locally installed PostgreSQL tools are used. A historical Task 12 claim says the drill was rerun, but its local report was never committed; rerun and retain a durable report before relying on that claim.
 
 ## Accessibility and product evidence
 

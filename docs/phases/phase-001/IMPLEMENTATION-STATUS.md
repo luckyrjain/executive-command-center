@@ -13,13 +13,12 @@ This document maps the approved Phase 1 contracts to delivered repository capabi
 
 ## Overall status
 
-Phase 1 backend and frontend capabilities are implemented across the core domain, deterministic intelligence, query, brief, recommendation, audit, executive frontend, and production-hardening surfaces (`docs/superpowers/plans/2026-07-16-phase-1-completion.md`, Tasks 1-11, all independently reviewed — `.superpowers/sdd/progress.md`). Every capability below, including the executive frontend and browser acceptance, is delivered. Phase 1 exit still requires the seven-day daily-use validation and human change review named in "Remaining Phase 1 exit work" below — this document does not claim Phase 1 itself is complete.
+Phase 1 backend and frontend capabilities are implemented across the core domain, deterministic intelligence, query, brief, recommendation, audit, executive frontend, and production-hardening surfaces (`docs/superpowers/plans/2026-07-16-phase-1-completion.md`, Tasks 1-11). Every capability below, including the executive frontend and browser acceptance, is delivered. Phase 1 exit still requires the seven-day daily-use validation and human change review named in "Remaining Phase 1 exit work" below — this document does not claim Phase 1 itself is complete.
 
-> **Citation note:** `.superpowers/sdd/*.md` files cited throughout this
-> document do not exist anywhere in this repository (tracked or untracked).
-> Treat those citations as unverifiable dead pointers, not evidence that the
-> capability claims below are false — cross-check against the actual code
-> under `backend/ecc/domains/` and `frontend/src/` instead.
+> **Evidence note:** historical review claims in this document previously
+> referenced uncommitted local agent reports. Those reports are not durable
+> repository evidence. Treat review-only claims as unverified and rely on the
+> committed source/test paths below or rerun the named checks.
 
 ## Capability status
 
@@ -38,7 +37,7 @@ Phase 1 backend and frontend capabilities are implemented across the core domain
 | Today dashboard | Implemented | Deterministic executive aggregation endpoint |
 | Morning Brief | Implemented | Persisted snapshots, refresh, source versions and stale-state handling |
 | Recommendations | Implemented | Publish, confirm, reject, defer, pin and durable execution lifecycle |
-| Executive frontend | Implemented | Today, Morning Brief, Work Actions, Recommendations, Search and Audit (Tasks 1-6; `.superpowers/sdd/task-1-review.md` through `task-6-review.md`) |
+| Executive frontend | Implemented | Today, Morning Brief, Work Actions, Recommendations, Search and Audit (Tasks 1-6; committed source and acceptance scenarios exist, but historical local review reports are not durable evidence) |
 | Browser acceptance | Implemented | Ten named Playwright scenarios (`frontend/e2e/scenarios/`) plus a dedicated `assertNoSeriousAccessibilityViolations` accessibility helper, orchestrated by `frontend/e2e/run.mjs` and required by the frontend CI gate (Task 6; `task-6-review.md`) |
 
 ## Delivery sequence
@@ -82,9 +81,9 @@ The Phase 1 merge gate requires:
 
 ## Remaining Phase 1 exit work
 
-All engineering delivery slices (Tasks 1-11 of `docs/superpowers/plans/2026-07-16-phase-1-completion.md`) are implemented, individually reviewed with zero Critical or Important findings each (`.superpowers/sdd/progress.md`), and re-verified locally by Task 12 (`.superpowers/sdd/task-12-report.md`). What remains open:
+All engineering delivery slices (Tasks 1-11 of `docs/superpowers/plans/2026-07-16-phase-1-completion.md`) are implemented. Historical local-agent review and Task 12 rerun reports were never committed, so their claimed zero-finding/re-verification results are unverified. What remains open:
 
-- Confirm Task 11's HIGH/CRITICAL Trivy container/filesystem scans and `pnpm audit` pass against live CVE data on a real GitHub Actions run of this branch — their CI YAML is syntax/logic-verified but has never executed live outside this local environment (`.superpowers/sdd/task-11-review.md`).
+- Confirm Task 11's HIGH/CRITICAL Trivy container/filesystem scans and `pnpm audit` pass against live CVE data on a current GitHub Actions run; historical local review notes are not durable evidence.
 - Complete a final human change-review sign-off of the whole branch (`feature/phase-1-production-hardening`) — each of Tasks 1-11 closed individually with zero Critical/Important findings, but the whole-branch human review itself has not yet occurred.
 - Complete the seven-day daily-use product validation gate (`docs/runbooks/PHASE-1-DAILY-USE.md`) — 0 of 7 required days are recorded as of this update; it is a product-usage outcome, not something any task or automated process can satisfy on its own.
 

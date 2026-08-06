@@ -182,6 +182,7 @@ Every PR must include
 - Documentation Updates
 - Architecture Impact
 - Rollback Plan
+- Documentation governance result (`make docs-check`)
 
 ---
 
@@ -252,6 +253,14 @@ Every feature requires
 - Unit Tests
 - Integration Tests
 - Acceptance Tests
+
+Before requesting review, run:
+
+```bash
+make docs-check
+```
+
+The command verifies the canonical phase registry, generated status projections, document metadata/lifecycle vocabulary, phase contracts, links/anchors, environment aliases, and durable evidence references. Edit `docs/phases/status.json` and run the renderer when phase state changes; never hand-edit a generated phase-status block.
 
 AI features additionally require
 

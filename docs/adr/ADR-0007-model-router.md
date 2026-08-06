@@ -2,8 +2,9 @@
 id: ADR-0007
 title: Model Router
 status: Accepted
+version: 1.0.0
 date: 2026-07-13
-owners: [Lucky Jain]
+owner: Lucky Jain
 related: [ADR-0004, RFC-005]
 ---
 

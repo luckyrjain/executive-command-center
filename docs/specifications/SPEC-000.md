@@ -1,7 +1,7 @@
 ---
 id: SPEC-000
 title: Executive Command Center Constitution
-status: Ratified
+status: Approved
 version: 1.0.0
 owner: Lucky Jain
 classification: Constitutional Document

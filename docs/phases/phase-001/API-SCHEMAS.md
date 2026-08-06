@@ -1,7 +1,7 @@
 ---
 id: PHASE-001-API-SCHEMAS
 title: Phase 1 API Schemas
-status: Approved
+status: Approved for Implementation
 version: 1.0.3
 owner: Lucky Jain
 ---

@@ -1,3 +1,11 @@
+---
+id: PHASE-5-RECOVERY
+title: Phase 5 Durable Worker Recovery Runbook
+status: Active
+version: 1.0.0
+owner: Lucky Jain
+---
+
 # Phase 5 Durable Worker Recovery Runbook
 
 **Status:** implemented as of Task 2 (`backend/ecc/domains/automation/worker.py`); the "Kill switches and their recovery interaction" section below is implemented as of Task 6 (`ecc.domains.automation.kill_switches`, `worker._CLAIMABLE_PREDICATE`'s two `NOT EXISTS` subqueries). Written at design time as part of Phase 5's Task 0 design pass (`docs/superpowers/specs/2026-07-25-phase-5-automation-design.md`, `docs/adr/ADR-0013-durable-workflow-execution.md`); every claim in this document is now a real, tested property of `worker.py` (`tests/test_automation_worker_postgres.py`, `tests/test_automation_kill_switches_postgres.py`), not a forecast. One correction from the design-time draft, below (the `WHERE` clause's expired-lease branch), is called out explicitly rather than silently reconciled — the rest of this document's numbers and mechanics matched the implementation exactly. **One disclosed gap Task 6 introduces, not present before it:** the diagnostic query in "If the operator needs to manually confirm recovery happened" below (`status IN ('leased', 'running')`) does not cover a run stuck in `status = 'compensating'` (Task 6's own new state) -- see the "Kill switches and their recovery interaction" section's own closing note for why, and `worker.py`'s module docstring ("Task 6: a disclosed, real scope boundary") for the full reasoning.

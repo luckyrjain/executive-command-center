@@ -1,7 +1,7 @@
 ---
 id: PHASE-001-PRIORITY-MODEL
 title: Phase 1 Priority Model
-status: Approved
+status: Approved for Implementation
 version: 1.0.1
 owner: Lucky Jain
 ---

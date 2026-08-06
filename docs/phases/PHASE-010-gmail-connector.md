@@ -2,7 +2,7 @@
 id: PHASE-010
 title: Gmail Connector
 status: Approved for Implementation
-version: 0.3.0
+version: 0.4.2
 owner: Lucky Jain
 depends_on:
   - PHASE-001
@@ -15,13 +15,20 @@ depends_on:
   - RFC-004
   - RFC-005
   - STD-001
+contracts:
+  - phase-010/DATA-MODEL.md
+  - phase-010/API-SCHEMAS.md
+  - phase-010/SYNC-CONTRACT.md
+  - phase-010/PRIVACY-CONSENT-CONTRACT.md
+  - phase-010/UX-STATES.md
+  - phase-010/TEST-PLAN.md
 ---
 
 # PHASE-010 — Gmail Connector
 
 ## Approved decisions
 
-Status moved from Draft after resolving `docs/superpowers/specs/2026-08-04-phase-10-gmail-connector-design.md`'s five decisions (connector mechanics/Protocol extension; privacy/consent model; OAuth scope, verification reality and rollout gating; `recommendations` create-path extension and AI-tool safety rubric; attention/knowledge integration), reached through direct discussion with the repository owner. In summary: the `ConnectorAdapter` Protocol gains its first OAuth2-authorization-code-grant shape (`get_authorization_url`/`handle_oauth_callback`) and its first re-invocable windowed `backfill`, composing Phase 6's connector mechanics with Phase 7's consent/encryption/deletion framework for the first time; a new `email` `personal_domains` entry at the `high_stakes` tier owns dedicated `email_threads`/`email_messages` tables, encrypted with Phase 7's existing personal-data key while the OAuth token itself uses Phase 6's existing connector-token key; shipping is restricted to an application-enforced internal-user allowlist, which is the actual mechanism keeping this phase outside Google's CASA security-assessment requirement (verified directly against Google's own OAuth verification docs, not assumed); `recommendations`' `execute_target()` gains a `"create"` operation reusing the existing per-resource `Create` models, giving the long-unused `source="ai"` field its first real populator; and email-derived attention items reuse Phase 3's existing deterministic ingestion path, not a new AI-runtime task type. Implementation plan: `docs/superpowers/plans/2026-08-04-phase-10-gmail-connector.md`. Delivery status: Task 1 (OAuth2 connector framework extension, Gmail connector skeleton, internal allowlist) complete -- see `docs/phases/phase-010/IMPLEMENTATION-STATUS.md`.
+Status moved from Draft after resolving `docs/superpowers/specs/2026-08-04-phase-10-gmail-connector-design.md`'s five decisions (connector mechanics/Protocol extension; privacy/consent model; OAuth scope, verification reality and rollout gating; `recommendations` create-path extension and AI-tool safety rubric; attention/knowledge integration), reached through direct discussion with the repository owner. In summary: the `ConnectorAdapter` Protocol gains its first OAuth2-authorization-code-grant shape (`get_authorization_url`/`handle_oauth_callback`) and its first re-invocable windowed `backfill`, composing Phase 6's connector mechanics with Phase 7's consent/encryption/deletion framework for the first time; a new `email` `personal_domains` entry at the `high_stakes` tier owns dedicated `email_threads`/`email_messages` tables, encrypted with Phase 7's existing personal-data key while the OAuth token itself uses Phase 6's existing connector-token key; shipping is restricted to an application-enforced internal-user allowlist, which is the actual mechanism keeping this phase outside Google's CASA security-assessment requirement (verified directly against Google's own OAuth verification docs, not assumed); `recommendations`' `execute_target()` gains a `"create"` operation reusing the existing per-resource `Create` models, giving the long-unused `source="ai"` field its first real populator; and email-derived attention items reuse Phase 3's existing deterministic ingestion path, not a new AI-runtime task type. Implementation plan: `docs/superpowers/plans/2026-08-04-phase-10-gmail-connector.md`. Delivery status: Tasks 1-4 (OAuth2 connector framework, internal allowlist, 30-day backfill, incremental history sync, deduplication, participant entity linking, deterministic awaiting-reply attention integration, and the governed recommendations create path) are complete. Tasks 5-8 remain open; see `docs/phases/phase-010/IMPLEMENTATION-STATUS.md`.
 
 **Disclosed, not yet resolved, per the design doc's own "not yet decided" note:** incremental-sync transport (polling assumed, Cloud Pub/Sub push not yet committed to) and whether `httpx` alone (vs. Google's official client library) suffices are both defaults carried into the implementation plan, not explicit repository-owner sign-off in the same form as the five decisions above.
 
@@ -114,3 +121,12 @@ Revoking the `email` domain's consent purges all synced content and disconnects 
 ## Deferred backlog
 
 Gmail write actions (compose/reply/send/archive/label-modify); public/general-availability rollout (blocked on Google's CASA assessment); push-notification-based incremental sync; Google Calendar or any other Google Workspace product; `cross_domain_grants` sharing of the `email` domain; non-internal users.
+
+## Changelog
+
+| Version | Date | Summary | Author |
+|---|---|---|---|
+| 0.4.2 | 2026-08-06 | Reconciled delivery through Task 4 after the recommendations create-path merge | Lucky Jain |
+| 0.4.1 | 2026-08-06 | Reconciled delivery through Task 3 after the attention-integration merge | Lucky Jain |
+| 0.4.0 | 2026-08-06 | Added six governed contracts and reconciled delivery through Task 2 | Lucky Jain |
+| 0.3.0 | 2026-08-04 | Approved the Phase 10 implementation scope and decisions | Lucky Jain |
