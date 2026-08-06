@@ -10,6 +10,7 @@ export type EngineeringView =
   | 'reliability'
   | 'repositories'
   | 'work-items'
+  | 'team-suggestions'
   | 'incidents'
   | 'decisions'
   | 'connector-health'
@@ -196,3 +197,24 @@ export type WorkItemListResponse = { work_items: WorkItem[] }
 // --- Team assignment (`POST /engineering/repositories|work-items/{id}/team`) --
 
 export type TeamAssignmentRequest = { expected_version: number; team_entity_id: string | null }
+
+// --- Team suggestions review (`GET|POST /engineering/team-suggestions*`) --
+
+export type TeamSuggestionSampleItem = {
+  id: string
+  resource_type: 'repository' | 'work_item'
+  name: string
+}
+
+export type TeamSuggestionGroup = {
+  suggested_team_name: string
+  repository_count: number
+  work_item_count: number
+  sample_items: TeamSuggestionSampleItem[]
+}
+
+export type TeamSuggestionListResponse = { items: TeamSuggestionGroup[] }
+
+export type TeamSuggestionConfirmRequest = { suggested_team_name: string; team_entity_id: string }
+export type TeamSuggestionDismissRequest = { suggested_team_name: string }
+export type TeamSuggestionActionResponse = { updated: string[]; skipped_unauthorized: string[] }

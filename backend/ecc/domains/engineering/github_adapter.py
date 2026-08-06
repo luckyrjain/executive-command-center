@@ -246,7 +246,13 @@ def _upsert_repository(
                     provider_updated_at = EXCLUDED.provider_updated_at,
                     observed_at = EXCLUDED.observed_at,
                     updated_at = EXCLUDED.updated_at,
-                    suggested_team_name = EXCLUDED.suggested_team_name
+                    suggested_team_name = EXCLUDED.suggested_team_name,
+                    team_suggestion_dismissed_at = CASE
+                        WHEN repositories.suggested_team_name
+                            IS DISTINCT FROM EXCLUDED.suggested_team_name
+                        THEN NULL
+                        ELSE repositories.team_suggestion_dismissed_at
+                    END
                 """  # noqa: S608 -- WORKSPACE_ORIGINAL_OWNER_SQL is a fixed
                 # module constant, never request-derived; nothing here is
                 # string-interpolated user input.

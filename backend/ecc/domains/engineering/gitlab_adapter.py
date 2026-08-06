@@ -108,6 +108,7 @@ from uuid import uuid4
 import httpx
 from sqlalchemy import text
 
+from ecc.config import get_settings
 from ecc.database import SessionFactory
 
 from .connectors import (
@@ -325,7 +326,13 @@ def _upsert_repository(
                     provider_updated_at = EXCLUDED.provider_updated_at,
                     observed_at = EXCLUDED.observed_at,
                     updated_at = EXCLUDED.updated_at,
-                    suggested_team_name = EXCLUDED.suggested_team_name
+                    suggested_team_name = EXCLUDED.suggested_team_name,
+                    team_suggestion_dismissed_at = CASE
+                        WHEN repositories.suggested_team_name
+                            IS DISTINCT FROM EXCLUDED.suggested_team_name
+                        THEN NULL
+                        ELSE repositories.team_suggestion_dismissed_at
+                    END
                 """  # noqa: S608 -- see github_adapter._upsert_repository's identical note
             ),
             {
@@ -410,7 +417,21 @@ class GitLabAdapter:
         this cannot use Jira's fixed-suffix-allowlist approach (GitLab
         self-managed hosts are arbitrary customer domains), and for the
         disclosed DNS-rebinding limitation of a connect-time-only check.
+
+        `ECC_GITLAB_PRIVATE_HOST_ALLOWLIST` (`Settings.gitlab_private_host_
+        allowlist`) is an operator-controlled, exact-hostname escape hatch
+        for a deployment's own legitimate internal GitLab -- never settable
+        by the connector UI itself, and empty by default (fails closed, no
+        host trusted until named). Checked before resolution even runs, so
+        an allowlisted host never needs a resolvable/mockable DNS answer.
         """
+        allowlist = {
+            entry.strip().casefold()
+            for entry in get_settings().gitlab_private_host_allowlist.split(",")
+            if entry.strip()
+        }
+        if host.casefold() in allowlist:
+            return
         for ip_str in self._resolve_host(host):
             if _is_private_address(ip_str):
                 raise AdapterAuthorizationError(

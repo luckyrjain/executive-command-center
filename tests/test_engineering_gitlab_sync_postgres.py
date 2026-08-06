@@ -207,6 +207,36 @@ def test_reject_private_host_raises_for_unresolvable_host() -> None:
         adapter._reject_private_host("does-not-exist.invalid")
 
 
+def test_reject_private_host_allows_allowlisted_private_host(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`ECC_GITLAB_PRIVATE_HOST_ALLOWLIST` is the operator-controlled escape
+    hatch for a deployment's own legitimate internal GitLab -- an exact,
+    case-insensitive hostname match bypasses the private-address check
+    entirely (never resolving the host at all).
+    """
+    monkeypatch.setenv("ECC_GITLAB_PRIVATE_HOST_ALLOWLIST", "Gitlab-EE.mpokket.org, other.example")
+    get_settings.cache_clear()
+    try:
+        adapter = GitLabAdapter(resolve_host=lambda host: ["10.0.0.5"])
+        adapter._reject_private_host("gitlab-ee.mpokket.org")  # must not raise
+    finally:
+        get_settings.cache_clear()
+
+
+def test_reject_private_host_still_rejects_non_allowlisted_private_host(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ECC_GITLAB_PRIVATE_HOST_ALLOWLIST", "other.example")
+    get_settings.cache_clear()
+    try:
+        adapter = GitLabAdapter(resolve_host=lambda host: ["10.0.0.5"])
+        with pytest.raises(AdapterAuthorizationError, match="private/internal"):
+            adapter._reject_private_host("gitlab-ee.mpokket.org")
+    finally:
+        get_settings.cache_clear()
+
+
 # --- unit-level: GitLabAdapter.authorize ------------------------------------
 
 
@@ -836,6 +866,50 @@ def test_incremental_resync_refreshes_suggestion_without_touching_confirmed_team
             )
 
 
+def test_incremental_resync_clears_dismissed_suggestion_when_namespace_changes(
+    seeded_account_context: ConnectorAccountContext,
+) -> None:
+    """Identical reasoning to `test_engineering_github_sync_postgres.py`'s
+    own dismissal-reset test -- GitLab's suggestion source is the
+    project's `namespace.name` instead of GitHub's `owner.login`.
+    """
+    projects = [
+        _project(1, path="acme/a", updated_at="2024-01-03T00:00:00Z", namespace={"name": "acme"})
+    ]
+    adapter = GitLabAdapter(transport=httpx.MockTransport(lambda r: _json_response(projects)))
+    adapter.backfill(seeded_account_context, "repository")
+
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "UPDATE repositories SET team_suggestion_dismissed_at = :now "
+                "WHERE workspace_id = :workspace_id"
+            ),
+            {"now": datetime.now(UTC), "workspace_id": seeded_account_context.workspace_id},
+        )
+
+    projects_new_namespace = [
+        _project(
+            1, path="acme/a", updated_at="2024-01-04T00:00:00Z", namespace={"name": "acme-new"}
+        )
+    ]
+    adapter2 = GitLabAdapter(
+        transport=httpx.MockTransport(lambda r: _json_response(projects_new_namespace))
+    )
+    adapter2.incremental_sync(seeded_account_context, "repository", "2024-01-03T00:00:00Z")
+
+    with engine.begin() as connection:
+        cleared = connection.execute(
+            text(
+                "SELECT team_suggestion_dismissed_at, suggested_team_name FROM repositories "
+                "WHERE workspace_id = :workspace_id"
+            ),
+            {"workspace_id": seeded_account_context.workspace_id},
+        ).one()
+    assert cleared.team_suggestion_dismissed_at is None
+    assert cleared.suggested_team_name == "acme-new"
+
+
 def test_backfill_paginates_via_link_header(
     seeded_account_context: ConnectorAccountContext,
 ) -> None:
@@ -1428,3 +1502,36 @@ def test_sync_reports_partial_on_rate_limit_and_records_it(
     # connector account is not moved to 'error' the way an adapter
     # exception would (matches github_adapter.py's identical test).
     assert account_status == "active"
+
+
+def test_repositories_have_team_suggestion_dismissed_at_column() -> None:
+    """Migration `0072_team_suggestion_dismissal.py` -- proves the
+    column exists and defaults to NULL before any adapter/endpoint code
+    depends on it.
+    """
+    with engine.begin() as connection:
+        row = connection.execute(
+            text(
+                "SELECT column_name, is_nullable FROM information_schema.columns "
+                "WHERE table_name = 'repositories' AND column_name = 'team_suggestion_dismissed_at'"
+            )
+        ).one_or_none()
+    assert row is not None
+    assert row.is_nullable == "YES"
+
+
+def test_engineering_work_items_have_team_suggestion_dismissed_at_column() -> None:
+    """Migration `0072_team_suggestion_dismissal.py` adds the same column to
+    `engineering_work_items` in the same `upgrade()` loop -- proves it exists
+    and defaults to NULL there too.
+    """
+    with engine.begin() as connection:
+        row = connection.execute(
+            text(
+                "SELECT column_name, is_nullable FROM information_schema.columns "
+                "WHERE table_name = 'engineering_work_items' "
+                "AND column_name = 'team_suggestion_dismissed_at'"
+            )
+        ).one_or_none()
+    assert row is not None
+    assert row.is_nullable == "YES"

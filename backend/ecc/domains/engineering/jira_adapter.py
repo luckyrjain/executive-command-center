@@ -261,7 +261,13 @@ def _upsert_work_item(
                     provider_updated_at = EXCLUDED.provider_updated_at,
                     observed_at = EXCLUDED.observed_at,
                     updated_at = EXCLUDED.updated_at,
-                    suggested_team_name = EXCLUDED.suggested_team_name
+                    suggested_team_name = EXCLUDED.suggested_team_name,
+                    team_suggestion_dismissed_at = CASE
+                        WHEN engineering_work_items.suggested_team_name
+                            IS DISTINCT FROM EXCLUDED.suggested_team_name
+                        THEN NULL
+                        ELSE engineering_work_items.team_suggestion_dismissed_at
+                    END
                 """  # noqa: S608 -- see github_adapter._upsert_repository's identical note
             ),
             {
