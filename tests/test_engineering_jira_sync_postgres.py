@@ -1074,3 +1074,61 @@ def test_sync_reports_partial_on_rate_limit_and_records_it(
             text("SELECT status FROM connector_accounts WHERE id = :id"), {"id": account_id}
         ).scalar_one()
     assert account_status == "active"
+
+
+def test_incremental_resync_clears_dismissed_suggestion_when_project_changes(
+    seeded_account_context: ConnectorAccountContext,
+) -> None:
+    """Identical reasoning to the GitHub/GitLab adapters' own dismissal-
+    reset tests -- Jira's suggestion source is the issue's `fields.
+    project.name` (no native "team" construct exists in Jira's API).
+    """
+    issues = [
+        _issue(
+            1,
+            key="ACME-1",
+            summary="Fix the thing",
+            updated="2024-01-03T00:00:00.000+0000",
+            project={"name": "Acme Project"},
+        )
+    ]
+    adapter = JiraAdapter(
+        transport=httpx.MockTransport(lambda r: _json_response(_search_response(issues)))
+    )
+    adapter.backfill(seeded_account_context, "work_item")
+
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "UPDATE engineering_work_items SET team_suggestion_dismissed_at = :now "
+                "WHERE workspace_id = :workspace_id"
+            ),
+            {"now": datetime.now(UTC), "workspace_id": seeded_account_context.workspace_id},
+        )
+
+    issues_new_project = [
+        _issue(
+            1,
+            key="ACME-1",
+            summary="Fix the thing",
+            updated="2024-01-04T00:00:00.000+0000",
+            project={"name": "Acme Project New"},
+        )
+    ]
+    adapter2 = JiraAdapter(
+        transport=httpx.MockTransport(
+            lambda r: _json_response(_search_response(issues_new_project))
+        )
+    )
+    adapter2.incremental_sync(seeded_account_context, "work_item", "2024-01-03T00:00:00.000+0000")
+
+    with engine.begin() as connection:
+        cleared = connection.execute(
+            text(
+                "SELECT team_suggestion_dismissed_at, suggested_team_name "
+                "FROM engineering_work_items WHERE workspace_id = :workspace_id"
+            ),
+            {"workspace_id": seeded_account_context.workspace_id},
+        ).one()
+    assert cleared.team_suggestion_dismissed_at is None
+    assert cleared.suggested_team_name == "Acme Project New"

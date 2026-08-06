@@ -543,6 +543,46 @@ class WorkItemListResponse(BaseModel):
     work_items: list[WorkItemResponse]
 
 
+# --- Team suggestions review (docs/superpowers/specs/2026-08-06-team-
+# suggestions-review-page-design.md) --------------------------------------
+
+
+class TeamSuggestionSampleItem(BaseModel):
+    id: UUID
+    resource_type: Literal["repository", "work_item"]
+    name: str
+
+
+class TeamSuggestionGroup(BaseModel):
+    suggested_team_name: str
+    repository_count: int
+    work_item_count: int
+    sample_items: list[TeamSuggestionSampleItem]
+
+
+class TeamSuggestionListResponse(BaseModel):
+    items: list[TeamSuggestionGroup]
+
+
+class TeamSuggestionConfirmRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    suggested_team_name: str = Field(min_length=1)
+    team_entity_id: UUID
+
+
+class TeamSuggestionDismissRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    suggested_team_name: str = Field(min_length=1)
+
+
+class TeamSuggestionActionResponse(BaseModel):
+    updated: list[UUID]
+    skipped_unauthorized: list[UUID]
+
+
+_TEAM_SUGGESTION_SAMPLE_CAP = 5
+
+
 # --- Datadog projections (monitors/service definitions/dashboards) -----
 # Migration `0051_phase6_datadog_connector.py`'s own three new tables --
 # deliberately no `team_assignment_version`/`team_assignment_updated_by`
@@ -1683,6 +1723,271 @@ def list_work_items_endpoint(
         .all()
     )
     return WorkItemListResponse(work_items=[WorkItemResponse(**dict(row)) for row in rows])
+
+
+@router.get("/team-suggestions", response_model=TeamSuggestionListResponse)
+def list_team_suggestions_endpoint(
+    auth: AuthDep, session: SessionDep
+) -> TeamSuggestionListResponse:
+    """Grouped, read-only view of every unconfirmed, undismissed
+    `suggested_team_name` across `repositories` and `engineering_work_
+    items` -- see the design doc's "Backend endpoints" section. Runs two
+    separate visibility-filtered queries (one per table) rather than a
+    single `UNION ALL`, because `authz.visible_resource_filter_sql` binds
+    its own fixed parameter names (`__authz_resource_type` etc.) per call
+    -- merging two calls' params into one query text would make both
+    subqueries silently share whichever `resource_type` value won the
+    dict merge. Grouping by `suggested_team_name` happens in Python
+    instead, over what are already small, pre-filtered row sets.
+    """
+    visibility_sql_repo, visibility_params_repo = authz.visible_resource_filter_sql(
+        session, auth, resource_type="repositories", action="read", table_alias="repositories"
+    )
+    repo_rows = (
+        session.execute(
+            text(
+                "SELECT id, name, suggested_team_name FROM repositories "
+                f"WHERE workspace_id = :workspace_id AND ({visibility_sql_repo}) "  # noqa: S608
+                "AND team_entity_id IS NULL AND team_suggestion_dismissed_at IS NULL "
+                "AND suggested_team_name IS NOT NULL"
+            ),
+            {"workspace_id": auth.workspace_id, **visibility_params_repo},
+        )
+        .mappings()
+        .all()
+    )
+
+    visibility_sql_wi, visibility_params_wi = authz.visible_resource_filter_sql(
+        session,
+        auth,
+        resource_type="engineering_work_items",
+        action="read",
+        table_alias="engineering_work_items",
+    )
+    work_item_rows = (
+        session.execute(
+            text(
+                "SELECT id, title AS name, suggested_team_name FROM engineering_work_items "
+                f"WHERE workspace_id = :workspace_id AND ({visibility_sql_wi}) "  # noqa: S608
+                "AND team_entity_id IS NULL AND team_suggestion_dismissed_at IS NULL "
+                "AND suggested_team_name IS NOT NULL"
+            ),
+            {"workspace_id": auth.workspace_id, **visibility_params_wi},
+        )
+        .mappings()
+        .all()
+    )
+
+    groups: dict[str, dict[str, Any]] = {}
+    for row in repo_rows:
+        group = groups.setdefault(
+            row["suggested_team_name"],
+            {"repository_count": 0, "work_item_count": 0, "sample_items": []},
+        )
+        group["repository_count"] += 1
+        if len(group["sample_items"]) < _TEAM_SUGGESTION_SAMPLE_CAP:
+            group["sample_items"].append(
+                {"id": row["id"], "resource_type": "repository", "name": row["name"]}
+            )
+    for row in work_item_rows:
+        group = groups.setdefault(
+            row["suggested_team_name"],
+            {"repository_count": 0, "work_item_count": 0, "sample_items": []},
+        )
+        group["work_item_count"] += 1
+        if len(group["sample_items"]) < _TEAM_SUGGESTION_SAMPLE_CAP:
+            group["sample_items"].append(
+                {"id": row["id"], "resource_type": "work_item", "name": row["name"]}
+            )
+
+    items = [
+        TeamSuggestionGroup(suggested_team_name=name, **data)
+        for name, data in sorted(
+            groups.items(),
+            key=lambda kv: kv[1]["repository_count"] + kv[1]["work_item_count"],
+            reverse=True,
+        )
+    ]
+    return TeamSuggestionListResponse(items=items)
+
+
+def _lock_and_authorize_suggestion_candidates(
+    session: Session,
+    auth: AuthContext,
+    *,
+    table: Literal["repositories", "engineering_work_items"],
+    suggested_team_name: str,
+) -> tuple[list[UUID], list[UUID]]:
+    """Locks every row in `table` still eligible for a team-suggestion
+    bulk action (unconfirmed, undismissed, matching `suggested_team_
+    name`), then authorizes each individually for `action="write"`.
+    Returns `(authorized_ids, skipped_unauthorized_ids)`. Locking before
+    authorizing matches the single-item endpoints' own `FOR UPDATE`
+    timing, so a concurrent sync or another bulk action can't change a
+    row out from under this one mid-check. `table` is always one of the
+    two hardcoded literals below -- never request-derived.
+
+    The candidate `SELECT` itself is restricted to `action="read"`-visible
+    rows via `authz.visible_resource_filter_sql` (the same filter `list_
+    team_suggestions_endpoint` applies) -- see `authz.authorize`'s
+    docstring: a row invisible to the caller must never even be selected
+    or locked, let alone surfaced in `skipped_unauthorized`, or an
+    unauthorized caller could learn a private row's id exists by noticing
+    it show up there. The subsequent per-row `action="write"` check is
+    then only ever run against rows already known to be visible, matching
+    `_validate_team_entity`/`assign_repository_team_endpoint`'s read-then-
+    write precedent.
+    """
+    visibility_sql, visibility_params = authz.visible_resource_filter_sql(
+        session, auth, resource_type=table, action="read", table_alias=table
+    )
+    rows = session.execute(
+        text(
+            f"SELECT id FROM {table} WHERE workspace_id = :workspace_id "  # noqa: S608
+            f"AND ({visibility_sql}) "
+            "AND suggested_team_name = :suggested_team_name "
+            "AND team_entity_id IS NULL AND team_suggestion_dismissed_at IS NULL FOR UPDATE"
+        ),
+        {
+            "workspace_id": auth.workspace_id,
+            "suggested_team_name": suggested_team_name,
+            **visibility_params,
+        },
+    ).all()
+    authorized: list[UUID] = []
+    skipped: list[UUID] = []
+    for (row_id,) in rows:
+        if authz.authorize(session, auth, resource_type=table, resource_id=row_id, action="write"):
+            authorized.append(row_id)
+        else:
+            skipped.append(row_id)
+    return authorized, skipped
+
+
+_TEAM_SUGGESTION_TABLES: tuple[
+    tuple[Literal["repositories", "engineering_work_items"], str, str], ...
+] = (
+    ("repositories", "repository", "repository.team_assigned"),
+    ("engineering_work_items", "engineering_work_item", "engineering_work_item.team_assigned"),
+)
+
+
+@router.post("/team-suggestions/confirm", response_model=TeamSuggestionActionResponse)
+def confirm_team_suggestion_endpoint(
+    payload: TeamSuggestionConfirmRequest,
+    request: Request,
+    auth: AuthDep,
+    session: SessionDep,
+    _csrf: CsrfDep,
+    idempotency_key: IdempotencyHeader,
+) -> TeamSuggestionActionResponse:
+    """Bulk sibling of `assign_repository_team_endpoint`/`assign_work_
+    item_team_endpoint`: confirms every currently-unconfirmed, undismissed
+    `repositories`/`engineering_work_items` row sharing one `suggested_
+    team_name`, in one transaction. No `expected_version` -- see the
+    design doc's "Backend endpoints" section for why a per-row version
+    doesn't apply to a set-based confirm.
+    """
+    request_hash = _request_hash(payload, "confirm_team_suggestion")
+    now = datetime.now(UTC)
+    with session.begin():
+        _lock_idempotency(session, auth, idempotency_key)
+        cached = _load_cached(session, auth, idempotency_key, request_hash)
+        if cached is not None:
+            return TeamSuggestionActionResponse.model_validate(cached)
+
+        _validate_team_entity(session, auth, payload.team_entity_id)
+
+        updated: list[UUID] = []
+        skipped: list[UUID] = []
+        for table, aggregate_type, event_type in _TEAM_SUGGESTION_TABLES:
+            authorized_ids, skipped_ids = _lock_and_authorize_suggestion_candidates(
+                session, auth, table=table, suggested_team_name=payload.suggested_team_name
+            )
+            skipped.extend(skipped_ids)
+            for row_id in authorized_ids:
+                new_version = session.execute(
+                    text(
+                        f"UPDATE {table} SET team_entity_id = :team_entity_id, "  # noqa: S608
+                        "team_assignment_version = team_assignment_version + 1, "
+                        "team_assignment_updated_by = :actor_id, updated_at = :now "
+                        "WHERE workspace_id = :workspace_id AND id = :id "
+                        "AND team_entity_id IS NULL AND team_suggestion_dismissed_at IS NULL "
+                        "RETURNING team_assignment_version"
+                    ),
+                    {
+                        "team_entity_id": payload.team_entity_id,
+                        "actor_id": auth.user_id,
+                        "now": now,
+                        "workspace_id": auth.workspace_id,
+                        "id": row_id,
+                    },
+                ).scalar_one()
+                _write_team_assignment_side_effects(
+                    session,
+                    auth,
+                    request,
+                    aggregate_type=aggregate_type,
+                    event_type=event_type,
+                    aggregate_id=row_id,
+                    version=new_version,
+                    now=now,
+                )
+                updated.append(row_id)
+
+        response = TeamSuggestionActionResponse(updated=updated, skipped_unauthorized=skipped)
+        _store_idempotency(
+            session, auth, idempotency_key, request_hash, response.model_dump(mode="json"), now
+        )
+        return response
+
+
+@router.post("/team-suggestions/dismiss", response_model=TeamSuggestionActionResponse)
+def dismiss_team_suggestion_endpoint(
+    payload: TeamSuggestionDismissRequest,
+    auth: AuthDep,
+    session: SessionDep,
+    _csrf: CsrfDep,
+    idempotency_key: IdempotencyHeader,
+) -> TeamSuggestionActionResponse:
+    """Bulk-hides every currently-unconfirmed, undismissed row sharing one
+    `suggested_team_name`, without assigning any team. No audit event --
+    unlike confirm, dismissing writes no durable link a future reader
+    needs an audit trail for; the adapter-side reset rule (Tasks 2-4) is
+    what keeps this from permanently suppressing a since-changed
+    suggestion.
+    """
+    request_hash = _request_hash(payload, "dismiss_team_suggestion")
+    now = datetime.now(UTC)
+    with session.begin():
+        _lock_idempotency(session, auth, idempotency_key)
+        cached = _load_cached(session, auth, idempotency_key, request_hash)
+        if cached is not None:
+            return TeamSuggestionActionResponse.model_validate(cached)
+
+        updated: list[UUID] = []
+        skipped: list[UUID] = []
+        for table, _aggregate_type, _event_type in _TEAM_SUGGESTION_TABLES:
+            authorized_ids, skipped_ids = _lock_and_authorize_suggestion_candidates(
+                session, auth, table=table, suggested_team_name=payload.suggested_team_name
+            )
+            skipped.extend(skipped_ids)
+            for row_id in authorized_ids:
+                session.execute(
+                    text(
+                        f"UPDATE {table} SET team_suggestion_dismissed_at = :now "  # noqa: S608
+                        "WHERE workspace_id = :workspace_id AND id = :id "
+                        "AND team_entity_id IS NULL AND team_suggestion_dismissed_at IS NULL"
+                    ),
+                    {"now": now, "workspace_id": auth.workspace_id, "id": row_id},
+                )
+                updated.append(row_id)
+
+        response = TeamSuggestionActionResponse(updated=updated, skipped_unauthorized=skipped)
+        _store_idempotency(
+            session, auth, idempotency_key, request_hash, response.model_dump(mode="json"), now
+        )
+        return response
 
 
 @router.get("/monitors", response_model=MonitorListResponse)
