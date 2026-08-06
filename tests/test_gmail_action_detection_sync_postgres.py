@@ -32,6 +32,11 @@ Covers:
 6. A candidate left over after one call's own `_MAX_ACTION_DETECTIONS_
    PER_CALL` bound is picked up by a later call, not permanently lost
    (round 3 review finding).
+7. `email` domain consent revoked mid-batch halts the remaining batch --
+   round 7 review found `detect_actions_since`'s per-row loop never
+   repeated the same per-write consent recheck `_sync_messages`/`_sync_
+   history` already do, despite `SYNC-CONTRACT.md`'s own general contract
+   covering this write path too.
 """
 
 from __future__ import annotations
@@ -645,6 +650,7 @@ def backlog_context() -> Iterator[dict]:
                 credential=credential,
             ),
             "workspace_id": workspace_id,
+            "owner_id": owner_id,
             "message_ids": message_ids,
             "external_message_ids": external_message_ids,
             "since": now - timedelta(minutes=5),
@@ -719,6 +725,85 @@ def test_overflow_beyond_one_calls_own_bound_is_picked_up_by_the_next_call_not_l
             "every message must eventually be fetched across calls, not permanently "
             f"excluded once its own created_at falls behind a later call's since; "
             f"still unfetched: {set(message_ids) - fetched_after_second_call}"
+        )
+    finally:
+        get_settings.cache_clear()
+
+
+# ---------------------------------------------------------------------------
+# Round 7 review finding: `detect_actions_since`'s per-row loop never
+# repeated the same per-write consent recheck `_sync_messages`/`_sync_
+# history` already do, despite `SYNC-CONTRACT.md`'s own general contract
+# ("An active `email` domain consent is checked before external fetch and
+# again before each message write. Revocation during a call stops further
+# writes.") covering this write path too -- found only by actually revoking
+# consent mid-batch and asserting later messages are never fetched, which no
+# test before this one did.
+# ---------------------------------------------------------------------------
+
+
+def _revoke_consent(workspace_id: UUID, owner_id: UUID) -> None:
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "UPDATE domain_consents SET revoked_at = :now "
+                "WHERE workspace_id = :workspace_id AND owner_id = :owner_id "
+                "AND domain_key = 'email'"
+            ),
+            {"workspace_id": workspace_id, "owner_id": owner_id, "now": datetime.now(UTC)},
+        )
+
+
+def test_batch_halts_when_consent_is_revoked_mid_batch(
+    backlog_context: dict, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`SYNC-CONTRACT.md`'s own general contract -- consent checked before
+    external fetch and again before each message write, revocation during
+    a call stops further writes -- applies to this write path exactly like
+    it already does to `_sync_messages`/`_sync_history`. Revokes consent as
+    a side effect of fetching the *first* message's body; a second message
+    must never be fetched afterward.
+    """
+    monkeypatch.setenv("ECC_EMAIL_ACTION_DETECTION_ENABLED", "true")
+    get_settings.cache_clear()
+    try:
+        workspace_id = backlog_context["workspace_id"]
+        owner_id = backlog_context["owner_id"]
+        message_ids = backlog_context["message_ids"]
+        external_message_ids = backlog_context["external_message_ids"]
+
+        fetched_external_ids: list[str] = []
+        encoded_body = base64.urlsafe_b64encode(_PLAIN_TEXT_BODY.encode()).decode().rstrip("=")
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            message_id = request.url.path.rsplit("/", 1)[-1]
+            assert message_id in external_message_ids, f"unexpected message id {message_id!r}"
+            fetched_external_ids.append(message_id)
+            if len(fetched_external_ids) == 1:
+                _revoke_consent(workspace_id, owner_id)
+            return httpx.Response(
+                200,
+                json={
+                    "id": message_id,
+                    "payload": {"mimeType": "text/plain", "body": {"data": encoded_body}},
+                },
+            )
+
+        adapter = GmailAdapter(transport=httpx.MockTransport(handler))
+
+        adapter.detect_actions_since(
+            backlog_context["context"],
+            since=backlog_context["since"],
+            ollama_adapter=_ollama_adapter(has_action=False),
+        )
+
+        assert len(fetched_external_ids) == 1, (
+            "only the message that triggered the mid-batch revocation may be fetched; "
+            f"got {len(fetched_external_ids)} fetches: {fetched_external_ids}"
+        )
+        fetched = _fetched_message_ids(workspace_id, message_ids)
+        assert len(fetched) == 1, (
+            f"only one message's body may be stored after consent is revoked, got {len(fetched)}"
         )
     finally:
         get_settings.cache_clear()

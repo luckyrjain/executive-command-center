@@ -2784,6 +2784,25 @@ class GmailAdapter:
 
         headers = _bearer_headers(context.credential)
         for row in rows:
+            # Re-checked per message, not merely once above -- round 7
+            # review found this loop never repeated the same recheck
+            # `_sync_messages`/`_sync_history` already do before every one
+            # of their own writes, despite `SYNC-CONTRACT.md`'s own general
+            # contract ("An active `email` domain consent is checked
+            # before external fetch and again before each message write.
+            # Revocation during a call stops further writes.") covering
+            # this write path too. Consent-revocation disconnect/purge is
+            # not yet implemented (Task 7, per this phase's own status
+            # doc) -- today, this per-message recheck is the *only*
+            # enforcement standing between a user revoking `email` domain
+            # consent and this loop continuing to fetch, decrypt-and-store,
+            # and run their mail through an AI model regardless. `return`,
+            # not `continue`, on revocation -- stops the whole remaining
+            # batch, matching `_sync_messages`' identical "halts the call"
+            # semantics, not merely this one row.
+            with SessionFactory() as session, session.begin():
+                if not _email_consent_active(session, context.workspace_id, owner_id):
+                    return
             try:
                 self._detect_action_for_message(
                     workspace_id=context.workspace_id,

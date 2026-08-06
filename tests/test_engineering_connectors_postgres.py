@@ -1300,9 +1300,14 @@ def test_sync_invokes_proactive_action_detection_with_a_valid_call_signature(
     failure mode this closes. `email_action_detection_enabled` must be
     turned on for the hook to fire at all (`detect_actions_since`'s own
     feature-flag check happens inside the real adapter, but the *call
-    site* itself is gated only by `outcome.items_processed > 0`, so this
-    test needs the flag on to prove the call site's own contract, even
-    though this particular fake adapter ignores the flag itself).
+    site* itself has no gate of its own at all -- round 4 review removed
+    the `outcome.items_processed > 0` gate this docstring used to describe
+    here, since it silently defeated `detect_actions_since`'s own backlog-
+    recovery guarantee (see `test_sync_invokes_proactive_action_detection_
+    even_when_this_calls_own_items_processed_is_zero`, immediately below).
+    This test still turns the flag on for symmetry with a real deployment,
+    even though this particular fake adapter ignores the flag itself and
+    the call site never checks it either).
     """
     monkeypatch.setenv("ECC_EMAIL_ACTION_DETECTION_ENABLED", "true")
     get_settings.cache_clear()
