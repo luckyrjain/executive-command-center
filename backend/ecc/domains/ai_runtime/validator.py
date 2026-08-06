@@ -249,21 +249,27 @@ class GroundingFailure:
 
     `reason` also covers `personal.generate_insight`'s second, distinct
     failure mode (`missing_professional_referral`, see `check_personal_
-    insight_grounding` below) and `email.detect_action`'s own second
-    failure mode (`missing_citation_for_action`, see `check_email_
-    detect_action_grounding` below) -- reusing this one dataclass rather
-    than inventing a near-identical type per task for a check that is
-    still conceptually "did this output satisfy the structural safety
+    insight_grounding` below) -- reusing this one dataclass rather than
+    inventing a near-identical type per task for a check that is still
+    conceptually "did this output satisfy the structural safety
     requirements it was shown enough to satisfy," just checking a
-    different field. `ungrounded_codes` is simply empty (`()`) for those
-    other reasons; nothing in this dataclass claims the reasons share a
-    meaning beyond all mapping to `execute_run`'s existing
-    `grounding_failed` error code.
+    different field. `ungrounded_codes` is simply empty (`()`) for that
+    other reason; nothing in this dataclass claims the two reasons share a
+    meaning beyond both mapping to `execute_run`'s existing `grounding_
+    failed` error code.
+
+    `email.detect_action` has no second failure mode of its own here --
+    unlike `personal.generate_insight`'s professional-referral check,
+    `EmailDetectActionOutput._validate_action_shape`'s own conditional
+    `model_validator` already enforces `cited_message_ids` is non-empty
+    whenever `has_action` is true, so an unsupported claim citing nothing
+    fails schema validation (`schema_invalid`) before `check_email_
+    detect_action_grounding` ever runs -- that function only ever
+    produces the shared `"ungrounded_citation"` reason (or `None`), the
+    same as `check_explain_item_grounding`.
     """
 
-    reason: Literal[
-        "ungrounded_citation", "missing_professional_referral", "missing_citation_for_action"
-    ] = "ungrounded_citation"
+    reason: Literal["ungrounded_citation", "missing_professional_referral"] = "ungrounded_citation"
     ungrounded_codes: tuple[str, ...] = ()
 
 

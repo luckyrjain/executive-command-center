@@ -1380,7 +1380,7 @@ def sync_connector_endpoint(
     detect_actions = getattr(adapter, "detect_actions_since", None)
     if callable(detect_actions) and outcome.items_processed > 0:
         try:
-            detect_actions(context, since=now, auth=auth)
+            detect_actions(context, since=now)
         except Exception:  # noqa: BLE001 -- best-effort, never fails the sync response
             pass
 

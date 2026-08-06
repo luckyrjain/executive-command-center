@@ -2651,6 +2651,18 @@ class GmailAdapter:
         `_process_message`'s own participant-resolution loop already
         establishes for a different per-item failure.
 
+        That "skip and keep going" guarantee is per-*batch*, not per-
+        *message* across calls: `_detect_action_for_message`'s own body-
+        fetch UPDATE commits (`body IS NULL` no longer matches) before
+        evidence registration/`execute_run`/`create_recommendation` run,
+        so a failure in any of those *later* steps leaves the message
+        permanently ineligible for a future `detect_actions_since` call's
+        own `WHERE ... AND m.body IS NULL` selection -- not retried, just
+        quietly never proactively scanned again. A deliberate trade-off
+        (retrying would mean re-selecting on some signal other than "body
+        not yet fetched," which nothing here currently tracks), not an
+        oversight -- found and documented by round 1 review.
+
         Builds its own `AuthContext` from the account's `owner_id`, not a
         caller-supplied one -- the created recommendation must belong to
         the connected account's own owner (`_owner_id_for_account`),
@@ -2690,6 +2702,7 @@ class GmailAdapter:
                           AND m.direction = 'inbound' AND m.body IS NULL
                           AND m.created_at >= :since
                         ORDER BY m.sent_at ASC
+                        LIMIT :limit
                         """
                     ),
                     {
@@ -2697,6 +2710,19 @@ class GmailAdapter:
                         "owner_id": owner_id,
                         "connector_account_id": context.connector_account_id,
                         "since": since,
+                        # Bounds this method's own per-call work the same
+                        # way `_sync_messages`/`_sync_history`'s own `while
+                        # calls_made < _MAX_MESSAGES_PER_CALL` loops bound
+                        # theirs -- today this stays implicitly bounded by
+                        # `backfill`/`incremental_sync` never writing more
+                        # than `_MAX_MESSAGES_PER_CALL` new rows per call in
+                        # the first place, but that's a coupling to a
+                        # different function's own budget, not a bound this
+                        # query enforces for itself -- found by round 1
+                        # review, defense-in-depth rather than a live bug
+                        # (each fetched row still costs one live Gmail
+                        # `messages.get` plus one Ollama call).
+                        "limit": _MAX_MESSAGES_PER_CALL,
                     },
                 )
                 .mappings()
@@ -2817,6 +2843,22 @@ class GmailAdapter:
             if not output.get("has_action"):
                 return
 
+            # `evidence_ids=[evidence_id]` -- only the message that
+            # triggered *this* detection run, not every id in the model's
+            # own `output["cited_message_ids"]` (which may also name
+            # earlier messages in the same thread, already grounded and
+            # already fetched by a prior run of this same method). Those
+            # earlier messages each got their own `pkos_evidence` row the
+            # call that first fetched *their* body, but this method keeps
+            # no message-id -> evidence-id index to look that back up by,
+            # and re-registering a fresh evidence row per cited id here
+            # would duplicate evidence already on record for the same
+            # message. A human confirming this recommendation still sees
+            # the full cited thread content in `rationale`/the prompt this
+            # ran against; `evidence_ids` itself is a narrower pointer to
+            # "the message that made this run happen," not an exhaustive
+            # citation index -- a deliberate scope decision, not an
+            # oversight, found and documented by round 1 review.
             recommendation_payload = RecommendationCreate(
                 recommendation_type="email_action_detected",
                 target_type=output["target_type"],

@@ -1496,7 +1496,7 @@ def _prepare_email_detect_action_request(
         session,
         auth,
         tool_name="email.get_thread_content",
-        tool_input={"thread_id": raw_thread_id},
+        tool_input={"thread_id": str(raw_thread_id)},
         eligible_tools=port.eligible_tools,
     )
     steps.append(_tool_step(1, dispatch))
