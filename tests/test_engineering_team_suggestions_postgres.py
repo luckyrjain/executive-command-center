@@ -240,3 +240,88 @@ def test_team_suggestions_sample_items_cap_is_shared_across_resource_types(sugge
 
     resource_types = {sample["resource_type"] for sample in platform["sample_items"]}
     assert resource_types == {"repository", "work_item"}
+
+
+def test_confirm_team_suggestion_bulk_assigns_across_resource_types(suggestions_context) -> None:
+    client, workspace_id, user_id, token = suggestions_context
+    account_id = _insert_connector_account(workspace_id, user_id)
+    team_id = _insert_pkos_team(workspace_id, name="Platform")
+    repo_a = _insert_repository(workspace_id, account_id, user_id, name="acme/a", suggested_team_name="Platform")
+    repo_b = _insert_repository(workspace_id, account_id, user_id, name="acme/b", suggested_team_name="Platform")
+    _insert_repository(workspace_id, account_id, user_id, name="acme/other", suggested_team_name="Growth")
+
+    response = client.post(
+        "/api/v1/engineering/team-suggestions/confirm",
+        json={"suggested_team_name": "Platform", "team_entity_id": str(team_id)},
+        headers=_headers(token, key=str(uuid4())),
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert set(body["updated"]) == {str(repo_a), str(repo_b)}
+    assert body["skipped_unauthorized"] == []
+
+    with engine.begin() as connection:
+        rows = connection.execute(
+            text(
+                "SELECT team_entity_id, team_assignment_version FROM repositories "
+                "WHERE workspace_id = :workspace_id AND suggested_team_name = 'Platform'"
+            ),
+            {"workspace_id": workspace_id},
+        ).all()
+    assert all(row.team_entity_id == team_id for row in rows)
+    assert all(row.team_assignment_version == 2 for row in rows)
+
+
+def test_confirm_team_suggestion_is_idempotent_on_replay(suggestions_context) -> None:
+    client, workspace_id, user_id, token = suggestions_context
+    account_id = _insert_connector_account(workspace_id, user_id)
+    team_id = _insert_pkos_team(workspace_id)
+    _insert_repository(workspace_id, account_id, user_id, name="acme/a", suggested_team_name="Platform")
+    key = str(uuid4())
+    payload = {"suggested_team_name": "Platform", "team_entity_id": str(team_id)}
+
+    first = client.post(
+        "/api/v1/engineering/team-suggestions/confirm", json=payload, headers=_headers(token, key=key)
+    )
+    second = client.post(
+        "/api/v1/engineering/team-suggestions/confirm", json=payload, headers=_headers(token, key=key)
+    )
+    # Compare only business logic fields, not request_id/correlation_id which are added per-request
+    first_body = first.json()
+    second_body = second.json()
+    assert first_body["updated"] == second_body["updated"]
+    assert first_body["skipped_unauthorized"] == second_body["skipped_unauthorized"]
+
+    with engine.begin() as connection:
+        version = connection.execute(
+            text(
+                "SELECT team_assignment_version FROM repositories WHERE workspace_id = :workspace_id"
+            ),
+            {"workspace_id": workspace_id},
+        ).scalar_one()
+    assert version == 2  # not bumped twice
+
+
+def test_confirm_team_suggestion_rejects_non_team_entity(suggestions_context) -> None:
+    client, workspace_id, user_id, token = suggestions_context
+    account_id = _insert_connector_account(workspace_id, user_id)
+    _insert_repository(workspace_id, account_id, user_id, name="acme/a", suggested_team_name="Platform")
+    not_a_team_id = uuid4()
+    now = datetime.now(UTC)
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO pkos_nodes (id, workspace_id, node_type, canonical_name, "
+                "status, confidence, version, created_at, updated_at) "
+                "VALUES (:id, :workspace_id, 'person', 'Not A Team', 'active', 1.0, 1, :now, :now)"
+            ),
+            {"id": not_a_team_id, "workspace_id": workspace_id, "now": now},
+        )
+
+    response = client.post(
+        "/api/v1/engineering/team-suggestions/confirm",
+        json={"suggested_team_name": "Platform", "team_entity_id": str(not_a_team_id)},
+        headers=_headers(token, key=str(uuid4())),
+    )
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "TEAM_ENTITY_KIND_MISMATCH"

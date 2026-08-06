@@ -1806,6 +1806,112 @@ def list_team_suggestions_endpoint(auth: AuthDep, session: SessionDep) -> TeamSu
     return TeamSuggestionListResponse(items=items)
 
 
+def _lock_and_authorize_suggestion_candidates(
+    session: Session,
+    auth: AuthContext,
+    *,
+    table: Literal["repositories", "engineering_work_items"],
+    suggested_team_name: str,
+) -> tuple[list[UUID], list[UUID]]:
+    """Locks every row in `table` still eligible for a team-suggestion
+    bulk action (unconfirmed, undismissed, matching `suggested_team_
+    name`), then authorizes each individually for `action="write"`.
+    Returns `(authorized_ids, skipped_unauthorized_ids)`. Locking before
+    authorizing matches the single-item endpoints' own `FOR UPDATE`
+    timing, so a concurrent sync or another bulk action can't change a
+    row out from under this one mid-check. `table` is always one of the
+    two hardcoded literals below -- never request-derived.
+    """
+    rows = session.execute(
+        text(
+            f"SELECT id FROM {table} WHERE workspace_id = :workspace_id "  # noqa: S608
+            "AND suggested_team_name = :suggested_team_name "
+            "AND team_entity_id IS NULL AND team_suggestion_dismissed_at IS NULL FOR UPDATE"
+        ),
+        {"workspace_id": auth.workspace_id, "suggested_team_name": suggested_team_name},
+    ).all()
+    authorized: list[UUID] = []
+    skipped: list[UUID] = []
+    for (row_id,) in rows:
+        if authz.authorize(session, auth, resource_type=table, resource_id=row_id, action="write"):
+            authorized.append(row_id)
+        else:
+            skipped.append(row_id)
+    return authorized, skipped
+
+
+_TEAM_SUGGESTION_TABLES: tuple[
+    tuple[Literal["repositories", "engineering_work_items"], str, str], ...
+] = (
+    ("repositories", "repository", "repository.team_assigned"),
+    ("engineering_work_items", "engineering_work_item", "engineering_work_item.team_assigned"),
+)
+
+
+@router.post("/team-suggestions/confirm", response_model=TeamSuggestionActionResponse)
+def confirm_team_suggestion_endpoint(
+    payload: TeamSuggestionConfirmRequest,
+    request: Request,
+    auth: AuthDep,
+    session: SessionDep,
+    _csrf: CsrfDep,
+    idempotency_key: IdempotencyHeader,
+) -> TeamSuggestionActionResponse:
+    """Bulk sibling of `assign_repository_team_endpoint`/`assign_work_
+    item_team_endpoint`: confirms every currently-unconfirmed, undismissed
+    `repositories`/`engineering_work_items` row sharing one `suggested_
+    team_name`, in one transaction. No `expected_version` -- see the
+    design doc's "Backend endpoints" section for why a per-row version
+    doesn't apply to a set-based confirm.
+    """
+    request_hash = _request_hash(payload, "confirm_team_suggestion")
+    now = datetime.now(UTC)
+    with session.begin():
+        _lock_idempotency(session, auth, idempotency_key)
+        cached = _load_cached(session, auth, idempotency_key, request_hash)
+        if cached is not None:
+            return TeamSuggestionActionResponse.model_validate(cached)
+
+        _validate_team_entity(session, auth, payload.team_entity_id)
+
+        updated: list[UUID] = []
+        skipped: list[UUID] = []
+        for table, aggregate_type, event_type in _TEAM_SUGGESTION_TABLES:
+            authorized_ids, skipped_ids = _lock_and_authorize_suggestion_candidates(
+                session, auth, table=table, suggested_team_name=payload.suggested_team_name
+            )
+            skipped.extend(skipped_ids)
+            for row_id in authorized_ids:
+                new_version = session.execute(
+                    text(
+                        f"UPDATE {table} SET team_entity_id = :team_entity_id, "  # noqa: S608
+                        "team_assignment_version = team_assignment_version + 1, "
+                        "team_assignment_updated_by = :actor_id, updated_at = :now "
+                        "WHERE workspace_id = :workspace_id AND id = :id "
+                        "RETURNING team_assignment_version"
+                    ),
+                    {
+                        "team_entity_id": payload.team_entity_id,
+                        "actor_id": auth.user_id,
+                        "now": now,
+                        "workspace_id": auth.workspace_id,
+                        "id": row_id,
+                    },
+                ).scalar_one()
+                _write_team_assignment_side_effects(
+                    session, auth, request,
+                    aggregate_type=aggregate_type, event_type=event_type,
+                    aggregate_id=row_id, version=new_version, now=now,
+                )
+                updated.append(row_id)
+
+        response = TeamSuggestionActionResponse(updated=updated, skipped_unauthorized=skipped)
+        _store_idempotency(
+            session, auth, idempotency_key, request_hash, response.model_dump(mode="json"), now
+        )
+        return response
+
+
 @router.get("/monitors", response_model=MonitorListResponse)
 def list_monitors_endpoint(
     auth: AuthDep,
