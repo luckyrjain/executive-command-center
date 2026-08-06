@@ -65,6 +65,12 @@ Covers, per the implementation plan's own Task 3 scope:
     not with how many threads are actually awaiting reply. This test
     confirms the narrowed fetch still matches correctly (not just that
     it's smaller).
+12. A real `email_thread` item, produced by `regenerate_attention` itself,
+    is invisible to a second, active member of the *same* workspace via
+    `GET /api/v1/attention` (still visible to its own owner) -- round 5
+    review finding: the hardcoded `visibility='private'` this entity_type
+    relies on (`attention.py`'s own `email_thread_rows` comment) had no
+    test exercising the primary read path it protects.
 """
 
 from collections.abc import Iterator
@@ -847,6 +853,82 @@ def test_removed_member_owned_thread_is_pruned_from_attention(
             .one_or_none()
         )
     assert row is None
+
+
+def test_email_thread_item_not_visible_to_another_workspace_member(
+    email_attention_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    """Round 5 (architecture/quality) review finding: this file's own
+    docstring enumerates 11 covered scenarios but none of them exercise
+    `GET /api/v1/attention` (the primary read path every `email_thread`
+    item is meant to be gated on) across two different workspace members
+    -- only `test_dashboard_briefs_postgres.py`'s round-4 fix test does,
+    and only for the secondary `top_priorities` dashboard section, and
+    only with a plain `'task'` row inserted directly by raw SQL rather
+    than a real `email_thread` item produced by `regenerate_attention`
+    itself. `attention.py`'s own `email_thread_rows` comment states the
+    entire privacy guarantee for this entity_type rests on hardcoding
+    `visibility='private'` (`email_threads` has no visibility column of
+    its own to read one from) -- this test is the one place that specific
+    claim is verified end-to-end against the endpoint it actually protects,
+    for a row `regenerate_attention` really produced.
+    """
+    client, workspace_id, owner_id, token = email_attention_test_context
+    now = datetime.now(UTC)
+    sender = "known.contact@example.test"
+    _resolve_sender(workspace_id, sender)
+    thread_id = _seed_thread(workspace_id, owner_id, "Only the owner should see this", now)
+    _seed_message(
+        workspace_id, owner_id, thread_id, sender=sender, direction="inbound", sent_at=now
+    )
+    regenerate = client.post("/api/v1/attention/regenerate", headers=_headers(token), json={})
+    assert regenerate.status_code == 200, regenerate.text
+    item = next(i for i in regenerate.json()["items"] if i["entity_id"] == str(thread_id))
+    assert item["entity_type"] == "email_thread"
+
+    # A second, active member of the *same* workspace -- not the owner.
+    other_id = uuid4()
+    other_token = f"session-{uuid4()}"
+    other_now = datetime.now(UTC)
+    with engine.begin() as connection:
+        create_identity(
+            connection,
+            workspace_id=workspace_id,
+            user_id=other_id,
+            email=f"{other_id}@example.test",
+            now=other_now,
+            role="admin",
+        )
+        connection.execute(
+            text(
+                "INSERT INTO sessions (id, workspace_id, user_id, token_hash, "
+                "expires_at, last_seen_at) "
+                "VALUES (:id, :workspace_id, :user_id, :token_hash, :expires_at, :last_seen_at)"
+            ),
+            {
+                "id": uuid4(),
+                "workspace_id": workspace_id,
+                "user_id": other_id,
+                "token_hash": sha256(other_token.encode()).hexdigest(),
+                "expires_at": other_now + timedelta(hours=1),
+                "last_seen_at": other_now,
+            },
+        )
+
+    other_client = TestClient(app)
+    other_client.cookies.set("ecc_session", other_token)
+    try:
+        listed = other_client.get("/api/v1/attention", headers=_headers(other_token))
+        assert listed.status_code == 200, listed.text
+        assert all(i["entity_id"] != str(thread_id) for i in listed.json()["items"])
+    finally:
+        other_client.close()
+
+    # The owner themselves must still see it -- this proves the item is
+    # actually gated on visibility, not simply absent/broken for everyone.
+    owner_listed = client.get("/api/v1/attention", headers=_headers(token))
+    assert owner_listed.status_code == 200, owner_listed.text
+    assert any(i["entity_id"] == str(thread_id) for i in owner_listed.json()["items"])
 
 
 def test_known_email_aliases_bounded_to_candidate_senders_still_matches(
