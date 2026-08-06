@@ -18,6 +18,7 @@ export type Recommendation = {
   target_type: string
   target_id?: string | null
   proposed_action: Record<string, unknown>
+  proposed_fields?: Record<string, unknown> | null
   expected_version?: number | null
   rationale: string
   confidence: number
@@ -73,11 +74,19 @@ function fetchRecommendations(): Promise<RecommendationList> {
   return apiRequest(`/api/v1/recommendations?${statuses}`)
 }
 
+export function isCreateRecommendation(item: Recommendation): boolean {
+  return item.proposed_action.operation === 'create'
+}
+
 export function actionPayload(item: Recommendation, action: ActionName): Record<string, unknown> {
   if (action === 'confirm') {
+    // A create-type recommendation proposes a brand-new row -- there is no
+    // existing target to have a version of, so `target_expected_version`
+    // must be omitted (the backend rejects it as 422 if present) rather
+    // than echoing back `item.expected_version` (always null for this type).
     return {
       expected_version: item.version,
-      target_expected_version: item.expected_version,
+      target_expected_version: isCreateRecommendation(item) ? null : item.expected_version,
     }
   }
   if (action === 'defer') {
@@ -104,7 +113,15 @@ function mutateRecommendation({ item, action }: ActionRequest): Promise<Recommen
 
 export function actionSummary(action: Record<string, unknown>): string {
   const operation = typeof action.operation === 'string' ? action.operation : 'update'
-  const fields = Object.keys(action).filter((key) => key !== 'operation')
+  // A create-type action is always exactly `{operation: 'create', value: null}`
+  // (see `recommendation_targets.py`'s `_ALLOWED` -- `value` is a required but
+  // unused sentinel for this operation, there is no scalar to whitelist the way
+  // every other operation has). Filtering out null/undefined-valued keys, not
+  // just `operation`, keeps that sentinel from rendering as the literal,
+  // meaningless text "create · value".
+  const fields = Object.keys(action).filter(
+    (key) => key !== 'operation' && action[key] !== null && action[key] !== undefined,
+  )
   return fields.length ? `${operation.replaceAll('_', ' ')} · ${fields.join(', ')}` : operation.replaceAll('_', ' ')
 }
 
@@ -246,7 +263,7 @@ export default function RecommendationPanel() {
                   <h3>{item.recommendation_type.replaceAll('_', ' ')}</h3>
                   <p>{item.rationale}</p>
                   <dl>
-                    <div><dt>Target</dt><dd>{item.target_type}</dd></div>
+                    <div><dt>Target</dt><dd>{isCreateRecommendation(item) ? `New ${item.target_type}` : item.target_type}</dd></div>
                     <div><dt>Action</dt><dd>{actionSummary(item.proposed_action)}</dd></div>
                     <div><dt>Evidence</dt><dd>{item.evidence_ids.length} reference{item.evidence_ids.length === 1 ? '' : 's'}</dd></div>
                   </dl>
@@ -257,6 +274,13 @@ export default function RecommendationPanel() {
                       {item.target_type === 'risk' && item.target_id ? (
                         <RiskFactorsPreview label={item.recommendation_type.replaceAll('_', ' ')} riskId={item.target_id} />
                       ) : null}
+                      {isCreateRecommendation(item) && item.proposed_fields ? (
+                        <dl aria-label={`Proposed new ${item.target_type}`} className="proposed-fields-preview">
+                          {Object.entries(item.proposed_fields).map(([key, value]) => (
+                            <div key={key}><dt>{key.replaceAll('_', ' ')}</dt><dd>{String(value)}</dd></div>
+                          ))}
+                        </dl>
+                      ) : null}
                     </div>
                   ) : null}
                 </div>
@@ -266,7 +290,7 @@ export default function RecommendationPanel() {
                   ) : null}
                   {canDecide ? (
                     <>
-                      <button className="primary-action" type="button" onClick={() => mutation.mutate({ item, action: 'confirm' })} disabled={busy || item.expected_version == null}>Confirm and execute</button>
+                      <button className="primary-action" type="button" onClick={() => mutation.mutate({ item, action: 'confirm' })} disabled={busy || (!isCreateRecommendation(item) && item.expected_version == null)}>Confirm and execute</button>
                       <button type="button" onClick={() => mutation.mutate({ item, action: 'reject' })} disabled={busy}>Reject</button>
                       <button type="button" onClick={() => mutation.mutate({ item, action: 'defer' })} disabled={busy}>Defer 24h</button>
                     </>

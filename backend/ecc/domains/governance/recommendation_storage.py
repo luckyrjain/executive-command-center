@@ -15,10 +15,10 @@ from ecc.domains.governance.recommendation_models import RecommendationResponse
 from ecc.observability import record_idempotency_conflict
 
 FIELDS = """
-id, recommendation_type, target_type, target_id, proposed_action, expected_version,
-rationale, confidence, status, evidence_ids, expires_at, confirmed_by, confirmed_at,
-execution_result, source, pinned, deferred_until, created_by, updated_by, created_at,
-updated_at, version, archived_at, pre_archive_status
+id, recommendation_type, target_type, target_id, proposed_action, proposed_fields,
+expected_version, rationale, confidence, status, evidence_ids, expires_at, confirmed_by,
+confirmed_at, execution_result, source, pinned, deferred_until, created_by, updated_by,
+created_at, updated_at, version, archived_at, pre_archive_status
 """
 
 

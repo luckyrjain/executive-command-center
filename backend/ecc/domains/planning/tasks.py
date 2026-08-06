@@ -393,6 +393,101 @@ def _decode_cursor(cursor: str) -> tuple[datetime, UUID]:
         raise HTTPException(status_code=400, detail="MALFORMED_CURSOR") from exc
 
 
+def insert_task(
+    session: Session,
+    auth: AuthContext,
+    payload: TaskCreate,
+    *,
+    request_id: UUID,
+    correlation_id: UUID,
+    idempotency_key: str,
+    now: datetime,
+) -> TaskResponse:
+    """The actual row-write + audit/outbox emission behind `POST /api/v1/tasks`,
+    split out so `ecc.domains.governance.recommendation_targets.execute_target`'s
+    `operation="create"` branch can call the identical path a manual creation
+    uses -- no second insert path -- rather than duplicating this INSERT.
+    Deliberately excludes `session.begin()`/idempotency-key locking/replay
+    (both callers already run inside their own already-open transaction and
+    idempotency scheme; nesting a second `session.begin()` here would raise).
+    """
+    task_id = uuid4()
+    row = (
+        session.execute(
+            text(
+                f"""
+            INSERT INTO tasks (
+                id, workspace_id, owner_id, title, description, status,
+                manual_priority, due_date, due_at, pinned, source_type,
+                source_ref, created_by, updated_by, created_at, updated_at,
+                version
+            ) VALUES (
+                :id, :workspace_id, :owner_id, :title, :description, :status,
+                :manual_priority, :due_date, :due_at, false, 'local',
+                :source_ref, :actor_id, :actor_id, :now, :now, 1
+            )
+            RETURNING {_SELECT_FIELDS}
+            """
+            ),
+            {
+                "id": task_id,
+                "workspace_id": auth.workspace_id,
+                "owner_id": auth.user_id,
+                "title": payload.title,
+                "description": payload.description,
+                "status": payload.status,
+                "manual_priority": payload.manual_priority,
+                "due_date": payload.due_date,
+                "due_at": payload.due_at,
+                "source_ref": payload.source_ref,
+                "actor_id": auth.user_id,
+                "now": now,
+            },
+        )
+        .mappings()
+        .one()
+    )
+    response = _to_response(dict(row))
+    after = response.model_dump(mode="json")
+    changed = [
+        "title",
+        "description",
+        "status",
+        "manual_priority",
+        "due_date",
+        "due_at",
+    ]
+    _write_audit(
+        session,
+        auth,
+        "task.created",
+        task_id,
+        response.version,
+        request_id,
+        correlation_id,
+        idempotency_key,
+        None,
+        after,
+        changed,
+        now,
+    )
+    _write_outbox(
+        session,
+        auth,
+        "task.created.v1",
+        task_id,
+        response.version,
+        correlation_id,
+        {
+            "owner_id": str(auth.user_id),
+            "status": response.status,
+            "priority": response.manual_priority,
+        },
+        now,
+    )
+    return response
+
+
 @router.post("", response_model=TaskResponse, status_code=status.HTTP_201_CREATED)
 def create_task(
     payload: TaskCreate,
@@ -418,79 +513,14 @@ def create_task(
         if cached is not None:
             return cached
 
-        task_id = uuid4()
-        row = (
-            session.execute(
-                text(
-                    f"""
-                INSERT INTO tasks (
-                    id, workspace_id, owner_id, title, description, status,
-                    manual_priority, due_date, due_at, pinned, source_type,
-                    source_ref, created_by, updated_by, created_at, updated_at,
-                    version
-                ) VALUES (
-                    :id, :workspace_id, :owner_id, :title, :description, :status,
-                    :manual_priority, :due_date, :due_at, false, 'local',
-                    :source_ref, :actor_id, :actor_id, :now, :now, 1
-                )
-                RETURNING {_SELECT_FIELDS}
-                """
-                ),
-                {
-                    "id": task_id,
-                    "workspace_id": auth.workspace_id,
-                    "owner_id": auth.user_id,
-                    "title": payload.title,
-                    "description": payload.description,
-                    "status": payload.status,
-                    "manual_priority": payload.manual_priority,
-                    "due_date": payload.due_date,
-                    "due_at": payload.due_at,
-                    "source_ref": payload.source_ref,
-                    "actor_id": auth.user_id,
-                    "now": now,
-                },
-            )
-            .mappings()
-            .one()
-        )
-        response = _to_response(dict(row))
-        after = response.model_dump(mode="json")
-        changed = [
-            "title",
-            "description",
-            "status",
-            "manual_priority",
-            "due_date",
-            "due_at",
-        ]
-        _write_audit(
+        response = insert_task(
             session,
             auth,
-            "task.created",
-            task_id,
-            response.version,
-            request_id,
-            correlation_id,
-            idempotency_key,
-            None,
-            after,
-            changed,
-            now,
-        )
-        _write_outbox(
-            session,
-            auth,
-            "task.created.v1",
-            task_id,
-            response.version,
-            correlation_id,
-            {
-                "owner_id": str(auth.user_id),
-                "status": response.status,
-                "priority": response.manual_priority,
-            },
-            now,
+            payload,
+            request_id=request_id,
+            correlation_id=correlation_id,
+            idempotency_key=idempotency_key,
+            now=now,
         )
         _store_idempotency(
             session,

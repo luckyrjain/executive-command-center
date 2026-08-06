@@ -337,6 +337,63 @@ def _write_side_effects(
     queue_lifecycle_event(session, "risk", "risk.created", "allowed")
 
 
+def insert_risk(
+    session: Session,
+    auth: AuthContext,
+    payload: RiskCreate,
+    request: Request,
+    now: datetime,
+) -> RiskResponse:
+    """The actual row-write + audit/outbox emission behind `POST /api/v1/risks`,
+    split out so `ecc.domains.governance.recommendation_targets.execute_target`'s
+    `operation="create"` branch can call the identical path a manual creation
+    uses -- no second insert path -- rather than duplicating this INSERT.
+    Deliberately excludes `session.begin()`/idempotency-key locking/replay
+    (both callers already run inside their own already-open transaction and
+    idempotency scheme; nesting a second `session.begin()` here would raise).
+    """
+    risk_id = uuid4()
+    row = (
+        session.execute(
+            text(
+                f"""
+                INSERT INTO risks (
+                    id, workspace_id, description, probability, impact, status,
+                    owner_id, mitigation, trigger, review_at, project_id, pinned,
+                    created_by, updated_by, created_at, updated_at, version
+                ) VALUES (
+                    :id, :workspace_id, :description, :probability, :impact, :status,
+                    :owner_id, :mitigation, :trigger, :review_at, :project_id, :pinned,
+                    :actor_id, :actor_id, :now, :now, 1
+                )
+                RETURNING {_RISK_FIELDS}
+                """
+            ),
+            {
+                "id": risk_id,
+                "workspace_id": auth.workspace_id,
+                "description": payload.description,
+                "probability": payload.probability,
+                "impact": payload.impact,
+                "status": payload.status,
+                "owner_id": auth.user_id,
+                "mitigation": payload.mitigation,
+                "trigger": payload.trigger,
+                "review_at": payload.review_at,
+                "project_id": payload.project_id,
+                "pinned": payload.pinned,
+                "actor_id": auth.user_id,
+                "now": now,
+            },
+        )
+        .mappings()
+        .one()
+    )
+    response = _project(dict(row), now)
+    _write_side_effects(session, auth, request, risk_id, 1, now)
+    return response
+
+
 @router.post("", response_model=RiskResponse, status_code=status.HTTP_201_CREATED)
 def create_risk(
     payload: RiskCreate,
@@ -349,50 +406,12 @@ def create_risk(
     authz.require_role_action(session, auth, "write")
     request_hash = _request_hash(payload, "create")
     now = datetime.now(UTC)
-    risk_id = uuid4()
     with session.begin():
         _lock_idempotency(session, auth, idempotency_key)
         cached = _load_cached(session, auth, idempotency_key, request_hash)
         if cached is not None:
             return cached
-        row = (
-            session.execute(
-                text(
-                    f"""
-                    INSERT INTO risks (
-                        id, workspace_id, description, probability, impact, status,
-                        owner_id, mitigation, trigger, review_at, project_id, pinned,
-                        created_by, updated_by, created_at, updated_at, version
-                    ) VALUES (
-                        :id, :workspace_id, :description, :probability, :impact, :status,
-                        :owner_id, :mitigation, :trigger, :review_at, :project_id, :pinned,
-                        :actor_id, :actor_id, :now, :now, 1
-                    )
-                    RETURNING {_RISK_FIELDS}
-                    """
-                ),
-                {
-                    "id": risk_id,
-                    "workspace_id": auth.workspace_id,
-                    "description": payload.description,
-                    "probability": payload.probability,
-                    "impact": payload.impact,
-                    "status": payload.status,
-                    "owner_id": auth.user_id,
-                    "mitigation": payload.mitigation,
-                    "trigger": payload.trigger,
-                    "review_at": payload.review_at,
-                    "project_id": payload.project_id,
-                    "pinned": payload.pinned,
-                    "actor_id": auth.user_id,
-                    "now": now,
-                },
-            )
-            .mappings()
-            .one()
-        )
-        response = _project(dict(row), now)
-        _write_side_effects(session, auth, request, risk_id, 1, now)
+        response = insert_risk(session, auth, payload, request, now)
         session.execute(
             text(
                 """
