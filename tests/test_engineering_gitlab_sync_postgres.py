@@ -1474,3 +1474,19 @@ def test_repositories_have_team_suggestion_dismissed_at_column() -> None:
         ).one_or_none()
     assert row is not None
     assert row.is_nullable == "YES"
+
+
+def test_engineering_work_items_have_team_suggestion_dismissed_at_column() -> None:
+    """Migration `0072_team_suggestion_dismissal.py` adds the same column to
+    `engineering_work_items` in the same `upgrade()` loop -- proves it exists
+    and defaults to NULL there too.
+    """
+    with engine.begin() as connection:
+        row = connection.execute(
+            text(
+                "SELECT column_name, is_nullable FROM information_schema.columns "
+                "WHERE table_name = 'engineering_work_items' AND column_name = 'team_suggestion_dismissed_at'"
+            )
+        ).one_or_none()
+    assert row is not None
+    assert row.is_nullable == "YES"
