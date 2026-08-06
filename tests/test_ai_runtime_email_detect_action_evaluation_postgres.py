@@ -33,6 +33,16 @@ Covers:
    (the widened `EvaluationRunCreateRequest.task_type` Literal).
 6. The promotion-floor gate now also covers `email.detect_action.v1`
    (`prompts.py`'s `_GATED_PROMPT_IDS`).
+7. Two genuinely concurrent `run_evaluation` calls for the same `(workspace_
+   id, owner_id)` do not corrupt each other's synthetic data -- round 6
+   review found that, unlike `meeting.prep_summary` (which has its own
+   dedicated serialization lock for a *different* collision mechanism),
+   `email.detect_action`'s synthetic `email_threads` rows all share one
+   `personal_domains` row per `(workspace_id, owner_id)`, and that row's
+   `ondelete="CASCADE"` FK meant one run's own per-example cleanup could
+   delete the *other* run's still-in-flight synthetic thread out from under
+   it. Fixed with `_synthetic_email_thread_serialization_lock`, mirroring
+   `_synthetic_meeting_serialization_lock`'s own `pg_advisory_lock` pattern.
 
 Real `email_messages` ids are random `uuid4()`s assigned at insertion
 time, not deterministic -- the mocked adapter below extracts the real ids
@@ -45,6 +55,7 @@ insight_evaluation_postgres.py`'s own mocked adapter uses for its
 import json
 import re
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from hmac import new
@@ -61,6 +72,7 @@ from ecc.auth import AuthContext
 from ecc.config import get_settings
 from ecc.database import SessionFactory, engine
 from ecc.domains.ai_runtime.evaluation import (
+    EvaluationRun,
     check_promotion_floors,
     get_evaluation_run,
     run_evaluation,
@@ -564,6 +576,63 @@ def test_run_evaluation_does_not_delete_a_pre_existing_real_personal_domain_or_i
             ).scalar_one()
             == 1
         ), "a real email_messages row must not be cascade-deleted"
+
+
+def test_run_evaluation_concurrent_same_caller_runs_do_not_corrupt_each_others_data(
+    run_context: dict,
+) -> None:
+    """Round 6 review finding: two `email.detect_action` evaluation runs
+    for the *same* `(workspace_id, owner_id)`, submitted with genuine
+    start-time overlap (different threads, no shared `Idempotency-Key` --
+    this test calls `run_evaluation` directly, below the HTTP layer's
+    idempotency-lock entirely), must not corrupt each other's synthetic
+    data. Before `_synthetic_email_thread_serialization_lock`: both calls'
+    `_insert_synthetic_email_thread` race on the same `personal_domains`
+    row (`ON CONFLICT DO NOTHING` on `(workspace_id, owner_id, domain_
+    key)`); one wins and gets `inserted_domain_id`, the other gets `None`
+    -- correctly deferring its own cleanup, per round 5's fix -- but its
+    own synthetic `email_threads` row still references the winner's row
+    via that same FK. When the winner's *own* per-example cleanup deletes
+    the row it created (`_delete_synthetic_email_thread` runs per-example,
+    not batched), `ondelete="CASCADE"` (migration `0069`) deletes every
+    `email_threads` row currently matching that shared key -- including
+    the loser's still-in-flight synthetic thread, mid-run, not merely at
+    its own cleanup. This test does not assert on the specific mechanism
+    (a race is nondeterministic by nature) -- it asserts on the outcome
+    the lock exists to guarantee: both runs complete, pass every floor,
+    and leave zero synthetic rows behind, run after run, not merely on
+    one lucky ordering.
+    """
+    auth = run_context["auth"]
+
+    def run_once() -> EvaluationRun:
+        adapter = _adapter_with_grounded_responses()
+        with SessionFactory() as session:
+            return run_evaluation(
+                TASK_TYPE,
+                1,
+                _SEEDED_MODEL_ID,
+                session=session,
+                auth=auth,
+                ollama_adapter=adapter,
+            )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [executor.submit(run_once) for _ in range(2)]
+        results = [future.result() for future in futures]
+
+    for run in results:
+        assert run.metrics.total_examples == 10
+        assert run.failures == []
+        assert check_promotion_floors(run) is True
+
+    with engine.connect() as connection:
+        for table in ("connector_accounts", "email_threads", "email_messages", "personal_domains"):
+            count = connection.execute(
+                text(f"SELECT count(*) FROM {table} WHERE workspace_id = :workspace_id"),  # noqa: S608
+                {"workspace_id": run_context["workspace_id"]},
+            ).scalar_one()
+            assert count == 0, f"synthetic {table} rows must be cleaned up after both runs"
 
 
 # ---------------------------------------------------------------------------

@@ -83,7 +83,7 @@ same is a later task's decision, not attempted here.
 
 import time
 from collections.abc import Iterator
-from contextlib import contextmanager, nullcontext
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
@@ -1670,6 +1670,48 @@ def _synthetic_meeting_serialization_lock(workspace_id: UUID) -> Iterator[None]:
             )
 
 
+@contextmanager
+def _synthetic_email_thread_serialization_lock(
+    workspace_id: UUID, owner_id: UUID
+) -> Iterator[None]:
+    """Serializes `email.detect_action` evaluation runs for one `(workspace_
+    id, owner_id)` -- a different collision mechanism than `_synthetic_
+    meeting_serialization_lock`'s deterministic-id `IntegrityError` risk,
+    but the same "two overlapping runs for the same caller corrupt each
+    other's data" shape, found by round 6 review as a narrower residual of
+    round 5's own CRITICAL fix. `_insert_synthetic_email_thread`'s own
+    `personal_domains` insert (`ON CONFLICT DO NOTHING`) means at most one
+    of two concurrent runs for the same caller ever "owns" that row (round
+    5's fix correctly ensures only the owning run's cleanup ever deletes
+    it) -- but every `email_threads` row either run creates for this
+    caller, this run's own or the other run's, shares that one `personal_
+    domains` row via its `ondelete="CASCADE"` FK (migration `0069`).
+    `_delete_synthetic_email_thread` runs per-example, not batched at the
+    end of `run_evaluation`, so the owning run's very first per-example
+    cleanup would cascade-delete every `email_threads` row currently
+    matching that shared key -- including the other, still-in-flight run's
+    own synthetic thread -- mid-run, not merely at cleanup. Scoped by
+    `owner_id` in addition to `workspace_id` (unlike the meeting lock,
+    scoped workspace-only) because the collision key here is `(workspace_
+    id, owner_id, 'email')`, not workspace-wide. Same `lock_engine`/
+    `pg_advisory_lock` pattern as `_synthetic_meeting_serialization_lock`,
+    held on its own dedicated connection for this context manager's entire
+    duration.
+    """
+    lock_key = f"{workspace_id}:{owner_id}:email.detect_action:synthetic-eval-data"
+    with lock_engine.connect().execution_options(isolation_level="AUTOCOMMIT") as connection:
+        connection.execute(
+            text("SELECT pg_advisory_lock(hashtextextended(:lock_key, 0))"), {"lock_key": lock_key}
+        )
+        try:
+            yield
+        finally:
+            connection.execute(
+                text("SELECT pg_advisory_unlock(hashtextextended(:lock_key, 0))"),
+                {"lock_key": lock_key},
+            )
+
+
 def run_evaluation(
     task_type: str,
     prompt_version: int,
@@ -1714,15 +1756,28 @@ def run_evaluation(
     scores: list[_ExampleScore] = []
     synthetic_item_ids: list[UUID] = []
 
-    # Only `meeting.prep_summary` needs the serialization lock -- see
-    # `_synthetic_meeting_serialization_lock`'s own docstring for why
-    # `attention.explain_item`'s random-uuid4 synthetic items have no
-    # such collision risk and don't pay for it.
-    serialization_lock = (
-        _synthetic_meeting_serialization_lock(auth.workspace_id)
-        if task_type == "meeting.prep_summary"
-        else nullcontext()
-    )
+    # `meeting.prep_summary` and `email.detect_action` each need their own
+    # serialization lock -- see `_synthetic_meeting_serialization_lock`'s
+    # and `_synthetic_email_thread_serialization_lock`'s own docstrings for
+    # the two distinct collision mechanisms (a deterministic-id `INSERT`
+    # collision vs. a shared-row `CASCADE`-delete race). `attention.
+    # explain_item`'s random-uuid4 synthetic items and `personal.
+    # generate_insight`'s per-example `domain_ids` have no comparable risk
+    # within a single run's own examples, so neither pays for a lock here
+    # -- `personal.generate_insight`'s own cross-*run* exposure to the
+    # identical `personal_domains`-row hazard (round 6 review: found, but
+    # pre-existing Phase 7 code untouched by this PR, so out of scope for
+    # this fix) is a separate, already-flagged gap, not something this
+    # lock's scope silently claims to cover.
+    serialization_lock: AbstractContextManager[None]
+    if task_type == "meeting.prep_summary":
+        serialization_lock = _synthetic_meeting_serialization_lock(auth.workspace_id)
+    elif task_type == "email.detect_action":
+        serialization_lock = _synthetic_email_thread_serialization_lock(
+            auth.workspace_id, auth.user_id
+        )
+    else:
+        serialization_lock = nullcontext()
     with serialization_lock:
         try:
             for example in evaluation_set.examples:
