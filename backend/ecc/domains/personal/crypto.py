@@ -10,12 +10,20 @@ ciphertext token is already URL-safe-base64 ASCII text, so this module
 simply keeps it as a `str` rather than round-tripping through bytes the
 way `engineering.crypto`'s `bytea`-column callers do.
 
-`ecc.domains.personal.domains` is the only caller: `_encrypt_payload`
-encrypts a `sensitive`/`high_stakes` record_type's listed fields before
-`INSERT`/`UPDATE`; `_decrypt_payload` is the inverse, called only for the
-single-record response paths (create/get/patch), never list/summary
-(`_redact_payload` handles those instead -- design doc Decision 3: "only a
-single-record fetch returns the decrypted value").
+`ecc.domains.personal.domains` was the original, and is still the primary,
+caller: `_encrypt_payload` encrypts a `sensitive`/`high_stakes` record_
+type's listed fields before `INSERT`/`UPDATE`; `_decrypt_payload` is the
+inverse, called only for the single-record response paths (create/get/
+patch), never list/summary (`_redact_payload` handles those instead --
+design doc Decision 3: "only a single-record fetch returns the decrypted
+value"). Phase 10 Task 5 added two more direct callers for the identical
+reason -- `gmail_adapter.py`'s `_detect_action_for_message` encrypts a
+fetched Gmail message body before storing it in `email_messages.body`
+(itself a `personal_domains`-owned, `high_stakes`-classified column, the
+same tier `_encrypt_payload`'s own callers use), and `email_action_tools.
+py`'s `get_thread_content_tool` decrypts it back for the AI runtime to
+reason about -- both reusing this module's key rather than introducing a
+second one for what is still the same personal-data encryption boundary.
 """
 
 from base64 import urlsafe_b64encode

@@ -454,7 +454,7 @@ class _MessageCursorAdapter:
 
 
 @dataclass
-class _ActionDetectionSpyAdapter:
+class _ActionDetectionSpyAdapter(_MessageCursorAdapter):
     """Phase 10 Task 5 review finding: `sync_connector_endpoint`'s own
     proactive-action-detection hook (`connector_accounts.py`, "Task 5:
     proactive Gmail action detection") calls `getattr(adapter, "detect_
@@ -478,39 +478,17 @@ class _ActionDetectionSpyAdapter:
     spy's `__call__` itself raises `TypeError` the exact same way the
     real adapter would, and the test below fails loudly instead of the
     production code silently swallowing it.
+
+    Subclasses `_MessageCursorAdapter` rather than duplicating its
+    `authorize`/`backfill`/`incremental_sync`/`handle_webhook`/`refresh_
+    permissions`/`disconnect` bodies -- matching this file's own `_Raising
+    DisconnectAdapter(_SpyDisconnectAdapter)` precedent for a fake that
+    only needs to add one new behavior on top of an existing sibling.
     """
 
-    provider: str = "gmail"
-    required_scopes: frozenset[str] = field(default_factory=frozenset)
     detect_actions_since_calls: list[tuple[ConnectorAccountContext, datetime]] = field(
         default_factory=list
     )
-
-    def authorize(self, credential: str) -> ConnectorAuthorization:
-        raise NotImplementedError
-
-    def backfill(self, account: ConnectorAccountContext, resource_type: str) -> SyncOutcome:
-        return SyncOutcome(
-            resource_type=resource_type, items_processed=1, status="succeeded", next_cursor="1"
-        )
-
-    def incremental_sync(
-        self, account: ConnectorAccountContext, resource_type: str, cursor: str | None
-    ) -> SyncOutcome:
-        return SyncOutcome(
-            resource_type=resource_type, items_processed=1, status="succeeded", next_cursor="2"
-        )
-
-    def handle_webhook(
-        self, account: ConnectorAccountContext, payload: bytes, headers: object
-    ) -> SyncOutcome:
-        raise NotImplementedError
-
-    def refresh_permissions(self, account: ConnectorAccountContext) -> str:
-        return "active"
-
-    def disconnect(self, account: ConnectorAccountContext) -> None:
-        return None
 
     # Deliberately matches `GmailAdapter.detect_actions_since`'s real
     # signature exactly (`self, context, *, since, ollama_adapter=None`)

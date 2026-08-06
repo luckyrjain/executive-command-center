@@ -27,6 +27,21 @@ method call with no multi-step graph to crash-recover mid-way through.
 `sync_runs.status` still records `running` before the call and
 `succeeded`/`failed`/`partial` after, so a stuck run remains visible.
 
+**Phase 10 Task 5's proactive-detection hook (below) rides on that same
+synchronous premise, imperfectly.** Unlike a plain `backfill`/`incremental_
+sync` call, `GmailAdapter.detect_actions_since` -- reached via this
+function's own best-effort `getattr(adapter, "detect_actions_since",
+None)` hook after phase 3 -- does its own additional live Gmail-plus-
+Ollama round trip per candidate message, sequentially, still inside this
+same synchronous request. `detect_actions_since`'s own `_MAX_ACTION_
+DETECTIONS_PER_CALL` bound (`gmail_adapter.py`, deliberately much smaller
+than `backfill`/`incremental_sync`'s own `_MAX_MESSAGES_PER_CALL`) caps
+how bad this gets per call, but does not make the hook itself durable or
+non-blocking -- found by Loop 2 round 2 review; feature-flagged off by
+default, and moving this hook to `ecc.domains.automation.worker`'s own
+durable dispatch (matching `workflow_runs`, not this module's own
+`sync_runs`) remains the real fix before wider production rollout.
+
 **Pool-exhaustion fix (Task 1's own disclosed blocker for Task 2, now
 resolved).** `sync_connector_endpoint` no longer holds one `session.
 begin()` transaction across the entire adapter call. It now runs in three

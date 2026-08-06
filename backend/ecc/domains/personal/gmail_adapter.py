@@ -165,6 +165,26 @@ _MAX_MESSAGES_PER_CALL = 200
 _RATE_LIMIT_MAX_WAIT_SECONDS = 5.0
 _DEFAULT_BACKFILL_WINDOW = timedelta(days=30)
 
+# Task 5's own, much smaller bound -- deliberately not `_MAX_MESSAGES_PER_
+# CALL`. `connector_accounts.py`'s own module docstring justifies its
+# synchronous, non-worker-dispatched `/sync` handler on the premise that
+# "a sync call is a single adapter method call" -- true for `backfill`/
+# `incremental_sync` themselves (a `messages.get` round trip per message,
+# cheap), but `detect_actions_since` adds a *second*, much more expensive
+# round trip per candidate on top of that: a live Gmail body fetch *and* a
+# live `execute_run` Ollama inference call (`router.py`'s own
+# `timeout_seconds=40.0` per model call), run sequentially, still inside
+# that same synchronous request handler. Reusing `_MAX_MESSAGES_PER_CALL`
+# (200) here would let one `/sync` call block for up to 200 sequential
+# Gmail-plus-Ollama round trips before the HTTP response returns --
+# realistically minutes, worst-case well past most reverse-proxy/gateway
+# timeouts -- found by round 2 review. A smaller bound reduces, but does
+# not eliminate, that risk; it is not a substitute for moving this hook to
+# a durable background dispatch (`ecc.domains.automation.worker`) before
+# `email_action_detection_enabled` is ever turned on outside a controlled
+# test, which remains the real fix and is out of scope for this task.
+_MAX_ACTION_DETECTIONS_PER_CALL = 5
+
 # Gmail's own quota-error shape (`{"error": {"errors": [{"reason": ...}]}}`)
 # distinguishes rate limiting from every other 403 (insufficient scope,
 # account suspended, ...) only by `reason` -- treating every 403 as
@@ -2710,19 +2730,18 @@ class GmailAdapter:
                         "owner_id": owner_id,
                         "connector_account_id": context.connector_account_id,
                         "since": since,
-                        # Bounds this method's own per-call work the same
-                        # way `_sync_messages`/`_sync_history`'s own `while
-                        # calls_made < _MAX_MESSAGES_PER_CALL` loops bound
-                        # theirs -- today this stays implicitly bounded by
-                        # `backfill`/`incremental_sync` never writing more
-                        # than `_MAX_MESSAGES_PER_CALL` new rows per call in
-                        # the first place, but that's a coupling to a
-                        # different function's own budget, not a bound this
-                        # query enforces for itself -- found by round 1
-                        # review, defense-in-depth rather than a live bug
-                        # (each fetched row still costs one live Gmail
-                        # `messages.get` plus one Ollama call).
-                        "limit": _MAX_MESSAGES_PER_CALL,
+                        # `_MAX_ACTION_DETECTIONS_PER_CALL`, not `_MAX_
+                        # MESSAGES_PER_CALL` -- see that constant's own
+                        # comment. Round 1 review flagged this query's
+                        # missing bound as defense-in-depth against
+                        # `backfill`/`incremental_sync`'s own budget
+                        # someday growing; round 2 review found the
+                        # sharper reason this needs its own, much smaller
+                        # bound regardless: every row here costs a live
+                        # Gmail `messages.get` *and* a live Ollama
+                        # inference call, sequentially, inside `/sync`'s
+                        # own synchronous request handler.
+                        "limit": _MAX_ACTION_DETECTIONS_PER_CALL,
                     },
                 )
                 .mappings()
