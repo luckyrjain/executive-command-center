@@ -25,6 +25,13 @@ Covers:
 4. `email_action_detection_enabled` defaults to `False` -- with the flag
    left unset, `detect_actions_since` no-ops entirely: no Gmail request,
    no Ollama call, no body fetched, no recommendation created.
+5. A message with no extractable `text/plain` part (HTML-only mail) is
+   marked handled with an empty-string body sentinel, not left eligible
+   forever -- a second call's transport would raise if the message were
+   fetched again (round 4 review finding).
+6. A candidate left over after one call's own `_MAX_ACTION_DETECTIONS_
+   PER_CALL` bound is picked up by a later call, not permanently lost
+   (round 3 review finding).
 """
 
 from __future__ import annotations
@@ -69,22 +76,22 @@ _PLAIN_TEXT_BODY = (
 _ID_PATTERN = re.compile(r'id="([0-9a-fA-F-]{36})"')
 
 
-@pytest.fixture(autouse=True)
-def _reset_breakers() -> Iterator[None]:
-    reset_circuit_breakers()
-    yield
-    reset_circuit_breakers()
-
-
-@pytest.fixture
-def detection_context() -> Iterator[dict]:
+def _seed_base_rows(
+    *, account_display_name: str, thread_subject: str
+) -> tuple[UUID, UUID, UUID, UUID, bytes, datetime]:
+    """Shared setup for `detection_context`/`backlog_context`: a workspace,
+    identity, active `gmail` connector account, enabled `email` domain with
+    consent granted, and one thread. Returns `(workspace_id, owner_id,
+    account_id, thread_id, credential, now)` -- callers insert their own
+    `email_messages` rows against `thread_id` (`detection_context` seeds
+    one; `backlog_context` seeds `_MAX_ACTION_DETECTIONS_PER_CALL + 2`),
+    since that is the one part of each fixture's setup that is not shared.
+    """
     workspace_id = uuid4()
     owner_id = uuid4()
     account_id = uuid4()
     thread_id = uuid4()
-    message_id = uuid4()
     now = datetime.now(UTC)
-    external_message_id = f"detect-{message_id}"
     credential = _pack_credential("access-1", "refresh-1", now + timedelta(hours=1))
 
     with engine.begin() as connection:
@@ -106,7 +113,7 @@ def detection_context() -> Iterator[dict]:
                     granted_scopes, encrypted_credentials, status, version,
                     created_by, updated_by, created_at, updated_at, owner_id, visibility
                 ) VALUES (
-                    :id, :workspace_id, 'gmail', :external_account_id, 'Detection test account',
+                    :id, :workspace_id, 'gmail', :external_account_id, :display_name,
                     ARRAY['https://www.googleapis.com/auth/gmail.readonly'], :encrypted,
                     'active', 1, :actor_id, :actor_id, :now, :now, :actor_id, 'workspace'
                 )
@@ -116,6 +123,7 @@ def detection_context() -> Iterator[dict]:
                 "id": account_id,
                 "workspace_id": workspace_id,
                 "external_account_id": _OWNER_EMAIL,
+                "display_name": account_display_name,
                 "encrypted": encrypt_credential(credential),
                 "actor_id": owner_id,
                 "now": now,
@@ -161,10 +169,70 @@ def detection_context() -> Iterator[dict]:
                 "owner_id": owner_id,
                 "connector_account_id": account_id,
                 "external_thread_id": f"thread-{thread_id}",
-                "subject": "Signed contract needed by Friday",
+                "subject": thread_subject,
                 "now": now,
             },
         )
+
+    return workspace_id, owner_id, account_id, thread_id, credential, now
+
+
+def _teardown_workspace(workspace_id: UUID) -> None:
+    with engine.begin() as connection:
+        for table in (
+            "generated_artifacts",
+            "ai_run_steps",
+            "ai_runs",
+            "recommendations",
+            "audit_events",
+            "event_outbox",
+            "idempotency_records",
+            "tasks",
+            "commitments",
+            "risks",
+            # `entity_aliases.source_id` FKs to `pkos_evidence` (`fk_
+            # entity_aliases_workspace_source`) -- deleted before it,
+            # not after, or the delete would violate that FK.
+            "entity_aliases",
+            "pkos_evidence",
+            "pkos_nodes",
+            "email_messages",
+            "email_threads",
+            "domain_consents",
+            "personal_domains",
+            "connector_accounts",
+            "users",
+        ):
+            connection.execute(
+                text(f"DELETE FROM {table} WHERE workspace_id = :workspace_id"),  # noqa: S608
+                {"workspace_id": workspace_id},
+            )
+        connection.execute(
+            text("DELETE FROM workspaces WHERE id = :workspace_id"),
+            {"workspace_id": workspace_id},
+        )
+        connection.execute(
+            text("DELETE FROM accounts WHERE email = :email"), {"email": _OWNER_EMAIL}
+        )
+
+
+@pytest.fixture(autouse=True)
+def _reset_breakers() -> Iterator[None]:
+    reset_circuit_breakers()
+    yield
+    reset_circuit_breakers()
+
+
+@pytest.fixture
+def detection_context() -> Iterator[dict]:
+    workspace_id, owner_id, account_id, thread_id, credential, now = _seed_base_rows(
+        account_display_name="Detection test account",
+        thread_subject="Signed contract needed by Friday",
+    )
+    message_id = uuid4()
+    external_message_id = f"detect-{message_id}"
+
+    with engine.begin() as connection:
         connection.execute(
             text(
                 """
@@ -206,42 +274,7 @@ def detection_context() -> Iterator[dict]:
             "since": now - timedelta(minutes=5),
         }
     finally:
-        with engine.begin() as connection:
-            for table in (
-                "generated_artifacts",
-                "ai_run_steps",
-                "ai_runs",
-                "recommendations",
-                "audit_events",
-                "event_outbox",
-                "idempotency_records",
-                "tasks",
-                "commitments",
-                "risks",
-                # `entity_aliases.source_id` FKs to `pkos_evidence` (`fk_
-                # entity_aliases_workspace_source`) -- deleted before it,
-                # not after, or the delete would violate that FK.
-                "entity_aliases",
-                "pkos_evidence",
-                "pkos_nodes",
-                "email_messages",
-                "email_threads",
-                "domain_consents",
-                "personal_domains",
-                "connector_accounts",
-                "users",
-            ):
-                connection.execute(
-                    text(f"DELETE FROM {table} WHERE workspace_id = :workspace_id"),  # noqa: S608
-                    {"workspace_id": workspace_id},
-                )
-            connection.execute(
-                text("DELETE FROM workspaces WHERE id = :workspace_id"),
-                {"workspace_id": workspace_id},
-            )
-            connection.execute(
-                text("DELETE FROM accounts WHERE email = :email"), {"email": _OWNER_EMAIL}
-            )
+        _teardown_workspace(workspace_id)
 
 
 def _gmail_transport(external_message_id: str) -> httpx.MockTransport:
@@ -460,6 +493,80 @@ def test_feature_flag_disabled_by_default_no_ops_entirely(detection_context: dic
     assert fetched_at is None
 
 
+def _gmail_transport_html_only(external_message_id: str) -> httpx.MockTransport:
+    """A message whose Gmail `payload` has no `text/plain` part anywhere in
+    its MIME tree -- `_extract_plain_text_body` returns `None` for this,
+    the same as an HTML-only email.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == f"/gmail/v1/users/me/messages/{external_message_id}"
+        return httpx.Response(
+            200,
+            json={
+                "id": external_message_id,
+                "payload": {
+                    "mimeType": "text/html",
+                    "body": {"data": base64.urlsafe_b64encode(b"<p>hi</p>").decode().rstrip("=")},
+                },
+            },
+        )
+
+    return httpx.MockTransport(handler)
+
+
+def test_no_extractable_plain_text_is_marked_handled_not_retried_forever(
+    detection_context: dict, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round 4 review finding: a message whose Gmail response parses fully
+    but has no `text/plain` part used to leave `body IS NULL`, so
+    `detect_actions_since`'s own `WHERE ... AND body IS NULL` eligibility
+    query re-selected, re-fetched, and re-rejected it on every future call
+    forever. Fixed by writing an empty-string body sentinel
+    (`_detect_action_for_message`) once the Gmail response has been fully,
+    successfully parsed and genuinely has nothing extractable -- proven
+    here by a first call that fetches the message, then a second call
+    whose Gmail transport raises on any request: if the message were still
+    eligible, this second call would hit it again.
+    """
+    monkeypatch.setenv("ECC_EMAIL_ACTION_DETECTION_ENABLED", "true")
+    get_settings.cache_clear()
+    try:
+        workspace_id = detection_context["workspace_id"]
+        message_id = detection_context["message_id"]
+        external_message_id = detection_context["external_message_id"]
+
+        first_adapter = GmailAdapter(transport=_gmail_transport_html_only(external_message_id))
+        first_adapter.detect_actions_since(
+            detection_context["context"],
+            since=detection_context["since"],
+            ollama_adapter=_ollama_adapter(has_action=False),
+        )
+
+        assert _recommendations(workspace_id) == []
+        body, fetched_at = _message_body(workspace_id, message_id)
+        assert body is not None
+        assert fetched_at is not None
+        assert decrypt_field(body) == ""
+
+        def _unexpected_gmail_call(request: httpx.Request) -> httpx.Response:
+            raise AssertionError(
+                f"unexpected Gmail request to {request.url}: message should no longer be "
+                "eligible (body is no longer NULL)"
+            )
+
+        second_adapter = GmailAdapter(transport=httpx.MockTransport(_unexpected_gmail_call))
+        second_adapter.detect_actions_since(
+            detection_context["context"],
+            since=datetime.now(UTC),
+            ollama_adapter=_ollama_adapter(has_action=False),
+        )
+
+        assert _recommendations(workspace_id) == []
+    finally:
+        get_settings.cache_clear()
+
+
 # ---------------------------------------------------------------------------
 # Loop 2 round 3 review finding: a candidate left over after one call's own
 # `_MAX_ACTION_DETECTIONS_PER_CALL` bound must be picked up by a later call,
@@ -478,94 +585,14 @@ def backlog_context() -> Iterator[dict]:
     will ever process, so a test can prove the overflow survives into a
     second call rather than being lost.
     """
-    workspace_id = uuid4()
-    owner_id = uuid4()
-    account_id = uuid4()
-    thread_id = uuid4()
-    now = datetime.now(UTC)
-    credential = _pack_credential("access-1", "refresh-1", now + timedelta(hours=1))
+    workspace_id, owner_id, account_id, thread_id, credential, now = _seed_base_rows(
+        account_display_name="Backlog test account", thread_subject="Backlog thread"
+    )
     message_count = _MAX_ACTION_DETECTIONS_PER_CALL + 2
     message_ids = [uuid4() for _ in range(message_count)]
     external_message_ids = [f"backlog-{message_id}" for message_id in message_ids]
 
     with engine.begin() as connection:
-        connection.execute(
-            text(
-                "INSERT INTO workspaces (id, name, timezone, created_at) "
-                "VALUES (:id, 'Gmail Action Detection Backlog Test', 'UTC', :now)"
-            ),
-            {"id": workspace_id, "now": now},
-        )
-        create_identity(
-            connection, workspace_id=workspace_id, user_id=owner_id, email=_OWNER_EMAIL, now=now
-        )
-        connection.execute(
-            text(
-                """
-                INSERT INTO connector_accounts (
-                    id, workspace_id, provider, external_account_id, display_name,
-                    granted_scopes, encrypted_credentials, status, version,
-                    created_by, updated_by, created_at, updated_at, owner_id, visibility
-                ) VALUES (
-                    :id, :workspace_id, 'gmail', :external_account_id, 'Backlog test account',
-                    ARRAY['https://www.googleapis.com/auth/gmail.readonly'], :encrypted,
-                    'active', 1, :actor_id, :actor_id, :now, :now, :actor_id, 'workspace'
-                )
-                """
-            ),
-            {
-                "id": account_id,
-                "workspace_id": workspace_id,
-                "external_account_id": _OWNER_EMAIL,
-                "encrypted": encrypt_credential(credential),
-                "actor_id": owner_id,
-                "now": now,
-            },
-        )
-        connection.execute(
-            text(
-                """
-                INSERT INTO personal_domains (
-                    id, workspace_id, owner_id, domain_key, classification, enabled,
-                    enabled_at, created_by, updated_by, created_at, updated_at, version
-                ) VALUES (
-                    :id, :workspace_id, :owner_id, 'email', 'high_stakes', true,
-                    :now, :owner_id, :owner_id, :now, :now, 1
-                )
-                """
-            ),
-            {"id": uuid4(), "workspace_id": workspace_id, "owner_id": owner_id, "now": now},
-        )
-        connection.execute(
-            text(
-                "INSERT INTO domain_consents (id, workspace_id, owner_id, domain_key, "
-                "granted_at, created_at) "
-                "VALUES (:id, :workspace_id, :owner_id, 'email', :now, :now)"
-            ),
-            {"id": uuid4(), "workspace_id": workspace_id, "owner_id": owner_id, "now": now},
-        )
-        connection.execute(
-            text(
-                """
-                INSERT INTO email_threads (
-                    id, workspace_id, owner_id, domain_key, connector_account_id,
-                    external_thread_id, subject, last_message_at, created_at, updated_at
-                ) VALUES (
-                    :id, :workspace_id, :owner_id, 'email', :connector_account_id,
-                    :external_thread_id, :subject, :now, :now, :now
-                )
-                """
-            ),
-            {
-                "id": thread_id,
-                "workspace_id": workspace_id,
-                "owner_id": owner_id,
-                "connector_account_id": account_id,
-                "external_thread_id": f"thread-{thread_id}",
-                "subject": "Backlog thread",
-                "now": now,
-            },
-        )
         for index, (message_id, external_message_id) in enumerate(
             zip(message_ids, external_message_ids, strict=True)
         ):
@@ -613,39 +640,7 @@ def backlog_context() -> Iterator[dict]:
             "since": now - timedelta(minutes=5),
         }
     finally:
-        with engine.begin() as connection:
-            for table in (
-                "generated_artifacts",
-                "ai_run_steps",
-                "ai_runs",
-                "recommendations",
-                "audit_events",
-                "event_outbox",
-                "idempotency_records",
-                "tasks",
-                "commitments",
-                "risks",
-                "entity_aliases",
-                "pkos_evidence",
-                "pkos_nodes",
-                "email_messages",
-                "email_threads",
-                "domain_consents",
-                "personal_domains",
-                "connector_accounts",
-                "users",
-            ):
-                connection.execute(
-                    text(f"DELETE FROM {table} WHERE workspace_id = :workspace_id"),  # noqa: S608
-                    {"workspace_id": workspace_id},
-                )
-            connection.execute(
-                text("DELETE FROM workspaces WHERE id = :workspace_id"),
-                {"workspace_id": workspace_id},
-            )
-            connection.execute(
-                text("DELETE FROM accounts WHERE email = :email"), {"email": _OWNER_EMAIL}
-            )
+        _teardown_workspace(workspace_id)
 
 
 def _gmail_transport_for_any_of(external_message_ids: list[str]) -> httpx.MockTransport:

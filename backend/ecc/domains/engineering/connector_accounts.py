@@ -1392,8 +1392,22 @@ def sync_connector_endpoint(
     # succeeded and been recorded -- the next sync call's own newly-
     # inserted messages are unaffected, and a skipped message is simply
     # never proactively scanned, not silently corrupted.
+    #
+    # Not gated on `outcome.items_processed > 0` -- round 4 review found
+    # that gate silently defeated `detect_actions_since`'s own "a backlog
+    # beyond one call's own bound is worked down over subsequent calls"
+    # guarantee (that method's own docstring, added by round 3's fix):
+    # `items_processed` counts messages *this* `backfill`/`incremental_
+    # sync` call fetched (new or duplicate), so on any ordinary poll where
+    # Gmail reports no activity -- ordinary steady-state for a normal-
+    # cadence connector, not an edge case -- it stays `0` and the hook
+    # never ran at all, leaving any prior over-budget backlog untouched
+    # indefinitely rather than "worked down." `detect_actions_since`
+    # itself is cheap to call when there is nothing to do (its own
+    # eligibility query returning zero rows, then an immediate return), so
+    # nothing is saved by skipping the call -- only correctness was lost.
     detect_actions = getattr(adapter, "detect_actions_since", None)
-    if callable(detect_actions) and outcome.items_processed > 0:
+    if callable(detect_actions):
         try:
             detect_actions(context, since=now)
         except Exception:  # noqa: BLE001 -- best-effort, never fails the sync response

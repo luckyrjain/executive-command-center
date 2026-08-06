@@ -489,6 +489,24 @@ class _ActionDetectionSpyAdapter(_MessageCursorAdapter):
     detect_actions_since_calls: list[tuple[ConnectorAccountContext, datetime]] = field(
         default_factory=list
     )
+    # Round 4 review finding: the call site's own former `outcome.items_
+    # processed > 0` gate silently defeated `detect_actions_since`'s
+    # "backlog worked down over subsequent calls" guarantee whenever a
+    # sync call found no new/duplicate messages -- an ordinary steady
+    # state for a normal-cadence connector, not an edge case. Overriding
+    # `backfill` to return a caller-controlled `items_processed` (default
+    # 1, matching `_MessageCursorAdapter`'s own hardcoded value) lets a
+    # test prove the hook still fires when this call's own `items_
+    # processed` is `0`.
+    items_processed: int = 1
+
+    def backfill(self, account: ConnectorAccountContext, resource_type: str) -> SyncOutcome:
+        return SyncOutcome(
+            resource_type=resource_type,
+            items_processed=self.items_processed,
+            status="succeeded",
+            next_cursor="1",
+        )
 
     # Deliberately matches `GmailAdapter.detect_actions_since`'s real
     # signature exactly (`self, context, *, since, ollama_adapter=None`)
@@ -1307,6 +1325,44 @@ def test_sync_invokes_proactive_action_detection_with_a_valid_call_signature(
         assert called_context.connector_account_id == account_id
         assert called_context.workspace_id == workspace_id
         assert called_since is not None
+    finally:
+        get_settings.cache_clear()
+
+
+def test_sync_invokes_proactive_action_detection_even_when_this_calls_own_items_processed_is_zero(
+    engineering_test_context: tuple[TestClient, UUID, UUID, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 4 review finding: the call site originally gated the hook on
+    `outcome.items_processed > 0` -- but `items_processed` counts only
+    messages *this* `backfill`/`incremental_sync` call itself fetched
+    (new or duplicate), so on any ordinary poll where Gmail reports no
+    activity (a ordinary steady state for a normal-cadence connector, not
+    an edge case) it stays `0`, and the hook never ran at all -- silently
+    defeating `detect_actions_since`'s own "a backlog beyond one call's
+    own bound is worked down over subsequent calls" guarantee (`gmail_
+    adapter.py`, added by Loop 2 round 3's fix) for exactly the case that
+    guarantee exists to cover: a quiet call following a burst that left a
+    backlog behind. Fixed by dropping the gate entirely -- this test
+    proves the hook still fires with `items_processed=0`.
+    """
+    monkeypatch.setenv("ECC_EMAIL_ACTION_DETECTION_ENABLED", "true")
+    get_settings.cache_clear()
+    try:
+        client, workspace_id, user_id, token = engineering_test_context
+        spy = _ActionDetectionSpyAdapter(items_processed=0)
+        monkeypatch.setattr(connector_accounts_module, "connector_registry", _registry_with(spy))
+        account_id = _insert_connector_account(workspace_id, user_id, provider="gmail")
+
+        response = client.post(
+            f"/api/v1/engineering/connectors/{account_id}/sync",
+            json={"run_type": "backfill", "resource_type": "message"},
+            headers=_headers(token, key=str(uuid4())),
+        )
+
+        assert response.status_code == 201, response.text
+        assert response.json()["status"] == "succeeded"
+        assert len(spy.detect_actions_since_calls) == 1
     finally:
         get_settings.cache_clear()
 

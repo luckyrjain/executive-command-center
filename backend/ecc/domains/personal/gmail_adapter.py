@@ -2701,6 +2701,23 @@ class GmailAdapter:
         not yet fetched," which nothing here currently tracks), not an
         oversight -- found and documented by round 1 review.
 
+        `_detect_action_for_message` applies that same "commit the body
+        UPDATE, accept no further retry" treatment to one case *before*
+        evidence registration too, as of round 4 review's fix: a message
+        whose Gmail response parsed successfully (200, valid JSON, a dict
+        `payload`) but yielded no `text/plain` part is written with an
+        empty-string body rather than left `body IS NULL` -- otherwise it
+        would be re-selected, re-fetched, and re-rejected by every future
+        call forever (round 4's finding: this was the one path through
+        `_detect_action_for_message` that could never make a message
+        ineligible, unlike every other early return, which stays `body IS
+        NULL` because the failure genuinely may be transient -- a rate-
+        limited or non-200 response, an unparseable response body, a
+        missing `payload` key). An empty-string body is exactly `email_
+        action_tools.py`'s own "genuinely empty" case, not "not yet
+        fetched" -- that tool renders it as an empty message rather than
+        omitting it.
+
         Builds its own `AuthContext` from the account's `owner_id`, not a
         caller-supplied one -- the created recommendation must belong to
         the connected account's own owner (`_owner_id_for_account`),
@@ -2811,11 +2828,28 @@ class GmailAdapter:
         if not isinstance(payload, dict):
             return
         plain_text = _extract_plain_text_body(payload)
-        if not plain_text:
-            return
-
         now = datetime.now(UTC)
-        encrypted_body = encrypt_field(plain_text)
+        # Round 4 review finding: `plain_text` being falsy (HTML-only mail
+        # with no `text/plain` part, or a `payload` with no extractable
+        # content) used to just `return` here, leaving `body` `NULL`
+        # forever -- `detect_actions_since`'s own eligibility query has no
+        # way to tell "not yet fetched" apart from "fetched, nothing usable
+        # was there," so this message would be re-selected, re-fetched, and
+        # re-rejected by every future call indefinitely. A `payload` this
+        # method got far enough to structurally parse (a 200 response,
+        # valid JSON, a dict body, a dict `payload`) that genuinely has no
+        # `text/plain` part is a fact about the message itself that will
+        # not change on retry -- Gmail message content is immutable --
+        # unlike the non-200/malformed-response/missing-`payload` cases
+        # above, which stay silent `return`s (still `body IS NULL`, still
+        # eligible next call) because those genuinely are transient or
+        # indicate a response this method could not make sense of, not a
+        # property of the message. The empty-string sentinel written below
+        # is exactly `email_action_tools.py`'s own "genuinely empty" case
+        # (that module's docstring): its `get_thread_content_tool` renders
+        # `body = ''` as an empty message rather than omitting it, which is
+        # correct here -- there is no content to omit-as-not-yet-fetched.
+        encrypted_body = encrypt_field(plain_text or "")
 
         with SessionFactory() as session, session.begin():
             # `AND body IS NULL`: lost a race against another call already
@@ -2838,6 +2872,8 @@ class GmailAdapter:
             )
             if cast("CursorResult[Any]", updated).rowcount == 0:
                 return
+        if not plain_text:
+            return
 
         node_id = _resolve_or_create_person(
             workspace_id=workspace_id,
