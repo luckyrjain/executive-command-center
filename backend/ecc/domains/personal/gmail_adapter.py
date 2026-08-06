@@ -342,7 +342,19 @@ def _email_consent_active(session: Session, workspace_id: UUID, owner_id: UUID) 
     return row is not None
 
 
-def _normalize_email(value: str) -> str:
+# Not underscore-prefixed: `ecc.domains.attention.attention` (a different
+# domain package) imports this directly to reproduce the exact same
+# `entity_aliases.normalized_value` normalization when matching a thread's
+# last-inbound sender against a resolved contact (see that module's own
+# `_score_awaiting_reply`/`regenerate_attention` comments for why the match
+# has to happen in Python rather than SQL). Every other private-helper
+# import elsewhere in this codebase (`identity/invitations.py` <-
+# `identity/accounts.py`, `engineering/write_actions.py` <-
+# `engineering/{gitlab,jira}_adapter.py`) is between sibling modules in the
+# *same* domain package and keeps the leading underscore; this is the one
+# cross-domain case, so it gets a real public name instead of reaching past
+# another domain's underscore.
+def normalize_email(value: str) -> str:
     return value.strip().casefold()
 
 
@@ -786,7 +798,7 @@ def _resolve_or_create_person(
     the first time) only ever risks re-running *this* function, never
     rolling back an unrelated message write alongside it.
     """
-    normalized = _normalize_email(email)
+    normalized = normalize_email(email)
     with SessionFactory() as session, session.begin():
         existing = session.execute(
             text(

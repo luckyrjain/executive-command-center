@@ -43,7 +43,7 @@ internally accurate.
    `waiting_link`.
    (`test_awaiting_reply_thread_is_pruned_once_replied`)
 7. A sender whose email address contains a character where Postgres's
-   `LOWER()` and Python's `_normalize_email` (`.strip().casefold()`) do
+   `LOWER()` and Python's `normalize_email` (`.strip().casefold()`) do
    not agree (the German sharp s, `ß`, which `.casefold()` expands to
    `ss` but Postgres's `LOWER()` leaves untouched) still surfaces as
    awaiting reply -- round 1 review finding: the eligibility query used
@@ -615,7 +615,7 @@ def test_inbound_thread_from_casefold_divergent_sender_surfaces_as_awaiting_repl
     """Round 1 review finding: `regenerate_attention`'s own eligibility
     query used to resolve the last inbound message's sender against
     `entity_aliases` via SQL `ea.normalized_value = LOWER(TRIM(lm.sender))`
-    -- but Postgres's `LOWER()` and Python's `_normalize_email`
+    -- but Postgres's `LOWER()` and Python's `normalize_email`
     (`.strip().casefold()`, what actually wrote every `entity_aliases.
     normalized_value` row) are not the same function. `'straße@example.
     test'.strip().casefold()` expands the German sharp s to `'strasse@

@@ -14,7 +14,7 @@ from sqlalchemy.orm import Session
 
 from ecc.auth import AuthContext, AuthDep, CsrfDep
 from ecc.database import get_session
-from ecc.domains.personal.gmail_adapter import _normalize_email
+from ecc.domains.personal.gmail_adapter import normalize_email
 from ecc.observability import (
     queue_lifecycle_event,
     record_audit_outbox_failure,
@@ -369,7 +369,7 @@ def _score_awaiting_reply(
     (the inbound-last-message check in SQL, the owner's `email` domain
     being enabled/consented in SQL, and -- since round 1 review -- the
     sender resolution against `entity_aliases` done in Python via
-    `_normalize_email`, not a SQL-side `EXISTS`/`LOWER(TRIM(...))`
+    `normalize_email`, not a SQL-side `EXISTS`/`LOWER(TRIM(...))`
     comparison, which diverges from Python's `.casefold()` for a real
     class of addresses) -- every row reaching this function is, by
     construction, "awaiting reply," so unlike `_score_task`/`_score_
@@ -639,9 +639,14 @@ def regenerate_attention(auth: AuthDep, session: SessionDep, _csrf: CsrfDep) -> 
         # `entity_aliases.normalized_value` row, in `gmail_adapter.py`'s
         # `_resolve_or_create_person`) for characters like the German
         # sharp s. Sender resolution is instead done below in Python,
-        # using the real `_normalize_email` against a separately-fetched
+        # using the real `normalize_email` against a separately-fetched
         # set of known aliases (`known_email_aliases`), then filtered
-        # into `email_threads`.
+        # into `email_threads`. `normalize_email` is deliberately not
+        # underscore-prefixed in `gmail_adapter.py` -- this is a
+        # cross-domain (attention <- personal) call, unlike every other
+        # private-helper import in this codebase, which stays within one
+        # domain's own sibling modules (see `gmail_adapter.py`'s own
+        # comment on the function).
         #
         # `wm.status = 'active'` (round 2 review): `email_threads.owner_id`
         # -- unlike `tasks`/`commitments`/`risks`/`waiting_links` -- is
@@ -746,12 +751,12 @@ def regenerate_attention(auth: AuthDep, session: SessionDep, _csrf: CsrfDep) -> 
         # candidates just fetched above -- bounds this to the number of
         # distinct last-inbound senders across threads that already passed
         # every other eligibility gate, typically orders of magnitude
-        # smaller. `_normalize_email` (not SQL `LOWER(TRIM(...))`) still
+        # smaller. `normalize_email` (not SQL `LOWER(TRIM(...))`) still
         # does the normalization, so this preserves round 1's own fix --
         # only the *set of candidates checked* is narrowed, not the
         # comparison itself.
         candidate_senders = list(
-            {_normalize_email(row["last_inbound_sender"]) for row in email_thread_candidates}
+            {normalize_email(row["last_inbound_sender"]) for row in email_thread_candidates}
         )
         known_email_aliases = {
             row[0]
@@ -767,7 +772,7 @@ def regenerate_attention(auth: AuthDep, session: SessionDep, _csrf: CsrfDep) -> 
         email_threads = [
             row
             for row in email_thread_candidates
-            if _normalize_email(row["last_inbound_sender"]) in known_email_aliases
+            if normalize_email(row["last_inbound_sender"]) in known_email_aliases
         ]
         eligible_email_thread_ids = [row["id"] for row in email_threads]
         session.execute(
