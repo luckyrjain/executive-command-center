@@ -325,3 +325,51 @@ def test_confirm_team_suggestion_rejects_non_team_entity(suggestions_context) ->
     )
     assert response.status_code == 422
     assert response.json()["error"]["code"] == "TEAM_ENTITY_KIND_MISMATCH"
+
+
+def test_dismiss_team_suggestion_hides_it_without_assigning_team(suggestions_context) -> None:
+    client, workspace_id, user_id, token = suggestions_context
+    account_id = _insert_connector_account(workspace_id, user_id)
+    _insert_repository(workspace_id, account_id, user_id, name="acme/a", suggested_team_name="Personal Namespace")
+
+    response = client.post(
+        "/api/v1/engineering/team-suggestions/dismiss",
+        json={"suggested_team_name": "Personal Namespace"},
+        headers=_headers(token, key=str(uuid4())),
+    )
+    assert response.status_code == 200
+    assert len(response.json()["updated"]) == 1
+
+    with engine.begin() as connection:
+        row = connection.execute(
+            text(
+                "SELECT team_entity_id, team_suggestion_dismissed_at FROM repositories "
+                "WHERE workspace_id = :workspace_id"
+            ),
+            {"workspace_id": workspace_id},
+        ).one()
+    assert row.team_entity_id is None
+    assert row.team_suggestion_dismissed_at is not None
+
+    list_response = client.get("/api/v1/engineering/team-suggestions", headers=_headers(token))
+    assert list_response.json()["items"] == []
+
+
+def test_dismiss_team_suggestion_is_idempotent_on_replay(suggestions_context) -> None:
+    client, workspace_id, user_id, token = suggestions_context
+    account_id = _insert_connector_account(workspace_id, user_id)
+    _insert_repository(workspace_id, account_id, user_id, name="acme/a", suggested_team_name="Personal Namespace")
+    key = str(uuid4())
+    payload = {"suggested_team_name": "Personal Namespace"}
+
+    first = client.post(
+        "/api/v1/engineering/team-suggestions/dismiss", json=payload, headers=_headers(token, key=key)
+    )
+    second = client.post(
+        "/api/v1/engineering/team-suggestions/dismiss", json=payload, headers=_headers(token, key=key)
+    )
+    # Compare only business logic fields, not request_id/correlation_id which are added per-request
+    first_body = first.json()
+    second_body = second.json()
+    assert first_body["updated"] == second_body["updated"]
+    assert first_body["skipped_unauthorized"] == second_body["skipped_unauthorized"]

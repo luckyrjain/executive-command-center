@@ -1912,6 +1912,53 @@ def confirm_team_suggestion_endpoint(
         return response
 
 
+@router.post("/team-suggestions/dismiss", response_model=TeamSuggestionActionResponse)
+def dismiss_team_suggestion_endpoint(
+    payload: TeamSuggestionDismissRequest,
+    auth: AuthDep,
+    session: SessionDep,
+    _csrf: CsrfDep,
+    idempotency_key: IdempotencyHeader,
+) -> TeamSuggestionActionResponse:
+    """Bulk-hides every currently-unconfirmed, undismissed row sharing one
+    `suggested_team_name`, without assigning any team. No audit event --
+    unlike confirm, dismissing writes no durable link a future reader
+    needs an audit trail for; the adapter-side reset rule (Tasks 2-4) is
+    what keeps this from permanently suppressing a since-changed
+    suggestion.
+    """
+    request_hash = _request_hash(payload, "dismiss_team_suggestion")
+    now = datetime.now(UTC)
+    with session.begin():
+        _lock_idempotency(session, auth, idempotency_key)
+        cached = _load_cached(session, auth, idempotency_key, request_hash)
+        if cached is not None:
+            return TeamSuggestionActionResponse.model_validate(cached)
+
+        updated: list[UUID] = []
+        skipped: list[UUID] = []
+        for table, _aggregate_type, _event_type in _TEAM_SUGGESTION_TABLES:
+            authorized_ids, skipped_ids = _lock_and_authorize_suggestion_candidates(
+                session, auth, table=table, suggested_team_name=payload.suggested_team_name
+            )
+            skipped.extend(skipped_ids)
+            for row_id in authorized_ids:
+                session.execute(
+                    text(
+                        f"UPDATE {table} SET team_suggestion_dismissed_at = :now "  # noqa: S608
+                        "WHERE workspace_id = :workspace_id AND id = :id"
+                    ),
+                    {"now": now, "workspace_id": auth.workspace_id, "id": row_id},
+                )
+                updated.append(row_id)
+
+        response = TeamSuggestionActionResponse(updated=updated, skipped_unauthorized=skipped)
+        _store_idempotency(
+            session, auth, idempotency_key, request_hash, response.model_dump(mode="json"), now
+        )
+        return response
+
+
 @router.get("/monitors", response_model=MonitorListResponse)
 def list_monitors_endpoint(
     auth: AuthDep,
