@@ -1,6 +1,6 @@
 SHELL := /bin/bash
 
-.PHONY: setup dev stop check test migrate backup restore verify-restore
+.PHONY: setup dev stop check docs-check test migrate backup restore verify-restore
 
 setup:
 	uv sync --all-groups
@@ -19,6 +19,10 @@ check:
 	uv run mypy backend
 	pnpm --filter @ecc/frontend lint
 	pnpm --filter @ecc/frontend typecheck
+
+docs-check:
+	python scripts/docs_status.py check
+	python scripts/check_docs.py
 
 test:
 	uv run pytest

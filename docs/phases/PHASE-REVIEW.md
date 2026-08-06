@@ -1,13 +1,19 @@
 ---
 id: PHASE-DOCUMENTATION-REVIEW
 title: Phase 0-9 Documentation Completeness Review
-status: Active
-version: 1.0.1
+status: Archived
+version: 1.1.0
 owner: Lucky Jain
 updated: 2026-07-23
+as_of: 2026-07-23
 ---
 
-# Phase 0–9 Documentation Completeness Review
+# Phase 0-9 Documentation Completeness Review
+
+> **Archived snapshot as of 2026-07-23.** This report records the Phase 0-9
+> review at that date and is not a current status source. See the
+> [canonical phase registry](status.json) for current engineering,
+> validation, and promotion state.
 
 ## Review objective
 
@@ -167,3 +173,10 @@ The Phase 0–9 documentation set is complete for its declared maturity:
 - Phases 2–9 contain complete Draft specifications and supporting contract sets.
 - No Draft phase is represented as implemented or approved.
 - Remaining decisions are named approval gates with owners to be assigned during phase planning.
+
+## Changelog
+
+| Version | Date | Summary | Author |
+|---|---|---|---|
+| 1.1.0 | 2026-08-06 | Archived the review as a dated historical snapshot | Lucky Jain |
+| 1.0.1 | 2026-07-23 | Recorded the Phase 0-9 completeness review | Lucky Jain |

@@ -1,7 +1,7 @@
 ---
 id: PHASE-001-AUDIT-CONTRACT
 title: Phase 1 Audit Contract
-status: Approved
+status: Approved for Implementation
 version: 1.0.2
 owner: Lucky Jain
 ---

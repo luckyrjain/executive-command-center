@@ -2,9 +2,9 @@
 id: ADR-0012
 title: Ollama Local Inference
 status: Accepted
+version: 1.0.0
 date: 2026-07-23
-owners:
-  - Lucky Jain
+owner: Lucky Jain
 related:
   - RFC-005
   - ADR-0004

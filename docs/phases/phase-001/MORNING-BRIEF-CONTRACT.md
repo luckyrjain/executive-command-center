@@ -1,7 +1,7 @@
 ---
 id: PHASE-001-MORNING-BRIEF
 title: Phase 1 Morning Brief Contract
-status: Approved
+status: Approved for Implementation
 version: 1.0.2
 owner: Lucky Jain
 ---

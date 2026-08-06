@@ -1,7 +1,7 @@
 ---
 id: API-CONTRACTS
 title: Domain API Contracts
-status: Accepted
+status: Approved
 version: 1.1.2
 owner: Lucky Jain
 related:

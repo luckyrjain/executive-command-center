@@ -283,10 +283,9 @@ def test_no_document_claims_completion_while_daily_use_gate_is_open() -> None:
     assert violations == [], "\n".join(violations)
 
 
-# Checklist items in PHASE-1-RELEASE-GATE.md that Tasks 1-11 (per
-# .superpowers/sdd/progress.md and the corresponding task-N-review.md)
-# produced genuine, independently-reviewed evidence for. Each must be
-# checked, not left unchecked -- this is the "don't underclaim" direction.
+# Checklist items in PHASE-1-RELEASE-GATE.md that have durable evidence for
+# the immutable Phase 1 baseline. Each must be checked, not left unchecked --
+# this is the "don't underclaim" direction.
 RELEASE_GATE_ITEMS_WITH_EVIDENCE = (
     "Backend Ruff, formatting, mypy, Alembic and PostgreSQL tests pass.",
     "Frontend typecheck, unit tests, production build and Chromium acceptance pass.",
@@ -314,7 +313,6 @@ RELEASE_GATE_ITEMS_WITH_EVIDENCE = (
     "Deployment and rollback procedures are documented.",
     "Database migration rollback limitations are explicit.",
     "Environment variables and secret ownership are documented.",
-    "Critical, High and Medium review findings are zero before merge.",
     # Moved here from RELEASE_GATE_ITEMS_STILL_OPEN after PR #15 merged: the
     # branch's final commit (c79afb3) was independently re-verified live via
     # GitHub Actions CI (run IDs 29804619977/29804620011) rather than only
@@ -326,11 +324,9 @@ RELEASE_GATE_ITEMS_WITH_EVIDENCE = (
     "Dependency, secret, container and SBOM scans pass.",
 )
 
-# Checklist items that genuinely cannot be proven live in this local
-# environment, or that reflect a real currently-open gap: no live CI/CD
-# pipeline exists yet to run post-deploy smoke checks automatically, because
-# Phase 1 has no hosted environment. This must stay unchecked, not be
-# silently checked off.
+# Checklist items that lack durable evidence or reflect a real currently-open
+# gap. These must stay unchecked rather than being inferred from missing local
+# reports or silently checked off.
 #
 # ("Backend Ruff, formatting, mypy, Alembic and PostgreSQL tests pass." was
 # also in this list after Task 12 discovered a real, CI-config-reproducing
@@ -341,7 +337,10 @@ RELEASE_GATE_ITEMS_WITH_EVIDENCE = (
 # SBOM scans pass." was here too, until PR #15's merge and its live CI
 # verification moved it to RELEASE_GATE_ITEMS_WITH_EVIDENCE as well -- see
 # the comment there.)
-RELEASE_GATE_ITEMS_STILL_OPEN = ("Post-deployment smoke checks are automated.",)
+RELEASE_GATE_ITEMS_STILL_OPEN = (
+    "Post-deployment smoke checks are automated.",
+    "Critical, High and Medium review findings are zero before release.",
+)
 
 
 def test_release_gate_checks_items_with_genuine_evidence() -> None:

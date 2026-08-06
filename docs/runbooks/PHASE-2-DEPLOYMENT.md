@@ -1,3 +1,11 @@
+---
+id: PHASE-2-DEPLOYMENT
+title: Phase 2 Deployment Runbook
+status: Active
+version: 1.0.0
+owner: Lucky Jain
+---
+
 # Phase 2 Deployment Runbook (Delta from Phase 1)
 
 **Scope:** what changes operationally when deploying Phase 2 (the knowledge

@@ -2,9 +2,9 @@
 id: ADR-0001
 title: Repository Layout
 status: Accepted
+version: 1.0.0
 date: 2026-07-13
-owners:
-  - Lucky Jain
+owner: Lucky Jain
 related:
   - STD-001
   - PHASE-000

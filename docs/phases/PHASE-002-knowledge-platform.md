@@ -1,8 +1,8 @@
 ---
 id: PHASE-002
 title: Knowledge Platform
-status: Draft
-version: 0.2.0
+status: Approved for Implementation
+version: 0.3.0
 owner: Lucky Jain
 depends_on:
   - PHASE-001
@@ -110,3 +110,10 @@ Disable embedding and hybrid flags while retaining lexical retrieval. Rebuild pr
 ## Deferred backlog
 
 External ingestion, dedicated graph database, ontology learning, cross-workspace federation, connector-specific resolvers and AI-generated claims.
+
+## Changelog
+
+| Version | Date | Summary | Author |
+|---|---|---|---|
+| 0.3.0 | 2026-08-06 | Reconciled the specification lifecycle with its approved contracts and delivered implementation | Lucky Jain |
+| 0.2.0 | 2026-07-22 | Published the Phase 2 specification | Lucky Jain |

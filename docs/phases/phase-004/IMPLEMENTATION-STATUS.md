@@ -1,7 +1,7 @@
 ---
 id: PHASE-004-IMPLEMENTATION-STATUS
 title: Phase 4 Implementation Status
-status: Implemented (Tasks 0-26 of the first activation slice); both meeting.prep_summary's latency floor and attention.explain_item's prohibited-fact-count floor cleared on a real live-model run (phase H/I); a genuine gap in the temperature=0/seed=0 reproducibility guarantee found and the affected test corrected; sparse_pack's intermittent schema_invalid investigated and recorded as a known limitation (phase J); migration 0029's in-place seed edit fixed to a properly versioned row (Task 23); a real live-Ollama CI failure this fix caused (a missed prompt_version=1 assertion) fixed, plus a round-5 review's further findings (Task 24); a bounded, owner-authorized raw-output diagnostic window closed without reproducing sparse_pack, but incidentally evidencing the underlying json_invalid mechanism via attention.explain_item, whose own floors missed twice with a repeated three-example signature worth tracking (phase K, Task 25); that signature recurred a third time and was root-caused and fixed via prompt version 3 (phase L, Task 26), not yet re-verified against a real model
+status: Active
 version: 0.23.0
 owner: Lucky Jain
 updated: 2026-07-31

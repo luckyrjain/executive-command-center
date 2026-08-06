@@ -1,7 +1,7 @@
 ---
 id: PHASE-001-UX-STATES
 title: Phase 1 UX States
-status: Approved
+status: Approved for Implementation
 version: 1.0.2
 owner: Lucky Jain
 ---

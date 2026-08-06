@@ -2,8 +2,9 @@
 id: ADR-0008
 title: Authentication and Workspace Identity
 status: Accepted
+version: 1.0.0
 date: 2026-07-13
-owners: [Lucky Jain]
+owner: Lucky Jain
 related: [RFC-004, RFC-005, PHASE-000]
 ---
 

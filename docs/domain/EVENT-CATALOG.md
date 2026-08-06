@@ -1,7 +1,7 @@
 ---
 id: EVENT-CATALOG
 title: Domain Event Catalog
-status: Accepted
+status: Approved
 version: 1.4.0
 owner: Lucky Jain
 related:

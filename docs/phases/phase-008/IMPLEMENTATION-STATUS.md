@@ -1,7 +1,7 @@
 ---
 id: PHASE-008-IMPLEMENTATION-STATUS
 title: Phase 8 Implementation Status
-status: Task 1 (account/membership/session framework), Task 2 (invitations), Task 3 (authorization engine, schema-wide migration, engineering reference domain), Task 4 (authorization widened to every remaining domain), Task 5 (sharing-review UX and effective permissions), Task 6 (delegation), Task 7 (notifications and shared activity), Task 8 (ownership transfer and member removal), Task 9 (executive UX and multi-identity browser acceptance) and four whole-phase review rounds complete
+status: Active
 version: 0.13.0
 owner: Lucky Jain
 updated: 2026-08-04

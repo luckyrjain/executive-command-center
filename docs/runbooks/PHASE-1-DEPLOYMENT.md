@@ -1,3 +1,11 @@
+---
+id: PHASE-1-DEPLOYMENT
+title: Phase 1 Deployment Runbook
+status: Active
+version: 1.0.0
+owner: Lucky Jain
+---
+
 # Phase 1 Deployment Runbook
 
 **Scope:** Executive Command Center Phase 1 (FastAPI backend, React frontend, PostgreSQL 18).
@@ -174,12 +182,10 @@ Phase 1 scope).
 
 **Recovery time objective (RTO):** 600 seconds (`config/phase1-acceptance.json`
 `backup_restore.rto_seconds`), measured end-to-end by
-`scripts/verify_restore.sh`'s `$SECONDS` check. Actually measured: 7
-seconds wall-clock for a full backup+restore+verify cycle against real
-PostgreSQL 18 in this environment on 2026-07-20 (see
-`.superpowers/sdd/task-12-report.md`'s full-proof section for the live
-re-run), and 24 seconds in Task 9's original drill
-(`.superpowers/sdd/task-9-report.md`) — both well inside budget.
+`scripts/verify_restore.sh`'s `$SECONDS` check. Historical local reports
+claimed 7-second and 24-second drills, but those reports were never committed
+and the measurements are unverified. Run the current drill and retain its
+timestamped artifact before making an RTO claim for a release candidate.
 
 ## Restore
 
@@ -212,9 +218,8 @@ uv run python scripts/phase1_evidence.py \
 ## Change ownership and review
 
 Every deployment to a shared or production environment MUST be preceded by
-a reviewed pull request (per `docs/CONTRIBUTING.md` and this branch's own
-history — every task in `docs/superpowers/plans/2026-07-16-phase-1-completion.md`
-was independently reviewed before being considered complete; see
-`.superpowers/sdd/progress.md`). This runbook does not itself constitute
+a reviewed pull request per `docs/CONTRIBUTING.md`. Historical local-agent
+review reports for the Phase 1 task sequence were never committed, so they
+cannot satisfy a new release review. This runbook does not itself constitute
 that review, and no deployment against this document satisfies Phase 1's
 outstanding human change-review exit gate on its own.

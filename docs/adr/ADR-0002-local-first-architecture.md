@@ -2,9 +2,9 @@
 id: ADR-0002
 title: Local-First Architecture
 status: Accepted
+version: 1.0.0
 date: 2026-07-13
-owners:
-  - Lucky Jain
+owner: Lucky Jain
 related:
   - RFC-001
   - RFC-004

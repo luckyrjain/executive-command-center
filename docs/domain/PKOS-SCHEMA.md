@@ -1,7 +1,7 @@
 ---
 id: PKOS-SCHEMA
 title: Personal Knowledge Operating System Schema
-status: Accepted
+status: Approved
 version: 1.1.1
 owner: Lucky Jain
 related:
