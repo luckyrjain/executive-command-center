@@ -100,6 +100,7 @@ from sqlalchemy.orm import Session
 
 from ecc.auth import AuthContext, AuthDep, CsrfDep
 from ecc.database import get_session, lock_engine
+from ecc.domains.personal.crypto import encrypt_field
 from ecc.domains.personal.domains import classification_for, encrypt_record_payload
 from ecc.observability import record_database_failure, record_idempotency_conflict
 from ecc.platform import authz
@@ -176,6 +177,13 @@ _LATENCY_P95_CEILING_SECONDS_BY_TASK_TYPE: dict[str, float] = {
     # above) -- expected to move once a real `ollama-evaluation` run
     # against this task type's own dataset exists to size it against.
     "personal.generate_insight": 35.0,
+    # Phase 10 Task 5's `email.detect_action` -- same "initial value, no
+    # live-model history yet" position as `personal.generate_insight`'s
+    # own entry above, sized by the identical analogy (`router.py:
+    # TASK_REQUIREMENTS["email.detect_action"]`'s own comment): a single
+    # email's full body is not obviously larger than that task's
+    # cross-domain evidence bundle, so this starts at the same 35.0.
+    "email.detect_action": 35.0,
 }
 
 
@@ -253,6 +261,41 @@ class PersonalInsightEvaluationExample(TypedDict):
     must_cite: list[str]
     must_not_state: list[str]
     reference_explanation: str
+
+
+class EmailDetectActionMessageExample(TypedDict):
+    """One synthetic `email_messages` row for an `EmailDetectAction
+    EvaluationExample`'s thread -- `sent_at_days_ago` mirrors `Personal
+    InsightSourceExample`'s own `effective_at_days_ago` convention for a
+    reproducible relative timestamp (`_insert_synthetic_email_thread`
+    below converts it the identical way).
+    """
+
+    sender: str
+    direction: Literal["inbound", "outbound"]
+    sent_at_days_ago: int
+    body: str
+
+
+class EmailDetectActionEvaluationExample(TypedDict):
+    """One row of `evaluation_sets.examples` for `task_type='email.
+    detect_action'` -- matches `tests/fixtures/phase10_evaluation_email_
+    detect_action.py`'s `EXAMPLES` shape and migration `0073_phase10_
+    email_detect_action_eval.py`'s seeded JSONB content exactly. A
+    negative example (a newsletter/FYI-only/already-resolved thread) sets
+    `reference_has_action=False`; documentation only, like every other
+    `reference_*` field here -- `_score_example` never reads it, since a
+    live-model run's real output is scored structurally (schema validity,
+    grounding, prohibited facts, latency), not compared against a fixed
+    reference answer.
+    """
+
+    key: str
+    subject: str | None
+    messages: list[EmailDetectActionMessageExample]
+    must_cite: list[str]
+    must_not_state: list[str]
+    reference_has_action: bool
 
 
 # `evaluation_sets.examples` is untyped JSONB and this activation now stores
@@ -474,6 +517,7 @@ _OUTPUT_TEXT_FIELD: dict[str, str] = {
     "attention.explain_item": "explanation_text",
     "meeting.prep_summary": "summary_text",
     "personal.generate_insight": "explanation_text",
+    "email.detect_action": "rationale",
 }
 
 
@@ -1145,6 +1189,152 @@ def _delete_synthetic_personal_insight_sources(
     session.commit()
 
 
+def _insert_synthetic_email_thread(
+    session: Session, auth: AuthContext, example: dict[str, Any], *, now: datetime
+) -> tuple[UUID, UUID, list[UUID]]:
+    """Inserts one synthetic `email_threads` row and its `email_messages`
+    -- bodies encrypted via `ecc.domains.personal.crypto.encrypt_field`
+    exactly like Task 5's own `gmail_adapter.py:detect_actions_since`
+    would store a real fetched body, so this harness genuinely exercises
+    `email_action_tools.get_thread_content_tool`'s own decrypt-before-
+    prompting path rather than handing the model already-plaintext
+    synthetic data no real message would ever have. A synthetic
+    `connector_accounts` row is also created -- `email_threads.connector_
+    account_id` is `NOT NULL` (migration `0069`) and this evaluation
+    harness has no real connected Gmail account to reference; its
+    `encrypted_credentials` is never read by anything this harness
+    exercises (`get_thread_content_tool` only ever reads `email_threads`/
+    `email_messages`), so a placeholder value is sufficient.
+
+    Returns `(connector_account_id, thread_id, message_ids)` for
+    `_delete_synthetic_email_thread` below. Not context-managed -- see
+    `_insert_synthetic_item`'s identical rationale (this session's
+    transaction may already be autobegun by `run_evaluation`'s preceding
+    reads). Per-example (not batched, like `attention.explain_item`'s
+    synthetic items), the same `personal.generate_insight`-precedent
+    reasoning: this evaluation dataset's own examples need fresh rows to
+    avoid id/uniqueness collisions across the dataset, not because
+    `email_threads`/`email_messages` has any workspace-wide section a
+    batched shape would leak across examples the way `meeting.prep_
+    summary`'s own `risks` section does.
+    """
+    connector_account_id = uuid4()
+    session.execute(
+        text(
+            """
+            INSERT INTO connector_accounts (
+                id, workspace_id, provider, external_account_id, display_name,
+                granted_scopes, encrypted_credentials, status, version,
+                created_by, updated_by, created_at, updated_at, owner_id, visibility
+            ) VALUES (
+                :id, :workspace_id, 'gmail', :external_account_id, 'evaluation harness',
+                '{}', :encrypted_credentials, 'active', 1,
+                :actor_id, :actor_id, :now, :now, :actor_id, 'workspace'
+            )
+            """
+        ),
+        {
+            "id": connector_account_id,
+            "workspace_id": auth.workspace_id,
+            "external_account_id": f"evaluation-{connector_account_id}",
+            "encrypted_credentials": b"",
+            "actor_id": auth.user_id,
+            "now": now,
+        },
+    )
+    thread_id = uuid4()
+    session.execute(
+        text(
+            """
+            INSERT INTO email_threads (
+                id, workspace_id, owner_id, domain_key, connector_account_id,
+                external_thread_id, subject, last_message_at, created_at, updated_at
+            ) VALUES (
+                :id, :workspace_id, :owner_id, 'email', :connector_account_id,
+                :external_thread_id, :subject, :now, :now, :now
+            )
+            """
+        ),
+        {
+            "id": thread_id,
+            "workspace_id": auth.workspace_id,
+            "owner_id": auth.user_id,
+            "connector_account_id": connector_account_id,
+            "external_thread_id": f"evaluation-{thread_id}",
+            "subject": example["subject"],
+            "now": now,
+        },
+    )
+    message_ids: list[UUID] = []
+    for message in example["messages"]:
+        message_id = uuid4()
+        message_ids.append(message_id)
+        session.execute(
+            text(
+                """
+                INSERT INTO email_messages (
+                    id, workspace_id, owner_id, thread_id, external_message_id,
+                    sender, recipients, sent_at, direction, snippet, body,
+                    body_fetched_at, created_at, updated_at
+                ) VALUES (
+                    :id, :workspace_id, :owner_id, :thread_id, :external_message_id,
+                    :sender, :recipients, :sent_at, :direction, NULL, :body,
+                    :now, :now, :now
+                )
+                """
+            ),
+            {
+                "id": message_id,
+                "workspace_id": auth.workspace_id,
+                "owner_id": auth.user_id,
+                "thread_id": thread_id,
+                "external_message_id": f"evaluation-{message_id}",
+                "sender": message["sender"],
+                "recipients": ["owner@evaluation.test"],
+                "sent_at": now - timedelta(days=message["sent_at_days_ago"]),
+                "direction": message["direction"],
+                "body": encrypt_field(message["body"]),
+                "now": now,
+            },
+        )
+    session.commit()
+    return connector_account_id, thread_id, message_ids
+
+
+def _delete_synthetic_email_thread(
+    session: Session,
+    auth: AuthContext,
+    connector_account_id: UUID,
+    thread_id: UUID,
+    message_ids: list[UUID],
+) -> None:
+    """Deletes everything `_insert_synthetic_email_thread` created for one
+    example, immediately after that example is scored -- see that
+    function's docstring for why. Deletes child rows (`email_messages`)
+    before the `email_threads`/`connector_accounts` rows they FK-
+    reference, regardless of what `ondelete=CASCADE` may or may not
+    already handle -- explicit, not relying on cascade, matching `_delete_
+    synthetic_personal_insight_sources`'s identical discipline. Not
+    context-managed -- see `_insert_synthetic_item`'s identical rationale.
+    """
+    if message_ids:
+        session.execute(
+            text(
+                "DELETE FROM email_messages WHERE workspace_id = :workspace_id AND id = ANY(:ids)"
+            ),
+            {"workspace_id": auth.workspace_id, "ids": message_ids},
+        )
+    session.execute(
+        text("DELETE FROM email_threads WHERE workspace_id = :workspace_id AND id = :id"),
+        {"workspace_id": auth.workspace_id, "id": thread_id},
+    )
+    session.execute(
+        text("DELETE FROM connector_accounts WHERE workspace_id = :workspace_id AND id = :id"),
+        {"workspace_id": auth.workspace_id, "id": connector_account_id},
+    )
+    session.commit()
+
+
 # ---------------------------------------------------------------------------
 # generated_artifacts -- module docstring's "first concrete producer".
 # ---------------------------------------------------------------------------
@@ -1482,6 +1672,12 @@ def run_evaluation(
                     source_domain_keys = [source["domain_key"] for source in example["sources"]]
                     run_input = {"source_domain_keys": source_domain_keys}
                     source_versions = {"source_domain_keys": source_domain_keys}
+                elif task_type == "email.detect_action":
+                    connector_account_id, thread_id, message_ids = _insert_synthetic_email_thread(
+                        session, auth, example, now=now
+                    )
+                    run_input = {"thread_id": str(thread_id)}
+                    source_versions = {"thread_id": str(thread_id)}
                 else:
                     item_id = _insert_synthetic_item(session, auth, example, now=now)
                     synthetic_item_ids.append(item_id)
@@ -1560,6 +1756,12 @@ def run_evaluation(
                         _delete_synthetic_personal_insight_sources(
                             session, auth, domain_ids, grant_ids, record_ids
                         )
+                    elif task_type == "email.detect_action":
+                        if session.in_transaction():
+                            session.rollback()
+                        _delete_synthetic_email_thread(
+                            session, auth, connector_account_id, thread_id, message_ids
+                        )
         finally:
             # Guard against a leftover open transaction from a mid-loop
             # exception (should not happen -- execute_run always returns an
@@ -1617,7 +1819,10 @@ class EvaluationSetListResponse(BaseModel):
 class EvaluationRunCreateRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     task_type: Literal[
-        "attention.explain_item", "meeting.prep_summary", "personal.generate_insight"
+        "attention.explain_item",
+        "meeting.prep_summary",
+        "personal.generate_insight",
+        "email.detect_action",
     ]
     prompt_version: int = Field(ge=1)
     model_id: str = Field(min_length=1, max_length=200)
