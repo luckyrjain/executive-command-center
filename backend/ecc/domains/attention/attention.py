@@ -365,10 +365,14 @@ def _score_awaiting_reply(
     since, and the sender resolves to a known `pkos_nodes` contact.
 
     Eligibility is entirely enforced by `regenerate_attention`'s own
-    `email_threads` query (the inbound-last-message check, the sender
-    resolution `EXISTS` against `entity_aliases`, and the owner's `email`
-    domain being enabled/consented) -- every row reaching this function is,
-    by construction, "awaiting reply," so unlike `_score_task`/`_score_
+    email_thread candidate query and its own subsequent Python-side filter
+    (the inbound-last-message check in SQL, the owner's `email` domain
+    being enabled/consented in SQL, and -- since round 1 review -- the
+    sender resolution against `entity_aliases` done in Python via
+    `_normalize_email`, not a SQL-side `EXISTS`/`LOWER(TRIM(...))`
+    comparison, which diverges from Python's `.casefold()` for a real
+    class of addresses) -- every row reaching this function is, by
+    construction, "awaiting reply," so unlike `_score_task`/`_score_
     risk` there is no separate eligibility gate re-checked here. No pin
     concept for email threads (no `pinned` column on `email_threads`, the
     same reasoning `_score_waiting`'s own docstring gives for
@@ -383,7 +387,7 @@ def _score_awaiting_reply(
             "awaiting_reply",
             "Awaiting your reply",
             policy.awaiting_reply_points,
-            "direction",
+            "last_inbound_sender",
         )
     ]
     age = now - row["last_inbound_sent_at"]

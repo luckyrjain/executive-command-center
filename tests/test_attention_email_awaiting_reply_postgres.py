@@ -94,6 +94,24 @@ internally accurate.
     relies on (`attention.py`'s own `email_thread_rows` comment) had no
     test exercising the primary read path it protects.
     (`test_email_thread_item_not_visible_to_another_workspace_member`)
+13. The `awaiting_reply` factor's own `source_field` metadata names a real
+    field genuinely present on the scored row, the same way every other
+    entity type's factors already do (e.g. `_score_waiting`'s
+    `waiting_direction` factor correctly points at `waiting_links.
+    direction`, which really is a key on its row) -- round 8 review
+    finding: `_score_awaiting_reply` copied `"direction"` from that same
+    sibling factor without noticing `email_thread`'s own row never
+    carries a `direction` key at all (the `email_thread_candidates` query
+    consumes `email_messages.direction` only inside its own `WHERE`
+    clause, never projecting it into the row `_score_awaiting_reply`
+    receives). Beyond the internal inconsistency, `source_field` is not
+    inert metadata -- `ai_runtime/runtime.py`'s `_render_factors_block`
+    surfaces it verbatim to the model as "(from workspace field:
+    {source_field})", so a nonexistent field name was being presented as
+    real provenance. Fixed by pointing it at `last_inbound_sender`
+    instead, which is both a real key on the row and the genuine evidence
+    backing this factor (who the reply is owed to).
+    (`test_awaiting_reply_factor_source_field_names_a_real_row_field`)
 """
 
 from collections.abc import Iterator
@@ -985,3 +1003,27 @@ def test_email_thread_item_not_visible_to_another_workspace_member(
     owner_listed = client.get("/api/v1/attention", headers=_headers(token))
     assert owner_listed.status_code == 200, owner_listed.text
     assert any(i["entity_id"] == str(thread_id) for i in owner_listed.json()["items"])
+
+
+def test_awaiting_reply_factor_source_field_names_a_real_row_field(
+    email_attention_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    client, workspace_id, owner_id, token = email_attention_test_context
+    now = datetime.now(UTC)
+    sender = "known.contact@example.test"
+    _resolve_sender(workspace_id, sender)
+    thread_id = _seed_thread(workspace_id, owner_id, "Need your sign-off", now)
+    _seed_message(
+        workspace_id, owner_id, thread_id, sender=sender, direction="inbound", sent_at=now
+    )
+
+    regenerate = client.post("/api/v1/attention/regenerate", headers=_headers(token), json={})
+    assert regenerate.status_code == 200, regenerate.text
+    item = next(i for i in regenerate.json()["items"] if i["entity_id"] == str(thread_id))
+    factors_by_code = {f["code"]: f for f in item["factors"]}
+    # `email_thread`'s own row has no `direction` key at all (unlike
+    # `waiting_link`'s row, where `_score_waiting`'s own `waiting_direction`
+    # factor's identical-looking `source_field="direction"` really is a key
+    # on that row) -- `last_inbound_sender` is both a real key on this row
+    # and the genuine evidence behind this factor.
+    assert factors_by_code["awaiting_reply"]["source_field"] == "last_inbound_sender"

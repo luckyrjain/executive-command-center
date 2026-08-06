@@ -546,7 +546,7 @@ def test_execute_run_explain_item_handles_an_email_thread_sourced_item(
             "code": "awaiting_reply",
             "label": "Awaiting your reply",
             "points": 12,
-            "source_field": "direction",
+            "source_field": "last_inbound_sender",
         },
         {
             "code": "stale_7d",
