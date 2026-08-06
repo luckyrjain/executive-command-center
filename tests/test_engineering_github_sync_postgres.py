@@ -516,6 +516,63 @@ def test_incremental_resync_refreshes_suggestion_without_touching_confirmed_team
             )
 
 
+def test_incremental_resync_clears_dismissed_suggestion_when_name_changes(
+    seeded_account_context: ConnectorAccountContext,
+) -> None:
+    """A human dismissal (`team_suggestion_dismissed_at`) is a judgment
+    about one specific `suggested_team_name` -- if the repo's owner
+    changes, the next sync must clear the old dismissal so the new
+    suggestion isn't silently suppressed by a stale one.
+    """
+    repos = [_repo(1, full_name="acme/a", updated_at="2024-01-03T00:00:00Z", owner_login="acme")]
+    adapter = GitHubAdapter(transport=httpx.MockTransport(lambda r: _json_response(repos)))
+    adapter.backfill(seeded_account_context, "repository")
+
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "UPDATE repositories SET team_suggestion_dismissed_at = :now "
+                "WHERE workspace_id = :workspace_id"
+            ),
+            {"now": datetime.now(UTC), "workspace_id": seeded_account_context.workspace_id},
+        )
+
+    # Same owner, later sync -- dismissal must survive.
+    repos_same_owner = [
+        _repo(1, full_name="acme/a", updated_at="2024-01-04T00:00:00Z", owner_login="acme")
+    ]
+    adapter2 = GitHubAdapter(transport=httpx.MockTransport(lambda r: _json_response(repos_same_owner)))
+    adapter2.incremental_sync(seeded_account_context, "repository", "2024-01-03T00:00:00Z")
+
+    with engine.begin() as connection:
+        still_dismissed = connection.execute(
+            text(
+                "SELECT team_suggestion_dismissed_at FROM repositories "
+                "WHERE workspace_id = :workspace_id"
+            ),
+            {"workspace_id": seeded_account_context.workspace_id},
+        ).scalar_one()
+    assert still_dismissed is not None
+
+    # Owner changes -- dismissal must clear, new suggestion must show.
+    repos_new_owner = [
+        _repo(1, full_name="acme/a", updated_at="2024-01-05T00:00:00Z", owner_login="acme-new")
+    ]
+    adapter3 = GitHubAdapter(transport=httpx.MockTransport(lambda r: _json_response(repos_new_owner)))
+    adapter3.incremental_sync(seeded_account_context, "repository", "2024-01-04T00:00:00Z")
+
+    with engine.begin() as connection:
+        cleared = connection.execute(
+            text(
+                "SELECT team_suggestion_dismissed_at, suggested_team_name FROM repositories "
+                "WHERE workspace_id = :workspace_id"
+            ),
+            {"workspace_id": seeded_account_context.workspace_id},
+        ).one()
+    assert cleared.team_suggestion_dismissed_at is None
+    assert cleared.suggested_team_name == "acme-new"
+
+
 def test_backfill_paginates_via_link_header(
     seeded_account_context: ConnectorAccountContext,
 ) -> None:
