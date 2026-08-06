@@ -100,6 +100,7 @@ resource type no-op-succeeds rather than raises" contract interpretation.
 
 from __future__ import annotations
 
+import base64
 import time
 from collections.abc import Callable, Mapping
 from datetime import UTC, datetime, timedelta
@@ -113,12 +114,14 @@ from urllib.parse import urlencode
 from uuid import UUID, uuid4
 
 import httpx
-from sqlalchemy import text
+from sqlalchemy import CursorResult, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from ecc.auth import AuthContext
 from ecc.config import get_settings
 from ecc.database import SessionFactory
+from ecc.domains.ai_runtime.runtime import execute_run
 from ecc.domains.engineering.connectors import (
     AdapterAuthorizationError,
     ConnectorAccountContext,
@@ -126,6 +129,10 @@ from ecc.domains.engineering.connectors import (
     PermissionState,
     SyncOutcome,
 )
+from ecc.domains.governance.recommendation_models import RecommendationCreate
+from ecc.domains.governance.recommendation_mutations import create_recommendation, synthetic_request
+
+from .crypto import encrypt_field
 
 GOOGLE_OAUTH_AUTHORIZE_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 GOOGLE_OAUTH_BASE_URL = "https://oauth2.googleapis.com"
@@ -1028,6 +1035,85 @@ def _insert_message_if_new(
         },
     ).one_or_none()
     return row[0] if row is not None else None
+
+
+# -- Task 5: proactive action detection --------------------------------------
+
+
+def _extract_plain_text_body(payload: dict[str, Any]) -> str | None:
+    """Walks a `messages.get(format=full)` response's own MIME `payload`
+    tree for the first `text/plain` part's decoded body -- Gmail's own
+    `body.data` is base64url-encoded (RFC 4648 section 5, not standard
+    base64), matching the encoding every other Google Workspace API uses
+    for binary-ish payload fields. A multipart message (`multipart/
+    alternative`, `multipart/mixed`, ...) nests its real content under
+    `payload.parts`, each itself shaped like a top-level `payload`, hence
+    the recursion; a simple, non-multipart message has its body directly
+    on the top-level `payload.body.data` with no `parts` at all. Returns
+    `None` for a message with no `text/plain` part reachable this way
+    (an HTML-only message, or a malformed/truncated response) -- callers
+    treat that as "nothing to store," the same "malformed input is
+    skipped, not raised" contract `_process_message` already documents
+    for this file's other Gmail-response parsing.
+    """
+    mime_type = payload.get("mimeType")
+    body = payload.get("body")
+    if mime_type == "text/plain" and isinstance(body, dict):
+        data = body.get("data")
+        if isinstance(data, str) and data:
+            try:
+                return base64.urlsafe_b64decode(data + "=" * (-len(data) % 4)).decode(
+                    "utf-8", errors="replace"
+                )
+            except (ValueError, TypeError):
+                return None
+    parts = payload.get("parts")
+    if isinstance(parts, list):
+        for part in parts:
+            if isinstance(part, dict):
+                extracted = _extract_plain_text_body(part)
+                if extracted is not None:
+                    return extracted
+    return None
+
+
+def _register_message_evidence(
+    session: Session, *, workspace_id: UUID, node_id: UUID, external_message_id: str, now: datetime
+) -> UUID:
+    """One fresh `pkos_evidence` row citing the specific message that
+    triggered a detection run -- distinct from whatever (possibly much
+    older) `pkos_evidence` row `_resolve_or_create_person` created the
+    first time this sender was ever seen (see that function's own
+    docstring): a recommendation's `evidence_ids` must point at the email
+    actually reasoned about, not merely at "this sender is a known
+    person." `source_ref` is deliberately namespaced (`gmail:detect_
+    action:...`, not `_resolve_or_create_person`'s own bare `gmail:...`)
+    so the two purposes never collide on the same `sha256`.
+    """
+    evidence_id = uuid4()
+    source_ref = f"gmail:detect_action:{external_message_id}"
+    session.execute(
+        text(
+            """
+            INSERT INTO pkos_evidence (
+                id, workspace_id, node_id, source_type, source_ref, sha256,
+                captured_at, evidence_state
+            ) VALUES (
+                :id, :workspace_id, :node_id, 'gmail_sync', :source_ref, :sha256,
+                :now, 'available'
+            )
+            """
+        ),
+        {
+            "id": evidence_id,
+            "workspace_id": workspace_id,
+            "node_id": node_id,
+            "source_ref": source_ref,
+            "sha256": sha256(source_ref.encode()).hexdigest(),
+            "now": now,
+        },
+    )
+    return evidence_id
 
 
 def _is_rate_limited(response: httpx.Response) -> bool:
@@ -2528,3 +2614,209 @@ class GmailAdapter:
         except httpx.HTTPError:
             pass
         return None
+
+    # -- Task 5: proactive action detection -- not part of either Protocol,
+    # same "Gmail-specific, called only from `sync_connector_endpoint`'s
+    # own explicit `account.provider == "gmail"` branch" shape as `is_
+    # account_allowed` above. --
+
+    def detect_actions_since(self, context: ConnectorAccountContext, *, since: datetime) -> None:
+        """Called from `connector_accounts.sync_connector_endpoint`'s phase
+        3, after a successful `backfill`/`incremental_sync` (see that
+        module's own call-site comment). Feature-flagged off by default
+        (`config.py:email_action_detection_enabled`) -- Task 1-4's own
+        sync/OAuth/create-path machinery is unaffected either way.
+
+        For every inbound message newly written by this sync call
+        (`email_messages.created_at >= since`, still `body IS NULL` --
+        `gmail.metadata`-only sync never populates it) in this account's
+        own threads: fetches the full body (`gmail.readonly`, `format=
+        full`), stores it encrypted, registers it as `pkos_evidence`, and
+        runs it through the `email.detect_action` AI task type. A `has_
+        action: true` result becomes a `source="ai"` recommendation via
+        Task 4's create-path (`create_recommendation`) -- this method
+        never writes a `tasks`/`commitments`/`risks` row directly.
+
+        Best-effort per message: one message's failure (a transient Gmail
+        API error, a malformed response, a grounding-check rejection)
+        does not prevent the next message in the same batch from being
+        tried -- the same "skip only this one, keep going" discipline
+        `_process_message`'s own participant-resolution loop already
+        establishes for a different per-item failure.
+
+        Builds its own `AuthContext` from the account's `owner_id`, not a
+        caller-supplied one -- the created recommendation must belong to
+        the connected account's own owner (`_owner_id_for_account`),
+        regardless of which user's own request happened to trigger this
+        particular sync call.
+        """
+        if not get_settings().email_action_detection_enabled:
+            return
+
+        with SessionFactory() as session, session.begin():
+            owner_id = _owner_id_for_account(
+                session, context.workspace_id, context.connector_account_id
+            )
+        if owner_id is None:
+            return
+        with SessionFactory() as session, session.begin():
+            if not _email_consent_active(session, context.workspace_id, owner_id):
+                return
+
+        with SessionFactory() as session, session.begin():
+            rows = (
+                session.execute(
+                    text(
+                        """
+                        SELECT m.id, m.thread_id, m.external_message_id, m.sender
+                        FROM email_messages m
+                        JOIN email_threads t
+                          ON t.id = m.thread_id AND t.workspace_id = m.workspace_id
+                        WHERE m.workspace_id = :workspace_id AND m.owner_id = :owner_id
+                          AND t.connector_account_id = :connector_account_id
+                          AND m.direction = 'inbound' AND m.body IS NULL
+                          AND m.created_at >= :since
+                        ORDER BY m.sent_at ASC
+                        """
+                    ),
+                    {
+                        "workspace_id": context.workspace_id,
+                        "owner_id": owner_id,
+                        "connector_account_id": context.connector_account_id,
+                        "since": since,
+                    },
+                )
+                .mappings()
+                .all()
+            )
+
+        headers = _bearer_headers(context.credential)
+        for row in rows:
+            try:
+                self._detect_action_for_message(
+                    workspace_id=context.workspace_id,
+                    owner_id=owner_id,
+                    message_id=row["id"],
+                    thread_id=row["thread_id"],
+                    external_message_id=row["external_message_id"],
+                    sender=row["sender"],
+                    headers=headers,
+                )
+            except Exception:  # noqa: BLE001 -- one message's failure never stops the batch
+                continue
+
+    def _detect_action_for_message(
+        self,
+        *,
+        workspace_id: UUID,
+        owner_id: UUID,
+        message_id: UUID,
+        thread_id: UUID,
+        external_message_id: str,
+        sender: str,
+        headers: dict[str, str],
+    ) -> None:
+        get_response = self._request_with_rate_limit_retry(
+            "GET",
+            f"/gmail/v1/users/me/messages/{external_message_id}",
+            headers=headers,
+            params={"format": "full"},
+        )
+        if get_response is None or get_response.status_code != 200:
+            return
+        try:
+            body_json = get_response.json()
+        except ValueError:
+            return
+        if not isinstance(body_json, dict):
+            return
+        payload = body_json.get("payload")
+        if not isinstance(payload, dict):
+            return
+        plain_text = _extract_plain_text_body(payload)
+        if not plain_text:
+            return
+
+        now = datetime.now(UTC)
+        encrypted_body = encrypt_field(plain_text)
+
+        with SessionFactory() as session, session.begin():
+            # `AND body IS NULL`: lost a race against another call already
+            # fetching this same message's body (e.g. an overlapping
+            # `incremental_sync`) -- the winner's own detection run is
+            # authoritative, so this one skips rather than re-detecting
+            # against the same content a second time.
+            updated = session.execute(
+                text(
+                    "UPDATE email_messages SET body = :body, body_fetched_at = :now, "
+                    "updated_at = :now WHERE id = :id AND workspace_id = :workspace_id "
+                    "AND body IS NULL"
+                ),
+                {
+                    "body": encrypted_body,
+                    "now": now,
+                    "id": message_id,
+                    "workspace_id": workspace_id,
+                },
+            )
+            if cast("CursorResult[Any]", updated).rowcount == 0:
+                return
+
+        node_id = _resolve_or_create_person(
+            workspace_id=workspace_id,
+            owner_id=owner_id,
+            email=sender,
+            display_name=sender,
+            source_ref=f"gmail:{external_message_id}",
+            now=now,
+        )
+        with SessionFactory() as session, session.begin():
+            evidence_id = _register_message_evidence(
+                session,
+                workspace_id=workspace_id,
+                node_id=node_id,
+                external_message_id=external_message_id,
+                now=now,
+            )
+
+        auth = AuthContext(workspace_id=workspace_id, user_id=owner_id, timezone="UTC")
+        # Bare session, not wrapped in its own `with session.begin():` --
+        # `execute_run`/`create_recommendation` each manage their own
+        # transaction boundaries and call `session.commit()` internally
+        # (see `execute_run`'s own docstring on why it is "deliberately
+        # not wrapped"; `ai_insights.py:generate_insight_endpoint`'s
+        # identical three-phase shape is the precedent this mirrors).
+        session = SessionFactory()
+        try:
+            run = execute_run(
+                "email.detect_action",
+                "restricted",
+                {"thread_id": str(thread_id)},
+                session=session,
+                auth=auth,
+            )
+            if run.status != "completed" or run.output is None:
+                return
+            output = run.output
+            if not output.get("has_action"):
+                return
+
+            recommendation_payload = RecommendationCreate(
+                recommendation_type="email_action_detected",
+                target_type=output["target_type"],
+                proposed_action={"operation": "create", "value": None},
+                proposed_fields=output["proposed_fields"],
+                rationale=output["rationale"],
+                confidence=output["confidence"],
+                evidence_ids=[evidence_id],
+                source="ai",
+            )
+            create_recommendation(
+                session,
+                auth,
+                recommendation_payload,
+                synthetic_request(uuid4(), uuid4()),
+                f"email-detect-action:{external_message_id}",
+            )
+        finally:
+            session.close()

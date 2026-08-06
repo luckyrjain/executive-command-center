@@ -1359,7 +1359,32 @@ def sync_connector_endpoint(
             response.model_dump(mode="json"),
             now,
         )
-        return response
+
+    # Phase 10 Task 5: proactive Gmail action detection, run only after
+    # phase 3's own transaction has committed -- `detect_actions_since`
+    # opens its own short, per-message sessions/transactions, matching
+    # `gmail_adapter._resolve_or_create_person`'s "keep this independent of
+    # whatever transaction writes the triggering row" discipline, not
+    # `outcome_session`'s. Duck-typed via `getattr`, not a shared Protocol
+    # member (`gmail_adapter.py`'s own module docstring: Gmail-specific
+    # surface like `is_account_allowed` is deliberately not part of either
+    # Protocol) -- this also avoids `connector_accounts.py` (engineering
+    # domain) importing `gmail_adapter.py` (personal domain) at module
+    # level, which would cycle back through `gmail_adapter.py`'s own
+    # `from ecc.domains.engineering.connectors import ...`. Best-effort:
+    # any failure here (a transient Gmail API error, a malformed body) is
+    # swallowed rather than failing a sync response that has already fully
+    # succeeded and been recorded -- the next sync call's own newly-
+    # inserted messages are unaffected, and a skipped message is simply
+    # never proactively scanned, not silently corrupted.
+    detect_actions = getattr(adapter, "detect_actions_since", None)
+    if callable(detect_actions) and outcome.items_processed > 0:
+        try:
+            detect_actions(context, since=now, auth=auth)
+        except Exception:  # noqa: BLE001 -- best-effort, never fails the sync response
+            pass
+
+    return response
 
 
 @router.post("/connectors/{account_id}/disable", response_model=ConnectorAccountResponse)

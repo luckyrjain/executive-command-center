@@ -37,9 +37,17 @@ isolation, against no database at all.
 import re
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
-from typing import Literal
+from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    TypeAdapter,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 _MAX_EXPLANATION_WORDS = 60
 
@@ -241,17 +249,21 @@ class GroundingFailure:
 
     `reason` also covers `personal.generate_insight`'s second, distinct
     failure mode (`missing_professional_referral`, see `check_personal_
-    insight_grounding` below) -- reusing this one dataclass rather than
-    inventing a second, near-identical type for a check that is still
-    conceptually "did this output satisfy the structural safety
+    insight_grounding` below) and `email.detect_action`'s own second
+    failure mode (`missing_citation_for_action`, see `check_email_
+    detect_action_grounding` below) -- reusing this one dataclass rather
+    than inventing a near-identical type per task for a check that is
+    still conceptually "did this output satisfy the structural safety
     requirements it was shown enough to satisfy," just checking a
-    different field. `ungrounded_codes` is simply empty (`()`) for that
-    second reason; nothing in this dataclass claims the two reasons share
-    a meaning beyond both mapping to `execute_run`'s existing
+    different field. `ungrounded_codes` is simply empty (`()`) for those
+    other reasons; nothing in this dataclass claims the reasons share a
+    meaning beyond all mapping to `execute_run`'s existing
     `grounding_failed` error code.
     """
 
-    reason: Literal["ungrounded_citation", "missing_professional_referral"] = "ungrounded_citation"
+    reason: Literal[
+        "ungrounded_citation", "missing_professional_referral", "missing_citation_for_action"
+    ] = "ungrounded_citation"
     ungrounded_codes: tuple[str, ...] = ()
 
 
@@ -497,4 +509,128 @@ def check_personal_insight_grounding(
         return GroundingFailure(ungrounded_codes=ungrounded)
     if requires_professional_referral and not (output.professional_referral_note or "").strip():
         return GroundingFailure(reason="missing_professional_referral")
+    return None
+
+
+# ---------------------------------------------------------------------------
+# email.detect_action -- Phase 10 Task 5's proactive Gmail action-detection
+# tool (`docs/superpowers/plans/2026-08-04-phase-10-gmail-connector.md`
+# Task 5). The fourth task type this module registers, and the first whose
+# output is never persisted directly: a `has_action: true` result becomes a
+# `source="ai"` `recommendations` row via `governance.recommendation_
+# mutations.create_recommendation` (Task 4's create-path), never a direct
+# `tasks`/`commitments`/`risks` write -- this module has no opinion on that;
+# it only validates the model's own output shape and grounding.
+# ---------------------------------------------------------------------------
+
+_MAX_ACTION_RATIONALE_WORDS = 100
+
+# Same defense-in-depth rationale as `_MAX_EXPLANATION_CHARS` above.
+_MAX_ACTION_RATIONALE_CHARS = 2000
+
+
+class EmailDetectActionOutput(BaseModel):
+    """`{has_action, target_type, operation, proposed_fields, rationale,
+    confidence, cited_message_ids}` -- `has_action: false` (the required-
+    to-clear-the-evaluation-floor negative outcome for newsletters/FYI-only
+    mail/already-resolved threads, per the plan) is a first-class, equally
+    valid answer, not an error: every other field is `None`/empty in that
+    case, enforced below, so a negative determination can never carry
+    stray create-payload data alongside it.
+
+    `proposed_fields` is deliberately `dict[str, Any]`, not one of
+    `TaskCreate`/`CommitmentCreate`/`RiskCreate` directly -- this module has
+    no dependency on the `planning`/`communication`/`governance` domains
+    (matching every other task type's schema here, none of which imports
+    another domain's models), and the real, authoritative validation
+    against the right `*Create` model already happens exactly once, at
+    `RecommendationCreate`'s own `model_validator` (`governance.
+    recommendation_models`), the instant this output becomes a
+    recommendation -- re-declaring that validation here would be a second,
+    driftable copy of the same rule Task 4 already owns.
+
+    `operation` is always `"create"` when `has_action` is true (Task 5
+    only ever detects a brand-new task/commitment/risk, never proposes an
+    update to an existing one -- there is no "existing target" a proactive
+    email scan could safely identify without a human already having
+    linked that email to one). It is still a real field, not a hardcoded
+    constant, because `RecommendationCreate.proposed_action` needs the
+    exact `{"operation": "create", "value": None}` shape verbatim
+    (`recommendation_targets.py`'s `_ALLOWED[*]["create"] = {None}`
+    sentinel) -- keeping it here makes that shape traceable to the model's
+    own output rather than synthesized silently downstream.
+
+    `cited_message_ids` is required non-empty when `has_action` is true
+    (enforced below, not just by `check_email_detect_action_grounding`):
+    an action claimed with zero citations would trivially pass a grounding
+    check whose `ungrounded` set is computed by intersecting an *empty*
+    cited list against the valid ids, i.e. an unsupported claim that
+    accidentally looks "grounded" because it cites nothing at all. This
+    schema-level requirement closes that gap structurally; `check_email_
+    detect_action_grounding` still separately verifies every id actually
+    cited is real (the model could cite a plausible-looking but invented
+    id, which an empty-list check alone would never catch).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    has_action: bool
+    target_type: Literal["task", "commitment", "risk"] | None = None
+    operation: Literal["create"] | None = None
+    proposed_fields: dict[str, Any] | None = None
+    rationale: str = Field(min_length=1, max_length=_MAX_ACTION_RATIONALE_CHARS)
+    confidence: float = Field(ge=0, le=1)
+    cited_message_ids: list[str] = Field(default_factory=list)
+
+    @field_validator("rationale")
+    @classmethod
+    def _max_word_count(cls, value: str) -> str:
+        word_count = len(value.split())
+        if word_count > _MAX_ACTION_RATIONALE_WORDS:
+            raise ValueError(
+                f"rationale exceeds {_MAX_ACTION_RATIONALE_WORDS} words (got {word_count})"
+            )
+        return value
+
+    @model_validator(mode="after")
+    def _validate_action_shape(self) -> EmailDetectActionOutput:
+        if self.has_action:
+            if self.target_type is None:
+                raise ValueError("target_type is required when has_action is true")
+            if self.operation is None:
+                raise ValueError("operation is required when has_action is true")
+            if not self.proposed_fields:
+                raise ValueError("proposed_fields is required when has_action is true")
+            if not self.cited_message_ids:
+                raise ValueError("cited_message_ids is required when has_action is true")
+        else:
+            if self.target_type is not None:
+                raise ValueError("target_type must be omitted when has_action is false")
+            if self.operation is not None:
+                raise ValueError("operation must be omitted when has_action is false")
+            if self.proposed_fields is not None:
+                raise ValueError("proposed_fields must be omitted when has_action is false")
+        return self
+
+
+def check_email_detect_action_grounding(
+    output: EmailDetectActionOutput, message_ids: Iterable[str]
+) -> GroundingFailure | None:
+    """`check_explain_item_grounding`'s exact citation-grounding pattern,
+    against the source Gmail thread's own `email_messages.id`s (as
+    returned by the `email.get_thread_content` tool) instead of factor
+    codes. Returns `None` immediately (no citations to check) for a
+    `has_action: false` output -- `EmailDetectActionOutput._validate_
+    action_shape` already guarantees `cited_message_ids` is empty in that
+    case, so there is nothing this check could meaningfully validate; a
+    negative determination is never rejected on grounding grounds.
+    """
+    if not output.has_action:
+        return None
+    valid_ids = set(message_ids)
+    ungrounded = tuple(
+        message_id for message_id in output.cited_message_ids if message_id not in valid_ids
+    )
+    if ungrounded:
+        return GroundingFailure(ungrounded_codes=ungrounded)
     return None

@@ -1,6 +1,7 @@
 from datetime import UTC, datetime
 from json import dumps
-from typing import Annotated, Any
+from types import SimpleNamespace
+from typing import Annotated, Any, cast
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
@@ -55,15 +56,49 @@ def _start(
     return load_cached(session, auth, idempotency_key, digest)
 
 
-@router.post("", response_model=RecommendationResponse, status_code=201)
-def generate_recommendation(
+def synthetic_request(request_id: UUID, correlation_id: UUID) -> Request:
+    """A minimal `Request`-shaped stand-in for `create_recommendation`'s
+    internal (non-HTTP) callers -- Phase 10 Task 5's own sync-pipeline hook
+    (`gmail_adapter.py`), which has no real inbound HTTP request to thread
+    through, the same "no live request" gap `recommendation_targets.py`'s
+    own `_request_ids` fallback-to-`uuid4()` already handles for a
+    *missing* id pair. `record_event` only ever reads `request.state.
+    request_id`/`request.state.correlation_id` (never any other `Request`
+    attribute) across every call site in this module, so a `SimpleNamespace`
+    satisfying just that shape is sufficient; `cast` tells mypy to trust it
+    structurally matches `Request` for this one narrow use.
+    """
+    return cast(
+        Request,
+        SimpleNamespace(
+            state=SimpleNamespace(request_id=str(request_id), correlation_id=str(correlation_id))
+        ),
+    )
+
+
+def create_recommendation(
+    session: Session,
+    auth: AuthContext,
     payload: RecommendationCreate,
     request: Request,
-    auth: AuthDep,
-    _: CsrfDep,
-    session: SessionDep,
-    idempotency_key: IdempotencyHeader,
+    idempotency_key: str,
 ) -> RecommendationResponse:
+    """`generate_recommendation`'s full body, factored out so a non-HTTP
+    caller can create a recommendation the exact same way `POST /api/v1/
+    recommendations` does -- Task 4's own "no second insert path" discipline
+    (`insert_task`/`insert_commitment`/`insert_risk`) applied one layer up,
+    to recommendation creation itself, for Phase 10 Task 5's proactive
+    `email.detect_action` sync-pipeline hook (the first non-HTTP caller).
+    The HTTP endpoint below is now a thin wrapper supplying `AuthDep`/
+    `CsrfDep`/the real inbound `Request` this function itself has no
+    opinion on; `request` here is used only for `record_event`'s
+    `request_id`/`correlation_id` (see `synthetic_request` above for the
+    non-HTTP caller's own supplied value), and `idempotency_key` is passed
+    explicitly rather than resolved from an HTTP header, so a system caller
+    can synthesize its own stable, replay-safe key (e.g. `f"email-detect-
+    action:{message_id}"`) instead of requiring a browser-originated
+    `Idempotency-Key` header that does not exist for it.
+    """
     authz.require_role_action(session, auth, "write")
     validate_action(payload.target_type, payload.proposed_action)
     is_create = payload.proposed_action.get("operation") == "create"
@@ -198,6 +233,18 @@ def generate_recommendation(
     save_cached(session, auth, idempotency_key, digest, response, 201, now)
     session.commit()
     return response
+
+
+@router.post("", response_model=RecommendationResponse, status_code=201)
+def generate_recommendation(
+    payload: RecommendationCreate,
+    request: Request,
+    auth: AuthDep,
+    _: CsrfDep,
+    session: SessionDep,
+    idempotency_key: IdempotencyHeader,
+) -> RecommendationResponse:
+    return create_recommendation(session, auth, payload, request, idempotency_key)
 
 
 def _transition(
