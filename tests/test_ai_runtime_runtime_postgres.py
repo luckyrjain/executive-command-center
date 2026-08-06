@@ -202,6 +202,27 @@ def run_context() -> Iterator[dict]:
             "meeting_participants",
             "meetings",
             "pkos_nodes",
+            # `email.detect_action`'s own required-input tables (Loop 2
+            # round 11 review of PR #124 found this teardown never
+            # extended for round 10's own new `_insert_email_thread_with_
+            # injected_message_body` fixture helper -- `connector_
+            # accounts.created_by`/`updated_by`/`owner_id` all FK to
+            # `users` with `ON DELETE RESTRICT`/no action, not `CASCADE`,
+            # so leaving a `connector_accounts` row in place made the
+            # `users` delete below raise `IntegrityError`, aborting this
+            # entire teardown transaction and leaking every row for that
+            # workspace permanently). `email_messages`/`email_threads`
+            # would in fact cascade-delete once `connector_accounts`/
+            # `personal_domains` are gone (both of those tables' own FKs
+            # to `personal_domains`/`connector_accounts` are `ON DELETE
+            # CASCADE`), but deleted explicitly here anyway, matching
+            # `test_gmail_action_detection_sync_postgres.py`'s own
+            # `_teardown_workspace`'s exact ordering precedent for these
+            # four tables.
+            "email_messages",
+            "email_threads",
+            "personal_domains",
+            "connector_accounts",
             "sessions",
             "users",
         ):
