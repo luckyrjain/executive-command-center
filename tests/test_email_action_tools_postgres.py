@@ -17,8 +17,12 @@ opposite of the `NULL` case, and the exact distinction this module's own
 docstring documents (round 5 review finding: previously untested); a
 message whose stored `body` fails to decrypt under the current key falls
 back to a fixed placeholder string rather than raising (round 5 review
-finding: previously untested); and messages are returned oldest-first
-(`sent_at ASC`).
+finding: previously untested); messages are returned oldest-first
+(`sent_at ASC`); and a thread with more than `_MAX_THREAD_MESSAGES`
+eligible messages returns only the most recent `_MAX_THREAD_MESSAGES` of
+them, still in oldest-first order, rather than every message the thread
+has ever accumulated (round 13 review finding: previously unbounded,
+unlike every sibling deterministic tool in this runtime).
 """
 
 from collections.abc import Iterator
@@ -34,7 +38,7 @@ from ecc.config import get_settings
 from ecc.database import SessionFactory, engine
 from ecc.domains.ai_runtime.tools import ToolNotFound, ToolResult
 from ecc.domains.personal.crypto import encrypt_field
-from ecc.domains.personal.email_action_tools import get_thread_content_tool
+from ecc.domains.personal.email_action_tools import _MAX_THREAD_MESSAGES, get_thread_content_tool
 
 settings = get_settings()
 pytestmark = pytest.mark.skipif(
@@ -323,6 +327,57 @@ def test_fetched_messages_return_genuinely_decrypted_bodies_in_sent_at_order(
     assert messages[0]["body"] == "Please sign and return the attached contract by Friday."
     assert messages[1]["sender"] == "later@partner-co.test"
     assert messages[1]["body"] == "Following up -- any update?"
+
+
+def test_thread_with_more_than_the_cap_returns_only_the_most_recent_messages_in_order(
+    tool_context: dict,
+) -> None:
+    """Round 13 review finding: this was the one deterministic tool in the
+    whole AI runtime with no size bound at all, unlike every sibling
+    (`_MAX_FACTORS`/`_MAX_CLAIMS`/`_MAX_EVIDENCE`/`_MAX_RECORDS_PER_DOMAIN`),
+    a direct gap against the design doc's own Decision 6 "every tool
+    result is ... size-bounded" contract. Inserts `_MAX_THREAD_MESSAGES +
+    10` messages -- proves the tool returns exactly `_MAX_THREAD_MESSAGES`
+    of them, that the *newest* ones survive the cap rather than the
+    oldest (the newest is normally the one that triggered this call in
+    the first place, so an oldest-first-then-truncate approach would drop
+    exactly the wrong end), and that the surviving messages are still
+    returned in the same oldest-first order every other test in this file
+    already relies on.
+    """
+    thread_id = _insert_thread(
+        workspace_id=tool_context["workspace_id"],
+        owner_id=tool_context["user_id"],
+        connector_account_id=tool_context["connector_account_id"],
+        subject="Long-running thread",
+        now=tool_context["now"],
+    )
+    now = tool_context["now"]
+    total_messages = _MAX_THREAD_MESSAGES + 10
+    for i in range(total_messages):
+        _insert_message(
+            workspace_id=tool_context["workspace_id"],
+            owner_id=tool_context["user_id"],
+            thread_id=thread_id,
+            sender=f"sender-{i}@partner-co.test",
+            sent_at=now + timedelta(minutes=i),
+            body=f"message-{i}",
+        )
+
+    with SessionFactory() as session:
+        result = get_thread_content_tool(session, tool_context["auth"], thread_id=thread_id)
+
+    assert isinstance(result, ToolResult)
+    messages = result.output["messages"]
+    assert len(messages) == _MAX_THREAD_MESSAGES
+    # The oldest surviving message is the one dropped-up-to boundary, not
+    # message-0 -- the ten oldest messages (message-0 .. message-9) must
+    # not survive the cap.
+    expected_bodies = [f"message-{i}" for i in range(10, total_messages)]
+    assert [m["body"] for m in messages] == expected_bodies
+    # The newest message (the one that would realistically have triggered
+    # this call) is always present.
+    assert messages[-1]["body"] == f"message-{total_messages - 1}"
 
 
 def test_message_with_no_fetched_body_is_omitted_not_rendered_empty(tool_context: dict) -> None:

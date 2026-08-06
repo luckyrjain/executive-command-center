@@ -31,6 +31,29 @@ until Task 5's own proactive fetch populates it for the triggering message)
 is omitted entirely rather than rendered as an empty body a small model
 might otherwise mistake for "this message has no content" -- an absence of
 fetched content is not the same claim as an email that is genuinely empty.
+
+Capped at `_MAX_THREAD_MESSAGES` -- round 13 review found this was the one
+deterministic tool in the whole runtime with no size bound at all, a direct
+gap against the design doc's own Decision 6 contract ("every tool result
+is ... size-bounded (a hard cap on returned rows/characters, e.g.
+`attention.get_item` returns exactly one item, `knowledge.get_entity`
+truncates claims/evidence lists to a fixed page size)"), unlike every
+sibling deterministic tool (`attention/tools.py:_MAX_FACTORS`,
+`knowledge/tools.py:_MAX_CLAIMS`/`_MAX_EVIDENCE`, `insight_tools.py:_MAX_
+RECORDS_PER_DOMAIN`, `meeting_prep.py:_MAX_EVIDENCE`, all `20`-`50`) --
+an organically long-running thread (a support/notification/reply-all
+thread, whose message count an external sender fully controls simply by
+replying into it) would otherwise decrypt and render every historical
+message every single time any new message in that thread became eligible,
+paid before `execute_run`'s own token-budget check even runs. The
+`LIMIT` alone, ordered `sent_at ASC` like the rest of this query, would
+silently drop the *newest* messages first on an oversized thread --
+exactly backwards, since the newest message is normally the one that
+triggered this call in the first place. Selects the most recent `_MAX_
+THREAD_MESSAGES` messages (by `sent_at DESC LIMIT`), then re-sorts that
+capped set back to the same oldest-first order documented above, so a
+thread within the cap is unaffected and one over the cap still keeps its
+most recent (most relevant) messages, in the same reading order.
 """
 
 from typing import Any
@@ -44,6 +67,11 @@ from ecc.auth import AuthContext
 from ecc.domains.ai_runtime.tools import ToolNotFound, ToolResult
 
 from .crypto import decrypt_field
+
+# Matches `insight_tools.py:_MAX_RECORDS_PER_DOMAIN`/`meeting_prep.py:_MAX_
+# EVIDENCE`'s own `50` -- see this module's own docstring for why a thread
+# needs a cap at all and why it's applied newest-first, not oldest-first.
+_MAX_THREAD_MESSAGES = 50
 
 
 def get_thread_content_tool(
@@ -63,9 +91,13 @@ def get_thread_content_tool(
         session.execute(
             text(
                 """
-                SELECT id, sender, sent_at, direction, body FROM email_messages
-                WHERE workspace_id = :workspace_id AND owner_id = :owner_id
-                  AND thread_id = :thread_id AND body IS NOT NULL
+                SELECT id, sender, sent_at, direction, body FROM (
+                    SELECT id, sender, sent_at, direction, body FROM email_messages
+                    WHERE workspace_id = :workspace_id AND owner_id = :owner_id
+                      AND thread_id = :thread_id AND body IS NOT NULL
+                    ORDER BY sent_at DESC
+                    LIMIT :limit
+                ) AS most_recent
                 ORDER BY sent_at ASC
                 """
             ),
@@ -73,6 +105,7 @@ def get_thread_content_tool(
                 "workspace_id": auth.workspace_id,
                 "owner_id": auth.user_id,
                 "thread_id": thread_id,
+                "limit": _MAX_THREAD_MESSAGES,
             },
         )
         .mappings()
