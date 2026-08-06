@@ -6,6 +6,7 @@ import DeliveryPanel from './DeliveryPanel'
 import ReliabilityPanel from './ReliabilityPanel'
 import RepositoriesPanel from './RepositoriesPanel'
 import WorkItemsPanel from './WorkItemsPanel'
+import TeamSuggestionsPanel from './TeamSuggestionsPanel'
 import IncidentsPanel from './IncidentsPanel'
 import DecisionsPanel from './DecisionsPanel'
 import ConnectorHealthPanel from './ConnectorHealthPanel'
@@ -18,6 +19,7 @@ const TABS: ReadonlyArray<{ view: EngineeringView; label: string }> = [
   { view: 'reliability', label: 'Reliability' },
   { view: 'repositories', label: 'Repositories' },
   { view: 'work-items', label: 'Work items' },
+  { view: 'team-suggestions', label: 'Team suggestions' },
   { view: 'incidents', label: 'Incidents' },
   { view: 'decisions', label: 'Decisions' },
   { view: 'connector-health', label: 'Connector health' },
@@ -87,6 +89,7 @@ export default function EngineeringWorkspace() {
           : view === 'reliability' ? <ReliabilityPanel />
           : view === 'repositories' ? <RepositoriesPanel />
           : view === 'work-items' ? <WorkItemsPanel />
+          : view === 'team-suggestions' ? <TeamSuggestionsPanel />
           : view === 'incidents' ? <IncidentsPanel />
           : view === 'decisions' ? <DecisionsPanel />
           : view === 'connector-health' ? <ConnectorHealthPanel />
