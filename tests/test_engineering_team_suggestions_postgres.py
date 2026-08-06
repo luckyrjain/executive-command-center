@@ -132,6 +132,37 @@ def _insert_repository(
     return repo_id
 
 
+def _insert_work_item(
+    workspace_id: UUID, connector_account_id: UUID, owner_id: UUID, *,
+    title: str, suggested_team_name: str | None,
+    team_entity_id: UUID | None = None, dismissed: bool = False,
+) -> UUID:
+    item_id = uuid4()
+    now = datetime.now(UTC)
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO engineering_work_items (id, workspace_id, connector_account_id, "
+                "provider, external_id, title, source_url, permission_state, "
+                "freshness_state, observed_at, created_at, updated_at, "
+                "suggested_team_name, team_entity_id, team_suggestion_dismissed_at, "
+                "owner_id, visibility) "
+                "VALUES (:id, :workspace_id, :connector_account_id, 'jira', :ext_id, "
+                ":title, :source_url, 'active', 'fresh', :now, :now, :now, "
+                ":suggested_team_name, :team_entity_id, :dismissed_at, :owner_id, 'workspace')"
+            ),
+            {
+                "id": item_id, "workspace_id": workspace_id,
+                "connector_account_id": connector_account_id,
+                "ext_id": str(item_id), "title": title,
+                "source_url": f"https://example.test/{item_id}", "now": now,
+                "suggested_team_name": suggested_team_name, "team_entity_id": team_entity_id,
+                "dismissed_at": now if dismissed else None, "owner_id": owner_id,
+            },
+        )
+    return item_id
+
+
 def _insert_pkos_team(workspace_id: UUID, *, name: str = "Platform") -> UUID:
     team_id = uuid4()
     now = datetime.now(UTC)
@@ -175,3 +206,37 @@ def test_team_suggestions_excludes_confirmed_dismissed_and_null_names(suggestion
     response = client.get("/api/v1/engineering/team-suggestions", headers=_headers(token))
     names = {item["suggested_team_name"] for item in response.json()["items"]}
     assert names == {"Infra"}
+
+
+def test_team_suggestions_sample_items_cap_is_shared_across_resource_types(suggestions_context) -> None:
+    """`sample_items` must be capped at 5 *combined* across `repository`
+    and `work_item` rows, not 5 per resource type. 3 repositories + 3 work
+    items sharing a `suggested_team_name` produce 6 matching rows total;
+    the cap must trim that to 5, and -- since repository rows are
+    processed first -- the 5 kept samples must include both resource
+    types (3 repositories + 2 work items), proving the cap is shared
+    rather than reset per loop.
+    """
+    client, workspace_id, user_id, token = suggestions_context
+    account_id = _insert_connector_account(workspace_id, user_id)
+    for i in range(3):
+        _insert_repository(
+            workspace_id, account_id, user_id, name=f"acme/repo-{i}",
+            suggested_team_name="Platform",
+        )
+    for i in range(3):
+        _insert_work_item(
+            workspace_id, account_id, user_id, title=f"Work item {i}",
+            suggested_team_name="Platform",
+        )
+
+    response = client.get("/api/v1/engineering/team-suggestions", headers=_headers(token))
+    assert response.status_code == 200
+    items = {item["suggested_team_name"]: item for item in response.json()["items"]}
+    platform = items["Platform"]
+    assert platform["repository_count"] == 3
+    assert platform["work_item_count"] == 3
+    assert len(platform["sample_items"]) == 5
+
+    resource_types = {sample["resource_type"] for sample in platform["sample_items"]}
+    assert resource_types == {"repository", "work_item"}
