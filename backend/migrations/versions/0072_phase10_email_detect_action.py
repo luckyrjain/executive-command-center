@@ -1,0 +1,256 @@
+"""Phase 10 Task 5: register `email.detect_action`, the fourth AI task type
+this activation registers and the first Gmail Connector one -- a proactive
+scan of a newly-synced email thread's own content, deciding whether it
+contains a clear task/commitment/risk (`has_action: true`, with the
+relevant `*Create` model's own fields as `proposed_fields`) or nothing
+actionable (`has_action: false` -- a newsletter, FYI-only mail, or an
+already-resolved thread).
+
+Three new rows, following `0057_phase7_insight.py`'s exact established
+precedent for wiring on a new task type:
+
+1. `tool_definitions`: `email.get_thread_content` (`scopes=["read:email"]`),
+   handler `ecc.domains.personal.email_action_tools:get_thread_content_tool`
+   (new module) -- reads every fetched (`body IS NOT NULL`) message in the
+   requested thread, decrypted, scoped to the caller's own workspace/owner
+   (that module's own docstring has the full detail).
+2. `prompt_versions`: `email.detect_action.v1`, version 1, active. The
+   template's own instructions restate this task's own "propose a new
+   row, never assume an existing one" scope in plain language --
+   belt-and-suspenders alongside the schema-level/grounding-check
+   enforcement `validator.py:EmailDetectActionOutput`/`check_email_
+   detect_action_grounding` actually rely on, matching every prior task
+   type's own "the schema is the contract, the prompt is a hint"
+   discipline.
+3. `routing_policies`: `email.detect_action`, version 1, active.
+   `capability="extraction"` (`router.py:TASK_REQUIREMENTS`, same PR) --
+   both registered models already declare it (migrations 0028/0032), so
+   no `model_definitions` change is needed here. `constraints.max_input_
+   tokens` (4096) is smaller than `personal.generate_insight`'s own 6144:
+   this prompt's evidence is a single email thread's content, not a
+   multi-domain, multi-record evidence bundle.
+
+`config.py`'s own feature flag for the actual production call site (the
+same "these three rows only make the capability *exist*; the call site is
+what makes it *reachable*" split `0057`'s own docstring restates) ships
+alongside this migration in the same PR, default off.
+"""
+
+import json
+from hashlib import sha256
+from typing import Any
+from uuid import uuid4
+
+import sqlalchemy as sa
+from alembic import op
+from sqlalchemy.dialects import postgresql
+
+revision = "0072_phase10_email_detect_action"
+down_revision = "0071_phase10_recs_create_path"
+branch_labels = None
+depends_on = None
+
+_TASK_TYPE = "email.detect_action"
+_PROVIDER = "ollama"
+_FIRST_MODEL_ID = "qwen2.5:1.5b-instruct-q4_K_M"
+_SECOND_MODEL_ID = "qwen2.5:3b-instruct-q4_K_M"
+
+_TOOL_NAME = "email.get_thread_content"
+_TOOL_INPUT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "thread_id": {"type": "string"},
+    },
+    "required": ["thread_id"],
+    "additionalProperties": False,
+}
+_TOOL_OUTPUT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "subject": {"type": ["string", "null"]},
+        "messages": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string"},
+                    "sender": {"type": "string"},
+                    "sent_at": {"type": "string"},
+                    "direction": {"type": "string"},
+                    "body": {"type": "string"},
+                },
+                "required": ["id", "sender", "sent_at", "direction", "body"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    "required": ["subject", "messages"],
+    "additionalProperties": False,
+}
+
+_PROMPT_ID = "email.detect_action.v1"
+_PROMPT_TEMPLATE = (
+    "You are reviewing one email thread to decide whether it describes a "
+    "clear task, commitment or risk that has not already been captured "
+    "elsewhere.\n\n"
+    "Read the thread content below. If it clearly asks the recipient to "
+    "do something, promises the recipient will do something, or "
+    "describes a real risk that has not already been resolved, set "
+    "has_action to true, target_type to the single best match among "
+    '"task", "commitment" or "risk", operation to "create", and '
+    "proposed_fields to an object with that target type's own required "
+    "fields, populated only from what the thread actually says. If the "
+    "thread is a newsletter, an FYI-only message, or a thread whose "
+    "action has already been resolved, set has_action to false and leave "
+    "target_type, operation and proposed_fields unset. Do not invent "
+    "facts that are not present in the thread. Every ID you list in "
+    "cited_message_ids must be one of the message IDs given here, and "
+    "cited_message_ids must be non-empty whenever has_action is true.\n\n"
+    "{{ thread_content }}"
+    'Respond with JSON matching exactly: {"has_action": boolean, '
+    '"target_type": "task" or "commitment" or "risk" or null, '
+    '"operation": "create" or null, "proposed_fields": object or null, '
+    '"rationale": string, "confidence": number between 0 and 1, '
+    '"cited_message_ids": [string, ...]}'
+)
+_PROMPT_INPUT_SCHEMA_REF = "email.detect_action.input.v1"
+_PROMPT_OUTPUT_SCHEMA_REF = "email.detect_action.output.v1"
+
+
+def _canonical_hash(material: dict[str, Any]) -> str:
+    """Mirrors `0057_phase7_insight.py`'s identical helper (in turn
+    mirroring `prompts.py:compute_template_hash`/`tools.py:compute_
+    definition_hash`) -- sha256 over canonical (UTF-8, sorted-object-keys,
+    compact-separator) JSON bytes.
+    """
+    canonical = json.dumps(material, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def upgrade() -> None:
+    uuid = postgresql.UUID(as_uuid=True)
+
+    tool_definitions = sa.table(
+        "tool_definitions",
+        sa.column("id", uuid),
+        sa.column("name", sa.String()),
+        sa.column("version", sa.Integer()),
+        sa.column("scopes", postgresql.ARRAY(sa.Text())),
+        sa.column("input_schema", postgresql.JSONB()),
+        sa.column("output_schema", postgresql.JSONB()),
+        sa.column("handler_ref", sa.String()),
+        sa.column("definition_hash", sa.String()),
+        sa.column("status", sa.String()),
+        sa.column("created_at", sa.DateTime(timezone=True)),
+        sa.column("updated_at", sa.DateTime(timezone=True)),
+    )
+    tool_handler_ref = "ecc.domains.personal.email_action_tools:get_thread_content_tool"
+    tool_hash = _canonical_hash(
+        {
+            "input_schema": _TOOL_INPUT_SCHEMA,
+            "output_schema": _TOOL_OUTPUT_SCHEMA,
+            "scopes": ["read:email"],
+            "handler_ref": tool_handler_ref,
+        }
+    )
+    op.execute(
+        tool_definitions.insert().values(
+            id=uuid4(),
+            name=_TOOL_NAME,
+            version=1,
+            scopes=["read:email"],
+            input_schema=_TOOL_INPUT_SCHEMA,
+            output_schema=_TOOL_OUTPUT_SCHEMA,
+            handler_ref=tool_handler_ref,
+            definition_hash=tool_hash,
+            status="active",
+            created_at=sa.func.now(),
+            updated_at=sa.func.now(),
+        )
+    )
+
+    prompt_versions = sa.table(
+        "prompt_versions",
+        sa.column("id", uuid),
+        sa.column("prompt_id", sa.String()),
+        sa.column("version", sa.Integer()),
+        sa.column("template", sa.Text()),
+        sa.column("template_hash", sa.String()),
+        sa.column("input_schema_ref", sa.String()),
+        sa.column("output_schema_ref", sa.String()),
+        sa.column("status", sa.String()),
+        sa.column("created_at", sa.DateTime(timezone=True)),
+        sa.column("updated_at", sa.DateTime(timezone=True)),
+    )
+    prompt_hash = _canonical_hash(
+        {
+            "template": _PROMPT_TEMPLATE,
+            "input_schema_ref": _PROMPT_INPUT_SCHEMA_REF,
+            "output_schema_ref": _PROMPT_OUTPUT_SCHEMA_REF,
+        }
+    )
+    op.execute(
+        prompt_versions.insert().values(
+            id=uuid4(),
+            prompt_id=_PROMPT_ID,
+            version=1,
+            template=_PROMPT_TEMPLATE,
+            template_hash=prompt_hash,
+            input_schema_ref=_PROMPT_INPUT_SCHEMA_REF,
+            output_schema_ref=_PROMPT_OUTPUT_SCHEMA_REF,
+            status="active",
+            created_at=sa.func.now(),
+            updated_at=sa.func.now(),
+        )
+    )
+
+    routing_policies = sa.table(
+        "routing_policies",
+        sa.column("id", uuid),
+        sa.column("task_type", sa.String()),
+        sa.column("version", sa.Integer()),
+        sa.column("candidates", postgresql.JSONB()),
+        sa.column("constraints", postgresql.JSONB()),
+        sa.column("fallback", postgresql.JSONB()),
+        sa.column("status", sa.String()),
+        sa.column("created_at", sa.DateTime(timezone=True)),
+        sa.column("updated_at", sa.DateTime(timezone=True)),
+    )
+    op.execute(
+        routing_policies.insert().values(
+            id=uuid4(),
+            task_type=_TASK_TYPE,
+            version=1,
+            candidates=[
+                {"provider": _PROVIDER, "model_id": _FIRST_MODEL_ID},
+                {"provider": _PROVIDER, "model_id": _SECOND_MODEL_ID},
+            ],
+            constraints={
+                "max_input_tokens": 4096,
+                # Kept in sync with router.py's TASK_REQUIREMENTS["email.
+                # detect_action"].max_output_tokens by convention -- that
+                # value wins at runtime (budgets.py:RunBudget.from_policy),
+                # but this row should still reflect it rather than a stale
+                # number.
+                "max_output_tokens": 600,
+                "per_model_call_timeout_seconds": 40,
+                "per_tool_call_timeout_seconds": 5,
+                "total_run_budget_seconds": 95,
+            },
+            fallback={},
+            status="active",
+            created_at=sa.func.now(),
+            updated_at=sa.func.now(),
+        )
+    )
+
+
+def downgrade() -> None:
+    routing_policies = sa.table("routing_policies", sa.column("task_type", sa.String()))
+    op.execute(routing_policies.delete().where(routing_policies.c.task_type == _TASK_TYPE))
+
+    prompt_versions = sa.table("prompt_versions", sa.column("prompt_id", sa.String()))
+    op.execute(prompt_versions.delete().where(prompt_versions.c.prompt_id == _PROMPT_ID))
+
+    tool_definitions = sa.table("tool_definitions", sa.column("name", sa.String()))
+    op.execute(tool_definitions.delete().where(tool_definitions.c.name == _TOOL_NAME))
