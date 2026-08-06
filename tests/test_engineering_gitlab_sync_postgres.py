@@ -1505,7 +1505,7 @@ def test_sync_reports_partial_on_rate_limit_and_records_it(
 
 
 def test_repositories_have_team_suggestion_dismissed_at_column() -> None:
-    """Migration `0072_phase6_team_suggestion_dismissal.py` -- proves the
+    """Migration `0072_team_suggestion_dismissal.py` -- proves the
     column exists and defaults to NULL before any adapter/endpoint code
     depends on it.
     """
@@ -1529,7 +1529,8 @@ def test_engineering_work_items_have_team_suggestion_dismissed_at_column() -> No
         row = connection.execute(
             text(
                 "SELECT column_name, is_nullable FROM information_schema.columns "
-                "WHERE table_name = 'engineering_work_items' AND column_name = 'team_suggestion_dismissed_at'"
+                "WHERE table_name = 'engineering_work_items' "
+                "AND column_name = 'team_suggestion_dismissed_at'"
             )
         ).one_or_none()
     assert row is not None

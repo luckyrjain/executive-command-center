@@ -150,8 +150,30 @@ describe('TeamSuggestionsPanel', () => {
   })
 
   it('surfaces a load failure as an alert, not a silent empty list', async () => {
-    vi.stubGlobal('fetch', vi.fn(() => Promise.reject(new TypeError('fetch failed'))))
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((input: RequestInfo | URL) => {
+        const url = String(input)
+        if (url.includes('/knowledge/entities')) return response({ items: [] })
+        return Promise.reject(new TypeError('fetch failed'))
+      }),
+    )
     renderPanel()
     expect(await screen.findByRole('alert', {}, { timeout: 3000 })).toBeTruthy()
+  })
+
+  it('shows an alert when the team picker fails to load, without blocking the group list', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((input: RequestInfo | URL) => {
+        const url = String(input)
+        if (url.includes('/knowledge/entities')) return Promise.reject(new TypeError('fetch failed'))
+        return response({ items: [group()] })
+      }),
+    )
+    renderPanel()
+    await screen.findByText('acme')
+    expect(await screen.findByRole('alert', {}, { timeout: 3000 })).toBeTruthy()
+    expect(screen.getByText(/Could not load teams to assign/)).toBeTruthy()
   })
 })

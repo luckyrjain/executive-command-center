@@ -263,7 +263,8 @@ def _upsert_work_item(
                     updated_at = EXCLUDED.updated_at,
                     suggested_team_name = EXCLUDED.suggested_team_name,
                     team_suggestion_dismissed_at = CASE
-                        WHEN engineering_work_items.suggested_team_name IS DISTINCT FROM EXCLUDED.suggested_team_name
+                        WHEN engineering_work_items.suggested_team_name
+                            IS DISTINCT FROM EXCLUDED.suggested_team_name
                         THEN NULL
                         ELSE engineering_work_items.team_suggestion_dismissed_at
                     END

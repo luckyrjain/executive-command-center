@@ -1726,7 +1726,9 @@ def list_work_items_endpoint(
 
 
 @router.get("/team-suggestions", response_model=TeamSuggestionListResponse)
-def list_team_suggestions_endpoint(auth: AuthDep, session: SessionDep) -> TeamSuggestionListResponse:
+def list_team_suggestions_endpoint(
+    auth: AuthDep, session: SessionDep
+) -> TeamSuggestionListResponse:
     """Grouped, read-only view of every unconfirmed, undismissed
     `suggested_team_name` across `repositories` and `engineering_work_
     items` -- see the design doc's "Backend endpoints" section. Runs two
@@ -1756,7 +1758,10 @@ def list_team_suggestions_endpoint(auth: AuthDep, session: SessionDep) -> TeamSu
     )
 
     visibility_sql_wi, visibility_params_wi = authz.visible_resource_filter_sql(
-        session, auth, resource_type="engineering_work_items", action="read",
+        session,
+        auth,
+        resource_type="engineering_work_items",
+        action="read",
         table_alias="engineering_work_items",
     )
     work_item_rows = (
@@ -1821,14 +1826,33 @@ def _lock_and_authorize_suggestion_candidates(
     timing, so a concurrent sync or another bulk action can't change a
     row out from under this one mid-check. `table` is always one of the
     two hardcoded literals below -- never request-derived.
+
+    The candidate `SELECT` itself is restricted to `action="read"`-visible
+    rows via `authz.visible_resource_filter_sql` (the same filter `list_
+    team_suggestions_endpoint` applies) -- see `authz.authorize`'s
+    docstring: a row invisible to the caller must never even be selected
+    or locked, let alone surfaced in `skipped_unauthorized`, or an
+    unauthorized caller could learn a private row's id exists by noticing
+    it show up there. The subsequent per-row `action="write"` check is
+    then only ever run against rows already known to be visible, matching
+    `_validate_team_entity`/`assign_repository_team_endpoint`'s read-then-
+    write precedent.
     """
+    visibility_sql, visibility_params = authz.visible_resource_filter_sql(
+        session, auth, resource_type=table, action="read", table_alias=table
+    )
     rows = session.execute(
         text(
             f"SELECT id FROM {table} WHERE workspace_id = :workspace_id "  # noqa: S608
+            f"AND ({visibility_sql}) "
             "AND suggested_team_name = :suggested_team_name "
             "AND team_entity_id IS NULL AND team_suggestion_dismissed_at IS NULL FOR UPDATE"
         ),
-        {"workspace_id": auth.workspace_id, "suggested_team_name": suggested_team_name},
+        {
+            "workspace_id": auth.workspace_id,
+            "suggested_team_name": suggested_team_name,
+            **visibility_params,
+        },
     ).all()
     authorized: list[UUID] = []
     skipped: list[UUID] = []
@@ -1888,6 +1912,7 @@ def confirm_team_suggestion_endpoint(
                         "team_assignment_version = team_assignment_version + 1, "
                         "team_assignment_updated_by = :actor_id, updated_at = :now "
                         "WHERE workspace_id = :workspace_id AND id = :id "
+                        "AND team_entity_id IS NULL AND team_suggestion_dismissed_at IS NULL "
                         "RETURNING team_assignment_version"
                     ),
                     {
@@ -1899,9 +1924,14 @@ def confirm_team_suggestion_endpoint(
                     },
                 ).scalar_one()
                 _write_team_assignment_side_effects(
-                    session, auth, request,
-                    aggregate_type=aggregate_type, event_type=event_type,
-                    aggregate_id=row_id, version=new_version, now=now,
+                    session,
+                    auth,
+                    request,
+                    aggregate_type=aggregate_type,
+                    event_type=event_type,
+                    aggregate_id=row_id,
+                    version=new_version,
+                    now=now,
                 )
                 updated.append(row_id)
 
@@ -1946,7 +1976,8 @@ def dismiss_team_suggestion_endpoint(
                 session.execute(
                     text(
                         f"UPDATE {table} SET team_suggestion_dismissed_at = :now "  # noqa: S608
-                        "WHERE workspace_id = :workspace_id AND id = :id"
+                        "WHERE workspace_id = :workspace_id AND id = :id "
+                        "AND team_entity_id IS NULL AND team_suggestion_dismissed_at IS NULL"
                     ),
                     {"now": now, "workspace_id": auth.workspace_id, "id": row_id},
                 )

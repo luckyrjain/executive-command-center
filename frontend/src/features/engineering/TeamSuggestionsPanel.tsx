@@ -125,6 +125,13 @@ export default function TeamSuggestionsPanel() {
       {query.isError ? <div role="alert" className="inline-status error-panel">{query.error.message}</div> : null}
       {query.data && items.length === 0 ? <p className="empty-state">No pending team suggestions.</p> : null}
 
+      {teamsQuery.isLoading ? <p role="status">Loading teams…</p> : null}
+      {teamsQuery.isError ? (
+        <div role="alert" className="inline-status error-panel">
+          {`Could not load teams to assign: ${teamsQuery.error.message}. Confirm is unavailable until this loads -- Dismiss still works.`}
+        </div>
+      ) : null}
+
       <ul className="work-list">
         {items.map((group) => <SuggestionRow key={group.suggested_team_name} group={group} teamsById={teamsById} />)}
       </ul>

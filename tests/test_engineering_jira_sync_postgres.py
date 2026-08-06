@@ -1092,7 +1092,9 @@ def test_incremental_resync_clears_dismissed_suggestion_when_project_changes(
             project={"name": "Acme Project"},
         )
     ]
-    adapter = JiraAdapter(transport=httpx.MockTransport(lambda r: _json_response(_search_response(issues))))
+    adapter = JiraAdapter(
+        transport=httpx.MockTransport(lambda r: _json_response(_search_response(issues)))
+    )
     adapter.backfill(seeded_account_context, "work_item")
 
     with engine.begin() as connection:
@@ -1114,15 +1116,17 @@ def test_incremental_resync_clears_dismissed_suggestion_when_project_changes(
         )
     ]
     adapter2 = JiraAdapter(
-        transport=httpx.MockTransport(lambda r: _json_response(_search_response(issues_new_project)))
+        transport=httpx.MockTransport(
+            lambda r: _json_response(_search_response(issues_new_project))
+        )
     )
     adapter2.incremental_sync(seeded_account_context, "work_item", "2024-01-03T00:00:00.000+0000")
 
     with engine.begin() as connection:
         cleared = connection.execute(
             text(
-                "SELECT team_suggestion_dismissed_at, suggested_team_name FROM engineering_work_items "
-                "WHERE workspace_id = :workspace_id"
+                "SELECT team_suggestion_dismissed_at, suggested_team_name "
+                "FROM engineering_work_items WHERE workspace_id = :workspace_id"
             ),
             {"workspace_id": seeded_account_context.workspace_id},
         ).one()

@@ -541,7 +541,9 @@ def test_incremental_resync_clears_dismissed_suggestion_when_name_changes(
     repos_same_owner = [
         _repo(1, full_name="acme/a", updated_at="2024-01-04T00:00:00Z", owner_login="acme")
     ]
-    adapter2 = GitHubAdapter(transport=httpx.MockTransport(lambda r: _json_response(repos_same_owner)))
+    adapter2 = GitHubAdapter(
+        transport=httpx.MockTransport(lambda r: _json_response(repos_same_owner))
+    )
     adapter2.incremental_sync(seeded_account_context, "repository", "2024-01-03T00:00:00Z")
 
     with engine.begin() as connection:
@@ -558,7 +560,9 @@ def test_incremental_resync_clears_dismissed_suggestion_when_name_changes(
     repos_new_owner = [
         _repo(1, full_name="acme/a", updated_at="2024-01-05T00:00:00Z", owner_login="acme-new")
     ]
-    adapter3 = GitHubAdapter(transport=httpx.MockTransport(lambda r: _json_response(repos_new_owner)))
+    adapter3 = GitHubAdapter(
+        transport=httpx.MockTransport(lambda r: _json_response(repos_new_owner))
+    )
     adapter3.incremental_sync(seeded_account_context, "repository", "2024-01-04T00:00:00Z")
 
     with engine.begin() as connection:
