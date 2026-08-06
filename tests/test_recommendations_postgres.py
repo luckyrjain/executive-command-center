@@ -616,7 +616,7 @@ def test_create_task_recommendation_end_to_end(
 def test_create_commitment_recommendation_end_to_end(
     recommendation_context: tuple[TestClient, UUID, UUID, str],
 ) -> None:
-    client, _workspace_id, user_id, token = recommendation_context
+    client, workspace_id, user_id, token = recommendation_context
     generated = _generate_create(
         client,
         token,
@@ -645,15 +645,26 @@ def test_create_commitment_recommendation_end_to_end(
             .mappings()
             .one()
         )
+        audit_count = connection.execute(
+            text(
+                """
+                SELECT count(*) FROM audit_events
+                WHERE workspace_id=:workspace_id AND aggregate_type='commitment'
+                  AND aggregate_id=:commitment_id AND event_type='commitment.created'
+                """
+            ),
+            {"workspace_id": workspace_id, "commitment_id": new_commitment_id},
+        ).scalar_one()
     assert commitment["summary"] == "Deliver the Q3 report"
     assert commitment["direction"] == "made_by_me"
     assert commitment["owner_id"] == user_id
+    assert audit_count == 1
 
 
 def test_create_risk_recommendation_end_to_end(
     recommendation_context: tuple[TestClient, UUID, UUID, str],
 ) -> None:
-    client, _workspace_id, user_id, token = recommendation_context
+    client, workspace_id, user_id, token = recommendation_context
     generated = _generate_create(
         client,
         token,
@@ -682,10 +693,21 @@ def test_create_risk_recommendation_end_to_end(
             .mappings()
             .one()
         )
+        audit_count = connection.execute(
+            text(
+                """
+                SELECT count(*) FROM audit_events
+                WHERE workspace_id=:workspace_id AND aggregate_type='risk'
+                  AND aggregate_id=:risk_id AND event_type='risk.created'
+                """
+            ),
+            {"workspace_id": workspace_id, "risk_id": new_risk_id},
+        ).scalar_one()
     assert risk["description"] == "Vendor may miss the renewal deadline"
     assert risk["probability"] == 3
     assert risk["impact"] == 4
     assert risk["owner_id"] == user_id
+    assert audit_count == 1
 
 
 def test_confirm_create_recommendation_rejects_a_target_expected_version(
