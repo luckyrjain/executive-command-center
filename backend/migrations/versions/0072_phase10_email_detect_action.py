@@ -46,7 +46,7 @@ from alembic import op
 from sqlalchemy.dialects import postgresql
 
 revision = "0072_phase10_email_detect_action"
-down_revision = "0071_phase10_recs_create_path"
+down_revision = "0072_team_suggestion_dismissal"
 branch_labels = None
 depends_on = None
 
