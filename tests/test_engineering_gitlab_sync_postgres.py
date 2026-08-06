@@ -866,6 +866,50 @@ def test_incremental_resync_refreshes_suggestion_without_touching_confirmed_team
             )
 
 
+def test_incremental_resync_clears_dismissed_suggestion_when_namespace_changes(
+    seeded_account_context: ConnectorAccountContext,
+) -> None:
+    """Identical reasoning to `test_engineering_github_sync_postgres.py`'s
+    own dismissal-reset test -- GitLab's suggestion source is the
+    project's `namespace.name` instead of GitHub's `owner.login`.
+    """
+    projects = [
+        _project(1, path="acme/a", updated_at="2024-01-03T00:00:00Z", namespace={"name": "acme"})
+    ]
+    adapter = GitLabAdapter(transport=httpx.MockTransport(lambda r: _json_response(projects)))
+    adapter.backfill(seeded_account_context, "repository")
+
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "UPDATE repositories SET team_suggestion_dismissed_at = :now "
+                "WHERE workspace_id = :workspace_id"
+            ),
+            {"now": datetime.now(UTC), "workspace_id": seeded_account_context.workspace_id},
+        )
+
+    projects_new_namespace = [
+        _project(
+            1, path="acme/a", updated_at="2024-01-04T00:00:00Z", namespace={"name": "acme-new"}
+        )
+    ]
+    adapter2 = GitLabAdapter(
+        transport=httpx.MockTransport(lambda r: _json_response(projects_new_namespace))
+    )
+    adapter2.incremental_sync(seeded_account_context, "repository", "2024-01-03T00:00:00Z")
+
+    with engine.begin() as connection:
+        cleared = connection.execute(
+            text(
+                "SELECT team_suggestion_dismissed_at, suggested_team_name FROM repositories "
+                "WHERE workspace_id = :workspace_id"
+            ),
+            {"workspace_id": seeded_account_context.workspace_id},
+        ).one()
+    assert cleared.team_suggestion_dismissed_at is None
+    assert cleared.suggested_team_name == "acme-new"
+
+
 def test_backfill_paginates_via_link_header(
     seeded_account_context: ConnectorAccountContext,
 ) -> None:
