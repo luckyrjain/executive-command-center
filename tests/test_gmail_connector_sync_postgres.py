@@ -329,6 +329,26 @@ Covers, per this task's own scope:
     `test_incremental_sync_reports_next_cursor_zero_not_the_stale_start_when_history_id_is_zero`,
     each mutation-confirmed against the corresponding site reverted to a
     bare truthiness check.
+30. `_upsert_thread`'s `ON CONFLICT DO UPDATE` bumped `email_threads.
+    updated_at` unconditionally, even on the exact no-op resync item 5's
+    own `test_backfill_rerun_over_an_overlapping_window_does_not_
+    duplicate_rows` already exercises -- that test only ever asserted row
+    *counts*, never `updated_at` itself, so it passed both before and
+    after this bug existed and never caught it. `attention.py`'s Phase 10
+    Task 3 code (a separate task, reviewed under its own "Loop 2" round
+    numbering, not this file's rounds 1-29 above) derives `attention_
+    items.source_entity_version` for `email_thread` rows directly from
+    this column (`email_threads` has no real optimistic-concurrency
+    `version` column of its own), so the unconditional bump silently
+    un-dismissed a dismissed `email_thread` attention item on the next
+    `regenerate_attention` call after an ordinary backfill re-run or
+    incremental/backfill overlap touched the thread with zero new
+    content -- found by that task's own Loop 2 round 6 review, fixed
+    here since the bug lives in this file's own `gmail_adapter.py`, not
+    `attention.py`. Closed with `test_backfill_rerun_over_an_overlapping_
+    window_does_not_bump_thread_updated_at`, asserting `updated_at` is
+    byte-for-byte unchanged across an identical re-sync of the same
+    single message.
 """
 
 from __future__ import annotations

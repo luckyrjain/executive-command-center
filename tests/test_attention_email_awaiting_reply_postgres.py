@@ -2,7 +2,18 @@
 attention._score_awaiting_reply`) and its `regenerate_attention` wiring
 (`entity_type='email_thread'`).
 
-Covers, per the implementation plan's own Task 3 scope:
+Covers, per the implementation plan's own Task 3 scope. Each item names its
+own test function explicitly (round 7 review addition) rather than relying
+on this list's number matching the function's physical position in the file
+below -- items 8 and 12 each drifted out of physical-position sync once
+already (rounds 3 and 6 respectively, a new test inserted before an
+earlier-numbered one, always caught and fixed, but recurring twice in six
+rounds shows the position-matching convention itself is the fragile part,
+not any one insertion). Naming the function directly makes that drift
+permanently harmless: a reader or reviewer can always find item N's test by
+name, regardless of where a later round happens to insert it, so this list
+no longer needs to be kept in physical-position order at all -- only
+internally accurate.
 
 1. An `email_threads` row whose own last message (by `sent_at`) is
    inbound, from a sender already resolved into `pkos_nodes` (via
@@ -10,21 +21,27 @@ Covers, per the implementation plan's own Task 3 scope:
    `_resolve_or_create_person` performs at write time), surfaces in
    `POST /api/v1/attention/regenerate`'s own response as an
    `entity_type='email_thread'` item.
+   (`test_inbound_thread_from_known_contact_surfaces_as_awaiting_reply`)
 2. A thread whose last message is outbound (already replied) does not.
+   (`test_outbound_reply_does_not_surface_as_awaiting_reply`)
 3. A thread whose last message is inbound but the sender has never been
    resolved into `pkos_nodes` does not.
+   (`test_inbound_thread_from_unresolved_sender_does_not_surface`)
 4. A thread whose owner's `email` personal domain is disabled does not.
+   (`test_disabled_email_domain_does_not_surface_awaiting_reply`)
 5. Staleness factors (`stale_7d`/`stale_14d`) age in as the last inbound
    message's own age crosses those thresholds, reusing the exact
    generic `stale_7d_points`/`stale_14d_points` policy fields
    `_score_waiting` already shares -- not a second, email-specific
    threshold pair.
+   (`test_awaiting_reply_thread_ages_into_stale_factors`)
 6. A thread that later receives an outbound reply is pruned from the
    attention queue on the next `regenerate_attention` call (the
    `email_thread` branch of the stale-row `DELETE`), the same lifecycle
    `test_attention_waiting_postgres.py`'s own
    `test_waiting_link_surfaces_in_attention_queue_and_ages` verifies for
    `waiting_link`.
+   (`test_awaiting_reply_thread_is_pruned_once_replied`)
 7. A sender whose email address contains a character where Postgres's
    `LOWER()` and Python's `_normalize_email` (`.strip().casefold()`) do
    not agree (the German sharp s, `ß`, which `.casefold()` expands to
@@ -34,6 +51,7 @@ Covers, per the implementation plan's own Task 3 scope:
    `LOWER(TRIM(sender))` computed in SQL, which silently failed to match
    for exactly this kind of address even though the sender genuinely
    resolves to a known contact.
+   (`test_inbound_thread_from_casefold_divergent_sender_surfaces_as_awaiting_reply`)
 8. A dismissed `email_thread` item stays dismissed across a subsequent
    `regenerate_attention` call where the underlying thread hasn't
    changed -- round 1 review finding: no existing test, for any entity
@@ -43,11 +61,13 @@ Covers, per the implementation plan's own Task 3 scope:
    than the real optimistic-concurrency `version` every other entity
    type has, making this the one place a bug in that derivation would
    show up as a spurious un-dismiss.
+   (`test_dismissed_email_thread_stays_dismissed_across_an_unchanged_regenerate`)
 9. Two messages in the same thread with an identical `sent_at` -- one
    inbound, one outbound -- resolve deterministically by `id`, not by
    Postgres's own unspecified tie order -- round 2 review finding: the
    eligibility query's own `LATERAL` subquery picking a thread's "last"
    message had no tiebreaker at all.
+   (`test_identical_sent_at_tie_resolves_deterministically_by_id`)
 10. A thread owned by a member whose `workspace_memberships.status` is
     no longer `'active'` (removed from the workspace) is not eligible,
     and is pruned from `attention_items` if already present -- round 2
@@ -58,6 +78,7 @@ Covers, per the implementation plan's own Task 3 scope:
     permanently unreachable by anyone (hardcoded `visibility='private'`,
     and the removed member can never again pass `authz.authorize`'s own
     active-membership check).
+    (`test_removed_member_owned_thread_is_pruned_from_attention`)
 11. `known_email_aliases` is bounded to the workspace's own candidate
     senders, not every resolved contact the workspace has ever
     accumulated -- round 2 review finding: an unconditional fetch of
@@ -65,12 +86,14 @@ Covers, per the implementation plan's own Task 3 scope:
     not with how many threads are actually awaiting reply. This test
     confirms the narrowed fetch still matches correctly (not just that
     it's smaller).
+    (`test_known_email_aliases_bounded_to_candidate_senders_still_matches`)
 12. A real `email_thread` item, produced by `regenerate_attention` itself,
     is invisible to a second, active member of the *same* workspace via
     `GET /api/v1/attention` (still visible to its own owner) -- round 5
     review finding: the hardcoded `visibility='private'` this entity_type
     relies on (`attention.py`'s own `email_thread_rows` comment) had no
     test exercising the primary read path it protects.
+    (`test_email_thread_item_not_visible_to_another_workspace_member`)
 """
 
 from collections.abc import Iterator
