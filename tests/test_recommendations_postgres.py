@@ -569,6 +569,21 @@ def test_create_task_recommendation_end_to_end(
     assert generated["expected_version"] is None
     recommendation_id = generated["id"]
 
+    # `RecommendationPanel`'s `fetchRecommendations` reads the list endpoint,
+    # not the single-recommendation GET the other assertions in this file
+    # exercise -- confirm `proposed_fields` actually survives that path too
+    # (it shares `FIELDS`/`project` with the single-recommendation GET, but
+    # nothing exercised the list endpoint for a create-type row before this).
+    listed = client.get("/api/v1/recommendations")
+    assert listed.status_code == 200
+    listed_item = next(item for item in listed.json()["items"] if item["id"] == recommendation_id)
+    assert listed_item["proposed_fields"] == {
+        "title": "Send the signed contract back",
+        "manual_priority": "high",
+    }
+    assert listed_item["target_id"] is None
+    assert listed_item["expected_version"] is None
+
     published = client.post(
         f"/api/v1/recommendations/{recommendation_id}/publish",
         headers=_headers(token),

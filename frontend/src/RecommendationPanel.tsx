@@ -113,7 +113,15 @@ function mutateRecommendation({ item, action }: ActionRequest): Promise<Recommen
 
 export function actionSummary(action: Record<string, unknown>): string {
   const operation = typeof action.operation === 'string' ? action.operation : 'update'
-  const fields = Object.keys(action).filter((key) => key !== 'operation')
+  // A create-type action is always exactly `{operation: 'create', value: null}`
+  // (see `recommendation_targets.py`'s `_ALLOWED` -- `value` is a required but
+  // unused sentinel for this operation, there is no scalar to whitelist the way
+  // every other operation has). Filtering out null/undefined-valued keys, not
+  // just `operation`, keeps that sentinel from rendering as the literal,
+  // meaningless text "create · value".
+  const fields = Object.keys(action).filter(
+    (key) => key !== 'operation' && action[key] !== null && action[key] !== undefined,
+  )
   return fields.length ? `${operation.replaceAll('_', ' ')} · ${fields.join(', ')}` : operation.replaceAll('_', ' ')
 }
 
