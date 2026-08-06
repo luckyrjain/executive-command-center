@@ -18,8 +18,13 @@ insight_sources_tool`'s identical "decrypt for the model, never redact"
 reasoning.
 
 Messages ordered oldest-first (`sent_at ASC`) -- the same top-to-bottom
-order a human reads a thread in Gmail's own UI, matching `runtime.py:
-_render_thread_content_block`'s docstring. A message whose `body` is still
+order a human reads a thread in Gmail's own UI. `runtime.py:_render_
+thread_content_block` renders `messages` in whatever order this tool's
+own output supplies them, with no ordering of its own (round 8 review:
+its docstring only covers the untrusted-data wrapping rationale, not
+ordering -- corrected here after a prior version of this docstring
+pointed there as if it did), so this `ORDER BY` is the entire ordering
+guarantee. A message whose `body` is still
 `NULL` (never fetched -- most messages in a thread other than the one that
 triggered this call, since `gmail.metadata`-only sync leaves `body` `NULL`
 until Task 5's own proactive fetch populates it for the triggering message)
