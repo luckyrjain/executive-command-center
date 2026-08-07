@@ -179,6 +179,22 @@ TASK_REQUIREMENTS: dict[str, TaskRequirements] = {
         timeout_seconds=40.0,
         max_output_tokens=600,
     ),
+    # Phase 10 Task 5 (`docs/superpowers/plans/2026-08-04-phase-10-gmail-
+    # connector.md`): the proactive Gmail action-detection tool, the
+    # fourth task type this activation registers. No live-model evaluation
+    # history yet, same starting position `personal.generate_insight` was
+    # in -- sized by the same analogy that entry's own comment documents:
+    # a single email's full body (this task's evidence) is not obviously
+    # larger than `meeting.prep_summary`'s seven-section bundle, so this
+    # starts at that task's post-tuning numbers rather than `attention.
+    # explain_item`'s tighter ones, expected to be revised once a real
+    # `ollama-evaluation` CI run exercises it.
+    "email.detect_action": TaskRequirements(
+        capability="extraction",
+        requires_structured_output=True,
+        timeout_seconds=40.0,
+        max_output_tokens=600,
+    ),
 }
 
 

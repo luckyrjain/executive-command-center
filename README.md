@@ -7,7 +7,7 @@ Executive Command Center (ECC) is a specification-driven platform for helping ex
 ## Current status
 
 <!-- BEGIN GENERATED PHASE STATUS -->
-**Current engineering phase:** Phase 10 — Gmail Connector (In progress; Tasks 1-4 of 8 complete).
+**Current engineering phase:** Phase 10 — Gmail Connector (In progress; Tasks 1-5 of 8 complete).
 
 | Phase | Name | Engineering | Validation | Promotion |
 |---:|---|---|---|---|
@@ -34,7 +34,7 @@ Executive Command Center (ECC) is a specification-driven platform for helping ex
 - Phase 7: personal-data export deletion and restore evidence; encryption-key rotation decision; independent change review and promotion decision.
 - Phase 8: first production owner provisioning; account recovery and MFA or step-up decision; independent change review and promotion decision.
 - Phase 9: specification approval; predecessor production-readiness and promotion decisions.
-- Phase 10: Tasks 5-8; real Gmail account verification; backup and restore verification; independent change review.
+- Phase 10: Tasks 6-8; real Gmail account verification; backup and restore verification; independent change review.
 
 Source: [`docs/phases/status.json`](docs/phases/status.json). Specification approval, engineering completion, validation, and promotion are independent states.
 <!-- END GENERATED PHASE STATUS -->

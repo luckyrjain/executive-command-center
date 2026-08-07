@@ -98,6 +98,36 @@ connector_sync_postgres.py` for Task 2's own dedicated test file):
     accounts_provider` to allow it, unlike the `_RaisingAdapter`/
     `_SpyDisconnectAdapter` family above, which stay on `"sandbox"` for
     that reason. Fixed by migration `0070_gmail_sync_cursor_type.py`.
+
+Plus one item closing a gap Phase 10 Gmail Connector Task 5's own Loop 2
+round 1 review found in this module's territory (`sync_connector_
+endpoint`'s own proactive-action-detection call site, not `GmailAdapter.
+detect_actions_since`'s internal logic -- see `tests/test_gmail_action_
+detection_sync_postgres.py` for Task 5's own dedicated test file):
+
+26. `test_sync_invokes_proactive_action_detection_with_a_valid_call_
+    signature`: the call site originally passed `auth=auth`, a keyword
+    argument `detect_actions_since` has never accepted, so every real
+    invocation raised `TypeError` -- silently swallowed by the
+    deliberately broad `except Exception: pass` immediately around it,
+    meaning the feature never ran in production despite every direct-call
+    test of `detect_actions_since` itself passing. Proven end to end
+    through the real HTTP endpoint via `_ActionDetectionSpyAdapter`, a
+    fake registered under the real `"gmail"` provider slug whose `detect_
+    actions_since` signature exactly matches the real adapter's, so a
+    future call-site drift raises the identical `TypeError` and fails
+    this test loudly instead of being swallowed. Fixed by dropping the
+    stray `auth=auth` keyword from the call site.
+27. `test_sync_invokes_proactive_action_detection_even_when_this_calls_
+    own_items_processed_is_zero`: round 4 review found the call site's
+    `outcome.items_processed > 0` gate silently defeated `detect_actions_
+    since`'s own "a backlog beyond one call's own bound is worked down
+    over subsequent calls" guarantee -- a call that itself synced zero new
+    messages (e.g. a poll that found nothing new) never re-ran detection
+    against an existing backlog either, even though the backlog is
+    unrelated to this call's own `items_processed` count. Proven by
+    asserting the hook still fires when `_ActionDetectionSpyAdapter`'s own
+    `items_processed` is `0`.
 """
 
 import threading
@@ -431,6 +461,72 @@ class _MessageCursorAdapter:
 
     def disconnect(self, account: ConnectorAccountContext) -> None:
         return None
+
+
+@dataclass
+class _ActionDetectionSpyAdapter(_MessageCursorAdapter):
+    """Phase 10 Task 5 review finding: `sync_connector_endpoint`'s own
+    proactive-action-detection hook (`connector_accounts.py`, "Task 5:
+    proactive Gmail action detection") calls `getattr(adapter, "detect_
+    actions_since", None)(context, since=now)` -- a call site whose
+    keyword arguments must exactly match `GmailAdapter.detect_actions_
+    since`'s real signature. A stale kwarg here (this PR originally
+    passed `auth=auth`, a parameter that method has never accepted, since
+    it deliberately builds its own `AuthContext` from the account's own
+    `owner_id` rather than trusting a caller-supplied one) raises
+    `TypeError` on every real invocation -- silently swallowed by the
+    deliberately broad `except Exception: pass` immediately around it, so
+    the sync response still returns its normal success status with no
+    trace anywhere that the hook never ran. No test that only calls
+    `detect_actions_since` directly (every test in `tests/test_gmail_
+    action_detection_sync_postgres.py` does exactly this) can ever catch
+    a call-site argument mismatch, since it never exercises the actual
+    call site. This spy is registered under the real `"gmail"` provider
+    slug via `sync_connector_endpoint`'s own `getattr`-based duck typing
+    and records every call it receives *without* raising -- if the call
+    site's kwargs ever drift from this method's own signature again, this
+    spy's `__call__` itself raises `TypeError` the exact same way the
+    real adapter would, and the test below fails loudly instead of the
+    production code silently swallowing it.
+
+    Subclasses `_MessageCursorAdapter` rather than duplicating its
+    `authorize`/`backfill`/`incremental_sync`/`handle_webhook`/`refresh_
+    permissions`/`disconnect` bodies -- matching this file's own `_Raising
+    DisconnectAdapter(_SpyDisconnectAdapter)` precedent for a fake that
+    only needs to add one new behavior on top of an existing sibling.
+    """
+
+    detect_actions_since_calls: list[tuple[ConnectorAccountContext, datetime]] = field(
+        default_factory=list
+    )
+    # Round 4 review finding: the call site's own former `outcome.items_
+    # processed > 0` gate silently defeated `detect_actions_since`'s
+    # "backlog worked down over subsequent calls" guarantee whenever a
+    # sync call found no new/duplicate messages -- an ordinary steady
+    # state for a normal-cadence connector, not an edge case. Overriding
+    # `backfill` to return a caller-controlled `items_processed` (default
+    # 1, matching `_MessageCursorAdapter`'s own hardcoded value) lets a
+    # test prove the hook still fires when this call's own `items_
+    # processed` is `0`.
+    items_processed: int = 1
+
+    def backfill(self, account: ConnectorAccountContext, resource_type: str) -> SyncOutcome:
+        return SyncOutcome(
+            resource_type=resource_type,
+            items_processed=self.items_processed,
+            status="succeeded",
+            next_cursor="1",
+        )
+
+    # Deliberately matches `GmailAdapter.detect_actions_since`'s real
+    # signature exactly (`self, context, *, since, ollama_adapter=None`)
+    # -- any keyword the real call site passes that this signature
+    # doesn't accept (or vice versa) raises `TypeError` here the same way
+    # it would against the real adapter.
+    def detect_actions_since(
+        self, context: ConnectorAccountContext, *, since: datetime, ollama_adapter: Any = None
+    ) -> None:
+        self.detect_actions_since_calls.append((context, since))
 
 
 # --- unit-level: sandbox adapter / registry / crypto (no database) ---------
@@ -1198,6 +1294,92 @@ def test_sync_persists_a_message_resource_type_cursor(
             {"workspace_id": workspace_id, "account_id": account_id},
         ).scalar_one()
     assert cursor_value == "12345"
+
+
+def test_sync_invokes_proactive_action_detection_with_a_valid_call_signature(
+    engineering_test_context: tuple[TestClient, UUID, UUID, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Phase 10 Task 5 review finding: exercises `sync_connector_endpoint`'s
+    own `getattr(adapter, "detect_actions_since", None)(context, since=now)`
+    call site directly (not `GmailAdapter.detect_actions_since` called
+    in isolation, which every test in `test_gmail_action_detection_sync_
+    postgres.py` does and which cannot catch a call-site argument
+    mismatch) -- see `_ActionDetectionSpyAdapter`'s own docstring for the
+    exact `TypeError`-silently-swallowed-by-`except Exception: pass`
+    failure mode this closes. `email_action_detection_enabled` must be
+    turned on for the hook to fire at all (`detect_actions_since`'s own
+    feature-flag check happens inside the real adapter, but the *call
+    site* itself has no gate of its own at all -- round 4 review removed
+    the `outcome.items_processed > 0` gate this docstring used to describe
+    here, since it silently defeated `detect_actions_since`'s own backlog-
+    recovery guarantee (see `test_sync_invokes_proactive_action_detection_
+    even_when_this_calls_own_items_processed_is_zero`, immediately below).
+    This test still turns the flag on for symmetry with a real deployment,
+    even though this particular fake adapter ignores the flag itself and
+    the call site never checks it either).
+    """
+    monkeypatch.setenv("ECC_EMAIL_ACTION_DETECTION_ENABLED", "true")
+    get_settings.cache_clear()
+    try:
+        client, workspace_id, user_id, token = engineering_test_context
+        spy = _ActionDetectionSpyAdapter()
+        monkeypatch.setattr(connector_accounts_module, "connector_registry", _registry_with(spy))
+        account_id = _insert_connector_account(workspace_id, user_id, provider="gmail")
+
+        response = client.post(
+            f"/api/v1/engineering/connectors/{account_id}/sync",
+            json={"run_type": "backfill", "resource_type": "message"},
+            headers=_headers(token, key=str(uuid4())),
+        )
+
+        assert response.status_code == 201, response.text
+        assert response.json()["status"] == "succeeded"
+        assert len(spy.detect_actions_since_calls) == 1
+        called_context, called_since = spy.detect_actions_since_calls[0]
+        assert called_context.connector_account_id == account_id
+        assert called_context.workspace_id == workspace_id
+        assert called_since is not None
+    finally:
+        get_settings.cache_clear()
+
+
+def test_sync_invokes_proactive_action_detection_even_when_this_calls_own_items_processed_is_zero(
+    engineering_test_context: tuple[TestClient, UUID, UUID, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Round 4 review finding: the call site originally gated the hook on
+    `outcome.items_processed > 0` -- but `items_processed` counts only
+    messages *this* `backfill`/`incremental_sync` call itself fetched
+    (new or duplicate), so on any ordinary poll where Gmail reports no
+    activity (a ordinary steady state for a normal-cadence connector, not
+    an edge case) it stays `0`, and the hook never ran at all -- silently
+    defeating `detect_actions_since`'s own "a backlog beyond one call's
+    own bound is worked down over subsequent calls" guarantee (`gmail_
+    adapter.py`, added by Loop 2 round 3's fix) for exactly the case that
+    guarantee exists to cover: a quiet call following a burst that left a
+    backlog behind. Fixed by dropping the gate entirely -- this test
+    proves the hook still fires with `items_processed=0`.
+    """
+    monkeypatch.setenv("ECC_EMAIL_ACTION_DETECTION_ENABLED", "true")
+    get_settings.cache_clear()
+    try:
+        client, workspace_id, user_id, token = engineering_test_context
+        spy = _ActionDetectionSpyAdapter(items_processed=0)
+        monkeypatch.setattr(connector_accounts_module, "connector_registry", _registry_with(spy))
+        account_id = _insert_connector_account(workspace_id, user_id, provider="gmail")
+
+        response = client.post(
+            f"/api/v1/engineering/connectors/{account_id}/sync",
+            json={"run_type": "backfill", "resource_type": "message"},
+            headers=_headers(token, key=str(uuid4())),
+        )
+
+        assert response.status_code == 201, response.text
+        assert response.json()["status"] == "succeeded"
+        assert len(spy.detect_actions_since_calls) == 1
+    finally:
+        get_settings.cache_clear()
 
 
 def test_sync_rejects_invalid_run_type_and_resource_type(

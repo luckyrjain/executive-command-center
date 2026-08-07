@@ -126,6 +126,17 @@ class Settings(BaseSettings):
     # same "no implicit access" default every other allowlist-shaped
     # setting in this codebase uses.
     gmail_oauth_allowlist: str = Field(default="", validation_alias="ECC_GMAIL_OAUTH_ALLOWLIST")
+    # Phase 10 Task 5 (`docs/superpowers/plans/2026-08-04-phase-10-gmail-
+    # connector.md`): proactive Gmail action detection, wired to Phase 4
+    # (AI Runtime) via the `email.detect_action` task type but opt-in,
+    # mirroring `meeting_prep_ai_enrichment_enabled`/`personal_ai_insight_
+    # generation_enabled`'s own "deterministic core, AI optional and
+    # gated" pattern -- Task 1-4's own sync/OAuth/create-path machinery is
+    # unaffected either way; this flag gates only the proactive body-fetch-
+    # and-detect call gmail_adapter.py's sync hook makes.
+    email_action_detection_enabled: bool = Field(
+        default=False, validation_alias="ECC_EMAIL_ACTION_DETECTION_ENABLED"
+    )
 
     # Self-managed GitLab instances on a private network (on-prem, VPN-only,
     # internal DNS) resolve to RFC 1918/loopback/link-local/CGNAT addresses

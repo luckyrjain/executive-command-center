@@ -27,6 +27,21 @@ method call with no multi-step graph to crash-recover mid-way through.
 `sync_runs.status` still records `running` before the call and
 `succeeded`/`failed`/`partial` after, so a stuck run remains visible.
 
+**Phase 10 Task 5's proactive-detection hook (below) rides on that same
+synchronous premise, imperfectly.** Unlike a plain `backfill`/`incremental_
+sync` call, `GmailAdapter.detect_actions_since` -- reached via this
+function's own best-effort `getattr(adapter, "detect_actions_since",
+None)` hook after phase 3 -- does its own additional live Gmail-plus-
+Ollama round trip per candidate message, sequentially, still inside this
+same synchronous request. `detect_actions_since`'s own `_MAX_ACTION_
+DETECTIONS_PER_CALL` bound (`gmail_adapter.py`, deliberately much smaller
+than `backfill`/`incremental_sync`'s own `_MAX_MESSAGES_PER_CALL`) caps
+how bad this gets per call, but does not make the hook itself durable or
+non-blocking -- found by Loop 2 round 2 review; feature-flagged off by
+default, and moving this hook to `ecc.domains.automation.worker`'s own
+durable dispatch (matching `workflow_runs`, not this module's own
+`sync_runs`) remains the real fix before wider production rollout.
+
 **Pool-exhaustion fix (Task 1's own disclosed blocker for Task 2, now
 resolved).** `sync_connector_endpoint` no longer holds one `session.
 begin()` transaction across the entire adapter call. It now runs in three
@@ -1399,7 +1414,55 @@ def sync_connector_endpoint(
             response.model_dump(mode="json"),
             now,
         )
-        return response
+
+    # Phase 10 Task 5: proactive Gmail action detection, run only after
+    # phase 3's own transaction has committed -- `detect_actions_since`
+    # opens its own short, per-message sessions/transactions, matching
+    # `gmail_adapter._resolve_or_create_person`'s "keep this independent of
+    # whatever transaction writes the triggering row" discipline, not
+    # `outcome_session`'s. Duck-typed via `getattr`, not a shared Protocol
+    # member (`gmail_adapter.py`'s own module docstring: Gmail-specific
+    # surface like `is_account_allowed` is deliberately not part of either
+    # Protocol) -- this also avoids `connector_accounts.py` (engineering
+    # domain) importing `gmail_adapter.py` (personal domain) at module
+    # level, which would be a domain-layering back-reference (engineering
+    # depending on personal, on top of personal already depending on
+    # engineering's own `connectors` module for its Protocol types) rather
+    # than a clean one-directional dependency. Round 9 review: not an
+    # actual circular import -- `ecc.domains.engineering.connectors`
+    # itself imports neither `connector_accounts.py` nor `gmail_adapter.py`
+    # (verified against its own import list), so this specific `getattr`
+    # would not raise `ImportError` even at module level. Kept duck-typed
+    # regardless, for the layering reason above and to keep
+    # `connector_accounts.py` provider-agnostic the way it already is for
+    # GitHub/GitLab/Jira/Datadog. Best-effort:
+    # any failure here (a transient Gmail API error, a malformed body) is
+    # swallowed rather than failing a sync response that has already fully
+    # succeeded and been recorded -- the next sync call's own newly-
+    # inserted messages are unaffected, and a skipped message is simply
+    # never proactively scanned, not silently corrupted.
+    #
+    # Not gated on `outcome.items_processed > 0` -- round 4 review found
+    # that gate silently defeated `detect_actions_since`'s own "a backlog
+    # beyond one call's own bound is worked down over subsequent calls"
+    # guarantee (that method's own docstring, added by round 3's fix):
+    # `items_processed` counts messages *this* `backfill`/`incremental_
+    # sync` call fetched (new or duplicate), so on any ordinary poll where
+    # Gmail reports no activity -- ordinary steady-state for a normal-
+    # cadence connector, not an edge case -- it stays `0` and the hook
+    # never ran at all, leaving any prior over-budget backlog untouched
+    # indefinitely rather than "worked down." `detect_actions_since`
+    # itself is cheap to call when there is nothing to do (its own
+    # eligibility query returning zero rows, then an immediate return), so
+    # nothing is saved by skipping the call -- only correctness was lost.
+    detect_actions = getattr(adapter, "detect_actions_since", None)
+    if callable(detect_actions):
+        try:
+            detect_actions(context, since=now)
+        except Exception:  # noqa: BLE001 -- best-effort, never fails the sync response
+            pass
+
+    return response
 
 
 @router.post("/connectors/{account_id}/disable", response_model=ConnectorAccountResponse)
