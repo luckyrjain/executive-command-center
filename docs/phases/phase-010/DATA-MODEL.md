@@ -2,7 +2,7 @@
 id: PHASE-010-DATA-MODEL
 title: Phase 10 Gmail Data Model
 status: Approved for Implementation
-version: 1.1.0
+version: 1.2.0
 owner: Lucky Jain
 depends_on:
   - PHASE-010
@@ -14,14 +14,22 @@ depends_on:
 
 ## Delivery boundary
 
-- **Current (Tasks 1-2, 5):** OAuth connector account, 30-day metadata
+- **Current (Tasks 1-2, 5-6):** OAuth connector account, 30-day metadata
   backfill, Gmail-history incremental sync, thread/message projections,
-  sender/recipient entity linking, and (Task 5) controlled body retrieval
-  and caching for a message that triggers `email.detect_action`.
-  Attention projections (Task 3) and recommendation creation (Task 4) also
-  shipped, but through tables this document does not own (`attention_items`,
-  `recommendations`) rather than a change to the tables below.
-- **Planned (Tasks 6-8):** consent-revocation purge and executive UX.
+  sender/recipient entity linking, (Task 5) controlled body retrieval and
+  caching for a message that triggers `email.detect_action`, and (Task 6)
+  on-demand human-facing body retrieval/caching for an explicit thread
+  open plus a per-thread "forget this" write path that nulls the same
+  cached fields back out. Task 6 adds no new table or column to the ones
+  below -- it reuses Task 5's own `body`/`snippet`/`body_fetched_at`
+  columns for both writes; its one schema change (`deletion_jobs.scope`/
+  `resource_id`) belongs to Phase 7's own `deletion_jobs` table, documented
+  in `docs/phases/phase-007/DATA-MODEL.md`'s cross-phase amendment, not
+  here. Attention projections (Task 3) and recommendation creation (Task 4)
+  also shipped, but through tables this document does not own
+  (`attention_items`, `recommendations`) rather than a change to the tables
+  below.
+- **Planned (Tasks 7-8):** consent-revocation purge and executive UX.
 
 ## Current tables
 
@@ -58,7 +66,7 @@ queries. `(workspace_id, id)` is unique for the message composite FK.
 | `sender`, `recipients` | Normalized plaintext addresses, each at most 320 characters |
 | `sent_at`, `direction` | UTC time and `inbound` or `outbound` |
 | `snippet`, `body` | Nullable narrative fields; `body` holds Fernet ciphertext (`ECC_PERSONAL_DATA_ENCRYPTION_KEY`) once fetched |
-| `body_fetched_at` | Null until Task 5's own body fetch populates it |
+| `body_fetched_at` | Null until a body fetch (Task 5's proactive path or Task 6's on-demand `GET`) populates it; renulled by Task 6's own "forget this" |
 | `created_at`, `updated_at` | UTC lifecycle timestamps |
 
 Task 2 writes `snippet`, `body`, and `body_fetched_at` as `NULL`; it fetches
@@ -70,7 +78,15 @@ encrypt_field`, and writes `body`/`body_fetched_at` together in the same
 `body IS NULL` until its own turn. Index `ix_email_messages_thread_sent`
 supports thread chronology; the partial index `ix_email_messages_detect_
 action_eligible` (`workspace_id, owner_id, direction WHERE body IS NULL`,
-migration `0074`) supports Task 5's own eligibility scan.
+migration `0074`) supports Task 5's own eligibility scan. Task 6's `GET
+/api/v1/personal/gmail/threads/{thread_id}` calls the same `fetch_and_
+store_body` method (extracted from `_detect_action_for_message` for this
+reuse) for every still-`body IS NULL` message in a thread an owner
+explicitly opens, up to `MAX_THREAD_MESSAGES`; its own `POST .../forget`
+is the only write path that ever nulls `snippet`/`body`/`body_fetched_at`
+back out once set, via `UPDATE ... WHERE thread_id = :thread_id` scoped to
+one thread (`docs/phases/phase-010/PRIVACY-CONSENT-CONTRACT.md`'s own
+entry covers why nulling, not row deletion).
 
 ### `sync_cursors` and `sync_runs`
 
@@ -98,7 +114,7 @@ claim consent revocation already purges Gmail data.
 
 ## Planned model changes
 
-Tasks 6-8 may add further schema for consent-revocation purge and executive
+Tasks 7-8 may add further schema for consent-revocation purge and executive
 UX. They require their own migration and contract-version update; this
 document does not describe those rows as present.
 
@@ -108,3 +124,4 @@ document does not describe those rows as present.
 |---|---|---|---|
 | 1.0.0 | 2026-08-06 | Documented the Task 1-2 Gmail persistence contract | Lucky Jain |
 | 1.1.0 | 2026-08-06 | Task 5 review (Loop 2 round 16): documented body/body_fetched_at now populated by `email.detect_action`'s own body fetch, and the new `ix_email_messages_detect_action_eligible` partial index (migration `0074`); this document had gone stale after Tasks 3-5 shipped without a contract-version update | Lucky Jain |
+| 1.2.0 | 2026-08-09 | Task 6 review: documented on-demand human-facing body retrieval and the new "forget this" write path that renulls `snippet`/`body`/`body_fetched_at`; this document had gone stale after Task 6 shipped without a contract-version update | Lucky Jain |

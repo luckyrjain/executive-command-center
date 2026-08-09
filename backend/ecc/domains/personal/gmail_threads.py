@@ -38,13 +38,21 @@ need something to point at. Records the action in `deletion_jobs` with
 task's own schema addition), mirroring `export_deletion.py`'s own
 audit-trail shape at the narrower granularity.
 
-Both endpoints check `_email_consent_active` (imported from
-`gmail_adapter.py`, the identical check Task 5's own per-message recheck
-uses), not `require_enabled_domain` -- consistent with Task 5's own
-precedent (that function never separately checks `personal_domains.
-enabled` either), since a live Gmail fetch is exactly what `domain_
-consents` governs; `personal_domains.enabled` is a separate "is this data
-domain turned on at all" concern this task does not newly enforce.
+`GET` checks `_email_consent_active` (imported from `gmail_adapter.py`,
+the identical check Task 5's own per-message recheck uses), not `require_
+enabled_domain` -- consistent with Task 5's own precedent (that function
+never separately checks `personal_domains.enabled` either), since a live
+Gmail fetch is exactly what `domain_consents` governs; `personal_domains.
+enabled` is a separate "is this data domain turned on at all" concern this
+task does not newly enforce.
+
+`POST .../forget` deliberately does NOT check `_email_consent_active`:
+unlike `GET`, it makes no live Gmail call, and a deletion/forget action
+should stay available even without an active consent grant (e.g. right
+after revoking consent, when there is no active grant to check) --
+gating a deletion capability behind the very consent state a user might
+be in the middle of revoking would be backwards. Both endpoints stay
+scoped to the caller's own `workspace_id`/`owner_id` regardless.
 """
 
 from datetime import UTC, datetime
@@ -69,7 +77,7 @@ from .domains import (
     request_hash,
     store_idempotency,
 )
-from .email_action_tools import get_thread_content_tool
+from .email_action_tools import MAX_THREAD_MESSAGES, get_thread_content_tool
 from .gmail_adapter import GmailAdapter, _bearer_headers, _email_consent_active
 
 router = APIRouter(prefix="/api/v1/personal/gmail", tags=["personal"])
@@ -137,14 +145,29 @@ def get_thread_endpoint(
     # here, on this explicit open, rather than waiting for a future sync
     # call to happen to select it (Task 6's own "on explicit user open"
     # scope, distinct from Task 5's own account-wide proactive scan).
+    # Bounded at `MAX_THREAD_MESSAGES` (newest first): `get_thread_content_
+    # tool`'s own response below never returns more than that many messages
+    # regardless, so fetching more would be wasted live Gmail calls -- and,
+    # unbounded, a thread an external sender can grow arbitrarily long
+    # (e.g. a reply-all/notification thread) would otherwise make one `GET`
+    # trigger one sequential live Gmail round trip per unfetched message,
+    # the same request-blocking failure mode `_MAX_ACTION_DETECTIONS_PER_
+    # CALL` in `gmail_adapter.py` already exists to prevent for the
+    # proactive path.
     unfetched = (
         session.execute(
             text(
                 "SELECT id, external_message_id FROM email_messages "
                 "WHERE workspace_id = :workspace_id AND owner_id = :owner_id "
-                "AND thread_id = :thread_id AND body IS NULL"
+                "AND thread_id = :thread_id AND body IS NULL "
+                "ORDER BY sent_at DESC LIMIT :limit"
             ),
-            {"workspace_id": auth.workspace_id, "owner_id": auth.user_id, "thread_id": thread_id},
+            {
+                "workspace_id": auth.workspace_id,
+                "owner_id": auth.user_id,
+                "thread_id": thread_id,
+                "limit": MAX_THREAD_MESSAGES,
+            },
         )
         .mappings()
         .all()

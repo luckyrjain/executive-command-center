@@ -32,7 +32,7 @@ is omitted entirely rather than rendered as an empty body a small model
 might otherwise mistake for "this message has no content" -- an absence of
 fetched content is not the same claim as an email that is genuinely empty.
 
-Capped at `_MAX_THREAD_MESSAGES` -- round 13 review found this was the one
+Capped at `MAX_THREAD_MESSAGES` -- round 13 review found this was the one
 deterministic tool in the whole runtime with no size bound at all, a direct
 gap against the design doc's own Decision 6 contract ("every tool result
 is ... size-bounded (a hard cap on returned rows/characters, e.g.
@@ -46,7 +46,7 @@ thread, whose message count an external sender fully controls simply by
 replying into it) would otherwise decrypt and render every historical
 message every single time any new message in that thread became eligible,
 paid before `execute_run`'s own token-budget check even runs. Selects the
-most recent `_MAX_THREAD_MESSAGES` messages (by `sent_at DESC LIMIT`),
+most recent `MAX_THREAD_MESSAGES` messages (by `sent_at DESC LIMIT`),
 then re-sorts that capped set back to the same oldest-first order
 documented above, so a thread within the cap is unaffected and one over
 the cap still keeps its most recent (most relevant) messages, in the same
@@ -54,7 +54,7 @@ reading order.
 
 `trigger_message_id`, when given, is always included in the capped set,
 never counted against it as "just another message" -- round 14 review
-found that "most recent `_MAX_THREAD_MESSAGES` by `sent_at`" alone (round
+found that "most recent `MAX_THREAD_MESSAGES` by `sent_at`" alone (round
 13's original fix) can silently exclude the specific message that
 triggered this call: `detect_actions_since`'s own eligibility query
 (`gmail_adapter.py`) orders `(created_at >= since) DESC, sent_at ASC`,
@@ -70,9 +70,9 @@ exists to evaluate -- and if grounding then passes on some other, visible
 message, the created recommendation's own evidence (which cites the
 triggering message specifically, per `_register_message_evidence`) would
 point at a message the model was never actually shown. Reserves one slot
-for it (`_MAX_THREAD_MESSAGES - 1` from the ordinary "most recent" pool,
+for it (`MAX_THREAD_MESSAGES - 1` from the ordinary "most recent" pool,
 excluding the trigger from that pool so it is never counted twice) rather
-than appending it as message `_MAX_THREAD_MESSAGES + 1`, so the *total*
+than appending it as message `MAX_THREAD_MESSAGES + 1`, so the *total*
 size bound this cap exists to enforce is never itself violated by the
 guarantee meant to fix a different bug.
 """
@@ -92,7 +92,11 @@ from .crypto import decrypt_field
 # Matches `insight_tools.py:_MAX_RECORDS_PER_DOMAIN`/`meeting_prep.py:_MAX_
 # EVIDENCE`'s own `50` -- see this module's own docstring for why a thread
 # needs a cap at all and why it's applied newest-first, not oldest-first.
-_MAX_THREAD_MESSAGES = 50
+# Not underscore-prefixed: `gmail_threads.py:get_thread_endpoint` is a
+# genuine second caller (bounding how many still-unfetched messages one
+# explicit thread-open will fetch live from Gmail, since this tool's own
+# response is capped at this many messages regardless).
+MAX_THREAD_MESSAGES = 50
 
 
 def get_thread_content_tool(
@@ -108,12 +112,12 @@ def get_thread_content_tool(
     if thread_row is None:
         return ToolNotFound(tool="email.get_thread_content")
 
-    # `trigger_message_id` reserves one of `_MAX_THREAD_MESSAGES`'s own
+    # `trigger_message_id` reserves one of `MAX_THREAD_MESSAGES`'s own
     # slots for itself (see this module's own docstring) -- the "most
     # recent" pool is capped one lower and explicitly excludes it, so the
     # `UNION ALL` below can never double-count it or push the total past
     # the cap this whole mechanism exists to enforce.
-    most_recent_limit = _MAX_THREAD_MESSAGES - (1 if trigger_message_id is not None else 0)
+    most_recent_limit = MAX_THREAD_MESSAGES - (1 if trigger_message_id is not None else 0)
     rows = (
         session.execute(
             text(

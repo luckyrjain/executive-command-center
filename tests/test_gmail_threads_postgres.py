@@ -168,7 +168,7 @@ def _insert_message(
     return message_id
 
 
-def _cleanup_workspace(workspace_id: UUID) -> None:
+def _cleanup_workspace(workspace_id: UUID, *, email: str = _OWNER_EMAIL) -> None:
     with engine.begin() as connection:
         for table in (
             "deletion_jobs",
@@ -190,6 +190,12 @@ def _cleanup_workspace(workspace_id: UUID) -> None:
         connection.execute(
             text("DELETE FROM workspaces WHERE id = :workspace_id"), {"workspace_id": workspace_id}
         )
+        # `accounts` is not workspace-scoped (Phase 8 Decision 1 -- one
+        # `accounts` row can anchor `users` rows in more than one workspace),
+        # so it needs its own delete by email, matching the established
+        # `_teardown_workspace` precedent in
+        # `test_gmail_action_detection_sync_postgres.py`.
+        connection.execute(text("DELETE FROM accounts WHERE email = :email"), {"email": email})
 
 
 @pytest.fixture
@@ -345,7 +351,9 @@ def test_get_thread_fetches_unfetched_message_and_returns_decrypted_content(
     assert decrypt_field(row["body"]) == _PLAIN_TEXT_BODY
 
 
-def test_get_thread_already_fetched_does_not_call_gmail_again(gmail_threads_context: dict) -> None:
+def test_get_thread_already_fetched_does_not_call_gmail_again(
+    gmail_threads_context: dict, monkeypatch: pytest.MonkeyPatch
+) -> None:
     ctx = gmail_threads_context
     with engine.begin() as connection:
         thread_id = _insert_thread(
@@ -365,6 +373,8 @@ def test_get_thread_already_fetched_does_not_call_gmail_again(gmail_threads_cont
             now=ctx["now"],
             fetched=True,
         )
+
+    monkeypatch.setattr(gmail_threads, "_adapter", GmailAdapter(transport=_raising_transport()))
 
     resp = ctx["client"].get(f"/api/v1/personal/gmail/threads/{thread_id}")
     assert resp.status_code == 200
@@ -475,7 +485,7 @@ def test_get_thread_belonging_to_a_different_workspace_is_404(gmail_threads_cont
         assert resp.status_code == 404
         assert resp.json()["detail"] == "THREAD_NOT_FOUND"
     finally:
-        _cleanup_workspace(other_workspace_id)
+        _cleanup_workspace(other_workspace_id, email="other-owner@example.test")
 
 
 def test_forget_thread_removes_only_targeted_threads_content(gmail_threads_context: dict) -> None:
