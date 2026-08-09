@@ -1,0 +1,253 @@
+"""On-demand Gmail thread reading and per-thread "forget this" (Phase 10
+Gmail Connector Task 6, `docs/superpowers/plans/2026-08-04-phase-10-
+gmail-connector.md`, Task 6).
+
+`GET /api/v1/personal/gmail/threads/{thread_id}`: fetches any still-`body
+IS NULL` message in the caller's own thread via the exact same
+fetch-and-store mechanism Task 5's proactive sync-time detection uses
+(`GmailAdapter.fetch_and_store_body`, extracted from `_detect_action_for_
+message` specifically so this task reuses it rather than duplicating it),
+then returns the thread's full decrypted content via `email_action_tools.
+get_thread_content_tool` -- the exact same tool `email.detect_action`'s
+own AI runtime call uses to read a thread, reused here for the
+human-facing HTTP surface for the identical reason: one rendering of "what
+does this thread contain," not two. No `trigger_message_id` is passed
+(that field exists solely for `email.detect_action`'s own "the message
+that triggered this run must survive the cap" guarantee -- an explicit
+human thread-open has no analogous single triggering message), so this
+call gets the tool's own plain most-recent-`_MAX_THREAD_MESSAGES` behavior.
+
+`POST /api/v1/personal/gmail/threads/{thread_id}/forget`: the plan's own
+"forget this" scope is narrower than Phase 7's whole-domain delete
+(`export_deletion.py`) -- it "deletes the cached body/message content for
+that thread only, not the whole `email` domain." Nulls `snippet`/`body`/
+`body_fetched_at` for every message in the targeted thread, back to
+exactly the state Task 2's own metadata-only sync leaves a never-opened
+message in -- deliberately does NOT delete the `email_messages` rows
+themselves (unlike `export_deletion.py`'s per-table `DELETE`s), preserving
+`external_message_id`'s own dedup/idempotency role for a future
+incremental sync and the thread's own chronology; a "forgotten" thread can
+still be re-opened later, which re-fetches its content exactly like a
+never-opened thread would. Also does NOT delete the `email_threads` row --
+`export_deletion.py`'s own domain-delete precedent (that module's own
+docstring) keeps the *existence* record (there, `personal_domains`; here,
+`email_threads`) while removing the *content* underneath it, for the
+identical reason: a `deletion_jobs` audit row and any future re-open both
+need something to point at. Records the action in `deletion_jobs` with
+`scope='thread'`, `resource_id=<thread_id>` (migration `0075`, this
+task's own schema addition), mirroring `export_deletion.py`'s own
+audit-trail shape at the narrower granularity.
+
+Both endpoints check `_email_consent_active` (imported from
+`gmail_adapter.py`, the identical check Task 5's own per-message recheck
+uses), not `require_enabled_domain` -- consistent with Task 5's own
+precedent (that function never separately checks `personal_domains.
+enabled` either), since a live Gmail fetch is exactly what `domain_
+consents` governs; `personal_domains.enabled` is a separate "is this data
+domain turned on at all" concern this task does not newly enforce.
+"""
+
+from datetime import UTC, datetime
+from typing import Annotated
+from uuid import UUID, uuid4
+
+from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel, ConfigDict
+from sqlalchemy import text
+from sqlalchemy.orm import Session
+
+from ecc.auth import AuthContext, AuthDep, CsrfDep
+from ecc.database import get_session
+from ecc.domains.ai_runtime.tools import ToolNotFound
+from ecc.domains.engineering.connector_accounts import _get_encrypted_credential
+from ecc.domains.engineering.crypto import decrypt_credential
+
+from .domains import (
+    IdempotencyHeader,
+    load_cached,
+    lock_idempotency,
+    request_hash,
+    store_idempotency,
+)
+from .email_action_tools import get_thread_content_tool
+from .gmail_adapter import GmailAdapter, _bearer_headers, _email_consent_active
+
+router = APIRouter(prefix="/api/v1/personal/gmail", tags=["personal"])
+SessionDep = Annotated[Session, Depends(get_session)]
+
+# Module-level singleton, mirroring `gmail_oauth.py`'s own identical
+# "constructed with no arguments, reads `ECC_GMAIL_OAUTH_*` lazily" shape.
+_adapter = GmailAdapter()
+
+
+class _EmptyBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+
+class ThreadMessageResponse(BaseModel):
+    id: str
+    sender: str
+    sent_at: str
+    direction: str
+    body: str
+
+
+class ThreadContentResponse(BaseModel):
+    subject: str | None
+    messages: list[ThreadMessageResponse]
+
+
+class ThreadForgetResponse(BaseModel):
+    id: UUID
+    thread_id: UUID
+    status: str
+    requested_at: datetime
+    completed_at: datetime | None
+
+
+def _require_email_consent(session: Session, auth: AuthContext) -> None:
+    if not _email_consent_active(session, auth.workspace_id, auth.user_id):
+        raise HTTPException(status_code=403, detail="EMAIL_CONSENT_NOT_ACTIVE")
+
+
+def _thread_connector_account_id(
+    session: Session, auth: AuthContext, thread_id: UUID
+) -> UUID | None:
+    row = session.execute(
+        text(
+            "SELECT connector_account_id FROM email_threads "
+            "WHERE workspace_id = :workspace_id AND owner_id = :owner_id AND id = :id"
+        ),
+        {"workspace_id": auth.workspace_id, "owner_id": auth.user_id, "id": thread_id},
+    ).one_or_none()
+    return row[0] if row is not None else None
+
+
+@router.get("/threads/{thread_id}", response_model=ThreadContentResponse)
+def get_thread_endpoint(
+    thread_id: UUID, auth: AuthDep, session: SessionDep
+) -> ThreadContentResponse:
+    connector_account_id = _thread_connector_account_id(session, auth, thread_id)
+    if connector_account_id is None:
+        raise HTTPException(status_code=404, detail="THREAD_NOT_FOUND")
+    _require_email_consent(session, auth)
+
+    # Every message in this thread that Task 5's own proactive path, or an
+    # earlier open of this same thread, has not already fetched -- fetched
+    # here, on this explicit open, rather than waiting for a future sync
+    # call to happen to select it (Task 6's own "on explicit user open"
+    # scope, distinct from Task 5's own account-wide proactive scan).
+    unfetched = (
+        session.execute(
+            text(
+                "SELECT id, external_message_id FROM email_messages "
+                "WHERE workspace_id = :workspace_id AND owner_id = :owner_id "
+                "AND thread_id = :thread_id AND body IS NULL"
+            ),
+            {"workspace_id": auth.workspace_id, "owner_id": auth.user_id, "thread_id": thread_id},
+        )
+        .mappings()
+        .all()
+    )
+    if unfetched:
+        encrypted = _get_encrypted_credential(session, auth.workspace_id, connector_account_id)
+        credential = decrypt_credential(encrypted)
+        headers = _bearer_headers(credential)
+        for row in unfetched:
+            # Best-effort per message, matching `detect_actions_since`'s
+            # own "one message's failure never stops the rest" discipline
+            # -- a message this call could not fetch (a transient Gmail
+            # error) simply stays `body IS NULL`, omitted from the
+            # response below rather than failing this whole request.
+            _adapter.fetch_and_store_body(
+                workspace_id=auth.workspace_id,
+                message_id=row["id"],
+                external_message_id=row["external_message_id"],
+                headers=headers,
+            )
+
+    result = get_thread_content_tool(session, auth, thread_id)
+    if isinstance(result, ToolNotFound):
+        # Reached only via a genuine TOCTOU race (the thread was deleted or
+        # transferred between the lookup above and this call) -- both
+        # checks are scoped identically (`workspace_id`/`owner_id`/`id`),
+        # so this is not a normal path, just defense in depth.
+        raise HTTPException(status_code=404, detail="THREAD_NOT_FOUND")
+    return ThreadContentResponse.model_validate(result.output)
+
+
+@router.post("/threads/{thread_id}/forget", response_model=ThreadForgetResponse)
+def forget_thread_endpoint(
+    thread_id: UUID,
+    auth: AuthDep,
+    session: SessionDep,
+    _csrf: CsrfDep,
+    idempotency_key: IdempotencyHeader,
+) -> ThreadForgetResponse:
+    """Idempotency-key handling matches `export_deletion.py:delete_domain_
+    endpoint` exactly (same rationale: the underlying `UPDATE`s are
+    individually idempotent, but the `deletion_jobs` audit `INSERT` is
+    not -- a retry without this guard would insert a second `'completed'`
+    row for the same thread and moment).
+    """
+    req_hash = request_hash(_EmptyBody(), f"forget_thread:{thread_id}")
+    now = datetime.now(UTC)
+    with session.begin():
+        lock_idempotency(session, auth, idempotency_key)
+        cached = load_cached(session, auth, idempotency_key, req_hash, domain="gmail_thread_forget")
+        if cached is not None:
+            return ThreadForgetResponse.model_validate(cached)
+
+        thread_row = session.execute(
+            text(
+                "SELECT id FROM email_threads WHERE workspace_id = :workspace_id "
+                "AND owner_id = :owner_id AND id = :id"
+            ),
+            {"workspace_id": auth.workspace_id, "owner_id": auth.user_id, "id": thread_id},
+        ).one_or_none()
+        if thread_row is None:
+            raise HTTPException(status_code=404, detail="THREAD_NOT_FOUND")
+
+        session.execute(
+            text(
+                "UPDATE email_messages SET snippet = NULL, body = NULL, body_fetched_at = NULL, "
+                "updated_at = :now WHERE workspace_id = :workspace_id AND owner_id = :owner_id "
+                "AND thread_id = :thread_id"
+            ),
+            {
+                "now": now,
+                "workspace_id": auth.workspace_id,
+                "owner_id": auth.user_id,
+                "thread_id": thread_id,
+            },
+        )
+
+        job_id = uuid4()
+        session.execute(
+            text(
+                """
+                INSERT INTO deletion_jobs (
+                    id, workspace_id, owner_id, domain_key, scope, resource_id, status,
+                    requested_at, completed_at, created_by
+                ) VALUES (
+                    :id, :workspace_id, :owner_id, 'email', 'thread', :resource_id, 'completed',
+                    :now, :now, :actor_id
+                )
+                """
+            ),
+            {
+                "id": job_id,
+                "workspace_id": auth.workspace_id,
+                "owner_id": auth.user_id,
+                "resource_id": thread_id,
+                "now": now,
+                "actor_id": auth.user_id,
+            },
+        )
+        response = ThreadForgetResponse(
+            id=job_id, thread_id=thread_id, status="completed", requested_at=now, completed_at=now
+        )
+        store_idempotency(
+            session, auth, idempotency_key, req_hash, response.model_dump(mode="json"), now
+        )
+        return response

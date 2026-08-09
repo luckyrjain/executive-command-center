@@ -2,7 +2,7 @@
 id: PHASE-010-TEST-PLAN
 title: Phase 10 Gmail Test Plan
 status: Approved for Implementation
-version: 1.1.0
+version: 1.2.0
 owner: Lucky Jain
 depends_on:
   - PHASE-010
@@ -12,7 +12,7 @@ depends_on:
 
 # Phase 10 Gmail Test Plan
 
-## Current automated evidence (Tasks 1-5)
+## Current automated evidence (Tasks 1-6)
 
 | Area | Committed test path | Coverage |
 |---|---|---|
@@ -23,12 +23,13 @@ depends_on:
 | Awaiting-reply attention (Task 3) | `tests/test_attention_email_awaiting_reply_postgres.py` | Positive/negative surfacing, disabled-domain and unresolved-sender exclusion, staleness aging, dismissal persistence, removed-member exclusion, casefold-divergent sender resolution |
 | Create-type recommendations (Task 4) | `tests/test_recommendations_postgres.py` | Schema validation of the create-type shape, generate/publish/confirm/execute for task/commitment/risk, `target_expected_version` presence/absence enforcement, no cross-supersession |
 | `email.detect_action` (Task 5) | `tests/test_email_action_tools_postgres.py`, `tests/test_gmail_action_detection_sync_postgres.py`, `tests/test_ai_runtime_email_detect_action_evaluation_postgres.py`, `tests/test_ai_runtime_runtime_postgres.py` | Workspace/owner-scoped thread-content tool (decryption, size-bounded cap, trigger-message inclusion), body fetch/consent-recheck/RecursionError-guard in the sync-pipeline hook, evaluation-harness floors and synthetic-source isolation, prompt-injection cannot dispatch an out-of-scope tool |
+| On-demand thread read/forget (Task 6) | `tests/test_gmail_threads_postgres.py` | Fetch-and-cache round-trip and no-refetch-when-cached for `GET`; consent rejection; 404 for nonexistent and cross-workspace threads; "forget" scoped to only the targeted thread with exactly one `deletion_jobs` row recorded; idempotency replay; 404 forgetting a nonexistent thread; reopening a forgotten thread refetches its content (proves content is nulled, not deleted) |
 
 These are committed, rerunnable tests. They primarily use mocked Google HTTP
 transport and real PostgreSQL. Their existence does not satisfy real-account,
 privacy-operation, or production-recovery gates.
 
-## Required Task 6-8 automated tests
+## Required Task 7-8 automated tests
 
 - consent-revocation disconnect/purge ordering, retry, partial failure,
   deletion propagation, and completion evidence;
@@ -40,7 +41,11 @@ tests, and `email.detect_action`'s own prompt-injection/prohibited-action
 adversarial fixtures (zero automatic writes -- `EmailDetectActionOutput`'s
 fail-closed model validator plus grounding-check enforcement) and body
 fetch/cache encryption/authorization/permission-loss/malformed-MIME/size-
-bound tests have shipped -- see "Current automated evidence" above.
+bound tests have shipped -- see "Current automated evidence" above. On-demand
+thread read/forget tests (Task 6) have likewise shipped; the item removed
+here is narrower than Task 6's own "forget" -- Task 6 nulls one thread's
+cached content, not the connector-wide disconnect/purge this bullet still
+correctly lists as unshipped.
 
 ## Required non-mocked evidence before promotion
 
@@ -62,3 +67,4 @@ No gate is satisfied by an unchecked box or an uncommitted local report.
 |---|---|---|---|
 | 1.0.0 | 2026-08-06 | Recorded current Task 1-2 coverage and required promotion evidence | Lucky Jain |
 | 1.1.0 | 2026-08-06 | Task 5 review (Loop 2 round 16): recorded shipped Task 3/4/5 automated evidence, moved out of "Required"; this document had gone stale after Tasks 3-5 shipped without a contract-version update | Lucky Jain |
+| 1.2.0 | 2026-08-06 | Task 6: recorded shipped on-demand thread read/forget test coverage, renamed "Required" heading from "Task 6-8" to "Task 7-8" | Lucky Jain |
