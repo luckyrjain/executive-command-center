@@ -2,14 +2,14 @@
 id: PHASE-010-IMPLEMENTATION-STATUS
 title: Phase 10 Implementation Status
 status: Active
-version: 0.5.0
+version: 0.6.0
 owner: Lucky Jain
 updated: 2026-08-06
 ---
 
 # Phase 10 Implementation Status
 
-Design pass, Task 1, Task 2, Task 3, Task 4 and Task 5 delivered per `docs/superpowers/plans/2026-08-04-phase-10-gmail-connector.md`.
+Design pass, Task 1, Task 2, Task 3, Task 4, Task 5 and Task 6 delivered per `docs/superpowers/plans/2026-08-04-phase-10-gmail-connector.md`.
 
 | Slice | Status |
 |---|---|
@@ -21,7 +21,7 @@ Design pass, Task 1, Task 2, Task 3, Task 4 and Task 5 delivered per `docs/super
 | Deterministic attention integration | Done -- an "awaiting reply" heuristic (`_score_awaiting_reply`) feeding `attention_items` via the exact `task`/`commitment`/`risk`/`waiting_link` ingestion pattern, `entity_type='email_thread'` widened onto `EntityType`, `attention.explain_item` needing no code change; Loop 2 review complete (13 rounds, closed on 2 consecutive clean rounds -- see "Task 3 evidence" below) |
 | `recommendations` create-path extension | Done -- `execute_target`'s `operation="create"` branch calls the same `insert_task`/`insert_commitment`/`insert_risk` helpers `POST /api/v1/tasks`/`/commitments`/`/risks` use (no second insert path); `RecommendationCreate.target_id`/`expected_version` widened to `... | None`, `proposed_fields` added, reusing `TaskCreate`/`CommitmentCreate`/`RiskCreate`; `RecommendationPanel.tsx` renders/confirms create-type recommendations; Loop 2 review complete (5 rounds, closed on 2 consecutive clean rounds -- see "Task 4 evidence" below) |
 | AI-runtime action-detection tool | Done -- new `email.detect_action` AI task type (`EmailDetectActionOutput`, fail-closed both directions on `has_action`'s conditional shape; `check_email_detect_action_grounding` against the source thread's own `email_messages.id`s); `email.get_thread_content` deterministic tool; `GmailAdapter.detect_actions_since` fetches a newly-synced inbound message's full body (`gmail.readonly`, `format=full`), stores it encrypted, registers `pkos_evidence`, and runs it through the task type, feeding a `has_action: true` result to Task 4's own `create_recommendation` (extracted as this feature's first non-HTTP caller) as a `source="ai"` recommendation -- never a direct `tasks`/`commitments`/`risks` write; feature-flagged off by default (`email_action_detection_enabled`); 10-example evaluation dataset (4 positive, 6 negative); see "Task 5 evidence" below |
-| On-demand thread reading/caching | Not started (Task 6) |
+| On-demand thread reading/caching | Done -- `GET /api/v1/personal/gmail/threads/{thread_id}` fetches any still-uncached message body on explicit open (reusing Task 5's own `fetch_and_store_body`) and returns the thread's decrypted content; `POST .../forget` nulls a single thread's cached content, recorded in `deletion_jobs` with a new `scope='thread'` (migration `0075`, widening Phase 7's table); Loop 2 review in progress (4 rounds so far, each finding and fixing something real -- see "Task 6 -- Loop 2 review evidence" below) |
 | Consent revocation cascade | Not started (Task 7) |
 | Executive UX and browser acceptance | Not started (Task 8) |
 
@@ -563,3 +563,9 @@ Round 3 found and fixed real issues on both lenses, so the loop still does not c
 **Round 4 (architecture/quality): found and fixed 2 doc-coherence issues, no code issues.** This document's own Task 6 evidence had accumulated two dangling `"see below"`/`"see the Loop 2 review evidence section"` cross-references pointing at a subsection that (unlike Task 4's and Task 5's own) did not yet exist -- fixed by adding this subsection. Separately, `tests/test_gmail_threads_postgres.py`'s own numbered "Covers" docstring had drifted out of sync with the file's actual physical test order (rounds 2 and 3's new tests were inserted near the top, not appended where their list numbers implied) -- the identical "Covers"-list-vs-physical-position drift this same document already diagnosed once for a sibling file (Task 3's own round 7, `test_attention_email_awaiting_reply_postgres.py`) -- fixed by renumbering the list to match physical order.
 
 Round 4 found and fixed a real issue on the security lens (a test that didn't prove its own claim) and doc-only issues on the architecture lens, so the loop still does not close -- round 5 needs two fresh, independent, consecutive clean rounds to close.
+
+**Round 5 (architecture/quality): clean.** A genuinely fresh read of the full diff, independently re-verifying every specific claim in this same "Loop 2 review evidence" subsection (the `MAX_THREAD_MESSAGES` rename, the `budgets.py:RunBudget` `NameError` reproduction, the `fetch_and_store_body` extraction's behavioral equivalence, the round-4 docstring-numbering fix, the round-4 call-spy fix, and this subsection's own round-by-round bookkeeping) against the actual current code, tests, and history -- all held up. No findings.
+
+**Round 5 (security/correctness): found and fixed 2 doc-only issues, no code issues.** (1) This same document's own top-of-file summary sentence and status table (lines 12/24, above every task's own evidence section) were never updated across all 4 rounds of Task 6's own review -- still said "Task 1 ... Task 5 delivered" and "On-demand thread reading/caching: Not started (Task 6)", directly contradicting this file's own Task 6 evidence section 500 lines below it. The identical failure class this same document's own history already diagnosed once before, for a different row (Task 3's round 9). Fixed. (2) Migration `0072_phase10_email_detect_action.py`'s own docstring (untouched by this PR, from Task 5) still names `_MAX_THREAD_MESSAGES` -- stale since this PR's own rename, in `email_action_tools.py`, to the now-public `MAX_THREAD_MESSAGES`. Reviewed and explicitly **not fixed**: this codebase's own established discipline (this same review's own round 2 already applied it once for this identical migration file) treats an already-applied migration's own docstring as historical record, accurately describing what the code looked like at the time that migration was written and merged -- not something later, unrelated renames retroactively update. Migration `0075` (this PR's own new migration) is fair game to keep accurate as this PR itself evolves; migration `0072` (merged in a prior PR) is not.
+
+Round 5 found and fixed 2 real (documentation-only) issues on the security lens; the architecture lens was independently clean. Because a real issue was found on at least one lens, round 5 does not count toward the two consecutive clean rounds needed to close the loop -- round 6 needs two fresh, independent, consecutive clean rounds to close.
