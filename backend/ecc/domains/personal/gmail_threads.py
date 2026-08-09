@@ -16,6 +16,13 @@ does this thread contain," not two. No `trigger_message_id` is passed
 that triggered this run must survive the cap" guarantee -- an explicit
 human thread-open has no analogous single triggering message), so this
 call gets the tool's own plain most-recent-`MAX_THREAD_MESSAGES` behavior.
+A disconnected connector account skips the live-fetch attempt entirely
+(Loop 2 round 3 review finding: `sync_connector_endpoint`'s own `409
+CONNECTOR_DISCONNECTED` gate in `connector_accounts.py` has no
+equivalent here otherwise) rather than decrypting and using a credential
+Google has likely already revoked -- but, unlike that endpoint, does not
+fail the whole request over it, since a disconnected connector should not
+block reading a thread's already-cached content.
 
 `POST /api/v1/personal/gmail/threads/{thread_id}/forget`: the plan's own
 "forget this" scope is narrower than Phase 7's whole-domain delete
@@ -118,26 +125,30 @@ def _require_email_consent(session: Session, auth: AuthContext) -> None:
         raise HTTPException(status_code=403, detail="EMAIL_CONSENT_NOT_ACTIVE")
 
 
-def _thread_connector_account_id(
+def _thread_connector_account(
     session: Session, auth: AuthContext, thread_id: UUID
-) -> UUID | None:
+) -> tuple[UUID, str] | None:
     row = session.execute(
         text(
-            "SELECT connector_account_id FROM email_threads "
-            "WHERE workspace_id = :workspace_id AND owner_id = :owner_id AND id = :id"
+            "SELECT ca.id, ca.status FROM email_threads et "
+            "JOIN connector_accounts ca ON ca.workspace_id = et.workspace_id "
+            "AND ca.id = et.connector_account_id "
+            "WHERE et.workspace_id = :workspace_id AND et.owner_id = :owner_id "
+            "AND et.id = :id"
         ),
         {"workspace_id": auth.workspace_id, "owner_id": auth.user_id, "id": thread_id},
     ).one_or_none()
-    return row[0] if row is not None else None
+    return (row[0], row[1]) if row is not None else None
 
 
 @router.get("/threads/{thread_id}", response_model=ThreadContentResponse)
 def get_thread_endpoint(
     thread_id: UUID, auth: AuthDep, session: SessionDep
 ) -> ThreadContentResponse:
-    connector_account_id = _thread_connector_account_id(session, auth, thread_id)
-    if connector_account_id is None:
+    account = _thread_connector_account(session, auth, thread_id)
+    if account is None:
         raise HTTPException(status_code=404, detail="THREAD_NOT_FOUND")
+    connector_account_id, connector_status = account
     _require_email_consent(session, auth)
 
     # Every message in this thread that Task 5's own proactive path, or an
@@ -172,7 +183,15 @@ def get_thread_endpoint(
         .mappings()
         .all()
     )
-    if unfetched:
+    # `connector_status != "disconnected"`: matches `sync_connector_endpoint`'s
+    # own `409 CONNECTOR_DISCONNECTED` gate (`connector_accounts.py`) in
+    # spirit, not status code -- a disconnected connector's credential is
+    # best-effort-revoked at Google already and should not be decrypted and
+    # used for a fresh live call here. Unlike that endpoint, this one does
+    # not fail the whole request over it: skipping the live-fetch attempt
+    # still lets already-cached content render below, which a disconnected
+    # connector should not block reading.
+    if unfetched and connector_status != "disconnected":
         encrypted = _get_encrypted_credential(session, auth.workspace_id, connector_account_id)
         credential = decrypt_credential(encrypted)
         headers = _bearer_headers(credential)

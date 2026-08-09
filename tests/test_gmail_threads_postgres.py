@@ -32,6 +32,10 @@ Covers:
     live fetch raises a transient `httpx` error, still returns 200 with
     the other message's content -- one message's failure does not fail
     the whole request (round 2 review finding).
+11. `GET` on a thread whose connector account is disconnected skips the
+    live-fetch attempt entirely (no Gmail call, proven with a raising
+    transport) rather than decrypting and using a likely-revoked
+    credential -- round 3 review finding.
 """
 
 import base64
@@ -432,6 +436,40 @@ def test_get_thread_one_message_fetch_failure_does_not_fail_the_request(
     failing_row = _message_row(ctx["workspace_id"], failing_message_id)
     assert failing_row["body_fetched_at"] is None
     assert failing_row["body"] is None
+
+
+def test_get_thread_with_disconnected_connector_skips_live_fetch(
+    gmail_threads_context: dict, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ctx = gmail_threads_context
+    with engine.begin() as connection:
+        connection.execute(
+            text("UPDATE connector_accounts SET status = 'disconnected' WHERE id = :id"),
+            {"id": ctx["account_id"]},
+        )
+        thread_id = _insert_thread(
+            connection,
+            workspace_id=ctx["workspace_id"],
+            owner_id=ctx["owner_id"],
+            account_id=ctx["account_id"],
+            subject="Disconnected connector",
+            now=ctx["now"],
+        )
+        _insert_message(
+            connection,
+            workspace_id=ctx["workspace_id"],
+            owner_id=ctx["owner_id"],
+            thread_id=thread_id,
+            external_message_id=f"msg-{uuid4()}",
+            now=ctx["now"],
+            fetched=False,
+        )
+
+    monkeypatch.setattr(gmail_threads, "_adapter", GmailAdapter(transport=_raising_transport()))
+
+    resp = ctx["client"].get(f"/api/v1/personal/gmail/threads/{thread_id}")
+    assert resp.status_code == 200
+    assert resp.json()["messages"] == []
 
 
 def test_get_thread_already_fetched_does_not_call_gmail_again(
