@@ -124,4 +124,4 @@ document does not describe those rows as present.
 |---|---|---|---|
 | 1.0.0 | 2026-08-06 | Documented the Task 1-2 Gmail persistence contract | Lucky Jain |
 | 1.1.0 | 2026-08-06 | Task 5 review (Loop 2 round 16): documented body/body_fetched_at now populated by `email.detect_action`'s own body fetch, and the new `ix_email_messages_detect_action_eligible` partial index (migration `0074`); this document had gone stale after Tasks 3-5 shipped without a contract-version update | Lucky Jain |
-| 1.2.0 | 2026-08-09 | Task 6 review: documented on-demand human-facing body retrieval and the new "forget this" write path that renulls `snippet`/`body`/`body_fetched_at`; this document had gone stale after Task 6 shipped without a contract-version update | Lucky Jain |
+| 1.2.0 | 2026-08-06 | Task 6 review: documented on-demand human-facing body retrieval and the new "forget this" write path that renulls `snippet`/`body`/`body_fetched_at`; this document had gone stale after Task 6 shipped without a contract-version update | Lucky Jain |
