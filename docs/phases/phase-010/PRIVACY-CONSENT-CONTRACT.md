@@ -80,7 +80,7 @@ Task 7's own consent-revocation cascade is the mechanism that will need
 to reach evidence/recommendation propagation, at the domain-wide scope
 this "Unsupported" section's own opening sentence already names.
 
-## Planned controls (Task 7-8)
+## Planned controls (Tasks 7-8)
 
 - export with decrypted owner-authorized content and no credential material;
 - revocation cascade with retryable deletion job and completion evidence;
