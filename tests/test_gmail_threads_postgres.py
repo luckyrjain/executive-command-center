@@ -3,43 +3,47 @@
 against a real Postgres database and the real `TestClient`-driven HTTP
 endpoints (`ecc.domains.personal.gmail_threads`).
 
-Covers:
+Covers, in the same order these tests physically appear below (round 4
+review finding: an earlier version of this list was numbered in a
+different order than the file itself, which made it actively misleading
+to a reader scanning top-to-bottom -- kept in sync with physical order
+going forward rather than insertion order):
 1. `GET /threads/{thread_id}` fetches a still-unfetched message's body via
    the exact same fetch-and-store mechanism Task 5 uses
    (`GmailAdapter.fetch_and_store_body`), stores it encrypted, and returns
    the decrypted thread content.
-2. A second `GET` on an already-fetched thread does not re-fetch (the
+2. `GET` on a thread with two unfetched messages, where one message's
+   live fetch raises a transient `httpx` error, still returns 200 with
+   the other message's content -- one message's failure does not fail
+   the whole request (round 2 review finding).
+3. `GET` on a thread whose connector account is disconnected skips the
+   live-fetch attempt entirely rather than decrypting and using a
+   likely-revoked credential (round 3 review finding) -- proven with a
+   call-spy directly on `fetch_and_store_body`, not merely a raising
+   transport, since the endpoint's own per-message `except Exception:
+   continue` (added for item 2 above) would otherwise silently mask a
+   raising transport's exception too, making "skipped" and "attempted,
+   then masked" indistinguishable (round 4 review finding).
+4. A second `GET` on an already-fetched thread does not re-fetch (the
    `body IS NULL` guard is respected) -- proven with a transport that
    raises if called, not merely asserting the response looks right.
-3. `GET` without an active `email` domain consent is rejected (`403`), no
+5. `GET` without an active `email` domain consent is rejected (`403`), no
    Gmail call made.
-4. `GET` on a thread that does not exist, or belongs to a different
+6. `GET` on a thread that does not exist, or belongs to a different
    workspace, is a non-disclosing `404`.
-5. `POST .../forget` nulls `snippet`/`body`/`body_fetched_at` for every
+7. `POST .../forget` nulls `snippet`/`body`/`body_fetched_at` for every
    message in the targeted thread only -- a second, untouched thread in
    the same domain keeps its own cached content, proving the scoping
-   (the plan's own "removes only the targeted thread's cached content").
-6. `POST .../forget` writes exactly one `deletion_jobs` row,
-   `scope='thread'`, `resource_id=<thread_id>`, `status='completed'`.
-7. `POST .../forget` idempotency-key replay returns the cached response
+   (the plan's own "removes only the targeted thread's cached content"),
+   and writes exactly one `deletion_jobs` row, `scope='thread'`,
+   `resource_id=<thread_id>`, `status='completed'`.
+8. `POST .../forget` idempotency-key replay returns the cached response
    without inserting a second `deletion_jobs` row.
-8. `POST .../forget` on a thread that does not exist is a `404`.
-9. A thread `GET`-opened again after being forgotten re-fetches its
-   content from Gmail -- proving "forget" nulls the cache rather than
-   deleting the message row (which would otherwise make the thread
-   unreadable, not merely uncached).
-10. `GET` on a thread with two unfetched messages, where one message's
-    live fetch raises a transient `httpx` error, still returns 200 with
-    the other message's content -- one message's failure does not fail
-    the whole request (round 2 review finding).
-11. `GET` on a thread whose connector account is disconnected skips the
-    live-fetch attempt entirely rather than decrypting and using a
-    likely-revoked credential (round 3 review finding) -- proven with a
-    call-spy directly on `fetch_and_store_body`, not merely a raising
-    transport, since the endpoint's own per-message `except Exception:
-    continue` (added for item 10 above) would otherwise silently mask a
-    raising transport's exception too, making "skipped" and "attempted,
-    then masked" indistinguishable (round 4 review finding).
+9. `POST .../forget` on a thread that does not exist is a `404`.
+10. A thread `GET`-opened again after being forgotten re-fetches its
+    content from Gmail -- proving "forget" nulls the cache rather than
+    deleting the message row (which would otherwise make the thread
+    unreadable, not merely uncached).
 """
 
 import base64
