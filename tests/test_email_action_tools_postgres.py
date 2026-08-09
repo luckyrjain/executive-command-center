@@ -24,7 +24,7 @@ them, still in oldest-first order, rather than every message the thread
 has ever accumulated (round 13 review finding: previously unbounded,
 unlike every sibling deterministic tool in this runtime); and passing a
 `trigger_message_id` guarantees that specific message survives the cap
-even when it would not otherwise be among the most recent `_MAX_THREAD_
+even when it would not otherwise be among the most recent `MAX_THREAD_
 MESSAGES` (round 14 review finding: round 13's own cap alone could
 silently exclude the very message a real call is triggered for, on a
 thread where an old backlog message is processed long after many newer
@@ -395,7 +395,7 @@ def test_trigger_message_id_is_always_included_even_when_older_than_the_cap_wind
     own eligibility query prioritizes an account's freshly-synced messages
     over older same-thread backlog (`ORDER BY (created_at >= since) DESC,
     sent_at ASC`), so on a busy, long-running thread an old backlog
-    message can still be waiting its turn long after `_MAX_THREAD_
+    message can still be waiting its turn long after `MAX_THREAD_
     MESSAGES` *newer* messages in that same thread already have non-null
     bodies -- by the time it's finally processed, it would fall outside
     the "most recent N" window entirely, and the model would never see
