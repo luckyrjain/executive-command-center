@@ -181,13 +181,22 @@ def get_thread_endpoint(
             # own "one message's failure never stops the rest" discipline
             # -- a message this call could not fetch (a transient Gmail
             # error) simply stays `body IS NULL`, omitted from the
-            # response below rather than failing this whole request.
-            _adapter.fetch_and_store_body(
-                workspace_id=auth.workspace_id,
-                message_id=row["id"],
-                external_message_id=row["external_message_id"],
-                headers=headers,
-            )
+            # response below rather than failing this whole request. Without
+            # this `try/except`, `fetch_and_store_body`'s own `httpx.
+            # HTTPError` -> `RuntimeError` re-raise on a genuine transient
+            # failure (timeout, connection reset) would propagate out of
+            # this loop and turn one message's hiccup into a 500 for the
+            # whole thread -- including content already fetched, in this
+            # call or an earlier one, for every other message in it.
+            try:
+                _adapter.fetch_and_store_body(
+                    workspace_id=auth.workspace_id,
+                    message_id=row["id"],
+                    external_message_id=row["external_message_id"],
+                    headers=headers,
+                )
+            except Exception:  # noqa: BLE001 -- one message's failure never stops the batch
+                continue
 
     result = get_thread_content_tool(session, auth, thread_id)
     if isinstance(result, ToolNotFound):

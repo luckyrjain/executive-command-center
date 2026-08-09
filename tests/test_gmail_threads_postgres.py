@@ -28,6 +28,10 @@ Covers:
    content from Gmail -- proving "forget" nulls the cache rather than
    deleting the message row (which would otherwise make the thread
    unreadable, not merely uncached).
+10. `GET` on a thread with two unfetched messages, where one message's
+    live fetch raises a transient `httpx` error, still returns 200 with
+    the other message's content -- one message's failure does not fail
+    the whole request (round 2 review finding).
 """
 
 import base64
@@ -85,6 +89,27 @@ def _gmail_transport(*external_message_ids: str) -> httpx.MockTransport:
     def handler(request: httpx.Request) -> httpx.Response:
         external_id = request.url.path.rsplit("/", 1)[-1]
         assert external_id in allowed, f"unexpected message fetch: {external_id}"
+        return httpx.Response(
+            200,
+            json={
+                "id": external_id,
+                "payload": {"mimeType": "text/plain", "body": {"data": encoded_body}},
+            },
+        )
+
+    return httpx.MockTransport(handler)
+
+
+def _gmail_transport_with_one_failure(
+    ok_external_message_id: str, failing_external_message_id: str
+) -> httpx.MockTransport:
+    encoded_body = base64.urlsafe_b64encode(_PLAIN_TEXT_BODY.encode()).decode().rstrip("=")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        external_id = request.url.path.rsplit("/", 1)[-1]
+        if external_id == failing_external_message_id:
+            raise httpx.ConnectError("simulated transient Gmail failure")
+        assert external_id == ok_external_message_id, f"unexpected message fetch: {external_id}"
         return httpx.Response(
             200,
             json={
@@ -351,6 +376,64 @@ def test_get_thread_fetches_unfetched_message_and_returns_decrypted_content(
     assert decrypt_field(row["body"]) == _PLAIN_TEXT_BODY
 
 
+def test_get_thread_one_message_fetch_failure_does_not_fail_the_request(
+    gmail_threads_context: dict, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ctx = gmail_threads_context
+    with engine.begin() as connection:
+        thread_id = _insert_thread(
+            connection,
+            workspace_id=ctx["workspace_id"],
+            owner_id=ctx["owner_id"],
+            account_id=ctx["account_id"],
+            subject="Partial failure",
+            now=ctx["now"],
+        )
+        ok_external_message_id = f"msg-{uuid4()}"
+        ok_message_id = _insert_message(
+            connection,
+            workspace_id=ctx["workspace_id"],
+            owner_id=ctx["owner_id"],
+            thread_id=thread_id,
+            external_message_id=ok_external_message_id,
+            now=ctx["now"],
+            fetched=False,
+        )
+        failing_external_message_id = f"msg-{uuid4()}"
+        failing_message_id = _insert_message(
+            connection,
+            workspace_id=ctx["workspace_id"],
+            owner_id=ctx["owner_id"],
+            thread_id=thread_id,
+            external_message_id=failing_external_message_id,
+            now=ctx["now"],
+            fetched=False,
+        )
+
+    monkeypatch.setattr(
+        gmail_threads,
+        "_adapter",
+        GmailAdapter(
+            transport=_gmail_transport_with_one_failure(
+                ok_external_message_id, failing_external_message_id
+            )
+        ),
+    )
+
+    resp = ctx["client"].get(f"/api/v1/personal/gmail/threads/{thread_id}")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert len(body["messages"]) == 1
+    assert body["messages"][0]["body"] == _PLAIN_TEXT_BODY
+
+    ok_row = _message_row(ctx["workspace_id"], ok_message_id)
+    assert ok_row["body_fetched_at"] is not None
+
+    failing_row = _message_row(ctx["workspace_id"], failing_message_id)
+    assert failing_row["body_fetched_at"] is None
+    assert failing_row["body"] is None
+
+
 def test_get_thread_already_fetched_does_not_call_gmail_again(
     gmail_threads_context: dict, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -416,14 +499,14 @@ def test_get_thread_without_active_consent_is_rejected(
 
     resp = ctx["client"].get(f"/api/v1/personal/gmail/threads/{thread_id}")
     assert resp.status_code == 403
-    assert resp.json()["detail"] == "EMAIL_CONSENT_NOT_ACTIVE"
+    assert resp.json()["error"]["code"] == "EMAIL_CONSENT_NOT_ACTIVE"
 
 
 def test_get_thread_not_found_is_non_disclosing_404(gmail_threads_context: dict) -> None:
     ctx = gmail_threads_context
     resp = ctx["client"].get(f"/api/v1/personal/gmail/threads/{uuid4()}")
     assert resp.status_code == 404
-    assert resp.json()["detail"] == "THREAD_NOT_FOUND"
+    assert resp.json()["error"]["code"] == "THREAD_NOT_FOUND"
 
 
 def test_get_thread_belonging_to_a_different_workspace_is_404(gmail_threads_context: dict) -> None:
@@ -471,6 +554,25 @@ def test_get_thread_belonging_to_a_different_workspace_is_404(gmail_threads_cont
                 "now": now,
             },
         )
+        connection.execute(
+            text(
+                """
+                INSERT INTO personal_domains (
+                    id, workspace_id, owner_id, domain_key, classification, enabled,
+                    enabled_at, created_by, updated_by, created_at, updated_at, version
+                ) VALUES (
+                    :id, :workspace_id, :owner_id, 'email', 'high_stakes', true,
+                    :now, :owner_id, :owner_id, :now, :now, 1
+                )
+                """
+            ),
+            {
+                "id": uuid4(),
+                "workspace_id": other_workspace_id,
+                "owner_id": other_owner_id,
+                "now": now,
+            },
+        )
         other_thread_id = _insert_thread(
             connection,
             workspace_id=other_workspace_id,
@@ -483,7 +585,7 @@ def test_get_thread_belonging_to_a_different_workspace_is_404(gmail_threads_cont
     try:
         resp = ctx["client"].get(f"/api/v1/personal/gmail/threads/{other_thread_id}")
         assert resp.status_code == 404
-        assert resp.json()["detail"] == "THREAD_NOT_FOUND"
+        assert resp.json()["error"]["code"] == "THREAD_NOT_FOUND"
     finally:
         _cleanup_workspace(other_workspace_id, email="other-owner@example.test")
 
@@ -595,7 +697,15 @@ def test_forget_thread_idempotency_replay_does_not_insert_a_second_job(
     )
     assert first.status_code == 200
     assert second.status_code == 200
-    assert first.json() == second.json()
+    # Compare only the cached business fields, not the full body: `response_
+    # contract_middleware` stamps a fresh `request_id`/`correlation_id` onto
+    # every response -- including a replayed one -- so those two keys
+    # legitimately differ between calls even though the cached payload
+    # underneath is identical (matching the established pattern in
+    # `test_collaboration_delegations_postgres.py`'s own idempotency-replay
+    # test, which compares specific fields rather than the whole body).
+    for field in ("id", "thread_id", "status", "requested_at", "completed_at"):
+        assert first.json()[field] == second.json()[field]
 
     with engine.begin() as connection:
         count = connection.execute(
@@ -615,7 +725,7 @@ def test_forget_thread_not_found_is_404(gmail_threads_context: dict) -> None:
         headers=_headers(ctx["token"], str(uuid4())),
     )
     assert resp.status_code == 404
-    assert resp.json()["detail"] == "THREAD_NOT_FOUND"
+    assert resp.json()["error"]["code"] == "THREAD_NOT_FOUND"
 
 
 def test_reopening_a_forgotten_thread_refetches_its_content(

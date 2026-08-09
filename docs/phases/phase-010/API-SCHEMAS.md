@@ -92,8 +92,10 @@ Requires an authenticated workspace session with an active `email` domain
 consent (`403 EMAIL_CONSENT_NOT_ACTIVE` otherwise). Fetches any not-yet-
 cached message body in the thread from Gmail (`gmail.readonly`) before
 responding -- the first endpoint anywhere in this codebase that returns
-thread subjects, participants, snippets, or bodies (correcting this
-document's own prior "no current endpoint" claim, now stale).
+thread subjects, senders, or bodies (correcting this document's own prior
+"no current endpoint" claim, now stale). The response carries each
+message's `sender` only, not a full participant/recipient list, and no
+`snippet` field -- matching the worked example below.
 
 ```json
 {
