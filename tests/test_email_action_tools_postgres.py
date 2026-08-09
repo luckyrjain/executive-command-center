@@ -18,8 +18,8 @@ docstring documents (round 5 review finding: previously untested); a
 message whose stored `body` fails to decrypt under the current key falls
 back to a fixed placeholder string rather than raising (round 5 review
 finding: previously untested); messages are returned oldest-first
-(`sent_at ASC`); and a thread with more than `_MAX_THREAD_MESSAGES`
-eligible messages returns only the most recent `_MAX_THREAD_MESSAGES` of
+(`sent_at ASC`); and a thread with more than `MAX_THREAD_MESSAGES`
+eligible messages returns only the most recent `MAX_THREAD_MESSAGES` of
 them, still in oldest-first order, rather than every message the thread
 has ever accumulated (round 13 review finding: previously unbounded,
 unlike every sibling deterministic tool in this runtime); and passing a
@@ -44,7 +44,7 @@ from ecc.config import get_settings
 from ecc.database import SessionFactory, engine
 from ecc.domains.ai_runtime.tools import ToolNotFound, ToolResult
 from ecc.domains.personal.crypto import encrypt_field
-from ecc.domains.personal.email_action_tools import _MAX_THREAD_MESSAGES, get_thread_content_tool
+from ecc.domains.personal.email_action_tools import MAX_THREAD_MESSAGES, get_thread_content_tool
 
 settings = get_settings()
 pytestmark = pytest.mark.skipif(
@@ -342,8 +342,8 @@ def test_thread_with_more_than_the_cap_returns_only_the_most_recent_messages_in_
     whole AI runtime with no size bound at all, unlike every sibling
     (`_MAX_FACTORS`/`_MAX_CLAIMS`/`_MAX_EVIDENCE`/`_MAX_RECORDS_PER_DOMAIN`),
     a direct gap against the design doc's own Decision 6 "every tool
-    result is ... size-bounded" contract. Inserts `_MAX_THREAD_MESSAGES +
-    10` messages -- proves the tool returns exactly `_MAX_THREAD_MESSAGES`
+    result is ... size-bounded" contract. Inserts `MAX_THREAD_MESSAGES +
+    10` messages -- proves the tool returns exactly `MAX_THREAD_MESSAGES`
     of them, that the *newest* ones survive the cap rather than the
     oldest (the newest is normally the one that triggered this call in
     the first place, so an oldest-first-then-truncate approach would drop
@@ -359,7 +359,7 @@ def test_thread_with_more_than_the_cap_returns_only_the_most_recent_messages_in_
         now=tool_context["now"],
     )
     now = tool_context["now"]
-    total_messages = _MAX_THREAD_MESSAGES + 10
+    total_messages = MAX_THREAD_MESSAGES + 10
     for i in range(total_messages):
         _insert_message(
             workspace_id=tool_context["workspace_id"],
@@ -375,7 +375,7 @@ def test_thread_with_more_than_the_cap_returns_only_the_most_recent_messages_in_
 
     assert isinstance(result, ToolResult)
     messages = result.output["messages"]
-    assert len(messages) == _MAX_THREAD_MESSAGES
+    assert len(messages) == MAX_THREAD_MESSAGES
     # The oldest surviving message is the one dropped-up-to boundary, not
     # message-0 -- the ten oldest messages (message-0 .. message-9) must
     # not survive the cap.
@@ -390,7 +390,7 @@ def test_trigger_message_id_is_always_included_even_when_older_than_the_cap_wind
     tool_context: dict,
 ) -> None:
     """Round 14 review finding: round 13's own cap alone -- "most recent
-    `_MAX_THREAD_MESSAGES` by `sent_at`" -- can silently exclude the
+    `MAX_THREAD_MESSAGES` by `sent_at`" -- can silently exclude the
     specific message that triggered this call. `detect_actions_since`'s
     own eligibility query prioritizes an account's freshly-synced messages
     over older same-thread backlog (`ORDER BY (created_at >= since) DESC,
@@ -400,7 +400,7 @@ def test_trigger_message_id_is_always_included_even_when_older_than_the_cap_wind
     bodies -- by the time it's finally processed, it would fall outside
     the "most recent N" window entirely, and the model would never see
     the very email the run exists to evaluate. Simulates exactly that:
-    the oldest message in a `_MAX_THREAD_MESSAGES + 10`-message thread is
+    the oldest message in a `MAX_THREAD_MESSAGES + 10`-message thread is
     the one this call is triggered for; without the `trigger_message_id`
     guarantee, this exact message would be the *first* one the cap drops
     (proven by the sibling test above, whose own oldest-10-dropped
@@ -414,7 +414,7 @@ def test_trigger_message_id_is_always_included_even_when_older_than_the_cap_wind
         now=tool_context["now"],
     )
     now = tool_context["now"]
-    total_messages = _MAX_THREAD_MESSAGES + 10
+    total_messages = MAX_THREAD_MESSAGES + 10
     message_ids: list[UUID] = []
     for i in range(total_messages):
         message_id = _insert_message(
@@ -435,16 +435,16 @@ def test_trigger_message_id_is_always_included_even_when_older_than_the_cap_wind
 
     assert isinstance(result, ToolResult)
     messages = result.output["messages"]
-    # Still capped at _MAX_THREAD_MESSAGES total -- the guarantee reserves
+    # Still capped at MAX_THREAD_MESSAGES total -- the guarantee reserves
     # a slot for the trigger rather than appending a 51st message.
-    assert len(messages) == _MAX_THREAD_MESSAGES
+    assert len(messages) == MAX_THREAD_MESSAGES
     # The trigger (message-0, the oldest) is present, first in the still-
     # oldest-first output, even though it would not otherwise have
     # survived the cap.
     assert messages[0]["body"] == "message-0"
     # The 49 most-recent other messages (message-11..message-59) fill the
     # remaining slots, still in oldest-first order.
-    rest_start = total_messages - (_MAX_THREAD_MESSAGES - 1)
+    rest_start = total_messages - (MAX_THREAD_MESSAGES - 1)
     expected_rest = [f"message-{i}" for i in range(rest_start, total_messages)]
     assert [m["body"] for m in messages[1:]] == expected_rest
 

@@ -15,7 +15,7 @@ does this thread contain," not two. No `trigger_message_id` is passed
 (that field exists solely for `email.detect_action`'s own "the message
 that triggered this run must survive the cap" guarantee -- an explicit
 human thread-open has no analogous single triggering message), so this
-call gets the tool's own plain most-recent-`_MAX_THREAD_MESSAGES` behavior.
+call gets the tool's own plain most-recent-`MAX_THREAD_MESSAGES` behavior.
 
 `POST /api/v1/personal/gmail/threads/{thread_id}/forget`: the plan's own
 "forget this" scope is narrower than Phase 7's whole-domain delete
