@@ -33,9 +33,13 @@ Covers:
     the other message's content -- one message's failure does not fail
     the whole request (round 2 review finding).
 11. `GET` on a thread whose connector account is disconnected skips the
-    live-fetch attempt entirely (no Gmail call, proven with a raising
-    transport) rather than decrypting and using a likely-revoked
-    credential -- round 3 review finding.
+    live-fetch attempt entirely rather than decrypting and using a
+    likely-revoked credential (round 3 review finding) -- proven with a
+    call-spy directly on `fetch_and_store_body`, not merely a raising
+    transport, since the endpoint's own per-message `except Exception:
+    continue` (added for item 10 above) would otherwise silently mask a
+    raising transport's exception too, making "skipped" and "attempted,
+    then masked" indistinguishable (round 4 review finding).
 """
 
 import base64
@@ -465,11 +469,28 @@ def test_get_thread_with_disconnected_connector_skips_live_fetch(
             fetched=False,
         )
 
-    monkeypatch.setattr(gmail_threads, "_adapter", GmailAdapter(transport=_raising_transport()))
+    # A `_raising_transport()` alone would not actually prove the live
+    # fetch was skipped: `get_thread_endpoint`'s own per-message `except
+    # Exception: continue` (added for the round-2 partial-failure fix)
+    # would silently swallow the `AssertionError` a raising transport
+    # produces, exactly as it swallows a genuine transient failure --
+    # making "skipped" and "attempted, then masked" indistinguishable by
+    # response shape alone (round 4 review finding). A call-spy on
+    # `fetch_and_store_body` itself, upstream of that `try`/`except`, is
+    # the only assertion that is actually causally tied to the
+    # disconnected-status check rather than to "was some exception raised
+    # somewhere in the loop."
+    calls: list[UUID] = []
+    monkeypatch.setattr(
+        gmail_threads._adapter,
+        "fetch_and_store_body",
+        lambda **kwargs: calls.append(kwargs["message_id"]),
+    )
 
     resp = ctx["client"].get(f"/api/v1/personal/gmail/threads/{thread_id}")
     assert resp.status_code == 200
     assert resp.json()["messages"] == []
+    assert calls == []
 
 
 def test_get_thread_already_fetched_does_not_call_gmail_again(
