@@ -128,6 +128,27 @@ detection_sync_postgres.py` for Task 5's own dedicated test file):
     unrelated to this call's own `items_processed` count. Proven by
     asserting the hook still fires when `_ActionDetectionSpyAdapter`'s own
     `items_processed` is `0`.
+
+Plus two items closing a gap Phase 10 Gmail Connector Task 7's own Loop 2
+rounds 1-2 review found in this module's territory (this generic,
+provider-agnostic `/disable` endpoint, not `gmail_revocation.py`'s own
+cascade -- see `tests/test_gmail_revocation_postgres.py` for Task 7's own
+dedicated test file):
+
+28. `test_disable_rejects_gmail_provider_account`: this endpoint only
+    marks a row `disconnected` and clears synced projections -- it never
+    reaches the domain-consent cascade, so disabling a `gmail`-provider
+    account through this path used to leave the exact "disconnected but
+    data (and domain consent) remains" state Task 7 exists to make
+    unreachable. Now rejected with `409 GMAIL_DISABLE_REQUIRES_DOMAIN_
+    ENDPOINT`, directing callers to the domain-level endpoint that
+    actually reaches the cascade. `test_disable_already_disconnected_
+    gmail_account_is_still_an_idempotent_noop`: round 2 review found the
+    round-1 rejection was originally unconditional, regressing every other
+    provider's own established contract that disabling an already-
+    disconnected connector is an idempotent `200` no-op; fixed by gating
+    the rejection on `account.status != "disconnected"`, proven here by an
+    already-disconnected `gmail` row still returning `200`.
 """
 
 import threading
