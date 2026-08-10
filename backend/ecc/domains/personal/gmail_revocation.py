@@ -368,9 +368,11 @@ def cascade_email_revocation(
     # `email_messages` before `email_threads` (Loop 2 round 35 review:
     # corrected -- migration `0069`'s `email_messages -> email_threads` FK
     # already has `ondelete="CASCADE"`, confirmed live against Postgres, so
-    # a plain `DELETE FROM email_threads` alone would already cascade this
-    # away; both statements are redundant-but-harmless given the real
-    # cascade). Explicit child-before-parent order kept anyway, matching
+    # a plain `DELETE FROM email_threads` alone would already cascade the
+    # `email_messages` delete away; the explicit child-before-parent
+    # *order* -- not the parent delete itself, which is the only statement
+    # that removes `email_threads` rows at all -- is what's redundant-but-
+    # harmless here, round 36 review). Explicit order kept anyway, matching
     # every other Phase 7 domain's own explicit-order convention
     # (`export_deletion.py:_CHILD_TABLES_DELETE_ORDER`) for defense-in-
     # depth and readability, not because it's load-bearing here.
