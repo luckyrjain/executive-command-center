@@ -49,6 +49,7 @@ from .domains import (
     request_hash,
     store_idempotency,
 )
+from .gmail_revocation import PendingGmailRevoke, cascade_email_revocation, finish_gmail_revocation
 
 router = APIRouter(prefix="/api/v1/personal", tags=["personal"])
 
@@ -154,7 +155,16 @@ def export_domain_endpoint(
     )
 
 
-def _delete_domain_data(session: Session, auth: AuthContext, domain_key: str) -> None:
+def _delete_domain_data(
+    session: Session, auth: AuthContext, domain_key: str, now: datetime
+) -> PendingGmailRevoke | None:
+    """Returns pending Google-side revoke info when `domain_key ==
+    "email"` -- see `gmail_revocation.py`'s own module docstring. `now` is
+    the caller's own single timestamp for this request, reused here so
+    every row this cascade touches shares the identical `updated_at`/
+    `disconnected_at` moment the rest of `delete_domain_endpoint`'s own
+    writes use.
+    """
     params = {"workspace_id": auth.workspace_id, "owner_id": auth.user_id, "domain_key": domain_key}
     for table in _CHILD_TABLES_DELETE_ORDER:
         session.execute(
@@ -197,6 +207,15 @@ def _delete_domain_data(session: Session, auth: AuthContext, domain_key: str) ->
         params,
     )
 
+    # Phase 10 Task 7: `email` is the one domain whose deletion needs to
+    # reach beyond this module's own generic tables -- see `gmail_
+    # revocation.py`'s own module docstring for the full cascade (Gmail
+    # connector disconnect, `email_threads`/`email_messages`, and every
+    # derived `attention_items`/`recommendations`/`pkos_evidence` row).
+    if domain_key == "email":
+        return cascade_email_revocation(session, auth, now)
+    return None
+
 
 @router.post("/domains/{domain_key}/delete", response_model=DomainDeletionResponse)
 def delete_domain_endpoint(
@@ -217,6 +236,7 @@ def delete_domain_endpoint(
     """
     req_hash = request_hash(_EmptyBody(), f"delete_domain:{domain_key}")
     now = datetime.now(UTC)
+    pending_gmail_revoke: PendingGmailRevoke | None = None
     with session.begin():
         lock_idempotency(session, auth, idempotency_key)
         cached = load_cached(
@@ -229,7 +249,7 @@ def delete_domain_endpoint(
         if domain is None:
             raise HTTPException(status_code=404, detail="DOMAIN_NOT_FOUND")
 
-        _delete_domain_data(session, auth, domain_key)
+        pending_gmail_revoke = _delete_domain_data(session, auth, domain_key, now)
 
         session.execute(
             text(
@@ -285,4 +305,13 @@ def delete_domain_endpoint(
         store_idempotency(
             session, auth, idempotency_key, req_hash, response.model_dump(mode="json"), now
         )
-        return response
+
+    # Transaction above has committed. Release `session`'s pooled
+    # connection before the deferred, best-effort Google-side revoke's
+    # potentially slow, blocking network call -- see `gmail_revocation.py`'s
+    # own module docstring, matching `domains.py:_disable_domain`'s
+    # identical shape for the same reason.
+    if pending_gmail_revoke is not None:
+        session.close()
+        finish_gmail_revocation(pending_gmail_revoke)
+    return response

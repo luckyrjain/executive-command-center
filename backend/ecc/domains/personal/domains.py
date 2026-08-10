@@ -71,6 +71,11 @@ from sqlalchemy.orm import Session
 from ecc.auth import AuthContext, AuthDep, CsrfDep
 from ecc.database import get_session
 from ecc.domains.personal.crypto import decrypt_field, encrypt_field
+from ecc.domains.personal.gmail_revocation import (
+    PendingGmailRevoke,
+    cascade_email_revocation,
+    finish_gmail_revocation,
+)
 from ecc.observability import (
     queue_lifecycle_event,
     record_audit_outbox_failure,
@@ -727,8 +732,22 @@ def _disable_domain(
     session: Session,
     idempotency_key: str,
 ) -> DomainResponse:
+    """Phase 10 Task 7: for `domain_key == "email"` specifically, a real
+    enabled -> disabled transition here also runs `gmail_revocation.
+    cascade_email_revocation` -- disconnecting the Gmail connector account
+    and purging every email-derived record -- in the same transaction as
+    the state change itself. Every other domain's own disable stays exactly
+    as before (data untouched, a separate explicit `POST .../delete`
+    required to purge anything); see `gmail_revocation.py`'s own module
+    docstring for why `email` is deliberately different in kind, not
+    degree. Both `disable_domain_endpoint` and `revoke_consent_endpoint`
+    call this single write path, so the cascade is reached identically
+    from either HTTP entry point, matching this module's own "one real
+    write path per state transition" convention (see module docstring).
+    """
     req_hash = request_hash(_EmptyBody(), f"disable_domain:{domain_key}")
     now = datetime.now(UTC)
+    pending_gmail_revoke: PendingGmailRevoke | None = None
     with session.begin():
         lock_idempotency(session, auth, idempotency_key)
         cached = load_cached(session, auth, idempotency_key, req_hash, domain="personal_domains")
@@ -767,6 +786,8 @@ def _disable_domain(
                 },
             )
             version = domain.version + 1
+            if domain_key == "email":
+                pending_gmail_revoke = cascade_email_revocation(session, auth, now)
 
         refreshed = get_domain(session, auth, domain_key)
         assert refreshed is not None
@@ -785,7 +806,16 @@ def _disable_domain(
         store_idempotency(
             session, auth, idempotency_key, req_hash, response.model_dump(mode="json"), now
         )
-        return response
+
+    # Transaction above has committed. Release `session`'s pooled
+    # connection before the deferred, best-effort Google-side revoke's
+    # potentially slow, blocking network call -- see `gmail_revocation.py`'s
+    # own module docstring for why, matching `connector_accounts.py:
+    # disable_connector_endpoint`'s identical established split.
+    if pending_gmail_revoke is not None:
+        session.close()
+        finish_gmail_revocation(pending_gmail_revoke)
+    return response
 
 
 @router.post("/domains/{domain_key}/disable", response_model=DomainResponse)

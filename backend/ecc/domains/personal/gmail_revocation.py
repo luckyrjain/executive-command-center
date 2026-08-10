@@ -1,0 +1,270 @@
+"""Phase 10 Gmail Connector Task 7: consent revocation cascade
+(`docs/superpowers/plans/2026-08-04-phase-10-gmail-connector.md`, Task 7:
+"Revoking the `email` domain's `domain_consents` row calls `GmailAdapter.
+disconnect()` ... and runs Phase 7's existing deletion-job pipeline ...
+-- one action, both effects, no partial 'disconnected but data remains'
+state reachable through this path").
+
+**Why `email` disabling/revoking now purges data, unlike every other
+domain.** For `habits`/`learning`/`travel`/`relationships`/`health`/
+`finance`, `domains.py:_disable_domain` only flips `personal_domains.
+enabled` and closes the open `domain_consents` row -- the underlying
+records stay intact, and a separate, explicit `POST .../delete`
+(`export_deletion.py`) is required to actually purge anything. `email` is
+different in kind, not degree: its data is a synced *mirror of a live,
+externally-connected Google account*, not a self-reported record a user
+typed in. Leaving a full inbox mirror and an active OAuth grant behind
+after "disabling" the domain would defeat consent revocation's entire
+purpose for this domain specifically -- `PRIVACY-CONSENT-CONTRACT.md`'s
+own "Unsupported" section (pre-Task-7) named exactly this gap as a
+production blocker. This module is called from *both* `domains.py:_
+disable_domain` (the single write path `disable_domain_endpoint` and
+`revoke_consent_endpoint` both already funnel through) and `export_
+deletion.py:_delete_domain_data`, so every code path that disables or
+deletes the `email` domain reaches the identical cascade -- matching this
+codebase's own "one real write path per state transition" convention
+rather than duplicating this logic at each HTTP entry point.
+
+**No new `deletion_jobs` schema for "retry"/"partial failure."**
+`TEST-PLAN.md`'s "Required Task 7-8" bullet names "retry, partial
+failure" as needed evidence; `export_deletion.py`'s own module docstring
+predicted this task as the natural point to introduce a real `pending ->
+worker -> completed` `deletion_jobs` lifecycle. On inspection, that
+machinery is not actually needed: every write below runs inside the
+*same* transaction `_disable_domain`/`_delete_domain_data` already opens
+(`with session.begin():`), so a failure at any point rolls back
+everything written so far in this cascade too -- there is no reachable
+partially-purged state, and no `deletion_jobs` row is ever written for a
+failed attempt (the existing `domain="personal_domains"`/`"personal_
+domain_deletion"` idempotency-key guard in each caller means a client
+retry with the *same* `Idempotency-Key` simply re-attempts the whole
+cascade from scratch, since every `DELETE`/`UPDATE` here is independently
+idempotent -- deleting already-gone rows or updating an already-
+`disconnected` status is a no-op). Building a new `pending`/`failed`
+status now, with nothing that would ever leave a row in either state for
+longer than one transaction, would be exactly the kind of premature
+machinery `export_deletion.py`'s own docstring already warns against.
+
+**Deferred, best-effort Google-side revoke.** Matches `connector_
+accounts.py:disable_connector_endpoint`'s own established split exactly,
+for the identical reason (that endpoint's own round-23 review comment):
+credential decryption is fast and local, so it happens *inside* the
+caller's transaction; the actual outbound HTTPS call to Google's
+`/revoke` endpoint is slow and blocking, so it must happen only *after*
+that transaction commits and the session's pooled connection is released
+-- `cascade_email_revocation` below returns the decrypted context for the
+caller to pass to `finish_gmail_revocation` post-commit, rather than
+calling `disconnect()` itself.
+
+**What is deliberately NOT deleted.**
+- `pkos_nodes` (the resolved person entities themselves): `gmail_adapter.
+  py:_resolve_or_create_person` deduplicates at *workspace* scope, not
+  owner scope -- a node this owner's Gmail sync first created may be the
+  same node a different owner's own Gmail sync, or an entirely different
+  domain's entity resolution, has since reused. Deleting it here could
+  destroy state another owner or domain still depends on. Only the
+  `gmail_sync`-sourced `pkos_evidence` rows this owner's own email
+  produced are removed; an evidence-less node (a bare `canonical_name`,
+  no content) carries no privacy exposure of its own.
+- `recommendations` rows already `status = 'executed'`: Task 4's own
+  create-path confirms these into a real, independent `tasks`/
+  `commitments`/`risks` row via the same internal creation function every
+  other caller uses -- that downstream row is the owner's own work
+  product, not Gmail data, and survives. The recommendation row itself is
+  redacted in place (its own `rationale`/`proposed_action`/`evidence_ids`
+  nulled), matching `gmail_threads.py:forget_thread_endpoint`'s own "null
+  the content, keep the audit skeleton" convention exactly -- the fact
+  that a recommendation once existed, was confirmed, and led to that task
+  remains visible; the Gmail-derived narrative behind it does not.
+"""
+
+from __future__ import annotations
+
+from datetime import datetime
+
+from sqlalchemy import text
+from sqlalchemy.orm import Session
+
+from ecc.auth import AuthContext
+from ecc.domains.engineering.connector_accounts import _get_encrypted_credential
+from ecc.domains.engineering.connectors import ConnectorAccountContext
+from ecc.domains.engineering.crypto import decrypt_credential
+
+from .gmail_adapter import GmailAdapter
+
+# Module-level singleton, mirroring `gmail_threads.py`'s own identical
+# "constructed with no arguments, reads `ECC_GMAIL_OAUTH_*` lazily" shape.
+_adapter = GmailAdapter()
+
+PendingGmailRevoke = tuple[GmailAdapter, ConnectorAccountContext]
+
+_REDACTED_RATIONALE = "Source email no longer available -- email consent was revoked."
+
+
+def cascade_email_revocation(
+    session: Session, auth: AuthContext, now: datetime
+) -> PendingGmailRevoke | None:
+    """Purges every email-derived record this owner's Gmail sync ever
+    wrote and marks the owner's `gmail` connector account(s)
+    `disconnected` -- called from within an already-open transaction, so
+    every write here commits or rolls back atomically with whatever
+    domain-level state change triggered it. Returns pending Google-side
+    revoke info for the caller to pass to `finish_gmail_revocation` after
+    that transaction commits (see module docstring).
+    """
+    params = {"workspace_id": auth.workspace_id, "owner_id": auth.user_id}
+
+    # `attention_items.owner_id` (migration `0063`'s Phase 8 authz
+    # widening) is explicitly set at write time from the underlying
+    # entity's own owner (`attention.py`'s email-thread branch selects
+    # `et.owner_id` directly into the row), so it is a reliable scoping
+    # key here -- unlike `pkos_evidence`/`pkos_nodes` below, whose own
+    # `owner_id` (added by the same migration) is backfilled/defaulted to
+    # a generic "workspace's earliest-created user" fallback with no
+    # correlation to which owner's Gmail sync actually produced a given
+    # row, and so is deliberately NOT trusted for scoping there.
+    session.execute(
+        text(
+            "DELETE FROM attention_items WHERE workspace_id = :workspace_id "
+            "AND owner_id = :owner_id AND entity_type = 'email_thread'"
+        ),
+        params,
+    )
+
+    # `recommendations.owner_id` (migration `0063`) is backfilled/
+    # defaulted from `created_by`, and Task 5's own `email.detect_action`
+    # always creates under the run's own owner-scoped `AuthContext`
+    # (`created_by = created_at actor = the email's owner`), so `owner_id`
+    # here is reliable too. See module docstring for why `executed` rows
+    # are redacted in place rather than deleted.
+    session.execute(
+        text(
+            "UPDATE recommendations SET rationale = :redacted, "
+            "proposed_action = '{}'::jsonb, evidence_ids = '{}' "
+            "WHERE workspace_id = :workspace_id AND owner_id = :owner_id "
+            "AND recommendation_type = 'email_action_detected' AND status = 'executed'"
+        ),
+        {"redacted": _REDACTED_RATIONALE, **params},
+    )
+    session.execute(
+        text(
+            "DELETE FROM recommendations WHERE workspace_id = :workspace_id "
+            "AND owner_id = :owner_id AND recommendation_type = 'email_action_detected' "
+            "AND status != 'executed'"
+        ),
+        params,
+    )
+
+    # `pkos_evidence` gained an `owner_id` column from the same migration
+    # `0063`, but -- unlike `attention_items`/`recommendations` above --
+    # it is never set at write time here (`gmail_adapter.py`'s own two
+    # `INSERT INTO pkos_evidence` sites list no `owner_id` column at all)
+    # and so falls back to that migration's generic "workspace's
+    # earliest-created user" default, unrelated to which owner's Gmail
+    # sync actually produced a given evidence row -- deliberately NOT
+    # trusted for scoping. `external_message_id`s must be captured BEFORE
+    # `email_messages` is deleted below (no FK from `pkos_evidence` back
+    # to it -- the identical "an audit/derived record must remain
+    # resolvable independent of the content it once pointed at" reasoning
+    # migration `0075`'s own docstring already gives for `deletion_jobs.
+    # resource_id`), matched by the exact `source_ref` strings `gmail_
+    # adapter.py`'s two write sites deterministically construct from
+    # `external_message_id` (`_resolve_or_create_person`: `f"gmail:
+    # {external_message_id}"`; `_register_message_evidence`: `f"gmail:
+    # detect_action:{external_message_id}"`). Does NOT touch `pkos_
+    # nodes` -- see module docstring's "what is deliberately NOT
+    # deleted" section.
+    external_message_ids: list[str] = [
+        row[0]
+        for row in session.execute(
+            text(
+                "SELECT external_message_id FROM email_messages "
+                "WHERE workspace_id = :workspace_id AND owner_id = :owner_id"
+            ),
+            params,
+        )
+    ]
+    if external_message_ids:
+        refs = [f"gmail:{mid}" for mid in external_message_ids] + [
+            f"gmail:detect_action:{mid}" for mid in external_message_ids
+        ]
+        session.execute(
+            text(
+                "DELETE FROM pkos_evidence WHERE workspace_id = :workspace_id "
+                "AND source_type = 'gmail_sync' AND source_ref = ANY(:refs)"
+            ),
+            {"workspace_id": auth.workspace_id, "refs": refs},
+        )
+
+    # `email_messages` before `email_threads` -- Task 1's own migration
+    # `0069` leaves the child->parent relationship with no `ondelete`
+    # cascade (matching every other Phase 7 domain's own explicit-order
+    # convention, `export_deletion.py:_CHILD_TABLES_DELETE_ORDER`, rather
+    # than relying on a cascade), so the order here is what keeps this
+    # FK-safe.
+    session.execute(
+        text(
+            "DELETE FROM email_messages WHERE workspace_id = :workspace_id AND owner_id = :owner_id"
+        ),
+        params,
+    )
+    session.execute(
+        text(
+            "DELETE FROM email_threads WHERE workspace_id = :workspace_id AND owner_id = :owner_id"
+        ),
+        params,
+    )
+
+    # `connector_accounts.owner_id` (migration `0063`) is set explicitly
+    # at write time by `gmail_oauth.py`'s own OAuth-callback `INSERT`
+    # (the connecting user, `auth.user_id`), so it is reliable here too.
+    pending_revoke: PendingGmailRevoke | None = None
+    account_row = session.execute(
+        text(
+            "SELECT id, external_account_id FROM connector_accounts "
+            "WHERE workspace_id = :workspace_id AND provider = 'gmail' "
+            "AND owner_id = :owner_id AND status != 'disconnected'"
+        ),
+        params,
+    ).one_or_none()
+    if account_row is not None:
+        account_id, external_account_id = account_row
+        # Matches `connector_accounts.py:disable_connector_endpoint`'s
+        # own established split exactly -- see module docstring.
+        try:
+            encrypted = _get_encrypted_credential(session, auth.workspace_id, account_id)
+            pending_revoke = (
+                _adapter,
+                ConnectorAccountContext(
+                    workspace_id=auth.workspace_id,
+                    connector_account_id=account_id,
+                    external_account_id=external_account_id,
+                    credential=decrypt_credential(encrypted),
+                ),
+            )
+        except Exception:  # noqa: BLE001 -- best-effort, never blocks the cascade
+            pending_revoke = None
+        session.execute(
+            text(
+                "UPDATE connector_accounts SET status = 'disconnected', "
+                "disconnected_at = :now, updated_at = :now, updated_by = :actor_id, "
+                "version = version + 1 WHERE id = :id"
+            ),
+            {"now": now, "actor_id": auth.user_id, "id": account_id},
+        )
+
+    return pending_revoke
+
+
+def finish_gmail_revocation(pending: PendingGmailRevoke | None) -> None:
+    """Call only after the transaction `cascade_email_revocation` ran
+    inside has committed and the caller's session connection has been
+    released (`session.close()`) -- see module docstring.
+    """
+    if pending is None:
+        return
+    adapter, context = pending
+    try:
+        adapter.disconnect(context)
+    except Exception:  # noqa: BLE001 -- best-effort revocation, never raises to the caller
+        pass

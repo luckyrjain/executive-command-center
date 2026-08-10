@@ -2,7 +2,7 @@
 id: PHASE-010-API-SCHEMAS
 title: Phase 10 Gmail API Schemas
 status: Approved for Implementation
-version: 1.1.0
+version: 1.2.0
 owner: Lucky Jain
 depends_on:
   - PHASE-010
@@ -13,13 +13,15 @@ depends_on:
 
 ## Delivery boundary
 
-- **Current (Tasks 1-2, 6):** OAuth start/callback plus reuse of generic
+- **Current (Tasks 1-2, 6-7):** OAuth start/callback plus reuse of generic
   connector list, sync, sync-run, and disable endpoints; on-demand thread
   reading and per-thread "forget this" (Task 6, below) -- the first
   Gmail-specific *read* HTTP endpoints, and the first sub-domain-
-  granularity deletion endpoint anywhere in this codebase.
-- **Planned (Tasks 7-8):** consent-revocation cascade, and Gmail panel
-  endpoints or response extensions.
+  granularity deletion endpoint anywhere in this codebase; the consent
+  revocation cascade (Task 7, below), which adds no new endpoint at all --
+  it changes what three of Phase 7's own existing generic personal-domain
+  endpoints do for `domain_key = "email"` specifically.
+- **Planned (Task 8):** Gmail panel endpoints or response extensions.
 
 ## Current OAuth endpoints
 
@@ -136,10 +138,28 @@ rows (see `PRIVACY-CONSENT-CONTRACT.md`'s own entry for why).
 
 Errors: `404 THREAD_NOT_FOUND`.
 
+## Consent revocation cascade (Task 7)
+
+No new endpoint. `POST /api/v1/personal/domains/email/disable`, `POST
+/api/v1/personal/consents/{id}/revoke`, and `POST /api/v1/personal/domains/
+email/delete` -- Phase 7's own existing generic personal-domain endpoints,
+documented in `docs/phases/phase-007/API-SCHEMAS.md`, unchanged in request/
+response shape -- now additionally, for `domain_key = "email"` only, best-
+effort revoke the owner's Gmail OAuth grant, disconnect their `gmail`
+connector account, and purge every email-derived record (threads,
+messages, `email_thread` attention items, non-`executed` `email_action_
+detected` recommendations and their evidence) in the same request. Every
+other `domain_key` is unaffected -- disabling `habits`/`health`/`finance`/
+etc. still only flips `enabled`/revokes consent, data untouched, exactly
+as `docs/phases/phase-007/API-SCHEMAS.md` already documents. See
+`PRIVACY-CONSENT-CONTRACT.md`'s own "Consent revocation cascade (Task 7)"
+section for the full cascade description and why "retry" needed no new
+`deletion_jobs` schema.
+
 ## Planned APIs
 
-Tasks 7-8 must version this contract before adding consent-revocation
-cascade or frontend-specific query surfaces.
+Task 8 must version this contract before adding Gmail panel endpoints or
+response extensions.
 
 ## Changelog
 
@@ -147,3 +167,4 @@ cascade or frontend-specific query surfaces.
 |---|---|---|---|
 | 1.0.0 | 2026-08-06 | Documented current OAuth and generic sync surfaces | Lucky Jain |
 | 1.1.0 | 2026-08-06 | Task 6: documented `GET`/`POST .../forget` thread endpoints, correcting the "no current endpoint returns thread content" claim | Lucky Jain |
+| 1.2.0 | 2026-08-10 | Task 7: documented the consent revocation cascade's behavior change to three existing Phase 7 generic endpoints (no new endpoint added) | Lucky Jain |

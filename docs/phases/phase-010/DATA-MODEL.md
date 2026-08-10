@@ -2,7 +2,7 @@
 id: PHASE-010-DATA-MODEL
 title: Phase 10 Gmail Data Model
 status: Approved for Implementation
-version: 1.2.0
+version: 1.3.0
 owner: Lucky Jain
 depends_on:
   - PHASE-010
@@ -105,18 +105,32 @@ Concurrent creation converges on the unique alias row.
 
 ## Ownership, retention, and deletion
 
-All email queries must include both `workspace_id` and `owner_id`. Database
-cascades remove messages with a thread and threads with their personal domain
-or connector account. **Current limitation:** Task 2 does not connect a
-`domain_consents` revocation to connector disable and deletion. That cascade
-is planned for Task 7 and remains a production blocker; operators must not
-claim consent revocation already purges Gmail data.
+All email queries must include both `workspace_id` and `owner_id`.
+`email_threads`/`email_messages` carry `ondelete=CASCADE` FKs to their
+personal domain and connector account, but neither of those parent rows is
+ever actually hard-deleted by this application (`personal_domains`/
+`connector_accounts` are always kept, only `enabled`/`status` flipped) --
+so, in practice, those schema-level cascades never fire on their own.
+**Task 7** closes the gap this previously left open: `ecc.domains.
+personal.gmail_revocation.cascade_email_revocation` performs the explicit
+purge Phase 7's own `_disable_domain`/`_delete_domain_data` write paths
+now run for `domain_key = "email"` -- disconnecting the Gmail connector
+account and deleting `email_threads`/`email_messages` plus every derived
+`attention_items`/`recommendations`/`pkos_evidence` row this owner's own
+Gmail sync produced -- rather than relying on a cascade that would only
+ever fire if a parent row were hard-deleted, which none of this
+application's own code paths do. See `PRIVACY-CONSENT-CONTRACT.md`'s own
+"Consent revocation cascade (Task 7)" section for the full description.
 
 ## Planned model changes
 
-Tasks 7-8 may add further schema for consent-revocation purge and executive
-UX. They require their own migration and contract-version update; this
-document does not describe those rows as present.
+Task 8 may add further schema for executive UX. Task 7's own consent
+revocation cascade needed no new migration at all (see `gmail_revocation.
+py`'s own module docstring for why `deletion_jobs`'s existing `'pending'`/
+`'completed'` states, migration `0054`'s original shape, were already
+sufficient) -- this document's own prior "Tasks 7-8 may add further
+schema for consent-revocation purge" claim is now stale in that
+particular respect.
 
 ## Changelog
 
@@ -125,3 +139,4 @@ document does not describe those rows as present.
 | 1.0.0 | 2026-08-06 | Documented the Task 1-2 Gmail persistence contract | Lucky Jain |
 | 1.1.0 | 2026-08-06 | Task 5 review (Loop 2 round 16): documented body/body_fetched_at now populated by `email.detect_action`'s own body fetch, and the new `ix_email_messages_detect_action_eligible` partial index (migration `0074`); this document had gone stale after Tasks 3-5 shipped without a contract-version update | Lucky Jain |
 | 1.2.0 | 2026-08-06 | Task 6 review: documented on-demand human-facing body retrieval and the new "forget this" write path that renulls `snippet`/`body`/`body_fetched_at`; this document had gone stale after Task 6 shipped without a contract-version update | Lucky Jain |
+| 1.3.0 | 2026-08-10 | Task 7: documented the consent revocation cascade, correcting the "cascade is planned for Task 7" claim and the "Tasks 7-8 may add further schema" claim (no new migration was needed) | Lucky Jain |
