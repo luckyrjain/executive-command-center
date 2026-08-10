@@ -51,8 +51,8 @@ Companion to `docs/superpowers/specs/2026-08-04-phase-10-gmail-connector-design.
 
 ## Task 7 -- Consent revocation cascade
 
-- Revoking the `email` domain's `domain_consents` row calls `GmailAdapter.disconnect()` (revokes the OAuth grant) and runs Phase 7's existing deletion-job pipeline against `email_threads`/`email_messages` -- one action, both effects, no partial "disconnected but data remains" state reachable through this path.
-- Tests: revocation leaves zero readable synced content and a revoked OAuth grant; no code path disconnects without also purging, or purges without also disconnecting.
+- Revoking the `email` domain's `domain_consents` row calls `GmailAdapter.disconnect()` (revokes the OAuth grant) and runs Phase 7's existing deletion-job pipeline against `email_threads`/`email_messages` -- one action, both effects, no partial "disconnected but data remains" state reachable through this path (subject to the three narrow, deliberate exceptions `PRIVACY-CONSENT-CONTRACT.md`'s Task 7 section names, found during implementation review).
+- Tests: revocation leaves zero readable synced content and a revoked OAuth grant, subject to the same exceptions; no code path disconnects without also purging, or purges without also disconnecting.
 
 ## Task 8 -- Executive UX and browser acceptance
 

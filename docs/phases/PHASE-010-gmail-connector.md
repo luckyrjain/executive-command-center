@@ -2,7 +2,7 @@
 id: PHASE-010
 title: Gmail Connector
 status: Approved for Implementation
-version: 0.4.6
+version: 0.4.7
 owner: Lucky Jain
 depends_on:
   - PHASE-001
@@ -62,7 +62,7 @@ Any Gmail write action (compose, reply, send, archive, label-modify) this phase.
 
 ## Functional requirements
 
-- Gmail sync of any kind requires an active `domain_consents` row for the `email` domain; revoking it halts sync, disconnects the OAuth grant and deletes synced content.
+- Gmail sync of any kind requires an active `domain_consents` row for the `email` domain; revoking it halts sync, disconnects the OAuth grant and deletes synced content (subject to the three narrow, deliberate exceptions `PRIVACY-CONSENT-CONTRACT.md`'s Task 7 section names).
 - Only an account on the internal allowlist (config-driven) may initiate the Gmail OAuth flow at all. As built: `authorize()` is never called for `gmail` at all, and `get_authorization_url()`'s own fixed signature carries no account/email argument to check -- the caller-side allowlist check lives in `gmail_oauth.py`'s router (pre-redirect, against the caller's own account email) and again, authoritatively, inside `handle_oauth_callback` (post-exchange, against the actual Google account).
 - Every synced message body is Fernet-encrypted at rest using the existing `ECC_PERSONAL_DATA_ENCRYPTION_KEY` (Phase 7); the Gmail OAuth access/refresh tokens themselves use the existing `ECC_CONNECTOR_TOKEN_ENCRYPTION_KEY` (Phase 6) — two already-approved keys used for their already-established purposes, no new key.
 - Every AI-proposed task/commitment/risk requires explicit human confirmation via the extended `recommendations` flow before any row is created; nothing is written automatically.
@@ -126,6 +126,7 @@ Gmail write actions (compose/reply/send/archive/label-modify); public/general-av
 
 | Version | Date | Summary | Author |
 |---|---|---|---|
+| 0.4.7 | 2026-08-10 | Task 7 Loop 2 round 30 review (MEDIUM): round 29's own fix missed a fifth unqualified claim in "Functional requirements" ("...disconnects the OAuth grant and deletes synced content"); cross-referenced the same three named deliberate exceptions. Also qualified the identical claim in `docs/superpowers/plans/2026-08-04-phase-10-gmail-connector.md`'s own Task 7 section (LOW, a file outside this doc's own maintained set) | Lucky Jain |
 | 0.4.6 | 2026-08-10 | Task 7 Loop 2 round 29 review (MEDIUM): the "In scope"/"Security and privacy"/"Acceptance criteria"/"Rollback plan" sections' "purges all synced content"/"zero readable synced content" claims were the one place among Task 7's docs never brought into rounds 4-7's ambiguous-`external_message_id`-carve-out disclosure sweep -- all four now cross-reference `PRIVACY-CONSENT-CONTRACT.md`'s three named deliberate exceptions | Lucky Jain |
 | 0.4.5 | 2026-08-10 | Reconciled delivery through Task 7 after the consent revocation cascade merge (Loop 2 round 16 review: this file's own version/changelog had not been bumped for this edit, unlike every prior task boundary) | Lucky Jain |
 | 0.4.4 | 2026-08-06 | Reconciled delivery through Task 6 after the on-demand thread read/forget merge | Lucky Jain |
