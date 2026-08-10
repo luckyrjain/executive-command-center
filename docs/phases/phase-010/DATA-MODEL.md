@@ -2,7 +2,7 @@
 id: PHASE-010-DATA-MODEL
 title: Phase 10 Gmail Data Model
 status: Approved for Implementation
-version: 1.3.1
+version: 1.4.0
 owner: Lucky Jain
 depends_on:
   - PHASE-010
@@ -129,15 +129,32 @@ instead, not deleted (its confirmed downstream `tasks`/`commitments`/
 `PRIVACY-CONSENT-CONTRACT.md`'s own "Consent revocation cascade (Task 7)"
 section for the full description.
 
+### `email_message_id_purge_log`
+
+Added by migration `0076` (Task 7 Loop 2 round 8 review), not part of the
+original Task 7 delivery. One row per `(workspace_id, external_message_id,
+owner_id)` an owner's own cascade has ever processed, written by
+`cascade_email_revocation` before it deletes that owner's own `email_
+messages` rows -- an append-only ledger that outlives those rows,
+closing a sequential cross-owner `pkos_evidence` leak the round-4 fix
+below could not: that fix's own ambiguity check only ever compared
+against still-*live* `email_messages` rows, so it missed the case where a
+first owner's own colliding row is already gone by the time a second
+owner's cascade runs. Never itself purged by any code path in this
+codebase (a `workspace_id` `ON DELETE CASCADE` FK is its only removal
+path) -- see migration `0076`'s own docstring for the full reasoning,
+including why that is the correct call privacy-wise (no message content,
+only an opaque id).
+
 ## Planned model changes
 
 Task 8 may add further schema for executive UX. Task 7's own consent
-revocation cascade needed no new migration at all (see `gmail_revocation.
-py`'s own module docstring for why `deletion_jobs`'s existing `'pending'`/
-`'completed'` states, migration `0054`'s original shape, were already
-sufficient) -- this document's own prior "Tasks 7-8 may add further
-schema for consent-revocation purge" claim is now stale in that
-particular respect.
+revocation cascade shipped needing no new migration -- this document's own
+prior "Tasks 7-8 may add further schema for consent-revocation purge"
+claim went stale in that particular respect -- but Loop 2 round 8 review
+added one after all: `email_message_id_purge_log` (migration `0076`),
+described above, closing a gap the original cascade design could not
+close without persisted state.
 
 ## Changelog
 
@@ -148,3 +165,4 @@ particular respect.
 | 1.2.0 | 2026-08-06 | Task 6 review: documented on-demand human-facing body retrieval and the new "forget this" write path that renulls `snippet`/`body`/`body_fetched_at`; this document had gone stale after Task 6 shipped without a contract-version update | Lucky Jain |
 | 1.3.0 | 2026-08-10 | Task 7: documented the consent revocation cascade, correcting the "cascade is planned for Task 7" claim and the "Tasks 7-8 may add further schema" claim (no new migration was needed) | Lucky Jain |
 | 1.3.1 | 2026-08-10 | Task 7 Loop 2 round 5 review: this file was never revisited across four review rounds -- corrected the "every derived ... row" overclaim (round 4's cross-owner collision fix leaves an ambiguous evidence row unpurged) and the imprecise "recommendations ... row" language (executed ones are redacted in place, not deleted); also noted an owner can hold more than one Gmail connector account | Lucky Jain |
+| 1.4.0 | 2026-08-10 | Task 7 Loop 2 round 8 review: documented the new `email_message_id_purge_log` table (migration `0076`), closing a sequential cross-owner evidence leak the round-4 fix could not close without persisted state -- correcting this document's own prior "no new migration was needed" claim | Lucky Jain |

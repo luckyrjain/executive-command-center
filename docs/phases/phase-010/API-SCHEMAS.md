@@ -2,7 +2,7 @@
 id: PHASE-010-API-SCHEMAS
 title: Phase 10 Gmail API Schemas
 status: Approved for Implementation
-version: 1.2.2
+version: 1.2.3
 owner: Lucky Jain
 depends_on:
   - PHASE-010
@@ -154,10 +154,15 @@ message, deliberately left unpurged, see `PRIVACY-CONSENT-CONTRACT.md`)
 in the same request. Every
 other `domain_key` is unaffected -- disabling `habits`/`health`/`finance`/
 etc. still only flips `enabled`/revokes consent, data untouched, exactly
-as `docs/phases/phase-007/API-SCHEMAS.md` already documents. See
-`PRIVACY-CONSENT-CONTRACT.md`'s own "Consent revocation cascade (Task 7)"
-section for the full cascade description and why "retry" needed no new
-`deletion_jobs` schema.
+as `docs/phases/phase-007/API-SCHEMAS.md` already documents. `POST .../
+consents/{id}/revoke` additionally now requires `id` to name the
+currently-active consent (`revoked_at IS NULL`); a stale/already-revoked
+`id` gets the same `404 CONSENT_NOT_FOUND` every other unresolved lookup
+in this contract returns, rather than resolving to `domain_key` and
+re-running the cascade (Loop 2 round 8 review; see `PRIVACY-CONSENT-
+CONTRACT.md`). See `PRIVACY-CONSENT-CONTRACT.md`'s own "Consent
+revocation cascade (Task 7)" section for the full cascade description and
+why "retry" needed no new `deletion_jobs` schema.
 
 ## Planned APIs
 
@@ -173,3 +178,4 @@ response extensions.
 | 1.2.0 | 2026-08-10 | Task 7: documented the consent revocation cascade's behavior change to three existing Phase 7 generic endpoints (no new endpoint added) | Lucky Jain |
 | 1.2.1 | 2026-08-10 | Task 7 Loop 2 round 4 review: corrected the "Current reused connector endpoints" table's `disable` row, stale since round 1 -- it still described pre-fix behavior for `gmail`, contradicting this same file's own consent revocation cascade section below it | Lucky Jain |
 | 1.2.2 | 2026-08-10 | Task 7 Loop 2 round 6 review: the `disable` row missed round 2's already-disconnected idempotent-no-op carve-out; the "Consent revocation cascade" section overclaimed "every email-derived record" against round 4's own ambiguous-id carve-out | Lucky Jain |
+| 1.2.3 | 2026-08-10 | Task 7 Loop 2 round 8 review: documented `POST .../consents/{id}/revoke`'s new `revoked_at IS NULL` requirement, closing a stale-consent-id replay that could re-trigger the cascade | Lucky Jain |

@@ -2,7 +2,7 @@
 id: PHASE-010-PRIVACY-CONSENT-CONTRACT
 title: Phase 10 Gmail Privacy and Consent Contract
 status: Approved for Implementation
-version: 1.3.3
+version: 1.3.4
 owner: Lucky Jain
 depends_on:
   - PHASE-010
@@ -63,7 +63,13 @@ message_id` happens to collide with a *different* owner's own message
 (only unique per `(workspace_id, thread_id)`, not per-workspace): that
 row is deliberately left alone rather than risk deleting across the
 ownership boundary (Loop 2 round 4 review finding; see `gmail_
-revocation.py`'s own module docstring). `email`-sourced `recommendations` not
+revocation.py`'s own module docstring) -- durably, across separate
+cascade runs, not only within one: `email_message_id_purge_log`
+(migration `0076`, Loop 2 round 8 review) records every id a cascade
+processes before that owner's own `email_messages` rows are deleted, so a
+*second*, independent owner's own later cascade still finds the first
+owner's record of the collision even after the first owner's own
+colliding row is long gone. `email`-sourced `recommendations` not
 yet `executed` are deleted outright; an already-`executed` one (which now
 has an independent, confirmed `tasks`/`commitments`/`risks` row) is
 redacted in place instead -- its own Gmail-derived `rationale`/`proposed_
@@ -83,6 +89,20 @@ touching `personal_domains`/data at all until Loop 2 round 1 review found
 it and closed it (that endpoint now rejects `gmail`-provider accounts
 outright, `409 GMAIL_DISABLE_REQUIRES_DOMAIN_ENDPOINT`, directing callers
 to the domain-level endpoints above).
+
+**`revoke_consent_endpoint` only accepts the currently-active consent
+(Loop 2 round 8 review).** Its own `domain_consents` lookup requires
+`revoked_at IS NULL` before resolving a `consent_id` to a `domain_key` and
+reaching the cascade above. Without that filter, a stale/already-revoked
+`consent_id` -- a replayed request, a double-submitted form, or a client
+retry landing after the owner already re-granted `email` consent and
+resynced Gmail -- would still trigger a fresh disable-and-purge cascade
+against the *current* state, using an identifier for a grant that no
+longer exists. Harmless for every other domain (disable/re-enable is
+fully reversible); destructive for `email` specifically, since disabling
+now cascades. A stale id is rejected the same non-disclosing way every
+other lookup in this module already fails closed (`404 CONSENT_NOT_
+FOUND`).
 
 **"Retryable" is the existing idempotency-key mechanism, not a new
 `deletion_jobs` state.** Every step above runs inside the same transaction
@@ -151,3 +171,4 @@ Gmail is internal-development only.
 | 1.3.1 | 2026-08-10 | Task 7 Loop 2 round 1 review: documented and closed a cascade-bypassing third write path (the generic engineering connector-disable endpoint) and the multi-connector-account cascade crash | Lucky Jain |
 | 1.3.2 | 2026-08-10 | Task 7 Loop 2 round 5 review: corrected the "every Gmail-sourced pkos_evidence row" overclaim -- round 4's fix deliberately leaves a cross-owner-colliding evidence row unpurged; this file was never revisited when that fix shipped | Lucky Jain |
 | 1.3.3 | 2026-08-10 | Task 7 Loop 2 round 6 review: corrected a second, nearby "purging every email-derived record" overclaim that round 5's fix missed -- internally inconsistent with the three carve-outs this same section already discloses two sentences earlier | Lucky Jain |
+| 1.3.4 | 2026-08-10 | Task 7 Loop 2 round 8 review: documented `email_message_id_purge_log` (migration `0076`, closing a sequential cross-owner evidence leak) and `revoke_consent_endpoint`'s new `revoked_at IS NULL` requirement (closing a stale-consent-id replay that could re-trigger the cascade against freshly re-granted state) | Lucky Jain |

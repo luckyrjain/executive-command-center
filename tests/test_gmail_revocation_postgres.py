@@ -66,6 +66,17 @@ Covers, in the same order these tests physically appear below:
     2 round 5 review finding: the original version only ever seeded one
     message, so it never exercised the `if safe_ids:` purge branch
     alongside a non-empty `ambiguous_ids`).
+14. The collision fix above only defends against a *concurrent* collision
+    (both owners' rows still live). Two owners disabling *sequentially* --
+    the second only after the first owner's own colliding `email_messages`
+    row (the only thing that made the id ambiguous) is already gone -- do
+    not leak the first owner's preserved evidence either, via `email_
+    message_id_purge_log` (migration `0076`, Loop 2 round 8 review
+    finding).
+15. `revoke_consent_endpoint` rejects a stale/already-revoked `consent_id`
+    (`404 CONSENT_NOT_FOUND`) rather than resolving it to `domain_key` and
+    re-running the cascade against a domain the owner has since re-granted
+    consent for and resynced -- Loop 2 round 8 review finding.
 """
 
 import threading
@@ -84,8 +95,9 @@ from fastapi.testclient import TestClient
 from identity_fixtures import create_identity
 from sqlalchemy import text
 
+from ecc.auth import AuthContext
 from ecc.config import get_settings
-from ecc.database import STATEMENT_TIMEOUT_MS, engine
+from ecc.database import STATEMENT_TIMEOUT_MS, SessionFactory, engine
 from ecc.domains.engineering.connectors import ConnectorAccountContext
 from ecc.domains.engineering.crypto import encrypt_credential
 from ecc.domains.personal import gmail_revocation
@@ -1278,3 +1290,171 @@ def test_disable_domain_does_not_purge_evidence_with_a_colliding_external_messag
             {"workspace_id": ctx["workspace_id"], "source_ref": f"gmail:{safe_external_id}"},
         ).one_or_none()
     assert safe_evidence_row is None, "non-ambiguous evidence must still be purged normally"
+
+
+def test_sequential_disables_by_two_colliding_owners_do_not_leak_the_first_owners_evidence(
+    gmail_revocation_context: dict,
+) -> None:
+    """Loop 2 round 8 review finding: the fix directly above only ever
+    defends against a *concurrent* collision -- both owners' `email_
+    messages` rows for the shared id are still live at the moment either
+    owner's cascade runs. It does not defend against a *sequential* one:
+    owner A disables first, correctly leaving the shared evidence row
+    alone (owner B's row is still live) but still deleting *A's own*
+    `email_messages` row for that id -- which was the only thing that made
+    the id ambiguous in the first place. If owner B then disables
+    independently afterwards, B's own ambiguity check would find no
+    *other* owner's live row left for that id and (before this fix) wrongly
+    conclude it is safe, purging the shared evidence row after all. This
+    proves `email_message_id_purge_log` (migration `0076`) closes that
+    window: A's own cascade logs the id before deleting A's `email_
+    messages` row, and B's own later, independent cascade run still finds
+    A's log entry and correctly treats the id as ambiguous.
+
+    Owner B's own cascade is invoked directly (`gmail_revocation.cascade_
+    email_revocation`), not via the HTTP endpoint the rest of this file
+    uses -- there is no second `sessions` row/login flow for a second owner
+    in this fixture, and the module-level call is exactly what a second,
+    independent HTTP request from owner B would itself reach.
+    """
+    ctx = gmail_revocation_context
+    seeded = _seed_full_cascade_fixture(ctx)
+    colliding_external_id = seeded["external_message_id"]
+
+    other_owner_id = uuid4()
+    other_email = f"other-owner-{uuid4()}@example.test"
+    ctx["extra_owner_emails"].append(other_email)
+    with engine.begin() as connection:
+        create_identity(
+            connection,
+            workspace_id=ctx["workspace_id"],
+            user_id=other_owner_id,
+            email=other_email,
+            now=ctx["now"],
+        )
+        _insert_enabled_email_domain(
+            connection, workspace_id=ctx["workspace_id"], owner_id=other_owner_id, now=ctx["now"]
+        )
+        other_thread_id = _insert_thread(
+            connection,
+            workspace_id=ctx["workspace_id"],
+            owner_id=other_owner_id,
+            account_id=ctx["account_id"],
+            now=ctx["now"],
+        )
+        _insert_message(
+            connection,
+            workspace_id=ctx["workspace_id"],
+            owner_id=other_owner_id,
+            thread_id=other_thread_id,
+            external_message_id=colliding_external_id,
+            now=ctx["now"],
+        )
+
+    # Owner A (the fixture's own owner) disables first. The shared evidence
+    # survives -- owner B's own row is still live -- but A's own `email_
+    # messages` row for the colliding id is gone afterwards.
+    resp = ctx["client"].post(
+        "/api/v1/personal/domains/email/disable",
+        headers=_headers(ctx["token"], str(uuid4())),
+    )
+    assert resp.status_code == 200, resp.text
+    with engine.begin() as connection:
+        evidence_after_a = connection.execute(
+            text(
+                "SELECT id FROM pkos_evidence WHERE workspace_id = :workspace_id "
+                "AND source_ref = :source_ref"
+            ),
+            {
+                "workspace_id": ctx["workspace_id"],
+                "source_ref": f"gmail:detect_action:{colliding_external_id}",
+            },
+        ).one_or_none()
+    assert evidence_after_a is not None, "A's own cascade must leave the ambiguous evidence alone"
+
+    # Owner B disables independently afterwards. Before migration 0076, B's
+    # own ambiguity check would find no other owner's live row left (A's is
+    # gone) and wrongly purge the shared evidence row here.
+    with SessionFactory() as session, session.begin():
+        gmail_revocation.cascade_email_revocation(
+            session,
+            AuthContext(workspace_id=ctx["workspace_id"], user_id=other_owner_id, timezone="UTC"),
+            ctx["now"],
+        )
+
+    with engine.begin() as connection:
+        evidence_after_b = connection.execute(
+            text(
+                "SELECT id FROM pkos_evidence WHERE workspace_id = :workspace_id "
+                "AND source_ref = :source_ref"
+            ),
+            {
+                "workspace_id": ctx["workspace_id"],
+                "source_ref": f"gmail:detect_action:{colliding_external_id}",
+            },
+        ).one_or_none()
+    assert evidence_after_b is not None, (
+        "B's own later, independent cascade must not leak A's preserved evidence"
+    )
+
+
+def test_revoke_consent_endpoint_rejects_a_stale_already_revoked_consent_id(
+    gmail_revocation_context: dict,
+) -> None:
+    """Loop 2 round 8 review finding: `revoke_consent_endpoint`'s own
+    consent lookup did not filter `revoked_at IS NULL`, so a stale/already-
+    revoked `consent_id` -- reused after the owner re-granted `email`
+    consent -- would still resolve to `domain_key = 'email'` and trigger a
+    fresh disable-and-purge cascade against the *current* (freshly re-
+    granted) state. Revokes the fixture's own original consent once (which
+    disables the domain and purges the fixture's own seeded data), then
+    re-grants a brand new consent/domain-enable, seeds fresh cascade data
+    under the new grant, and replays the ORIGINAL (now stale) `consent_id`
+    -- asserting it is rejected (`404 CONSENT_NOT_FOUND`, the same non-
+    disclosing shape every other lookup in this module already uses) and
+    the freshly re-granted data survives untouched.
+    """
+    ctx = gmail_revocation_context
+    stale_consent_id = ctx["consent_id"]
+
+    first_resp = ctx["client"].post(
+        f"/api/v1/personal/consents/{stale_consent_id}/revoke",
+        headers=_headers(ctx["token"], str(uuid4())),
+    )
+    assert first_resp.status_code == 200, first_resp.text
+    assert _connector_status(ctx["workspace_id"], ctx["account_id"]) == "disconnected"
+
+    # Re-grant: a fresh `POST /consents` enable, then reactivate the
+    # connector and reconnect fresh Gmail data under the new grant.
+    enable_resp = ctx["client"].post(
+        "/api/v1/personal/consents",
+        json={"domain_key": "email"},
+        headers=_headers(ctx["token"], str(uuid4())),
+    )
+    assert enable_resp.status_code == 201, enable_resp.text
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "UPDATE connector_accounts SET status = 'active', disconnected_at = NULL "
+                "WHERE workspace_id = :workspace_id AND id = :id"
+            ),
+            {"workspace_id": ctx["workspace_id"], "id": ctx["account_id"]},
+        )
+    seeded = _seed_full_cascade_fixture(ctx)
+
+    # Replay the ORIGINAL, now-stale `consent_id` from the first revoke.
+    replay_resp = ctx["client"].post(
+        f"/api/v1/personal/consents/{stale_consent_id}/revoke",
+        headers=_headers(ctx["token"], str(uuid4())),
+    )
+    assert replay_resp.status_code == 404, replay_resp.text
+    assert replay_resp.json()["error"]["code"] == "CONSENT_NOT_FOUND"
+
+    # The freshly re-granted state is untouched by the rejected replay.
+    assert _connector_status(ctx["workspace_id"], ctx["account_id"]) == "active"
+    with engine.begin() as connection:
+        thread_row = connection.execute(
+            text("SELECT id FROM email_threads WHERE workspace_id = :workspace_id AND id = :id"),
+            {"workspace_id": ctx["workspace_id"], "id": seeded["thread_id"]},
+        ).one_or_none()
+    assert thread_row is not None, "the replayed stale consent_id must not re-trigger the cascade"

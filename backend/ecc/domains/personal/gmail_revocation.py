@@ -83,6 +83,35 @@ GMAIL_DISABLE_REQUIRES_DOMAIN_ENDPOINT`) and directing callers to the
 domain-level endpoints that funnel through this module instead, restoring
 the "one real write path" property for real.
 
+**Loop 2 round 8 review (PR #128) -- the cross-owner ambiguity check (round
+4, above) only defended against a *concurrent* collision, not a
+*sequential* one.** Owner A and owner B, same workspace, coincidentally
+share one message's raw `external_message_id`. A disables `email` first:
+A's own check correctly sees B's still-live `email_messages` row and
+leaves the shared `pkos_evidence` row alone -- but A's *own* `email_
+messages` row for that id is still deleted (correctly; it is A's own
+data), which also erases the only signal that made the id ambiguous. B
+later disables `email` independently: B's own check now finds no *other*
+owner's live row for that id, concludes it is safe, and deletes the
+shared evidence row after all. Fixed by `email_message_id_purge_log`
+(migration `0076`): every cascade logs every `external_message_id` it
+processes, unconditionally, before this owner's own `email_messages` rows
+are deleted; the ambiguity check now also treats an id as ambiguous if a
+*different* owner has a log entry for it, not only a still-live row --
+see migration `0076`'s own docstring for the full reasoning, including
+why that log is itself never purged by any code path in this codebase.
+
+**Loop 2 round 8 review (PR #128) -- `revoke_consent_endpoint` could
+replay a stale `consent_id`.** `domains.py`'s consent lookup did not
+filter `revoked_at IS NULL` before resolving `domain_key` and triggering
+this module's cascade -- for every domain except `email` that is harmless
+(disable/re-enable is fully reversible), but for `email` a stale or
+already-revoked `consent_id`, reused after the owner re-granted consent
+and resynced Gmail, would still successfully trigger a full disable and
+data-purging cascade against the *current* state. Fixed at the lookup
+site (`domains.py:revoke_consent_endpoint`), not here -- see that
+function's own updated comment.
+
 **What is deliberately NOT deleted.**
 - `pkos_nodes` (the resolved person entities themselves): `gmail_adapter.
   py:_resolve_or_create_person` deduplicates at *workspace* scope, not
@@ -223,18 +252,46 @@ def cascade_email_revocation(
         # below has no owner qualifier of its own (unlike every other
         # DELETE/UPDATE in this function), such a collision would silently
         # purge a *different* owner's evidence too. Excluding any id that
-        # also belongs to another owner's own `email_messages` row in this
-        # workspace closes that window without trusting `pkos_evidence.
-        # owner_id` (still not reliable -- see above): this owner's own
-        # cascade simply skips evidence for an ambiguous id rather than
-        # risk deleting across the boundary; that one row is left behind
-        # rather than purged, a strictly safer failure mode than the
-        # alternative.
+        # also belongs to another owner -- either a still-live `email_
+        # messages` row, or a `email_message_id_purge_log` row a *previous*
+        # cascade left behind for it (Loop 2 round 8 review: a live-row-only
+        # check misses the *sequential* case, where the other owner's own
+        # cascade already ran and deleted the very row that would have
+        # proven the collision -- see migration `0076`'s own docstring) --
+        # closes that window without trusting `pkos_evidence.owner_id`
+        # (still not reliable -- see above): this owner's own cascade
+        # simply skips evidence for an ambiguous id rather than risk
+        # deleting across the boundary; that one row is left behind rather
+        # than purged, a strictly safer failure mode than the alternative.
+        #
+        # Every id this cascade processes (ambiguous or not) is logged
+        # first, unconditionally -- a *future* other-owner cascade needs
+        # this owner's own entry to still exist after this owner's own
+        # `email_messages` rows are gone below.
+        session.execute(
+            text(
+                "INSERT INTO email_message_id_purge_log "
+                "(workspace_id, external_message_id, owner_id, purged_at) "
+                "SELECT :workspace_id, id, :owner_id, :now "
+                "FROM unnest(:candidate_ids::text[]) AS id "
+                "ON CONFLICT (workspace_id, external_message_id, owner_id) DO NOTHING"
+            ),
+            {
+                "workspace_id": auth.workspace_id,
+                "owner_id": auth.user_id,
+                "candidate_ids": external_message_ids,
+                "now": now,
+            },
+        )
         ambiguous_ids = {
             row[0]
             for row in session.execute(
                 text(
                     "SELECT DISTINCT external_message_id FROM email_messages "
+                    "WHERE workspace_id = :workspace_id AND owner_id != :owner_id "
+                    "AND external_message_id = ANY(:candidate_ids) "
+                    "UNION "
+                    "SELECT DISTINCT external_message_id FROM email_message_id_purge_log "
                     "WHERE workspace_id = :workspace_id AND owner_id != :owner_id "
                     "AND external_message_id = ANY(:candidate_ids)"
                 ),
@@ -290,18 +347,12 @@ def cascade_email_revocation(
     # domain-level disable/delete after the first already left the
     # connector `disconnected`), not an error.
     #
-    # `.all()`, not `.one_or_none()`: an owner has no per-owner uniqueness
-    # constraint on `provider = 'gmail'` (only `uq_connector_accounts_
-    # workspace_provider_external_id`, scoped by `external_account_id`,
-    # migration `0044`) and `gmail_oauth.py`'s OAuth callback places no
-    # restriction on a second, distinct external Google account for the
-    # same `owner_id` -- an owner who connected two separate Google
-    # accounts has two simultaneously non-`disconnected` rows here. Loop 2
-    # round 1 review found the original `.one_or_none()` raised `Multiple
-    # ResultsFound` in that case, uncaught, aborting this entire cascade
-    # (and the caller's whole disable/delete request) with a 500. Every
-    # matching row is disconnected below instead of just one, matching
-    # this task's own "connector_accounts row(**s**)" (plural) language.
+    # `.all()`, not `.one_or_none()`: see module docstring's own "Loop 2
+    # round 1 review -- an owner can hold more than one `gmail` connector
+    # account" paragraph for why more than one matching row here is a real,
+    # expected case rather than a data-integrity error (Loop 2 round 8
+    # review: this paragraph used to restate that same narrative in full a
+    # second time here rather than cross-referencing it).
     # `ORDER BY id`: Loop 2 round 2 review -- a multi-row `FOR UPDATE`
     # with no deterministic order risks a classic lock-order deadlock
     # against a second concurrent cascade for the same owner (e.g. a

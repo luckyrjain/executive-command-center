@@ -883,11 +883,27 @@ def revoke_consent_endpoint(
     # bug `list_insights_endpoint`'s own docstring documents for the
     # identical shape.
     with session.begin():
+        # `AND revoked_at IS NULL` (Loop 2 round 8 review): without it, a
+        # stale/already-revoked `consent_id` -- e.g. a replayed request, a
+        # double-submitted form, or a client retry that lands after the
+        # user already re-granted `email` consent and resynced Gmail --
+        # would still resolve to a `domain_key` here and go on to trigger
+        # `_disable_domain` below. `_disable_domain` itself only mutates
+        # `if domain.enabled`, so a stale id is harmless for every other
+        # domain (disabling and re-enabling is fully reversible, no data
+        # loss). For `email` specifically it is not: `_disable_domain`
+        # cannot tell *which* consent triggered it, so it would disable
+        # and cascade-purge the *current*, freshly-resynced `email` state
+        # using an identifier that no longer names an active grant.
+        # Requiring the referenced consent to still be the live one closes
+        # that window the same non-disclosing way every other lookup in
+        # this module already fails closed (`404 CONSENT_NOT_FOUND`).
         row = (
             session.execute(
                 text(
                     "SELECT domain_key FROM domain_consents "
-                    "WHERE workspace_id = :workspace_id AND owner_id = :owner_id AND id = :id"
+                    "WHERE workspace_id = :workspace_id AND owner_id = :owner_id "
+                    "AND id = :id AND revoked_at IS NULL"
                 ),
                 {"workspace_id": auth.workspace_id, "owner_id": auth.user_id, "id": consent_id},
             )
