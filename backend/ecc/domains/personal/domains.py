@@ -940,17 +940,10 @@ def revoke_consent_endpoint(
     #
     # This lookup only resolves `id` to a `domain_key` -- it does NOT gate
     # on whether the consent has been superseded by a later grant. That
-    # check now happens *inside* `_disable_domain`'s own transaction (Loop
-    # 2 round 10 review finding): doing it here, in this separate,
-    # already-committed transaction, left a real TOCTOU window between
-    # this SELECT and `_disable_domain`'s own `FOR UPDATE` lock on the
-    # `personal_domains` row -- a concurrent re-grant could commit in that
-    # gap, and `_disable_domain` would then disable-and-cascade-purge the
-    # freshly re-granted state anyway, using a `consent_id` that had
-    # already gone stale by the time the actual mutation ran. Passing
-    # `consent_id` through and re-validating after the same row lock
-    # `_enable_domain`'s own re-grant path also acquires closes that
-    # window: whichever transaction gets the lock first is authoritative.
+    # check happens *inside* `_disable_domain`'s own transaction instead
+    # (see that function's own docstring for why, Loop 2 round 10 review
+    # finding -- doing it here, in this separate, already-committed
+    # transaction, left a TOCTOU window this file's own tests reproduce).
     with session.begin():
         row = (
             session.execute(

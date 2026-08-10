@@ -247,7 +247,21 @@ def delete_domain_endpoint(
         if cached is not None:
             return DomainDeletionResponse.model_validate(cached)
 
-        domain = get_domain(session, auth, domain_key)
+        # `for_update=True` (Loop 2 round 11 review finding): without it,
+        # this row was read unlocked while every write below still landed
+        # unconditionally by `id` -- a concurrent `POST /consents` re-grant
+        # (`_enable_domain`'s own `existing = get_domain(..., for_update=
+        # True)` on the same row) could commit in between, and this
+        # endpoint's own trailing `UPDATE personal_domains SET enabled =
+        # false`/`UPDATE domain_consents SET revoked_at = :now WHERE
+        # revoked_at IS NULL` would then silently clobber that fresh grant
+        # -- reverting it and revoking its brand-new consent with no error
+        # surfaced to the caller who just re-granted. The identical class
+        # of gap `domains.py:_disable_domain` closed in Loop 2 round 10
+        # (see that function's own docstring for the full reasoning);
+        # acquiring the same lock here before any write closes it the same
+        # way.
+        domain = get_domain(session, auth, domain_key, for_update=True)
         if domain is None:
             raise HTTPException(status_code=404, detail="DOMAIN_NOT_FOUND")
 

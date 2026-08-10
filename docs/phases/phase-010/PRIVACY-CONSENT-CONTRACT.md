@@ -2,7 +2,7 @@
 id: PHASE-010-PRIVACY-CONSENT-CONTRACT
 title: Phase 10 Gmail Privacy and Consent Contract
 status: Approved for Implementation
-version: 1.3.6
+version: 1.3.7
 owner: Lucky Jain
 depends_on:
   - PHASE-010
@@ -132,6 +132,14 @@ by timing. The comparison itself was also widened from `>` to `>=`
 (round 10 LOW finding): a strict `>` has a same-timestamp blind spot
 under coarse clock resolution that `>=` fails closed on instead.
 
+**`delete_domain_endpoint` had the identical TOCTOU gap, closed round 11
+review.** Round 10's fix only covered `_disable_domain`'s own call site;
+`export_deletion.py:delete_domain_endpoint` read `personal_domains`
+without `for_update=True` while its own trailing writes still landed
+unconditionally, so a concurrent re-grant could commit in between and be
+silently clobbered. Fixed by adding `for_update=True` to that same read,
+mirroring `_disable_domain`'s own lock.
+
 **"Retryable" is the existing idempotency-key mechanism, not a new
 `deletion_jobs` state.** Every step above runs inside the same transaction
 `_disable_domain`/`_delete_domain_data` already opens, so a failure at any
@@ -202,3 +210,4 @@ Gmail is internal-development only.
 | 1.3.4 | 2026-08-10 | Task 7 Loop 2 round 8 review: documented `email_message_id_purge_log` (migration `0076`, closing a sequential cross-owner evidence leak) and `revoke_consent_endpoint`'s new `revoked_at IS NULL` requirement (closing a stale-consent-id replay that could re-trigger the cascade against freshly re-granted state) | Lucky Jain |
 | 1.3.5 | 2026-08-10 | Task 7 Loop 2 round 9 review: corrected the round-8 `revoke_consent_endpoint` description -- the plain `revoked_at IS NULL` check broke legitimate `Idempotency-Key` retries; replaced with a `NOT EXISTS (a later grant)` check that only rejects a consent a later grant has actually superseded | Lucky Jain |
 | 1.3.6 | 2026-08-10 | Task 7 Loop 2 round 10 review: documented the TOCTOU fix moving the `NOT EXISTS` re-check inside `_disable_domain`'s own transaction (closing a race the round 8-9 fix left open under genuine concurrency) and widening the comparison from `>` to `>=` | Lucky Jain |
+| 1.3.7 | 2026-08-10 | Task 7 Loop 2 round 11 review: documented `delete_domain_endpoint`'s own `for_update=True` fix, closing the identical TOCTOU gap round 10 left open at that call site | Lucky Jain |

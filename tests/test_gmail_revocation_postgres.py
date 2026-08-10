@@ -90,10 +90,15 @@ Covers, in the same order these tests physically appear below:
     that committed before `_disable_domain` was ever called, leaving a
     TOCTOU window for a concurrent re-grant to commit in between and have
     `_disable_domain` disable-and-cascade-purge the freshly re-granted
-    state anyway. Proves the fix's own load-bearing mechanism: while a raw
-    connection holds the `personal_domains` row's lock, a concurrent
-    `POST /consents` re-grant for the same domain blocks until it is
-    released.
+    state anyway. Proven end-to-end (Loop 2 round 11 review: the round-10
+    version of this test only proved the underlying lock-contention
+    mechanism via an unrelated `POST /consents` call, never actually
+    exercising `revoke_consent_endpoint`'s own code path) -- revokes a
+    consent for real, holds the `personal_domains` row's lock, replays that
+    now-superseded `consent_id` against `revoke_consent_endpoint` itself in
+    a background thread (which blocks on the lock), regrants over the SAME
+    held connection while the replay is blocked, then releases the lock and
+    asserts the replay rejects with `404 CONSENT_NOT_FOUND` once unblocked.
 """
 
 import threading
@@ -1532,7 +1537,17 @@ def test_revoke_consent_endpoint_idempotency_key_replay_without_regrant_still_su
         headers=_headers(ctx["token"], key),
     )
     assert replay_resp.status_code == 200, replay_resp.text
-    assert replay_resp.json() == first_resp.json()
+    # `request_id`/`correlation_id` are per-HTTP-call tracing fields the
+    # outer middleware injects into every response envelope -- they are not
+    # part of `DomainResponse` itself (see that model's own field list) and
+    # legitimately differ between these two calls even though the second is
+    # served from the idempotency cache. Compare only the cached payload's
+    # own fields; the `audit_event_count == 1` assertion below is the actual
+    # proof of a cache hit, not this equality check.
+    untraced = {"request_id", "correlation_id"}
+    assert {k: v for k, v in replay_resp.json().items() if k not in untraced} == {
+        k: v for k, v in first_resp.json().items() if k not in untraced
+    }
 
     with engine.begin() as connection:
         audit_event_count = connection.execute(
@@ -1558,40 +1573,85 @@ def test_revoke_consent_endpoint_serializes_against_a_concurrent_regrant(
     *inside* `_disable_domain`'s own transaction, immediately after it
     acquires the same `personal_domains` row lock `_enable_domain`'s own
     re-grant path (`existing = get_domain(..., for_update=True)`) also
-    acquires. This proves the mechanism the fix actually depends on: while
-    a raw connection holds that same row locked, a concurrent `POST /
-    consents` re-grant for the SAME domain genuinely blocks rather than
-    racing ahead -- the same `FOR UPDATE` semantics `test_disable_domain_
-    releases_pool_connection_and_row_lock_before_revoke_call` above proves
-    are NOT held during an unrelated blocking call, inverted here to prove
-    they ARE held (and thus serialize) when it matters.
+    acquires.
+
+    Loop 2 round 11 review finding: this test used to only prove the
+    underlying lock-contention mechanism in the abstract (a raw connection
+    holding the row locked blocks an unrelated `POST /consents` call) and
+    never actually exercised `revoke_consent_endpoint`'s own code path
+    under real concurrency, so a regression in the `consent_id` re-check
+    itself would not have failed this test; it also managed the raw
+    connection with `text("BEGIN")`/`text("COMMIT")` executed before a
+    `try` block, a genuine leak window (a raise during setup would skip
+    `finally`) that also bypasses SQLAlchemy's own autobegin tracking.
+    Rewritten to prove the real end-to-end behavior with a properly scoped
+    connection: revoke the consent for real first (so `revoked_at` is
+    genuinely set), hold the `personal_domains` row lock, submit a
+    *replay* of that now-superseded `consent_id` via `revoke_consent_
+    endpoint` in a background thread (blocks acquiring the same lock
+    inside `_disable_domain`), perform the exact regrant `_enable_domain`
+    would over the SAME held connection while the replay is blocked, then
+    release the lock -- the replay must then observe the fresh grant and
+    reject with `404 CONSENT_NOT_FOUND`, not silently disable-and-cascade
+    the just-re-granted domain.
     """
     ctx = gmail_revocation_context
 
-    def _create_consent() -> Any:
+    first_resp = ctx["client"].post(
+        f"/api/v1/personal/consents/{ctx['consent_id']}/revoke",
+        headers=_headers(ctx["token"], str(uuid4())),
+    )
+    assert first_resp.status_code == 200, first_resp.text
+
+    def _replay_stale_revoke() -> Any:
         return ctx["client"].post(
-            "/api/v1/personal/consents",
-            json={"domain_key": "email"},
+            f"/api/v1/personal/consents/{ctx['consent_id']}/revoke",
             headers=_headers(ctx["token"], str(uuid4())),
         )
 
-    holder = engine.connect()
-    holder.execute(text("BEGIN"))
-    holder.execute(
-        text(
-            "SELECT id FROM personal_domains WHERE workspace_id = :workspace_id "
-            "AND owner_id = :owner_id AND domain_key = 'email' FOR UPDATE"
-        ),
-        {"workspace_id": ctx["workspace_id"], "owner_id": ctx["owner_id"]},
-    )
-    try:
+    with engine.connect() as holder:
+        holder.execute(
+            text(
+                "SELECT id FROM personal_domains WHERE workspace_id = :workspace_id "
+                "AND owner_id = :owner_id AND domain_key = 'email' FOR UPDATE"
+            ),
+            {"workspace_id": ctx["workspace_id"], "owner_id": ctx["owner_id"]},
+        )
         with ThreadPoolExecutor(max_workers=1) as pool:
-            future = pool.submit(_create_consent)
+            future = pool.submit(_replay_stale_revoke)
             with pytest.raises(FutureTimeoutError):
                 future.result(timeout=1)
 
-            holder.execute(text("COMMIT"))
-            resp = future.result(timeout=5)
-        assert resp.status_code == 201, resp.text
-    finally:
-        holder.close()
+            regrant_now = datetime.now(UTC)
+            holder.execute(
+                text(
+                    "UPDATE personal_domains SET enabled = true, enabled_at = :now, "
+                    "updated_at = :now, updated_by = :owner_id, version = version + 1 "
+                    "WHERE workspace_id = :workspace_id AND owner_id = :owner_id "
+                    "AND domain_key = 'email'"
+                ),
+                {
+                    "now": regrant_now,
+                    "workspace_id": ctx["workspace_id"],
+                    "owner_id": ctx["owner_id"],
+                },
+            )
+            holder.execute(
+                text(
+                    "INSERT INTO domain_consents (id, workspace_id, owner_id, domain_key, "
+                    "granted_at, created_at) "
+                    "VALUES (:id, :workspace_id, :owner_id, 'email', :now, :now)"
+                ),
+                {
+                    "id": uuid4(),
+                    "workspace_id": ctx["workspace_id"],
+                    "owner_id": ctx["owner_id"],
+                    "now": regrant_now,
+                },
+            )
+            holder.commit()
+
+            replay_resp = future.result(timeout=5)
+
+    assert replay_resp.status_code == 404, replay_resp.text
+    assert replay_resp.json()["error"]["code"] == "CONSENT_NOT_FOUND"
