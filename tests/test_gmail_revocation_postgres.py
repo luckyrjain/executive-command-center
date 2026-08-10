@@ -1350,7 +1350,7 @@ def test_disable_domain_serializes_against_a_genuinely_concurrent_colliding_casc
 
     This test proves the lock itself is real and load-bearing, the same
     way `test_revoke_consent_endpoint_serializes_against_a_concurrent_
-    regrant` above proves its own row lock: a raw connection holds the
+    regrant` below proves its own row lock: a raw connection holds the
     advisory lock for the colliding id first, a background thread's own
     `disable` call (which needs that same lock inside `cascade_email_
     revocation`) genuinely blocks rather than racing ahead, and once the
