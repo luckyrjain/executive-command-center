@@ -1401,9 +1401,7 @@ def test_disable_domain_serializes_against_a_genuinely_concurrent_colliding_casc
 
     with engine.connect() as holder:
         holder.execute(
-            text(
-                "SELECT pg_advisory_xact_lock(hashtextextended(:workspace_id || ':' || :id, 0))"
-            ),
+            text("SELECT pg_advisory_xact_lock(hashtextextended(:workspace_id || ':' || :id, 0))"),
             {"workspace_id": str(ctx["workspace_id"]), "id": colliding_external_id},
         )
         with ThreadPoolExecutor(max_workers=1) as pool:
