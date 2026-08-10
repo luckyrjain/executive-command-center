@@ -166,6 +166,22 @@ endpoint as item 28 above):
     item 28's own `test_disable_rejects_gmail_provider_account` now seeds a
     `personal_domains` row via `_insert_personal_email_domain` to keep
     proving the rejection still fires when one does exist.
+
+Plus one item closing a gap Phase 10 Gmail Connector Task 7's own Loop 2
+round 27 review found in this module's territory (the same `/disable`
+endpoint's idempotency handling, not the gmail-provider gate itself):
+
+30. `test_disable_idempotency_key_reused_after_a_gmail_reconnect_is_
+    rejected`: this endpoint's idempotency cache hit used to return the
+    first call's stale cached `"disconnected"` response unconditionally,
+    without re-checking whether the account had been reconnected (reusing
+    the same row/id, per `gmail_oauth_callback_endpoint`'s own reactivation
+    `UPDATE`) in the meantime -- the identical bug class `test_gmail_
+    revocation_postgres.py`'s items 21-22 closed for `disable_domain_
+    endpoint`/`delete_domain_endpoint`, never propagated to this sibling
+    endpoint. Fixed by moving `get_connector_account` ahead of the cache
+    check and rejecting a cache hit with `409 IDEMPOTENCY_CONFLICT` when
+    the account is no longer `disconnected`.
 """
 
 import threading
@@ -1820,6 +1836,63 @@ def test_disable_idempotency_replay(
     first_body = {k: v for k, v in first.json().items() if k not in ignored}
     replay_body = {k: v for k, v in replay.json().items() if k not in ignored}
     assert replay_body == first_body
+
+
+def test_disable_idempotency_key_reused_after_a_gmail_reconnect_is_rejected(
+    engineering_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    """Loop 2 round 27 review finding (MEDIUM-HIGH): `request_hash` above is
+    a function of `account_id` alone, and `idempotency_records` rows live
+    365 days, so the same `Idempotency-Key` reused across a real disable ->
+    a genuine Gmail reconnect via `gmail_oauth.py` (reactivates this exact
+    row's `status` back to `'active'`, same `id`, per `gmail_oauth_
+    callback_endpoint`'s own `UPDATE ... WHERE id = :id`) -> a second
+    disable attempt used to match the first call's cached `"disconnected"`
+    response and return it immediately, without actually disconnecting the
+    freshly-reconnected account or attempting to revoke its live Google
+    grant. Identical bug class to `test_gmail_revocation_postgres.py`'s
+    items 21-22 (rounds 21-22, for `disable_domain_endpoint`/`delete_
+    domain_endpoint`), never propagated to this sibling endpoint. No
+    `personal_domains` row is seeded, so the gmail-specific `409 GMAIL_
+    DISABLE_REQUIRES_DOMAIN_ENDPOINT` rejection (item 28/29 above) does not
+    apply here -- this test is entirely about the idempotency cache-hit
+    path, which runs before that rejection is ever reached.
+    """
+    client, workspace_id, user_id, token = engineering_test_context
+    account_id = _insert_connector_account(workspace_id, user_id, provider="gmail")
+    key = str(uuid4())
+
+    first = client.post(
+        f"/api/v1/engineering/connectors/{account_id}/disable",
+        headers=_headers(token, key=key),
+    )
+    assert first.status_code == 200, first.text
+    assert first.json()["status"] == "disconnected"
+
+    # Simulates a genuine Gmail reconnect via the real OAuth callback
+    # endpoint (`gmail_oauth.py`), which reactivates this same row.
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "UPDATE connector_accounts SET status = 'active', disconnected_at = NULL "
+                "WHERE workspace_id = :workspace_id AND id = :id"
+            ),
+            {"workspace_id": workspace_id, "id": account_id},
+        )
+
+    replay = client.post(
+        f"/api/v1/engineering/connectors/{account_id}/disable",
+        headers=_headers(token, key=key),
+    )
+    assert replay.status_code == 409, replay.text
+    assert replay.json()["error"]["code"] == "IDEMPOTENCY_CONFLICT"
+
+    with engine.begin() as connection:
+        status = connection.execute(
+            text("SELECT status FROM connector_accounts WHERE id = :id"),
+            {"id": account_id},
+        ).scalar_one()
+    assert status == "active", "a 409 rejection must not mutate the account either"
 
 
 def test_sync_connector_provider_not_supported(

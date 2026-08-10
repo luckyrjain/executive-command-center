@@ -1531,15 +1531,38 @@ def disable_connector_endpoint(
     pending_revoke: tuple[ConnectorAdapter, ConnectorAccountContext] | None = None
     with session.begin():
         _lock_idempotency(session, auth, idempotency_key)
-        cached = _load_cached(session, auth, idempotency_key, request_hash)
-        if cached is not None:
-            return ConnectorAccountResponse.model_validate(cached)
 
+        # `get_connector_account` moved ahead of `_load_cached` (Loop 2
+        # round 27 review finding, MEDIUM-HIGH): `request_hash` above is a
+        # function of `account_id` alone, and `idempotency_records` rows
+        # live 365 days (`_store_idempotency`), so the same `Idempotency-
+        # Key` reused across a real disable -> `gmail_oauth.py` reconnect
+        # (reactivates this exact row's `status` back to `'active'`, same
+        # `id`) -> a second disable attempt used to match the *first*
+        # call's cached `"disconnected"` response and return it immediately
+        # -- before `account.status` was even read again, and therefore
+        # without actually disconnecting the freshly-reconnected account or
+        # attempting to revoke its live Google grant. The caller was told
+        # the connector was disconnected while it stayed fully active and
+        # syncing -- the identical "stale success response masks a
+        # materially different current state" bug class rounds 21/22/24
+        # closed for `domains.py:_disable_domain`/`delete_domain_endpoint`,
+        # never propagated to this sibling endpoint. Fetching `account`
+        # first lets the cache-hit branch below check whether it is still
+        # actually disconnected before trusting the cache.
+        #
         # `for_update=True`: see sync_connector_endpoint's identical comment
         # -- serializes a concurrent disable/sync against the same account.
         account = get_connector_account(session, auth.workspace_id, account_id, for_update=True)
         if account is None:
             raise HTTPException(status_code=404, detail="CONNECTOR_NOT_FOUND")
+
+        cached = _load_cached(session, auth, idempotency_key, request_hash)
+        if cached is not None:
+            if account.status != "disconnected":
+                record_idempotency_conflict("engineering_connector_account")
+                raise HTTPException(status_code=409, detail="IDEMPOTENCY_CONFLICT")
+            return ConnectorAccountResponse.model_validate(cached)
 
         if account.status != "disconnected":
             if account.provider == "gmail" and _personal_email_domain_exists(
