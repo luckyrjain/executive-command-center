@@ -84,11 +84,22 @@ Covers, in the same order these tests physically appear below:
     first attempt (a plain `revoked_at IS NULL` check) wrongly 404'd that
     case too, since it ran before `_disable_domain`'s own idempotency-
     cache check ever got a chance to fire.
+17. The check for item 15 above genuinely serializes against a concurrent
+    re-grant, not merely a sequential one -- Loop 2 round 10 review
+    finding: items 15/16's own check used to run in a separate transaction
+    that committed before `_disable_domain` was ever called, leaving a
+    TOCTOU window for a concurrent re-grant to commit in between and have
+    `_disable_domain` disable-and-cascade-purge the freshly re-granted
+    state anyway. Proves the fix's own load-bearing mechanism: while a raw
+    connection holds the `personal_domains` row's lock, a concurrent
+    `POST /consents` re-grant for the same domain blocks until it is
+    released.
 """
 
 import threading
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
@@ -372,6 +383,7 @@ def _cleanup_workspace(workspace_id: UUID, *, emails: list[str]) -> None:
             "pkos_evidence",
             "pkos_nodes",
             "attention_items",
+            "email_message_id_purge_log",
             "email_messages",
             "email_threads",
             "domain_consents",
@@ -1495,7 +1507,16 @@ def test_revoke_consent_endpoint_idempotency_key_replay_without_regrant_still_su
     the retry reaches `_disable_domain`'s own idempotency cache -- proven
     here with the SAME `Idempotency-Key` on both calls, asserting the
     second call is a `200`, not a `404`, with the identical cached
-    response body.
+    response body. Response-body equality alone would not by itself rule
+    out a harmless independent recompute landing on the same values
+    (`domain.enabled` is already `False` either way, so a non-cached
+    second pass through `_disable_domain` would skip the cascade and still
+    return an identically-shaped response) -- Loop 2 round 10 review
+    finding: the direct proof is that `write_side_effects` inserts one
+    fresh `audit_events` row per real execution, with no `ON CONFLICT`
+    dedup, so a genuine second execution would leave two rows for this
+    domain's `personal_domain.disabled` event; asserting exactly one below
+    is what actually distinguishes a real cache hit from a coincidence.
     """
     ctx = gmail_revocation_context
     key = str(uuid4())
@@ -1512,3 +1533,65 @@ def test_revoke_consent_endpoint_idempotency_key_replay_without_regrant_still_su
     )
     assert replay_resp.status_code == 200, replay_resp.text
     assert replay_resp.json() == first_resp.json()
+
+    with engine.begin() as connection:
+        audit_event_count = connection.execute(
+            text(
+                "SELECT COUNT(*) FROM audit_events WHERE workspace_id = :workspace_id "
+                "AND event_type = 'personal_domain.disabled'"
+            ),
+            {"workspace_id": ctx["workspace_id"]},
+        ).scalar_one()
+    assert audit_event_count == 1, "the replay must be served from cache, not re-executed"
+
+
+def test_revoke_consent_endpoint_serializes_against_a_concurrent_regrant(
+    gmail_revocation_context: dict,
+) -> None:
+    """Loop 2 round 10 review finding: the stale-consent-id check two
+    tests above used to run in its own, separately-committed transaction
+    *before* `_disable_domain`'s own `FOR UPDATE` lock on the `personal_
+    domains` row -- a genuine TOCTOU window existed between that check and
+    the actual mutation, where a concurrent re-grant could commit in
+    between and `_disable_domain` would go on to disable-and-cascade-purge
+    the freshly re-granted state anyway. Fixed by moving the re-validation
+    *inside* `_disable_domain`'s own transaction, immediately after it
+    acquires the same `personal_domains` row lock `_enable_domain`'s own
+    re-grant path (`existing = get_domain(..., for_update=True)`) also
+    acquires. This proves the mechanism the fix actually depends on: while
+    a raw connection holds that same row locked, a concurrent `POST /
+    consents` re-grant for the SAME domain genuinely blocks rather than
+    racing ahead -- the same `FOR UPDATE` semantics `test_disable_domain_
+    releases_pool_connection_and_row_lock_before_revoke_call` above proves
+    are NOT held during an unrelated blocking call, inverted here to prove
+    they ARE held (and thus serialize) when it matters.
+    """
+    ctx = gmail_revocation_context
+
+    def _create_consent() -> Any:
+        return ctx["client"].post(
+            "/api/v1/personal/consents",
+            json={"domain_key": "email"},
+            headers=_headers(ctx["token"], str(uuid4())),
+        )
+
+    holder = engine.connect()
+    holder.execute(text("BEGIN"))
+    holder.execute(
+        text(
+            "SELECT id FROM personal_domains WHERE workspace_id = :workspace_id "
+            "AND owner_id = :owner_id AND domain_key = 'email' FOR UPDATE"
+        ),
+        {"workspace_id": ctx["workspace_id"], "owner_id": ctx["owner_id"]},
+    )
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(_create_consent)
+            with pytest.raises(FutureTimeoutError):
+                future.result(timeout=1)
+
+            holder.execute(text("COMMIT"))
+            resp = future.result(timeout=5)
+        assert resp.status_code == 201, resp.text
+    finally:
+        holder.close()

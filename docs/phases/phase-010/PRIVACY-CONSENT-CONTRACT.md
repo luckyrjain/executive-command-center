@@ -2,7 +2,7 @@
 id: PHASE-010-PRIVACY-CONSENT-CONTRACT
 title: Phase 10 Gmail Privacy and Consent Contract
 status: Approved for Implementation
-version: 1.3.5
+version: 1.3.6
 owner: Lucky Jain
 depends_on:
   - PHASE-010
@@ -113,6 +113,25 @@ later grant has superseded) is rejected the same non-disclosing way
 every other lookup in this module already fails closed (`404 CONSENT_
 NOT_FOUND`).
 
+**The `NOT EXISTS (a later grant)` re-check itself moved, round 10
+review, to close a TOCTOU window the first two rounds left open.**
+`revoke_consent_endpoint` originally ran that check in its own, separate
+transaction that committed *before* `_disable_domain` was even called --
+a concurrent re-grant could commit in the gap between that check and
+`_disable_domain`'s own `FOR UPDATE` lock on `personal_domains`, and
+`_disable_domain` would then disable-and-cascade-purge the freshly
+re-granted state anyway, using a `consent_id` that had already gone
+stale by the time the actual mutation ran (the same underlying failure
+mode rounds 8-9 were built to prevent, just not under genuine
+concurrency). Fixed by passing `consent_id` through to `_disable_domain`
+and re-validating *after* it acquires the same `personal_domains` row
+lock `_enable_domain`'s own re-grant path also acquires (`existing =
+get_domain(..., for_update=True)`) -- whichever transaction gets that
+lock first is authoritative, closing the window structurally rather than
+by timing. The comparison itself was also widened from `>` to `>=`
+(round 10 LOW finding): a strict `>` has a same-timestamp blind spot
+under coarse clock resolution that `>=` fails closed on instead.
+
 **"Retryable" is the existing idempotency-key mechanism, not a new
 `deletion_jobs` state.** Every step above runs inside the same transaction
 `_disable_domain`/`_delete_domain_data` already opens, so a failure at any
@@ -182,3 +201,4 @@ Gmail is internal-development only.
 | 1.3.3 | 2026-08-10 | Task 7 Loop 2 round 6 review: corrected a second, nearby "purging every email-derived record" overclaim that round 5's fix missed -- internally inconsistent with the three carve-outs this same section already discloses two sentences earlier | Lucky Jain |
 | 1.3.4 | 2026-08-10 | Task 7 Loop 2 round 8 review: documented `email_message_id_purge_log` (migration `0076`, closing a sequential cross-owner evidence leak) and `revoke_consent_endpoint`'s new `revoked_at IS NULL` requirement (closing a stale-consent-id replay that could re-trigger the cascade against freshly re-granted state) | Lucky Jain |
 | 1.3.5 | 2026-08-10 | Task 7 Loop 2 round 9 review: corrected the round-8 `revoke_consent_endpoint` description -- the plain `revoked_at IS NULL` check broke legitimate `Idempotency-Key` retries; replaced with a `NOT EXISTS (a later grant)` check that only rejects a consent a later grant has actually superseded | Lucky Jain |
+| 1.3.6 | 2026-08-10 | Task 7 Loop 2 round 10 review: documented the TOCTOU fix moving the `NOT EXISTS` re-check inside `_disable_domain`'s own transaction (closing a race the round 8-9 fix left open under genuine concurrency) and widening the comparison from `>` to `>=` | Lucky Jain |

@@ -731,6 +731,8 @@ def _disable_domain(
     auth: AuthContext,
     session: Session,
     idempotency_key: str,
+    *,
+    consent_id: UUID | None = None,
 ) -> DomainResponse:
     """Phase 10 Task 7: for `domain_key == "email"` specifically, a real
     enabled -> disabled transition here also runs `gmail_revocation.
@@ -747,6 +749,24 @@ def _disable_domain(
     call this single write path, so the cascade is reached identically
     from either HTTP entry point, matching this module's own "one real
     write path per state transition" convention (see module docstring).
+
+    `consent_id` (`revoke_consent_endpoint` only -- `disable_domain_
+    endpoint` has no consent-specific identifier to re-check) re-validates
+    that the referenced consent has not been superseded by a later grant,
+    *inside* this same transaction, immediately after `domain` is locked
+    below -- not before this function is even called. Loop 2 round 10
+    review finding: `revoke_consent_endpoint`'s own round-8/9 staleness
+    check used to run in its own, separate, already-committed transaction
+    before ever calling this function -- a real TOCTOU window existed
+    between that check and this function's own `FOR UPDATE` lock, where a
+    concurrent re-grant could commit in between, and this function would
+    then disable-and-cascade-purge the freshly re-granted state anyway,
+    the exact outcome the round-8/9 fix was meant to prevent (just not
+    under genuine concurrency). Re-validating after acquiring the same
+    `personal_domains` row lock `_enable_domain`'s own re-grant path also
+    acquires closes the window: whichever transaction gets the lock first
+    is authoritative, and the loser sees a fully consistent post-commit
+    state before it decides anything.
     """
     req_hash = request_hash(_EmptyBody(), f"disable_domain:{domain_key}")
     now = datetime.now(UTC)
@@ -760,6 +780,41 @@ def _disable_domain(
         domain = get_domain(session, auth, domain_key, for_update=True)
         if domain is None:
             raise HTTPException(status_code=404, detail="DOMAIN_NOT_FOUND")
+
+        if consent_id is not None:
+            # `>=`, not `>` (Loop 2 round 10 review LOW finding): a strict
+            # `>` has a same-timestamp blind spot -- if a regrant's
+            # `granted_at` ties this consent's own `revoked_at` (coarse
+            # clock resolution, VM clock jitter), `NOT EXISTS` would wrongly
+            # conclude nothing supersedes it. `>=` fails closed on a tie
+            # instead of relying on wall-clock precision; harmless for the
+            # true idempotent-retry case above, which creates no new
+            # `domain_consents` row for this check to ever compare against.
+            still_valid = session.execute(
+                text(
+                    """
+                    SELECT 1 FROM domain_consents dc
+                    WHERE workspace_id = :workspace_id AND owner_id = :owner_id AND id = :consent_id
+                      AND (
+                        revoked_at IS NULL
+                        OR NOT EXISTS (
+                          SELECT 1 FROM domain_consents newer
+                          WHERE newer.workspace_id = dc.workspace_id
+                            AND newer.owner_id = dc.owner_id
+                            AND newer.domain_key = dc.domain_key
+                            AND newer.granted_at >= dc.revoked_at
+                        )
+                      )
+                    """
+                ),
+                {
+                    "workspace_id": auth.workspace_id,
+                    "owner_id": auth.user_id,
+                    "consent_id": consent_id,
+                },
+            ).one_or_none()
+            if still_valid is None:
+                raise HTTPException(status_code=404, detail="CONSENT_NOT_FOUND")
 
         version = domain.version
         if domain.enabled:
@@ -882,53 +937,26 @@ def revoke_consent_endpoint(
     # `InvalidRequestError` ("a transaction is already begun"), exactly the
     # bug `list_insights_endpoint`'s own docstring documents for the
     # identical shape.
+    #
+    # This lookup only resolves `id` to a `domain_key` -- it does NOT gate
+    # on whether the consent has been superseded by a later grant. That
+    # check now happens *inside* `_disable_domain`'s own transaction (Loop
+    # 2 round 10 review finding): doing it here, in this separate,
+    # already-committed transaction, left a real TOCTOU window between
+    # this SELECT and `_disable_domain`'s own `FOR UPDATE` lock on the
+    # `personal_domains` row -- a concurrent re-grant could commit in that
+    # gap, and `_disable_domain` would then disable-and-cascade-purge the
+    # freshly re-granted state anyway, using a `consent_id` that had
+    # already gone stale by the time the actual mutation ran. Passing
+    # `consent_id` through and re-validating after the same row lock
+    # `_enable_domain`'s own re-grant path also acquires closes that
+    # window: whichever transaction gets the lock first is authoritative.
     with session.begin():
-        # Reject only a consent that was both revoked AND superseded by a
-        # *later* grant for the same domain (Loop 2 round 8 review, refined
-        # round 9): a stale/already-revoked `consent_id` -- e.g. a replayed
-        # request, a double-submitted form, or a client retry that lands
-        # after the user already re-granted `email` consent and resynced
-        # Gmail -- would otherwise still resolve to a `domain_key` here and
-        # go on to trigger `_disable_domain` below. `_disable_domain`
-        # itself only mutates `if domain.enabled`, so a stale id is
-        # harmless for every other domain (disabling and re-enabling is
-        # fully reversible, no data loss). For `email` specifically it is
-        # not: `_disable_domain` cannot tell *which* consent triggered it,
-        # so it would disable and cascade-purge the *current*, freshly-
-        # resynced `email` state using an identifier that no longer names
-        # an active grant. A plain `AND revoked_at IS NULL` closed that
-        # window but broke a genuinely different, legitimate case: an
-        # `Idempotency-Key` retry of a revoke that already succeeded (no
-        # re-grant in between) -- round 9 review found the first successful
-        # call sets `revoked_at`, so the identical retry's own lookup
-        # (which runs *before* `_disable_domain`'s own idempotency-cache
-        # check even has a chance to fire) would 404 instead of returning
-        # the cached response. `NOT EXISTS (a later grant for this same
-        # domain)` distinguishes the two: a revoked consent with no
-        # subsequent re-grant still resolves normally (the retry reaches
-        # `_disable_domain`, which either serves the cache or safely no-ops
-        # via `if domain.enabled` -- domain is still disabled either way);
-        # only a revoked consent that a *later* grant has actually
-        # superseded is rejected, the same non-disclosing way every other
-        # lookup in this module already fails closed (`404 CONSENT_NOT_
-        # FOUND`).
         row = (
             session.execute(
                 text(
-                    """
-                    SELECT domain_key FROM domain_consents dc
-                    WHERE workspace_id = :workspace_id AND owner_id = :owner_id AND id = :id
-                      AND (
-                        revoked_at IS NULL
-                        OR NOT EXISTS (
-                          SELECT 1 FROM domain_consents newer
-                          WHERE newer.workspace_id = dc.workspace_id
-                            AND newer.owner_id = dc.owner_id
-                            AND newer.domain_key = dc.domain_key
-                            AND newer.granted_at > dc.revoked_at
-                        )
-                      )
-                    """
+                    "SELECT domain_key FROM domain_consents "
+                    "WHERE workspace_id = :workspace_id AND owner_id = :owner_id AND id = :id"
                 ),
                 {"workspace_id": auth.workspace_id, "owner_id": auth.user_id, "id": consent_id},
             )
@@ -937,7 +965,9 @@ def revoke_consent_endpoint(
         )
     if row is None:
         raise HTTPException(status_code=404, detail="CONSENT_NOT_FOUND")
-    return _disable_domain(row["domain_key"], request, auth, session, idempotency_key)
+    return _disable_domain(
+        row["domain_key"], request, auth, session, idempotency_key, consent_id=consent_id
+    )
 
 
 # ---------------------------------------------------------------------------
