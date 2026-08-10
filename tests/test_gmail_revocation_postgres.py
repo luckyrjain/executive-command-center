@@ -1911,10 +1911,10 @@ def test_disable_domain_idempotency_key_reused_after_an_oauth_reconnect_is_rejec
     `connector_accounts` row -- reactivates it straight back to `status=
     'active'` with no reference whatsoever to `personal_domains`/`domain_
     consents`. A real disable, followed by a genuine Gmail reconnect
-    through that unrelated OAuth flow (simulated here the same way the
-    concurrent-regrant test above does, by updating `connector_accounts`
-    directly, since exercising the real OAuth callback needs Google
-    transport mocking this file does not otherwise set up), leaves
+    through that unrelated OAuth flow (simulated here the same way item
+    18 above does, by updating `connector_accounts` directly, since
+    exercising the real OAuth callback needs Google transport mocking
+    this file does not otherwise set up), leaves
     `domain.enabled` still `False` -- round 21's own fix alone would have
     let the replay through and silently served the stale cached response
     again, leaving the freshly-reconnected connector row untouched.

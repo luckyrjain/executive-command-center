@@ -2,7 +2,7 @@
 id: PHASE-010-API-SCHEMAS
 title: Phase 10 Gmail API Schemas
 status: Approved for Implementation
-version: 1.2.4
+version: 1.2.5
 owner: Lucky Jain
 depends_on:
   - PHASE-010
@@ -162,9 +162,21 @@ returns, rather than resolving to `domain_key` and re-running the cascade
 (Loop 2 round 8 review, refined round 9 -- an `id` that is merely revoked,
 with no later grant superseding it, still resolves normally, so a same-
 `Idempotency-Key` retry of an already-succeeded revoke keeps working; see
-`PRIVACY-CONSENT-CONTRACT.md`). See `PRIVACY-CONSENT-CONTRACT.md`'s own
-"Consent revocation cascade (Task 7)" section for the full cascade
-description and why "retry" needed no new `deletion_jobs` schema.
+`PRIVACY-CONSENT-CONTRACT.md`). `POST .../domains/email/disable` and
+`POST .../domains/email/delete` (and, transitively, `POST .../consents/
+{id}/revoke`) additionally now return `409 IDEMPOTENCY_CONFLICT` for an
+`Idempotency-Key` reused after a genuine later state change -- the domain
+re-enabled, or the owner's Gmail account reconnected through the separate
+OAuth flow -- even though the request itself is byte-identical and would
+normally hash-match the cached response (every other domain's own
+disable/delete endpoints, and this framework generally, only 409 on a
+request-hash *mismatch*; see `docs/domain/API-CONTRACTS.md`). This is
+`email`-specific, matching this cascade's own consent/data-purge stakes
+(Loop 2 rounds 21-22 review; see `PRIVACY-CONSENT-CONTRACT.md`'s own
+"Reusing the same `Idempotency-Key`..." sections for why). See
+`PRIVACY-CONSENT-CONTRACT.md`'s own "Consent revocation cascade (Task 7)"
+section for the full cascade description and why "retry" needed no new
+`deletion_jobs` schema.
 
 ## Planned APIs
 
@@ -182,3 +194,4 @@ response extensions.
 | 1.2.2 | 2026-08-10 | Task 7 Loop 2 round 6 review: the `disable` row missed round 2's already-disconnected idempotent-no-op carve-out; the "Consent revocation cascade" section overclaimed "every email-derived record" against round 4's own ambiguous-id carve-out | Lucky Jain |
 | 1.2.3 | 2026-08-10 | Task 7 Loop 2 round 8 review: documented `POST .../consents/{id}/revoke`'s new `revoked_at IS NULL` requirement, closing a stale-consent-id replay that could re-trigger the cascade | Lucky Jain |
 | 1.2.4 | 2026-08-10 | Task 7 Loop 2 round 9 review: corrected the round-8 revoke row -- the plain `revoked_at IS NULL` check broke legitimate `Idempotency-Key` retries; replaced with a check for a later superseding grant | Lucky Jain |
+| 1.2.5 | 2026-08-10 | Task 7 Loop 2 round 23 review: documented the new `409 IDEMPOTENCY_CONFLICT` behavior (rounds 21-22) for `disable`/`delete`/`revoke` on a same-hash `Idempotency-Key` reused after a genuine domain re-enable or Gmail OAuth reconnect -- this file had gone stale since round 9, never updated for either round | Lucky Jain |
