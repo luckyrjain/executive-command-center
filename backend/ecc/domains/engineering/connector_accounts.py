@@ -322,6 +322,31 @@ def get_connector_account(
     return _row_to_account(dict(row)) if row is not None else None
 
 
+def _personal_email_domain_exists(session: Session, workspace_id: UUID, account_id: UUID) -> bool:
+    """Loop 2 round 25 review finding (MEDIUM), `disable_connector_
+    endpoint`'s own `gmail`-provider gate: whether this specific `gmail`
+    connector account's owner has any `personal_domains` row for `email`
+    at all -- not whether the domain is *enabled*, which `_disable_domain`
+    below the redirect this gate points to already checks in its own
+    right. Joins through `connector_accounts.owner_id` (migration `0063`)
+    rather than taking an `owner_id` parameter directly, since the only
+    caller has an `account_id`, not an owner, in hand.
+    """
+    return (
+        session.execute(
+            text(
+                "SELECT 1 FROM personal_domains pd "
+                "JOIN connector_accounts ca ON ca.workspace_id = pd.workspace_id "
+                "AND ca.owner_id = pd.owner_id "
+                "WHERE ca.id = :account_id AND ca.workspace_id = :workspace_id "
+                "AND pd.domain_key = 'email' LIMIT 1"
+            ),
+            {"account_id": account_id, "workspace_id": workspace_id},
+        ).first()
+        is not None
+    )
+
+
 def list_connector_accounts(
     session: Session,
     workspace_id: UUID,
@@ -1517,7 +1542,9 @@ def disable_connector_endpoint(
             raise HTTPException(status_code=404, detail="CONNECTOR_NOT_FOUND")
 
         if account.status != "disconnected":
-            if account.provider == "gmail":
+            if account.provider == "gmail" and _personal_email_domain_exists(
+                session, auth.workspace_id, account_id
+            ):
                 # Loop 2 round 1 review (PR #128): this endpoint is a
                 # generic, provider-agnostic connector-level disable -- it
                 # only marks the row `disconnected` and clears synced
@@ -1542,6 +1569,27 @@ def disable_connector_endpoint(
                 # found the unconditional version silently broke that same
                 # contract for `gmail` specifically, with no test covering
                 # the no-op case for this provider.
+                #
+                # Also gated on `_personal_email_domain_exists` (Loop 2
+                # round 25 review finding, MEDIUM): this gate has no
+                # dependency of its own on `personal_domains` -- an
+                # allowlisted user who completes the Gmail OAuth flow
+                # (`gmail_oauth.py`) without ever calling `POST /domains`
+                # or `POST /consents` for `email` gets an `active`
+                # `connector_accounts` row with no matching domain row at
+                # all. Before this check, this generic endpoint
+                # unconditionally redirected every non-disconnected
+                # `gmail` account to the domain-level endpoint, which
+                # 404s `DOMAIN_NOT_FOUND` for exactly that owner -- a
+                # connector with no HTTP-reachable way to disconnect it,
+                # a regression this same round-1 fix introduced (before
+                # it, this endpoint could still disconnect any provider
+                # unconditionally). No cascade-bypass risk in this
+                # specific case: with no `personal_domains`/`domain_
+                # consents` row, there is nothing for the cascade to
+                # purge or revoke beyond what this generic path already
+                # does, so falling through to the same disconnect every
+                # other provider gets is correct, not merely convenient.
                 raise HTTPException(
                     status_code=409, detail="GMAIL_DISABLE_REQUIRES_DOMAIN_ENDPOINT"
                 )

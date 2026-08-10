@@ -149,6 +149,23 @@ dedicated test file):
     disconnected connector is an idempotent `200` no-op; fixed by gating
     the rejection on `account.status != "disconnected"`, proven here by an
     already-disconnected `gmail` row still returning `200`.
+
+Plus one item closing a gap Phase 10 Gmail Connector Task 7's own Loop 2
+round 25 review found in this module's territory (the same `/disable`
+endpoint as item 28 above):
+
+29. `test_disable_falls_through_for_a_gmail_account_with_no_domain_row_at_
+    all`: item 28's rejection had no dependency of its own on `personal_
+    domains` -- an allowlisted user who completes the Gmail OAuth flow
+    (`gmail_oauth.py`) without ever calling `POST /domains`/`POST
+    /consents` for `email` gets an `active` `connector_accounts` row with
+    no matching domain row at all, so the unconditional redirect to the
+    domain-level endpoint 404d `DOMAIN_NOT_FOUND` for exactly that owner --
+    a connector with no HTTP-reachable way to disconnect it. Fixed by
+    gating the rejection on a new `_personal_email_domain_exists` check;
+    item 28's own `test_disable_rejects_gmail_provider_account` now seeds a
+    `personal_domains` row via `_insert_personal_email_domain` to keep
+    proving the rejection still fires when one does exist.
 """
 
 import threading
@@ -765,6 +782,32 @@ def _insert_connector_account(
             },
         )
     return account_id
+
+
+def _insert_personal_email_domain(workspace_id: UUID, owner_id: UUID) -> None:
+    """Seeds a `personal_domains` row for `email` (Loop 2 round 25 review) --
+    mirrors `_insert_enabled_email_domain` in `test_gmail_revocation_
+    postgres.py`. `disable_connector_endpoint`'s gmail-provider rejection is
+    gated on this row existing (`_personal_email_domain_exists` in
+    `connector_accounts.py`), so tests exercising that rejection must seed
+    it explicitly rather than relying on `_insert_connector_account` alone.
+    """
+    now = datetime.now(UTC)
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                """
+                INSERT INTO personal_domains (
+                    id, workspace_id, owner_id, domain_key, classification, enabled,
+                    enabled_at, created_by, updated_by, created_at, updated_at, version
+                ) VALUES (
+                    :id, :workspace_id, :owner_id, 'email', 'high_stakes', true,
+                    :now, :owner_id, :owner_id, :now, :now, 1
+                )
+                """
+            ),
+            {"id": uuid4(), "workspace_id": workspace_id, "owner_id": owner_id, "now": now},
+        )
 
 
 def test_create_connector_success_never_returns_credential(
@@ -1463,9 +1506,14 @@ def test_disable_rejects_gmail_provider_account(
     unreachable. Now rejected outright, directing callers to the
     domain-level endpoint (`POST /api/v1/personal/domains/email/disable`)
     that actually reaches the cascade.
+
+    Seeds a `personal_domains` row for `email` (Loop 2 round 25 review:
+    this rejection is now itself gated on one existing -- see the
+    companion test below for the case where none does).
     """
     client, workspace_id, user_id, token = engineering_test_context
     account_id = _insert_connector_account(workspace_id, user_id, provider="gmail")
+    _insert_personal_email_domain(workspace_id, user_id)
 
     response = client.post(
         f"/api/v1/engineering/connectors/{account_id}/disable",
@@ -1480,6 +1528,32 @@ def test_disable_rejects_gmail_provider_account(
             {"id": account_id},
         ).scalar_one()
     assert status == "active", "rejected disable must not mutate the account"
+
+
+def test_disable_falls_through_for_a_gmail_account_with_no_domain_row_at_all(
+    engineering_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    """Loop 2 round 25 review finding (MEDIUM): the round-1 rejection above
+    has no dependency of its own on `personal_domains` -- an allowlisted
+    user who completes the Gmail OAuth flow (`gmail_oauth.py`) without
+    ever calling `POST /domains`/`POST /consents` for `email` gets an
+    `active` `connector_accounts` row with no matching domain row. Before
+    this fix, this endpoint unconditionally redirected every such account
+    to the domain-level endpoint, which 404s `DOMAIN_NOT_FOUND` for
+    exactly that owner -- a connector with no HTTP-reachable way to
+    disconnect it. No `personal_domains` row is seeded here (unlike the
+    test above), so the rejection must NOT fire; the account falls
+    through to the same generic disconnect every other provider gets.
+    """
+    client, workspace_id, user_id, token = engineering_test_context
+    account_id = _insert_connector_account(workspace_id, user_id, provider="gmail")
+
+    response = client.post(
+        f"/api/v1/engineering/connectors/{account_id}/disable",
+        headers=_headers(token, key=str(uuid4())),
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "disconnected"
 
 
 def test_disable_already_disconnected_gmail_account_is_still_an_idempotent_noop(
