@@ -2,7 +2,7 @@
 id: PHASE-010-API-SCHEMAS
 title: Phase 10 Gmail API Schemas
 status: Approved for Implementation
-version: 1.2.1
+version: 1.2.2
 owner: Lucky Jain
 depends_on:
   - PHASE-010
@@ -80,7 +80,7 @@ validation errors.
 | `GET /api/v1/engineering/connectors` | Lists authorized visible accounts; never returns credentials |
 | `POST /api/v1/engineering/connectors/{id}/sync` | Body `{"run_type":"backfill|incremental","resource_type":"message"}`; requires `Idempotency-Key` and CSRF |
 | `GET /api/v1/engineering/sync-runs` | Lists redacted run outcome and item count |
-| `POST /api/v1/engineering/connectors/{id}/disable` | For every other provider: revokes the token best-effort and marks the account disconnected. For `gmail` specifically: rejected outright with `409 GMAIL_DISABLE_REQUIRES_DOMAIN_ENDPOINT` and no mutation -- Loop 2 round 1 review found this generic endpoint could disconnect a `gmail` account (and revoke its live Google grant) without running the consent revocation cascade below, leaving `personal_domains`/data untouched; callers must use the domain-level endpoints instead, which reach `gmail_revocation.cascade_email_revocation` |
+| `POST /api/v1/engineering/connectors/{id}/disable` | For every other provider: revokes the token best-effort and marks the account disconnected. For `gmail` specifically: if the account is not already `disconnected`, rejected with `409 GMAIL_DISABLE_REQUIRES_DOMAIN_ENDPOINT` and no mutation (Loop 2 round 1 review found this generic endpoint could otherwise disconnect a `gmail` account, and revoke its live Google grant, without running the consent revocation cascade below); an already-`disconnected` `gmail` account is unaffected by this guard and still returns the same idempotent `200` no-op as every other provider (Loop 2 round 2 review). Callers must use the domain-level endpoints instead, which reach `gmail_revocation.cascade_email_revocation` |
 
 Manual `webhook` sync is not accepted. A second running sync for the same
 account returns `409 CONNECTOR_SYNC_IN_PROGRESS`. Provider errors are
@@ -145,10 +145,13 @@ No new endpoint. `POST /api/v1/personal/domains/email/disable`, `POST
 email/delete` -- Phase 7's own existing generic personal-domain endpoints,
 documented in `docs/phases/phase-007/API-SCHEMAS.md`, unchanged in request/
 response shape -- now additionally, for `domain_key = "email"` only, best-
-effort revoke the owner's Gmail OAuth grant, disconnect their `gmail`
-connector account, and purge every email-derived record (threads,
-messages, `email_thread` attention items, non-`executed` `email_action_
-detected` recommendations and their evidence) in the same request. Every
+effort revoke the owner's Gmail OAuth grant, disconnect every one of
+their `gmail` connector account(s), and purge their own email-derived
+records (threads, messages, `email_thread` attention items, non-
+`executed` `email_action_detected` recommendations, and their evidence --
+except an evidence row whose id collides with a different owner's own
+message, deliberately left unpurged, see `PRIVACY-CONSENT-CONTRACT.md`)
+in the same request. Every
 other `domain_key` is unaffected -- disabling `habits`/`health`/`finance`/
 etc. still only flips `enabled`/revokes consent, data untouched, exactly
 as `docs/phases/phase-007/API-SCHEMAS.md` already documents. See
@@ -169,3 +172,4 @@ response extensions.
 | 1.1.0 | 2026-08-06 | Task 6: documented `GET`/`POST .../forget` thread endpoints, correcting the "no current endpoint returns thread content" claim | Lucky Jain |
 | 1.2.0 | 2026-08-10 | Task 7: documented the consent revocation cascade's behavior change to three existing Phase 7 generic endpoints (no new endpoint added) | Lucky Jain |
 | 1.2.1 | 2026-08-10 | Task 7 Loop 2 round 4 review: corrected the "Current reused connector endpoints" table's `disable` row, stale since round 1 -- it still described pre-fix behavior for `gmail`, contradicting this same file's own consent revocation cascade section below it | Lucky Jain |
+| 1.2.2 | 2026-08-10 | Task 7 Loop 2 round 6 review: the `disable` row missed round 2's already-disconnected idempotent-no-op carve-out; the "Consent revocation cascade" section overclaimed "every email-derived record" against round 4's own ambiguous-id carve-out | Lucky Jain |

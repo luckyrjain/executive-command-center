@@ -43,13 +43,19 @@ Covers, in the same order these tests physically appear below:
     dedicated concurrency test proving this; the two call sites that
     actually reach `finish_gmail_revocation` for `gmail` (this module's
     own `_disable_domain`/`delete_domain_endpoint`) had none.
-11. A second owner's own Gmail data (thread/message/attention item/
+11. `export_deletion.py:delete_domain_endpoint`'s own identical `session.
+    close()` before `finish_gmail_revocation(...)` sequence releases the
+    pooled connection and row lock before the blocking Google revoke call
+    runs, same as item 10 above -- Loop 2 round 5 review finding: item 10
+    only ever covered `disable_domain_endpoint`, leaving the OTHER call
+    site that reaches `finish_gmail_revocation` for `gmail` unproven.
+12. A second owner's own Gmail data (thread/message/attention item/
     connector) in the SAME workspace is completely untouched by the first
     owner's disable -- Loop 2 round 4 review finding: every test above
     exercises exactly one owner, so a regression dropping an `owner_id`
     clause from any of the cascade's five raw-SQL statements would go
     undetected.
-12. Two owners whose own Gmail accounts each produce a message sharing the
+13. Two owners whose own Gmail accounts each produce a message sharing the
     same raw `external_message_id` (only unique per `(workspace_id,
     thread_id)`, not per-workspace) do not leak `pkos_evidence` across the
     ownership boundary -- Loop 2 round 4 review finding: `source_ref`
@@ -60,12 +66,6 @@ Covers, in the same order these tests physically appear below:
     2 round 5 review finding: the original version only ever seeded one
     message, so it never exercised the `if safe_ids:` purge branch
     alongside a non-empty `ambiguous_ids`).
-13. `export_deletion.py:delete_domain_endpoint`'s own identical `session.
-    close()` before `finish_gmail_revocation(...)` sequence releases the
-    pooled connection and row lock before the blocking Google revoke call
-    runs, same as item 10 above -- Loop 2 round 5 review finding: item 10
-    only ever covered `disable_domain_endpoint`, leaving the OTHER call
-    site that reaches `finish_gmail_revocation` for `gmail` unproven.
 """
 
 import threading
@@ -332,7 +332,17 @@ def _insert_recommendation(
     return recommendation_id
 
 
-def _cleanup_workspace(workspace_id: UUID, *, email: str = _OWNER_EMAIL) -> None:
+def _cleanup_workspace(workspace_id: UUID, *, emails: list[str] | None = None) -> None:
+    """`emails` defaults to just `_OWNER_EMAIL`; tests that seed a second
+    owner (Loop 2 round 4-5's cross-owner tests) pass that owner's own
+    email too via `ctx["extra_owner_emails"]`, appended by the test itself
+    -- must happen here, in the SAME transaction sequence as the
+    workspace-scoped `users` deletion below, not inline in the test body:
+    `accounts` has a `RESTRICT` FK from `users` (`fk_users_account`), so
+    deleting a second owner's `accounts` row before their own `users` row
+    is gone raises `RestrictViolation` (Loop 2 round 6 review: CI caught
+    this exact ordering bug in the original version of this fix).
+    """
     with engine.begin() as connection:
         for table in (
             "deletion_jobs",
@@ -365,7 +375,12 @@ def _cleanup_workspace(workspace_id: UUID, *, email: str = _OWNER_EMAIL) -> None
         )
         # `accounts` is not workspace-scoped -- matches `test_gmail_threads_
         # postgres.py`'s own established `_cleanup_workspace` precedent.
-        connection.execute(text("DELETE FROM accounts WHERE email = :email"), {"email": email})
+        # Runs only after every `users` row referencing these accounts
+        # (workspace-scoped, deleted above) is gone.
+        connection.execute(
+            text("DELETE FROM accounts WHERE email = ANY(:emails)"),
+            {"emails": emails if emails is not None else [_OWNER_EMAIL]},
+        )
 
 
 @pytest.fixture
@@ -453,6 +468,7 @@ def gmail_revocation_context(monkeypatch: pytest.MonkeyPatch) -> Iterator[dict]:
 
     client = TestClient(app)
     client.cookies.set("ecc_session", token)
+    extra_owner_emails: list[str] = []
     try:
         yield {
             "client": client,
@@ -462,10 +478,11 @@ def gmail_revocation_context(monkeypatch: pytest.MonkeyPatch) -> Iterator[dict]:
             "account_id": account_id,
             "consent_id": consent_id,
             "now": now,
+            "extra_owner_emails": extra_owner_emails,
         }
     finally:
         client.close()
-        _cleanup_workspace(workspace_id)
+        _cleanup_workspace(workspace_id, emails=[_OWNER_EMAIL, *extra_owner_emails])
 
 
 def _insert_gmail_connector_account(
@@ -1133,14 +1150,14 @@ def test_disable_domain_does_not_affect_a_different_owners_gmail_data(
     assert other_attention_count == 1
     assert _connector_status(ctx["workspace_id"], other_account_id) == "active"
 
-    # `_cleanup_workspace` (the fixture's own teardown) only knows the
-    # primary owner's `accounts` row by email -- clean up this test's own
-    # second identity explicitly, matching `_cleanup_workspace`'s own
-    # `accounts` handling (not workspace-scoped).
-    with engine.begin() as connection:
-        connection.execute(
-            text("DELETE FROM accounts WHERE email = :email"), {"email": other_email}
-        )
+    # `_cleanup_workspace` (the fixture's own teardown) only ever knew the
+    # primary owner's `accounts` row by email -- register this test's own
+    # second identity so the fixture cleans it up too, in the correct
+    # order (after this workspace's `users` rows are gone). Deleting it
+    # here directly would raise `RestrictViolation` on `fk_users_account`
+    # since the second owner's own `users` row still exists at this point
+    # (Loop 2 round 6 review: CI caught this exact ordering bug).
+    ctx["extra_owner_emails"].append(other_email)
 
 
 def test_disable_domain_does_not_purge_evidence_with_a_colliding_external_message_id(
@@ -1263,7 +1280,7 @@ def test_disable_domain_does_not_purge_evidence_with_a_colliding_external_messag
         ).one_or_none()
     assert safe_evidence_row is None, "non-ambiguous evidence must still be purged normally"
 
-    with engine.begin() as connection:
-        connection.execute(
-            text("DELETE FROM accounts WHERE email = :email"), {"email": other_email}
-        )
+    # See the identical comment in `test_disable_domain_does_not_affect_a_
+    # different_owners_gmail_data` above -- deleting this second identity's
+    # `accounts` row directly here would raise `RestrictViolation`.
+    ctx["extra_owner_emails"].append(other_email)

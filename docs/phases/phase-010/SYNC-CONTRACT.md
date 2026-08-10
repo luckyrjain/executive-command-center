@@ -2,7 +2,7 @@
 id: PHASE-010-SYNC-CONTRACT
 title: Phase 10 Gmail Sync Contract
 status: Approved for Implementation
-version: 1.3.0
+version: 1.3.1
 owner: Lucky Jain
 depends_on:
   - PHASE-010
@@ -60,8 +60,11 @@ converge through their unique normalized-email constraint.
 
 An active `email` domain consent is checked before external fetch and again
 before each message write. Revocation during a call stops further writes,
-and now (Task 7) also disconnects the connector and purges every synced
-row -- see "Planned behavior" below. OAuth refresh requires both `gmail.
+and now (Task 7) also disconnects the connector and purges the owner's own
+synced rows -- see `PRIVACY-CONSENT-CONTRACT.md`'s own "Consent revocation
+cascade (Task 7)" section for the one deliberate exception (a `pkos_
+evidence` row left unpurged when its id collides with a different owner's
+own message). OAuth refresh requires both `gmail.
 metadata` and `gmail.readonly`; missing scope returns `permission_lost`.
 **Current limitation:** there is no scheduled permission reconciliation;
 an expired/revoked grant is only discovered on the next sync attempt, not
@@ -111,3 +114,4 @@ Pub/Sub push is explicitly deferred and `handle_webhook` remains a no-op.
 | 1.1.0 | 2026-08-06 | Task 5 review (Loop 2 round 16): moved shipped Task 3/5 behavior (attention projection, body retrieval, recommendation/evidence creation) from "Planned" to "Current"; this document had gone stale after Tasks 3-5 shipped without a contract-version update | Lucky Jain |
 | 1.2.0 | 2026-08-06 | Task 6: clarified that the new on-demand thread read/forget HTTP surface is not a sync-pipeline change, and renamed the "Planned" heading from "Tasks 6-8" to "Tasks 7-8" now that Task 6 has shipped | Lucky Jain |
 | 1.3.0 | 2026-08-10 | Task 7: documented consent-revocation disconnect/purge as shipped, renamed "Planned" heading from "Tasks 7-8" to "Task 8" | Lucky Jain |
+| 1.3.1 | 2026-08-10 | Task 7 Loop 2 round 6 review: this file was never revisited across six review rounds -- corrected the "purges every synced row" overclaim (round 4's ambiguous-id carve-out) | Lucky Jain |

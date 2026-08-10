@@ -2,7 +2,7 @@
 id: PHASE-010-PRIVACY-CONSENT-CONTRACT
 title: Phase 10 Gmail Privacy and Consent Contract
 status: Approved for Implementation
-version: 1.3.2
+version: 1.3.3
 owner: Lucky Jain
 depends_on:
   - PHASE-010
@@ -74,7 +74,8 @@ endpoint`'s own "null the content, keep the audit skeleton" convention.
 destroy state a different owner or domain still depends on; only the
 evidence pointing at it is removed. This is the single action the plan's
 own Task 7 bullet describes: revoking consent, disconnecting Google, and
-purging every email-derived record all happen together, with no code path
+purging the owner's own email-derived records (subject only to the three
+deliberate exceptions above) all happen together, with no code path
 that does only one of the three -- including the generic engineering
 `POST /connectors/{account_id}/disable` endpoint, which could disconnect
 a `gmail`-provider account (and revoke the live Google grant) without
@@ -149,3 +150,4 @@ Gmail is internal-development only.
 | 1.3.0 | 2026-08-10 | Task 7: documented the consent revocation cascade (disconnect + domain-wide purge, one action), moved it out of "Unsupported"/"Planned" into "Current controls"; only Task 8's export/audit-event/retention items remain planned | Lucky Jain |
 | 1.3.1 | 2026-08-10 | Task 7 Loop 2 round 1 review: documented and closed a cascade-bypassing third write path (the generic engineering connector-disable endpoint) and the multi-connector-account cascade crash | Lucky Jain |
 | 1.3.2 | 2026-08-10 | Task 7 Loop 2 round 5 review: corrected the "every Gmail-sourced pkos_evidence row" overclaim -- round 4's fix deliberately leaves a cross-owner-colliding evidence row unpurged; this file was never revisited when that fix shipped | Lucky Jain |
+| 1.3.3 | 2026-08-10 | Task 7 Loop 2 round 6 review: corrected a second, nearby "purging every email-derived record" overclaim that round 5's fix missed -- internally inconsistent with the three carve-outs this same section already discloses two sentences earlier | Lucky Jain |
