@@ -726,6 +726,34 @@ def enable_domain_endpoint(
     )
 
 
+def _gmail_reconnected(session: Session, auth: AuthContext, domain_key: str) -> bool:
+    """Whether the owner has a non-`disconnected` `gmail` connector account
+    (`gmail_oauth.py:gmail_oauth_callback_endpoint` reactivates a row
+    straight back to `status='active'` with no reference to `personal_
+    domains`/`domain_consents` at all, so this is the only reliable signal).
+    Mirrors `cascade_email_revocation`'s own `status != 'disconnected'`
+    query exactly. Callers must re-invoke this immediately before each use
+    rather than caching one result across multiple decisions in the same
+    transaction (Loop 2 round 32 review finding, LOW): this is a plain,
+    unlocked read -- nothing blocks a concurrent reconnect from committing
+    in between, since the reconnect never touches `personal_domains` and so
+    isn't serialized by `_disable_domain`'s own `for_update=True` lock on
+    `domain`.
+    """
+    return (
+        domain_key == "email"
+        and session.execute(
+            text(
+                "SELECT 1 FROM connector_accounts WHERE workspace_id = :workspace_id "
+                "AND provider = 'gmail' AND owner_id = :owner_id "
+                "AND status != 'disconnected' LIMIT 1"
+            ),
+            {"workspace_id": auth.workspace_id, "owner_id": auth.user_id},
+        ).first()
+        is not None
+    )
+
+
 def _disable_domain(
     domain_key: str,
     request: Request,
@@ -807,21 +835,17 @@ def _disable_domain(
         # (it is the sole reconnect path -- the generic engineering
         # `create_connector_endpoint` never registers `gmail`, and
         # `disable_connector_endpoint` rejects it with `409 GMAIL_DISABLE_
-        # REQUIRES_DOMAIN_ENDPOINT`). Computed once here, ahead of both
-        # places below that need it, mirroring `cascade_email_revocation`'s
-        # own `status != 'disconnected'` query exactly.
-        reconnected = (
-            domain_key == "email"
-            and session.execute(
-                text(
-                    "SELECT 1 FROM connector_accounts WHERE workspace_id = :workspace_id "
-                    "AND provider = 'gmail' AND owner_id = :owner_id "
-                    "AND status != 'disconnected' LIMIT 1"
-                ),
-                {"workspace_id": auth.workspace_id, "owner_id": auth.user_id},
-            ).first()
-            is not None
-        )
+        # REQUIRES_DOMAIN_ENDPOINT`). Used for the cache-hit check just
+        # below; re-queried fresh, not reused, immediately before the
+        # cascade-trigger decision further down (Loop 2 round 32 review
+        # finding, LOW: this read is unlocked -- nothing blocks a
+        # concurrent reconnect from committing between this line and the
+        # cascade-trigger decision, since the reconnect never touches
+        # `personal_domains` and so isn't blocked by `domain`'s own lock
+        # above -- reusing one stale boolean across both call sites risked
+        # a fresh disable racing a concurrent reconnect and missing it by a
+        # window as narrow as this function's own remaining work).
+        reconnected = _gmail_reconnected(session, auth, domain_key)
 
         cached = load_cached(session, auth, idempotency_key, req_hash, domain="personal_domains")
         if cached is not None:
@@ -920,7 +944,16 @@ def _disable_domain(
         # cascade` (no reconnect in between) is unaffected: `reconnected`
         # is `False` there, so this condition is exactly `domain.enabled`,
         # unchanged from before this fix.
-        if domain_key == "email" and (domain.enabled or reconnected):
+        #
+        # Re-queried here, not the `reconnected` computed above for the
+        # cache-hit check (Loop 2 round 32 review finding, LOW): narrows
+        # the unlocked-read TOCTOU window described above to the gap
+        # between this line and `cascade_email_revocation`'s own `FOR
+        # UPDATE` a few lines inside it, rather than this whole function's
+        # remaining work.
+        if domain_key == "email" and (
+            domain.enabled or _gmail_reconnected(session, auth, domain_key)
+        ):
             pending_gmail_revokes = cascade_email_revocation(session, auth, now)
 
         refreshed = get_domain(session, auth, domain_key)
