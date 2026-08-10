@@ -2,7 +2,7 @@
 id: PHASE-010-SYNC-CONTRACT
 title: Phase 10 Gmail Sync Contract
 status: Approved for Implementation
-version: 1.1.0
+version: 1.2.0
 owner: Lucky Jain
 depends_on:
   - PHASE-010
@@ -73,7 +73,7 @@ lengths, recipient count, parsing complexity, invalid timestamps, duplicate
 IDs, and response shapes are bounded or rejected so one malformed email does
 not wedge the account cursor.
 
-## Planned behavior (Tasks 6-8)
+## Planned behavior (Tasks 7-8)
 
 - consent-revocation disconnect and purge;
 - executive sync state and retry UI.
@@ -81,6 +81,18 @@ not wedge the account cursor.
 Deterministic awaiting-reply attention projection (Task 3), controlled body
 retrieval using `gmail.readonly` (Task 5), and recommendation/evidence
 creation (Task 5) have shipped -- see "Current behavior" above.
+
+Task 6 shipped on-demand human-facing thread reading and a per-thread
+"forget this" action (`GET`/`POST .../forget`, `API-SCHEMAS.md`'s own
+"Current thread endpoints" section), but neither is a sync-pipeline change:
+the `GET` endpoint fetches an already-known thread's not-yet-cached
+message bodies synchronously on request, outside backfill/incremental
+sync's own cursor-driven flow, and "forget" only nulls cached content for
+one thread, not the connector-wide "disconnect and purge" this section's
+own bullet still correctly lists as unshipped. The "Current limitation" the
+Consent and permissions subsection above already names -- no scheduled
+permission reconciliation or automatic consent-revocation disconnect/purge
+-- remains accurate after Task 6.
 
 ## Polling and push decision
 
@@ -94,3 +106,4 @@ Pub/Sub push is explicitly deferred and `handle_webhook` remains a no-op.
 |---|---|---|---|
 | 1.0.0 | 2026-08-06 | Documented Task 2 backfill and history-cursor behavior | Lucky Jain |
 | 1.1.0 | 2026-08-06 | Task 5 review (Loop 2 round 16): moved shipped Task 3/5 behavior (attention projection, body retrieval, recommendation/evidence creation) from "Planned" to "Current"; this document had gone stale after Tasks 3-5 shipped without a contract-version update | Lucky Jain |
+| 1.2.0 | 2026-08-06 | Task 6: clarified that the new on-demand thread read/forget HTTP surface is not a sync-pipeline change, and renamed the "Planned" heading from "Tasks 6-8" to "Tasks 7-8" now that Task 6 has shipped | Lucky Jain |

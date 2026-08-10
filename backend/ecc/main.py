@@ -68,6 +68,7 @@ from ecc.domains.personal.domains import router as personal_domains_router
 from ecc.domains.personal.export_deletion import router as personal_export_deletion_router
 from ecc.domains.personal.gmail_adapter import GmailAdapter
 from ecc.domains.personal.gmail_oauth import router as personal_gmail_oauth_router
+from ecc.domains.personal.gmail_threads import router as personal_gmail_threads_router
 from ecc.domains.personal.grants import router as personal_grants_router
 from ecc.domains.personal.habits import router as personal_habits_router
 from ecc.domains.planning.tasks import router as tasks_router
@@ -270,10 +271,15 @@ app.include_router(personal_grants_router)
 app.include_router(personal_ai_insights_router)
 # Phase 10 Gmail Connector Task 1: POST /personal/gmail/oauth/start, GET
 # .../oauth/callback (ecc.domains.personal.gmail_oauth) -- the only two
-# Gmail-specific routes; GET|POST /engineering/connectors and friends
-# (already registered above) handle everything else for a `provider=
-# 'gmail'` connector account, same as any other provider.
+# Gmail-specific routes at that point; GET|POST /engineering/connectors
+# and friends (already registered above) handle everything else for a
+# `provider='gmail'` connector account, same as any other provider.
 app.include_router(personal_gmail_oauth_router)
+# Phase 10 Gmail Connector Task 6: GET /personal/gmail/threads/{thread_id}
+# (on-demand fetch-and-cache, reusing Task 5's own fetch-and-store path),
+# POST .../forget (per-thread "forget this," narrower than Task 1-5's own
+# whole-domain export_deletion.py) -- ecc.domains.personal.gmail_threads.
+app.include_router(personal_gmail_threads_router)
 app.middleware("http")(rejected_mutation_audit_middleware)
 # Pure-ASGI body size guard: registered via add_middleware (not the
 # "http" dispatch helper) so it can intercept the raw receive() channel and

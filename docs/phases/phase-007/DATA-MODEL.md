@@ -2,7 +2,7 @@
 id: PHASE-007-DATA-MODEL
 title: Phase 7 Personal Intelligence Data Model
 status: Approved for Implementation
-version: 0.9.0
+version: 0.9.1
 owner: Lucky Jain
 ---
 
@@ -85,3 +85,7 @@ Ships `personal_domains`, `domain_consents`, `domain_records`, `domain_sources`,
 **Explicitly, `transaction` is a manually-entered ledger record the user logs themselves -- never a real money movement.** `PHASE-007-personal-intelligence.md`'s own out-of-scope line rules out bank-account write access or transaction execution this activation; this task adds no bank/payment-provider integration of any kind, mirroring `domain_sources.source_type`'s existing `manual|imported_file` closed enum (no connector-based personal-domain source exists for any domain yet, `finance` included).
 
 **The second real, non-synthetic proof that `professional_referral_note`'s conditional requirement fires for a `high_stakes` domain, confirming it generalizes beyond `health`.** `tests/test_personal_finance_postgres.py` exercises the identical end-to-end path Task 6 proved for `health` -- a real `finance` domain, a real grant, a real `domain_records` row, a mocked model response omitting the note failing as `grounding_failed`, one supplying it succeeding -- against a domain whose own record types (`account`/`transaction`) `requires_professional_referral`'s computation has never seen before, closing the loop on "keyed off `high_stakes` classification in general" being a demonstrated fact across two domains, not a claim resting on one.
+
+## Cross-phase amendment: Phase 10 Task 6 widens `deletion_jobs`
+
+**`deletion_jobs` gains a second `scope` value and a `resource_id` column** (`backend/migrations/versions/0075_phase10_thread_forget.py`), for Phase 10 Task 6's own per-thread Gmail "forget this" action -- the first sub-domain-granularity deletion this codebase has ever performed, and so the first time anything other than this table's original `scope IN ('domain')`/no-resource-column shape (Task 1, above) was needed. `scope` is now `CHECK`-constrained to `'domain'` (unchanged meaning, every existing/future `export_deletion.py` row) or `'thread'` (Phase 10 only); `resource_id UUID`, nullable, `NULL` for every `'domain'`-scope row, populated with the targeted `email_threads.id` for a `'thread'`-scope row. No FK from `resource_id` to `email_threads` -- a `deletion_jobs` row is a permanent audit record of an action that happened and must not itself become deletable-or-blocking via an FK to a row Phase 10 Task 6 deliberately never deletes (see that phase's own `PRIVACY-CONSENT-CONTRACT.md` for why a forgotten thread's own row is retained, not removed). This document's own "Core records" list (top of file) and Task 1's own `deletion_jobs` description are otherwise unchanged -- domain-wide deletion's own shape and guarantees are not affected by this widening.

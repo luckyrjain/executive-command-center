@@ -2832,18 +2832,35 @@ class GmailAdapter:
             except Exception:  # noqa: BLE001 -- one message's failure never stops the batch
                 continue
 
-    def _detect_action_for_message(
+    def fetch_and_store_body(
         self,
         *,
         workspace_id: UUID,
-        owner_id: UUID,
         message_id: UUID,
-        thread_id: UUID,
         external_message_id: str,
-        sender: str,
         headers: dict[str, str],
-        ollama_adapter: OllamaAdapter | None,
-    ) -> None:
+    ) -> str | None:
+        """Fetches one message's full body (`gmail.readonly`, `format=
+        full`), encrypts and stores it, and returns the decrypted plain
+        text on success (`""` for a genuinely empty/unextractable
+        message, matching `email_action_tools.py`'s own "empty, not
+        omitted" convention) -- or `None` if this call could not commit a
+        body (a transient failure, still `body IS NULL` and eligible for
+        a future call, or lost a race against another call that already
+        fetched this same message).
+
+        Extracted from `_detect_action_for_message` (Task 5) so Task 6's
+        `gmail_threads.py:get_thread_endpoint` (a second, cross-module
+        caller -- the reason this method is not underscore-prefixed like
+        every other single-caller helper in this file) reuses this exact
+        fetch-and-store mechanism for its own on-demand, explicit-thread-
+        open fetch, rather than a second one -- the phase plan's own
+        "matching Task 5's own fetch-and-store path" Task 6 instruction.
+        Callers are themselves responsible for checking `body IS NULL`
+        before calling this (this method always makes a live Gmail call
+        regardless of current state) -- both current callers do so via
+        their own eligibility query.
+        """
         get_response = self._request_with_rate_limit_retry(
             "GET",
             f"/gmail/v1/users/me/messages/{external_message_id}",
@@ -2851,7 +2868,7 @@ class GmailAdapter:
             params={"format": "full"},
         )
         if get_response is None or get_response.status_code != 200:
-            return
+            return None
         try:
             body_json = get_response.json()
         except ValueError:
@@ -2860,7 +2877,7 @@ class GmailAdapter:
             # of the message itself, so this stays a silent `return`
             # (`body IS NULL`, retried next call) like the non-200/missing-
             # `payload` cases below.
-            return
+            return None
         except RecursionError:
             # Round 9 review: `httpx.Response.json()` calls `json.loads`
             # directly, whose own recursive-descent parser has no depth cap
@@ -2886,10 +2903,10 @@ class GmailAdapter:
             plain_text = None
         else:
             if not isinstance(body_json, dict):
-                return
+                return None
             payload = body_json.get("payload")
             if not isinstance(payload, dict):
-                return
+                return None
             try:
                 plain_text = _extract_plain_text_body(payload)
             except RecursionError:
@@ -2932,9 +2949,10 @@ class GmailAdapter:
         with SessionFactory() as session, session.begin():
             # `AND body IS NULL`: lost a race against another call already
             # fetching this same message's body (e.g. an overlapping
-            # `incremental_sync`) -- the winner's own detection run is
-            # authoritative, so this one skips rather than re-detecting
-            # against the same content a second time.
+            # `incremental_sync`, or Task 6's own on-demand fetch racing
+            # this proactive one) -- the winner's own write is
+            # authoritative, so this one skips rather than overwriting
+            # already-stored content a second time.
             updated = session.execute(
                 text(
                     "UPDATE email_messages SET body = :body, body_fetched_at = :now, "
@@ -2949,9 +2967,30 @@ class GmailAdapter:
                 },
             )
             if cast("CursorResult[Any]", updated).rowcount == 0:
-                return
+                return None
+        return plain_text or ""
+
+    def _detect_action_for_message(
+        self,
+        *,
+        workspace_id: UUID,
+        owner_id: UUID,
+        message_id: UUID,
+        thread_id: UUID,
+        external_message_id: str,
+        sender: str,
+        headers: dict[str, str],
+        ollama_adapter: OllamaAdapter | None,
+    ) -> None:
+        plain_text = self.fetch_and_store_body(
+            workspace_id=workspace_id,
+            message_id=message_id,
+            external_message_id=external_message_id,
+            headers=headers,
+        )
         if not plain_text:
             return
+        now = datetime.now(UTC)
 
         node_id = _resolve_or_create_person(
             workspace_id=workspace_id,

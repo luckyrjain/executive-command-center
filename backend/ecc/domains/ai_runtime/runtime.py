@@ -390,7 +390,7 @@ class _EmailMessageOut(BaseModel):
 
 class _EmailGetThreadContentOutput(BaseModel):
     """`email.get_thread_content`'s output (Phase 10 Task 5): up to the most
-    recent `_MAX_THREAD_MESSAGES` fetched messages in the requested thread
+    recent `MAX_THREAD_MESSAGES` fetched messages in the requested thread
     (round 13 review -- this was originally unbounded), plus the message
     that triggered the call when the caller supplied one, even if older
     than that cap window (round 14 review; see `email_action_tools.py:get_

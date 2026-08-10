@@ -2,7 +2,7 @@
 id: PHASE-010-PRIVACY-CONSENT-CONTRACT
 title: Phase 10 Gmail Privacy and Consent Contract
 status: Approved for Implementation
-version: 1.1.0
+version: 1.2.0
 owner: Lucky Jain
 depends_on:
   - PHASE-010
@@ -11,7 +11,7 @@ depends_on:
 
 # Phase 10 Gmail Privacy and Consent Contract
 
-## Current controls (Tasks 1-2, 5)
+## Current controls (Tasks 1-2, 5-6)
 
 ### Scopes and rollout boundary
 
@@ -47,7 +47,7 @@ scoped under the Phase 7 personal-domain model.
 
 ## Unsupported — production blocker
 
-Tasks 1-5 do **not** yet provide a single consent-revocation action that
+Tasks 1-6 do **not** yet provide a single consent-revocation action that
 disconnects Google, purges threads/messages/body cache, removes derived
 attention/recommendations/evidence, and records completion. They also do not
 provide Gmail-specific export, deletion verification, or key rotation. Until
@@ -60,11 +60,32 @@ reads a thread's already-fetched, decrypted message bodies for the
 boundaries beyond the existing `ai_runs`/`ai_run_steps`/audit-event
 machinery every AI task type already writes through remain planned (below).
 
-## Planned controls (Tasks 6-8)
+On-demand human-facing thread reading, and a real (if narrower than Task
+7's own eventual revocation cascade) deletion control, both shipped with
+Task 6: `GET /api/v1/personal/gmail/threads/{thread_id}` fetches and
+returns a thread's decrypted content to the authenticated owner directly
+(not gated behind the AI feature flag above -- consent-gated only, per
+`_email_consent_active`), and `POST .../forget` nulls a single thread's
+own cached `snippet`/`body`/`body_fetched_at`, recorded in `deletion_jobs`
+with `scope='thread'` (migration `0075`, widening the Phase 7 `deletion_
+jobs` table `docs/phases/phase-007/DATA-MODEL.md` documents). **Explicitly
+narrower than Task 7's own cascade, not a substitute for it**: Task 6's
+"forget this" does not disconnect Google, does not touch any other
+thread, and does not propagate to that thread's own derived `pkos_
+evidence`/`recommendations` rows (a recommendation created from a since-
+forgotten thread's content keeps citing evidence that itself still
+exists, unaffected) -- a deliberate, plan-scoped limitation ("deletes the
+cached body/message content for that thread only"), not an oversight;
+Task 7's own consent-revocation cascade is the mechanism that will need
+to reach evidence/recommendation propagation, at the domain-wide scope
+this "Unsupported" section's own opening sentence already names.
+
+## Planned controls (Tasks 7-8)
 
 - export with decrypted owner-authorized content and no credential material;
 - revocation cascade with retryable deletion job and completion evidence;
-- deletion propagation to derived PKOS/attention/recommendation records;
+- deletion propagation to derived PKOS/attention/recommendation records
+  (including a since-forgotten thread's own, per the note above);
 - redacted audit events for connect, sync, body access, revoke, and delete;
 - explicit retention period and cache expiry before body storage is enabled.
 
@@ -74,3 +95,4 @@ machinery every AI task type already writes through remain planned (below).
 |---|---|---|---|
 | 1.0.0 | 2026-08-06 | Documented current controls and explicit Task 7 privacy blocker | Lucky Jain |
 | 1.1.0 | 2026-08-06 | Task 5 review (Loop 2 round 16): documented Task 5's body population and on-demand AI body access (`email.get_thread_content`), moved out of "Planned"; this document had gone stale after Tasks 3-5 shipped without a contract-version update | Lucky Jain |
+| 1.2.0 | 2026-08-06 | Task 6: documented on-demand human-facing thread reading and per-thread "forget this," explicitly scoped narrower than Task 7's own eventual revocation cascade | Lucky Jain |
