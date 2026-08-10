@@ -801,38 +801,39 @@ def _disable_domain(
         if domain is None:
             raise HTTPException(status_code=404, detail="DOMAIN_NOT_FOUND")
 
+        # `gmail_oauth.py:gmail_oauth_callback_endpoint` reactivates a
+        # `connector_accounts` row straight back to `status='active'` with
+        # no reference to `personal_domains`/`domain_consents` whatsoever
+        # (it is the sole reconnect path -- the generic engineering
+        # `create_connector_endpoint` never registers `gmail`, and
+        # `disable_connector_endpoint` rejects it with `409 GMAIL_DISABLE_
+        # REQUIRES_DOMAIN_ENDPOINT`). Computed once here, ahead of both
+        # places below that need it, mirroring `cascade_email_revocation`'s
+        # own `status != 'disconnected'` query exactly.
+        reconnected = (
+            domain_key == "email"
+            and session.execute(
+                text(
+                    "SELECT 1 FROM connector_accounts WHERE workspace_id = :workspace_id "
+                    "AND provider = 'gmail' AND owner_id = :owner_id "
+                    "AND status != 'disconnected' LIMIT 1"
+                ),
+                {"workspace_id": auth.workspace_id, "owner_id": auth.user_id},
+            ).first()
+            is not None
+        )
+
         cached = load_cached(session, auth, idempotency_key, req_hash, domain="personal_domains")
         if cached is not None:
             # `domain.enabled` alone (round 21) is necessary but not
-            # sufficient -- Loop 2 round 22 review finding (MEDIUM-HIGH):
-            # `gmail_oauth.py:gmail_oauth_callback_endpoint` reactivates a
-            # `connector_accounts` row straight back to `status='active'`
-            # with no reference to `personal_domains`/`domain_consents`
-            # whatsoever (it is the sole reconnect path -- the generic
-            # engineering `create_connector_endpoint` never registers
-            # `gmail`, and `disable_connector_endpoint` rejects it with
-            # `409 GMAIL_DISABLE_REQUIRES_DOMAIN_ENDPOINT`). A real disable
-            # -> a genuine Gmail reconnect through that unrelated OAuth
-            # flow (no domain re-enable at all) -> the same `Idempotency-
-            # Key` replayed here still found `domain.enabled is False` and
-            # silently served the stale cached response, leaving the
-            # freshly-reconnected, still-live connector row untouched.
-            # Checked here rather than gating the reconnect flow itself
-            # (Task 1 code this PR does not otherwise touch): mirrors
-            # `cascade_email_revocation`'s own `status != 'disconnected'`
-            # query exactly.
-            reconnected = (
-                domain_key == "email"
-                and session.execute(
-                    text(
-                        "SELECT 1 FROM connector_accounts WHERE workspace_id = :workspace_id "
-                        "AND provider = 'gmail' AND owner_id = :owner_id "
-                        "AND status != 'disconnected' LIMIT 1"
-                    ),
-                    {"workspace_id": auth.workspace_id, "owner_id": auth.user_id},
-                ).first()
-                is not None
-            )
+            # sufficient -- Loop 2 round 22 review finding (MEDIUM-HIGH): a
+            # real disable -> a genuine Gmail reconnect through the OAuth
+            # flow above (no domain re-enable at all) -> the same
+            # `Idempotency-Key` replayed here still found `domain.enabled
+            # is False` and silently served the stale cached response,
+            # leaving the freshly-reconnected, still-live connector row
+            # untouched. Checked here rather than gating the reconnect
+            # flow itself (Task 1 code this PR does not otherwise touch).
             if domain.enabled or reconnected:
                 record_idempotency_conflict("personal_domains")
                 raise HTTPException(status_code=409, detail="IDEMPOTENCY_CONFLICT")
@@ -901,8 +902,26 @@ def _disable_domain(
                 },
             )
             version = domain.version + 1
-            if domain_key == "email":
-                pending_gmail_revokes = cascade_email_revocation(session, auth, now)
+        # `domain.enabled or reconnected`, not merely `domain.enabled`
+        # (Loop 2 round 24 review finding, HIGH): the `UPDATE`s above are
+        # skipped when the domain is already disabled, but the cascade
+        # below still needs to run when `reconnected` is true even then --
+        # a fresh (non-replayed) disable request against an already-off
+        # domain used to be treated as a pure no-op unconditionally, so a
+        # Gmail reconnect via the OAuth flow after a disable, followed by a
+        # genuinely fresh `disable` call (a new Idempotency-Key, not a
+        # replay -- round 21/22's own fix only covers a replayed key), left
+        # the freshly-reconnected connector's `status='active'` row and its
+        # unrevoked Google grant untouched, with a plain `200` response
+        # indistinguishable from a routine already-disabled no-op.
+        # `_delete_domain_data`'s own identical cascade call already runs
+        # unconditionally for this exact reason; this now matches it.
+        # `test_disabling_an_already_disabled_domain_does_not_rerun_
+        # cascade` (no reconnect in between) is unaffected: `reconnected`
+        # is `False` there, so this condition is exactly `domain.enabled`,
+        # unchanged from before this fix.
+        if domain_key == "email" and (domain.enabled or reconnected):
+            pending_gmail_revokes = cascade_email_revocation(session, auth, now)
 
         refreshed = get_domain(session, auth, domain_key)
         assert refreshed is not None

@@ -138,6 +138,18 @@ Covers, in the same order these tests physically appear below:
     connector account on a cache hit.
 22. The identical fix for `delete_domain_endpoint`, same mechanism and
     same severity as item 21 above.
+23. Items 21-22's own fix only covers a *replayed* `Idempotency-Key` --
+    Loop 2 round 24 review finding (HIGH): `_disable_domain` gated
+    `cascade_email_revocation` entirely behind `if domain.enabled:`, so a
+    genuinely *fresh* disable request (a new key, not a retry) against a
+    domain that's already off was unconditionally a no-op, even when the
+    owner had reconnected Gmail via the OAuth flow in the meantime. The
+    freshly-reconnected connector was left untouched with a plain `200`
+    response indistinguishable from a routine no-op --
+    `delete_domain_endpoint`'s own identical cascade call has always run
+    unconditionally, so this gap was specific to `disable`. Closed by
+    triggering the cascade on `domain.enabled or reconnected`, not merely
+    `domain.enabled`.
 """
 
 import threading
@@ -1983,3 +1995,70 @@ def test_delete_domain_endpoint_idempotency_key_reused_after_an_oauth_reconnect_
     assert replay.json()["error"]["code"] == "IDEMPOTENCY_CONFLICT"
 
     assert _connector_status(ctx["workspace_id"], ctx["account_id"]) == "active"
+
+
+def test_disable_domain_still_reaches_a_reconnected_connector_on_a_fresh_key(
+    gmail_revocation_context: dict,
+) -> None:
+    """Loop 2 round 24 review finding (HIGH): items 21/22 above only proved
+    a *replayed* `Idempotency-Key` correctly rejects a stale cached
+    response after an out-of-band Gmail reconnect -- they never checked
+    the more ordinary case, a genuinely fresh disable request (a new key,
+    not a retry) against a domain that's already disabled. Before this
+    fix, `_disable_domain` gated `cascade_email_revocation` entirely
+    behind `if domain.enabled:`, so a fresh disable call against an
+    already-off domain was unconditionally treated as a pure no-op --
+    even when the owner had reconnected Gmail via the OAuth flow in the
+    meantime (which never touches `personal_domains`). The freshly-
+    reconnected connector's `status='active'` row and its unrevoked
+    Google grant were left untouched, and the caller got a plain `200`
+    indistinguishable from a routine already-disabled no-op --
+    `delete_domain_endpoint`'s own identical cascade call has always run
+    unconditionally, so this asymmetry was specific to `disable`.
+    """
+    ctx = gmail_revocation_context
+    _seed_full_cascade_fixture(ctx)
+
+    first = ctx["client"].post(
+        "/api/v1/personal/domains/email/disable",
+        headers=_headers(ctx["token"], str(uuid4())),
+    )
+    assert first.status_code == 200, first.text
+    assert _connector_status(ctx["workspace_id"], ctx["account_id"]) == "disconnected"
+
+    # Simulates a genuine Gmail reconnect via the real OAuth callback
+    # endpoint (see items 21/22 above), then a fresh thread arriving via a
+    # sync this reconnected connector could now legitimately run (proving
+    # the cascade actually re-executes, not merely that the connector gets
+    # disconnected again).
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "UPDATE connector_accounts SET status = 'active', disconnected_at = NULL "
+                "WHERE workspace_id = :workspace_id AND id = :id"
+            ),
+            {"workspace_id": ctx["workspace_id"], "id": ctx["account_id"]},
+        )
+        thread_id = _insert_thread(
+            connection,
+            workspace_id=ctx["workspace_id"],
+            owner_id=ctx["owner_id"],
+            account_id=ctx["account_id"],
+            now=ctx["now"],
+        )
+
+    # A genuinely fresh key, not a replay of `first`'s own key.
+    second = ctx["client"].post(
+        "/api/v1/personal/domains/email/disable",
+        headers=_headers(ctx["token"], str(uuid4())),
+    )
+    assert second.status_code == 200, second.text
+    assert second.json()["enabled"] is False
+
+    assert _connector_status(ctx["workspace_id"], ctx["account_id"]) == "disconnected"
+    with engine.begin() as connection:
+        row = connection.execute(
+            text("SELECT id FROM email_threads WHERE workspace_id = :workspace_id AND id = :id"),
+            {"workspace_id": ctx["workspace_id"], "id": thread_id},
+        ).one_or_none()
+    assert row is None, "the reconnected connector's thread must be purged by the fresh disable"

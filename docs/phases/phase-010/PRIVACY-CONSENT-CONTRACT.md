@@ -2,7 +2,7 @@
 id: PHASE-010-PRIVACY-CONSENT-CONTRACT
 title: Phase 10 Gmail Privacy and Consent Contract
 status: Approved for Implementation
-version: 1.4.2
+version: 1.4.3
 owner: Lucky Jain
 depends_on:
   - PHASE-010
@@ -223,6 +223,23 @@ account for the owner, mirroring `cascade_email_revocation`'s own
 identical query, rather than gating the OAuth reconnect flow itself
 (Task 1 code this document's Task 7 section does not otherwise touch).
 
+**A genuinely fresh disable request, not only a replayed one, must also
+reach a reconnected Gmail account, round 24 review.** Rounds 21-22 close
+the case of a *replayed* `Idempotency-Key`. `_disable_domain` separately
+gated `cascade_email_revocation` behind `if domain.enabled:`, so a
+genuinely fresh disable request (a new key, the ordinary shape of a real
+client call) against a domain that was already disabled was
+unconditionally a no-op -- even with a reconnected Gmail account from
+the same gap above. The freshly-reconnected connector and its unrevoked
+Google grant were left untouched indefinitely, with a plain success
+response indistinguishable from a routine no-op.
+`delete_domain_endpoint`/`_delete_domain_data` already call the cascade
+unconditionally for `email`, so this gap was specific to `disable`; that
+asymmetry was itself the tell. Fixed by triggering the cascade on
+`domain.enabled or reconnected` (the same check rounds 21-22
+introduced), not merely `domain.enabled`, matching `_delete_domain_
+data`'s own unconditional shape.
+
 ### On-demand thread reading and per-thread "forget" (Tasks 5-6)
 
 On-demand AI body access shipped with Task 5: `email.get_thread_content`
@@ -286,3 +303,4 @@ Gmail is internal-development only.
 | 1.4.0 | 2026-08-10 | Task 7 Loop 2 round 19 review: the round-17 advisory lock was rekeyed from one lock per candidate id to one per workspace, closing a resource-exhaustion risk the per-id version had for large mailboxes (Postgres's shared advisory-lock pool is a database-wide, not per-session, resource) | Lucky Jain |
 | 1.4.1 | 2026-08-10 | Task 7 Loop 2 round 21 review: documented the new `409 IDEMPOTENCY_CONFLICT` fix closing an idempotency-key-reuse-after-regrant gap in `disable_domain_endpoint`/`delete_domain_endpoint` -- a reused key used to return the first call's stale cached "success" without re-running the cascade against freshly re-granted, freshly-synced data | Lucky Jain |
 | 1.4.2 | 2026-08-10 | Task 7 Loop 2 round 22 review: `domain.enabled` alone (round 21) was not sufficient -- a genuine Gmail reconnect through the separate OAuth callback flow also needed to invalidate a cached idempotency response, since that flow never touches `personal_domains`/`domain_consents` at all; widened the cache-hit check to also detect a reactivated `gmail` connector account | Lucky Jain |
+| 1.4.3 | 2026-08-10 | Task 7 Loop 2 round 24 review (HIGH): a genuinely fresh (non-replayed) disable request against an already-disabled domain was unconditionally a no-op, even with a Gmail account reconnected in the meantime -- `cascade_email_revocation` is now triggered on `domain.enabled or reconnected`, not merely `domain.enabled`, matching `delete_domain_endpoint`'s own already-unconditional cascade call | Lucky Jain |
