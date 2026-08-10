@@ -2,7 +2,7 @@
 id: PHASE-010-TEST-PLAN
 title: Phase 10 Gmail Test Plan
 status: Approved for Implementation
-version: 1.3.0
+version: 1.3.1
 owner: Lucky Jain
 depends_on:
   - PHASE-010
@@ -24,7 +24,7 @@ depends_on:
 | Create-type recommendations (Task 4) | `tests/test_recommendations_postgres.py` | Schema validation of the create-type shape, generate/publish/confirm/execute for task/commitment/risk, `target_expected_version` presence/absence enforcement, no cross-supersession |
 | `email.detect_action` (Task 5) | `tests/test_email_action_tools_postgres.py`, `tests/test_gmail_action_detection_sync_postgres.py`, `tests/test_ai_runtime_email_detect_action_evaluation_postgres.py`, `tests/test_ai_runtime_runtime_postgres.py` | Workspace/owner-scoped thread-content tool (decryption, size-bounded cap, trigger-message inclusion), body fetch/consent-recheck/RecursionError-guard in the sync-pipeline hook, evaluation-harness floors and synthetic-source isolation, prompt-injection cannot dispatch an out-of-scope tool |
 | On-demand thread read/forget (Task 6) | `tests/test_gmail_threads_postgres.py` | Fetch-and-cache round-trip and no-refetch-when-cached for `GET`; one message's fetch failure does not fail the whole request; a disconnected connector account skips the live-fetch attempt (no Gmail call; cached content, if any, is unaffected by this path); consent rejection; 404 for nonexistent and cross-workspace threads; "forget" scoped to only the targeted thread with exactly one `deletion_jobs` row recorded; idempotency replay; 404 forgetting a nonexistent thread; reopening a forgotten thread refetches its content (proves content is nulled, not deleted) |
-| Consent revocation cascade (Task 7) | `tests/test_gmail_revocation_postgres.py` | Disabling `email` disconnects the connector and purges threads/messages, `email_thread` attention items, non-`executed` recommendations, and their `gmail_sync` evidence; an already-`executed` recommendation is redacted in place, not deleted, and its confirmed `target_id` survives; `pkos_nodes` survive (only their evidence is removed); `revoke_consent_endpoint` and `delete_domain_endpoint` reach the identical cascade; disabling an already-disabled domain, and an idempotency-key replay, both no-op rather than re-running the cascade; a non-`email` domain's own disable is unaffected |
+| Consent revocation cascade (Task 7) | `tests/test_gmail_revocation_postgres.py`, `tests/test_engineering_connectors_postgres.py` | Disabling `email` disconnects the connector and purges threads/messages, `email_thread` attention items, non-`executed` recommendations, and their `gmail_sync` evidence; an already-`executed` recommendation is redacted in place, not deleted, and its confirmed `target_id` survives; `pkos_nodes` survive (only their evidence is removed); `revoke_consent_endpoint` and `delete_domain_endpoint` reach the identical cascade; disabling an already-disabled domain, and an idempotency-key replay, both no-op rather than re-running the cascade; a non-`email` domain's own disable is unaffected; an owner with two simultaneously-active `gmail` connector accounts has both disconnected by one cascade run (Loop 2 round 1 review); the generic engineering `POST /connectors/{id}/disable` endpoint rejects `gmail`-provider accounts outright (`409 GMAIL_DISABLE_REQUIRES_DOMAIN_ENDPOINT`, `test_engineering_connectors_postgres.py`), closing a cascade-bypassing third write path the same review round found |
 
 These are committed, rerunnable tests. They primarily use mocked Google HTTP
 transport and real PostgreSQL. Their existence does not satisfy real-account,
@@ -69,3 +69,4 @@ No gate is satisfied by an unchecked box or an uncommitted local report.
 | 1.1.0 | 2026-08-06 | Task 5 review (Loop 2 round 16): recorded shipped Task 3/4/5 automated evidence, moved out of "Required"; this document had gone stale after Tasks 3-5 shipped without a contract-version update | Lucky Jain |
 | 1.2.0 | 2026-08-06 | Task 6: recorded shipped on-demand thread read/forget test coverage, renamed "Required" heading from "Task 6-8" to "Task 7-8" | Lucky Jain |
 | 1.3.0 | 2026-08-10 | Task 7: recorded shipped consent revocation cascade test coverage, renamed "Required" heading from "Task 7-8" to "Task 8" | Lucky Jain |
+| 1.3.1 | 2026-08-10 | Task 7 Loop 2 round 1-2 review: recorded the multi-connector-account and generic-disable-endpoint-rejection regression coverage, including the cross-file `test_engineering_connectors_postgres.py` addition | Lucky Jain |

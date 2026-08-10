@@ -79,7 +79,7 @@ of the data this module purges -- the exact "disconnected but data
 remains" state this task's own docstring above says is unreachable
 "through this path" was in fact reachable through a *different* path.
 Fixed by rejecting `gmail`-provider disables at that endpoint (`409
-GMAIL_MUST_DISABLE_VIA_DOMAIN_ENDPOINT`) and directing callers to the
+GMAIL_DISABLE_REQUIRES_DOMAIN_ENDPOINT`) and directing callers to the
 domain-level endpoints that funnel through this module instead, restoring
 the "one real write path" property for real.
 
@@ -267,12 +267,19 @@ def cascade_email_revocation(
     # (and the caller's whole disable/delete request) with a 500. Every
     # matching row is disconnected below instead of just one, matching
     # this task's own "connector_accounts row(**s**)" (plural) language.
+    # `ORDER BY id`: Loop 2 round 2 review -- a multi-row `FOR UPDATE`
+    # with no deterministic order risks a classic lock-order deadlock
+    # against a second concurrent cascade for the same owner (e.g. a
+    # racing `disable_domain_endpoint` and `revoke_consent_endpoint` call)
+    # if Postgres ever visited the matching rows in different orders for
+    # the two transactions. Ordering by `id` guarantees every concurrent
+    # caller acquires these locks in the same sequence.
     account_rows = session.execute(
         text(
             "SELECT id, external_account_id FROM connector_accounts "
             "WHERE workspace_id = :workspace_id AND provider = 'gmail' "
             "AND owner_id = :owner_id AND status != 'disconnected' "
-            "FOR UPDATE"
+            "ORDER BY id FOR UPDATE"
         ),
         params,
     ).all()

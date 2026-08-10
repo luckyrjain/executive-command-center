@@ -74,7 +74,7 @@ that does only one of the three -- including the generic engineering
 a `gmail`-provider account (and revoke the live Google grant) without
 touching `personal_domains`/data at all until Loop 2 round 1 review found
 it and closed it (that endpoint now rejects `gmail`-provider accounts
-outright, `409 GMAIL_MUST_DISABLE_VIA_DOMAIN_ENDPOINT`, directing callers
+outright, `409 GMAIL_DISABLE_REQUIRES_DOMAIN_ENDPOINT`, directing callers
 to the domain-level endpoints above).
 
 **"Retryable" is the existing idempotency-key mechanism, not a new

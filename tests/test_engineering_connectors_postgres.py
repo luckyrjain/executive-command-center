@@ -1451,7 +1451,7 @@ def test_disable_rejects_gmail_provider_account(
         headers=_headers(token, key=str(uuid4())),
     )
     assert response.status_code == 409
-    assert response.json()["detail"] == "GMAIL_MUST_DISABLE_VIA_DOMAIN_ENDPOINT"
+    assert response.json()["error"]["code"] == "GMAIL_DISABLE_REQUIRES_DOMAIN_ENDPOINT"
 
     with engine.begin() as connection:
         status = connection.execute(
@@ -1459,6 +1459,33 @@ def test_disable_rejects_gmail_provider_account(
             {"id": account_id},
         ).scalar_one()
     assert status == "active", "rejected disable must not mutate the account"
+
+
+def test_disable_already_disconnected_gmail_account_is_still_an_idempotent_noop(
+    engineering_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    """Loop 2 round 2 review finding: the gmail-provider rejection above is
+    gated on `account.status != "disconnected"` specifically so it does
+    NOT break every other provider's own established contract that
+    disabling an already-disconnected connector is an idempotent `200`
+    no-op (see the un-guarded case in `test_disable_invokes_adapter_
+    disconnect` and friends, which never see this branch since none of
+    them use `provider="gmail"`). An already-`disconnected` `gmail` row
+    has nothing left to bypass -- rejecting it too would regress that
+    contract for this provider specifically, which the original
+    unconditional version of the guard did.
+    """
+    client, workspace_id, user_id, token = engineering_test_context
+    account_id = _insert_connector_account(
+        workspace_id, user_id, provider="gmail", status="disconnected"
+    )
+
+    response = client.post(
+        f"/api/v1/engineering/connectors/{account_id}/disable",
+        headers=_headers(token, key=str(uuid4())),
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "disconnected"
 
 
 def test_disable_succeeds_when_adapter_disconnect_raises(
