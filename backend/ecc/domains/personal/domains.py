@@ -754,8 +754,10 @@ def _disable_domain(
     `consent_id` (`revoke_consent_endpoint` only -- `disable_domain_
     endpoint` has no consent-specific identifier to re-check) re-validates
     that the referenced consent has not been superseded by a later grant,
-    *inside* this same transaction, immediately after `domain` is locked
-    below -- not before this function is even called. Loop 2 round 10
+    *inside* this same transaction, after `domain` is locked below (only
+    the round-21 idempotency cache-hit check, itself resolved before any
+    mutation, can still run in between) -- not before this function is
+    even called. Loop 2 round 10
     review finding: `revoke_consent_endpoint`'s own round-8/9 staleness
     check used to run in its own, separate, already-committed transaction
     before ever calling this function -- a real TOCTOU window existed
