@@ -139,6 +139,13 @@ endpoint`), not here -- see that function's own updated comment.
   the content, keep the audit skeleton" convention exactly -- the fact
   that a recommendation once existed, was confirmed, and led to that task
   remains visible; the Gmail-derived narrative behind it does not.
+- A `pkos_evidence` row whose `source_ref` id ambiguously collides with a
+  *different* owner's own message (`email_messages.external_message_id`
+  is only unique per `(workspace_id, thread_id)`, not per-workspace, Loop
+  2 round 4 review finding): left alone rather than purged, since deleting
+  it could destroy the other owner's own still-live evidence -- see the
+  ambiguity check's own inline comments below for the full mechanism,
+  including the sequential-disable case migration `0076` closes.
 """
 
 from __future__ import annotations
