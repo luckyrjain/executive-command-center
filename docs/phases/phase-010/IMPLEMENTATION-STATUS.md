@@ -2,7 +2,7 @@
 id: PHASE-010-IMPLEMENTATION-STATUS
 title: Phase 10 Implementation Status
 status: Active
-version: 0.7.35
+version: 0.7.36
 owner: Lucky Jain
 updated: 2026-08-10
 ---
@@ -788,4 +788,8 @@ Because security found and fixed a genuine (if LOW, cosmetic) inaccuracy, round 
 
 **Round 36 (security/correctness and architecture/quality, launched concurrently): security lens clean; architecture lens found one further, genuinely marginal LOW wording imprecision in round 35's own new comment.** Security lens independently re-verified round 35's FK-cascade claim not just by reading the schema but by empirically running the delete in a rolled-back transaction (a plain `DELETE FROM email_threads` alone, skipping `email_messages` entirely, cascade-deleted the child row as claimed), then fact-checked every other schema/migration-referencing comment across all four primary files against live Postgres and migration source and found all of them accurate -- no second inaccuracy, confirming round 35's find was an isolated first instance after 34 rounds of never specifically auditing comment-vs-schema accuracy. Architecture lens, explicitly weighing whether to report something this marginal, flagged that round 35's own new comment said "both statements are redundant-but-harmless," when only the child delete is actually redundant given the cascade -- the parent delete is the sole statement that removes `email_threads` rows at all, so a literal reading could be misread as neither delete being load-bearing. Self-assessed as "arguably within the noise floor... unlike round 35's own finding," and the paper's own final verdict called the PR "in every substantive sense, converged." Fixed anyway for consistency with this review's own established precedent of correcting every reported finding regardless of severity: reworded to scope "redundant" to the child-before-parent *order*, not the parent delete's own existence, matching the more careful phrasing `IMPLEMENTATION-STATUS.md`'s own round-35 paragraph already used.
 
-Because a genuine (if maximally marginal) finding was reported and fixed, round 36 does not count as a clean round: the clean-round counter resets to zero again. Launching round 37.
+Because a genuine (if maximally marginal) finding was reported and fixed, round 36 does not count as a clean round: the clean-round counter resets to zero again.
+
+**Round 37 (security/correctness and architecture/quality, launched concurrently): clean on both lenses -- the first of the two consecutive clean rounds needed to close Loop 2 (counter reset after round 36).** Both lenses were explicitly calibrated this round to only report genuine, unambiguous, concrete defects -- not debatable phrasing or matters of stylistic preference -- given round 36's own finding had been self-assessed as "arguably within the noise floor." Security lens re-read all four primary files end to end, independently re-verified round 36's comment edit against migration source and live Postgres, re-traced every prior fix (TOCTOU narrowing, idempotency gating across all three endpoints, the `>=` supersession check, the advisory-lock/purge-log defense, the child-before-parent delete split) for mutual consistency, and checked SQL construction for injection risk -- found nothing meeting the bar. Architecture lens verified round 36's edit and its own IMPLEMENTATION-STATUS.md paragraph for accuracy, cross-checked every objectively-checkable claim (test counts, migration file existence, referenced symbol names, all six docs' version/changelog consistency, and the PR description's own file-change-count claim against GitHub's actual PR metadata) -- all matched exactly, nothing meeting the bar either.
+
+Round 38 must also be clean on both lenses for Loop 2 to close.
