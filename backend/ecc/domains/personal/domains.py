@@ -285,8 +285,9 @@ def get_domain(
     session: Session, auth: AuthContext, domain_key: str, *, for_update: bool = False
 ) -> PersonalDomain | None:
     """`for_update=True` locks the row for the caller's own transaction --
-    used by `_enable_domain`/`_disable_domain` (both mutate this row) so a
-    second concurrent enable/disable for the same domain blocks until the
+    used by `_enable_domain`/`_disable_domain`/`export_deletion.py:
+    delete_domain_endpoint` (all three mutate this row) so a second
+    concurrent enable/disable/delete for the same domain blocks until the
     first transaction commits, mirroring `connector_accounts.
     get_connector_account`'s identical `for_update` precedent.
     """
