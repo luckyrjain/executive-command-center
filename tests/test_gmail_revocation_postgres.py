@@ -733,7 +733,15 @@ def test_disable_domain_idempotency_replay_does_not_rerun_cascade(
         "/api/v1/personal/domains/email/disable", headers=_headers(ctx["token"], key)
     )
     assert second.status_code == 200, second.text
-    assert second.json() == first.json()
+    # Not a full-body comparison: `response_contract_middleware` stamps a
+    # fresh `request_id`/`correlation_id` onto every response, including a
+    # cached replay, so two calls' bodies never match exactly -- matches
+    # `test_gmail_threads_postgres.py`'s own established idempotency-
+    # replay pattern (compare only the specific business fields).
+    first_body = first.json()
+    second_body = second.json()
+    for field in ("id", "domain_key", "enabled", "version"):
+        assert second_body[field] == first_body[field]
 
     with engine.begin() as connection:
         row = connection.execute(
