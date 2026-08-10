@@ -294,9 +294,14 @@ def cascade_email_revocation(
         # with a `pg_advisory_xact_lock` keyed on `(workspace_id, id)` for
         # every candidate id, acquired in sorted order to avoid a deadlock
         # if two colliding owners' candidate sets overlap on more than one
-        # id -- mirrors this codebase's own established `pg_advisory_xact_
-        # lock(hashtextextended(...))` idempotency-lock pattern (e.g.
-        # `calendar/events.py:_lock_idempotency`), just keyed differently.
+        # id -- the same underlying `pg_advisory_xact_lock(hashtextextended(
+        # ...))` primitive this codebase's own idempotency locks already use
+        # (e.g. `calendar/events.py:_lock_idempotency`), but a genuinely
+        # different shape: those lock exactly one Python-built key per call;
+        # this needs a *set* of keys locked together, so the concatenation
+        # and the per-id loop both move into one SQL statement (`unnest(...)
+        # ... ORDER BY id`) rather than a Python-side helper.
+        #
         # Whichever cascade acquires the lock for a given id first is now
         # authoritative for it; the loser's own ambiguity check, once
         # unblocked, correctly observes the winner's now-committed purge-

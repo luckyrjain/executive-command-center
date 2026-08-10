@@ -1332,7 +1332,7 @@ def test_disable_domain_does_not_purge_evidence_with_a_colliding_external_messag
 def test_disable_domain_serializes_against_a_genuinely_concurrent_colliding_cascade(
     gmail_revocation_context: dict,
 ) -> None:
-    """Loop 2 round 17 review finding: the fix two tests above (round 4)
+    """Loop 2 round 17 review finding: the fix in the test above (round 4)
     and the fix below (round 8, sequential case) both only ever defend
     against a colliding id that is already *committed* by the time the
     ambiguity check runs -- either a still-live row or a prior cascade's
