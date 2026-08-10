@@ -212,16 +212,50 @@ def cascade_email_revocation(
         )
     ]
     if external_message_ids:
-        refs = [f"gmail:{mid}" for mid in external_message_ids] + [
-            f"gmail:detect_action:{mid}" for mid in external_message_ids
-        ]
-        session.execute(
-            text(
-                "DELETE FROM pkos_evidence WHERE workspace_id = :workspace_id "
-                "AND source_type = 'gmail_sync' AND source_ref = ANY(:refs)"
-            ),
-            {"workspace_id": auth.workspace_id, "refs": refs},
-        )
+        # `email_messages.external_message_id` (Gmail's own opaque message
+        # id) is only uniqueness-constrained per `(workspace_id, thread_id)`
+        # (`uq_email_messages_thread_external_id`, migration `0069`), not
+        # per-workspace -- so nothing in the schema rules out two different
+        # owners in the same workspace, each with their own connected
+        # Gmail account, happening to have a message sharing the same raw
+        # id (Loop 2 round 4 review finding). Since `source_ref` matching
+        # below has no owner qualifier of its own (unlike every other
+        # DELETE/UPDATE in this function), such a collision would silently
+        # purge a *different* owner's evidence too. Excluding any id that
+        # also belongs to another owner's own `email_messages` row in this
+        # workspace closes that window without trusting `pkos_evidence.
+        # owner_id` (still not reliable -- see above): this owner's own
+        # cascade simply skips evidence for an ambiguous id rather than
+        # risk deleting across the boundary; that one row is left behind
+        # rather than purged, a strictly safer failure mode than the
+        # alternative.
+        ambiguous_ids = {
+            row[0]
+            for row in session.execute(
+                text(
+                    "SELECT DISTINCT external_message_id FROM email_messages "
+                    "WHERE workspace_id = :workspace_id AND owner_id != :owner_id "
+                    "AND external_message_id = ANY(:candidate_ids)"
+                ),
+                {
+                    "workspace_id": auth.workspace_id,
+                    "owner_id": auth.user_id,
+                    "candidate_ids": external_message_ids,
+                },
+            )
+        }
+        safe_ids = [mid for mid in external_message_ids if mid not in ambiguous_ids]
+        if safe_ids:
+            refs = [f"gmail:{mid}" for mid in safe_ids] + [
+                f"gmail:detect_action:{mid}" for mid in safe_ids
+            ]
+            session.execute(
+                text(
+                    "DELETE FROM pkos_evidence WHERE workspace_id = :workspace_id "
+                    "AND source_type = 'gmail_sync' AND source_ref = ANY(:refs)"
+                ),
+                {"workspace_id": auth.workspace_id, "refs": refs},
+            )
 
     # `email_messages` before `email_threads` -- Task 1's own migration
     # `0069` leaves the child->parent relationship with no `ondelete`

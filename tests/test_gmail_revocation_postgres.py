@@ -35,9 +35,32 @@ Covers, in the same order these tests physically appear below:
    account_id` is unique) has both disconnected by one cascade run --
    Loop 2 round 1 review finding: the original `.one_or_none()` raised
    `MultipleResultsFound` here, aborting the entire cascade.
+10. `domains.py:_disable_domain`'s `session.close()` before `finish_
+    gmail_revocation(...)` actually releases the pooled connection and the
+    cascade's own `FOR UPDATE` lock before the (potentially slow) Google
+    revoke call runs -- Loop 2 round 4 review finding: `connector_
+    accounts.py:disable_connector_endpoint`'s own identical pattern has a
+    dedicated concurrency test proving this; the two call sites that
+    actually reach `finish_gmail_revocation` for `gmail` (this module's
+    own `_disable_domain`/`delete_domain_endpoint`) had none.
+11. A second owner's own Gmail data (thread/message/attention item/
+    connector) in the SAME workspace is completely untouched by the first
+    owner's disable -- Loop 2 round 4 review finding: every test above
+    exercises exactly one owner, so a regression dropping an `owner_id`
+    clause from any of the cascade's five raw-SQL statements would go
+    undetected.
+12. Two owners whose own Gmail accounts each produce a message sharing the
+    same raw `external_message_id` (only unique per `(workspace_id,
+    thread_id)`, not per-workspace) do not leak `pkos_evidence` across the
+    ownership boundary -- Loop 2 round 4 review finding: `source_ref`
+    matching has no owner qualifier of its own; the fix skips (does not
+    purge) an evidence row whose id is ambiguous across owners.
 """
 
+import threading
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from hmac import new
@@ -51,7 +74,8 @@ from identity_fixtures import create_identity
 from sqlalchemy import text
 
 from ecc.config import get_settings
-from ecc.database import engine
+from ecc.database import STATEMENT_TIMEOUT_MS, engine
+from ecc.domains.engineering.connectors import ConnectorAccountContext
 from ecc.domains.engineering.crypto import encrypt_credential
 from ecc.domains.personal import gmail_revocation
 from ecc.domains.personal.gmail_adapter import GmailAdapter, _pack_credential
@@ -65,6 +89,25 @@ pytestmark = pytest.mark.skipif(
 
 _OWNER_EMAIL = "gmail-revocation-owner@example.test"
 _SENDER = "colleague@partner-co.test"
+
+
+@dataclass
+class _SlowDisconnectAdapter:
+    """Blocks inside `disconnect()` until released -- mirrors `test_
+    engineering_connectors_postgres.py`'s own `_SlowDisconnectAdapter`
+    (round 23 review's fake) for `disable_connector_endpoint`, applied
+    here to the two call sites that actually reach `finish_gmail_
+    revocation` for `gmail` -- `domains.py:_disable_domain` and `export_
+    deletion.py:delete_domain_endpoint` -- which had no equivalent
+    coverage (Loop 2 round 4 review finding).
+    """
+
+    entered_disconnect: threading.Event = field(default_factory=threading.Event)
+    release: threading.Event = field(default_factory=threading.Event)
+
+    def disconnect(self, account: ConnectorAccountContext) -> None:
+        self.entered_disconnect.set()
+        self.release.wait(timeout=5)
 
 
 def _revoke_transport() -> httpx.MockTransport:
@@ -797,8 +840,8 @@ def test_disable_domain_idempotency_replay_does_not_rerun_cascade(
     # replay pattern (compare only the specific business fields).
     first_body = first.json()
     second_body = second.json()
-    for field in ("id", "domain_key", "enabled", "version"):
-        assert second_body[field] == first_body[field]
+    for field_name in ("id", "domain_key", "enabled", "version"):
+        assert second_body[field_name] == first_body[field_name]
 
     with engine.begin() as connection:
         row = connection.execute(
@@ -840,3 +883,251 @@ def test_disable_domain_with_multiple_connector_accounts_disconnects_all(
 
     assert _connector_status(ctx["workspace_id"], ctx["account_id"]) == "disconnected"
     assert _connector_status(ctx["workspace_id"], second_account_id) == "disconnected"
+
+
+def test_disable_domain_releases_pool_connection_and_row_lock_before_revoke_call(
+    gmail_revocation_context: dict, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Loop 2 round 4 review finding: `domains.py:_disable_domain` calls
+    `session.close()` immediately before `finish_gmail_revocation(...)`'s
+    potentially slow, blocking Google revoke call -- matching `connector_
+    accounts.py:disable_connector_endpoint`'s own established split
+    (round 23 review) exactly, for the identical reason. That endpoint has
+    its own dedicated concurrency test proving the pool connection and row
+    lock are actually released before the blocking call runs; this module
+    (the only other call site that ever reaches `finish_gmail_revocation`
+    for `gmail`) had none. Reproduced here the same way: while a `/disable`
+    request is genuinely blocked inside `disconnect()`, a concurrent raw
+    `SELECT ... FOR UPDATE NOWAIT` on the same `connector_accounts` row
+    must succeed immediately -- if the connection/lock were still held, it
+    would raise `LockNotAvailable` instead.
+    """
+    ctx = gmail_revocation_context
+    slow_adapter = _SlowDisconnectAdapter()
+    monkeypatch.setattr(gmail_revocation, "_adapter", slow_adapter)
+
+    def _disable() -> Any:
+        return ctx["client"].post(
+            "/api/v1/personal/domains/email/disable",
+            headers=_headers(ctx["token"], str(uuid4())),
+        )
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(_disable)
+        assert slow_adapter.entered_disconnect.wait(timeout=5), "disconnect() never entered"
+
+        with engine.connect() as probe:
+            probe.execution_options(isolation_level="AUTOCOMMIT")
+            probe.execute(text("SET statement_timeout = '2s'"))
+            row = (
+                probe.execute(
+                    text(
+                        "SELECT id, status FROM connector_accounts WHERE id = :id FOR UPDATE NOWAIT"
+                    ),
+                    {"id": ctx["account_id"]},
+                )
+                .mappings()
+                .one()
+            )
+            assert row["id"] == ctx["account_id"]
+            probe.rollback()
+            # Session-scoped `SET` (not `SET LOCAL`) survives past `probe.
+            # rollback()` -- restore the connection's baseline before it
+            # returns to the pool, matching `test_engineering_connectors_
+            # postgres.py`'s own identical concurrency test exactly.
+            probe.execute(text(f"SET statement_timeout = {STATEMENT_TIMEOUT_MS}"))
+
+        slow_adapter.release.set()
+        response = future.result(timeout=5)
+
+    assert response.status_code == 200, response.text
+    assert _connector_status(ctx["workspace_id"], ctx["account_id"]) == "disconnected"
+
+
+def test_disable_domain_does_not_affect_a_different_owners_gmail_data(
+    gmail_revocation_context: dict,
+) -> None:
+    """Loop 2 round 4 review finding: every test above exercises exactly
+    one owner, so a regression that dropped an `owner_id` clause from one
+    of `cascade_email_revocation`'s five hand-written raw-SQL statements
+    would go undetected -- there is no `workspace_id`-only row for it to
+    accidentally also match. Seeds a second owner in the SAME workspace
+    with their own connector account, thread, message, and attention item,
+    then disables only the first owner's `email` domain and asserts the
+    second owner's data (and connector) is completely untouched.
+    """
+    ctx = gmail_revocation_context
+    _seed_full_cascade_fixture(ctx)
+
+    other_owner_id = uuid4()
+    other_account_id = uuid4()
+    other_email = f"other-owner-{uuid4()}@example.test"
+    credential = _pack_credential("other-access", "other-refresh", ctx["now"] + timedelta(hours=1))
+    with engine.begin() as connection:
+        create_identity(
+            connection,
+            workspace_id=ctx["workspace_id"],
+            user_id=other_owner_id,
+            email=other_email,
+            now=ctx["now"],
+        )
+        connection.execute(
+            text(
+                """
+                INSERT INTO connector_accounts (
+                    id, workspace_id, provider, external_account_id, display_name,
+                    granted_scopes, encrypted_credentials, status, version,
+                    created_by, updated_by, created_at, updated_at, owner_id, visibility
+                ) VALUES (
+                    :id, :workspace_id, 'gmail', :external_account_id, 'Other owner account',
+                    ARRAY['https://www.googleapis.com/auth/gmail.readonly'], :encrypted,
+                    'active', 1, :actor_id, :actor_id, :now, :now, :actor_id, 'workspace'
+                )
+                """
+            ),
+            {
+                "id": other_account_id,
+                "workspace_id": ctx["workspace_id"],
+                "external_account_id": other_email,
+                "encrypted": encrypt_credential(credential),
+                "actor_id": other_owner_id,
+                "now": ctx["now"],
+            },
+        )
+        other_thread_id = _insert_thread(
+            connection,
+            workspace_id=ctx["workspace_id"],
+            owner_id=other_owner_id,
+            account_id=other_account_id,
+            now=ctx["now"],
+        )
+        _insert_message(
+            connection,
+            workspace_id=ctx["workspace_id"],
+            owner_id=other_owner_id,
+            thread_id=other_thread_id,
+            external_message_id=f"other-msg-{uuid4()}",
+            now=ctx["now"],
+        )
+        _insert_attention_item(
+            connection,
+            workspace_id=ctx["workspace_id"],
+            owner_id=other_owner_id,
+            thread_id=other_thread_id,
+            now=ctx["now"],
+        )
+
+    resp = ctx["client"].post(
+        "/api/v1/personal/domains/email/disable",
+        headers=_headers(ctx["token"], str(uuid4())),
+    )
+    assert resp.status_code == 200, resp.text
+
+    # This owner's own data (and connector) is purged as usual.
+    assert _connector_status(ctx["workspace_id"], ctx["account_id"]) == "disconnected"
+    assert _row_count("email_threads", ctx["workspace_id"]) == 1  # the other owner's, only
+
+    # The other owner's data and connector are completely untouched.
+    with engine.begin() as connection:
+        other_thread_row = connection.execute(
+            text("SELECT id FROM email_threads WHERE workspace_id = :workspace_id AND id = :id"),
+            {"workspace_id": ctx["workspace_id"], "id": other_thread_id},
+        ).one_or_none()
+        other_attention_count = connection.execute(
+            text(
+                "SELECT COUNT(*) FROM attention_items "
+                "WHERE workspace_id = :workspace_id AND owner_id = :owner_id"
+            ),
+            {"workspace_id": ctx["workspace_id"], "owner_id": other_owner_id},
+        ).scalar_one()
+    assert other_thread_row is not None
+    assert other_attention_count == 1
+    assert _connector_status(ctx["workspace_id"], other_account_id) == "active"
+
+    # `_cleanup_workspace` (the fixture's own teardown) only knows the
+    # primary owner's `accounts` row by email -- clean up this test's own
+    # second identity explicitly, matching `_cleanup_workspace`'s own
+    # `accounts` handling (not workspace-scoped).
+    with engine.begin() as connection:
+        connection.execute(
+            text("DELETE FROM accounts WHERE email = :email"), {"email": other_email}
+        )
+
+
+def test_disable_domain_does_not_purge_evidence_with_a_colliding_external_message_id(
+    gmail_revocation_context: dict,
+) -> None:
+    """Loop 2 round 4 review finding: `email_messages.external_message_id`
+    is only uniqueness-constrained per `(workspace_id, thread_id)`
+    (migration `0069`), not per-workspace -- nothing rules out two
+    different owners' own connected Gmail accounts each producing a
+    message that happens to share the same raw id. `source_ref` matching
+    against `pkos_evidence` (this file's own `_seed_full_cascade_fixture`
+    and every test above use exactly one owner, so this collision was
+    previously untested) has no owner qualifier of its own. Seeds a
+    second owner with a message sharing this owner's own `external_
+    message_id`, then asserts the cascade leaves the now-ambiguous
+    evidence row alone (`gmail_revocation.py`'s fix: an id that also
+    belongs to another owner is skipped, not purged) rather than risk
+    deleting across the ownership boundary.
+    """
+    ctx = gmail_revocation_context
+    seeded = _seed_full_cascade_fixture(ctx)
+    colliding_external_id = seeded["external_message_id"]
+
+    other_owner_id = uuid4()
+    other_email = f"other-owner-{uuid4()}@example.test"
+    with engine.begin() as connection:
+        create_identity(
+            connection,
+            workspace_id=ctx["workspace_id"],
+            user_id=other_owner_id,
+            email=other_email,
+            now=ctx["now"],
+        )
+        other_thread_id = _insert_thread(
+            connection,
+            workspace_id=ctx["workspace_id"],
+            owner_id=other_owner_id,
+            account_id=ctx["account_id"],
+            now=ctx["now"],
+        )
+        # Same raw `external_message_id` as this owner's own message above
+        # -- only `(workspace_id, thread_id)` is unique, so a *different*
+        # thread (this other owner's) can legally reuse it.
+        _insert_message(
+            connection,
+            workspace_id=ctx["workspace_id"],
+            owner_id=other_owner_id,
+            thread_id=other_thread_id,
+            external_message_id=colliding_external_id,
+            now=ctx["now"],
+        )
+
+    resp = ctx["client"].post(
+        "/api/v1/personal/domains/email/disable",
+        headers=_headers(ctx["token"], str(uuid4())),
+    )
+    assert resp.status_code == 200, resp.text
+
+    # This owner's own message/thread are still purged as usual.
+    assert _row_count("email_messages", ctx["workspace_id"]) == 1  # the other owner's, only
+    # The now-ambiguous evidence row (shared `source_ref` with the other
+    # owner's still-live message) survives -- skipped, not purged.
+    with engine.begin() as connection:
+        evidence_row = connection.execute(
+            text(
+                "SELECT id FROM pkos_evidence WHERE workspace_id = :workspace_id "
+                "AND source_ref = :source_ref"
+            ),
+            {
+                "workspace_id": ctx["workspace_id"],
+                "source_ref": f"gmail:detect_action:{colliding_external_id}",
+            },
+        ).one_or_none()
+    assert evidence_row is not None, "ambiguous evidence must be left alone, not purged"
+
+    with engine.begin() as connection:
+        connection.execute(
+            text("DELETE FROM accounts WHERE email = :email"), {"email": other_email}
+        )

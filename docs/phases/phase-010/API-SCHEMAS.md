@@ -2,7 +2,7 @@
 id: PHASE-010-API-SCHEMAS
 title: Phase 10 Gmail API Schemas
 status: Approved for Implementation
-version: 1.2.0
+version: 1.2.1
 owner: Lucky Jain
 depends_on:
   - PHASE-010
@@ -80,7 +80,7 @@ validation errors.
 | `GET /api/v1/engineering/connectors` | Lists authorized visible accounts; never returns credentials |
 | `POST /api/v1/engineering/connectors/{id}/sync` | Body `{"run_type":"backfill|incremental","resource_type":"message"}`; requires `Idempotency-Key` and CSRF |
 | `GET /api/v1/engineering/sync-runs` | Lists redacted run outcome and item count |
-| `POST /api/v1/engineering/connectors/{id}/disable` | Revokes the Google token best-effort and marks the account disconnected |
+| `POST /api/v1/engineering/connectors/{id}/disable` | For every other provider: revokes the token best-effort and marks the account disconnected. For `gmail` specifically: rejected outright with `409 GMAIL_DISABLE_REQUIRES_DOMAIN_ENDPOINT` and no mutation -- Loop 2 round 1 review found this generic endpoint could disconnect a `gmail` account (and revoke its live Google grant) without running the consent revocation cascade below, leaving `personal_domains`/data untouched; callers must use the domain-level endpoints instead, which reach `gmail_revocation.cascade_email_revocation` |
 
 Manual `webhook` sync is not accepted. A second running sync for the same
 account returns `409 CONNECTOR_SYNC_IN_PROGRESS`. Provider errors are
@@ -168,3 +168,4 @@ response extensions.
 | 1.0.0 | 2026-08-06 | Documented current OAuth and generic sync surfaces | Lucky Jain |
 | 1.1.0 | 2026-08-06 | Task 6: documented `GET`/`POST .../forget` thread endpoints, correcting the "no current endpoint returns thread content" claim | Lucky Jain |
 | 1.2.0 | 2026-08-10 | Task 7: documented the consent revocation cascade's behavior change to three existing Phase 7 generic endpoints (no new endpoint added) | Lucky Jain |
+| 1.2.1 | 2026-08-10 | Task 7 Loop 2 round 4 review: corrected the "Current reused connector endpoints" table's `disable` row, stale since round 1 -- it still described pre-fix behavior for `gmail`, contradicting this same file's own consent revocation cascade section below it | Lucky Jain |
