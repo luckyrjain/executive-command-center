@@ -1065,6 +1065,11 @@ def test_disable_domain_does_not_affect_a_different_owners_gmail_data(
     other_owner_id = uuid4()
     other_account_id = uuid4()
     other_email = f"other-owner-{uuid4()}@example.test"
+    # Registered immediately, not after the test's own assertions -- Loop 2
+    # round 7 review finding: registering only at the end left this email
+    # unregistered (an orphaned `accounts` row) if any earlier assertion in
+    # this test failed.
+    ctx["extra_owner_emails"].append(other_email)
     credential = _pack_credential("other-access", "other-refresh", ctx["now"] + timedelta(hours=1))
     with engine.begin() as connection:
         create_identity(
@@ -1150,15 +1155,6 @@ def test_disable_domain_does_not_affect_a_different_owners_gmail_data(
     assert other_attention_count == 1
     assert _connector_status(ctx["workspace_id"], other_account_id) == "active"
 
-    # `_cleanup_workspace` (the fixture's own teardown) only ever knew the
-    # primary owner's `accounts` row by email -- register this test's own
-    # second identity so the fixture cleans it up too, in the correct
-    # order (after this workspace's `users` rows are gone). Deleting it
-    # here directly would raise `RestrictViolation` on `fk_users_account`
-    # since the second owner's own `users` row still exists at this point
-    # (Loop 2 round 6 review: CI caught this exact ordering bug).
-    ctx["extra_owner_emails"].append(other_email)
-
 
 def test_disable_domain_does_not_purge_evidence_with_a_colliding_external_message_id(
     gmail_revocation_context: dict,
@@ -1214,6 +1210,9 @@ def test_disable_domain_does_not_purge_evidence_with_a_colliding_external_messag
 
     other_owner_id = uuid4()
     other_email = f"other-owner-{uuid4()}@example.test"
+    # Registered immediately -- see the identical comment in `test_disable_
+    # domain_does_not_affect_a_different_owners_gmail_data` above.
+    ctx["extra_owner_emails"].append(other_email)
     with engine.begin() as connection:
         create_identity(
             connection,
@@ -1279,8 +1278,3 @@ def test_disable_domain_does_not_purge_evidence_with_a_colliding_external_messag
             {"workspace_id": ctx["workspace_id"], "source_ref": f"gmail:{safe_external_id}"},
         ).one_or_none()
     assert safe_evidence_row is None, "non-ambiguous evidence must still be purged normally"
-
-    # See the identical comment in `test_disable_domain_does_not_affect_a_
-    # different_owners_gmail_data` above -- deleting this second identity's
-    # `accounts` row directly here would raise `RestrictViolation`.
-    ctx["extra_owner_emails"].append(other_email)
