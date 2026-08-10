@@ -2,7 +2,7 @@
 id: PHASE-010-PRIVACY-CONSENT-CONTRACT
 title: Phase 10 Gmail Privacy and Consent Contract
 status: Approved for Implementation
-version: 1.4.3
+version: 1.4.4
 owner: Lucky Jain
 depends_on:
   - PHASE-010
@@ -98,7 +98,15 @@ a `gmail`-provider account (and revoke the live Google grant) without
 touching `personal_domains`/data at all until Loop 2 round 1 review found
 it and closed it (that endpoint now rejects `gmail`-provider accounts
 outright, `409 GMAIL_DISABLE_REQUIRES_DOMAIN_ENDPOINT`, directing callers
-to the domain-level endpoints above).
+to the domain-level endpoints above). That rejection is itself gated on
+the owner having a `personal_domains` row for `email` in the first place
+(Loop 2 round 25 review): an owner who completed the Gmail OAuth flow
+without ever calling `POST /domains`/`POST /consents` for `email` has no
+such row, so there is nothing for the cascade to purge or revoke, and the
+generic endpoint falls through to disconnect the account the same way any
+other provider's is -- without this carve-out, that owner's connector had
+no HTTP-reachable way to disconnect it at all, since the domain-level
+endpoints 404 `DOMAIN_NOT_FOUND` for an owner with no domain row.
 
 **`revoke_consent_endpoint` rejects a `consent_id` a later grant has
 superseded (Loop 2 round 8 review, refined round 9).** Its own `domain_
@@ -304,3 +312,4 @@ Gmail is internal-development only.
 | 1.4.1 | 2026-08-10 | Task 7 Loop 2 round 21 review: documented the new `409 IDEMPOTENCY_CONFLICT` fix closing an idempotency-key-reuse-after-regrant gap in `disable_domain_endpoint`/`delete_domain_endpoint` -- a reused key used to return the first call's stale cached "success" without re-running the cascade against freshly re-granted, freshly-synced data | Lucky Jain |
 | 1.4.2 | 2026-08-10 | Task 7 Loop 2 round 22 review: `domain.enabled` alone (round 21) was not sufficient -- a genuine Gmail reconnect through the separate OAuth callback flow also needed to invalidate a cached idempotency response, since that flow never touches `personal_domains`/`domain_consents` at all; widened the cache-hit check to also detect a reactivated `gmail` connector account | Lucky Jain |
 | 1.4.3 | 2026-08-10 | Task 7 Loop 2 round 24 review (HIGH): a genuinely fresh (non-replayed) disable request against an already-disabled domain was unconditionally a no-op, even with a Gmail account reconnected in the meantime -- `cascade_email_revocation` is now triggered on `domain.enabled or reconnected`, not merely `domain.enabled`, matching `delete_domain_endpoint`'s own already-unconditional cascade call | Lucky Jain |
+| 1.4.4 | 2026-08-10 | Task 7 Loop 2 round 25 review (MEDIUM): the generic engineering `/disable` endpoint's `gmail`-provider rejection is now gated on the owner having a `personal_domains` row for `email` at all -- without it, an OAuth-connected owner who never enabled the `email` domain had no HTTP-reachable way to disconnect their `gmail` account, since the domain-level endpoints 404 for them too | Lucky Jain |
