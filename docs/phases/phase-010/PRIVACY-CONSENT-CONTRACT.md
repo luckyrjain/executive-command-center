@@ -2,7 +2,7 @@
 id: PHASE-010-PRIVACY-CONSENT-CONTRACT
 title: Phase 10 Gmail Privacy and Consent Contract
 status: Approved for Implementation
-version: 1.3.9
+version: 1.4.0
 owner: Lucky Jain
 depends_on:
   - PHASE-010
@@ -71,9 +71,15 @@ processes before that owner's own `email_messages` rows are deleted, so a
 owner's record of the collision even after the first owner's own
 colliding row is long gone -- and against a *genuinely concurrent* second
 cascade too (neither has committed yet): a `pg_advisory_xact_lock` keyed
-on `(workspace_id, external_message_id)` serializes two colliding owners'
-cascades on that specific id (Loop 2 round 17 review, closing the one
-window neither the round-4 nor round-8 fix covered). `email`-sourced `recommendations` not
+on `workspace_id` serializes every gmail cascade in the same workspace on
+this section, which trivially includes two colliding owners' (Loop 2
+round 17 review, closing the one window neither the round-4 nor round-8
+fix covered; round 19 review widened the key from one lock per candidate
+id to one per workspace, since the former could exhaust Postgres's shared
+advisory-lock pool for a large mailbox -- a database-wide resource, so
+this traded a small amount of unnecessary cross-owner serialization,
+acceptable for an infrequent action, for eliminating that resource-
+exhaustion risk entirely). `email`-sourced `recommendations` not
 yet `executed` are deleted outright; an already-`executed` one (which now
 has an independent, confirmed `tasks`/`commitments`/`risks` row) is
 redacted in place instead -- its own Gmail-derived `rationale`/`proposed_
@@ -232,3 +238,4 @@ Gmail is internal-development only.
 | 1.3.7 | 2026-08-10 | Task 7 Loop 2 round 11 review: documented `delete_domain_endpoint`'s own `for_update=True` fix, closing the identical TOCTOU gap round 10 left open at that call site | Lucky Jain |
 | 1.3.8 | 2026-08-10 | Task 7 Loop 2 round 12 review: corrected the 1.3.7 entry -- the round-11 fix serializes `delete_domain_endpoint`'s sequence but does not reject a losing race the way `_disable_domain`'s `consent_id` check does, since this endpoint has no such identifier; the same already-accepted self-race behavior `disable_domain_endpoint` has had since round 10 | Lucky Jain |
 | 1.3.9 | 2026-08-10 | Task 7 Loop 2 round 17 review: documented the new advisory-lock fix closing the genuine-concurrency gap in the cross-owner colliding-`external_message_id` evidence check (neither the round-4 nor round-8 fix covered two truly-overlapping, not-yet-committed cascades) | Lucky Jain |
+| 1.4.0 | 2026-08-10 | Task 7 Loop 2 round 19 review: the round-17 advisory lock was rekeyed from one lock per candidate id to one per workspace, closing a resource-exhaustion risk the per-id version had for large mailboxes (Postgres's shared advisory-lock pool is a database-wide, not per-session, resource) | Lucky Jain |

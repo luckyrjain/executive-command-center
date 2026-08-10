@@ -290,28 +290,28 @@ def cascade_email_revocation(
         # owner_id` is never trustworthy, see above). Nothing else in this
         # cascade serializes two *different* owners against each other: the
         # `personal_domains`/`connector_accounts` row locks and the
-        # idempotency advisory lock are all scoped per-owner. Closed here
-        # with a `pg_advisory_xact_lock` keyed on `(workspace_id, id)` for
-        # every candidate id, acquired in sorted order to avoid a deadlock
-        # if two colliding owners' candidate sets overlap on more than one
-        # id -- the same underlying `pg_advisory_xact_lock(hashtextextended(
-        # ...))` primitive this codebase's own idempotency locks already use
-        # (e.g. `calendar/events.py:_lock_idempotency`), but a genuinely
-        # different shape: those lock exactly one Python-built key per call;
-        # this needs a *set* of keys locked together, so the concatenation
-        # and the per-id loop both move into one SQL statement (`unnest(...)
-        # ... ORDER BY id`) rather than a Python-side helper.
-        #
-        # Whichever cascade acquires the lock for a given id first is now
-        # authoritative for it; the loser's own ambiguity check, once
-        # unblocked, correctly observes the winner's now-committed purge-
-        # log entry (or live row) and treats the id as ambiguous.
+        # idempotency advisory lock are all scoped per-owner. Closed with a
+        # `pg_advisory_xact_lock` keyed on `workspace_id` alone -- Loop 2
+        # round 19 review finding (MEDIUM-HIGH): the first version of this
+        # fix keyed one lock per candidate id instead, which for a large,
+        # long-synced mailbox could acquire thousands of distinct heavyweight
+        # advisory locks in one transaction, risking `max_locks_per_
+        # transaction` shared-memory exhaustion -- a resource Postgres pools
+        # database-wide, so one owner's own large mailbox could transiently
+        # fail unrelated lock acquisitions for *other* tenants sharing the
+        # instance, not just their own request. A single workspace-scoped
+        # lock is O(1) regardless of mailbox size and still fully closes the
+        # race: it over-serializes (every gmail cascade in the same
+        # workspace blocks on this section, not only genuinely colliding
+        # ones), but that is a correct, acceptable trade-off for an action
+        # this infrequent (a deliberate consent revoke/delete), and it also
+        # now matches this codebase's own established `pg_advisory_xact_
+        # lock(hashtextextended(...))` idempotency-lock shape exactly (e.g.
+        # `calendar/events.py:_lock_idempotency`) rather than diverging from
+        # it, closing a round-18 review note in the same motion.
         session.execute(
-            text(
-                "SELECT pg_advisory_xact_lock(hashtextextended(:workspace_id || ':' || id, 0)) "
-                "FROM unnest(CAST(:candidate_ids AS text[])) AS id ORDER BY id"
-            ),
-            {"workspace_id": str(auth.workspace_id), "candidate_ids": external_message_ids},
+            text("SELECT pg_advisory_xact_lock(hashtextextended(:lock_key, 0))"),
+            {"lock_key": f"{auth.workspace_id}:gmail_revocation_evidence"},
         )
 
         # Every id this cascade processes (ambiguous or not) is logged

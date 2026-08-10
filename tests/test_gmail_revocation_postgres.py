@@ -1343,21 +1343,29 @@ def test_disable_domain_serializes_against_a_genuinely_concurrent_colliding_casc
     truly-concurrent cascades for a colliding id could each independently
     conclude "not ambiguous" and both purge the `pkos_evidence` row --
     the one DELETE in this cascade with no `owner_id` qualifier of its
-    own. Fixed with a `pg_advisory_xact_lock` keyed on `(workspace_id,
-    external_message_id)`, acquired before the ambiguity check for every
-    candidate id, so two colliding owners' cascades are forced to
-    serialize on that specific id rather than racing.
+    own. Fixed with a `pg_advisory_xact_lock` keyed on `workspace_id`
+    alone, acquired before the ambiguity check -- Loop 2 round 19 review
+    finding: an earlier version of this fix keyed one lock per candidate
+    id instead, which for a large mailbox could exhaust Postgres's shared
+    `max_locks_per_transaction` pool (a database-wide resource, so one
+    owner's own large mailbox could transiently break lock acquisition
+    for *other* tenants too); a single workspace-scoped lock is O(1)
+    regardless of mailbox size and still fully closes the race, at the
+    cost of over-serializing every gmail cascade in the same workspace
+    against this section, not only genuinely colliding ones -- an
+    acceptable trade-off for an action this infrequent.
 
     This test proves the lock itself is real and load-bearing, the same
     way `test_revoke_consent_endpoint_serializes_against_a_concurrent_
     regrant` below proves its own row lock: a raw connection holds the
-    advisory lock for the colliding id first, a background thread's own
+    workspace-scoped advisory lock first, a background thread's own
     `disable` call (which needs that same lock inside `cascade_email_
     revocation`) genuinely blocks rather than racing ahead, and once the
-    lock is released the disable proceeds and correctly treats the id as
-    ambiguous (the other owner's message is still live), leaving the
-    shared evidence row unpurged -- the same outcome the sequential-case
-    fix already proves, now proven to hold under genuine concurrency too.
+    lock is released the disable proceeds and correctly treats the
+    colliding id as ambiguous (the other owner's message is still live),
+    leaving the shared evidence row unpurged -- the same outcome the
+    sequential-case fix already proves, now proven to hold under genuine
+    concurrency too.
     """
     ctx = gmail_revocation_context
     seeded = _seed_full_cascade_fixture(ctx)
@@ -1401,8 +1409,8 @@ def test_disable_domain_serializes_against_a_genuinely_concurrent_colliding_casc
 
     with engine.connect() as holder:
         holder.execute(
-            text("SELECT pg_advisory_xact_lock(hashtextextended(:workspace_id || ':' || :id, 0))"),
-            {"workspace_id": str(ctx["workspace_id"]), "id": colliding_external_id},
+            text("SELECT pg_advisory_xact_lock(hashtextextended(:lock_key, 0))"),
+            {"lock_key": f"{ctx['workspace_id']}:gmail_revocation_evidence"},
         )
         with ThreadPoolExecutor(max_workers=1) as pool:
             future = pool.submit(_disable)
