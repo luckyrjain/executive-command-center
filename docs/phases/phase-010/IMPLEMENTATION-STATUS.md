@@ -2,7 +2,7 @@
 id: PHASE-010-IMPLEMENTATION-STATUS
 title: Phase 10 Implementation Status
 status: Active
-version: 0.7.16
+version: 0.7.17
 owner: Lucky Jain
 updated: 2026-08-10
 ---
@@ -710,4 +710,8 @@ Architecture lens was instructed to systematically re-verify every remaining cou
 
 Architecture lens found the one remaining doc among the six Task-7 docs whose "Current" heading was never reconciled for Task 7: `SYNC-CONTRACT.md`'s own `## Current behavior (Tasks 2-5)` heading still excluded Task 7 even though the "Consent and permissions" subsection directly beneath it already described Task 7's cascade as shipped -- the other five docs' equivalent headers were all correctly updated, making this the sole outlier. Fixed to `(Tasks 2-3, 5-7)`, matching this file's own established range-notation convention (Task 4 and Task 6 are both deliberately excluded, the latter explicitly argued elsewhere in the same file).
 
-Loop 2 review round 18 in progress.
+**Round 18 (security/correctness and architecture/quality, launched concurrently): security lens clean, having independently and empirically re-verified round 17's advisory-lock fix; architecture lens found two LOW findings in round 17's own new code, both fixed.** Security lens did not merely re-read round 17's fix -- it reproduced the exact SQL against a live Postgres instance to empirically confirm two specific claims rather than trust the reasoning: that removing `ORDER BY id` from the lock-acquisition query genuinely deadlocks two transactions with oppositely-ordered overlapping candidate sets (confirmed: `deadlock detected`), and that keeping it genuinely serializes them cleanly instead (confirmed). Also traced lock release across every exit path in both callers (including the idempotency-cache early return, which still commits via `session.begin()`'s context manager) and confirmed there is exactly one writer of `email_message_id_purge_log` and one `pkos_evidence` bulk-delete site in the whole codebase, both inside the new lock. Verdict: round 17's fix is correct and complete.
+
+Architecture lens found two LOW issues introduced by round 17's own new code (not pre-existing staleness): the new test's docstring said "the fix two tests above" when the round-4 fix it references is proven by the test immediately preceding it (one test above, not two); and the new lock's comment claimed to "mirror" this codebase's established `pg_advisory_xact_lock(hashtextextended(...))` idempotency-lock pattern "just keyed differently," overstating the similarity -- every other call site locks exactly one Python-built key per call, while this one locks a *set* of keys together in a single SQL statement, a genuinely different shape worth describing accurately rather than understating. Both fixed with no behavior change.
+
+Loop 2 review round 19 in progress.
