@@ -2,7 +2,7 @@
 id: PHASE-010
 title: Gmail Connector
 status: Approved for Implementation
-version: 0.4.4
+version: 0.4.5
 owner: Lucky Jain
 depends_on:
   - PHASE-001
@@ -126,6 +126,7 @@ Gmail write actions (compose/reply/send/archive/label-modify); public/general-av
 
 | Version | Date | Summary | Author |
 |---|---|---|---|
+| 0.4.5 | 2026-08-10 | Reconciled delivery through Task 7 after the consent revocation cascade merge (Loop 2 round 16 review: this file's own version/changelog had not been bumped for this edit, unlike every prior task boundary) | Lucky Jain |
 | 0.4.4 | 2026-08-06 | Reconciled delivery through Task 6 after the on-demand thread read/forget merge | Lucky Jain |
 | 0.4.3 | 2026-08-06 | Reconciled delivery through Task 5 after the email.detect_action merge | Lucky Jain |
 | 0.4.2 | 2026-08-06 | Reconciled delivery through Task 4 after the recommendations create-path merge | Lucky Jain |

@@ -2,7 +2,7 @@
 id: PHASE-010-DATA-MODEL
 title: Phase 10 Gmail Data Model
 status: Approved for Implementation
-version: 1.4.0
+version: 1.4.1
 owner: Lucky Jain
 depends_on:
   - PHASE-010
@@ -14,22 +14,27 @@ depends_on:
 
 ## Delivery boundary
 
-- **Current (Tasks 1-2, 5-6):** OAuth connector account, 30-day metadata
+- **Current (Tasks 1-2, 5-7):** OAuth connector account, 30-day metadata
   backfill, Gmail-history incremental sync, thread/message projections,
   sender/recipient entity linking, (Task 5) controlled body retrieval and
-  caching for a message that triggers `email.detect_action`, and (Task 6)
+  caching for a message that triggers `email.detect_action`, (Task 6)
   on-demand human-facing body retrieval/caching for an explicit thread
   open plus a per-thread "forget this" write path that nulls the same
-  cached fields back out. Task 6 adds no new table or column to the ones
-  below -- it reuses Task 5's own `body`/`snippet`/`body_fetched_at`
-  columns for both writes; its one schema change (`deletion_jobs.scope`/
-  `resource_id`) belongs to Phase 7's own `deletion_jobs` table, documented
-  in `docs/phases/phase-007/DATA-MODEL.md`'s cross-phase amendment, not
-  here. Attention projections (Task 3) and recommendation creation (Task 4)
-  also shipped, but through tables this document does not own
-  (`attention_items`, `recommendations`) rather than a change to the tables
-  below.
-- **Planned (Tasks 7-8):** consent-revocation purge and executive UX.
+  cached fields back out, and (Task 7) the consent-revocation cascade
+  (see "Ownership, retention, and deletion" below) plus its own new
+  `email_message_id_purge_log` table. Task 6 adds no new table or column
+  to the ones below -- it reuses Task 5's own `body`/`snippet`/
+  `body_fetched_at` columns for both writes; its one schema change
+  (`deletion_jobs.scope`/`resource_id`) belongs to Phase 7's own
+  `deletion_jobs` table, documented in `docs/phases/phase-007/DATA-
+  MODEL.md`'s cross-phase amendment, not here. Attention projections
+  (Task 3) and recommendation creation (Task 4) also shipped, but through
+  tables this document does not own (`attention_items`, `recommendations`)
+  rather than a change to the tables below.
+- **Planned (Task 8):** executive UX. (Loop 2 round 16 review: this
+  section had not been reconciled since Task 6 -- still claimed consent-
+  revocation purge was merely "planned" for "Tasks 7-8" after Task 7
+  shipped it, directly contradicting the rest of this same document.)
 
 ## Current tables
 
@@ -166,3 +171,4 @@ close without persisted state.
 | 1.3.0 | 2026-08-10 | Task 7: documented the consent revocation cascade, correcting the "cascade is planned for Task 7" claim and the "Tasks 7-8 may add further schema" claim (no new migration was needed) | Lucky Jain |
 | 1.3.1 | 2026-08-10 | Task 7 Loop 2 round 5 review: this file was never revisited across four review rounds -- corrected the "every derived ... row" overclaim (round 4's cross-owner collision fix leaves an ambiguous evidence row unpurged) and the imprecise "recommendations ... row" language (executed ones are redacted in place, not deleted); also noted an owner can hold more than one Gmail connector account | Lucky Jain |
 | 1.4.0 | 2026-08-10 | Task 7 Loop 2 round 8 review: documented the new `email_message_id_purge_log` table (migration `0076`), closing a sequential cross-owner evidence leak the round-4 fix could not close without persisted state -- correcting this document's own prior "no new migration was needed" claim | Lucky Jain |
+| 1.4.1 | 2026-08-10 | Task 7 Loop 2 round 16 review: the "Delivery boundary" section at the top of this file was never reconciled after Task 7 shipped -- still read "Current (Tasks 1-2, 5-6)" / "Planned (Tasks 7-8): consent-revocation purge" while the rest of this same document (as of 1.3.0-1.4.0) already described Task 7's cascade as fully shipped; corrected | Lucky Jain |

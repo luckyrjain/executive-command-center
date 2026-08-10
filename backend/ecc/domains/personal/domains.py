@@ -739,10 +739,10 @@ def _disable_domain(
     enabled -> disabled transition here also runs `gmail_revocation.
     cascade_email_revocation` -- disconnecting the owner's Gmail connector
     account(s) and purging the owner's own email-derived records (see
-    that function's own docstring for the one deliberate carve-out: an
-    evidence row whose id collides with a different owner's own message
-    is left alone) -- in the same transaction as the state change itself.
-    Every other domain's own disable stays exactly
+    that function's own docstring for its three deliberate exceptions,
+    e.g. an evidence row whose id collides with a different owner's own
+    message is left alone) -- in the same transaction as the state
+    change itself. Every other domain's own disable stays exactly
     as before (data untouched, a separate explicit `POST .../delete`
     required to purge anything); see `gmail_revocation.py`'s own module
     docstring for why `email` is deliberately different in kind, not

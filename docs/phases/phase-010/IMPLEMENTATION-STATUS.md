@@ -2,7 +2,7 @@
 id: PHASE-010-IMPLEMENTATION-STATUS
 title: Phase 10 Implementation Status
 status: Active
-version: 0.7.14
+version: 0.7.15
 owner: Lucky Jain
 updated: 2026-08-10
 ---
@@ -702,4 +702,8 @@ Architecture lens's exhaustive sweep found two more instances of the same recurr
 
 Architecture lens's exhaustive sweep found one more instance of the recurring "doc claim goes stale" pattern: this document's own Task 7 "Tests: ..." evidence paragraph (line ~623) was last rolled forward in round 6 ("13 tests as of Loop 2 round 5") and never revisited through rounds 7-14, even as rounds 8-11 added four more tests (17 total today) -- the exact same failure class this document's own Task 5 evidence section already named and fixed for itself in its own round 2 ("the ... evidence paragraph ... went stale the moment round 1 added an 18th test ... without the running total ... ever being rolled forward"), just never applied to Task 7's analogous paragraph until now. Fixed by rolling the count and description forward to describe all 17 tests, including the four rounds 8-11 added.
 
-Loop 2 review round 16 in progress.
+**Round 16 (security/correctness and architecture/quality, launched concurrently): security lens clean for a 5th consecutive round; architecture lens found three more LOW doc-staleness issues, all fixed.** Security lens was explicitly told not to pattern-match to the prior 4 clean rounds and to look with genuinely fresh eyes; it re-derived the cross-owner ambiguity check's atomicity for truly concurrent (not just sequential) cascades from first principles, re-verified `source_ref`/literal consistency between every `gmail_adapter.py` write site and `gmail_revocation.py`'s matching deletes, re-traced `session.close()`-before-blocking-revoke safety, re-verified the gmail 409 guard introduces no authorization bypass or oracle, and re-checked the `still_valid` consent-supersession self-join can't spuriously match its own row -- no findings.
+
+Architecture lens was instructed to systematically re-verify every remaining count/caller-list/totalizing claim across the whole PR rather than just the usual files, and found three more instances of the recurring pattern, none in the "six Task 7 docs" checklist this review has repeatedly swept: first, `docs/phases/PHASE-010-gmail-connector.md` (the phase doc, not a Task-7-specific one) had its "Delivery status" paragraph edited to say "Tasks 1-7 ... are complete" without the version/changelog bump this file has given itself at every single prior task boundary -- fixed. Second, `DATA-MODEL.md`'s own "Delivery boundary" section at the very top of the file still read "Current (Tasks 1-2, 5-6)" / "Planned (Tasks 7-8): consent-revocation purge," directly contradicting the rest of the same document (already reconciled through 1.4.0) which describes Task 7's cascade as fully shipped -- the top-of-file summary was simply never reconciled against the body it summarizes. Fixed. Third, three separate "the one deliberate carve-out"/"the one deliberate exception" cross-references (`domains.py:_disable_domain`'s docstring, `export_deletion.py:_delete_domain_data`'s comment, `SYNC-CONTRACT.md`) all undercounted the canonical three exceptions `cascade_email_revocation`'s own docstring names (confirmed accurate as of round 14) -- round 14's own fix only touched the module docstring itself, never checking whether callers' own local "the one" numerals still agreed with it. All three corrected to "three deliberate exceptions."
+
+Loop 2 review round 17 in progress.
