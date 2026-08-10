@@ -27,9 +27,11 @@ message with this raw id in this workspace." `cascade_email_revocation`'s
 ambiguity check now additionally treats an id as ambiguous if a *different*
 owner has a ledger row for it -- catching exactly the sequential case above,
 since A's ledger row survives A's own `email_messages` deletion. Deliberately
-never deleted or pruned by any code path in this codebase (an owner-removal
-or workspace-deletion cascade is the only thing that should ever clear it --
-see the `workspace_id` FK below); a handful of opaque Gmail message ids plus
+never deleted or pruned by any code path in this codebase -- `owner_id` here
+carries no FK of its own (member removal never hard-deletes a `users` row,
+only flips `workspace_memberships.status`, so there is no owner-removal event
+to hang a purge off), and the `workspace_id` `ON DELETE CASCADE` FK below is
+this table's only removal path; a handful of opaque Gmail message ids plus
 owner references carries no content of its own to purge, matching this
 table's own `deletion_jobs` sibling's identical "permanent record of an
 action, not itself in scope for a domain's own privacy purge" precedent

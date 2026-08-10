@@ -102,15 +102,22 @@ see migration `0076`'s own docstring for the full reasoning, including
 why that log is itself never purged by any code path in this codebase.
 
 **Loop 2 round 8 review (PR #128) -- `revoke_consent_endpoint` could
-replay a stale `consent_id`.** `domains.py`'s consent lookup did not
-filter `revoked_at IS NULL` before resolving `domain_key` and triggering
-this module's cascade -- for every domain except `email` that is harmless
-(disable/re-enable is fully reversible), but for `email` a stale or
-already-revoked `consent_id`, reused after the owner re-granted consent
-and resynced Gmail, would still successfully trigger a full disable and
-data-purging cascade against the *current* state. Fixed at the lookup
-site (`domains.py:revoke_consent_endpoint`), not here -- see that
-function's own updated comment.
+replay a stale `consent_id`, fixed round 9 for an idempotency-key
+regression the first fix introduced.** `domains.py`'s consent lookup did
+not check whether a `consent_id` had since been superseded by a later
+grant before resolving `domain_key` and triggering this module's cascade
+-- for every domain except `email` that is harmless (disable/re-enable is
+fully reversible), but for `email` a stale, revoked-then-re-granted-over
+`consent_id` would still successfully trigger a full disable and data-
+purging cascade against the *current* state. Round 8's own first fix
+(`AND revoked_at IS NULL`) closed that but broke a legitimate case: an
+`Idempotency-Key` retry of a revoke that already succeeded, no re-grant
+in between, now 404'd instead of returning the cached response, since the
+lookup ran before `_disable_domain`'s own idempotency-cache check ever
+got a chance to fire. Round 9's fix distinguishes the two: a revoked
+consent is only rejected if a *later* grant for the same domain actually
+superseded it. Fixed at the lookup site (`domains.py:revoke_consent_
+endpoint`), not here -- see that function's own updated comment.
 
 **What is deliberately NOT deleted.**
 - `pkos_nodes` (the resolved person entities themselves): `gmail_adapter.
@@ -273,7 +280,7 @@ def cascade_email_revocation(
                 "INSERT INTO email_message_id_purge_log "
                 "(workspace_id, external_message_id, owner_id, purged_at) "
                 "SELECT :workspace_id, id, :owner_id, :now "
-                "FROM unnest(:candidate_ids::text[]) AS id "
+                "FROM unnest(CAST(:candidate_ids AS text[])) AS id "
                 "ON CONFLICT (workspace_id, external_message_id, owner_id) DO NOTHING"
             ),
             {

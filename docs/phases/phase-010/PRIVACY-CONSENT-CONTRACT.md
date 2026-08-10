@@ -2,7 +2,7 @@
 id: PHASE-010-PRIVACY-CONSENT-CONTRACT
 title: Phase 10 Gmail Privacy and Consent Contract
 status: Approved for Implementation
-version: 1.3.4
+version: 1.3.5
 owner: Lucky Jain
 depends_on:
   - PHASE-010
@@ -90,19 +90,28 @@ it and closed it (that endpoint now rejects `gmail`-provider accounts
 outright, `409 GMAIL_DISABLE_REQUIRES_DOMAIN_ENDPOINT`, directing callers
 to the domain-level endpoints above).
 
-**`revoke_consent_endpoint` only accepts the currently-active consent
-(Loop 2 round 8 review).** Its own `domain_consents` lookup requires
-`revoked_at IS NULL` before resolving a `consent_id` to a `domain_key` and
-reaching the cascade above. Without that filter, a stale/already-revoked
+**`revoke_consent_endpoint` rejects a `consent_id` a later grant has
+superseded (Loop 2 round 8 review, refined round 9).** Its own `domain_
+consents` lookup resolves a `consent_id` to a `domain_key` only if the
+consent is still active, or -- if revoked -- no *later* grant for the
+same domain exists. Without that check, a stale/already-revoked
 `consent_id` -- a replayed request, a double-submitted form, or a client
 retry landing after the owner already re-granted `email` consent and
 resynced Gmail -- would still trigger a fresh disable-and-purge cascade
 against the *current* state, using an identifier for a grant that no
 longer exists. Harmless for every other domain (disable/re-enable is
 fully reversible); destructive for `email` specifically, since disabling
-now cascades. A stale id is rejected the same non-disclosing way every
-other lookup in this module already fails closed (`404 CONSENT_NOT_
-FOUND`).
+now cascades. Round 8's first attempt at this fix (a plain `AND revoked_
+at IS NULL`) closed that but broke a legitimate case round 9 review
+found: an `Idempotency-Key` retry of a revoke that had already succeeded,
+with no re-grant in between, now 404'd instead of returning the cached
+response, since the lookup runs before `_disable_domain`'s own
+idempotency-cache check ever gets a chance to fire. The `NOT EXISTS (a
+later grant)` condition distinguishes the two -- a revoked consent with
+nothing superseding it still resolves normally. A truly stale id (one a
+later grant has superseded) is rejected the same non-disclosing way
+every other lookup in this module already fails closed (`404 CONSENT_
+NOT_FOUND`).
 
 **"Retryable" is the existing idempotency-key mechanism, not a new
 `deletion_jobs` state.** Every step above runs inside the same transaction
@@ -172,3 +181,4 @@ Gmail is internal-development only.
 | 1.3.2 | 2026-08-10 | Task 7 Loop 2 round 5 review: corrected the "every Gmail-sourced pkos_evidence row" overclaim -- round 4's fix deliberately leaves a cross-owner-colliding evidence row unpurged; this file was never revisited when that fix shipped | Lucky Jain |
 | 1.3.3 | 2026-08-10 | Task 7 Loop 2 round 6 review: corrected a second, nearby "purging every email-derived record" overclaim that round 5's fix missed -- internally inconsistent with the three carve-outs this same section already discloses two sentences earlier | Lucky Jain |
 | 1.3.4 | 2026-08-10 | Task 7 Loop 2 round 8 review: documented `email_message_id_purge_log` (migration `0076`, closing a sequential cross-owner evidence leak) and `revoke_consent_endpoint`'s new `revoked_at IS NULL` requirement (closing a stale-consent-id replay that could re-trigger the cascade against freshly re-granted state) | Lucky Jain |
+| 1.3.5 | 2026-08-10 | Task 7 Loop 2 round 9 review: corrected the round-8 `revoke_consent_endpoint` description -- the plain `revoked_at IS NULL` check broke legitimate `Idempotency-Key` retries; replaced with a `NOT EXISTS (a later grant)` check that only rejects a consent a later grant has actually superseded | Lucky Jain |

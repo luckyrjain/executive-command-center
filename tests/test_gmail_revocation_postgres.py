@@ -73,10 +73,17 @@ Covers, in the same order these tests physically appear below:
     not leak the first owner's preserved evidence either, via `email_
     message_id_purge_log` (migration `0076`, Loop 2 round 8 review
     finding).
-15. `revoke_consent_endpoint` rejects a stale/already-revoked `consent_id`
-    (`404 CONSENT_NOT_FOUND`) rather than resolving it to `domain_key` and
-    re-running the cascade against a domain the owner has since re-granted
-    consent for and resynced -- Loop 2 round 8 review finding.
+15. `revoke_consent_endpoint` rejects a `consent_id` a *later* grant has
+    superseded (`404 CONSENT_NOT_FOUND`) rather than resolving it to
+    `domain_key` and re-running the cascade against a domain the owner has
+    since re-granted consent for and resynced -- Loop 2 round 8 review
+    finding, check refined round 9 (see item 16).
+16. The fix for item 15 above must not reject a *legitimate* same-
+    `Idempotency-Key` retry of a revoke that already succeeded, with no
+    re-grant in between -- Loop 2 round 9 review finding: round 8's own
+    first attempt (a plain `revoked_at IS NULL` check) wrongly 404'd that
+    case too, since it ran before `_disable_domain`'s own idempotency-
+    cache check ever got a chance to fire.
 """
 
 import threading
@@ -1313,9 +1320,16 @@ def test_sequential_disables_by_two_colliding_owners_do_not_leak_the_first_owner
 
     Owner B's own cascade is invoked directly (`gmail_revocation.cascade_
     email_revocation`), not via the HTTP endpoint the rest of this file
-    uses -- there is no second `sessions` row/login flow for a second owner
-    in this fixture, and the module-level call is exactly what a second,
-    independent HTTP request from owner B would itself reach.
+    uses -- a deliberate simplification to keep this test isolated to the
+    one thing it exists to prove (the ledger closes the sequential leak),
+    rather than a constraint (a second `sessions` row for owner B is no
+    harder to add here than the second identity this test already creates
+    below). This does mean owner B's own leg of this test does not also
+    exercise `_disable_domain`'s own commit -> `session.close()` ->
+    `finish_gmail_revocation` sequencing the way owner A's leg does (via
+    the real HTTP call below) -- that sequencing is already proven
+    generically, for a single owner, by `test_disable_domain_releases_
+    pool_connection_and_row_lock_before_revoke_call` above.
     """
     ctx = gmail_revocation_context
     seeded = _seed_full_cascade_fixture(ctx)
@@ -1401,8 +1415,9 @@ def test_sequential_disables_by_two_colliding_owners_do_not_leak_the_first_owner
 def test_revoke_consent_endpoint_rejects_a_stale_already_revoked_consent_id(
     gmail_revocation_context: dict,
 ) -> None:
-    """Loop 2 round 8 review finding: `revoke_consent_endpoint`'s own
-    consent lookup did not filter `revoked_at IS NULL`, so a stale/already-
+    """Loop 2 round 8 review finding, check refined round 9: `revoke_
+    consent_endpoint`'s own consent lookup did not check whether a `consent_
+    id` had since been superseded by a later grant, so a stale/already-
     revoked `consent_id` -- reused after the owner re-granted `email`
     consent -- would still resolve to `domain_key = 'email'` and trigger a
     fresh disable-and-purge cascade against the *current* (freshly re-
@@ -1412,7 +1427,11 @@ def test_revoke_consent_endpoint_rejects_a_stale_already_revoked_consent_id(
     under the new grant, and replays the ORIGINAL (now stale) `consent_id`
     -- asserting it is rejected (`404 CONSENT_NOT_FOUND`, the same non-
     disclosing shape every other lookup in this module already uses) and
-    the freshly re-granted data survives untouched.
+    the freshly re-granted data survives untouched. See the companion test
+    directly below for the case this must NOT reject: a same-`Idempotency-
+    Key` retry of a revoke that already succeeded, with no re-grant in
+    between (round 9 review finding: a plain `revoked_at IS NULL` check,
+    round 8's own first attempt at this fix, wrongly rejected that case).
     """
     ctx = gmail_revocation_context
     stale_consent_id = ctx["consent_id"]
@@ -1458,3 +1477,38 @@ def test_revoke_consent_endpoint_rejects_a_stale_already_revoked_consent_id(
             {"workspace_id": ctx["workspace_id"], "id": seeded["thread_id"]},
         ).one_or_none()
     assert thread_row is not None, "the replayed stale consent_id must not re-trigger the cascade"
+
+
+def test_revoke_consent_endpoint_idempotency_key_replay_without_regrant_still_succeeds(
+    gmail_revocation_context: dict,
+) -> None:
+    """Loop 2 round 9 review finding: round 8's own first fix for the stale-
+    consent-id replay above (a plain `AND revoked_at IS NULL`) over-
+    corrected -- it also rejected this test's own scenario, a *legitimate*
+    `Idempotency-Key` retry of a revoke that had already succeeded, with no
+    re-grant in between. The first successful call itself sets `revoked_
+    at`, and that plain filter ran before `_disable_domain`'s own
+    idempotency-cache check ever got a chance to fire, so the identical
+    retry 404'd instead of returning the cached response. The refined
+    check (`revoked_at IS NULL OR NOT EXISTS (a later grant)`) still
+    resolves `domain_key` for a revoked consent nothing has superseded, so
+    the retry reaches `_disable_domain`'s own idempotency cache -- proven
+    here with the SAME `Idempotency-Key` on both calls, asserting the
+    second call is a `200`, not a `404`, with the identical cached
+    response body.
+    """
+    ctx = gmail_revocation_context
+    key = str(uuid4())
+
+    first_resp = ctx["client"].post(
+        f"/api/v1/personal/consents/{ctx['consent_id']}/revoke",
+        headers=_headers(ctx["token"], key),
+    )
+    assert first_resp.status_code == 200, first_resp.text
+
+    replay_resp = ctx["client"].post(
+        f"/api/v1/personal/consents/{ctx['consent_id']}/revoke",
+        headers=_headers(ctx["token"], key),
+    )
+    assert replay_resp.status_code == 200, replay_resp.text
+    assert replay_resp.json() == first_resp.json()

@@ -883,27 +883,52 @@ def revoke_consent_endpoint(
     # bug `list_insights_endpoint`'s own docstring documents for the
     # identical shape.
     with session.begin():
-        # `AND revoked_at IS NULL` (Loop 2 round 8 review): without it, a
-        # stale/already-revoked `consent_id` -- e.g. a replayed request, a
-        # double-submitted form, or a client retry that lands after the
-        # user already re-granted `email` consent and resynced Gmail --
-        # would still resolve to a `domain_key` here and go on to trigger
-        # `_disable_domain` below. `_disable_domain` itself only mutates
-        # `if domain.enabled`, so a stale id is harmless for every other
-        # domain (disabling and re-enabling is fully reversible, no data
-        # loss). For `email` specifically it is not: `_disable_domain`
-        # cannot tell *which* consent triggered it, so it would disable
-        # and cascade-purge the *current*, freshly-resynced `email` state
-        # using an identifier that no longer names an active grant.
-        # Requiring the referenced consent to still be the live one closes
-        # that window the same non-disclosing way every other lookup in
-        # this module already fails closed (`404 CONSENT_NOT_FOUND`).
+        # Reject only a consent that was both revoked AND superseded by a
+        # *later* grant for the same domain (Loop 2 round 8 review, refined
+        # round 9): a stale/already-revoked `consent_id` -- e.g. a replayed
+        # request, a double-submitted form, or a client retry that lands
+        # after the user already re-granted `email` consent and resynced
+        # Gmail -- would otherwise still resolve to a `domain_key` here and
+        # go on to trigger `_disable_domain` below. `_disable_domain`
+        # itself only mutates `if domain.enabled`, so a stale id is
+        # harmless for every other domain (disabling and re-enabling is
+        # fully reversible, no data loss). For `email` specifically it is
+        # not: `_disable_domain` cannot tell *which* consent triggered it,
+        # so it would disable and cascade-purge the *current*, freshly-
+        # resynced `email` state using an identifier that no longer names
+        # an active grant. A plain `AND revoked_at IS NULL` closed that
+        # window but broke a genuinely different, legitimate case: an
+        # `Idempotency-Key` retry of a revoke that already succeeded (no
+        # re-grant in between) -- round 9 review found the first successful
+        # call sets `revoked_at`, so the identical retry's own lookup
+        # (which runs *before* `_disable_domain`'s own idempotency-cache
+        # check even has a chance to fire) would 404 instead of returning
+        # the cached response. `NOT EXISTS (a later grant for this same
+        # domain)` distinguishes the two: a revoked consent with no
+        # subsequent re-grant still resolves normally (the retry reaches
+        # `_disable_domain`, which either serves the cache or safely no-ops
+        # via `if domain.enabled` -- domain is still disabled either way);
+        # only a revoked consent that a *later* grant has actually
+        # superseded is rejected, the same non-disclosing way every other
+        # lookup in this module already fails closed (`404 CONSENT_NOT_
+        # FOUND`).
         row = (
             session.execute(
                 text(
-                    "SELECT domain_key FROM domain_consents "
-                    "WHERE workspace_id = :workspace_id AND owner_id = :owner_id "
-                    "AND id = :id AND revoked_at IS NULL"
+                    """
+                    SELECT domain_key FROM domain_consents dc
+                    WHERE workspace_id = :workspace_id AND owner_id = :owner_id AND id = :id
+                      AND (
+                        revoked_at IS NULL
+                        OR NOT EXISTS (
+                          SELECT 1 FROM domain_consents newer
+                          WHERE newer.workspace_id = dc.workspace_id
+                            AND newer.owner_id = dc.owner_id
+                            AND newer.domain_key = dc.domain_key
+                            AND newer.granted_at > dc.revoked_at
+                        )
+                      )
+                    """
                 ),
                 {"workspace_id": auth.workspace_id, "owner_id": auth.user_id, "id": consent_id},
             )
