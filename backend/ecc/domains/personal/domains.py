@@ -747,7 +747,7 @@ def _disable_domain(
     """
     req_hash = request_hash(_EmptyBody(), f"disable_domain:{domain_key}")
     now = datetime.now(UTC)
-    pending_gmail_revoke: PendingGmailRevoke | None = None
+    pending_gmail_revokes: list[PendingGmailRevoke] = []
     with session.begin():
         lock_idempotency(session, auth, idempotency_key)
         cached = load_cached(session, auth, idempotency_key, req_hash, domain="personal_domains")
@@ -787,7 +787,7 @@ def _disable_domain(
             )
             version = domain.version + 1
             if domain_key == "email":
-                pending_gmail_revoke = cascade_email_revocation(session, auth, now)
+                pending_gmail_revokes = cascade_email_revocation(session, auth, now)
 
         refreshed = get_domain(session, auth, domain_key)
         assert refreshed is not None
@@ -812,9 +812,9 @@ def _disable_domain(
     # potentially slow, blocking network call -- see `gmail_revocation.py`'s
     # own module docstring for why, matching `connector_accounts.py:
     # disable_connector_endpoint`'s identical established split.
-    if pending_gmail_revoke is not None:
+    if pending_gmail_revokes:
         session.close()
-        finish_gmail_revocation(pending_gmail_revoke)
+        finish_gmail_revocation(pending_gmail_revokes)
     return response
 
 

@@ -52,9 +52,36 @@ credential decryption is fast and local, so it happens *inside* the
 caller's transaction; the actual outbound HTTPS call to Google's
 `/revoke` endpoint is slow and blocking, so it must happen only *after*
 that transaction commits and the session's pooled connection is released
--- `cascade_email_revocation` below returns the decrypted context for the
-caller to pass to `finish_gmail_revocation` post-commit, rather than
+-- `cascade_email_revocation` below returns the decrypted context(s) for
+the caller to pass to `finish_gmail_revocation` post-commit, rather than
 calling `disconnect()` itself.
+
+**Loop 2 round 1 review (PR #128) -- an owner can hold more than one
+`gmail` connector account.** `connector_accounts` has no owner-scoped
+uniqueness (only `uq_connector_accounts_workspace_provider_external_id`,
+scoped to `workspace_id`+`provider`+`external_account_id`, migration
+`0044`), and `gmail_oauth.py`'s OAuth-callback `INSERT` places no
+restriction on a second, distinct `external_account_id` for the same
+`owner_id` -- an owner who has connected two separate Google accounts has
+two simultaneously-`active` rows. The original version of this function
+used `.one_or_none()`, which raised `MultipleResultsFound` in that case,
+uncaught, aborting the entire cascade transaction with a 500 and leaving
+the email domain impossible to disable at all for that owner. Fixed by
+disconnecting every matching row, not just one -- matching the task's own
+"connector_accounts row(**s**)" (plural) language.
+
+**Loop 2 round 1 review (PR #128) -- `disable_connector_endpoint` was a
+third, cascade-bypassing write path.** `connector_accounts.py`'s generic,
+provider-agnostic `POST /connectors/{account_id}/disable` could disconnect
+a `gmail`-provider row (including revoking the live Google OAuth grant)
+without ever touching `personal_domains`/`domain_consents` or purging any
+of the data this module purges -- the exact "disconnected but data
+remains" state this task's own docstring above says is unreachable
+"through this path" was in fact reachable through a *different* path.
+Fixed by rejecting `gmail`-provider disables at that endpoint (`409
+GMAIL_MUST_DISABLE_VIA_DOMAIN_ENDPOINT`) and directing callers to the
+domain-level endpoints that funnel through this module instead, restoring
+the "one real write path" property for real.
 
 **What is deliberately NOT deleted.**
 - `pkos_nodes` (the resolved person entities themselves): `gmail_adapter.
@@ -103,7 +130,7 @@ _REDACTED_RATIONALE = "Source email no longer available -- email consent was rev
 
 def cascade_email_revocation(
     session: Session, auth: AuthContext, now: datetime
-) -> PendingGmailRevoke | None:
+) -> list[PendingGmailRevoke]:
     """Purges every email-derived record this owner's Gmail sync ever
     wrote and marks the owner's `gmail` connector account(s)
     `disconnected` -- called from within an already-open transaction, so
@@ -218,32 +245,56 @@ def cascade_email_revocation(
     # `connector_accounts.owner_id` (migration `0063`) is set explicitly
     # at write time by `gmail_oauth.py`'s own OAuth-callback `INSERT`
     # (the connecting user, `auth.user_id`), so it is reliable here too.
-    pending_revoke: PendingGmailRevoke | None = None
-    account_row = session.execute(
+    # `FOR UPDATE`: mirrors `connector_accounts.py:get_connector_account
+    # (..., for_update=True)`'s own established reason exactly (serializes
+    # a concurrent mutator of the same account -- e.g. a racing generic
+    # `disable_connector_endpoint` call, or another concurrent revocation
+    # request) -- Loop 2 round 1 review flagged this SELECT as an
+    # unacknowledged deviation from the pattern the module docstring says
+    # it matches "exactly". No matching rows is the common case (every
+    # domain-level disable/delete after the first already left the
+    # connector `disconnected`), not an error.
+    #
+    # `.all()`, not `.one_or_none()`: an owner has no per-owner uniqueness
+    # constraint on `provider = 'gmail'` (only `uq_connector_accounts_
+    # workspace_provider_external_id`, scoped by `external_account_id`,
+    # migration `0044`) and `gmail_oauth.py`'s OAuth callback places no
+    # restriction on a second, distinct external Google account for the
+    # same `owner_id` -- an owner who connected two separate Google
+    # accounts has two simultaneously non-`disconnected` rows here. Loop 2
+    # round 1 review found the original `.one_or_none()` raised `Multiple
+    # ResultsFound` in that case, uncaught, aborting this entire cascade
+    # (and the caller's whole disable/delete request) with a 500. Every
+    # matching row is disconnected below instead of just one, matching
+    # this task's own "connector_accounts row(**s**)" (plural) language.
+    account_rows = session.execute(
         text(
             "SELECT id, external_account_id FROM connector_accounts "
             "WHERE workspace_id = :workspace_id AND provider = 'gmail' "
-            "AND owner_id = :owner_id AND status != 'disconnected'"
+            "AND owner_id = :owner_id AND status != 'disconnected' "
+            "FOR UPDATE"
         ),
         params,
-    ).one_or_none()
-    if account_row is not None:
-        account_id, external_account_id = account_row
+    ).all()
+    pending_revokes: list[PendingGmailRevoke] = []
+    for account_id, external_account_id in account_rows:
         # Matches `connector_accounts.py:disable_connector_endpoint`'s
         # own established split exactly -- see module docstring.
         try:
             encrypted = _get_encrypted_credential(session, auth.workspace_id, account_id)
-            pending_revoke = (
-                _adapter,
-                ConnectorAccountContext(
-                    workspace_id=auth.workspace_id,
-                    connector_account_id=account_id,
-                    external_account_id=external_account_id,
-                    credential=decrypt_credential(encrypted),
-                ),
+            pending_revokes.append(
+                (
+                    _adapter,
+                    ConnectorAccountContext(
+                        workspace_id=auth.workspace_id,
+                        connector_account_id=account_id,
+                        external_account_id=external_account_id,
+                        credential=decrypt_credential(encrypted),
+                    ),
+                )
             )
         except Exception:  # noqa: BLE001 -- best-effort, never blocks the cascade
-            pending_revoke = None
+            pass
         session.execute(
             text(
                 "UPDATE connector_accounts SET status = 'disconnected', "
@@ -253,18 +304,19 @@ def cascade_email_revocation(
             {"now": now, "actor_id": auth.user_id, "id": account_id},
         )
 
-    return pending_revoke
+    return pending_revokes
 
 
-def finish_gmail_revocation(pending: PendingGmailRevoke | None) -> None:
+def finish_gmail_revocation(pending: list[PendingGmailRevoke]) -> None:
     """Call only after the transaction `cascade_email_revocation` ran
     inside has committed and the caller's session connection has been
-    released (`session.close()`) -- see module docstring.
+    released (`session.close()`) -- see module docstring. Revokes every
+    pending entry (an owner may have had more than one connected Gmail
+    account) -- each is independently best-effort, so one failing does not
+    stop the rest from being attempted.
     """
-    if pending is None:
-        return
-    adapter, context = pending
-    try:
-        adapter.disconnect(context)
-    except Exception:  # noqa: BLE001 -- best-effort revocation, never raises to the caller
-        pass
+    for adapter, context in pending:
+        try:
+            adapter.disconnect(context)
+        except Exception:  # noqa: BLE001 -- best-effort revocation, never raises to the caller
+            pass

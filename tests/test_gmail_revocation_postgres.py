@@ -30,6 +30,11 @@ Covers, in the same order these tests physically appear below:
    contract.
 8. Idempotency-key replay of `disable_domain_endpoint` returns the cached
    response without a second cascade run.
+9. An owner with *two* simultaneously-active `gmail` connector accounts
+   (no per-owner uniqueness on `provider = 'gmail'` -- only `external_
+   account_id` is unique) has both disconnected by one cascade run --
+   Loop 2 round 1 review finding: the original `.one_or_none()` raised
+   `MultipleResultsFound` here, aborting the entire cascade.
 """
 
 from collections.abc import Iterator
@@ -39,6 +44,7 @@ from hmac import new
 from typing import Any
 from uuid import UUID, uuid4
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 from identity_fixtures import create_identity
@@ -47,7 +53,8 @@ from sqlalchemy import text
 from ecc.config import get_settings
 from ecc.database import engine
 from ecc.domains.engineering.crypto import encrypt_credential
-from ecc.domains.personal.gmail_adapter import _pack_credential
+from ecc.domains.personal import gmail_revocation
+from ecc.domains.personal.gmail_adapter import GmailAdapter, _pack_credential
 from ecc.main import app
 
 settings = get_settings()
@@ -58,6 +65,24 @@ pytestmark = pytest.mark.skipif(
 
 _OWNER_EMAIL = "gmail-revocation-owner@example.test"
 _SENDER = "colleague@partner-co.test"
+
+
+def _revoke_transport() -> httpx.MockTransport:
+    """Every test below that reaches `GmailAdapter.disconnect` (via
+    `finish_gmail_revocation`, after the transaction commits) needs
+    Google's `/revoke` endpoint to return success -- without this, each
+    cascade test made a real, unmocked outbound HTTPS call to Google's
+    live endpoint (Loop 2 round 1 review finding). Unlike `test_gmail_
+    threads_postgres.py`'s own per-test transports (which vary message
+    content/failure behavior across tests), every cascade test here needs
+    identical revoke behavior, so this is installed once by the shared
+    `gmail_revocation_context` fixture below rather than per test.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={})
+
+    return httpx.MockTransport(handler)
 
 
 def _headers(token: str, key: str | None = None) -> dict[str, str]:
@@ -290,7 +315,8 @@ def _cleanup_workspace(workspace_id: UUID, *, email: str = _OWNER_EMAIL) -> None
 
 
 @pytest.fixture
-def gmail_revocation_context() -> Iterator[dict]:
+def gmail_revocation_context(monkeypatch: pytest.MonkeyPatch) -> Iterator[dict]:
+    monkeypatch.setattr(gmail_revocation, "_adapter", GmailAdapter(transport=_revoke_transport()))
     workspace_id = uuid4()
     owner_id = uuid4()
     account_id = uuid4()
@@ -386,6 +412,37 @@ def gmail_revocation_context() -> Iterator[dict]:
     finally:
         client.close()
         _cleanup_workspace(workspace_id)
+
+
+def _insert_gmail_connector_account(
+    connection, *, workspace_id: UUID, owner_id: UUID, external_account_id: str, now: datetime
+) -> UUID:
+    account_id = uuid4()
+    credential = _pack_credential("access-2", "refresh-2", now + timedelta(hours=1))
+    connection.execute(
+        text(
+            """
+            INSERT INTO connector_accounts (
+                id, workspace_id, provider, external_account_id, display_name,
+                granted_scopes, encrypted_credentials, status, version,
+                created_by, updated_by, created_at, updated_at, owner_id, visibility
+            ) VALUES (
+                :id, :workspace_id, 'gmail', :external_account_id, 'Second linked account',
+                ARRAY['https://www.googleapis.com/auth/gmail.readonly'], :encrypted,
+                'active', 1, :actor_id, :actor_id, :now, :now, :actor_id, 'workspace'
+            )
+            """
+        ),
+        {
+            "id": account_id,
+            "workspace_id": workspace_id,
+            "external_account_id": external_account_id,
+            "encrypted": encrypt_credential(credential),
+            "actor_id": owner_id,
+            "now": now,
+        },
+    )
+    return account_id
 
 
 def _row_count(table: str, workspace_id: UUID) -> int:
@@ -749,3 +806,37 @@ def test_disable_domain_idempotency_replay_does_not_rerun_cascade(
             {"workspace_id": ctx["workspace_id"], "id": thread_id},
         ).one_or_none()
     assert row is not None, "idempotency replay must not re-run the cascade"
+
+
+def test_disable_domain_with_multiple_connector_accounts_disconnects_all(
+    gmail_revocation_context: dict,
+) -> None:
+    """Loop 2 round 1 review finding: `connector_accounts` has no per-owner
+    uniqueness on `provider = 'gmail'` (only `external_account_id` is
+    unique), so an owner who connected two separate Google accounts has
+    two simultaneously-`active` rows. `cascade_email_revocation`'s
+    original `SELECT ... .one_or_none()` raised `MultipleResultsFound`
+    here, uncaught, aborting the entire disable request with a 500 --
+    proving that regression requires seeding a second row, which no other
+    test in this file does.
+    """
+    ctx = gmail_revocation_context
+    _seed_full_cascade_fixture(ctx)
+    with engine.begin() as connection:
+        second_account_id = _insert_gmail_connector_account(
+            connection,
+            workspace_id=ctx["workspace_id"],
+            owner_id=ctx["owner_id"],
+            external_account_id="second-google-account@example.test",
+            now=ctx["now"],
+        )
+
+    resp = ctx["client"].post(
+        "/api/v1/personal/domains/email/disable",
+        headers=_headers(ctx["token"], str(uuid4())),
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["enabled"] is False
+
+    assert _connector_status(ctx["workspace_id"], ctx["account_id"]) == "disconnected"
+    assert _connector_status(ctx["workspace_id"], second_account_id) == "disconnected"

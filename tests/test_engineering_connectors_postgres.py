@@ -1429,6 +1429,38 @@ def test_disable_invokes_adapter_disconnect(
     assert spy.disconnect_calls[0].connector_account_id == account_id
 
 
+def test_disable_rejects_gmail_provider_account(
+    engineering_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    """Loop 2 round 1 review finding (PR #128): this generic, provider-
+    agnostic endpoint only marks a row `disconnected` and clears synced
+    projections -- it never touches `personal_domains`/`domain_consents`
+    or purges the owner's Gmail-derived data (`ecc.domains.personal.
+    gmail_revocation`'s cascade). Disabling a `gmail`-provider account
+    through this path used to leave exactly the "disconnected but data
+    (and domain consent) remains" state Phase 10 Task 7 exists to make
+    unreachable. Now rejected outright, directing callers to the
+    domain-level endpoint (`POST /api/v1/personal/domains/email/disable`)
+    that actually reaches the cascade.
+    """
+    client, workspace_id, user_id, token = engineering_test_context
+    account_id = _insert_connector_account(workspace_id, user_id, provider="gmail")
+
+    response = client.post(
+        f"/api/v1/engineering/connectors/{account_id}/disable",
+        headers=_headers(token, key=str(uuid4())),
+    )
+    assert response.status_code == 409
+    assert response.json()["detail"] == "GMAIL_MUST_DISABLE_VIA_DOMAIN_ENDPOINT"
+
+    with engine.begin() as connection:
+        status = connection.execute(
+            text("SELECT status FROM connector_accounts WHERE id = :id"),
+            {"id": account_id},
+        ).scalar_one()
+    assert status == "active", "rejected disable must not mutate the account"
+
+
 def test_disable_succeeds_when_adapter_disconnect_raises(
     engineering_test_context: tuple[TestClient, UUID, UUID, str],
     monkeypatch: pytest.MonkeyPatch,

@@ -157,7 +157,7 @@ def export_domain_endpoint(
 
 def _delete_domain_data(
     session: Session, auth: AuthContext, domain_key: str, now: datetime
-) -> PendingGmailRevoke | None:
+) -> list[PendingGmailRevoke]:
     """Returns pending Google-side revoke info when `domain_key ==
     "email"` -- see `gmail_revocation.py`'s own module docstring. `now` is
     the caller's own single timestamp for this request, reused here so
@@ -214,7 +214,7 @@ def _delete_domain_data(
     # derived `attention_items`/`recommendations`/`pkos_evidence` row).
     if domain_key == "email":
         return cascade_email_revocation(session, auth, now)
-    return None
+    return []
 
 
 @router.post("/domains/{domain_key}/delete", response_model=DomainDeletionResponse)
@@ -236,7 +236,7 @@ def delete_domain_endpoint(
     """
     req_hash = request_hash(_EmptyBody(), f"delete_domain:{domain_key}")
     now = datetime.now(UTC)
-    pending_gmail_revoke: PendingGmailRevoke | None = None
+    pending_gmail_revokes: list[PendingGmailRevoke] = []
     with session.begin():
         lock_idempotency(session, auth, idempotency_key)
         cached = load_cached(
@@ -249,7 +249,7 @@ def delete_domain_endpoint(
         if domain is None:
             raise HTTPException(status_code=404, detail="DOMAIN_NOT_FOUND")
 
-        pending_gmail_revoke = _delete_domain_data(session, auth, domain_key, now)
+        pending_gmail_revokes = _delete_domain_data(session, auth, domain_key, now)
 
         session.execute(
             text(
@@ -311,7 +311,7 @@ def delete_domain_endpoint(
     # potentially slow, blocking network call -- see `gmail_revocation.py`'s
     # own module docstring, matching `domains.py:_disable_domain`'s
     # identical shape for the same reason.
-    if pending_gmail_revoke is not None:
+    if pending_gmail_revokes:
         session.close()
-        finish_gmail_revocation(pending_gmail_revoke)
+        finish_gmail_revocation(pending_gmail_revokes)
     return response

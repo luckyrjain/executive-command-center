@@ -1515,6 +1515,22 @@ def disable_connector_endpoint(
         account = get_connector_account(session, auth.workspace_id, account_id, for_update=True)
         if account is None:
             raise HTTPException(status_code=404, detail="CONNECTOR_NOT_FOUND")
+        if account.provider == "gmail":
+            # Loop 2 round 1 review (PR #128): this endpoint is a generic,
+            # provider-agnostic connector-level disable -- it only marks
+            # the row `disconnected` and clears synced projections, and
+            # never touches `personal_domains`/`domain_consents` or
+            # purges the owner's Gmail-derived data (`gmail_revocation.
+            # py`'s cascade). For every other provider that is correct
+            # (disable retains previously-synced data, `CONNECTOR-
+            # CONTRACT.md`); for `gmail` specifically it would leave a
+            # real "disconnected but data (and domain consent) remains"
+            # state reachable through this endpoint -- exactly what
+            # `gmail_revocation.py`'s own module docstring says is
+            # unreachable "through this path", except this was a
+            # different path. Route callers to the domain-level endpoint,
+            # which reaches the cascade via `domains.py:_disable_domain`.
+            raise HTTPException(status_code=409, detail="GMAIL_MUST_DISABLE_VIA_DOMAIN_ENDPOINT")
 
         if account.status != "disconnected":
             adapter = connector_registry.get(account.provider)

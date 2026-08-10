@@ -2,7 +2,7 @@
 id: PHASE-010-PRIVACY-CONSENT-CONTRACT
 title: Phase 10 Gmail Privacy and Consent Contract
 status: Approved for Implementation
-version: 1.3.0
+version: 1.3.1
 owner: Lucky Jain
 depends_on:
   - PHASE-010
@@ -69,7 +69,13 @@ destroy state a different owner or domain still depends on; only the
 evidence pointing at it is removed. This is the single action the plan's
 own Task 7 bullet describes: revoking consent, disconnecting Google, and
 purging every email-derived record all happen together, with no code path
-that does only one of the three.
+that does only one of the three -- including the generic engineering
+`POST /connectors/{account_id}/disable` endpoint, which could disconnect
+a `gmail`-provider account (and revoke the live Google grant) without
+touching `personal_domains`/data at all until Loop 2 round 1 review found
+it and closed it (that endpoint now rejects `gmail`-provider accounts
+outright, `409 GMAIL_MUST_DISABLE_VIA_DOMAIN_ENDPOINT`, directing callers
+to the domain-level endpoints above).
 
 **"Retryable" is the existing idempotency-key mechanism, not a new
 `deletion_jobs` state.** Every step above runs inside the same transaction
@@ -135,3 +141,4 @@ Gmail is internal-development only.
 | 1.1.0 | 2026-08-06 | Task 5 review (Loop 2 round 16): documented Task 5's body population and on-demand AI body access (`email.get_thread_content`), moved out of "Planned"; this document had gone stale after Tasks 3-5 shipped without a contract-version update | Lucky Jain |
 | 1.2.0 | 2026-08-06 | Task 6: documented on-demand human-facing thread reading and per-thread "forget this," explicitly scoped narrower than Task 7's own eventual revocation cascade | Lucky Jain |
 | 1.3.0 | 2026-08-10 | Task 7: documented the consent revocation cascade (disconnect + domain-wide purge, one action), moved it out of "Unsupported"/"Planned" into "Current controls"; only Task 8's export/audit-event/retention items remain planned | Lucky Jain |
+| 1.3.1 | 2026-08-10 | Task 7 Loop 2 round 1 review: documented and closed a cascade-bypassing third write path (the generic engineering connector-disable endpoint) and the multi-connector-account cascade crash | Lucky Jain |
