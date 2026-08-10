@@ -2,7 +2,7 @@
 id: PHASE-010-API-SCHEMAS
 title: Phase 10 Gmail API Schemas
 status: Approved for Implementation
-version: 1.2.6
+version: 1.2.7
 owner: Lucky Jain
 depends_on:
   - PHASE-010
@@ -176,7 +176,13 @@ request-hash *mismatch*; see `docs/domain/API-CONTRACTS.md`). This is
 "Reusing the same `Idempotency-Key`..." sections for why). See
 `PRIVACY-CONSENT-CONTRACT.md`'s own "Consent revocation cascade (Task 7)"
 section for the full cascade description and why "retry" needed no new
-`deletion_jobs` schema.
+`deletion_jobs` schema. `POST /api/v1/engineering/connectors/{id}/disable`
+(the generic, provider-agnostic endpoint documented above) has the
+identical `409 IDEMPOTENCY_CONFLICT`-on-reconnect behavior for any
+account whose `Idempotency-Key` is reused after it stops being
+`disconnected` in the interim -- in practice reachable only via a `gmail`
+account's OAuth reconnect, since no other provider has a way to leave
+`disconnected` once entered (Loop 2 round 27 review).
 
 ## Planned APIs
 
@@ -196,3 +202,4 @@ response extensions.
 | 1.2.4 | 2026-08-10 | Task 7 Loop 2 round 9 review: corrected the round-8 revoke row -- the plain `revoked_at IS NULL` check broke legitimate `Idempotency-Key` retries; replaced with a check for a later superseding grant | Lucky Jain |
 | 1.2.5 | 2026-08-10 | Task 7 Loop 2 round 23 review: documented the new `409 IDEMPOTENCY_CONFLICT` behavior (rounds 21-22) for `disable`/`delete`/`revoke` on a same-hash `Idempotency-Key` reused after a genuine domain re-enable or Gmail OAuth reconnect -- this file had gone stale since round 9, never updated for either round | Lucky Jain |
 | 1.2.6 | 2026-08-10 | Task 7 Loop 2 round 25 review (MEDIUM): documented that the generic `/disable` endpoint's `gmail`-provider rejection now also requires the owner to have a `personal_domains` row for `email`, falling through to the ordinary disconnect otherwise | Lucky Jain |
+| 1.2.7 | 2026-08-10 | Task 7 Loop 2 round 27 review (MEDIUM-HIGH): documented that the generic `/disable` endpoint also now returns `409 IDEMPOTENCY_CONFLICT` for a reused `Idempotency-Key` if the account is no longer `disconnected` when replayed -- reachable only via a `gmail` OAuth reconnect, since no other provider has a way to leave `disconnected` | Lucky Jain |

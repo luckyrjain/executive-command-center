@@ -2,7 +2,7 @@
 id: PHASE-010-PRIVACY-CONSENT-CONTRACT
 title: Phase 10 Gmail Privacy and Consent Contract
 status: Approved for Implementation
-version: 1.4.4
+version: 1.4.5
 owner: Lucky Jain
 depends_on:
   - PHASE-010
@@ -214,7 +214,8 @@ invalidate a stale cached response, round 22 review.** `gmail_oauth.py:
 gmail_oauth_callback_endpoint` -- the sole reconnect path for a `gmail`-
 provider `connector_accounts` row (the generic engineering connector-
 create endpoint never registers `gmail`; the generic disable endpoint
-rejects it outright) -- reactivates that row straight back to `status=
+rejects it when the owner has a `personal_domains` row for `email`, round
+25 review) -- reactivates that row straight back to `status=
 'active'` with zero reference to `personal_domains`/`domain_consents`.
 A real disable/delete followed by a genuine reconnect through that
 unrelated OAuth flow (no domain re-enable at all) left `domain.enabled`
@@ -247,6 +248,19 @@ asymmetry was itself the tell. Fixed by triggering the cascade on
 `domain.enabled or reconnected` (the same check rounds 21-22
 introduced), not merely `domain.enabled`, matching `_delete_domain_
 data`'s own unconditional shape.
+
+**The generic engineering `/disable` endpoint had the identical stale-
+cache-after-reconnect gap rounds 21-22 closed for the domain-level
+endpoints, round 27 review.** `disable_connector_endpoint`'s own
+idempotency cache-hit check (added round 1 for this endpoint's `gmail`-
+specific guard) returned the first call's cached `"disconnected"`
+response unconditionally, with no re-check of the account's current
+state -- so a real disable, followed by a genuine Gmail reconnect (same
+row, same `id`), followed by the same `Idempotency-Key` replayed against
+this endpoint, served the stale cached success while the account stayed
+live, still syncing, with an unrevoked Google grant. Fixed the same way
+as rounds 21-22: reject a cache hit with `409 IDEMPOTENCY_CONFLICT`
+whenever the account is no longer `disconnected`.
 
 ### On-demand thread reading and per-thread "forget" (Tasks 5-6)
 
@@ -313,3 +327,4 @@ Gmail is internal-development only.
 | 1.4.2 | 2026-08-10 | Task 7 Loop 2 round 22 review: `domain.enabled` alone (round 21) was not sufficient -- a genuine Gmail reconnect through the separate OAuth callback flow also needed to invalidate a cached idempotency response, since that flow never touches `personal_domains`/`domain_consents` at all; widened the cache-hit check to also detect a reactivated `gmail` connector account | Lucky Jain |
 | 1.4.3 | 2026-08-10 | Task 7 Loop 2 round 24 review (HIGH): a genuinely fresh (non-replayed) disable request against an already-disabled domain was unconditionally a no-op, even with a Gmail account reconnected in the meantime -- `cascade_email_revocation` is now triggered on `domain.enabled or reconnected`, not merely `domain.enabled`, matching `delete_domain_endpoint`'s own already-unconditional cascade call | Lucky Jain |
 | 1.4.4 | 2026-08-10 | Task 7 Loop 2 round 25 review (MEDIUM): the generic engineering `/disable` endpoint's `gmail`-provider rejection is now gated on the owner having a `personal_domains` row for `email` at all -- without it, an OAuth-connected owner who never enabled the `email` domain had no HTTP-reachable way to disconnect their `gmail` account, since the domain-level endpoints 404 for them too | Lucky Jain |
+| 1.4.5 | 2026-08-10 | Task 7 Loop 2 round 27 review (MEDIUM-HIGH): the generic engineering `/disable` endpoint now also rejects a reused `Idempotency-Key` with `409 IDEMPOTENCY_CONFLICT` if the account is no longer `disconnected` when replayed -- the same stale-cache-after-reconnect gap rounds 21-22 closed for the domain-level endpoints, never propagated to this sibling endpoint | Lucky Jain |
