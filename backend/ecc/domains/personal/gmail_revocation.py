@@ -365,12 +365,15 @@ def cascade_email_revocation(
                 {"workspace_id": auth.workspace_id, "refs": refs},
             )
 
-    # `email_messages` before `email_threads` -- Task 1's own migration
-    # `0069` leaves the child->parent relationship with no `ondelete`
-    # cascade (matching every other Phase 7 domain's own explicit-order
-    # convention, `export_deletion.py:_CHILD_TABLES_DELETE_ORDER`, rather
-    # than relying on a cascade), so the order here is what keeps this
-    # FK-safe.
+    # `email_messages` before `email_threads` (Loop 2 round 35 review:
+    # corrected -- migration `0069`'s `email_messages -> email_threads` FK
+    # already has `ondelete="CASCADE"`, confirmed live against Postgres, so
+    # a plain `DELETE FROM email_threads` alone would already cascade this
+    # away; both statements are redundant-but-harmless given the real
+    # cascade). Explicit child-before-parent order kept anyway, matching
+    # every other Phase 7 domain's own explicit-order convention
+    # (`export_deletion.py:_CHILD_TABLES_DELETE_ORDER`) for defense-in-
+    # depth and readability, not because it's load-bearing here.
     session.execute(
         text(
             "DELETE FROM email_messages WHERE workspace_id = :workspace_id AND owner_id = :owner_id"
