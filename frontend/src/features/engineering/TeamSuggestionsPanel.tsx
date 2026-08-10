@@ -31,10 +31,11 @@ function createTeamEntity(canonicalName: string): Promise<KnowledgeEntity> {
 }
 
 /**
- * One group's row: bulk-confirm (via a team picker) or bulk-dismiss every
- * `repositories`/`engineering_work_items` row sharing this `suggested_
- * team_name`. See `docs/superpowers/specs/2026-08-06-team-suggestions-
- * review-page-design.md`'s "Frontend" section.
+ * One group's row: bulk-confirm (via a team picker), bulk-confirm (via
+ * inline create), or bulk-dismiss every `repositories`/`engineering_work_items`
+ * row sharing this `suggested_team_name`. See `docs/superpowers/specs/2026-08-06-
+ * team-suggestions-review-page-design.md` and `docs/superpowers/specs/2026-08-10-
+ * team-suggestions-inline-create-design.md`.
  */
 function SuggestionRow({ group, teamsById }: { group: TeamSuggestionGroup; teamsById: Map<string, string> }) {
   const queryClient = useQueryClient()
@@ -67,6 +68,8 @@ function SuggestionRow({ group, teamsById }: { group: TeamSuggestionGroup; teams
       void queryClient.invalidateQueries({ queryKey: ['knowledge', 'entities', 'team'] })
     },
     onError: () => {
+      // When create succeeds but confirm fails, the created team entity is orphaned but real.
+      // Invalidate the entities query so the newly created team appears in the dropdown for retry.
       void queryClient.invalidateQueries({ queryKey: ['knowledge', 'entities', 'team'] })
     },
   })
@@ -167,7 +170,7 @@ export default function TeamSuggestionsPanel() {
       {teamsQuery.isLoading ? <p role="status">Loading teams…</p> : null}
       {teamsQuery.isError ? (
         <div role="alert" className="inline-status error-panel">
-          {`Could not load teams to assign: ${teamsQuery.error.message}. Confirm is unavailable until this loads -- Dismiss still works.`}
+          {`Could not load teams to assign: ${teamsQuery.error.message}. Confirm is unavailable until this loads -- Create & confirm and Dismiss still work.`}
         </div>
       ) : null}
 
