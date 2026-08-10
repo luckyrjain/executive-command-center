@@ -131,13 +131,14 @@ _REDACTED_RATIONALE = "Source email no longer available -- email consent was rev
 def cascade_email_revocation(
     session: Session, auth: AuthContext, now: datetime
 ) -> list[PendingGmailRevoke]:
-    """Purges every email-derived record this owner's Gmail sync ever
-    wrote and marks the owner's `gmail` connector account(s)
-    `disconnected` -- called from within an already-open transaction, so
-    every write here commits or rolls back atomically with whatever
-    domain-level state change triggered it. Returns pending Google-side
-    revoke info for the caller to pass to `finish_gmail_revocation` after
-    that transaction commits (see module docstring).
+    """Purges this owner's email-derived records (subject to the three
+    deliberate exceptions the module docstring's "What is deliberately
+    NOT deleted" section names) and marks the owner's `gmail` connector
+    account(s) `disconnected` -- called from within an already-open
+    transaction, so every write here commits or rolls back atomically
+    with whatever domain-level state change triggered it. Returns pending
+    Google-side revoke info for the caller to pass to `finish_gmail_
+    revocation` after that transaction commits (see module docstring).
     """
     params = {"workspace_id": auth.workspace_id, "owner_id": auth.user_id}
 

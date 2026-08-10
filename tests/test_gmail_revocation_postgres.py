@@ -332,16 +332,16 @@ def _insert_recommendation(
     return recommendation_id
 
 
-def _cleanup_workspace(workspace_id: UUID, *, emails: list[str] | None = None) -> None:
-    """`emails` defaults to just `_OWNER_EMAIL`; tests that seed a second
-    owner (Loop 2 round 4-5's cross-owner tests) pass that owner's own
-    email too via `ctx["extra_owner_emails"]`, appended by the test itself
-    -- must happen here, in the SAME transaction sequence as the
-    workspace-scoped `users` deletion below, not inline in the test body:
-    `accounts` has a `RESTRICT` FK from `users` (`fk_users_account`), so
-    deleting a second owner's `accounts` row before their own `users` row
-    is gone raises `RestrictViolation` (Loop 2 round 6 review: CI caught
-    this exact ordering bug in the original version of this fix).
+def _cleanup_workspace(workspace_id: UUID, *, emails: list[str]) -> None:
+    """`emails` is `[_OWNER_EMAIL, *ctx["extra_owner_emails"]]` -- tests
+    that seed a second owner (Loop 2 round 4-5's cross-owner tests) append
+    that owner's own email to `extra_owner_emails` themselves. Cleanup
+    must happen here, in the SAME transaction sequence as the workspace-
+    scoped `users` deletion below, not inline in the test body: `accounts`
+    has a `RESTRICT` FK from `users` (`fk_users_account`), so deleting a
+    second owner's `accounts` row before their own `users` row is gone
+    raises `RestrictViolation` (Loop 2 round 6 review: CI caught this
+    exact ordering bug in the original version of this fix).
     """
     with engine.begin() as connection:
         for table in (
@@ -379,7 +379,7 @@ def _cleanup_workspace(workspace_id: UUID, *, emails: list[str] | None = None) -
         # (workspace-scoped, deleted above) is gone.
         connection.execute(
             text("DELETE FROM accounts WHERE email = ANY(:emails)"),
-            {"emails": emails if emails is not None else [_OWNER_EMAIL]},
+            {"emails": emails},
         )
 
 
