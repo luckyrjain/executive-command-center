@@ -258,6 +258,12 @@ _WORKSPACE_ID_TABLES: tuple[str, ...] = (
     # PR's own CI run against the email_messages table).
     "email_threads",
     "email_messages",
+    # Phase 10 Task 7 Loop 2 round 8 review (migration 0076) --
+    # email_message_id_purge_log, also workspace-scoped; seeded here from
+    # day one for the same reason as email_threads/email_messages above,
+    # closing this exact gap before it repeats a twentieth time (found on
+    # this same PR's own CI run against this table).
+    "email_message_id_purge_log",
 )
 # `workspaces` is scoped by its own `id`, not a `workspace_id` column.
 _WORKSPACE_TABLE = "workspaces"
@@ -2830,6 +2836,36 @@ def _seed_personal(cur: psycopg.Cursor[Any], label: str, ids: Mapping[str, UUID]
             "external_message_id": f"acceptance-message-{label}",
             "sender": f"sender-{label}@example.test",
             "recipients": [f"{label}@example.test"],
+            "now": SEED_EPOCH,
+        },
+    )
+
+    # `email_message_id_purge_log` (Phase 10 Task 7 Loop 2 round 8 review,
+    # migration `0076`), workspace-scoped like every table above. This
+    # exact gap (a new workspace-scoped table with no seed row here) was
+    # found by this same PR's own CI run, failing `verify_restore.sh`'s
+    # generic workspace-isolation check -- closed here the same way every
+    # prior phase's own identical gap was. Reuses this same fixture's own
+    # `external_message_id` string (`gmail_revocation.cascade_email_
+    # revocation` writes one such row per id it processes, using the
+    # owner's own connected Gmail message ids) -- this row is never read
+    # by anything except the ambiguity-check query itself, so it only
+    # needs to prove the table round-trips through backup/restore and
+    # stays workspace-isolated, the same reasoning `_seed_invitations`'s
+    # own docstring below gives for its own new-table seed row.
+    cur.execute(
+        """
+        INSERT INTO email_message_id_purge_log (
+            workspace_id, external_message_id, owner_id, purged_at
+        ) VALUES (
+            %(workspace_id)s, %(external_message_id)s, %(owner_id)s, %(now)s
+        )
+        ON CONFLICT (workspace_id, external_message_id, owner_id) DO NOTHING
+        """,
+        {
+            "workspace_id": ids["workspace"],
+            "external_message_id": f"acceptance-message-{label}",
+            "owner_id": ids["user"],
             "now": SEED_EPOCH,
         },
     )

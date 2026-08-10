@@ -37,6 +37,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from ecc.auth import AuthContext, AuthDep, CsrfDep
+from ecc.observability import record_idempotency_conflict
 
 from .domains import (
     DomainKey,
@@ -49,6 +50,7 @@ from .domains import (
     request_hash,
     store_idempotency,
 )
+from .gmail_revocation import PendingGmailRevoke, cascade_email_revocation, finish_gmail_revocation
 
 router = APIRouter(prefix="/api/v1/personal", tags=["personal"])
 
@@ -154,7 +156,16 @@ def export_domain_endpoint(
     )
 
 
-def _delete_domain_data(session: Session, auth: AuthContext, domain_key: str) -> None:
+def _delete_domain_data(
+    session: Session, auth: AuthContext, domain_key: str, now: datetime
+) -> list[PendingGmailRevoke]:
+    """Returns pending Google-side revoke info when `domain_key ==
+    "email"` -- see `gmail_revocation.py`'s own module docstring. `now` is
+    the caller's own single timestamp for this request, reused here so
+    every row this cascade touches shares the identical `updated_at`/
+    `disconnected_at` moment the rest of `delete_domain_endpoint`'s own
+    writes use.
+    """
     params = {"workspace_id": auth.workspace_id, "owner_id": auth.user_id, "domain_key": domain_key}
     for table in _CHILD_TABLES_DELETE_ORDER:
         session.execute(
@@ -197,6 +208,18 @@ def _delete_domain_data(session: Session, auth: AuthContext, domain_key: str) ->
         params,
     )
 
+    # Phase 10 Task 7: `email` is the one domain whose deletion needs to
+    # reach beyond this module's own generic tables -- see `gmail_
+    # revocation.py`'s own module docstring for the full cascade (Gmail
+    # connector disconnect, `email_threads`/`email_messages`, and the
+    # owner's own `attention_items`/`recommendations`/`pkos_evidence`,
+    # subject to that function's own three deliberate exceptions, e.g. an
+    # evidence row whose id collides with a different owner's own
+    # message is left alone rather than purged).
+    if domain_key == "email":
+        return cascade_email_revocation(session, auth, now)
+    return []
+
 
 @router.post("/domains/{domain_key}/delete", response_model=DomainDeletionResponse)
 def delete_domain_endpoint(
@@ -217,19 +240,74 @@ def delete_domain_endpoint(
     """
     req_hash = request_hash(_EmptyBody(), f"delete_domain:{domain_key}")
     now = datetime.now(UTC)
+    pending_gmail_revokes: list[PendingGmailRevoke] = []
     with session.begin():
         lock_idempotency(session, auth, idempotency_key)
+
+        # `for_update=True` (Loop 2 round 11 review finding, corrected round
+        # 12): serializes this whole read-cascade-write sequence against
+        # `_enable_domain`'s own `existing = get_domain(..., for_update=
+        # True)` on the same row, so a concurrent `POST /consents` re-grant
+        # can never interleave with (only ever precede or follow) this
+        # endpoint's own reads and writes. It does NOT reject the delete if
+        # a re-grant won the race and committed first: unlike `revoke_
+        # consent_endpoint`, this endpoint carries no caller-supplied
+        # `consent_id` to re-validate freshness against (see `_disable_
+        # domain`'s own docstring on why that check only runs when one is
+        # given), so a delete that loses the race to a fresh re-grant still
+        # proceeds -- purging the freshly-synced data and revoking the new
+        # consent, with no error surfaced. This is the same, already-
+        # accepted self-race behavior `disable_domain_endpoint` has always
+        # had when called without a `consent_id` (see `_disable_domain`'s
+        # docstring); it is not a new gap this lock closes, only a lost-
+        # update/torn-read hazard within the sequence itself.
+        #
+        # Fetched ahead of `load_cached` (Loop 2 round 21 review finding,
+        # MEDIUM-HIGH, mirroring `_disable_domain`'s identical fix): an
+        # `Idempotency-Key` reused across a real delete -> re-enable/resync
+        # -> delete-again sequence used to match the *first* call's cached
+        # row (`req_hash` depends only on `domain_key`, and idempotency
+        # records live 365 days) and return its stale "completed" response
+        # immediately, without ever reaching `_delete_domain_data` again --
+        # silently no-oping the second, real purge while telling the caller
+        # it succeeded.
+        domain = get_domain(session, auth, domain_key, for_update=True)
+        if domain is None:
+            raise HTTPException(status_code=404, detail="DOMAIN_NOT_FOUND")
+
         cached = load_cached(
             session, auth, idempotency_key, req_hash, domain="personal_domain_deletion"
         )
         if cached is not None:
+            # `domain.enabled` alone is necessary but not sufficient --
+            # Loop 2 round 22 review finding (MEDIUM-HIGH), mirroring
+            # `_disable_domain`'s identical fix: `gmail_oauth.py:
+            # gmail_oauth_callback_endpoint` reactivates a `connector_
+            # accounts` row straight back to `status='active'` with no
+            # reference to `personal_domains`/`domain_consents` at all, so
+            # a real delete -> a genuine Gmail reconnect through that
+            # unrelated OAuth flow -> the same `Idempotency-Key` replayed
+            # here still found `domain.enabled is False` and silently
+            # served the stale cached "completed" response, leaving the
+            # freshly-reconnected connector row untouched.
+            reconnected = (
+                domain_key == "email"
+                and session.execute(
+                    text(
+                        "SELECT 1 FROM connector_accounts WHERE workspace_id = :workspace_id "
+                        "AND provider = 'gmail' AND owner_id = :owner_id "
+                        "AND status != 'disconnected' LIMIT 1"
+                    ),
+                    {"workspace_id": auth.workspace_id, "owner_id": auth.user_id},
+                ).first()
+                is not None
+            )
+            if domain.enabled or reconnected:
+                record_idempotency_conflict("personal_domain_deletion")
+                raise HTTPException(status_code=409, detail="IDEMPOTENCY_CONFLICT")
             return DomainDeletionResponse.model_validate(cached)
 
-        domain = get_domain(session, auth, domain_key)
-        if domain is None:
-            raise HTTPException(status_code=404, detail="DOMAIN_NOT_FOUND")
-
-        _delete_domain_data(session, auth, domain_key)
+        pending_gmail_revokes = _delete_domain_data(session, auth, domain_key, now)
 
         session.execute(
             text(
@@ -285,4 +363,13 @@ def delete_domain_endpoint(
         store_idempotency(
             session, auth, idempotency_key, req_hash, response.model_dump(mode="json"), now
         )
-        return response
+
+    # Transaction above has committed. Release `session`'s pooled
+    # connection before the deferred, best-effort Google-side revoke's
+    # potentially slow, blocking network call -- see `gmail_revocation.py`'s
+    # own module docstring, matching `domains.py:_disable_domain`'s
+    # identical shape for the same reason.
+    if pending_gmail_revokes:
+        session.close()
+        finish_gmail_revocation(pending_gmail_revokes)
+    return response

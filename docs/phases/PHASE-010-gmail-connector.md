@@ -2,7 +2,7 @@
 id: PHASE-010
 title: Gmail Connector
 status: Approved for Implementation
-version: 0.4.4
+version: 0.4.8
 owner: Lucky Jain
 depends_on:
   - PHASE-001
@@ -28,7 +28,7 @@ contracts:
 
 ## Approved decisions
 
-Status moved from Draft after resolving `docs/superpowers/specs/2026-08-04-phase-10-gmail-connector-design.md`'s five decisions (connector mechanics/Protocol extension; privacy/consent model; OAuth scope, verification reality and rollout gating; `recommendations` create-path extension and AI-tool safety rubric; attention/knowledge integration), reached through direct discussion with the repository owner. In summary: the `ConnectorAdapter` Protocol gains its first OAuth2-authorization-code-grant shape (`get_authorization_url`/`handle_oauth_callback`) and its first re-invocable windowed `backfill`, composing Phase 6's connector mechanics with Phase 7's consent/encryption/deletion framework for the first time; a new `email` `personal_domains` entry at the `high_stakes` tier owns dedicated `email_threads`/`email_messages` tables, encrypted with Phase 7's existing personal-data key while the OAuth token itself uses Phase 6's existing connector-token key; shipping is restricted to an application-enforced internal-user allowlist, which is the actual mechanism keeping this phase outside Google's CASA security-assessment requirement (verified directly against Google's own OAuth verification docs, not assumed); `recommendations`' `execute_target()` gains a `"create"` operation reusing the existing per-resource `Create` models, giving the long-unused `source="ai"` field its first real populator; and email-derived attention items reuse Phase 3's existing deterministic ingestion path, not a new AI-runtime task type. Implementation plan: `docs/superpowers/plans/2026-08-04-phase-10-gmail-connector.md`. Delivery status: Tasks 1-6 (OAuth2 connector framework, internal allowlist, 30-day backfill, incremental history sync, deduplication, participant entity linking, deterministic awaiting-reply attention integration, the governed recommendations create path, the `email.detect_action` AI-runtime action-detection tool, and on-demand human-facing thread reading plus a per-thread "forget this" deletion control) are complete. Tasks 7-8 remain open; see `docs/phases/phase-010/IMPLEMENTATION-STATUS.md`.
+Status moved from Draft after resolving `docs/superpowers/specs/2026-08-04-phase-10-gmail-connector-design.md`'s five decisions (connector mechanics/Protocol extension; privacy/consent model; OAuth scope, verification reality and rollout gating; `recommendations` create-path extension and AI-tool safety rubric; attention/knowledge integration), reached through direct discussion with the repository owner. In summary: the `ConnectorAdapter` Protocol gains its first OAuth2-authorization-code-grant shape (`get_authorization_url`/`handle_oauth_callback`) and its first re-invocable windowed `backfill`, composing Phase 6's connector mechanics with Phase 7's consent/encryption/deletion framework for the first time; a new `email` `personal_domains` entry at the `high_stakes` tier owns dedicated `email_threads`/`email_messages` tables, encrypted with Phase 7's existing personal-data key while the OAuth token itself uses Phase 6's existing connector-token key; shipping is restricted to an application-enforced internal-user allowlist, which is the actual mechanism keeping this phase outside Google's CASA security-assessment requirement (verified directly against Google's own OAuth verification docs, not assumed); `recommendations`' `execute_target()` gains a `"create"` operation reusing the existing per-resource `Create` models, giving the long-unused `source="ai"` field its first real populator; and email-derived attention items reuse Phase 3's existing deterministic ingestion path, not a new AI-runtime task type. Implementation plan: `docs/superpowers/plans/2026-08-04-phase-10-gmail-connector.md`. Delivery status: Tasks 1-7 (OAuth2 connector framework, internal allowlist, 30-day backfill, incremental history sync, deduplication, participant entity linking, deterministic awaiting-reply attention integration, the governed recommendations create path, the `email.detect_action` AI-runtime action-detection tool, on-demand human-facing thread reading plus a per-thread "forget this" deletion control, and the consent revocation cascade) are complete. Task 8 remains open; see `docs/phases/phase-010/IMPLEMENTATION-STATUS.md`.
 
 **Disclosed, not yet resolved, per the design doc's own "not yet decided" note:** incremental-sync transport (polling assumed, Cloud Pub/Sub push not yet committed to) and whether `httpx` alone (vs. Google's official client library) suffices are both defaults carried into the implementation plan, not explicit repository-owner sign-off in the same form as the five decisions above.
 
@@ -51,7 +51,7 @@ Users see which emails imply a reply, a task or a commitment without manually re
 - `recommendations`' `execute_target()` extended with a `"create"` operation (today it only updates existing rows), reusing the existing `TaskCreate`/`CommitmentCreate`/`RiskCreate` request models as the create-recommendation's proposed-fields payload.
 - `ConnectorAdapter` Protocol extended: `authorize()` split into `get_authorization_url()`/`handle_oauth_callback()` for true 3-legged OAuth2 (no existing adapter needed this — all are PAT-based); `backfill()` gains an optional bounded window parameter.
 - Sender/recipient resolution into `pkos_nodes` via Phase 2's existing entity resolution.
-- Revoking the `email` domain's consent disconnects the OAuth connector and purges all synced content via Phase 7's existing deletion-job pipeline, in one action.
+- Revoking the `email` domain's consent disconnects the OAuth connector and purges all synced content (subject to the three narrow, deliberate exceptions `PRIVACY-CONSENT-CONTRACT.md`'s Task 7 section names) via Phase 7's existing deletion-job pipeline, in one action.
 - A `GmailPanel` inside the existing `PersonalWorkspace` shell; `RecommendationPanel` extended to render and confirm create-type proposals.
 
 ## Out of scope
@@ -62,7 +62,7 @@ Any Gmail write action (compose, reply, send, archive, label-modify) this phase.
 
 ## Functional requirements
 
-- Gmail sync of any kind requires an active `domain_consents` row for the `email` domain; revoking it halts sync, disconnects the OAuth grant and deletes synced content.
+- Gmail sync of any kind requires an active `domain_consents` row for the `email` domain; revoking it halts sync, disconnects the OAuth grant and deletes synced content (subject to the three narrow, deliberate exceptions `PRIVACY-CONSENT-CONTRACT.md`'s Task 7 section names).
 - Only an account on the internal allowlist (config-driven) may initiate the Gmail OAuth flow at all. As built: `authorize()` is never called for `gmail` at all, and `get_authorization_url()`'s own fixed signature carries no account/email argument to check -- the caller-side allowlist check lives in `gmail_oauth.py`'s router (pre-redirect, against the caller's own account email) and again, authoritatively, inside `handle_oauth_callback` (post-exchange, against the actual Google account).
 - Every synced message body is Fernet-encrypted at rest using the existing `ECC_PERSONAL_DATA_ENCRYPTION_KEY` (Phase 7); the Gmail OAuth access/refresh tokens themselves use the existing `ECC_CONNECTOR_TOKEN_ENCRYPTION_KEY` (Phase 6) — two already-approved keys used for their already-established purposes, no new key.
 - Every AI-proposed task/commitment/risk requires explicit human confirmation via the extended `recommendations` flow before any row is created; nothing is written automatically.
@@ -92,7 +92,7 @@ New `GmailPanel` inside `PersonalWorkspace`, alongside `DomainsPanel`/`RecordsPa
 
 ## Security and privacy
 
-Internal-user allowlist is the load-bearing mechanism keeping this phase outside Google's CASA security-assessment requirement (verified against Google's own OAuth verification docs: `gmail.metadata` and `gmail.readonly` are both restricted-tier scopes regardless of usage pattern — narrow scope usage does not itself avoid the audit, staying within Google's OAuth test-user cap does). Email content is classified and encrypted at the same tier Phase 7 uses for `health`/`finance`. Consent revocation is the single action that both disconnects the connector and purges all synced content — no separate, weaker "just disconnect" path exists in this phase's scope.
+Internal-user allowlist is the load-bearing mechanism keeping this phase outside Google's CASA security-assessment requirement (verified against Google's own OAuth verification docs: `gmail.metadata` and `gmail.readonly` are both restricted-tier scopes regardless of usage pattern — narrow scope usage does not itself avoid the audit, staying within Google's OAuth test-user cap does). Email content is classified and encrypted at the same tier Phase 7 uses for `health`/`finance`. Consent revocation is the single action that both disconnects the connector and purges all synced content (subject to the three narrow, deliberate exceptions `PRIVACY-CONSENT-CONTRACT.md`'s Task 7 section names) — no separate, weaker "just disconnect" path exists in this phase's scope.
 
 ## Observability
 
@@ -100,13 +100,13 @@ Internal-user allowlist is the load-bearing mechanism keeping this phase outside
 
 ## Test strategy
 
-Cross-workspace isolation; consent-revocation purges connector and content together; encrypted fields never returned in a list/summary view; OAuth flow (authorization-url generation, callback/code-exchange, refresh); internal-allowlist enforcement (rejected for a non-allowlisted account); expand-backfill re-verifies live consent; `recommendations`' new create-path (schema validation, versioned confirm, audit event); the new AI-runtime tool's evaluation-floor adversarial fixtures.
+Cross-workspace isolation; consent-revocation purges connector and content together (subject to the three narrow, deliberate exceptions `PRIVACY-CONSENT-CONTRACT.md`'s Task 7 section names); encrypted fields never returned in a list/summary view; OAuth flow (authorization-url generation, callback/code-exchange, refresh); internal-allowlist enforcement (rejected for a non-allowlisted account); expand-backfill re-verifies live consent; `recommendations`' new create-path (schema validation, versioned confirm, audit event); the new AI-runtime tool's evaluation-floor adversarial fixtures.
 
 ## Acceptance criteria
 
 - A connected internal-allowlisted account backfills its last 30 days of Gmail metadata and produces at least one deterministic "awaiting reply" attention item where the fixture data warrants it.
 - An email whose content clearly implies a task produces a grounded, evidence-linked create-type recommendation that becomes a real `tasks` row only after explicit confirmation.
-- Revoking `email` domain consent disconnects the OAuth grant and leaves zero readable synced content behind.
+- Revoking `email` domain consent disconnects the OAuth grant and leaves zero readable synced content behind, subject to the three narrow, deliberate exceptions `PRIVACY-CONSENT-CONTRACT.md`'s Task 7 section names.
 - A non-allowlisted account cannot initiate the Gmail OAuth flow.
 - The new AI-runtime tool clears its own evaluation floors before its prompt version is promoted.
 
@@ -116,7 +116,7 @@ Real dynamic verification against a real test Gmail account (not solely mocked `
 
 ## Rollback plan
 
-Revoking the `email` domain's consent purges all synced content and disconnects the OAuth grant in one action — there is no partial/soft-disconnect state to reason about. No migration in this phase is destructive to any existing table.
+Revoking the `email` domain's consent purges all synced content (subject to the three narrow, deliberate exceptions `PRIVACY-CONSENT-CONTRACT.md`'s Task 7 section names) and disconnects the OAuth grant in one action — there is no partial/soft-disconnect state to reason about. No migration in this phase is destructive to any existing table.
 
 ## Deferred backlog
 
@@ -126,6 +126,10 @@ Gmail write actions (compose/reply/send/archive/label-modify); public/general-av
 
 | Version | Date | Summary | Author |
 |---|---|---|---|
+| 0.4.8 | 2026-08-10 | Task 7 Loop 2 round 31 review (MEDIUM): rounds 29-30's own fixes missed a sixth unqualified claim, in "Test strategy" ("consent-revocation purges connector and content together"); cross-referenced the same three named deliberate exceptions. A repo-wide grep confirms this bug class is now exhausted | Lucky Jain |
+| 0.4.7 | 2026-08-10 | Task 7 Loop 2 round 30 review (MEDIUM): round 29's own fix missed a fifth unqualified claim in "Functional requirements" ("...disconnects the OAuth grant and deletes synced content"); cross-referenced the same three named deliberate exceptions. Also qualified the identical claim in `docs/superpowers/plans/2026-08-04-phase-10-gmail-connector.md`'s own Task 7 section (LOW, a file outside this doc's own maintained set) | Lucky Jain |
+| 0.4.6 | 2026-08-10 | Task 7 Loop 2 round 29 review (MEDIUM): the "In scope"/"Security and privacy"/"Acceptance criteria"/"Rollback plan" sections' "purges all synced content"/"zero readable synced content" claims were the one place among Task 7's docs never brought into rounds 4-7's ambiguous-`external_message_id`-carve-out disclosure sweep -- all four now cross-reference `PRIVACY-CONSENT-CONTRACT.md`'s three named deliberate exceptions | Lucky Jain |
+| 0.4.5 | 2026-08-10 | Reconciled delivery through Task 7 after the consent revocation cascade merge (Loop 2 round 16 review: this file's own version/changelog had not been bumped for this edit, unlike every prior task boundary) | Lucky Jain |
 | 0.4.4 | 2026-08-06 | Reconciled delivery through Task 6 after the on-demand thread read/forget merge | Lucky Jain |
 | 0.4.3 | 2026-08-06 | Reconciled delivery through Task 5 after the email.detect_action merge | Lucky Jain |
 | 0.4.2 | 2026-08-06 | Reconciled delivery through Task 4 after the recommendations create-path merge | Lucky Jain |

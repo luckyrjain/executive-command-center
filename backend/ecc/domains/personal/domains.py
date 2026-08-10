@@ -71,6 +71,11 @@ from sqlalchemy.orm import Session
 from ecc.auth import AuthContext, AuthDep, CsrfDep
 from ecc.database import get_session
 from ecc.domains.personal.crypto import decrypt_field, encrypt_field
+from ecc.domains.personal.gmail_revocation import (
+    PendingGmailRevoke,
+    cascade_email_revocation,
+    finish_gmail_revocation,
+)
 from ecc.observability import (
     queue_lifecycle_event,
     record_audit_outbox_failure,
@@ -280,8 +285,9 @@ def get_domain(
     session: Session, auth: AuthContext, domain_key: str, *, for_update: bool = False
 ) -> PersonalDomain | None:
     """`for_update=True` locks the row for the caller's own transaction --
-    used by `_enable_domain`/`_disable_domain` (both mutate this row) so a
-    second concurrent enable/disable for the same domain blocks until the
+    used by `_enable_domain`/`_disable_domain`/`export_deletion.py:
+    delete_domain_endpoint` (all three mutate this row) so a second
+    concurrent enable/disable/delete for the same domain blocks until the
     first transaction commits, mirroring `connector_accounts.
     get_connector_account`'s identical `for_update` precedent.
     """
@@ -720,24 +726,177 @@ def enable_domain_endpoint(
     )
 
 
+def _gmail_reconnected(session: Session, auth: AuthContext, domain_key: str) -> bool:
+    """Whether the owner has a non-`disconnected` `gmail` connector account
+    (`gmail_oauth.py:gmail_oauth_callback_endpoint` reactivates a row
+    straight back to `status='active'` with no reference to `personal_
+    domains`/`domain_consents` at all, so this is the only reliable signal).
+    Mirrors `cascade_email_revocation`'s own `status != 'disconnected'`
+    query exactly. Callers must re-invoke this immediately before each use
+    rather than caching one result across multiple decisions in the same
+    transaction (Loop 2 round 32 review finding, LOW): this is a plain,
+    unlocked read -- nothing blocks a concurrent reconnect from committing
+    in between, since the reconnect never touches `personal_domains` and so
+    isn't serialized by `_disable_domain`'s own `for_update=True` lock on
+    `domain`.
+    """
+    return (
+        domain_key == "email"
+        and session.execute(
+            text(
+                "SELECT 1 FROM connector_accounts WHERE workspace_id = :workspace_id "
+                "AND provider = 'gmail' AND owner_id = :owner_id "
+                "AND status != 'disconnected' LIMIT 1"
+            ),
+            {"workspace_id": auth.workspace_id, "owner_id": auth.user_id},
+        ).first()
+        is not None
+    )
+
+
 def _disable_domain(
     domain_key: str,
     request: Request,
     auth: AuthContext,
     session: Session,
     idempotency_key: str,
+    *,
+    consent_id: UUID | None = None,
 ) -> DomainResponse:
+    """Phase 10 Task 7: for `domain_key == "email"` specifically, a real
+    enabled -> disabled transition here also runs `gmail_revocation.
+    cascade_email_revocation` -- disconnecting the owner's Gmail connector
+    account(s) and purging the owner's own email-derived records (see
+    that function's own docstring for its three deliberate exceptions,
+    e.g. an evidence row whose id collides with a different owner's own
+    message is left alone) -- in the same transaction as the state
+    change itself. Every other domain's own disable stays exactly
+    as before (data untouched, a separate explicit `POST .../delete`
+    required to purge anything); see `gmail_revocation.py`'s own module
+    docstring for why `email` is deliberately different in kind, not
+    degree. Both `disable_domain_endpoint` and `revoke_consent_endpoint`
+    call this single write path, so the cascade is reached identically
+    from either HTTP entry point, matching this module's own "one real
+    write path per state transition" convention (see module docstring).
+
+    `consent_id` (`revoke_consent_endpoint` only -- `disable_domain_
+    endpoint` has no consent-specific identifier to re-check) re-validates
+    that the referenced consent has not been superseded by a later grant,
+    *inside* this same transaction, after `domain` is locked below (only
+    the round-21 idempotency cache-hit check, itself resolved before any
+    mutation, can still run in between) -- not before this function is
+    even called. Loop 2 round 10
+    review finding: `revoke_consent_endpoint`'s own round-8/9 staleness
+    check used to run in its own, separate, already-committed transaction
+    before ever calling this function -- a real TOCTOU window existed
+    between that check and this function's own `FOR UPDATE` lock, where a
+    concurrent re-grant could commit in between, and this function would
+    then disable-and-cascade-purge the freshly re-granted state anyway,
+    the exact outcome the round-8/9 fix was meant to prevent (just not
+    under genuine concurrency). Re-validating after acquiring the same
+    `personal_domains` row lock `_enable_domain`'s own re-grant path also
+    acquires closes the window: whichever transaction gets the lock first
+    is authoritative, and the loser sees a fully consistent post-commit
+    state before it decides anything.
+    """
     req_hash = request_hash(_EmptyBody(), f"disable_domain:{domain_key}")
     now = datetime.now(UTC)
+    pending_gmail_revokes: list[PendingGmailRevoke] = []
     with session.begin():
         lock_idempotency(session, auth, idempotency_key)
-        cached = load_cached(session, auth, idempotency_key, req_hash, domain="personal_domains")
-        if cached is not None:
-            return DomainResponse.model_validate(cached)
 
+        # `get_domain` moved ahead of `load_cached` (Loop 2 round 21 review
+        # finding, MEDIUM-HIGH): `req_hash` above is a function of
+        # `domain_key` alone, and `idempotency_records` rows live for 365
+        # days (`store_idempotency`), so an `Idempotency-Key` reused across
+        # a real disable -> re-enable/resync -> disable-again sequence used
+        # to match the *first* call's cached row and return its stale
+        # `enabled: false` response immediately -- before this function's
+        # own `consent_id` staleness re-check, before `domain.enabled` was
+        # even read, and therefore before `cascade_email_revocation` ever
+        # ran. The caller was told the disable succeeded while the
+        # freshly-reconnected Gmail account and freshly-synced data were
+        # never touched, exactly the silent "disconnected but data
+        # remains" state this module's own docstring says Task 7 makes
+        # unreachable. Fetching `domain` first lets the cache-hit branch
+        # below check the facts that distinguish a genuine retry (nothing
+        # has changed since the cached response was produced) from a
+        # reused key applied to a materially different, later request --
+        # without changing `req_hash`'s own shape or touching `load_cached`/
+        # `store_idempotency`, which every other mutating endpoint in this
+        # package also shares.
         domain = get_domain(session, auth, domain_key, for_update=True)
         if domain is None:
             raise HTTPException(status_code=404, detail="DOMAIN_NOT_FOUND")
+
+        # `gmail_oauth.py:gmail_oauth_callback_endpoint` reactivates a
+        # `connector_accounts` row straight back to `status='active'` with
+        # no reference to `personal_domains`/`domain_consents` whatsoever
+        # (it is the sole reconnect path -- the generic engineering
+        # `create_connector_endpoint` never registers `gmail`, and
+        # `disable_connector_endpoint` rejects it with `409 GMAIL_DISABLE_
+        # REQUIRES_DOMAIN_ENDPOINT`). Used for the cache-hit check just
+        # below; re-queried fresh, not reused, immediately before the
+        # cascade-trigger decision further down (Loop 2 round 32 review
+        # finding, LOW: this read is unlocked -- nothing blocks a
+        # concurrent reconnect from committing between this line and the
+        # cascade-trigger decision, since the reconnect never touches
+        # `personal_domains` and so isn't blocked by `domain`'s own lock
+        # above -- reusing one stale boolean across both call sites risked
+        # a fresh disable racing a concurrent reconnect and missing it by a
+        # window as narrow as this function's own remaining work).
+        reconnected = _gmail_reconnected(session, auth, domain_key)
+
+        cached = load_cached(session, auth, idempotency_key, req_hash, domain="personal_domains")
+        if cached is not None:
+            # `domain.enabled` alone (round 21) is necessary but not
+            # sufficient -- Loop 2 round 22 review finding (MEDIUM-HIGH): a
+            # real disable -> a genuine Gmail reconnect through the OAuth
+            # flow above (no domain re-enable at all) -> the same
+            # `Idempotency-Key` replayed here still found `domain.enabled
+            # is False` and silently served the stale cached response,
+            # leaving the freshly-reconnected, still-live connector row
+            # untouched. Checked here rather than gating the reconnect
+            # flow itself (Task 1 code this PR does not otherwise touch).
+            if domain.enabled or reconnected:
+                record_idempotency_conflict("personal_domains")
+                raise HTTPException(status_code=409, detail="IDEMPOTENCY_CONFLICT")
+            return DomainResponse.model_validate(cached)
+
+        if consent_id is not None:
+            # `>=`, not `>` (Loop 2 round 10 review LOW finding): a strict
+            # `>` has a same-timestamp blind spot -- if a regrant's
+            # `granted_at` ties this consent's own `revoked_at` (coarse
+            # clock resolution, VM clock jitter), `NOT EXISTS` would wrongly
+            # conclude nothing supersedes it. `>=` fails closed on a tie
+            # instead of relying on wall-clock precision; harmless for the
+            # true idempotent-retry case above, which creates no new
+            # `domain_consents` row for this check to ever compare against.
+            still_valid = session.execute(
+                text(
+                    """
+                    SELECT 1 FROM domain_consents dc
+                    WHERE workspace_id = :workspace_id AND owner_id = :owner_id AND id = :consent_id
+                      AND (
+                        revoked_at IS NULL
+                        OR NOT EXISTS (
+                          SELECT 1 FROM domain_consents newer
+                          WHERE newer.workspace_id = dc.workspace_id
+                            AND newer.owner_id = dc.owner_id
+                            AND newer.domain_key = dc.domain_key
+                            AND newer.granted_at >= dc.revoked_at
+                        )
+                      )
+                    """
+                ),
+                {
+                    "workspace_id": auth.workspace_id,
+                    "owner_id": auth.user_id,
+                    "consent_id": consent_id,
+                },
+            ).one_or_none()
+            if still_valid is None:
+                raise HTTPException(status_code=404, detail="CONSENT_NOT_FOUND")
 
         version = domain.version
         if domain.enabled:
@@ -767,6 +926,35 @@ def _disable_domain(
                 },
             )
             version = domain.version + 1
+        # `domain.enabled or reconnected`, not merely `domain.enabled`
+        # (Loop 2 round 24 review finding, HIGH): the `UPDATE`s above are
+        # skipped when the domain is already disabled, but the cascade
+        # below still needs to run when `reconnected` is true even then --
+        # a fresh (non-replayed) disable request against an already-off
+        # domain used to be treated as a pure no-op unconditionally, so a
+        # Gmail reconnect via the OAuth flow after a disable, followed by a
+        # genuinely fresh `disable` call (a new Idempotency-Key, not a
+        # replay -- round 21/22's own fix only covers a replayed key), left
+        # the freshly-reconnected connector's `status='active'` row and its
+        # unrevoked Google grant untouched, with a plain `200` response
+        # indistinguishable from a routine already-disabled no-op.
+        # `_delete_domain_data`'s own identical cascade call already runs
+        # unconditionally for this exact reason; this now matches it.
+        # `test_disabling_an_already_disabled_domain_does_not_rerun_
+        # cascade` (no reconnect in between) is unaffected: `reconnected`
+        # is `False` there, so this condition is exactly `domain.enabled`,
+        # unchanged from before this fix.
+        #
+        # Re-queried here, not the `reconnected` computed above for the
+        # cache-hit check (Loop 2 round 32 review finding, LOW): narrows
+        # the unlocked-read TOCTOU window described above to the gap
+        # between this line and `cascade_email_revocation`'s own `FOR
+        # UPDATE` a few lines inside it, rather than this whole function's
+        # remaining work.
+        if domain_key == "email" and (
+            domain.enabled or _gmail_reconnected(session, auth, domain_key)
+        ):
+            pending_gmail_revokes = cascade_email_revocation(session, auth, now)
 
         refreshed = get_domain(session, auth, domain_key)
         assert refreshed is not None
@@ -785,7 +973,16 @@ def _disable_domain(
         store_idempotency(
             session, auth, idempotency_key, req_hash, response.model_dump(mode="json"), now
         )
-        return response
+
+    # Transaction above has committed. Release `session`'s pooled
+    # connection before the deferred, best-effort Google-side revoke's
+    # potentially slow, blocking network call -- see `gmail_revocation.py`'s
+    # own module docstring for why, matching `connector_accounts.py:
+    # disable_connector_endpoint`'s identical established split.
+    if pending_gmail_revokes:
+        session.close()
+        finish_gmail_revocation(pending_gmail_revokes)
+    return response
 
 
 @router.post("/domains/{domain_key}/disable", response_model=DomainResponse)
@@ -849,6 +1046,13 @@ def revoke_consent_endpoint(
     # `InvalidRequestError` ("a transaction is already begun"), exactly the
     # bug `list_insights_endpoint`'s own docstring documents for the
     # identical shape.
+    #
+    # This lookup only resolves `id` to a `domain_key` -- it does NOT gate
+    # on whether the consent has been superseded by a later grant. That
+    # check happens *inside* `_disable_domain`'s own transaction instead
+    # (see that function's own docstring for why, Loop 2 round 10 review
+    # finding -- doing it here, in this separate, already-committed
+    # transaction, left a TOCTOU window this file's own tests reproduce).
     with session.begin():
         row = (
             session.execute(
@@ -863,7 +1067,9 @@ def revoke_consent_endpoint(
         )
     if row is None:
         raise HTTPException(status_code=404, detail="CONSENT_NOT_FOUND")
-    return _disable_domain(row["domain_key"], request, auth, session, idempotency_key)
+    return _disable_domain(
+        row["domain_key"], request, auth, session, idempotency_key, consent_id=consent_id
+    )
 
 
 # ---------------------------------------------------------------------------

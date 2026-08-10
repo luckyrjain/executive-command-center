@@ -2,7 +2,7 @@
 id: PHASE-010-API-SCHEMAS
 title: Phase 10 Gmail API Schemas
 status: Approved for Implementation
-version: 1.1.0
+version: 1.2.7
 owner: Lucky Jain
 depends_on:
   - PHASE-010
@@ -13,13 +13,15 @@ depends_on:
 
 ## Delivery boundary
 
-- **Current (Tasks 1-2, 6):** OAuth start/callback plus reuse of generic
+- **Current (Tasks 1-2, 6-7):** OAuth start/callback plus reuse of generic
   connector list, sync, sync-run, and disable endpoints; on-demand thread
   reading and per-thread "forget this" (Task 6, below) -- the first
   Gmail-specific *read* HTTP endpoints, and the first sub-domain-
-  granularity deletion endpoint anywhere in this codebase.
-- **Planned (Tasks 7-8):** consent-revocation cascade, and Gmail panel
-  endpoints or response extensions.
+  granularity deletion endpoint anywhere in this codebase; the consent
+  revocation cascade (Task 7, below), which adds no new endpoint at all --
+  it changes what three of Phase 7's own existing generic personal-domain
+  endpoints do for `domain_key = "email"` specifically.
+- **Planned (Task 8):** Gmail panel endpoints or response extensions.
 
 ## Current OAuth endpoints
 
@@ -78,7 +80,7 @@ validation errors.
 | `GET /api/v1/engineering/connectors` | Lists authorized visible accounts; never returns credentials |
 | `POST /api/v1/engineering/connectors/{id}/sync` | Body `{"run_type":"backfill|incremental","resource_type":"message"}`; requires `Idempotency-Key` and CSRF |
 | `GET /api/v1/engineering/sync-runs` | Lists redacted run outcome and item count |
-| `POST /api/v1/engineering/connectors/{id}/disable` | Revokes the Google token best-effort and marks the account disconnected |
+| `POST /api/v1/engineering/connectors/{id}/disable` | For every other provider: revokes the token best-effort and marks the account disconnected. For `gmail` specifically: if the account is not already `disconnected` **and** the owner has a `personal_domains` row for `email`, rejected with `409 GMAIL_DISABLE_REQUIRES_DOMAIN_ENDPOINT` and no mutation (Loop 2 round 1 review found this generic endpoint could otherwise disconnect a `gmail` account, and revoke its live Google grant, without running the consent revocation cascade below); an already-`disconnected` `gmail` account is unaffected by this guard and still returns the same idempotent `200` no-op as every other provider (Loop 2 round 2 review); an owner who completed the Gmail OAuth flow without ever calling `POST /domains`/`POST /consents` for `email` has no `personal_domains` row at all, so this guard falls through and the account is disconnected the same way any other provider's is -- there is nothing for the cascade to purge or revoke in that case, and without this carve-out such a connector had no HTTP-reachable way to disconnect it at all, since the domain-level endpoints 404 `DOMAIN_NOT_FOUND` for an owner with no domain row (Loop 2 round 25 review). Callers with an `email` domain must use the domain-level endpoints instead, which reach `gmail_revocation.cascade_email_revocation` |
 
 Manual `webhook` sync is not accepted. A second running sync for the same
 account returns `409 CONNECTOR_SYNC_IN_PROGRESS`. Provider errors are
@@ -136,10 +138,56 @@ rows (see `PRIVACY-CONSENT-CONTRACT.md`'s own entry for why).
 
 Errors: `404 THREAD_NOT_FOUND`.
 
+## Consent revocation cascade (Task 7)
+
+No new endpoint. `POST /api/v1/personal/domains/email/disable`, `POST
+/api/v1/personal/consents/{id}/revoke`, and `POST /api/v1/personal/domains/
+email/delete` -- Phase 7's own existing generic personal-domain endpoints,
+documented in `docs/phases/phase-007/API-SCHEMAS.md`, unchanged in request/
+response shape -- now additionally, for `domain_key = "email"` only, best-
+effort revoke the owner's Gmail OAuth grant, disconnect every one of
+their `gmail` connector account(s), and purge their own email-derived
+records (threads, messages, `email_thread` attention items, non-
+`executed` `email_action_detected` recommendations, and their evidence --
+except an evidence row whose id collides with a different owner's own
+message, deliberately left unpurged, see `PRIVACY-CONSENT-CONTRACT.md`)
+in the same request. Every
+other `domain_key` is unaffected -- disabling `habits`/`health`/`finance`/
+etc. still only flips `enabled`/revokes consent, data untouched, exactly
+as `docs/phases/phase-007/API-SCHEMAS.md` already documents. `POST .../
+consents/{id}/revoke` additionally now rejects an `id` a *later* grant for
+the same domain has superseded; such an `id` gets the same `404
+CONSENT_NOT_FOUND` every other unresolved lookup in this contract
+returns, rather than resolving to `domain_key` and re-running the cascade
+(Loop 2 round 8 review, refined round 9 -- an `id` that is merely revoked,
+with no later grant superseding it, still resolves normally, so a same-
+`Idempotency-Key` retry of an already-succeeded revoke keeps working; see
+`PRIVACY-CONSENT-CONTRACT.md`). `POST .../domains/email/disable` and
+`POST .../domains/email/delete` (and, transitively, `POST .../consents/
+{id}/revoke`) additionally now return `409 IDEMPOTENCY_CONFLICT` for an
+`Idempotency-Key` reused after a genuine later state change -- the domain
+re-enabled, or the owner's Gmail account reconnected through the separate
+OAuth flow -- even though the request itself is byte-identical and would
+normally hash-match the cached response (every other domain's own
+disable/delete endpoints, and this framework generally, only 409 on a
+request-hash *mismatch*; see `docs/domain/API-CONTRACTS.md`). This is
+`email`-specific, matching this cascade's own consent/data-purge stakes
+(Loop 2 rounds 21-22 review; see `PRIVACY-CONSENT-CONTRACT.md`'s own
+"Reusing the same `Idempotency-Key`..." sections for why). See
+`PRIVACY-CONSENT-CONTRACT.md`'s own "Consent revocation cascade (Task 7)"
+section for the full cascade description and why "retry" needed no new
+`deletion_jobs` schema. `POST /api/v1/engineering/connectors/{id}/disable`
+(the generic, provider-agnostic endpoint documented above) has the
+identical `409 IDEMPOTENCY_CONFLICT`-on-reconnect behavior for any
+account whose `Idempotency-Key` is reused after it stops being
+`disconnected` in the interim -- in practice reachable only via a `gmail`
+account's OAuth reconnect, since no other provider has a way to leave
+`disconnected` once entered (Loop 2 round 27 review).
+
 ## Planned APIs
 
-Tasks 7-8 must version this contract before adding consent-revocation
-cascade or frontend-specific query surfaces.
+Task 8 must version this contract before adding Gmail panel endpoints or
+response extensions.
 
 ## Changelog
 
@@ -147,3 +195,11 @@ cascade or frontend-specific query surfaces.
 |---|---|---|---|
 | 1.0.0 | 2026-08-06 | Documented current OAuth and generic sync surfaces | Lucky Jain |
 | 1.1.0 | 2026-08-06 | Task 6: documented `GET`/`POST .../forget` thread endpoints, correcting the "no current endpoint returns thread content" claim | Lucky Jain |
+| 1.2.0 | 2026-08-10 | Task 7: documented the consent revocation cascade's behavior change to three existing Phase 7 generic endpoints (no new endpoint added) | Lucky Jain |
+| 1.2.1 | 2026-08-10 | Task 7 Loop 2 round 4 review: corrected the "Current reused connector endpoints" table's `disable` row, stale since round 1 -- it still described pre-fix behavior for `gmail`, contradicting this same file's own consent revocation cascade section below it | Lucky Jain |
+| 1.2.2 | 2026-08-10 | Task 7 Loop 2 round 6 review: the `disable` row missed round 2's already-disconnected idempotent-no-op carve-out; the "Consent revocation cascade" section overclaimed "every email-derived record" against round 4's own ambiguous-id carve-out | Lucky Jain |
+| 1.2.3 | 2026-08-10 | Task 7 Loop 2 round 8 review: documented `POST .../consents/{id}/revoke`'s new `revoked_at IS NULL` requirement, closing a stale-consent-id replay that could re-trigger the cascade | Lucky Jain |
+| 1.2.4 | 2026-08-10 | Task 7 Loop 2 round 9 review: corrected the round-8 revoke row -- the plain `revoked_at IS NULL` check broke legitimate `Idempotency-Key` retries; replaced with a check for a later superseding grant | Lucky Jain |
+| 1.2.5 | 2026-08-10 | Task 7 Loop 2 round 23 review: documented the new `409 IDEMPOTENCY_CONFLICT` behavior (rounds 21-22) for `disable`/`delete`/`revoke` on a same-hash `Idempotency-Key` reused after a genuine domain re-enable or Gmail OAuth reconnect -- this file had gone stale since round 9, never updated for either round | Lucky Jain |
+| 1.2.6 | 2026-08-10 | Task 7 Loop 2 round 25 review (MEDIUM): documented that the generic `/disable` endpoint's `gmail`-provider rejection now also requires the owner to have a `personal_domains` row for `email`, falling through to the ordinary disconnect otherwise | Lucky Jain |
+| 1.2.7 | 2026-08-10 | Task 7 Loop 2 round 27 review (MEDIUM-HIGH): documented that the generic `/disable` endpoint also now returns `409 IDEMPOTENCY_CONFLICT` for a reused `Idempotency-Key` if the account is no longer `disconnected` when replayed -- reachable only via a `gmail` OAuth reconnect, since no other provider has a way to leave `disconnected` | Lucky Jain |

@@ -322,6 +322,31 @@ def get_connector_account(
     return _row_to_account(dict(row)) if row is not None else None
 
 
+def _personal_email_domain_exists(session: Session, workspace_id: UUID, account_id: UUID) -> bool:
+    """Loop 2 round 25 review finding (MEDIUM), `disable_connector_
+    endpoint`'s own `gmail`-provider gate: whether this specific `gmail`
+    connector account's owner has any `personal_domains` row for `email`
+    at all -- not whether the domain is *enabled*, which `_disable_domain`
+    below the redirect this gate points to already checks in its own
+    right. Joins through `connector_accounts.owner_id` (migration `0063`)
+    rather than taking an `owner_id` parameter directly, since the only
+    caller has an `account_id`, not an owner, in hand.
+    """
+    return (
+        session.execute(
+            text(
+                "SELECT 1 FROM personal_domains pd "
+                "JOIN connector_accounts ca ON ca.workspace_id = pd.workspace_id "
+                "AND ca.owner_id = pd.owner_id "
+                "WHERE ca.id = :account_id AND ca.workspace_id = :workspace_id "
+                "AND pd.domain_key = 'email' LIMIT 1"
+            ),
+            {"account_id": account_id, "workspace_id": workspace_id},
+        ).first()
+        is not None
+    )
+
+
 def list_connector_accounts(
     session: Session,
     workspace_id: UUID,
@@ -1506,17 +1531,91 @@ def disable_connector_endpoint(
     pending_revoke: tuple[ConnectorAdapter, ConnectorAccountContext] | None = None
     with session.begin():
         _lock_idempotency(session, auth, idempotency_key)
-        cached = _load_cached(session, auth, idempotency_key, request_hash)
-        if cached is not None:
-            return ConnectorAccountResponse.model_validate(cached)
 
+        # `get_connector_account` moved ahead of `_load_cached` (Loop 2
+        # round 27 review finding, MEDIUM-HIGH): `request_hash` above is a
+        # function of `account_id` alone, and `idempotency_records` rows
+        # live 365 days (`_store_idempotency`), so the same `Idempotency-
+        # Key` reused across a real disable -> `gmail_oauth.py` reconnect
+        # (reactivates this exact row's `status` back to `'active'`, same
+        # `id`) -> a second disable attempt used to match the *first*
+        # call's cached `"disconnected"` response and return it immediately
+        # -- before `account.status` was even read again, and therefore
+        # without actually disconnecting the freshly-reconnected account or
+        # attempting to revoke its live Google grant. The caller was told
+        # the connector was disconnected while it stayed fully active and
+        # syncing -- the identical "stale success response masks a
+        # materially different current state" bug class rounds 21/22/24
+        # closed for `domains.py:_disable_domain`/`delete_domain_endpoint`,
+        # never propagated to this sibling endpoint. Fetching `account`
+        # first lets the cache-hit branch below check whether it is still
+        # actually disconnected before trusting the cache.
+        #
         # `for_update=True`: see sync_connector_endpoint's identical comment
         # -- serializes a concurrent disable/sync against the same account.
         account = get_connector_account(session, auth.workspace_id, account_id, for_update=True)
         if account is None:
             raise HTTPException(status_code=404, detail="CONNECTOR_NOT_FOUND")
 
+        cached = _load_cached(session, auth, idempotency_key, request_hash)
+        if cached is not None:
+            if account.status != "disconnected":
+                record_idempotency_conflict("engineering_connector_account")
+                raise HTTPException(status_code=409, detail="IDEMPOTENCY_CONFLICT")
+            return ConnectorAccountResponse.model_validate(cached)
+
         if account.status != "disconnected":
+            if account.provider == "gmail" and _personal_email_domain_exists(
+                session, auth.workspace_id, account_id
+            ):
+                # Loop 2 round 1 review (PR #128): this endpoint is a
+                # generic, provider-agnostic connector-level disable -- it
+                # only marks the row `disconnected` and clears synced
+                # projections, and never touches `personal_domains`/
+                # `domain_consents` or purges the owner's Gmail-derived
+                # data (`gmail_revocation.py`'s cascade). For every other
+                # provider that is correct (disable retains previously-
+                # synced data, `CONNECTOR-CONTRACT.md`); for `gmail`
+                # specifically it would leave a real "disconnected but
+                # data (and domain consent) remains" state reachable
+                # through this endpoint -- exactly what `gmail_revocation.
+                # py`'s own module docstring says is unreachable "through
+                # this path", except this was a different path. Route
+                # callers to the domain-level endpoint instead, which
+                # reaches the cascade via `domains.py:_disable_domain`.
+                # Gated on `status != "disconnected"`, not checked
+                # unconditionally above: an already-`disconnected` gmail
+                # account has nothing left to bypass, and every other
+                # provider's own established contract is that disabling
+                # an already-disconnected connector is an idempotent 200
+                # no-op (`test_disable_...` tests below) -- round 2 review
+                # found the unconditional version silently broke that same
+                # contract for `gmail` specifically, with no test covering
+                # the no-op case for this provider.
+                #
+                # Also gated on `_personal_email_domain_exists` (Loop 2
+                # round 25 review finding, MEDIUM): this gate has no
+                # dependency of its own on `personal_domains` -- an
+                # allowlisted user who completes the Gmail OAuth flow
+                # (`gmail_oauth.py`) without ever calling `POST /domains`
+                # or `POST /consents` for `email` gets an `active`
+                # `connector_accounts` row with no matching domain row at
+                # all. Before this check, this generic endpoint
+                # unconditionally redirected every non-disconnected
+                # `gmail` account to the domain-level endpoint, which
+                # 404s `DOMAIN_NOT_FOUND` for exactly that owner -- a
+                # connector with no HTTP-reachable way to disconnect it,
+                # a regression this same round-1 fix introduced (before
+                # it, this endpoint could still disconnect any provider
+                # unconditionally). No cascade-bypass risk in this
+                # specific case: with no `personal_domains`/`domain_
+                # consents` row, there is nothing for the cascade to
+                # purge or revoke beyond what this generic path already
+                # does, so falling through to the same disconnect every
+                # other provider gets is correct, not merely convenient.
+                raise HTTPException(
+                    status_code=409, detail="GMAIL_DISABLE_REQUIRES_DOMAIN_ENDPOINT"
+                )
             adapter = connector_registry.get(account.provider)
             if adapter is not None:
                 # Decryption failure is folded into the same best-effort

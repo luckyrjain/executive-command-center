@@ -128,6 +128,60 @@ detection_sync_postgres.py` for Task 5's own dedicated test file):
     unrelated to this call's own `items_processed` count. Proven by
     asserting the hook still fires when `_ActionDetectionSpyAdapter`'s own
     `items_processed` is `0`.
+
+Plus two items closing a gap Phase 10 Gmail Connector Task 7's own Loop 2
+rounds 1-2 review found in this module's territory (this generic,
+provider-agnostic `/disable` endpoint, not `gmail_revocation.py`'s own
+cascade -- see `tests/test_gmail_revocation_postgres.py` for Task 7's own
+dedicated test file):
+
+28. `test_disable_rejects_gmail_provider_account`: this endpoint only
+    marks a row `disconnected` and clears synced projections -- it never
+    reaches the domain-consent cascade, so disabling a `gmail`-provider
+    account through this path used to leave the exact "disconnected but
+    data (and domain consent) remains" state Task 7 exists to make
+    unreachable. Now rejected with `409 GMAIL_DISABLE_REQUIRES_DOMAIN_
+    ENDPOINT`, directing callers to the domain-level endpoint that
+    actually reaches the cascade. `test_disable_already_disconnected_
+    gmail_account_is_still_an_idempotent_noop`: round 2 review found the
+    round-1 rejection was originally unconditional, regressing every other
+    provider's own established contract that disabling an already-
+    disconnected connector is an idempotent `200` no-op; fixed by gating
+    the rejection on `account.status != "disconnected"`, proven here by an
+    already-disconnected `gmail` row still returning `200`.
+
+Plus one item closing a gap Phase 10 Gmail Connector Task 7's own Loop 2
+round 25 review found in this module's territory (the same `/disable`
+endpoint as item 28 above):
+
+29. `test_disable_falls_through_for_a_gmail_account_with_no_domain_row_at_
+    all`: item 28's rejection had no dependency of its own on `personal_
+    domains` -- an allowlisted user who completes the Gmail OAuth flow
+    (`gmail_oauth.py`) without ever calling `POST /domains`/`POST
+    /consents` for `email` gets an `active` `connector_accounts` row with
+    no matching domain row at all, so the unconditional redirect to the
+    domain-level endpoint 404d `DOMAIN_NOT_FOUND` for exactly that owner --
+    a connector with no HTTP-reachable way to disconnect it. Fixed by
+    gating the rejection on a new `_personal_email_domain_exists` check;
+    item 28's own `test_disable_rejects_gmail_provider_account` now seeds a
+    `personal_domains` row via `_insert_personal_email_domain` to keep
+    proving the rejection still fires when one does exist.
+
+Plus one item closing a gap Phase 10 Gmail Connector Task 7's own Loop 2
+round 27 review found in this module's territory (the same `/disable`
+endpoint's idempotency handling, not the gmail-provider gate itself):
+
+30. `test_disable_idempotency_key_reused_after_a_gmail_reconnect_is_
+    rejected`: this endpoint's idempotency cache hit used to return the
+    first call's stale cached `"disconnected"` response unconditionally,
+    without re-checking whether the account had been reconnected (reusing
+    the same row/id, per `gmail_oauth_callback_endpoint`'s own reactivation
+    `UPDATE`) in the meantime -- the identical bug class `test_gmail_
+    revocation_postgres.py`'s items 21-22 closed for `disable_domain_
+    endpoint`/`delete_domain_endpoint`, never propagated to this sibling
+    endpoint. Fixed by moving `get_connector_account` ahead of the cache
+    check and rejecting a cache hit with `409 IDEMPOTENCY_CONFLICT` when
+    the account is no longer `disconnected`.
 """
 
 import threading
@@ -744,6 +798,32 @@ def _insert_connector_account(
             },
         )
     return account_id
+
+
+def _insert_personal_email_domain(workspace_id: UUID, owner_id: UUID) -> None:
+    """Seeds a `personal_domains` row for `email` (Loop 2 round 25 review) --
+    mirrors `_insert_enabled_email_domain` in `test_gmail_revocation_
+    postgres.py`. `disable_connector_endpoint`'s gmail-provider rejection is
+    gated on this row existing (`_personal_email_domain_exists` in
+    `connector_accounts.py`), so tests exercising that rejection must seed
+    it explicitly rather than relying on `_insert_connector_account` alone.
+    """
+    now = datetime.now(UTC)
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                """
+                INSERT INTO personal_domains (
+                    id, workspace_id, owner_id, domain_key, classification, enabled,
+                    enabled_at, created_by, updated_by, created_at, updated_at, version
+                ) VALUES (
+                    :id, :workspace_id, :owner_id, 'email', 'high_stakes', true,
+                    :now, :owner_id, :owner_id, :now, :now, 1
+                )
+                """
+            ),
+            {"id": uuid4(), "workspace_id": workspace_id, "owner_id": owner_id, "now": now},
+        )
 
 
 def test_create_connector_success_never_returns_credential(
@@ -1429,6 +1509,96 @@ def test_disable_invokes_adapter_disconnect(
     assert spy.disconnect_calls[0].connector_account_id == account_id
 
 
+def test_disable_rejects_gmail_provider_account(
+    engineering_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    """Loop 2 round 1 review finding (PR #128): this generic, provider-
+    agnostic endpoint only marks a row `disconnected` and clears synced
+    projections -- it never touches `personal_domains`/`domain_consents`
+    or purges the owner's Gmail-derived data (`ecc.domains.personal.
+    gmail_revocation`'s cascade). Disabling a `gmail`-provider account
+    through this path used to leave exactly the "disconnected but data
+    (and domain consent) remains" state Phase 10 Task 7 exists to make
+    unreachable. Now rejected outright, directing callers to the
+    domain-level endpoint (`POST /api/v1/personal/domains/email/disable`)
+    that actually reaches the cascade.
+
+    Seeds a `personal_domains` row for `email` (Loop 2 round 25 review:
+    this rejection is now itself gated on one existing -- see the
+    companion test below for the case where none does).
+    """
+    client, workspace_id, user_id, token = engineering_test_context
+    account_id = _insert_connector_account(workspace_id, user_id, provider="gmail")
+    _insert_personal_email_domain(workspace_id, user_id)
+
+    response = client.post(
+        f"/api/v1/engineering/connectors/{account_id}/disable",
+        headers=_headers(token, key=str(uuid4())),
+    )
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "GMAIL_DISABLE_REQUIRES_DOMAIN_ENDPOINT"
+
+    with engine.begin() as connection:
+        status = connection.execute(
+            text("SELECT status FROM connector_accounts WHERE id = :id"),
+            {"id": account_id},
+        ).scalar_one()
+    assert status == "active", "rejected disable must not mutate the account"
+
+
+def test_disable_falls_through_for_a_gmail_account_with_no_domain_row_at_all(
+    engineering_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    """Loop 2 round 25 review finding (MEDIUM): the round-1 rejection above
+    has no dependency of its own on `personal_domains` -- an allowlisted
+    user who completes the Gmail OAuth flow (`gmail_oauth.py`) without
+    ever calling `POST /domains`/`POST /consents` for `email` gets an
+    `active` `connector_accounts` row with no matching domain row. Before
+    this fix, this endpoint unconditionally redirected every such account
+    to the domain-level endpoint, which 404s `DOMAIN_NOT_FOUND` for
+    exactly that owner -- a connector with no HTTP-reachable way to
+    disconnect it. No `personal_domains` row is seeded here (unlike the
+    test above), so the rejection must NOT fire; the account falls
+    through to the same generic disconnect every other provider gets.
+    """
+    client, workspace_id, user_id, token = engineering_test_context
+    account_id = _insert_connector_account(workspace_id, user_id, provider="gmail")
+
+    response = client.post(
+        f"/api/v1/engineering/connectors/{account_id}/disable",
+        headers=_headers(token, key=str(uuid4())),
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "disconnected"
+
+
+def test_disable_already_disconnected_gmail_account_is_still_an_idempotent_noop(
+    engineering_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    """Loop 2 round 2 review finding: the gmail-provider rejection above is
+    gated on `account.status != "disconnected"` specifically so it does
+    NOT break every other provider's own established contract that
+    disabling an already-disconnected connector is an idempotent `200`
+    no-op (see the un-guarded case in `test_disable_invokes_adapter_
+    disconnect` and friends, which never see this branch since none of
+    them use `provider="gmail"`). An already-`disconnected` `gmail` row
+    has nothing left to bypass -- rejecting it too would regress that
+    contract for this provider specifically, which the original
+    unconditional version of the guard did.
+    """
+    client, workspace_id, user_id, token = engineering_test_context
+    account_id = _insert_connector_account(
+        workspace_id, user_id, provider="gmail", status="disconnected"
+    )
+
+    response = client.post(
+        f"/api/v1/engineering/connectors/{account_id}/disable",
+        headers=_headers(token, key=str(uuid4())),
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "disconnected"
+
+
 def test_disable_succeeds_when_adapter_disconnect_raises(
     engineering_test_context: tuple[TestClient, UUID, UUID, str],
     monkeypatch: pytest.MonkeyPatch,
@@ -1666,6 +1836,63 @@ def test_disable_idempotency_replay(
     first_body = {k: v for k, v in first.json().items() if k not in ignored}
     replay_body = {k: v for k, v in replay.json().items() if k not in ignored}
     assert replay_body == first_body
+
+
+def test_disable_idempotency_key_reused_after_a_gmail_reconnect_is_rejected(
+    engineering_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    """Loop 2 round 27 review finding (MEDIUM-HIGH): `request_hash` above is
+    a function of `account_id` alone, and `idempotency_records` rows live
+    365 days, so the same `Idempotency-Key` reused across a real disable ->
+    a genuine Gmail reconnect via `gmail_oauth.py` (reactivates this exact
+    row's `status` back to `'active'`, same `id`, per `gmail_oauth_
+    callback_endpoint`'s own `UPDATE ... WHERE id = :id`) -> a second
+    disable attempt used to match the first call's cached `"disconnected"`
+    response and return it immediately, without actually disconnecting the
+    freshly-reconnected account or attempting to revoke its live Google
+    grant. Identical bug class to `test_gmail_revocation_postgres.py`'s
+    items 21-22 (rounds 21-22, for `disable_domain_endpoint`/`delete_
+    domain_endpoint`), never propagated to this sibling endpoint. No
+    `personal_domains` row is seeded, so the gmail-specific `409 GMAIL_
+    DISABLE_REQUIRES_DOMAIN_ENDPOINT` rejection (item 28/29 above) does not
+    apply here -- this test is entirely about the idempotency cache-hit
+    path, which runs before that rejection is ever reached.
+    """
+    client, workspace_id, user_id, token = engineering_test_context
+    account_id = _insert_connector_account(workspace_id, user_id, provider="gmail")
+    key = str(uuid4())
+
+    first = client.post(
+        f"/api/v1/engineering/connectors/{account_id}/disable",
+        headers=_headers(token, key=key),
+    )
+    assert first.status_code == 200, first.text
+    assert first.json()["status"] == "disconnected"
+
+    # Simulates a genuine Gmail reconnect via the real OAuth callback
+    # endpoint (`gmail_oauth.py`), which reactivates this same row.
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "UPDATE connector_accounts SET status = 'active', disconnected_at = NULL "
+                "WHERE workspace_id = :workspace_id AND id = :id"
+            ),
+            {"workspace_id": workspace_id, "id": account_id},
+        )
+
+    replay = client.post(
+        f"/api/v1/engineering/connectors/{account_id}/disable",
+        headers=_headers(token, key=key),
+    )
+    assert replay.status_code == 409, replay.text
+    assert replay.json()["error"]["code"] == "IDEMPOTENCY_CONFLICT"
+
+    with engine.begin() as connection:
+        status = connection.execute(
+            text("SELECT status FROM connector_accounts WHERE id = :id"),
+            {"id": account_id},
+        ).scalar_one()
+    assert status == "active", "a 409 rejection must not mutate the account either"
 
 
 def test_sync_connector_provider_not_supported(
