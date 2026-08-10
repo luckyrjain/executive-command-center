@@ -2,7 +2,7 @@
 id: PHASE-010-DATA-MODEL
 title: Phase 10 Gmail Data Model
 status: Approved for Implementation
-version: 1.3.0
+version: 1.3.1
 owner: Lucky Jain
 depends_on:
   - PHASE-010
@@ -114,13 +114,20 @@ so, in practice, those schema-level cascades never fire on their own.
 **Task 7** closes the gap this previously left open: `ecc.domains.
 personal.gmail_revocation.cascade_email_revocation` performs the explicit
 purge Phase 7's own `_disable_domain`/`_delete_domain_data` write paths
-now run for `domain_key = "email"` -- disconnecting the Gmail connector
-account and deleting `email_threads`/`email_messages` plus every derived
-`attention_items`/`recommendations`/`pkos_evidence` row this owner's own
-Gmail sync produced -- rather than relying on a cascade that would only
-ever fire if a parent row were hard-deleted, which none of this
-application's own code paths do. See `PRIVACY-CONSENT-CONTRACT.md`'s own
-"Consent revocation cascade (Task 7)" section for the full description.
+now run for `domain_key = "email"` -- disconnecting every one of the
+owner's own Gmail connector account(s) and deleting `email_threads`/
+`email_messages` plus the `attention_items`/`pkos_evidence` rows this
+owner's own Gmail sync produced (an evidence row is left alone rather
+than purged if its `external_message_id` happens to collide with a
+different owner's own message -- see `gmail_revocation.py`'s own module
+docstring), rather than relying on a cascade that would only ever fire if
+a parent row were hard-deleted, which none of this application's own code
+paths do. `email_action_detected` `recommendations` not yet `executed`
+are deleted the same way; an already-`executed` one is redacted in place
+instead, not deleted (its confirmed downstream `tasks`/`commitments`/
+`risks` row is the owner's own work product, not Gmail data). See
+`PRIVACY-CONSENT-CONTRACT.md`'s own "Consent revocation cascade (Task 7)"
+section for the full description.
 
 ## Planned model changes
 
@@ -140,3 +147,4 @@ particular respect.
 | 1.1.0 | 2026-08-06 | Task 5 review (Loop 2 round 16): documented body/body_fetched_at now populated by `email.detect_action`'s own body fetch, and the new `ix_email_messages_detect_action_eligible` partial index (migration `0074`); this document had gone stale after Tasks 3-5 shipped without a contract-version update | Lucky Jain |
 | 1.2.0 | 2026-08-06 | Task 6 review: documented on-demand human-facing body retrieval and the new "forget this" write path that renulls `snippet`/`body`/`body_fetched_at`; this document had gone stale after Task 6 shipped without a contract-version update | Lucky Jain |
 | 1.3.0 | 2026-08-10 | Task 7: documented the consent revocation cascade, correcting the "cascade is planned for Task 7" claim and the "Tasks 7-8 may add further schema" claim (no new migration was needed) | Lucky Jain |
+| 1.3.1 | 2026-08-10 | Task 7 Loop 2 round 5 review: this file was never revisited across four review rounds -- corrected the "every derived ... row" overclaim (round 4's cross-owner collision fix leaves an ambiguous evidence row unpurged) and the imprecise "recommendations ... row" language (executed ones are redacted in place, not deleted); also noted an owner can hold more than one Gmail connector account | Lucky Jain |

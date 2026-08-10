@@ -210,8 +210,10 @@ def _delete_domain_data(
     # Phase 10 Task 7: `email` is the one domain whose deletion needs to
     # reach beyond this module's own generic tables -- see `gmail_
     # revocation.py`'s own module docstring for the full cascade (Gmail
-    # connector disconnect, `email_threads`/`email_messages`, and every
-    # derived `attention_items`/`recommendations`/`pkos_evidence` row).
+    # connector disconnect, `email_threads`/`email_messages`, and the
+    # owner's own `attention_items`/`recommendations`/`pkos_evidence` --
+    # with one deliberate carve-out for an evidence row whose id collides
+    # with a different owner's own message, left alone rather than purged).
     if domain_key == "email":
         return cascade_email_revocation(session, auth, now)
     return []

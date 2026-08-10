@@ -2,7 +2,7 @@
 id: PHASE-010-IMPLEMENTATION-STATUS
 title: Phase 10 Implementation Status
 status: Active
-version: 0.7.2
+version: 0.7.3
 owner: Lucky Jain
 updated: 2026-08-10
 ---
@@ -646,4 +646,10 @@ Left as an accepted, disclosed low-risk gap (security lens, LOW): an idempotency
 
 Security lens found a genuine, if low-probability, architectural gap: `email_messages.external_message_id` is only uniqueness-constrained per `(workspace_id, thread_id)` (migration `0069`), not per-workspace -- nothing in the schema rules out two different owners' own connected Gmail accounts each producing a message that happens to share the same raw id. `pkos_evidence` purge matches by `source_ref` string alone, with no owner qualifier (unlike every other statement in `cascade_email_revocation`), so such a collision would silently purge a different owner's evidence too. Fixed in `gmail_revocation.py`: before deleting, any candidate id that also belongs to another owner's own `email_messages` row in the same workspace is excluded from the purge -- an ambiguous id is left alone rather than risk deleting across the ownership boundary (a strictly safer failure mode: one row not purged, versus purging the wrong owner's data). New test `test_disable_domain_does_not_purge_evidence_with_a_colliding_external_message_id` proves it. (In practice this collision requires two independent real Google accounts to be assigned the identical opaque message id by Google's own infrastructure -- not something any workspace member can engineer deliberately, since neither their own nor another owner's Gmail-assigned ids are caller-controlled -- but the fix costs one query and closes the gap regardless of how unlikely.)
 
-Loop 2 review round 5 in progress.
+**Round 5 (security/correctness and architecture/quality, launched concurrently, explicitly instructed to bring fresh scrutiny rather than confirm round 3's earlier clean pass): findings on both lenses, all fixed.** Architecture lens found the same class of doc-staleness issue round 4 itself had just fixed once (in `API-SCHEMAS.md`) was still present elsewhere: `PRIVACY-CONSENT-CONTRACT.md` and `DATA-MODEL.md` both still claimed "every Gmail-sourced `pkos_evidence` row" / "every derived ... row" is purged, overclaiming completeness against round 4's own deliberate ambiguous-id carve-out -- `DATA-MODEL.md` in particular had never been revisited across any of the five review rounds despite the cascade's actual behavior changing twice since its one edit. Both corrected, along with the identical overclaim in two in-code docstrings (`domains.py:_disable_domain`, `export_deletion.py`'s own inline comment).
+
+Security lens found two test-coverage gaps in round 4's own new tests: `test_disable_domain_does_not_purge_evidence_with_a_colliding_external_message_id` only ever seeded one message, so it exercised the "every candidate id is ambiguous" branch and never proved the mixed case (`safe_ids` still purging normally alongside a non-empty `ambiguous_ids`) -- a future refactor collapsing that branch structure would have passed unnoticed. Fixed by seeding a second, non-colliding message/evidence pair for the same owner and asserting it is still purged. Second, the round-4 concurrency test only covered `disable_domain_endpoint`; `delete_domain_endpoint`'s own identical `session.close()`-before-blocking-revoke sequence (the OTHER call site that ever reaches `finish_gmail_revocation` for `gmail`) had no equivalent proof, despite the shared test fake's own docstring claiming both were covered. Fixed with a mirrored `test_delete_domain_releases_pool_connection_and_row_lock_before_revoke_call`.
+
+Both new round-5 cross-owner tests (and one round-4 test) initially failed CI with `ForeignKeyViolation` on `email_threads_workspace_id_owner_id_domain_key_fkey`: `email_threads` has a real FK to `personal_domains(workspace_id, owner_id, domain_key)` (migration `0069`), and the second owner seeded in each test had no such row. Fixed with a new `_insert_enabled_email_domain` test helper, used before inserting any second owner's own thread.
+
+Loop 2 review round 6 in progress.

@@ -2,7 +2,7 @@
 id: PHASE-010-PRIVACY-CONSENT-CONTRACT
 title: Phase 10 Gmail Privacy and Consent Contract
 status: Approved for Implementation
-version: 1.3.1
+version: 1.3.2
 owner: Lucky Jain
 depends_on:
   - PHASE-010
@@ -55,9 +55,15 @@ personal.gmail_revocation.cascade_email_revocation` in the same request:
 best-effort Google-side token revoke (deferred until after the local
 transaction commits, matching `connector_accounts.py:disable_connector_
 endpoint`'s own established split), disconnecting the owner's `gmail`
-connector account, and purging `email_threads`/`email_messages`, the
-owner's own `entity_type='email_thread'` `attention_items`, and every
-Gmail-sourced `pkos_evidence` row. `email`-sourced `recommendations` not
+connector account(s) (an owner can hold more than one), and purging
+`email_threads`/`email_messages`, the owner's own `entity_type='email_
+thread'` `attention_items`, and every Gmail-sourced `pkos_evidence` row
+this owner's own Gmail sync produced -- except a row whose `external_
+message_id` happens to collide with a *different* owner's own message
+(only unique per `(workspace_id, thread_id)`, not per-workspace): that
+row is deliberately left alone rather than risk deleting across the
+ownership boundary (Loop 2 round 4 review finding; see `gmail_
+revocation.py`'s own module docstring). `email`-sourced `recommendations` not
 yet `executed` are deleted outright; an already-`executed` one (which now
 has an independent, confirmed `tasks`/`commitments`/`risks` row) is
 redacted in place instead -- its own Gmail-derived `rationale`/`proposed_
@@ -142,3 +148,4 @@ Gmail is internal-development only.
 | 1.2.0 | 2026-08-06 | Task 6: documented on-demand human-facing thread reading and per-thread "forget this," explicitly scoped narrower than Task 7's own eventual revocation cascade | Lucky Jain |
 | 1.3.0 | 2026-08-10 | Task 7: documented the consent revocation cascade (disconnect + domain-wide purge, one action), moved it out of "Unsupported"/"Planned" into "Current controls"; only Task 8's export/audit-event/retention items remain planned | Lucky Jain |
 | 1.3.1 | 2026-08-10 | Task 7 Loop 2 round 1 review: documented and closed a cascade-bypassing third write path (the generic engineering connector-disable endpoint) and the multi-connector-account cascade crash | Lucky Jain |
+| 1.3.2 | 2026-08-10 | Task 7 Loop 2 round 5 review: corrected the "every Gmail-sourced pkos_evidence row" overclaim -- round 4's fix deliberately leaves a cross-owner-colliding evidence row unpurged; this file was never revisited when that fix shipped | Lucky Jain |

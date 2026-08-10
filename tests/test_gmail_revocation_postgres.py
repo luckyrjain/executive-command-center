@@ -54,7 +54,18 @@ Covers, in the same order these tests physically appear below:
     thread_id)`, not per-workspace) do not leak `pkos_evidence` across the
     ownership boundary -- Loop 2 round 4 review finding: `source_ref`
     matching has no owner qualifier of its own; the fix skips (does not
-    purge) an evidence row whose id is ambiguous across owners.
+    purge) an evidence row whose id is ambiguous across owners. This same
+    test also proves the mixed case: a second, non-colliding evidence row
+    for the SAME owner is still purged normally in the same request (Loop
+    2 round 5 review finding: the original version only ever seeded one
+    message, so it never exercised the `if safe_ids:` purge branch
+    alongside a non-empty `ambiguous_ids`).
+13. `export_deletion.py:delete_domain_endpoint`'s own identical `session.
+    close()` before `finish_gmail_revocation(...)` sequence releases the
+    pooled connection and row lock before the blocking Google revoke call
+    runs, same as item 10 above -- Loop 2 round 5 review finding: item 10
+    only ever covered `disable_domain_endpoint`, leaving the OTHER call
+    site that reaches `finish_gmail_revocation` for `gmail` unproven.
 """
 
 import threading
@@ -486,6 +497,33 @@ def _insert_gmail_connector_account(
         },
     )
     return account_id
+
+
+def _insert_enabled_email_domain(
+    connection, *, workspace_id: UUID, owner_id: UUID, now: datetime
+) -> None:
+    """`email_threads`'s own FK to `personal_domains(workspace_id, owner_
+    id, domain_key)` (migration `0069`) means a second owner's own thread
+    cannot be inserted without this row existing for them first -- Loop 2
+    round 5 review's own new cross-owner tests found this the hard way
+    (CI: `ForeignKeyViolation` on `email_threads_workspace_id_owner_id_
+    domain_key_fkey`), since `gmail_revocation_context` only ever creates
+    this row for the primary owner.
+    """
+    connection.execute(
+        text(
+            """
+            INSERT INTO personal_domains (
+                id, workspace_id, owner_id, domain_key, classification, enabled,
+                enabled_at, created_by, updated_by, created_at, updated_at, version
+            ) VALUES (
+                :id, :workspace_id, :owner_id, 'email', 'high_stakes', true,
+                :now, :owner_id, :owner_id, :now, :now, 1
+            )
+            """
+        ),
+        {"id": uuid4(), "workspace_id": workspace_id, "owner_id": owner_id, "now": now},
+    )
 
 
 def _row_count(table: str, workspace_id: UUID) -> int:
@@ -944,6 +982,54 @@ def test_disable_domain_releases_pool_connection_and_row_lock_before_revoke_call
     assert _connector_status(ctx["workspace_id"], ctx["account_id"]) == "disconnected"
 
 
+def test_delete_domain_releases_pool_connection_and_row_lock_before_revoke_call(
+    gmail_revocation_context: dict, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Loop 2 round 5 review finding: the round-4 concurrency test above
+    only covers `disable_domain_endpoint`; `export_deletion.py:delete_
+    domain_endpoint`'s own identical `session.close()` before `finish_
+    gmail_revocation(...)` sequence (the OTHER call site that ever reaches
+    it for `gmail`) had no equivalent proof, despite this file's own
+    `_SlowDisconnectAdapter` docstring claiming both were covered.
+    """
+    ctx = gmail_revocation_context
+    slow_adapter = _SlowDisconnectAdapter()
+    monkeypatch.setattr(gmail_revocation, "_adapter", slow_adapter)
+
+    def _delete() -> Any:
+        return ctx["client"].post(
+            "/api/v1/personal/domains/email/delete",
+            headers=_headers(ctx["token"], str(uuid4())),
+        )
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(_delete)
+        assert slow_adapter.entered_disconnect.wait(timeout=5), "disconnect() never entered"
+
+        with engine.connect() as probe:
+            probe.execution_options(isolation_level="AUTOCOMMIT")
+            probe.execute(text("SET statement_timeout = '2s'"))
+            row = (
+                probe.execute(
+                    text(
+                        "SELECT id, status FROM connector_accounts WHERE id = :id FOR UPDATE NOWAIT"
+                    ),
+                    {"id": ctx["account_id"]},
+                )
+                .mappings()
+                .one()
+            )
+            assert row["id"] == ctx["account_id"]
+            probe.rollback()
+            probe.execute(text(f"SET statement_timeout = {STATEMENT_TIMEOUT_MS}"))
+
+        slow_adapter.release.set()
+        response = future.result(timeout=5)
+
+    assert response.status_code == 200, response.text
+    assert _connector_status(ctx["workspace_id"], ctx["account_id"]) == "disconnected"
+
+
 def test_disable_domain_does_not_affect_a_different_owners_gmail_data(
     gmail_revocation_context: dict,
 ) -> None:
@@ -970,6 +1056,9 @@ def test_disable_domain_does_not_affect_a_different_owners_gmail_data(
             user_id=other_owner_id,
             email=other_email,
             now=ctx["now"],
+        )
+        _insert_enabled_email_domain(
+            connection, workspace_id=ctx["workspace_id"], owner_id=other_owner_id, now=ctx["now"]
         )
         connection.execute(
             text(
@@ -1069,11 +1158,42 @@ def test_disable_domain_does_not_purge_evidence_with_a_colliding_external_messag
     message_id`, then asserts the cascade leaves the now-ambiguous
     evidence row alone (`gmail_revocation.py`'s fix: an id that also
     belongs to another owner is skipped, not purged) rather than risk
-    deleting across the ownership boundary.
+    deleting across the ownership boundary -- while a second, non-
+    colliding evidence row for this same owner is still purged normally
+    (Loop 2 round 5 review finding: the original version of this test
+    only ever seeded one message, so it exercised the "every candidate id
+    is ambiguous" branch and never proved the mixed case -- a future
+    refactor collapsing the `if safe_ids:` purge into "purge nothing
+    whenever any id is ambiguous" would have passed unnoticed).
     """
     ctx = gmail_revocation_context
     seeded = _seed_full_cascade_fixture(ctx)
     colliding_external_id = seeded["external_message_id"]
+
+    with engine.begin() as connection:
+        safe_thread_id = _insert_thread(
+            connection,
+            workspace_id=ctx["workspace_id"],
+            owner_id=ctx["owner_id"],
+            account_id=ctx["account_id"],
+            now=ctx["now"],
+        )
+        safe_external_id = f"safe-msg-{uuid4()}"
+        _insert_message(
+            connection,
+            workspace_id=ctx["workspace_id"],
+            owner_id=ctx["owner_id"],
+            thread_id=safe_thread_id,
+            external_message_id=safe_external_id,
+            now=ctx["now"],
+        )
+        _insert_pkos_evidence(
+            connection,
+            workspace_id=ctx["workspace_id"],
+            node_id=seeded["node_id"],
+            source_ref=f"gmail:{safe_external_id}",
+            now=ctx["now"],
+        )
 
     other_owner_id = uuid4()
     other_email = f"other-owner-{uuid4()}@example.test"
@@ -1084,6 +1204,9 @@ def test_disable_domain_does_not_purge_evidence_with_a_colliding_external_messag
             user_id=other_owner_id,
             email=other_email,
             now=ctx["now"],
+        )
+        _insert_enabled_email_domain(
+            connection, workspace_id=ctx["workspace_id"], owner_id=other_owner_id, now=ctx["now"]
         )
         other_thread_id = _insert_thread(
             connection,
@@ -1126,6 +1249,19 @@ def test_disable_domain_does_not_purge_evidence_with_a_colliding_external_messag
             },
         ).one_or_none()
     assert evidence_row is not None, "ambiguous evidence must be left alone, not purged"
+
+    # The mixed case: this owner's OTHER, non-colliding evidence row is
+    # still purged normally in the same request -- the `safe_ids` branch
+    # still fires even while `ambiguous_ids` is non-empty.
+    with engine.begin() as connection:
+        safe_evidence_row = connection.execute(
+            text(
+                "SELECT id FROM pkos_evidence WHERE workspace_id = :workspace_id "
+                "AND source_ref = :source_ref"
+            ),
+            {"workspace_id": ctx["workspace_id"], "source_ref": f"gmail:{safe_external_id}"},
+        ).one_or_none()
+    assert safe_evidence_row is None, "non-ambiguous evidence must still be purged normally"
 
     with engine.begin() as connection:
         connection.execute(
