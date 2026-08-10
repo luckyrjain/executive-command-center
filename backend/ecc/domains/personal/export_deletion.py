@@ -247,20 +247,23 @@ def delete_domain_endpoint(
         if cached is not None:
             return DomainDeletionResponse.model_validate(cached)
 
-        # `for_update=True` (Loop 2 round 11 review finding): without it,
-        # this row was read unlocked while every write below still landed
-        # unconditionally by `id` -- a concurrent `POST /consents` re-grant
-        # (`_enable_domain`'s own `existing = get_domain(..., for_update=
-        # True)` on the same row) could commit in between, and this
-        # endpoint's own trailing `UPDATE personal_domains SET enabled =
-        # false`/`UPDATE domain_consents SET revoked_at = :now WHERE
-        # revoked_at IS NULL` would then silently clobber that fresh grant
-        # -- reverting it and revoking its brand-new consent with no error
-        # surfaced to the caller who just re-granted. The identical class
-        # of gap `domains.py:_disable_domain` closed in Loop 2 round 10
-        # (see that function's own docstring for the full reasoning);
-        # acquiring the same lock here before any write closes it the same
-        # way.
+        # `for_update=True` (Loop 2 round 11 review finding, corrected round
+        # 12): serializes this whole read-cascade-write sequence against
+        # `_enable_domain`'s own `existing = get_domain(..., for_update=
+        # True)` on the same row, so a concurrent `POST /consents` re-grant
+        # can never interleave with (only ever precede or follow) this
+        # endpoint's own reads and writes. It does NOT reject the delete if
+        # a re-grant won the race and committed first: unlike `revoke_
+        # consent_endpoint`, this endpoint carries no caller-supplied
+        # `consent_id` to re-validate freshness against (see `_disable_
+        # domain`'s own docstring on why that check only runs when one is
+        # given), so a delete that loses the race to a fresh re-grant still
+        # proceeds -- purging the freshly-synced data and revoking the new
+        # consent, with no error surfaced. This is the same, already-
+        # accepted self-race behavior `disable_domain_endpoint` has always
+        # had when called without a `consent_id` (see `_disable_domain`'s
+        # docstring); it is not a new gap this lock closes, only a lost-
+        # update/torn-read hazard within the sequence itself.
         domain = get_domain(session, auth, domain_key, for_update=True)
         if domain is None:
             raise HTTPException(status_code=404, detail="DOMAIN_NOT_FOUND")

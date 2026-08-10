@@ -2,7 +2,7 @@
 id: PHASE-010-PRIVACY-CONSENT-CONTRACT
 title: Phase 10 Gmail Privacy and Consent Contract
 status: Approved for Implementation
-version: 1.3.7
+version: 1.3.8
 owner: Lucky Jain
 depends_on:
   - PHASE-010
@@ -132,13 +132,28 @@ by timing. The comparison itself was also widened from `>` to `>=`
 (round 10 LOW finding): a strict `>` has a same-timestamp blind spot
 under coarse clock resolution that `>=` fails closed on instead.
 
-**`delete_domain_endpoint` had the identical TOCTOU gap, closed round 11
-review.** Round 10's fix only covered `_disable_domain`'s own call site;
-`export_deletion.py:delete_domain_endpoint` read `personal_domains`
-without `for_update=True` while its own trailing writes still landed
-unconditionally, so a concurrent re-grant could commit in between and be
-silently clobbered. Fixed by adding `for_update=True` to that same read,
-mirroring `_disable_domain`'s own lock.
+**`delete_domain_endpoint` gained a `for_update=True` lock round 11
+review -- corrected round 12 review to describe accurately what it does
+and does not do.** `export_deletion.py:delete_domain_endpoint` read
+`personal_domains` without `for_update=True` while its own trailing
+writes still landed unconditionally; round 11 added the lock, mirroring
+`_disable_domain`'s own. Round 11's own framing claimed this closed "the
+identical TOCTOU gap" round 10 closed for `_disable_domain` -- it does
+not. `_disable_domain`'s round-10 fix rejects (`404`) when a caller-
+supplied `consent_id` has been superseded by a later grant;
+`delete_domain_endpoint` takes no `consent_id` at all, so it has nothing
+to validate freshness against and cannot reject on one. A concurrent
+re-grant that commits and releases the lock before this endpoint
+acquires it is not rejected -- the endpoint proceeds against the fresh
+state and reverts it anyway. This is not a new gap: `disable_domain_
+endpoint` has had the identical characteristic since round 10 (it also
+never passes a `consent_id`), already disclosed in `_disable_domain`'s
+own docstring. The lock still has real value -- it serializes this
+endpoint's whole read-cascade-write sequence against `_enable_domain`'s
+own lock, preventing torn/interleaved writes within that sequence -- it
+just does not provide staleness rejection. Corrected `export_deletion.
+py`'s own comment and this document's wording accordingly; no code
+behavior changed.
 
 **"Retryable" is the existing idempotency-key mechanism, not a new
 `deletion_jobs` state.** Every step above runs inside the same transaction
@@ -211,3 +226,4 @@ Gmail is internal-development only.
 | 1.3.5 | 2026-08-10 | Task 7 Loop 2 round 9 review: corrected the round-8 `revoke_consent_endpoint` description -- the plain `revoked_at IS NULL` check broke legitimate `Idempotency-Key` retries; replaced with a `NOT EXISTS (a later grant)` check that only rejects a consent a later grant has actually superseded | Lucky Jain |
 | 1.3.6 | 2026-08-10 | Task 7 Loop 2 round 10 review: documented the TOCTOU fix moving the `NOT EXISTS` re-check inside `_disable_domain`'s own transaction (closing a race the round 8-9 fix left open under genuine concurrency) and widening the comparison from `>` to `>=` | Lucky Jain |
 | 1.3.7 | 2026-08-10 | Task 7 Loop 2 round 11 review: documented `delete_domain_endpoint`'s own `for_update=True` fix, closing the identical TOCTOU gap round 10 left open at that call site | Lucky Jain |
+| 1.3.8 | 2026-08-10 | Task 7 Loop 2 round 12 review: corrected the 1.3.7 entry -- the round-11 fix serializes `delete_domain_endpoint`'s sequence but does not reject a losing race the way `_disable_domain`'s `consent_id` check does, since this endpoint has no such identifier; the same already-accepted self-race behavior `disable_domain_endpoint` has had since round 10 | Lucky Jain |
