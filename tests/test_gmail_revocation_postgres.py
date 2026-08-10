@@ -73,12 +73,15 @@ Covers, in the same order these tests physically appear below:
     (both in flight, neither committed yet), where each one's own
     ambiguity check (under `READ COMMITTED`) could independently see "not
     ambiguous" -- Loop 2 round 17 review finding. Closed with a `pg_
-    advisory_xact_lock` keyed on `(workspace_id, external_message_id)`,
-    proven end-to-end the same way item 18 below proves its own lock: a
-    raw connection holds the lock for the colliding id first, a background
-    thread's own `disable` call genuinely blocks rather than racing ahead,
-    and once released the disable proceeds and correctly treats the id as
-    ambiguous.
+    advisory_xact_lock` keyed on `workspace_id` alone (round 17 first
+    keyed it per candidate `external_message_id`; round 19 review found
+    that risked exhausting Postgres's database-wide `max_locks_per_
+    transaction` pool for a large mailbox, a cross-tenant denial-of-
+    service vector, so it was widened to one lock per workspace), proven
+    end-to-end the same way item 18 below proves its own lock: a raw
+    connection holds the lock first, a background thread's own `disable`
+    call genuinely blocks rather than racing ahead, and once released the
+    disable proceeds and correctly treats the id as ambiguous.
 15. The collision fix above only defends against a *concurrent* collision
     (both owners' rows still live). Two owners disabling *sequentially* --
     the second only after the first owner's own colliding `email_messages`
