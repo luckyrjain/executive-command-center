@@ -2,7 +2,7 @@
 id: PHASE-010-PRIVACY-CONSENT-CONTRACT
 title: Phase 10 Gmail Privacy and Consent Contract
 status: Approved for Implementation
-version: 1.4.0
+version: 1.4.1
 owner: Lucky Jain
 depends_on:
   - PHASE-010
@@ -178,6 +178,28 @@ revocation.py`'s own module docstring for the full reasoning against
 adding `'failed'`/`'retrying'` states with nothing that would ever
 populate them for longer than one transaction.
 
+**Reusing the same `Idempotency-Key` after a genuine re-grant is rejected
+outright, round 21 review.** The paragraph above describes retrying a
+*failed* attempt (no `idempotency_records` row is ever written for one,
+so a retry genuinely re-attempts the cascade). A *succeeded* disable/
+delete does write one, and it lives 365 days -- reusing that same key
+later, after the owner genuinely re-enabled `email` and resynced Gmail,
+used to match the first call's cached row (`req_hash` depends only on
+`domain_key`, not on domain state) and return its stale "success"
+response immediately, without `cascade_email_revocation` ever running a
+second time. The caller was told the new consent was revoked and the
+freshly-synced data purged when neither had happened -- exactly the
+silent "disconnected but data remains" state this document's own Task 7
+section exists to make unreachable, reachable here through ordinary
+idempotency-key reuse alone, no attacker or cross-tenant access
+required. Fixed by checking, on a cache hit, whether the domain is
+currently enabled again -- the one fact that distinguishes a genuine
+retry (nothing has changed) from a reused key applied to a materially
+different, later request -- and rejecting with `409 IDEMPOTENCY_
+CONFLICT` (the same code this idempotency framework already returns for
+a request-hash mismatch) rather than silently serving the stale
+response.
+
 ### On-demand thread reading and per-thread "forget" (Tasks 5-6)
 
 On-demand AI body access shipped with Task 5: `email.get_thread_content`
@@ -239,3 +261,4 @@ Gmail is internal-development only.
 | 1.3.8 | 2026-08-10 | Task 7 Loop 2 round 12 review: corrected the 1.3.7 entry -- the round-11 fix serializes `delete_domain_endpoint`'s sequence but does not reject a losing race the way `_disable_domain`'s `consent_id` check does, since this endpoint has no such identifier; the same already-accepted self-race behavior `disable_domain_endpoint` has had since round 10 | Lucky Jain |
 | 1.3.9 | 2026-08-10 | Task 7 Loop 2 round 17 review: documented the new advisory-lock fix closing the genuine-concurrency gap in the cross-owner colliding-`external_message_id` evidence check (neither the round-4 nor round-8 fix covered two truly-overlapping, not-yet-committed cascades) | Lucky Jain |
 | 1.4.0 | 2026-08-10 | Task 7 Loop 2 round 19 review: the round-17 advisory lock was rekeyed from one lock per candidate id to one per workspace, closing a resource-exhaustion risk the per-id version had for large mailboxes (Postgres's shared advisory-lock pool is a database-wide, not per-session, resource) | Lucky Jain |
+| 1.4.1 | 2026-08-10 | Task 7 Loop 2 round 21 review: documented the new `409 IDEMPOTENCY_CONFLICT` fix closing an idempotency-key-reuse-after-regrant gap in `disable_domain_endpoint`/`delete_domain_endpoint` -- a reused key used to return the first call's stale cached "success" without re-running the cascade against freshly re-granted, freshly-synced data | Lucky Jain |

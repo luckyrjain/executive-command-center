@@ -30,12 +30,25 @@ Covers, in the same order these tests physically appear below:
    contract.
 8. Idempotency-key replay of `disable_domain_endpoint` returns the cached
    response without a second cascade run.
-9. An owner with *two* simultaneously-active `gmail` connector accounts
-   (no per-owner uniqueness on `provider = 'gmail'` -- only `external_
-   account_id` is unique) has both disconnected by one cascade run --
-   Loop 2 round 1 review finding: the original `.one_or_none()` raised
-   `MultipleResultsFound` here, aborting the entire cascade.
-10. `domains.py:_disable_domain`'s `session.close()` before `finish_
+9. Reusing the *same* `Idempotency-Key` for `disable_domain_endpoint`
+   across a real disable -> re-enable -> disable-again sequence is
+   rejected (`409 IDEMPOTENCY_CONFLICT`), not silently served item 8's own
+   stale cached "success" -- Loop 2 round 21 review finding (MEDIUM-HIGH):
+   `req_hash` for this endpoint depends only on `domain_key`, and
+   `idempotency_records` rows live 365 days, so replaying the first call's
+   key after a real re-enable used to return the original, now-stale
+   `enabled: false` response without ever re-running `cascade_email_
+   revocation` -- the caller was told the disable succeeded while the
+   freshly-reconnected Gmail account and freshly-synced data were
+   untouched.
+10. The identical fix for `delete_domain_endpoint`, same mechanism and
+    same severity as item 9 above.
+11. An owner with *two* simultaneously-active `gmail` connector accounts
+    (no per-owner uniqueness on `provider = 'gmail'` -- only `external_
+    account_id` is unique) has both disconnected by one cascade run --
+    Loop 2 round 1 review finding: the original `.one_or_none()` raised
+    `MultipleResultsFound` here, aborting the entire cascade.
+12. `domains.py:_disable_domain`'s `session.close()` before `finish_
     gmail_revocation(...)` actually releases the pooled connection and the
     cascade's own `FOR UPDATE` lock before the (potentially slow) Google
     revoke call runs -- Loop 2 round 4 review finding: `connector_
@@ -43,19 +56,19 @@ Covers, in the same order these tests physically appear below:
     dedicated concurrency test proving this; the two call sites that
     actually reach `finish_gmail_revocation` for `gmail` (this module's
     own `_disable_domain`/`delete_domain_endpoint`) had none.
-11. `export_deletion.py:delete_domain_endpoint`'s own identical `session.
+13. `export_deletion.py:delete_domain_endpoint`'s own identical `session.
     close()` before `finish_gmail_revocation(...)` sequence releases the
     pooled connection and row lock before the blocking Google revoke call
-    runs, same as item 10 above -- Loop 2 round 5 review finding: item 10
+    runs, same as item 12 above -- Loop 2 round 5 review finding: item 12
     only ever covered `disable_domain_endpoint`, leaving the OTHER call
     site that reaches `finish_gmail_revocation` for `gmail` unproven.
-12. A second owner's own Gmail data (thread/message/attention item/
+14. A second owner's own Gmail data (thread/message/attention item/
     connector) in the SAME workspace is completely untouched by the first
     owner's disable -- Loop 2 round 4 review finding: every test above
     exercises exactly one owner, so a regression dropping an `owner_id`
     clause from any of the cascade's five raw-SQL statements would go
     undetected.
-13. Two owners whose own Gmail accounts each produce a message sharing the
+15. Two owners whose own Gmail accounts each produce a message sharing the
     same raw `external_message_id` (only unique per `(workspace_id,
     thread_id)`, not per-workspace) do not leak `pkos_evidence` across the
     ownership boundary -- Loop 2 round 4 review finding: `source_ref`
@@ -66,7 +79,7 @@ Covers, in the same order these tests physically appear below:
     2 round 5 review finding: the original version only ever seeded one
     message, so it never exercised the `if safe_ids:` purge branch
     alongside a non-empty `ambiguous_ids`).
-14. The collision fix above only defends against a colliding id that is
+16. The collision fix above only defends against a colliding id that is
     already *committed* by the time the ambiguity check runs -- neither a
     still-live row nor a *finished* prior cascade's own purge-log entry
     defends against two owners' cascades genuinely *overlapping* in time
@@ -78,31 +91,31 @@ Covers, in the same order these tests physically appear below:
     that risked exhausting Postgres's database-wide `max_locks_per_
     transaction` pool for a large mailbox, a cross-tenant denial-of-
     service vector, so it was widened to one lock per workspace), proven
-    end-to-end the same way item 18 below proves its own lock: a raw
+    end-to-end the same way item 20 below proves its own lock: a raw
     connection holds the lock first, a background thread's own `disable`
     call genuinely blocks rather than racing ahead, and once released the
     disable proceeds and correctly treats the id as ambiguous.
-15. The collision fix above only defends against a *concurrent* collision
+17. The collision fix above only defends against a *concurrent* collision
     (both owners' rows still live). Two owners disabling *sequentially* --
     the second only after the first owner's own colliding `email_messages`
     row (the only thing that made the id ambiguous) is already gone -- do
     not leak the first owner's preserved evidence either, via `email_
     message_id_purge_log` (migration `0076`, Loop 2 round 8 review
     finding).
-16. `revoke_consent_endpoint` rejects a `consent_id` a *later* grant has
+18. `revoke_consent_endpoint` rejects a `consent_id` a *later* grant has
     superseded (`404 CONSENT_NOT_FOUND`) rather than resolving it to
     `domain_key` and re-running the cascade against a domain the owner has
     since re-granted consent for and resynced -- Loop 2 round 8 review
-    finding, check refined round 9 (see item 17).
-17. The fix for item 16 above must not reject a *legitimate* same-
+    finding, check refined round 9 (see item 19).
+19. The fix for item 18 above must not reject a *legitimate* same-
     `Idempotency-Key` retry of a revoke that already succeeded, with no
     re-grant in between -- Loop 2 round 9 review finding: round 8's own
     first attempt (a plain `revoked_at IS NULL` check) wrongly 404'd that
     case too, since it ran before `_disable_domain`'s own idempotency-
     cache check ever got a chance to fire.
-18. The check for item 16 above genuinely serializes against a concurrent
+20. The check for item 18 above genuinely serializes against a concurrent
     re-grant, not merely a sequential one -- Loop 2 round 10 review
-    finding: items 16/17's own check used to run in a separate transaction
+    finding: items 18/19's own check used to run in a separate transaction
     that committed before `_disable_domain` was ever called, leaving a
     TOCTOU window for a concurrent re-grant to commit in between and have
     `_disable_domain` disable-and-cascade-purge the freshly re-granted
@@ -956,6 +969,101 @@ def test_disable_domain_idempotency_replay_does_not_rerun_cascade(
             {"workspace_id": ctx["workspace_id"], "id": thread_id},
         ).one_or_none()
     assert row is not None, "idempotency replay must not re-run the cascade"
+
+
+def test_disable_domain_idempotency_key_reused_after_a_regrant_is_rejected(
+    gmail_revocation_context: dict,
+) -> None:
+    """Loop 2 round 21 review finding (MEDIUM-HIGH): unlike item 8 above (a
+    replay with nothing else happening in between), this reuses the same
+    `Idempotency-Key` for a *second*, materially different real-world
+    request -- a disable, then a genuine re-enable/re-grant, then a second
+    disable attempt with the SAME key. Before this fix, `_disable_domain`
+    checked the idempotency cache before ever reading `personal_domains`,
+    so this returned the FIRST call's stale `enabled: false` response
+    without running `cascade_email_revocation` a second time -- silently
+    telling the caller the (new) consent was revoked and data purged when
+    neither had happened. Now rejected with `409 IDEMPOTENCY_CONFLICT`
+    instead, forcing the caller to retry with a fresh key rather than
+    trusting a stale "success."
+    """
+    ctx = gmail_revocation_context
+    _seed_full_cascade_fixture(ctx)
+    key = str(uuid4())
+
+    first = ctx["client"].post(
+        "/api/v1/personal/domains/email/disable", headers=_headers(ctx["token"], key)
+    )
+    assert first.status_code == 200, first.text
+
+    regrant = ctx["client"].post(
+        "/api/v1/personal/domains/email/enable", headers=_headers(ctx["token"], str(uuid4()))
+    )
+    assert regrant.status_code == 200, regrant.text
+    assert regrant.json()["enabled"] is True
+
+    replay = ctx["client"].post(
+        "/api/v1/personal/domains/email/disable", headers=_headers(ctx["token"], key)
+    )
+    assert replay.status_code == 409, replay.text
+    assert replay.json()["error"]["code"] == "IDEMPOTENCY_CONFLICT"
+
+    # The rejected replay must not have mutated anything -- the domain is
+    # still enabled from the regrant above, not silently disabled either.
+    with engine.begin() as connection:
+        enabled = connection.execute(
+            text(
+                "SELECT enabled FROM personal_domains "
+                "WHERE workspace_id = :workspace_id AND owner_id = :owner_id "
+                "AND domain_key = 'email'"
+            ),
+            {"workspace_id": ctx["workspace_id"], "owner_id": ctx["owner_id"]},
+        ).scalar_one()
+    assert enabled is True
+
+
+def test_delete_domain_endpoint_idempotency_key_reused_after_a_regrant_is_rejected(
+    gmail_revocation_context: dict,
+) -> None:
+    """Loop 2 round 21 review finding: the identical gap as the test above,
+    for `delete_domain_endpoint` -- a delete, then a genuine re-enable, then
+    a second delete attempt with the SAME `Idempotency-Key` used to
+    silently no-op (return the first delete's cached "completed" response
+    without ever calling `_delete_domain_data` again), leaving the
+    freshly-reconnected/resynced data unpurged while the caller was told
+    the delete had already completed.
+    """
+    ctx = gmail_revocation_context
+    _seed_full_cascade_fixture(ctx)
+    key = str(uuid4())
+
+    first = ctx["client"].post(
+        "/api/v1/personal/domains/email/delete", headers=_headers(ctx["token"], key)
+    )
+    assert first.status_code == 200, first.text
+
+    regrant = ctx["client"].post(
+        "/api/v1/personal/domains/email/enable", headers=_headers(ctx["token"], str(uuid4()))
+    )
+    assert regrant.status_code == 200, regrant.text
+    assert regrant.json()["enabled"] is True
+
+    replay = ctx["client"].post(
+        "/api/v1/personal/domains/email/delete", headers=_headers(ctx["token"], key)
+    )
+    assert replay.status_code == 409, replay.text
+    assert replay.json()["error"]["code"] == "IDEMPOTENCY_CONFLICT"
+
+    with engine.begin() as connection:
+        enabled = connection.execute(
+            text(
+                "SELECT enabled FROM personal_domains "
+                "WHERE workspace_id = :workspace_id AND owner_id = :owner_id "
+                "AND domain_key = 'email'"
+            ),
+            {"workspace_id": ctx["workspace_id"], "owner_id": ctx["owner_id"]},
+        ).scalar_one()
+    assert enabled is True
 
 
 def test_disable_domain_with_multiple_connector_accounts_disconnects_all(

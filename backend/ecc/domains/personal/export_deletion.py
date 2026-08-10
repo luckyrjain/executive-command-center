@@ -37,6 +37,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from ecc.auth import AuthContext, AuthDep, CsrfDep
+from ecc.observability import record_idempotency_conflict
 
 from .domains import (
     DomainKey,
@@ -242,11 +243,6 @@ def delete_domain_endpoint(
     pending_gmail_revokes: list[PendingGmailRevoke] = []
     with session.begin():
         lock_idempotency(session, auth, idempotency_key)
-        cached = load_cached(
-            session, auth, idempotency_key, req_hash, domain="personal_domain_deletion"
-        )
-        if cached is not None:
-            return DomainDeletionResponse.model_validate(cached)
 
         # `for_update=True` (Loop 2 round 11 review finding, corrected round
         # 12): serializes this whole read-cascade-write sequence against
@@ -265,9 +261,28 @@ def delete_domain_endpoint(
         # had when called without a `consent_id` (see `_disable_domain`'s
         # docstring); it is not a new gap this lock closes, only a lost-
         # update/torn-read hazard within the sequence itself.
+        #
+        # Fetched ahead of `load_cached` (Loop 2 round 21 review finding,
+        # MEDIUM-HIGH, mirroring `_disable_domain`'s identical fix): an
+        # `Idempotency-Key` reused across a real delete -> re-enable/resync
+        # -> delete-again sequence used to match the *first* call's cached
+        # row (`req_hash` depends only on `domain_key`, and idempotency
+        # records live 365 days) and return its stale "completed" response
+        # immediately, without ever reaching `_delete_domain_data` again --
+        # silently no-oping the second, real purge while telling the caller
+        # it succeeded.
         domain = get_domain(session, auth, domain_key, for_update=True)
         if domain is None:
             raise HTTPException(status_code=404, detail="DOMAIN_NOT_FOUND")
+
+        cached = load_cached(
+            session, auth, idempotency_key, req_hash, domain="personal_domain_deletion"
+        )
+        if cached is not None:
+            if domain.enabled:
+                record_idempotency_conflict("personal_domain_deletion")
+                raise HTTPException(status_code=409, detail="IDEMPOTENCY_CONFLICT")
+            return DomainDeletionResponse.model_validate(cached)
 
         pending_gmail_revokes = _delete_domain_data(session, auth, domain_key, now)
 

@@ -774,13 +774,38 @@ def _disable_domain(
     pending_gmail_revokes: list[PendingGmailRevoke] = []
     with session.begin():
         lock_idempotency(session, auth, idempotency_key)
-        cached = load_cached(session, auth, idempotency_key, req_hash, domain="personal_domains")
-        if cached is not None:
-            return DomainResponse.model_validate(cached)
 
+        # `get_domain` moved ahead of `load_cached` (Loop 2 round 21 review
+        # finding, MEDIUM-HIGH): `req_hash` above is a function of
+        # `domain_key` alone, and `idempotency_records` rows live for 365
+        # days (`store_idempotency`), so an `Idempotency-Key` reused across
+        # a real disable -> re-enable/resync -> disable-again sequence used
+        # to match the *first* call's cached row and return its stale
+        # `enabled: false` response immediately -- before this function's
+        # own `consent_id` staleness re-check, before `domain.enabled` was
+        # even read, and therefore before `cascade_email_revocation` ever
+        # ran. The caller was told the disable succeeded while the
+        # freshly-reconnected Gmail account and freshly-synced data were
+        # never touched, exactly the silent "disconnected but data
+        # remains" state this module's own docstring says Task 7 makes
+        # unreachable. Fetching `domain` first lets the cache-hit branch
+        # below check the one fact that actually distinguishes a genuine
+        # retry (nothing has changed since the cached response was
+        # produced, so the domain is still disabled) from a reused key
+        # applied to a materially different, later request (the domain is
+        # enabled again) -- without changing `req_hash`'s own shape or
+        # touching `load_cached`/`store_idempotency`, which every other
+        # mutating endpoint in this package also shares.
         domain = get_domain(session, auth, domain_key, for_update=True)
         if domain is None:
             raise HTTPException(status_code=404, detail="DOMAIN_NOT_FOUND")
+
+        cached = load_cached(session, auth, idempotency_key, req_hash, domain="personal_domains")
+        if cached is not None:
+            if domain.enabled:
+                record_idempotency_conflict("personal_domains")
+                raise HTTPException(status_code=409, detail="IDEMPOTENCY_CONFLICT")
+            return DomainResponse.model_validate(cached)
 
         if consent_id is not None:
             # `>=`, not `>` (Loop 2 round 10 review LOW finding): a strict
