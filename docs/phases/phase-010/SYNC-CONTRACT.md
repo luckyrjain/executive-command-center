@@ -2,7 +2,7 @@
 id: PHASE-010-SYNC-CONTRACT
 title: Phase 10 Gmail Sync Contract
 status: Approved for Implementation
-version: 1.3.2
+version: 1.3.3
 owner: Lucky Jain
 depends_on:
   - PHASE-010
@@ -11,7 +11,7 @@ depends_on:
 
 # Phase 10 Gmail Sync Contract
 
-## Current behavior (Tasks 2-5)
+## Current behavior (Tasks 2-3, 5-7)
 
 Gmail sync is pull-based and manually invoked through the existing connector
 sync endpoint. No scheduler or Pub/Sub push consumer is shipped.
@@ -116,3 +116,4 @@ Pub/Sub push is explicitly deferred and `handle_webhook` remains a no-op.
 | 1.3.0 | 2026-08-10 | Task 7: documented consent-revocation disconnect/purge as shipped, renamed "Planned" heading from "Tasks 7-8" to "Task 8" | Lucky Jain |
 | 1.3.1 | 2026-08-10 | Task 7 Loop 2 round 6 review: this file was never revisited across six review rounds -- corrected the "purges every synced row" overclaim (round 4's ambiguous-id carve-out) | Lucky Jain |
 | 1.3.2 | 2026-08-10 | Task 7 Loop 2 round 16 review: corrected "the one deliberate exception" to "three deliberate exceptions" -- `cascade_email_revocation` (confirmed accurate as of round 14) actually names three (`pkos_nodes`, executed-recommendation redaction, and the evidence-collision carve-out this section already named) | Lucky Jain |
+| 1.3.3 | 2026-08-10 | Task 7 Loop 2 round 17 review: the "Current behavior" heading still read "(Tasks 2-5)" after Task 7's own consent-revocation cascade sentence was added into the "Consent and permissions" subsection beneath it two versions ago -- corrected to "(Tasks 2-3, 5-7)", the sole remaining outlier among the six Task-7 docs' own "Current"/"Delivery boundary" headers | Lucky Jain |

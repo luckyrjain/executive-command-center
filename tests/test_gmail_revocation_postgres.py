@@ -66,27 +66,40 @@ Covers, in the same order these tests physically appear below:
     2 round 5 review finding: the original version only ever seeded one
     message, so it never exercised the `if safe_ids:` purge branch
     alongside a non-empty `ambiguous_ids`).
-14. The collision fix above only defends against a *concurrent* collision
+14. The collision fix above only defends against a colliding id that is
+    already *committed* by the time the ambiguity check runs -- neither a
+    still-live row nor a *finished* prior cascade's own purge-log entry
+    defends against two owners' cascades genuinely *overlapping* in time
+    (both in flight, neither committed yet), where each one's own
+    ambiguity check (under `READ COMMITTED`) could independently see "not
+    ambiguous" -- Loop 2 round 17 review finding. Closed with a `pg_
+    advisory_xact_lock` keyed on `(workspace_id, external_message_id)`,
+    proven end-to-end the same way item 18 below proves its own lock: a
+    raw connection holds the lock for the colliding id first, a background
+    thread's own `disable` call genuinely blocks rather than racing ahead,
+    and once released the disable proceeds and correctly treats the id as
+    ambiguous.
+15. The collision fix above only defends against a *concurrent* collision
     (both owners' rows still live). Two owners disabling *sequentially* --
     the second only after the first owner's own colliding `email_messages`
     row (the only thing that made the id ambiguous) is already gone -- do
     not leak the first owner's preserved evidence either, via `email_
     message_id_purge_log` (migration `0076`, Loop 2 round 8 review
     finding).
-15. `revoke_consent_endpoint` rejects a `consent_id` a *later* grant has
+16. `revoke_consent_endpoint` rejects a `consent_id` a *later* grant has
     superseded (`404 CONSENT_NOT_FOUND`) rather than resolving it to
     `domain_key` and re-running the cascade against a domain the owner has
     since re-granted consent for and resynced -- Loop 2 round 8 review
-    finding, check refined round 9 (see item 16).
-16. The fix for item 15 above must not reject a *legitimate* same-
+    finding, check refined round 9 (see item 17).
+17. The fix for item 16 above must not reject a *legitimate* same-
     `Idempotency-Key` retry of a revoke that already succeeded, with no
     re-grant in between -- Loop 2 round 9 review finding: round 8's own
     first attempt (a plain `revoked_at IS NULL` check) wrongly 404'd that
     case too, since it ran before `_disable_domain`'s own idempotency-
     cache check ever got a chance to fire.
-17. The check for item 15 above genuinely serializes against a concurrent
+18. The check for item 16 above genuinely serializes against a concurrent
     re-grant, not merely a sequential one -- Loop 2 round 10 review
-    finding: items 15/16's own check used to run in a separate transaction
+    finding: items 16/17's own check used to run in a separate transaction
     that committed before `_disable_domain` was ever called, leaving a
     TOCTOU window for a concurrent re-grant to commit in between and have
     `_disable_domain` disable-and-cascade-purge the freshly re-granted
@@ -1314,6 +1327,109 @@ def test_disable_domain_does_not_purge_evidence_with_a_colliding_external_messag
             {"workspace_id": ctx["workspace_id"], "source_ref": f"gmail:{safe_external_id}"},
         ).one_or_none()
     assert safe_evidence_row is None, "non-ambiguous evidence must still be purged normally"
+
+
+def test_disable_domain_serializes_against_a_genuinely_concurrent_colliding_cascade(
+    gmail_revocation_context: dict,
+) -> None:
+    """Loop 2 round 17 review finding: the fix two tests above (round 4)
+    and the fix below (round 8, sequential case) both only ever defend
+    against a colliding id that is already *committed* by the time the
+    ambiguity check runs -- either a still-live row or a prior cascade's
+    own finished purge-log entry. Neither defends against two owners'
+    cascades genuinely *overlapping* in time (both in flight, neither
+    committed yet): under default `READ COMMITTED` isolation, each
+    cascade's ambiguity check only ever sees committed data, so two
+    truly-concurrent cascades for a colliding id could each independently
+    conclude "not ambiguous" and both purge the `pkos_evidence` row --
+    the one DELETE in this cascade with no `owner_id` qualifier of its
+    own. Fixed with a `pg_advisory_xact_lock` keyed on `(workspace_id,
+    external_message_id)`, acquired before the ambiguity check for every
+    candidate id, so two colliding owners' cascades are forced to
+    serialize on that specific id rather than racing.
+
+    This test proves the lock itself is real and load-bearing, the same
+    way `test_revoke_consent_endpoint_serializes_against_a_concurrent_
+    regrant` above proves its own row lock: a raw connection holds the
+    advisory lock for the colliding id first, a background thread's own
+    `disable` call (which needs that same lock inside `cascade_email_
+    revocation`) genuinely blocks rather than racing ahead, and once the
+    lock is released the disable proceeds and correctly treats the id as
+    ambiguous (the other owner's message is still live), leaving the
+    shared evidence row unpurged -- the same outcome the sequential-case
+    fix already proves, now proven to hold under genuine concurrency too.
+    """
+    ctx = gmail_revocation_context
+    seeded = _seed_full_cascade_fixture(ctx)
+    colliding_external_id = seeded["external_message_id"]
+
+    other_owner_id = uuid4()
+    other_email = f"other-owner-{uuid4()}@example.test"
+    ctx["extra_owner_emails"].append(other_email)
+    with engine.begin() as connection:
+        create_identity(
+            connection,
+            workspace_id=ctx["workspace_id"],
+            user_id=other_owner_id,
+            email=other_email,
+            now=ctx["now"],
+        )
+        _insert_enabled_email_domain(
+            connection, workspace_id=ctx["workspace_id"], owner_id=other_owner_id, now=ctx["now"]
+        )
+        other_thread_id = _insert_thread(
+            connection,
+            workspace_id=ctx["workspace_id"],
+            owner_id=other_owner_id,
+            account_id=ctx["account_id"],
+            now=ctx["now"],
+        )
+        _insert_message(
+            connection,
+            workspace_id=ctx["workspace_id"],
+            owner_id=other_owner_id,
+            thread_id=other_thread_id,
+            external_message_id=colliding_external_id,
+            now=ctx["now"],
+        )
+
+    def _disable() -> Any:
+        return ctx["client"].post(
+            "/api/v1/personal/domains/email/disable",
+            headers=_headers(ctx["token"], str(uuid4())),
+        )
+
+    with engine.connect() as holder:
+        holder.execute(
+            text(
+                "SELECT pg_advisory_xact_lock(hashtextextended(:workspace_id || ':' || :id, 0))"
+            ),
+            {"workspace_id": str(ctx["workspace_id"]), "id": colliding_external_id},
+        )
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(_disable)
+            with pytest.raises(FutureTimeoutError):
+                future.result(timeout=1)
+
+            holder.commit()
+            resp = future.result(timeout=5)
+        assert resp.status_code == 200, resp.text
+
+    # This owner's own message is purged, but the shared evidence row
+    # survives -- the id was correctly treated as ambiguous once the
+    # blocked cascade finally acquired the lock and ran its check.
+    with engine.begin() as connection:
+        evidence_row = connection.execute(
+            text(
+                "SELECT id FROM pkos_evidence WHERE workspace_id = :workspace_id "
+                "AND source_ref = :source_ref"
+            ),
+            {
+                "workspace_id": ctx["workspace_id"],
+                "source_ref": f"gmail:detect_action:{colliding_external_id}",
+            },
+        ).one_or_none()
+    assert evidence_row is not None, "ambiguous evidence must be left alone, not purged"
 
 
 def test_sequential_disables_by_two_colliding_owners_do_not_leak_the_first_owners_evidence(

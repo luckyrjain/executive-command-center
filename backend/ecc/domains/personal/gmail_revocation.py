@@ -278,6 +278,37 @@ def cascade_email_revocation(
         # deleting across the boundary; that one row is left behind rather
         # than purged, a strictly safer failure mode than the alternative.
         #
+        # Loop 2 round 17 review finding (MEDIUM): the round-4/round-8 fixes
+        # above only ever defend against a colliding id that is already
+        # *committed* -- either still live or logged by a *finished* prior
+        # cascade. Two owners' cascades genuinely overlapping in time (both
+        # in flight, neither committed yet) each run this ambiguity check
+        # under default READ COMMITTED isolation, so each can independently
+        # see "not ambiguous" and both proceed to the owner-unscoped
+        # `pkos_evidence` DELETE below -- the one statement in this
+        # function with no `owner_id` qualifier of its own (`pkos_evidence.
+        # owner_id` is never trustworthy, see above). Nothing else in this
+        # cascade serializes two *different* owners against each other: the
+        # `personal_domains`/`connector_accounts` row locks and the
+        # idempotency advisory lock are all scoped per-owner. Closed here
+        # with a `pg_advisory_xact_lock` keyed on `(workspace_id, id)` for
+        # every candidate id, acquired in sorted order to avoid a deadlock
+        # if two colliding owners' candidate sets overlap on more than one
+        # id -- mirrors this codebase's own established `pg_advisory_xact_
+        # lock(hashtextextended(...))` idempotency-lock pattern (e.g.
+        # `calendar/events.py:_lock_idempotency`), just keyed differently.
+        # Whichever cascade acquires the lock for a given id first is now
+        # authoritative for it; the loser's own ambiguity check, once
+        # unblocked, correctly observes the winner's now-committed purge-
+        # log entry (or live row) and treats the id as ambiguous.
+        session.execute(
+            text(
+                "SELECT pg_advisory_xact_lock(hashtextextended(:workspace_id || ':' || id, 0)) "
+                "FROM unnest(CAST(:candidate_ids AS text[])) AS id ORDER BY id"
+            ),
+            {"workspace_id": str(auth.workspace_id), "candidate_ids": external_message_ids},
+        )
+
         # Every id this cascade processes (ambiguous or not) is logged
         # first, unconditionally -- a *future* other-owner cascade needs
         # this owner's own entry to still exist after this owner's own
