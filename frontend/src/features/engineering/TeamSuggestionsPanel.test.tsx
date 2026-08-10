@@ -36,11 +36,18 @@ function stubFetch({
   // group from the next refetch, mirroring RepositoriesPanel.test.tsx's
   // own identical pattern for the same reason.
   const state = groups.map((g) => ({ ...g }))
+  let nextTeamId = 1
   vi.stubGlobal(
     'fetch',
     vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input)
-      if (url.includes('/knowledge/entities')) return response({ items: teams })
+      if (url.includes('/knowledge/entities')) {
+        if (init?.method === 'POST') {
+          const body = JSON.parse(String(init.body)) as { kind: string; canonical_name: string }
+          return response({ id: `new-team-${nextTeamId++}`, kind: body.kind, canonical_name: body.canonical_name })
+        }
+        return response({ items: teams })
+      }
       if (init?.method === 'POST' && url.includes('/team-suggestions/confirm')) {
         const body = JSON.parse(String(init.body)) as { suggested_team_name: string }
         const index = state.findIndex((g) => g.suggested_team_name === body.suggested_team_name)
@@ -100,6 +107,20 @@ describe('TeamSuggestionsPanel', () => {
     expect(confirmButton.hasAttribute('disabled')).toBe(false)
   })
 
+  it('disables Create & confirm when the team name is empty', async () => {
+    stubFetch({ groups: [group()], teams: [] })
+    renderPanel()
+    await screen.findByText('acme')
+    const createButton = screen.getByRole('button', { name: 'Create & confirm' })
+    expect(createButton.hasAttribute('disabled')).toBe(false)
+
+    fireEvent.change(screen.getByLabelText('New team name for acme'), { target: { value: '   ' } })
+    expect(createButton.hasAttribute('disabled')).toBe(true)
+
+    fireEvent.change(screen.getByLabelText('New team name for acme'), { target: { value: 'Acme Platform' } })
+    expect(createButton.hasAttribute('disabled')).toBe(false)
+  })
+
   it('confirming posts the suggested name and chosen team, then removes the group', async () => {
     stubFetch({ groups: [group()], teams: [{ id: 'team-1', canonical_name: 'Platform' }] })
     renderPanel()
@@ -112,6 +133,52 @@ describe('TeamSuggestionsPanel', () => {
     const postCall = calls.find(([, init]) => init?.method === 'POST')
     expect(String(postCall?.[0])).toContain('/api/v1/engineering/team-suggestions/confirm')
     expect(JSON.parse(String(postCall?.[1]?.body))).toEqual({ suggested_team_name: 'acme', team_entity_id: 'team-1' })
+  })
+
+  it('creating a team from the suggestion posts create then confirm, then removes the group', async () => {
+    stubFetch({ groups: [group()], teams: [] })
+    renderPanel()
+    await screen.findByText('acme')
+
+    fireEvent.click(screen.getByRole('button', { name: 'Create & confirm' }))
+
+    await waitFor(() => expect(screen.queryByText('acme')).toBeNull())
+    const calls = (fetch as unknown as { mock: { calls: [RequestInfo | URL, RequestInit?][] } }).mock.calls
+    const createCall = calls.find(([url, init]) => init?.method === 'POST' && String(url).includes('/knowledge/entities'))
+    expect(JSON.parse(String(createCall?.[1]?.body))).toEqual({ kind: 'team', canonical_name: 'acme' })
+
+    const confirmCall = calls.find(([url, init]) => init?.method === 'POST' && String(url).includes('/team-suggestions/confirm'))
+    expect(JSON.parse(String(confirmCall?.[1]?.body))).toEqual({ suggested_team_name: 'acme', team_entity_id: 'new-team-1' })
+  })
+
+  it('keeps the created team usable when confirm fails after create succeeds', async () => {
+    let createdTeam = false
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input)
+        if (url.includes('/knowledge/entities')) {
+          if (init?.method === 'POST') {
+            const body = JSON.parse(String(init.body)) as { kind: string; canonical_name: string }
+            createdTeam = true
+            return response({ id: 'new-team-1', kind: body.kind, canonical_name: body.canonical_name })
+          }
+          return response({ items: createdTeam ? [{ id: 'new-team-1', canonical_name: 'acme' }] : [] })
+        }
+        if (init?.method === 'POST' && url.includes('/team-suggestions/confirm')) {
+          return Promise.reject(new TypeError('fetch failed'))
+        }
+        return response({ items: [group()] })
+      }),
+    )
+    renderPanel()
+    await screen.findByText('acme')
+
+    fireEvent.click(screen.getByRole('button', { name: 'Create & confirm' }))
+
+    expect(await screen.findByRole('alert', {}, { timeout: 3000 })).toBeTruthy()
+    expect(screen.getByText('2 repositories · 1 work items (3 total)')).toBeTruthy()
+    expect(screen.getByRole('option', { name: 'acme' })).toBeTruthy()
   })
 
   it('dismissing removes the group without assigning a team', async () => {

@@ -3,7 +3,7 @@ import { useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
 import { apiRequest } from '../../api/client'
-import type { EntityList } from '../knowledge/types'
+import type { EntityList, KnowledgeEntity } from '../knowledge/types'
 import type {
   TeamSuggestionActionResponse,
   TeamSuggestionConfirmRequest,
@@ -26,6 +26,10 @@ function dismissSuggestion(suggestedTeamName: string): Promise<TeamSuggestionAct
   return apiRequest('/api/v1/engineering/team-suggestions/dismiss', { method: 'POST', body })
 }
 
+function createTeamEntity(canonicalName: string): Promise<KnowledgeEntity> {
+  return apiRequest('/api/v1/knowledge/entities', { method: 'POST', body: { kind: 'team', canonical_name: canonicalName } })
+}
+
 /**
  * One group's row: bulk-confirm (via a team picker) or bulk-dismiss every
  * `repositories`/`engineering_work_items` row sharing this `suggested_
@@ -36,6 +40,7 @@ function SuggestionRow({ group, teamsById }: { group: TeamSuggestionGroup; teams
   const queryClient = useQueryClient()
   const [teamEntityId, setTeamEntityId] = useState('')
   const [lastResult, setLastResult] = useState<TeamSuggestionActionResponse | null>(null)
+  const [newTeamName, setNewTeamName] = useState(group.suggested_team_name)
 
   function invalidate() {
     void queryClient.invalidateQueries({ queryKey: ['engineering', 'team-suggestions'] })
@@ -51,7 +56,21 @@ function SuggestionRow({ group, teamsById }: { group: TeamSuggestionGroup; teams
     mutationFn: () => dismissSuggestion(group.suggested_team_name),
     onSuccess: (result) => { setLastResult(result); invalidate() },
   })
-  const busy = confirmMutation.isPending || dismissMutation.isPending
+  const createAndConfirmMutation = useMutation({
+    mutationFn: async () => {
+      const entity = await createTeamEntity(newTeamName.trim())
+      return confirmSuggestion(group.suggested_team_name, entity.id)
+    },
+    onSuccess: (result) => {
+      setLastResult(result)
+      invalidate()
+      void queryClient.invalidateQueries({ queryKey: ['knowledge', 'entities', 'team'] })
+    },
+    onError: () => {
+      void queryClient.invalidateQueries({ queryKey: ['knowledge', 'entities', 'team'] })
+    },
+  })
+  const busy = confirmMutation.isPending || dismissMutation.isPending || createAndConfirmMutation.isPending
   const total = group.repository_count + group.work_item_count
 
   return (
@@ -85,8 +104,28 @@ function SuggestionRow({ group, teamsById }: { group: TeamSuggestionGroup; teams
           Dismiss
         </button>
       </div>
+      <div className="work-actions">
+        <label>
+          {`New team name for ${group.suggested_team_name}`}
+          <input
+            aria-label={`New team name for ${group.suggested_team_name}`}
+            type="text"
+            value={newTeamName}
+            disabled={busy}
+            onChange={(event) => setNewTeamName(event.target.value)}
+          />
+        </label>
+        <button
+          type="button"
+          disabled={!newTeamName.trim() || busy}
+          onClick={() => createAndConfirmMutation.mutate()}
+        >
+          Create & confirm
+        </button>
+      </div>
       {confirmMutation.isError ? <span role="alert" className="inline-status error-panel">{confirmMutation.error.message}</span> : null}
       {dismissMutation.isError ? <span role="alert" className="inline-status error-panel">{dismissMutation.error.message}</span> : null}
+      {createAndConfirmMutation.isError ? <span role="alert" className="inline-status error-panel">{createAndConfirmMutation.error.message}</span> : null}
       {lastResult && lastResult.skipped_unauthorized.length > 0 ? (
         <p role="status">
           {`Applied to ${lastResult.updated.length} of ${lastResult.updated.length + lastResult.skipped_unauthorized.length} — ${lastResult.skipped_unauthorized.length} skipped: insufficient permission.`}
