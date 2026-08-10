@@ -2,7 +2,7 @@
 id: PHASE-010-TEST-PLAN
 title: Phase 10 Gmail Test Plan
 status: Approved for Implementation
-version: 1.4.4
+version: 1.4.5
 owner: Lucky Jain
 depends_on:
   - PHASE-010
@@ -53,7 +53,7 @@ no separate "partial failure" state was needed) have all shipped -- see
 |---|---|
 | Real Gmail account | Internal allowlisted test account completes OAuth, 30-day backfill, incremental sync, reconnect, permission loss, and revoke |
 | Backup/restore | Encrypted thread/message fixtures restore with checksums, owner isolation, indexes, cursors, and application readiness |
-| Privacy | Export/delete/revoke test proves zero readable content and derived-record propagation |
+| Privacy | Export/delete/revoke test proves zero readable content (subject to the three narrow, deliberate exceptions `PRIVACY-CONSENT-CONTRACT.md`'s Task 7 section names) and derived-record propagation |
 | Performance | Representative mailbox records p50/p95, quota calls, DB time, memory, and bounded partial-resume behavior |
 | Security/adversarial | Independent review plus malicious headers/MIME, OAuth state, token leakage, cross-owner/workspace, SSRF/redirect, and prompt injection tests |
 | Accessibility | Browser report covering every UX state in `UX-STATES.md` |
@@ -83,3 +83,4 @@ No gate is satisfied by an unchecked box or an uncommitted local report.
 | 1.4.2 | 2026-08-10 | Task 7 Loop 2 round 24 review (HIGH): recorded coverage proving a genuinely fresh disable request, not only a replayed one, now reaches a Gmail account reconnected after a real disable (test count 22 -> 23) | Lucky Jain |
 | 1.4.3 | 2026-08-10 | Task 7 Loop 2 round 25 review (MEDIUM): recorded coverage for the generic engineering `/disable` endpoint's `gmail`-provider rejection now falling through when the owner has no `personal_domains` row for `email` at all | Lucky Jain |
 | 1.4.4 | 2026-08-10 | Task 7 Loop 2 round 27 review (MEDIUM-HIGH): recorded coverage for the generic engineering `/disable` endpoint now rejecting an `Idempotency-Key` reused after a genuine Gmail reconnect with `409 IDEMPOTENCY_CONFLICT`, instead of serving a stale cached `"disconnected"` response | Lucky Jain |
+| 1.4.5 | 2026-08-10 | Task 7 Loop 2 round 31 review (MEDIUM): qualified the "Required non-mocked evidence before promotion" Privacy gate row's unqualified "zero readable content" claim with a cross-reference to `PRIVACY-CONSENT-CONTRACT.md`'s three named deliberate exceptions, matching this same file's own line 46 | Lucky Jain |

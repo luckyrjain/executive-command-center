@@ -2,7 +2,7 @@
 id: PHASE-010
 title: Gmail Connector
 status: Approved for Implementation
-version: 0.4.7
+version: 0.4.8
 owner: Lucky Jain
 depends_on:
   - PHASE-001
@@ -100,7 +100,7 @@ Internal-user allowlist is the load-bearing mechanism keeping this phase outside
 
 ## Test strategy
 
-Cross-workspace isolation; consent-revocation purges connector and content together; encrypted fields never returned in a list/summary view; OAuth flow (authorization-url generation, callback/code-exchange, refresh); internal-allowlist enforcement (rejected for a non-allowlisted account); expand-backfill re-verifies live consent; `recommendations`' new create-path (schema validation, versioned confirm, audit event); the new AI-runtime tool's evaluation-floor adversarial fixtures.
+Cross-workspace isolation; consent-revocation purges connector and content together (subject to the three narrow, deliberate exceptions `PRIVACY-CONSENT-CONTRACT.md`'s Task 7 section names); encrypted fields never returned in a list/summary view; OAuth flow (authorization-url generation, callback/code-exchange, refresh); internal-allowlist enforcement (rejected for a non-allowlisted account); expand-backfill re-verifies live consent; `recommendations`' new create-path (schema validation, versioned confirm, audit event); the new AI-runtime tool's evaluation-floor adversarial fixtures.
 
 ## Acceptance criteria
 
@@ -126,6 +126,7 @@ Gmail write actions (compose/reply/send/archive/label-modify); public/general-av
 
 | Version | Date | Summary | Author |
 |---|---|---|---|
+| 0.4.8 | 2026-08-10 | Task 7 Loop 2 round 31 review (MEDIUM): rounds 29-30's own fixes missed a sixth unqualified claim, in "Test strategy" ("consent-revocation purges connector and content together"); cross-referenced the same three named deliberate exceptions. A repo-wide grep confirms this bug class is now exhausted | Lucky Jain |
 | 0.4.7 | 2026-08-10 | Task 7 Loop 2 round 30 review (MEDIUM): round 29's own fix missed a fifth unqualified claim in "Functional requirements" ("...disconnects the OAuth grant and deletes synced content"); cross-referenced the same three named deliberate exceptions. Also qualified the identical claim in `docs/superpowers/plans/2026-08-04-phase-10-gmail-connector.md`'s own Task 7 section (LOW, a file outside this doc's own maintained set) | Lucky Jain |
 | 0.4.6 | 2026-08-10 | Task 7 Loop 2 round 29 review (MEDIUM): the "In scope"/"Security and privacy"/"Acceptance criteria"/"Rollback plan" sections' "purges all synced content"/"zero readable synced content" claims were the one place among Task 7's docs never brought into rounds 4-7's ambiguous-`external_message_id`-carve-out disclosure sweep -- all four now cross-reference `PRIVACY-CONSENT-CONTRACT.md`'s three named deliberate exceptions | Lucky Jain |
 | 0.4.5 | 2026-08-10 | Reconciled delivery through Task 7 after the consent revocation cascade merge (Loop 2 round 16 review: this file's own version/changelog had not been bumped for this edit, unlike every prior task boundary) | Lucky Jain |
