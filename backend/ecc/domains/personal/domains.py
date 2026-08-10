@@ -791,20 +791,49 @@ def _disable_domain(
         # never touched, exactly the silent "disconnected but data
         # remains" state this module's own docstring says Task 7 makes
         # unreachable. Fetching `domain` first lets the cache-hit branch
-        # below check the one fact that actually distinguishes a genuine
-        # retry (nothing has changed since the cached response was
-        # produced, so the domain is still disabled) from a reused key
-        # applied to a materially different, later request (the domain is
-        # enabled again) -- without changing `req_hash`'s own shape or
-        # touching `load_cached`/`store_idempotency`, which every other
-        # mutating endpoint in this package also shares.
+        # below check the facts that distinguish a genuine retry (nothing
+        # has changed since the cached response was produced) from a
+        # reused key applied to a materially different, later request --
+        # without changing `req_hash`'s own shape or touching `load_cached`/
+        # `store_idempotency`, which every other mutating endpoint in this
+        # package also shares.
         domain = get_domain(session, auth, domain_key, for_update=True)
         if domain is None:
             raise HTTPException(status_code=404, detail="DOMAIN_NOT_FOUND")
 
         cached = load_cached(session, auth, idempotency_key, req_hash, domain="personal_domains")
         if cached is not None:
-            if domain.enabled:
+            # `domain.enabled` alone (round 21) is necessary but not
+            # sufficient -- Loop 2 round 22 review finding (MEDIUM-HIGH):
+            # `gmail_oauth.py:gmail_oauth_callback_endpoint` reactivates a
+            # `connector_accounts` row straight back to `status='active'`
+            # with no reference to `personal_domains`/`domain_consents`
+            # whatsoever (it is the sole reconnect path -- the generic
+            # engineering `create_connector_endpoint` never registers
+            # `gmail`, and `disable_connector_endpoint` rejects it with
+            # `409 GMAIL_DISABLE_REQUIRES_DOMAIN_ENDPOINT`). A real disable
+            # -> a genuine Gmail reconnect through that unrelated OAuth
+            # flow (no domain re-enable at all) -> the same `Idempotency-
+            # Key` replayed here still found `domain.enabled is False` and
+            # silently served the stale cached response, leaving the
+            # freshly-reconnected, still-live connector row untouched.
+            # Checked here rather than gating the reconnect flow itself
+            # (Task 1 code this PR does not otherwise touch): mirrors
+            # `cascade_email_revocation`'s own `status != 'disconnected'`
+            # query exactly.
+            reconnected = (
+                domain_key == "email"
+                and session.execute(
+                    text(
+                        "SELECT 1 FROM connector_accounts WHERE workspace_id = :workspace_id "
+                        "AND provider = 'gmail' AND owner_id = :owner_id "
+                        "AND status != 'disconnected' LIMIT 1"
+                    ),
+                    {"workspace_id": auth.workspace_id, "owner_id": auth.user_id},
+                ).first()
+                is not None
+            )
+            if domain.enabled or reconnected:
                 record_idempotency_conflict("personal_domains")
                 raise HTTPException(status_code=409, detail="IDEMPOTENCY_CONFLICT")
             return DomainResponse.model_validate(cached)

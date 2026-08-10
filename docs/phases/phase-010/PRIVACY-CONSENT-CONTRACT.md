@@ -2,7 +2,7 @@
 id: PHASE-010-PRIVACY-CONSENT-CONTRACT
 title: Phase 10 Gmail Privacy and Consent Contract
 status: Approved for Implementation
-version: 1.4.1
+version: 1.4.2
 owner: Lucky Jain
 depends_on:
   - PHASE-010
@@ -193,12 +193,35 @@ silent "disconnected but data remains" state this document's own Task 7
 section exists to make unreachable, reachable here through ordinary
 idempotency-key reuse alone, no attacker or cross-tenant access
 required. Fixed by checking, on a cache hit, whether the domain is
-currently enabled again -- the one fact that distinguishes a genuine
-retry (nothing has changed) from a reused key applied to a materially
+currently enabled again -- one fact that distinguishes a genuine retry
+(nothing has changed) from a reused key applied to a materially
 different, later request -- and rejecting with `409 IDEMPOTENCY_
 CONFLICT` (the same code this idempotency framework already returns for
 a request-hash mismatch) rather than silently serving the stale
-response.
+response. (Round 22 review found `domain.enabled` alone is not the
+*only* such fact -- see the paragraph below.)
+
+**A genuine Gmail reconnect, not only a domain re-enable, must also
+invalidate a stale cached response, round 22 review.** `gmail_oauth.py:
+gmail_oauth_callback_endpoint` -- the sole reconnect path for a `gmail`-
+provider `connector_accounts` row (the generic engineering connector-
+create endpoint never registers `gmail`; the generic disable endpoint
+rejects it outright) -- reactivates that row straight back to `status=
+'active'` with zero reference to `personal_domains`/`domain_consents`.
+A real disable/delete followed by a genuine reconnect through that
+unrelated OAuth flow (no domain re-enable at all) left `domain.enabled`
+still `False`, so round 21's own check alone would still have served
+the stale cached response on a same-key replay -- leaving the freshly-
+reconnected, still-live connector row untouched. No fresh email content
+can resync through this specific gap (`gmail_adapter._email_consent_
+active` independently re-checks `domain_consents.revoked_at IS NULL`
+before every sync write, and that stays set from the original
+disable); what leaks past round 21's fix alone is the connector's live/
+undisconnected status and its unrevoked Google grant. Fixed by widening
+the cache-hit check to also query for a reactivated `gmail` connector
+account for the owner, mirroring `cascade_email_revocation`'s own
+identical query, rather than gating the OAuth reconnect flow itself
+(Task 1 code this document's Task 7 section does not otherwise touch).
 
 ### On-demand thread reading and per-thread "forget" (Tasks 5-6)
 
@@ -262,3 +285,4 @@ Gmail is internal-development only.
 | 1.3.9 | 2026-08-10 | Task 7 Loop 2 round 17 review: documented the new advisory-lock fix closing the genuine-concurrency gap in the cross-owner colliding-`external_message_id` evidence check (neither the round-4 nor round-8 fix covered two truly-overlapping, not-yet-committed cascades) | Lucky Jain |
 | 1.4.0 | 2026-08-10 | Task 7 Loop 2 round 19 review: the round-17 advisory lock was rekeyed from one lock per candidate id to one per workspace, closing a resource-exhaustion risk the per-id version had for large mailboxes (Postgres's shared advisory-lock pool is a database-wide, not per-session, resource) | Lucky Jain |
 | 1.4.1 | 2026-08-10 | Task 7 Loop 2 round 21 review: documented the new `409 IDEMPOTENCY_CONFLICT` fix closing an idempotency-key-reuse-after-regrant gap in `disable_domain_endpoint`/`delete_domain_endpoint` -- a reused key used to return the first call's stale cached "success" without re-running the cascade against freshly re-granted, freshly-synced data | Lucky Jain |
+| 1.4.2 | 2026-08-10 | Task 7 Loop 2 round 22 review: `domain.enabled` alone (round 21) was not sufficient -- a genuine Gmail reconnect through the separate OAuth callback flow also needed to invalidate a cached idempotency response, since that flow never touches `personal_domains`/`domain_consents` at all; widened the cache-hit check to also detect a reactivated `gmail` connector account | Lucky Jain |

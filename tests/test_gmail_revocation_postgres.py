@@ -128,6 +128,16 @@ Covers, in the same order these tests physically appear below:
     a background thread (which blocks on the lock), regrants over the SAME
     held connection while the replay is blocked, then releases the lock and
     asserts the replay rejects with `404 CONSENT_NOT_FOUND` once unblocked.
+21. Items 9-10's own `domain.enabled` check is necessary but not
+    sufficient -- Loop 2 round 22 review finding (MEDIUM-HIGH): a genuine
+    Gmail reconnect through `gmail_oauth_callback_endpoint` (which never
+    references `personal_domains`/`domain_consents` at all) leaves
+    `domain.enabled` still `False`, so a same-`Idempotency-Key` replay
+    after that reconnect would still have been served item 9's own stale
+    cached response. Closed by also checking for a reactivated `gmail`
+    connector account on a cache hit.
+22. The identical fix for `delete_domain_endpoint`, same mechanism and
+    same severity as item 21 above.
 """
 
 import threading
@@ -1888,3 +1898,88 @@ def test_revoke_consent_endpoint_serializes_against_a_concurrent_regrant(
 
     assert replay_resp.status_code == 404, replay_resp.text
     assert replay_resp.json()["error"]["code"] == "CONSENT_NOT_FOUND"
+
+
+def test_disable_domain_idempotency_key_reused_after_an_oauth_reconnect_is_rejected(
+    gmail_revocation_context: dict,
+) -> None:
+    """Loop 2 round 22 review finding (MEDIUM-HIGH): round 21's own fix
+    (item 9 above) checked `domain.enabled` on a cache hit, but that is
+    not the only way a reused `Idempotency-Key` can be replayed against a
+    materially different, later request. `gmail_oauth.py:gmail_oauth_
+    callback_endpoint` -- the sole reconnect path for a `gmail`-provider
+    `connector_accounts` row -- reactivates it straight back to `status=
+    'active'` with no reference whatsoever to `personal_domains`/`domain_
+    consents`. A real disable, followed by a genuine Gmail reconnect
+    through that unrelated OAuth flow (simulated here the same way the
+    concurrent-regrant test above does, by updating `connector_accounts`
+    directly, since exercising the real OAuth callback needs Google
+    transport mocking this file does not otherwise set up), leaves
+    `domain.enabled` still `False` -- round 21's own fix alone would have
+    let the replay through and silently served the stale cached response
+    again, leaving the freshly-reconnected connector row untouched.
+    """
+    ctx = gmail_revocation_context
+    _seed_full_cascade_fixture(ctx)
+    key = str(uuid4())
+
+    first = ctx["client"].post(
+        "/api/v1/personal/domains/email/disable", headers=_headers(ctx["token"], key)
+    )
+    assert first.status_code == 200, first.text
+    assert _connector_status(ctx["workspace_id"], ctx["account_id"]) == "disconnected"
+
+    # Simulates a genuine Gmail reconnect via the real OAuth callback
+    # endpoint, which never touches `personal_domains`/`domain_consents`.
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "UPDATE connector_accounts SET status = 'active', disconnected_at = NULL "
+                "WHERE workspace_id = :workspace_id AND id = :id"
+            ),
+            {"workspace_id": ctx["workspace_id"], "id": ctx["account_id"]},
+        )
+
+    replay = ctx["client"].post(
+        "/api/v1/personal/domains/email/disable", headers=_headers(ctx["token"], key)
+    )
+    assert replay.status_code == 409, replay.text
+    assert replay.json()["error"]["code"] == "IDEMPOTENCY_CONFLICT"
+
+    # The rejected replay must not have disconnected the freshly-
+    # reconnected account either.
+    assert _connector_status(ctx["workspace_id"], ctx["account_id"]) == "active"
+
+
+def test_delete_domain_endpoint_idempotency_key_reused_after_an_oauth_reconnect_is_rejected(
+    gmail_revocation_context: dict,
+) -> None:
+    """Loop 2 round 22 review finding: the identical gap as the test above,
+    for `delete_domain_endpoint`.
+    """
+    ctx = gmail_revocation_context
+    _seed_full_cascade_fixture(ctx)
+    key = str(uuid4())
+
+    first = ctx["client"].post(
+        "/api/v1/personal/domains/email/delete", headers=_headers(ctx["token"], key)
+    )
+    assert first.status_code == 200, first.text
+    assert _connector_status(ctx["workspace_id"], ctx["account_id"]) == "disconnected"
+
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "UPDATE connector_accounts SET status = 'active', disconnected_at = NULL "
+                "WHERE workspace_id = :workspace_id AND id = :id"
+            ),
+            {"workspace_id": ctx["workspace_id"], "id": ctx["account_id"]},
+        )
+
+    replay = ctx["client"].post(
+        "/api/v1/personal/domains/email/delete", headers=_headers(ctx["token"], key)
+    )
+    assert replay.status_code == 409, replay.text
+    assert replay.json()["error"]["code"] == "IDEMPOTENCY_CONFLICT"
+
+    assert _connector_status(ctx["workspace_id"], ctx["account_id"]) == "active"

@@ -279,7 +279,30 @@ def delete_domain_endpoint(
             session, auth, idempotency_key, req_hash, domain="personal_domain_deletion"
         )
         if cached is not None:
-            if domain.enabled:
+            # `domain.enabled` alone is necessary but not sufficient --
+            # Loop 2 round 22 review finding (MEDIUM-HIGH), mirroring
+            # `_disable_domain`'s identical fix: `gmail_oauth.py:
+            # gmail_oauth_callback_endpoint` reactivates a `connector_
+            # accounts` row straight back to `status='active'` with no
+            # reference to `personal_domains`/`domain_consents` at all, so
+            # a real delete -> a genuine Gmail reconnect through that
+            # unrelated OAuth flow -> the same `Idempotency-Key` replayed
+            # here still found `domain.enabled is False` and silently
+            # served the stale cached "completed" response, leaving the
+            # freshly-reconnected connector row untouched.
+            reconnected = (
+                domain_key == "email"
+                and session.execute(
+                    text(
+                        "SELECT 1 FROM connector_accounts WHERE workspace_id = :workspace_id "
+                        "AND provider = 'gmail' AND owner_id = :owner_id "
+                        "AND status != 'disconnected' LIMIT 1"
+                    ),
+                    {"workspace_id": auth.workspace_id, "owner_id": auth.user_id},
+                ).first()
+                is not None
+            )
+            if domain.enabled or reconnected:
                 record_idempotency_conflict("personal_domain_deletion")
                 raise HTTPException(status_code=409, detail="IDEMPOTENCY_CONFLICT")
             return DomainDeletionResponse.model_validate(cached)
