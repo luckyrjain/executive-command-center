@@ -2,7 +2,7 @@
 id: PHASE-010-API-SCHEMAS
 title: Phase 10 Gmail API Schemas
 status: Approved for Implementation
-version: 1.4.0
+version: 1.4.1
 owner: Lucky Jain
 depends_on:
   - PHASE-010
@@ -21,8 +21,13 @@ depends_on:
   revocation cascade (Task 7, below), which adds no new endpoint at all --
   it changes what three of Phase 7's own existing generic personal-domain
   endpoints do for `domain_key = "email"` specifically.
-- **Current (Task 8):** the Gmail panel's own two backend additions -- a
-  thread-list endpoint and a `since` sync parameter, both documented below.
+- **Current (Task 8):** the Gmail panel's own three backend additions -- a
+  thread-list endpoint and a `since` sync parameter, both documented below,
+  plus a `recommendation_type` server-side filter on Phase 1's own
+  `GET /api/v1/recommendations` (the embedded `RecommendationPanel`
+  instance's own dependency, added by a Loop 2 round 5 review fix; this
+  file's own delivery boundary is thread-list/`since` only, so see
+  `docs/phases/phase-001/API-SCHEMAS.md` for the parameter's own contract).
 
 ## Current OAuth endpoints
 
@@ -239,3 +244,4 @@ is now closed out.
 | 1.2.7 | 2026-08-10 | Task 7 Loop 2 round 27 review (MEDIUM-HIGH): documented that the generic `/disable` endpoint also now returns `409 IDEMPOTENCY_CONFLICT` for a reused `Idempotency-Key` if the account is no longer `disconnected` when replayed -- reachable only via a `gmail` OAuth reconnect, since no other provider has a way to leave `disconnected` | Lucky Jain |
 | 1.3.0 | 2026-08-11 | Task 8: documented `GET /api/v1/personal/gmail/threads` (list) and the `since` field on `SyncRequest`, the plan's own two backend-shaped Task 8 gaps; closed out "Planned APIs" now that the plan's final task has shipped | Lucky Jain |
 | 1.4.0 | 2026-08-11 | Task 8 Loop 2 round 5 review: corrected the "computed live from every message" overclaim -- `last_sender`/`last_direction` come from the single most recent message only, `message_count`/`body_cached` are the true aggregates | Lucky Jain |
+| 1.4.1 | 2026-08-11 | Task 8 Loop 2 round 8 review: "Current (Task 8)" named only two of Task 8's three real backend additions, omitting the `recommendation_type` server-side filter round 5 added to `GET /api/v1/recommendations` -- round 5's own IMPLEMENTATION-STATUS.md evidence had also incorrectly claimed this file was updated for that parameter when it never was; added a cross-reference bullet pointing at `docs/phases/phase-001/API-SCHEMAS.md`, this parameter's own owning doc | Lucky Jain |

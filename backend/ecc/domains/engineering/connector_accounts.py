@@ -466,12 +466,12 @@ class SyncRequest(BaseModel):
     run_type: ManualSyncRunType
     resource_type: ResourceType
     # Phase 10 Gmail Connector Task 8: threads `connectors.py`'s own
-    # `ConnectorProtocol.backfill(..., since=...)` parameter (Task 1,
+    # `ConnectorAdapter.backfill(..., since=...)` parameter (Task 1,
     # accepted and ignored by every adapter through Phase 6) out to a real
     # HTTP caller for the first time -- `GmailAdapter.backfill`'s own
     # docstring names this exact field as the deferred "expand history"
     # caller. Only meaningful for `run_type="backfill"`; ignored for
-    # `"incremental"`, whose `ConnectorProtocol.incremental_sync` has no
+    # `"incremental"`, whose `ConnectorAdapter.incremental_sync` has no
     # `since` parameter at all (it resumes from `cursor` instead).
     since: datetime | None = None
 
