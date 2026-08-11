@@ -44,6 +44,21 @@ going forward rather than insertion order):
     content from Gmail -- proving "forget" nulls the cache rather than
     deleting the message row (which would otherwise make the thread
     unreadable, not merely uncached).
+
+Task 8's own additions, appended rather than renumbered into the list
+above (matching this file's own "kept in sync with physical order"
+discipline for the block it belongs to):
+11. `GET /threads` (list) returns the caller's own threads newest-
+    `last_message_at`-first, each with its most recent message's
+    `sender`/`direction`, a `message_count`, and a `body_cached` flag
+    computed over every message in the thread, not only the most recent
+    one.
+12. `GET /threads` respects an explicit `limit` query parameter.
+13. `GET /threads` is scoped to the caller's own `workspace_id`/`owner_id`
+    -- a thread belonging to a different owner in the same workspace, or a
+    different workspace entirely, never appears.
+14. `GET /threads` is rejected `403` without an active `email` domain
+    consent, matching `GET /threads/{thread_id}`'s identical gate.
 """
 
 import base64
@@ -134,7 +149,14 @@ def _gmail_transport_with_one_failure(
 
 
 def _insert_thread(
-    connection, *, workspace_id: UUID, owner_id: UUID, account_id: UUID, subject: str, now: datetime
+    connection,
+    *,
+    workspace_id: UUID,
+    owner_id: UUID,
+    account_id: UUID,
+    subject: str,
+    now: datetime,
+    last_message_at: datetime | None = None,
 ) -> UUID:
     thread_id = uuid4()
     connection.execute(
@@ -145,7 +167,7 @@ def _insert_thread(
                 external_thread_id, subject, last_message_at, created_at, updated_at
             ) VALUES (
                 :id, :workspace_id, :owner_id, 'email', :connector_account_id,
-                :external_thread_id, :subject, :now, :now, :now
+                :external_thread_id, :subject, :last_message_at, :now, :now
             )
             """
         ),
@@ -156,6 +178,7 @@ def _insert_thread(
             "connector_account_id": account_id,
             "external_thread_id": f"thread-{thread_id}",
             "subject": subject,
+            "last_message_at": last_message_at or now,
             "now": now,
         },
     )
@@ -171,6 +194,9 @@ def _insert_message(
     external_message_id: str,
     now: datetime,
     fetched: bool,
+    sent_at: datetime | None = None,
+    sender: str = _SENDER,
+    direction: str = "inbound",
 ) -> UUID:
     message_id = uuid4()
     body = _encrypt_field(_PLAIN_TEXT_BODY) if fetched else None
@@ -183,7 +209,7 @@ def _insert_message(
                 body_fetched_at, created_at, updated_at
             ) VALUES (
                 :id, :workspace_id, :owner_id, :thread_id, :external_message_id,
-                :sender, :recipients, :now, 'inbound', :snippet, :body,
+                :sender, :recipients, :sent_at, :direction, :snippet, :body,
                 :body_fetched_at, :now, :now
             )
             """
@@ -194,8 +220,10 @@ def _insert_message(
             "owner_id": owner_id,
             "thread_id": thread_id,
             "external_message_id": external_message_id,
-            "sender": _SENDER,
+            "sender": sender,
             "recipients": [_OWNER_EMAIL],
+            "sent_at": sent_at or now,
+            "direction": direction,
             "now": now,
             "snippet": "preview" if fetched else None,
             "body": body,
@@ -828,3 +856,238 @@ def test_reopening_a_forgotten_thread_refetches_its_content(
     assert resp.status_code == 200
     assert resp.json()["messages"][0]["body"] == _PLAIN_TEXT_BODY
     assert _message_row(ctx["workspace_id"], message_id)["body"] is not None
+
+
+def test_list_threads_returns_newest_first_with_summary_fields(gmail_threads_context: dict) -> None:
+    ctx = gmail_threads_context
+    older_at = ctx["now"] - timedelta(hours=2)
+    newer_at = ctx["now"]
+    with engine.begin() as connection:
+        older_thread_id = _insert_thread(
+            connection,
+            workspace_id=ctx["workspace_id"],
+            owner_id=ctx["owner_id"],
+            account_id=ctx["account_id"],
+            subject="Older thread",
+            now=ctx["now"],
+            last_message_at=older_at,
+        )
+        _insert_message(
+            connection,
+            workspace_id=ctx["workspace_id"],
+            owner_id=ctx["owner_id"],
+            thread_id=older_thread_id,
+            external_message_id=f"msg-{uuid4()}",
+            now=ctx["now"],
+            fetched=False,
+            sent_at=older_at,
+        )
+        newer_thread_id = _insert_thread(
+            connection,
+            workspace_id=ctx["workspace_id"],
+            owner_id=ctx["owner_id"],
+            account_id=ctx["account_id"],
+            subject="Newer thread",
+            now=ctx["now"],
+            last_message_at=newer_at,
+        )
+        _insert_message(
+            connection,
+            workspace_id=ctx["workspace_id"],
+            owner_id=ctx["owner_id"],
+            thread_id=newer_thread_id,
+            external_message_id=f"msg-{uuid4()}",
+            now=ctx["now"],
+            fetched=False,
+            sent_at=older_at,
+            sender=_SENDER,
+            direction="inbound",
+        )
+        _insert_message(
+            connection,
+            workspace_id=ctx["workspace_id"],
+            owner_id=ctx["owner_id"],
+            thread_id=newer_thread_id,
+            external_message_id=f"msg-{uuid4()}",
+            now=ctx["now"],
+            fetched=True,
+            sent_at=newer_at,
+            sender=_OWNER_EMAIL,
+            direction="outbound",
+        )
+
+    resp = ctx["client"].get("/api/v1/personal/gmail/threads")
+    assert resp.status_code == 200
+    threads = resp.json()["threads"]
+    assert [t["id"] for t in threads] == [str(newer_thread_id), str(older_thread_id)]
+
+    newer = threads[0]
+    assert newer["subject"] == "Newer thread"
+    assert newer["last_sender"] == _OWNER_EMAIL
+    assert newer["last_direction"] == "outbound"
+    assert newer["message_count"] == 2
+    assert newer["body_cached"] is True
+
+    older = threads[1]
+    assert older["subject"] == "Older thread"
+    assert older["last_sender"] == _SENDER
+    assert older["last_direction"] == "inbound"
+    assert older["message_count"] == 1
+    assert older["body_cached"] is False
+
+
+def test_list_threads_respects_limit(gmail_threads_context: dict) -> None:
+    ctx = gmail_threads_context
+    with engine.begin() as connection:
+        for offset in range(3):
+            thread_id = _insert_thread(
+                connection,
+                workspace_id=ctx["workspace_id"],
+                owner_id=ctx["owner_id"],
+                account_id=ctx["account_id"],
+                subject=f"Thread {offset}",
+                now=ctx["now"],
+                last_message_at=ctx["now"] - timedelta(hours=offset),
+            )
+            _insert_message(
+                connection,
+                workspace_id=ctx["workspace_id"],
+                owner_id=ctx["owner_id"],
+                thread_id=thread_id,
+                external_message_id=f"msg-{uuid4()}",
+                now=ctx["now"],
+                fetched=False,
+            )
+
+    resp = ctx["client"].get("/api/v1/personal/gmail/threads", params={"limit": 2})
+    assert resp.status_code == 200
+    threads = resp.json()["threads"]
+    assert len(threads) == 2
+    assert threads[0]["subject"] == "Thread 0"
+    assert threads[1]["subject"] == "Thread 1"
+
+
+def test_list_threads_only_returns_callers_own_threads(gmail_threads_context: dict) -> None:
+    ctx = gmail_threads_context
+    other_workspace_id = uuid4()
+    other_owner_id = uuid4()
+    now = ctx["now"]
+    with engine.begin() as connection:
+        own_thread_id = _insert_thread(
+            connection,
+            workspace_id=ctx["workspace_id"],
+            owner_id=ctx["owner_id"],
+            account_id=ctx["account_id"],
+            subject="Mine",
+            now=now,
+        )
+        _insert_message(
+            connection,
+            workspace_id=ctx["workspace_id"],
+            owner_id=ctx["owner_id"],
+            thread_id=own_thread_id,
+            external_message_id=f"msg-{uuid4()}",
+            now=now,
+            fetched=False,
+        )
+
+        connection.execute(
+            text(
+                "INSERT INTO workspaces (id, name, timezone, created_at) "
+                "VALUES (:id, 'Other Workspace', 'UTC', :now)"
+            ),
+            {"id": other_workspace_id, "now": now},
+        )
+        create_identity(
+            connection,
+            workspace_id=other_workspace_id,
+            user_id=other_owner_id,
+            email="other-owner@example.test",
+            now=now,
+        )
+        other_account_id = uuid4()
+        connection.execute(
+            text(
+                """
+                INSERT INTO connector_accounts (
+                    id, workspace_id, provider, external_account_id, display_name,
+                    granted_scopes, encrypted_credentials, status, version,
+                    created_by, updated_by, created_at, updated_at, owner_id, visibility
+                ) VALUES (
+                    :id, :workspace_id, 'gmail', 'other-owner@example.test', 'Other account',
+                    ARRAY['https://www.googleapis.com/auth/gmail.readonly'], :encrypted,
+                    'active', 1, :actor_id, :actor_id, :now, :now, :actor_id, 'workspace'
+                )
+                """
+            ),
+            {
+                "id": other_account_id,
+                "workspace_id": other_workspace_id,
+                "encrypted": encrypt_credential(
+                    _pack_credential("access-2", "refresh-2", now + timedelta(hours=1))
+                ),
+                "actor_id": other_owner_id,
+                "now": now,
+            },
+        )
+        connection.execute(
+            text(
+                """
+                INSERT INTO personal_domains (
+                    id, workspace_id, owner_id, domain_key, classification, enabled,
+                    enabled_at, created_by, updated_by, created_at, updated_at, version
+                ) VALUES (
+                    :id, :workspace_id, :owner_id, 'email', 'high_stakes', true,
+                    :now, :owner_id, :owner_id, :now, :now, 1
+                )
+                """
+            ),
+            {
+                "id": uuid4(),
+                "workspace_id": other_workspace_id,
+                "owner_id": other_owner_id,
+                "now": now,
+            },
+        )
+        other_thread_id = _insert_thread(
+            connection,
+            workspace_id=other_workspace_id,
+            owner_id=other_owner_id,
+            account_id=other_account_id,
+            subject="Not yours",
+            now=now,
+        )
+        _insert_message(
+            connection,
+            workspace_id=other_workspace_id,
+            owner_id=other_owner_id,
+            thread_id=other_thread_id,
+            external_message_id=f"msg-{uuid4()}",
+            now=now,
+            fetched=False,
+        )
+
+    try:
+        resp = ctx["client"].get("/api/v1/personal/gmail/threads")
+        assert resp.status_code == 200
+        thread_ids = [t["id"] for t in resp.json()["threads"]]
+        assert thread_ids == [str(own_thread_id)]
+    finally:
+        _cleanup_workspace(other_workspace_id, email="other-owner@example.test")
+
+
+def test_list_threads_without_active_consent_is_rejected(gmail_threads_context: dict) -> None:
+    ctx = gmail_threads_context
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "UPDATE domain_consents SET revoked_at = :now "
+                "WHERE workspace_id = :workspace_id AND owner_id = :owner_id "
+                "AND domain_key = 'email'"
+            ),
+            {"now": ctx["now"], "workspace_id": ctx["workspace_id"], "owner_id": ctx["owner_id"]},
+        )
+
+    resp = ctx["client"].get("/api/v1/personal/gmail/threads")
+    assert resp.status_code == 403
+    assert resp.json()["error"]["code"] == "EMAIL_CONSENT_NOT_ACTIVE"

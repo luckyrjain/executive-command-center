@@ -1,17 +1,32 @@
-export type PersonalView = 'domains' | 'records' | 'insights' | 'grants' | 'export'
+export type PersonalView = 'domains' | 'records' | 'insights' | 'grants' | 'export' | 'gmail'
 
-export type DomainKey = 'habits' | 'learning' | 'travel' | 'relationships' | 'health' | 'finance'
+export type DomainKey =
+  | 'habits'
+  | 'learning'
+  | 'travel'
+  | 'relationships'
+  | 'health'
+  | 'finance'
+  | 'email'
 
 export type Classification = 'standard' | 'sensitive' | 'high_stakes'
 
 // Mirrors `backend/ecc/domains/personal/domains.py`'s own
-// `_CLASSIFICATION_BY_DOMAIN` -- the six domains and their classification
-// are a closed enum fixed since Task 1's migration, never returned by any
-// list endpoint on their own (only enabled domains have a `personal_
-// domains` row at all), so the frontend keeps its own copy the same way
-// `ConnectorHealthPanel.tsx`'s `PROVIDERS` list keeps its own copy of a
-// backend-fixed enum.
-export const DOMAIN_KEYS: readonly DomainKey[] = ['habits', 'learning', 'travel', 'relationships', 'health', 'finance']
+// `_CLASSIFICATION_BY_DOMAIN` -- the seven domains and their classification
+// are a closed enum (six fixed since Task 1's migration, `email` added
+// Phase 10 Task 1), never returned by any list endpoint on their own (only
+// enabled domains have a `personal_domains` row at all), so the frontend
+// keeps its own copy the same way `ConnectorHealthPanel.tsx`'s `PROVIDERS`
+// list keeps its own copy of a backend-fixed enum.
+export const DOMAIN_KEYS: readonly DomainKey[] = [
+  'habits',
+  'learning',
+  'travel',
+  'relationships',
+  'health',
+  'finance',
+  'email',
+]
 
 export const CLASSIFICATION_BY_DOMAIN: Record<DomainKey, Classification> = {
   habits: 'standard',
@@ -20,6 +35,7 @@ export const CLASSIFICATION_BY_DOMAIN: Record<DomainKey, Classification> = {
   relationships: 'sensitive',
   health: 'high_stakes',
   finance: 'high_stakes',
+  email: 'high_stakes',
 }
 
 export const DOMAIN_LABELS: Record<DomainKey, string> = {
@@ -29,6 +45,7 @@ export const DOMAIN_LABELS: Record<DomainKey, string> = {
   relationships: 'Relationships',
   health: 'Health',
   finance: 'Finance',
+  email: 'Email',
 }
 
 export type Domain = {
@@ -115,6 +132,43 @@ export type DomainExport = {
 export type DomainDeletion = {
   id: string
   domain_key: string
+  status: string
+  requested_at: string
+  completed_at: string | null
+}
+
+// --- Gmail (Phase 10 Task 8) --------------------------------------------
+// Mirrors `backend/ecc/domains/personal/gmail_threads.py`'s response
+// models and `POST /api/v1/personal/gmail/oauth/start`'s response
+// (`docs/phases/phase-010/API-SCHEMAS.md`) field-for-field.
+
+export type GmailOAuthStartResponse = { authorization_url: string }
+
+export type GmailThreadSummary = {
+  id: string
+  subject: string | null
+  last_message_at: string
+  last_sender: string | null
+  last_direction: string | null
+  message_count: number
+  body_cached: boolean
+}
+
+export type GmailThreadListResponse = { threads: GmailThreadSummary[] }
+
+export type GmailThreadMessage = {
+  id: string
+  sender: string
+  sent_at: string
+  direction: string
+  body: string
+}
+
+export type GmailThreadContent = { subject: string | null; messages: GmailThreadMessage[] }
+
+export type GmailThreadForgetResponse = {
+  id: string
+  thread_id: string
   status: string
   requested_at: string
   completed_at: string | null

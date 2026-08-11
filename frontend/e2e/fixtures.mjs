@@ -1483,6 +1483,22 @@ function makePersonalApi(overrides = {}) {
   const records = [...(overrides.records ?? [])]
   const insights = [...(overrides.insights ?? [])]
   const grants = [...(overrides.grants ?? [])]
+  // Phase 10 Task 8's own Gmail-specific state -- each item combines the
+  // list endpoint's own summary fields with the full message array the
+  // detail endpoint returns, computed on read (`last_sender`/`last_
+  // direction`/`message_count`/`body_cached`) rather than stored
+  // separately, so a fixture scenario cannot let the two drift apart the
+  // way two independently-maintained arrays could.
+  const gmailThreads = [...(overrides.gmailThreads ?? [])]
+  // A plain object, not a bare `let`/`const`, so a scenario can flip
+  // allowlist state mid-run via `fixtures.personal.gmailAllowlist.
+  // allowlisted = true` (the OAuth allowlist is an env-configured admin
+  // action in production, out of band from anything this app's own UI can
+  // do -- a scenario simulating "an admin added this account" needs a
+  // mutable reference the dispatch closure below reads live, the same
+  // reason `gmailThreads`/`domains` are mutated in place rather than
+  // reassigned).
+  const gmailAllowlist = { allowlisted: overrides.gmailAllowlisted ?? true }
   const generateResponse = overrides.generateResponse
     ?? { available: false, insight: null, error_code: 'grounding_failed' }
 
@@ -1537,6 +1553,53 @@ function makePersonalApi(overrides = {}) {
     const disableMatch = pathname.match(/^\/api\/v1\/personal\/domains\/([^/]+)\/disable$/)
     if (disableMatch && method === 'POST') {
       return { status: 200, body: setEnabled(disableMatch[1], false) }
+    }
+
+    // --- Gmail (Phase 10 Task 8) ------------------------------------------
+    if (pathname === '/api/v1/personal/gmail/oauth/start' && method === 'POST') {
+      if (!gmailAllowlist.allowlisted) {
+        return { status: 403, body: { error: { code: 'GMAIL_ACCOUNT_NOT_ALLOWLISTED', message: 'Not allowlisted' } } }
+      }
+      return { status: 200, body: { authorization_url: 'https://accounts.google.com/o/oauth2/v2/auth?state=fixture-state' } }
+    }
+    if (pathname === '/api/v1/personal/gmail/threads' && method === 'GET') {
+      // Mirrors `gmail_threads.py:list_threads_endpoint`'s own `_require_
+      // email_consent` gate -- reuses this same closure's `findDomain`,
+      // since the real endpoint's consent check and `DomainsPanel`'s own
+      // `email` row are the identical `personal_domains`/`domain_consents`
+      // state in production.
+      if (!findDomain('email')?.enabled) {
+        return { status: 403, body: { error: { code: 'EMAIL_CONSENT_NOT_ACTIVE', message: 'Email consent is not active' } } }
+      }
+      const items = [...gmailThreads]
+        .sort((a, b) => new Date(b.last_message_at).getTime() - new Date(a.last_message_at).getTime())
+        .map((thread) => {
+          const lastMessage = [...thread.messages].sort((a, b) => new Date(b.sent_at).getTime() - new Date(a.sent_at).getTime())[0] ?? null
+          return {
+            id: thread.id,
+            subject: thread.subject,
+            last_message_at: thread.last_message_at,
+            last_sender: lastMessage?.sender ?? null,
+            last_direction: lastMessage?.direction ?? null,
+            message_count: thread.messages.length,
+            body_cached: thread.messages.some((message) => message.body != null),
+          }
+        })
+      return { status: 200, body: { threads: items } }
+    }
+    const gmailThreadMatch = pathname.match(/^\/api\/v1\/personal\/gmail\/threads\/([^/]+)$/)
+    if (gmailThreadMatch && method === 'GET') {
+      const thread = gmailThreads.find((t) => t.id === gmailThreadMatch[1])
+      if (!thread) return { status: 404, body: { error: { code: 'THREAD_NOT_FOUND', message: 'Not found' } } }
+      return { status: 200, body: { subject: thread.subject, messages: thread.messages } }
+    }
+    const gmailForgetMatch = pathname.match(/^\/api\/v1\/personal\/gmail\/threads\/([^/]+)\/forget$/)
+    if (gmailForgetMatch && method === 'POST') {
+      const thread = gmailThreads.find((t) => t.id === gmailForgetMatch[1])
+      if (!thread) return { status: 404, body: { error: { code: 'THREAD_NOT_FOUND', message: 'Not found' } } }
+      for (const message of thread.messages) message.body = null
+      const now = nowIso()
+      return { status: 200, body: { id: `personal-gmail-forget-${nextId++}`, thread_id: thread.id, status: 'completed', requested_at: now, completed_at: now } }
     }
 
     if (pathname === '/api/v1/personal/records' && method === 'GET') {
@@ -1653,7 +1716,7 @@ function makePersonalApi(overrides = {}) {
     return null
   }
 
-  return { domains, records, insights, grants, dispatch }
+  return { domains, records, insights, grants, gmailThreads, gmailAllowlist, dispatch }
 }
 
 /**

@@ -6,6 +6,7 @@ import RecordsPanel from './RecordsPanel'
 import InsightsPanel from './InsightsPanel'
 import GrantsPanel from './GrantsPanel'
 import ExportDeletePanel from './ExportDeletePanel'
+import GmailPanel from './GmailPanel'
 import type { PersonalView } from './types'
 
 const TABS: ReadonlyArray<{ view: PersonalView; label: string }> = [
@@ -14,6 +15,7 @@ const TABS: ReadonlyArray<{ view: PersonalView; label: string }> = [
   { view: 'insights', label: 'Insights' },
   { view: 'grants', label: 'Cross-domain grants' },
   { view: 'export', label: 'Export & delete' },
+  { view: 'gmail', label: 'Gmail' },
 ]
 
 /**
@@ -27,11 +29,17 @@ const TABS: ReadonlyArray<{ view: PersonalView; label: string }> = [
  * backend endpoint here already takes a `domain_key` parameter rather than
  * exposing a per-domain route (`API-SCHEMAS.md`'s own "a caller names a
  * domain_key, never a domain-specific code path" convention), so a single
- * domain-aware UI covers all six domains with no per-domain duplication --
- * `habits`' own `goals`/`routines`/`check_ins` extras are intentionally out
- * of this task's scope (not named in the implementation plan's Task 8
- * coverage list: "enable -> capture -> grant/revoke -> inspect/dismiss
- * insight -> export -> delete").
+ * domain-aware UI covers all six generic domains with no per-domain
+ * duplication -- `habits`' own `goals`/`routines`/`check_ins` extras are
+ * intentionally out of this task's scope (not named in the implementation
+ * plan's Task 8 coverage list: "enable -> capture -> grant/revoke ->
+ * inspect/dismiss insight -> export -> delete"). `email` is the one
+ * exception: Phase 10 Task 8 adds a dedicated `GmailPanel` tab because
+ * Gmail's own connect/sync/thread-reading surface is Gmail-specific, not
+ * expressible through the generic domain-record endpoints the other six
+ * tabs share -- the `email` domain itself still uses `DomainsPanel`/
+ * `ExportDeletePanel` like every other domain for enable/consent/export/
+ * delete, so `GmailPanel` only owns what is genuinely Gmail-specific.
  */
 export default function PersonalWorkspace() {
   const [view, setView] = useState<PersonalView>('domains')
@@ -79,7 +87,8 @@ export default function PersonalWorkspace() {
           : view === 'records' ? <RecordsPanel />
           : view === 'insights' ? <InsightsPanel />
           : view === 'grants' ? <GrantsPanel />
-          : <ExportDeletePanel />}
+          : view === 'export' ? <ExportDeletePanel />
+          : <GmailPanel />}
       </div>
     </section>
   )

@@ -74,6 +74,18 @@ function fetchRecommendations(): Promise<RecommendationList> {
   return apiRequest(`/api/v1/recommendations?${statuses}`)
 }
 
+// `recommendation_type` is a free-form string, not an enum
+// (`backend/ecc/domains/governance/recommendations.py`), and `list_
+// recommendations` has no server-side filter for it -- so a domain-scoped
+// embed of this panel (e.g. `GmailPanel`, Phase 10 Task 8, filtering to
+// `email_action_detected`) filters the fetched page client-side rather
+// than widening the shared endpoint's own query-param contract for one
+// caller.
+function filterByType(list: RecommendationList, recommendationType?: string): RecommendationList {
+  if (!recommendationType) return list
+  return { ...list, items: list.items.filter((item) => item.recommendation_type === recommendationType) }
+}
+
 export function isCreateRecommendation(item: Recommendation): boolean {
   return item.proposed_action.operation === 'create'
 }
@@ -192,11 +204,23 @@ function RiskFactorsPreview({ label, riskId }: { label: string; riskId: string }
   )
 }
 
-export default function RecommendationPanel() {
+export default function RecommendationPanel({ recommendationType, title }: {
+  // Filters the fetched page to only this `recommendation_type` (client-
+  // side, see `filterByType` above) -- e.g. `GmailPanel` passes
+  // `"email_action_detected"` to review only Gmail-sourced recommendations
+  // inline, reusing this panel rather than duplicating its review/confirm/
+  // reject/defer/pin UI (plan's own "reusing the extended RecommendationPanel").
+  recommendationType?: string
+  // Overrides the heading text and its `id` (so an embedded instance never
+  // collides with the top-level `/recommendations` view's own heading id,
+  // even though the two are never rendered simultaneously today).
+  title?: string
+} = {}) {
   const queryClient = useQueryClient()
+  const headingId = recommendationType ? `recommendations-title-${recommendationType}` : 'recommendations-title'
   const recommendations = useQuery({
-    queryKey: ['recommendations', 'review'],
-    queryFn: fetchRecommendations,
+    queryKey: ['recommendations', 'review', recommendationType ?? null],
+    queryFn: async () => filterByType(await fetchRecommendations(), recommendationType),
     refetchInterval: 60_000,
     retry: 1,
   })
@@ -226,11 +250,11 @@ export default function RecommendationPanel() {
   const items = recommendations.data?.items ?? []
 
   return (
-    <section className="recommendation-panel" aria-labelledby="recommendations-title">
+    <section className="recommendation-panel" aria-labelledby={headingId}>
       <div className="recommendation-heading">
         <div>
           <p className="eyebrow">HUMAN CONFIRMATION REQUIRED</p>
-          <h2 id="recommendations-title">Recommendations</h2>
+          <h2 id={headingId}>{title ?? 'Recommendations'}</h2>
           <p>Review rationale and evidence metadata before any authoritative change executes.</p>
         </div>
         <button type="button" onClick={() => recommendations.refetch()} disabled={recommendations.isFetching}>
