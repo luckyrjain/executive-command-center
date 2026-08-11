@@ -237,7 +237,21 @@ def _insert_message(
     return message_id
 
 
-def _cleanup_workspace(workspace_id: UUID, *, email: str = _OWNER_EMAIL) -> None:
+def _cleanup_workspace(workspace_id: UUID, *, emails: list[str] | None = None) -> None:
+    """`emails` defaults to `[_OWNER_EMAIL]`; a test that creates an extra
+    same-workspace identity (e.g. a peer owner for an isolation test) must
+    pass that identity's own email too -- `accounts` rows are deleted only
+    after every workspace-scoped `users`/`workspace_memberships` row
+    referencing them is gone, matching `test_gmail_revocation_postgres.
+    py`'s own `_cleanup_workspace(..., emails=[...])` precedent. A test's
+    own `finally` block must never delete an extra identity's `accounts`
+    row itself -- that FK ordering only holds once *this* function's own
+    workspace-scoped deletes have already run first (round 3 review
+    finding: an earlier version of the same-workspace-peer-owner test
+    below deleted the peer's `accounts` row in its own `finally`, before
+    this function's own teardown removed the peer's still-referencing
+    `users` row, raising `ForeignKeyViolation` instead of passing).
+    """
     with engine.begin() as connection:
         for table in (
             "deletion_jobs",
@@ -264,7 +278,10 @@ def _cleanup_workspace(workspace_id: UUID, *, email: str = _OWNER_EMAIL) -> None
         # so it needs its own delete by email, matching the established
         # `_teardown_workspace` precedent in
         # `test_gmail_action_detection_sync_postgres.py`.
-        connection.execute(text("DELETE FROM accounts WHERE email = :email"), {"email": email})
+        connection.execute(
+            text("DELETE FROM accounts WHERE email = ANY(:emails)"),
+            {"emails": emails or [_OWNER_EMAIL]},
+        )
 
 
 @pytest.fixture
@@ -348,6 +365,7 @@ def gmail_threads_context() -> Iterator[dict]:
             {"id": uuid4(), "workspace_id": workspace_id, "owner_id": owner_id, "now": now},
         )
 
+    extra_owner_emails: list[str] = []
     client = TestClient(app)
     client.cookies.set("ecc_session", token)
     try:
@@ -358,10 +376,11 @@ def gmail_threads_context() -> Iterator[dict]:
             "owner_id": owner_id,
             "account_id": account_id,
             "now": now,
+            "extra_owner_emails": extra_owner_emails,
         }
     finally:
         client.close()
-        _cleanup_workspace(workspace_id)
+        _cleanup_workspace(workspace_id, emails=[_OWNER_EMAIL, *extra_owner_emails])
 
 
 def _message_row(workspace_id: UUID, message_id: UUID) -> dict:
@@ -682,7 +701,7 @@ def test_get_thread_belonging_to_a_different_workspace_is_404(gmail_threads_cont
         assert resp.status_code == 404
         assert resp.json()["error"]["code"] == "THREAD_NOT_FOUND"
     finally:
-        _cleanup_workspace(other_workspace_id, email="other-owner@example.test")
+        _cleanup_workspace(other_workspace_id, emails=["other-owner@example.test"])
 
 
 def test_forget_thread_removes_only_targeted_threads_content(gmail_threads_context: dict) -> None:
@@ -1009,6 +1028,31 @@ def test_list_threads_excludes_a_different_owners_thread_in_the_same_workspace(
             email=peer_email,
             now=now,
         )
+        # `email_threads`'s own `(workspace_id, owner_id, domain_key)` FK
+        # (migration `0069`) requires a matching `personal_domains` row for
+        # *every* distinct owner, not just the fixture's own default owner
+        # -- the peer needs one too before a thread can be inserted for
+        # them (round 3 review: CI caught this as a real bug, distinct
+        # from the review agents' own accounts-cleanup finding below).
+        connection.execute(
+            text(
+                """
+                INSERT INTO personal_domains (
+                    id, workspace_id, owner_id, domain_key, classification, enabled,
+                    enabled_at, created_by, updated_by, created_at, updated_at, version
+                ) VALUES (
+                    :id, :workspace_id, :owner_id, 'email', 'high_stakes', true,
+                    :now, :owner_id, :owner_id, :now, :now, 1
+                )
+                """
+            ),
+            {
+                "id": uuid4(),
+                "workspace_id": ctx["workspace_id"],
+                "owner_id": peer_owner_id,
+                "now": now,
+            },
+        )
         peer_account_id = uuid4()
         connection.execute(
             text(
@@ -1053,16 +1097,11 @@ def test_list_threads_excludes_a_different_owners_thread_in_the_same_workspace(
             fetched=False,
         )
 
-    try:
-        resp = ctx["client"].get("/api/v1/personal/gmail/threads")
-        assert resp.status_code == 200
-        thread_ids = [t["id"] for t in resp.json()["threads"]]
-        assert thread_ids == [str(own_thread_id)]
-    finally:
-        with engine.begin() as connection:
-            connection.execute(
-                text("DELETE FROM accounts WHERE email = :email"), {"email": peer_email}
-            )
+    ctx["extra_owner_emails"].append(peer_email)
+    resp = ctx["client"].get("/api/v1/personal/gmail/threads")
+    assert resp.status_code == 200
+    thread_ids = [t["id"] for t in resp.json()["threads"]]
+    assert thread_ids == [str(own_thread_id)]
 
 
 def test_list_threads_only_returns_callers_own_threads(gmail_threads_context: dict) -> None:
@@ -1171,7 +1210,7 @@ def test_list_threads_only_returns_callers_own_threads(gmail_threads_context: di
         thread_ids = [t["id"] for t in resp.json()["threads"]]
         assert thread_ids == [str(own_thread_id)]
     finally:
-        _cleanup_workspace(other_workspace_id, email="other-owner@example.test")
+        _cleanup_workspace(other_workspace_id, emails=["other-owner@example.test"])
 
 
 def test_list_threads_without_active_consent_is_rejected(gmail_threads_context: dict) -> None:
