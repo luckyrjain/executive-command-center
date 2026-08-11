@@ -73,7 +73,7 @@ function ThreadDetail({ threadId, onForgotten }: { threadId: string; onForgotten
             {thread.data.messages.map((message) => (
               <li key={message.id}>
                 <small>{message.direction === 'outbound' ? 'To' : 'From'} {message.sender} · {formatTimestamp(message.sent_at)}</small>
-                {message.body ? <p>{message.body}</p> : <p className="empty-state">Body not fetched -- not yet cached, permission lost, or deleted from the provider.</p>}
+                {message.body ? <p>{message.body}</p> : <p className="empty-state">(no text content in this message)</p>}
               </li>
             ))}
             {thread.data.messages.length === 0 ? <li className="empty-state">No message bodies are cached for this thread yet.</li> : null}

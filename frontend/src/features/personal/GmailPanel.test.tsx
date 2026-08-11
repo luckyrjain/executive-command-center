@@ -223,6 +223,25 @@ describe('GmailPanel', () => {
     ))
   })
 
+  it('shows a genuinely empty message body as empty, not as "not fetched"', async () => {
+    // Loop 2 round 7 review (PR #130): `get_thread_content_tool`'s own SQL
+    // only ever returns messages with `body IS NOT NULL` -- an
+    // HTML-only/unextractable message the adapter *did* fetch is stored
+    // and returned as `body: ""` (the documented "genuinely empty, not
+    // unfetched" sentinel), never as a missing/omitted message. The old
+    // truthy check on `message.body` rendered the misleading "Body not
+    // fetched -- not yet cached, permission lost, or deleted" copy for
+    // this real, reachable case.
+    stubFetch({
+      domains: [domain()], connectors: [connector()], threads: [thread()],
+      threadContent: { subject: 'Signed contract needed by Friday', messages: [{ id: 'msg-1', sender: 'priya@partner-co.test', sent_at: '2026-08-10T00:00:00Z', direction: 'inbound', body: '' }] },
+    })
+    renderPanel()
+    fireEvent.click(await screen.findByRole('button', { name: 'Signed contract needed by Friday' }))
+    expect(await screen.findByText('(no text content in this message)')).toBeTruthy()
+    expect(screen.queryByText(/not fetched/)).toBeNull()
+  })
+
   it('disconnects through the domain-level endpoint (not the generic connector endpoint) once consent is active', async () => {
     const fetch = stubFetch({ domains: [domain()], connectors: [connector()], threads: [] })
     renderPanel()
