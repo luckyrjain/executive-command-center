@@ -2,7 +2,7 @@
 id: PHASE-010-API-SCHEMAS
 title: Phase 10 Gmail API Schemas
 status: Approved for Implementation
-version: 1.3.0
+version: 1.4.0
 owner: Lucky Jain
 depends_on:
   - PHASE-010
@@ -100,9 +100,11 @@ first, capped by an optional `limit` query parameter (default 50, max
 200) -- no offset/cursor, matching this file's own "Current reused
 connector endpoints" table (`list_sync_runs_endpoint`/`list_repositories_
 endpoint`), neither of which paginate at this activation's expected data
-volume. `last_sender`/`last_direction`/`message_count`/`body_cached` are
-computed live from every message in the thread, not only its most recent
-one.
+volume. `last_sender`/`last_direction` come from the single most recent
+message only; `message_count`/`body_cached` are computed over every
+message in the thread (round 5 review: earlier wording claimed all four
+fields were aggregated across the thread, which was true only for the
+latter two).
 
 ```json
 {
@@ -236,3 +238,4 @@ is now closed out.
 | 1.2.6 | 2026-08-10 | Task 7 Loop 2 round 25 review (MEDIUM): documented that the generic `/disable` endpoint's `gmail`-provider rejection now also requires the owner to have a `personal_domains` row for `email`, falling through to the ordinary disconnect otherwise | Lucky Jain |
 | 1.2.7 | 2026-08-10 | Task 7 Loop 2 round 27 review (MEDIUM-HIGH): documented that the generic `/disable` endpoint also now returns `409 IDEMPOTENCY_CONFLICT` for a reused `Idempotency-Key` if the account is no longer `disconnected` when replayed -- reachable only via a `gmail` OAuth reconnect, since no other provider has a way to leave `disconnected` | Lucky Jain |
 | 1.3.0 | 2026-08-11 | Task 8: documented `GET /api/v1/personal/gmail/threads` (list) and the `since` field on `SyncRequest`, the plan's own two backend-shaped Task 8 gaps; closed out "Planned APIs" now that the plan's final task has shipped | Lucky Jain |
+| 1.4.0 | 2026-08-11 | Task 8 Loop 2 round 5 review: corrected the "computed live from every message" overclaim -- `last_sender`/`last_direction` come from the single most recent message only, `message_count`/`body_cached` are the true aggregates | Lucky Jain |

@@ -134,12 +134,13 @@ def _generate(
     *,
     expires_at: datetime | None = None,
     key: str | None = None,
+    recommendation_type: str = "task_priority",
 ) -> dict[str, object]:
     response = client.post(
         "/api/v1/recommendations",
         headers=_headers(token, key),
         json={
-            "recommendation_type": "task_priority",
+            "recommendation_type": recommendation_type,
             "target_type": "task",
             "target_id": str(task_id),
             "proposed_action": {"operation": "set_priority", "value": "critical"},
@@ -336,6 +337,35 @@ def test_reject_defer_pin_expiry_and_isolation(
                 text("DELETE FROM users WHERE workspace_id=:id"), {"id": other_workspace}
             )
             connection.execute(text("DELETE FROM workspaces WHERE id=:id"), {"id": other_workspace})
+
+
+def test_list_filters_by_recommendation_type_server_side(
+    recommendation_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    # Loop 2 round 5 review (PR #130): a domain-scoped embed of the shared
+    # recommendation review UI (e.g. GmailPanel filtering to
+    # `email_action_detected`) used to filter the already-paginated page
+    # client-side, which could silently hide its own items behind a
+    # workspace-wide backlog of other-typed recommendations. `recommendation_
+    # type` is now filtered server-side, before `limit` applies.
+    client, workspace_id, user_id, token = recommendation_context
+    priority_task = _task(workspace_id, user_id, "Priority target")
+    other_task = _task(workspace_id, user_id, "Other target")
+    priority = _generate(client, token, priority_task, recommendation_type="task_priority")
+    other = _generate(client, token, other_task, recommendation_type="email_action_detected")
+
+    filtered = client.get(
+        "/api/v1/recommendations", params={"recommendation_type": "email_action_detected"}
+    )
+    assert filtered.status_code == 200
+    filtered_ids = [item["id"] for item in filtered.json()["items"]]
+    assert filtered_ids == [other["id"]]
+    assert priority["id"] not in filtered_ids
+
+    unfiltered = client.get("/api/v1/recommendations")
+    assert unfiltered.status_code == 200
+    unfiltered_ids = {item["id"] for item in unfiltered.json()["items"]}
+    assert {priority["id"], other["id"]} <= unfiltered_ids
 
 
 def test_supersession_and_stored_target_version_enforcement(

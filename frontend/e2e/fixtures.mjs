@@ -1915,10 +1915,21 @@ export async function createFixtureApi(page, overrides = {}) {
       // Honoring that filter (rather than returning every seeded item) means
       // recommendation-terminals.mjs can trust that a 'rejected'/'expired'/
       // 'superseded' fixture item behaves like production: invisible to this
-      // list, not merely hidden by client-side rendering.
+      // list, not merely hidden by client-side rendering. `recommendation_
+      // type` (Phase 10 Task 8 Loop 2 round 5 review) is also honored now
+      // that RecommendationPanel's own embedded-instance filtering moved
+      // server-side -- gmail-panel-states.mjs's own "second, unrelated
+      // recommendation asserted absent" assertion depends on this fixture
+      // actually filtering, not merely on the (now-removed) client-side
+      // filter masking an unfiltered response.
       filterList: (items, params) => {
         const statuses = params.getAll('status')
-        return statuses.length ? items.filter((item) => statuses.includes(item.status)) : items
+        let filtered = statuses.length ? items.filter((item) => statuses.includes(item.status)) : items
+        const recommendationType = params.get('recommendation_type')
+        if (recommendationType) {
+          filtered = filtered.filter((item) => item.recommendation_type === recommendationType)
+        }
+        return filtered
       },
       actions: {
         publish: () => ({ status: 'pending_confirmation' }),

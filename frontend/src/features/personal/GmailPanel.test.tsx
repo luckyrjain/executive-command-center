@@ -180,6 +180,12 @@ describe('GmailPanel', () => {
     // resolving off the faster `connectors` query alone.
     expect(await screen.findByRole('button', { name: 'Sync now' })).toHaveProperty('disabled', true)
     expect(screen.getByText(/Reconnect below before syncing/)).toBeTruthy()
+    // Loop 2 round 5 review (PR #130): the expand-history button had no
+    // permission_lost gate at all -- a user could still submit a sync from
+    // this same broken connector through the second form, contradicting
+    // UX-STATES.md's own "Sync actions disable" claim for this state.
+    fireEvent.change(screen.getByLabelText('Sync history from date'), { target: { value: '2026-01-01' } })
+    expect(screen.getByRole('button', { name: 'Sync from this date' })).toHaveProperty('disabled', true)
   })
 
   it('sends an expand-history sync with the chosen since date', async () => {
