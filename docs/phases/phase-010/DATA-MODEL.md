@@ -2,7 +2,7 @@
 id: PHASE-010-DATA-MODEL
 title: Phase 10 Gmail Data Model
 status: Approved for Implementation
-version: 1.5.0
+version: 1.5.1
 owner: Lucky Jain
 depends_on:
   - PHASE-010
@@ -38,7 +38,8 @@ depends_on:
   the existing `email_threads`/`email_messages` columns above; `SyncRequest.
   since` (`connector_accounts.py`) is a new request field threaded into
   `GmailAdapter.backfill`'s own `since` parameter, which has accepted it
-  since migration `0069`'s own `connectors.py` Protocol widening (Task 1) --
+  since Task 1's own `connectors.py` Protocol widening (a pure Python
+  signature change, not a migration) --
   Task 8 is the first real caller to pass a non-`None` value.
 
 ## Current tables
@@ -180,3 +181,4 @@ state.
 | 1.4.0 | 2026-08-10 | Task 7 Loop 2 round 8 review: documented the new `email_message_id_purge_log` table (migration `0076`), closing a sequential cross-owner evidence leak the round-4 fix could not close without persisted state -- correcting this document's own prior "no new migration was needed" claim | Lucky Jain |
 | 1.4.1 | 2026-08-10 | Task 7 Loop 2 round 16 review: the "Delivery boundary" section at the top of this file was never reconciled after Task 7 shipped -- still read "Current (Tasks 1-2, 5-6)" / "Planned (Tasks 7-8): consent-revocation purge" while the rest of this same document (as of 1.3.0-1.4.0) already described Task 7's cascade as fully shipped; corrected | Lucky Jain |
 | 1.5.0 | 2026-08-11 | Task 8: documented the thread-list endpoint and `since` param as read-shaped additions needing no migration, and closed "Planned model changes" out now that the plan's final task has shipped | Lucky Jain |
+| 1.5.1 | 2026-08-11 | Task 8 Loop 2 round 10 review: this file's own text said `since` "needs no migration" and then, two sentences later, attributed its acceptance to "migration `0069`'s ... Protocol widening" -- a self-contradiction, since a Python `Protocol` signature change is not a migration; corrected to credit Task 1's `connectors.py` widening directly | Lucky Jain |

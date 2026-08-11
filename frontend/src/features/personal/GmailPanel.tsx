@@ -260,7 +260,7 @@ export default function GmailPanel() {
               />
             </label>
             <div className="work-actions">
-              <button type="submit" disabled={syncMutation.isPending || !sinceInput || activeAccount.status === 'disconnected' || activeAccount.status === 'permission_lost'}>
+              <button type="submit" disabled={syncMutation.isPending || !sinceInput || activeAccount.status === 'disconnected' || activeAccount.status === 'permission_lost' || latestRun?.status === 'running'}>
                 Sync from this date
               </button>
             </div>

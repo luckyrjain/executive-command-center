@@ -2,7 +2,7 @@
 id: PHASE-010-IMPLEMENTATION-STATUS
 title: Phase 10 Implementation Status
 status: Active
-version: 0.16.0
+version: 0.17.0
 owner: Lucky Jain
 updated: 2026-08-11
 ---
@@ -894,3 +894,14 @@ Round 8 found and fixed real issues on both lenses (1 on security/correctness, 5
 **Local verification (round 9).** No backend/frontend code touched this round -- doc-only fix. `make docs-check` clean.
 
 Round 9 found and fixed a real issue (architecture/quality lens), so it does not count as a clean round -- the 2-consecutive-clean-round requirement resets: round 10 must be clean on both lenses, and round 11 after it must also be clean, to close Loop 2.
+
+**Round 10 (security/correctness): clean -- the first of the two consecutive clean rounds needed to close Loop 2.** A fresh, from-scratch pass over the full diff: SQL parameter binding, the thread-list LATERAL join's `owner_id` defense-in-depth re-filter (re-verified against migration `0069`'s own DDL, not merely its docstring's claim), the `recommendation_type` filter's server-side-before-`LIMIT` placement, the round-8 naive-`since`-as-UTC fix and its reachability through the real HTTP path, idempotency (`_request_hash` covers the new `since` field, so a replayed key with a different `since` correctly 409s rather than serving a stale window), XSS, OAuth redirect safety, authorization, and FK-ordering in the new isolation tests. Zero findings.
+
+**Round 10 (architecture/quality): found and fixed 2 issues.**
+
+1. **`GmailPanel.tsx`'s expand-history "Sync from this date" button could submit a duplicate sync while one was already running.** The primary "Sync now" button's `disabled` expression includes `latestRun?.status === 'running'` (guarding against a sync started elsewhere -- another tab/session, or a re-mount mid-flight -- that `syncMutation.isPending` alone can't see, since that flag only reflects this component instance's own in-flight request), but the expand-history button shares the same mutation without the same guard. `UX-STATES.md`'s own "Accessibility and safety" section states "Loading and retry actions must not create duplicate syncs" -- a written contract the primary button already honors and the second button did not, the identical asymmetric-gating bug class round 5 already fixed once for `permission_lost` on this exact pair of buttons. The backend does reject the resulting duplicate with `409 CONNECTOR_SYNC_IN_PROGRESS`, so this was a UX/contract violation rather than a data-integrity risk. Fixed by adding the same `latestRun?.status === 'running'` condition to the expand-history button; regression test added (`GmailPanel.test.tsx`, "disables both sync buttons, not only the primary one, while a sync is already running").
+2. **`API-SCHEMAS.md` and `DATA-MODEL.md` both misattributed a Python interface change to a database migration.** Both said `GmailAdapter.backfill`'s `since` parameter has been "accepted since migration `0069`'s ... Protocol widening (Task 1)" -- migration `0069` is a schema migration (widens `connector_accounts.provider`/`personal_domains.domain_key`, creates `email_threads`/`email_messages`); the `since` parameter is a pure Python `Protocol` signature change in `connectors.py` with no accompanying migration at all. `DATA-MODEL.md`'s own text even self-contradicted two sentences earlier, calling the same Task 8 additions "read-shaped ... needing no migration." Three other places in this same PR already state the fact correctly with no migration reference (`connector_accounts.py`'s own comment, `SYNC-CONTRACT.md`'s Task 8 row, and this document's own Task 8 evidence text above) -- only these two files attached a migration number, apparently copied from one into the other. Fixed both to credit Task 1's `connectors.py` widening directly.
+
+**Local verification (round 10).** `npx tsc --noEmit` clean; full `vitest run` (457 tests, +1 from round 10's new `GmailPanel.test.tsx` case) passing. No backend files touched this round. `make docs-check` clean.
+
+Round 10 found and fixed real issues (architecture/quality lens), so it does not count as a clean round -- the 2-consecutive-clean-round requirement resets: round 11 must be clean on both lenses, and round 12 after it must also be clean, to close Loop 2.

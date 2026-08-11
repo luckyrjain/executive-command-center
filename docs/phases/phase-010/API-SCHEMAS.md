@@ -2,7 +2,7 @@
 id: PHASE-010-API-SCHEMAS
 title: Phase 10 Gmail API Schemas
 status: Approved for Implementation
-version: 1.4.1
+version: 1.4.2
 owner: Lucky Jain
 depends_on:
   - PHASE-010
@@ -84,7 +84,7 @@ validation errors.
 | Endpoint | Gmail contract |
 |---|---|
 | `GET /api/v1/engineering/connectors` | Lists authorized visible accounts; never returns credentials |
-| `POST /api/v1/engineering/connectors/{id}/sync` | Body `{"run_type":"backfill|incremental","resource_type":"message","since":null}`; requires `Idempotency-Key` and CSRF. `since` (Task 8, optional, defaults `null`) is `GmailAdapter.backfill`'s own "expand history" parameter (accepted since migration `0069`'s Task 1 Protocol widening, `connectors.py`) finally reaching an HTTP caller -- only meaningful with `run_type: "backfill"`; `incremental_sync` has no `since` parameter at all (it resumes from `cursor` instead), so this field is silently ignored for `run_type: "incremental"` |
+| `POST /api/v1/engineering/connectors/{id}/sync` | Body `{"run_type":"backfill|incremental","resource_type":"message","since":null}`; requires `Idempotency-Key` and CSRF. `since` (Task 8, optional, defaults `null`) is `GmailAdapter.backfill`'s own "expand history" parameter (accepted since Task 1's own `connectors.py` Protocol widening -- a pure Python signature change, not a migration) finally reaching an HTTP caller -- only meaningful with `run_type: "backfill"`; `incremental_sync` has no `since` parameter at all (it resumes from `cursor` instead), so this field is silently ignored for `run_type: "incremental"` |
 | `GET /api/v1/engineering/sync-runs` | Lists redacted run outcome and item count |
 | `POST /api/v1/engineering/connectors/{id}/disable` | For every other provider: revokes the token best-effort and marks the account disconnected. For `gmail` specifically: if the account is not already `disconnected` **and** the owner has a `personal_domains` row for `email`, rejected with `409 GMAIL_DISABLE_REQUIRES_DOMAIN_ENDPOINT` and no mutation (Loop 2 round 1 review found this generic endpoint could otherwise disconnect a `gmail` account, and revoke its live Google grant, without running the consent revocation cascade below); an already-`disconnected` `gmail` account is unaffected by this guard and still returns the same idempotent `200` no-op as every other provider (Loop 2 round 2 review); an owner who completed the Gmail OAuth flow without ever calling `POST /domains`/`POST /consents` for `email` has no `personal_domains` row at all, so this guard falls through and the account is disconnected the same way any other provider's is -- there is nothing for the cascade to purge or revoke in that case, and without this carve-out such a connector had no HTTP-reachable way to disconnect it at all, since the domain-level endpoints 404 `DOMAIN_NOT_FOUND` for an owner with no domain row (Loop 2 round 25 review). Callers with an `email` domain must use the domain-level endpoints instead, which reach `gmail_revocation.cascade_email_revocation` |
 
@@ -245,3 +245,4 @@ is now closed out.
 | 1.3.0 | 2026-08-11 | Task 8: documented `GET /api/v1/personal/gmail/threads` (list) and the `since` field on `SyncRequest`, the plan's own two backend-shaped Task 8 gaps; closed out "Planned APIs" now that the plan's final task has shipped | Lucky Jain |
 | 1.4.0 | 2026-08-11 | Task 8 Loop 2 round 5 review: corrected the "computed live from every message" overclaim -- `last_sender`/`last_direction` come from the single most recent message only, `message_count`/`body_cached` are the true aggregates | Lucky Jain |
 | 1.4.1 | 2026-08-11 | Task 8 Loop 2 round 8 review: "Current (Task 8)" named only two of Task 8's three real backend additions, omitting the `recommendation_type` server-side filter round 5 added to `GET /api/v1/recommendations` -- round 5's own IMPLEMENTATION-STATUS.md evidence had also incorrectly claimed this file was updated for that parameter when it never was; added a cross-reference bullet pointing at `docs/phases/phase-001/API-SCHEMAS.md`, this parameter's own owning doc | Lucky Jain |
+| 1.4.2 | 2026-08-11 | Task 8 Loop 2 round 10 review: the `sync` endpoint row credited `since`'s acceptance to "migration `0069`'s Task 1 Protocol widening" -- migration `0069` is a database schema migration; the `since` parameter is a pure Python `Protocol` signature change with no accompanying migration at all. Corrected to credit Task 1's `connectors.py` widening directly, matching how this same fact is stated correctly elsewhere in this PR | Lucky Jain |

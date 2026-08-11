@@ -188,6 +188,26 @@ describe('GmailPanel', () => {
     expect(screen.getByRole('button', { name: 'Sync from this date' })).toHaveProperty('disabled', true)
   })
 
+  it('disables both sync buttons, not only the primary one, while a sync is already running', async () => {
+    // Loop 2 round 10 review (PR #130): the primary "Sync now" button's
+    // `disabled` expression already checked `latestRun?.status ===
+    // 'running'` (guarding against a sync started elsewhere -- another
+    // tab/session, or a re-mount mid-flight -- that `syncMutation.isPending`
+    // alone can't see), but the expand-history "Sync from this date" button
+    // shared the same mutation without the same guard, letting a user
+    // submit a second, duplicate sync while one was already in flight --
+    // the same asymmetric-gating bug class round 5 fixed for
+    // `permission_lost` on this identical pair of buttons.
+    stubFetch({
+      domains: [domain()], connectors: [connector()], threads: [],
+      syncRuns: [{ id: 'run-1', connector_account_id: 'connector-1', run_type: 'backfill', status: 'running', items_processed: 1, error_summary: null, started_at: '2026-08-01T00:00:00Z', completed_at: null }],
+    })
+    renderPanel()
+    expect(await screen.findByRole('button', { name: 'Sync now' })).toHaveProperty('disabled', true)
+    fireEvent.change(screen.getByLabelText('Sync history from date'), { target: { value: '2026-01-01' } })
+    expect(screen.getByRole('button', { name: 'Sync from this date' })).toHaveProperty('disabled', true)
+  })
+
   it('sends an expand-history sync with the chosen since date', async () => {
     const fetch = stubFetch({ domains: [domain()], connectors: [connector()], threads: [] })
     renderPanel()
