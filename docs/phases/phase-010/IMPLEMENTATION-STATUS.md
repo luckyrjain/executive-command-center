@@ -2,7 +2,7 @@
 id: PHASE-010-IMPLEMENTATION-STATUS
 title: Phase 10 Implementation Status
 status: Active
-version: 0.17.0
+version: 0.18.0
 owner: Lucky Jain
 updated: 2026-08-11
 ---
@@ -905,3 +905,15 @@ Round 9 found and fixed a real issue (architecture/quality lens), so it does not
 **Local verification (round 10).** `npx tsc --noEmit` clean; full `vitest run` (457 tests, +1 from round 10's new `GmailPanel.test.tsx` case) passing. No backend files touched this round. `make docs-check` clean.
 
 Round 10 found and fixed real issues (architecture/quality lens), so it does not count as a clean round -- the 2-consecutive-clean-round requirement resets: round 11 must be clean on both lenses, and round 12 after it must also be clean, to close Loop 2.
+
+**Round 11 (security/correctness): clean -- the third consecutive clean round for this lens (rounds 9, 10, 11), though the loop-closing counter needs both lenses clean together.** A fully fresh pass over the whole diff: SQL parameter binding, multi-tenancy/owner scoping (including the LATERAL join's defense-in-depth re-filter and the new isolation tests), consent gating, datetime handling (confirmed the round-8 fix is the only `.timestamp()` call site and now fully closes the reachability gap), idempotency (`since` covered by `_request_hash`), XSS, OAuth redirect safety, CSRF, and FK-ordering in test cleanup. Also independently re-verified round 10's own duplicate-sync-guard fix is complete (both buttons now share the identical `disabled` expression). Zero findings.
+
+**Round 11 (architecture/quality): found and fixed 3 issues.**
+
+1. **`TEST-PLAN.md`'s `GmailPanel` coverage row went stale again, the same recurring class rounds 7-8 already found for this exact row.** Round 10 added a 15th test case (the duplicate-sync-guard regression test) but never updated `TEST-PLAN.md`, which still said "14 cases" and never mentioned the new test. Fixed: bumped to "15 cases," added the new test to the coverage description, added a new changelog row.
+2. **`PersonalWorkspace.tsx`'s docstring miscounted the generic tabs and overclaimed `email`'s data is fully Gmail-specific.** It said the generic domain-record endpoints are shared by "the other six tabs" -- excluding `gmail` itself, `TABS` has only five other entries. More substantively, it claimed Gmail's surface is "not expressible through the generic domain-record endpoints," implying `email` is reachable only via `DomainsPanel`/`GmailPanel`/`ExportDeletePanel` -- but `RecordsPanel.tsx`/`InsightsPanel.tsx`/`GrantsPanel.tsx` (untouched by this PR) all iterate the same `DOMAIN_KEYS` constant this PR widened to include `'email'`, so enabling the Email domain also makes it a fully working option in Records/Insights/Grants -- a second, disconnected data surface for the same `domain_key` that `GmailPanel` never reads. Not a new backend capability (the generic domain-record/insight/grant endpoints have accepted `domain_key: "email"` since Task 1's own `DomainKey` widening) -- just newly UI-reachable. Fixed by correcting "six tabs" to "five tabs" and adding a paragraph disclosing this side effect as accepted, matching this PR's own established practice of disclosing rather than silently absorbing or dropping out-of-scope observations (see the three deferred `PRIVACY-CONSENT-CONTRACT.md` items from the original implementation).
+3. **`GmailPanel.tsx`'s OAuth-pending comment fabricated a quotation from `UX-STATES.md`.** The comment cited `(UX-STATES.md: "OAuth pending -- disable duplicate starts")` as if verbatim -- no such string exists anywhere in that file; the real "OAuth pending" row says "...which is what prevents a duplicate click...". This predates every review round (present since the original Task 8 WIP commit, `e5851ca`, never touched by rounds 1, 5, 7, or 10). Fixed to quote the real text.
+
+**Local verification (round 11).** `npx tsc --noEmit` clean (no logic changes, doc-comment/docstring edits only plus a `TEST-PLAN.md` row). `make docs-check` clean.
+
+Round 11 found and fixed real issues (architecture/quality lens), so it does not count as a clean round -- the 2-consecutive-clean-round requirement resets: round 12 must be clean on both lenses, and round 13 after it must also be clean, to close Loop 2.

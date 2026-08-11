@@ -144,7 +144,7 @@ export default function GmailPanel() {
       // screen is not an origin this app can render inline. The mutation's
       // own `isPending` flag never resolves before this navigation actually
       // happens, which is what disables a duplicate "Connect" click
-      // (UX-STATES.md: "OAuth pending -- disable duplicate starts").
+      // (UX-STATES.md's "OAuth pending" row: "prevents a duplicate click").
       window.location.href = data.authorization_url
     },
   })

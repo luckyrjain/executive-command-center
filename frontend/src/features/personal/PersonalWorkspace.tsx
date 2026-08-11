@@ -36,10 +36,18 @@ const TABS: ReadonlyArray<{ view: PersonalView; label: string }> = [
  * inspect/dismiss insight -> export -> delete"). `email` is the one
  * exception: Phase 10 Task 8 adds a dedicated `GmailPanel` tab because
  * Gmail's own connect/sync/thread-reading surface is Gmail-specific, not
- * expressible through the generic domain-record endpoints the other six
+ * expressible through the generic domain-record endpoints the other five
  * tabs share -- the `email` domain itself still uses `DomainsPanel`/
  * `ExportDeletePanel` like every other domain for enable/consent/export/
  * delete, so `GmailPanel` only owns what is genuinely Gmail-specific.
+ * Widening `DOMAIN_KEYS` (`types.ts`) to include `'email'` for `DomainsPanel`/
+ * `ExportDeletePanel`/`GmailPanel` also, as a side effect, exposes `email`
+ * generically through `RecordsPanel`/`InsightsPanel`/`GrantsPanel` (all
+ * three simply iterate `DOMAIN_KEYS`) -- accepted, not a defect: the
+ * backend's generic domain-record/insight/grant endpoints have taken
+ * `domain_key: "email"` since Task 1's own `DomainKey` widening, so this
+ * is pre-existing backend capability becoming UI-reachable, not new
+ * surface `GmailPanel` needs to own or guard against.
  */
 export default function PersonalWorkspace() {
   const [view, setView] = useState<PersonalView>('domains')
