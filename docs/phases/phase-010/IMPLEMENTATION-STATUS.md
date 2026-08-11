@@ -2,7 +2,7 @@
 id: PHASE-010-IMPLEMENTATION-STATUS
 title: Phase 10 Implementation Status
 status: Active
-version: 0.15.0
+version: 0.16.0
 owner: Lucky Jain
 updated: 2026-08-11
 ---
@@ -886,3 +886,11 @@ Round 7 found and fixed a real issue (architecture/quality lens), so it does not
 **Local verification (round 8).** `ruff check` clean on `gmail_adapter.py`, `connector_accounts.py`, `tests/test_gmail_connector_sync_postgres.py`. `python -c "import ast; ast.parse(...)"` clean on all touched backend/test files. The naive-`since` fix's own normalization logic verified standalone (full `pytest` collection remains blocked in this sandbox by the pre-existing `budgets.py:RunBudget` `NameError`, confirmed unrelated to this diff and reproducible from a minimal same-shaped repro class in an unmodified file). No frontend files touched this round, so `vitest`/`tsc` were not re-run beyond the counts already re-confirmed above. `make docs-check` clean.
 
 Round 8 found and fixed real issues on both lenses (1 on security/correctness, 5 on architecture/quality), so it does not count as a clean round -- the 2-consecutive-clean-round requirement resets: round 9 must be clean on both lenses, and round 10 after it must also be clean, to close Loop 2.
+
+**Round 9 (security/correctness): clean.** A genuinely fresh pass, re-deriving (not re-trusting) SQL injection/parameter binding, multi-tenancy scoping (including the thread-list LATERAL join's `owner_id` re-filter, re-verified against migration `0069`'s own "no FK" disclosure), consent/authorization gating, credential handling, XSS, CSRF/idempotency, OAuth redirect safety, and -- given round 8's own finding -- a specific sweep for any other naive-vs-aware datetime ambiguity elsewhere in the diff (found none; every other timestamp flows from `datetime.now(UTC)` or a `timestamptz` column). Also re-verified round 8's own timezone fix and its new test are correct. Zero findings.
+
+**Round 9 (architecture/quality): found and fixed 1 issue -- a changelog-ordering break in `PHASE-010-gmail-connector.md` that predates round 8 but had gone unnoticed by every prior round.** This file's changelog table has always used a strict descending-version convention (every row above the next is a higher version, matching the front-matter `version:` field to the table's own top row) -- but the original Task 8 commit (`22c4fb6`) inserted its new `0.5.0` row *below* the pre-existing `0.4.8` row instead of above it, and round 7's own `0.5.1` row landed between them, leaving the table reading `0.4.8, 0.5.1, 0.5.0, 0.4.7, ...` top to bottom -- not monotonic, and no longer matching the front matter's own `version: 0.5.1`. `scripts/check_docs.py` only validates required front-matter keys exist, not changelog ordering, so no tooling caught this; it survived round 8's own review because round 8 touched other files, not this one. Fixed by moving the `0.5.1`/`0.5.0` rows above `0.4.8`, restoring strict descending order.
+
+**Local verification (round 9).** No backend/frontend code touched this round -- doc-only fix. `make docs-check` clean.
+
+Round 9 found and fixed a real issue (architecture/quality lens), so it does not count as a clean round -- the 2-consecutive-clean-round requirement resets: round 10 must be clean on both lenses, and round 11 after it must also be clean, to close Loop 2.

@@ -2,7 +2,7 @@
 id: PHASE-010
 title: Gmail Connector
 status: Approved for Implementation
-version: 0.5.1
+version: 0.5.2
 owner: Lucky Jain
 depends_on:
   - PHASE-001
@@ -126,9 +126,10 @@ Gmail write actions (compose/reply/send/archive/label-modify); public/general-av
 
 | Version | Date | Summary | Author |
 |---|---|---|---|
-| 0.4.8 | 2026-08-10 | Task 7 Loop 2 round 31 review (MEDIUM): rounds 29-30's own fixes missed a sixth unqualified claim, in "Test strategy" ("consent-revocation purges connector and content together"); cross-referenced the same three named deliberate exceptions. A repo-wide grep confirms this bug class is now exhausted | Lucky Jain |
+| 0.5.2 | 2026-08-11 | Task 8 Loop 2 round 9 review: this table's own strict-descending-version convention broke when rounds 7-8's `0.5.1`/`0.5.0` rows were inserted below `0.4.8` instead of above it, leaving `0.4.8` above two higher versions and the front matter's `version` no longer matching the table's top row -- reordered, no content changed | Lucky Jain |
 | 0.5.1 | 2026-08-11 | Task 8 Loop 2 round 7 review: this file's own changelog row and `docs/ROADMAP.md` both still claimed Task 8's Loop 2 review "has not yet started," contradicting rounds 1-6 already recorded in `IMPLEMENTATION-STATUS.md` -- both corrected to "is in progress" | Lucky Jain |
 | 0.5.0 | 2026-08-11 | Reconciled delivery through Task 8 -- the plan's final task -- after the `GmailPanel`/thread-list/`since`-param merge; Task 8's own Loop 2 review has not yet started | Lucky Jain |
+| 0.4.8 | 2026-08-10 | Task 7 Loop 2 round 31 review (MEDIUM): rounds 29-30's own fixes missed a sixth unqualified claim, in "Test strategy" ("consent-revocation purges connector and content together"); cross-referenced the same three named deliberate exceptions. A repo-wide grep confirms this bug class is now exhausted | Lucky Jain |
 | 0.4.7 | 2026-08-10 | Task 7 Loop 2 round 30 review (MEDIUM): round 29's own fix missed a fifth unqualified claim in "Functional requirements" ("...disconnects the OAuth grant and deletes synced content"); cross-referenced the same three named deliberate exceptions. Also qualified the identical claim in `docs/superpowers/plans/2026-08-04-phase-10-gmail-connector.md`'s own Task 7 section (LOW, a file outside this doc's own maintained set) | Lucky Jain |
 | 0.4.6 | 2026-08-10 | Task 7 Loop 2 round 29 review (MEDIUM): the "In scope"/"Security and privacy"/"Acceptance criteria"/"Rollback plan" sections' "purges all synced content"/"zero readable synced content" claims were the one place among Task 7's docs never brought into rounds 4-7's ambiguous-`external_message_id`-carve-out disclosure sweep -- all four now cross-reference `PRIVACY-CONSENT-CONTRACT.md`'s three named deliberate exceptions | Lucky Jain |
 | 0.4.5 | 2026-08-10 | Reconciled delivery through Task 7 after the consent revocation cascade merge (Loop 2 round 16 review: this file's own version/changelog had not been bumped for this edit, unlike every prior task boundary) | Lucky Jain |
