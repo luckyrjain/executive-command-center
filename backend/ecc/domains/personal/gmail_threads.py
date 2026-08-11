@@ -78,7 +78,16 @@ rather than three separate correlated subqueries -- the window functions
 subquery's own full `WHERE`-filtered row set before its `ORDER BY ...
 LIMIT 1` trims it down to the single most-recent message, so one row
 carries the most-recent message's own `sender`/`direction` alongside
-aggregates computed over every message in the thread.
+aggregates computed over every message in the thread. The lateral
+subquery's own `WHERE` also re-filters `email_messages` by `owner_id`
+(Loop 2 round 2 review, defense-in-depth), matching every other query
+against this table in this module and in `email_action_tools.py` --
+migration `0069`'s own docstring discloses no FK ties an `email_messages`
+row's `owner_id` to its parent thread's, so relying solely on the outer
+`email_threads` filter would be a real (if currently unreachable, since
+every write path derives both values from the same sync-call owner
+context) narrowing of that defense-in-depth layer versus the rest of
+this module.
 """
 
 from datetime import UTC, datetime
@@ -196,6 +205,7 @@ def list_threads_endpoint(
                            BOOL_OR(em.body IS NOT NULL) OVER () AS body_cached
                     FROM email_messages em
                     WHERE em.workspace_id = et.workspace_id AND em.thread_id = et.id
+                    AND em.owner_id = :owner_id
                     ORDER BY em.sent_at DESC
                     LIMIT 1
                 ) lm ON true

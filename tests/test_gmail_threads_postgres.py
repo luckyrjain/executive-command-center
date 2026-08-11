@@ -56,7 +56,11 @@ discipline for the block it belongs to):
 12. `GET /threads` respects an explicit `limit` query parameter.
 13. `GET /threads` is scoped to the caller's own `workspace_id`/`owner_id`
     -- a thread belonging to a different owner in the same workspace, or a
-    different workspace entirely, never appears.
+    different workspace entirely, never appears (two separate tests: the
+    round-2-review-added same-workspace case, and the pre-existing
+    different-workspace case, since varying both workspace_id and owner_id
+    together in one test would not actually prove same-workspace isolation
+    on its own).
 14. `GET /threads` is rejected `403` without an active `email` domain
     consent, matching `GET /threads/{thread_id}`'s identical gate.
 """
@@ -965,6 +969,100 @@ def test_list_threads_respects_limit(gmail_threads_context: dict) -> None:
     assert len(threads) == 2
     assert threads[0]["subject"] == "Thread 0"
     assert threads[1]["subject"] == "Thread 1"
+
+
+def test_list_threads_excludes_a_different_owners_thread_in_the_same_workspace(
+    gmail_threads_context: dict,
+) -> None:
+    # Loop 2 round 2 review (PR #130): the existing "only returns caller's
+    # own threads" test below only varies workspace_id *and* owner_id
+    # together, so it never actually proved same-workspace, different-
+    # owner isolation -- the exact gap this module's docstring already
+    # (over)claimed was covered under item 13. A peer owner's own thread,
+    # in the identical workspace, must still be invisible.
+    ctx = gmail_threads_context
+    peer_owner_id = uuid4()
+    peer_email = "gmail-threads-peer@example.test"
+    now = ctx["now"]
+    with engine.begin() as connection:
+        own_thread_id = _insert_thread(
+            connection,
+            workspace_id=ctx["workspace_id"],
+            owner_id=ctx["owner_id"],
+            account_id=ctx["account_id"],
+            subject="Mine",
+            now=now,
+        )
+        _insert_message(
+            connection,
+            workspace_id=ctx["workspace_id"],
+            owner_id=ctx["owner_id"],
+            thread_id=own_thread_id,
+            external_message_id=f"msg-{uuid4()}",
+            now=now,
+            fetched=False,
+        )
+        create_identity(
+            connection,
+            workspace_id=ctx["workspace_id"],
+            user_id=peer_owner_id,
+            email=peer_email,
+            now=now,
+        )
+        peer_account_id = uuid4()
+        connection.execute(
+            text(
+                """
+                INSERT INTO connector_accounts (
+                    id, workspace_id, provider, external_account_id, display_name,
+                    granted_scopes, encrypted_credentials, status, version,
+                    created_by, updated_by, created_at, updated_at, owner_id, visibility
+                ) VALUES (
+                    :id, :workspace_id, 'gmail', :peer_email, 'Peer account',
+                    ARRAY['https://www.googleapis.com/auth/gmail.readonly'], :encrypted,
+                    'active', 1, :actor_id, :actor_id, :now, :now, :actor_id, 'workspace'
+                )
+                """
+            ),
+            {
+                "id": peer_account_id,
+                "workspace_id": ctx["workspace_id"],
+                "peer_email": peer_email,
+                "encrypted": encrypt_credential(
+                    _pack_credential("access-peer", "refresh-peer", now + timedelta(hours=1))
+                ),
+                "actor_id": peer_owner_id,
+                "now": now,
+            },
+        )
+        peer_thread_id = _insert_thread(
+            connection,
+            workspace_id=ctx["workspace_id"],
+            owner_id=peer_owner_id,
+            account_id=peer_account_id,
+            subject="Peer's, not mine",
+            now=now,
+        )
+        _insert_message(
+            connection,
+            workspace_id=ctx["workspace_id"],
+            owner_id=peer_owner_id,
+            thread_id=peer_thread_id,
+            external_message_id=f"msg-{uuid4()}",
+            now=now,
+            fetched=False,
+        )
+
+    try:
+        resp = ctx["client"].get("/api/v1/personal/gmail/threads")
+        assert resp.status_code == 200
+        thread_ids = [t["id"] for t in resp.json()["threads"]]
+        assert thread_ids == [str(own_thread_id)]
+    finally:
+        with engine.begin() as connection:
+            connection.execute(
+                text("DELETE FROM accounts WHERE email = :email"), {"email": peer_email}
+            )
 
 
 def test_list_threads_only_returns_callers_own_threads(gmail_threads_context: dict) -> None:
