@@ -58,9 +58,11 @@ from datetime import UTC, datetime
 from hashlib import sha256
 from secrets import token_urlsafe
 from typing import Annotated
+from urllib.parse import urlencode
 from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi.responses import RedirectResponse
 from pydantic import BaseModel
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
@@ -560,3 +562,47 @@ def gmail_oauth_callback_endpoint(
 
     assert response is not None
     return response
+
+
+@router.get("/oauth/complete", include_in_schema=False)
+def gmail_oauth_complete_endpoint(
+    request: Request,
+    auth: AuthDep,
+    session: SessionDep,
+    code: str = Query(min_length=1),
+    state: str = Query(min_length=1),
+) -> RedirectResponse:
+    """The actual Google-facing OAuth redirect target -- `ECC_GMAIL_OAUTH_
+    REDIRECT_URI` (and the matching entry in the Google Cloud Console
+    OAuth client) must point here, not at `/oauth/callback` above. Google
+    lands the browser's own top-level navigation on whatever URI that
+    setting names, so the response has to be something a browser can
+    usefully land on -- `/oauth/callback` is deliberately the opposite: a
+    plain API endpoint returning `ConnectorAccountResponse` JSON, kept
+    byte-for-byte unchanged here so its own ~30 integration tests
+    (covering this feature's extensive revoke/rollback/race-condition
+    review history) keep exercising the exact contract they always have.
+    This endpoint is a thin wrapper: call that same function in-process
+    (a plain Python call sharing this request's own `auth`/`session`, not
+    a second HTTP round-trip or a duplicated copy of its logic), then
+    convert whatever it returns or raises into a redirect back to
+    `settings.frontend_url` -- the one thing a browser landing here can
+    actually use.
+
+    Before this endpoint existed, Google's registered redirect target
+    *was* `/oauth/callback` itself, stranding the user's browser on raw
+    backend JSON at the API origin with no way back into the app --
+    `IMPLEMENTATION-STATUS.md`'s own "Task 8 evidence" section disclosed
+    this as an accepted limitation; this closes it.
+    """
+    try:
+        gmail_oauth_callback_endpoint(request, auth, session, code=code, state=state)
+    except HTTPException as exc:
+        if isinstance(exc.detail, str):
+            error_code = exc.detail
+        else:
+            error_code = exc.detail.get("code", "GMAIL_OAUTH_FAILED")
+        query = urlencode({"gmail": "error", "code": error_code})
+    else:
+        query = urlencode({"gmail": "connected"})
+    return RedirectResponse(f"{get_settings().frontend_url}/?{query}", status_code=302)

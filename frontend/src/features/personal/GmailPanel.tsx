@@ -1,7 +1,7 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
-import { apiRequest } from '../../api/client'
+import { ApiError, apiRequest } from '../../api/client'
 import RecommendationPanel from '../../RecommendationPanel'
 import type { ConnectorAccount, ConnectorAccountListResponse, SyncRun, SyncRunListResponse } from '../engineering/types'
 import { personalErrorMessage, formatTimestamp } from './errors'
@@ -90,10 +90,38 @@ function ThreadDetail({ threadId, onForgotten }: { threadId: string; onForgotten
   )
 }
 
+type OAuthReturnStatus = { kind: 'connected' } | { kind: 'error'; code: string }
+
+// `gmail_oauth.py`'s `GET /oauth/complete` is the real Google-facing
+// redirect target -- it does the token exchange server-side, then sends
+// the browser's own top-level navigation back here with `?gmail=connected`
+// or `?gmail=error&code=...`, since a bare backend JSON response is not
+// something this SPA can render. Read once on mount, then strip the
+// params from the URL (`history.replaceState`, the same one-shot-query-
+// param pattern `dev_bootstrap.py`'s own completion page uses) so a page
+// refresh doesn't keep re-showing a stale result.
+function readOAuthReturnStatus(): OAuthReturnStatus | null {
+  const params = new URLSearchParams(window.location.search)
+  const gmail = params.get('gmail')
+  if (gmail === 'connected') return { kind: 'connected' }
+  if (gmail === 'error') return { kind: 'error', code: params.get('code') ?? 'GMAIL_OAUTH_FAILED' }
+  return null
+}
+
 export default function GmailPanel() {
   const queryClient = useQueryClient()
   const [selectedThreadId, setSelectedThreadId] = useState<string | null>(null)
   const [sinceInput, setSinceInput] = useState('')
+  const [oauthReturn] = useState<OAuthReturnStatus | null>(readOAuthReturnStatus)
+
+  useEffect(() => {
+    if (oauthReturn === null) return
+    const params = new URLSearchParams(window.location.search)
+    params.delete('gmail')
+    params.delete('code')
+    const query = params.toString()
+    window.history.replaceState(null, '', window.location.pathname + (query ? `?${query}` : ''))
+  }, [oauthReturn])
 
   const domains = useQuery({
     queryKey: ['personal', 'domains'],
@@ -186,6 +214,15 @@ export default function GmailPanel() {
     <section className="work-panel" aria-labelledby="personal-gmail-title">
       <h2 id="personal-gmail-title">Gmail</h2>
       <p>Read-only Gmail access, gated by an internal allowlist and your own explicit email-domain consent. Nothing here is visible to another workspace member unless they share it directly.</p>
+
+      {oauthReturn?.kind === 'connected' ? (
+        <p role="status" className="inline-status">Google account connected.</p>
+      ) : null}
+      {oauthReturn?.kind === 'error' ? (
+        <div role="alert" className="inline-status error-panel">
+          {personalErrorMessage(new ApiError(0, oauthReturn.code, oauthReturn.code))}
+        </div>
+      ) : null}
 
       {domains.isLoading ? <p role="status">Loading…</p> : null}
       {domains.isError ? <div role="alert" className="inline-status error-panel">{personalErrorMessage(domains.error)}</div> : null}

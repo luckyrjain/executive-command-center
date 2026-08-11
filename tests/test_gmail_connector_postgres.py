@@ -1719,6 +1719,61 @@ def test_oauth_start_returns_422_when_not_configured(
         get_settings.cache_clear()
 
 
+def test_oauth_complete_redirects_to_frontend_with_a_connected_marker_on_success(
+    gmail_test_context: tuple[TestClient, UUID, UUID, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, workspace_id, _user_id, token = gmail_test_context
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_ALLOWLIST", _ALLOWED_EMAIL)
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_CLIENT_ID", "cid")
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_CLIENT_SECRET", "csecret")
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_REDIRECT_URI", "https://ecc.example.test/oauth/complete")
+    monkeypatch.setenv("ECC_FRONTEND_URL", "https://app.example.test")
+    get_settings.cache_clear()
+    monkeypatch.setattr(gmail_oauth_module, "_adapter", GmailAdapter(transport=_oauth_transport()))
+    try:
+        start_response = client.post("/api/v1/personal/gmail/oauth/start", headers=_headers(token))
+        state = httpx.URL(start_response.json()["authorization_url"]).params["state"]
+
+        response = client.get(
+            "/api/v1/personal/gmail/oauth/complete",
+            params={"code": "auth-code", "state": state},
+            follow_redirects=False,
+        )
+        assert response.status_code == 302
+        assert response.headers["location"] == "https://app.example.test/?gmail=connected"
+
+        with engine.begin() as connection:
+            provider = connection.execute(
+                text("SELECT provider FROM connector_accounts WHERE workspace_id = :workspace_id"),
+                {"workspace_id": workspace_id},
+            ).scalar_one()
+        assert provider == "gmail"
+    finally:
+        get_settings.cache_clear()
+
+
+def test_oauth_complete_redirects_to_frontend_with_the_error_code_on_failure(
+    gmail_test_context: tuple[TestClient, UUID, UUID, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, _workspace_id, _user_id, token = gmail_test_context
+    monkeypatch.setenv("ECC_FRONTEND_URL", "https://app.example.test")
+    get_settings.cache_clear()
+    try:
+        response = client.get(
+            "/api/v1/personal/gmail/oauth/complete",
+            params={"code": "auth-code", "state": "tampered-state"},
+            follow_redirects=False,
+        )
+        assert response.status_code == 302
+        assert response.headers["location"] == (
+            "https://app.example.test/?gmail=error&code=GMAIL_OAUTH_STATE_INVALID"
+        )
+    finally:
+        get_settings.cache_clear()
+
+
 def test_oauth_callback_rejects_invalid_state(
     gmail_test_context: tuple[TestClient, UUID, UUID, str],
 ) -> None:

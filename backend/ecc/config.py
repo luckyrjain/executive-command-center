@@ -29,6 +29,13 @@ class Settings(BaseSettings):
     # ValidationError until this constraint was removed.
     session_secret: str = Field(default="", validation_alias="ECC_SESSION_SECRET")
     cors_origins: str = Field(default="http://localhost:5173", validation_alias="ECC_CORS_ORIGINS")
+    # The single canonical frontend origin a browser-facing redirect (e.g.
+    # the Gmail OAuth completion step, `gmail_oauth.py`) should send the
+    # user back to. Deliberately its own setting, not a reuse of
+    # `cors_origins` -- that field is a comma-separated allow-list for CORS
+    # validation and may legitimately hold more than one origin in a real
+    # deployment, which would make it ambiguous which one to redirect to.
+    frontend_url: str = Field(default="http://localhost:5173", validation_alias="ECC_FRONTEND_URL")
     metrics_token: str = Field(default="", validation_alias="ECC_METRICS_TOKEN")
     # Number of trusted reverse proxies/load balancers in front of this app
     # (e.g. 1 for a single nginx/ALB hop). 0 (the default) means "not behind

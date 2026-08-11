@@ -2,7 +2,7 @@
 id: PHASE-010-API-SCHEMAS
 title: Phase 10 Gmail API Schemas
 status: Approved for Implementation
-version: 1.4.2
+version: 1.5.0
 owner: Lucky Jain
 depends_on:
   - PHASE-010
@@ -78,6 +78,29 @@ Response is the existing `ConnectorAccountResponse`:
 Errors: `403 GMAIL_OAUTH_STATE_INVALID`, `422` with `{code:
 GMAIL_OAUTH_FAILED, error: <sanitized>}`, authorization errors, or standard
 validation errors.
+
+### `GET /api/v1/personal/gmail/oauth/complete?code=...&state=...` (later addition)
+
+The real Google-facing OAuth redirect target -- `ECC_GMAIL_OAUTH_REDIRECT_URI`
+(and the matching entry in the Google Cloud Console OAuth client) must name
+this path, not `/oauth/callback` above. `/oauth/callback` stayed a plain
+JSON API endpoint deliberately (its own ~30 integration tests keep testing
+that exact contract); this is a thin wrapper calling it in-process, then
+converting the result into a browser-usable response -- **not** JSON. A
+browser landing here is redirected (`302`) to `{ECC_FRONTEND_URL}/` with a
+query marker instead: `?gmail=connected` on success, `?gmail=error&code=
+<the same error code /oauth/callback would have returned>` on failure (state
+invalid, Google rejection, missing scope, not allowlisted). `GmailPanel.tsx`
+reads and clears this marker on mount. Requires no new settings beyond
+`ECC_FRONTEND_URL` (default `http://localhost:5173`, matching
+`ECC_CORS_ORIGINS`'s own default -- a separate setting, not a reuse of that
+comma-separated allow-list, since redirecting needs exactly one canonical
+target; see `frontend_url`'s own field comment in `backend/ecc/config.py`.
+
+Before this endpoint existed, Google's registered redirect target *was*
+`/oauth/callback` itself -- a real, disclosed gap: the browser landed on raw
+backend JSON at the API origin with no way back into the app, and a user had
+to navigate back to the frontend manually.
 
 ## Current reused connector endpoints
 
@@ -246,3 +269,4 @@ is now closed out.
 | 1.4.0 | 2026-08-11 | Task 8 Loop 2 round 5 review: corrected the "computed live from every message" overclaim -- `last_sender`/`last_direction` come from the single most recent message only, `message_count`/`body_cached` are the true aggregates | Lucky Jain |
 | 1.4.1 | 2026-08-11 | Task 8 Loop 2 round 8 review: "Current (Task 8)" named only two of Task 8's three real backend additions, omitting the `recommendation_type` server-side filter round 5 added to `GET /api/v1/recommendations` -- round 5's own IMPLEMENTATION-STATUS.md evidence had also incorrectly claimed this file was updated for that parameter when it never was; added a cross-reference bullet pointing at `docs/phases/phase-001/API-SCHEMAS.md`, this parameter's own owning doc | Lucky Jain |
 | 1.4.2 | 2026-08-11 | Task 8 Loop 2 round 10 review: the `sync` endpoint row credited `since`'s acceptance to "migration `0069`'s Task 1 Protocol widening" -- migration `0069` is a database schema migration; the `since` parameter is a pure Python `Protocol` signature change with no accompanying migration at all. Corrected to credit Task 1's `connectors.py` widening directly, matching how this same fact is stated correctly elsewhere in this PR | Lucky Jain |
+| 1.5.0 | 2026-08-11 | Later addition: documented `GET /api/v1/personal/gmail/oauth/complete`, the real Google-facing redirect target that closes the "browser stranded on raw backend JSON" gap `/oauth/callback`'s own section already disclosed | Lucky Jain |
