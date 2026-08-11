@@ -268,17 +268,29 @@ def _suggested_team_name(project: Mapping[str, Any]) -> str | None:
     why this is a free-text suggestion, never a link). Its *shape* differs
     between the two payloads this function is called with: the full `GET
     /projects` REST representation nests it as an object (`{"name": ...,
-    "path": ..., "kind": ...}`), but a real GitLab `Push Hook` webhook
-    payload's own `project.namespace` is a bare display-name string --
-    the identical REST-vs-webhook schema mismatch `_with_push_event_
-    activity_timestamp`'s own docstring already documents for
-    `last_activity_at`. Handling both shapes here, rather than assuming
-    the REST dict shape, avoids an `AttributeError` crashing every
-    webhook-driven upsert.
+    "path": ..., "kind": ..., "full_path": ...}`), but a real GitLab
+    `Push Hook` webhook payload's own `project.namespace` is a bare
+    display-name string -- the identical REST-vs-webhook schema mismatch
+    `_with_push_event_activity_timestamp`'s own docstring already
+    documents for `last_activity_at`. Handling both shapes here, rather
+    than assuming the REST dict shape, avoids an `AttributeError`
+    crashing every webhook-driven upsert.
+
+    For the REST dict shape, prefer `full_path` (e.g. "disbursement/neo")
+    over `name` (e.g. "Neo"): `name` is only the *immediate* subgroup, so
+    a project three levels deep in nested GitLab groups would otherwise
+    suggest the narrowest possible team and never surface the top-level
+    org group as a pending suggestion at all. `full_path` is present on
+    GitLab's default, unfiltered `GET /projects` response with no extra
+    API call. Fall back to `name` when `full_path` is absent (e.g. an
+    older self-managed GitLab instance). The webhook's bare-string shape
+    carries no parent info at all, so it keeps returning just the
+    immediate name -- an unavoidable gap given what GitLab's webhook
+    payload contains, not something this function can improve on.
     """
     namespace = project.get("namespace")
     if isinstance(namespace, Mapping):
-        return namespace.get("name")
+        return namespace.get("full_path") or namespace.get("name")
     if isinstance(namespace, str) and namespace:
         return namespace
     return None
