@@ -97,9 +97,12 @@ type OAuthReturnStatus = { kind: 'connected' } | { kind: 'error'; code: string }
 // the browser's own top-level navigation back here with `?gmail=connected`
 // or `?gmail=error&code=...`, since a bare backend JSON response is not
 // something this SPA can render. Read once on mount, then strip the
-// params from the URL (`history.replaceState`, the same one-shot-query-
-// param pattern `dev_bootstrap.py`'s own completion page uses) so a page
-// refresh doesn't keep re-showing a stale result.
+// params from the URL (`history.replaceState`) so a page refresh doesn't
+// keep re-showing a stale result -- the same one-shot-consume-then-clear
+// shape `dev_bootstrap.py`'s own completion page uses for its own
+// one-time code (that page parses `location.hash`, this reads
+// `location.search` -- different URL part, identical "read once, then
+// scrub the URL" intent).
 function readOAuthReturnStatus(): OAuthReturnStatus | null {
   const params = new URLSearchParams(window.location.search)
   const gmail = params.get('gmail')
@@ -112,6 +115,11 @@ export default function GmailPanel() {
   const queryClient = useQueryClient()
   const [selectedThreadId, setSelectedThreadId] = useState<string | null>(null)
   const [sinceInput, setSinceInput] = useState('')
+  // Lazy `useState` initializer (the function reference, not its called
+  // result) -- React invokes `readOAuthReturnStatus` exactly once, on
+  // first render, never again. The setter is intentionally never called:
+  // this value never changes over the component's lifetime, only gets
+  // read once and then cleared from the URL by the effect below.
   const [oauthReturn] = useState<OAuthReturnStatus | null>(readOAuthReturnStatus)
 
   useEffect(() => {

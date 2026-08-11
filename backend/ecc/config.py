@@ -251,6 +251,7 @@ def validate_production_settings(settings: Settings) -> None:
 
     _validate_session_secret(settings.session_secret)
     _validate_cors_origins(settings.cors_origin_list)
+    _validate_frontend_url(settings.frontend_url)
     _validate_connector_token_encryption_key(settings.connector_token_encryption_key)
     _validate_personal_data_encryption_key(settings.personal_data_encryption_key)
 
@@ -283,6 +284,22 @@ def _validate_cors_origins(origins: list[str]) -> None:
             raise ConfigurationError(
                 f"ECC_CORS_ORIGINS entry {origin!r} must use https:// outside development."
             )
+
+
+def _validate_frontend_url(url: str) -> None:
+    """Left unvalidated outside development, `frontend_url`'s permissive
+    `http://localhost:5173` default (correct for local dev) would silently
+    keep being used in a real deployment that forgot to set
+    `ECC_FRONTEND_URL` -- `gmail_oauth.py`'s OAuth-completion redirect
+    would then send every real user to a URL that only resolves on a
+    developer's own machine, with no startup failure to catch it. Same
+    https-required shape as `_validate_cors_origins`, applied to a single
+    canonical value instead of a list.
+    """
+    if not url:
+        raise ConfigurationError("ECC_FRONTEND_URL must not be empty outside development.")
+    if not url.startswith("https://"):
+        raise ConfigurationError("ECC_FRONTEND_URL must use https:// outside development.")
 
 
 def _validate_connector_token_encryption_key(key: str) -> None:

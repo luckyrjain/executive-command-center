@@ -1774,6 +1774,95 @@ def test_oauth_complete_redirects_to_frontend_with_the_error_code_on_failure(
         get_settings.cache_clear()
 
 
+def test_oauth_complete_redirects_with_denied_marker_when_code_is_missing(
+    gmail_test_context: tuple[TestClient, UUID, UUID, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Google's own "Cancel" redirect on its consent screen carries
+    `error=access_denied` and `state`, but no `code` at all -- the
+    mainline rejection path, not an edge case. `code` must stay optional
+    on this endpoint specifically (`/oauth/callback` above is unaffected,
+    still requires it) or FastAPI 422s during dependency resolution,
+    before this endpoint's own try/except ever runs, reintroducing the
+    exact "stranded on raw backend JSON" bug this endpoint exists to
+    close.
+    """
+    client, _workspace_id, _user_id, token = gmail_test_context
+    monkeypatch.setenv("ECC_FRONTEND_URL", "https://app.example.test")
+    get_settings.cache_clear()
+    try:
+        response = client.get(
+            "/api/v1/personal/gmail/oauth/complete",
+            params={"error": "access_denied", "state": "whatever-state"},
+            follow_redirects=False,
+        )
+        assert response.status_code == 302
+        assert response.headers["location"] == "https://app.example.test/?gmail=error&code=GMAIL_OAUTH_DENIED"
+    finally:
+        get_settings.cache_clear()
+
+
+def test_oauth_complete_redirects_with_a_generic_error_when_callback_raises_a_non_http_exception(
+    gmail_test_context: tuple[TestClient, UUID, UUID, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A transient failure inside `/oauth/callback` (a DB deadlock, a
+    dropped connection, an `AssertionError`) is not an `HTTPException` --
+    unlike every other endpoint in this app (whose raw 500 is invisible
+    to the end user, caught by the frontend's own `fetch`), this is the
+    one endpoint where an unhandled exception reaches the browser
+    directly via a top-level navigation. Must still redirect, not crash
+    past this wrapper.
+    """
+    client, _workspace_id, _user_id, token = gmail_test_context
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_ALLOWLIST", _ALLOWED_EMAIL)
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_CLIENT_ID", "cid")
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_CLIENT_SECRET", "csecret")
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_REDIRECT_URI", "https://ecc.example.test/oauth/complete")
+    monkeypatch.setenv("ECC_FRONTEND_URL", "https://app.example.test")
+    get_settings.cache_clear()
+
+    class _BrokenAdapter(GmailAdapter):
+        def handle_oauth_callback(self, code: str, state: str) -> object:
+            raise RuntimeError("simulated transient failure")
+
+    monkeypatch.setattr(
+        gmail_oauth_module, "_adapter", _BrokenAdapter(transport=_oauth_transport())
+    )
+    try:
+        start_response = client.post("/api/v1/personal/gmail/oauth/start", headers=_headers(token))
+        state = httpx.URL(start_response.json()["authorization_url"]).params["state"]
+
+        response = client.get(
+            "/api/v1/personal/gmail/oauth/complete",
+            params={"code": "auth-code", "state": state},
+            follow_redirects=False,
+        )
+        assert response.status_code == 302
+        assert response.headers["location"] == "https://app.example.test/?gmail=error&code=GMAIL_OAUTH_FAILED"
+    finally:
+        get_settings.cache_clear()
+
+
+def test_oauth_complete_strips_a_trailing_slash_from_frontend_url_before_redirecting(
+    gmail_test_context: tuple[TestClient, UUID, UUID, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, _workspace_id, _user_id, token = gmail_test_context
+    monkeypatch.setenv("ECC_FRONTEND_URL", "https://app.example.test/")
+    get_settings.cache_clear()
+    try:
+        response = client.get(
+            "/api/v1/personal/gmail/oauth/complete",
+            params={"error": "access_denied", "state": "whatever-state"},
+            follow_redirects=False,
+        )
+        assert response.status_code == 302
+        assert response.headers["location"] == "https://app.example.test/?gmail=error&code=GMAIL_OAUTH_DENIED"
+    finally:
+        get_settings.cache_clear()
+
+
 def test_oauth_callback_rejects_invalid_state(
     gmail_test_context: tuple[TestClient, UUID, UUID, str],
 ) -> None:
