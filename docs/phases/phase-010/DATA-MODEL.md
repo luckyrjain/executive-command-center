@@ -2,7 +2,7 @@
 id: PHASE-010-DATA-MODEL
 title: Phase 10 Gmail Data Model
 status: Approved for Implementation
-version: 1.4.1
+version: 1.5.0
 owner: Lucky Jain
 depends_on:
   - PHASE-010
@@ -31,10 +31,15 @@ depends_on:
   (Task 3) and recommendation creation (Task 4) also shipped, but through
   tables this document does not own (`attention_items`, `recommendations`)
   rather than a change to the tables below.
-- **Planned (Task 8):** executive UX. (Loop 2 round 16 review: this
-  section had not been reconciled since Task 6 -- still claimed consent-
-  revocation purge was merely "planned" for "Tasks 7-8" after Task 7
-  shipped it, directly contradicting the rest of this same document.)
+- **Current (Task 8):** executive UX (`GmailPanel`) and its two supporting
+  backend additions -- both read-shaped, neither needing a migration.
+  `GET /api/v1/personal/gmail/threads` computes every field it returns
+  (`last_sender`/`last_direction`/`message_count`/`body_cached`) live from
+  the existing `email_threads`/`email_messages` columns above; `SyncRequest.
+  since` (`connector_accounts.py`) is a new request field threaded into
+  `GmailAdapter.backfill`'s own `since` parameter, which has accepted it
+  since migration `0069`'s own `connectors.py` Protocol widening (Task 1) --
+  Task 8 is the first real caller to pass a non-`None` value.
 
 ## Current tables
 
@@ -153,13 +158,15 @@ only an opaque id).
 
 ## Planned model changes
 
-Task 8 may add further schema for executive UX. Task 7's own consent
-revocation cascade shipped needing no new migration -- this document's own
-prior "Tasks 7-8 may add further schema for consent-revocation purge"
-claim went stale in that particular respect -- but Loop 2 round 8 review
-added one after all: `email_message_id_purge_log` (migration `0076`),
-described above, closing a gap the original cascade design could not
-close without persisted state.
+None. Task 8 -- the plan's final task -- shipped its executive UX and the
+two backend additions above needing no new migration, closing this
+section out. Task 7's own consent revocation cascade similarly shipped
+needing no new migration -- this document's own prior "Tasks 7-8 may add
+further schema for consent-revocation purge" claim went stale in that
+particular respect -- but Loop 2 round 8 review added one after all:
+`email_message_id_purge_log` (migration `0076`), described above, closing
+a gap the original cascade design could not close without persisted
+state.
 
 ## Changelog
 
@@ -172,3 +179,4 @@ close without persisted state.
 | 1.3.1 | 2026-08-10 | Task 7 Loop 2 round 5 review: this file was never revisited across four review rounds -- corrected the "every derived ... row" overclaim (round 4's cross-owner collision fix leaves an ambiguous evidence row unpurged) and the imprecise "recommendations ... row" language (executed ones are redacted in place, not deleted); also noted an owner can hold more than one Gmail connector account | Lucky Jain |
 | 1.4.0 | 2026-08-10 | Task 7 Loop 2 round 8 review: documented the new `email_message_id_purge_log` table (migration `0076`), closing a sequential cross-owner evidence leak the round-4 fix could not close without persisted state -- correcting this document's own prior "no new migration was needed" claim | Lucky Jain |
 | 1.4.1 | 2026-08-10 | Task 7 Loop 2 round 16 review: the "Delivery boundary" section at the top of this file was never reconciled after Task 7 shipped -- still read "Current (Tasks 1-2, 5-6)" / "Planned (Tasks 7-8): consent-revocation purge" while the rest of this same document (as of 1.3.0-1.4.0) already described Task 7's cascade as fully shipped; corrected | Lucky Jain |
+| 1.5.0 | 2026-08-11 | Task 8: documented the thread-list endpoint and `since` param as read-shaped additions needing no migration, and closed "Planned model changes" out now that the plan's final task has shipped | Lucky Jain |

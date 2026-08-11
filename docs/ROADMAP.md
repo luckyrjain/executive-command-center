@@ -3,7 +3,7 @@
 ## Current status
 
 <!-- BEGIN GENERATED PHASE STATUS -->
-**Current engineering phase:** Phase 10 — Gmail Connector (In progress; Tasks 1-7 of 8 complete).
+**Current engineering phase:** Phase 10 — Gmail Connector (Engineering complete; Tasks 1-8 delivered).
 
 | Phase | Name | Engineering | Validation | Promotion |
 |---:|---|---|---|---|
@@ -17,7 +17,7 @@
 | 7 | Personal Intelligence | Engineering complete | Not started | Blocked |
 | 8 | Multi-user Workspaces | Engineering complete | Not started | Blocked |
 | 9 | Enterprise | Not started | Not started | Not promoted |
-| 10 | Gmail Connector | In progress | Not started | Not promoted |
+| 10 | Gmail Connector | Engineering complete | Not started | Blocked |
 
 **Open gates:**
 
@@ -30,7 +30,7 @@
 - Phase 7: personal-data export deletion and restore evidence; encryption-key rotation decision; independent change review and promotion decision.
 - Phase 8: first production owner provisioning; account recovery and MFA or step-up decision; independent change review and promotion decision.
 - Phase 9: specification approval; predecessor production-readiness and promotion decisions.
-- Phase 10: Task 8; real Gmail account verification; backup and restore verification; independent change review.
+- Phase 10: real Gmail account verification; backup and restore verification; independent change review.
 
 Source: [`docs/phases/status.json`](phases/status.json). Specification approval, engineering completion, validation, and promotion are independent states.
 <!-- END GENERATED PHASE STATUS -->
@@ -183,7 +183,7 @@ Specification: [PHASE-009](phases/PHASE-009-enterprise.md)
 
 ## Phase 10 — Gmail Connector
 
-**Status:** Approved for Implementation; contracts moved from Draft after resolving `docs/superpowers/specs/2026-08-04-phase-10-gmail-connector-design.md`'s five named decisions (connector mechanics/Protocol extension, privacy/consent model and encryption, OAuth scope/verification reality/rollout gating, `recommendations` create-path extension and AI-tool safety rubric, attention/knowledge integration), resolved in `PHASE-010-gmail-connector.md`'s own "Approved decisions" section. Unlike Phase 6-9, Phase 10 was never part of the original Phase 0-9 set `docs/phases/PHASE-REVIEW.md` reviewed -- its spec and design doc were written together as this phase's own first artifacts. **Engineering delivery is complete through Tasks 1–7 of 8**: internal-allowlist OAuth, manual 30-day metadata backfill/incremental history sync, deduplication, person-entity linking, deterministic awaiting-reply attention integration, the governed recommendations create path, AI-runtime action detection (`email.detect_action`), on-demand thread reading with per-thread "forget this," and the consent revocation cascade (disconnect + domain-wide purge, one action). Task 8 (executive UX) remains open. See `docs/phases/phase-010/IMPLEMENTATION-STATUS.md` for task-level evidence.
+**Status:** Approved for Implementation; contracts moved from Draft after resolving `docs/superpowers/specs/2026-08-04-phase-10-gmail-connector-design.md`'s five named decisions (connector mechanics/Protocol extension, privacy/consent model and encryption, OAuth scope/verification reality/rollout gating, `recommendations` create-path extension and AI-tool safety rubric, attention/knowledge integration), resolved in `PHASE-010-gmail-connector.md`'s own "Approved decisions" section. Unlike Phase 6-9, Phase 10 was never part of the original Phase 0-9 set `docs/phases/PHASE-REVIEW.md` reviewed -- its spec and design doc were written together as this phase's own first artifacts. **Engineering delivery is complete through all 8 tasks**: internal-allowlist OAuth, manual 30-day metadata backfill/incremental history sync, deduplication, person-entity linking, deterministic awaiting-reply attention integration, the governed recommendations create path, AI-runtime action detection (`email.detect_action`), on-demand thread reading with per-thread "forget this," the consent revocation cascade (disconnect + domain-wide purge, one action), and executive UX (`GmailPanel`, a thread-list endpoint, and an expand-backfill sync parameter). Task 8's own Loop 2 review has not yet started. See `docs/phases/phase-010/IMPLEMENTATION-STATUS.md` for task-level evidence.
 
 A Gmail connector composing Phase 6's connector/OAuth/sync framework with Phase 7's consent/encryption/deletion framework for the first time, gated by an internal-user allowlist that keeps this phase outside Google's CASA security-assessment requirement.
 

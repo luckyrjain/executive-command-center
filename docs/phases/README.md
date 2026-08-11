@@ -15,7 +15,7 @@ This is the canonical index for phase-wise product, architecture, API, data, UX,
 ## Status
 
 <!-- BEGIN GENERATED PHASE STATUS -->
-**Current engineering phase:** Phase 10 — Gmail Connector (In progress; Tasks 1-7 of 8 complete).
+**Current engineering phase:** Phase 10 — Gmail Connector (Engineering complete; Tasks 1-8 delivered).
 
 | Phase | Name | Engineering | Validation | Promotion |
 |---:|---|---|---|---|
@@ -29,7 +29,7 @@ This is the canonical index for phase-wise product, architecture, API, data, UX,
 | 7 | Personal Intelligence | Engineering complete | Not started | Blocked |
 | 8 | Multi-user Workspaces | Engineering complete | Not started | Blocked |
 | 9 | Enterprise | Not started | Not started | Not promoted |
-| 10 | Gmail Connector | In progress | Not started | Not promoted |
+| 10 | Gmail Connector | Engineering complete | Not started | Blocked |
 
 **Open gates:**
 
@@ -42,7 +42,7 @@ This is the canonical index for phase-wise product, architecture, API, data, UX,
 - Phase 7: personal-data export deletion and restore evidence; encryption-key rotation decision; independent change review and promotion decision.
 - Phase 8: first production owner provisioning; account recovery and MFA or step-up decision; independent change review and promotion decision.
 - Phase 9: specification approval; predecessor production-readiness and promotion decisions.
-- Phase 10: Task 8; real Gmail account verification; backup and restore verification; independent change review.
+- Phase 10: real Gmail account verification; backup and restore verification; independent change review.
 
 Source: [`docs/phases/status.json`](status.json). Specification approval, engineering completion, validation, and promotion are independent states.
 <!-- END GENERATED PHASE STATUS -->

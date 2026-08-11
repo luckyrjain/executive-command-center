@@ -119,7 +119,7 @@ export async function run({ page, baseURL }) {
   // back from Google's own consent screen ---------------------------------
   fixtures.personal.domains.push({ ...emailDomain })
   fixtures.engineering.connectors.push(gmailConnector())
-  fixtures.recommendations.push({ ...seedEmailRecommendation }, { ...seedOtherRecommendation })
+  fixtures.collections.recommendations.items.push({ ...seedEmailRecommendation }, { ...seedOtherRecommendation })
 
   await page.goto(baseURL)
   await page.getByRole('tab', { name: 'Personal' }).click()
@@ -129,7 +129,11 @@ export async function run({ page, baseURL }) {
 
   assert.equal(await panel.getByText(/Enable Email in the Domains tab/).count(), 0, 'consent-missing hint must not show once the email domain is enabled')
   await panel.getByText('owner@example.test').waitFor()
-  await panel.getByText('first sync not yet run').waitFor()
+  // `status: 'active'` (this connector's own seed, matching the real OAuth
+  // callback's own worked example in API-SCHEMAS.md) -- "first sync not yet
+  // run" is `statusLabel`'s text for `status === 'pending'` specifically, a
+  // distinct signal from "no sync run" (`neverSynced`, derived from `sync-
+  // runs` alone), so the button label is the correct thing to wait on here.
   await panel.getByRole('button', { name: 'Run first sync' }).click()
   await panel.getByRole('button', { name: 'Sync now' }).waitFor()
   assert.equal(fixtures.engineering.syncRuns.some((r) => r.connector_account_id === 'gmail-connector-1'), true)
@@ -172,7 +176,10 @@ export async function run({ page, baseURL }) {
   await panel.getByText('Could you please sign and return the attached contract by Friday?').waitFor()
 
   await panel.getByRole('button', { name: 'Forget cached content for this thread' }).click()
-  assert.equal(await panel.getByText('Could you please sign and return the attached contract by Friday?').count(), 0, 'forget must close the open thread detail')
+  // Waits (not a synchronous `.count()`): `onForgotten` only clears
+  // `selectedThreadId` once the mutation's own async `onSuccess` fires, a
+  // real gap between the click and the detail view actually unmounting.
+  await panel.getByText('Could you please sign and return the attached contract by Friday?').waitFor({ state: 'detached' })
   assert.equal(fixtures.personal.gmailThreads.find((t) => t.id === 'thread-1').messages[0].body, null)
 
   // --- Pending-recommendation review, filtered to this domain only --------
