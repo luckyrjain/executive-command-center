@@ -739,15 +739,52 @@ def test_backfill_with_a_legacy_bare_token_credential_syncs_against_gitlab_com(
     assert source_url == "https://gitlab.com/acme/a"
 
 
-def test_backfill_populates_suggested_team_name_from_namespace_object(
+def test_backfill_populates_suggested_team_name_from_namespace_full_path(
     seeded_account_context: ConnectorAccountContext,
 ) -> None:
     """Migration `0050_phase6_team_linkage.py`'s "hybrid: auto-suggest,
     human confirms" design -- `_upsert_repository` now writes GitLab's own
-    `namespace.name` (the group or user this project belongs to) into
-    `repositories.suggested_team_name`. The full `GET /projects` REST
-    representation nests `namespace` as an object -- see the next test for
-    the webhook payload's differently-shaped bare-string `namespace`.
+    `namespace.full_path` (the project's full group/subgroup path, e.g.
+    "disbursement/neo" -- present on the default, unfiltered `GET
+    /projects` REST response with no extra API call) into `repositories.
+    suggested_team_name`, not just the immediate subgroup's own `name`.
+    See the next test for the fallback when `full_path` is absent, and
+    the one after for the webhook payload's differently-shaped
+    bare-string `namespace`.
+    """
+    projects = [
+        _project(
+            1,
+            path="disbursement/neo/a",
+            updated_at="2024-01-03T00:00:00Z",
+            namespace={
+                "id": 9,
+                "name": "Neo",
+                "path": "neo",
+                "kind": "group",
+                "full_path": "disbursement/neo",
+            },
+        )
+    ]
+    adapter = GitLabAdapter(transport=httpx.MockTransport(lambda r: _json_response(projects)))
+    adapter.backfill(seeded_account_context, "repository")
+
+    with engine.begin() as connection:
+        suggested = connection.execute(
+            text("SELECT suggested_team_name FROM repositories WHERE workspace_id = :workspace_id"),
+            {"workspace_id": seeded_account_context.workspace_id},
+        ).scalar_one()
+    assert suggested == "disbursement/neo"
+
+
+def test_backfill_suggested_team_name_falls_back_to_name_when_full_path_absent(
+    seeded_account_context: ConnectorAccountContext,
+) -> None:
+    """A self-managed GitLab instance old enough to predate `full_path` on
+    the namespace object (or any REST response that simply omits it) must
+    not crash or lose the suggestion entirely -- falls back to the
+    immediate subgroup's own `name`, `_suggested_team_name`'s original
+    behavior.
     """
     projects = [
         _project(
