@@ -29,7 +29,8 @@ const TABS: ReadonlyArray<{ view: PersonalView; label: string }> = [
  * backend endpoint here already takes a `domain_key` parameter rather than
  * exposing a per-domain route (`API-SCHEMAS.md`'s own "a caller names a
  * domain_key, never a domain-specific code path" convention), so a single
- * domain-aware UI covers all six generic domains with no per-domain
+ * domain-aware UI covers all seven generic domains (six pre-Task-8, plus
+ * `email` as of this task -- see below) with no per-domain
  * duplication -- `habits`' own `goals`/`routines`/`check_ins` extras are
  * intentionally out of this task's scope (not named in the implementation
  * plan's Task 8 coverage list: "enable -> capture -> grant/revoke ->
