@@ -13,15 +13,72 @@ import type {
 
 const PROVIDERS: ReadonlyArray<ConnectorProvider> = ['github', 'gitlab', 'jira', 'datadog', 'sandbox']
 
-// Only GitLab's credential shape (`host|token`, `connector_accounts.
-// ConnectorCreateRequest`'s own docstring) is non-obvious from a bare
-// password-style input -- self-managed GitLab support means "just paste a
-// token" is no longer correct for this provider specifically. GitHub/Jira/
-// Datadog/sandbox get no placeholder: GitHub's is a bare token (nothing to
-// hint), and Jira/Datadog's own multi-part shapes are out of scope for this
-// hint-text pass.
-const CREDENTIAL_PLACEHOLDER: Partial<Record<ConnectorProvider, string>> = {
-  gitlab: 'host|token, e.g. gitlab.com|glpat-xxxx or gitlab-ee.example.com|glpat-xxxx',
+// `connector_accounts.ConnectorCreateRequest.credential` is one opaque
+// string per provider, but the shape underneath differs (bare token,
+// `host|token`, `site|email|api_token`, `site|api_key|app_key`) -- see
+// each adapter's own `_parse_credential`. Rather than ask the operator to
+// hand-assemble that string with the right delimiters, this form takes
+// each part as its own labeled field and joins them per provider on
+// submit (`buildCredential`), matching what the receiving adapter expects
+// exactly.
+const DATADOG_SITES = [
+  'api.datadoghq.com',
+  'api.us3.datadoghq.com',
+  'api.us5.datadoghq.com',
+  'api.datadoghq.eu',
+  'api.ap1.datadoghq.com',
+  'api.ddog-gov.com',
+] as const
+
+type CredentialFields = { host: string; site: string; email: string; token: string; appKey: string }
+
+function emptyCredentialFields(provider: ConnectorProvider): CredentialFields {
+  return {
+    host: 'gitlab.com',
+    site: provider === 'datadog' ? DATADOG_SITES[0] : '',
+    email: '',
+    token: '',
+    appKey: '',
+  }
+}
+
+// The secret/token field's label varies by provider (`datadog_adapter.py`'s
+// own `_parse_credential` calls it an API key, `jira_adapter.py`'s an API
+// token) -- sandbox has no real shape to name, so it keeps the generic
+// "Credential" label this form used everywhere before this change.
+const TOKEN_FIELD_LABEL: Partial<Record<ConnectorProvider, string>> = {
+  github: 'Personal access token',
+  gitlab: 'Personal access token',
+  jira: 'API token',
+  datadog: 'API key',
+}
+
+function tokenFieldLabel(provider: ConnectorProvider): string {
+  return TOKEN_FIELD_LABEL[provider] ?? 'Credential'
+}
+
+function buildCredential(provider: ConnectorProvider, fields: CredentialFields): string {
+  switch (provider) {
+    case 'gitlab':
+      return `${fields.host.trim() || 'gitlab.com'}|${fields.token}`
+    case 'jira':
+      return `${fields.site.trim()}|${fields.email.trim()}|${fields.token}`
+    case 'datadog':
+      return `${fields.site}|${fields.token}|${fields.appKey}`
+    default:
+      return fields.token
+  }
+}
+
+function isCredentialComplete(provider: ConnectorProvider, fields: CredentialFields): boolean {
+  switch (provider) {
+    case 'jira':
+      return fields.site.trim() !== '' && fields.email.trim() !== '' && fields.token.trim() !== ''
+    case 'datadog':
+      return fields.token.trim() !== '' && fields.appKey.trim() !== ''
+    default:
+      return fields.token.trim() !== ''
+  }
 }
 const RESOURCE_TYPES = [
   'repository', 'work_item', 'change', 'review', 'deployment', 'incident',
@@ -206,7 +263,7 @@ function ConnectorCard({ connector, syncRuns, now, onChanged }: {
 export default function ConnectorHealthPanel() {
   const queryClient = useQueryClient()
   const [provider, setProvider] = useState<ConnectorProvider>('github')
-  const [credential, setCredential] = useState('')
+  const [fields, setFields] = useState<CredentialFields>(() => emptyCredentialFields('github'))
 
   const connectors = useQuery({
     queryKey: ['engineering', 'connectors'],
@@ -220,12 +277,21 @@ export default function ConnectorHealthPanel() {
   })
 
   const createMutation = useMutation({
-    mutationFn: () => apiRequest<ConnectorAccount>('/api/v1/engineering/connectors', { method: 'POST', body: { provider, credential } }),
+    mutationFn: () =>
+      apiRequest<ConnectorAccount>('/api/v1/engineering/connectors', {
+        method: 'POST',
+        body: { provider, credential: buildCredential(provider, fields) },
+      }),
     onSuccess: () => {
-      setCredential('')
+      setFields(emptyCredentialFields(provider))
       refresh()
     },
   })
+
+  function selectProvider(next: ConnectorProvider) {
+    setProvider(next)
+    setFields(emptyCredentialFields(next))
+  }
 
   function refresh() {
     void queryClient.invalidateQueries({ queryKey: ['engineering', 'connectors'] })
@@ -249,22 +315,73 @@ export default function ConnectorHealthPanel() {
 
       <form onSubmit={(event) => { event.preventDefault(); createMutation.mutate() }}>
         <label>Provider
-          <select aria-label="Provider" value={provider} onChange={(e) => setProvider(e.target.value as ConnectorProvider)}>
+          <select aria-label="Provider" value={provider} onChange={(e) => selectProvider(e.target.value as ConnectorProvider)}>
             {PROVIDERS.map((p) => <option key={p} value={p}>{p}</option>)}
           </select>
         </label>
-        <label>Credential
+        {provider === 'gitlab' ? (
+          <label>Host
+            <input
+              aria-label="Host"
+              type="text"
+              value={fields.host}
+              onChange={(e) => setFields({ ...fields, host: e.target.value })}
+              autoComplete="off"
+            />
+          </label>
+        ) : null}
+        {provider === 'jira' ? (
+          <>
+            <label>Site
+              <input
+                aria-label="Site"
+                type="text"
+                value={fields.site}
+                onChange={(e) => setFields({ ...fields, site: e.target.value })}
+                autoComplete="off"
+                placeholder="yoursite.atlassian.net"
+              />
+            </label>
+            <label>Email
+              <input
+                aria-label="Email"
+                type="email"
+                value={fields.email}
+                onChange={(e) => setFields({ ...fields, email: e.target.value })}
+                autoComplete="off"
+              />
+            </label>
+          </>
+        ) : null}
+        {provider === 'datadog' ? (
+          <label>Site
+            <select aria-label="Site" value={fields.site} onChange={(e) => setFields({ ...fields, site: e.target.value })}>
+              {DATADOG_SITES.map((s) => <option key={s} value={s}>{s}</option>)}
+            </select>
+          </label>
+        ) : null}
+        <label>{tokenFieldLabel(provider)}
           <input
-            aria-label="Credential"
+            aria-label={tokenFieldLabel(provider)}
             type="password"
-            value={credential}
-            onChange={(e) => setCredential(e.target.value)}
+            value={fields.token}
+            onChange={(e) => setFields({ ...fields, token: e.target.value })}
             autoComplete="off"
-            placeholder={CREDENTIAL_PLACEHOLDER[provider]}
           />
         </label>
+        {provider === 'datadog' ? (
+          <label>Application key
+            <input
+              aria-label="Application key"
+              type="password"
+              value={fields.appKey}
+              onChange={(e) => setFields({ ...fields, appKey: e.target.value })}
+              autoComplete="off"
+            />
+          </label>
+        ) : null}
         <div className="work-actions">
-          <button type="submit" disabled={createMutation.isPending || !credential.trim()}>Connect</button>
+          <button type="submit" disabled={createMutation.isPending || !isCredentialComplete(provider, fields)}>Connect</button>
         </div>
       </form>
       {createMutation.isError ? <div role="alert" className="inline-status error-panel">{errorMessage(createMutation.error)}</div> : null}
