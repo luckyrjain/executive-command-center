@@ -2,7 +2,7 @@
 id: PHASE-006-API-SCHEMAS
 title: Phase 6 Engineering Workspace API
 status: Approved for Implementation
-version: 0.8.2
+version: 0.9.0
 owner: Lucky Jain
 ---
 
@@ -17,6 +17,9 @@ GET /engineering/repositories
 POST /engineering/repositories/{id}/team
 GET /engineering/work-items
 POST /engineering/work-items/{id}/team
+GET /engineering/team-suggestions
+POST /engineering/team-suggestions/confirm
+POST /engineering/team-suggestions/dismiss
 GET /engineering/changes
 GET /engineering/deployments
 GET|POST /engineering/incidents
@@ -42,5 +45,7 @@ GET /engineering/dashboards
 **Team linkage status (migration `0050_phase6_team_linkage.py`)**: `POST /engineering/repositories/{id}/team` and `POST /engineering/work-items/{id}/team` (`assign_repository_team_endpoint`/`assign_work_item_team_endpoint`) are new -- the "human confirms" half of this migration's own hybrid auto-suggest design (see `CONNECTOR-CONTRACT.md`'s "Team linkage status" section for the "auto-suggest" half). Body: `{"expected_version": <int>, "team_entity_id": "<uuid>" | null}` -- the `{id}` path parameter must itself resolve to a real repository/work-item in the caller's own workspace (404 `REPOSITORY_NOT_FOUND`/`WORK_ITEM_NOT_FOUND` otherwise); a non-null `team_entity_id` must reference a real, active, `kind="team"` `pkos_nodes` row in the caller's own workspace (404 `TEAM_ENTITY_NOT_FOUND` / 422 `TEAM_ENTITY_KIND_MISMATCH` otherwise); `null` clears an existing assignment. **Requires `Idempotency-Key`** and checks `expected_version` against `team_assignment_version` (409 `VERSION_CONFLICT` on a stale read) -- the first PR draft of this endpoint had neither, which review correctly flagged as leaving the first human-editable field either table has ever had with none of `update_entity`'s optimistic-concurrency, idempotency, or `audit_events`/`event_outbox` discipline every other mutating endpoint in this router has. Both `GET /engineering/repositories` and `GET /engineering/work-items` also gained an optional `team_entity_id` query filter, and both response bodies gained `team_entity_id`/`suggested_team_name`/`team_assignment_version`/`team_assignment_updated_by` fields.
 
 **Datadog connector status (migration `0051_phase6_datadog_connector.py`)**: `GET /engineering/monitors`, `GET /engineering/service-definitions` and `GET /engineering/dashboards` are new (`list_monitors_endpoint`/`list_service_definitions_endpoint`/`list_dashboards_endpoint`) -- read-only, mirroring `GET /engineering/repositories`'s own shape exactly: workspace-scoped, optional `connector_account_id` and `team_entity_id` query filters, no pagination. Each response body includes `team_entity_id`/`suggested_team_name` (read-only on these three routes) but **no `team_assignment_version`/`team_assignment_updated_by`** -- unlike `repositories`/`work-items`, no `POST .../team` confirm endpoint exists yet for monitors/service definitions/dashboards; see `CONNECTOR-CONTRACT.md`'s "Datadog connector status" and "Team linkage status" sections for why writing a confirmed link for these three resource types is deliberately deferred to its own follow-up task, not an oversight of this one.
+
+**Team suggestions review page status (migration `0072_team_suggestion_dismissal.py`, later addition)**: `GET /engineering/team-suggestions`, `POST /engineering/team-suggestions/confirm`, `POST /engineering/team-suggestions/dismiss` are new -- a grouped, bulk-action sibling of the per-item `POST .../{id}/team` endpoints above, not a replacement (see `CONNECTOR-CONTRACT.md`'s matching "Team suggestions review page" section for why). `GET` returns `{"items": [{"suggested_team_name", "repository_count", "work_item_count", "sample_items": [{"id", "resource_type": "repository"|"work_item", "name"}]}]}`, one entry per distinct pending `suggested_team_name` across `repositories`/`engineering_work_items` combined (dismissed and already-confirmed rows excluded). `POST .../confirm` body: `{"suggested_team_name": "<str>", "team_entity_id": "<uuid>"}`; `POST .../dismiss` body: `{"suggested_team_name": "<str>"}`. Both mutations respond `{"updated": ["<uuid>", ...], "skipped_unauthorized": ["<uuid>", ...]}` -- every currently-eligible row sharing that suggested name is locked and re-authorized individually for `action="write"` inside one transaction; a row the caller cannot write to is silently excluded from `updated` and reported in `skipped_unauthorized` instead of failing the whole batch. **Requires `Idempotency-Key`**, matching every other mutating endpoint in this router; no `expected_version` -- a set-based confirm has no single row version to check against, unlike the per-item endpoint.
 
 Connector creation returns required scopes and authorization state, never token values. Queries expose source coverage, freshness, definitions and evidence. Optional mutations route through approved automation policies. Signed cursors, isolation, redaction, idempotency and concurrency rules apply.
