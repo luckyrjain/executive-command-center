@@ -53,7 +53,17 @@ def list_recommendations(
     include_archived: bool = False,
     cursor: str | None = None,
     limit: LimitQuery = 20,
+    recommendation_type: str | None = None,
 ) -> RecommendationListResponse:
+    # `recommendation_type` (Phase 10 Task 8 Loop 2 round 5 review): a
+    # domain-scoped embed of `RecommendationPanel` (e.g. `GmailPanel`
+    # filtering to `email_action_detected`) was previously filtering the
+    # already-paginated page client-side -- in a workspace with 20+ newer
+    # recommendations of *other* types, a genuine, unconfirmed item of the
+    # embedded type would never enter the fetched page at all, silently
+    # hiding it from the one view whose whole purpose is surfacing it for
+    # human confirmation. Filtering server-side, before `LIMIT`, closes
+    # that gap regardless of how many other-typed recommendations exist.
     cursor_created: datetime | None = None
     cursor_id: UUID | None = None
     if cursor:
@@ -74,6 +84,10 @@ def list_recommendations(
                     OR status=ANY(CAST(:statuses AS text[]))
                   )
                   AND (
+                    CAST(:recommendation_type AS text) IS NULL
+                    OR recommendation_type=CAST(:recommendation_type AS text)
+                  )
+                  AND (
                     CAST(:cursor_created AS timestamptz) IS NULL
                     OR (created_at,id)<(
                         CAST(:cursor_created AS timestamptz),
@@ -88,6 +102,7 @@ def list_recommendations(
                 "workspace_id": auth.workspace_id,
                 "include_archived": include_archived,
                 "statuses": statuses,
+                "recommendation_type": recommendation_type,
                 "cursor_created": cursor_created,
                 "cursor_id": cursor_id,
                 "fetch_limit": limit + 1,

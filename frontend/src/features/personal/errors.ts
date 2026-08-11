@@ -22,6 +22,24 @@ export function personalErrorMessage(error: unknown): string {
   if (error.code === 'INSIGHT_NOT_FOUND') return 'This insight no longer exists.'
   if (error.code === 'GOAL_NOT_FOUND') return 'This goal no longer exists.'
   if (error.code === 'ROUTINE_NOT_FOUND') return 'This routine no longer exists.'
+  // Gmail-specific codes (Phase 10) -- `GmailPanel` lives in this feature
+  // but reaches both the `email` domain endpoints (`EMAIL_CONSENT_NOT_
+  // ACTIVE`/`THREAD_NOT_FOUND`, `gmail_threads.py`/`gmail_oauth.py`) and
+  // the generic engineering connector endpoints it shares with `Connector
+  // HealthPanel.tsx` for sync/status (`CONNECTOR_*`, that panel's own
+  // `errorMessage` has the identical three) -- kept here rather than
+  // duplicated into a second Gmail-only error module, matching this
+  // function's own "one mapping function" rationale above.
+  if (error.code === 'EMAIL_CONSENT_NOT_ACTIVE') return 'Email consent is not active. Enable the email domain and grant consent to view Gmail data.'
+  if (error.code === 'THREAD_NOT_FOUND') return 'This thread no longer exists.'
+  if (error.code === 'GMAIL_ACCOUNT_NOT_ALLOWLISTED') return 'This Google account is not on the internal allowlist for Gmail access.'
+  if (error.code === 'GMAIL_OAUTH_NOT_CONFIGURED') return 'Gmail OAuth is not configured for this deployment.'
+  if (error.code === 'GMAIL_OAUTH_STATE_INVALID') return 'This Gmail sign-in link expired or was already used. Start again.'
+  if (error.code === 'GMAIL_OAUTH_FAILED') return 'Google rejected this sign-in attempt. Try again.'
+  if (error.code === 'GMAIL_DISABLE_REQUIRES_DOMAIN_ENDPOINT') return 'Use the email domain\'s disable action to disconnect Gmail, not the generic connector action.'
+  if (error.code === 'CONNECTOR_NOT_FOUND') return 'This connector no longer exists in this workspace.'
+  if (error.code === 'CONNECTOR_DISCONNECTED') return 'This connector is already disconnected.'
+  if (error.code === 'CONNECTOR_SYNC_IN_PROGRESS') return 'A sync is already running for this connector -- wait for it to finish before starting another.'
   if (error.status === 401) return 'Your session is no longer valid. Sign in again.'
   if (error.status === 403) return 'You are not permitted to manage personal data in this workspace.'
   return error.message

@@ -2,7 +2,7 @@
 id: PHASE-010-PRIVACY-CONSENT-CONTRACT
 title: Phase 10 Gmail Privacy and Consent Contract
 status: Approved for Implementation
-version: 1.4.5
+version: 1.5.0
 owner: Lucky Jain
 depends_on:
   - PHASE-010
@@ -293,13 +293,26 @@ thread evidence-propagation action, only the domain-wide one).
 
 ## Unsupported — production blocker
 
-Task 8 does **not** yet provide Gmail-specific export, deletion
-verification, redacted audit events for connect/sync/body-access/revoke/
-delete, an explicit retention period and cache expiry before body storage
-is enabled, or key rotation. Until Task 8 and recovery evidence exist,
-Gmail is internal-development only.
+Task 8 -- the plan's final task -- shipped `GmailPanel`, the executive UX
+layer, per `docs/superpowers/plans/2026-08-04-phase-10-gmail-connector.md`'s
+own Task 8 scope (a frontend-only bullet: "GmailPanel inside the existing
+PersonalWorkspace shell ... wired into App.tsx/WorkspaceNavigation.tsx").
+This section's own three items were never actually part of that scope --
+an earlier draft of this document attributed them to "Task 8" without that
+attribution ever appearing in the authoritative plan. Explicitly resolved,
+not silently dropped: Gmail-specific export, deletion verification,
+redacted audit events for connect/sync/body-access/revoke/delete, an
+explicit retention period and cache expiry before body storage is
+enabled, and key rotation all remain genuinely unimplemented and are not
+scheduled against any further task in this phase's plan. **Gmail stays
+internal-development only** until this list and recovery evidence exist,
+whenever a future phase or task takes it up.
 
-## Planned controls (Task 8)
+## Deferred controls (open, not scheduled)
+
+Renamed from "Planned controls (Task 8)" -- these were never actually in
+Task 8's own scope (see "Unsupported — production blocker" above), so
+naming a task here would misstate when, or whether, they ship:
 
 - export with decrypted owner-authorized content and no credential material;
 - redacted audit events for connect, sync, body access, revoke, and delete;
@@ -328,3 +341,4 @@ Gmail is internal-development only.
 | 1.4.3 | 2026-08-10 | Task 7 Loop 2 round 24 review (HIGH): a genuinely fresh (non-replayed) disable request against an already-disabled domain was unconditionally a no-op, even with a Gmail account reconnected in the meantime -- `cascade_email_revocation` is now triggered on `domain.enabled or reconnected`, not merely `domain.enabled`, matching `delete_domain_endpoint`'s own already-unconditional cascade call | Lucky Jain |
 | 1.4.4 | 2026-08-10 | Task 7 Loop 2 round 25 review (MEDIUM): the generic engineering `/disable` endpoint's `gmail`-provider rejection is now gated on the owner having a `personal_domains` row for `email` at all -- without it, an OAuth-connected owner who never enabled the `email` domain had no HTTP-reachable way to disconnect their `gmail` account, since the domain-level endpoints 404 for them too | Lucky Jain |
 | 1.4.5 | 2026-08-10 | Task 7 Loop 2 round 27 review (MEDIUM-HIGH): the generic engineering `/disable` endpoint now also rejects a reused `Idempotency-Key` with `409 IDEMPOTENCY_CONFLICT` if the account is no longer `disconnected` when replayed -- the same stale-cache-after-reconnect gap rounds 21-22 closed for the domain-level endpoints, never propagated to this sibling endpoint | Lucky Jain |
+| 1.5.0 | 2026-08-11 | Task 8: explicit user decision -- Task 8 shipped exactly plan.md's own frontend-only scope (`GmailPanel`); export/audit-event/retention-policy were never actually in that scope despite this document's own prior "Planned controls (Task 8)" heading implying otherwise. Renamed to "Deferred controls (open, not scheduled)" and reworded "Unsupported — production blocker" to state plainly that Gmail stays internal-development-only with these three items open, not blocked on a task that will close them | Lucky Jain |

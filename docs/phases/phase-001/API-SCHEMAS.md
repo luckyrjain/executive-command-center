@@ -2,7 +2,7 @@
 id: PHASE-001-API-SCHEMAS
 title: Phase 1 API Schemas
 status: Approved for Implementation
-version: 1.0.3
+version: 1.0.4
 owner: Lucky Jain
 ---
 
@@ -71,7 +71,7 @@ Standalone meetings require all three API fields. Linked Meeting responses expos
 
 ## Recommendations
 
-`GET /recommendations`, `GET /recommendations/{id}`, and actions `/publish`, `/confirm`, `/reject`, `/defer`, `/pin`.
+`GET /recommendations`, `GET /recommendations/{id}`, and actions `/publish`, `/confirm`, `/reject`, `/defer`, `/pin`. `GET /recommendations` accepts an optional `recommendation_type` query parameter, filtered server-side before `limit`/`cursor` pagination applies (Phase 10 Task 8 Loop 2 round 5 review: a domain-scoped embed of the shared review UI filtering client-side could otherwise miss its own items behind a workspace-wide backlog of other-typed recommendations).
 
 - `POST /recommendations/{id}/publish` requires `expected_version`, is valid only from `proposed`, transitions to `pending_confirmation`, and returns the current recommendation.
 - `POST /recommendations/{id}/confirm` includes expected_recommendation_version and target expected_version. It is valid only from `pending_confirmation`; it atomically transitions to accepted, mutates the local target, transitions to executed, writes audit records and outbox events, then commits.

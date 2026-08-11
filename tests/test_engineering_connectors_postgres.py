@@ -250,7 +250,9 @@ class _RaisingAdapter:
             granted_scopes=self.required_scopes,
         )
 
-    def backfill(self, account: ConnectorAccountContext, resource_type: str) -> SyncOutcome:
+    def backfill(
+        self, account: ConnectorAccountContext, resource_type: str, since: datetime | None = None
+    ) -> SyncOutcome:
         raise RuntimeError("simulated adapter failure")
 
     def incremental_sync(
@@ -287,7 +289,9 @@ class _SpyDisconnectAdapter:
             granted_scopes=self.required_scopes,
         )
 
-    def backfill(self, account: ConnectorAccountContext, resource_type: str) -> SyncOutcome:
+    def backfill(
+        self, account: ConnectorAccountContext, resource_type: str, since: datetime | None = None
+    ) -> SyncOutcome:
         return SyncOutcome(
             resource_type=resource_type, items_processed=1, status="succeeded", next_cursor="1"
         )
@@ -347,7 +351,9 @@ class _SlowDisconnectAdapter:
             granted_scopes=self.required_scopes,
         )
 
-    def backfill(self, account: ConnectorAccountContext, resource_type: str) -> SyncOutcome:
+    def backfill(
+        self, account: ConnectorAccountContext, resource_type: str, since: datetime | None = None
+    ) -> SyncOutcome:
         raise NotImplementedError
 
     def incremental_sync(
@@ -389,7 +395,9 @@ class _SlowAdapter:
             granted_scopes=self.required_scopes,
         )
 
-    def backfill(self, account: ConnectorAccountContext, resource_type: str) -> SyncOutcome:
+    def backfill(
+        self, account: ConnectorAccountContext, resource_type: str, since: datetime | None = None
+    ) -> SyncOutcome:
         self.entered_phase2.set()
         self.release.wait(timeout=5)
         return SyncOutcome(
@@ -445,7 +453,9 @@ class _SlowAuthorizeAdapter:
             granted_scopes=self.required_scopes,
         )
 
-    def backfill(self, account: ConnectorAccountContext, resource_type: str) -> SyncOutcome:
+    def backfill(
+        self, account: ConnectorAccountContext, resource_type: str, since: datetime | None = None
+    ) -> SyncOutcome:
         raise NotImplementedError
 
     def incremental_sync(
@@ -489,11 +499,20 @@ class _MessageCursorAdapter:
 
     provider: str = "gmail"
     required_scopes: frozenset[str] = field(default_factory=frozenset)
+    # Task 8's own addition: records every `since` this fake's `backfill`
+    # was called with, so `test_sync_backfill_passes_since_through_to_
+    # adapter` can prove `SyncRequest.since` actually reaches the adapter
+    # call rather than merely being accepted and dropped by `SyncRequest`
+    # itself.
+    since_calls: list[datetime | None] = field(default_factory=list)
 
     def authorize(self, credential: str) -> ConnectorAuthorization:
         raise NotImplementedError
 
-    def backfill(self, account: ConnectorAccountContext, resource_type: str) -> SyncOutcome:
+    def backfill(
+        self, account: ConnectorAccountContext, resource_type: str, since: datetime | None = None
+    ) -> SyncOutcome:
+        self.since_calls.append(since)
         return SyncOutcome(
             resource_type=resource_type, items_processed=1, status="succeeded", next_cursor="12345"
         )
@@ -564,7 +583,9 @@ class _ActionDetectionSpyAdapter(_MessageCursorAdapter):
     # processed` is `0`.
     items_processed: int = 1
 
-    def backfill(self, account: ConnectorAccountContext, resource_type: str) -> SyncOutcome:
+    def backfill(
+        self, account: ConnectorAccountContext, resource_type: str, since: datetime | None = None
+    ) -> SyncOutcome:
         return SyncOutcome(
             resource_type=resource_type,
             items_processed=self.items_processed,
@@ -1374,6 +1395,57 @@ def test_sync_persists_a_message_resource_type_cursor(
             {"workspace_id": workspace_id, "account_id": account_id},
         ).scalar_one()
     assert cursor_value == "12345"
+
+
+def test_sync_backfill_passes_since_through_to_adapter(
+    engineering_test_context: tuple[TestClient, UUID, UUID, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Phase 10 Gmail Connector Task 8: `SyncRequest.since` -- new this
+    task -- must actually reach `adapter.backfill(..., since=...)`, not
+    only be accepted by the request model and silently dropped.
+    `GmailAdapter.backfill`'s own docstring names this exact field as the
+    deferred "expand history" caller Task 8 was meant to build. Proven
+    with the same `_MessageCursorAdapter` fake `test_sync_persists_a_
+    message_resource_type_cursor` above uses, registered under the real
+    `gmail` provider slug so this exercises the actual `sync_connector_
+    endpoint` code path, not a direct call to the adapter.
+    """
+    client, workspace_id, user_id, token = engineering_test_context
+    adapter = _MessageCursorAdapter()
+    monkeypatch.setattr(connector_accounts_module, "connector_registry", _registry_with(adapter))
+    account_id = _insert_connector_account(workspace_id, user_id, provider="gmail")
+
+    since = datetime(2026, 1, 1, tzinfo=UTC)
+    response = client.post(
+        f"/api/v1/engineering/connectors/{account_id}/sync",
+        json={"run_type": "backfill", "resource_type": "message", "since": since.isoformat()},
+        headers=_headers(token, key=str(uuid4())),
+    )
+    assert response.status_code == 201, response.text
+    assert adapter.since_calls == [since]
+
+
+def test_sync_backfill_without_since_passes_none_to_adapter(
+    engineering_test_context: tuple[TestClient, UUID, UUID, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The pre-Task-8 request shape (no `since` field at all) must keep
+    working exactly as before -- `adapter.backfill` still receives
+    `since=None`, matching every adapter's own "full backfill" default.
+    """
+    client, workspace_id, user_id, token = engineering_test_context
+    adapter = _MessageCursorAdapter()
+    monkeypatch.setattr(connector_accounts_module, "connector_registry", _registry_with(adapter))
+    account_id = _insert_connector_account(workspace_id, user_id, provider="gmail")
+
+    response = client.post(
+        f"/api/v1/engineering/connectors/{account_id}/sync",
+        json={"run_type": "backfill", "resource_type": "message"},
+        headers=_headers(token, key=str(uuid4())),
+    )
+    assert response.status_code == 201, response.text
+    assert adapter.since_calls == [None]
 
 
 def test_sync_invokes_proactive_action_detection_with_a_valid_call_signature(

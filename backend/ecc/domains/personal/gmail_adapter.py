@@ -1574,14 +1574,22 @@ class GmailAdapter:
         "not-yet-implemented resource type" contract interpretation.
 
         `since` defaults to `_DEFAULT_BACKFILL_WINDOW` (30 days) per plan
-        Task 2 -- explicit callers (the "expand history" UI, not built this
-        task) pass a real value for a wider or narrower window.
+        Task 2 -- explicit callers (`SyncRequest.since`, the "expand
+        history" UI built in Task 8) pass a real value for a wider or
+        narrower window.
         """
         if resource_type != "message":
             return SyncOutcome(
                 resource_type=resource_type, items_processed=0, status="succeeded", next_cursor=None
             )
         window_start = since or (datetime.now(UTC) - _DEFAULT_BACKFILL_WINDOW)
+        if window_start.tzinfo is None:
+            # Round 8 review (PR #130): `datetime.timestamp()` on a naive
+            # value is interpreted as local system time, not UTC. Round 17
+            # closed this as unreachable since nothing passed a real `since`
+            # then; Task 8's `SyncRequest.since` is now a real HTTP-reachable
+            # caller, so a naive value must be treated as UTC explicitly.
+            window_start = window_start.replace(tzinfo=UTC)
         query = f"after:{int(window_start.timestamp())}"
         return self._sync_messages(account, query=query)
 

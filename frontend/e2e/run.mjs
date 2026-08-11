@@ -23,6 +23,7 @@ import * as automationApprovalsKeyboard from './scenarios/automation-approvals-k
 import * as engineeringConnectorStates from './scenarios/engineering-connector-states.mjs'
 import * as engineeringLifecycle from './scenarios/engineering-lifecycle.mjs'
 import * as personalDomainLifecycle from './scenarios/personal-domain-lifecycle.mjs'
+import * as gmailPanelStates from './scenarios/gmail-panel-states.mjs'
 import * as multiIdentityCollaborationLifecycle from './scenarios/multi-identity-collaboration-lifecycle.mjs'
 
 const scenarios = [
@@ -60,6 +61,7 @@ const scenarios = [
   { name: 'engineering-connector-states', module: engineeringConnectorStates },
   { name: 'engineering-lifecycle', module: engineeringLifecycle },
   { name: 'personal-domain-lifecycle', module: personalDomainLifecycle },
+  { name: 'gmail-panel-states', module: gmailPanelStates },
   { name: 'multi-identity-collaboration-lifecycle', module: multiIdentityCollaborationLifecycle },
 ]
 

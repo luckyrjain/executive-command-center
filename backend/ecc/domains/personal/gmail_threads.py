@@ -60,13 +60,41 @@ after revoking consent, when there is no active grant to check) --
 gating a deletion capability behind the very consent state a user might
 be in the middle of revoking would be backwards. Both endpoints stay
 scoped to the caller's own `workspace_id`/`owner_id` regardless.
+
+`GET /api/v1/personal/gmail/threads` (Task 8): lists the caller's own
+threads, newest-`last_message_at`-first, capped by an optional `limit`
+(default 50, max 200) -- no offset/cursor, matching `connector_accounts.
+py`'s own list endpoints (`list_sync_runs_endpoint`, `list_repositories_
+endpoint`), none of which paginate at this activation's expected data
+volume. Gated on `_require_email_consent`, the identical check `GET .../
+{thread_id}` uses, even though this endpoint makes no live Gmail call
+itself -- it still returns subject lines and sender addresses, the same
+sensitivity class as thread content, and gating it identically lets the
+frontend reuse one `EMAIL_CONSENT_NOT_ACTIVE` error-handling path for
+both. Each row's `last_sender`/`last_direction`/`message_count`/
+`body_cached` are computed from a single `LEFT JOIN LATERAL` per thread
+rather than three separate correlated subqueries -- the window functions
+(`COUNT(*) OVER ()`, `BOOL_OR(...) OVER ()`) evaluate over the lateral
+subquery's own full `WHERE`-filtered row set before its `ORDER BY ...
+LIMIT 1` trims it down to the single most-recent message, so one row
+carries the most-recent message's own `sender`/`direction` alongside
+aggregates computed over every message in the thread. The lateral
+subquery's own `WHERE` also re-filters `email_messages` by `owner_id`
+(Loop 2 round 2 review, defense-in-depth), matching every other query
+against this table in this module and in `email_action_tools.py` --
+migration `0069`'s own docstring discloses no FK ties an `email_messages`
+row's `owner_id` to its parent thread's, so relying solely on the outer
+`email_threads` filter would be a real (if currently unreachable, since
+every write path derives both values from the same sync-call owner
+context) narrowing of that defense-in-depth layer versus the rest of
+this module.
 """
 
 from datetime import UTC, datetime
 from typing import Annotated
 from uuid import UUID, uuid4
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, ConfigDict
 from sqlalchemy import text
 from sqlalchemy.orm import Session
@@ -120,6 +148,20 @@ class ThreadForgetResponse(BaseModel):
     completed_at: datetime | None
 
 
+class ThreadSummaryResponse(BaseModel):
+    id: UUID
+    subject: str | None
+    last_message_at: datetime
+    last_sender: str | None
+    last_direction: str | None
+    message_count: int
+    body_cached: bool
+
+
+class ThreadListResponse(BaseModel):
+    threads: list[ThreadSummaryResponse]
+
+
 def _require_email_consent(session: Session, auth: AuthContext) -> None:
     if not _email_consent_active(session, auth.workspace_id, auth.user_id):
         raise HTTPException(status_code=403, detail="EMAIL_CONSENT_NOT_ACTIVE")
@@ -139,6 +181,47 @@ def _thread_connector_account(
         {"workspace_id": auth.workspace_id, "owner_id": auth.user_id, "id": thread_id},
     ).one_or_none()
     return (row[0], row[1]) if row is not None else None
+
+
+@router.get("/threads", response_model=ThreadListResponse)
+def list_threads_endpoint(
+    auth: AuthDep,
+    session: SessionDep,
+    limit: Annotated[int, Query(ge=1, le=200)] = 50,
+) -> ThreadListResponse:
+    _require_email_consent(session, auth)
+    rows = (
+        session.execute(
+            text(
+                """
+                SELECT et.id, et.subject, et.last_message_at,
+                       lm.sender AS last_sender, lm.direction AS last_direction,
+                       COALESCE(lm.message_count, 0) AS message_count,
+                       COALESCE(lm.body_cached, false) AS body_cached
+                FROM email_threads et
+                LEFT JOIN LATERAL (
+                    SELECT em.sender, em.direction,
+                           COUNT(*) OVER () AS message_count,
+                           BOOL_OR(em.body IS NOT NULL) OVER () AS body_cached
+                    FROM email_messages em
+                    WHERE em.workspace_id = et.workspace_id AND em.thread_id = et.id
+                    AND em.owner_id = :owner_id
+                    ORDER BY em.sent_at DESC
+                    LIMIT 1
+                ) lm ON true
+                WHERE et.workspace_id = :workspace_id AND et.owner_id = :owner_id
+                ORDER BY et.last_message_at DESC
+                LIMIT :limit
+                """
+            ),
+            {"workspace_id": auth.workspace_id, "owner_id": auth.user_id, "limit": limit},
+        )
+        .mappings()
+        .all()
+    )
+    return ThreadListResponse(
+        threads=[ThreadSummaryResponse.model_validate(dict(row)) for row in rows]
+    )
 
 
 @router.get("/threads/{thread_id}", response_model=ThreadContentResponse)

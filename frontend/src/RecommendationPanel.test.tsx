@@ -153,9 +153,9 @@ function fetchRouter(routes: Array<{ test: (url: string, init?: RequestInit) => 
   })
 }
 
-function renderPanel() {
+function renderPanel(props: { recommendationType?: string; title?: string } = {}) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } })
-  return render(<QueryClientProvider client={client}><RecommendationPanel /></QueryClientProvider>)
+  return render(<QueryClientProvider client={client}><RecommendationPanel {...props} /></QueryClientProvider>)
 }
 
 const isGet = (init?: RequestInit) => !init?.method || init.method === 'GET'
@@ -202,6 +202,27 @@ describe('recommendation preview (rendered)', () => {
     await screen.findByText('close risk')
     expect(screen.queryByLabelText('Risk factors for close risk')).toBeNull()
     expect(fetch.mock.calls.some((call) => String(call[0]).includes('/api/v1/risks/'))).toBe(false)
+  })
+
+  it('filters to a given recommendationType server-side, not by re-filtering the response client-side', async () => {
+    // Loop 2 round 5 review (PR #130): filtering an already-paginated page
+    // client-side could silently hide a domain-scoped embed's own items
+    // behind a workspace-wide backlog of other-typed recommendations --
+    // fixed by filtering server-side, before the endpoint's own `limit`
+    // applies. This proves the request itself carries the filter (the
+    // fixture below deliberately returns an *unfiltered* item list, so a
+    // regression back to client-side-only filtering would still pass if
+    // this test only checked the rendered items).
+    const otherTypeRecommendation = { ...riskRecommendation, id: 'rec-other-type', recommendation_type: 'close_risk' }
+    const fetch = fetchRouter([
+      { test: (url, init) => url.includes('/api/v1/recommendations?') && isGet(init), respond: () => jsonResponse({ items: [otherTypeRecommendation], next_cursor: null }) },
+    ])
+    vi.stubGlobal('fetch', fetch)
+    renderPanel({ recommendationType: 'email_action_detected' })
+
+    await waitFor(() => expect(fetch).toHaveBeenCalled())
+    const [url] = fetch.mock.calls[0]
+    expect(new URL(String(url), 'http://localhost').searchParams.get('recommendation_type')).toBe('email_action_detected')
   })
 
   it('suppresses all lifecycle actions once a recommendation reaches a terminal status', async () => {

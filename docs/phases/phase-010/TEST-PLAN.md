@@ -2,7 +2,7 @@
 id: PHASE-010-TEST-PLAN
 title: Phase 10 Gmail Test Plan
 status: Approved for Implementation
-version: 1.4.5
+version: 1.6.3
 owner: Lucky Jain
 depends_on:
   - PHASE-010
@@ -12,7 +12,7 @@ depends_on:
 
 # Phase 10 Gmail Test Plan
 
-## Current automated evidence (Tasks 1-7)
+## Current automated evidence (Tasks 1-8)
 
 | Area | Committed test path | Coverage |
 |---|---|---|
@@ -21,31 +21,46 @@ depends_on:
 | Backfill/history sync | `tests/test_gmail_connector_sync_postgres.py` | 30-day query, pagination/bounds, cursor expiry/fallback/resume, deduplication, ordering, consent rechecks, rate limits, malformed responses/headers, entity linking and concurrency |
 | Migration/backup fixtures | `scripts/seed_phase1_acceptance.py` | Representative email domain/thread/message rows are included in generic restore invariants |
 | Awaiting-reply attention (Task 3) | `tests/test_attention_email_awaiting_reply_postgres.py` | Positive/negative surfacing, disabled-domain and unresolved-sender exclusion, staleness aging, dismissal persistence, removed-member exclusion, casefold-divergent sender resolution |
-| Create-type recommendations (Task 4) | `tests/test_recommendations_postgres.py` | Schema validation of the create-type shape, generate/publish/confirm/execute for task/commitment/risk, `target_expected_version` presence/absence enforcement, no cross-supersession |
+| Create-type recommendations (Task 4) | `tests/test_recommendations_postgres.py` | Schema validation of the create-type shape, generate/publish/confirm/execute for task/commitment/risk, `target_expected_version` presence/absence enforcement, no cross-supersession; `GET /recommendations`'s `recommendation_type` query parameter filters server-side before pagination, proven by seeding two different-typed recommendations and asserting the filtered response contains only the matching one while the unfiltered response still contains both (Task 8 Loop 2 round 5 review) |
 | `email.detect_action` (Task 5) | `tests/test_email_action_tools_postgres.py`, `tests/test_gmail_action_detection_sync_postgres.py`, `tests/test_ai_runtime_email_detect_action_evaluation_postgres.py`, `tests/test_ai_runtime_runtime_postgres.py` | Workspace/owner-scoped thread-content tool (decryption, size-bounded cap, trigger-message inclusion), body fetch/consent-recheck/RecursionError-guard in the sync-pipeline hook, evaluation-harness floors and synthetic-source isolation, prompt-injection cannot dispatch an out-of-scope tool |
 | On-demand thread read/forget (Task 6) | `tests/test_gmail_threads_postgres.py` | Fetch-and-cache round-trip and no-refetch-when-cached for `GET`; one message's fetch failure does not fail the whole request; a disconnected connector account skips the live-fetch attempt (no Gmail call; cached content, if any, is unaffected by this path); consent rejection; 404 for nonexistent and cross-workspace threads; "forget" scoped to only the targeted thread with exactly one `deletion_jobs` row recorded; idempotency replay; 404 forgetting a nonexistent thread; reopening a forgotten thread refetches its content (proves content is nulled, not deleted) |
+| Thread list and expand-backfill (Task 8, backend) | `tests/test_gmail_threads_postgres.py`, `tests/test_engineering_connectors_postgres.py` | `GET /threads` returns the caller's own threads newest-first, with `last_sender`/`last_direction` from the single most recent message and `message_count`/`body_cached` computed over every message in the thread; respects an explicit `limit`; scoped to the caller's own `workspace_id`/`owner_id` (including same-workspace, different-owner isolation); rejected `403 EMAIL_CONSENT_NOT_ACTIVE` without active consent, matching the single-thread `GET`'s identical gate; `SyncRequest.since` reaches `adapter.backfill(..., since=...)` end-to-end through the real `sync_connector_endpoint` code path (not a direct adapter call), and a request with no `since` field still passes `since=None` exactly as before Task 8 |
+| `GmailPanel` (Task 8, frontend) | `frontend/src/features/personal/GmailPanel.test.tsx`, `frontend/e2e/scenarios/gmail-panel-states.mjs` | Component tests (15 cases): consent-missing hint + Connect action, real OAuth-start redirect, allowlist rejection without a bypass, connector status/sync/expand-history actions, first-sync-vs-incremental run-type selection, permission-lost disables sync, thread list/read/forget, domain-level vs. generic-connector disconnect endpoint selection by domain-row existence (row present and enabled, no row, row present but disabled -- the last a Loop 2 round 1 review regression case), thread-list load failure, a genuinely empty (but successfully fetched) message body rendering as "(no text content in this message)" rather than the misleading "not fetched" copy (Loop 2 round 7 review), both sync buttons -- not only the primary one -- disabling while a sync is already running (Loop 2 round 10 review). Browser-acceptance scenario (three fixture states, since Google's own OAuth redirect leaves this app's own SPA): allowlist-denied and consent-missing reached live, then a real top-level redirect to a fixture Google page (intercepted, no real network call); a connected fixture state covering first sync, thread list ordering/summary fields, keyboard-only thread open, forget, the embedded `RecommendationPanel` filtered to `email_action_detected` only, expand-history sync, and domain-level disconnect; a separately-seeded `permission_lost` fixture state (unreachable through any live action in this app) |
 | Consent revocation cascade (Task 7) | `tests/test_gmail_revocation_postgres.py`, `tests/test_engineering_connectors_postgres.py` | Disabling `email` disconnects the connector and purges threads/messages, `email_thread` attention items, non-`executed` recommendations, and their `gmail_sync` evidence; an already-`executed` recommendation is redacted in place, not deleted, and its confirmed `target_id` survives; `pkos_nodes` survive (only their evidence is removed); `revoke_consent_endpoint` and `delete_domain_endpoint` reach the identical cascade; disabling an already-disabled domain, and an idempotency-key replay, both no-op rather than re-running the cascade; a non-`email` domain's own disable is unaffected; an owner with two simultaneously-active `gmail` connector accounts has both disconnected by one cascade run (Loop 2 round 1 review); the generic engineering `POST /connectors/{id}/disable` endpoint rejects `gmail`-provider accounts outright (`409 GMAIL_DISABLE_REQUIRES_DOMAIN_ENDPOINT`) but stays an idempotent no-op for an already-disconnected one (Loop 2 rounds 1-2 review); the pool connection and cascade's own row lock are released before the blocking Google revoke call for both call sites that reach it; a second owner's own Gmail data (and connector) in the same workspace is untouched by the first owner's disable; two owners whose Gmail accounts produce a message sharing the same raw `external_message_id` do not leak `pkos_evidence` across the ownership boundary (Loop 2 round 4 review, all three); two owners disabling *sequentially* (not concurrently) for a colliding id do not leak the first owner's own preserved evidence via `email_message_id_purge_log` (migration `0076`); `revoke_consent_endpoint` rejects a `consent_id` a *later* grant has superseded rather than re-running the cascade against freshly re-granted state, while a merely-revoked `consent_id` with nothing superseding it -- including a same-`Idempotency-Key` retry of an already-succeeded revoke -- still resolves normally and is served from the idempotency cache, not re-executed (Loop 2 round 8 review, refined round 9); that re-check now genuinely serializes against a concurrent re-grant for the same domain via the shared `personal_domains` row lock (Loop 2 round 10 review, closing a TOCTOU window rounds 8-9 left open), proven end-to-end by revoking for real, holding the row lock, replaying the now-superseded `consent_id` against `revoke_consent_endpoint` itself in a background thread, regranting over the held connection, and asserting the replay rejects with `404 CONSENT_NOT_FOUND` once unblocked (Loop 2 round 11 review: the round-10 version of this test only proved generic lock contention, not `revoke_consent_endpoint`'s own behavior); `delete_domain_endpoint`'s own `for_update=True` lock (Loop 2 round 11 review) serializes its read-cascade-write sequence against a concurrent re-grant, though -- unlike `_disable_domain` -- it has no `consent_id` to reject staleness on, the same already-accepted self-race behavior `disable_domain_endpoint` has always had (Loop 2 round 12 review corrected the round-11 test-plan wording, which had overclaimed parity with `_disable_domain`'s own rejection behavior); two owners' colliding `external_message_id`s are also serialized against each other under genuine, not merely sequential, concurrency via a `pg_advisory_xact_lock` keyed on `workspace_id` (Loop 2 round 17 review, closing a TOCTOU window the round-4/round-8 fixes left open for two truly-overlapping cascades; round 19 review widened the key from one lock per candidate id to one per workspace to close a resource-exhaustion risk the original per-id keying had for large mailboxes); reusing the same `Idempotency-Key` for `disable_domain_endpoint`/`delete_domain_endpoint` across a real disable/delete followed by a genuine re-enable followed by a second disable/delete attempt is rejected with `409 IDEMPOTENCY_CONFLICT` rather than silently served the first call's stale cached response, while a same-key replay with nothing else changed in between is still served from cache correctly (Loop 2 round 21 review); the identical rejection also holds when the intervening state change is a genuine Gmail reconnect through the separate OAuth callback flow rather than a domain re-enable, since that flow never touches `personal_domains` (Loop 2 round 22 review, closing a gap round 21's `domain.enabled`-only check missed); a genuinely fresh (non-replayed) disable request against an already-disabled domain also now reaches a Gmail account reconnected in the meantime, not only a replayed-key request -- proven by asserting a thread inserted after the reconnect is purged by the fresh call (Loop 2 round 24 review, HIGH finding); the generic engineering `/disable` endpoint's own `gmail`-provider rejection is itself gated on the owner having a `personal_domains` row for `email` -- an owner with no such row (Gmail OAuth-connected but never enabled the `email` domain) falls through to the ordinary disconnect instead of being stuck behind a rejection the domain-level endpoints can't satisfy either (Loop 2 round 25 review, MEDIUM finding); that same generic `/disable` endpoint also now rejects a reused `Idempotency-Key` with `409 IDEMPOTENCY_CONFLICT` if the account is no longer `disconnected` when replayed (a real Gmail reconnect in between), the identical stale-cache-after-reconnect gap rounds 21-22 closed for the domain-level endpoints (Loop 2 round 27 review, MEDIUM-HIGH finding) |
 
 These are committed, rerunnable tests. They primarily use mocked Google HTTP
 transport and real PostgreSQL. Their existence does not satisfy real-account,
 privacy-operation, or production-recovery gates.
 
-## Required Task 8 automated tests
+## Required automated tests
 
-- Gmail panel loading/empty/stale/partial/error/deletion states, keyboard
-  operation, responsive layout, and WCAG 2.2 AA browser checks.
-
+None outstanding. Gmail panel loading/empty/stale/partial/error states,
+keyboard operation, and WCAG 2.2 AA browser checks now have real coverage
+(Task 8's own component tests and `gmail-panel-states.mjs`, every Axe
+check gated to serious/critical impact per `accessibility.mjs`'s own
+convention). Deletion-pending state coverage (round 5 review: corrected
+this section's own prior misattribution) comes entirely from the
+pre-existing, generic `ExportDeletePanel.test.tsx` -- `DOMAIN_KEYS`'s
+widening to include `email` means that generic flow now also governs
+Gmail's own domain deletion, but no `email`-specific deletion test exists
+in either Task 8 file; `UX-STATES.md`'s own "Deletion pending" row already
+discloses this delegation accurately. Responsive layout has no dedicated
+automated check in this activation -- no scenario in this suite tests
+viewport resizing; the
+shared `work-panel`/`work-list` CSS classes `GmailPanel` reuses are the
+same ones every other already-shipped panel in this workspace uses.
 Deterministic awaiting-reply attention tests, create-type recommendation
 tests, `email.detect_action`'s own prompt-injection/prohibited-action
 adversarial fixtures (zero automatic writes -- `EmailDetectActionOutput`'s
 fail-closed model validator plus grounding-check enforcement), body
 fetch/cache encryption/authorization/permission-loss/malformed-MIME/size-
-bound tests, on-demand thread read/forget, and the consent revocation
+bound tests, on-demand thread read/forget, the consent revocation
 cascade (disconnect/purge ordering, retry via the existing idempotency-key
 mechanism, and derived-record propagation to attention/recommendations/
 evidence -- see `PRIVACY-CONSENT-CONTRACT.md`'s own Task 7 section for why
-no separate "partial failure" state was needed) have all shipped -- see
-"Current automated evidence" above.
+no separate "partial failure" state was needed), and Task 8's own thread-
+list/expand-backfill/panel coverage have all shipped -- see "Current
+automated evidence" above.
 
 ## Required non-mocked evidence before promotion
 
@@ -84,3 +99,8 @@ No gate is satisfied by an unchecked box or an uncommitted local report.
 | 1.4.3 | 2026-08-10 | Task 7 Loop 2 round 25 review (MEDIUM): recorded coverage for the generic engineering `/disable` endpoint's `gmail`-provider rejection now falling through when the owner has no `personal_domains` row for `email` at all | Lucky Jain |
 | 1.4.4 | 2026-08-10 | Task 7 Loop 2 round 27 review (MEDIUM-HIGH): recorded coverage for the generic engineering `/disable` endpoint now rejecting an `Idempotency-Key` reused after a genuine Gmail reconnect with `409 IDEMPOTENCY_CONFLICT`, instead of serving a stale cached `"disconnected"` response | Lucky Jain |
 | 1.4.5 | 2026-08-10 | Task 7 Loop 2 round 31 review (MEDIUM): qualified the "Required non-mocked evidence before promotion" Privacy gate row's unqualified "zero readable content" claim with a cross-reference to `PRIVACY-CONSENT-CONTRACT.md`'s three named deliberate exceptions, matching this same file's own line 46 | Lucky Jain |
+| 1.5.0 | 2026-08-11 | Task 8: recorded shipped thread-list/expand-backfill backend coverage and `GmailPanel` component/browser-acceptance coverage; renamed "Required Task 8 automated tests" to "Required automated tests" with nothing outstanding, closing the plan's own final task | Lucky Jain |
+| 1.6.0 | 2026-08-11 | Task 8 Loop 2 round 5 review: added the new server-side `recommendation_type` filter test row, the same-workspace-different-owner isolation note, and corrected the "deletion" state misattribution -- coverage for that state comes entirely from the pre-existing generic `ExportDeletePanel.test.tsx`, not from any Task 8 file | Lucky Jain |
+| 1.6.1 | 2026-08-11 | Task 8 Loop 2 round 7 review: recorded the new genuinely-empty-vs-not-fetched message body regression test (`GmailPanel.test.tsx` test count 13 -> 14) | Lucky Jain |
+| 1.6.2 | 2026-08-11 | Task 8 Loop 2 round 8 review: this file's own round-7 test-count bump had never actually landed until now -- corrected "13 cases" to "14 cases" in the coverage row itself, matching the changelog claim above | Lucky Jain |
+| 1.6.3 | 2026-08-11 | Task 8 Loop 2 round 11 review: round 10 added a new `GmailPanel.test.tsx` case (the duplicate-sync-guard regression test) without updating this file -- corrected "14 cases" to "15 cases" and added the new test to the coverage row | Lucky Jain |

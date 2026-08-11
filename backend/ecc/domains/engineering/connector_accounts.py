@@ -465,6 +465,15 @@ class SyncRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     run_type: ManualSyncRunType
     resource_type: ResourceType
+    # Phase 10 Gmail Connector Task 8: threads `connectors.py`'s own
+    # `ConnectorAdapter.backfill(..., since=...)` parameter (Task 1,
+    # accepted and ignored by every adapter through Phase 6) out to a real
+    # HTTP caller for the first time -- `GmailAdapter.backfill`'s own
+    # docstring names this exact field as the deferred "expand history"
+    # caller. Only meaningful for `run_type="backfill"`; ignored for
+    # `"incremental"`, whose `ConnectorAdapter.incremental_sync` has no
+    # `since` parameter at all (it resumes from `cursor` instead).
+    since: datetime | None = None
 
 
 class SyncRunResponse(BaseModel):
@@ -1267,7 +1276,7 @@ def sync_connector_endpoint(
     failure_summary: str | None = None
     try:
         if payload.run_type == "backfill":
-            outcome = adapter.backfill(context, payload.resource_type)
+            outcome = adapter.backfill(context, payload.resource_type, since=payload.since)
         else:
             outcome = adapter.incremental_sync(context, payload.resource_type, prior_cursor)
     except Exception as exc:  # noqa: BLE001 -- classified as a failed sync run, not a crash

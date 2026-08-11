@@ -349,6 +349,17 @@ Covers, per this task's own scope:
     window_does_not_bump_thread_updated_at`, asserting `updated_at` is
     byte-for-byte unchanged across an identical re-sync of the same
     single message.
+31. A naive (no `tzinfo`) `since` is treated as UTC, not local system
+    time. `datetime.timestamp()` on a naive value is Python's own
+    local-time interpretation -- Phase 10 Task 8's own Loop 2 round 8
+    review found `SyncRequest.since` has no `tzinfo` requirement, so a
+    direct API caller bypassing `GmailPanel`'s own always-UTC
+    `toISOString()` construction could reach `backfill` with a naive
+    value and get a wrong day-range window whenever the server's local
+    `TZ` isn't UTC -- a bug round 17 had explicitly closed as
+    unreachable before Task 8 wired a real HTTP caller to this
+    parameter. Closed with `test_backfill_treats_a_naive_since_as_utc_
+    not_local_time`.
 """
 
 from __future__ import annotations
@@ -763,6 +774,34 @@ def test_backfill_uses_since_as_the_gmail_query_lower_bound(
     outcome = adapter.backfill(context, "message", since=since)
     assert outcome.status == "succeeded"
     assert captured_query["q"] == f"after:{int(since.timestamp())}"
+
+
+def test_backfill_treats_a_naive_since_as_utc_not_local_time(
+    seeded_gmail_account: tuple[ConnectorAccountContext, UUID],
+) -> None:
+    # Round 8 review (PR #130): `SyncRequest.since` has no `tzinfo`
+    # requirement, so a direct API caller (bypassing `GmailPanel`'s own
+    # always-UTC `toISOString()` construction) can reach `backfill` with a
+    # naive `datetime`. `datetime.timestamp()` on a naive value is
+    # local-system-time by Python's own definition -- round 17 closed this
+    # exact code shape as unreachable; Task 8 makes it reachable.
+    context, _owner_id = seeded_gmail_account
+    naive_since = datetime(2026, 1, 1)  # noqa: DTZ001 -- deliberately naive
+    aware_since = datetime(2026, 1, 1, tzinfo=UTC)
+    captured_query: dict[str, str] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/gmail/v1/users/me/messages":
+            captured_query["q"] = request.url.params.get("q", "")
+            return _json_response({"messages": []})
+        if request.url.path == "/gmail/v1/users/me/profile":
+            return _json_response({"historyId": 1})
+        raise AssertionError(f"unexpected request to {request.url}")
+
+    adapter = GmailAdapter(transport=httpx.MockTransport(handler))
+    outcome = adapter.backfill(context, "message", since=naive_since)
+    assert outcome.status == "succeeded"
+    assert captured_query["q"] == f"after:{int(aware_since.timestamp())}"
 
 
 def test_backfill_defaults_to_the_30_day_window_when_since_is_none(

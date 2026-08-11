@@ -2,7 +2,7 @@
 id: PHASE-010-API-SCHEMAS
 title: Phase 10 Gmail API Schemas
 status: Approved for Implementation
-version: 1.2.7
+version: 1.4.2
 owner: Lucky Jain
 depends_on:
   - PHASE-010
@@ -21,7 +21,13 @@ depends_on:
   revocation cascade (Task 7, below), which adds no new endpoint at all --
   it changes what three of Phase 7's own existing generic personal-domain
   endpoints do for `domain_key = "email"` specifically.
-- **Planned (Task 8):** Gmail panel endpoints or response extensions.
+- **Current (Task 8):** the Gmail panel's own three backend additions -- a
+  thread-list endpoint and a `since` sync parameter, both documented below,
+  plus a `recommendation_type` server-side filter on Phase 1's own
+  `GET /api/v1/recommendations` (the embedded `RecommendationPanel`
+  instance's own dependency, added by a Loop 2 round 5 review fix; this
+  file's own delivery boundary is thread-list/`since` only, so see
+  `docs/phases/phase-001/API-SCHEMAS.md` for the parameter's own contract).
 
 ## Current OAuth endpoints
 
@@ -78,7 +84,7 @@ validation errors.
 | Endpoint | Gmail contract |
 |---|---|
 | `GET /api/v1/engineering/connectors` | Lists authorized visible accounts; never returns credentials |
-| `POST /api/v1/engineering/connectors/{id}/sync` | Body `{"run_type":"backfill|incremental","resource_type":"message"}`; requires `Idempotency-Key` and CSRF |
+| `POST /api/v1/engineering/connectors/{id}/sync` | Body `{"run_type":"backfill|incremental","resource_type":"message","since":null}`; requires `Idempotency-Key` and CSRF. `since` (Task 8, optional, defaults `null`) is `GmailAdapter.backfill`'s own "expand history" parameter (accepted since Task 1's own `connectors.py` Protocol widening -- a pure Python signature change, not a migration) finally reaching an HTTP caller -- only meaningful with `run_type: "backfill"`; `incremental_sync` has no `since` parameter at all (it resumes from `cursor` instead), so this field is silently ignored for `run_type: "incremental"` |
 | `GET /api/v1/engineering/sync-runs` | Lists redacted run outcome and item count |
 | `POST /api/v1/engineering/connectors/{id}/disable` | For every other provider: revokes the token best-effort and marks the account disconnected. For `gmail` specifically: if the account is not already `disconnected` **and** the owner has a `personal_domains` row for `email`, rejected with `409 GMAIL_DISABLE_REQUIRES_DOMAIN_ENDPOINT` and no mutation (Loop 2 round 1 review found this generic endpoint could otherwise disconnect a `gmail` account, and revoke its live Google grant, without running the consent revocation cascade below); an already-`disconnected` `gmail` account is unaffected by this guard and still returns the same idempotent `200` no-op as every other provider (Loop 2 round 2 review); an owner who completed the Gmail OAuth flow without ever calling `POST /domains`/`POST /consents` for `email` has no `personal_domains` row at all, so this guard falls through and the account is disconnected the same way any other provider's is -- there is nothing for the cascade to purge or revoke in that case, and without this carve-out such a connector had no HTTP-reachable way to disconnect it at all, since the domain-level endpoints 404 `DOMAIN_NOT_FOUND` for an owner with no domain row (Loop 2 round 25 review). Callers with an `email` domain must use the domain-level endpoints instead, which reach `gmail_revocation.cascade_email_revocation` |
 
@@ -86,7 +92,40 @@ Manual `webhook` sync is not accepted. A second running sync for the same
 account returns `409 CONNECTOR_SYNC_IN_PROGRESS`. Provider errors are
 sanitized before persistence or response.
 
-## Current thread endpoints (Task 6)
+## Current thread endpoints (Task 6, list added Task 8)
+
+### `GET /api/v1/personal/gmail/threads`
+
+Requires the same active `email` domain consent as the single-thread `GET`
+below (`403 EMAIL_CONSENT_NOT_ACTIVE` otherwise) -- gated identically even
+though this endpoint makes no live Gmail call itself, since it still
+returns subject lines and sender addresses, the same sensitivity class as
+thread content. Lists the caller's own threads, newest-`last_message_at`-
+first, capped by an optional `limit` query parameter (default 50, max
+200) -- no offset/cursor, matching this file's own "Current reused
+connector endpoints" table (`list_sync_runs_endpoint`/`list_repositories_
+endpoint`), neither of which paginate at this activation's expected data
+volume. `last_sender`/`last_direction` come from the single most recent
+message only; `message_count`/`body_cached` are computed over every
+message in the thread (round 5 review: earlier wording claimed all four
+fields were aggregated across the thread, which was true only for the
+latter two).
+
+```json
+{
+  "threads": [
+    {
+      "id": "uuid",
+      "subject": "Signed contract needed by Friday",
+      "last_message_at": "2026-08-06T00:00:00Z",
+      "last_sender": "priya@partner-co.test",
+      "last_direction": "inbound",
+      "message_count": 3,
+      "body_cached": true
+    }
+  ]
+}
+```
 
 ### `GET /api/v1/personal/gmail/threads/{thread_id}`
 
@@ -186,8 +225,8 @@ account's OAuth reconnect, since no other provider has a way to leave
 
 ## Planned APIs
 
-Task 8 must version this contract before adding Gmail panel endpoints or
-response extensions.
+None. Task 8 -- the plan's final task -- is documented above; this section
+is now closed out.
 
 ## Changelog
 
@@ -203,3 +242,7 @@ response extensions.
 | 1.2.5 | 2026-08-10 | Task 7 Loop 2 round 23 review: documented the new `409 IDEMPOTENCY_CONFLICT` behavior (rounds 21-22) for `disable`/`delete`/`revoke` on a same-hash `Idempotency-Key` reused after a genuine domain re-enable or Gmail OAuth reconnect -- this file had gone stale since round 9, never updated for either round | Lucky Jain |
 | 1.2.6 | 2026-08-10 | Task 7 Loop 2 round 25 review (MEDIUM): documented that the generic `/disable` endpoint's `gmail`-provider rejection now also requires the owner to have a `personal_domains` row for `email`, falling through to the ordinary disconnect otherwise | Lucky Jain |
 | 1.2.7 | 2026-08-10 | Task 7 Loop 2 round 27 review (MEDIUM-HIGH): documented that the generic `/disable` endpoint also now returns `409 IDEMPOTENCY_CONFLICT` for a reused `Idempotency-Key` if the account is no longer `disconnected` when replayed -- reachable only via a `gmail` OAuth reconnect, since no other provider has a way to leave `disconnected` | Lucky Jain |
+| 1.3.0 | 2026-08-11 | Task 8: documented `GET /api/v1/personal/gmail/threads` (list) and the `since` field on `SyncRequest`, the plan's own two backend-shaped Task 8 gaps; closed out "Planned APIs" now that the plan's final task has shipped | Lucky Jain |
+| 1.4.0 | 2026-08-11 | Task 8 Loop 2 round 5 review: corrected the "computed live from every message" overclaim -- `last_sender`/`last_direction` come from the single most recent message only, `message_count`/`body_cached` are the true aggregates | Lucky Jain |
+| 1.4.1 | 2026-08-11 | Task 8 Loop 2 round 8 review: "Current (Task 8)" named only two of Task 8's three real backend additions, omitting the `recommendation_type` server-side filter round 5 added to `GET /api/v1/recommendations` -- round 5's own IMPLEMENTATION-STATUS.md evidence had also incorrectly claimed this file was updated for that parameter when it never was; added a cross-reference bullet pointing at `docs/phases/phase-001/API-SCHEMAS.md`, this parameter's own owning doc | Lucky Jain |
+| 1.4.2 | 2026-08-11 | Task 8 Loop 2 round 10 review: the `sync` endpoint row credited `since`'s acceptance to "migration `0069`'s Task 1 Protocol widening" -- migration `0069` is a database schema migration; the `since` parameter is a pure Python `Protocol` signature change with no accompanying migration at all. Corrected to credit Task 1's `connectors.py` widening directly, matching how this same fact is stated correctly elsewhere in this PR | Lucky Jain |

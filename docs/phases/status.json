@@ -181,12 +181,11 @@
       "name": "Gmail Connector",
       "specification": "docs/phases/PHASE-010-gmail-connector.md",
       "specification_status": "approved_for_implementation",
-      "engineering_status": "in_progress",
-      "engineering_summary": "Tasks 1-7 of 8 complete",
+      "engineering_status": "engineering_complete",
+      "engineering_summary": "Tasks 1-8 delivered",
       "validation_status": "not_started",
-      "promotion_status": "not_promoted",
+      "promotion_status": "blocked",
       "open_gates": [
-        "Task 8",
         "real Gmail account verification",
         "backup and restore verification",
         "independent change review"

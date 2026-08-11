@@ -37,7 +37,7 @@ beforeEach(() => {
 afterEach(() => { cleanup(); vi.unstubAllGlobals() })
 
 describe('DomainsPanel', () => {
-  it('shows all six domains as not-enabled when none have ever been enabled', async () => {
+  it('shows all seven domains as not-enabled when none have ever been enabled', async () => {
     vi.stubGlobal('fetch', vi.fn(() => response({ domains: [] })))
     renderPanel()
     expect(await screen.findByText('Habits')).toBeTruthy()
@@ -46,7 +46,8 @@ describe('DomainsPanel', () => {
     expect(screen.getByText('Relationships')).toBeTruthy()
     expect(screen.getByText('Health')).toBeTruthy()
     expect(screen.getByText('Finance')).toBeTruthy()
-    expect(screen.getAllByText(/Not enabled -- no data is captured/).length).toBe(6)
+    expect(screen.getByText('Email')).toBeTruthy()
+    expect(screen.getAllByText(/Not enabled -- no data is captured/).length).toBe(7)
   })
 
   it('shows a high-stakes domain\'s classification and retention note', async () => {

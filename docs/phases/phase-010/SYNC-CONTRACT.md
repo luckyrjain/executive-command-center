@@ -2,7 +2,7 @@
 id: PHASE-010-SYNC-CONTRACT
 title: Phase 10 Gmail Sync Contract
 status: Approved for Implementation
-version: 1.3.3
+version: 1.4.0
 owner: Lucky Jain
 depends_on:
   - PHASE-010
@@ -11,7 +11,7 @@ depends_on:
 
 # Phase 10 Gmail Sync Contract
 
-## Current behavior (Tasks 2-3, 5-7)
+## Current behavior (Tasks 2-3, 5-8)
 
 Gmail sync is pull-based and manually invoked through the existing connector
 sync endpoint. No scheduler or Pub/Sub push consumer is shipped.
@@ -32,7 +32,13 @@ evidence sections for the full detail this summary intentionally omits.
 
 - Resource type is `message`; other types complete with zero items.
 - Default lower bound is now minus 30 days.
-- An explicit `since` value narrows or expands the Gmail `after:<epoch>` query.
+- An explicit `since` value narrows or expands the Gmail `after:<epoch>` query
+  -- `POST /api/v1/engineering/connectors/{id}/sync`'s own `SyncRequest.since`
+  field (Task 8) is the first HTTP-reachable caller to pass one; every
+  adapter through Phase 6 has accepted and ignored this parameter since
+  Task 1's own Protocol widening, and `GmailAdapter.backfill` itself has
+  acted on it since Task 2 -- Task 8 only added the request field and the
+  `GmailPanel` "expand history" control that sets it, not new adapter logic.
 - `messages.list` pages contain at most 50 IDs; one invocation fetches at most
   200 messages, then returns `partial` without claiming it is caught up.
 - A fully completed pass returns the highest observed `historyId`; an empty
@@ -79,9 +85,13 @@ lengths, recipient count, parsing complexity, invalid timestamps, duplicate
 IDs, and response shapes are bounded or rejected so one malformed email does
 not wedge the account cursor.
 
-## Planned behavior (Task 8)
+## Planned behavior
 
-- executive sync state and retry UI.
+None. Task 8 -- the plan's final task -- shipped its own executive sync-
+state and retry UI (`GmailPanel`'s connector-status/sync-history/expand-
+history rendering, reusing the same `ConnectorAccount`/`SyncRun` shapes
+`ConnectorHealthPanel.tsx` already renders for every other provider), the
+last item this section's own "Planned behavior" bullet named.
 
 Deterministic awaiting-reply attention projection (Task 3), controlled body
 retrieval using `gmail.readonly` (Task 5), and recommendation/evidence
@@ -95,10 +105,9 @@ message bodies synchronously on request, outside backfill/incremental
 sync's own cursor-driven flow, and "forget" only nulls cached content for
 one thread. Task 7 shipped consent-revocation disconnect and purge (see
 "Consent and permissions" above and `PRIVACY-CONSENT-CONTRACT.md`'s own
-Task 7 section) -- also not itself a sync-pipeline change, but the gap
-this section's own "Planned behavior" bullet used to name here is now
-closed; only the unrelated "no scheduled permission reconciliation"
-limitation remains.
+Task 7 section) -- also not itself a sync-pipeline change. Task 8 shipped
+the `GET /threads` list endpoint (`API-SCHEMAS.md`) -- also not a sync-
+pipeline change, a read computed from already-synced data.
 
 ## Polling and push decision
 
@@ -117,3 +126,4 @@ Pub/Sub push is explicitly deferred and `handle_webhook` remains a no-op.
 | 1.3.1 | 2026-08-10 | Task 7 Loop 2 round 6 review: this file was never revisited across six review rounds -- corrected the "purges every synced row" overclaim (round 4's ambiguous-id carve-out) | Lucky Jain |
 | 1.3.2 | 2026-08-10 | Task 7 Loop 2 round 16 review: corrected "the one deliberate exception" to "three deliberate exceptions" -- `cascade_email_revocation` (confirmed accurate as of round 14) actually names three (`pkos_nodes`, executed-recommendation redaction, and the evidence-collision carve-out this section already named) | Lucky Jain |
 | 1.3.3 | 2026-08-10 | Task 7 Loop 2 round 17 review: the "Current behavior" heading still read "(Tasks 2-5)" after Task 7's own consent-revocation cascade sentence was added into the "Consent and permissions" subsection beneath it two versions ago -- corrected to "(Tasks 2-3, 5-7)", the sole remaining outlier among the six Task-7 docs' own "Current"/"Delivery boundary" headers | Lucky Jain |
+| 1.4.0 | 2026-08-11 | Task 8: documented `SyncRequest.since` as the first HTTP-reachable caller of `GmailAdapter.backfill`'s own long-accepted `since` parameter, and the new `GET /threads` list endpoint (not a sync-pipeline change); closed "Planned behavior" out now that the plan's final task has shipped | Lucky Jain |
