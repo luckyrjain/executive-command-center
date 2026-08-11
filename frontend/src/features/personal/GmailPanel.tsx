@@ -169,7 +169,7 @@ export default function GmailPanel() {
     // domain endpoint would 404 `DOMAIN_NOT_FOUND` -- the generic connector
     // endpoint is the only one that can reach that account at all.
     mutationFn: () =>
-      consentActive
+      emailDomain !== null
         ? apiRequest(`/api/v1/personal/domains/email/disable`, { method: 'POST' })
         : apiRequest(`/api/v1/engineering/connectors/${activeAccount?.id}/disable`, { method: 'POST' }),
     onSuccess: () => {

@@ -238,6 +238,21 @@ describe('GmailPanel', () => {
     ))
   })
 
+  it('disconnects through the domain-level endpoint when a disabled email domain row still exists (reconnect-without-re-enable)', async () => {
+    // A `personal_domains` row for `email` survives a prior disable (it only
+    // flips `enabled` to false); the backend's own disconnect gate keys off
+    // row existence, not `enabled`, so the frontend must too -- otherwise a
+    // reconnected-but-not-re-enabled account 409s on disconnect.
+    const fetch = stubFetch({ domains: [domain({ enabled: false })], connectors: [connector()], threads: [] })
+    renderPanel()
+    fireEvent.click(await screen.findByRole('button', { name: 'Disconnect' }))
+    await waitFor(() => expect(fetch).toHaveBeenCalledWith(
+      expect.stringContaining('/api/v1/personal/domains/email/disable'),
+      expect.objectContaining({ method: 'POST' }),
+    ))
+    expect(fetch).not.toHaveBeenCalledWith(expect.stringContaining('/connectors/connector-1/disable'), expect.anything())
+  })
+
   it('surfaces a thread-list load failure as an alert', async () => {
     vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input)

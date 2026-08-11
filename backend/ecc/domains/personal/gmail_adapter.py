@@ -1574,8 +1574,9 @@ class GmailAdapter:
         "not-yet-implemented resource type" contract interpretation.
 
         `since` defaults to `_DEFAULT_BACKFILL_WINDOW` (30 days) per plan
-        Task 2 -- explicit callers (the "expand history" UI, not built this
-        task) pass a real value for a wider or narrower window.
+        Task 2 -- explicit callers (`SyncRequest.since`, the "expand
+        history" UI built in Task 8) pass a real value for a wider or
+        narrower window.
         """
         if resource_type != "message":
             return SyncOutcome(
