@@ -2,7 +2,7 @@
 id: PHASE-010-IMPLEMENTATION-STATUS
 title: Phase 10 Implementation Status
 status: Active
-version: 0.13.0
+version: 0.14.0
 owner: Lucky Jain
 updated: 2026-08-11
 ---
@@ -872,3 +872,7 @@ Security/correctness lens: zero findings, re-deriving SQL injection/parameter bi
 **Local verification (round 7).** No backend files touched this round (`get_thread_content_tool`'s SQL/behavior was read, not changed). Frontend `npx tsc --noEmit` clean; full `vitest run` (456 tests, +1 from round 7's new `GmailPanel.test.tsx` case) passing. `make docs-check` clean.
 
 Round 7 found and fixed a real issue (architecture/quality lens), so it does not count as a clean round -- the 2-consecutive-clean-round requirement resets: round 8 must be clean on both lenses, and round 9 after it must also be clean, to close Loop 2.
+
+**Round 8 (security/correctness): found and fixed 1 issue -- a naive `since` datetime is misinterpreted as local system time, a bug round 17 had explicitly closed as unreachable before this very task made it reachable.** `SyncRequest.since` (`connector_accounts.py`) has no `tzinfo` requirement, and `GmailAdapter.backfill` (`gmail_adapter.py`) computed `int(window_start.timestamp())` directly -- `datetime.timestamp()` on a naive value is Python's own local-system-time interpretation, not UTC, confirmed live (`datetime(2026, 1, 1).timestamp()` differs from the UTC-intended epoch whenever the process's local `TZ` isn't UTC). Round 17 (Task 2's own Loop 2 review, see "Task 2 -- Loop 2 review evidence" above) investigated this identical code shape and closed it as "latent-but-unreachable... confirmed, via grep, unreachable through any current production or test call site," because at that point nothing ever passed a real `since` value through to `backfill`. Task 8's entire purpose is exactly that: wiring `SyncRequest.since` through `sync_connector_endpoint` to `adapter.backfill(..., since=payload.since)` for the first real HTTP caller -- so the reasoning that justified leaving it unfixed no longer holds. Impact is bounded (only the caller's own backfill window shifts by the server's UTC offset; not a cross-tenant leak, auth bypass, or injection) and not reachable through the shipped `GmailPanel.tsx` UI at all (`new Date(sinceInput).toISOString()` always produces a `Z`-suffixed, UTC-aware string) -- only a direct API caller bypassing the UI (Swagger, curl, another client) can trigger it. Fixed by normalizing at the adapter boundary: a naive `window_start` is now explicitly stamped `tzinfo=UTC` before `.timestamp()` is called, so every caller -- UI or direct API -- gets the same, documented behavior regardless of the server's local timezone. Closed with a new regression test, `test_backfill_treats_a_naive_since_as_utc_not_local_time` (`tests/test_gmail_connector_sync_postgres.py`, item 31 in the file's own "Covers" list), asserting a naive and an equivalent UTC-aware `since` produce byte-identical Gmail queries. Verified independently by the orchestrating session (not merely trusting the reviewing agent's report): reproduced the fix's own normalization logic standalone (`datetime(2026,1,1)` vs. `datetime(2026,1,1,tzinfo=UTC)` both now producing `after:1767225600`) before committing.
+
+Architecture/quality lens for round 8 was still in progress when this paragraph was written; see below for its own result once available.
