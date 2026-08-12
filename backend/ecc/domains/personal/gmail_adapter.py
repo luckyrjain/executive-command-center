@@ -25,7 +25,7 @@ single-host API.
 **Credential shape is a JSON string, not a bare token.** Every existing
 adapter's `credential` is a single opaque token string; Gmail's OAuth grant
 is an access/refresh token *pair* plus an expiry. `_pack_credential`/
-`_unpack_credential` below serialize/deserialize
+`_unpack_credential` (`gmail_shared.py`) serialize/deserialize
 `{"access_token", "refresh_token", "expires_at"}` as a JSON string --
 `ConnectorAccountContext.credential` stays `str` (the Protocol's own type),
 `ecc.domains.engineering.crypto.encrypt_credential`/`decrypt_credential`
@@ -109,7 +109,6 @@ from email.errors import InvalidHeaderDefect
 from email.headerregistry import HeaderRegistry
 from email.utils import getaddresses, parseaddr
 from hashlib import sha256
-from json import dumps, loads
 from typing import Any, cast
 from urllib.parse import urlencode
 from uuid import UUID, uuid4
@@ -131,6 +130,13 @@ from ecc.domains.engineering.connectors import (
 )
 
 from .crypto import encrypt_field
+from .gmail_shared import (
+    _bearer_headers,
+    _email_consent_active,
+    _pack_credential,
+    _unpack_credential,
+    normalize_email,
+)
 
 GOOGLE_OAUTH_AUTHORIZE_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 GOOGLE_OAUTH_BASE_URL = "https://oauth2.googleapis.com"
@@ -274,36 +280,6 @@ def _to_header_exceeds_length_limit(to_header: str) -> bool:
     return len(to_header) > _MAX_TO_HEADER_LENGTH
 
 
-def _pack_credential(access_token: str, refresh_token: str, expires_at: datetime) -> str:
-    return dumps(
-        {
-            "access_token": access_token,
-            "refresh_token": refresh_token,
-            "expires_at": expires_at.isoformat(),
-        }
-    )
-
-
-def _unpack_credential(credential: str) -> dict[str, str]:
-    """Every caller (`refresh_permissions`, `disconnect`) catches only
-    `(ValueError, TypeError)` around this call -- `loads` itself only ever
-    raises `ValueError` (malformed JSON), but valid JSON that isn't an
-    object (a list, `null`, a bare number) would decode successfully and
-    silently violate this function's own `dict[str, str]` return
-    annotation, surfacing later as an uncaught `AttributeError` on the
-    caller's first `.get(...)` instead -- found by round 5 review. Raising
-    `TypeError` here instead keeps both callers' existing narrow `except`
-    sufficient, rather than requiring every call site to separately guard
-    against a shape violation this function itself is responsible for.
-    """
-    data = loads(credential)
-    if not isinstance(data, dict):
-        raise TypeError(
-            f"Gmail credential JSON must decode to an object, got {type(data).__name__}"
-        )
-    return data
-
-
 # -- Task 2: DB helpers shared by `backfill`/`incremental_sync` --------------
 #
 # `ConnectorAccountContext` (the argument every `ConnectorAdapter` method
@@ -327,40 +303,6 @@ def _owner_id_for_account(
         {"workspace_id": workspace_id, "connector_account_id": connector_account_id},
     ).one_or_none()
     return row[0] if row is not None else None
-
-
-def _email_consent_active(session: Session, workspace_id: UUID, owner_id: UUID) -> bool:
-    """Plan Task 2: "each re-invocation re-verifies the `email` domain's
-    `domain_consents` row is still active at call time, not merely at
-    original connect time" -- called both before a sync call starts
-    fetching anything, and again before writing each message it fetches
-    (see `_sync_messages`), so a consent revoked mid-call halts further
-    writes rather than only being checked once at the top.
-    """
-    row = session.execute(
-        text(
-            "SELECT 1 FROM domain_consents WHERE workspace_id = :workspace_id "
-            "AND owner_id = :owner_id AND domain_key = 'email' AND revoked_at IS NULL"
-        ),
-        {"workspace_id": workspace_id, "owner_id": owner_id},
-    ).one_or_none()
-    return row is not None
-
-
-# Not underscore-prefixed: `ecc.domains.attention.attention` (a different
-# domain package) imports this directly to reproduce the exact same
-# `entity_aliases.normalized_value` normalization when matching a thread's
-# last-inbound sender against a resolved contact (see that module's own
-# `_score_awaiting_reply`/`regenerate_attention` comments for why the match
-# has to happen in Python rather than SQL). Every other private-helper
-# import elsewhere in this codebase (`identity/invitations.py` <-
-# `identity/accounts.py`, `engineering/write_actions.py` <-
-# `engineering/{gitlab,jira}_adapter.py`) is between sibling modules in the
-# *same* domain package and keeps the leading underscore; this is the one
-# cross-domain case, so it gets a real public name instead of reaching past
-# another domain's underscore.
-def normalize_email(value: str) -> str:
-    return value.strip().casefold()
 
 
 def _contains_nul(value: str) -> bool:
@@ -1189,11 +1131,6 @@ def _is_rate_limited(response: httpx.Response) -> bool:
     return any(
         isinstance(item, dict) and item.get("reason") in _RATE_LIMIT_REASONS for item in errors
     )
-
-
-def _bearer_headers(credential: str) -> dict[str, str]:
-    access_token = _unpack_credential(credential).get("access_token", "")
-    return {"Authorization": f"Bearer {access_token}"}
 
 
 def _coerce_int(value: Any) -> int | None:
