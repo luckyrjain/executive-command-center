@@ -56,21 +56,33 @@ this module in two: this file is the decision engine 40+ callers across
 every domain import (`authorize`/`require_active_role`/`require_role_
 action`/`effective_permissions`/`visible_resource_filter_sql`), never
 touched by that split; `authz_grants.py` is a *consumer* of it, the same
-as any other domain, importing `current_role`/`account_id_for`/`load_
-resource`/`active_grant_actions_for`/`ROLE_PERMISSIONS` (promoted off
-their underscore prefix for exactly that reason) plus `UnknownResource
-TypeError`/`ResourceRef`/`require_known_resource_type`/`require_
-grantable`/`EffectivePermissions`/`effective_permissions` from here.
-`require_grantable` stays in this file despite having zero decision-
-engine callers of its own (call graph says it's grants-exclusive) --
-`ecc.domains.collaboration.delegations` already imports it directly via
-`authz.require_grantable`, and moving it would either break that import
-or require `authz_grants.py`/`authz.py` to import from each other in
-both directions. `_active_grant_exists` stays here too, despite its own
-name reading like a grants helper -- it is `authorize()`'s own step 4,
-called from nowhere else, the one name-vs-call-graph mismatch this split
-found that runs the other way (a "grants" name that's actually decision-
-engine-exclusive, not the reverse).
+as any other domain, importing `current_role`/`account_id_for`/`users_
+id_for_account`/`load_resource`/`active_grant_actions_for`/`ROLE_
+PERMISSIONS` (promoted off their underscore prefix for exactly that
+reason) plus `UnknownResourceTypeError`/`ResourceRef`/`require_known_
+resource_type`/`require_grantable`/`EffectivePermissions`/`effective_
+permissions` from here. `require_grantable` stays in this file despite
+having zero decision-engine callers of its own (call graph says it's
+grants-exclusive) -- `ecc.domains.collaboration.delegations` already
+imports it directly via `authz.require_grantable`, and moving it would
+either break that import or require `authz_grants.py`/`authz.py` to
+import from each other in both directions. `_active_grant_exists` stays
+here too, despite its own name reading like a grants helper -- it is
+`authorize()`'s own step 4, called from nowhere else, the one name-vs-
+call-graph mismatch this split found that runs the other way (a
+"grants" name that's actually decision-engine-exclusive, not the
+reverse).
+
+**`users_id_for_account`** (account_id_for's own inverse -- resolves an
+`AuthContext.account_id` to the `users_id` the FK columns actually
+store) is a later, narrower deepening: it existed as two verbatim-in-
+spirit private copies (`authz_grants.py`'s own `_users_id_for_account`,
+`ecc.domains.collaboration.delegations`'s own), untracked by this split's
+own audit above since neither module's copy predates it. Promoted here
+next to its documented inverse rather than left duplicated, following
+`account_id_for`'s own precedent exactly -- both are Optional-returning,
+leaving the caller's own None-vs-raise choice at the call site instead of
+baking one policy into the shared helper.
 """
 
 from __future__ import annotations
@@ -328,6 +340,28 @@ def account_id_for(session: Session, *, workspace_id: UUID, users_id: UUID) -> U
         .one_or_none()
     )
     return None if row is None else row["account_id"]
+
+
+def users_id_for_account(session: Session, *, workspace_id: UUID, account_id: UUID) -> UUID | None:
+    """The inverse of `account_id_for` -- `resource_grants.granted_by`/
+    `owner_id` FK to `users.(workspace_id, id)`, not `accounts.id`, so a
+    caller holding an `AuthContext.account_id` (the normal shape auth
+    dependencies hand callers) needs this to resolve the `users_id` those
+    columns actually store. Read-only -- see `current_role`'s own docstring
+    for why this never calls `session.rollback()`.
+    """
+    row = (
+        session.execute(
+            text(
+                "SELECT id FROM users WHERE workspace_id = :workspace_id "
+                "AND account_id = :account_id"
+            ),
+            {"workspace_id": workspace_id, "account_id": account_id},
+        )
+        .mappings()
+        .one_or_none()
+    )
+    return None if row is None else row["id"]
 
 
 _UNOWNABLE_FOR_REMOVAL_PURPOSES: frozenset[str] = frozenset({"audit_events"})

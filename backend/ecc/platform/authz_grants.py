@@ -52,6 +52,7 @@ from .authz import (
     load_resource,
     require_grantable,
     require_known_resource_type,
+    users_id_for_account,
 )
 
 
@@ -92,30 +93,6 @@ def _notify_member(
             "now": now,
         },
     )
-
-
-def _users_id_for_account(session: Session, *, workspace_id: UUID, account_id: UUID) -> UUID | None:
-    """The inverse of `account_id_for` -- resolves an `accounts.id` to its
-    `users.id` anchor within one workspace. `owner_id` on every table
-    `_RESOURCE_TABLES` names FKs `users.(workspace_id, id)`, not
-    `accounts.id` (migration `0063_phase8_authz_visibility.py`'s own FK
-    topology), so `create_ownership_transfer_endpoint` needs this to stamp
-    the transferred resource's new `owner_id` from the request's
-    account-scoped `to_account_id`. Read-only -- see `current_role`'s own
-    docstring for why this never calls `session.rollback()`.
-    """
-    row = (
-        session.execute(
-            text(
-                "SELECT id FROM users "
-                "WHERE workspace_id = :workspace_id AND account_id = :account_id"
-            ),
-            {"workspace_id": workspace_id, "account_id": account_id},
-        )
-        .mappings()
-        .one_or_none()
-    )
-    return None if row is None else row["id"]
 
 
 def _load_resource_for_update(
@@ -768,7 +745,7 @@ def create_ownership_transfer_endpoint(
         if to_membership is None:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="RECIPIENT_NOT_FOUND")
 
-        to_users_id = _users_id_for_account(
+        to_users_id = users_id_for_account(
             session, workspace_id=auth.workspace_id, account_id=payload.to_account_id
         )
         assert to_users_id is not None  # active membership implies a users row exists

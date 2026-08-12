@@ -140,41 +140,32 @@ class DelegationListResponse(BaseModel):
 
 
 def _account_id_for(session: Session, *, workspace_id: UUID, users_id: UUID) -> UUID:
-    row = (
-        session.execute(
-            text("SELECT account_id FROM users WHERE workspace_id = :workspace_id AND id = :id"),
-            {"workspace_id": workspace_id, "id": users_id},
-        )
-        .mappings()
-        .one()
-    )
-    result: UUID = row["account_id"]
-    return result
+    """Thin, raising wrapper around `authz.account_id_for` -- every call
+    site here passes an `auth.user_id` from an already-authenticated
+    session, so the row is always expected to exist; the assert converts
+    that expectation into a hard failure rather than silently propagating
+    `None` (candidate 6's dedup: this used to be its own private copy of
+    `authz.account_id_for`'s query, see that function's own docstring).
+    """
+    account_id = authz.account_id_for(session, workspace_id=workspace_id, users_id=users_id)
+    assert account_id is not None  # an authenticated caller's own users row always exists
+    return account_id
 
 
 def _users_id_for_account(session: Session, *, workspace_id: UUID, account_id: UUID) -> UUID:
-    """The inverse of `_account_id_for` -- `resource_grants.granted_by` FKs
-    to `users.(workspace_id, id)`, not `accounts.id`, so `_grant_evidence`
-    (called from `accept_delegation_endpoint`, where `auth.user_id` is the
+    """Thin, raising wrapper around `authz.users_id_for_account` (`_account_
+    id_for`'s own inverse). `resource_grants.granted_by` FKs to `users.
+    (workspace_id, id)`, not `accounts.id`, so `_grant_evidence` (called
+    from `accept_delegation_endpoint`, where `auth.user_id` is the
     *recipient's* own `users_id`, not the delegator's) needs this to stamp
     `granted_by` as the delegator -- the party who actually decided this
     evidence should be shared -- rather than the recipient granting
     themselves access, which `revoke_grant_endpoint`'s "the original
     granter may always revoke" rule would then misattribute.
     """
-    row = (
-        session.execute(
-            text(
-                "SELECT id FROM users "
-                "WHERE workspace_id = :workspace_id AND account_id = :account_id"
-            ),
-            {"workspace_id": workspace_id, "account_id": account_id},
-        )
-        .mappings()
-        .one()
-    )
-    result: UUID = row["id"]
-    return result
+    users_id = authz.users_id_for_account(session, workspace_id=workspace_id, account_id=account_id)
+    assert users_id is not None  # active membership implies a users row exists
+    return users_id
 
 
 def _request_hash(action: str, payload: BaseModel | None = None) -> str:
