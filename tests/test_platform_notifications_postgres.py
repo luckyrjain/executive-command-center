@@ -16,7 +16,7 @@ stated test requirements:
    `UNGRANTABLE_RESOURCE_TYPES` -- as the fixture).
 
 Plus coverage of the two notification-producing call sites this task wired
-(`ecc.platform.authz.create_grant_endpoint`, `ecc.domains.collaboration.
+(`ecc.platform.authz_grants.create_grant_endpoint`, `ecc.domains.collaboration.
 delegations`'s six transitions), `GET /notifications`'s own account-scoping
 and `unread_only` filter, `POST /notifications/{id}/read`'s idempotency and
 "never leak existence" 404 shape, and `/shared/activity`'s positive case

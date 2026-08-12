@@ -46,7 +46,7 @@ access to it at proposal time. Acceptance creates one read-only (`actions
 naming exactly that set -- the contract's own "never a broader grant"
 line. Each such grant auto-widens its resource from `private` to
 `shared_explicitly` if needed (the identical strict-widening half of
-`ecc.platform.authz.create_grant_endpoint`'s own Task 5 fix -- a
+`ecc.platform.authz_grants.create_grant_endpoint`'s own Task 5 fix -- a
 conditional `UPDATE ... WHERE visibility = 'private'`, a safe no-op
 otherwise) but never narrows an already-`workspace`-visible resource --
 unlike Task 5's own explicit, UI-mediated `narrow_visibility` flow, an
