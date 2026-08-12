@@ -39,20 +39,19 @@ from ecc.domains.engineering.connectors import ConnectorAccountContext
 from ecc.domains.governance.recommendation_models import RecommendationCreate
 from ecc.domains.governance.recommendation_mutations import create_recommendation, synthetic_request
 
-# A plain, real (not TYPE_CHECKING-guarded) import -- no cycle to avoid
-# here. `gmail_adapter.py` never imports this module at ITS OWN top
-# level (only from inside `detect_actions_since`'s method body, deferred
-# to call time -- see that method's own comment for why); `gmail_
-# threads.py` already imports `_bearer_headers`/`_email_consent_active`
-# from `gmail_adapter.py` the same plain way, with no cycle either, for
-# the identical reason.
-from .gmail_adapter import (
-    GmailAdapter,
-    _bearer_headers,
-    _email_consent_active,
-    _owner_id_for_account,
-    _resolve_or_create_person,
-)
+# `GmailAdapter`/`_owner_id_for_account`/`_resolve_or_create_person`: a
+# plain, real (not TYPE_CHECKING-guarded) import from `gmail_adapter.py`
+# -- no cycle to avoid. `gmail_adapter.py` never imports this module at
+# ITS OWN top level (only from inside `detect_actions_since`'s method
+# body, deferred to call time -- see that method's own comment for why).
+# `_bearer_headers`/`_email_consent_active` come from `gmail_shared.py`
+# instead (see that module's own docstring): a later architecture-review
+# extraction pulled them, and `normalize_email`/`_pack_credential`/
+# `_unpack_credential`, out of `gmail_adapter.py` for the identical
+# "cross-module caller reaching past the adapter class for a stateless
+# helper" reason this module's own split exists for.
+from .gmail_adapter import GmailAdapter, _owner_id_for_account, _resolve_or_create_person
+from .gmail_shared import _bearer_headers, _email_consent_active
 
 # Task 5's own, much smaller bound -- deliberately not `_MAX_MESSAGES_PER_
 # CALL`. `connector_accounts.py`'s own module docstring justifies its
