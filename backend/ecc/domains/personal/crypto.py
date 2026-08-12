@@ -17,7 +17,7 @@ inverse, called only for the single-record response paths (create/get/
 patch), never list/summary (`_redact_payload` handles those instead --
 design doc Decision 3: "only a single-record fetch returns the decrypted
 value"). Phase 10 Task 5 added two more direct callers for the identical
-reason -- `gmail_adapter.py`'s `_detect_action_for_message` encrypts a
+reason -- `gmail_adapter.py`'s `fetch_and_store_body` encrypts a
 fetched Gmail message body before storing it in `email_messages.body`
 (itself a `personal_domains`-owned, `high_stakes`-classified column, the
 same tier `_encrypt_payload`'s own callers use), and `email_action_tools.
