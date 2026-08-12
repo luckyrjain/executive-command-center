@@ -381,8 +381,8 @@ from ecc.domains.engineering.connectors import ConnectorAccountContext
 from ecc.domains.engineering.crypto import encrypt_credential
 from ecc.domains.personal.gmail_adapter import (
     GmailAdapter,
+    GmailHistoryCursor,
     _pack_credential,
-    _parse_history_cursor,
 )
 
 settings = get_settings()
@@ -3106,7 +3106,7 @@ def test_incremental_sync_reports_next_cursor_zero_not_the_stale_start_when_hist
     assert outcome.next_cursor == "0"
 
 
-# --- `_parse_history_cursor`: malformed compound state degrades safely -------
+# --- `GmailHistoryCursor.from_str`: malformed compound state degrades safely -
 #
 # Round 14 review: `_parse_history_cursor`'s own docstring -- and its
 # module-level comment above the function -- had never had a single direct
@@ -3115,49 +3115,56 @@ def test_incremental_sync_reports_next_cursor_zero_not_the_stale_start_when_hist
 # `_process_message`. The full-`_sync_history` integration test above
 # (`test_incremental_sync_makes_forward_progress_through_a_single_oversized_
 # history_record`) only ever exercises the well-formed compound cursor
-# `_build_history_cursor` itself produces -- never a malformed one, since
+# `GmailHistoryCursor` itself produces -- never a malformed one, since
 # nothing in that test's own mocked Gmail responses can produce one. These
 # tests close that gap and, in doing so, found the docstring's own claim
 # ("a non-integer/negative record id or skip count" degrades to the plain-
 # cursor fallback) was only half true: `skip_count < 0` was checked, but the
-# symmetric `record_id < 0` case was not -- `_parse_history_cursor("100:-5:
-# 3")` returned `("100", -5, 3)` as if it were a well-formed compound
-# cursor, not the documented degrade-to-plain fallback. Harmless in
-# practice today (a real Gmail `history[]` record `id`, parsed via
-# `_coerce_int` the same way this function's own `record_id` is, is never
-# negative, so a negative `pending_stuck_record_id` could only ever
-# originate from corrupted persisted state and would then simply never
-# match any real record -- equivalent in effect, not in the `list_start_
-# history_id` value handed to `history.list`, to the documented fallback),
-# but a real, mutation-testable gap between this function's own documented
-# contract and what it actually did -- found by round 14 review. Fixed by
-# adding the missing `record_id < 0` check, symmetric with the pre-existing
-# `skip_count < 0` one.
+# symmetric `record_id < 0` case was not -- `GmailHistoryCursor.from_str(
+# "100:-5:3")` returned a live `(list_start_history_id="100", stuck_record_
+# id=-5, stuck_offset=3)` as if it were a well-formed compound cursor, not
+# the documented degrade-to-plain fallback. Harmless in practice today (a
+# real Gmail `history[]` record `id`, parsed via `_coerce_int` the same way
+# this method's own `record_id` is, is never negative, so a negative
+# `pending_stuck_record_id` could only ever originate from corrupted
+# persisted state and would then simply never match any real record --
+# equivalent in effect, not in the `list_start_history_id` value handed to
+# `history.list`, to the documented fallback), but a real, mutation-testable
+# gap between this method's own documented contract and what it actually
+# did -- found by round 14 review. Fixed by adding the missing `record_id <
+# 0` check, symmetric with the pre-existing `skip_count < 0` one. Later
+# collapsed from two free functions (`_parse_history_cursor`/`_build_
+# history_cursor`) into this one owned type -- see `GmailHistoryCursor`'s
+# own module-level comment for why.
+
+
+def _cursor_fields(cursor: GmailHistoryCursor) -> tuple[str, int | None, int]:
+    return cursor.list_start_history_id, cursor.stuck_record_id, cursor.stuck_offset
 
 
 def test_parse_history_cursor_returns_the_plain_no_skip_case_for_a_bare_historyid() -> None:
-    assert _parse_history_cursor("12345") == ("12345", None, 0)
+    assert _cursor_fields(GmailHistoryCursor.from_str("12345")) == ("12345", None, 0)
 
 
 def test_parse_history_cursor_parses_a_well_formed_compound_cursor() -> None:
-    assert _parse_history_cursor("100:101:2") == ("100", 101, 2)
+    assert _cursor_fields(GmailHistoryCursor.from_str("100:101:2")) == ("100", 101, 2)
 
 
 def test_parse_history_cursor_degrades_wrong_field_count_to_a_plain_cursor() -> None:
-    assert _parse_history_cursor("100:101") == ("100:101", None, 0)
-    assert _parse_history_cursor("100:101:2:3") == ("100:101:2:3", None, 0)
+    assert _cursor_fields(GmailHistoryCursor.from_str("100:101")) == ("100:101", None, 0)
+    assert _cursor_fields(GmailHistoryCursor.from_str("100:101:2:3")) == ("100:101:2:3", None, 0)
 
 
 def test_parse_history_cursor_degrades_a_non_integer_record_id_to_a_plain_cursor() -> None:
-    assert _parse_history_cursor("100:abc:2") == ("100:abc:2", None, 0)
+    assert _cursor_fields(GmailHistoryCursor.from_str("100:abc:2")) == ("100:abc:2", None, 0)
 
 
 def test_parse_history_cursor_degrades_a_non_integer_skip_count_to_a_plain_cursor() -> None:
-    assert _parse_history_cursor("100:101:xyz") == ("100:101:xyz", None, 0)
+    assert _cursor_fields(GmailHistoryCursor.from_str("100:101:xyz")) == ("100:101:xyz", None, 0)
 
 
 def test_parse_history_cursor_degrades_a_negative_skip_count_to_a_plain_cursor() -> None:
-    assert _parse_history_cursor("100:101:-2") == ("100:101:-2", None, 0)
+    assert _cursor_fields(GmailHistoryCursor.from_str("100:101:-2")) == ("100:101:-2", None, 0)
 
 
 def test_parse_history_cursor_degrades_a_negative_record_id_to_a_plain_cursor() -> None:
@@ -3166,10 +3173,39 @@ def test_parse_history_cursor_degrades_a_negative_record_id_to_a_plain_cursor() 
     documented plain-cursor fallback -- see this section's own module-level
     comment for the full mechanism and why this is safe-in-practice but a
     real contract violation. Mutation-confirmed: reverting the fix (dropping
-    `record_id < 0` from `_parse_history_cursor`'s own guard) makes this
-    test fail with `("100", -5, 3)` instead of the expected degraded tuple.
+    `record_id < 0` from `GmailHistoryCursor.from_str`'s own guard) makes
+    this test fail with `("100", -5, 3)` instead of the expected degraded
+    tuple.
     """
-    assert _parse_history_cursor("100:-5:3") == ("100:-5:3", None, 0)
+    assert _cursor_fields(GmailHistoryCursor.from_str("100:-5:3")) == ("100:-5:3", None, 0)
+
+
+def test_history_cursor_round_trips_through_str_for_every_parseable_shape() -> None:
+    """`str(GmailHistoryCursor.from_str(s)) == s` for every shape `_sync_
+    history` itself ever persists and replays -- a bare historyId, a well-
+    formed compound cursor with a positive skip offset, and a degraded
+    (malformed) string echoed back unchanged. The one shape that does NOT
+    round-trip -- a well-formed compound cursor whose own skip offset is
+    exactly `0` -- is never produced by `with_progress` (see `__str__`'s own
+    docstring) and is handled at its one call site (`_sync_history`'s
+    `history_response is None` branch) by echoing `start_history_id`
+    verbatim instead of going through `str(cursor)`, not by this type.
+    """
+    for cursor_str in ("12345", "100:101:2", "100:101", "100:abc:2", "100:101:xyz"):
+        assert str(GmailHistoryCursor.from_str(cursor_str)) == cursor_str
+
+
+def test_history_cursor_with_resumed_through_clears_any_stuck_point() -> None:
+    cursor = GmailHistoryCursor.from_str("100:101:2").with_resumed_through(101)
+    assert _cursor_fields(cursor) == ("100", None, 0)
+    assert str(cursor) == "101"
+
+
+def test_history_cursor_with_progress_keeps_the_prior_resumable_history_id() -> None:
+    cursor = GmailHistoryCursor.from_str("100").with_resumed_through(101).with_progress(102, 3)
+    assert cursor.resumable_history_id == 101
+    assert _cursor_fields(cursor) == ("100", 102, 3)
+    assert str(cursor) == "101:102:3"
 
 
 # --- _process_message guard clauses: skip gracefully, never crash ------------
