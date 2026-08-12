@@ -2323,9 +2323,9 @@ class GmailAdapter:
         # is the `while calls_made < _MAX_MESSAGES_PER_CALL` loop's own two
         # possible exits -- either its condition failing naturally (every
         # record on the just-finished page completed, `budget_exhausted`
-        # never set this pass, so `record_history_id`/`already_skipped_
-        # this_record` reflect that *completed* last record rather than an
-        # interrupted one) or the explicit `if budget_exhausted: break`
+        # never set this pass, so `record_history_id`/`record_stuck_offset`
+        # reflect that *completed* last record rather than an interrupted
+        # one) or the explicit `if budget_exhausted: break`
         # above falling through to this same statement (budget ran out
         # mid-record). Only `with_progress` when `budget_exhausted` -- a
         # completed last record already advanced `cursor` via
