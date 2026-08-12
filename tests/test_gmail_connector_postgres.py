@@ -1797,7 +1797,10 @@ def test_oauth_complete_redirects_with_denied_marker_when_code_is_missing(
             follow_redirects=False,
         )
         assert response.status_code == 302
-        assert response.headers["location"] == "https://app.example.test/?gmail=error&code=GMAIL_OAUTH_DENIED"
+        assert (
+            response.headers["location"]
+            == "https://app.example.test/?gmail=error&code=GMAIL_OAUTH_DENIED"
+        )
     finally:
         get_settings.cache_clear()
 
@@ -1839,7 +1842,10 @@ def test_oauth_complete_redirects_with_a_generic_error_when_callback_raises_a_no
             follow_redirects=False,
         )
         assert response.status_code == 302
-        assert response.headers["location"] == "https://app.example.test/?gmail=error&code=GMAIL_OAUTH_FAILED"
+        assert (
+            response.headers["location"]
+            == "https://app.example.test/?gmail=error&code=GMAIL_OAUTH_FAILED"
+        )
     finally:
         get_settings.cache_clear()
 
@@ -1858,7 +1864,10 @@ def test_oauth_complete_strips_a_trailing_slash_from_frontend_url_before_redirec
             follow_redirects=False,
         )
         assert response.status_code == 302
-        assert response.headers["location"] == "https://app.example.test/?gmail=error&code=GMAIL_OAUTH_DENIED"
+        assert (
+            response.headers["location"]
+            == "https://app.example.test/?gmail=error&code=GMAIL_OAUTH_DENIED"
+        )
     finally:
         get_settings.cache_clear()
 
