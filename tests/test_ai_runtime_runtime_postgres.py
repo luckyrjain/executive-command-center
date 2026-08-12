@@ -2630,13 +2630,14 @@ def test_execute_run_meeting_prep_summary_passes_its_own_40s_timeout_to_the_adap
     assert spy.observed_timeout_seconds == [40.0]
 
 
-def test_execute_run_attention_explain_item_still_passes_its_own_20s_timeout(
+def test_execute_run_attention_explain_item_still_passes_its_own_30s_timeout(
     run_context: dict,
 ) -> None:
-    """Sibling proof for `attention.explain_item`'s own, unchanged 20.0s
-    timeout -- confirms the wiring is genuinely per-task (`router.py:
-    TASK_REQUIREMENTS`), not hardcoded to `meeting.prep_summary`'s new
-    25.0s value specifically.
+    """Sibling proof for `attention.explain_item`'s own timeout (30.0s,
+    raised from 20.0s by migration `0077_phase4_expl_item_timeout.py`) --
+    confirms the wiring is genuinely per-task (`router.py:
+    TASK_REQUIREMENTS`), not hardcoded to `meeting.prep_summary`'s own
+    40.0s value specifically.
     """
     item_id = _insert_attention_item(run_context["workspace_id"], factors=_DEFAULT_FACTORS)
     inner = _adapter_with_responses(_valid_output(["overdue"]))
@@ -2653,7 +2654,7 @@ def test_execute_run_attention_explain_item_still_passes_its_own_20s_timeout(
         )
 
     assert run.status == "completed"
-    assert spy.observed_timeout_seconds == [20.0]
+    assert spy.observed_timeout_seconds == [30.0]
 
 
 def test_execute_run_meeting_prep_summary_ungrounded_citation_fails_grounding(
