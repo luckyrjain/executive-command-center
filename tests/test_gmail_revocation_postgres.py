@@ -175,7 +175,8 @@ from ecc.database import STATEMENT_TIMEOUT_MS, SessionFactory, engine
 from ecc.domains.engineering.connectors import ConnectorAccountContext
 from ecc.domains.engineering.crypto import encrypt_credential
 from ecc.domains.personal import gmail_revocation
-from ecc.domains.personal.gmail_adapter import GmailAdapter, _pack_credential
+from ecc.domains.personal.gmail_adapter import GmailAdapter
+from ecc.domains.personal.gmail_shared import _pack_credential
 from ecc.main import app
 
 settings = get_settings()
