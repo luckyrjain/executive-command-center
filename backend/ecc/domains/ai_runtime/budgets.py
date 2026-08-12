@@ -200,7 +200,7 @@ def candidate_state_for(
 
 @dataclass(frozen=True, slots=True)
 class RunBudget:
-    """One run's Decision 5 budget: 60s total wall clock, 20s per-model-
+    """One run's Decision 5 budget: 80s total wall clock, 30s per-model-
     call, 5s per-tool-call, 3072 max input tokens, 512 max output tokens
     (for `attention.explain_item`, this activation's only task type).
     Always built via `from_policy` -- the dataclass constructor itself

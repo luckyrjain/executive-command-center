@@ -95,6 +95,14 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    # Restores `routing_policies.constraints` only. `router.py:TASK_
+    # REQUIREMENTS["attention.explain_item"]` remains the actual source of
+    # truth for `per_model_call_timeout_seconds` (see module docstring) --
+    # running this downgrade without also reverting that Python constant in
+    # the same deploy leaves the per-call timeout at 30s while the total
+    # budget reverts to 60s, which no longer fits the "two full-length
+    # calls plus slack" invariant this migration is built on (2 x 30s = 60s,
+    # zero slack left for routing/tool-dispatch/validation overhead).
     routing_policies = _routing_policies_table()
     op.execute(
         routing_policies.update()

@@ -438,7 +438,7 @@ def check_promotion_floors(evaluation_run: EvaluationRun) -> bool:
     """`EVALUATION-CONTRACT.md`'s four floors, all required simultaneously
     (design doc Decision 9's table): 100% schema validity, 100% grounding,
     zero prohibited-fact occurrences, p95 latency strictly under the
-    evaluated task type's own declared ceiling (20s for `attention.
+    evaluated task type's own declared ceiling (25s for `attention.
     explain_item`, 35s for `meeting.prep_summary` -- distinct numbers, not
     one shared value; see `_LATENCY_P95_CEILING_SECONDS_BY_TASK_TYPE`'s own
     comment). A pure function over already-computed metrics -- no database
