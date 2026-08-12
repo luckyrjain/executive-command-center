@@ -69,9 +69,9 @@ from ecc.domains.personal.gmail_adapter import (
     _MAX_ACTION_DETECTIONS_PER_CALL,
     GmailAdapter,
     _BodyParseOutcome,
-    _pack_credential,
     _parse_message_body_response,
 )
+from ecc.domains.personal.gmail_shared import _pack_credential
 
 settings = get_settings()
 pytestmark = pytest.mark.skipif(

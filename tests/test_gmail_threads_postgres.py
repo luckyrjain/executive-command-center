@@ -84,7 +84,8 @@ from ecc.domains.engineering.crypto import encrypt_credential
 from ecc.domains.personal import gmail_threads
 from ecc.domains.personal.crypto import decrypt_field
 from ecc.domains.personal.crypto import encrypt_field as _encrypt_field
-from ecc.domains.personal.gmail_adapter import GmailAdapter, _pack_credential
+from ecc.domains.personal.gmail_adapter import GmailAdapter
+from ecc.domains.personal.gmail_shared import _pack_credential
 from ecc.main import app
 
 settings = get_settings()

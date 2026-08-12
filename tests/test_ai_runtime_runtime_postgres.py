@@ -87,7 +87,7 @@ from ecc.domains.ai_runtime.validator import ExplainItemOutput
 from ecc.domains.engineering.crypto import encrypt_credential
 from ecc.domains.knowledge import tools as knowledge_tools
 from ecc.domains.personal.crypto import encrypt_field
-from ecc.domains.personal.gmail_adapter import _pack_credential
+from ecc.domains.personal.gmail_shared import _pack_credential
 from ecc.main import app
 
 settings = get_settings()

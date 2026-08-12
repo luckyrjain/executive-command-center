@@ -45,7 +45,7 @@ need something to point at. Records the action in `deletion_jobs` with
 task's own schema addition), mirroring `export_deletion.py`'s own
 audit-trail shape at the narrower granularity.
 
-`GET` checks `_email_consent_active` (imported from `gmail_adapter.py`,
+`GET` checks `_email_consent_active` (imported from `gmail_shared.py`,
 the identical check Task 5's own per-message recheck uses), not `require_
 enabled_domain` -- consistent with Task 5's own precedent (that function
 never separately checks `personal_domains.enabled` either), since a live
@@ -113,7 +113,8 @@ from .domains import (
     store_idempotency,
 )
 from .email_action_tools import MAX_THREAD_MESSAGES, get_thread_content_tool
-from .gmail_adapter import GmailAdapter, _bearer_headers, _email_consent_active
+from .gmail_adapter import GmailAdapter
+from .gmail_shared import _bearer_headers, _email_consent_active
 
 router = APIRouter(prefix="/api/v1/personal/gmail", tags=["personal"])
 SessionDep = Annotated[Session, Depends(get_session)]

@@ -14,7 +14,7 @@ from sqlalchemy.orm import Session
 
 from ecc.auth import AuthContext, AuthDep, CsrfDep
 from ecc.database import get_session
-from ecc.domains.personal.gmail_adapter import normalize_email
+from ecc.domains.personal.gmail_shared import normalize_email
 from ecc.observability import (
     queue_lifecycle_event,
     record_audit_outbox_failure,
@@ -637,16 +637,16 @@ def regenerate_attention(auth: AuthDep, session: SessionDep, _csrf: CsrfDep) -> 
         # `LOWER(TRIM(sender))` comparison diverges from Python's
         # `.casefold()` (the function that actually wrote every
         # `entity_aliases.normalized_value` row, in `gmail_adapter.py`'s
-        # `_resolve_or_create_person`) for characters like the German
-        # sharp s. Sender resolution is instead done below in Python,
-        # using the real `normalize_email` against a separately-fetched
-        # set of known aliases (`known_email_aliases`), then filtered
-        # into `email_threads`. `normalize_email` is deliberately not
-        # underscore-prefixed in `gmail_adapter.py` -- this is a
-        # cross-domain (attention <- personal) call, unlike every other
-        # private-helper import in this codebase, which stays within one
-        # domain's own sibling modules (see `gmail_adapter.py`'s own
-        # comment on the function).
+        # `_resolve_or_create_person`, via `gmail_shared.normalize_email`)
+        # for characters like the German sharp s. Sender resolution is
+        # instead done below in Python, using the real `normalize_email`
+        # against a separately-fetched set of known aliases
+        # (`known_email_aliases`), then filtered into `email_threads`.
+        # `normalize_email` lives in `ecc.domains.personal.gmail_shared`
+        # (not `gmail_adapter.py`, which imports it back from there)
+        # specifically so this cross-domain (attention <- personal) call
+        # doesn't have to reach into `gmail_adapter.py`'s own, much
+        # heavier, import graph for one stateless string helper.
         #
         # `wm.status = 'active'` (round 2 review): `email_threads.owner_id`
         # -- unlike `tasks`/`commitments`/`risks`/`waiting_links` -- is
