@@ -81,7 +81,8 @@ queries. `(workspace_id, id)` is unique for the message composite FK.
 | `created_at`, `updated_at` | UTC lifecycle timestamps |
 
 Task 2 writes `snippet`, `body`, and `body_fetched_at` as `NULL`; it fetches
-headers only. Task 5's `gmail_adapter.py:_detect_action_for_message` fetches
+headers only. Task 5's `gmail_adapter.py:fetch_and_store_body` (called from
+`gmail_action_detection.py:_detect_action_for_message`) fetches
 one message's full body (`gmail.readonly`, `format=full`) the first time it
 becomes eligible for `email.detect_action`, encrypts it with `crypto.
 encrypt_field`, and writes `body`/`body_fetched_at` together in the same

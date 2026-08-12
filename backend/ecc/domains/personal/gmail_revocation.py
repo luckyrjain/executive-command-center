@@ -238,13 +238,13 @@ def cascade_email_revocation(
     # to it -- the identical "an audit/derived record must remain
     # resolvable independent of the content it once pointed at" reasoning
     # migration `0075`'s own docstring already gives for `deletion_jobs.
-    # resource_id`), matched by the exact `source_ref` strings `gmail_
-    # adapter.py`'s two write sites deterministically construct from
-    # `external_message_id` (`_resolve_or_create_person`: `f"gmail:
-    # {external_message_id}"`; `_register_message_evidence`: `f"gmail:
-    # detect_action:{external_message_id}"`). Does NOT touch `pkos_
-    # nodes` -- see module docstring's "what is deliberately NOT
-    # deleted" section.
+    # resource_id`), matched by the exact `source_ref` strings two write
+    # sites deterministically construct from `external_message_id`
+    # (`gmail_adapter.py`'s `_resolve_or_create_person`: `f"gmail:
+    # {external_message_id}"`; `gmail_action_detection.py`'s `_register_
+    # message_evidence`: `f"gmail:detect_action:{external_message_id}"`).
+    # Does NOT touch `pkos_nodes` -- see module docstring's "what is
+    # deliberately NOT deleted" section.
     external_message_ids: list[str] = [
         row[0]
         for row in session.execute(

@@ -2776,8 +2776,8 @@ class GmailAdapter:
         makes a live Gmail call regardless of current state) -- both
         current callers do so via their own eligibility query. Parsing
         the response into "retry later" vs. "permanent, write this" is
-        `_parse_message_body_response`'s own job -- see that function's docstring and
-        `_BodyParseOutcome`'s for why that decision is a single explicit
+        `_parse_message_body_response`'s own job -- see that function's
+        docstring and `_BodyParseOutcome`'s for why that decision is a single explicit
         field, not two different things both spelled `None`.
         """
         get_response = self._request_with_rate_limit_retry(

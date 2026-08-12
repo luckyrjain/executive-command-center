@@ -339,8 +339,7 @@ def _detect_action_for_message(
     # (see `execute_run`'s own docstring on why it is "deliberately
     # not wrapped"; `ai_insights.py:generate_insight_endpoint`'s
     # identical three-phase shape is the precedent this mirrors).
-    session = SessionFactory()
-    try:
+    with SessionFactory() as session:
         run = execute_run(
             "email.detect_action",
             "restricted",
@@ -393,5 +392,3 @@ def _detect_action_for_message(
             synthetic_request(uuid4(), uuid4()),
             f"email-detect-action:{external_message_id}",
         )
-    finally:
-        session.close()

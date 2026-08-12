@@ -1,8 +1,9 @@
 """Phase 10 Task 5's sync-pipeline wiring (`docs/superpowers/plans/2026-
 08-04-phase-10-gmail-connector.md` Task 5: "sync-pipeline wiring produces
 a pending (unconfirmed) recommendation, never an immediate write") --
-`GmailAdapter.detect_actions_since`/`_detect_action_for_message`
-(`backend/ecc/domains/personal/gmail_adapter.py`) end to end, with a
+`GmailAdapter.detect_actions_since` (`backend/ecc/domains/personal/
+gmail_adapter.py`, a thin delegator) and `_detect_action_for_message`
+(`backend/ecc/domains/personal/gmail_action_detection.py`) end to end, with a
 mocked Gmail transport (the `messages.get(format=full)` body fetch) and a
 mocked `OllamaAdapter` (injected via the `ollama_adapter` parameter added
 for exactly this purpose), against a real Postgres database.

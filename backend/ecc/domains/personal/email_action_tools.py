@@ -57,7 +57,7 @@ never counted against it as "just another message" -- round 14 review
 found that "most recent `MAX_THREAD_MESSAGES` by `sent_at`" alone (round
 13's original fix) can silently exclude the specific message that
 triggered this call: `detect_actions_since`'s own eligibility query
-(`gmail_adapter.py`) orders `(created_at >= since) DESC, sent_at ASC`,
+(`gmail_action_detection.py`) orders `(created_at >= since) DESC, sent_at ASC`,
 deliberately prioritizing an account's freshly-synced messages over older
 same-thread backlog (the round 3/4 "backlog worked down over subsequent
 calls, not lost" design) -- so on a busy, long-running thread, an old
