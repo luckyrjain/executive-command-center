@@ -53,14 +53,17 @@ non-`active`-status case this same branch also handles).
 from __future__ import annotations
 
 import hmac
+import logging
 from base64 import urlsafe_b64decode, urlsafe_b64encode
 from datetime import UTC, datetime
 from hashlib import sha256
 from secrets import token_urlsafe
 from typing import Annotated
+from urllib.parse import urlencode
 from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi.responses import RedirectResponse
 from pydantic import BaseModel
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
@@ -96,6 +99,7 @@ _STATE_TTL_SECONDS = 600
 # reads its own key lazily) so importing this module in an environment
 # with no Gmail OAuth app configured never itself raises.
 _adapter = GmailAdapter()
+_logger = logging.getLogger(__name__)
 
 
 class OAuthStartResponse(BaseModel):
@@ -560,3 +564,100 @@ def gmail_oauth_callback_endpoint(
 
     assert response is not None
     return response
+
+
+@router.get("/oauth/complete", include_in_schema=False)
+def gmail_oauth_complete_endpoint(
+    request: Request,
+    auth: AuthDep,
+    session: SessionDep,
+    code: str | None = Query(default=None, min_length=1),
+    state: str = Query(min_length=1),
+) -> RedirectResponse:
+    """The actual Google-facing OAuth redirect target -- `ECC_GMAIL_OAUTH_
+    REDIRECT_URI` (and the matching entry in the Google Cloud Console
+    OAuth client) must point here, not at `/oauth/callback` above. Google
+    lands the browser's own top-level navigation on whatever URI that
+    setting names, so the response has to be something a browser can
+    usefully land on -- `/oauth/callback` is deliberately the opposite: a
+    plain API endpoint returning `ConnectorAccountResponse` JSON, kept
+    byte-for-byte unchanged here so its own ~30 integration tests
+    (covering this feature's extensive revoke/rollback/race-condition
+    review history) keep exercising the exact contract they always have.
+    This endpoint is a thin wrapper: call that same function in-process
+    (a plain Python call sharing this request's own `auth`/`session`, not
+    a second HTTP round-trip or a duplicated copy of its logic), then
+    convert whatever it returns or raises into a redirect back to
+    `settings.frontend_url` -- the one thing a browser landing here can
+    actually use.
+
+    Before this endpoint existed, Google's registered redirect target
+    *was* `/oauth/callback` itself, stranding the user's browser on raw
+    backend JSON at the API origin with no way back into the app --
+    `IMPLEMENTATION-STATUS.md`'s own "Task 8 evidence" section disclosed
+    this as an accepted limitation; this closes it.
+
+    **`code` is optional, deliberately** -- when the user clicks "Cancel"
+    on Google's own consent screen (the mainline rejection path, not an
+    edge case), Google's redirect carries `error=access_denied` and
+    `state`, but no `code` at all. A required `code` would make FastAPI
+    422 during dependency resolution, before this function's own
+    try/except ever runs -- reintroducing the exact "stranded on raw
+    backend JSON" bug this endpoint exists to close, for the single most
+    common non-success path. A missing `code` redirects with
+    `GMAIL_OAUTH_DENIED` without ever calling into `/oauth/callback`
+    (which itself still requires `code`, correctly, for its own direct
+    API-caller contract).
+
+    **Only `HTTPException`/generic `Exception` raised from *inside* this
+    function's own body are caught** -- an `auth`/`session` dependency
+    failure (e.g. an expired ECC session cookie while the user was on
+    Google's consent screen) is resolved by FastAPI before this body
+    runs, so it still surfaces as a raw JSON 401 rather than a redirect.
+    Accepted, not fixed: catching it would mean bypassing this codebase's
+    `AuthDep`/`SessionDep` dependency-injection convention entirely for
+    this one route, a larger and more fragile change than the narrow,
+    low-likelihood case (`_STATE_TTL_SECONDS` gives a 10-minute consent
+    window; a 7-day session would need to already be within that same
+    window of expiring) warrants.
+
+    **This function's own translation of `/oauth/callback`'s failure
+    modes into a redirect is not contract-enforced** -- it only works
+    because both are read together here. A future change to
+    `/oauth/callback`'s own raised-exception shapes (a new `HTTPException.
+    detail` shape, or a new non-`HTTPException` raised from a helper it
+    calls) needs a matching update below; nothing currently forces that.
+    """
+    if code is None:
+        query = urlencode({"gmail": "error", "code": "GMAIL_OAUTH_DENIED"})
+        return RedirectResponse(
+            f"{get_settings().frontend_url.rstrip('/')}/?{query}", status_code=302
+        )
+
+    try:
+        gmail_oauth_callback_endpoint(request, auth, session, code=code, state=state)
+    except HTTPException as exc:
+        if isinstance(exc.detail, str):
+            error_code = exc.detail
+        else:
+            error_code = exc.detail.get("code", "GMAIL_OAUTH_FAILED")
+        query = urlencode({"gmail": "error", "code": error_code})
+    except Exception:
+        # A non-`HTTPException` escaping `/oauth/callback` (a transient DB
+        # error, a dropped connection, an `AssertionError`) would
+        # otherwise propagate past this function too -- this app
+        # registers no generic exception handler (`main.py`), so every
+        # *other* endpoint's raw 500 is at least invisible to the end
+        # user (the frontend's own `fetch` catches it and shows an
+        # alert). This is the one endpoint where an unhandled exception
+        # reaches the browser directly via a top-level navigation --
+        # logged here (the stack trace is otherwise lost, since redirecting
+        # instead of re-raising is what keeps the user out of a raw error
+        # page) and reported to the frontend as the same generic
+        # `GMAIL_OAUTH_FAILED` code `/oauth/callback`'s own `Adapter
+        # AuthorizationError` branch already uses.
+        _logger.exception("Unhandled error completing Gmail OAuth")
+        query = urlencode({"gmail": "error", "code": "GMAIL_OAUTH_FAILED"})
+    else:
+        query = urlencode({"gmail": "connected"})
+    return RedirectResponse(f"{get_settings().frontend_url.rstrip('/')}/?{query}", status_code=302)
