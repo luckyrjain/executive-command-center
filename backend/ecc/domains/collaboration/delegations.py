@@ -147,7 +147,7 @@ def _account_id_for(session: Session, *, workspace_id: UUID, users_id: UUID) -> 
     `None` (candidate 6's dedup: this used to be its own private copy of
     `authz.account_id_for`'s query, see that function's own docstring).
     `ecc.platform.notifications` carries an identical wrapper -- the same
-    per-module-duplication convention `_notify_member` above follows, not
+    per-module-duplication convention `_notify_member` below follows, not
     an oversight.
     """
     account_id = authz.account_id_for(session, workspace_id=workspace_id, users_id=users_id)
