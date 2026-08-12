@@ -11,7 +11,11 @@ engine = create_engine(settings.database_url, pool_pre_ping=True)
 SessionFactory = sessionmaker(bind=engine, expire_on_commit=False)
 
 # A separate, unpooled engine for session-scoped advisory locks
-# (ecc.domains.ai_runtime.runtime/evaluation's `_held_idempotency_lock`).
+# (ecc.domains.ai_runtime.runtime's `held_idempotency_lock`, the one
+# canonical implementation an architecture-review deepening consolidated
+# personal/ai_insights.py's and ai_runtime/evaluation.py's own duplicate
+# copies into -- attention/meeting_prep.py already imported this one
+# directly).
 # Those locks are held for a request's *entire* critical section, which can
 # span multiple synchronous outbound model calls lasting tens of seconds to
 # minutes -- drawing that connection from the app's shared, size-capped

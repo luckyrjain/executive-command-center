@@ -1453,7 +1453,7 @@ def test_create_prep_idempotent_replay_does_not_call_model_again(
     meeting_prep_test_context: tuple[TestClient, UUID, UUID, str, UUID],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """`create_prep`'s docstring claims `_held_idempotency_lock` plus the
+    """`create_prep`'s docstring claims `held_idempotency_lock` plus the
     idempotency-record cache keeps a same-key replay from reaching
     `execute_run` a second time -- proven directly here (not merely
     implied by the transaction restructuring passing other tests) by
