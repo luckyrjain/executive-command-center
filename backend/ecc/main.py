@@ -82,8 +82,8 @@ from ecc.http_security import (
 )
 from ecc.logging import configure_logging
 from ecc.observability import render_metrics, request_observability_middleware
-from ecc.platform.authz import ownership_router
-from ecc.platform.authz import router as authz_router
+from ecc.platform.authz_grants import ownership_router
+from ecc.platform.authz_grants import router as authz_router
 from ecc.platform.notifications import router as notifications_router
 from ecc.search import router as search_router
 
@@ -164,8 +164,9 @@ app.include_router(identity_router)
 app.include_router(identity_accounts_router)
 app.include_router(identity_invitations_router)
 # Phase 8 Task 3: the authorization engine's own direct API -- GET|POST
-# /sharing/grants, DELETE /sharing/grants/{id} (ecc.platform.authz). The
-# authorize() function itself is not an HTTP endpoint; every domain's own
+# /sharing/grants, DELETE /sharing/grants/{id} (ecc.platform.authz_grants,
+# split from ecc.platform.authz by a later architecture-review deepening).
+# The authorize() function itself is not an HTTP endpoint; every domain's own
 # list/get/mutate endpoints call it directly, starting with `engineering`
 # in this task, widened to every remaining domain in Task 4.
 app.include_router(authz_router)
@@ -175,8 +176,8 @@ app.include_router(collaboration_delegations_router)
 # Phase 8 Task 7: GET /notifications, POST /notifications/{id}/read,
 # GET /shared/activity (ecc.platform.notifications).
 app.include_router(notifications_router)
-# Phase 8 Task 8: POST|GET /ownership/transfers (ecc.platform.authz) and
-# GET /identity/workspaces/{id}/members, PATCH|DELETE .../members/{user_id}
+# Phase 8 Task 8: POST|GET /ownership/transfers (ecc.platform.authz_grants)
+# and GET /identity/workspaces/{id}/members, PATCH|DELETE .../members/{user_id}
 # (ecc.domains.identity.membership_removal).
 app.include_router(ownership_router)
 app.include_router(identity_membership_removal_router)
