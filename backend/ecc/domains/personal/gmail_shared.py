@@ -13,6 +13,9 @@ case) -- reaching a sibling/cross-domain module past its adapter class just
 for a stateless helper, and pulling in that module's own heavy import graph
 to do it. `gmail_adapter.py` itself now imports these back from here rather
 than defining them, so its own internal call sites are unaffected.
+`gmail_action_detection.py` (a later, separate architecture-review split)
+is a third consumer of `_bearer_headers`/`_email_consent_active`, for the
+identical reason.
 """
 
 from __future__ import annotations

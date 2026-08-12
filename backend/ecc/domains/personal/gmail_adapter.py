@@ -2659,13 +2659,14 @@ class GmailAdapter:
     # directly; see that module's own docstring for why.
     #
     # Imported inside the method body, not at this module's own top
-    # level, because `gmail_action_detection.py` itself imports several
-    # of this module's helpers (`_bearer_headers`, `_owner_id_for_
-    # account`, `_email_consent_active`, `_resolve_or_create_person`) --
-    # a top-level import here, in the other direction, would be
-    # circular. Deferring it to call time sidesteps that entirely: by
-    # the time anything actually *calls* `detect_actions_since`, both
-    # modules have long finished loading. --
+    # level, because `gmail_action_detection.py` itself imports two of
+    # this module's own helpers (`_owner_id_for_account`, `_resolve_or_
+    # create_person`) -- a top-level import here, in the other
+    # direction, would be circular. Deferring it to call time sidesteps
+    # that entirely: by the time anything actually *calls* `detect_
+    # actions_since`, both modules have long finished loading.
+    # (`_bearer_headers`/`_email_consent_active`, the other two names
+    # that module imports, come from `gmail_shared.py`, not here.) --
 
     def detect_actions_since(
         self,
