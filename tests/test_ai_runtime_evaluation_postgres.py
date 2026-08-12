@@ -804,7 +804,7 @@ def test_post_evaluations_runs_concurrent_same_idempotency_key_only_evaluates_on
     run_context: dict,
 ) -> None:
     """`test_ai_runtime_runtime_postgres.py`'s identical `/ai/runs` test
-    covers the same `_held_idempotency_lock` guarantee for this endpoint's
+    covers the same `held_idempotency_lock` guarantee for this endpoint's
     sibling: two genuinely concurrent OS threads POSTing `/ai/evaluations/
     runs` with the *same* Idempotency-Key must not both reach `run_
     evaluation` and independently re-run the full labelled set. Distinct

@@ -495,7 +495,7 @@ def test_run_evaluation_concurrent_same_workspace_runs_do_not_collide(
 ) -> None:
     """Two `meeting.prep_summary` evaluation runs in the *same* workspace,
     submitted with genuine start-time overlap (different threads, no
-    shared `Idempotency-Key` -- `_held_idempotency_lock` at the HTTP layer
+    shared `Idempotency-Key` -- `held_idempotency_lock` at the HTTP layer
     only serializes requests sharing the same key, and this test calls
     `run_evaluation` directly, below that layer entirely) must not race to
     `INSERT` the same salted synthetic-meeting primary key. Before

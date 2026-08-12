@@ -2294,7 +2294,7 @@ def test_post_ai_runs_concurrent_same_idempotency_key_only_calls_the_model_once(
 ) -> None:
     """Two genuinely concurrent OS threads POSTing `/ai/runs` with the
     *same* Idempotency-Key must not both reach `execute_run` and
-    independently trigger a real model call -- `_held_idempotency_lock`'s
+    independently trigger a real model call -- `held_idempotency_lock`'s
     own docstring states this exact requirement ("two concurrent requests
     carrying the same Idempotency-Key must not both reach `execute_run`").
     A real coverage gap found during Phase 4 audit: the only existing
