@@ -1088,7 +1088,7 @@ def _extract_plain_text_body(payload: dict[str, Any]) -> str | None:
     their outgoing MIME structure the same way they control their
     headers -- the identical "single crafted message reaches an uncaught
     crash" failure class every guard in this file exists to close. Guarded
-    at the caller (`_detect_action_for_message` wraps this call in
+    at the caller (`_parse_message_body_response` wraps this call in
     `try`/`except RecursionError`), the same "guard at the point of use,
     not inside the recursive walk itself" shape as every `RecursionError`
     guard elsewhere in this module.
@@ -1181,20 +1181,15 @@ def _parse_message_body_response(get_response: httpx.Response | None) -> _BodyPa
         # `except RecursionError` above -- same deliberate resolved-empty
         # grouping, same reason.
         return _BodyParseOutcome(retriable=False)
-    # A `payload` this function got far enough to structurally parse (a
-    # 200 response, valid JSON, a dict body, a dict `payload`) that
-    # genuinely has no `text/plain` part is a fact about the message
-    # itself that will not change on retry -- Gmail message content is
-    # immutable -- unlike the non-200/malformed-JSON/missing-`payload`
-    # cases above, which stay retriable because those genuinely are
-    # transient or indicate a response this function could not make
-    # sense of, not a property of the message. Round 4 review's own
-    # finding: `detect_actions_since`'s own eligibility query (`WHERE
-    # ... body IS NULL`) has no way to tell "not yet fetched" apart from
-    # "fetched, nothing usable was there" -- treating this case as
-    # retriable would leave `body IS NULL` forever, silently
-    # re-selecting, re-fetching, and re-rejecting this message every
-    # future call indefinitely.
+    # A structurally-parsed `payload` with no `text/plain` part is
+    # resolved-empty, not retriable, for the same reason as both
+    # `RecursionError` branches above -- see `_BodyParseOutcome`'s own
+    # docstring. Round 4 review's own finding, specifically: `detect_
+    # actions_since`'s eligibility query (`WHERE ... body IS NULL`) has
+    # no way to tell "not yet fetched" apart from "fetched, nothing
+    # usable was there" -- treating this case as retriable would leave
+    # `body IS NULL` forever, silently re-selecting, re-fetching, and
+    # re-rejecting this message every future call indefinitely.
     return _BodyParseOutcome(retriable=False, text=plain_text or "")
 
 
