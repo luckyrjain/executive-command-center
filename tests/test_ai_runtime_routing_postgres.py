@@ -447,7 +447,7 @@ def test_routing_policies_seeded_row() -> None:
     ]
     assert record["constraints"]["max_input_tokens"] == 3072
     assert record["constraints"]["max_output_tokens"] == 512
-    assert record["constraints"]["per_model_call_timeout_seconds"] == 20
+    assert record["constraints"]["per_model_call_timeout_seconds"] == 30
     assert record["fallback"] == {}
     assert record["status"] == "active"
 

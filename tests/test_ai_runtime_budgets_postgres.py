@@ -309,8 +309,8 @@ def test_run_budget_from_policy_reads_the_seeded_routing_policy_row() -> None:
     seeds -- not a second hardcoded copy.
     """
     budget = RunBudget.from_policy(_seeded_policy())
-    assert budget.total_wall_clock_seconds == 60.0
-    assert budget.per_model_call_seconds == 20.0
+    assert budget.total_wall_clock_seconds == 80.0
+    assert budget.per_model_call_seconds == 30.0
     assert budget.per_tool_call_seconds == 5.0
     assert budget.max_input_tokens == 3072
     assert budget.max_output_tokens == 512
@@ -326,15 +326,6 @@ def test_run_budget_per_model_call_and_max_output_tokens_match_task_requirements
     budget = RunBudget.from_policy(_seeded_policy())
     assert budget.per_model_call_seconds == requirements.timeout_seconds
     assert budget.max_output_tokens == requirements.max_output_tokens
-
-
-def test_run_budget_per_model_call_seconds_matches_ollama_adapter_default_timeout() -> None:
-    """Cross-checks the budget's per-model-call number against
-    `ollama_client.py`'s own default timeout constant -- another place
-    this same number must not silently drift.
-    """
-    budget = RunBudget.from_policy(_seeded_policy())
-    assert budget.per_model_call_seconds == DEFAULT_PER_MODEL_CALL_TIMEOUT_SECONDS
 
 
 def test_run_budget_from_policy_falls_back_to_constraints_for_unregistered_task_type() -> None:
@@ -537,7 +528,7 @@ def test_run_guard_within_budget_stays_running() -> None:
 def test_run_guard_exceeding_total_budget_marks_degraded_never_left_running() -> None:
     clock = _FakeClock()
     guard = RunGuard(RunBudget.from_policy(_seeded_policy()), clock=clock)
-    clock.advance(61.0)
+    clock.advance(81.0)
     with pytest.raises(RunBudgetExceeded) as exc_info:
         guard.check_total_budget()
     assert guard.status == "degraded"
@@ -549,7 +540,7 @@ def test_run_guard_exceeding_total_budget_cancels_the_token() -> None:
     clock = _FakeClock()
     guard = RunGuard(RunBudget.from_policy(_seeded_policy()), clock=clock)
     token = CancellationToken()
-    clock.advance(61.0)
+    clock.advance(81.0)
     with pytest.raises(RunBudgetExceeded):
         guard.check_total_budget(token)
     assert token.is_cancelled()
@@ -563,7 +554,7 @@ def test_run_guard_degraded_run_cannot_be_completed_afterwards() -> None:
     """
     clock = _FakeClock()
     guard = RunGuard(RunBudget.from_policy(_seeded_policy()), clock=clock)
-    clock.advance(61.0)
+    clock.advance(81.0)
     with pytest.raises(RunBudgetExceeded):
         guard.check_total_budget()
     guard.complete()
@@ -760,10 +751,12 @@ def test_run_budget_meeting_prep_summary_per_model_call_seconds_diverges_from_de
     TASK_REQUIREMENTS`, phase H fix -- raised again from phase G's 32.0s
     after real CI kept clearing the timeout cleanly but missing the
     latency promotion floor) is deliberately *not* equal to `ollama_
-    client.py`'s default constant -- confirming the two task types now
-    genuinely diverge, unlike `test_run_budget_per_model_call_seconds_
-    matches_ollama_adapter_default_timeout` above (which is still correct
-    for `attention.explain_item` specifically).
+    client.py`'s default constant. `attention.explain_item` has since
+    diverged too (30.0s, migration `0077_phase4_expl_item_timeout.py`) --
+    the coincidental "matches the shared default" cross-check this task
+    type used to have was removed once that stopped being true; both
+    registered task types now genuinely diverge from the shared default,
+    each in their own direction.
     """
     with SessionFactory() as session:
         policy = air.get_policy(session, "meeting.prep_summary")
@@ -778,7 +771,7 @@ def test_run_budget_meeting_prep_summary_total_wall_clock_seconds_diverges_from_
     phase H fix) was raised in lockstep with its per-model-call timeout
     (40.0s) so a schema-repair retry still fits twice alongside routing/
     tool-dispatch/validation overhead -- deliberately *not* equal to
-    `attention.explain_item`'s 60.0s (`test_run_budget_from_policy_reads_
+    `attention.explain_item`'s 80.0s (`test_run_budget_from_policy_reads_
     the_seeded_routing_policy_row` above), confirming the two task types'
     total budgets now genuinely diverge too, not just their per-call ones.
     """
