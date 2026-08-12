@@ -29,6 +29,13 @@ class Settings(BaseSettings):
     # ValidationError until this constraint was removed.
     session_secret: str = Field(default="", validation_alias="ECC_SESSION_SECRET")
     cors_origins: str = Field(default="http://localhost:5173", validation_alias="ECC_CORS_ORIGINS")
+    # The single canonical frontend origin a browser-facing redirect (e.g.
+    # the Gmail OAuth completion step, `gmail_oauth.py`) should send the
+    # user back to. Deliberately its own setting, not a reuse of
+    # `cors_origins` -- that field is a comma-separated allow-list for CORS
+    # validation and may legitimately hold more than one origin in a real
+    # deployment, which would make it ambiguous which one to redirect to.
+    frontend_url: str = Field(default="http://localhost:5173", validation_alias="ECC_FRONTEND_URL")
     metrics_token: str = Field(default="", validation_alias="ECC_METRICS_TOKEN")
     # Number of trusted reverse proxies/load balancers in front of this app
     # (e.g. 1 for a single nginx/ALB hop). 0 (the default) means "not behind
@@ -244,6 +251,7 @@ def validate_production_settings(settings: Settings) -> None:
 
     _validate_session_secret(settings.session_secret)
     _validate_cors_origins(settings.cors_origin_list)
+    _validate_frontend_url(settings.frontend_url)
     _validate_connector_token_encryption_key(settings.connector_token_encryption_key)
     _validate_personal_data_encryption_key(settings.personal_data_encryption_key)
 
@@ -276,6 +284,22 @@ def _validate_cors_origins(origins: list[str]) -> None:
             raise ConfigurationError(
                 f"ECC_CORS_ORIGINS entry {origin!r} must use https:// outside development."
             )
+
+
+def _validate_frontend_url(url: str) -> None:
+    """Left unvalidated outside development, `frontend_url`'s permissive
+    `http://localhost:5173` default (correct for local dev) would silently
+    keep being used in a real deployment that forgot to set
+    `ECC_FRONTEND_URL` -- `gmail_oauth.py`'s OAuth-completion redirect
+    would then send every real user to a URL that only resolves on a
+    developer's own machine, with no startup failure to catch it. Same
+    https-required shape as `_validate_cors_origins`, applied to a single
+    canonical value instead of a list.
+    """
+    if not url:
+        raise ConfigurationError("ECC_FRONTEND_URL must not be empty outside development.")
+    if not url.startswith("https://"):
+        raise ConfigurationError("ECC_FRONTEND_URL must use https:// outside development.")
 
 
 def _validate_connector_token_encryption_key(key: str) -> None:

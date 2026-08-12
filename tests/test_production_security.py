@@ -84,6 +84,7 @@ def _settings(**overrides: object) -> Settings:
         "database_url": "postgresql+psycopg://ecc:ecc@localhost:5432/ecc",
         "session_secret": VALID_PROD_SECRET,
         "cors_origins": "https://app.example.com",
+        "frontend_url": "https://app.example.com",
         "connector_token_encryption_key": VALID_CONNECTOR_TOKEN_KEY,
         "personal_data_encryption_key": VALID_PERSONAL_DATA_KEY,
     }
@@ -188,6 +189,38 @@ def test_rejects_empty_cors_origins_in_production() -> None:
 
 def test_rejects_mixed_wildcard_and_valid_cors_origins_in_production() -> None:
     settings = _settings(cors_origins="https://app.example.com,*")
+
+    with pytest.raises(ConfigurationError):
+        validate_production_settings(settings)
+
+
+# ---------------------------------------------------------------------------
+# validate_production_settings: frontend_url
+# ---------------------------------------------------------------------------
+
+
+def test_rejects_empty_frontend_url_in_production() -> None:
+    settings = _settings(frontend_url="")
+
+    with pytest.raises(ConfigurationError):
+        validate_production_settings(settings)
+
+
+def test_rejects_http_scheme_frontend_url_in_production() -> None:
+    settings = _settings(frontend_url="http://app.example.com")
+
+    with pytest.raises(ConfigurationError):
+        validate_production_settings(settings)
+
+
+def test_rejects_default_localhost_frontend_url_in_production() -> None:
+    """The unset-in-.env case: `frontend_url`'s pydantic default
+    (`http://localhost:5173`, correct for local dev) must not silently
+    pass production validation just because a value happens to be
+    present -- it fails the same http:// check as any other misconfigured
+    value, not a distinct "still the default" check.
+    """
+    settings = _settings(frontend_url="http://localhost:5173")
 
     with pytest.raises(ConfigurationError):
         validate_production_settings(settings)
@@ -311,6 +344,7 @@ def _reload_main(monkeypatch: pytest.MonkeyPatch, environment: str | None) -> Mo
         monkeypatch.setenv("ECC_ENV", environment)
     monkeypatch.setenv("ECC_SESSION_SECRET", VALID_PROD_SECRET)
     monkeypatch.setenv("ECC_CORS_ORIGINS", "https://app.example.com")
+    monkeypatch.setenv("ECC_FRONTEND_URL", "https://app.example.com")
     monkeypatch.setenv("ECC_CONNECTOR_TOKEN_ENCRYPTION_KEY", VALID_CONNECTOR_TOKEN_KEY)
     monkeypatch.setenv("ECC_PERSONAL_DATA_ENCRYPTION_KEY", VALID_PERSONAL_DATA_KEY)
     config_module.get_settings.cache_clear()
@@ -329,6 +363,7 @@ def restore_main_module() -> Iterator[None]:
     restore_vars = (
         "ECC_ENV",
         "ECC_CORS_ORIGINS",
+        "ECC_FRONTEND_URL",
         "ECC_SESSION_SECRET",
         "ECC_CONNECTOR_TOKEN_ENCRYPTION_KEY",
         "ECC_PERSONAL_DATA_ENCRYPTION_KEY",

@@ -103,7 +103,16 @@ function stubFetch(handlers: {
 beforeEach(() => {
   document.cookie = 'ecc_csrf=gmail-panel-token; Secure; SameSite=Strict'
   vi.stubGlobal('crypto', { randomUUID: vi.fn(() => 'gmail-panel-request-id') })
-  Object.defineProperty(window, 'location', { value: { ...window.location, href: '' }, writable: true })
+  // `search`/`pathname` reset explicitly (not just `href`), not merely
+  // spread-preserved -- otherwise a test that overrides `search` (the
+  // OAuth-return-banner tests below) leaks that value into every
+  // following test via this same spread, since `Object.defineProperty`
+  // mutates the real `window` global and nothing else in this file resets
+  // it between tests.
+  Object.defineProperty(window, 'location', {
+    value: { ...window.location, href: '', search: '', pathname: '/' },
+    writable: true,
+  })
 })
 afterEach(() => { cleanup(); vi.unstubAllGlobals() })
 
@@ -136,6 +145,46 @@ describe('GmailPanel', () => {
     renderPanel()
     fireEvent.click(await screen.findByRole('button', { name: 'Connect Gmail' }))
     expect(await screen.findByText(/not on the internal allowlist/)).toBeTruthy()
+  })
+
+  it('shows a connected banner when returning from the real oauth/complete redirect, and clears the query params', async () => {
+    Object.defineProperty(window, 'location', {
+      value: { ...window.location, href: '', search: '?gmail=connected', pathname: '/' },
+      writable: true,
+    })
+    const replaceStateSpy = vi.spyOn(window.history, 'replaceState')
+    stubFetch({ domains: [domain()], connectors: [] })
+    renderPanel()
+
+    expect(await screen.findByText('Google account connected.')).toBeTruthy()
+    await waitFor(() => expect(replaceStateSpy).toHaveBeenCalled())
+    const clearedUrl = String(replaceStateSpy.mock.calls[0]?.[2])
+    expect(clearedUrl).not.toContain('gmail=')
+  })
+
+  it('shows a readable error banner when returning from a failed oauth/complete redirect', async () => {
+    Object.defineProperty(window, 'location', {
+      value: {
+        ...window.location,
+        href: '',
+        search: '?gmail=error&code=GMAIL_OAUTH_STATE_INVALID',
+        pathname: '/',
+      },
+      writable: true,
+    })
+    stubFetch({ domains: [], connectors: [] })
+    renderPanel()
+
+    expect(await screen.findByText('This Gmail sign-in link expired or was already used. Start again.')).toBeTruthy()
+  })
+
+  it('shows no OAuth-return banner on an ordinary page load with no gmail query param', async () => {
+    stubFetch({ domains: [domain()], connectors: [] })
+    renderPanel()
+
+    expect(await screen.findByRole('button', { name: 'Connect Gmail' })).toBeTruthy()
+    expect(screen.queryByText('Google account connected.')).toBeNull()
+    expect(screen.queryByText(/This Gmail sign-in link expired/)).toBeNull()
   })
 
   it('shows connector status, last-sync time, and a working sync action for a connected account', async () => {

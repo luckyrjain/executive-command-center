@@ -35,6 +35,7 @@ export function personalErrorMessage(error: unknown): string {
   if (error.code === 'GMAIL_ACCOUNT_NOT_ALLOWLISTED') return 'This Google account is not on the internal allowlist for Gmail access.'
   if (error.code === 'GMAIL_OAUTH_NOT_CONFIGURED') return 'Gmail OAuth is not configured for this deployment.'
   if (error.code === 'GMAIL_OAUTH_STATE_INVALID') return 'This Gmail sign-in link expired or was already used. Start again.'
+  if (error.code === 'GMAIL_OAUTH_DENIED') return 'Google sign-in was cancelled. Click Connect Gmail to try again.'
   if (error.code === 'GMAIL_OAUTH_FAILED') return 'Google rejected this sign-in attempt. Try again.'
   if (error.code === 'GMAIL_DISABLE_REQUIRES_DOMAIN_ENDPOINT') return 'Use the email domain\'s disable action to disconnect Gmail, not the generic connector action.'
   if (error.code === 'CONNECTOR_NOT_FOUND') return 'This connector no longer exists in this workspace.'
