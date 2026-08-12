@@ -2153,7 +2153,7 @@ class GmailAdapter:
             # it -- a single running counter, not a baseline plus a
             # separate this-call's-own-progress counter summed at each of
             # the three return sites that report it.
-            already_skipped_this_record = 0
+            record_stuck_offset = 0
             for entry in history_entries:
                 if not isinstance(entry, dict):
                     continue
@@ -2177,11 +2177,11 @@ class GmailAdapter:
                 # own module-level comment for why a record's own
                 # `id` is unique/strictly-increasing enough per call to
                 # match at most once. Every *other* record's `record_
-                # message_ids` is untouched (`already_skipped_this_record`
+                # message_ids` is untouched (`record_stuck_offset`
                 # stays `0`), identical to round 12's own behavior.
-                already_skipped_this_record = 0
+                record_stuck_offset = 0
                 if record_history_id is not None and record_history_id == pending_stuck_record_id:
-                    already_skipped_this_record = pending_skip_count
+                    record_stuck_offset = pending_skip_count
                     record_message_ids = record_message_ids[pending_skip_count:]
 
                 record_fully_processed = True
@@ -2205,7 +2205,7 @@ class GmailAdapter:
                         # `resumable_history_id` closes the *inter*-record
                         # instance of this gap: a subsequent call resumes
                         # past every record this call *did* finish. Round
-                        # 13: `already_skipped_this_record`, reported via
+                        # 13: `record_stuck_offset`, reported via
                         # `cursor.with_progress` at every return site
                         # below, closes the *intra*-record instance --
                         # without them, a single record whose own message
@@ -2232,9 +2232,7 @@ class GmailAdapter:
                                 items_processed=items_processed,
                                 status="partial",
                                 next_cursor=str(
-                                    cursor.with_progress(
-                                        record_history_id, already_skipped_this_record
-                                    )
+                                    cursor.with_progress(record_history_id, record_stuck_offset)
                                 ),
                                 error_summary="email domain consent was revoked mid-sync",
                             )
@@ -2254,7 +2252,7 @@ class GmailAdapter:
                             items_processed=items_processed,
                             status="partial",
                             next_cursor=str(
-                                cursor.with_progress(record_history_id, already_skipped_this_record)
+                                cursor.with_progress(record_history_id, record_stuck_offset)
                             ),
                             error_summary=_RATE_LIMIT_ERROR_SUMMARY,
                         )
@@ -2281,7 +2279,7 @@ class GmailAdapter:
                         now=now,
                     )
                     items_processed += 1
-                    already_skipped_this_record += 1
+                    record_stuck_offset += 1
 
                 if budget_exhausted:
                     break
@@ -2334,7 +2332,7 @@ class GmailAdapter:
         # `with_resumed_through` above and needs no further mid-record
         # skip point layered on top of it (and the exact same in-scope
         # local variables Python's own function-level -- not block-level
-        # -- scoping keeps `already_skipped_this_record` live from the
+        # -- scoping keeps `record_stuck_offset` live from the
         # `for` loop above) rather than needing a second, separately-
         # tracked piece of state for this one site.
         return SyncOutcome(
@@ -2342,7 +2340,7 @@ class GmailAdapter:
             items_processed=items_processed,
             status="partial",
             next_cursor=str(
-                cursor.with_progress(record_history_id, already_skipped_this_record)
+                cursor.with_progress(record_history_id, record_stuck_offset)
                 if budget_exhausted
                 else cursor
             ),

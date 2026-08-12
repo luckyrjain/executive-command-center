@@ -3182,32 +3182,32 @@ def _cursor_fields(cursor: GmailHistoryCursor) -> tuple[str, int | None, int]:
     return cursor.list_start_history_id, cursor.stuck_record_id, cursor.stuck_offset
 
 
-def test_parse_history_cursor_returns_the_plain_no_skip_case_for_a_bare_historyid() -> None:
+def test_history_cursor_from_str_returns_the_plain_no_skip_case_for_a_bare_historyid() -> None:
     assert _cursor_fields(GmailHistoryCursor.from_str("12345")) == ("12345", None, 0)
 
 
-def test_parse_history_cursor_parses_a_well_formed_compound_cursor() -> None:
+def test_history_cursor_from_str_parses_a_well_formed_compound_cursor() -> None:
     assert _cursor_fields(GmailHistoryCursor.from_str("100:101:2")) == ("100", 101, 2)
 
 
-def test_parse_history_cursor_degrades_wrong_field_count_to_a_plain_cursor() -> None:
+def test_history_cursor_from_str_degrades_wrong_field_count_to_a_plain_cursor() -> None:
     assert _cursor_fields(GmailHistoryCursor.from_str("100:101")) == ("100:101", None, 0)
     assert _cursor_fields(GmailHistoryCursor.from_str("100:101:2:3")) == ("100:101:2:3", None, 0)
 
 
-def test_parse_history_cursor_degrades_a_non_integer_record_id_to_a_plain_cursor() -> None:
+def test_history_cursor_from_str_degrades_a_non_integer_record_id_to_a_plain_cursor() -> None:
     assert _cursor_fields(GmailHistoryCursor.from_str("100:abc:2")) == ("100:abc:2", None, 0)
 
 
-def test_parse_history_cursor_degrades_a_non_integer_skip_count_to_a_plain_cursor() -> None:
+def test_history_cursor_from_str_degrades_a_non_integer_skip_count_to_a_plain_cursor() -> None:
     assert _cursor_fields(GmailHistoryCursor.from_str("100:101:xyz")) == ("100:101:xyz", None, 0)
 
 
-def test_parse_history_cursor_degrades_a_negative_skip_count_to_a_plain_cursor() -> None:
+def test_history_cursor_from_str_degrades_a_negative_skip_count_to_a_plain_cursor() -> None:
     assert _cursor_fields(GmailHistoryCursor.from_str("100:101:-2")) == ("100:101:-2", None, 0)
 
 
-def test_parse_history_cursor_degrades_a_negative_record_id_to_a_plain_cursor() -> None:
+def test_history_cursor_from_str_degrades_a_negative_record_id_to_a_plain_cursor() -> None:
     """Round 14 review: previously returned `("100", -5, 3)` -- a live
     (if never Gmail-reachable) `record_id`/`skip_count` pair, not the
     documented plain-cursor fallback -- see this section's own module-level
