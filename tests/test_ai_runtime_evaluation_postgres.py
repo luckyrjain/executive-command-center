@@ -129,28 +129,29 @@ def test_check_promotion_floors_fails_on_any_prohibited_fact() -> None:
 
 
 def test_check_promotion_floors_fails_on_latency_at_or_above_ceiling() -> None:
-    assert check_promotion_floors(_run(_metrics(latency_p95_seconds=20.0))) is False
     assert check_promotion_floors(_run(_metrics(latency_p95_seconds=25.0))) is False
+    assert check_promotion_floors(_run(_metrics(latency_p95_seconds=30.0))) is False
 
 
 def test_check_promotion_floors_passes_at_latency_just_under_ceiling() -> None:
-    assert check_promotion_floors(_run(_metrics(latency_p95_seconds=19.999))) is True
+    assert check_promotion_floors(_run(_metrics(latency_p95_seconds=24.999))) is True
 
 
 def test_check_promotion_floors_latency_ceiling_is_task_type_specific() -> None:
     """`meeting.prep_summary`'s own declared floor is 35s today
     (`EVALUATION-CONTRACT.md`'s table, raised from 25s in phase H -- see
     `test_check_promotion_floors_meeting_prep_summary_fails_at_or_above_
-    its_own_ceiling` below), not `attention.explain_item`'s tighter 20s --
+    its_own_ceiling` below), not `attention.explain_item`'s tighter 25s
+    (raised from 20s by migration `0077_phase4_expl_item_timeout.py`) --
     Phase 4 post-launch audit, phase G, fixing a real bug where
     `check_promotion_floors` held a single flat 20.0s ceiling regardless of
     `evaluation_run.task_type`, silently making meeting.prep_summary's
     documented floor unreachable. A latency between the two ceilings
-    (22.0s) must pass for `meeting.prep_summary` and fail for `attention.
+    (30.0s) must pass for `meeting.prep_summary` and fail for `attention.
     explain_item` -- proving the ceiling genuinely varies by task type, not
     just that both happen to reject some shared value.
     """
-    metrics = _metrics(latency_p95_seconds=22.0)
+    metrics = _metrics(latency_p95_seconds=30.0)
     assert check_promotion_floors(_run(metrics, task_type="meeting.prep_summary")) is True
     assert check_promotion_floors(_run(metrics, task_type="attention.explain_item")) is False
 
@@ -180,10 +181,12 @@ def test_check_promotion_floors_unregistered_task_type_falls_back_to_strictest_c
     not happen against real registered task types, but this is a pure
     function with no guarantee its caller only ever passes one of the two
     known types) fails safe -- held to the strictest defined ceiling
-    (20.0s) rather than silently admitting unbounded latency.
+    (25.0s, `attention.explain_item`'s own, raised from 20.0s by migration
+    `0077_phase4_expl_item_timeout.py`) rather than silently admitting
+    unbounded latency.
     """
     assert (
-        check_promotion_floors(_run(_metrics(latency_p95_seconds=22.0), task_type="unknown.task"))
+        check_promotion_floors(_run(_metrics(latency_p95_seconds=26.0), task_type="unknown.task"))
         is False
     )
 
@@ -804,7 +807,7 @@ def test_post_evaluations_runs_concurrent_same_idempotency_key_only_evaluates_on
     run_context: dict,
 ) -> None:
     """`test_ai_runtime_runtime_postgres.py`'s identical `/ai/runs` test
-    covers the same `_held_idempotency_lock` guarantee for this endpoint's
+    covers the same `held_idempotency_lock` guarantee for this endpoint's
     sibling: two genuinely concurrent OS threads POSTing `/ai/evaluations/
     runs` with the *same* Idempotency-Key must not both reach `run_
     evaluation` and independently re-run the full labelled set. Distinct

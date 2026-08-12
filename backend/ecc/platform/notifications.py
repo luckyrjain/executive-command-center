@@ -109,7 +109,7 @@ def list_notifications_endpoint(
 ) -> NotificationListResponse:
     """Always scoped to the caller's own `account_id` -- there is no
     `owner`/`admin` "see everyone's notifications" broadening here, unlike
-    `authz.list_grants_endpoint`/`delegations.list_delegations_endpoint`'s
+    `authz_grants.list_grants_endpoint`/`delegations.list_delegations_endpoint`'s
     own oversight carve-out: a notification is inherently addressed to one
     account, not a workspace resource an administrator oversees.
     """

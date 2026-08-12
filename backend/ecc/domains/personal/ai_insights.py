@@ -50,8 +50,6 @@ record id plus every source domain key), not lost by this column's own
 single-value shape.
 """
 
-from collections.abc import Iterator
-from contextlib import contextmanager
 from datetime import UTC, datetime
 from json import dumps
 from typing import Any
@@ -65,8 +63,7 @@ from sqlalchemy.orm import Session
 
 from ecc.auth import AuthContext, AuthDep, CsrfDep
 from ecc.config import get_settings
-from ecc.database import lock_engine
-from ecc.domains.ai_runtime.runtime import OllamaAdapterDep, execute_run
+from ecc.domains.ai_runtime.runtime import OllamaAdapterDep, execute_run, held_idempotency_lock
 
 from .domains import (
     DomainKey,
@@ -80,34 +77,6 @@ from .domains import (
 from .habits import InsightResponse
 
 router = APIRouter(prefix="/api/v1/personal", tags=["personal"])
-
-
-@contextmanager
-def _held_idempotency_lock(auth: AuthContext, key: str) -> Iterator[None]:
-    """Session-scoped `pg_advisory_lock`, held on its own dedicated
-    connection for this context manager's entire duration -- mirrors
-    `ai_runtime/runtime.py`'s/`ai_runtime/evaluation.py`'s identical
-    helper, for the identical reason: `execute_run` commits partway
-    through (`_persist_terminal`'s own docstring), so `domains.py:lock_
-    idempotency`'s transaction-scoped `pg_advisory_xact_lock` would
-    release the instant that first inner commit happens, long before the
-    model call this whole request is trying to serialize actually
-    finishes. Uses `lock_engine` (`NullPool`, no `statement_timeout`), not
-    the main `engine`, matching those two modules' own identical
-    rationale.
-    """
-    lock_key = f"{auth.workspace_id}:{auth.user_id}:{key}"
-    with lock_engine.connect().execution_options(isolation_level="AUTOCOMMIT") as connection:
-        connection.execute(
-            text("SELECT pg_advisory_lock(hashtextextended(:lock_key, 0))"), {"lock_key": lock_key}
-        )
-        try:
-            yield
-        finally:
-            connection.execute(
-                text("SELECT pg_advisory_unlock(hashtextextended(:lock_key, 0))"),
-                {"lock_key": lock_key},
-            )
 
 
 class InsightGenerateRequest(BaseModel):
@@ -174,7 +143,7 @@ def generate_insight_endpoint(
     internal commit runs (`_persist_terminal`'s docstring) -- confirmed by
     a real `sqlalchemy.exc.InvalidRequestError: Can't operate on closed
     transaction` this endpoint's own first draft hit in CI, not a
-    hypothetical. `_held_idempotency_lock` (session-scoped, not tied to
+    hypothetical. `held_idempotency_lock` (session-scoped, not tied to
     any one transaction) is what actually serializes two concurrent
     requests sharing the same Idempotency-Key across the whole body,
     including the model call.
@@ -182,7 +151,7 @@ def generate_insight_endpoint(
     req_hash = request_hash(payload, "generate_insight")
     now = datetime.now(UTC)
 
-    with _held_idempotency_lock(auth, idempotency_key):
+    with held_idempotency_lock(auth, idempotency_key):
         with session.begin():
             cached = load_cached(
                 session, auth, idempotency_key, req_hash, domain="personal_insight"

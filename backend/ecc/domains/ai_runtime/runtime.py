@@ -2128,7 +2128,7 @@ def _request_hash(payload: BaseModel, action: str) -> str:
 
 
 @contextmanager
-def _held_idempotency_lock(auth: AuthContext, key: str) -> Iterator[None]:
+def held_idempotency_lock(auth: AuthContext, key: str) -> Iterator[None]:
     """A session-scoped `pg_advisory_lock`, held on its own dedicated
     connection for this context manager's entire duration -- unlike
     `pg_advisory_xact_lock`, this is not released early by `execute_run`'s
@@ -2146,6 +2146,18 @@ def _held_idempotency_lock(auth: AuthContext, key: str) -> Iterator[None]:
     `execute_run` does not have that property (it is also called directly,
     session-less-transaction-wise, from tests and from `evaluation.py`'s
     per-example loop), so this endpoint cannot rely on it either.
+
+    Not underscore-prefixed: an architecture-review deepening found this
+    exact lock hand-duplicated in `evaluation.py` and `personal/ai_
+    insights.py` (both citing this function's own rationale as their
+    justification, verbatim), plus `attention/meeting_prep.py` already
+    importing this module's copy directly -- consolidated here as the one
+    canonical implementation all four call sites share, matching this
+    codebase's own convention for a helper with 2+ cross-module callers
+    (`gmail_adapter.py:fetch_and_store_body`'s identical reasoning). The
+    lock semantics above are domain-agnostic (keyed on `workspace_id`/
+    `user_id`/an opaque `key`) -- nothing here is specific to an AI run,
+    only every current caller happens to be one.
 
     Uses `ecc.database.lock_engine` (`NullPool`, no `statement_timeout`),
     not the app's main `engine` -- this lock can be held for tens of
@@ -2252,7 +2264,7 @@ def create_run(
     check) -- rather than surfacing a nonexistent/cross-workspace id as a
     200 "failed run" body.
 
-    The entire body below runs inside `_held_idempotency_lock` (see its
+    The entire body below runs inside `held_idempotency_lock` (see its
     own docstring): a concurrent duplicate request with the same
     Idempotency-Key blocks until this one finishes and stores its
     response, then finds it cached, rather than independently reaching
@@ -2261,7 +2273,7 @@ def create_run(
     authz.require_role_action(session, auth, "write")
     request_hash = _request_hash(payload, "create_run")
     now = datetime.now(UTC)
-    with _held_idempotency_lock(auth, idempotency_key):
+    with held_idempotency_lock(auth, idempotency_key):
         with session.begin():
             cached = _load_cached(session, auth, idempotency_key, request_hash)
         if cached is not None:
@@ -2304,7 +2316,7 @@ def create_run(
             # failure won't find a cached response and will re-invoke
             # `execute_run`, a second real model call -- but that requires
             # this exact statement to fail specifically (a DB blip, not a
-            # concurrent request; `_held_idempotency_lock` above already
+            # concurrent request; `held_idempotency_lock` above already
             # fully serializes those), a narrower window than discarding
             # a response the caller already has.
             record_database_failure("/api/v1/ai/runs")

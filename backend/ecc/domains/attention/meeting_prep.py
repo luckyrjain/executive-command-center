@@ -62,9 +62,9 @@ from ecc.config import get_settings
 from ecc.database import get_session
 from ecc.domains.ai_runtime.ollama_client import OllamaAdapter
 from ecc.domains.ai_runtime.runtime import (
-    _held_idempotency_lock,
     execute_run,
     get_ollama_adapter,
+    held_idempotency_lock,
 )
 from ecc.observability import (
     queue_lifecycle_event,
@@ -1393,7 +1393,7 @@ def create_prep(
     operate on closed transaction`). So only this path pays for splitting
     the body into several short transactions with `_compute_enrichment`
     called bare between them, exactly like `ai_runtime/runtime.py:
-    create_run`'s own three-phase shape, with `_held_idempotency_lock`
+    create_run`'s own three-phase shape, with `held_idempotency_lock`
     (a session-scoped lock, not tied to any one transaction) as what
     keeps two concurrent requests carrying the same Idempotency-Key from
     both reaching `execute_run` and each triggering a real model call.
@@ -1496,7 +1496,7 @@ def create_prep(
             enrichment = EnrichmentOut(available=False, summary=None, error_code="feature_disabled")
             return _insert_pack(generated, enrichment)
 
-    with _held_idempotency_lock(auth, idempotency_key):
+    with held_idempotency_lock(auth, idempotency_key):
         with session.begin():
             cached = _load_cached(session, auth, idempotency_key, request_hash)
         if cached is not None:
@@ -1730,7 +1730,7 @@ def refresh_prep(
                 raise
             raise HTTPException(status_code=409, detail="MEETING_PACK_EXISTS") from exc
 
-    with _held_idempotency_lock(auth, idempotency_key):
+    with held_idempotency_lock(auth, idempotency_key):
         with session.begin():
             cached = _load_cached(session, auth, idempotency_key, request_hash)
         if cached is not None:

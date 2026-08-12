@@ -206,8 +206,9 @@ def test_eligibility_step5_half_open_is_not_excluded() -> None:
 def test_eligibility_step6_latency_excludes_over_budget_candidate() -> None:
     """Step 6: rolling observed p95 latency must fit within the task's
     declared timeout minus the fixed 500ms overhead reserve. The seeded
-    `attention.explain_item` timeout is 20s, so 19.6s observed p95 exceeds
-    the 19.5s effective budget.
+    `attention.explain_item` timeout is 30s (raised from 20s by migration
+    `0077_phase4_expl_item_timeout.py`), so 29.6s observed p95 exceeds
+    the 29.5s effective budget.
     """
     candidate = _model()
     decision = air.route(
@@ -216,7 +217,7 @@ def test_eligibility_step6_latency_excludes_over_budget_candidate() -> None:
         _ctx(),
         candidates=[candidate],
         candidate_states={
-            candidate.model_id: air.CandidateState(observed_p95_latency_seconds=19.6)
+            candidate.model_id: air.CandidateState(observed_p95_latency_seconds=29.6)
         },
     )
     assert isinstance(decision, air.NoEligibleCandidate)
@@ -446,7 +447,7 @@ def test_routing_policies_seeded_row() -> None:
     ]
     assert record["constraints"]["max_input_tokens"] == 3072
     assert record["constraints"]["max_output_tokens"] == 512
-    assert record["constraints"]["per_model_call_timeout_seconds"] == 20
+    assert record["constraints"]["per_model_call_timeout_seconds"] == 30
     assert record["fallback"] == {}
     assert record["status"] == "active"
 

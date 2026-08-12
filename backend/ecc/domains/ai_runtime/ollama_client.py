@@ -46,13 +46,15 @@ from .budgets import CancellationToken
 DEFAULT_OLLAMA_HOST = "http://127.0.0.1:11434"
 
 # design doc Decision 5's budget table default: "Per-model-call timeout |
-# 20s" -- `attention.explain_item`'s own declared timeout
-# (`router.py:TASK_REQUIREMENTS`) and `generate()`'s fallback when no
-# per-call `timeout_seconds` override is given. Individual task types can
-# declare a different value (`meeting.prep_summary`'s own, larger prompts
-# need more decode time -- see that entry's own comment) and get it
-# genuinely enforced via `generate(timeout_seconds=...)`, not just this
-# constant.
+# 20s" -- `generate()`'s fallback when no per-call `timeout_seconds`
+# override is given, not any one task's real declared timeout today (every
+# real call path, `runtime.py:execute_run`, always passes an explicit
+# override -- see that override's own docstring below). Individual task
+# types can declare a different value (`router.py:TASK_REQUIREMENTS`;
+# `attention.explain_item` and `meeting.prep_summary` have each since
+# diverged from this original shared default in their own direction) and
+# get it genuinely enforced via `generate(timeout_seconds=...)`, not just
+# this constant.
 DEFAULT_PER_MODEL_CALL_TIMEOUT_SECONDS = 20.0
 
 # The underlying `httpx` client's own request-timeout, bounding a single
@@ -65,7 +67,7 @@ DEFAULT_PER_MODEL_CALL_TIMEOUT_SECONDS = 20.0
 # its source -- so this value cannot vary per call the way the manual
 # wall-clock deadline below can. It must stay a fixed ceiling comfortably
 # above every currently-registered task's own declared timeout (`router.py:
-# TASK_REQUIREMENTS` -- 20s/40s today) so a longer-than-`DEFAULT_PER_MODEL_
+# TASK_REQUIREMENTS` -- 30s/40s today) so a longer-than-`DEFAULT_PER_MODEL_
 # CALL_TIMEOUT_SECONDS` per-call override (`meeting.prep_summary`'s 40s) is
 # never silently cut short here first.
 #
