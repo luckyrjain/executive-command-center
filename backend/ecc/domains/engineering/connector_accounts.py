@@ -34,8 +34,9 @@ function's own best-effort `getattr(adapter, "detect_actions_since",
 None)` hook after phase 3 -- does its own additional live Gmail-plus-
 Ollama round trip per candidate message, sequentially, still inside this
 same synchronous request. `detect_actions_since`'s own `_MAX_ACTION_
-DETECTIONS_PER_CALL` bound (`gmail_adapter.py`, deliberately much smaller
-than `backfill`/`incremental_sync`'s own `_MAX_MESSAGES_PER_CALL`) caps
+DETECTIONS_PER_CALL` bound (`gmail_action_detection.py`, deliberately
+much smaller than `backfill`/`incremental_sync`'s own `_MAX_MESSAGES_
+PER_CALL` in `gmail_adapter.py`) caps
 how bad this gets per call, but does not make the hook itself durable or
 non-blocking -- found by Loop 2 round 2 review; feature-flagged off by
 default, and moving this hook to `ecc.domains.automation.worker`'s own

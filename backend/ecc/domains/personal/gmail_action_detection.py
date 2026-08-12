@@ -25,7 +25,6 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from hashlib import sha256
-from typing import TYPE_CHECKING
 from uuid import UUID, uuid4
 
 from sqlalchemy import text
@@ -40,21 +39,20 @@ from ecc.domains.engineering.connectors import ConnectorAccountContext
 from ecc.domains.governance.recommendation_models import RecommendationCreate
 from ecc.domains.governance.recommendation_mutations import create_recommendation, synthetic_request
 
+# A plain, real (not TYPE_CHECKING-guarded) import -- no cycle to avoid
+# here. `gmail_adapter.py` never imports this module at ITS OWN top
+# level (only from inside `detect_actions_since`'s method body, deferred
+# to call time -- see that method's own comment for why); `gmail_
+# threads.py` already imports `_bearer_headers`/`_email_consent_active`
+# from `gmail_adapter.py` the same plain way, with no cycle either, for
+# the identical reason.
 from .gmail_adapter import (
+    GmailAdapter,
     _bearer_headers,
     _email_consent_active,
     _owner_id_for_account,
     _resolve_or_create_person,
 )
-
-if TYPE_CHECKING:
-    # Only for the `adapter: GmailAdapter` type hints below -- `from
-    # __future__ import annotations` (above) means this name is never
-    # evaluated at runtime, so this import doesn't have to be real. It
-    # can't be: `GmailAdapter.detect_actions_since` imports *this* module
-    # from inside its own method body specifically to avoid the reverse
-    # of this same cycle (see that method's own comment for why).
-    from .gmail_adapter import GmailAdapter
 
 # Task 5's own, much smaller bound -- deliberately not `_MAX_MESSAGES_PER_
 # CALL`. `connector_accounts.py`'s own module docstring justifies its

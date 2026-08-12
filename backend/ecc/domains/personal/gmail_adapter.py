@@ -2719,10 +2719,7 @@ class GmailAdapter:
     # (an architecture-review deepening: the actual logic, and its
     # detection-exclusive helpers, live there now) -- kept as a real,
     # non-deleted method, not a free function callers reach for
-    # directly, because `connector_accounts.py`'s own dispatch is
-    # duck-typed (`getattr(adapter, "detect_actions_since", None)`),
-    # not a typed Protocol member: deleting this method would silently
-    # stop action detection in production with no error anywhere.
+    # directly; see that module's own docstring for why.
     #
     # Imported inside the method body, not at this module's own top
     # level, because `gmail_action_detection.py` itself imports several
