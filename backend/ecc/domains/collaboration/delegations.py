@@ -146,26 +146,13 @@ def _account_id_for(session: Session, *, workspace_id: UUID, users_id: UUID) -> 
     that expectation into a hard failure rather than silently propagating
     `None` (candidate 6's dedup: this used to be its own private copy of
     `authz.account_id_for`'s query, see that function's own docstring).
+    `ecc.platform.notifications` carries an identical wrapper -- the same
+    per-module-duplication convention `_notify_member` above follows, not
+    an oversight.
     """
     account_id = authz.account_id_for(session, workspace_id=workspace_id, users_id=users_id)
     assert account_id is not None  # an authenticated caller's own users row always exists
     return account_id
-
-
-def _users_id_for_account(session: Session, *, workspace_id: UUID, account_id: UUID) -> UUID:
-    """Thin, raising wrapper around `authz.users_id_for_account` (`_account_
-    id_for`'s own inverse). `resource_grants.granted_by` FKs to `users.
-    (workspace_id, id)`, not `accounts.id`, so `_grant_evidence` (called
-    from `accept_delegation_endpoint`, where `auth.user_id` is the
-    *recipient's* own `users_id`, not the delegator's) needs this to stamp
-    `granted_by` as the delegator -- the party who actually decided this
-    evidence should be shared -- rather than the recipient granting
-    themselves access, which `revoke_grant_endpoint`'s "the original
-    granter may always revoke" rule would then misattribute.
-    """
-    users_id = authz.users_id_for_account(session, workspace_id=workspace_id, account_id=account_id)
-    assert users_id is not None  # active membership implies a users row exists
-    return users_id
 
 
 def _request_hash(action: str, payload: BaseModel | None = None) -> str:
@@ -836,9 +823,18 @@ def accept_delegation_endpoint(
         if updated is None:
             raise HTTPException(status_code=409, detail="DELEGATION_NOT_PROPOSED")
 
-        delegator_users_id = _users_id_for_account(
+        # `resource_grants.granted_by` FKs to `users.(workspace_id, id)`,
+        # not `accounts.id`, so `_grant_evidence` below (called here, where
+        # `auth.user_id` is the *recipient's* own `users_id`, not the
+        # delegator's) needs this to stamp `granted_by` as the delegator --
+        # the party who actually decided this evidence should be shared --
+        # rather than the recipient granting themselves access, which
+        # `revoke_grant_endpoint`'s "the original granter may always
+        # revoke" rule would then misattribute.
+        delegator_users_id = authz.users_id_for_account(
             session, workspace_id=auth.workspace_id, account_id=row["delegator_account_id"]
         )
+        assert delegator_users_id is not None  # active membership implies a users row exists
         _grant_evidence(
             session,
             workspace_id=auth.workspace_id,

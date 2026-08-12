@@ -74,15 +74,25 @@ call-graph mismatch this split found that runs the other way (a
 reverse).
 
 **`users_id_for_account`** (account_id_for's own inverse -- resolves an
-`AuthContext.account_id` to the `users_id` the FK columns actually
-store) is a later, narrower deepening: it existed as two verbatim-in-
-spirit private copies (`authz_grants.py`'s own `_users_id_for_account`,
-`ecc.domains.collaboration.delegations`'s own), untracked by this split's
-own audit above since neither module's copy predates it. Promoted here
-next to its documented inverse rather than left duplicated, following
-`account_id_for`'s own precedent exactly -- both are Optional-returning,
-leaving the caller's own None-vs-raise choice at the call site instead of
-baking one policy into the shared helper.
+`accounts.id` value, typically read from a request payload field or a DB
+row's own account-scoped column (never from `AuthContext`, which has no
+`account_id` of its own -- only `workspace_id`/`user_id`/`timezone`), to
+the `users_id` the FK columns actually store) is a later, narrower
+deepening: it existed as two verbatim-in-spirit private copies
+(`authz_grants.py`'s own `_users_id_for_account`, `ecc.domains.
+collaboration.delegations`'s own -- the latter predates this split by 9
+days, Task 6's own `c983455`; only `authz_grants.py`'s copy was this
+split's own untouched relocation out of the pre-split monolithic file).
+Promoted here next to its documented inverse rather than left duplicated,
+following `account_id_for`'s own precedent exactly -- both are Optional-
+returning, leaving the caller's own None-vs-raise choice at the call
+site instead of baking one policy into the shared helper. Like `account_
+id_for`, `workspace_id` here must always be the caller's own
+authenticated `AuthContext.workspace_id`, never a request-controlled
+value -- the query can only ever resolve a `users_id` within that
+workspace (returning `None` on any cross-workspace `account_id`), so an
+untrusted `workspace_id` would silently narrow the search rather than
+widen it, but callers should not rely on that as a safety net.
 """
 
 from __future__ import annotations
@@ -345,10 +355,14 @@ def account_id_for(session: Session, *, workspace_id: UUID, users_id: UUID) -> U
 def users_id_for_account(session: Session, *, workspace_id: UUID, account_id: UUID) -> UUID | None:
     """The inverse of `account_id_for` -- `resource_grants.granted_by`/
     `owner_id` FK to `users.(workspace_id, id)`, not `accounts.id`, so a
-    caller holding an `AuthContext.account_id` (the normal shape auth
-    dependencies hand callers) needs this to resolve the `users_id` those
-    columns actually store. Read-only -- see `current_role`'s own docstring
-    for why this never calls `session.rollback()`.
+    caller holding some other party's `account_id` (typically a request
+    payload field or a DB row's own account-scoped column, never
+    `AuthContext` -- it has no `account_id` of its own) needs this to
+    resolve the `users_id` those columns actually store. `workspace_id`
+    must be the caller's own authenticated `AuthContext.workspace_id`;
+    the query can only resolve a `users_id` within that workspace. Read-
+    only -- see `current_role`'s own docstring for why this never calls
+    `session.rollback()`.
     """
     row = (
         session.execute(

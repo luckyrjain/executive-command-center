@@ -75,6 +75,9 @@ def _account_id_for(session: Session, *, workspace_id: UUID, users_id: UUID) -> 
     that expectation into a hard failure rather than silently propagating
     `None` (candidate 6's dedup: this used to be its own private copy of
     `authz.account_id_for`'s query, see that function's own docstring).
+    `ecc.domains.collaboration.delegations` carries an identical wrapper --
+    the same per-module-duplication convention that module's own `_notify_
+    member` follows, not an oversight.
     """
     account_id = authz.account_id_for(session, workspace_id=workspace_id, users_id=users_id)
     assert account_id is not None  # an authenticated caller's own users row always exists
