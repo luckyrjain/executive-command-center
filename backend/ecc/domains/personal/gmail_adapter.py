@@ -103,6 +103,7 @@ from __future__ import annotations
 import base64
 import time
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from email.errors import InvalidHeaderDefect
 from email.headerregistry import HeaderRegistry
@@ -1111,6 +1112,95 @@ def _extract_plain_text_body(payload: dict[str, Any]) -> str | None:
                 if extracted is not None:
                     return extracted
     return None
+
+
+@dataclass(frozen=True, slots=True)
+class _BodyParseOutcome:
+    """What parsing one `messages.get(format=full)` response concluded.
+    `retriable=True` (`text` unused, left `""`) means this call couldn't
+    reach a durable conclusion -- a non-200/no response, malformed JSON, a
+    response shaped unlike Gmail's own contract -- so the caller must
+    leave `body IS NULL` and let a future call retry. `retriable=False`
+    means this message's content is a permanent, immutable fact (Gmail
+    message content never changes) that must be committed once and never
+    re-attempted -- `text` is `""` when the response parsed fine but had
+    nothing extractable (no `text/plain` part, or a nesting deep enough to
+    exceed the recursion limit), matching `email_action_tools.py`'s own
+    "genuinely empty, not unfetched" convention.
+
+    Exists so "should this call retry, or write and stop" is a single
+    explicit field read at one call site (`fetch_and_store_body`), not two
+    different meanings both spelled `None` -- a bare function-level
+    `return None` (retriable) versus a local `plain_text = None` that
+    still falls through to a write (resolved-empty) -- which is exactly
+    the shape of bug rounds 4 and 9 review each found and fixed once (a
+    new `except` branch landing on the wrong side of that distinction).
+    """
+
+    retriable: bool
+    text: str = ""
+
+
+def _parse_message_body_response(get_response: httpx.Response | None) -> _BodyParseOutcome:
+    """Pure parsing, no I/O -- `fetch_and_store_body` owns the actual
+    Gmail request and the `email_messages` write. Every branch here
+    mirrors that method's own pre-extraction behavior exactly; see
+    `_BodyParseOutcome`'s own docstring for why the return type exists.
+    """
+    if get_response is None or get_response.status_code != 200:
+        return _BodyParseOutcome(retriable=True)
+    try:
+        body_json = get_response.json()
+    except ValueError:
+        # Malformed/truncated JSON -- presumed a transient response
+        # glitch (a proxy cutting the body short, say), not a property of
+        # the message itself.
+        return _BodyParseOutcome(retriable=True)
+    except RecursionError:
+        # Round 9 review: `httpx.Response.json()` calls `json.loads`
+        # directly, whose own recursive-descent parser has no depth cap
+        # either -- a sufficiently deep JSON array/object nesting in
+        # Gmail's response raises `RecursionError` here, not `ValueError`.
+        # Unlike a `ValueError`, this is *not* presumed transient: Gmail
+        # generates `messages.get`'s response deterministically from this
+        # specific message's own stored MIME structure, so a response
+        # nested this deeply is a permanent property of the message, not
+        # a passing glitch -- resolved-empty, not retriable, precisely so
+        # this message is marked handled once and for all (returning
+        # retriable here instead would leave `body IS NULL` forever,
+        # reopening the round-4-fixed "poison message" failure class
+        # through this new trigger).
+        return _BodyParseOutcome(retriable=False)
+    if not isinstance(body_json, dict):
+        return _BodyParseOutcome(retriable=True)
+    payload = body_json.get("payload")
+    if not isinstance(payload, dict):
+        return _BodyParseOutcome(retriable=True)
+    try:
+        plain_text = _extract_plain_text_body(payload)
+    except RecursionError:
+        # See `_extract_plain_text_body`'s own docstring: a maliciously
+        # deep `parts` nesting drives its recursive walk past the
+        # interpreter's recursion limit -- the identical "deterministic
+        # property of this message, not a transient glitch" reasoning as
+        # the `except RecursionError` above, just reached one step
+        # further down, after the response parsed as JSON but its MIME
+        # tree couldn't be walked.
+        return _BodyParseOutcome(retriable=False)
+    # A `payload` this function got far enough to structurally parse (a
+    # 200 response, valid JSON, a dict body, a dict `payload`) that
+    # genuinely has no `text/plain` part is a fact about the message
+    # itself that will not change on retry -- Gmail message content is
+    # immutable -- unlike the non-200/malformed-JSON/missing-`payload`
+    # cases above, which stay retriable because those genuinely are
+    # transient or indicate a response this function could not make
+    # sense of, not a property of the message. Round 4 review's own
+    # finding: this was the one path through the original, unextracted
+    # version of this logic that could `return None`-meaning-retriable
+    # despite having nothing left to retry -- silently leaving `body IS
+    # NULL` forever, re-selected, re-fetched, and re-rejected by every
+    # future call indefinitely.
+    return _BodyParseOutcome(retriable=False, text=plain_text or "")
 
 
 def _register_message_evidence(
@@ -2867,7 +2957,11 @@ class GmailAdapter:
         Callers are themselves responsible for checking `body IS NULL`
         before calling this (this method always makes a live Gmail call
         regardless of current state) -- both current callers do so via
-        their own eligibility query.
+        their own eligibility query. Parsing the response into "retry
+        later" vs. "permanent, write this" is `_parse_message_body_
+        response`'s own job -- see that function's docstring and
+        `_BodyParseOutcome`'s for why that decision is a single explicit
+        field, not two different things both spelled `None`.
         """
         get_response = self._request_with_rate_limit_retry(
             "GET",
@@ -2875,84 +2969,15 @@ class GmailAdapter:
             headers=headers,
             params={"format": "full"},
         )
-        if get_response is None or get_response.status_code != 200:
+        outcome = _parse_message_body_response(get_response)
+        if outcome.retriable:
             return None
-        try:
-            body_json = get_response.json()
-        except ValueError:
-            # Malformed/truncated JSON -- presumed a transient response
-            # glitch (a proxy cutting the body short, say), not a property
-            # of the message itself, so this stays a silent `return`
-            # (`body IS NULL`, retried next call) like the non-200/missing-
-            # `payload` cases below.
-            return None
-        except RecursionError:
-            # Round 9 review: `httpx.Response.json()` calls `json.loads`
-            # directly, whose own recursive-descent parser has no depth cap
-            # either -- a sufficiently deep JSON array/object nesting in
-            # Gmail's response raises `RecursionError` here, not `ValueError`
-            # (`json.JSONDecodeError`'s own base class), the same "not any
-            # exception type this module already anticipated" gap
-            # `_parse_address`'s docstring describes for stdlib header
-            # parsing. Unlike a `ValueError`, this is *not* presumed
-            # transient: Gmail generates `messages.get`'s response
-            # deterministically from this specific message's own stored
-            # MIME structure, so a response nested this deeply is a
-            # permanent property of the message, not a passing glitch --
-            # the same "genuinely won't change on retry" reasoning the
-            # round-4 comment below gives for a structurally-parsed message
-            # with no `text/plain` part. Falls through to that same empty-
-            # string sentinel path (`plain_text = None`, same as "nothing
-            # extractable") rather than `return`ing, precisely so this
-            # message is marked handled once and for all -- returning here
-            # instead would leave `body IS NULL` forever, reopening the
-            # round-4-fixed "poison message" failure class through this
-            # new trigger.
-            plain_text = None
-        else:
-            if not isinstance(body_json, dict):
-                return None
-            payload = body_json.get("payload")
-            if not isinstance(payload, dict):
-                return None
-            try:
-                plain_text = _extract_plain_text_body(payload)
-            except RecursionError:
-                # See `_extract_plain_text_body`'s own docstring: a
-                # maliciously deep `parts` nesting drives its recursive walk
-                # past the interpreter's recursion limit -- the identical
-                # "deterministic property of this message, not a transient
-                # glitch" reasoning as the `except RecursionError` above,
-                # just reached one step further down, after the response
-                # parsed as JSON but its MIME tree couldn't be walked. Falls
-                # through to the same sentinel path for the same reason.
-                plain_text = None
         now = datetime.now(UTC)
-        # Round 4 review finding: `plain_text` being falsy (HTML-only mail
-        # with no `text/plain` part, or a `payload` with no extractable
-        # content) used to just `return` here, leaving `body` `NULL`
-        # forever -- `detect_actions_since`'s own eligibility query has no
-        # way to tell "not yet fetched" apart from "fetched, nothing usable
-        # was there," so this message would be re-selected, re-fetched, and
-        # re-rejected by every future call indefinitely. A `payload` this
-        # method got far enough to structurally parse (a 200 response,
-        # valid JSON, a dict body, a dict `payload`) that genuinely has no
-        # `text/plain` part is a fact about the message itself that will
-        # not change on retry -- Gmail message content is immutable --
-        # unlike the non-200/malformed-JSON (`ValueError`)/missing-
-        # `payload` cases above, which stay silent `return`s (still `body
-        # IS NULL`, still eligible next call) because those genuinely are
-        # transient or indicate a response this method could not make
-        # sense of, not a property of the message. (The two `except
-        # RecursionError` branches above are deliberately *not* in that
-        # group, despite also being reached while parsing the response --
-        # see their own comments for why they instead join this branch.)
-        # The empty-string sentinel written below
-        # is exactly `email_action_tools.py`'s own "genuinely empty" case
-        # (that module's docstring): its `get_thread_content_tool` renders
-        # `body = ''` as an empty message rather than omitting it, which is
+        # `email_action_tools.py`'s own "genuinely empty" case (that
+        # module's docstring): its `get_thread_content_tool` renders `body
+        # = ''` as an empty message rather than omitting it, which is
         # correct here -- there is no content to omit-as-not-yet-fetched.
-        encrypted_body = encrypt_field(plain_text or "")
+        encrypted_body = encrypt_field(outcome.text)
 
         with SessionFactory() as session, session.begin():
             # `AND body IS NULL`: lost a race against another call already
@@ -2976,7 +3001,7 @@ class GmailAdapter:
             )
             if cast("CursorResult[Any]", updated).rowcount == 0:
                 return None
-        return plain_text or ""
+        return outcome.text
 
     def _detect_action_for_message(
         self,

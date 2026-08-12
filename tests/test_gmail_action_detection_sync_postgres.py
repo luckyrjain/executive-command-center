@@ -68,7 +68,9 @@ from ecc.domains.personal.crypto import decrypt_field
 from ecc.domains.personal.gmail_adapter import (
     _MAX_ACTION_DETECTIONS_PER_CALL,
     GmailAdapter,
+    _BodyParseOutcome,
     _pack_credential,
+    _parse_message_body_response,
 )
 
 settings = get_settings()
@@ -577,6 +579,90 @@ def _gmail_transport_deeply_nested_mime(external_message_id: str) -> httpx.MockT
         return httpx.Response(200, content=body, headers={"content-type": "application/json"})
 
     return httpx.MockTransport(handler)
+
+
+# --- `_parse_message_body_response`: pure parsing, no HTTP/DB needed ---------
+#
+# Code review finding on the `fetch_and_store_body` refactor: "retriable"
+# (stays `body IS NULL`, eligible for a future call) and "resolved, possibly
+# empty" (permanent, write it) used to both be spelled `None` -- a bare
+# `return None` for the former, a local `plain_text = None` that still fell
+# through to a write for the latter -- exactly the collision rounds 4 and 9
+# review each found once, in two different exception branches. These tests
+# exercise the extracted `_parse_message_body_response` directly, with no
+# Postgres/live-Gmail-transport machinery, covering every branch the two
+# integration tests below (`test_no_extractable_plain_text_is_marked_
+# handled_not_retried_forever`/`test_recursion_error_extracting_body_is_
+# marked_handled_not_retried_forever`) already prove end-to-end.
+
+
+def test_parse_message_body_response_is_retriable_when_response_is_none() -> None:
+    assert _parse_message_body_response(None) == _BodyParseOutcome(retriable=True)
+
+
+def test_parse_message_body_response_is_retriable_on_non_200_status() -> None:
+    response = httpx.Response(429, json={"error": "rate limited"})
+    assert _parse_message_body_response(response) == _BodyParseOutcome(retriable=True)
+
+
+def test_parse_message_body_response_is_retriable_on_malformed_json() -> None:
+    response = httpx.Response(200, content=b"not json")
+    assert _parse_message_body_response(response) == _BodyParseOutcome(retriable=True)
+
+
+def test_parse_message_body_response_is_retriable_on_non_object_response_body() -> None:
+    response = httpx.Response(200, json=["not", "an", "object"])
+    assert _parse_message_body_response(response) == _BodyParseOutcome(retriable=True)
+
+
+def test_parse_message_body_response_is_retriable_on_missing_payload() -> None:
+    response = httpx.Response(200, json={"id": "msg-1"})
+    assert _parse_message_body_response(response) == _BodyParseOutcome(retriable=True)
+
+
+def test_parse_message_body_response_is_retriable_on_non_object_payload() -> None:
+    response = httpx.Response(200, json={"id": "msg-1", "payload": "not an object"})
+    assert _parse_message_body_response(response) == _BodyParseOutcome(retriable=True)
+
+
+def test_parse_message_body_response_resolves_extracted_plain_text() -> None:
+    data = base64.urlsafe_b64encode(b"hello world").decode().rstrip("=")
+    response = httpx.Response(
+        200,
+        json={
+            "id": "msg-1",
+            "payload": {"mimeType": "text/plain", "body": {"data": data}},
+        },
+    )
+    assert _parse_message_body_response(response) == _BodyParseOutcome(
+        retriable=False, text="hello world"
+    )
+
+
+def test_parse_message_body_response_resolves_empty_when_no_plain_text_part() -> None:
+    """Round 4 review's own finding: a structurally-parsed `payload` with
+    no `text/plain` part reachable is a permanent fact about the message,
+    not a reason to retry.
+    """
+    response = httpx.Response(
+        200,
+        json={
+            "id": "msg-1",
+            "payload": {"mimeType": "text/html", "body": {"data": "not-plain-text"}},
+        },
+    )
+    assert _parse_message_body_response(response) == _BodyParseOutcome(retriable=False, text="")
+
+
+def test_parse_message_body_response_resolves_empty_on_deeply_nested_mime() -> None:
+    """Round 9 review's own finding -- see `_build_deeply_nested_mime_
+    payload_json`'s own docstring for why this doesn't pin down which of
+    the two internal `RecursionError` sites actually fires; both resolve
+    to the identical outcome.
+    """
+    body = b'{"id":"msg-1","payload":%s}' % _build_deeply_nested_mime_payload_json(5000)
+    response = httpx.Response(200, content=body, headers={"content-type": "application/json"})
+    assert _parse_message_body_response(response) == _BodyParseOutcome(retriable=False, text="")
 
 
 def test_recursion_error_extracting_body_is_marked_handled_not_retried_forever(
