@@ -1161,15 +1161,11 @@ def _parse_message_body_response(get_response: httpx.Response | None) -> _BodyPa
         # directly, whose own recursive-descent parser has no depth cap
         # either -- a sufficiently deep JSON array/object nesting in
         # Gmail's response raises `RecursionError` here, not `ValueError`.
-        # Unlike a `ValueError`, this is *not* presumed transient: Gmail
-        # generates `messages.get`'s response deterministically from this
-        # specific message's own stored MIME structure, so a response
-        # nested this deeply is a permanent property of the message, not
-        # a passing glitch -- resolved-empty, not retriable, precisely so
-        # this message is marked handled once and for all (returning
-        # retriable here instead would leave `body IS NULL` forever,
-        # reopening the round-4-fixed "poison message" failure class
-        # through this new trigger).
+        # Deliberately resolved-empty here, NOT retriable like the
+        # `ValueError` case just above -- see `_BodyParseOutcome`'s own
+        # docstring for why (Gmail's response is a deterministic property
+        # of the message, not a transient glitch) and for the bug class
+        # grouping this the wrong way would reopen.
         return _BodyParseOutcome(retriable=False)
     if not isinstance(body_json, dict):
         return _BodyParseOutcome(retriable=True)
@@ -1181,11 +1177,9 @@ def _parse_message_body_response(get_response: httpx.Response | None) -> _BodyPa
     except RecursionError:
         # See `_extract_plain_text_body`'s own docstring: a maliciously
         # deep `parts` nesting drives its recursive walk past the
-        # interpreter's recursion limit -- the identical "deterministic
-        # property of this message, not a transient glitch" reasoning as
-        # the `except RecursionError` above, just reached one step
-        # further down, after the response parsed as JSON but its MIME
-        # tree couldn't be walked.
+        # interpreter's recursion limit, one step further down than the
+        # `except RecursionError` above -- same deliberate resolved-empty
+        # grouping, same reason.
         return _BodyParseOutcome(retriable=False)
     # A `payload` this function got far enough to structurally parse (a
     # 200 response, valid JSON, a dict body, a dict `payload`) that
@@ -1195,10 +1189,11 @@ def _parse_message_body_response(get_response: httpx.Response | None) -> _BodyPa
     # cases above, which stay retriable because those genuinely are
     # transient or indicate a response this function could not make
     # sense of, not a property of the message. Round 4 review's own
-    # finding: this was the one path through the original, unextracted
-    # version of this logic that could `return None`-meaning-retriable
-    # despite having nothing left to retry -- silently leaving `body IS
-    # NULL` forever, re-selected, re-fetched, and re-rejected by every
+    # finding: `detect_actions_since`'s own eligibility query (`WHERE
+    # ... body IS NULL`) has no way to tell "not yet fetched" apart from
+    # "fetched, nothing usable was there" -- treating this case as
+    # retriable would leave `body IS NULL` forever, silently
+    # re-selecting, re-fetching, and re-rejecting this message every
     # future call indefinitely.
     return _BodyParseOutcome(retriable=False, text=plain_text or "")
 
