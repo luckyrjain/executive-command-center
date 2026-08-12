@@ -1450,6 +1450,46 @@ def test_incremental_sync_resumes_from_history_cursor(
     assert rows[0]["external_message_id"] == "msg-9"
 
 
+def test_incremental_sync_clears_a_stuck_record_even_when_an_intervening_page_has_no_entries(
+    seeded_gmail_account: tuple[ConnectorAccountContext, UUID],
+) -> None:
+    """Code review finding on the `GmailHistoryCursor` refactor: the input
+    cursor `"100:101:2"` claims a prior call got stuck 2 messages into
+    record 101. Page 1 of `history.list` (filtered server-side to
+    `historyTypes=messageAdded`) comes back with an empty `history` array
+    -- e.g. every real change on that page was a `labelsAdded`/
+    `labelsRemoved` entry Gmail's own filter dropped -- but a non-empty
+    `nextPageToken`, so the per-record loop that would normally clear the
+    stuck point via `with_resumed_through` never runs even once. Page 2
+    then gets rate-limited past the bounded retry. `next_cursor` must
+    still collapse to the plain `"100"` here, matching what the
+    pre-`GmailHistoryCursor` code did unconditionally at this exact
+    branch -- not round-trip the stale `"100:101:2"` verbatim, which
+    would wrongly re-trim 2 messages off whatever record 101 turns out to
+    be on the next, successful call.
+    """
+    context, _owner_id = seeded_gmail_account
+    calls = {"history": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/gmail/v1/users/me/history":
+            calls["history"] += 1
+            if calls["history"] == 1:
+                assert request.url.params.get("startHistoryId") == "100"
+                return _json_response({"history": [], "nextPageToken": "page-2"})
+            return httpx.Response(
+                429, json={"error": {"errors": [{"reason": "rateLimitExceeded"}]}}
+            )
+        raise AssertionError(f"unexpected request to {request.url}")
+
+    adapter = GmailAdapter(transport=httpx.MockTransport(handler), sleep=lambda _seconds: None)
+    outcome = adapter.incremental_sync(context, "message", "100:101:2")
+
+    assert outcome.status == "partial"
+    assert outcome.items_processed == 0
+    assert outcome.next_cursor == "100"
+
+
 def test_incremental_sync_falls_back_to_backfill_when_history_id_expired(
     seeded_gmail_account: tuple[ConnectorAccountContext, UUID],
 ) -> None:

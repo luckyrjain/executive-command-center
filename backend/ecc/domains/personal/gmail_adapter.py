@@ -103,6 +103,7 @@ from __future__ import annotations
 import base64
 import time
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from email.errors import InvalidHeaderDefect
 from email.headerregistry import HeaderRegistry
@@ -1244,6 +1245,7 @@ def _coerce_int(value: Any) -> int | None:
 # `next_cursor`, and every return site advances the *same* instance via
 # `with_resumed_through`/`with_progress` rather than rebuilding a
 # `(base, record_id, offset)` triple by hand each time.
+@dataclass(frozen=True, slots=True)
 class GmailHistoryCursor:
     """Parses from, and serializes back to, the single opaque `str`
     `ConnectorAdapter.incremental_sync` contracts for. The *input* skip
@@ -1254,20 +1256,10 @@ class GmailHistoryCursor:
     what any return site's `str(cursor)` reports as its `next_cursor`.
     """
 
-    __slots__ = ("list_start_history_id", "resumable_history_id", "stuck_record_id", "stuck_offset")
-
-    def __init__(
-        self,
-        list_start_history_id: str,
-        *,
-        resumable_history_id: int | None = None,
-        stuck_record_id: int | None = None,
-        stuck_offset: int = 0,
-    ) -> None:
-        self.list_start_history_id = list_start_history_id
-        self.resumable_history_id = resumable_history_id
-        self.stuck_record_id = stuck_record_id
-        self.stuck_offset = stuck_offset
+    list_start_history_id: str
+    resumable_history_id: int | None = None
+    stuck_record_id: int | None = None
+    stuck_offset: int = 0
 
     @classmethod
     def from_str(cls, cursor: str) -> GmailHistoryCursor:
@@ -1317,7 +1309,7 @@ class GmailHistoryCursor:
         intra-record skip point, since a fully-completed record is by
         definition not the one this call is stuck on.
         """
-        return GmailHistoryCursor(self.list_start_history_id, resumable_history_id=record_id)
+        return replace(self, resumable_history_id=record_id, stuck_record_id=None, stuck_offset=0)
 
     def with_progress(self, record_id: int | None, offset: int) -> GmailHistoryCursor:
         """This call is returning partway through `record_id` (or, when
@@ -1326,12 +1318,7 @@ class GmailHistoryCursor:
         (`resumable_history_id`) this call already reached through
         *fully*-completed records carries forward unchanged.
         """
-        return GmailHistoryCursor(
-            self.list_start_history_id,
-            resumable_history_id=self.resumable_history_id,
-            stuck_record_id=record_id,
-            stuck_offset=offset,
-        )
+        return replace(self, stuck_record_id=record_id, stuck_offset=offset)
 
 
 class GmailAdapter:
@@ -2089,19 +2076,28 @@ class GmailAdapter:
                 # in -- the one input `str(cursor)` doesn't promise to
                 # preserve byte-for-byte, since it was never `with_progress`-
                 # built in the first place. On any *later* page of this
-                # same call, reaching here always means every earlier
-                # page's records already fully completed without
-                # interruption (a mid-record interruption always `break`s
-                # the outer `while` loop itself, never falls through to
-                # fetch another page) -- `cursor` was already advanced past
-                # each of them via `with_resumed_through`, which clears any
-                # stuck point, so `str(cursor)` correctly reports a plain
-                # cursor there.
+                # same call, a mid-record interruption always `break`s the
+                # outer `while` loop itself and never falls through to
+                # fetch another page -- so reaching here never means THIS
+                # call is itself stuck mid-record. It does NOT mean every
+                # earlier page's `history[]` was non-empty, though: a page
+                # can legitimately carry zero `messagesAdded`-type entries
+                # (e.g. all `labelsAdded`/`labelsRemoved`) alongside a real
+                # `nextPageToken`, in which case `with_resumed_through`
+                # never ran and `cursor` still carries whatever stuck point
+                # it was originally parsed with. `with_progress(None, 0)`
+                # clears that unconditionally, the same way the pre-`Gmail
+                # HistoryCursor` code unconditionally passed `None, 0` here
+                # regardless of what the input cursor carried.
                 return SyncOutcome(
                     resource_type="message",
                     items_processed=items_processed,
                     status="partial",
-                    next_cursor=start_history_id if page_token is None else str(cursor),
+                    next_cursor=(
+                        start_history_id
+                        if page_token is None
+                        else str(cursor.with_progress(None, 0))
+                    ),
                     error_summary=_RATE_LIMIT_ERROR_SUMMARY,
                 )
             if history_response.status_code == 404:
@@ -2149,8 +2145,15 @@ class GmailAdapter:
             # genuinely, safely resumable from.
             budget_exhausted = False
             record_history_id: int | None = None
+            # This record's own current stuck-offset -- how far into it
+            # `next_cursor` should report as already handled if this call
+            # returns partway through it. Seeded from `pending_skip_count`
+            # below when this is the record a PRIOR call left off in, then
+            # incremented in place as this call itself processes more of
+            # it -- a single running counter, not a baseline plus a
+            # separate this-call's-own-progress counter summed at each of
+            # the three return sites that report it.
             already_skipped_this_record = 0
-            processed_in_record_this_call = 0
             for entry in history_entries:
                 if not isinstance(entry, dict):
                     continue
@@ -2182,7 +2185,6 @@ class GmailAdapter:
                     record_message_ids = record_message_ids[pending_skip_count:]
 
                 record_fully_processed = True
-                processed_in_record_this_call = 0
                 for message_id in record_message_ids:
                     if calls_made >= _MAX_MESSAGES_PER_CALL:
                         # Round 1 review: this page's own record still had
@@ -2203,10 +2205,9 @@ class GmailAdapter:
                         # `resumable_history_id` closes the *inter*-record
                         # instance of this gap: a subsequent call resumes
                         # past every record this call *did* finish. Round
-                        # 13: `already_skipped_this_record`/`processed_in_
-                        # record_this_call`, combined via `cursor.
-                        # with_progress` at every return site below, close
-                        # the *intra*-record instance --
+                        # 13: `already_skipped_this_record`, reported via
+                        # `cursor.with_progress` at every return site
+                        # below, closes the *intra*-record instance --
                         # without them, a single record whose own message
                         # count exceeds this budget could never finish no
                         # matter how many retries, since every one of them
@@ -2232,8 +2233,7 @@ class GmailAdapter:
                                 status="partial",
                                 next_cursor=str(
                                     cursor.with_progress(
-                                        record_history_id,
-                                        already_skipped_this_record + processed_in_record_this_call,
+                                        record_history_id, already_skipped_this_record
                                     )
                                 ),
                                 error_summary="email domain consent was revoked mid-sync",
@@ -2254,10 +2254,7 @@ class GmailAdapter:
                             items_processed=items_processed,
                             status="partial",
                             next_cursor=str(
-                                cursor.with_progress(
-                                    record_history_id,
-                                    already_skipped_this_record + processed_in_record_this_call,
-                                )
+                                cursor.with_progress(record_history_id, already_skipped_this_record)
                             ),
                             error_summary=_RATE_LIMIT_ERROR_SUMMARY,
                         )
@@ -2284,7 +2281,7 @@ class GmailAdapter:
                         now=now,
                     )
                     items_processed += 1
-                    processed_in_record_this_call += 1
+                    already_skipped_this_record += 1
 
                 if budget_exhausted:
                     break
@@ -2328,26 +2325,24 @@ class GmailAdapter:
         # is the `while calls_made < _MAX_MESSAGES_PER_CALL` loop's own two
         # possible exits -- either its condition failing naturally (every
         # record on the just-finished page completed, `budget_exhausted`
-        # never set this pass, so `record_history_id`/`processed_in_
-        # record_this_call` reflect that *completed* last record rather
-        # than an interrupted one) or the explicit `if budget_exhausted:
-        # break` above falling through to this same statement (budget ran
-        # out mid-record). Only `with_progress` when `budget_exhausted` --
-        # a completed last record already advanced `cursor` via
+        # never set this pass, so `record_history_id`/`already_skipped_
+        # this_record` reflect that *completed* last record rather than an
+        # interrupted one) or the explicit `if budget_exhausted: break`
+        # above falling through to this same statement (budget ran out
+        # mid-record). Only `with_progress` when `budget_exhausted` -- a
+        # completed last record already advanced `cursor` via
         # `with_resumed_through` above and needs no further mid-record
         # skip point layered on top of it (and the exact same in-scope
         # local variables Python's own function-level -- not block-level
-        # -- scoping keeps live from the `for` loop above) rather than
-        # needing a third, separately-tracked piece of state for this one
-        # site.
+        # -- scoping keeps `already_skipped_this_record` live from the
+        # `for` loop above) rather than needing a second, separately-
+        # tracked piece of state for this one site.
         return SyncOutcome(
             resource_type="message",
             items_processed=items_processed,
             status="partial",
             next_cursor=str(
-                cursor.with_progress(
-                    record_history_id, already_skipped_this_record + processed_in_record_this_call
-                )
+                cursor.with_progress(record_history_id, already_skipped_this_record)
                 if budget_exhausted
                 else cursor
             ),
