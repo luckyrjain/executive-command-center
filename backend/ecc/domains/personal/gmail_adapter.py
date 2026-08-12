@@ -1246,7 +1246,7 @@ def _coerce_int(value: Any) -> int | None:
 # `with_resumed_through`/`with_progress` rather than rebuilding a
 # `(base, record_id, offset)` triple by hand each time.
 @dataclass(frozen=True, slots=True)
-class GmailHistoryCursor:
+class _GmailHistoryCursor:
     """Parses from, and serializes back to, the single opaque `str`
     `ConnectorAdapter.incremental_sync` contracts for. The *input* skip
     point (`stuck_record_id`/`stuck_offset` as parsed) is consulted at
@@ -1262,7 +1262,7 @@ class GmailHistoryCursor:
     stuck_offset: int = 0
 
     @classmethod
-    def from_str(cls, cursor: str) -> GmailHistoryCursor:
+    def from_str(cls, cursor: str) -> _GmailHistoryCursor:
         """Malformed compound state (the wrong number of `:`-separated
         fields, or a non-integer/negative record id or skip count --
         never produced by `__str__` itself, but this module doesn't
@@ -1303,7 +1303,7 @@ class GmailHistoryCursor:
             return base
         return f"{base}:{self.stuck_record_id}:{self.stuck_offset}"
 
-    def with_resumed_through(self, record_id: int) -> GmailHistoryCursor:
+    def with_resumed_through(self, record_id: int) -> _GmailHistoryCursor:
         """A whole `history[]` record (`record_id`) just fully completed
         -- advances the record-granularity resume point and clears any
         intra-record skip point, since a fully-completed record is by
@@ -1311,7 +1311,7 @@ class GmailHistoryCursor:
         """
         return replace(self, resumable_history_id=record_id, stuck_record_id=None, stuck_offset=0)
 
-    def with_progress(self, record_id: int | None, offset: int) -> GmailHistoryCursor:
+    def with_progress(self, record_id: int | None, offset: int) -> _GmailHistoryCursor:
         """This call is returning partway through `record_id` (or, when
         `record_id` is `None`, not stuck mid-record at all) having
         processed `offset` of its messages so far -- the resume point
@@ -1637,7 +1637,7 @@ class GmailAdapter:
     ) -> SyncOutcome:
         """`cursor` is a Gmail `historyId` (a string-encoded integer), or --
         round 13 review -- `_sync_history`'s own compound `"{historyId}:
-        {record_id}:{skip_count}"` form (see `GmailHistoryCursor`'s own
+        {record_id}:{skip_count}"` form (see `_GmailHistoryCursor`'s own
         module-level comment); either way it's still a single opaque `str`
         from this method's own point of view, per `ConnectorAdapter.
         incremental_sync`'s own "resumes from cursor, or behaves like a
@@ -1981,7 +1981,7 @@ class GmailAdapter:
                     # truthiness rather than `bool`'s own `int` subtyping.
                     # Nothing before this fix validated Gmail's own
                     # `historyId` fields can never be exactly `0` (unlike,
-                    # say, `GmailHistoryCursor.from_str`'s own `record_id < 0`
+                    # say, `_GmailHistoryCursor.from_str`'s own `record_id < 0`
                     # check, added by round 14 review for a value this
                     # module itself never produces but also never rules
                     # out on the read side) -- every other `is None`/`is
@@ -2017,7 +2017,7 @@ class GmailAdapter:
                 raise RuntimeError("email domain consent is not active")
 
         # Round 13 review: `start_history_id` (this method's own `cursor`
-        # argument) may be a plain historyId or a `GmailHistoryCursor`-
+        # argument) may be a plain historyId or a `_GmailHistoryCursor`-
         # produced compound string carrying "and skip the first N messages
         # of record M" -- see that type's own module-level comment for
         # why. `cursor.list_start_history_id` is what every `history.list`
@@ -2029,7 +2029,7 @@ class GmailAdapter:
         # loop runs -- from then on `cursor` itself is advanced to reflect
         # *this* call's own progress, which is what every return site
         # below reports back via `str(cursor)`.
-        cursor = GmailHistoryCursor.from_str(start_history_id)
+        cursor = _GmailHistoryCursor.from_str(start_history_id)
         list_start_history_id = cursor.list_start_history_id
         pending_stuck_record_id = cursor.stuck_record_id
         pending_skip_count = cursor.stuck_offset
@@ -2173,7 +2173,7 @@ class GmailAdapter:
                             record_message_ids.append(message_id)
 
                 # Round 13 review: this is the one record (if any) a PRIOR
-                # call got stuck partway through -- see `GmailHistoryCursor`'s
+                # call got stuck partway through -- see `_GmailHistoryCursor`'s
                 # own module-level comment for why a record's own
                 # `id` is unique/strictly-increasing enough per call to
                 # match at most once. Every *other* record's `record_
