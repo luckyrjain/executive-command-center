@@ -65,8 +65,8 @@ from ecc.domains.ai_runtime.runtime import reset_circuit_breakers
 from ecc.domains.engineering.connectors import ConnectorAccountContext
 from ecc.domains.engineering.crypto import encrypt_credential
 from ecc.domains.personal.crypto import decrypt_field
+from ecc.domains.personal.gmail_action_detection import _MAX_ACTION_DETECTIONS_PER_CALL
 from ecc.domains.personal.gmail_adapter import (
-    _MAX_ACTION_DETECTIONS_PER_CALL,
     GmailAdapter,
     _BodyParseOutcome,
     _pack_credential,
