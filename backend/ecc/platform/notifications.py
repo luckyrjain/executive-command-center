@@ -5,17 +5,14 @@
 
 **No shared `notify()` helper exported from here.** Writing a
 `member_notifications` row is a two-line `INSERT ... ON CONFLICT DO
-NOTHING`; rather than have `ecc.platform.authz` (which also needs to write
-one, from `create_grant_endpoint`) import this module -- which would need
-to import `authz` right back for `/shared/activity`'s own use of
-`authorize()`, a real circular import -- each writer (`authz.py`'s
+NOTHING`; rather than have `ecc.platform.authz_grants` (which also needs to
+write one, from `create_grant_endpoint`) import this module -- which would
+need to import `authz` right back for `/shared/activity`'s own use of
+`authorize()`, a real circular import -- each writer (`authz_grants.py`'s
 `create_grant_endpoint`, `ecc.domains.collaboration.delegations`'s six
-transition endpoints) carries its own private copy, the identical
-per-module-duplication convention this codebase already uses for the
-idempotency helpers (`_lock_idempotency`/`_load_cached`/`_store_
-idempotency`, reimplemented in every domain rather than shared). This
-module owns only the *read* side of `member_notifications` plus the
-separate, read-only `/shared/activity` feed.
+transition endpoints) carries its own private copy. This module owns only
+the *read* side of `member_notifications` plus the separate, read-only
+`/shared/activity` feed.
 """
 
 from __future__ import annotations

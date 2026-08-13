@@ -18,7 +18,7 @@ internally accurate.
 1. An `email_threads` row whose own last message (by `sent_at`) is
    inbound, from a sender already resolved into `pkos_nodes` (via
    `entity_aliases`, the same lookup `gmail_adapter.py`'s own
-   `_resolve_or_create_person` performs at write time), surfaces in
+   `resolve_or_create_person` performs at write time), surfaces in
    `POST /api/v1/attention/regenerate`'s own response as an
    `entity_type='email_thread'` item.
    (`test_inbound_thread_from_known_contact_surfaces_as_awaiting_reply`)
@@ -376,12 +376,12 @@ def _seed_message(
 
 
 def _resolve_sender(workspace_id: UUID, email: str) -> None:
-    """Mirrors `gmail_adapter.py`'s own `_resolve_or_create_person`: a
+    """Mirrors `gmail_adapter.py`'s own `resolve_or_create_person`: a
     `pkos_nodes` person, a `pkos_evidence` row, and an `entity_aliases` row
     keyed on the normalized (`.strip().casefold()`, reproduced here as
     `LOWER(TRIM(...))`'s Python-side equivalent) email address --
     `regenerate_attention`'s own eligibility query looks this up the same
-    way at read time `_resolve_or_create_person` writes it at sync time.
+    way at read time `resolve_or_create_person` writes it at sync time.
     """
     node_id = uuid4()
     evidence_id = uuid4()
@@ -624,7 +624,7 @@ def test_inbound_thread_from_casefold_divergent_sender_surfaces_as_awaiting_repl
     unchanged, confirmed directly against this database's own collation
     (`SELECT LOWER('ß')` = `'ß'`, not `'ss'`). A real contact who has
     already been resolved into `pkos_nodes` (their normalized alias is
-    `'strasse@example.test'`, exactly as `_resolve_or_create_person`
+    `'strasse@example.test'`, exactly as `resolve_or_create_person`
     would have written it) sending a message from the literal address
     `'straße@example.test'` must still surface as awaiting reply --
     before the fix, the SQL-side `LOWER(TRIM(...))` comparison silently

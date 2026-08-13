@@ -637,7 +637,7 @@ def regenerate_attention(auth: AuthDep, session: SessionDep, _csrf: CsrfDep) -> 
         # `LOWER(TRIM(sender))` comparison diverges from Python's
         # `.casefold()` (the function that actually wrote every
         # `entity_aliases.normalized_value` row, in `gmail_adapter.py`'s
-        # `_resolve_or_create_person`, via `gmail_shared.normalize_email`)
+        # `resolve_or_create_person`, via `gmail_shared.normalize_email`)
         # for characters like the German sharp s. Sender resolution is
         # instead done below in Python, using the real `normalize_email`
         # against a separately-fetched set of known aliases

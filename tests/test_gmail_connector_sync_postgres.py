@@ -156,7 +156,7 @@ Covers, per this task's own scope:
     downstream-DB-cost guard (which only ever runs *after* this parse would
     already have paid its cost), found by round 7 review.
 23. A failure resolving one participant into `pkos_nodes`
-    (`_resolve_or_create_person` raising -- realistically a transient DB
+    (`resolve_or_create_person` raising -- realistically a transient DB
     error, not malformed input; unlike every prior finding in this file,
     reachable with no crafted header at all) previously propagated
     uncaught out of `_process_message`, aborting the entire sync call --
@@ -866,7 +866,7 @@ def test_participant_resolution_failure_does_not_crash_the_sync_call(
     `_process_message`'s participant-resolution loop even starts (`_resolve_
     or_create_person` deliberately opens a separate transaction per
     participant -- see that function's own docstring). Previously, an
-    uncaught exception from *any* participant's `_resolve_or_create_person`
+    uncaught exception from *any* participant's `resolve_or_create_person`
     call -- a transient one (a deadlock, a dropped connection, the app's own
     `statement_timeout`; unlike every other guard in this file, this needs
     no malformed input at all) as much as an unexpected one -- propagated
@@ -914,14 +914,14 @@ def test_participant_resolution_failure_does_not_crash_the_sync_call(
             return _json_response(second_body)
         raise AssertionError(f"unexpected request to {request.url}")
 
-    real_resolve = gmail_adapter_module._resolve_or_create_person
+    real_resolve = gmail_adapter_module.resolve_or_create_person
 
     def flaky_resolve(*, email: str, **kwargs: Any) -> UUID:
         if email == "bob@example.test":
             raise RuntimeError("simulated transient DB failure resolving bob")
         return real_resolve(email=email, **kwargs)  # type: ignore[no-any-return]
 
-    monkeypatch.setattr(gmail_adapter_module, "_resolve_or_create_person", flaky_resolve)
+    monkeypatch.setattr(gmail_adapter_module, "resolve_or_create_person", flaky_resolve)
 
     adapter = GmailAdapter(transport=httpx.MockTransport(handler))
     # Must not raise -- the pre-fix behavior let bob's RuntimeError escape
@@ -971,14 +971,14 @@ def test_participant_resolution_failure_still_resolves_other_participants_of_the
             return _json_response(body)
         raise AssertionError(f"unexpected request to {request.url}")
 
-    real_resolve = gmail_adapter_module._resolve_or_create_person
+    real_resolve = gmail_adapter_module.resolve_or_create_person
 
     def flaky_resolve(*, email: str, **kwargs: Any) -> UUID:
         if email == "bob@example.test":
             raise RuntimeError("simulated transient DB failure resolving bob")
         return real_resolve(email=email, **kwargs)  # type: ignore[no-any-return]
 
-    monkeypatch.setattr(gmail_adapter_module, "_resolve_or_create_person", flaky_resolve)
+    monkeypatch.setattr(gmail_adapter_module, "resolve_or_create_person", flaky_resolve)
 
     adapter = GmailAdapter(transport=httpx.MockTransport(handler))
     outcome = adapter.backfill(context, "message", since=datetime.now(UTC) - timedelta(days=1))
@@ -999,7 +999,7 @@ def test_participant_resolution_failure_still_resolves_other_participants_of_the
     # naming bob still resolves him normally, once the transient failure
     # has cleared (proving the failure is isolated to this one message's
     # own evidence of bob, not a permanent block on ever resolving him).
-    monkeypatch.setattr(gmail_adapter_module, "_resolve_or_create_person", real_resolve)
+    monkeypatch.setattr(gmail_adapter_module, "resolve_or_create_person", real_resolve)
     second_body = _message_body(
         message_id="msg-2",
         thread_id="thread-2",
@@ -1603,7 +1603,7 @@ def test_nul_byte_in_from_display_name_is_skipped_not_a_crash(
     """Same NUL-byte hazard as the address case above, but in the display-
     name half of the header -- `parseaddr` keeps it separate from the
     address, and it flows to `pkos_nodes.canonical_name` (also `text`)
-    via `_resolve_or_create_person`, not `email_messages.sender`. A valid
+    via `resolve_or_create_person`, not `email_messages.sender`. A valid
     address alongside a NUL-carrying display name must still be treated
     as unparseable as a whole (matching `_parse_address`'s own "can't
     make sense of it" contract), not silently truncate/strip just the
@@ -2272,7 +2272,7 @@ def test_to_header_recipient_count_is_capped_to_bound_entity_resolution_work(
     """`email_messages.recipients` is an unbounded `ARRAY(VARCHAR(320))`
     (migration `0069`) -- nothing previously bounded how many addresses a
     single `To` header could carry, and each *distinct* one makes
-    `_resolve_or_create_person` open its own independent `SessionFactory`
+    `resolve_or_create_person` open its own independent `SessionFactory`
     transaction: a real, synchronous, per-participant round trip to
     Postgres, not merely an in-memory parse. Gmail forwards a sender's raw
     `To` header verbatim and RFC 5322 places no upper bound on how many

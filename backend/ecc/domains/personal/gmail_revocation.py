@@ -121,7 +121,7 @@ endpoint`), not here -- see that function's own updated comment.
 
 **What is deliberately NOT deleted.**
 - `pkos_nodes` (the resolved person entities themselves): `gmail_adapter.
-  py:_resolve_or_create_person` deduplicates at *workspace* scope, not
+  py:resolve_or_create_person` deduplicates at *workspace* scope, not
   owner scope -- a node this owner's Gmail sync first created may be the
   same node a different owner's own Gmail sync, or an entirely different
   domain's entity resolution, has since reused. Deleting it here could
@@ -240,7 +240,7 @@ def cascade_email_revocation(
     # migration `0075`'s own docstring already gives for `deletion_jobs.
     # resource_id`), matched by the exact `source_ref` strings two write
     # sites deterministically construct from `external_message_id`
-    # (`gmail_adapter.py`'s `_resolve_or_create_person`: `f"gmail:
+    # (`gmail_adapter.py`'s `resolve_or_create_person`: `f"gmail:
     # {external_message_id}"`; `gmail_action_detection.py`'s `_register_
     # message_evidence`: `f"gmail:detect_action:{external_message_id}"`).
     # Does NOT touch `pkos_nodes` -- see module docstring's "what is

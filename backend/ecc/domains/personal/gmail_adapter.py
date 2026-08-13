@@ -211,7 +211,7 @@ _MAX_EMAIL_ADDRESS_LENGTH = 320
 # (migration `0069`) -- storing an enormous array is not itself a crash
 # risk the way an individual oversized address is (see `_MAX_EMAIL_
 # ADDRESS_LENGTH`'s own comment, a per-element bound this one doesn't
-# duplicate). The actual cost is `_resolve_or_create_person`: it opens its
+# duplicate). The actual cost is `resolve_or_create_person`: it opens its
 # own independent `SessionFactory` transaction -- a real, synchronous,
 # per-participant round trip to Postgres, not merely an in-memory parse --
 # for every distinct sender/recipient `_process_message` hands it. Gmail
@@ -234,7 +234,7 @@ _MAX_EMAIL_ADDRESS_LENGTH = 320
 _MAX_RECIPIENTS_PER_MESSAGE = 500
 
 # `_MAX_RECIPIENTS_PER_MESSAGE` bounds *downstream* cost -- the DB work
-# `_resolve_or_create_person` does per parsed recipient -- but nothing
+# `resolve_or_create_person` does per parsed recipient -- but nothing
 # before this guard bounded the cost of *parsing* the header in the first
 # place, and that parse is not free: `_to_header_has_grammar_defect`'s own
 # `HeaderRegistry` cross-check (see that function's own docstring) is a
@@ -287,12 +287,12 @@ def _to_header_exceeds_length_limit(to_header: str) -> bool:
 # workspace-shared, not per-owner. Gmail's own `connector_accounts` row does
 # have one, though (`gmail_oauth.py`'s `gmail_oauth_callback_endpoint` sets
 # it to the connecting user, `auth.user_id`, at INSERT time -- see that
-# module's own INSERT), so `_owner_id_for_account` below reads it back
+# module's own INSERT), so `owner_id_for_account` below reads it back
 # directly rather than requiring `owner_id` to be threaded through a wider
 # Protocol change every other adapter would need to accept and ignore.
 
 
-def _owner_id_for_account(
+def owner_id_for_account(
     session: Session, workspace_id: UUID, connector_account_id: UUID
 ) -> UUID | None:
     row = session.execute(
@@ -721,7 +721,7 @@ def _to_header_has_grammar_defect(to_header: str) -> bool:
     return any(isinstance(defect, InvalidHeaderDefect) for defect in defects)
 
 
-def _resolve_or_create_person(
+def resolve_or_create_person(
     *,
     workspace_id: UUID,
     owner_id: UUID,
@@ -1661,7 +1661,7 @@ class GmailAdapter:
 
     def _sync_messages(self, account: ConnectorAccountContext, *, query: str) -> SyncOutcome:
         with SessionFactory() as session, session.begin():
-            owner_id = _owner_id_for_account(
+            owner_id = owner_id_for_account(
                 session, account.workspace_id, account.connector_account_id
             )
         if owner_id is None:
@@ -1960,7 +1960,7 @@ class GmailAdapter:
         self, account: ConnectorAccountContext, *, start_history_id: str
     ) -> SyncOutcome:
         with SessionFactory() as session, session.begin():
-            owner_id = _owner_id_for_account(
+            owner_id = owner_id_for_account(
                 session, account.workspace_id, account.connector_account_id
             )
         if owner_id is None:
@@ -2509,7 +2509,7 @@ class GmailAdapter:
                 # `except Exception` -- round 9 review: `_insert_message_if_new`
                 # above already committed the `email_messages`/`email_threads`
                 # write in its own transaction, closed before this loop even
-                # starts (see `_resolve_or_create_person`'s own docstring for
+                # starts (see `resolve_or_create_person`'s own docstring for
                 # why entity resolution is deliberately a *separate*
                 # transaction per participant, not reused from that write).
                 # An uncaught failure here -- a transient one (a deadlock, a
@@ -2550,7 +2550,7 @@ class GmailAdapter:
                 # cascading into every other message and account still
                 # waiting in this call.
                 try:
-                    _resolve_or_create_person(
+                    resolve_or_create_person(
                         workspace_id=workspace_id,
                         owner_id=owner_id,
                         email=participant_email,
@@ -2660,7 +2660,7 @@ class GmailAdapter:
     #
     # Imported inside the method body, not at this module's own top
     # level, because `gmail_action_detection.py` itself imports two of
-    # this module's own helpers (`_owner_id_for_account`, `_resolve_or_
+    # this module's own helpers (`owner_id_for_account`, `_resolve_or_
     # create_person`) -- a top-level import here, in the other
     # direction, would be circular. Deferring it to call time sidesteps
     # that entirely: by the time anything actually *calls* `detect_

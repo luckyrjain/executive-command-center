@@ -1453,7 +1453,7 @@ def sync_connector_endpoint(
     # Phase 10 Task 5: proactive Gmail action detection, run only after
     # phase 3's own transaction has committed -- `detect_actions_since`
     # opens its own short, per-message sessions/transactions, matching
-    # `gmail_adapter._resolve_or_create_person`'s "keep this independent of
+    # `gmail_adapter.resolve_or_create_person`'s "keep this independent of
     # whatever transaction writes the triggering row" discipline, not
     # `outcome_session`'s. Duck-typed via `getattr`, not a shared Protocol
     # member (`gmail_adapter.py`'s own module docstring: Gmail-specific
