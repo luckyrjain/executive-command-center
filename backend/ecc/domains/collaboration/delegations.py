@@ -307,9 +307,9 @@ def _notify_member(
 ) -> None:
     """Private, duplicated per-module rather than imported from
     `ecc.platform.notifications` -- see that module's own docstring for the
-    layering reason (and `ecc.platform.authz`'s identical copy, the same
-    per-module-duplication convention this file's own idempotency helpers
-    already follow).
+    layering reason (and `ecc.platform.authz_grants`'s identical copy, the
+    same per-module-duplication convention this file's own idempotency
+    helpers already follow).
     """
     session.execute(
         text(
