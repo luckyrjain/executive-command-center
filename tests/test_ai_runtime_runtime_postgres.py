@@ -2221,9 +2221,9 @@ def test_post_ai_runs_happy_path(run_context: dict, http_client: TestClient) -> 
 def test_post_ai_runs_idempotency_store_failure_still_returns_the_completed_run(
     run_context: dict, http_client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """`execute_run` above `_store_idempotency`'s call site already
+    """`execute_run` above `store_idempotency`'s call site already
     committed the real `ai_runs` row (`_persist_terminal`'s own internal
-    commit) by the time `_store_idempotency` runs -- a failure writing
+    commit) by the time `store_idempotency` runs -- a failure writing
     only the idempotency bookkeeping record must not discard the response
     the caller already successfully obtained. Before this fix, this
     scenario surfaced as an unhandled 500 even though the run itself had
@@ -2234,7 +2234,7 @@ def test_post_ai_runs_idempotency_store_failure_still_returns_the_completed_run(
     def _failing_store(*args: object, **kwargs: object) -> None:
         raise SQLAlchemyError("simulated idempotency-record write failure")
 
-    monkeypatch.setattr(runtime_module, "_store_idempotency", _failing_store)
+    monkeypatch.setattr(runtime_module, "store_idempotency", _failing_store)
 
     response = http_client.post(
         "/api/v1/ai/runs",
@@ -2258,7 +2258,7 @@ def test_post_ai_runs_conflicting_payload_same_key_returns_idempotency_conflict(
     run_context: dict, http_client: TestClient
 ) -> None:
     """Reusing an Idempotency-Key with a materially different payload is
-    not a valid retry -- it must 409 IDEMPOTENCY_CONFLICT (`_load_cached`'s
+    not a valid retry -- it must 409 IDEMPOTENCY_CONFLICT (`load_cached`'s
     `request_hash` mismatch check), never silently replay the first
     response or silently execute the second, different request. A real
     coverage gap found during Phase 4 audit: this exact pattern is already

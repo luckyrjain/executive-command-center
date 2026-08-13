@@ -87,7 +87,6 @@ from collections.abc import Iterator
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from hashlib import sha256
 from json import dumps
 from math import ceil
 from typing import Annotated, Any, Literal, TypedDict
@@ -103,13 +102,19 @@ from ecc.auth import AuthContext, AuthDep, CsrfDep
 from ecc.database import get_session, lock_engine
 from ecc.domains.personal.crypto import encrypt_field
 from ecc.domains.personal.domains import classification_for, encrypt_record_payload
-from ecc.observability import record_database_failure, record_idempotency_conflict
+from ecc.observability import record_database_failure
 from ecc.platform import authz
+from ecc.platform.idempotency import (
+    held_idempotency_lock,
+    load_cached,
+    request_hash,
+    store_idempotency,
+)
 
 from .ollama_client import OllamaAdapter
 from .prompts import get_active_prompt
 from .registry import get_model
-from .runtime import TASK_PORTS, AiRun, OllamaAdapterDep, execute_run, held_idempotency_lock
+from .runtime import TASK_PORTS, AiRun, OllamaAdapterDep, execute_run
 
 __all__ = [
     "EvaluationConfigError",
@@ -2117,73 +2122,6 @@ def list_evaluations(auth: AuthDep, session: SessionDep) -> EvaluationSetListRes
     )
 
 
-def _request_hash(payload: BaseModel, action: str) -> str:
-    material = {"action": action, "payload": payload.model_dump(mode="json")}
-    return sha256(dumps(material, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
-
-
-def _load_cached(
-    session: Session, auth: AuthContext, key: str, request_hash: str
-) -> EvaluationRunResponse | None:
-    row = (
-        session.execute(
-            text(
-                """
-                SELECT request_hash, response_body FROM idempotency_records
-                WHERE workspace_id = :workspace_id AND actor_id = :actor_id
-                  AND key = :key AND expires_at > :now
-                """
-            ),
-            {
-                "workspace_id": auth.workspace_id,
-                "actor_id": auth.user_id,
-                "key": key,
-                "now": datetime.now(UTC),
-            },
-        )
-        .mappings()
-        .one_or_none()
-    )
-    if row is None:
-        return None
-    if row["request_hash"] != request_hash:
-        record_idempotency_conflict("ai_runtime")
-        raise HTTPException(status_code=409, detail="IDEMPOTENCY_CONFLICT")
-    return EvaluationRunResponse.model_validate(row["response_body"])
-
-
-def _store_idempotency(
-    session: Session,
-    auth: AuthContext,
-    key: str,
-    request_hash: str,
-    response: EvaluationRunResponse,
-    now: datetime,
-) -> None:
-    session.execute(
-        text(
-            """
-            INSERT INTO idempotency_records (
-                workspace_id, actor_id, key, request_hash, response_status,
-                response_body, created_at, expires_at
-            ) VALUES (
-                :workspace_id, :actor_id, :key, :request_hash, 200,
-                CAST(:response_body AS jsonb), :created_at, :expires_at
-            )
-            """
-        ),
-        {
-            "workspace_id": auth.workspace_id,
-            "actor_id": auth.user_id,
-            "key": key,
-            "request_hash": request_hash,
-            "response_body": dumps(response.model_dump(mode="json")),
-            "created_at": now,
-            "expires_at": now + timedelta(days=365),
-        },
-    )
-
-
 @router.post("/evaluations/runs", response_model=EvaluationRunResponse)
 def create_evaluation_run(
     payload: EvaluationRunCreateRequest,
@@ -2212,11 +2150,18 @@ def create_evaluation_run(
     20-example run before the first one's response is even stored.
     """
     authz.require_role_action(session, auth, "write")
-    request_hash = _request_hash(payload, "create_evaluation_run")
+    req_hash = request_hash(payload, "create_evaluation_run")
     now = datetime.now(UTC)
     with held_idempotency_lock(auth, idempotency_key):
         with session.begin():
-            cached = _load_cached(session, auth, idempotency_key, request_hash)
+            cached = load_cached(
+                session,
+                auth,
+                idempotency_key,
+                req_hash,
+                domain="ai_runtime",
+                response_model=EvaluationRunResponse,
+            )
         if cached is not None:
             return cached
 
@@ -2237,7 +2182,9 @@ def create_evaluation_run(
         response = _to_response(run)
         try:
             with session.begin():
-                _store_idempotency(session, auth, idempotency_key, request_hash, response, now)
+                store_idempotency(
+                    session, auth, idempotency_key, req_hash, response.model_dump(mode="json"), now
+                )
         except SQLAlchemyError:
             # `run` above is already persisted (`_persist_evaluation_run`,
             # inside `run_evaluation`) -- losing only the idempotency

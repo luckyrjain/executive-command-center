@@ -35,11 +35,9 @@ being reachable from a hypothetical future multi-tool task.
 """
 
 import threading
-from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
-from hashlib import sha256
+from datetime import UTC, datetime
 from importlib import import_module
 from json import JSONDecodeError, dumps, loads
 from typing import Annotated, Any, Literal, cast
@@ -52,15 +50,20 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from ecc.auth import AuthContext, AuthDep, CsrfDep
-from ecc.database import get_session, lock_engine
+from ecc.database import get_session
 from ecc.observability import (
     queue_lifecycle_event,
     record_audit_outbox_failure,
     record_database_failure,
-    record_idempotency_conflict,
 )
 from ecc.platform import authz
 from ecc.platform.authz import WORKSPACE_ORIGINAL_OWNER_SQL
+from ecc.platform.idempotency import (
+    held_idempotency_lock,
+    load_cached,
+    request_hash,
+    store_idempotency,
+)
 
 from . import tools as ai_tools
 from .budgets import (
@@ -2122,127 +2125,6 @@ def _row_to_response(row: dict[str, Any]) -> AiRunResponse:
     )
 
 
-def _request_hash(payload: BaseModel, action: str) -> str:
-    material = {"action": action, "payload": payload.model_dump(mode="json")}
-    return sha256(dumps(material, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
-
-
-@contextmanager
-def held_idempotency_lock(auth: AuthContext, key: str) -> Iterator[None]:
-    """A session-scoped `pg_advisory_lock`, held on its own dedicated
-    connection for this context manager's entire duration -- unlike
-    `pg_advisory_xact_lock`, this is not released early by `execute_run`'s
-    own internal `session.commit()` calls partway through a run
-    (`_persist_terminal`'s docstring). `create_run` wraps its whole body
-    (cache check, existence check, `execute_run`, idempotency store) in
-    this lock specifically because that whole body -- not just the
-    initial cache lookup -- is the critical section: two concurrent
-    requests carrying the same Idempotency-Key must not both reach
-    `execute_run` and independently trigger a real model call. Every other
-    idempotency-key endpoint in this codebase (including `prompts.py`'s own
-    `activate_policy`) safely uses the lighter transaction-scoped
-    `pg_advisory_xact_lock` because their entire critical section fits
-    inside one `session.begin()` block with no internal commit --
-    `execute_run` does not have that property (it is also called directly,
-    session-less-transaction-wise, from tests and from `evaluation.py`'s
-    per-example loop), so this endpoint cannot rely on it either.
-
-    Not underscore-prefixed: an architecture-review deepening found this
-    exact lock hand-duplicated in `evaluation.py` and `personal/ai_
-    insights.py` (both citing this function's own rationale as their
-    justification, verbatim), plus `attention/meeting_prep.py` already
-    importing this module's copy directly -- consolidated here as the one
-    canonical implementation all four call sites share, matching this
-    codebase's own convention for a helper with 2+ cross-module callers
-    (`gmail_adapter.py:fetch_and_store_body`'s identical reasoning). The
-    lock semantics above are domain-agnostic (keyed on `workspace_id`/
-    `user_id`/an opaque `key`) -- nothing here is specific to an AI run,
-    only every current caller happens to be one.
-
-    Uses `ecc.database.lock_engine` (`NullPool`, no `statement_timeout`),
-    not the app's main `engine` -- this lock can be held for tens of
-    seconds to minutes (the synchronous model call), and the main engine's
-    shared, size-capped pool plus its 5-second `statement_timeout`
-    connect-listener are both sized/tuned for ordinary short queries, not
-    a lock-wait meant to block indefinitely until the first request
-    releases it. See `lock_engine`'s own docstring in `database.py`.
-    """
-    lock_key = f"{auth.workspace_id}:{auth.user_id}:{key}"
-    with lock_engine.connect().execution_options(isolation_level="AUTOCOMMIT") as connection:
-        connection.execute(
-            text("SELECT pg_advisory_lock(hashtextextended(:lock_key, 0))"), {"lock_key": lock_key}
-        )
-        try:
-            yield
-        finally:
-            connection.execute(
-                text("SELECT pg_advisory_unlock(hashtextextended(:lock_key, 0))"),
-                {"lock_key": lock_key},
-            )
-
-
-def _load_cached(
-    session: Session, auth: AuthContext, key: str, request_hash: str
-) -> AiRunResponse | None:
-    row = (
-        session.execute(
-            text(
-                """
-                SELECT request_hash, response_body FROM idempotency_records
-                WHERE workspace_id = :workspace_id AND actor_id = :actor_id
-                  AND key = :key AND expires_at > :now
-                """
-            ),
-            {
-                "workspace_id": auth.workspace_id,
-                "actor_id": auth.user_id,
-                "key": key,
-                "now": datetime.now(UTC),
-            },
-        )
-        .mappings()
-        .one_or_none()
-    )
-    if row is None:
-        return None
-    if row["request_hash"] != request_hash:
-        record_idempotency_conflict("ai_runtime")
-        raise HTTPException(status_code=409, detail="IDEMPOTENCY_CONFLICT")
-    return AiRunResponse.model_validate(row["response_body"])
-
-
-def _store_idempotency(
-    session: Session,
-    auth: AuthContext,
-    key: str,
-    request_hash: str,
-    response: AiRunResponse,
-    now: datetime,
-) -> None:
-    session.execute(
-        text(
-            """
-            INSERT INTO idempotency_records (
-                workspace_id, actor_id, key, request_hash, response_status,
-                response_body, created_at, expires_at
-            ) VALUES (
-                :workspace_id, :actor_id, :key, :request_hash, 200,
-                CAST(:response_body AS jsonb), :created_at, :expires_at
-            )
-            """
-        ),
-        {
-            "workspace_id": auth.workspace_id,
-            "actor_id": auth.user_id,
-            "key": key,
-            "request_hash": request_hash,
-            "response_body": dumps(response.model_dump(mode="json")),
-            "created_at": now,
-            "expires_at": now + timedelta(days=365),
-        },
-    )
-
-
 @router.post("/runs", response_model=AiRunResponse)
 def create_run(
     payload: AiRunCreateRequest,
@@ -2271,11 +2153,18 @@ def create_run(
     `execute_run` and triggering a second real model call.
     """
     authz.require_role_action(session, auth, "write")
-    request_hash = _request_hash(payload, "create_run")
+    req_hash = request_hash(payload, "create_run")
     now = datetime.now(UTC)
     with held_idempotency_lock(auth, idempotency_key):
         with session.begin():
-            cached = _load_cached(session, auth, idempotency_key, request_hash)
+            cached = load_cached(
+                session,
+                auth,
+                idempotency_key,
+                req_hash,
+                domain="ai_runtime",
+                response_model=AiRunResponse,
+            )
         if cached is not None:
             return cached
 
@@ -2305,7 +2194,9 @@ def create_run(
         response = _to_response(run)
         try:
             with session.begin():
-                _store_idempotency(session, auth, idempotency_key, request_hash, response, now)
+                store_idempotency(
+                    session, auth, idempotency_key, req_hash, response.model_dump(mode="json"), now
+                )
         except SQLAlchemyError:
             # `run` above is already committed (`execute_run`'s own
             # internal commit, `_persist_terminal`) -- losing only the

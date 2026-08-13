@@ -38,6 +38,7 @@ from sqlalchemy.orm import Session
 
 from ecc.auth import AuthContext, AuthDep, CsrfDep
 from ecc.observability import record_idempotency_conflict
+from ecc.platform.idempotency import load_cached, lock_idempotency, request_hash, store_idempotency
 
 from .domains import (
     DomainKey,
@@ -45,10 +46,6 @@ from .domains import (
     SessionDep,
     _decrypt_payload,
     get_domain,
-    load_cached,
-    lock_idempotency,
-    request_hash,
-    store_idempotency,
 )
 from .gmail_revocation import PendingGmailRevoke, cascade_email_revocation, finish_gmail_revocation
 

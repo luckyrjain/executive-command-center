@@ -42,16 +42,13 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from ecc.auth import AuthContext, AuthDep, CsrfDep
+from ecc.platform.idempotency import load_cached, lock_idempotency, request_hash, store_idempotency
 
 from .domains import (
     DomainKey,
     IdempotencyHeader,
     SessionDep,
-    load_cached,
-    lock_idempotency,
-    request_hash,
     require_enabled_domain,
-    store_idempotency,
 )
 
 # A second `APIRouter` on the identical `/api/v1/personal` prefix, not a

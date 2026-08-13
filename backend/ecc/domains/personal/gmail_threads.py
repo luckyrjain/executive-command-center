@@ -104,14 +104,9 @@ from ecc.database import get_session
 from ecc.domains.ai_runtime.tools import ToolNotFound
 from ecc.domains.engineering.connector_accounts import _get_encrypted_credential
 from ecc.domains.engineering.crypto import decrypt_credential
+from ecc.platform.idempotency import load_cached, lock_idempotency, request_hash, store_idempotency
 
-from .domains import (
-    IdempotencyHeader,
-    load_cached,
-    lock_idempotency,
-    request_hash,
-    store_idempotency,
-)
+from .domains import IdempotencyHeader
 from .email_action_tools import MAX_THREAD_MESSAGES, get_thread_content_tool
 from .gmail_adapter import GmailAdapter
 from .gmail_shared import _bearer_headers, _email_consent_active

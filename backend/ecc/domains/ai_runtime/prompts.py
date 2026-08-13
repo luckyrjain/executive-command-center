@@ -37,7 +37,7 @@ Key + response replay follows `attention/capacity.py`'s
 """
 
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from hashlib import sha256
 from json import dumps
 from typing import Annotated, Any, Literal
@@ -54,9 +54,9 @@ from ecc.database import get_session
 from ecc.observability import (
     queue_lifecycle_event,
     record_audit_outbox_failure,
-    record_idempotency_conflict,
 )
 from ecc.platform import authz
+from ecc.platform.idempotency import load_cached, lock_idempotency, request_hash, store_idempotency
 
 from .tools import (
     ToolDefinition,
@@ -276,88 +276,11 @@ class PolicyActivateResponse(BaseModel):
     status: Literal["active"]
 
 
-def _request_hash(payload: BaseModel, action: str) -> str:
-    material = {"action": action, "payload": payload.model_dump(mode="json")}
-    return sha256(dumps(material, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
-
-
 def _request_ids(request: Request) -> tuple[UUID, UUID]:
     try:
         return UUID(request.state.request_id), UUID(request.state.correlation_id)
     except (AttributeError, TypeError, ValueError):
         return uuid4(), uuid4()
-
-
-def _lock_idempotency(session: Session, auth: AuthContext, key: str) -> None:
-    lock_key = f"{auth.workspace_id}:{auth.user_id}:{key}"
-    session.execute(
-        text("SELECT pg_advisory_xact_lock(hashtextextended(:lock_key, 0))"),
-        {"lock_key": lock_key},
-    )
-
-
-def _load_cached(
-    session: Session, auth: AuthContext, key: str, request_hash: str
-) -> PolicyActivateResponse | None:
-    row = (
-        session.execute(
-            text(
-                """
-                SELECT request_hash, response_body FROM idempotency_records
-                WHERE workspace_id = :workspace_id AND actor_id = :actor_id
-                  AND key = :key AND expires_at > :now
-                """
-            ),
-            {
-                "workspace_id": auth.workspace_id,
-                "actor_id": auth.user_id,
-                "key": key,
-                "now": datetime.now(UTC),
-            },
-        )
-        .mappings()
-        .one_or_none()
-    )
-    if row is None:
-        return None
-    if row["request_hash"] != request_hash:
-        record_idempotency_conflict("ai_runtime")
-        raise HTTPException(status_code=409, detail="IDEMPOTENCY_CONFLICT")
-    return PolicyActivateResponse.model_validate(row["response_body"])
-
-
-def _store_idempotency(
-    session: Session,
-    auth: AuthContext,
-    key: str,
-    request_hash: str,
-    response: PolicyActivateResponse,
-    now: datetime,
-    response_status: int = 200,
-) -> None:
-    session.execute(
-        text(
-            """
-            INSERT INTO idempotency_records (
-                workspace_id, actor_id, key, request_hash, response_status,
-                response_body, created_at, expires_at
-            ) VALUES (
-                :workspace_id, :actor_id, :key, :request_hash, :response_status,
-                CAST(:response_body AS jsonb), :created_at, :expires_at
-            )
-            """
-        ),
-        {
-            "workspace_id": auth.workspace_id,
-            "actor_id": auth.user_id,
-            "key": key,
-            "request_hash": request_hash,
-            "response_status": response_status,
-            "response_body": dumps(response.model_dump(mode="json")),
-            "created_at": now,
-            "expires_at": now + timedelta(days=365),
-        },
-    )
 
 
 # Task 5 addition: the exact set of gated prompt families -- design doc
@@ -574,11 +497,18 @@ def activate_policy(
     role = authz.require_active_role(session, auth)
     if role not in {"owner", "admin"}:
         raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
-    request_hash = _request_hash(payload, f"activate:{prompt_id_or_tool_name}")
+    req_hash = request_hash(payload, f"activate:{prompt_id_or_tool_name}")
     now = datetime.now(UTC)
     with session.begin():
-        _lock_idempotency(session, auth, idempotency_key)
-        cached = _load_cached(session, auth, idempotency_key, request_hash)
+        lock_idempotency(session, auth, idempotency_key)
+        cached = load_cached(
+            session,
+            auth,
+            idempotency_key,
+            req_hash,
+            domain="ai_runtime",
+            response_model=PolicyActivateResponse,
+        )
         if cached is not None:
             return cached
 
@@ -639,5 +569,7 @@ def activate_policy(
             version=result.version,
             now=now,
         )
-        _store_idempotency(session, auth, idempotency_key, request_hash, response, now)
+        store_idempotency(
+            session, auth, idempotency_key, req_hash, response.model_dump(mode="json"), now
+        )
         return response
