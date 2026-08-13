@@ -81,6 +81,7 @@ producer of `generated_artifacts` rows in this activation (Task 4's `POST
 same is a later task's decision, not attempted here.
 """
 
+import re
 import time
 from collections.abc import Iterator
 from contextlib import AbstractContextManager, contextmanager, nullcontext
@@ -533,18 +534,83 @@ _OUTPUT_TEXT_FIELD: dict[str, str] = {
 }
 
 
+# Found via a real `ollama-evaluation` CI run (`EVALUATION-CONTRACT.md`'s
+# "the prohibited-fact-count floor is the one still missed" line): the
+# model's actual output for `task_due_48h_medium_waiting` was "...close to
+# being completed but not yet overdue" -- a *correct*, negated statement,
+# which a raw substring check cannot distinguish from asserting the fact
+# outright. Two prior prompt-engineering attempts (migrations 0053/0055)
+# tried to stop the model from ever mentioning the word at all; the actual
+# bug was here the whole time. `_NEGATION_WINDOW_WORDS` looks back a small,
+# fixed number of words rather than doing real NLP -- deliberately narrow,
+# matching `validator.py:_strip_markdown_fence`'s own precedent of favoring
+# a materially safer, narrower heuristic over a cleverer one that could
+# silently accept what should fail.
+_NEGATION_CUES = frozenset(
+    {
+        "not",
+        "no",
+        "never",
+        "without",
+        "cannot",
+        "cant",
+        "isnt",
+        "arent",
+        "wasnt",
+        "werent",
+        "doesnt",
+        "dont",
+        "didnt",
+        "hasnt",
+        "havent",
+        "hadnt",
+        "wont",
+        "wouldnt",
+        "shouldnt",
+        "couldnt",
+    }
+)
+_NEGATION_WINDOW_WORDS = 4
+_WORD_RE = re.compile(r"[\w']+")
+
+
+def _phrase_occurrence_is_negated(text_value: str, start_index: int) -> bool:
+    """True if a negation cue appears in the `_NEGATION_WINDOW_WORDS` words
+    immediately preceding this occurrence of a `must_not_state` phrase --
+    "not yet overdue" correctly rules out the fact the phrase names, plain
+    "overdue" asserts it. Apostrophes are stripped from each word (`isn't`
+    -> `isnt`) so `_NEGATION_CUES` doesn't need every apostrophe variant.
+    """
+    preceding_words = _WORD_RE.findall(text_value[:start_index])[-_NEGATION_WINDOW_WORDS:]
+    return any(word.replace("'", "") in _NEGATION_CUES for word in preceding_words)
+
+
 def _prohibited_matches(task_type: str, example: dict[str, Any], run: AiRun) -> tuple[str, ...]:
     """`must_not_state`'s hallucination probe (design doc Decision 9): a
-    completed run's free-text output containing any of the example's
-    forbidden phrases (case-insensitive substring match) is a prohibited-
-    fact occurrence. Only meaningful for a `completed` run -- a run that
-    never produced a validated `output` has nothing to check.
+    completed run's free-text output containing any *un-negated*
+    occurrence of one of the example's forbidden phrases (case-insensitive
+    substring match) is a prohibited-fact occurrence -- asserting the fact,
+    not merely mentioning the words that name it (`_phrase_occurrence_is_
+    negated`). A phrase every occurrence of which is negated is not a
+    violation; a phrase occurring more than once, negated only some of the
+    time, still is -- the model asserted the fact at least once. Only
+    meaningful for a `completed` run -- a run that never produced a
+    validated `output` has nothing to check.
     """
     if run.output is None:
         return ()
     field = _OUTPUT_TEXT_FIELD[task_type]
     text_value = str(run.output.get(field, "")).casefold()
-    return tuple(phrase for phrase in example["must_not_state"] if phrase.casefold() in text_value)
+    violations = []
+    for phrase in example["must_not_state"]:
+        needle = phrase.casefold()
+        index = text_value.find(needle)
+        while index != -1:
+            if not _phrase_occurrence_is_negated(text_value, index):
+                violations.append(phrase)
+                break
+            index = text_value.find(needle, index + 1)
+    return tuple(violations)
 
 
 def _score_example(
