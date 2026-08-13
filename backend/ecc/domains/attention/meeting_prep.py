@@ -61,17 +61,19 @@ from ecc.auth import AuthContext, AuthDep, CsrfDep
 from ecc.config import get_settings
 from ecc.database import get_session
 from ecc.domains.ai_runtime.ollama_client import OllamaAdapter
-from ecc.domains.ai_runtime.runtime import (
-    execute_run,
-    get_ollama_adapter,
-    held_idempotency_lock,
-)
+from ecc.domains.ai_runtime.runtime import execute_run, get_ollama_adapter
 from ecc.observability import (
     queue_lifecycle_event,
     record_audit_outbox_failure,
-    record_idempotency_conflict,
 )
 from ecc.platform import authz
+from ecc.platform.idempotency import (
+    held_idempotency_lock,
+    load_cached,
+    lock_idempotency,
+    request_hash,
+    store_idempotency,
+)
 
 router = APIRouter(prefix="/api/v1/meetings", tags=["meeting-prep"])
 SessionDep = Annotated[Session, Depends(get_session)]
@@ -423,9 +425,15 @@ class MeetingPack(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Idempotency / audit helpers (per-module, matching every other Phase 3
-# domain file's convention -- no shared utility module).
+# Audit helper. The idempotency lock/cache quartet this comment used to
+# introduce (`_lock_idempotency`/`_request_hash`/`_load_cached`/
+# `_store_cached`) moved to `ecc.platform.idempotency` -- see that module's
+# own docstring.
 # ---------------------------------------------------------------------------
+
+
+class _EmptyBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
 
 
 def _violated_constraint(exc: IntegrityError) -> str | None:
@@ -441,90 +449,11 @@ def _violated_constraint(exc: IntegrityError) -> str | None:
     return getattr(diag, "constraint_name", None) if diag is not None else None
 
 
-def _lock_idempotency(session: Session, auth: AuthContext, key: str) -> None:
-    lock_key = f"{auth.workspace_id}:{auth.user_id}:{key}"
-    session.execute(
-        text("SELECT pg_advisory_xact_lock(hashtextextended(:lock_key, 0))"),
-        {"lock_key": lock_key},
-    )
-
-
-def _request_hash(action: str, payload: dict[str, Any] | None = None) -> str:
-    material = {"action": action, "payload": payload or {}}
-    return sha256(
-        dumps(material, sort_keys=True, separators=(",", ":"), default=str).encode()
-    ).hexdigest()
-
-
 def _request_ids(request: Request) -> tuple[UUID, UUID]:
     try:
         return UUID(request.state.request_id), UUID(request.state.correlation_id)
     except (AttributeError, TypeError, ValueError):
         return uuid4(), uuid4()
-
-
-def _load_cached(
-    session: Session, auth: AuthContext, key: str, request_hash: str
-) -> dict[str, Any] | None:
-    row = (
-        session.execute(
-            text(
-                """
-                SELECT request_hash, response_body FROM idempotency_records
-                WHERE workspace_id = :workspace_id AND actor_id = :actor_id
-                  AND key = :key AND expires_at > :now
-                """
-            ),
-            {
-                "workspace_id": auth.workspace_id,
-                "actor_id": auth.user_id,
-                "key": key,
-                "now": datetime.now(UTC),
-            },
-        )
-        .mappings()
-        .one_or_none()
-    )
-    if row is None:
-        return None
-    if row["request_hash"] != request_hash:
-        record_idempotency_conflict("meeting_prep")
-        raise HTTPException(status_code=409, detail="IDEMPOTENCY_CONFLICT")
-    return dict(row["response_body"])
-
-
-def _store_cached(
-    session: Session,
-    auth: AuthContext,
-    key: str,
-    request_hash: str,
-    response_body: dict[str, Any],
-    response_status: int,
-    now: datetime,
-) -> None:
-    session.execute(
-        text(
-            """
-            INSERT INTO idempotency_records (
-                workspace_id, actor_id, key, request_hash, response_status,
-                response_body, created_at, expires_at
-            ) VALUES (
-                :workspace_id, :actor_id, :key, :request_hash, :response_status,
-                CAST(:response_body AS jsonb), :created_at, :expires_at
-            )
-            """
-        ),
-        {
-            "workspace_id": auth.workspace_id,
-            "actor_id": auth.user_id,
-            "key": key,
-            "request_hash": request_hash,
-            "response_status": response_status,
-            "response_body": dumps(response_body, default=str),
-            "created_at": now,
-            "expires_at": now + timedelta(days=365),
-        },
-    )
 
 
 def _write_event(
@@ -1233,11 +1162,11 @@ def add_participant(
     _csrf: CsrfDep,
     idempotency_key: IdempotencyHeader,
 ) -> ParticipantResponse:
-    request_hash = _request_hash(f"add_participant:{meeting_id}", payload.model_dump(mode="json"))
+    req_hash = request_hash(payload, f"add_participant:{meeting_id}")
     now = datetime.now(UTC)
     with session.begin():
-        _lock_idempotency(session, auth, idempotency_key)
-        cached = _load_cached(session, auth, idempotency_key, request_hash)
+        lock_idempotency(session, auth, idempotency_key)
+        cached = load_cached(session, auth, idempotency_key, req_hash, domain="meeting_prep")
         if cached is not None:
             return ParticipantResponse.model_validate(cached)
 
@@ -1335,8 +1264,8 @@ def add_participant(
             entity_name=entity["canonical_name"],
             role=payload.role,
         )
-        _store_cached(
-            session, auth, idempotency_key, request_hash, response.model_dump(mode="json"), 201, now
+        store_idempotency(
+            session, auth, idempotency_key, req_hash, response.model_dump(mode="json"), now, 201
         )
         return response
 
@@ -1382,7 +1311,7 @@ def create_prep(
     session or calling `execute_run`) -- so there is no reason to split
     the transaction at all, and this path is exactly the pre-Phase-4
     shape: one `session.begin()`, the lighter transaction-scoped
-    `_lock_idempotency` every other endpoint in this module uses.
+    `lock_idempotency` every other endpoint in this module uses.
 
     When the flag is on, `_compute_enrichment` really does call
     `execute_run`, which unconditionally commits partway through
@@ -1398,7 +1327,7 @@ def create_prep(
     keeps two concurrent requests carrying the same Idempotency-Key from
     both reaching `execute_run` and each triggering a real model call.
     """
-    request_hash = _request_hash(f"create_prep:{meeting_id}")
+    req_hash = request_hash(_EmptyBody(), f"create_prep:{meeting_id}")
     now = datetime.now(UTC)
     pack_id = uuid4()
 
@@ -1462,21 +1391,21 @@ def create_prep(
             1,
             now,
         )
-        _store_cached(
+        store_idempotency(
             session,
             auth,
             idempotency_key,
-            request_hash,
+            req_hash,
             response.model_dump(mode="json"),
-            201,
             now,
+            201,
         )
         return response
 
     if not get_settings().meeting_prep_ai_enrichment_enabled:
         with session.begin():
-            _lock_idempotency(session, auth, idempotency_key)
-            cached = _load_cached(session, auth, idempotency_key, request_hash)
+            lock_idempotency(session, auth, idempotency_key)
+            cached = load_cached(session, auth, idempotency_key, req_hash, domain="meeting_prep")
             if cached is not None:
                 return MeetingPack.model_validate(cached)
 
@@ -1498,7 +1427,7 @@ def create_prep(
 
     with held_idempotency_lock(auth, idempotency_key):
         with session.begin():
-            cached = _load_cached(session, auth, idempotency_key, request_hash)
+            cached = load_cached(session, auth, idempotency_key, req_hash, domain="meeting_prep")
         if cached is not None:
             return MeetingPack.model_validate(cached)
 
@@ -1620,7 +1549,7 @@ def refresh_prep(
     (that endpoint's own idempotency-replay path is what makes a
     same-key retry safe either way).
     """
-    request_hash = _request_hash(f"refresh_prep:{meeting_id}")
+    req_hash = request_hash(_EmptyBody(), f"refresh_prep:{meeting_id}")
     now = datetime.now(UTC)
     new_pack_id = uuid4()
 
@@ -1691,22 +1620,24 @@ def refresh_prep(
             1,
             now,
         )
-        _store_cached(
+        store_idempotency(
             session,
             auth,
             idempotency_key,
-            request_hash,
+            req_hash,
             response.model_dump(mode="json"),
-            201,
             now,
+            201,
         )
         return response
 
     if not get_settings().meeting_prep_ai_enrichment_enabled:
         try:
             with session.begin():
-                _lock_idempotency(session, auth, idempotency_key)
-                cached = _load_cached(session, auth, idempotency_key, request_hash)
+                lock_idempotency(session, auth, idempotency_key)
+                cached = load_cached(
+                    session, auth, idempotency_key, req_hash, domain="meeting_prep"
+                )
                 if cached is not None:
                     return MeetingPack.model_validate(cached)
 
@@ -1732,7 +1663,7 @@ def refresh_prep(
 
     with held_idempotency_lock(auth, idempotency_key):
         with session.begin():
-            cached = _load_cached(session, auth, idempotency_key, request_hash)
+            cached = load_cached(session, auth, idempotency_key, req_hash, domain="meeting_prep")
         if cached is not None:
             return MeetingPack.model_validate(cached)
 

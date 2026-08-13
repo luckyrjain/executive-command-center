@@ -63,16 +63,19 @@ from sqlalchemy.orm import Session
 
 from ecc.auth import AuthContext, AuthDep, CsrfDep
 from ecc.config import get_settings
-from ecc.domains.ai_runtime.runtime import OllamaAdapterDep, execute_run, held_idempotency_lock
+from ecc.domains.ai_runtime.runtime import OllamaAdapterDep, execute_run
+from ecc.platform.idempotency import (
+    held_idempotency_lock,
+    load_cached,
+    request_hash,
+    store_idempotency,
+)
 
 from .domains import (
     DomainKey,
     IdempotencyHeader,
     SessionDep,
     classification_for,
-    load_cached,
-    request_hash,
-    store_idempotency,
 )
 from .habits import InsightResponse
 

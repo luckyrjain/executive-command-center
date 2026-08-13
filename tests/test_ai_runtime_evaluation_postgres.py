@@ -787,9 +787,9 @@ def test_post_evaluations_runs_happy_path(run_context: dict, http_client: TestCl
 def test_post_evaluations_runs_idempotency_store_failure_still_returns_the_completed_run(
     run_context: dict, http_client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """`run_evaluation` above `_store_idempotency`'s call site already
+    """`run_evaluation` above `store_idempotency`'s call site already
     persisted the real `evaluation_runs` row (`_persist_evaluation_run`,
-    inside `run_evaluation`) by the time `_store_idempotency` runs -- a
+    inside `run_evaluation`) by the time `store_idempotency` runs -- a
     failure writing only the idempotency bookkeeping record must not
     discard the response the caller already successfully obtained. Before
     this fix, this scenario surfaced as an unhandled 500 even though the
@@ -801,7 +801,7 @@ def test_post_evaluations_runs_idempotency_store_failure_still_returns_the_compl
     def _failing_store(*args: object, **kwargs: object) -> None:
         raise SQLAlchemyError("simulated idempotency-record write failure")
 
-    monkeypatch.setattr(evaluation_module, "_store_idempotency", _failing_store)
+    monkeypatch.setattr(evaluation_module, "store_idempotency", _failing_store)
 
     response = http_client.post(
         "/api/v1/ai/evaluations/runs",
