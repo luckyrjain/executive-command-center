@@ -767,6 +767,163 @@ def _mutate_commitment(
         return response
 
 
+def lifecycle_write(
+    session: Session,
+    auth: AuthContext,
+    commitment_id: UUID,
+    action: Literal["confirm", "fulfil", "cancel", "break", "archive", "restore"],
+    *,
+    expected_version: int,
+    reason: str | None,
+    request_id: UUID,
+    correlation_id: UUID,
+    idempotency_key: str,
+    now: datetime,
+) -> CommitmentResponse:
+    """The guard + row-write + audit/outbox emission behind every commitment
+    lifecycle transition, split out so `ecc.domains.governance.
+    recommendation_targets.execute_target`'s `set_status` branch can call
+    the identical path a manual transition uses, instead of a raw `UPDATE`
+    that bypasses these guards and never writes an audit trail. Deliberately
+    excludes `session.begin()`/idempotency-key locking/replay (both callers
+    already run inside their own already-open transaction and idempotency
+    scheme; nesting a second `session.begin()` here would raise) -- mirrors
+    `insert_commitment`'s own precedent exactly.
+    """
+    if not authz.authorize(
+        session, auth, resource_type="commitments", resource_id=commitment_id, action="read"
+    ):
+        raise HTTPException(status_code=404, detail="COMMITMENT_NOT_FOUND")
+    if not authz.authorize(
+        session, auth, resource_type="commitments", resource_id=commitment_id, action="write"
+    ):
+        raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
+    current = _get_row(session, auth, commitment_id, for_update=True)
+    if current is None:
+        raise HTTPException(status_code=404, detail="COMMITMENT_NOT_FOUND")
+    _check_version(current, expected_version)
+
+    target_reached = (
+        (action == "confirm" and current["status"] == "active")
+        or (action == "fulfil" and current["status"] == "fulfilled")
+        or (action == "cancel" and current["status"] == "cancelled")
+        or (action == "break" and current["status"] == "broken")
+        or (action == "archive" and current["archived_at"] is not None)
+    )
+    if target_reached:
+        return _to_response(current)
+
+    if action in {"confirm", "fulfil", "cancel", "break"} and current["archived_at"]:
+        raise HTTPException(status_code=409, detail="COMMITMENT_ARCHIVED")
+    if action == "confirm" and current["status"] not in {"detected", "confirmed"}:
+        raise HTTPException(status_code=409, detail="INVALID_COMMITMENT_TRANSITION")
+    if action in {"fulfil", "cancel", "break"} and current["status"] not in {
+        "confirmed",
+        "active",
+    }:
+        raise HTTPException(status_code=409, detail="INVALID_COMMITMENT_TRANSITION")
+    if action == "restore" and current["archived_at"] is None:
+        raise HTTPException(status_code=409, detail="COMMITMENT_NOT_ARCHIVED")
+
+    if action == "confirm":
+        assignments = "status = 'active'"
+        audit_type = "commitment.confirmed"
+        event_type = "commitment.confirmed.v1"
+        event_payload = {
+            "owner_id": str(auth.user_id),
+            "due_date": str(current["due_date"]) if current["due_date"] else None,
+            "due_at": current["due_at"].isoformat() if current["due_at"] else None,
+        }
+        changed_fields = ["status"]
+    elif action == "fulfil":
+        assignments = "status = 'fulfilled', fulfilled_at = :now"
+        audit_type = "commitment.fulfilled"
+        event_type = "commitment.fulfilled.v1"
+        event_payload = {"fulfilled_at": now.isoformat()}
+        changed_fields = ["status", "fulfilled_at"]
+    elif action == "cancel":
+        assignments = "status = 'cancelled', fulfilled_at = NULL"
+        audit_type = "commitment.cancelled"
+        event_type = "commitment.cancelled.v1"
+        event_payload = {"reason": reason}
+        changed_fields = ["status", "fulfilled_at"]
+    elif action == "break":
+        assignments = "status = 'broken', fulfilled_at = NULL"
+        audit_type = "commitment.broken"
+        event_type = "commitment.broken.v1"
+        event_payload = {"reason": reason}
+        changed_fields = ["status", "fulfilled_at"]
+    elif action == "archive":
+        assignments = "archived_at = :now, pre_archive_status = status"
+        audit_type = "commitment.archived"
+        event_type = "commitment.archived.v1"
+        event_payload = {
+            "archived_at": now.isoformat(),
+            "pre_archive_status": current["status"],
+        }
+        changed_fields = ["archived_at", "pre_archive_status"]
+    else:
+        restored_status = current["pre_archive_status"] or "confirmed"
+        assignments = "archived_at = NULL, pre_archive_status = NULL, status = :restored_status"
+        audit_type = "commitment.restored"
+        event_type = "commitment.restored.v1"
+        event_payload = {"restored_status": restored_status}
+        changed_fields = ["archived_at", "pre_archive_status", "status"]
+
+    params: dict[str, Any] = {
+        "workspace_id": auth.workspace_id,
+        "commitment_id": commitment_id,
+        "updated_by": auth.user_id,
+        "now": now,
+    }
+    if action == "restore":
+        params["restored_status"] = current["pre_archive_status"] or "confirmed"
+    row = (
+        session.execute(
+            text(
+                f"""
+                UPDATE commitments
+                SET {assignments}, updated_by = :updated_by,
+                    updated_at = :now, version = version + 1
+                WHERE workspace_id = :workspace_id AND id = :commitment_id
+                RETURNING {_SELECT_FIELDS}
+                """
+            ),
+            params,
+        )
+        .mappings()
+        .one()
+    )
+    response = _to_response(dict(row))
+    before = _to_response(current).model_dump(mode="json")
+    after = response.model_dump(mode="json")
+    _write_audit(
+        session,
+        auth,
+        audit_type,
+        commitment_id,
+        response.version,
+        request_id,
+        correlation_id,
+        idempotency_key,
+        before,
+        after,
+        changed_fields,
+        now,
+    )
+    _write_outbox(
+        session,
+        auth,
+        event_type,
+        commitment_id,
+        response.version,
+        correlation_id,
+        event_payload,
+        now,
+    )
+    return response
+
+
 def _lifecycle(
     commitment_id: UUID,
     payload: CommitmentAction,
@@ -774,7 +931,7 @@ def _lifecycle(
     auth: AuthContext,
     session: Session,
     idempotency_key: str,
-    action: Literal["confirm", "fulfil", "cancel", "archive", "restore"],
+    action: Literal["confirm", "fulfil", "cancel", "break", "archive", "restore"],
 ) -> CommitmentResponse:
     request_hash = _request_hash(payload, f"{action}:{commitment_id}")
     request_id, correlation_id = _request_ids(request)
@@ -784,131 +941,17 @@ def _lifecycle(
         cached = _load_cached(session, auth, idempotency_key, request_hash)
         if cached is not None:
             return cached
-        if not authz.authorize(
-            session, auth, resource_type="commitments", resource_id=commitment_id, action="read"
-        ):
-            raise HTTPException(status_code=404, detail="COMMITMENT_NOT_FOUND")
-        if not authz.authorize(
-            session, auth, resource_type="commitments", resource_id=commitment_id, action="write"
-        ):
-            raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
-        current = _get_row(session, auth, commitment_id, for_update=True)
-        if current is None:
-            raise HTTPException(status_code=404, detail="COMMITMENT_NOT_FOUND")
-        _check_version(current, payload.expected_version)
-
-        target_reached = (
-            (action == "confirm" and current["status"] == "active")
-            or (action == "fulfil" and current["status"] == "fulfilled")
-            or (action == "cancel" and current["status"] == "cancelled")
-            or (action == "archive" and current["archived_at"] is not None)
-        )
-        if target_reached:
-            response = _to_response(current)
-            _store_cached(session, auth, idempotency_key, request_hash, response, 200, now)
-            return response
-
-        if action in {"confirm", "fulfil", "cancel"} and current["archived_at"]:
-            raise HTTPException(status_code=409, detail="COMMITMENT_ARCHIVED")
-        if action == "confirm" and current["status"] not in {"detected", "confirmed"}:
-            raise HTTPException(status_code=409, detail="INVALID_COMMITMENT_TRANSITION")
-        if action in {"fulfil", "cancel"} and current["status"] not in {
-            "confirmed",
-            "active",
-        }:
-            raise HTTPException(status_code=409, detail="INVALID_COMMITMENT_TRANSITION")
-        if action == "restore" and current["archived_at"] is None:
-            raise HTTPException(status_code=409, detail="COMMITMENT_NOT_ARCHIVED")
-
-        if action == "confirm":
-            assignments = "status = 'active'"
-            audit_type = "commitment.confirmed"
-            event_type = "commitment.confirmed.v1"
-            event_payload = {
-                "owner_id": str(auth.user_id),
-                "due_date": str(current["due_date"]) if current["due_date"] else None,
-                "due_at": current["due_at"].isoformat() if current["due_at"] else None,
-            }
-            changed_fields = ["status"]
-        elif action == "fulfil":
-            assignments = "status = 'fulfilled', fulfilled_at = :now"
-            audit_type = "commitment.fulfilled"
-            event_type = "commitment.fulfilled.v1"
-            event_payload = {"fulfilled_at": now.isoformat()}
-            changed_fields = ["status", "fulfilled_at"]
-        elif action == "cancel":
-            assignments = "status = 'cancelled', fulfilled_at = NULL"
-            audit_type = "commitment.cancelled"
-            event_type = "commitment.cancelled.v1"
-            event_payload = {"reason": payload.reason}
-            changed_fields = ["status", "fulfilled_at"]
-        elif action == "archive":
-            assignments = "archived_at = :now, pre_archive_status = status"
-            audit_type = "commitment.archived"
-            event_type = "commitment.archived.v1"
-            event_payload = {
-                "archived_at": now.isoformat(),
-                "pre_archive_status": current["status"],
-            }
-            changed_fields = ["archived_at", "pre_archive_status"]
-        else:
-            restored_status = current["pre_archive_status"] or "confirmed"
-            assignments = "archived_at = NULL, pre_archive_status = NULL, status = :restored_status"
-            audit_type = "commitment.restored"
-            event_type = "commitment.restored.v1"
-            event_payload = {"restored_status": restored_status}
-            changed_fields = ["archived_at", "pre_archive_status", "status"]
-
-        params: dict[str, Any] = {
-            "workspace_id": auth.workspace_id,
-            "commitment_id": commitment_id,
-            "updated_by": auth.user_id,
-            "now": now,
-        }
-        if action == "restore":
-            params["restored_status"] = current["pre_archive_status"] or "confirmed"
-        row = (
-            session.execute(
-                text(
-                    f"""
-                    UPDATE commitments
-                    SET {assignments}, updated_by = :updated_by,
-                        updated_at = :now, version = version + 1
-                    WHERE workspace_id = :workspace_id AND id = :commitment_id
-                    RETURNING {_SELECT_FIELDS}
-                    """
-                ),
-                params,
-            )
-            .mappings()
-            .one()
-        )
-        response = _to_response(dict(row))
-        before = _to_response(current).model_dump(mode="json")
-        after = response.model_dump(mode="json")
-        _write_audit(
+        response = lifecycle_write(
             session,
             auth,
-            audit_type,
             commitment_id,
-            response.version,
-            request_id,
-            correlation_id,
-            idempotency_key,
-            before,
-            after,
-            changed_fields,
-            now,
-        )
-        _write_outbox(
-            session,
-            auth,
-            event_type,
-            commitment_id,
-            response.version,
-            correlation_id,
-            event_payload,
-            now,
+            action,
+            expected_version=payload.expected_version,
+            reason=payload.reason,
+            request_id=request_id,
+            correlation_id=correlation_id,
+            idempotency_key=idempotency_key,
+            now=now,
         )
         _store_cached(session, auth, idempotency_key, request_hash, response, 200, now)
         return response
@@ -951,6 +994,19 @@ def cancel_commitment(
     idempotency_key: IdempotencyHeader,
 ) -> CommitmentResponse:
     return _lifecycle(commitment_id, payload, request, auth, session, idempotency_key, "cancel")
+
+
+@router.post("/{commitment_id}/break", response_model=CommitmentResponse)
+def break_commitment(
+    commitment_id: UUID,
+    payload: CommitmentAction,
+    request: Request,
+    auth: AuthDep,
+    session: SessionDep,
+    _csrf: CsrfDep,
+    idempotency_key: IdempotencyHeader,
+) -> CommitmentResponse:
+    return _lifecycle(commitment_id, payload, request, auth, session, idempotency_key, "break")
 
 
 @router.post("/{commitment_id}/archive", response_model=CommitmentResponse)

@@ -774,6 +774,233 @@ def update_task(
         return response
 
 
+def set_task_status_write(
+    session: Session,
+    auth: AuthContext,
+    task_id: UUID,
+    new_status: Literal["captured", "planned", "in_progress", "blocked"],
+    *,
+    expected_version: int,
+    request_id: UUID,
+    correlation_id: UUID,
+    idempotency_key: str,
+    now: datetime,
+) -> TaskResponse:
+    """The single-field `status` slice of `update_task`'s guard + write +
+    audit/outbox emission, for the non-terminal status values `execute_target`'s
+    `set_status` branch can request (`completed`/`cancelled` go through
+    `lifecycle_task_write` instead, since only those two have a lifecycle
+    action). Mirrors `update_task`'s own `TASK_ARCHIVED`/`TASK_TERMINAL`
+    guards exactly rather than reimplementing them independently, so a
+    recommendation-driven status set can never bypass what a manual `PATCH`
+    already enforces. Deliberately excludes `session.begin()`/idempotency-key
+    locking/replay -- see `insert_task`'s own docstring for why.
+    """
+    if not authz.authorize(
+        session, auth, resource_type="tasks", resource_id=task_id, action="read"
+    ):
+        raise HTTPException(status_code=404, detail="TASK_NOT_FOUND")
+    if not authz.authorize(
+        session, auth, resource_type="tasks", resource_id=task_id, action="write"
+    ):
+        raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
+    current = _get_task_row(session, auth, task_id, for_update=True)
+    if current is None:
+        raise HTTPException(status_code=404, detail="TASK_NOT_FOUND")
+    _raise_version_conflict(current, expected_version)
+    if current["archived_at"] is not None:
+        raise HTTPException(status_code=409, detail="TASK_ARCHIVED")
+    if current["status"] in {"completed", "cancelled"} and new_status != current["status"]:
+        raise HTTPException(status_code=409, detail="TASK_TERMINAL")
+
+    if new_status == current["status"]:
+        return _to_response(current)
+
+    row = (
+        session.execute(
+            text(
+                f"""
+                UPDATE tasks
+                SET status = :status, updated_by = :updated_by,
+                    updated_at = :now, version = version + 1
+                WHERE workspace_id = :workspace_id AND id = :task_id
+                RETURNING {_SELECT_FIELDS}
+                """
+            ),
+            {
+                "status": new_status,
+                "workspace_id": auth.workspace_id,
+                "task_id": task_id,
+                "updated_by": auth.user_id,
+                "now": now,
+            },
+        )
+        .mappings()
+        .one()
+    )
+    response = _to_response(dict(row))
+    before = _to_response(current).model_dump(mode="json")
+    after = response.model_dump(mode="json")
+    _write_audit(
+        session,
+        auth,
+        "task.updated",
+        task_id,
+        response.version,
+        request_id,
+        correlation_id,
+        idempotency_key,
+        before,
+        after,
+        ["status"],
+        now,
+    )
+    _write_outbox(
+        session,
+        auth,
+        "task.updated.v1",
+        task_id,
+        response.version,
+        correlation_id,
+        {"changed_fields": ["status"]},
+        now,
+    )
+    return response
+
+
+def lifecycle_task_write(
+    session: Session,
+    auth: AuthContext,
+    task_id: UUID,
+    action: Literal["complete", "cancel", "archive", "restore"],
+    *,
+    expected_version: int,
+    reason: str | None,
+    request_id: UUID,
+    correlation_id: UUID,
+    idempotency_key: str,
+    now: datetime,
+) -> TaskResponse:
+    """The guard + row-write + audit/outbox emission behind every task
+    lifecycle transition, split out so `ecc.domains.governance.
+    recommendation_targets.execute_target`'s `set_status` branch can call
+    the identical path a manual transition uses, instead of a raw `UPDATE`
+    that bypasses these guards and never writes an audit trail. Deliberately
+    excludes `session.begin()`/idempotency-key locking/replay (both callers
+    already run inside their own already-open transaction and idempotency
+    scheme; nesting a second `session.begin()` here would raise) -- mirrors
+    `insert_task`'s own precedent exactly.
+    """
+    if not authz.authorize(
+        session, auth, resource_type="tasks", resource_id=task_id, action="read"
+    ):
+        raise HTTPException(status_code=404, detail="TASK_NOT_FOUND")
+    if not authz.authorize(
+        session, auth, resource_type="tasks", resource_id=task_id, action="write"
+    ):
+        raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
+    current = _get_task_row(session, auth, task_id, for_update=True)
+    if current is None:
+        raise HTTPException(status_code=404, detail="TASK_NOT_FOUND")
+    _raise_version_conflict(current, expected_version)
+
+    target_reached = (
+        (action == "complete" and current["status"] == "completed")
+        or (action == "cancel" and current["status"] == "cancelled")
+        or (action == "archive" and current["archived_at"] is not None)
+        or (action == "restore" and current["archived_at"] is None)
+    )
+    if target_reached:
+        return _to_response(current)
+
+    if action in {"complete", "cancel"} and current["status"] in {"completed", "cancelled"}:
+        raise HTTPException(status_code=409, detail="TASK_TERMINAL")
+
+    if action in {"complete", "cancel"} and current["archived_at"] is not None:
+        raise HTTPException(status_code=409, detail="TASK_ARCHIVED")
+
+    event_payload: dict[str, Any]
+    if action == "complete":
+        assignments = "status = 'completed', completed_at = :now"
+        audit_type = "task.completed"
+        event_type = "task.completed.v1"
+        event_payload = {"completed_at": now.isoformat()}
+        changed_fields = ["status", "completed_at"]
+    elif action == "cancel":
+        assignments = "status = 'cancelled', completed_at = NULL"
+        audit_type = "task.cancelled"
+        event_type = "task.cancelled.v1"
+        event_payload = {"reason": reason}
+        changed_fields = ["status", "completed_at"]
+    elif action == "archive":
+        assignments = "archived_at = :now, pre_archive_status = status"
+        audit_type = "task.archived"
+        event_type = "task.archived.v1"
+        event_payload = {
+            "archived_at": now.isoformat(),
+            "pre_archive_status": current["status"],
+        }
+        changed_fields = ["archived_at", "pre_archive_status"]
+    else:
+        restored_status = current["pre_archive_status"] or "captured"
+        assignments = "archived_at = NULL, pre_archive_status = NULL, status = :restored_status"
+        audit_type = "task.restored"
+        event_type = "task.restored.v1"
+        event_payload = {"restored_status": restored_status}
+        changed_fields = ["archived_at", "pre_archive_status", "status"]
+
+    row = (
+        session.execute(
+            text(
+                f"""
+            UPDATE tasks
+            SET {assignments}, updated_by = :updated_by,
+                updated_at = :now, version = version + 1
+            WHERE workspace_id = :workspace_id AND id = :task_id
+            RETURNING {_SELECT_FIELDS}
+            """
+            ),
+            {
+                "workspace_id": auth.workspace_id,
+                "task_id": task_id,
+                "updated_by": auth.user_id,
+                "restored_status": current["pre_archive_status"] or "captured",
+                "now": now,
+            },
+        )
+        .mappings()
+        .one()
+    )
+    response = _to_response(dict(row))
+    before = _to_response(current).model_dump(mode="json")
+    after = response.model_dump(mode="json")
+    _write_audit(
+        session,
+        auth,
+        audit_type,
+        task_id,
+        response.version,
+        request_id,
+        correlation_id,
+        idempotency_key,
+        before,
+        after,
+        changed_fields,
+        now,
+    )
+    _write_outbox(
+        session,
+        auth,
+        event_type,
+        task_id,
+        response.version,
+        correlation_id,
+        event_payload,
+        now,
+    )
+    return response
+
+
 def _lifecycle_task(
     task_id: UUID,
     payload: TaskAction,
@@ -797,122 +1024,17 @@ def _lifecycle_task(
         )
         if cached is not None:
             return cached
-        if not authz.authorize(
-            session, auth, resource_type="tasks", resource_id=task_id, action="read"
-        ):
-            raise HTTPException(status_code=404, detail="TASK_NOT_FOUND")
-        if not authz.authorize(
-            session, auth, resource_type="tasks", resource_id=task_id, action="write"
-        ):
-            raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
-        current = _get_task_row(session, auth, task_id, for_update=True)
-        if current is None:
-            raise HTTPException(status_code=404, detail="TASK_NOT_FOUND")
-        _raise_version_conflict(current, payload.expected_version)
-
-        target_reached = (
-            (action == "complete" and current["status"] == "completed")
-            or (action == "cancel" and current["status"] == "cancelled")
-            or (action == "archive" and current["archived_at"] is not None)
-            or (action == "restore" and current["archived_at"] is None)
-        )
-        if target_reached:
-            response = _to_response(current)
-            _store_idempotency(
-                session,
-                auth,
-                idempotency_key,
-                request_hash,
-                response,
-                200,
-                now,
-            )
-            return response
-
-        if action in {"complete", "cancel"} and current["status"] in {"completed", "cancelled"}:
-            raise HTTPException(status_code=409, detail="TASK_TERMINAL")
-
-        if action in {"complete", "cancel"} and current["archived_at"] is not None:
-            raise HTTPException(status_code=409, detail="TASK_ARCHIVED")
-
-        event_payload: dict[str, Any]
-        if action == "complete":
-            assignments = "status = 'completed', completed_at = :now"
-            audit_type = "task.completed"
-            event_type = "task.completed.v1"
-            event_payload = {"completed_at": now.isoformat()}
-            changed_fields = ["status", "completed_at"]
-        elif action == "cancel":
-            assignments = "status = 'cancelled', completed_at = NULL"
-            audit_type = "task.cancelled"
-            event_type = "task.cancelled.v1"
-            event_payload = {"reason": payload.reason}
-            changed_fields = ["status", "completed_at"]
-        elif action == "archive":
-            assignments = "archived_at = :now, pre_archive_status = status"
-            audit_type = "task.archived"
-            event_type = "task.archived.v1"
-            event_payload = {
-                "archived_at": now.isoformat(),
-                "pre_archive_status": current["status"],
-            }
-            changed_fields = ["archived_at", "pre_archive_status"]
-        else:
-            restored_status = current["pre_archive_status"] or "captured"
-            assignments = "archived_at = NULL, pre_archive_status = NULL, status = :restored_status"
-            audit_type = "task.restored"
-            event_type = "task.restored.v1"
-            event_payload = {"restored_status": restored_status}
-            changed_fields = ["archived_at", "pre_archive_status", "status"]
-
-        row = (
-            session.execute(
-                text(
-                    f"""
-                UPDATE tasks
-                SET {assignments}, updated_by = :updated_by,
-                    updated_at = :now, version = version + 1
-                WHERE workspace_id = :workspace_id AND id = :task_id
-                RETURNING {_SELECT_FIELDS}
-                """
-                ),
-                {
-                    "workspace_id": auth.workspace_id,
-                    "task_id": task_id,
-                    "updated_by": auth.user_id,
-                    "restored_status": current["pre_archive_status"] or "captured",
-                    "now": now,
-                },
-            )
-            .mappings()
-            .one()
-        )
-        response = _to_response(dict(row))
-        before = _to_response(current).model_dump(mode="json")
-        after = response.model_dump(mode="json")
-        _write_audit(
+        response = lifecycle_task_write(
             session,
             auth,
-            audit_type,
             task_id,
-            response.version,
-            request_id,
-            correlation_id,
-            idempotency_key,
-            before,
-            after,
-            changed_fields,
-            now,
-        )
-        _write_outbox(
-            session,
-            auth,
-            event_type,
-            task_id,
-            response.version,
-            correlation_id,
-            event_payload,
-            now,
+            action,
+            expected_version=payload.expected_version,
+            reason=payload.reason,
+            request_id=request_id,
+            correlation_id=correlation_id,
+            idempotency_key=idempotency_key,
+            now=now,
         )
         _store_idempotency(
             session,

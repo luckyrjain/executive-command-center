@@ -1,5 +1,5 @@
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, Literal
 from uuid import UUID, uuid4
 
 from fastapi import HTTPException, Request
@@ -8,9 +8,41 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from ecc.auth import AuthContext
-from ecc.domains.communication.commitments import CommitmentCreate, insert_commitment
+from ecc.domains.communication.commitments import (
+    CommitmentCreate,
+    insert_commitment,
+    lifecycle_write,
+)
+from ecc.domains.governance.risk_mutations import set_risk_status_write
 from ecc.domains.governance.risks import RiskCreate, insert_risk
-from ecc.domains.planning.tasks import TaskCreate, insert_task
+from ecc.domains.planning.tasks import (
+    TaskCreate,
+    insert_task,
+    lifecycle_task_write,
+    set_task_status_write,
+)
+
+# Commitment status values a recommendation may target -- "confirmed" is
+# deliberately absent: it's `CommitmentCreate`'s own create-time-only value
+# (see that model's `status` field), never a real transition target, and
+# nothing in this codebase has ever generated a recommendation naming it.
+# "broken" IS a real transition as of the `POST .../break` endpoint added
+# alongside this fix -- see `commitments.py`'s `lifecycle_write` docstring.
+_COMMITMENT_STATUS_ACTIONS: dict[
+    str, Literal["confirm", "fulfil", "cancel", "break", "archive", "restore"]
+] = {
+    "active": "confirm",
+    "fulfilled": "fulfil",
+    "broken": "break",
+    "cancelled": "cancel",
+}
+# Task status values with a dedicated lifecycle action (side-effect fields,
+# terminal-state guard) vs. values `set_task_status_write` handles as a
+# plain, non-terminal field write -- see that function's own docstring.
+_TASK_STATUS_ACTIONS: dict[str, Literal["complete", "cancel", "archive", "restore"]] = {
+    "completed": "complete",
+    "cancelled": "cancel",
+}
 
 _ALLOWED: dict[str, dict[str, set[Any]]] = {
     "task": {
@@ -35,7 +67,7 @@ _ALLOWED: dict[str, dict[str, set[Any]]] = {
         "create": {None},
     },
     "commitment": {
-        "set_status": {"confirmed", "active", "fulfilled", "broken", "cancelled"},
+        "set_status": {"active", "fulfilled", "broken", "cancelled"},
         "set_importance": {"low", "medium", "high", "critical"},
         "set_pinned": {True, False},
         "create": {None},
@@ -199,6 +231,88 @@ def _execute_create(
     raise HTTPException(status_code=422, detail="UNSUPPORTED_TARGET_TYPE")
 
 
+def _execute_set_status(
+    session: Session,
+    auth: AuthContext,
+    request: Request,
+    recommendation_id: UUID,
+    target_type: str,
+    target_id: UUID,
+    value: Any,
+    expected_version: int,
+) -> dict[str, Any]:
+    """Routes a `set_status` recommendation through the target's own real
+    transition logic instead of the generic column-patch `_update_query`
+    every other operation below uses. Status is a state-machine
+    transition -- side-effect fields (`fulfilled_at`/`completed_at`),
+    terminal-state guards, and an audit trail -- not a plain field write;
+    the generic raw `UPDATE` used to bypass all three, letting a
+    recommendation un-terminal an already-fulfilled/broken/cancelled
+    commitment with no audit trail at all (architecture-review finding).
+    `idempotency_key` is synthetic, matching `_execute_create`'s own
+    precedent exactly -- distinct from `confirm_recommendation`'s own
+    caller-supplied `Idempotency-Key`, which already wraps this whole call
+    in its own lock/cache/replay.
+    """
+    now = datetime.now(UTC)
+    request_id, correlation_id = _request_ids(request)
+    idempotency_key = f"recommendation-confirm:{recommendation_id}"
+    if target_type == "commitment":
+        commitment_response = lifecycle_write(
+            session,
+            auth,
+            target_id,
+            _COMMITMENT_STATUS_ACTIONS[value],
+            expected_version=expected_version,
+            reason=None,
+            request_id=request_id,
+            correlation_id=correlation_id,
+            idempotency_key=idempotency_key,
+            now=now,
+        )
+        version = commitment_response.version
+    elif target_type == "task":
+        if value in _TASK_STATUS_ACTIONS:
+            task_response = lifecycle_task_write(
+                session,
+                auth,
+                target_id,
+                _TASK_STATUS_ACTIONS[value],
+                expected_version=expected_version,
+                reason=None,
+                request_id=request_id,
+                correlation_id=correlation_id,
+                idempotency_key=idempotency_key,
+                now=now,
+            )
+        else:
+            task_response = set_task_status_write(
+                session,
+                auth,
+                target_id,
+                value,
+                expected_version=expected_version,
+                request_id=request_id,
+                correlation_id=correlation_id,
+                idempotency_key=idempotency_key,
+                now=now,
+            )
+        version = task_response.version
+    elif target_type == "risk":
+        risk_response = set_risk_status_write(
+            session, auth, request, target_id, value, expected_version=expected_version, now=now
+        )
+        version = risk_response.version
+    else:
+        raise HTTPException(status_code=422, detail="UNSUPPORTED_TARGET_TYPE")
+    return {
+        "target_type": target_type,
+        "target_id": str(target_id),
+        "resulting_version": version,
+        "operation": "set_status",
+    }
+
+
 def execute_target(
     session: Session,
     auth: AuthContext,
@@ -222,14 +336,22 @@ def execute_target(
         # this should be unreachable -- a defensive 500, not a user-facing
         # validation path, if that invariant is ever violated.
         raise HTTPException(status_code=500, detail="TARGET_ID_OR_VERSION_MISSING")
+    if operation == "set_status":
+        return _execute_set_status(
+            session,
+            auth,
+            request,
+            recommendation_id,
+            target_type,
+            target_id,
+            action["value"],
+            expected_version,
+        )
     columns = {
-        ("task", "set_status"): ("tasks", "status"),
         ("task", "set_priority"): ("tasks", "manual_priority"),
         ("task", "set_pinned"): ("tasks", "pinned"),
-        ("commitment", "set_status"): ("commitments", "status"),
         ("commitment", "set_importance"): ("commitments", "importance"),
         ("commitment", "set_pinned"): ("commitments", "pinned"),
-        ("risk", "set_status"): ("risks", "status"),
         ("risk", "set_probability"): ("risks", "probability"),
         ("risk", "set_impact"): ("risks", "impact"),
         ("risk", "set_pinned"): ("risks", "pinned"),

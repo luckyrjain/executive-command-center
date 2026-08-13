@@ -127,6 +127,39 @@ def _task(workspace_id: UUID, user_id: UUID, title: str = "Recommendation target
     return task_id
 
 
+def _commitment(
+    workspace_id: UUID,
+    user_id: UUID,
+    status: str = "active",
+    summary: str = "Recommendation target",
+) -> UUID:
+    commitment_id = uuid4()
+    now = datetime.now(UTC)
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                """
+                INSERT INTO commitments (
+                    id,workspace_id,owner_id,summary,direction,status,importance,pinned,
+                    created_by,updated_by,created_at,updated_at,version
+                ) VALUES (
+                    :id,:workspace_id,:user_id,:summary,'made_by_me',:status,'medium',false,
+                    :user_id,:user_id,:now,:now,1
+                )
+                """
+            ),
+            {
+                "id": commitment_id,
+                "workspace_id": workspace_id,
+                "user_id": user_id,
+                "summary": summary,
+                "status": status,
+                "now": now,
+            },
+        )
+    return commitment_id
+
+
 def _generate(
     client: TestClient,
     token: str,
@@ -816,3 +849,137 @@ def test_two_pending_create_recommendations_of_the_same_type_do_not_supersede_ea
     second_loaded = client.get(f"/api/v1/recommendations/{second['id']}")
     assert second_loaded.status_code == 200
     assert second_loaded.json()["status"] == "proposed"
+
+
+def test_confirm_set_status_recommendation_routes_through_the_real_state_machine(
+    recommendation_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    """Architecture-review finding: `execute_target`'s `set_status` branch
+    used to run a raw `UPDATE commitments SET status=...`, bypassing
+    `commitments.py`'s own `_lifecycle`/`lifecycle_write` guards entirely --
+    a recommendation could silently un-terminal an already-`cancelled`
+    commitment back to `active`, with no audit trail at all. Confirms the
+    fix: the same transition attempted here must be rejected with the
+    identical `INVALID_COMMITMENT_TRANSITION` a manual `POST .../confirm`
+    would return, the commitment's status must be untouched, and the whole
+    confirm attempt must roll back cleanly (no partial recommendation-state
+    mutation left behind by the rejected execution).
+    """
+    client, workspace_id, user_id, token = recommendation_context
+    commitment_id = _commitment(workspace_id, user_id, status="cancelled")
+
+    generated = client.post(
+        "/api/v1/recommendations",
+        headers=_headers(token),
+        json={
+            "recommendation_type": "commitment_status",
+            "target_type": "commitment",
+            "target_id": str(commitment_id),
+            "proposed_action": {"operation": "set_status", "value": "active"},
+            "expected_version": 1,
+            "rationale": "New activity suggests this commitment is back on.",
+            "confidence": 0.8,
+            "evidence_ids": [],
+            "expires_at": None,
+            "source": "rule",
+        },
+    ).json()
+    recommendation_id = generated["id"]
+    client.post(
+        f"/api/v1/recommendations/{recommendation_id}/publish",
+        headers=_headers(token),
+        json={"expected_version": 1},
+    )
+
+    confirmed = client.post(
+        f"/api/v1/recommendations/{recommendation_id}/confirm",
+        headers=_headers(token),
+        json={"expected_version": 2, "target_expected_version": 1},
+    )
+    assert confirmed.status_code == 409
+    assert confirmed.json()["error"]["code"] == "INVALID_COMMITMENT_TRANSITION"
+
+    with engine.connect() as connection:
+        commitment = (
+            connection.execute(
+                text("SELECT status, version FROM commitments WHERE id=:id"),
+                {"id": commitment_id},
+            )
+            .mappings()
+            .one()
+        )
+        recommendation_status = connection.execute(
+            text("SELECT status FROM recommendations WHERE id=:id"),
+            {"id": UUID(str(recommendation_id))},
+        ).scalar_one()
+    assert commitment["status"] == "cancelled"
+    assert commitment["version"] == 1
+    assert recommendation_status == "pending_confirmation"
+
+
+def test_confirm_set_status_recommendation_writes_audit_trail_and_supports_break(
+    recommendation_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    """A *valid* recommendation-driven status transition -- unlike the
+    rejected one above -- must both succeed and leave the exact audit trail
+    a manual `POST .../break` would (the missing-audit-trail half of the
+    same architecture-review finding). Also exercises the new `broken`
+    status/`POST /commitments/{id}/break` endpoint this fix added, since
+    nothing could reach that status at all before it.
+    """
+    client, workspace_id, user_id, token = recommendation_context
+    commitment_id = _commitment(workspace_id, user_id, status="active")
+
+    generated = client.post(
+        "/api/v1/recommendations",
+        headers=_headers(token),
+        json={
+            "recommendation_type": "commitment_status",
+            "target_type": "commitment",
+            "target_id": str(commitment_id),
+            "proposed_action": {"operation": "set_status", "value": "broken"},
+            "expected_version": 1,
+            "rationale": "Counterparty confirmed this will not be delivered.",
+            "confidence": 0.85,
+            "evidence_ids": [],
+            "expires_at": None,
+            "source": "rule",
+        },
+    ).json()
+    recommendation_id = generated["id"]
+    client.post(
+        f"/api/v1/recommendations/{recommendation_id}/publish",
+        headers=_headers(token),
+        json={"expected_version": 1},
+    )
+
+    confirmed = client.post(
+        f"/api/v1/recommendations/{recommendation_id}/confirm",
+        headers=_headers(token),
+        json={"expected_version": 2, "target_expected_version": 1},
+    )
+    assert confirmed.status_code == 200
+    assert confirmed.json()["status"] == "executed"
+
+    with engine.connect() as connection:
+        commitment = (
+            connection.execute(
+                text("SELECT status, version FROM commitments WHERE id=:id"),
+                {"id": commitment_id},
+            )
+            .mappings()
+            .one()
+        )
+        audit_count = connection.execute(
+            text(
+                """
+                SELECT count(*) FROM audit_events
+                WHERE workspace_id=:workspace_id AND aggregate_type='commitment'
+                  AND aggregate_id=:commitment_id AND event_type='commitment.broken'
+                """
+            ),
+            {"workspace_id": workspace_id, "commitment_id": commitment_id},
+        ).scalar_one()
+    assert commitment["status"] == "broken"
+    assert commitment["version"] == 2
+    assert audit_count == 1
