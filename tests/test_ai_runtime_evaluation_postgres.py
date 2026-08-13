@@ -470,6 +470,51 @@ def test_run_evaluation_prohibited_fact_fails_only_that_floor(run_context: dict)
     assert any(failure["reason"] == "prohibited_fact" for failure in run.failures)
 
 
+def test_run_evaluation_negated_prohibited_fact_does_not_fail_that_floor(
+    run_context: dict,
+) -> None:
+    """`_phrase_occurrence_is_negated`'s own regression test. Found via a
+    real `ollama-evaluation` CI run: `task_due_48h_medium_waiting`'s actual
+    model output was "...close to being completed but not yet overdue" --
+    a correct, negated statement a raw substring match cannot distinguish
+    from asserting the fact outright. Two prior prompt-engineering attempts
+    (migrations 0053/0055) tried to stop the model from ever mentioning the
+    word at all; the actual bug was the checker's own substring match. A
+    response that only ever mentions a `must_not_state` phrase negated must
+    not count as a prohibited-fact occurrence.
+    """
+    example_with_probe = next(example for example in EXAMPLES if example["must_not_state"])
+    phrase = example_with_probe["must_not_state"][0]
+    responses = []
+    for example in EXAMPLES:
+        if example["key"] == example_with_probe["key"]:
+            explanation = f"{example['reference_explanation']} This is not {phrase}."
+            responses.append(
+                json.dumps(
+                    {
+                        "explanation_text": explanation,
+                        "cited_factor_codes": list(example["must_cite"]),
+                    }
+                )
+            )
+        else:
+            responses.append(_valid_response(example))
+    adapter = _adapter_with_responses(*responses)
+    with SessionFactory() as session:
+        run = run_evaluation(
+            TASK_TYPE,
+            3,
+            _SEEDED_MODEL_ID,
+            session=session,
+            auth=run_context["auth"],
+            ollama_adapter=adapter,
+        )
+
+    assert run.metrics.prohibited_fact_count == 0
+    assert run.failures == []
+    assert check_promotion_floors(run) is True
+
+
 def test_run_evaluation_provider_error_on_one_example_lands_in_other_failure(
     run_context: dict,
 ) -> None:
