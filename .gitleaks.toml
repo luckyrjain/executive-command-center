@@ -1,0 +1,11 @@
+title = "gitleaks config"
+
+# Extend, don't replace, gitleaks' own default rule set.
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Generated/cache output, not source -- content hashes here are file digests, not secrets"
+paths = [
+  '''graphify-out/.*''',
+]
