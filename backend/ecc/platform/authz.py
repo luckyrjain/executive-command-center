@@ -557,20 +557,32 @@ class EffectivePermissions(BaseModel):
     granted_actions: list[Action]
 
 
-def effective_permissions(
+@dataclass(frozen=True)
+class _ResourceAccessContext:
+    role: Role
+    resource: ResourceRef
+    is_owner: bool
+
+
+def _resource_access_context(
     session: Session, auth: AuthContext, *, resource_type: str, resource_id: UUID
-) -> EffectivePermissions | None:
-    """The richer, response-shaped counterpart to `authorize()`'s plain
-    `bool` -- same six-step decision (kept in the same order deliberately,
-    so the two are easy to eyeball against each other and never drift),
-    but returns *why* access is allowed and exactly which actions it
-    covers, rather than a single action's pass/fail. Returns `None` under
-    the identical conditions `authorize()` returns `False` for -- no active
-    membership, unknown/cross-workspace/nonexistent resource, `private`
-    and not the owner, or `shared_explicitly` with no active grant -- so
-    every caller translates `None` to `404` exactly like every other
-    single-resource route already does, never a different failure shape
-    that could itself leak existence.
+) -> _ResourceAccessContext | None:
+    """Steps 1-2 of Decision 2's six-step check -- role lookup, resource
+    load, the cross-workspace check, and the owner test -- shared by
+    `authorize()` and `effective_permissions()`, which is where their
+    branches genuinely coincide. Returns `None` under the same conditions
+    both callers already treat as an unconditional deny (no active
+    membership, unknown/cross-workspace/nonexistent resource).
+
+    Deliberately stops here rather than also resolving steps 3-5
+    (`private`/`shared_explicitly`/`workspace`): `authorize()`'s
+    `shared_explicitly` check only ever needs a lean single-action
+    `_active_grant_exists` `EXISTS` query, while `effective_permissions()`
+    needs `active_grant_actions_for`'s richer union-of-actions query --
+    two different query shapes for the same step, kept apart on purpose
+    (see `active_grant_actions_for`'s own docstring for the cost this
+    avoids on `authorize()`'s hot path). Folding that step in here would
+    force one query shape on both callers.
     """
     role = current_role(session, workspace_id=auth.workspace_id, users_id=auth.user_id)
     if role is None:
@@ -578,20 +590,45 @@ def effective_permissions(
     resource = load_resource(session, resource_type=resource_type, resource_id=resource_id)
     if resource is None or resource.workspace_id != auth.workspace_id:
         return None
-    if resource.owner_id == auth.user_id:
+    return _ResourceAccessContext(
+        role=role, resource=resource, is_owner=resource.owner_id == auth.user_id
+    )
+
+
+def effective_permissions(
+    session: Session, auth: AuthContext, *, resource_type: str, resource_id: UUID
+) -> EffectivePermissions | None:
+    """The richer, response-shaped counterpart to `authorize()`'s plain
+    `bool` -- same six-step decision, sharing `_resource_access_context`'s
+    role/resource/owner steps with it so those can't drift, but returns
+    *why* access is allowed and exactly which actions it covers, rather
+    than a single action's pass/fail. Returns `None` under the identical
+    conditions `authorize()` returns `False` for -- no active membership,
+    unknown/cross-workspace/nonexistent resource, `private` and not the
+    owner, or `shared_explicitly` with no active grant -- so every caller
+    translates `None` to `404` exactly like every other single-resource
+    route already does, never a different failure shape that could itself
+    leak existence.
+    """
+    ctx = _resource_access_context(
+        session, auth, resource_type=resource_type, resource_id=resource_id
+    )
+    if ctx is None:
+        return None
+    if ctx.is_owner:
         return EffectivePermissions(
             resource_type=resource_type,
             resource_id=resource_id,
-            visibility=resource.visibility,
-            owner_id=resource.owner_id,
+            visibility=ctx.resource.visibility,
+            owner_id=ctx.resource.owner_id,
             is_owner=True,
-            role=role,
+            role=ctx.role,
             via="owner",
             granted_actions=list(ACTIONS),
         )
-    if resource.visibility == "private":
+    if ctx.resource.visibility == "private":
         return None
-    if resource.visibility == "shared_explicitly":
+    if ctx.resource.visibility == "shared_explicitly":
         account_id = account_id_for(session, workspace_id=auth.workspace_id, users_id=auth.user_id)
         if account_id is None:
             return None
@@ -608,23 +645,23 @@ def effective_permissions(
         return EffectivePermissions(
             resource_type=resource_type,
             resource_id=resource_id,
-            visibility=resource.visibility,
-            owner_id=resource.owner_id,
+            visibility=ctx.resource.visibility,
+            owner_id=ctx.resource.owner_id,
             is_owner=False,
-            role=role,
+            role=ctx.role,
             via="resource_grant",
             granted_actions=sorted(actions),
         )
-    if resource.visibility == "workspace":
+    if ctx.resource.visibility == "workspace":
         return EffectivePermissions(
             resource_type=resource_type,
             resource_id=resource_id,
-            visibility=resource.visibility,
-            owner_id=resource.owner_id,
+            visibility=ctx.resource.visibility,
+            owner_id=ctx.resource.owner_id,
             is_owner=False,
-            role=role,
+            role=ctx.role,
             via="workspace_role",
-            granted_actions=sorted(ROLE_PERMISSIONS[role]),
+            granted_actions=sorted(ROLE_PERMISSIONS[ctx.role]),
         )
     return None
 
@@ -700,21 +737,19 @@ def authorize(
     leak this two-call pattern (see `connector_accounts.py`'s call sites
     for the canonical shape) exists to prevent.
     """
-    role = current_role(session, workspace_id=auth.workspace_id, users_id=auth.user_id)
-    if role is None:
-        return False  # step 1: not an active member of this workspace at all
+    ctx = _resource_access_context(
+        session, auth, resource_type=resource_type, resource_id=resource_id
+    )
+    if ctx is None:
+        return False  # steps 1-2: no active membership, or no such resource in this workspace
 
-    resource = load_resource(session, resource_type=resource_type, resource_id=resource_id)
-    if resource is None or resource.workspace_id != auth.workspace_id:
-        return False  # no such resource in the caller's own workspace
-
-    if resource.owner_id == auth.user_id:
+    if ctx.is_owner:
         return True  # step 2: the owner is always allowed
 
-    if resource.visibility == "private":
+    if ctx.resource.visibility == "private":
         return False  # step 3
 
-    if resource.visibility == "shared_explicitly":
+    if ctx.resource.visibility == "shared_explicitly":
         account_id = account_id_for(session, workspace_id=auth.workspace_id, users_id=auth.user_id)
         if account_id is None:
             return False
@@ -728,8 +763,8 @@ def authorize(
             now=datetime.now(UTC),
         )  # step 4
 
-    if resource.visibility == "workspace":
-        return action in ROLE_PERMISSIONS[role]  # step 5
+    if ctx.resource.visibility == "workspace":
+        return action in ROLE_PERMISSIONS[ctx.role]  # step 5
 
     return False  # step 6: no implicit allow path exists anywhere in this function
 

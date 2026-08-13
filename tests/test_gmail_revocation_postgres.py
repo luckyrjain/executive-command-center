@@ -329,7 +329,7 @@ def _insert_attention_item(
 
 
 def _insert_pkos_node(connection, *, workspace_id: UUID, owner_id: UUID, now: datetime) -> UUID:
-    """Matches `gmail_adapter.py:_resolve_or_create_person`'s own `INSERT
+    """Matches `gmail_adapter.py:resolve_or_create_person`'s own `INSERT
     INTO pkos_nodes` column list exactly.
     """
     node_id = uuid4()

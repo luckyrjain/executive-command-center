@@ -3,7 +3,7 @@ Gmail. Split out of `gmail_adapter.py` (deepening candidate from an
 architecture review) -- these three names (`detect_actions_since`,
 `_detect_action_for_message`, `_register_message_evidence`) and
 `_MAX_ACTION_DETECTIONS_PER_CALL` were the genuinely detection-exclusive
-slice of that file; `fetch_and_store_body` and `_resolve_or_create_person`
+slice of that file; `fetch_and_store_body` and `resolve_or_create_person`
 stayed there since both are also used by code that has nothing to do with
 AI detection (`gmail_threads.py`'s on-demand thread-open fetch, and the
 ordinary sync path's own participant resolution, respectively) --
@@ -45,7 +45,7 @@ from ecc.domains.governance.recommendation_mutations import create_recommendatio
 # comment there). `_bearer_headers`/`_email_consent_active` come from
 # `gmail_shared.py`, not `gmail_adapter.py` -- see that module's own
 # docstring.
-from .gmail_adapter import GmailAdapter, _owner_id_for_account, _resolve_or_create_person
+from .gmail_adapter import GmailAdapter, owner_id_for_account, resolve_or_create_person
 from .gmail_shared import _bearer_headers, _email_consent_active
 
 # Task 5's own, much smaller bound -- deliberately not `_MAX_MESSAGES_PER_
@@ -75,12 +75,12 @@ def _register_message_evidence(
 ) -> UUID:
     """One fresh `pkos_evidence` row citing the specific message that
     triggered a detection run -- distinct from whatever (possibly much
-    older) `pkos_evidence` row `_resolve_or_create_person` created the
+    older) `pkos_evidence` row `resolve_or_create_person` created the
     first time this sender was ever seen (see that function's own
     docstring): a recommendation's `evidence_ids` must point at the email
     actually reasoned about, not merely at "this sender is a known
     person." `source_ref` is deliberately namespaced (`gmail:detect_
-    action:...`, not `_resolve_or_create_person`'s own bare `gmail:...`)
+    action:...`, not `resolve_or_create_person`'s own bare `gmail:...`)
     so the two purposes never collide on the same `sha256`.
     """
     evidence_id = uuid4()
@@ -188,7 +188,7 @@ def detect_actions_since(
 
     Builds its own `AuthContext` from the account's `owner_id`, not a
     caller-supplied one -- the created recommendation must belong to
-    the connected account's own owner (`_owner_id_for_account`),
+    the connected account's own owner (`owner_id_for_account`),
     regardless of which user's own request happened to trigger this
     particular sync call.
 
@@ -202,9 +202,7 @@ def detect_actions_since(
         return
 
     with SessionFactory() as session, session.begin():
-        owner_id = _owner_id_for_account(
-            session, context.workspace_id, context.connector_account_id
-        )
+        owner_id = owner_id_for_account(session, context.workspace_id, context.connector_account_id)
     if owner_id is None:
         return
     with SessionFactory() as session, session.begin():
@@ -309,7 +307,7 @@ def _detect_action_for_message(
         return
     now = datetime.now(UTC)
 
-    node_id = _resolve_or_create_person(
+    node_id = resolve_or_create_person(
         workspace_id=workspace_id,
         owner_id=owner_id,
         email=sender,

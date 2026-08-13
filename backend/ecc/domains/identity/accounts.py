@@ -89,6 +89,7 @@ from ecc.auth import (
 from ecc.config import get_settings
 from ecc.database import get_session
 from ecc.observability import queue_lifecycle_event, record_audit_outbox_failure
+from ecc.platform import authz
 
 router = APIRouter(prefix="/api/v1/identity", tags=["identity"])
 SessionDep = Annotated[Session, Depends(get_session)]
@@ -556,19 +557,12 @@ def select_workspace_endpoint(
 ) -> LoginAuthenticated:
     if auth is not None:
         require_csrf(ecc_session=ecc_session, csrf_token=csrf_token)
-        account_id_row = (
-            session.execute(
-                text(
-                    "SELECT account_id FROM users "
-                    "WHERE workspace_id = :workspace_id AND id = :users_id"
-                ),
-                {"workspace_id": auth.workspace_id, "users_id": auth.user_id},
-            )
-            .mappings()
-            .one()
+        account_id = authz.account_id_for(
+            session, workspace_id=auth.workspace_id, users_id=auth.user_id
         )
         session.rollback()
-        account_id = account_id_row["account_id"]
+        if account_id is None:
+            raise RuntimeError("authenticated user has no account_id on record")
     elif payload.pending_login_token is not None:
         account_id = _verify_pending_login_token(payload.pending_login_token)
         if account_id is None:
@@ -740,17 +734,12 @@ def get_me_endpoint(auth: AuthDep, session: SessionDep) -> MeResponse:
 
 @router.get("/workspaces", response_model=WorkspaceListResponse)
 def list_workspaces_endpoint(auth: AuthDep, session: SessionDep) -> WorkspaceListResponse:
-    account_id_row = (
-        session.execute(
-            text(
-                "SELECT account_id FROM users WHERE workspace_id = :workspace_id AND id = :users_id"
-            ),
-            {"workspace_id": auth.workspace_id, "users_id": auth.user_id},
-        )
-        .mappings()
-        .one()
+    account_id = authz.account_id_for(
+        session, workspace_id=auth.workspace_id, users_id=auth.user_id
     )
     session.rollback()
+    if account_id is None:
+        raise RuntimeError("authenticated user has no account_id on record")
     rows = (
         session.execute(
             text(
@@ -762,7 +751,7 @@ def list_workspaces_endpoint(auth: AuthDep, session: SessionDep) -> WorkspaceLis
                 ORDER BY w.created_at ASC
                 """
             ),
-            {"account_id": account_id_row["account_id"]},
+            {"account_id": account_id},
         )
         .mappings()
         .all()
@@ -815,17 +804,12 @@ def create_workspace_endpoint(
     is a visible, correctable user action (rename/delete), not a silent
     duplicate-side-effect risk the way a domain-resource create is.
     """
-    account_id_row = (
-        session.execute(
-            text(
-                "SELECT account_id FROM users WHERE workspace_id = :workspace_id AND id = :users_id"
-            ),
-            {"workspace_id": auth.workspace_id, "users_id": auth.user_id},
-        )
-        .mappings()
-        .one()
+    account_id = authz.account_id_for(
+        session, workspace_id=auth.workspace_id, users_id=auth.user_id
     )
     session.rollback()
+    if account_id is None:
+        raise RuntimeError("authenticated user has no account_id on record")
     now = datetime.now(UTC)
     new_workspace_id = uuid4()
     new_users_id = uuid4()
@@ -850,7 +834,7 @@ def create_workspace_endpoint(
             {
                 "id": new_users_id,
                 "workspace_id": new_workspace_id,
-                "account_id": account_id_row["account_id"],
+                "account_id": account_id,
                 "now": now,
             },
         )
@@ -869,7 +853,7 @@ def create_workspace_endpoint(
             {
                 "id": uuid4(),
                 "workspace_id": new_workspace_id,
-                "account_id": account_id_row["account_id"],
+                "account_id": account_id,
                 "users_id": new_users_id,
                 "now": now,
             },
