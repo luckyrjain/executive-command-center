@@ -84,7 +84,6 @@ authorizes unattended execution."
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
-from hashlib import sha256
 from json import dumps
 from typing import Annotated, Any, Literal
 from uuid import UUID, uuid4
@@ -100,9 +99,9 @@ from ecc.database import get_session
 from ecc.observability import (
     queue_lifecycle_event,
     record_audit_outbox_failure,
-    record_idempotency_conflict,
 )
 from ecc.platform import authz
+from ecc.platform.idempotency import load_cached, lock_idempotency, request_hash, store_idempotency
 
 ApprovalMode = Literal["preview_only", "per_run", "bounded_recurring"]
 PolicyLifecycleStatus = Literal["active", "expired", "revoked"]
@@ -437,88 +436,11 @@ def _to_response(policy: AutomationPolicy) -> PolicyResponse:
     )
 
 
-def _request_hash(payload: BaseModel, action: str) -> str:
-    material = {"action": action, "payload": payload.model_dump(mode="json")}
-    return sha256(dumps(material, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
-
-
 def _request_ids(request: Request) -> tuple[UUID, UUID]:
     try:
         return UUID(request.state.request_id), UUID(request.state.correlation_id)
     except (AttributeError, TypeError, ValueError):
         return uuid4(), uuid4()
-
-
-def _lock_idempotency(session: Session, auth: AuthContext, key: str) -> None:
-    lock_key = f"{auth.workspace_id}:{auth.user_id}:{key}"
-    session.execute(
-        text("SELECT pg_advisory_xact_lock(hashtextextended(:lock_key, 0))"),
-        {"lock_key": lock_key},
-    )
-
-
-def _load_cached(
-    session: Session, auth: AuthContext, key: str, request_hash: str
-) -> PolicyResponse | None:
-    row = (
-        session.execute(
-            text(
-                """
-                SELECT request_hash, response_body FROM idempotency_records
-                WHERE workspace_id = :workspace_id AND actor_id = :actor_id
-                  AND key = :key AND expires_at > :now
-                """
-            ),
-            {
-                "workspace_id": auth.workspace_id,
-                "actor_id": auth.user_id,
-                "key": key,
-                "now": datetime.now(UTC),
-            },
-        )
-        .mappings()
-        .one_or_none()
-    )
-    if row is None:
-        return None
-    if row["request_hash"] != request_hash:
-        record_idempotency_conflict("automation_policy")
-        raise HTTPException(status_code=409, detail="IDEMPOTENCY_CONFLICT")
-    return PolicyResponse.model_validate(row["response_body"])
-
-
-def _store_idempotency(
-    session: Session,
-    auth: AuthContext,
-    key: str,
-    request_hash: str,
-    response: PolicyResponse,
-    now: datetime,
-    response_status: int = 200,
-) -> None:
-    session.execute(
-        text(
-            """
-            INSERT INTO idempotency_records (
-                workspace_id, actor_id, key, request_hash, response_status,
-                response_body, created_at, expires_at
-            ) VALUES (
-                :workspace_id, :actor_id, :key, :request_hash, :response_status,
-                CAST(:response_body AS jsonb), :created_at, :expires_at
-            )
-            """
-        ),
-        {
-            "workspace_id": auth.workspace_id,
-            "actor_id": auth.user_id,
-            "key": key,
-            "request_hash": request_hash,
-            "response_status": response_status,
-            "response_body": dumps(response.model_dump(mode="json")),
-            "created_at": now,
-            "expires_at": now + timedelta(days=365),
-        },
-    )
 
 
 def _write_side_effects(
@@ -606,11 +528,18 @@ def create_policy_endpoint(
     idempotency_key: IdempotencyHeader,
 ) -> PolicyResponse:
     authz.require_role_action(session, auth, "write")
-    request_hash = _request_hash(payload, "create_policy")
+    req_hash = request_hash(payload, "create_policy")
     now = datetime.now(UTC)
     with session.begin():
-        _lock_idempotency(session, auth, idempotency_key)
-        cached = _load_cached(session, auth, idempotency_key, request_hash)
+        lock_idempotency(session, auth, idempotency_key)
+        cached = load_cached(
+            session,
+            auth,
+            idempotency_key,
+            req_hash,
+            domain="automation_policy",
+            response_model=PolicyResponse,
+        )
         if cached is not None:
             return cached
 
@@ -640,14 +569,14 @@ def create_policy_endpoint(
             version=created.version,
             now=now,
         )
-        _store_idempotency(
+        store_idempotency(
             session,
             auth,
             idempotency_key,
-            request_hash,
-            response,
+            req_hash,
+            response.model_dump(mode="json"),
             now,
-            response_status=status.HTTP_201_CREATED,
+            status.HTTP_201_CREATED,
         )
         return response
 
@@ -665,11 +594,18 @@ def revoke_policy_endpoint(
     _csrf: CsrfDep,
     idempotency_key: IdempotencyHeader,
 ) -> PolicyResponse:
-    request_hash = _request_hash(_EmptyBody(), f"revoke:{policy_id}")
+    req_hash = request_hash(_EmptyBody(), f"revoke:{policy_id}")
     now = datetime.now(UTC)
     with session.begin():
-        _lock_idempotency(session, auth, idempotency_key)
-        cached = _load_cached(session, auth, idempotency_key, request_hash)
+        lock_idempotency(session, auth, idempotency_key)
+        cached = load_cached(
+            session,
+            auth,
+            idempotency_key,
+            req_hash,
+            domain="automation_policy",
+            response_model=PolicyResponse,
+        )
         if cached is not None:
             return cached
 
@@ -710,5 +646,7 @@ def revoke_policy_endpoint(
             version=result.version,
             now=now,
         )
-        _store_idempotency(session, auth, idempotency_key, request_hash, response, now)
+        store_idempotency(
+            session, auth, idempotency_key, req_hash, response.model_dump(mode="json"), now
+        )
         return response
