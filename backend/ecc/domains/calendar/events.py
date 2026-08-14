@@ -1,6 +1,5 @@
 from base64 import urlsafe_b64decode, urlsafe_b64encode
 from datetime import UTC, date, datetime, time, timedelta
-from hashlib import sha256
 from hmac import compare_digest, new
 from json import dumps, loads
 from typing import Annotated, Any, Literal
@@ -19,9 +18,9 @@ from ecc.database import get_session
 from ecc.observability import (
     queue_lifecycle_event,
     record_audit_outbox_failure,
-    record_idempotency_conflict,
 )
 from ecc.platform import authz
+from ecc.platform.idempotency import load_cached, lock_idempotency, request_hash, store_idempotency
 
 router = APIRouter(prefix="/api/v1/calendar/events", tags=["calendar-events"])
 
@@ -129,89 +128,6 @@ def _validate_timezone(value: str) -> None:
         ZoneInfo(value)
     except ZoneInfoNotFoundError as exc:
         raise ValueError("timezone must be a valid IANA timezone") from exc
-
-
-def _request_hash(payload: BaseModel, action: str) -> str:
-    material = {"action": action, "payload": payload.model_dump(mode="json")}
-    return sha256(dumps(material, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
-
-
-def _lock_idempotency(session: Session, auth: AuthContext, key: str) -> None:
-    lock_key = f"{auth.workspace_id}:{auth.user_id}:{key}"
-    session.execute(
-        text("SELECT pg_advisory_xact_lock(hashtextextended(:lock_key, 0))"),
-        {"lock_key": lock_key},
-    )
-
-
-def _load_cached(
-    session: Session,
-    auth: AuthContext,
-    key: str,
-    request_hash: str,
-) -> CalendarEventResponse | None:
-    row = (
-        session.execute(
-            text(
-                """
-                SELECT request_hash, response_body
-                FROM idempotency_records
-                WHERE workspace_id = :workspace_id
-                  AND actor_id = :actor_id
-                  AND key = :key
-                  AND expires_at > :now
-                """
-            ),
-            {
-                "workspace_id": auth.workspace_id,
-                "actor_id": auth.user_id,
-                "key": key,
-                "now": datetime.now(UTC),
-            },
-        )
-        .mappings()
-        .one_or_none()
-    )
-    if row is None:
-        return None
-    if row["request_hash"] != request_hash:
-        record_idempotency_conflict("calendar_events")
-        raise HTTPException(status_code=409, detail="IDEMPOTENCY_CONFLICT")
-    return CalendarEventResponse.model_validate(row["response_body"])
-
-
-def _store_cached(
-    session: Session,
-    auth: AuthContext,
-    key: str,
-    request_hash: str,
-    response: CalendarEventResponse,
-    status_code: int,
-    now: datetime,
-) -> None:
-    session.execute(
-        text(
-            """
-            INSERT INTO idempotency_records (
-                workspace_id, actor_id, key, request_hash, response_status,
-                response_body, created_at, expires_at
-            ) VALUES (
-                :workspace_id, :actor_id, :key, :request_hash, :response_status,
-                CAST(:response_body AS jsonb), :created_at, :expires_at
-            )
-            """
-        ),
-        {
-            "workspace_id": auth.workspace_id,
-            "actor_id": auth.user_id,
-            "key": key,
-            "request_hash": request_hash,
-            "response_status": status_code,
-            "response_body": dumps(response.model_dump(mode="json")),
-            "created_at": now,
-            "expires_at": now + timedelta(days=365),
-        },
-    )
 
 
 def _request_ids(request: Request) -> tuple[UUID, UUID]:
@@ -348,12 +264,19 @@ def create_calendar_event(
     idempotency_key: IdempotencyHeader,
 ) -> CalendarEventResponse:
     authz.require_role_action(session, auth, "write")
-    request_hash = _request_hash(payload, "create")
+    req_hash = request_hash(payload, "create")
     now = datetime.now(UTC)
     event_id = uuid4()
     with session.begin():
-        _lock_idempotency(session, auth, idempotency_key)
-        cached = _load_cached(session, auth, idempotency_key, request_hash)
+        lock_idempotency(session, auth, idempotency_key)
+        cached = load_cached(
+            session,
+            auth,
+            idempotency_key,
+            req_hash,
+            domain="calendar_events",
+            response_model=CalendarEventResponse,
+        )
         if cached is not None:
             return cached
         row = (
@@ -388,7 +311,15 @@ def create_calendar_event(
         _write_audit_and_outbox(
             session, auth, request, "calendar_event.created", event_id, 1, ["*"], now
         )
-        _store_cached(session, auth, idempotency_key, request_hash, response, 201, now)
+        store_idempotency(
+            session,
+            auth,
+            idempotency_key,
+            req_hash,
+            response.model_dump(mode="json"),
+            now,
+            response_status=201,
+        )
         return response
 
 
@@ -484,11 +415,18 @@ def update_calendar_event(
     _csrf: CsrfDep,
     idempotency_key: IdempotencyHeader,
 ) -> CalendarEventResponse:
-    request_hash = _request_hash(payload, f"update:{event_id}")
+    req_hash = request_hash(payload, f"update:{event_id}")
     now = datetime.now(UTC)
     with session.begin():
-        _lock_idempotency(session, auth, idempotency_key)
-        cached = _load_cached(session, auth, idempotency_key, request_hash)
+        lock_idempotency(session, auth, idempotency_key)
+        cached = load_cached(
+            session,
+            auth,
+            idempotency_key,
+            req_hash,
+            domain="calendar_events",
+            response_model=CalendarEventResponse,
+        )
         if cached is not None:
             return cached
         # Two-phase read-then-write authz check: a plain existence lookup
@@ -517,7 +455,9 @@ def update_calendar_event(
         fields = payload.model_fields_set - {"expected_version"}
         if not fields:
             response = CalendarEventResponse.model_validate(current)
-            _store_cached(session, auth, idempotency_key, request_hash, response, 200, now)
+            store_idempotency(
+                session, auth, idempotency_key, req_hash, response.model_dump(mode="json"), now
+            )
             return response
         candidate = current.copy()
         for field in fields:
@@ -563,7 +503,9 @@ def update_calendar_event(
             sorted(fields),
             now,
         )
-        _store_cached(session, auth, idempotency_key, request_hash, response, 200, now)
+        store_idempotency(
+            session, auth, idempotency_key, req_hash, response.model_dump(mode="json"), now
+        )
         return response
 
 
@@ -576,11 +518,18 @@ def _lifecycle(
     idempotency_key: str,
     action: Literal["archive", "restore"],
 ) -> CalendarEventResponse:
-    request_hash = _request_hash(payload, f"{action}:{event_id}")
+    req_hash = request_hash(payload, f"{action}:{event_id}")
     now = datetime.now(UTC)
     with session.begin():
-        _lock_idempotency(session, auth, idempotency_key)
-        cached = _load_cached(session, auth, idempotency_key, request_hash)
+        lock_idempotency(session, auth, idempotency_key)
+        cached = load_cached(
+            session,
+            auth,
+            idempotency_key,
+            req_hash,
+            domain="calendar_events",
+            response_model=CalendarEventResponse,
+        )
         if cached is not None:
             return cached
         if not authz.authorize(
@@ -601,7 +550,9 @@ def _lifecycle(
             )
         if action == "archive" and current["archived_at"] is not None:
             response = CalendarEventResponse.model_validate(current)
-            _store_cached(session, auth, idempotency_key, request_hash, response, 200, now)
+            store_idempotency(
+                session, auth, idempotency_key, req_hash, response.model_dump(mode="json"), now
+            )
             return response
         if action == "restore" and current["archived_at"] is None:
             raise HTTPException(status_code=409, detail="CALENDAR_EVENT_NOT_ARCHIVED")
@@ -643,7 +594,9 @@ def _lifecycle(
             ["archived_at", "pre_archive_status"],
             now,
         )
-        _store_cached(session, auth, idempotency_key, request_hash, response, 200, now)
+        store_idempotency(
+            session, auth, idempotency_key, req_hash, response.model_dump(mode="json"), now
+        )
         return response
 
 
