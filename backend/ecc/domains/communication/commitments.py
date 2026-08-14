@@ -1,5 +1,5 @@
 from base64 import urlsafe_b64decode, urlsafe_b64encode
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, date, datetime
 from hashlib import sha256
 from hmac import compare_digest, new
 from json import dumps, loads
@@ -18,9 +18,9 @@ from ecc.database import get_session
 from ecc.observability import (
     queue_lifecycle_event,
     record_audit_outbox_failure,
-    record_idempotency_conflict,
 )
 from ecc.platform import authz
+from ecc.platform.idempotency import load_cached, lock_idempotency, request_hash, store_idempotency
 
 router = APIRouter(prefix="/api/v1/commitments", tags=["commitments"])
 
@@ -152,92 +152,6 @@ def _request_ids(request: Request) -> tuple[UUID, UUID]:
         return UUID(request.state.request_id), UUID(request.state.correlation_id)
     except (AttributeError, TypeError, ValueError):
         return uuid4(), uuid4()
-
-
-def _request_hash(payload: BaseModel, action: str) -> str:
-    material = {
-        "action": action,
-        "payload": payload.model_dump(mode="json", exclude_none=False),
-    }
-    return sha256(dumps(material, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
-
-
-def _lock_idempotency(session: Session, auth: AuthContext, key: str) -> None:
-    lock_key = f"{auth.workspace_id}:{auth.user_id}:{key}"
-    session.execute(
-        text("SELECT pg_advisory_xact_lock(hashtextextended(:lock_key, 0))"),
-        {"lock_key": lock_key},
-    )
-
-
-def _load_cached(
-    session: Session,
-    auth: AuthContext,
-    key: str,
-    request_hash: str,
-) -> CommitmentResponse | None:
-    row = (
-        session.execute(
-            text(
-                """
-                SELECT request_hash, response_body
-                FROM idempotency_records
-                WHERE workspace_id = :workspace_id
-                  AND actor_id = :actor_id
-                  AND key = :key
-                  AND expires_at > :now
-                """
-            ),
-            {
-                "workspace_id": auth.workspace_id,
-                "actor_id": auth.user_id,
-                "key": key,
-                "now": datetime.now(UTC),
-            },
-        )
-        .mappings()
-        .one_or_none()
-    )
-    if row is None:
-        return None
-    if row["request_hash"] != request_hash:
-        record_idempotency_conflict("commitments")
-        raise HTTPException(status_code=409, detail="IDEMPOTENCY_CONFLICT")
-    return CommitmentResponse.model_validate(row["response_body"])
-
-
-def _store_cached(
-    session: Session,
-    auth: AuthContext,
-    key: str,
-    request_hash: str,
-    response: CommitmentResponse,
-    response_status: int,
-    now: datetime,
-) -> None:
-    session.execute(
-        text(
-            """
-            INSERT INTO idempotency_records (
-                workspace_id, actor_id, key, request_hash, response_status,
-                response_body, created_at, expires_at
-            ) VALUES (
-                :workspace_id, :actor_id, :key, :request_hash, :response_status,
-                CAST(:response_body AS jsonb), :created_at, :expires_at
-            )
-            """
-        ),
-        {
-            "workspace_id": auth.workspace_id,
-            "actor_id": auth.user_id,
-            "key": key,
-            "request_hash": request_hash,
-            "response_status": response_status,
-            "response_body": dumps(response.model_dump(mode="json")),
-            "created_at": now,
-            "expires_at": now + timedelta(days=365),
-        },
-    )
 
 
 def _write_audit(
@@ -520,13 +434,20 @@ def create_commitment(
     idempotency_key: IdempotencyHeader,
 ) -> CommitmentResponse:
     authz.require_role_action(session, auth, "write")
-    request_hash = _request_hash(payload, "create")
+    req_hash = request_hash(payload, "create")
     request_id, correlation_id = _request_ids(request)
     now = datetime.now(UTC)
 
     with session.begin():
-        _lock_idempotency(session, auth, idempotency_key)
-        cached = _load_cached(session, auth, idempotency_key, request_hash)
+        lock_idempotency(session, auth, idempotency_key)
+        cached = load_cached(
+            session,
+            auth,
+            idempotency_key,
+            req_hash,
+            domain="commitments",
+            response_model=CommitmentResponse,
+        )
         if cached is not None:
             return cached
         response = insert_commitment(
@@ -538,14 +459,14 @@ def create_commitment(
             idempotency_key=idempotency_key,
             now=now,
         )
-        _store_cached(
+        store_idempotency(
             session,
             auth,
             idempotency_key,
-            request_hash,
-            response,
-            201,
+            req_hash,
+            response.model_dump(mode="json"),
             now,
+            201,
         )
         return response
 
@@ -672,12 +593,19 @@ def _mutate_commitment(
     session: Session,
     idempotency_key: str,
 ) -> CommitmentResponse:
-    request_hash = _request_hash(payload, f"update:{commitment_id}")
+    req_hash = request_hash(payload, f"update:{commitment_id}")
     request_id, correlation_id = _request_ids(request)
     now = datetime.now(UTC)
     with session.begin():
-        _lock_idempotency(session, auth, idempotency_key)
-        cached = _load_cached(session, auth, idempotency_key, request_hash)
+        lock_idempotency(session, auth, idempotency_key)
+        cached = load_cached(
+            session,
+            auth,
+            idempotency_key,
+            req_hash,
+            domain="commitments",
+            response_model=CommitmentResponse,
+        )
         if cached is not None:
             return cached
         if not authz.authorize(
@@ -701,7 +629,9 @@ def _mutate_commitment(
             _validate_references(session, auth, payload.counterparty_person_id, None)
         if not fields:
             response = _to_response(current)
-            _store_cached(session, auth, idempotency_key, request_hash, response, 200, now)
+            store_idempotency(
+                session, auth, idempotency_key, req_hash, response.model_dump(mode="json"), now
+            )
             return response
         effective_due_date = payload.due_date if "due_date" in fields else current["due_date"]
         effective_due_at = payload.due_at if "due_at" in fields else current["due_at"]
@@ -763,7 +693,9 @@ def _mutate_commitment(
             {"changed_fields": changed_fields},
             now,
         )
-        _store_cached(session, auth, idempotency_key, request_hash, response, 200, now)
+        store_idempotency(
+            session, auth, idempotency_key, req_hash, response.model_dump(mode="json"), now
+        )
         return response
 
 
@@ -933,12 +865,19 @@ def _lifecycle(
     idempotency_key: str,
     action: Literal["confirm", "fulfil", "cancel", "break", "archive", "restore"],
 ) -> CommitmentResponse:
-    request_hash = _request_hash(payload, f"{action}:{commitment_id}")
+    req_hash = request_hash(payload, f"{action}:{commitment_id}")
     request_id, correlation_id = _request_ids(request)
     now = datetime.now(UTC)
     with session.begin():
-        _lock_idempotency(session, auth, idempotency_key)
-        cached = _load_cached(session, auth, idempotency_key, request_hash)
+        lock_idempotency(session, auth, idempotency_key)
+        cached = load_cached(
+            session,
+            auth,
+            idempotency_key,
+            req_hash,
+            domain="commitments",
+            response_model=CommitmentResponse,
+        )
         if cached is not None:
             return cached
         response = lifecycle_write(
@@ -953,7 +892,9 @@ def _lifecycle(
             idempotency_key=idempotency_key,
             now=now,
         )
-        _store_cached(session, auth, idempotency_key, request_hash, response, 200, now)
+        store_idempotency(
+            session, auth, idempotency_key, req_hash, response.model_dump(mode="json"), now
+        )
         return response
 
 
