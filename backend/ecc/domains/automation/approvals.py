@@ -137,7 +137,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from hashlib import sha256
 from json import dumps
 from typing import Annotated, Any, Literal
 from uuid import UUID, uuid4
@@ -153,10 +152,10 @@ from ecc.database import get_session
 from ecc.observability import (
     queue_lifecycle_event,
     record_audit_outbox_failure,
-    record_idempotency_conflict,
 )
 from ecc.platform import authz
 from ecc.platform.authz import WORKSPACE_ORIGINAL_OWNER_SQL
+from ecc.platform.idempotency import load_cached, lock_idempotency, request_hash, store_idempotency
 
 from .adapters import ActionAdapter
 from .policy import AutomationPolicy
@@ -587,86 +586,11 @@ def _to_response(approval: ApprovalRequest) -> ApprovalResponse:
     )
 
 
-def _request_hash(payload: BaseModel, action: str) -> str:
-    material = {"action": action, "payload": payload.model_dump(mode="json")}
-    return sha256(dumps(material, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
-
-
 def _request_ids(request: Request) -> tuple[UUID, UUID]:
     try:
         return UUID(request.state.request_id), UUID(request.state.correlation_id)
     except (AttributeError, TypeError, ValueError):
         return uuid4(), uuid4()
-
-
-def _lock_idempotency(session: Session, auth: AuthContext, key: str) -> None:
-    lock_key = f"{auth.workspace_id}:{auth.user_id}:{key}"
-    session.execute(
-        text("SELECT pg_advisory_xact_lock(hashtextextended(:lock_key, 0))"),
-        {"lock_key": lock_key},
-    )
-
-
-def _load_cached(
-    session: Session, auth: AuthContext, key: str, request_hash: str
-) -> ApprovalResponse | None:
-    row = (
-        session.execute(
-            text(
-                """
-                SELECT request_hash, response_body FROM idempotency_records
-                WHERE workspace_id = :workspace_id AND actor_id = :actor_id
-                  AND key = :key AND expires_at > :now
-                """
-            ),
-            {
-                "workspace_id": auth.workspace_id,
-                "actor_id": auth.user_id,
-                "key": key,
-                "now": datetime.now(UTC),
-            },
-        )
-        .mappings()
-        .one_or_none()
-    )
-    if row is None:
-        return None
-    if row["request_hash"] != request_hash:
-        record_idempotency_conflict("approval_request")
-        raise HTTPException(status_code=409, detail="IDEMPOTENCY_CONFLICT")
-    return ApprovalResponse.model_validate(row["response_body"])
-
-
-def _store_idempotency(
-    session: Session,
-    auth: AuthContext,
-    key: str,
-    request_hash: str,
-    response: ApprovalResponse,
-    now: datetime,
-) -> None:
-    session.execute(
-        text(
-            """
-            INSERT INTO idempotency_records (
-                workspace_id, actor_id, key, request_hash, response_status,
-                response_body, created_at, expires_at
-            ) VALUES (
-                :workspace_id, :actor_id, :key, :request_hash, 200,
-                CAST(:response_body AS jsonb), :created_at, :expires_at
-            )
-            """
-        ),
-        {
-            "workspace_id": auth.workspace_id,
-            "actor_id": auth.user_id,
-            "key": key,
-            "request_hash": request_hash,
-            "response_body": dumps(response.model_dump(mode="json")),
-            "created_at": now,
-            "expires_at": now + timedelta(days=365),
-        },
-    )
 
 
 def _write_side_effects(
@@ -888,11 +812,18 @@ def approve_endpoint(
     _csrf: CsrfDep,
     idempotency_key: IdempotencyHeader,
 ) -> ApprovalResponse:
-    request_hash = _request_hash(payload, f"approve:{approval_id}")
+    req_hash = request_hash(payload, f"approve:{approval_id}")
     now = datetime.now(UTC)
     with session.begin():
-        _lock_idempotency(session, auth, idempotency_key)
-        cached = _load_cached(session, auth, idempotency_key, request_hash)
+        lock_idempotency(session, auth, idempotency_key)
+        cached = load_cached(
+            session,
+            auth,
+            idempotency_key,
+            req_hash,
+            domain="approval_request",
+            response_model=ApprovalResponse,
+        )
         if cached is not None:
             return cached
 
@@ -952,7 +883,9 @@ def approve_endpoint(
             aggregate_id=result.id,
             now=now,
         )
-        _store_idempotency(session, auth, idempotency_key, request_hash, response, now)
+        store_idempotency(
+            session, auth, idempotency_key, req_hash, response.model_dump(mode="json"), now
+        )
         return response
 
 
@@ -965,11 +898,18 @@ def reject_endpoint(
     _csrf: CsrfDep,
     idempotency_key: IdempotencyHeader,
 ) -> ApprovalResponse:
-    request_hash = _request_hash(_EmptyBody(), f"reject:{approval_id}")
+    req_hash = request_hash(_EmptyBody(), f"reject:{approval_id}")
     now = datetime.now(UTC)
     with session.begin():
-        _lock_idempotency(session, auth, idempotency_key)
-        cached = _load_cached(session, auth, idempotency_key, request_hash)
+        lock_idempotency(session, auth, idempotency_key)
+        cached = load_cached(
+            session,
+            auth,
+            idempotency_key,
+            req_hash,
+            domain="approval_request",
+            response_model=ApprovalResponse,
+        )
         if cached is not None:
             return cached
 
@@ -1025,5 +965,7 @@ def reject_endpoint(
             aggregate_id=result.id,
             now=now,
         )
-        _store_idempotency(session, auth, idempotency_key, request_hash, response, now)
+        store_idempotency(
+            session, auth, idempotency_key, req_hash, response.model_dump(mode="json"), now
+        )
         return response

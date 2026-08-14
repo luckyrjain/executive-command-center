@@ -94,13 +94,12 @@ A `'paused'` run already requires an explicit `resume_run`, and
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
-from hashlib import sha256
+from datetime import UTC, datetime
 from json import dumps
 from typing import Annotated, Any
 from uuid import UUID, uuid4
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Path
+from fastapi import APIRouter, Depends, Header, Path
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
@@ -113,9 +112,9 @@ from ecc.observability import (
     queue_lifecycle_event,
     queue_run_state_transition,
     record_audit_outbox_failure,
-    record_idempotency_conflict,
 )
 from ecc.platform import authz
+from ecc.platform.idempotency import load_cached, lock_idempotency, request_hash, store_idempotency
 
 _KILL_SWITCH_FIELDS = """
     id, workspace_id, workflow_id, active, reason, activated_by, activated_at,
@@ -565,88 +564,13 @@ def _to_response(workflow_id: str | None, switch: KillSwitch | None) -> KillSwit
     )
 
 
-def _request_hash(payload: BaseModel, action: str) -> str:
-    material = {"action": action, "payload": payload.model_dump(mode="json")}
-    return sha256(dumps(material, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
-
-
-def _lock_idempotency(session: Session, auth: AuthContext, key: str) -> None:
-    lock_key = f"{auth.workspace_id}:{auth.user_id}:{key}"
-    session.execute(
-        text("SELECT pg_advisory_xact_lock(hashtextextended(:lock_key, 0))"),
-        {"lock_key": lock_key},
-    )
-
-
-def _load_cached(
-    session: Session, auth: AuthContext, key: str, request_hash: str
-) -> KillSwitchResponse | None:
-    row = (
-        session.execute(
-            text(
-                """
-                SELECT request_hash, response_body FROM idempotency_records
-                WHERE workspace_id = :workspace_id AND actor_id = :actor_id
-                  AND key = :key AND expires_at > :now
-                """
-            ),
-            {
-                "workspace_id": auth.workspace_id,
-                "actor_id": auth.user_id,
-                "key": key,
-                "now": datetime.now(UTC),
-            },
-        )
-        .mappings()
-        .one_or_none()
-    )
-    if row is None:
-        return None
-    if row["request_hash"] != request_hash:
-        record_idempotency_conflict("automation_kill_switch")
-        raise HTTPException(status_code=409, detail="IDEMPOTENCY_CONFLICT")
-    return KillSwitchResponse.model_validate(row["response_body"])
-
-
-def _store_idempotency(
-    session: Session,
-    auth: AuthContext,
-    key: str,
-    request_hash: str,
-    response: KillSwitchResponse,
-    now: datetime,
-) -> None:
-    session.execute(
-        text(
-            """
-            INSERT INTO idempotency_records (
-                workspace_id, actor_id, key, request_hash, response_status,
-                response_body, created_at, expires_at
-            ) VALUES (
-                :workspace_id, :actor_id, :key, :request_hash, 200,
-                CAST(:response_body AS jsonb), :created_at, :expires_at
-            )
-            """
-        ),
-        {
-            "workspace_id": auth.workspace_id,
-            "actor_id": auth.user_id,
-            "key": key,
-            "request_hash": request_hash,
-            "response_body": dumps(response.model_dump(mode="json")),
-            "created_at": now,
-            "expires_at": now + timedelta(days=365),
-        },
-    )
-
-
 def _handle_kill_switch_request(
     session: Session,
     auth: AuthContext,
     workflow_id: str | None,
     payload: KillSwitchRequest,
     idempotency_key: str,
-    request_hash: str,
+    req_hash: str,
 ) -> KillSwitchResponse:
     # Kill switches are workspace-wide operational controls keyed by an
     # opaque workflow_id string (this module's own docstring: neither
@@ -658,8 +582,15 @@ def _handle_kill_switch_request(
     authz.require_role_action(session, auth, "write")
     now = datetime.now(UTC)
     with session.begin():
-        _lock_idempotency(session, auth, idempotency_key)
-        cached = _load_cached(session, auth, idempotency_key, request_hash)
+        lock_idempotency(session, auth, idempotency_key)
+        cached = load_cached(
+            session,
+            auth,
+            idempotency_key,
+            req_hash,
+            domain="automation_kill_switch",
+            response_model=KillSwitchResponse,
+        )
         if cached is not None:
             return cached
 
@@ -672,7 +603,9 @@ def _handle_kill_switch_request(
 
         latest = get_latest_kill_switch(session, auth.workspace_id, workflow_id)
         response = _to_response(workflow_id, latest)
-        _store_idempotency(session, auth, idempotency_key, request_hash, response, now)
+        store_idempotency(
+            session, auth, idempotency_key, req_hash, response.model_dump(mode="json"), now
+        )
         return response
 
 
@@ -761,9 +694,9 @@ def workflow_kill_switch_endpoint(
     `automation_kill_switches.workflow_id` (`sa.String(200)`) and produced a
     `DataError`/500 instead of a `422`.
     """
-    request_hash = _request_hash(payload, f"kill_switch:{workflow_id}")
+    req_hash = request_hash(payload, f"kill_switch:{workflow_id}")
     return _handle_kill_switch_request(
-        session, auth, workflow_id, payload, idempotency_key, request_hash
+        session, auth, workflow_id, payload, idempotency_key, req_hash
     )
 
 
@@ -775,5 +708,5 @@ def global_kill_switch_endpoint(
     _csrf: CsrfDep,
     idempotency_key: IdempotencyHeader,
 ) -> KillSwitchResponse:
-    request_hash = _request_hash(payload, "kill_switch:global")
-    return _handle_kill_switch_request(session, auth, None, payload, idempotency_key, request_hash)
+    req_hash = request_hash(payload, "kill_switch:global")
+    return _handle_kill_switch_request(session, auth, None, payload, idempotency_key, req_hash)
