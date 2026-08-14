@@ -1,7 +1,6 @@
 from base64 import urlsafe_b64decode, urlsafe_b64encode
 from dataclasses import dataclass, field
-from datetime import UTC, datetime, timedelta
-from hashlib import sha256
+from datetime import UTC, datetime
 from hmac import compare_digest, new
 from json import dumps, loads
 from typing import Annotated, Any, Literal
@@ -17,12 +16,9 @@ from sqlalchemy.orm import Session
 from ecc.auth import AuthContext, AuthDep, CsrfDep
 from ecc.config import get_settings
 from ecc.database import get_session
-from ecc.observability import (
-    queue_lifecycle_event,
-    record_audit_outbox_failure,
-    record_idempotency_conflict,
-)
+from ecc.observability import queue_lifecycle_event, record_audit_outbox_failure
 from ecc.platform import authz
+from ecc.platform.idempotency import load_cached, lock_idempotency, request_hash, store_idempotency
 
 # Bumped whenever score_candidate's factors or weighting change -- stored on
 # every resolution_candidates row per ENTITY-RESOLUTION-CONTRACT.md's
@@ -267,158 +263,11 @@ def _project(row: dict[str, Any]) -> ResolutionCandidateResponse:
     )
 
 
-def _request_hash(payload: BaseModel, action: str) -> str:
-    material = {"action": action, "payload": payload.model_dump(mode="json")}
-    return sha256(dumps(material, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
-
-
 def _request_ids(request: Request) -> tuple[UUID, UUID]:
     try:
         return UUID(request.state.request_id), UUID(request.state.correlation_id)
     except (AttributeError, TypeError, ValueError):
         return uuid4(), uuid4()
-
-
-def _lock_idempotency(session: Session, auth: AuthContext, key: str) -> None:
-    lock_key = f"{auth.workspace_id}:{auth.user_id}:{key}"
-    session.execute(
-        text("SELECT pg_advisory_xact_lock(hashtextextended(:lock_key, 0))"),
-        {"lock_key": lock_key},
-    )
-
-
-def _load_cached(
-    session: Session, auth: AuthContext, key: str, request_hash: str
-) -> ResolutionCandidateResponse | None:
-    row = (
-        session.execute(
-            text(
-                """
-                SELECT request_hash, response_body
-                FROM idempotency_records
-                WHERE workspace_id = :workspace_id
-                  AND actor_id = :actor_id
-                  AND key = :key
-                  AND expires_at > :now
-                """
-            ),
-            {
-                "workspace_id": auth.workspace_id,
-                "actor_id": auth.user_id,
-                "key": key,
-                "now": datetime.now(UTC),
-            },
-        )
-        .mappings()
-        .one_or_none()
-    )
-    if row is None:
-        return None
-    if row["request_hash"] != request_hash:
-        record_idempotency_conflict("knowledge_resolution")
-        raise HTTPException(status_code=409, detail="IDEMPOTENCY_CONFLICT")
-    return ResolutionCandidateResponse.model_validate(row["response_body"])
-
-
-def _store_cached(
-    session: Session,
-    auth: AuthContext,
-    key: str,
-    request_hash: str,
-    response: ResolutionCandidateResponse,
-    now: datetime,
-    status_code: int,
-) -> None:
-    session.execute(
-        text(
-            """
-            INSERT INTO idempotency_records (
-                workspace_id, actor_id, key, request_hash, response_status,
-                response_body, created_at, expires_at
-            ) VALUES (
-                :workspace_id, :actor_id, :key, :request_hash, :response_status,
-                CAST(:response_body AS jsonb), :created_at, :expires_at
-            )
-            """
-        ),
-        {
-            "workspace_id": auth.workspace_id,
-            "actor_id": auth.user_id,
-            "key": key,
-            "request_hash": request_hash,
-            "response_status": status_code,
-            "response_body": dumps(response.model_dump(mode="json")),
-            "created_at": now,
-            "expires_at": now + timedelta(days=365),
-        },
-    )
-
-
-def _load_cached_result(
-    session: Session, auth: AuthContext, key: str, request_hash: str
-) -> ResolutionCandidateResult | None:
-    row = (
-        session.execute(
-            text(
-                """
-                SELECT request_hash, response_body
-                FROM idempotency_records
-                WHERE workspace_id = :workspace_id
-                  AND actor_id = :actor_id
-                  AND key = :key
-                  AND expires_at > :now
-                """
-            ),
-            {
-                "workspace_id": auth.workspace_id,
-                "actor_id": auth.user_id,
-                "key": key,
-                "now": datetime.now(UTC),
-            },
-        )
-        .mappings()
-        .one_or_none()
-    )
-    if row is None:
-        return None
-    if row["request_hash"] != request_hash:
-        record_idempotency_conflict("knowledge_resolution")
-        raise HTTPException(status_code=409, detail="IDEMPOTENCY_CONFLICT")
-    return ResolutionCandidateResult.model_validate(row["response_body"])
-
-
-def _store_cached_result(
-    session: Session,
-    auth: AuthContext,
-    key: str,
-    request_hash: str,
-    response: ResolutionCandidateResult,
-    now: datetime,
-    status_code: int,
-) -> None:
-    session.execute(
-        text(
-            """
-            INSERT INTO idempotency_records (
-                workspace_id, actor_id, key, request_hash, response_status,
-                response_body, created_at, expires_at
-            ) VALUES (
-                :workspace_id, :actor_id, :key, :request_hash, :response_status,
-                CAST(:response_body AS jsonb), :created_at, :expires_at
-            )
-            """
-        ),
-        {
-            "workspace_id": auth.workspace_id,
-            "actor_id": auth.user_id,
-            "key": key,
-            "request_hash": request_hash,
-            "response_status": status_code,
-            "response_body": dumps(response.model_dump(mode="json")),
-            "created_at": now,
-            "expires_at": now + timedelta(days=365),
-        },
-    )
 
 
 def _entity_row(session: Session, auth: AuthContext, entity_id: UUID) -> dict[str, Any] | None:
@@ -593,11 +442,18 @@ def create_candidate(
     if payload.left_entity_id == payload.right_entity_id:
         raise HTTPException(status_code=422, detail="SELF_CANDIDATE_NOT_ALLOWED")
     authz.require_role_action(session, auth, "write")
-    request_hash = _request_hash(payload, "create_candidate")
+    req_hash = request_hash(payload, "create_candidate")
     now = datetime.now(UTC)
     with session.begin():
-        _lock_idempotency(session, auth, idempotency_key)
-        cached = _load_cached_result(session, auth, idempotency_key, request_hash)
+        lock_idempotency(session, auth, idempotency_key)
+        cached = load_cached(
+            session,
+            auth,
+            idempotency_key,
+            req_hash,
+            domain="knowledge_resolution",
+            response_model=ResolutionCandidateResult,
+        )
         if cached is not None:
             return cached
 
@@ -621,7 +477,9 @@ def create_candidate(
         existing = _existing_candidate(session, auth, left_id, right_id)
         if existing is not None:
             response = ResolutionCandidateResult(deterministic=False, candidate=_project(existing))
-            _store_cached_result(session, auth, idempotency_key, request_hash, response, now, 201)
+            store_idempotency(
+                session, auth, idempotency_key, req_hash, response.model_dump(mode="json"), now, 201
+            )
             return response
 
         left = _candidate_entity(session, auth, left_id)
@@ -632,7 +490,9 @@ def create_candidate(
         # ResolutionCandidateResult's docstring).
         if _deterministic_alias_match(left, right):
             response = ResolutionCandidateResult(deterministic=True, candidate=None)
-            _store_cached_result(session, auth, idempotency_key, request_hash, response, now, 201)
+            store_idempotency(
+                session, auth, idempotency_key, req_hash, response.model_dump(mode="json"), now, 201
+            )
             return response
 
         result = score_candidate(left, right)
@@ -680,7 +540,9 @@ def create_candidate(
             session, auth, request, "resolution_candidate.created", candidate_id, now
         )
         response = ResolutionCandidateResult(deterministic=False, candidate=candidate)
-        _store_cached_result(session, auth, idempotency_key, request_hash, response, now, 201)
+        store_idempotency(
+            session, auth, idempotency_key, req_hash, response.model_dump(mode="json"), now, 201
+        )
         return response
 
 
@@ -842,11 +704,18 @@ def _decide_candidate(
     new_status: Literal["confirmed", "rejected"],
 ) -> ResolutionCandidateResponse:
     action = "confirm" if new_status == "confirmed" else "reject"
-    request_hash = _request_hash(payload, f"{action}:{candidate_id}")
+    req_hash = request_hash(payload, f"{action}:{candidate_id}")
     now = datetime.now(UTC)
     with session.begin():
-        _lock_idempotency(session, auth, idempotency_key)
-        cached = _load_cached(session, auth, idempotency_key, request_hash)
+        lock_idempotency(session, auth, idempotency_key)
+        cached = load_cached(
+            session,
+            auth,
+            idempotency_key,
+            req_hash,
+            domain="knowledge_resolution",
+            response_model=ResolutionCandidateResponse,
+        )
         if cached is not None:
             return cached
         if not authz.authorize(
@@ -899,7 +768,9 @@ def _decide_candidate(
         # record rather than erroring.
         if current["status"] == new_status:
             response = _project(dict(current))
-            _store_cached(session, auth, idempotency_key, request_hash, response, now, 200)
+            store_idempotency(
+                session, auth, idempotency_key, req_hash, response.model_dump(mode="json"), now, 200
+            )
             return response
         if current["status"] != "open":
             raise HTTPException(status_code=409, detail="CANDIDATE_NOT_OPEN")
@@ -945,7 +816,9 @@ def _decide_candidate(
         _write_side_effects(
             session, auth, request, f"resolution_candidate.{new_status}", candidate_id, now
         )
-        _store_cached(session, auth, idempotency_key, request_hash, response, now, 200)
+        store_idempotency(
+            session, auth, idempotency_key, req_hash, response.model_dump(mode="json"), now, 200
+        )
         return response
 
 
@@ -995,10 +868,17 @@ def defer_candidate(
     identical defer semantics for attention_items: postpone review, don't
     make a decision)."""
     now = datetime.now(UTC)
-    request_hash = _request_hash(payload, f"defer:{candidate_id}")
+    req_hash = request_hash(payload, f"defer:{candidate_id}")
     with session.begin():
-        _lock_idempotency(session, auth, idempotency_key)
-        cached = _load_cached(session, auth, idempotency_key, request_hash)
+        lock_idempotency(session, auth, idempotency_key)
+        cached = load_cached(
+            session,
+            auth,
+            idempotency_key,
+            req_hash,
+            domain="knowledge_resolution",
+            response_model=ResolutionCandidateResponse,
+        )
         if cached is not None:
             return cached
         if payload.deferred_until <= now:
@@ -1047,7 +927,9 @@ def defer_candidate(
             raise HTTPException(status_code=409, detail="CANDIDATE_NOT_OPEN")
         if current["deferred_until"] == payload.deferred_until:
             response = _project(dict(current))
-            _store_cached(session, auth, idempotency_key, request_hash, response, now, 200)
+            store_idempotency(
+                session, auth, idempotency_key, req_hash, response.model_dump(mode="json"), now, 200
+            )
             return response
         row = (
             session.execute(
@@ -1072,5 +954,7 @@ def defer_candidate(
         _write_side_effects(
             session, auth, request, "resolution_candidate.deferred", candidate_id, now
         )
-        _store_cached(session, auth, idempotency_key, request_hash, response, now, 200)
+        store_idempotency(
+            session, auth, idempotency_key, req_hash, response.model_dump(mode="json"), now, 200
+        )
         return response

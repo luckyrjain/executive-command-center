@@ -7,19 +7,17 @@ from pydantic import BaseModel, ConfigDict
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from ecc.auth import AuthContext, AuthDep, CsrfDep
+from ecc.auth import AuthDep, CsrfDep
 from ecc.database import get_session
 from ecc.domains.knowledge.relationships import (
     RelationshipResponse,
     _fetch_relationship,
-    _load_cached,
-    _request_hash,
     _source_entity_version,
-    _store_cached,
     _write_side_effects,
 )
 from ecc.domains.knowledge.timeline import queue_timeline_entry
 from ecc.platform import authz
+from ecc.platform.idempotency import load_cached, lock_idempotency, request_hash, store_idempotency
 
 router = APIRouter(prefix="/api/v1/knowledge/relationships", tags=["knowledge-relationships"])
 SessionDep = Annotated[Session, Depends(get_session)]
@@ -33,14 +31,6 @@ class RelationshipInvalidate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
-def _lock_idempotency(session: Session, auth: AuthContext, key: str) -> None:
-    lock_key = f"{auth.workspace_id}:{auth.user_id}:{key}"
-    session.execute(
-        text("SELECT pg_advisory_xact_lock(hashtextextended(:lock_key, 0))"),
-        {"lock_key": lock_key},
-    )
-
-
 @router.post("/{relationship_id}/invalidate", response_model=RelationshipResponse)
 def invalidate_relationship(
     relationship_id: UUID,
@@ -51,11 +41,18 @@ def invalidate_relationship(
     _csrf: CsrfDep,
     idempotency_key: IdempotencyHeader,
 ) -> RelationshipResponse:
-    request_hash = _request_hash(payload, f"invalidate:{relationship_id}")
+    req_hash = request_hash(payload, f"invalidate:{relationship_id}")
     now = datetime.now(UTC)
     with session.begin():
-        _lock_idempotency(session, auth, idempotency_key)
-        cached = _load_cached(session, auth, idempotency_key, request_hash)
+        lock_idempotency(session, auth, idempotency_key)
+        cached = load_cached(
+            session,
+            auth,
+            idempotency_key,
+            req_hash,
+            domain="knowledge_relationships",
+            response_model=RelationshipResponse,
+        )
         if cached is not None:
             return cached
         if not authz.authorize(
@@ -129,5 +126,7 @@ def invalidate_relationship(
             now,
             source_id=response.evidence_id,
         )
-        _store_cached(session, auth, idempotency_key, request_hash, response, now, 200)
+        store_idempotency(
+            session, auth, idempotency_key, req_hash, response.model_dump(mode="json"), now, 200
+        )
         return response

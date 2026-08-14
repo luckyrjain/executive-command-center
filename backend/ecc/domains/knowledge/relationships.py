@@ -1,5 +1,4 @@
-from datetime import UTC, datetime, timedelta
-from hashlib import sha256
+from datetime import UTC, datetime
 from json import dumps
 from typing import Annotated, Any, Literal
 from uuid import UUID, uuid4
@@ -13,12 +12,9 @@ from sqlalchemy.orm import Session
 from ecc.auth import AuthContext, AuthDep, CsrfDep
 from ecc.database import get_session
 from ecc.domains.knowledge.timeline import queue_timeline_entry
-from ecc.observability import (
-    queue_lifecycle_event,
-    record_audit_outbox_failure,
-    record_idempotency_conflict,
-)
+from ecc.observability import queue_lifecycle_event, record_audit_outbox_failure
 from ecc.platform import authz
+from ecc.platform.idempotency import load_cached, lock_idempotency, request_hash, store_idempotency
 
 router = APIRouter(prefix="/api/v1/knowledge", tags=["knowledge-relationships"])
 SessionDep = Annotated[Session, Depends(get_session)]
@@ -165,91 +161,11 @@ def _fetch_relationship(
     return _project(dict(row))
 
 
-def _request_hash(payload: BaseModel, action: str) -> str:
-    material = {"action": action, "payload": payload.model_dump(mode="json")}
-    return sha256(dumps(material, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
-
-
 def _request_ids(request: Request) -> tuple[UUID, UUID]:
     try:
         return UUID(request.state.request_id), UUID(request.state.correlation_id)
     except (AttributeError, TypeError, ValueError):
         return uuid4(), uuid4()
-
-
-def _lock_idempotency(session: Session, auth: AuthContext, key: str) -> None:
-    lock_key = f"{auth.workspace_id}:{auth.user_id}:{key}"
-    session.execute(
-        text("SELECT pg_advisory_xact_lock(hashtextextended(:lock_key, 0))"),
-        {"lock_key": lock_key},
-    )
-
-
-def _load_cached(
-    session: Session, auth: AuthContext, key: str, request_hash: str
-) -> RelationshipResponse | None:
-    row = (
-        session.execute(
-            text(
-                """
-                SELECT request_hash, response_body
-                FROM idempotency_records
-                WHERE workspace_id = :workspace_id
-                  AND actor_id = :actor_id
-                  AND key = :key
-                  AND expires_at > :now
-                """
-            ),
-            {
-                "workspace_id": auth.workspace_id,
-                "actor_id": auth.user_id,
-                "key": key,
-                "now": datetime.now(UTC),
-            },
-        )
-        .mappings()
-        .one_or_none()
-    )
-    if row is None:
-        return None
-    if row["request_hash"] != request_hash:
-        record_idempotency_conflict("knowledge_relationships")
-        raise HTTPException(status_code=409, detail="IDEMPOTENCY_CONFLICT")
-    return RelationshipResponse.model_validate(row["response_body"])
-
-
-def _store_cached(
-    session: Session,
-    auth: AuthContext,
-    key: str,
-    request_hash: str,
-    response: RelationshipResponse,
-    now: datetime,
-    status_code: int,
-) -> None:
-    session.execute(
-        text(
-            """
-            INSERT INTO idempotency_records (
-                workspace_id, actor_id, key, request_hash, response_status,
-                response_body, created_at, expires_at
-            ) VALUES (
-                :workspace_id, :actor_id, :key, :request_hash, :response_status,
-                CAST(:response_body AS jsonb), :created_at, :expires_at
-            )
-            """
-        ),
-        {
-            "workspace_id": auth.workspace_id,
-            "actor_id": auth.user_id,
-            "key": key,
-            "request_hash": request_hash,
-            "response_status": status_code,
-            "response_body": dumps(response.model_dump(mode="json")),
-            "created_at": now,
-            "expires_at": now + timedelta(days=365),
-        },
-    )
 
 
 def _entity_version(session: Session, auth: AuthContext, entity_id: UUID) -> int | None:
@@ -376,12 +292,19 @@ def create_relationship(
 ) -> RelationshipResponse:
     if entity_id == payload.to_entity_id:
         raise HTTPException(status_code=422, detail="SELF_RELATIONSHIP_NOT_PERMITTED")
-    request_hash = _request_hash(payload, f"create:{entity_id}")
+    req_hash = request_hash(payload, f"create:{entity_id}")
     now = datetime.now(UTC)
     relationship_id = uuid4()
     with session.begin():
-        _lock_idempotency(session, auth, idempotency_key)
-        cached = _load_cached(session, auth, idempotency_key, request_hash)
+        lock_idempotency(session, auth, idempotency_key)
+        cached = load_cached(
+            session,
+            auth,
+            idempotency_key,
+            req_hash,
+            domain="knowledge_relationships",
+            response_model=RelationshipResponse,
+        )
         if cached is not None:
             return cached
         # A relationship touches two entities -- the source (URL entity_id,
@@ -479,7 +402,15 @@ def create_relationship(
             now,
             source_id=payload.evidence_id,
         )
-        _store_cached(session, auth, idempotency_key, request_hash, response, now, 201)
+        store_idempotency(
+            session,
+            auth,
+            idempotency_key,
+            req_hash,
+            response.model_dump(mode="json"),
+            now,
+            201,
+        )
         return response
 
 
