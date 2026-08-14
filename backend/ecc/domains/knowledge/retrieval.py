@@ -1,11 +1,8 @@
-from base64 import urlsafe_b64decode, urlsafe_b64encode
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from hashlib import sha256
-from hmac import compare_digest, new
 from html import escape
-from json import dumps, loads
+from json import dumps
 from typing import Annotated, Any
 from unicodedata import normalize as unicode_normalize
 from uuid import UUID
@@ -16,7 +13,6 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from ecc.auth import AuthDep
-from ecc.config import get_settings
 from ecc.database import get_session
 from ecc.domains.knowledge.embeddings import (
     MODEL_ID,
@@ -24,7 +20,7 @@ from ecc.domains.knowledge.embeddings import (
     get_provider,
     vector_literal,
 )
-from ecc.platform import authz
+from ecc.platform import authz, cursor_pagination
 
 router = APIRouter(prefix="/api/v1/knowledge", tags=["knowledge-retrieval"])
 SessionDep = Annotated[Session, Depends(get_session)]
@@ -250,24 +246,17 @@ def _snippet(body: str, title: str) -> str:
 
 
 def _encode_cursor(score: float, entity_id: UUID) -> str:
-    payload = dumps({"score": score, "id": str(entity_id)}).encode()
-    signature = new(get_settings().session_secret.encode(), payload, sha256).hexdigest().encode()
-    return urlsafe_b64encode(payload + b"." + signature).decode().rstrip("=")
+    return cursor_pagination.encode_cursor({"score": score, "id": str(entity_id)})
 
 
 def _decode_cursor(cursor: str) -> tuple[float, UUID]:
+    decoded = cursor_pagination.decode_cursor(cursor)
     try:
-        raw = urlsafe_b64decode((cursor + "=" * (-len(cursor) % 4)).encode())
-        payload, signature = raw.rsplit(b".", 1)
-        expected = new(get_settings().session_secret.encode(), payload, sha256).hexdigest()
-        if not compare_digest(signature.decode(), expected):
-            raise ValueError
-        decoded = loads(payload)
         score = float(decoded["score"])
         if not 0 <= score <= 1:
             raise ValueError
         return score, UUID(decoded["id"])
-    except (ValueError, KeyError, TypeError, UnicodeDecodeError) as exc:
+    except (ValueError, KeyError, TypeError) as exc:
         raise HTTPException(status_code=400, detail="MALFORMED_CURSOR") from exc
 
 

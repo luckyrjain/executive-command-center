@@ -18,14 +18,12 @@ configurable start time is deferred until a real user need for it appears,
 consistent with this codebase's "no speculative field" discipline.
 """
 
-from base64 import urlsafe_b64decode, urlsafe_b64encode
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta
 from hashlib import sha256
-from hmac import compare_digest, new
-from json import dumps, loads
+from json import dumps
 from typing import Annotated, Any, Literal
 from uuid import UUID, uuid4
 from zoneinfo import ZoneInfo
@@ -37,14 +35,13 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from ecc.auth import AuthContext, AuthDep, CsrfDep
-from ecc.config import get_settings
 from ecc.database import get_session
 from ecc.observability import (
     queue_lifecycle_event,
     record_audit_outbox_failure,
     record_idempotency_conflict,
 )
-from ecc.platform import authz
+from ecc.platform import authz, cursor_pagination
 
 _WORKDAY_START = time(9, 0)
 DEFAULT_EFFORT_MINUTES = 30
@@ -952,25 +949,16 @@ def create_plan(
 
 
 def _encode_cursor(created_at: datetime, plan_id: UUID) -> str:
-    payload = dumps(
-        {"created_at": created_at.isoformat(), "id": str(plan_id)}, separators=(",", ":")
-    ).encode()
-    secret = get_settings().session_secret.encode()
-    signature = new(secret, payload, "sha256").hexdigest().encode()
-    return urlsafe_b64encode(payload + b"." + signature).decode().rstrip("=")
+    return cursor_pagination.encode_cursor(
+        {"created_at": created_at.isoformat(), "id": str(plan_id)}
+    )
 
 
 def _decode_cursor(cursor: str) -> tuple[datetime, UUID]:
+    decoded = cursor_pagination.decode_cursor(cursor, detail="CURSOR_INVALID")
     try:
-        padded = cursor + "=" * (-len(cursor) % 4)
-        raw = urlsafe_b64decode(padded.encode())
-        payload, signature = raw.rsplit(b".", 1)
-        expected = new(get_settings().session_secret.encode(), payload, "sha256").hexdigest()
-        if not compare_digest(signature.decode(), expected):
-            raise ValueError
-        decoded = loads(payload)
         return datetime.fromisoformat(decoded["created_at"]), UUID(decoded["id"])
-    except (ValueError, KeyError, TypeError, UnicodeDecodeError) as exc:
+    except (ValueError, KeyError, TypeError) as exc:
         raise HTTPException(status_code=400, detail="CURSOR_INVALID") from exc
 
 

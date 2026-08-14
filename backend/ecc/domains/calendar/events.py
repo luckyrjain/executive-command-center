@@ -1,7 +1,5 @@
-from base64 import urlsafe_b64decode, urlsafe_b64encode
 from datetime import UTC, date, datetime, time, timedelta
-from hmac import compare_digest, new
-from json import dumps, loads
+from json import dumps
 from typing import Annotated, Any, Literal
 from uuid import UUID, uuid4
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -13,13 +11,12 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from ecc.auth import AuthContext, AuthDep, CsrfDep
-from ecc.config import get_settings
 from ecc.database import get_session
 from ecc.observability import (
     queue_lifecycle_event,
     record_audit_outbox_failure,
 )
-from ecc.platform import authz
+from ecc.platform import authz, cursor_pagination
 from ecc.platform.idempotency import load_cached, lock_idempotency, request_hash, store_idempotency
 
 router = APIRouter(prefix="/api/v1/calendar/events", tags=["calendar-events"])
@@ -230,21 +227,16 @@ def _get_row(
 
 
 def _encode_cursor(starts_at: datetime, event_id: UUID) -> str:
-    payload = dumps({"starts_at": starts_at.isoformat(), "id": str(event_id)}).encode()
-    signature = new(get_settings().session_secret.encode(), payload, "sha256").hexdigest().encode()
-    return urlsafe_b64encode(payload + b"." + signature).decode().rstrip("=")
+    return cursor_pagination.encode_cursor(
+        {"starts_at": starts_at.isoformat(), "id": str(event_id)}
+    )
 
 
 def _decode_cursor(cursor: str) -> tuple[datetime, UUID]:
+    decoded = cursor_pagination.decode_cursor(cursor)
     try:
-        raw = urlsafe_b64decode((cursor + "=" * (-len(cursor) % 4)).encode())
-        payload, signature = raw.rsplit(b".", 1)
-        expected = new(get_settings().session_secret.encode(), payload, "sha256").hexdigest()
-        if not compare_digest(signature.decode(), expected):
-            raise ValueError
-        decoded = loads(payload)
         return datetime.fromisoformat(decoded["starts_at"]), UUID(decoded["id"])
-    except (ValueError, KeyError, TypeError, UnicodeDecodeError) as exc:
+    except (ValueError, KeyError, TypeError) as exc:
         raise HTTPException(status_code=400, detail="MALFORMED_CURSOR") from exc
 
 

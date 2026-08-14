@@ -1,7 +1,4 @@
-from base64 import urlsafe_b64decode, urlsafe_b64encode
 from datetime import datetime
-from hmac import compare_digest, new
-from json import dumps, loads
 from typing import Annotated
 from uuid import UUID
 
@@ -10,7 +7,6 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from ecc.auth import AuthDep
-from ecc.config import get_settings
 from ecc.database import get_session
 from ecc.domains.governance.recommendation_models import (
     RecommendationListResponse,
@@ -18,7 +14,7 @@ from ecc.domains.governance.recommendation_models import (
     RecommendationStatus,
 )
 from ecc.domains.governance.recommendation_storage import FIELDS, expire_if_needed, get_row, project
-from ecc.platform import authz
+from ecc.platform import authz, cursor_pagination
 
 router = APIRouter(prefix="/api/v1/recommendations", tags=["recommendations"])
 SessionDep = Annotated[Session, Depends(get_session)]
@@ -27,21 +23,16 @@ LimitQuery = Annotated[int, Query(ge=1, le=100)]
 
 
 def _encode_cursor(created_at: datetime, recommendation_id: UUID) -> str:
-    payload = dumps({"created_at": created_at.isoformat(), "id": str(recommendation_id)}).encode()
-    signature = new(get_settings().session_secret.encode(), payload, "sha256").hexdigest().encode()
-    return urlsafe_b64encode(payload + b"." + signature).decode().rstrip("=")
+    return cursor_pagination.encode_cursor(
+        {"created_at": created_at.isoformat(), "id": str(recommendation_id)}
+    )
 
 
 def _decode_cursor(cursor: str) -> tuple[datetime, UUID]:
+    decoded = cursor_pagination.decode_cursor(cursor)
     try:
-        raw = urlsafe_b64decode((cursor + "=" * (-len(cursor) % 4)).encode())
-        payload, signature = raw.rsplit(b".", 1)
-        expected = new(get_settings().session_secret.encode(), payload, "sha256").hexdigest()
-        if not compare_digest(signature.decode(), expected):
-            raise ValueError
-        decoded = loads(payload)
         return datetime.fromisoformat(decoded["created_at"]), UUID(decoded["id"])
-    except (ValueError, KeyError, TypeError, UnicodeDecodeError) as exc:
+    except (ValueError, KeyError, TypeError) as exc:
         raise HTTPException(status_code=400, detail="MALFORMED_CURSOR") from exc
 
 

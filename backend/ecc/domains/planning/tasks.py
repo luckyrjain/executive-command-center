@@ -1,8 +1,6 @@
-from base64 import urlsafe_b64decode, urlsafe_b64encode
 from datetime import UTC, date, datetime, timedelta
 from hashlib import sha256
-from hmac import compare_digest, new
-from json import dumps, loads
+from json import dumps
 from typing import Annotated, Any, Literal
 from uuid import UUID, uuid4
 
@@ -13,14 +11,13 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from ecc.auth import AuthContext, AuthDep, CsrfDep
-from ecc.config import get_settings
 from ecc.database import get_session
 from ecc.observability import (
     queue_lifecycle_event,
     record_audit_outbox_failure,
     record_idempotency_conflict,
 )
-from ecc.platform import authz
+from ecc.platform import authz, cursor_pagination
 
 router = APIRouter(prefix="/api/v1/tasks", tags=["tasks"])
 
@@ -370,26 +367,16 @@ def _raise_version_conflict(current: dict[str, Any], expected_version: int) -> N
 
 
 def _encode_cursor(created_at: datetime, task_id: UUID) -> str:
-    payload = dumps(
-        {"created_at": created_at.isoformat(), "id": str(task_id)},
-        separators=(",", ":"),
-    ).encode()
-    secret = get_settings().session_secret.encode()
-    signature = new(secret, payload, "sha256").hexdigest().encode()
-    return urlsafe_b64encode(payload + b"." + signature).decode().rstrip("=")
+    return cursor_pagination.encode_cursor(
+        {"created_at": created_at.isoformat(), "id": str(task_id)}
+    )
 
 
 def _decode_cursor(cursor: str) -> tuple[datetime, UUID]:
+    decoded = cursor_pagination.decode_cursor(cursor)
     try:
-        padded = cursor + "=" * (-len(cursor) % 4)
-        raw = urlsafe_b64decode(padded.encode())
-        payload, signature = raw.rsplit(b".", 1)
-        expected = new(get_settings().session_secret.encode(), payload, "sha256").hexdigest()
-        if not compare_digest(signature.decode(), expected):
-            raise ValueError
-        decoded = loads(payload)
         return datetime.fromisoformat(decoded["created_at"]), UUID(decoded["id"])
-    except (ValueError, KeyError, TypeError, UnicodeDecodeError) as exc:
+    except (ValueError, KeyError, TypeError) as exc:
         raise HTTPException(status_code=400, detail="MALFORMED_CURSOR") from exc
 
 
