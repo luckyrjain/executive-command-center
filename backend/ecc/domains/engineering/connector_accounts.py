@@ -114,7 +114,6 @@ intended caller; wiring it here would be speculative.
 
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from hashlib import sha256
 from json import dumps
 from typing import Annotated, Any, Literal
 from uuid import UUID, uuid4
@@ -133,6 +132,7 @@ from ecc.observability import (
     record_idempotency_conflict,
 )
 from ecc.platform import authz
+from ecc.platform.idempotency import load_cached, lock_idempotency, request_hash, store_idempotency
 
 from .connectors import (
     AdapterAuthorizationError,
@@ -757,89 +757,11 @@ def _to_response(account: ConnectorAccount) -> ConnectorAccountResponse:
     )
 
 
-def _request_hash(payload: BaseModel, action: str) -> str:
-    material = {"action": action, "payload": payload.model_dump(mode="json")}
-    return sha256(dumps(material, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
-
-
 def _request_ids(request: Request) -> tuple[UUID, UUID]:
     try:
         return UUID(request.state.request_id), UUID(request.state.correlation_id)
     except (AttributeError, TypeError, ValueError):
         return uuid4(), uuid4()
-
-
-def _lock_idempotency(session: Session, auth: AuthContext, key: str) -> None:
-    lock_key = f"{auth.workspace_id}:{auth.user_id}:{key}"
-    session.execute(
-        text("SELECT pg_advisory_xact_lock(hashtextextended(:lock_key, 0))"),
-        {"lock_key": lock_key},
-    )
-
-
-def _load_cached(
-    session: Session, auth: AuthContext, key: str, request_hash: str
-) -> dict[str, Any] | None:
-    row = (
-        session.execute(
-            text(
-                """
-                SELECT request_hash, response_body FROM idempotency_records
-                WHERE workspace_id = :workspace_id AND actor_id = :actor_id
-                  AND key = :key AND expires_at > :now
-                """
-            ),
-            {
-                "workspace_id": auth.workspace_id,
-                "actor_id": auth.user_id,
-                "key": key,
-                "now": datetime.now(UTC),
-            },
-        )
-        .mappings()
-        .one_or_none()
-    )
-    if row is None:
-        return None
-    if row["request_hash"] != request_hash:
-        record_idempotency_conflict("engineering_connector_account")
-        raise HTTPException(status_code=409, detail="IDEMPOTENCY_CONFLICT")
-    result: dict[str, Any] = row["response_body"]
-    return result
-
-
-def _store_idempotency(
-    session: Session,
-    auth: AuthContext,
-    key: str,
-    request_hash: str,
-    response_body: dict[str, Any],
-    now: datetime,
-    response_status: int = 200,
-) -> None:
-    session.execute(
-        text(
-            """
-            INSERT INTO idempotency_records (
-                workspace_id, actor_id, key, request_hash, response_status,
-                response_body, created_at, expires_at
-            ) VALUES (
-                :workspace_id, :actor_id, :key, :request_hash, :response_status,
-                CAST(:response_body AS jsonb), :created_at, :expires_at
-            )
-            """
-        ),
-        {
-            "workspace_id": auth.workspace_id,
-            "actor_id": auth.user_id,
-            "key": key,
-            "request_hash": request_hash,
-            "response_status": response_status,
-            "response_body": dumps(response_body),
-            "created_at": now,
-            "expires_at": now + timedelta(days=365),
-        },
-    )
 
 
 def _write_side_effects(
@@ -978,13 +900,15 @@ def create_connector_endpoint(
     -- that 409 is a genuine "come back later," not a replayable result.
     """
     authz.require_role_action(session, auth, "write")
-    request_hash = _request_hash(payload, "create_connector")
+    req_hash = request_hash(payload, "create_connector")
     now = datetime.now(UTC)
 
     # --- Phase 1: idempotency check, provider validation ------------------
     with session.begin():
-        _lock_idempotency(session, auth, idempotency_key)
-        cached = _load_cached(session, auth, idempotency_key, request_hash)
+        lock_idempotency(session, auth, idempotency_key)
+        cached = load_cached(
+            session, auth, idempotency_key, req_hash, domain="engineering_connector_account"
+        )
         if cached is not None:
             return ConnectorAccountResponse.model_validate(cached)
 
@@ -1061,8 +985,12 @@ def create_connector_endpoint(
             # safe. See this function's own docstring for why re-checking
             # the cache (rather than assuming this is a genuine duplicate)
             # is correct specifically here.
-            cached_after_conflict = _load_cached(
-                create_session, auth, idempotency_key, request_hash
+            cached_after_conflict = load_cached(
+                create_session,
+                auth,
+                idempotency_key,
+                req_hash,
+                domain="engineering_connector_account",
             )
             if cached_after_conflict is not None:
                 return ConnectorAccountResponse.model_validate(cached_after_conflict)
@@ -1080,11 +1008,11 @@ def create_connector_endpoint(
             version=created.version,
             now=now,
         )
-        _store_idempotency(
+        store_idempotency(
             create_session,
             auth,
             idempotency_key,
-            request_hash,
+            req_hash,
             response.model_dump(mode="json"),
             now,
             response_status=status.HTTP_201_CREATED,
@@ -1153,13 +1081,15 @@ def sync_connector_endpoint(
     # A transaction is already begun on this Session`.
     session.rollback()
 
-    request_hash = _request_hash(payload, f"sync:{account_id}")
+    req_hash = request_hash(payload, f"sync:{account_id}")
     now = datetime.now(UTC)
 
     # --- Phase 1: validate, reserve the run, read the cursor -------------
     with session.begin():
-        _lock_idempotency(session, auth, idempotency_key)
-        cached = _load_cached(session, auth, idempotency_key, request_hash)
+        lock_idempotency(session, auth, idempotency_key)
+        cached = load_cached(
+            session, auth, idempotency_key, req_hash, domain="engineering_connector_account"
+        )
         if cached is not None:
             return SyncRunResponse.model_validate(cached)
 
@@ -1335,11 +1265,11 @@ def sync_connector_endpoint(
                 version=audit_version,
                 now=completed_at,
             )
-            _store_idempotency(
+            store_idempotency(
                 outcome_session,
                 auth,
                 idempotency_key,
-                request_hash,
+                req_hash,
                 response.model_dump(mode="json"),
                 now,
             )
@@ -1441,11 +1371,11 @@ def sync_connector_endpoint(
             version=audit_version,
             now=completed_at,
         )
-        _store_idempotency(
+        store_idempotency(
             outcome_session,
             auth,
             idempotency_key,
-            request_hash,
+            req_hash,
             response.model_dump(mode="json"),
             now,
         )
@@ -1523,7 +1453,7 @@ def disable_connector_endpoint(
     # must be rolled back before phase 1's own `with session.begin():`.
     session.rollback()
 
-    request_hash = _request_hash(_EmptyBody(), f"disable:{account_id}")
+    req_hash = request_hash(_EmptyBody(), f"disable:{account_id}")
     now = datetime.now(UTC)
     # Round 23 review: `adapter.disconnect(...)` used to be called from
     # *inside* this transaction, while still holding the `FOR UPDATE` lock
@@ -1540,12 +1470,12 @@ def disable_connector_endpoint(
     # phase split for the identical class of risk.
     pending_revoke: tuple[ConnectorAdapter, ConnectorAccountContext] | None = None
     with session.begin():
-        _lock_idempotency(session, auth, idempotency_key)
+        lock_idempotency(session, auth, idempotency_key)
 
-        # `get_connector_account` moved ahead of `_load_cached` (Loop 2
-        # round 27 review finding, MEDIUM-HIGH): `request_hash` above is a
+        # `get_connector_account` moved ahead of `load_cached` (Loop 2
+        # round 27 review finding, MEDIUM-HIGH): `req_hash` above is a
         # function of `account_id` alone, and `idempotency_records` rows
-        # live 365 days (`_store_idempotency`), so the same `Idempotency-
+        # live 365 days (`store_idempotency`), so the same `Idempotency-
         # Key` reused across a real disable -> `gmail_oauth.py` reconnect
         # (reactivates this exact row's `status` back to `'active'`, same
         # `id`) -> a second disable attempt used to match the *first*
@@ -1567,7 +1497,9 @@ def disable_connector_endpoint(
         if account is None:
             raise HTTPException(status_code=404, detail="CONNECTOR_NOT_FOUND")
 
-        cached = _load_cached(session, auth, idempotency_key, request_hash)
+        cached = load_cached(
+            session, auth, idempotency_key, req_hash, domain="engineering_connector_account"
+        )
         if cached is not None:
             if account.status != "disconnected":
                 record_idempotency_conflict("engineering_connector_account")
@@ -1710,8 +1642,8 @@ def disable_connector_endpoint(
             version=updated.version,
             now=now,
         )
-        _store_idempotency(
-            session, auth, idempotency_key, request_hash, response.model_dump(mode="json"), now
+        store_idempotency(
+            session, auth, idempotency_key, req_hash, response.model_dump(mode="json"), now
         )
 
     # Transaction above has committed. Release `session`'s pooled
@@ -2060,11 +1992,13 @@ def confirm_team_suggestion_endpoint(
     design doc's "Backend endpoints" section for why a per-row version
     doesn't apply to a set-based confirm.
     """
-    request_hash = _request_hash(payload, "confirm_team_suggestion")
+    req_hash = request_hash(payload, "confirm_team_suggestion")
     now = datetime.now(UTC)
     with session.begin():
-        _lock_idempotency(session, auth, idempotency_key)
-        cached = _load_cached(session, auth, idempotency_key, request_hash)
+        lock_idempotency(session, auth, idempotency_key)
+        cached = load_cached(
+            session, auth, idempotency_key, req_hash, domain="engineering_connector_account"
+        )
         if cached is not None:
             return TeamSuggestionActionResponse.model_validate(cached)
 
@@ -2108,8 +2042,8 @@ def confirm_team_suggestion_endpoint(
                 updated.append(row_id)
 
         response = TeamSuggestionActionResponse(updated=updated, skipped_unauthorized=skipped)
-        _store_idempotency(
-            session, auth, idempotency_key, request_hash, response.model_dump(mode="json"), now
+        store_idempotency(
+            session, auth, idempotency_key, req_hash, response.model_dump(mode="json"), now
         )
         return response
 
@@ -2129,11 +2063,13 @@ def dismiss_team_suggestion_endpoint(
     what keeps this from permanently suppressing a since-changed
     suggestion.
     """
-    request_hash = _request_hash(payload, "dismiss_team_suggestion")
+    req_hash = request_hash(payload, "dismiss_team_suggestion")
     now = datetime.now(UTC)
     with session.begin():
-        _lock_idempotency(session, auth, idempotency_key)
-        cached = _load_cached(session, auth, idempotency_key, request_hash)
+        lock_idempotency(session, auth, idempotency_key)
+        cached = load_cached(
+            session, auth, idempotency_key, req_hash, domain="engineering_connector_account"
+        )
         if cached is not None:
             return TeamSuggestionActionResponse.model_validate(cached)
 
@@ -2156,8 +2092,8 @@ def dismiss_team_suggestion_endpoint(
                 updated.append(row_id)
 
         response = TeamSuggestionActionResponse(updated=updated, skipped_unauthorized=skipped)
-        _store_idempotency(
-            session, auth, idempotency_key, request_hash, response.model_dump(mode="json"), now
+        store_idempotency(
+            session, auth, idempotency_key, req_hash, response.model_dump(mode="json"), now
         )
         return response
 
@@ -2455,11 +2391,13 @@ def assign_repository_team_endpoint(
     # must be rolled back before this endpoint's own `with session.begin():`.
     session.rollback()
 
-    request_hash = _request_hash(payload, f"assign_repository_team:{repository_id}")
+    req_hash = request_hash(payload, f"assign_repository_team:{repository_id}")
     now = datetime.now(UTC)
     with session.begin():
-        _lock_idempotency(session, auth, idempotency_key)
-        cached = _load_cached(session, auth, idempotency_key, request_hash)
+        lock_idempotency(session, auth, idempotency_key)
+        cached = load_cached(
+            session, auth, idempotency_key, req_hash, domain="engineering_connector_account"
+        )
         if cached is not None:
             return RepositoryResponse.model_validate(cached)
 
@@ -2519,8 +2457,8 @@ def assign_repository_team_endpoint(
             version=response.team_assignment_version,
             now=now,
         )
-        _store_idempotency(
-            session, auth, idempotency_key, request_hash, response.model_dump(mode="json"), now
+        store_idempotency(
+            session, auth, idempotency_key, req_hash, response.model_dump(mode="json"), now
         )
         return response
 
@@ -2560,11 +2498,13 @@ def assign_work_item_team_endpoint(
     # must be rolled back before this endpoint's own `with session.begin():`.
     session.rollback()
 
-    request_hash = _request_hash(payload, f"assign_work_item_team:{work_item_id}")
+    req_hash = request_hash(payload, f"assign_work_item_team:{work_item_id}")
     now = datetime.now(UTC)
     with session.begin():
-        _lock_idempotency(session, auth, idempotency_key)
-        cached = _load_cached(session, auth, idempotency_key, request_hash)
+        lock_idempotency(session, auth, idempotency_key)
+        cached = load_cached(
+            session, auth, idempotency_key, req_hash, domain="engineering_connector_account"
+        )
         if cached is not None:
             return WorkItemResponse.model_validate(cached)
 
@@ -2625,7 +2565,7 @@ def assign_work_item_team_endpoint(
             version=response.team_assignment_version,
             now=now,
         )
-        _store_idempotency(
-            session, auth, idempotency_key, request_hash, response.model_dump(mode="json"), now
+        store_idempotency(
+            session, auth, idempotency_key, req_hash, response.model_dump(mode="json"), now
         )
         return response

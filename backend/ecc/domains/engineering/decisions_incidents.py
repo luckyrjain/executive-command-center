@@ -50,8 +50,7 @@ real scope across PRs when it turns out larger than one reviewable unit
 (Task 5's GitLab change/review sync deferral is the identical pattern).
 """
 
-from datetime import UTC, datetime, timedelta
-from hashlib import sha256
+from datetime import UTC, datetime
 from json import dumps
 from typing import Annotated, Any, Literal
 from uuid import UUID, uuid4
@@ -67,9 +66,9 @@ from ecc.database import get_session
 from ecc.observability import (
     queue_lifecycle_event,
     record_audit_outbox_failure,
-    record_idempotency_conflict,
 )
 from ecc.platform import authz
+from ecc.platform.idempotency import load_cached, lock_idempotency, request_hash, store_idempotency
 
 router = APIRouter(prefix="/api/v1/engineering", tags=["engineering"])
 
@@ -89,8 +88,6 @@ IncidentStatus = Literal["open", "resolved"]
 # speculative scope, the same reasoning this task already applies to
 # deferring deployment/work-item correlation.
 DecisionStatus = Literal["proposed", "decided", "superseded"]
-
-_IDEMPOTENCY_TTL = timedelta(hours=24)
 
 
 class _EmptyBody(BaseModel):
@@ -171,89 +168,11 @@ class DecisionListResponse(BaseModel):
     decisions: list[DecisionResponse]
 
 
-def _request_hash(payload: BaseModel, action: str) -> str:
-    material = {"action": action, "payload": payload.model_dump(mode="json")}
-    return sha256(dumps(material, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
-
-
 def _request_ids(request: Request) -> tuple[UUID, UUID]:
     try:
         return UUID(request.state.request_id), UUID(request.state.correlation_id)
     except (AttributeError, TypeError, ValueError):
         return uuid4(), uuid4()
-
-
-def _lock_idempotency(session: Session, auth: AuthContext, key: str) -> None:
-    lock_key = f"{auth.workspace_id}:{auth.user_id}:{key}"
-    session.execute(
-        text("SELECT pg_advisory_xact_lock(hashtextextended(:lock_key, 0))"),
-        {"lock_key": lock_key},
-    )
-
-
-def _load_cached(
-    session: Session, auth: AuthContext, key: str, request_hash: str
-) -> dict[str, Any] | None:
-    row = (
-        session.execute(
-            text(
-                """
-                SELECT request_hash, response_body FROM idempotency_records
-                WHERE workspace_id = :workspace_id AND actor_id = :actor_id
-                  AND key = :key AND expires_at > :now
-                """
-            ),
-            {
-                "workspace_id": auth.workspace_id,
-                "actor_id": auth.user_id,
-                "key": key,
-                "now": datetime.now(UTC),
-            },
-        )
-        .mappings()
-        .one_or_none()
-    )
-    if row is None:
-        return None
-    if row["request_hash"] != request_hash:
-        record_idempotency_conflict("engineering_decisions_incidents")
-        raise HTTPException(status_code=409, detail="IDEMPOTENCY_CONFLICT")
-    result: dict[str, Any] = row["response_body"]
-    return result
-
-
-def _store_idempotency(
-    session: Session,
-    auth: AuthContext,
-    key: str,
-    request_hash: str,
-    response_body: dict[str, Any],
-    now: datetime,
-    response_status: int = 200,
-) -> None:
-    session.execute(
-        text(
-            """
-            INSERT INTO idempotency_records (
-                workspace_id, actor_id, key, request_hash, response_status,
-                response_body, created_at, expires_at
-            ) VALUES (
-                :workspace_id, :actor_id, :key, :request_hash, :response_status,
-                CAST(:response_body AS jsonb), :created_at, :expires_at
-            )
-            """
-        ),
-        {
-            "workspace_id": auth.workspace_id,
-            "actor_id": auth.user_id,
-            "key": key,
-            "request_hash": request_hash,
-            "response_status": response_status,
-            "response_body": dumps(response_body),
-            "created_at": now,
-            "expires_at": now + _IDEMPOTENCY_TTL,
-        },
-    )
 
 
 def _write_side_effects(
@@ -448,11 +367,13 @@ def create_incident_endpoint(
     idempotency_key: IdempotencyHeader,
 ) -> IncidentResponse:
     authz.require_role_action(session, auth, "write")
-    request_hash = _request_hash(payload, "create_incident")
+    req_hash = request_hash(payload, "create_incident")
     now = datetime.now(UTC)
     with session.begin():
-        _lock_idempotency(session, auth, idempotency_key)
-        cached = _load_cached(session, auth, idempotency_key, request_hash)
+        lock_idempotency(session, auth, idempotency_key)
+        cached = load_cached(
+            session, auth, idempotency_key, req_hash, domain="engineering_decisions_incidents"
+        )
         if cached is not None:
             return IncidentResponse.model_validate(cached)
 
@@ -516,11 +437,11 @@ def create_incident_endpoint(
             version=1,
             now=now,
         )
-        _store_idempotency(
+        store_idempotency(
             session,
             auth,
             idempotency_key,
-            request_hash,
+            req_hash,
             response.model_dump(mode="json"),
             now,
             201,
@@ -538,11 +459,13 @@ def resolve_incident_endpoint(
     _csrf: CsrfDep,
     idempotency_key: IdempotencyHeader,
 ) -> IncidentResponse:
-    request_hash = _request_hash(payload, f"resolve_incident:{incident_id}")
+    req_hash = request_hash(payload, f"resolve_incident:{incident_id}")
     now = datetime.now(UTC)
     with session.begin():
-        _lock_idempotency(session, auth, idempotency_key)
-        cached = _load_cached(session, auth, idempotency_key, request_hash)
+        lock_idempotency(session, auth, idempotency_key)
+        cached = load_cached(
+            session, auth, idempotency_key, req_hash, domain="engineering_decisions_incidents"
+        )
         if cached is not None:
             return IncidentResponse.model_validate(cached)
 
@@ -620,8 +543,8 @@ def resolve_incident_endpoint(
             version=new_version,
             now=now,
         )
-        _store_idempotency(
-            session, auth, idempotency_key, request_hash, response.model_dump(mode="json"), now
+        store_idempotency(
+            session, auth, idempotency_key, req_hash, response.model_dump(mode="json"), now
         )
         return response
 
@@ -667,11 +590,13 @@ def create_decision_endpoint(
     idempotency_key: IdempotencyHeader,
 ) -> DecisionResponse:
     authz.require_role_action(session, auth, "write")
-    request_hash = _request_hash(payload, "create_decision")
+    req_hash = request_hash(payload, "create_decision")
     now = datetime.now(UTC)
     with session.begin():
-        _lock_idempotency(session, auth, idempotency_key)
-        cached = _load_cached(session, auth, idempotency_key, request_hash)
+        lock_idempotency(session, auth, idempotency_key)
+        cached = load_cached(
+            session, auth, idempotency_key, req_hash, domain="engineering_decisions_incidents"
+        )
         if cached is not None:
             return DecisionResponse.model_validate(cached)
 
@@ -734,11 +659,11 @@ def create_decision_endpoint(
             version=1,
             now=now,
         )
-        _store_idempotency(
+        store_idempotency(
             session,
             auth,
             idempotency_key,
-            request_hash,
+            req_hash,
             response.model_dump(mode="json"),
             now,
             201,
@@ -756,11 +681,13 @@ def decide_decision_endpoint(
     _csrf: CsrfDep,
     idempotency_key: IdempotencyHeader,
 ) -> DecisionResponse:
-    request_hash = _request_hash(payload, f"decide_decision:{decision_id}")
+    req_hash = request_hash(payload, f"decide_decision:{decision_id}")
     now = datetime.now(UTC)
     with session.begin():
-        _lock_idempotency(session, auth, idempotency_key)
-        cached = _load_cached(session, auth, idempotency_key, request_hash)
+        lock_idempotency(session, auth, idempotency_key)
+        cached = load_cached(
+            session, auth, idempotency_key, req_hash, domain="engineering_decisions_incidents"
+        )
         if cached is not None:
             return DecisionResponse.model_validate(cached)
 
@@ -839,8 +766,8 @@ def decide_decision_endpoint(
             version=new_version,
             now=now,
         )
-        _store_idempotency(
-            session, auth, idempotency_key, request_hash, response.model_dump(mode="json"), now
+        store_idempotency(
+            session, auth, idempotency_key, req_hash, response.model_dump(mode="json"), now
         )
         return response
 
