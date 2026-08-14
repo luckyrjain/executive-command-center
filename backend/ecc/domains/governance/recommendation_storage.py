@@ -105,7 +105,7 @@ def save_cached(
             "response_status": status_code,
             "response_body": response.model_dump_json(),
             "created_at": now,
-            "expires_at": now + timedelta(hours=24),
+            "expires_at": now + timedelta(days=365),
         },
     )
 

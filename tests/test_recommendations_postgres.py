@@ -258,6 +258,52 @@ def test_generate_publish_confirm_execute_and_replay(
     assert outbox_count == 4
 
 
+def test_idempotency_record_ttl_matches_every_other_domain(
+    recommendation_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    """`recommendation_storage.save_cached` hardcoded `timedelta(hours=24)`
+    for `idempotency_records.expires_at` -- every other domain (including
+    `ecc.platform.idempotency` itself) uses `timedelta(days=365)`. A
+    recommendation replay arriving more than 24h after the original request
+    silently lost idempotency protection and would double-execute, unlike
+    the structurally identical `risks`/`commitments`/`tasks` endpoints.
+    """
+    client, workspace_id, user_id, token = recommendation_context
+    task_id = _task(workspace_id, user_id)
+    idempotency_key = str(uuid4())
+    before = datetime.now(UTC)
+    response = client.post(
+        "/api/v1/recommendations",
+        headers=_headers(token, idempotency_key),
+        json={
+            "recommendation_type": "task_priority",
+            "target_type": "task",
+            "target_id": str(task_id),
+            "proposed_action": {"operation": "set_priority", "value": "critical"},
+            "expected_version": 1,
+            "rationale": "TTL regression coverage.",
+            "confidence": 0.9,
+            "evidence_ids": [],
+            "expires_at": None,
+            "source": "rule",
+        },
+    )
+    assert response.status_code == 201
+
+    with engine.connect() as connection:
+        expires_at = connection.execute(
+            text(
+                """
+                SELECT expires_at FROM idempotency_records
+                WHERE workspace_id=:workspace_id AND actor_id=:actor_id AND key=:key
+                """
+            ),
+            {"workspace_id": workspace_id, "actor_id": user_id, "key": idempotency_key},
+        ).scalar_one()
+    ttl = expires_at - before
+    assert ttl > timedelta(days=300)
+
+
 def test_target_conflict_rolls_back_acceptance(
     recommendation_context: tuple[TestClient, UUID, UUID, str],
 ) -> None:
