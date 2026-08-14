@@ -250,6 +250,75 @@ def _write_side_effects(
     queue_lifecycle_event(session, "risk", event_type, "allowed")
 
 
+def set_risk_status_write(
+    session: Session,
+    auth: AuthContext,
+    request: Request,
+    risk_id: UUID,
+    new_status: RiskStatus,
+    *,
+    expected_version: int,
+    now: datetime,
+) -> RiskResponse:
+    """The single-field `status` slice of `update_risk`'s guard + write +
+    audit/outbox emission, for `ecc.domains.governance.recommendation_
+    targets.execute_target`'s `set_status` branch to call instead of a raw
+    `UPDATE` that bypasses the `RISK_TERMINAL` guard and never writes an
+    audit trail. Mirrors `update_risk`'s own guards exactly. Deliberately
+    excludes `session.begin()`/idempotency-key locking/replay -- see
+    `insert_risk`'s own docstring for why (both callers already run inside
+    their own already-open transaction and idempotency scheme).
+    """
+    if not authz.authorize(
+        session, auth, resource_type="risks", resource_id=risk_id, action="read"
+    ):
+        raise HTTPException(status_code=404, detail="RISK_NOT_FOUND")
+    if not authz.authorize(
+        session, auth, resource_type="risks", resource_id=risk_id, action="write"
+    ):
+        raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
+    current = _get_row(session, auth, risk_id, for_update=True)
+    if current is None:
+        raise HTTPException(status_code=404, detail="RISK_NOT_FOUND")
+    if current["archived_at"] is not None:
+        raise HTTPException(status_code=409, detail="RISK_ARCHIVED")
+    if current["version"] != expected_version:
+        raise HTTPException(status_code=409, detail="VERSION_CONFLICT")
+    if current["status"] == "closed" and new_status != "closed":
+        raise HTTPException(status_code=409, detail="RISK_TERMINAL")
+
+    if new_status == current["status"]:
+        return _project(current, now)
+
+    row = (
+        session.execute(
+            text(
+                f"""
+                UPDATE risks
+                SET status = :status, updated_by = :actor_id,
+                    updated_at = :now, version = version + 1
+                WHERE workspace_id = :workspace_id AND id = :risk_id
+                RETURNING {_RISK_FIELDS}
+                """
+            ),
+            {
+                "status": new_status,
+                "workspace_id": auth.workspace_id,
+                "risk_id": risk_id,
+                "actor_id": auth.user_id,
+                "now": now,
+            },
+        )
+        .mappings()
+        .one()
+    )
+    response = _project(dict(row), now)
+    _write_side_effects(
+        session, auth, request, "risk.updated", risk_id, response.version, ["status"], now
+    )
+    return response
+
+
 @router.patch("/{risk_id}", response_model=RiskResponse)
 def update_risk(
     risk_id: UUID,
