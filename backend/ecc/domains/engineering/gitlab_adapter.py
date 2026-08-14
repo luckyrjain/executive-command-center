@@ -108,7 +108,7 @@ import httpx
 
 from ecc.config import get_settings
 
-from . import repository_sync
+from . import rate_limit_retry, repository_sync
 from .connectors import (
     AdapterAuthorizationError,
     ConnectorAccountContext,
@@ -420,29 +420,20 @@ class GitLabAdapter:
         constructed without a `base_url` precisely because the host varies
         per credential (self-managed instances).
         """
-        try:
-            response = self._client.request(method, url, headers=headers, params=params)
-        except httpx.HTTPError as exc:
-            raise RuntimeError(f"GitLab request failed: {exc}") from exc
 
-        if response.status_code != 429:
-            return response
+        def make_request() -> httpx.Response:
+            try:
+                return self._client.request(method, url, headers=headers, params=params)
+            except httpx.HTTPError as exc:
+                raise RuntimeError(f"GitLab request failed: {exc}") from exc
 
-        wait_seconds = self._rate_limit_wait_seconds(response)
-        if wait_seconds is None or wait_seconds > _RATE_LIMIT_MAX_WAIT_SECONDS:
-            return None
-        self._sleep(wait_seconds)
-        try:
-            retry_response = self._client.request(method, url, headers=headers, params=params)
-        except httpx.HTTPError as exc:
-            raise RuntimeError(f"GitLab request failed: {exc}") from exc
-
-        # A second rate-limit hit right after the bounded wait must not be
-        # trusted as a normal response -- matches `github_adapter.py`'s
-        # own identical review-fixed reasoning exactly.
-        if retry_response.status_code == 429:
-            return None
-        return retry_response
+        return rate_limit_retry.bounded_single_retry(
+            make_request,
+            is_rate_limited=lambda response: response.status_code == 429,
+            wait_seconds=self._rate_limit_wait_seconds,
+            max_wait_seconds=_RATE_LIMIT_MAX_WAIT_SECONDS,
+            sleep=self._sleep,
+        )
 
     def _rate_limit_wait_seconds(self, response: httpx.Response) -> float | None:
         retry_after = response.headers.get("Retry-After")

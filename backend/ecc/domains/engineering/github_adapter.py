@@ -127,7 +127,7 @@ from sqlalchemy import text
 
 from ecc.database import SessionFactory
 
-from . import repository_sync
+from . import rate_limit_retry, repository_sync
 from .connectors import (
     WORKSPACE_ORIGINAL_OWNER_SQL,
     AdapterAuthorizationError,
@@ -552,43 +552,30 @@ class GitHubAdapter:
         headers: dict[str, str],
         params: dict[str, Any] | None = None,
     ) -> httpx.Response | None:
-        """Returns `None` only when rate-limited beyond the bounded wait --
-        callers treat that as "give up for now, resume next sync call."
+        """GitHub's own rate-limit detection (`429`, or `403` with
+        `X-RateLimit-Remaining: 0`) over `rate_limit_retry.bounded_single_
+        retry`'s shared bounded-wait-then-one-retry envelope -- see that
+        function's docstring for the give-up-on-still-limited reasoning.
         """
-        try:
-            response = self._client.request(method, path, headers=headers, params=params)
-        except httpx.HTTPError as exc:
-            raise RuntimeError(f"GitHub request failed: {exc}") from exc
 
-        is_rate_limited = response.status_code == 429 or (
-            response.status_code == 403 and response.headers.get("X-RateLimit-Remaining") == "0"
+        def make_request() -> httpx.Response:
+            try:
+                return self._client.request(method, path, headers=headers, params=params)
+            except httpx.HTTPError as exc:
+                raise RuntimeError(f"GitHub request failed: {exc}") from exc
+
+        def is_rate_limited(response: httpx.Response) -> bool:
+            return response.status_code == 429 or (
+                response.status_code == 403 and response.headers.get("X-RateLimit-Remaining") == "0"
+            )
+
+        return rate_limit_retry.bounded_single_retry(
+            make_request,
+            is_rate_limited=is_rate_limited,
+            wait_seconds=self._rate_limit_wait_seconds,
+            max_wait_seconds=_RATE_LIMIT_MAX_WAIT_SECONDS,
+            sleep=self._sleep,
         )
-        if not is_rate_limited:
-            return response
-
-        wait_seconds = self._rate_limit_wait_seconds(response)
-        if wait_seconds is None or wait_seconds > _RATE_LIMIT_MAX_WAIT_SECONDS:
-            return None
-        self._sleep(wait_seconds)
-        try:
-            retry_response = self._client.request(method, path, headers=headers, params=params)
-        except httpx.HTTPError as exc:
-            raise RuntimeError(f"GitHub request failed: {exc}") from exc
-
-        # A second rate-limit hit right after the bounded wait must not be
-        # trusted as a normal response -- review found this previously fell
-        # through to the caller's own `status_code != 200` branch, which
-        # raises an opaque `RuntimeError` (the whole sync run reported
-        # `failed`) instead of the same clean `partial` + preserved-cursor
-        # outcome a first-hit rate limit gets. One retry is the bound; a
-        # still-limited retry gives up exactly like the first check does.
-        retry_is_rate_limited = retry_response.status_code == 429 or (
-            retry_response.status_code == 403
-            and retry_response.headers.get("X-RateLimit-Remaining") == "0"
-        )
-        if retry_is_rate_limited:
-            return None
-        return retry_response
 
     def _rate_limit_wait_seconds(self, response: httpx.Response) -> float | None:
         retry_after = response.headers.get("Retry-After")
