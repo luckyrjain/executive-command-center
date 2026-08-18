@@ -7,17 +7,15 @@ from uuid import UUID, uuid4
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from sqlalchemy import text
-from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from ecc.auth import AuthContext, AuthDep, CsrfDep
 from ecc.database import get_session
 from ecc.observability import (
     queue_lifecycle_event,
-    record_audit_outbox_failure,
     record_idempotency_conflict,
 )
-from ecc.platform import authz, cursor_pagination
+from ecc.platform import audit_outbox, authz, cursor_pagination
 
 router = APIRouter(prefix="/api/v1/tasks", tags=["tasks"])
 
@@ -230,106 +228,6 @@ def _store_idempotency(
     )
 
 
-def _write_audit(
-    session: Session,
-    auth: AuthContext,
-    event_type: str,
-    task_id: UUID,
-    aggregate_version: int,
-    request_id: UUID,
-    correlation_id: UUID,
-    idempotency_key: str,
-    before: dict[str, Any] | None,
-    after: dict[str, Any] | None,
-    changed_fields: list[str],
-    now: datetime,
-    authorization_result: str = "allowed",
-    failure_code: str | None = None,
-) -> None:
-    try:
-        session.execute(
-            text(
-                """
-                INSERT INTO audit_events (
-                    id, workspace_id, event_type, aggregate_type, aggregate_id,
-                    aggregate_version, actor_id, request_id, correlation_id,
-                    idempotency_key_hash, before, after, changed_fields,
-                    authorization_result, source, failure_code, metadata, occurred_at
-                ) VALUES (
-                    :id, :workspace_id, :event_type, 'task', :aggregate_id,
-                    :aggregate_version, :actor_id, :request_id, :correlation_id,
-                    :key_hash, CAST(:before AS jsonb), CAST(:after AS jsonb),
-                    :changed_fields, :authorization_result, 'user', :failure_code,
-                    '{}'::jsonb, :occurred_at
-                )
-                """
-            ),
-            {
-                "id": uuid4(),
-                "workspace_id": auth.workspace_id,
-                "event_type": event_type,
-                "aggregate_id": task_id,
-                "aggregate_version": aggregate_version,
-                "actor_id": auth.user_id,
-                "request_id": request_id,
-                "correlation_id": correlation_id,
-                "key_hash": sha256(idempotency_key.encode()).hexdigest(),
-                "before": dumps(before) if before is not None else None,
-                "after": dumps(after) if after is not None else None,
-                "changed_fields": changed_fields,
-                "authorization_result": authorization_result,
-                "failure_code": failure_code,
-                "occurred_at": now,
-            },
-        )
-    except SQLAlchemyError:
-        record_audit_outbox_failure("tasks")
-        raise
-    queue_lifecycle_event(session, "task", event_type, authorization_result)
-
-
-def _write_outbox(
-    session: Session,
-    auth: AuthContext,
-    event_type: str,
-    task_id: UUID,
-    task_version: int,
-    correlation_id: UUID,
-    payload: dict[str, Any],
-    now: datetime,
-) -> None:
-    event_payload = {
-        "task_id": str(task_id),
-        "task_version": task_version,
-        **payload,
-    }
-    try:
-        session.execute(
-            text(
-                """
-                INSERT INTO event_outbox (
-                    event_id, workspace_id, event_type, event_version,
-                    correlation_id, payload, occurred_at, attempt_count
-                ) VALUES (
-                    :event_id, :workspace_id, :event_type, 1,
-                    :correlation_id, CAST(:payload AS jsonb), :occurred_at, 0
-                )
-                """
-            ),
-            {
-                "event_id": uuid4(),
-                "workspace_id": auth.workspace_id,
-                "event_type": event_type,
-                "correlation_id": correlation_id,
-                "payload": dumps(event_payload),
-                "occurred_at": now,
-            },
-        )
-    except SQLAlchemyError:
-        record_audit_outbox_failure("tasks")
-        raise
-
-
 def _get_task_row(
     session: Session,
     auth: AuthContext,
@@ -444,34 +342,29 @@ def insert_task(
         "due_date",
         "due_at",
     ]
-    _write_audit(
+    audit_outbox.write_audit_and_outbox(
         session,
         auth,
-        "task.created",
-        task_id,
-        response.version,
-        request_id,
-        correlation_id,
-        idempotency_key,
-        None,
-        after,
-        changed,
-        now,
-    )
-    _write_outbox(
-        session,
-        auth,
-        "task.created.v1",
-        task_id,
-        response.version,
-        correlation_id,
-        {
+        (request_id, correlation_id),
+        event_type="task.created",
+        aggregate_type="task",
+        aggregate_id=task_id,
+        aggregate_version=response.version,
+        changed_fields=changed,
+        payload={
+            "task_id": str(task_id),
+            "task_version": response.version,
             "owner_id": str(auth.user_id),
             "status": response.status,
             "priority": response.manual_priority,
         },
-        now,
+        now=now,
+        domain="tasks",
+        idempotency_key_hash=sha256(idempotency_key.encode()).hexdigest(),
+        before=None,
+        after=after,
     )
+    queue_lifecycle_event(session, "task", "task.created", "allowed")
     return response
 
 
@@ -624,7 +517,6 @@ def update_task(
 ) -> TaskResponse:
     request_hash = _request_hash(payload, f"update:{task_id}")
     now = datetime.now(UTC)
-    request_id, correlation_id = _request_ids(request)
 
     with session.begin():
         _lock_idempotency_key(session, auth, idempotency_key)
@@ -725,30 +617,27 @@ def update_task(
         response = _to_response(dict(row))
         before = _to_response(current).model_dump(mode="json")
         after = response.model_dump(mode="json")
-        _write_audit(
+        audit_outbox.write_audit_and_outbox(
             session,
             auth,
-            "task.updated",
-            task_id,
-            response.version,
-            request_id,
-            correlation_id,
-            idempotency_key,
-            before,
-            after,
-            changed_fields,
-            now,
+            request,
+            event_type="task.updated",
+            aggregate_type="task",
+            aggregate_id=task_id,
+            aggregate_version=response.version,
+            changed_fields=changed_fields,
+            payload={
+                "task_id": str(task_id),
+                "task_version": response.version,
+                "changed_fields": changed_fields,
+            },
+            now=now,
+            domain="tasks",
+            idempotency_key_hash=sha256(idempotency_key.encode()).hexdigest(),
+            before=before,
+            after=after,
         )
-        _write_outbox(
-            session,
-            auth,
-            "task.updated.v1",
-            task_id,
-            response.version,
-            correlation_id,
-            {"changed_fields": changed_fields},
-            now,
-        )
+        queue_lifecycle_event(session, "task", "task.updated", "allowed")
         _store_idempotency(
             session,
             auth,
@@ -828,30 +717,27 @@ def set_task_status_write(
     response = _to_response(dict(row))
     before = _to_response(current).model_dump(mode="json")
     after = response.model_dump(mode="json")
-    _write_audit(
+    audit_outbox.write_audit_and_outbox(
         session,
         auth,
-        "task.updated",
-        task_id,
-        response.version,
-        request_id,
-        correlation_id,
-        idempotency_key,
-        before,
-        after,
-        ["status"],
-        now,
+        (request_id, correlation_id),
+        event_type="task.updated",
+        aggregate_type="task",
+        aggregate_id=task_id,
+        aggregate_version=response.version,
+        changed_fields=["status"],
+        payload={
+            "task_id": str(task_id),
+            "task_version": response.version,
+            "changed_fields": ["status"],
+        },
+        now=now,
+        domain="tasks",
+        idempotency_key_hash=sha256(idempotency_key.encode()).hexdigest(),
+        before=before,
+        after=after,
     )
-    _write_outbox(
-        session,
-        auth,
-        "task.updated.v1",
-        task_id,
-        response.version,
-        correlation_id,
-        {"changed_fields": ["status"]},
-        now,
-    )
+    queue_lifecycle_event(session, "task", "task.updated", "allowed")
     return response
 
 
@@ -910,19 +796,16 @@ def lifecycle_task_write(
     if action == "complete":
         assignments = "status = 'completed', completed_at = :now"
         audit_type = "task.completed"
-        event_type = "task.completed.v1"
         event_payload = {"completed_at": now.isoformat()}
         changed_fields = ["status", "completed_at"]
     elif action == "cancel":
         assignments = "status = 'cancelled', completed_at = NULL"
         audit_type = "task.cancelled"
-        event_type = "task.cancelled.v1"
         event_payload = {"reason": reason}
         changed_fields = ["status", "completed_at"]
     elif action == "archive":
         assignments = "archived_at = :now, pre_archive_status = status"
         audit_type = "task.archived"
-        event_type = "task.archived.v1"
         event_payload = {
             "archived_at": now.isoformat(),
             "pre_archive_status": current["status"],
@@ -932,7 +815,6 @@ def lifecycle_task_write(
         restored_status = current["pre_archive_status"] or "captured"
         assignments = "archived_at = NULL, pre_archive_status = NULL, status = :restored_status"
         audit_type = "task.restored"
-        event_type = "task.restored.v1"
         event_payload = {"restored_status": restored_status}
         changed_fields = ["archived_at", "pre_archive_status", "status"]
 
@@ -961,30 +843,27 @@ def lifecycle_task_write(
     response = _to_response(dict(row))
     before = _to_response(current).model_dump(mode="json")
     after = response.model_dump(mode="json")
-    _write_audit(
+    audit_outbox.write_audit_and_outbox(
         session,
         auth,
-        audit_type,
-        task_id,
-        response.version,
-        request_id,
-        correlation_id,
-        idempotency_key,
-        before,
-        after,
-        changed_fields,
-        now,
+        (request_id, correlation_id),
+        event_type=audit_type,
+        aggregate_type="task",
+        aggregate_id=task_id,
+        aggregate_version=response.version,
+        changed_fields=changed_fields,
+        payload={
+            "task_id": str(task_id),
+            "task_version": response.version,
+            **event_payload,
+        },
+        now=now,
+        domain="tasks",
+        idempotency_key_hash=sha256(idempotency_key.encode()).hexdigest(),
+        before=before,
+        after=after,
     )
-    _write_outbox(
-        session,
-        auth,
-        event_type,
-        task_id,
-        response.version,
-        correlation_id,
-        event_payload,
-        now,
-    )
+    queue_lifecycle_event(session, "task", audit_type, "allowed")
     return response
 
 

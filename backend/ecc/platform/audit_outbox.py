@@ -28,6 +28,14 @@ and this helper's parameters cover all of them:**
 - `attention/meeting_prep.py`/`attention/planning.py` conditionally
   skip the `event_outbox` write entirely for an audit-only sub-action
   -- pass `emit_outbox=False`.
+- `communication/commitments.py`'s `create_commitment` writes an
+  `event_outbox.event_type` that is not just `f"{event_type}.v1"` --
+  a commitment auto-detected from evidence records `audit_events.
+  event_type='commitment.created'` but `event_outbox.event_type=
+  'commitment.detected.v1'`, a genuinely different name, not a
+  version suffix on the same one -- pass `outbox_event_type` explicitly
+  for that one case; every other caller leaves it unset and gets the
+  usual `f"{event_type}.v1"` derivation.
 
 **Not covered, deliberately:** `ecc/audit.py`'s rejected-mutation
 middleware write is a genuinely different shape (its own `failure_
@@ -91,7 +99,7 @@ def _request_ids(request: Request) -> tuple[UUID, UUID]:
 def write_audit_and_outbox(
     session: Session,
     auth: AuthContext,
-    request: Request | None,
+    request: Request | tuple[UUID, UUID] | None,
     *,
     event_type: str,
     aggregate_type: str,
@@ -111,17 +119,40 @@ def write_audit_and_outbox(
     causation_id: UUID | None = None,
     emit_outbox: bool = True,
     actor_id: UUID | None = _UNSET,
+    outbox_event_type: str | None = None,
 ) -> None:
     """`event_type` is the base (unversioned) event name, e.g.
-    `"calendar_event.updated"` -- `event_outbox.event_type` is always
-    stored as `f"{event_type}.v1"`, matching every existing caller.
+    `"calendar_event.updated"` -- `event_outbox.event_type` is stored as
+    `f"{event_type}.v1"` by default, matching every existing caller.
     `domain` is passed to `record_audit_outbox_failure(domain)` on a
     write failure, matching each caller's own existing metric label.
+
+    `outbox_event_type` overrides the stored `event_outbox.event_type`
+    verbatim (no `.v1` appended) for the rare case where the outbox
+    event is genuinely a different name from the audit event, not just
+    a versioned variant of it -- see this module's own docstring.
 
     `request=None` for a non-HTTP call site with no `Request` in scope
     -- `request_id`/`correlation_id` are then a fresh `uuid4()` each,
     same as `_request_ids` already falls back to for a malformed
     `Request`. See this module's own docstring.
+
+    `request` also accepts a pre-derived `(request_id, correlation_id)`
+    tuple directly, for the "rich" trio's shared `insert_*`/`lifecycle_*`
+    functions (`communication/commitments.py`'s `insert_commitment`/
+    `lifecycle_write`, `planning/tasks.py`'s `insert_task`/
+    `lifecycle_task_write`/`set_task_status_write`) -- each is itself a
+    cross-file-shared function called by `governance/recommendation_
+    targets.py`'s `execute_target` (which derives the tuple from its own
+    real `Request` before calling in, precisely so these functions don't
+    need a `Request` object threaded through their own public signature)
+    -- and, for every one of them except `set_task_status_write` (which
+    `execute_target` is its only caller), also by its own module's HTTP
+    endpoint, which has a real `Request` and could derive the tuple
+    itself.
+    Passing the tuple straight through preserves that existing contract
+    instead of re-deriving a second, potentially different, request_id/
+    correlation_id pair from scratch.
 
     `actor_id` defaults to `auth.user_id` -- pass it explicitly only
     for the rare case where the acting identity for this specific
@@ -133,9 +164,12 @@ def write_audit_and_outbox(
     internal sentinel, so `actor_id=None` reliably means `NULL`, not
     "use the default."
     """
-    request_id, correlation_id = (
-        _request_ids(request) if request is not None else (uuid4(), uuid4())
-    )
+    if isinstance(request, tuple):
+        request_id, correlation_id = request
+    elif request is not None:
+        request_id, correlation_id = _request_ids(request)
+    else:
+        request_id, correlation_id = uuid4(), uuid4()
     resolved_actor_id = auth.user_id if actor_id is _UNSET else actor_id
     try:
         session.execute(
@@ -193,7 +227,7 @@ def write_audit_and_outbox(
                 {
                     "event_id": uuid4(),
                     "workspace_id": auth.workspace_id,
-                    "event_type": f"{event_type}.v1",
+                    "event_type": outbox_event_type or f"{event_type}.v1",
                     "correlation_id": correlation_id,
                     "causation_id": causation_id,
                     "payload": dumps(payload),
