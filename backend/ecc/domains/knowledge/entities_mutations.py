@@ -12,7 +12,7 @@ from sqlalchemy.orm import Session
 from ecc.auth import AuthContext, AuthDep, CsrfDep
 from ecc.database import get_session
 from ecc.domains.knowledge.embeddings import queue_embedding
-from ecc.domains.knowledge.entities import EntityResponse, _project
+from ecc.domains.knowledge.entities import EntityResponse, project_entity
 from ecc.domains.knowledge.retrieval import queue_retrieval_document
 from ecc.domains.knowledge.timeline import queue_timeline_entry
 from ecc.observability import queue_lifecycle_event, record_audit_outbox_failure
@@ -225,7 +225,7 @@ def update_entity(
             .mappings()
             .one()
         )
-        response = _project(dict(row))
+        response = project_entity(dict(row))
         _write_side_effects(
             session,
             auth,
@@ -327,7 +327,7 @@ def _transition_action(
             .mappings()
             .one()
         )
-        response = _project(dict(row))
+        response = project_entity(dict(row))
         _write_side_effects(
             session, auth, request, event_type, entity_id, response.version, ["status"], now
         )

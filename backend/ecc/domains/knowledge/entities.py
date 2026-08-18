@@ -88,7 +88,7 @@ def _request_ids(request: Request) -> tuple[UUID, UUID]:
         return uuid4(), uuid4()
 
 
-def _project(row: dict[str, Any]) -> EntityResponse:
+def project_entity(row: dict[str, Any]) -> EntityResponse:
     attributes = row.get("attributes") or {}
     return EntityResponse(
         id=row["id"],
@@ -254,7 +254,7 @@ def create_entity_core(
             .mappings()
             .one()
         )
-        response = _project(dict(row))
+        response = project_entity(dict(row))
         _write_side_effects(session, auth, request, entity_id, 1, now)
         queue_timeline_entry(
             session,
@@ -350,7 +350,7 @@ def list_entities(
         last = page[-1]
         next_cursor = _encode_cursor(last["updated_at"], last["id"])
     return EntityListResponse(
-        items=[_project(dict(row)) for row in page],
+        items=[project_entity(dict(row)) for row in page],
         next_cursor=next_cursor,
     )
 
@@ -366,7 +366,7 @@ def get_entity(entity_id: UUID, auth: AuthDep, session: SessionDep) -> EntityRes
     row = _get_row(session, auth, entity_id)
     if row is None:
         raise HTTPException(status_code=404, detail="ENTITY_NOT_FOUND")
-    return _project(row)
+    return project_entity(row)
 
 
 @router.get("/{entity_id}/aliases", response_model=EntityAliasListResponse)

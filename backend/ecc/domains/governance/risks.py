@@ -174,7 +174,7 @@ def _risk_factors(row: dict[str, Any], now: datetime) -> tuple[int, list[dict[st
     return score, factors, explanation
 
 
-def _project(row: dict[str, Any], now: datetime | None = None) -> RiskResponse:
+def project_risk(row: dict[str, Any], now: datetime | None = None) -> RiskResponse:
     current = now or datetime.now(UTC)
     score, factors, explanation = _risk_factors(row, current)
     return RiskResponse(
@@ -331,7 +331,7 @@ def insert_risk(
         .mappings()
         .one()
     )
-    response = _project(dict(row), now)
+    response = project_risk(dict(row), now)
     _write_side_effects(session, auth, request, risk_id, 1, now)
     return response
 
@@ -411,7 +411,7 @@ def list_risks(
         last = page[-1]
         next_cursor = _encode_cursor(last["updated_at"], last["id"])
     return RiskListResponse(
-        items=[_project(dict(row)) for row in page],
+        items=[project_risk(dict(row)) for row in page],
         next_cursor=next_cursor,
     )
 
@@ -427,4 +427,4 @@ def get_risk(risk_id: UUID, auth: AuthDep, session: SessionDep) -> RiskResponse:
     row = _get_row(session, auth, risk_id)
     if row is None:
         raise HTTPException(status_code=404, detail="RISK_NOT_FOUND")
-    return _project(row)
+    return project_risk(row)
