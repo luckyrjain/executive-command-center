@@ -438,6 +438,17 @@ def list_meetings(
         .all()
     )
     session.rollback()
+    # `limit + 1` was fetched above so a full page can be distinguished
+    # from "no more rows exist" -- this response must return only the
+    # first `limit` rows, and produce a cursor when the extra row proves
+    # more remain. Pre-existing bug (unrelated to the calendar_events
+    # visibility fix below): this used to return every one of the
+    # over-fetched `limit + 1` rows and never set `next_cursor`, so a
+    # workspace with more meetings than one page's `limit` got a
+    # too-large page and no way to ever reach the rest -- found while
+    # writing calendar/events.py's own test coverage, whose sibling
+    # `list_calendar_events` already does this correctly.
+    page = rows[:limit]
     # `_project` raises `LINKED_CALENDAR_EVENT_MISSING` (409) for a meeting
     # linked to a calendar_events row that no longer exists OR -- since
     # get_calendar_event_summary started applying a visibility check --
@@ -448,14 +459,18 @@ def list_meetings(
     # linked private event isn't theirs to see. Omit that one meeting from
     # the list instead of failing the whole request.
     items = []
-    for row in rows:
+    for row in page:
         try:
             items.append(_project(session, auth, dict(row)))
         except HTTPException as exc:
             if exc.status_code == 409 and exc.detail == "LINKED_CALENDAR_EVENT_MISSING":
                 continue
             raise
-    return MeetingListResponse(items=items)
+    next_cursor = None
+    if len(rows) > limit and page:
+        last = page[-1]
+        next_cursor = _encode_cursor(last["updated_at"], last["id"])
+    return MeetingListResponse(items=items, next_cursor=next_cursor)
 
 
 @router.get("/{meeting_id}", response_model=MeetingResponse)

@@ -349,6 +349,47 @@ def test_meeting_never_leaks_timing_of_a_calendar_event_invisible_to_caller(
     member_client.close()
 
 
+def test_list_meetings_paginates_instead_of_returning_every_over_fetched_row(
+    calendar_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    """`list_meetings` fetches `limit + 1` rows to detect whether another
+    page exists, but used to return every one of those over-fetched rows
+    verbatim and never set `next_cursor` -- a workspace with more meetings
+    than one page's `limit` got an oversized page with no way to reach the
+    rest. Found while writing calendar/events.py's own pagination test
+    coverage, whose sibling `list_calendar_events` already did this
+    correctly; this is the regression test for the `list_meetings` fix.
+    """
+    client, _, _, token = calendar_test_context
+    base = datetime(2026, 8, 1, 9, tzinfo=UTC)
+    for i in range(3):
+        standalone_starts = base + timedelta(hours=i)
+        create = client.post(
+            "/api/v1/meetings",
+            headers=_headers(token, f"paginate-meeting-{i}"),
+            json={
+                "title": f"Meeting {i}",
+                "starts_at": standalone_starts.isoformat(),
+                "ends_at": (standalone_starts + timedelta(hours=1)).isoformat(),
+                "timezone": "UTC",
+            },
+        )
+        assert create.status_code == 201, create.text
+
+    first_page = client.get("/api/v1/meetings?limit=2")
+    assert first_page.status_code == 200
+    body = first_page.json()
+    assert len(body["items"]) == 2
+    assert body["next_cursor"] is not None
+
+    second_page = client.get(f"/api/v1/meetings?limit=2&cursor={body['next_cursor']}")
+    assert second_page.status_code == 200
+    second_items = second_page.json()["items"]
+    assert len(second_items) == 1
+    first_ids = {item["id"] for item in body["items"]}
+    assert second_items[0]["id"] not in first_ids
+
+
 def test_standalone_meeting_reschedule_and_linked_timing_rejection(
     calendar_test_context: tuple[TestClient, UUID, UUID, str],
 ) -> None:
