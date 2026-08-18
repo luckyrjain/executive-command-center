@@ -7,17 +7,15 @@ from uuid import UUID, uuid4
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy import text
-from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from ecc.auth import AuthContext, AuthDep, CsrfDep
 from ecc.database import get_session
 from ecc.observability import (
     queue_lifecycle_event,
-    record_audit_outbox_failure,
     record_idempotency_conflict,
 )
-from ecc.platform import authz, cursor_pagination
+from ecc.platform import audit_outbox, authz, cursor_pagination
 
 router = APIRouter(prefix="/api/v1/waiting", tags=["waiting"])
 SessionDep = Annotated[Session, Depends(get_session)]
@@ -106,13 +104,6 @@ def _lock_idempotency(session: Session, auth: AuthContext, key: str) -> None:
 def _request_hash(payload: BaseModel, action: str) -> str:
     material = {"action": action, "payload": payload.model_dump(mode="json")}
     return sha256(dumps(material, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
-
-
-def _request_ids(request: Request) -> tuple[UUID, UUID]:
-    try:
-        return UUID(request.state.request_id), UUID(request.state.correlation_id)
-    except (AttributeError, TypeError, ValueError):
-        return uuid4(), uuid4()
 
 
 def _load_cached(
@@ -386,73 +377,22 @@ def create_waiting_link(
             .one()
         )
         response = WaitingLink.model_validate(dict(row))
-        _write_side_effects(session, auth, request, "waiting_link.opened", link_id, 1, now)
+        audit_outbox.write_audit_and_outbox(
+            session,
+            auth,
+            request,
+            event_type="waiting_link.opened",
+            aggregate_type="waiting_link",
+            aggregate_id=link_id,
+            aggregate_version=1,
+            changed_fields=["*"],
+            payload={"waiting_link_id": str(link_id), "version": 1},
+            now=now,
+            domain="waiting",
+        )
+        queue_lifecycle_event(session, "waiting_link", "waiting_link.opened", "allowed")
         _store_idempotency(session, auth, idempotency_key, request_hash, response, now)
         return response
-
-
-def _write_side_effects(
-    session: Session,
-    auth: AuthContext,
-    request: Request,
-    event_type: str,
-    link_id: UUID,
-    version: int,
-    now: datetime,
-) -> None:
-    request_id, correlation_id = _request_ids(request)
-    try:
-        session.execute(
-            text(
-                """
-                INSERT INTO audit_events (
-                    id, workspace_id, event_type, aggregate_type, aggregate_id,
-                    aggregate_version, actor_id, request_id, correlation_id,
-                    changed_fields, authorization_result, source, metadata, occurred_at
-                ) VALUES (
-                    :id, :workspace_id, :event_type, 'waiting_link', :aggregate_id,
-                    :aggregate_version, :actor_id, :request_id, :correlation_id,
-                    ARRAY['*'], 'allowed', 'user', '{}'::jsonb, :occurred_at
-                )
-                """
-            ),
-            {
-                "id": uuid4(),
-                "workspace_id": auth.workspace_id,
-                "event_type": event_type,
-                "aggregate_id": link_id,
-                "aggregate_version": version,
-                "actor_id": auth.user_id,
-                "request_id": request_id,
-                "correlation_id": correlation_id,
-                "occurred_at": now,
-            },
-        )
-        session.execute(
-            text(
-                """
-                INSERT INTO event_outbox (
-                    event_id, workspace_id, event_type, event_version,
-                    correlation_id, payload, occurred_at, attempt_count
-                ) VALUES (
-                    :event_id, :workspace_id, :event_type_v1, 1,
-                    :correlation_id, CAST(:payload AS jsonb), :occurred_at, 0
-                )
-                """
-            ),
-            {
-                "event_id": uuid4(),
-                "workspace_id": auth.workspace_id,
-                "event_type_v1": f"{event_type}.v1",
-                "correlation_id": correlation_id,
-                "payload": dumps({"waiting_link_id": str(link_id), "version": version}),
-                "occurred_at": now,
-            },
-        )
-    except SQLAlchemyError:
-        record_audit_outbox_failure("waiting")
-        raise
-    queue_lifecycle_event(session, "waiting_link", event_type, "allowed")
 
 
 def _encode_cursor(created_at: datetime, link_id: UUID) -> str:
@@ -681,7 +621,20 @@ def patch_waiting_link(
                 },
             )
             response = WaitingLink.model_validate(dict(new_row))
-            _write_side_effects(session, auth, request, "waiting_link.opened", new_id, 1, now)
+            audit_outbox.write_audit_and_outbox(
+                session,
+                auth,
+                request,
+                event_type="waiting_link.opened",
+                aggregate_type="waiting_link",
+                aggregate_id=new_id,
+                aggregate_version=1,
+                changed_fields=["*"],
+                payload={"waiting_link_id": str(new_id), "version": 1},
+                now=now,
+                domain="waiting",
+            )
+            queue_lifecycle_event(session, "waiting_link", "waiting_link.opened", "allowed")
         else:
             updated = (
                 session.execute(
@@ -781,7 +734,20 @@ def _terminate(
         event_type = (
             "waiting_link.fulfilled" if new_status == "fulfilled" else "waiting_link.cancelled"
         )
-        _write_side_effects(session, auth, request, event_type, link_id, updated["version"], now)
+        audit_outbox.write_audit_and_outbox(
+            session,
+            auth,
+            request,
+            event_type=event_type,
+            aggregate_type="waiting_link",
+            aggregate_id=link_id,
+            aggregate_version=updated["version"],
+            changed_fields=["*"],
+            payload={"waiting_link_id": str(link_id), "version": updated["version"]},
+            now=now,
+            domain="waiting",
+        )
+        queue_lifecycle_event(session, "waiting_link", event_type, "allowed")
         return response
 
 

@@ -95,14 +95,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from json import dumps
 from typing import Annotated, Any
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, Header, Path
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import text
-from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from ecc.auth import AuthContext, AuthDep, CsrfDep
@@ -111,9 +109,8 @@ from ecc.observability import (
     queue_kill_switch_event,
     queue_lifecycle_event,
     queue_run_state_transition,
-    record_audit_outbox_failure,
 )
-from ecc.platform import authz
+from ecc.platform import audit_outbox, authz
 from ecc.platform.idempotency import load_cached, lock_idempotency, request_hash, store_idempotency
 
 _KILL_SWITCH_FIELDS = """
@@ -271,85 +268,6 @@ def list_kill_switches(session: Session, workspace_id: UUID) -> list[KillSwitch]
     return [_row_to_kill_switch(dict(row)) for row in rows]
 
 
-def _write_kill_switch_audit(
-    session: Session,
-    *,
-    workspace_id: UUID,
-    actor_id: UUID,
-    event_type: str,
-    kill_switch_id: UUID,
-    workflow_id: str | None,
-    reason: str | None,
-    now: datetime,
-) -> None:
-    """`local_adapters.py`'s `_write_note_audit_and_outbox` is this
-    function's precedent -- an automation-package-owned audit_events/
-    event_outbox pair, `source='automation'`. `request_id`/`correlation_id`
-    are freshly generated when this is called from a genuine `Request`-less
-    context, but every current call site here *does* have a `Request`
-    (the HTTP router below) -- freshly generating regardless keeps this
-    helper reusable from a future non-HTTP caller too, matching `policy.py`/
-    `approvals.py`'s own `_request_ids` fallback shape.
-    """
-    request_id = uuid4()
-    correlation_id = uuid4()
-    try:
-        session.execute(
-            text(
-                """
-                INSERT INTO audit_events (
-                    id, workspace_id, event_type, aggregate_type, aggregate_id,
-                    aggregate_version, actor_id, request_id, correlation_id,
-                    changed_fields, authorization_result, source, metadata, occurred_at
-                ) VALUES (
-                    :id, :workspace_id, :event_type, 'automation_kill_switch', :aggregate_id,
-                    1, :actor_id, :request_id, :correlation_id,
-                    ARRAY['active'], 'allowed', 'automation', CAST(:metadata AS jsonb), :occurred_at
-                )
-                """
-            ),
-            {
-                "id": uuid4(),
-                "workspace_id": workspace_id,
-                "event_type": event_type,
-                "aggregate_id": kill_switch_id,
-                "actor_id": actor_id,
-                "request_id": request_id,
-                "correlation_id": correlation_id,
-                "metadata": dumps({"workflow_id": workflow_id, "reason": reason}),
-                "occurred_at": now,
-            },
-        )
-        session.execute(
-            text(
-                """
-                INSERT INTO event_outbox (
-                    event_id, workspace_id, event_type, event_version,
-                    correlation_id, payload, occurred_at, attempt_count
-                ) VALUES (
-                    :event_id, :workspace_id, :event_type_v1, 1,
-                    :correlation_id, CAST(:payload AS jsonb), :occurred_at, 0
-                )
-                """
-            ),
-            {
-                "event_id": uuid4(),
-                "workspace_id": workspace_id,
-                "event_type_v1": f"{event_type}.v1",
-                "correlation_id": correlation_id,
-                "payload": dumps(
-                    {"kill_switch_id": str(kill_switch_id), "workflow_id": workflow_id}
-                ),
-                "occurred_at": now,
-            },
-        )
-    except SQLAlchemyError:
-        record_audit_outbox_failure("automation_kill_switch")
-        raise
-    queue_lifecycle_event(session, "automation_kill_switch", event_type, "allowed")
-    queue_kill_switch_event(session, _scope_label(workflow_id), event_type.rsplit(".", 1)[-1])
-
-
 def _park_queued_runs_for_review(
     session: Session, workspace_id: UUID, workflow_id: str | None, now: datetime
 ) -> list[UUID]:
@@ -456,16 +374,41 @@ def activate_kill_switch(
             "now": now,
         },
     )
-    _write_kill_switch_audit(
+    # `request_id`/`correlation_id` are deliberately not derived from a real
+    # `Request` here, even though the HTTP router below does have one: this
+    # module's own audit write historically minted a fresh pair regardless,
+    # so this stays reusable from a future non-HTTP caller too, matching
+    # `policy.py`/`approvals.py`'s own `_request_ids` fallback shape.
+    # Threading the real router `Request` through instead would be an
+    # observable behavior change (`ecc.main`'s own request-id middleware
+    # populates `request.state.request_id` on every real HTTP call) --
+    # `write_audit_and_outbox(request=None)` mints a fresh `uuid4()` pair
+    # directly, reproducing that "always fresh" behavior exactly (see that
+    # function's own docstring). Likewise `workspace_id`/`actor_id` are
+    # adapted into a throwaway `AuthContext` -- this function's own
+    # signature takes bare primitives, not a full `AuthContext`, matching
+    # every direct (non-HTTP) call in
+    # `tests/test_automation_kill_switches_postgres.py`; `write_audit_and_
+    # outbox` only ever reads `auth.workspace_id`/`auth.user_id`, so the
+    # unused `timezone` field is inert.
+    event_type = "automation_kill_switch.activated"
+    audit_outbox.write_audit_and_outbox(
         session,
-        workspace_id=workspace_id,
-        actor_id=actor_id,
-        event_type="automation_kill_switch.activated",
-        kill_switch_id=kill_switch_id,
-        workflow_id=workflow_id,
-        reason=reason,
+        AuthContext(workspace_id=workspace_id, user_id=actor_id, timezone="UTC"),
+        None,
+        event_type=event_type,
+        aggregate_type="automation_kill_switch",
+        aggregate_id=kill_switch_id,
+        aggregate_version=1,
+        changed_fields=["active"],
+        payload={"kill_switch_id": str(kill_switch_id), "workflow_id": workflow_id},
         now=now,
+        domain="automation_kill_switch",
+        metadata={"workflow_id": workflow_id, "reason": reason},
+        source="automation",
     )
+    queue_lifecycle_event(session, "automation_kill_switch", event_type, "allowed")
+    queue_kill_switch_event(session, _scope_label(workflow_id), event_type.rsplit(".", 1)[-1])
     _park_queued_runs_for_review(session, workspace_id, workflow_id, now)
     result = get_kill_switch(session, workspace_id, kill_switch_id)
     assert result is not None
@@ -494,16 +437,28 @@ def deactivate_kill_switch(
         ),
         {"actor_id": actor_id, "now": now, "id": existing.id},
     )
-    _write_kill_switch_audit(
+    # See `activate_kill_switch`'s identical comment above for why
+    # `request_id`/`correlation_id` and `workspace_id`/`actor_id` are
+    # adapted into `request=None`/a throwaway `AuthContext` rather than the
+    # real ones the HTTP router below has.
+    event_type = "automation_kill_switch.deactivated"
+    audit_outbox.write_audit_and_outbox(
         session,
-        workspace_id=workspace_id,
-        actor_id=actor_id,
-        event_type="automation_kill_switch.deactivated",
-        kill_switch_id=existing.id,
-        workflow_id=workflow_id,
-        reason=existing.reason,
+        AuthContext(workspace_id=workspace_id, user_id=actor_id, timezone="UTC"),
+        None,
+        event_type=event_type,
+        aggregate_type="automation_kill_switch",
+        aggregate_id=existing.id,
+        aggregate_version=1,
+        changed_fields=["active"],
+        payload={"kill_switch_id": str(existing.id), "workflow_id": workflow_id},
         now=now,
+        domain="automation_kill_switch",
+        metadata={"workflow_id": workflow_id, "reason": existing.reason},
+        source="automation",
     )
+    queue_lifecycle_event(session, "automation_kill_switch", event_type, "allowed")
+    queue_kill_switch_event(session, _scope_label(workflow_id), event_type.rsplit(".", 1)[-1])
     return True
 
 

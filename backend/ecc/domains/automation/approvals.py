@@ -137,23 +137,18 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from json import dumps
 from typing import Annotated, Any, Literal
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import text
-from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from ecc.auth import AuthContext, AuthDep, CsrfDep
 from ecc.database import get_session
-from ecc.observability import (
-    queue_lifecycle_event,
-    record_audit_outbox_failure,
-)
-from ecc.platform import authz
+from ecc.observability import queue_lifecycle_event
+from ecc.platform import audit_outbox, authz
 from ecc.platform.authz import WORKSPACE_ORIGINAL_OWNER_SQL
 from ecc.platform.idempotency import load_cached, lock_idempotency, request_hash, store_idempotency
 
@@ -586,76 +581,6 @@ def _to_response(approval: ApprovalRequest) -> ApprovalResponse:
     )
 
 
-def _request_ids(request: Request) -> tuple[UUID, UUID]:
-    try:
-        return UUID(request.state.request_id), UUID(request.state.correlation_id)
-    except (AttributeError, TypeError, ValueError):
-        return uuid4(), uuid4()
-
-
-def _write_side_effects(
-    session: Session,
-    auth: AuthContext,
-    request: Request,
-    *,
-    event_type: str,
-    aggregate_id: UUID,
-    now: datetime,
-) -> None:
-    request_id, correlation_id = _request_ids(request)
-    try:
-        session.execute(
-            text(
-                """
-                INSERT INTO audit_events (
-                    id, workspace_id, event_type, aggregate_type, aggregate_id,
-                    aggregate_version, actor_id, request_id, correlation_id,
-                    changed_fields, authorization_result, source, metadata, occurred_at
-                ) VALUES (
-                    :id, :workspace_id, :event_type, 'approval_request', :aggregate_id,
-                    1, :actor_id, :request_id, :correlation_id,
-                    ARRAY['*'], 'allowed', 'user', '{}'::jsonb, :occurred_at
-                )
-                """
-            ),
-            {
-                "id": uuid4(),
-                "workspace_id": auth.workspace_id,
-                "event_type": event_type,
-                "aggregate_id": aggregate_id,
-                "actor_id": auth.user_id,
-                "request_id": request_id,
-                "correlation_id": correlation_id,
-                "occurred_at": now,
-            },
-        )
-        session.execute(
-            text(
-                """
-                INSERT INTO event_outbox (
-                    event_id, workspace_id, event_type, event_version,
-                    correlation_id, payload, occurred_at, attempt_count
-                ) VALUES (
-                    :event_id, :workspace_id, :event_type_v1, 1,
-                    :correlation_id, CAST(:payload AS jsonb), :occurred_at, 0
-                )
-                """
-            ),
-            {
-                "event_id": uuid4(),
-                "workspace_id": auth.workspace_id,
-                "event_type_v1": f"{event_type}.v1",
-                "correlation_id": correlation_id,
-                "payload": dumps({"aggregate_id": str(aggregate_id)}),
-                "occurred_at": now,
-            },
-        )
-    except SQLAlchemyError:
-        record_audit_outbox_failure("approval_request")
-        raise
-    queue_lifecycle_event(session, "approval_request", event_type, "allowed")
-
-
 def _advance_run_after_decision(
     session: Session,
     workspace_id: UUID,
@@ -875,14 +800,20 @@ def approve_endpoint(
             )
 
         response = _to_response(result)
-        _write_side_effects(
+        audit_outbox.write_audit_and_outbox(
             session,
             auth,
             request,
             event_type="approval_request.approved",
+            aggregate_type="approval_request",
             aggregate_id=result.id,
+            aggregate_version=1,
+            changed_fields=["*"],
+            payload={"aggregate_id": str(result.id)},
             now=now,
+            domain="approval_request",
         )
+        queue_lifecycle_event(session, "approval_request", "approval_request.approved", "allowed")
         store_idempotency(
             session, auth, idempotency_key, req_hash, response.model_dump(mode="json"), now
         )
@@ -957,14 +888,20 @@ def reject_endpoint(
             )
 
         response = _to_response(result)
-        _write_side_effects(
+        audit_outbox.write_audit_and_outbox(
             session,
             auth,
             request,
             event_type="approval_request.rejected",
+            aggregate_type="approval_request",
             aggregate_id=result.id,
+            aggregate_version=1,
+            changed_fields=["*"],
+            payload={"aggregate_id": str(result.id)},
             now=now,
+            domain="approval_request",
         )
+        queue_lifecycle_event(session, "approval_request", "approval_request.rejected", "allowed")
         store_idempotency(
             session, auth, idempotency_key, req_hash, response.model_dump(mode="json"), now
         )

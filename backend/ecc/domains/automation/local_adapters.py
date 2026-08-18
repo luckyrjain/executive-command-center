@@ -123,9 +123,10 @@ leaving `actor_id`, whose provenance is *identically* untrustworthy (same
 graph-authored `input_mapping`, same absent templating engine), enforced
 nowhere. That gap was real and reachable entirely within one workspace's
 own authorization boundary: `execute()` below writes `action_input.actor_id`
-into `notes.owner_id` *and* `notes.created_by`/`updated_by`, and `_write_
-note_audit_and_outbox` writes it into an `audit_events` row's `actor_id`
-with `authorization_result='allowed'`, `source='automation'`. So member A,
+into `notes.owner_id` *and* `notes.created_by`/`updated_by`, and its call
+into `audit_outbox.write_audit_and_outbox` writes it into an `audit_events`
+row's `actor_id` with `authorization_result='allowed'`, `source='automation'`.
+So member A,
 who is fully authorized to author workflows, could name member B's UUID and
 manufacture (a) a note B appears to own and have created, and (b) an audit
 event asserting B authorized an automation B never touched -- forged
@@ -192,18 +193,17 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from hashlib import sha256
-from json import dumps
 from typing import Any, Literal
 from uuid import UUID, uuid4
 
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import text
-from sqlalchemy.exc import SQLAlchemyError
-from sqlalchemy.orm import Session
 
+from ecc.auth import AuthContext
 from ecc.database import SessionFactory
 from ecc.domains.knowledge.notes import NoteType, SourceType
-from ecc.observability import queue_lifecycle_event, record_audit_outbox_failure
+from ecc.observability import queue_lifecycle_event
+from ecc.platform import audit_outbox
 
 # ---------------------------------------------------------------------------
 # local.create_note
@@ -248,101 +248,6 @@ class CreateNoteOutput(BaseModel):
     note_type: NoteType
     title: str | None
     created_at: datetime
-
-
-def _write_note_audit_and_outbox(
-    session: Session,
-    *,
-    workspace_id: UUID,
-    actor_id: UUID,
-    note_id: UUID,
-    note_type: NoteType,
-    meeting_id: UUID | None,
-    now: datetime,
-) -> None:
-    """`policy.py`'s `_write_side_effects` / `approvals.py`'s own
-    identically-named helper are this function's precedent -- an
-    automation-adapter-owned audit_events/event_outbox pair, not a call
-    into `notes.py`'s own request-scoped `_write_audit`/`_write_outbox`
-    (module docstring's option (b) reasoning). `source = 'automation'`
-    (`audit_events.source` is an unconstrained `String(16)`, confirmed
-    directly against migration `0002_phase1_task_foundation.py` -- no
-    `CHECK` restricts it to `'user'`), distinguishing this row from any
-    human-initiated `note.created` audit event at a glance. `request_id`/
-    `correlation_id` are freshly generated (no `Request` object exists in
-    this call path at all), mirroring `notes.py`'s own `_request_ids`
-    fallback for the identical "no request context" case.
-
-    `actor_id` is written verbatim into `audit_events.actor_id` alongside
-    `authorization_result='allowed'` -- i.e. this row is a positive assertion
-    that the named user authorized this write. It is therefore only ever safe
-    to call this helper with an `actor_id` that has been proven, not merely
-    authored: `worker._enforce_actor_scope` is what proves it (rejecting any
-    `CreateNoteInput.actor_id` that is not the dispatching run's own
-    `workflow_runs.created_by`) before `execute()` above can reach this
-    function at all. Batch C's audit found this unenforced, which made a
-    forged `audit_events` row reachable by any workflow author -- see this
-    module's own docstring for that discussion.
-    """
-    request_id = uuid4()
-    correlation_id = uuid4()
-    try:
-        session.execute(
-            text(
-                """
-                INSERT INTO audit_events (
-                    id, workspace_id, event_type, aggregate_type, aggregate_id,
-                    aggregate_version, actor_id, request_id, correlation_id,
-                    changed_fields, authorization_result, source, metadata, occurred_at
-                ) VALUES (
-                    :id, :workspace_id, 'note.created', 'note', :aggregate_id,
-                    1, :actor_id, :request_id, :correlation_id,
-                    ARRAY['*'], 'allowed', 'automation', CAST(:metadata AS jsonb), :occurred_at
-                )
-                """
-            ),
-            {
-                "id": uuid4(),
-                "workspace_id": workspace_id,
-                "aggregate_id": note_id,
-                "actor_id": actor_id,
-                "request_id": request_id,
-                "correlation_id": correlation_id,
-                "metadata": dumps({"body_redacted": True, "adapter_id": "local.create_note"}),
-                "occurred_at": now,
-            },
-        )
-        session.execute(
-            text(
-                """
-                INSERT INTO event_outbox (
-                    event_id, workspace_id, event_type, event_version,
-                    correlation_id, payload, occurred_at, attempt_count
-                ) VALUES (
-                    :event_id, :workspace_id, 'note.created.v1', 1,
-                    :correlation_id, CAST(:payload AS jsonb), :occurred_at, 0
-                )
-                """
-            ),
-            {
-                "event_id": uuid4(),
-                "workspace_id": workspace_id,
-                "correlation_id": correlation_id,
-                "payload": dumps(
-                    {
-                        "note_id": str(note_id),
-                        "version": 1,
-                        "note_type": note_type,
-                        "meeting_id": str(meeting_id) if meeting_id else None,
-                    }
-                ),
-                "occurred_at": now,
-            },
-        )
-    except SQLAlchemyError:
-        record_audit_outbox_failure("automation_local_create_note")
-        raise
-    queue_lifecycle_event(session, "automation_local_create_note", "note.created", "allowed")
 
 
 class LocalCreateNoteAdapter:
@@ -427,14 +332,34 @@ class LocalCreateNoteAdapter:
                 .mappings()
                 .one()
             )
-            _write_note_audit_and_outbox(
+            audit_outbox.write_audit_and_outbox(
                 session,
-                workspace_id=action_input.workspace_id,
-                actor_id=action_input.actor_id,
-                note_id=note_id,
-                note_type=action_input.note_type,
-                meeting_id=action_input.meeting_id,
+                AuthContext(
+                    workspace_id=action_input.workspace_id,
+                    user_id=action_input.actor_id,
+                    timezone="UTC",
+                ),
+                None,
+                event_type="note.created",
+                aggregate_type="note",
+                aggregate_id=note_id,
+                aggregate_version=1,
+                changed_fields=["*"],
+                payload={
+                    "note_id": str(note_id),
+                    "version": 1,
+                    "note_type": action_input.note_type,
+                    "meeting_id": (
+                        str(action_input.meeting_id) if action_input.meeting_id else None
+                    ),
+                },
                 now=now,
+                domain="automation_local_create_note",
+                metadata={"body_redacted": True, "adapter_id": "local.create_note"},
+                source="automation",
+            )
+            queue_lifecycle_event(
+                session, "automation_local_create_note", "note.created", "allowed"
             )
             session.commit()
         return CreateNoteOutput(

@@ -41,21 +41,17 @@ from datetime import UTC, datetime
 from hashlib import sha256
 from json import dumps
 from typing import Annotated, Any, Literal
-from uuid import UUID, uuid4
+from uuid import UUID
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import text
-from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from ecc.auth import AuthContext, AuthDep, CsrfDep
 from ecc.database import get_session
-from ecc.observability import (
-    queue_lifecycle_event,
-    record_audit_outbox_failure,
-)
-from ecc.platform import authz
+from ecc.observability import queue_lifecycle_event
+from ecc.platform import audit_outbox, authz
 from ecc.platform.idempotency import load_cached, lock_idempotency, request_hash, store_idempotency
 
 from .tools import (
@@ -276,13 +272,6 @@ class PolicyActivateResponse(BaseModel):
     status: Literal["active"]
 
 
-def _request_ids(request: Request) -> tuple[UUID, UUID]:
-    try:
-        return UUID(request.state.request_id), UUID(request.state.correlation_id)
-    except (AttributeError, TypeError, ValueError):
-        return uuid4(), uuid4()
-
-
 # Task 5 addition: the exact set of gated prompt families -- design doc
 # Decision 9's promotion rule ("Promotion of prompt_versions/routing_
 # policies changes for this task always re-runs the full 20-example set
@@ -387,84 +376,6 @@ def _current_active_version(
     return active.version if active is not None else None
 
 
-def _write_activation_audit(
-    session: Session,
-    auth: AuthContext,
-    request: Request,
-    *,
-    kind: Literal["prompt", "tool"],
-    aggregate_id: UUID,
-    name: str,
-    version: int,
-    now: datetime,
-) -> None:
-    """Audit + outbox for a policy activation, matching `attention/
-    capacity.py`'s `_write_side_effects` pattern exactly. `prompt_versions`/
-    `tool_definitions` are global platform data with no `workspace_id` of
-    their own (see this module's docstring), so `auth.workspace_id` here
-    records the acting administrator's own workspace context -- required
-    because `audit_events.workspace_id` is `NOT NULL` -- not a claim that
-    the mutated row itself belongs to that workspace.
-    """
-    request_id, correlation_id = _request_ids(request)
-    event_type = f"ai_{kind}.activated"
-    aggregate_type = "prompt_version" if kind == "prompt" else "tool_definition"
-    try:
-        session.execute(
-            text(
-                """
-                INSERT INTO audit_events (
-                    id, workspace_id, event_type, aggregate_type, aggregate_id,
-                    aggregate_version, actor_id, request_id, correlation_id,
-                    changed_fields, authorization_result, source, metadata, occurred_at
-                ) VALUES (
-                    :id, :workspace_id, :event_type, :aggregate_type, :aggregate_id,
-                    :aggregate_version, :actor_id, :request_id, :correlation_id,
-                    ARRAY['status'], 'allowed', 'user', :metadata, :occurred_at
-                )
-                """
-            ),
-            {
-                "id": uuid4(),
-                "workspace_id": auth.workspace_id,
-                "event_type": event_type,
-                "aggregate_type": aggregate_type,
-                "aggregate_id": aggregate_id,
-                "aggregate_version": version,
-                "actor_id": auth.user_id,
-                "request_id": request_id,
-                "correlation_id": correlation_id,
-                "metadata": dumps({"name": name}),
-                "occurred_at": now,
-            },
-        )
-        session.execute(
-            text(
-                """
-                INSERT INTO event_outbox (
-                    event_id, workspace_id, event_type, event_version,
-                    correlation_id, payload, occurred_at, attempt_count
-                ) VALUES (
-                    :event_id, :workspace_id, :event_type_v1, 1,
-                    :correlation_id, CAST(:payload AS jsonb), :occurred_at, 0
-                )
-                """
-            ),
-            {
-                "event_id": uuid4(),
-                "workspace_id": auth.workspace_id,
-                "event_type_v1": f"{event_type}.v1",
-                "correlation_id": correlation_id,
-                "payload": dumps({"name": name, "version": version}),
-                "occurred_at": now,
-            },
-        )
-    except SQLAlchemyError:
-        record_audit_outbox_failure("ai_runtime")
-        raise
-    queue_lifecycle_event(session, "ai_runtime", event_type, "allowed")
-
-
 @router.post("/policies/{prompt_id_or_tool_name}/activate", response_model=PolicyActivateResponse)
 def activate_policy(
     prompt_id_or_tool_name: str,
@@ -559,16 +470,23 @@ def activate_policy(
             active_version=result.version,
             status="active",
         )
-        _write_activation_audit(
+        event_type = f"ai_{kind}.activated"
+        aggregate_type = "prompt_version" if kind == "prompt" else "tool_definition"
+        audit_outbox.write_audit_and_outbox(
             session,
             auth,
             request,
-            kind=kind,
+            event_type=event_type,
+            aggregate_type=aggregate_type,
             aggregate_id=result.id,
-            name=prompt_id_or_tool_name,
-            version=result.version,
+            aggregate_version=result.version,
+            changed_fields=["status"],
+            payload={"name": prompt_id_or_tool_name, "version": result.version},
             now=now,
+            domain="ai_runtime",
+            metadata={"name": prompt_id_or_tool_name},
         )
+        queue_lifecycle_event(session, "ai_runtime", event_type, "allowed")
         store_idempotency(
             session, auth, idempotency_key, req_hash, response.model_dump(mode="json"), now
         )

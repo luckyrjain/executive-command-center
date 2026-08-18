@@ -38,16 +38,13 @@ from uuid import UUID, uuid4
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import text
-from sqlalchemy.exc import IntegrityError, SQLAlchemyError
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from ecc.auth import AuthContext, AuthDep, CsrfDep
 from ecc.database import get_session
-from ecc.observability import (
-    queue_lifecycle_event,
-    record_audit_outbox_failure,
-)
-from ecc.platform import authz
+from ecc.observability import queue_lifecycle_event
+from ecc.platform import audit_outbox, authz
 from ecc.platform.idempotency import load_cached, lock_idempotency, request_hash, store_idempotency
 
 from .adapters import ActionAdapter, AdapterRegistry
@@ -974,83 +971,6 @@ def _to_response(version: WorkflowVersion) -> WorkflowVersionResponse:
     )
 
 
-def _request_ids(request: Request) -> tuple[UUID, UUID]:
-    try:
-        return UUID(request.state.request_id), UUID(request.state.correlation_id)
-    except (AttributeError, TypeError, ValueError):
-        return uuid4(), uuid4()
-
-
-def _write_side_effects(
-    session: Session,
-    auth: AuthContext,
-    request: Request,
-    *,
-    event_type: str,
-    aggregate_id: UUID,
-    version: int,
-    now: datetime,
-) -> None:
-    """Audit + outbox for a workflow-version mutation, matching every other
-    mutating endpoint's `_write_side_effects` convention exactly (`ai_
-    runtime.prompts._write_activation_audit`, `attention.capacity.
-    _write_side_effects`).
-    """
-    request_id, correlation_id = _request_ids(request)
-    try:
-        session.execute(
-            text(
-                """
-                INSERT INTO audit_events (
-                    id, workspace_id, event_type, aggregate_type, aggregate_id,
-                    aggregate_version, actor_id, request_id, correlation_id,
-                    changed_fields, authorization_result, source, metadata, occurred_at
-                ) VALUES (
-                    :id, :workspace_id, :event_type, 'workflow_version', :aggregate_id,
-                    :aggregate_version, :actor_id, :request_id, :correlation_id,
-                    ARRAY['status'], 'allowed', 'user', '{}'::jsonb, :occurred_at
-                )
-                """
-            ),
-            {
-                "id": uuid4(),
-                "workspace_id": auth.workspace_id,
-                "event_type": event_type,
-                "aggregate_id": aggregate_id,
-                "aggregate_version": version,
-                "actor_id": auth.user_id,
-                "request_id": request_id,
-                "correlation_id": correlation_id,
-                "occurred_at": now,
-            },
-        )
-        session.execute(
-            text(
-                """
-                INSERT INTO event_outbox (
-                    event_id, workspace_id, event_type, event_version,
-                    correlation_id, payload, occurred_at, attempt_count
-                ) VALUES (
-                    :event_id, :workspace_id, :event_type_v1, 1,
-                    :correlation_id, CAST(:payload AS jsonb), :occurred_at, 0
-                )
-                """
-            ),
-            {
-                "event_id": uuid4(),
-                "workspace_id": auth.workspace_id,
-                "event_type_v1": f"{event_type}.v1",
-                "correlation_id": correlation_id,
-                "payload": dumps({"aggregate_id": str(aggregate_id), "version": version}),
-                "occurred_at": now,
-            },
-        )
-    except SQLAlchemyError:
-        record_audit_outbox_failure("automation_workflows")
-        raise
-    queue_lifecycle_event(session, "automation_workflows", event_type, "allowed")
-
-
 def _policy_ref_exists(session: Session, workspace_id: UUID, policy_ref: UUID) -> bool:
     return (
         session.execute(
@@ -1157,14 +1077,21 @@ def create_workflow_endpoint(
             raise HTTPException(status_code=409, detail="WORKFLOW_VERSION_CONFLICT") from exc
 
         response = _to_response(created)
-        _write_side_effects(
+        audit_outbox.write_audit_and_outbox(
             session,
             auth,
             request,
             event_type="workflow_version.drafted",
+            aggregate_type="workflow_version",
             aggregate_id=created.id,
-            version=created.version,
+            aggregate_version=created.version,
+            changed_fields=["status"],
+            payload={"aggregate_id": str(created.id), "version": created.version},
             now=now,
+            domain="automation_workflows",
+        )
+        queue_lifecycle_event(
+            session, "automation_workflows", "workflow_version.drafted", "allowed"
         )
         store_idempotency(
             session,
@@ -1299,14 +1226,21 @@ def publish_workflow_endpoint(
             )
 
         response = _to_response(result)
-        _write_side_effects(
+        audit_outbox.write_audit_and_outbox(
             session,
             auth,
             request,
             event_type="workflow_version.activated",
+            aggregate_type="workflow_version",
             aggregate_id=result.id,
-            version=result.version,
+            aggregate_version=result.version,
+            changed_fields=["status"],
+            payload={"aggregate_id": str(result.id), "version": result.version},
             now=now,
+            domain="automation_workflows",
+        )
+        queue_lifecycle_event(
+            session, "automation_workflows", "workflow_version.activated", "allowed"
         )
         store_idempotency(
             session, auth, idempotency_key, req_hash, response.model_dump(mode="json"), now
@@ -1362,14 +1296,21 @@ def disable_workflow_endpoint(
             )
 
         response = _to_response(result)
-        _write_side_effects(
+        audit_outbox.write_audit_and_outbox(
             session,
             auth,
             request,
             event_type="workflow_version.disabled",
+            aggregate_type="workflow_version",
             aggregate_id=result.id,
-            version=result.version,
+            aggregate_version=result.version,
+            changed_fields=["status"],
+            payload={"aggregate_id": str(result.id), "version": result.version},
             now=now,
+            domain="automation_workflows",
+        )
+        queue_lifecycle_event(
+            session, "automation_workflows", "workflow_version.disabled", "allowed"
         )
         store_idempotency(
             session, auth, idempotency_key, req_hash, response.model_dump(mode="json"), now

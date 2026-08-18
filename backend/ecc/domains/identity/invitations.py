@@ -75,13 +75,11 @@ from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from ecc.auth import AuthDep, CsrfDep
+from ecc.auth import AuthContext, AuthDep, CsrfDep
 from ecc.database import get_session
-from ecc.domains.identity.accounts import (
-    _EMAIL_PATTERN,
-    _normalize_email,
-    _write_identity_audit_event,
-)
+from ecc.domains.identity.accounts import _EMAIL_PATTERN, _normalize_email
+from ecc.observability import queue_lifecycle_event
+from ecc.platform import audit_outbox
 
 router = APIRouter(prefix="/api/v1/identity", tags=["identity"])
 SessionDep = Annotated[Session, Depends(get_session)]
@@ -283,16 +281,20 @@ def create_invitation_endpoint(
                 "created_at": now,
             },
         )
-        _write_identity_audit_event(
+        audit_outbox.write_audit_and_outbox(
             session,
+            auth,
             request,
-            workspace_id=workspace_id,
-            actor_users_id=auth.user_id,
             event_type="invitation.created",
             aggregate_type="invitation",
             aggregate_id=invitation_id,
+            aggregate_version=1,
+            changed_fields=["*"],
+            payload={"aggregate_id": str(invitation_id), "version": 1},
             now=now,
+            domain="identity",
         )
+        queue_lifecycle_event(session, "identity", "invitation.created", "allowed")
     return InvitationCreateResponse(
         id=invitation_id,
         email=payload.email,
@@ -559,16 +561,20 @@ def accept_invitation_endpoint(
             text("UPDATE invitations SET accepted_at = :now WHERE id = :id"),
             {"now": now, "id": invitation_id},
         )
-        _write_identity_audit_event(
+        audit_outbox.write_audit_and_outbox(
             session,
+            AuthContext(workspace_id=target_workspace_id, user_id=new_users_id, timezone="UTC"),
             request,
-            workspace_id=target_workspace_id,
-            actor_users_id=new_users_id,
             event_type="invitation.accepted",
             aggregate_type="invitation",
             aggregate_id=invitation_id,
+            aggregate_version=1,
+            changed_fields=["*"],
+            payload={"aggregate_id": str(invitation_id), "version": 1},
             now=now,
+            domain="identity",
         )
+        queue_lifecycle_event(session, "identity", "invitation.accepted", "allowed")
     return InvitationActionResponse(
         id=invitation_id,
         status="accepted",
@@ -653,16 +659,23 @@ def reject_invitation_endpoint(
         # to whichever *other* workspace their session belongs to) would
         # violate `fk_audit_workspace_actor`'s composite FK. `actor_id` is
         # nullable for exactly this case.
-        _write_identity_audit_event(
+        audit_outbox.write_audit_and_outbox(
             session,
+            AuthContext(
+                workspace_id=invitation["workspace_id"], user_id=auth.user_id, timezone="UTC"
+            ),
             request,
-            workspace_id=invitation["workspace_id"],
-            actor_users_id=None,
             event_type="invitation.rejected",
             aggregate_type="invitation",
             aggregate_id=invitation_id,
+            aggregate_version=1,
+            changed_fields=["*"],
+            payload={"aggregate_id": str(invitation_id), "version": 1},
             now=now,
+            domain="identity",
+            actor_id=None,
         )
+        queue_lifecycle_event(session, "identity", "invitation.rejected", "allowed")
     return InvitationActionResponse(
         id=invitation_id, status="rejected", workspace_id=invitation["workspace_id"]
     )
@@ -715,16 +728,20 @@ def revoke_invitation_endpoint(
             text("UPDATE invitations SET revoked_at = :now WHERE id = :id"),
             {"now": now, "id": invitation_id},
         )
-        _write_identity_audit_event(
+        audit_outbox.write_audit_and_outbox(
             session,
+            auth,
             request,
-            workspace_id=auth.workspace_id,
-            actor_users_id=auth.user_id,
             event_type="invitation.revoked",
             aggregate_type="invitation",
             aggregate_id=invitation_id,
+            aggregate_version=1,
+            changed_fields=["*"],
+            payload={"aggregate_id": str(invitation_id), "version": 1},
             now=now,
+            domain="identity",
         )
+        queue_lifecycle_event(session, "identity", "invitation.revoked", "allowed")
     return InvitationActionResponse(
         id=invitation_id, status="revoked", workspace_id=auth.workspace_id
     )

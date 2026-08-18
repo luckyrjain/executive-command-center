@@ -29,4 +29,6 @@ backups/
 .DS_Store
 .idea/
 .vscode/
+.claude*/*
 .playwright-mcp/*
+graphify*/*

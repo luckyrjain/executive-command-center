@@ -94,8 +94,8 @@ from ecc.auth import AuthDep, CsrfDep
 from ecc.database import get_session
 from ecc.domains.automation.worker import cancel_runs_for_removed_member
 from ecc.domains.collaboration.delegations import cancel_delegations_for_removed_member
-from ecc.domains.identity.accounts import _write_identity_audit_event
-from ecc.platform import authz
+from ecc.observability import queue_lifecycle_event
+from ecc.platform import audit_outbox, authz
 
 router = APIRouter(prefix="/api/v1/identity", tags=["identity"])
 SessionDep = Annotated[Session, Depends(get_session)]
@@ -280,16 +280,20 @@ def update_member_role_endpoint(
         # yet wired into `notifications.py`'s own `_AGGREGATE_TYPE_TO_
         # RESOURCE_TYPE` map -- see that module's own docstring note on why
         # this one is disclosed rather than wired up in the same pass.
-        _write_identity_audit_event(
+        audit_outbox.write_audit_and_outbox(
             session,
+            auth,
             request,
-            workspace_id=auth.workspace_id,
-            actor_users_id=auth.user_id,
             event_type="member.role_changed",
             aggregate_type="workspace_membership",
             aggregate_id=member["membership_id"],
+            aggregate_version=1,
+            changed_fields=["*"],
+            payload={"aggregate_id": str(member["membership_id"]), "version": 1},
             now=now,
+            domain="identity",
         )
+        queue_lifecycle_event(session, "identity", "member.role_changed", "allowed")
     return MemberResponse(
         user_id=user_id,
         account_id=member["account_id"],
@@ -384,16 +388,20 @@ def remove_member_endpoint(
             {"now": now, "id": member["membership_id"]},
         )
         # See `update_member_role_endpoint`'s own comment on this same call.
-        _write_identity_audit_event(
+        audit_outbox.write_audit_and_outbox(
             session,
+            auth,
             request,
-            workspace_id=auth.workspace_id,
-            actor_users_id=auth.user_id,
             event_type="member.removed",
             aggregate_type="workspace_membership",
             aggregate_id=member["membership_id"],
+            aggregate_version=1,
+            changed_fields=["*"],
+            payload={"aggregate_id": str(member["membership_id"]), "version": 1},
             now=now,
+            domain="identity",
         )
+        queue_lifecycle_event(session, "identity", "member.removed", "allowed")
     return MemberRemovalResponse(
         user_id=user_id,
         export=MemberExportSnapshot(

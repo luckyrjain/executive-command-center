@@ -65,7 +65,6 @@ import secrets
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from hmac import compare_digest, new
-from json import dumps
 from typing import Annotated, Any
 from uuid import UUID, uuid4
 
@@ -74,7 +73,7 @@ from argon2.exceptions import VerifyMismatchError
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy import text
-from sqlalchemy.exc import IntegrityError, SQLAlchemyError
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from ecc.auth import (
@@ -88,8 +87,8 @@ from ecc.auth import (
 )
 from ecc.config import get_settings
 from ecc.database import get_session
-from ecc.observability import queue_lifecycle_event, record_audit_outbox_failure
-from ecc.platform import authz
+from ecc.observability import queue_lifecycle_event
+from ecc.platform import audit_outbox, authz
 
 router = APIRouter(prefix="/api/v1/identity", tags=["identity"])
 SessionDep = Annotated[Session, Depends(get_session)]
@@ -458,16 +457,20 @@ def create_account_endpoint(
             text("UPDATE invitations SET accepted_at = :now WHERE id = :id"),
             {"now": now, "id": invitation["id"]},
         )
-        _write_identity_audit_event(
+        audit_outbox.write_audit_and_outbox(
             session,
+            AuthContext(workspace_id=workspace_id, user_id=users_id, timezone="UTC"),
             request,
-            workspace_id=workspace_id,
-            actor_users_id=users_id,
             event_type="invitation.accepted",
             aggregate_type="invitation",
             aggregate_id=invitation["id"],
+            aggregate_version=1,
+            changed_fields=["*"],
+            payload={"aggregate_id": str(invitation["id"]), "version": 1},
             now=now,
+            domain="identity",
         )
+        queue_lifecycle_event(session, "identity", "invitation.accepted", "allowed")
         session_token, csrf_token = _create_session_for(
             session, workspace_id=workspace_id, users_id=users_id, now=now
         )
@@ -604,91 +607,6 @@ def select_workspace_endpoint(
 # ---------------------------------------------------------------------------
 # GET|POST /identity/workspaces, GET|PATCH /identity/workspaces/{id}
 # ---------------------------------------------------------------------------
-
-
-def _write_identity_audit_event(
-    session: Session,
-    request: Request,
-    *,
-    workspace_id: UUID,
-    actor_users_id: UUID | None,
-    event_type: str,
-    aggregate_id: UUID,
-    now: datetime,
-    aggregate_type: str = "workspace",
-    version: int = 1,
-) -> None:
-    """Shared by every mutation in this `identity` domain package that
-    writes an audit trail entry -- `aggregate_type` defaults to
-    `'workspace'` for this module's own `workspace.created`/`workspace.
-    updated` events, and `ecc.domains.identity.invitations` passes
-    `aggregate_type='invitation'` for its own events rather than this
-    module carrying a second, near-duplicate copy hardcoded to a different
-    aggregate type. `actor_users_id` is `None` for the one case where no
-    workspace-scoped actor identity exists yet -- `invitations.py`'s own
-    `reject_invitation_endpoint`, where the caller is responding from a
-    session scoped to a *different* workspace and has no `users` row in
-    this event's own `workspace_id` at all; `audit_events.actor_id` is
-    nullable and its composite FK is skipped when NULL for exactly this.
-    """
-    try:
-        request_id = UUID(request.state.request_id)
-        correlation_id = UUID(request.state.correlation_id)
-    except (AttributeError, TypeError, ValueError):
-        request_id, correlation_id = uuid4(), uuid4()
-    try:
-        session.execute(
-            text(
-                """
-                INSERT INTO audit_events (
-                    id, workspace_id, event_type, aggregate_type, aggregate_id,
-                    aggregate_version, actor_id, request_id, correlation_id,
-                    changed_fields, authorization_result, source, metadata, occurred_at
-                ) VALUES (
-                    :id, :workspace_id, :event_type, :aggregate_type, :aggregate_id,
-                    :aggregate_version, :actor_id, :request_id, :correlation_id,
-                    ARRAY['*'], 'allowed', 'user', '{}'::jsonb, :occurred_at
-                )
-                """
-            ),
-            {
-                "id": uuid4(),
-                "workspace_id": workspace_id,
-                "event_type": event_type,
-                "aggregate_type": aggregate_type,
-                "aggregate_id": aggregate_id,
-                "aggregate_version": version,
-                "actor_id": actor_users_id,
-                "request_id": request_id,
-                "correlation_id": correlation_id,
-                "occurred_at": now,
-            },
-        )
-        session.execute(
-            text(
-                """
-                INSERT INTO event_outbox (
-                    event_id, workspace_id, event_type, event_version,
-                    correlation_id, payload, occurred_at, attempt_count
-                ) VALUES (
-                    :event_id, :workspace_id, :event_type_v1, 1,
-                    :correlation_id, CAST(:payload AS jsonb), :occurred_at, 0
-                )
-                """
-            ),
-            {
-                "event_id": uuid4(),
-                "workspace_id": workspace_id,
-                "event_type_v1": f"{event_type}.v1",
-                "correlation_id": correlation_id,
-                "payload": dumps({"aggregate_id": str(aggregate_id), "version": version}),
-                "occurred_at": now,
-            },
-        )
-    except SQLAlchemyError:
-        record_audit_outbox_failure("identity")
-        raise
-    queue_lifecycle_event(session, "identity", event_type, "allowed")
 
 
 class MeResponse(BaseModel):
@@ -858,16 +776,20 @@ def create_workspace_endpoint(
                 "now": now,
             },
         )
-        _write_identity_audit_event(
+        audit_outbox.write_audit_and_outbox(
             session,
+            AuthContext(workspace_id=new_workspace_id, user_id=new_users_id, timezone="UTC"),
             request,
-            workspace_id=new_workspace_id,
-            actor_users_id=new_users_id,
             event_type="workspace.created",
+            aggregate_type="workspace",
             aggregate_id=new_workspace_id,
-            version=1,
+            aggregate_version=1,
+            changed_fields=["*"],
+            payload={"aggregate_id": str(new_workspace_id), "version": 1},
             now=now,
+            domain="identity",
         )
+        queue_lifecycle_event(session, "identity", "workspace.created", "allowed")
     return WorkspaceResponse(
         id=new_workspace_id,
         name=payload.name,
@@ -926,16 +848,20 @@ def patch_workspace_endpoint(
                 text(f"UPDATE workspaces SET {set_clause} WHERE id = :workspace_id"),  # noqa: S608
                 {**updates, "workspace_id": workspace_id},
             )
-            _write_identity_audit_event(
+            audit_outbox.write_audit_and_outbox(
                 session,
+                auth,
                 request,
-                workspace_id=workspace_id,
-                actor_users_id=auth.user_id,
                 event_type="workspace.updated",
+                aggregate_type="workspace",
                 aggregate_id=workspace_id,
-                version=1,
+                aggregate_version=1,
+                changed_fields=["*"],
+                payload={"aggregate_id": str(workspace_id), "version": 1},
                 now=now,
+                domain="identity",
             )
+            queue_lifecycle_event(session, "identity", "workspace.updated", "allowed")
         row = (
             session.execute(
                 text(
