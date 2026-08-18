@@ -1,23 +1,18 @@
 from datetime import UTC, datetime
-from json import dumps
 from typing import Annotated, Literal
-from uuid import UUID, uuid4
+from uuid import UUID
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import text
-from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from ecc.auth import AuthContext, AuthDep, CsrfDep
 from ecc.database import get_session
 from ecc.domains.knowledge.embeddings import queue_embedding
 from ecc.domains.knowledge.retrieval import queue_retrieval_document
-from ecc.observability import (
-    queue_lifecycle_event,
-    record_audit_outbox_failure,
-)
-from ecc.platform import authz
+from ecc.observability import queue_lifecycle_event
+from ecc.platform import audit_outbox, authz
 from ecc.platform.idempotency import load_cached, lock_idempotency, request_hash, store_idempotency
 
 router = APIRouter(prefix="/api/v1/evidence", tags=["evidence"])
@@ -142,68 +137,6 @@ def resolve_evidence(
             )
     session.rollback()
     return EvidenceListResponse(items=items)
-
-
-def _request_ids(request: Request) -> tuple[UUID, UUID]:
-    try:
-        return UUID(request.state.request_id), UUID(request.state.correlation_id)
-    except (AttributeError, TypeError, ValueError):
-        return uuid4(), uuid4()
-
-
-def _write_side_effects(
-    session: Session, auth: AuthContext, request: Request, evidence_id: UUID, now: datetime
-) -> None:
-    request_id, correlation_id = _request_ids(request)
-    try:
-        session.execute(
-            text(
-                """
-                INSERT INTO audit_events (
-                    id, workspace_id, event_type, aggregate_type, aggregate_id,
-                    aggregate_version, actor_id, request_id, correlation_id,
-                    changed_fields, authorization_result, source, metadata, occurred_at
-                ) VALUES (
-                    :id, :workspace_id, 'evidence.deleted', 'evidence', :aggregate_id,
-                    1, :actor_id, :request_id, :correlation_id,
-                    ARRAY['evidence_state'], 'allowed', 'user', '{}'::jsonb, :occurred_at
-                )
-                """
-            ),
-            {
-                "id": uuid4(),
-                "workspace_id": auth.workspace_id,
-                "aggregate_id": evidence_id,
-                "actor_id": auth.user_id,
-                "request_id": request_id,
-                "correlation_id": correlation_id,
-                "occurred_at": now,
-            },
-        )
-        session.execute(
-            text(
-                """
-                INSERT INTO event_outbox (
-                    event_id, workspace_id, event_type, event_version,
-                    correlation_id, payload, occurred_at, attempt_count
-                ) VALUES (
-                    :event_id, :workspace_id, 'evidence.deleted.v1', 1,
-                    :correlation_id, CAST(:payload AS jsonb), :occurred_at, 0
-                )
-                """
-            ),
-            {
-                "event_id": uuid4(),
-                "workspace_id": auth.workspace_id,
-                "correlation_id": correlation_id,
-                "payload": dumps({"evidence_id": str(evidence_id)}),
-                "occurred_at": now,
-            },
-        )
-    except SQLAlchemyError:
-        record_audit_outbox_failure("evidence")
-        raise
-    queue_lifecycle_event(session, "evidence", "evidence.deleted", "allowed")
 
 
 def _entity_retrieval_fields(
@@ -345,7 +278,20 @@ def delete_evidence(
         for entity_id in affected_entities:
             _refresh_projections(session, auth, entity_id, now)
 
-        _write_side_effects(session, auth, request, evidence_id, now)
+        audit_outbox.write_audit_and_outbox(
+            session,
+            auth,
+            request,
+            event_type="evidence.deleted",
+            aggregate_type="evidence",
+            aggregate_id=evidence_id,
+            aggregate_version=1,
+            changed_fields=["evidence_state"],
+            payload={"evidence_id": str(evidence_id)},
+            now=now,
+            domain="evidence",
+        )
+        queue_lifecycle_event(session, "evidence", "evidence.deleted", "allowed")
         response = EvidenceDeleteResponse(id=evidence_id, evidence_state="deleted")
         store_idempotency(
             session, auth, idempotency_key, req_hash, response.model_dump(mode="json"), now, 200

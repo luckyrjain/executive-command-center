@@ -31,17 +31,15 @@ from zoneinfo import ZoneInfo
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from sqlalchemy import text
-from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from ecc.auth import AuthContext, AuthDep, CsrfDep
 from ecc.database import get_session
 from ecc.observability import (
     queue_lifecycle_event,
-    record_audit_outbox_failure,
     record_idempotency_conflict,
 )
-from ecc.platform import authz, cursor_pagination
+from ecc.platform import audit_outbox, authz, cursor_pagination
 
 _WORKDAY_START = time(9, 0)
 DEFAULT_EFFORT_MINUTES = 30
@@ -472,13 +470,6 @@ def _request_hash(payload: BaseModel, action: str) -> str:
     return sha256(dumps(material, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
-def _request_ids(request: Request) -> tuple[UUID, UUID]:
-    try:
-        return UUID(request.state.request_id), UUID(request.state.correlation_id)
-    except (AttributeError, TypeError, ValueError):
-        return uuid4(), uuid4()
-
-
 def _load_cached(session: Session, auth: AuthContext, key: str, request_hash: str) -> Plan | None:
     row = (
         session.execute(
@@ -872,55 +863,19 @@ def create_plan(
             )
 
         response = _row_to_plan(session, auth, dict(row))
-        request_id, correlation_id = _request_ids(request)
-        try:
-            session.execute(
-                text(
-                    """
-                    INSERT INTO audit_events (
-                        id, workspace_id, event_type, aggregate_type, aggregate_id,
-                        aggregate_version, actor_id, request_id, correlation_id,
-                        changed_fields, authorization_result, source, metadata, occurred_at
-                    ) VALUES (
-                        :id, :workspace_id, 'plan.proposed', 'plan', :aggregate_id,
-                        1, :actor_id, :request_id, :correlation_id,
-                        ARRAY['*'], 'allowed', 'user', '{}'::jsonb, :occurred_at
-                    )
-                    """
-                ),
-                {
-                    "id": uuid4(),
-                    "workspace_id": auth.workspace_id,
-                    "aggregate_id": plan_id,
-                    "actor_id": auth.user_id,
-                    "request_id": request_id,
-                    "correlation_id": correlation_id,
-                    "occurred_at": now,
-                },
-            )
-            session.execute(
-                text(
-                    """
-                    INSERT INTO event_outbox (
-                        event_id, workspace_id, event_type, event_version,
-                        correlation_id, payload, occurred_at, attempt_count
-                    ) VALUES (
-                        :event_id, :workspace_id, 'plan.proposed.v1', 1,
-                        :correlation_id, CAST(:payload AS jsonb), :occurred_at, 0
-                    )
-                    """
-                ),
-                {
-                    "event_id": uuid4(),
-                    "workspace_id": auth.workspace_id,
-                    "correlation_id": correlation_id,
-                    "payload": dumps({"plan_id": str(plan_id)}),
-                    "occurred_at": now,
-                },
-            )
-        except SQLAlchemyError:
-            record_audit_outbox_failure("planning")
-            raise
+        audit_outbox.write_audit_and_outbox(
+            session,
+            auth,
+            request,
+            event_type="plan.proposed",
+            aggregate_type="plan",
+            aggregate_id=plan_id,
+            aggregate_version=1,
+            changed_fields=["*"],
+            payload={"plan_id": str(plan_id)},
+            now=now,
+            domain="planning",
+        )
         queue_lifecycle_event(session, "plan", "plan.proposed", "allowed")
 
         session.execute(
@@ -1070,81 +1025,6 @@ def get_plan(plan_id: UUID, auth: AuthDep, session: SessionDep) -> Plan:
 # --------------------------------------------------------------------------
 
 
-def _write_plan_event(
-    session: Session,
-    auth: AuthContext,
-    request: Request,
-    event_type: str,
-    plan_id: UUID,
-    version: int,
-    now: datetime,
-    *,
-    emit_outbox: bool = True,
-) -> None:
-    """``emit_outbox=False`` for block move/remove: those are audit-only,
-    matching attention.py's dismiss/defer/restore precedent (audit_events
-    written, no event_outbox row, no catalog entry) -- Task 6's plan only
-    names ``plan.accepted.v1``/``plan.superseded.v1`` as new catalog
-    events, not a block-level one.
-    """
-    request_id, correlation_id = _request_ids(request)
-    try:
-        session.execute(
-            text(
-                """
-                INSERT INTO audit_events (
-                    id, workspace_id, event_type, aggregate_type, aggregate_id,
-                    aggregate_version, actor_id, request_id, correlation_id,
-                    changed_fields, authorization_result, source, metadata, occurred_at
-                ) VALUES (
-                    :id, :workspace_id, :event_type, 'plan', :aggregate_id,
-                    :aggregate_version, :actor_id, :request_id, :correlation_id,
-                    ARRAY['*'], 'allowed', 'user', '{}'::jsonb, :occurred_at
-                )
-                """
-            ),
-            {
-                "id": uuid4(),
-                "workspace_id": auth.workspace_id,
-                "event_type": event_type,
-                "aggregate_id": plan_id,
-                "aggregate_version": version,
-                "actor_id": auth.user_id,
-                "request_id": request_id,
-                "correlation_id": correlation_id,
-                "occurred_at": now,
-            },
-        )
-        if not emit_outbox:
-            queue_lifecycle_event(session, "plan", event_type, "allowed")
-            return
-        session.execute(
-            text(
-                """
-                INSERT INTO event_outbox (
-                    event_id, workspace_id, event_type, event_version,
-                    correlation_id, payload, occurred_at, attempt_count
-                ) VALUES (
-                    :event_id, :workspace_id, :event_type_v1, 1,
-                    :correlation_id, CAST(:payload AS jsonb), :occurred_at, 0
-                )
-                """
-            ),
-            {
-                "event_id": uuid4(),
-                "workspace_id": auth.workspace_id,
-                "event_type_v1": f"{event_type}.v1",
-                "correlation_id": correlation_id,
-                "payload": dumps({"plan_id": str(plan_id), "version": version}),
-                "occurred_at": now,
-            },
-        )
-    except SQLAlchemyError:
-        record_audit_outbox_failure("planning")
-        raise
-    queue_lifecycle_event(session, "plan", event_type, "allowed")
-
-
 def _get_plan_for_update(
     session: Session, auth: AuthContext, plan_id: UUID
 ) -> dict[str, Any] | None:
@@ -1239,7 +1119,20 @@ def accept_plan(
             {"now": now, "workspace_id": auth.workspace_id, "plan_id": plan_id},
         )
         response = _row_to_plan(session, auth, dict(row))
-        _write_plan_event(session, auth, request, "plan.accepted", plan_id, row["version"], now)
+        audit_outbox.write_audit_and_outbox(
+            session,
+            auth,
+            request,
+            event_type="plan.accepted",
+            aggregate_type="plan",
+            aggregate_id=plan_id,
+            aggregate_version=row["version"],
+            changed_fields=["*"],
+            payload={"plan_id": str(plan_id), "version": row["version"]},
+            now=now,
+            domain="planning",
+        )
+        queue_lifecycle_event(session, "plan", "plan.accepted", "allowed")
         _store_idempotent_plan(session, auth, idempotency_key, request_hash, response, now)
         return response
 
@@ -1305,7 +1198,20 @@ def supersede_plan(
             .one()
         )
         response = _row_to_plan(session, auth, dict(row))
-        _write_plan_event(session, auth, request, "plan.superseded", plan_id, row["version"], now)
+        audit_outbox.write_audit_and_outbox(
+            session,
+            auth,
+            request,
+            event_type="plan.superseded",
+            aggregate_type="plan",
+            aggregate_id=plan_id,
+            aggregate_version=row["version"],
+            changed_fields=["*"],
+            payload={"plan_id": str(plan_id), "version": row["version"]},
+            now=now,
+            domain="planning",
+        )
+        queue_lifecycle_event(session, "plan", "plan.superseded", "allowed")
         _store_idempotent_plan(session, auth, idempotency_key, request_hash, response, now)
         return response
 
@@ -1543,10 +1449,34 @@ def replan(
         response = _row_to_plan(session, auth, dict(new_row))
         response = response.model_copy(update={"diff": diff})
 
-        _write_plan_event(session, auth, request, "plan.proposed", new_plan_id, 1, now)
-        _write_plan_event(
-            session, auth, request, "plan.superseded", plan_id, old["version"] + 1, now
+        audit_outbox.write_audit_and_outbox(
+            session,
+            auth,
+            request,
+            event_type="plan.proposed",
+            aggregate_type="plan",
+            aggregate_id=new_plan_id,
+            aggregate_version=1,
+            changed_fields=["*"],
+            payload={"plan_id": str(new_plan_id), "version": 1},
+            now=now,
+            domain="planning",
         )
+        queue_lifecycle_event(session, "plan", "plan.proposed", "allowed")
+        audit_outbox.write_audit_and_outbox(
+            session,
+            auth,
+            request,
+            event_type="plan.superseded",
+            aggregate_type="plan",
+            aggregate_id=plan_id,
+            aggregate_version=old["version"] + 1,
+            changed_fields=["*"],
+            payload={"plan_id": str(plan_id), "version": old["version"] + 1},
+            now=now,
+            domain="planning",
+        )
+        queue_lifecycle_event(session, "plan", "plan.superseded", "allowed")
         _store_idempotent_plan(
             session, auth, idempotency_key, request_hash, response, now, response_status=201
         )
@@ -1746,16 +1676,21 @@ def move_block(
             .one()
         )
         response = _row_to_plan(session, auth, dict(row))
-        _write_plan_event(
+        audit_outbox.write_audit_and_outbox(
             session,
             auth,
             request,
-            "plan.block_moved",
-            plan_id,
-            row["version"],
-            now,
+            event_type="plan.block_moved",
+            aggregate_type="plan",
+            aggregate_id=plan_id,
+            aggregate_version=row["version"],
+            changed_fields=["*"],
+            payload={"plan_id": str(plan_id), "version": row["version"]},
+            now=now,
+            domain="planning",
             emit_outbox=False,
         )
+        queue_lifecycle_event(session, "plan", "plan.block_moved", "allowed")
         _store_idempotent_plan(session, auth, idempotency_key, request_hash, response, now)
         return response
 
@@ -1835,15 +1770,20 @@ def remove_block(
             .one()
         )
         response = _row_to_plan(session, auth, dict(row))
-        _write_plan_event(
+        audit_outbox.write_audit_and_outbox(
             session,
             auth,
             request,
-            "plan.block_removed",
-            plan_id,
-            row["version"],
-            now,
+            event_type="plan.block_removed",
+            aggregate_type="plan",
+            aggregate_id=plan_id,
+            aggregate_version=row["version"],
+            changed_fields=["*"],
+            payload={"plan_id": str(plan_id), "version": row["version"]},
+            now=now,
+            domain="planning",
             emit_outbox=False,
         )
+        queue_lifecycle_event(session, "plan", "plan.block_removed", "allowed")
         _store_idempotent_plan(session, auth, idempotency_key, request_hash, response, now)
         return response

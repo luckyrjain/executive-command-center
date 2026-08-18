@@ -64,7 +64,7 @@ from cryptography.fernet import InvalidToken
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import text
-from sqlalchemy.exc import IntegrityError, SQLAlchemyError
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from ecc.auth import AuthContext, AuthDep, CsrfDep
@@ -75,11 +75,8 @@ from ecc.domains.personal.gmail_revocation import (
     cascade_email_revocation,
     finish_gmail_revocation,
 )
-from ecc.observability import (
-    queue_lifecycle_event,
-    record_audit_outbox_failure,
-    record_idempotency_conflict,
-)
+from ecc.observability import queue_lifecycle_event, record_idempotency_conflict
+from ecc.platform import audit_outbox
 from ecc.platform.idempotency import load_cached, lock_idempotency, request_hash, store_idempotency
 
 DomainKey = Literal["habits", "learning", "travel", "relationships", "health", "finance", "email"]
@@ -337,95 +334,16 @@ def require_enabled_domain(session: Session, auth: AuthContext, domain_key: str)
     return domain
 
 
-# ---------------------------------------------------------------------------
-# `request_ids` below is this package's own request/correlation-id helper.
-# The idempotency lock/cache quartet this comment used to introduce
-# (`request_hash`/`lock_idempotency`/`load_cached`/`store_idempotency`) moved
-# to `ecc.platform.idempotency` -- an architecture-review deepening found the
-# same quartet hand-duplicated across this package, `ai_runtime`, and
-# `attention`; see that module's own docstring.
-# ---------------------------------------------------------------------------
-
-
-def request_ids(request: Request) -> tuple[UUID, UUID]:
-    try:
-        return UUID(request.state.request_id), UUID(request.state.correlation_id)
-    except (AttributeError, TypeError, ValueError):
-        return uuid4(), uuid4()
-
-
-def write_side_effects(
-    session: Session,
-    auth: AuthContext,
-    request: Request,
-    *,
-    domain: str,
-    event_type: str,
-    aggregate_type: str,
-    aggregate_id: UUID,
-    version: int,
-    now: datetime,
-) -> None:
-    """Personal-domain content never appears in `changed_fields`/audit
-    metadata beyond the aggregate id/type/version already recorded for
-    every other domain's mutations -- `RFC-005`'s "sensitive source content
-    MUST NOT be logged" discipline applies to the audit trail exactly as it
-    does to application logs.
-    """
-    request_id, correlation_id = request_ids(request)
-    try:
-        session.execute(
-            text(
-                """
-                INSERT INTO audit_events (
-                    id, workspace_id, event_type, aggregate_type, aggregate_id,
-                    aggregate_version, actor_id, request_id, correlation_id,
-                    changed_fields, authorization_result, source, metadata, occurred_at
-                ) VALUES (
-                    :id, :workspace_id, :event_type, :aggregate_type, :aggregate_id,
-                    :aggregate_version, :actor_id, :request_id, :correlation_id,
-                    ARRAY['*'], 'allowed', 'user', '{}'::jsonb, :occurred_at
-                )
-                """
-            ),
-            {
-                "id": uuid4(),
-                "workspace_id": auth.workspace_id,
-                "event_type": event_type,
-                "aggregate_type": aggregate_type,
-                "aggregate_id": aggregate_id,
-                "aggregate_version": version,
-                "actor_id": auth.user_id,
-                "request_id": request_id,
-                "correlation_id": correlation_id,
-                "occurred_at": now,
-            },
-        )
-        session.execute(
-            text(
-                """
-                INSERT INTO event_outbox (
-                    event_id, workspace_id, event_type, event_version,
-                    correlation_id, payload, occurred_at, attempt_count
-                ) VALUES (
-                    :event_id, :workspace_id, :event_type_v1, 1,
-                    :correlation_id, CAST(:payload AS jsonb), :occurred_at, 0
-                )
-                """
-            ),
-            {
-                "event_id": uuid4(),
-                "workspace_id": auth.workspace_id,
-                "event_type_v1": f"{event_type}.v1",
-                "correlation_id": correlation_id,
-                "payload": dumps({"aggregate_id": str(aggregate_id), "version": version}),
-                "occurred_at": now,
-            },
-        )
-    except SQLAlchemyError:
-        record_audit_outbox_failure(domain)
-        raise
-    queue_lifecycle_event(session, domain, event_type, "allowed")
+# The `audit_events`/`event_outbox` write for every mutation below goes
+# through `ecc.platform.audit_outbox.write_audit_and_outbox` (this
+# package's own former `write_side_effects` wrapper was folded into that
+# shared helper). Personal-domain content never appears in `changed_
+# fields`/audit metadata beyond the aggregate id/type/version already
+# recorded for every other domain's mutations -- `RFC-005`'s "sensitive
+# source content MUST NOT be logged" discipline applies to the audit
+# trail exactly as it does to application logs, so every call site here
+# passes `changed_fields=["*"]` and an aggregate-id/version-only payload,
+# never the record's own fields.
 
 
 # ---------------------------------------------------------------------------
@@ -603,17 +521,20 @@ def _enable_domain(
         domain = get_domain(session, auth, payload.domain_key)
         assert domain is not None
         response = _to_domain_response(domain)
-        write_side_effects(
+        audit_outbox.write_audit_and_outbox(
             session,
             auth,
             request,
-            domain="personal_domains",
             event_type="personal_domain.enabled",
             aggregate_type="personal_domain",
             aggregate_id=domain.id,
-            version=version,
+            aggregate_version=version,
+            changed_fields=["*"],
+            payload={"aggregate_id": str(domain.id), "version": version},
             now=now,
+            domain="personal_domains",
         )
+        queue_lifecycle_event(session, "personal_domains", "personal_domain.enabled", "allowed")
         store_idempotency(
             session, auth, idempotency_key, req_hash, response.model_dump(mode="json"), now
         )
@@ -879,17 +800,20 @@ def _disable_domain(
         refreshed = get_domain(session, auth, domain_key)
         assert refreshed is not None
         response = _to_domain_response(refreshed)
-        write_side_effects(
+        audit_outbox.write_audit_and_outbox(
             session,
             auth,
             request,
-            domain="personal_domains",
             event_type="personal_domain.disabled",
             aggregate_type="personal_domain",
             aggregate_id=domain.id,
-            version=version,
+            aggregate_version=version,
+            changed_fields=["*"],
+            payload={"aggregate_id": str(domain.id), "version": version},
             now=now,
+            domain="personal_domains",
         )
+        queue_lifecycle_event(session, "personal_domains", "personal_domain.disabled", "allowed")
         store_idempotency(
             session, auth, idempotency_key, req_hash, response.model_dump(mode="json"), now
         )
@@ -1146,17 +1070,20 @@ def create_record_endpoint(
         )
         row = _get_record_row(session, auth, record_id)
         assert row is not None
-        write_side_effects(
+        audit_outbox.write_audit_and_outbox(
             session,
             auth,
             request,
-            domain="personal_record",
             event_type="domain_record.created",
             aggregate_type="domain_record",
             aggregate_id=record_id,
-            version=1,
+            aggregate_version=1,
+            changed_fields=["*"],
+            payload={"aggregate_id": str(record_id), "version": 1},
             now=now,
+            domain="personal_record",
         )
+        queue_lifecycle_event(session, "personal_record", "domain_record.created", "allowed")
         # `row["payload"]` is still encrypted -- this is the form persisted
         # to the idempotency cache (module docstring's own note on why the
         # decrypted value must never reach that table). Only the response
@@ -1275,17 +1202,20 @@ def update_record_endpoint(
         )
         row = _get_record_row(session, auth, record_id)
         assert row is not None
-        write_side_effects(
+        audit_outbox.write_audit_and_outbox(
             session,
             auth,
             request,
-            domain="personal_record",
             event_type="domain_record.updated",
             aggregate_type="domain_record",
             aggregate_id=record_id,
-            version=row["version"],
+            aggregate_version=row["version"],
+            changed_fields=["*"],
+            payload={"aggregate_id": str(record_id), "version": row["version"]},
             now=now,
+            domain="personal_record",
         )
+        queue_lifecycle_event(session, "personal_record", "domain_record.updated", "allowed")
         # Same "encrypted form persisted, decrypted form returned" split as
         # create_record_endpoint.
         stored_response = RecordResponse(**row)

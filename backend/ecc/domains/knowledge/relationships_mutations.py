@@ -13,10 +13,10 @@ from ecc.domains.knowledge.relationships import (
     RelationshipResponse,
     _fetch_relationship,
     _source_entity_version,
-    _write_side_effects,
 )
 from ecc.domains.knowledge.timeline import queue_timeline_entry
-from ecc.platform import authz
+from ecc.observability import queue_lifecycle_event
+from ecc.platform import audit_outbox, authz
 from ecc.platform.idempotency import load_cached, lock_idempotency, request_hash, store_idempotency
 
 router = APIRouter(prefix="/api/v1/knowledge/relationships", tags=["knowledge-relationships"])
@@ -108,15 +108,20 @@ def invalidate_relationship(
         # `pkos_nodes` -- see `relationships.py`'s own `_fetch_relationship`.
         response = _fetch_relationship(session, auth, relationship_id)
         source_version = _source_entity_version(session, auth, relationship_id)
-        _write_side_effects(
+        audit_outbox.write_audit_and_outbox(
             session,
             auth,
             request,
-            "relationship.invalidated",
-            relationship_id,
-            source_version,
-            now,
+            event_type="relationship.invalidated",
+            aggregate_type="relationship",
+            aggregate_id=relationship_id,
+            aggregate_version=source_version,
+            changed_fields=["*"],
+            payload={"relationship_id": str(relationship_id)},
+            now=now,
+            domain="knowledge_relationships",
         )
+        queue_lifecycle_event(session, "relationship", "relationship.invalidated", "allowed")
         queue_timeline_entry(
             session,
             auth.workspace_id,

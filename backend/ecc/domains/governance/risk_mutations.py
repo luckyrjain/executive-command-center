@@ -1,22 +1,17 @@
 from datetime import UTC, datetime
-from json import dumps
 from typing import Annotated, Any
-from uuid import UUID, uuid4
+from uuid import UUID
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from sqlalchemy import text
-from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from ecc.auth import AuthContext, AuthDep, CsrfDep
 from ecc.database import get_session
 from ecc.domains.governance.risks import RiskResponse, RiskStatus, project_risk
-from ecc.observability import (
-    queue_lifecycle_event,
-    record_audit_outbox_failure,
-)
-from ecc.platform import authz
+from ecc.observability import queue_lifecycle_event
+from ecc.platform import audit_outbox, authz
 from ecc.platform.idempotency import load_cached, lock_idempotency, request_hash, store_idempotency
 
 router = APIRouter(prefix="/api/v1/risks", tags=["risks"])
@@ -69,13 +64,6 @@ class RiskAction(BaseModel):
     expected_version: int = Field(ge=1)
 
 
-def _request_ids(request: Request) -> tuple[UUID, UUID]:
-    try:
-        return UUID(request.state.request_id), UUID(request.state.correlation_id)
-    except (AttributeError, TypeError, ValueError):
-        return uuid4(), uuid4()
-
-
 def _get_row(
     session: Session,
     auth: AuthContext,
@@ -100,72 +88,6 @@ def _get_row(
         .one_or_none()
     )
     return dict(row) if row is not None else None
-
-
-def _write_side_effects(
-    session: Session,
-    auth: AuthContext,
-    request: Request,
-    event_type: str,
-    risk_id: UUID,
-    version: int,
-    changed_fields: list[str],
-    now: datetime,
-) -> None:
-    request_id, correlation_id = _request_ids(request)
-    try:
-        session.execute(
-            text(
-                """
-                INSERT INTO audit_events (
-                    id, workspace_id, event_type, aggregate_type, aggregate_id,
-                    aggregate_version, actor_id, request_id, correlation_id,
-                    changed_fields, authorization_result, source, metadata, occurred_at
-                ) VALUES (
-                    :id, :workspace_id, :event_type, 'risk', :aggregate_id,
-                    :aggregate_version, :actor_id, :request_id, :correlation_id,
-                    :changed_fields, 'allowed', 'user', '{}'::jsonb, :occurred_at
-                )
-                """
-            ),
-            {
-                "id": uuid4(),
-                "workspace_id": auth.workspace_id,
-                "event_type": event_type,
-                "aggregate_id": risk_id,
-                "aggregate_version": version,
-                "actor_id": auth.user_id,
-                "request_id": request_id,
-                "correlation_id": correlation_id,
-                "changed_fields": changed_fields,
-                "occurred_at": now,
-            },
-        )
-        session.execute(
-            text(
-                """
-                INSERT INTO event_outbox (
-                    event_id, workspace_id, event_type, event_version,
-                    correlation_id, payload, occurred_at, attempt_count
-                ) VALUES (
-                    :event_id, :workspace_id, :event_type, 1,
-                    :correlation_id, CAST(:payload AS jsonb), :occurred_at, 0
-                )
-                """
-            ),
-            {
-                "event_id": uuid4(),
-                "workspace_id": auth.workspace_id,
-                "event_type": f"{event_type}.v1",
-                "correlation_id": correlation_id,
-                "payload": dumps({"risk_id": str(risk_id), "version": version}),
-                "occurred_at": now,
-            },
-        )
-    except SQLAlchemyError:
-        record_audit_outbox_failure("risks")
-        raise
-    queue_lifecycle_event(session, "risk", event_type, "allowed")
 
 
 def set_risk_status_write(
@@ -231,9 +153,20 @@ def set_risk_status_write(
         .one()
     )
     response = project_risk(dict(row), now)
-    _write_side_effects(
-        session, auth, request, "risk.updated", risk_id, response.version, ["status"], now
+    audit_outbox.write_audit_and_outbox(
+        session,
+        auth,
+        request,
+        event_type="risk.updated",
+        aggregate_type="risk",
+        aggregate_id=risk_id,
+        aggregate_version=response.version,
+        changed_fields=["status"],
+        payload={"risk_id": str(risk_id), "version": response.version},
+        now=now,
+        domain="risks",
     )
+    queue_lifecycle_event(session, "risk", "risk.updated", "allowed")
     return response
 
 
@@ -306,16 +239,20 @@ def update_risk(
             .one()
         )
         response = project_risk(dict(row), now)
-        _write_side_effects(
+        audit_outbox.write_audit_and_outbox(
             session,
             auth,
             request,
-            "risk.updated",
-            risk_id,
-            response.version,
-            sorted(fields),
-            now,
+            event_type="risk.updated",
+            aggregate_type="risk",
+            aggregate_id=risk_id,
+            aggregate_version=response.version,
+            changed_fields=sorted(fields),
+            payload={"risk_id": str(risk_id), "version": response.version},
+            now=now,
+            domain="risks",
         )
+        queue_lifecycle_event(session, "risk", "risk.updated", "allowed")
         store_idempotency(
             session, auth, idempotency_key, req_hash, response.model_dump(mode="json"), now
         )
@@ -392,16 +329,20 @@ def _archive_action(
             .one()
         )
         response = project_risk(dict(row), now)
-        _write_side_effects(
+        audit_outbox.write_audit_and_outbox(
             session,
             auth,
             request,
-            event_type,
-            risk_id,
-            response.version,
-            ["archived_at", "pre_archive_status"],
-            now,
+            event_type=event_type,
+            aggregate_type="risk",
+            aggregate_id=risk_id,
+            aggregate_version=response.version,
+            changed_fields=["archived_at", "pre_archive_status"],
+            payload={"risk_id": str(risk_id), "version": response.version},
+            now=now,
+            domain="risks",
         )
+        queue_lifecycle_event(session, "risk", event_type, "allowed")
         store_idempotency(
             session, auth, idempotency_key, req_hash, response.model_dump(mode="json"), now
         )
