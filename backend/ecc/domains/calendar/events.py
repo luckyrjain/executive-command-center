@@ -226,6 +226,46 @@ def _get_row(
     return dict(row) if row is not None else None
 
 
+def get_calendar_event_summary(
+    session: Session, auth: AuthContext, event_id: UUID
+) -> dict[str, Any] | None:
+    """Visibility-respecting timing read for other domains that link to a
+    calendar event (`scheduling/meetings.py`, `attention/meeting_prep.py`)
+    -- both previously ran their own unfiltered `SELECT ... FROM
+    calendar_events WHERE workspace_id = ...` with no `authz.authorize`
+    check, so a meeting linked to a `visibility='private'` calendar event
+    (or one owned by someone else, per `_resource_access_context`'s own
+    visibility rules) still surfaced that event's own `starts_at`/`ends_
+    at`/`timezone` to anyone who could read the meeting -- disclosing a
+    resource across its own visibility tier via a meeting most workspace
+    members can see (Loop 2 architecture review's "calendar_events shared-
+    read-interface gap" finding).
+
+    Returns `None` both when the event doesn't exist AND when it exists
+    but isn't visible to `auth` -- collapsing "not found" and "not
+    visible" the same way `get_calendar_event`'s own 404 does, so a
+    caller can't use this function's return value to distinguish the two
+    and enumerate private event ids.
+
+    Callable from inside an already-open `with session.begin():` block --
+    `authz.authorize` never touches transaction state itself (see that
+    function's own docstring).
+    """
+    if not authz.authorize(
+        session, auth, resource_type="calendar_events", resource_id=event_id, action="read"
+    ):
+        return None
+    row = _get_row(session, auth, event_id)
+    if row is None:
+        return None
+    return {
+        "starts_at": row["starts_at"],
+        "ends_at": row["ends_at"],
+        "timezone": row["timezone"],
+        "archived_at": row["archived_at"],
+    }
+
+
 def _encode_cursor(starts_at: datetime, event_id: UUID) -> str:
     return cursor_pagination.encode_cursor(
         {"starts_at": starts_at.isoformat(), "id": str(event_id)}

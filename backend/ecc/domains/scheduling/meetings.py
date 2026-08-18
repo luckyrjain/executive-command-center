@@ -13,6 +13,7 @@ from sqlalchemy.orm import Session
 
 from ecc.auth import AuthContext, AuthDep, CsrfDep
 from ecc.database import get_session
+from ecc.domains.calendar.events import get_calendar_event_summary
 from ecc.observability import (
     queue_lifecycle_event,
     record_audit_outbox_failure,
@@ -266,35 +267,13 @@ def _get_row(
     return dict(row) if row is not None else None
 
 
-def _calendar_event(
-    session: Session,
-    auth: AuthContext,
-    event_id: UUID,
-) -> dict[str, Any] | None:
-    row = (
-        session.execute(
-            text(
-                """
-                SELECT id, starts_at, ends_at, timezone, archived_at
-                FROM calendar_events
-                WHERE workspace_id = :workspace_id AND id = :event_id
-                """
-            ),
-            {"workspace_id": auth.workspace_id, "event_id": event_id},
-        )
-        .mappings()
-        .one_or_none()
-    )
-    return dict(row) if row is not None else None
-
-
 def _project(session: Session, auth: AuthContext, row: dict[str, Any]) -> MeetingResponse:
     if row["calendar_event_id"] is None:
         starts_at = row["standalone_starts_at"]
         ends_at = row["standalone_ends_at"]
         timezone = row["standalone_timezone"]
     else:
-        event = _calendar_event(session, auth, row["calendar_event_id"])
+        event = get_calendar_event_summary(session, auth, row["calendar_event_id"])
         if event is None:
             raise HTTPException(status_code=409, detail="LINKED_CALENDAR_EVENT_MISSING")
         starts_at = event["starts_at"]
@@ -350,7 +329,7 @@ def create_meeting(
                 text("SELECT pg_advisory_xact_lock(hashtextextended(:link_key, 0))"),
                 {"link_key": link_key},
             )
-            event = _calendar_event(session, auth, payload.calendar_event_id)
+            event = get_calendar_event_summary(session, auth, payload.calendar_event_id)
             if event is None or event["archived_at"] is not None:
                 raise HTTPException(status_code=404, detail="CALENDAR_EVENT_NOT_FOUND")
             existing = session.execute(
@@ -459,7 +438,24 @@ def list_meetings(
         .all()
     )
     session.rollback()
-    return MeetingListResponse(items=[_project(session, auth, dict(row)) for row in rows])
+    # `_project` raises `LINKED_CALENDAR_EVENT_MISSING` (409) for a meeting
+    # linked to a calendar_events row that no longer exists OR -- since
+    # get_calendar_event_summary started applying a visibility check --
+    # exists but isn't visible to this caller. That's a reasonable error
+    # for a single `GET /meetings/{id}`, but letting it propagate out of
+    # this list comprehension would 409 the *entire* list for a caller who
+    # can see most of their meetings just fine, over one meeting whose
+    # linked private event isn't theirs to see. Omit that one meeting from
+    # the list instead of failing the whole request.
+    items = []
+    for row in rows:
+        try:
+            items.append(_project(session, auth, dict(row)))
+        except HTTPException as exc:
+            if exc.status_code == 409 and exc.detail == "LINKED_CALENDAR_EVENT_MISSING":
+                continue
+            raise
+    return MeetingListResponse(items=items)
 
 
 @router.get("/{meeting_id}", response_model=MeetingResponse)
