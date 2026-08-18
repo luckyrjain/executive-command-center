@@ -1,5 +1,4 @@
 from datetime import UTC, datetime
-from json import dumps
 from typing import Annotated, Any, Literal
 from uuid import UUID, uuid4
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -8,17 +7,13 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, s
 from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 from sqlalchemy import text
-from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from ecc.auth import AuthContext, AuthDep, CsrfDep
 from ecc.database import get_session
 from ecc.domains.calendar.events import get_calendar_event_summary
-from ecc.observability import (
-    queue_lifecycle_event,
-    record_audit_outbox_failure,
-)
-from ecc.platform import authz, cursor_pagination
+from ecc.observability import queue_lifecycle_event
+from ecc.platform import audit_outbox, authz, cursor_pagination
 from ecc.platform.idempotency import load_cached, lock_idempotency, request_hash, store_idempotency
 
 router = APIRouter(prefix="/api/v1/meetings", tags=["meetings"])
@@ -168,79 +163,6 @@ def _validate_timezone(value: str) -> None:
         raise ValueError("timezone must be a valid IANA timezone") from exc
 
 
-def _request_ids(request: Request) -> tuple[UUID, UUID]:
-    try:
-        return UUID(request.state.request_id), UUID(request.state.correlation_id)
-    except (AttributeError, TypeError, ValueError):
-        return uuid4(), uuid4()
-
-
-def _write_audit_and_outbox(
-    session: Session,
-    auth: AuthContext,
-    request: Request,
-    event_type: str,
-    meeting_id: UUID,
-    version: int,
-    changed_fields: list[str],
-    now: datetime,
-) -> None:
-    request_id, correlation_id = _request_ids(request)
-    try:
-        session.execute(
-            text(
-                """
-                INSERT INTO audit_events (
-                    id, workspace_id, event_type, aggregate_type, aggregate_id,
-                    aggregate_version, actor_id, request_id, correlation_id,
-                    changed_fields, authorization_result, source, metadata, occurred_at
-                ) VALUES (
-                    :id, :workspace_id, :event_type, 'meeting', :aggregate_id,
-                    :aggregate_version, :actor_id, :request_id, :correlation_id,
-                    :changed_fields, 'allowed', 'user', '{}'::jsonb, :occurred_at
-                )
-                """
-            ),
-            {
-                "id": uuid4(),
-                "workspace_id": auth.workspace_id,
-                "event_type": event_type,
-                "aggregate_id": meeting_id,
-                "aggregate_version": version,
-                "actor_id": auth.user_id,
-                "request_id": request_id,
-                "correlation_id": correlation_id,
-                "changed_fields": changed_fields,
-                "occurred_at": now,
-            },
-        )
-        session.execute(
-            text(
-                """
-                INSERT INTO event_outbox (
-                    event_id, workspace_id, event_type, event_version,
-                    correlation_id, payload, occurred_at, attempt_count
-                ) VALUES (
-                    :event_id, :workspace_id, :event_type, 1,
-                    :correlation_id, CAST(:payload AS jsonb), :occurred_at, 0
-                )
-                """
-            ),
-            {
-                "event_id": uuid4(),
-                "workspace_id": auth.workspace_id,
-                "event_type": f"{event_type}.v1",
-                "correlation_id": correlation_id,
-                "payload": dumps({"meeting_id": str(meeting_id), "version": version}),
-                "occurred_at": now,
-            },
-        )
-    except SQLAlchemyError:
-        record_audit_outbox_failure("meetings")
-        raise
-    queue_lifecycle_event(session, "meeting", event_type, "allowed")
-
-
 def _get_row(
     session: Session,
     auth: AuthContext,
@@ -379,9 +301,20 @@ def create_meeting(
             .one()
         )
         response = _project(session, auth, dict(row))
-        _write_audit_and_outbox(
-            session, auth, request, "meeting.created", meeting_id, 1, ["*"], now
+        audit_outbox.write_audit_and_outbox(
+            session,
+            auth,
+            request,
+            event_type="meeting.created",
+            aggregate_type="meeting",
+            aggregate_id=meeting_id,
+            aggregate_version=1,
+            changed_fields=["*"],
+            payload={"meeting_id": str(meeting_id), "version": 1},
+            now=now,
+            domain="meetings",
         )
+        queue_lifecycle_event(session, "meeting", "meeting.created", "allowed")
         store_idempotency(
             session,
             auth,
@@ -608,16 +541,20 @@ def update_meeting(
             .one()
         )
         response = _project(session, auth, dict(row))
-        _write_audit_and_outbox(
+        audit_outbox.write_audit_and_outbox(
             session,
             auth,
             request,
-            "meeting.updated",
-            meeting_id,
-            response.version,
-            sorted(fields),
-            now,
+            event_type="meeting.updated",
+            aggregate_type="meeting",
+            aggregate_id=meeting_id,
+            aggregate_version=response.version,
+            changed_fields=sorted(fields),
+            payload={"meeting_id": str(meeting_id), "version": response.version},
+            now=now,
+            domain="meetings",
         )
+        queue_lifecycle_event(session, "meeting", "meeting.updated", "allowed")
         store_idempotency(
             session, auth, idempotency_key, req_hash, response.model_dump(mode="json"), now
         )
@@ -699,16 +636,20 @@ def _lifecycle(
             .one()
         )
         response = _project(session, auth, dict(row))
-        _write_audit_and_outbox(
+        audit_outbox.write_audit_and_outbox(
             session,
             auth,
             request,
-            event_type,
-            meeting_id,
-            response.version,
-            ["archived_at", "pre_archive_status"],
-            now,
+            event_type=event_type,
+            aggregate_type="meeting",
+            aggregate_id=meeting_id,
+            aggregate_version=response.version,
+            changed_fields=["archived_at", "pre_archive_status"],
+            payload={"meeting_id": str(meeting_id), "version": response.version},
+            now=now,
+            domain="meetings",
         )
+        queue_lifecycle_event(session, "meeting", event_type, "allowed")
         store_idempotency(
             session, auth, idempotency_key, req_hash, response.model_dump(mode="json"), now
         )

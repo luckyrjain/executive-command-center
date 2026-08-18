@@ -7,17 +7,15 @@ from uuid import UUID, uuid4
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy import text
-from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from ecc.auth import AuthContext, AuthDep, CsrfDep
 from ecc.database import get_session
 from ecc.observability import (
     queue_lifecycle_event,
-    record_audit_outbox_failure,
     record_idempotency_conflict,
 )
-from ecc.platform import authz
+from ecc.platform import audit_outbox, authz
 
 router = APIRouter(prefix="/api/v1/risks", tags=["risks"])
 SessionDep = Annotated[Session, Depends(get_session)]
@@ -125,13 +123,6 @@ def _lock_idempotency(session: Session, auth: AuthContext, key: str) -> None:
 def _request_hash(payload: BaseModel, action: str) -> str:
     material = {"action": action, "payload": payload.model_dump(mode="json")}
     return sha256(dumps(material, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
-
-
-def _request_ids(request: Request) -> tuple[UUID, UUID]:
-    try:
-        return UUID(request.state.request_id), UUID(request.state.correlation_id)
-    except (AttributeError, TypeError, ValueError):
-        return uuid4(), uuid4()
 
 
 def _load_cached(
@@ -290,56 +281,19 @@ def record_risk_review(
             },
         )
         response = RiskReview.model_validate(dict(review_row))
-        request_id, correlation_id = _request_ids(request)
-        try:
-            session.execute(
-                text(
-                    """
-                    INSERT INTO audit_events (
-                        id, workspace_id, event_type, aggregate_type, aggregate_id,
-                        aggregate_version, actor_id, request_id, correlation_id,
-                        changed_fields, authorization_result, source, metadata, occurred_at
-                    ) VALUES (
-                        :id, :workspace_id, 'risk_review.recorded', 'risk', :aggregate_id,
-                        :aggregate_version, :actor_id, :request_id, :correlation_id,
-                        ARRAY['review_at','version'], 'allowed', 'user', '{}'::jsonb, :occurred_at
-                    )
-                    """
-                ),
-                {
-                    "id": uuid4(),
-                    "workspace_id": auth.workspace_id,
-                    "aggregate_id": risk_id,
-                    "aggregate_version": risk["version"] + 1,
-                    "actor_id": auth.user_id,
-                    "request_id": request_id,
-                    "correlation_id": correlation_id,
-                    "occurred_at": now,
-                },
-            )
-            session.execute(
-                text(
-                    """
-                    INSERT INTO event_outbox (
-                        event_id, workspace_id, event_type, event_version,
-                        correlation_id, payload, occurred_at, attempt_count
-                    ) VALUES (
-                        :event_id, :workspace_id, 'risk_review.recorded.v1', 1,
-                        :correlation_id, CAST(:payload AS jsonb), :occurred_at, 0
-                    )
-                    """
-                ),
-                {
-                    "event_id": uuid4(),
-                    "workspace_id": auth.workspace_id,
-                    "correlation_id": correlation_id,
-                    "payload": dumps({"risk_id": str(risk_id), "review_id": str(review_id)}),
-                    "occurred_at": now,
-                },
-            )
-        except SQLAlchemyError:
-            record_audit_outbox_failure("risk_reviews")
-            raise
+        audit_outbox.write_audit_and_outbox(
+            session,
+            auth,
+            request,
+            event_type="risk_review.recorded",
+            aggregate_type="risk",
+            aggregate_id=risk_id,
+            aggregate_version=risk["version"] + 1,
+            changed_fields=["review_at", "version"],
+            payload={"risk_id": str(risk_id), "review_id": str(review_id)},
+            now=now,
+            domain="risk_reviews",
+        )
         queue_lifecycle_event(session, "risk", "risk_review.recorded", "allowed")
 
         session.execute(

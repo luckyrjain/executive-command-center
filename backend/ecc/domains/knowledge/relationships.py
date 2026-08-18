@@ -1,19 +1,17 @@
 from datetime import UTC, datetime
-from json import dumps
 from typing import Annotated, Any, Literal
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from sqlalchemy import text
-from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from ecc.auth import AuthContext, AuthDep, CsrfDep
 from ecc.database import get_session
 from ecc.domains.knowledge.timeline import queue_timeline_entry
-from ecc.observability import queue_lifecycle_event, record_audit_outbox_failure
-from ecc.platform import authz
+from ecc.observability import queue_lifecycle_event
+from ecc.platform import audit_outbox, authz
 from ecc.platform.idempotency import load_cached, lock_idempotency, request_hash, store_idempotency
 
 router = APIRouter(prefix="/api/v1/knowledge", tags=["knowledge-relationships"])
@@ -161,13 +159,6 @@ def _fetch_relationship(
     return _project(dict(row))
 
 
-def _request_ids(request: Request) -> tuple[UUID, UUID]:
-    try:
-        return UUID(request.state.request_id), UUID(request.state.correlation_id)
-    except (AttributeError, TypeError, ValueError):
-        return uuid4(), uuid4()
-
-
 def _entity_version(session: Session, auth: AuthContext, entity_id: UUID) -> int | None:
     row = session.execute(
         text(
@@ -210,70 +201,6 @@ def _source_entity_version(session: Session, auth: AuthContext, relationship_id:
         {"workspace_id": auth.workspace_id, "relationship_id": relationship_id},
     ).one()
     return int(row[0])
-
-
-def _write_side_effects(
-    session: Session,
-    auth: AuthContext,
-    request: Request,
-    event_type: str,
-    relationship_id: UUID,
-    source_version: int,
-    now: datetime,
-) -> None:
-    request_id, correlation_id = _request_ids(request)
-    try:
-        session.execute(
-            text(
-                """
-                INSERT INTO audit_events (
-                    id, workspace_id, event_type, aggregate_type, aggregate_id,
-                    aggregate_version, actor_id, request_id, correlation_id,
-                    changed_fields, authorization_result, source, metadata, occurred_at
-                ) VALUES (
-                    :id, :workspace_id, :event_type, 'relationship', :aggregate_id,
-                    :aggregate_version, :actor_id, :request_id, :correlation_id,
-                    ARRAY['*'], 'allowed', 'user', '{}'::jsonb, :occurred_at
-                )
-                """
-            ),
-            {
-                "id": uuid4(),
-                "workspace_id": auth.workspace_id,
-                "event_type": event_type,
-                "aggregate_id": relationship_id,
-                "aggregate_version": source_version,
-                "actor_id": auth.user_id,
-                "request_id": request_id,
-                "correlation_id": correlation_id,
-                "occurred_at": now,
-            },
-        )
-        session.execute(
-            text(
-                """
-                INSERT INTO event_outbox (
-                    event_id, workspace_id, event_type, event_version,
-                    correlation_id, payload, occurred_at, attempt_count
-                ) VALUES (
-                    :event_id, :workspace_id, :event_type, 1,
-                    :correlation_id, CAST(:payload AS jsonb), :occurred_at, 0
-                )
-                """
-            ),
-            {
-                "event_id": uuid4(),
-                "workspace_id": auth.workspace_id,
-                "event_type": f"{event_type}.v1",
-                "correlation_id": correlation_id,
-                "payload": dumps({"relationship_id": str(relationship_id)}),
-                "occurred_at": now,
-            },
-        )
-    except SQLAlchemyError:
-        record_audit_outbox_failure("knowledge_relationships")
-        raise
-    queue_lifecycle_event(session, "relationship", event_type, "allowed")
 
 
 @router.post(
@@ -390,9 +317,20 @@ def create_relationship(
         # resolves `from_entity_name`/`to_entity_name` reads other rows in
         # `pkos_nodes`, which a plain `INSERT ... RETURNING` cannot express.
         response = _fetch_relationship(session, auth, relationship_id)
-        _write_side_effects(
-            session, auth, request, "relationship.created", relationship_id, source_version, now
+        audit_outbox.write_audit_and_outbox(
+            session,
+            auth,
+            request,
+            event_type="relationship.created",
+            aggregate_type="relationship",
+            aggregate_id=relationship_id,
+            aggregate_version=source_version,
+            changed_fields=["*"],
+            payload={"relationship_id": str(relationship_id)},
+            now=now,
+            domain="knowledge_relationships",
         )
+        queue_lifecycle_event(session, "relationship", "relationship.created", "allowed")
         queue_timeline_entry(
             session,
             auth.workspace_id,

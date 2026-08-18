@@ -54,7 +54,7 @@ from uuid import UUID, uuid4
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import text
-from sqlalchemy.exc import IntegrityError, SQLAlchemyError
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from ecc.auth import AuthContext, AuthDep, CsrfDep
@@ -63,11 +63,8 @@ from ecc.database import get_session
 from ecc.domains.ai_runtime.ollama_client import OllamaAdapter
 from ecc.domains.ai_runtime.runtime import execute_run, get_ollama_adapter
 from ecc.domains.calendar.events import get_calendar_event_summary
-from ecc.observability import (
-    queue_lifecycle_event,
-    record_audit_outbox_failure,
-)
-from ecc.platform import authz
+from ecc.observability import queue_lifecycle_event
+from ecc.platform import audit_outbox, authz
 from ecc.platform.idempotency import (
     held_idempotency_lock,
     load_cached,
@@ -448,83 +445,6 @@ def _violated_constraint(exc: IntegrityError) -> str | None:
     """
     diag = getattr(getattr(exc, "orig", None), "diag", None)
     return getattr(diag, "constraint_name", None) if diag is not None else None
-
-
-def _request_ids(request: Request) -> tuple[UUID, UUID]:
-    try:
-        return UUID(request.state.request_id), UUID(request.state.correlation_id)
-    except (AttributeError, TypeError, ValueError):
-        return uuid4(), uuid4()
-
-
-def _write_event(
-    session: Session,
-    auth: AuthContext,
-    request: Request,
-    event_type: str,
-    aggregate_type: str,
-    meeting_id: UUID,
-    aggregate_id: UUID,
-    aggregate_version: int,
-    now: datetime,
-    *,
-    emit_outbox: bool = True,
-) -> None:
-    request_id, correlation_id = _request_ids(request)
-    try:
-        session.execute(
-            text(
-                """
-                INSERT INTO audit_events (
-                    id, workspace_id, event_type, aggregate_type, aggregate_id,
-                    aggregate_version, actor_id, request_id, correlation_id,
-                    changed_fields, authorization_result, source, metadata, occurred_at
-                ) VALUES (
-                    :id, :workspace_id, :event_type, :aggregate_type, :aggregate_id,
-                    :aggregate_version, :actor_id, :request_id, :correlation_id,
-                    ARRAY['*'], 'allowed', 'user', '{}'::jsonb, :occurred_at
-                )
-                """
-            ),
-            {
-                "id": uuid4(),
-                "workspace_id": auth.workspace_id,
-                "event_type": event_type,
-                "aggregate_type": aggregate_type,
-                "aggregate_id": aggregate_id,
-                "aggregate_version": aggregate_version,
-                "actor_id": auth.user_id,
-                "request_id": request_id,
-                "correlation_id": correlation_id,
-                "occurred_at": now,
-            },
-        )
-        if emit_outbox:
-            session.execute(
-                text(
-                    """
-                    INSERT INTO event_outbox (
-                        event_id, workspace_id, event_type, event_version,
-                        correlation_id, payload, occurred_at, attempt_count
-                    ) VALUES (
-                        :event_id, :workspace_id, :event_type_v1, 1,
-                        :correlation_id, CAST(:payload AS jsonb), :occurred_at, 0
-                    )
-                    """
-                ),
-                {
-                    "event_id": uuid4(),
-                    "workspace_id": auth.workspace_id,
-                    "event_type_v1": f"{event_type}.v1",
-                    "correlation_id": correlation_id,
-                    "payload": dumps({"meeting_id": str(meeting_id)}),
-                    "occurred_at": now,
-                },
-            )
-    except SQLAlchemyError:
-        record_audit_outbox_failure("meeting_prep")
-        raise
-    queue_lifecycle_event(session, aggregate_type, event_type, "allowed")
 
 
 # ---------------------------------------------------------------------------
@@ -1236,17 +1156,22 @@ def add_participant(
             raise HTTPException(status_code=409, detail="PARTICIPANT_ALREADY_LINKED") from exc
         # Audit-only, no outbox/catalog event -- a minor sub-action, matching
         # attention_item.dismiss/defer/restore's established precedent.
-        _write_event(
+        audit_outbox.write_audit_and_outbox(
             session,
             auth,
             request,
-            "meeting_participant.linked",
-            "meeting_participant",
-            meeting_id,
-            participant_id,
-            1,
-            now,
+            event_type="meeting_participant.linked",
+            aggregate_type="meeting_participant",
+            aggregate_id=participant_id,
+            aggregate_version=1,
+            changed_fields=["*"],
+            payload={"meeting_id": str(meeting_id)},
+            now=now,
+            domain="meeting_prep",
             emit_outbox=False,
+        )
+        queue_lifecycle_event(
+            session, "meeting_participant", "meeting_participant.linked", "allowed"
         )
 
         response = ParticipantResponse(
@@ -1371,17 +1296,20 @@ def create_prep(
                 raise
             raise HTTPException(status_code=409, detail="MEETING_PACK_EXISTS") from exc
         response = _pack_row_to_response(dict(row), snapshot)
-        _write_event(
+        audit_outbox.write_audit_and_outbox(
             session,
             auth,
             request,
-            "meeting_pack.generated",
-            "meeting_pack",
-            meeting_id,
-            pack_id,
-            1,
-            now,
+            event_type="meeting_pack.generated",
+            aggregate_type="meeting_pack",
+            aggregate_id=pack_id,
+            aggregate_version=1,
+            changed_fields=["*"],
+            payload={"meeting_id": str(meeting_id)},
+            now=now,
+            domain="meeting_prep",
         )
+        queue_lifecycle_event(session, "meeting_pack", "meeting_pack.generated", "allowed")
         store_idempotency(
             session,
             auth,
@@ -1600,17 +1528,20 @@ def refresh_prep(
             .one()
         )
         response = _pack_row_to_response(dict(row), snapshot)
-        _write_event(
+        audit_outbox.write_audit_and_outbox(
             session,
             auth,
             request,
-            "meeting_pack.refreshed",
-            "meeting_pack",
-            meeting_id,
-            new_pack_id,
-            1,
-            now,
+            event_type="meeting_pack.refreshed",
+            aggregate_type="meeting_pack",
+            aggregate_id=new_pack_id,
+            aggregate_version=1,
+            changed_fields=["*"],
+            payload={"meeting_id": str(meeting_id)},
+            now=now,
+            domain="meeting_prep",
         )
+        queue_lifecycle_event(session, "meeting_pack", "meeting_pack.refreshed", "allowed")
         store_idempotency(
             session,
             auth,

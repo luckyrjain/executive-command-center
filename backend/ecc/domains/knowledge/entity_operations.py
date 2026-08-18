@@ -6,7 +6,6 @@ from uuid import UUID, uuid4
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import text
-from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from ecc.auth import AuthContext, AuthDep, CsrfDep
@@ -14,8 +13,8 @@ from ecc.database import get_session
 from ecc.domains.knowledge.embeddings import queue_embedding
 from ecc.domains.knowledge.retrieval import queue_retrieval_document
 from ecc.domains.knowledge.timeline import queue_timeline_entry
-from ecc.observability import queue_lifecycle_event, record_audit_outbox_failure
-from ecc.platform import authz
+from ecc.observability import queue_lifecycle_event
+from ecc.platform import audit_outbox, authz
 from ecc.platform.idempotency import load_cached, lock_idempotency, request_hash, store_idempotency
 
 router = APIRouter(prefix="/api/v1/knowledge", tags=["knowledge-entity-operations"])
@@ -93,13 +92,6 @@ def _project(row: dict[str, Any]) -> EntityOperationResponse:
     )
 
 
-def _request_ids(request: Request) -> tuple[UUID, UUID]:
-    try:
-        return UUID(request.state.request_id), UUID(request.state.correlation_id)
-    except (AttributeError, TypeError, ValueError):
-        return uuid4(), uuid4()
-
-
 def _lock_entity(session: Session, auth: AuthContext, entity_id: UUID) -> dict[str, Any] | None:
     row = (
         session.execute(
@@ -153,68 +145,6 @@ def _refresh_projections(
             session, auth.workspace_id, entity_id, kind, canonical_name, summary, version, now
         )
         queue_embedding(session, auth.workspace_id, entity_id, now)
-
-
-def _write_side_effects(
-    session: Session,
-    auth: AuthContext,
-    request: Request,
-    event_type: str,
-    operation_id: UUID,
-    now: datetime,
-) -> None:
-    request_id, correlation_id = _request_ids(request)
-    try:
-        session.execute(
-            text(
-                """
-                INSERT INTO audit_events (
-                    id, workspace_id, event_type, aggregate_type, aggregate_id,
-                    aggregate_version, actor_id, request_id, correlation_id,
-                    changed_fields, authorization_result, source, metadata, occurred_at
-                ) VALUES (
-                    :id, :workspace_id, :event_type, 'entity_operation', :aggregate_id,
-                    1, :actor_id, :request_id, :correlation_id,
-                    ARRAY['status'], 'allowed', 'user', '{}'::jsonb, :occurred_at
-                )
-                """
-            ),
-            {
-                "id": uuid4(),
-                "workspace_id": auth.workspace_id,
-                "event_type": event_type,
-                "aggregate_id": operation_id,
-                "actor_id": auth.user_id,
-                "request_id": request_id,
-                "correlation_id": correlation_id,
-                "occurred_at": now,
-            },
-        )
-        session.execute(
-            text(
-                """
-                INSERT INTO event_outbox (
-                    event_id, workspace_id, event_type, event_version,
-                    correlation_id, payload, occurred_at, attempt_count
-                ) VALUES (
-                    :event_id, :workspace_id, :event_type, 1,
-                    :correlation_id, CAST(:payload AS jsonb), :occurred_at, 0
-                )
-                """
-            ),
-            {
-                "event_id": uuid4(),
-                "workspace_id": auth.workspace_id,
-                "event_type": f"{event_type}.v1",
-                "correlation_id": correlation_id,
-                "payload": dumps({"operation_id": str(operation_id)}),
-                "occurred_at": now,
-            },
-        )
-    except SQLAlchemyError:
-        record_audit_outbox_failure("knowledge_entity_operations")
-        raise
-    queue_lifecycle_event(session, "entity_operation", event_type, "allowed")
 
 
 def _rehome_aliases(
@@ -510,7 +440,20 @@ def merge_entities(
             .one()
         )
         response = _project(dict(row))
-        _write_side_effects(session, auth, request, "entity_operation.merged", operation_id, now)
+        audit_outbox.write_audit_and_outbox(
+            session,
+            auth,
+            request,
+            event_type="entity_operation.merged",
+            aggregate_type="entity_operation",
+            aggregate_id=operation_id,
+            aggregate_version=1,
+            changed_fields=["status"],
+            payload={"operation_id": str(operation_id)},
+            now=now,
+            domain="knowledge_entity_operations",
+        )
+        queue_lifecycle_event(session, "entity_operation", "entity_operation.merged", "allowed")
         queue_timeline_entry(
             session,
             auth.workspace_id,
@@ -548,12 +491,13 @@ def _has_post_merge_dependent_activity(
     now-separate identities it actually describes. Claims and entity
     mutations recorded against the target both write audit_events with
     aggregate_type='knowledge_entity' and aggregate_id=target_id (see
-    claims.py/entities_mutations.py's _write_side_effects), so any such
-    row occurring after the merge is exactly that signal.
+    claims.py/entities_mutations.py's calls into audit_outbox.write_audit_
+    and_outbox), so any such row occurring after the merge is exactly that
+    signal.
 
     Relationships are the identical ambiguity but need a second query:
-    relationships.py's _write_side_effects writes aggregate_type='relationship'
-    with aggregate_id=<the relationship's own id>, not the entity's id, so a
+    relationships.py writes aggregate_type='relationship' with
+    aggregate_id=<the relationship's own id>, not the entity's id, so a
     relationship created against the target after the merge is invisible to
     the query above -- it has to join back through pkos_edges to find which
     entity a given relationship event actually touched."""
@@ -884,7 +828,20 @@ def reverse_operation(
             .one()
         )
         response = _project(dict(row))
-        _write_side_effects(session, auth, request, "entity_operation.reversed", reverse_id, now)
+        audit_outbox.write_audit_and_outbox(
+            session,
+            auth,
+            request,
+            event_type="entity_operation.reversed",
+            aggregate_type="entity_operation",
+            aggregate_id=reverse_id,
+            aggregate_version=1,
+            changed_fields=["status"],
+            payload={"operation_id": str(reverse_id)},
+            now=now,
+            domain="knowledge_entity_operations",
+        )
+        queue_lifecycle_event(session, "entity_operation", "entity_operation.reversed", "allowed")
         queue_timeline_entry(
             session,
             auth.workspace_id,
@@ -1161,7 +1118,20 @@ def split_operation(
             .one()
         )
         response = _project(dict(row))
-        _write_side_effects(session, auth, request, "entity_operation.split", split_id, now)
+        audit_outbox.write_audit_and_outbox(
+            session,
+            auth,
+            request,
+            event_type="entity_operation.split",
+            aggregate_type="entity_operation",
+            aggregate_id=split_id,
+            aggregate_version=1,
+            changed_fields=["status"],
+            payload={"operation_id": str(split_id)},
+            now=now,
+            domain="knowledge_entity_operations",
+        )
+        queue_lifecycle_event(session, "entity_operation", "entity_operation.split", "allowed")
         queue_timeline_entry(
             session,
             auth.workspace_id,

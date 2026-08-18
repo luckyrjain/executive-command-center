@@ -1,5 +1,4 @@
 from datetime import UTC, date, datetime, time, timedelta
-from json import dumps
 from typing import Annotated, Any, Literal
 from uuid import UUID, uuid4
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -7,16 +6,12 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from sqlalchemy import text
-from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from ecc.auth import AuthContext, AuthDep, CsrfDep
 from ecc.database import get_session
-from ecc.observability import (
-    queue_lifecycle_event,
-    record_audit_outbox_failure,
-)
-from ecc.platform import authz, cursor_pagination
+from ecc.observability import queue_lifecycle_event
+from ecc.platform import audit_outbox, authz, cursor_pagination
 from ecc.platform.idempotency import load_cached, lock_idempotency, request_hash, store_idempotency
 
 router = APIRouter(prefix="/api/v1/calendar/events", tags=["calendar-events"])
@@ -125,79 +120,6 @@ def _validate_timezone(value: str) -> None:
         ZoneInfo(value)
     except ZoneInfoNotFoundError as exc:
         raise ValueError("timezone must be a valid IANA timezone") from exc
-
-
-def _request_ids(request: Request) -> tuple[UUID, UUID]:
-    try:
-        return UUID(request.state.request_id), UUID(request.state.correlation_id)
-    except (AttributeError, TypeError, ValueError):
-        return uuid4(), uuid4()
-
-
-def _write_audit_and_outbox(
-    session: Session,
-    auth: AuthContext,
-    request: Request,
-    event_type: str,
-    event_id: UUID,
-    version: int,
-    changed_fields: list[str],
-    now: datetime,
-) -> None:
-    request_id, correlation_id = _request_ids(request)
-    try:
-        session.execute(
-            text(
-                """
-                INSERT INTO audit_events (
-                    id, workspace_id, event_type, aggregate_type, aggregate_id,
-                    aggregate_version, actor_id, request_id, correlation_id,
-                    changed_fields, authorization_result, source, metadata, occurred_at
-                ) VALUES (
-                    :id, :workspace_id, :event_type, 'calendar_event', :aggregate_id,
-                    :aggregate_version, :actor_id, :request_id, :correlation_id,
-                    :changed_fields, 'allowed', 'user', '{}'::jsonb, :occurred_at
-                )
-                """
-            ),
-            {
-                "id": uuid4(),
-                "workspace_id": auth.workspace_id,
-                "event_type": event_type,
-                "aggregate_id": event_id,
-                "aggregate_version": version,
-                "actor_id": auth.user_id,
-                "request_id": request_id,
-                "correlation_id": correlation_id,
-                "changed_fields": changed_fields,
-                "occurred_at": now,
-            },
-        )
-        session.execute(
-            text(
-                """
-                INSERT INTO event_outbox (
-                    event_id, workspace_id, event_type, event_version,
-                    correlation_id, payload, occurred_at, attempt_count
-                ) VALUES (
-                    :event_id, :workspace_id, :event_type, 1,
-                    :correlation_id, CAST(:payload AS jsonb), :occurred_at, 0
-                )
-                """
-            ),
-            {
-                "event_id": uuid4(),
-                "workspace_id": auth.workspace_id,
-                "event_type": f"{event_type}.v1",
-                "correlation_id": correlation_id,
-                "payload": dumps({"calendar_event_id": str(event_id), "version": version}),
-                "occurred_at": now,
-            },
-        )
-    except SQLAlchemyError:
-        record_audit_outbox_failure("calendar_events")
-        raise
-    queue_lifecycle_event(session, "calendar_event", event_type, "allowed")
 
 
 def _get_row(
@@ -340,9 +262,20 @@ def create_calendar_event(
             .one()
         )
         response = CalendarEventResponse.model_validate(row)
-        _write_audit_and_outbox(
-            session, auth, request, "calendar_event.created", event_id, 1, ["*"], now
+        audit_outbox.write_audit_and_outbox(
+            session,
+            auth,
+            request,
+            event_type="calendar_event.created",
+            aggregate_type="calendar_event",
+            aggregate_id=event_id,
+            aggregate_version=1,
+            changed_fields=["*"],
+            payload={"calendar_event_id": str(event_id), "version": 1},
+            now=now,
+            domain="calendar_events",
         )
+        queue_lifecycle_event(session, "calendar_event", "calendar_event.created", "allowed")
         store_idempotency(
             session,
             auth,
@@ -525,16 +458,20 @@ def update_calendar_event(
             .one()
         )
         response = CalendarEventResponse.model_validate(row)
-        _write_audit_and_outbox(
+        audit_outbox.write_audit_and_outbox(
             session,
             auth,
             request,
-            "calendar_event.updated",
-            event_id,
-            response.version,
-            sorted(fields),
-            now,
+            event_type="calendar_event.updated",
+            aggregate_type="calendar_event",
+            aggregate_id=event_id,
+            aggregate_version=response.version,
+            changed_fields=sorted(fields),
+            payload={"calendar_event_id": str(event_id), "version": response.version},
+            now=now,
+            domain="calendar_events",
         )
+        queue_lifecycle_event(session, "calendar_event", "calendar_event.updated", "allowed")
         store_idempotency(
             session, auth, idempotency_key, req_hash, response.model_dump(mode="json"), now
         )
@@ -616,16 +553,20 @@ def _lifecycle(
         )
         response = CalendarEventResponse.model_validate(row)
         event_type = "calendar_event.archived" if action == "archive" else "calendar_event.restored"
-        _write_audit_and_outbox(
+        audit_outbox.write_audit_and_outbox(
             session,
             auth,
             request,
-            event_type,
-            event_id,
-            response.version,
-            ["archived_at", "pre_archive_status"],
-            now,
+            event_type=event_type,
+            aggregate_type="calendar_event",
+            aggregate_id=event_id,
+            aggregate_version=response.version,
+            changed_fields=["archived_at", "pre_archive_status"],
+            payload={"calendar_event_id": str(event_id), "version": response.version},
+            now=now,
+            domain="calendar_events",
         )
+        queue_lifecycle_event(session, "calendar_event", event_type, "allowed")
         store_idempotency(
             session, auth, idempotency_key, req_hash, response.model_dump(mode="json"), now
         )

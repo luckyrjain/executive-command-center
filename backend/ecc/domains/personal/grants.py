@@ -30,15 +30,11 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from ecc.auth import AuthContext, AuthDep, CsrfDep
+from ecc.observability import queue_lifecycle_event
+from ecc.platform import audit_outbox
 from ecc.platform.idempotency import load_cached, lock_idempotency, request_hash, store_idempotency
 
-from .domains import (
-    DomainKey,
-    IdempotencyHeader,
-    SessionDep,
-    require_enabled_domain,
-    write_side_effects,
-)
+from .domains import DomainKey, IdempotencyHeader, SessionDep, require_enabled_domain
 
 router = APIRouter(prefix="/api/v1/personal", tags=["personal"])
 
@@ -172,16 +168,21 @@ def create_grant_endpoint(
         row = _get_grant_row(session, auth, grant_id)
         assert row is not None
         response = GrantResponse(**row)
-        write_side_effects(
+        audit_outbox.write_audit_and_outbox(
             session,
             auth,
             request,
-            domain="cross_domain_grant",
             event_type="cross_domain_grant.created",
             aggregate_type="cross_domain_grant",
             aggregate_id=grant_id,
-            version=1,
+            aggregate_version=1,
+            changed_fields=["*"],
+            payload={"aggregate_id": str(grant_id), "version": 1},
             now=now,
+            domain="cross_domain_grant",
+        )
+        queue_lifecycle_event(
+            session, "cross_domain_grant", "cross_domain_grant.created", "allowed"
         )
         store_idempotency(
             session,
@@ -228,16 +229,21 @@ def revoke_grant_endpoint(
         row = _get_grant_row(session, auth, grant_id)
         assert row is not None
         response = GrantResponse(**row)
-        write_side_effects(
+        audit_outbox.write_audit_and_outbox(
             session,
             auth,
             request,
-            domain="cross_domain_grant",
             event_type="cross_domain_grant.revoked",
             aggregate_type="cross_domain_grant",
             aggregate_id=grant_id,
-            version=1,
+            aggregate_version=1,
+            changed_fields=["*"],
+            payload={"aggregate_id": str(grant_id), "version": 1},
             now=now,
+            domain="cross_domain_grant",
+        )
+        queue_lifecycle_event(
+            session, "cross_domain_grant", "cross_domain_grant.revoked", "allowed"
         )
         store_idempotency(
             session, auth, idempotency_key, req_hash, response.model_dump(mode="json"), now

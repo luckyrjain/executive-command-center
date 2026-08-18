@@ -8,16 +8,15 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from sqlalchemy import text
-from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from ecc.auth import AuthContext, AuthDep, CsrfDep
 from ecc.database import get_session
 from ecc.observability import (
     queue_lifecycle_event,
-    record_audit_outbox_failure,
     record_idempotency_conflict,
 )
+from ecc.platform import audit_outbox
 
 router = APIRouter(prefix="/api/v1/planning", tags=["planning"])
 SessionDep = Annotated[Session, Depends(get_session)]
@@ -74,13 +73,6 @@ class CapacityProfilePut(BaseModel):
 def _request_hash(payload: BaseModel, action: str) -> str:
     material = {"action": action, "payload": payload.model_dump(mode="json")}
     return sha256(dumps(material, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
-
-
-def _request_ids(request: Request) -> tuple[UUID, UUID]:
-    try:
-        return UUID(request.state.request_id), UUID(request.state.correlation_id)
-    except (AttributeError, TypeError, ValueError):
-        return uuid4(), uuid4()
 
 
 def _lock_idempotency(session: Session, auth: AuthContext, key: str) -> None:
@@ -153,76 +145,6 @@ def _store_idempotency(
             "expires_at": now + timedelta(days=365),
         },
     )
-
-
-def _write_side_effects(
-    session: Session,
-    auth: AuthContext,
-    request: Request,
-    event_type: str,
-    version: int,
-    now: datetime,
-) -> None:
-    """Audit + outbox for a capacity profile write, matching every other
-    mutating endpoint in this domain (e.g. waiting.py's
-    ``_write_side_effects``). Capacity profiles have no single-row id of
-    their own -- they are one versioned unit per (workspace_id, user_id),
-    so ``auth.user_id`` is the aggregate id, the same key the profile is
-    already fetched by in ``_current_profile``.
-    """
-    request_id, correlation_id = _request_ids(request)
-    try:
-        session.execute(
-            text(
-                """
-                INSERT INTO audit_events (
-                    id, workspace_id, event_type, aggregate_type, aggregate_id,
-                    aggregate_version, actor_id, request_id, correlation_id,
-                    changed_fields, authorization_result, source, metadata, occurred_at
-                ) VALUES (
-                    :id, :workspace_id, :event_type, 'capacity_profile', :aggregate_id,
-                    :aggregate_version, :actor_id, :request_id, :correlation_id,
-                    ARRAY['*'], 'allowed', 'user', '{}'::jsonb, :occurred_at
-                )
-                """
-            ),
-            {
-                "id": uuid4(),
-                "workspace_id": auth.workspace_id,
-                "event_type": event_type,
-                "aggregate_id": auth.user_id,
-                "aggregate_version": version,
-                "actor_id": auth.user_id,
-                "request_id": request_id,
-                "correlation_id": correlation_id,
-                "occurred_at": now,
-            },
-        )
-        session.execute(
-            text(
-                """
-                INSERT INTO event_outbox (
-                    event_id, workspace_id, event_type, event_version,
-                    correlation_id, payload, occurred_at, attempt_count
-                ) VALUES (
-                    :event_id, :workspace_id, :event_type_v1, 1,
-                    :correlation_id, CAST(:payload AS jsonb), :occurred_at, 0
-                )
-                """
-            ),
-            {
-                "event_id": uuid4(),
-                "workspace_id": auth.workspace_id,
-                "event_type_v1": f"{event_type}.v1",
-                "correlation_id": correlation_id,
-                "payload": dumps({"user_id": str(auth.user_id), "version": version}),
-                "occurred_at": now,
-            },
-        )
-    except SQLAlchemyError:
-        record_audit_outbox_failure("capacity")
-        raise
-    queue_lifecycle_event(session, "capacity_profile", event_type, "allowed")
 
 
 def _current_profile(
@@ -366,6 +288,19 @@ def put_capacity_profile(
             version=new_version,
             days=sorted(payload.days, key=lambda day: day.weekday),
         )
-        _write_side_effects(session, auth, request, "capacity_profile.updated", new_version, now)
+        audit_outbox.write_audit_and_outbox(
+            session,
+            auth,
+            request,
+            event_type="capacity_profile.updated",
+            aggregate_type="capacity_profile",
+            aggregate_id=auth.user_id,
+            aggregate_version=new_version,
+            changed_fields=["*"],
+            payload={"user_id": str(auth.user_id), "version": new_version},
+            now=now,
+            domain="capacity",
+        )
+        queue_lifecycle_event(session, "capacity_profile", "capacity_profile.updated", "allowed")
         _store_idempotency(session, auth, idempotency_key, request_hash, response, now)
         return response

@@ -1,21 +1,16 @@
 from datetime import UTC, datetime, timedelta
-from json import dumps
 from typing import Annotated, Any, Literal
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy import text
-from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from ecc.auth import AuthContext, AuthDep, CsrfDep
 from ecc.database import get_session
-from ecc.observability import (
-    queue_lifecycle_event,
-    record_audit_outbox_failure,
-)
-from ecc.platform import authz, cursor_pagination
+from ecc.observability import queue_lifecycle_event
+from ecc.platform import audit_outbox, authz, cursor_pagination
 from ecc.platform.idempotency import load_cached, lock_idempotency, request_hash, store_idempotency
 
 router = APIRouter(prefix="/api/v1/risks", tags=["risks"])
@@ -88,13 +83,6 @@ class RiskResponse(BaseModel):
 class RiskListResponse(BaseModel):
     items: list[RiskResponse]
     next_cursor: str | None = None
-
-
-def _request_ids(request: Request) -> tuple[UUID, UUID]:
-    try:
-        return UUID(request.state.request_id), UUID(request.state.correlation_id)
-    except (AttributeError, TypeError, ValueError):
-        return uuid4(), uuid4()
 
 
 def _risk_factors(row: dict[str, Any], now: datetime) -> tuple[int, list[dict[str, Any]], str]:
@@ -218,67 +206,6 @@ def _get_row(session: Session, auth: AuthContext, risk_id: UUID) -> dict[str, An
     return dict(row) if row is not None else None
 
 
-def _write_side_effects(
-    session: Session,
-    auth: AuthContext,
-    request: Request,
-    risk_id: UUID,
-    version: int,
-    now: datetime,
-) -> None:
-    request_id, correlation_id = _request_ids(request)
-    try:
-        session.execute(
-            text(
-                """
-                INSERT INTO audit_events (
-                    id, workspace_id, event_type, aggregate_type, aggregate_id,
-                    aggregate_version, actor_id, request_id, correlation_id,
-                    changed_fields, authorization_result, source, metadata, occurred_at
-                ) VALUES (
-                    :id, :workspace_id, 'risk.created', 'risk', :aggregate_id,
-                    :aggregate_version, :actor_id, :request_id, :correlation_id,
-                    ARRAY['*'], 'allowed', 'user', '{}'::jsonb, :occurred_at
-                )
-                """
-            ),
-            {
-                "id": uuid4(),
-                "workspace_id": auth.workspace_id,
-                "aggregate_id": risk_id,
-                "aggregate_version": version,
-                "actor_id": auth.user_id,
-                "request_id": request_id,
-                "correlation_id": correlation_id,
-                "occurred_at": now,
-            },
-        )
-        session.execute(
-            text(
-                """
-                INSERT INTO event_outbox (
-                    event_id, workspace_id, event_type, event_version,
-                    correlation_id, payload, occurred_at, attempt_count
-                ) VALUES (
-                    :event_id, :workspace_id, 'risk.created.v1', 1,
-                    :correlation_id, CAST(:payload AS jsonb), :occurred_at, 0
-                )
-                """
-            ),
-            {
-                "event_id": uuid4(),
-                "workspace_id": auth.workspace_id,
-                "correlation_id": correlation_id,
-                "payload": dumps({"risk_id": str(risk_id), "version": version}),
-                "occurred_at": now,
-            },
-        )
-    except SQLAlchemyError:
-        record_audit_outbox_failure("risks")
-        raise
-    queue_lifecycle_event(session, "risk", "risk.created", "allowed")
-
-
 def insert_risk(
     session: Session,
     auth: AuthContext,
@@ -332,7 +259,20 @@ def insert_risk(
         .one()
     )
     response = project_risk(dict(row), now)
-    _write_side_effects(session, auth, request, risk_id, 1, now)
+    audit_outbox.write_audit_and_outbox(
+        session,
+        auth,
+        request,
+        event_type="risk.created",
+        aggregate_type="risk",
+        aggregate_id=risk_id,
+        aggregate_version=1,
+        changed_fields=["*"],
+        payload={"risk_id": str(risk_id), "version": 1},
+        now=now,
+        domain="risks",
+    )
+    queue_lifecycle_event(session, "risk", "risk.created", "allowed")
     return response
 
 

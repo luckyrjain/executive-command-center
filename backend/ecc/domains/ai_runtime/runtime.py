@@ -53,10 +53,9 @@ from ecc.auth import AuthContext, AuthDep, CsrfDep
 from ecc.database import get_session
 from ecc.observability import (
     queue_lifecycle_event,
-    record_audit_outbox_failure,
     record_database_failure,
 )
-from ecc.platform import authz
+from ecc.platform import audit_outbox, authz
 from ecc.platform.authz import WORKSPACE_ORIGINAL_OWNER_SQL
 from ecc.platform.idempotency import (
     held_idempotency_lock,
@@ -818,91 +817,6 @@ def _model_step(
     }
 
 
-def _write_run_event(
-    session: Session,
-    auth: AuthContext,
-    *,
-    run_id: UUID,
-    status: RunStatus,
-    task_type: str,
-    model_id: str | None,
-    prompt_version: int | None,
-    error_code: str | None,
-    now: datetime,
-) -> None:
-    """Audit + outbox for a completed run, matching `prompts.py:_write_
-    activation_audit`'s established pattern exactly. Emits `ai_run.
-    completed.v1`/`ai_run.failed.v1`/`ai_run.cancelled.v1`
-    (`docs/domain/EVENT-CATALOG.md`'s Phase 4 catalog) -- `degraded` is
-    reported under the `ai_run.failed.v1` event type with `status` in its
-    payload distinguishing the two, since `DATA-MODEL.md` names exactly
-    three run-outcome events, not four.
-    """
-    event_suffix = {"completed": "completed", "cancelled": "cancelled"}.get(status, "failed")
-    event_type = f"ai_run.{event_suffix}"
-    request_id, correlation_id = uuid4(), uuid4()
-    try:
-        session.execute(
-            text(
-                """
-                INSERT INTO audit_events (
-                    id, workspace_id, event_type, aggregate_type, aggregate_id,
-                    aggregate_version, actor_id, request_id, correlation_id,
-                    changed_fields, authorization_result, source, metadata, occurred_at
-                ) VALUES (
-                    :id, :workspace_id, :event_type, 'ai_run', :aggregate_id,
-                    1, :actor_id, :request_id, :correlation_id,
-                    ARRAY['status'], 'allowed', 'system', :metadata, :occurred_at
-                )
-                """
-            ),
-            {
-                "id": uuid4(),
-                "workspace_id": auth.workspace_id,
-                "event_type": event_type,
-                "aggregate_id": run_id,
-                "actor_id": auth.user_id,
-                "request_id": request_id,
-                "correlation_id": correlation_id,
-                "metadata": dumps({"task_type": task_type, "status": status}),
-                "occurred_at": now,
-            },
-        )
-        session.execute(
-            text(
-                """
-                INSERT INTO event_outbox (
-                    event_id, workspace_id, event_type, event_version,
-                    correlation_id, payload, occurred_at, attempt_count
-                ) VALUES (
-                    :event_id, :workspace_id, :event_type_v1, 1,
-                    :correlation_id, CAST(:payload AS jsonb), :occurred_at, 0
-                )
-                """
-            ),
-            {
-                "event_id": uuid4(),
-                "workspace_id": auth.workspace_id,
-                "event_type_v1": f"{event_type}.v1",
-                "correlation_id": correlation_id,
-                "payload": dumps(
-                    {
-                        "run_id": str(run_id),
-                        "task_type": task_type,
-                        "model_id": model_id,
-                        "prompt_version": prompt_version,
-                        "error_code": error_code,
-                    }
-                ),
-                "occurred_at": now,
-            },
-        )
-    except SQLAlchemyError:
-        record_audit_outbox_failure("ai_runtime")
-        raise
-    queue_lifecycle_event(session, "ai_runtime", event_type, "allowed")
-
-
 def _persist_terminal(
     session: Session,
     auth: AuthContext,
@@ -1002,17 +916,41 @@ def _persist_terminal(
                 "created_at": completed_at,
             },
         )
-    _write_run_event(
+    # Emits `ai_run.completed.v1`/`ai_run.failed.v1`/`ai_run.cancelled.v1`
+    # (`docs/domain/EVENT-CATALOG.md`'s Phase 4 catalog) -- `degraded` is
+    # reported under the `ai_run.failed.v1` event type with `status` in its
+    # payload distinguishing the two, since `DATA-MODEL.md` names exactly
+    # three run-outcome events, not four.
+    event_suffix = {"completed": "completed", "cancelled": "cancelled"}.get(status, "failed")
+    event_type = f"ai_run.{event_suffix}"
+    # No `Request` exists anywhere in `execute_run`'s call chain (this is a
+    # background/offline run-execution path, not an HTTP request handler) --
+    # `request=None` lets `write_audit_and_outbox` mint a fresh `uuid4()`
+    # pair for `request_id`/`correlation_id`, matching this call site's own
+    # prior behavior exactly (see `ecc/platform/audit_outbox.py`'s own
+    # docstring, which names this exact call site as a non-HTTP case).
+    audit_outbox.write_audit_and_outbox(
         session,
         auth,
-        run_id=run_id,
-        status=status,
-        task_type=task_type,
-        model_id=model_id,
-        prompt_version=prompt_version,
-        error_code=error_code,
+        None,
+        event_type=event_type,
+        aggregate_type="ai_run",
+        aggregate_id=run_id,
+        aggregate_version=1,
+        changed_fields=["status"],
+        payload={
+            "run_id": str(run_id),
+            "task_type": task_type,
+            "model_id": model_id,
+            "prompt_version": prompt_version,
+            "error_code": error_code,
+        },
         now=completed_at,
+        domain="ai_runtime",
+        metadata={"task_type": task_type, "status": status},
+        source="system",
     )
+    queue_lifecycle_event(session, "ai_runtime", event_type, "allowed")
     session.commit()
 
     return AiRun(
