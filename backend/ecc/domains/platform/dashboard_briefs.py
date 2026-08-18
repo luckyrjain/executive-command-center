@@ -21,7 +21,7 @@ from ecc.observability import (
     record_brief_stale,
     record_idempotency_conflict,
 )
-from ecc.platform import authz
+from ecc.platform import audit_outbox, authz
 
 router = APIRouter(prefix="/api/v1", tags=["dashboard", "briefs"])
 SessionDep = Annotated[Session, Depends(get_session)]
@@ -600,44 +600,36 @@ def _generate(
         .mappings()
         .one()
     )
+    # Extracted (no fallback), matching this function's prior behavior --
+    # event_outbox.event_type is written as the bare 'morning_brief.
+    # generated' literal (no '.v1' suffix, unlike every other migrated
+    # call site) so it's inserted manually below rather than through
+    # write_audit_and_outbox's own event_outbox insert, which always
+    # appends '.v1'. request_id/correlation_id are reused for both the
+    # audit_events row (via write_audit_and_outbox, emit_outbox=False)
+    # and the manual event_outbox row below, so they stay correlated.
     request_id = UUID(request.state.request_id)
     correlation_id = UUID(request.state.correlation_id)
+    audit_outbox.write_audit_and_outbox(
+        session,
+        AuthContext(workspace_id=workspace_id, user_id=user_id, timezone=timezone),
+        request,
+        event_type="morning_brief.generated",
+        aggregate_type="morning_brief",
+        aggregate_id=brief_id,
+        aggregate_version=version,
+        changed_fields=["sections", "source_versions", "generated_at"],
+        payload={
+            "brief_id": str(brief_id),
+            "briefing_date": day.isoformat(),
+            "version": version,
+        },
+        now=now,
+        domain="briefs",
+        after={"briefing_date": day.isoformat(), "generation_version": version},
+        emit_outbox=False,
+    )
     try:
-        session.execute(
-            text(
-                """
-                INSERT INTO audit_events (
-                    id, workspace_id, event_type, aggregate_type,
-                    aggregate_id, aggregate_version, actor_id,
-                    request_id, correlation_id, before, after,
-                    changed_fields, authorization_result, source,
-                    metadata, occurred_at
-                ) VALUES (
-                    :id, :w, 'morning_brief.generated', 'morning_brief',
-                    :aggregate_id, :version, :actor, :request_id,
-                    :correlation_id, NULL, CAST(:after AS jsonb),
-                    :fields, 'allowed', 'user', '{}'::jsonb, :now
-                )
-                """
-            ),
-            {
-                "id": uuid4(),
-                "w": workspace_id,
-                "aggregate_id": brief_id,
-                "version": version,
-                "actor": user_id,
-                "request_id": request_id,
-                "correlation_id": correlation_id,
-                "after": dumps(
-                    {
-                        "briefing_date": day.isoformat(),
-                        "generation_version": version,
-                    }
-                ),
-                "fields": ["sections", "source_versions", "generated_at"],
-                "now": now,
-            },
-        )
         session.execute(
             text(
                 """
