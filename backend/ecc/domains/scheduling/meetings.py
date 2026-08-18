@@ -1,7 +1,5 @@
-from base64 import urlsafe_b64decode, urlsafe_b64encode
 from datetime import UTC, datetime
-from hmac import compare_digest, new
-from json import dumps, loads
+from json import dumps
 from typing import Annotated, Any, Literal
 from uuid import UUID, uuid4
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -14,13 +12,13 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from ecc.auth import AuthContext, AuthDep, CsrfDep
-from ecc.config import get_settings
 from ecc.database import get_session
+from ecc.domains.calendar.events import get_calendar_event_summary
 from ecc.observability import (
     queue_lifecycle_event,
     record_audit_outbox_failure,
 )
-from ecc.platform import authz
+from ecc.platform import authz, cursor_pagination
 from ecc.platform.idempotency import load_cached, lock_idempotency, request_hash, store_idempotency
 
 router = APIRouter(prefix="/api/v1/meetings", tags=["meetings"])
@@ -145,21 +143,16 @@ class MeetingListResponse(BaseModel):
 
 
 def _encode_cursor(updated_at: datetime, meeting_id: UUID) -> str:
-    payload = dumps({"updated_at": updated_at.isoformat(), "id": str(meeting_id)}).encode()
-    signature = new(get_settings().session_secret.encode(), payload, "sha256").hexdigest().encode()
-    return urlsafe_b64encode(payload + b"." + signature).decode().rstrip("=")
+    return cursor_pagination.encode_cursor(
+        {"updated_at": updated_at.isoformat(), "id": str(meeting_id)}
+    )
 
 
 def _decode_cursor(cursor: str) -> tuple[datetime, UUID]:
+    decoded = cursor_pagination.decode_cursor(cursor)
     try:
-        raw = urlsafe_b64decode((cursor + "=" * (-len(cursor) % 4)).encode())
-        payload, signature = raw.rsplit(b".", 1)
-        expected = new(get_settings().session_secret.encode(), payload, "sha256").hexdigest()
-        if not compare_digest(signature.decode(), expected):
-            raise ValueError
-        decoded = loads(payload)
         return datetime.fromisoformat(decoded["updated_at"]), UUID(decoded["id"])
-    except (ValueError, KeyError, TypeError, UnicodeDecodeError) as exc:
+    except (ValueError, KeyError, TypeError) as exc:
         raise HTTPException(status_code=400, detail="MALFORMED_CURSOR") from exc
 
 
@@ -274,35 +267,13 @@ def _get_row(
     return dict(row) if row is not None else None
 
 
-def _calendar_event(
-    session: Session,
-    auth: AuthContext,
-    event_id: UUID,
-) -> dict[str, Any] | None:
-    row = (
-        session.execute(
-            text(
-                """
-                SELECT id, starts_at, ends_at, timezone, archived_at
-                FROM calendar_events
-                WHERE workspace_id = :workspace_id AND id = :event_id
-                """
-            ),
-            {"workspace_id": auth.workspace_id, "event_id": event_id},
-        )
-        .mappings()
-        .one_or_none()
-    )
-    return dict(row) if row is not None else None
-
-
 def _project(session: Session, auth: AuthContext, row: dict[str, Any]) -> MeetingResponse:
     if row["calendar_event_id"] is None:
         starts_at = row["standalone_starts_at"]
         ends_at = row["standalone_ends_at"]
         timezone = row["standalone_timezone"]
     else:
-        event = _calendar_event(session, auth, row["calendar_event_id"])
+        event = get_calendar_event_summary(session, auth, row["calendar_event_id"])
         if event is None:
             raise HTTPException(status_code=409, detail="LINKED_CALENDAR_EVENT_MISSING")
         starts_at = event["starts_at"]
@@ -358,7 +329,7 @@ def create_meeting(
                 text("SELECT pg_advisory_xact_lock(hashtextextended(:link_key, 0))"),
                 {"link_key": link_key},
             )
-            event = _calendar_event(session, auth, payload.calendar_event_id)
+            event = get_calendar_event_summary(session, auth, payload.calendar_event_id)
             if event is None or event["archived_at"] is not None:
                 raise HTTPException(status_code=404, detail="CALENDAR_EVENT_NOT_FOUND")
             existing = session.execute(
@@ -467,7 +438,39 @@ def list_meetings(
         .all()
     )
     session.rollback()
-    return MeetingListResponse(items=[_project(session, auth, dict(row)) for row in rows])
+    # `limit + 1` was fetched above so a full page can be distinguished
+    # from "no more rows exist" -- this response must return only the
+    # first `limit` rows, and produce a cursor when the extra row proves
+    # more remain. Pre-existing bug (unrelated to the calendar_events
+    # visibility fix below): this used to return every one of the
+    # over-fetched `limit + 1` rows and never set `next_cursor`, so a
+    # workspace with more meetings than one page's `limit` got a
+    # too-large page and no way to ever reach the rest -- found while
+    # writing calendar/events.py's own test coverage, whose sibling
+    # `list_calendar_events` already does this correctly.
+    page = rows[:limit]
+    # `_project` raises `LINKED_CALENDAR_EVENT_MISSING` (409) for a meeting
+    # linked to a calendar_events row that no longer exists OR -- since
+    # get_calendar_event_summary started applying a visibility check --
+    # exists but isn't visible to this caller. That's a reasonable error
+    # for a single `GET /meetings/{id}`, but letting it propagate out of
+    # this list comprehension would 409 the *entire* list for a caller who
+    # can see most of their meetings just fine, over one meeting whose
+    # linked private event isn't theirs to see. Omit that one meeting from
+    # the list instead of failing the whole request.
+    items = []
+    for row in page:
+        try:
+            items.append(_project(session, auth, dict(row)))
+        except HTTPException as exc:
+            if exc.status_code == 409 and exc.detail == "LINKED_CALENDAR_EVENT_MISSING":
+                continue
+            raise
+    next_cursor = None
+    if len(rows) > limit and page:
+        last = page[-1]
+        next_cursor = _encode_cursor(last["updated_at"], last["id"])
+    return MeetingListResponse(items=items, next_cursor=next_cursor)
 
 
 @router.get("/{meeting_id}", response_model=MeetingResponse)

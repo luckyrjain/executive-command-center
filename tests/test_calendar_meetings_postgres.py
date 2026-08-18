@@ -245,6 +245,151 @@ def test_linked_meeting_rejects_cross_workspace_event(
     assert response.status_code == 404
 
 
+def test_meeting_never_leaks_timing_of_a_calendar_event_invisible_to_caller(
+    calendar_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    """`scheduling/meetings.py`'s own `_calendar_event` (now `calendar.
+    events.get_calendar_event_summary`) used to run an unfiltered `SELECT
+    ... FROM calendar_events` with no `authz.authorize` check -- a meeting
+    linked to a `visibility='private'` calendar event still surfaced that
+    event's own `starts_at`/`ends_at`/`timezone` to every workspace member
+    who could read the (workspace-visible) meeting, regardless of whether
+    they could see the linked event itself. This is the regression test
+    for that fix (Loop 2 architecture review's "calendar_events shared-
+    read-interface gap" finding).
+    """
+    client, workspace_id, _, owner_token = calendar_test_context
+
+    member_id = uuid4()
+    member_token = f"session-{uuid4()}"
+    now = datetime.now(UTC)
+    with engine.begin() as connection:
+        create_identity(
+            connection,
+            workspace_id=workspace_id,
+            user_id=member_id,
+            role="member",
+            now=now,
+        )
+        connection.execute(
+            text(
+                """
+                INSERT INTO sessions (
+                    id, workspace_id, user_id, token_hash, expires_at, last_seen_at
+                ) VALUES (
+                    :id, :workspace_id, :user_id, :token_hash, :expires_at, :last_seen_at
+                )
+                """
+            ),
+            {
+                "id": uuid4(),
+                "workspace_id": workspace_id,
+                "user_id": member_id,
+                "token_hash": sha256(member_token.encode()).hexdigest(),
+                "expires_at": now + timedelta(hours=1),
+                "last_seen_at": now,
+            },
+        )
+    member_client = TestClient(app)
+    member_client.cookies.set("ecc_session", member_token)
+
+    starts_at = datetime(2026, 9, 1, 9, 0, tzinfo=UTC)
+    ends_at = starts_at + timedelta(hours=1)
+    create_event = client.post(
+        "/api/v1/calendar/events",
+        headers=_headers(owner_token, "create-private-event"),
+        json={
+            "title": "Confidential 1:1",
+            "starts_at": starts_at.isoformat(),
+            "ends_at": ends_at.isoformat(),
+            "timezone": "Asia/Kolkata",
+        },
+    )
+    assert create_event.status_code == 201
+    event_id = create_event.json()["id"]
+
+    # calendar_events creation already sets owner_id to the creating
+    # actor -- only visibility needs to change to make this event private.
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "UPDATE calendar_events SET visibility = 'private' "
+                "WHERE id = :id AND workspace_id = :workspace_id"
+            ),
+            {"id": event_id, "workspace_id": workspace_id},
+        )
+
+    create_meeting = client.post(
+        "/api/v1/meetings",
+        headers=_headers(owner_token, "create-meeting-on-private-event"),
+        json={"calendar_event_id": event_id, "title": "Team sync"},
+    )
+    assert create_meeting.status_code == 201
+    meeting_id = create_meeting.json()["id"]
+
+    # The owner can still read their own meeting/event timing.
+    owner_read = client.get(f"/api/v1/meetings/{meeting_id}")
+    assert owner_read.status_code == 200
+    assert owner_read.json()["starts_at"] == create_event.json()["starts_at"]
+
+    # A workspace member who cannot see the private calendar event must
+    # never learn its timing through the meeting.
+    member_read = member_client.get(f"/api/v1/meetings/{meeting_id}")
+    assert member_read.status_code == 409
+    assert member_read.json()["error"]["code"] == "LINKED_CALENDAR_EVENT_MISSING"
+
+    member_list = member_client.get("/api/v1/meetings")
+    assert member_list.status_code == 200
+    listed_ids = {item["id"] for item in member_list.json()["items"]}
+    assert meeting_id not in listed_ids, (
+        "list_meetings must not silently include a meeting whose linked "
+        "calendar event the caller cannot see"
+    )
+
+    member_client.close()
+
+
+def test_list_meetings_paginates_instead_of_returning_every_over_fetched_row(
+    calendar_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    """`list_meetings` fetches `limit + 1` rows to detect whether another
+    page exists, but used to return every one of those over-fetched rows
+    verbatim and never set `next_cursor` -- a workspace with more meetings
+    than one page's `limit` got an oversized page with no way to reach the
+    rest. Found while writing calendar/events.py's own pagination test
+    coverage, whose sibling `list_calendar_events` already did this
+    correctly; this is the regression test for the `list_meetings` fix.
+    """
+    client, _, _, token = calendar_test_context
+    base = datetime(2026, 8, 1, 9, tzinfo=UTC)
+    for i in range(3):
+        standalone_starts = base + timedelta(hours=i)
+        create = client.post(
+            "/api/v1/meetings",
+            headers=_headers(token, f"paginate-meeting-{i}"),
+            json={
+                "title": f"Meeting {i}",
+                "starts_at": standalone_starts.isoformat(),
+                "ends_at": (standalone_starts + timedelta(hours=1)).isoformat(),
+                "timezone": "UTC",
+            },
+        )
+        assert create.status_code == 201, create.text
+
+    first_page = client.get("/api/v1/meetings?limit=2")
+    assert first_page.status_code == 200
+    body = first_page.json()
+    assert len(body["items"]) == 2
+    assert body["next_cursor"] is not None
+
+    second_page = client.get(f"/api/v1/meetings?limit=2&cursor={body['next_cursor']}")
+    assert second_page.status_code == 200
+    second_items = second_page.json()["items"]
+    assert len(second_items) == 1
+    first_ids = {item["id"] for item in body["items"]}
+    assert second_items[0]["id"] not in first_ids
+
+
 def test_standalone_meeting_reschedule_and_linked_timing_rejection(
     calendar_test_context: tuple[TestClient, UUID, UUID, str],
 ) -> None:

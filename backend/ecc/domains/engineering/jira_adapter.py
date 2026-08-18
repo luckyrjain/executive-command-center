@@ -117,6 +117,7 @@ from sqlalchemy import text
 
 from ecc.database import SessionFactory
 
+from . import rate_limit_retry
 from .connectors import (
     WORKSPACE_ORIGINAL_OWNER_SQL,
     AdapterAuthorizationError,
@@ -329,31 +330,25 @@ class JiraAdapter:
         headers: dict[str, str],
         params: dict[str, Any] | None = None,
     ) -> httpx.Response | None:
-        """Returns `None` only when rate-limited beyond the bounded wait --
-        callers treat that as "give up for now, resume next sync call."
-        Matches `gitlab_adapter.py`'s identical method exactly, including
-        the fixed-from-the-start handling of a still-rate-limited retry.
+        """Jira's own request wrapping over `rate_limit_retry.bounded_
+        single_retry`'s shared bounded-wait-then-one-retry envelope -- see
+        that function's docstring for the give-up-on-still-limited
+        reasoning.
         """
-        try:
-            response = self._client.request(method, url, headers=headers, params=params)
-        except httpx.HTTPError as exc:
-            raise RuntimeError(f"Jira request failed: {exc}") from exc
 
-        if response.status_code != 429:
-            return response
+        def make_request() -> httpx.Response:
+            try:
+                return self._client.request(method, url, headers=headers, params=params)
+            except httpx.HTTPError as exc:
+                raise RuntimeError(f"Jira request failed: {exc}") from exc
 
-        wait_seconds = self._rate_limit_wait_seconds(response)
-        if wait_seconds is None or wait_seconds > _RATE_LIMIT_MAX_WAIT_SECONDS:
-            return None
-        self._sleep(wait_seconds)
-        try:
-            retry_response = self._client.request(method, url, headers=headers, params=params)
-        except httpx.HTTPError as exc:
-            raise RuntimeError(f"Jira request failed: {exc}") from exc
-
-        if retry_response.status_code == 429:
-            return None
-        return retry_response
+        return rate_limit_retry.bounded_single_retry(
+            make_request,
+            is_rate_limited=lambda response: response.status_code == 429,
+            wait_seconds=self._rate_limit_wait_seconds,
+            max_wait_seconds=_RATE_LIMIT_MAX_WAIT_SECONDS,
+            sleep=self._sleep,
+        )
 
     def _rate_limit_wait_seconds(self, response: httpx.Response) -> float | None:
         retry_after = response.headers.get("Retry-After")

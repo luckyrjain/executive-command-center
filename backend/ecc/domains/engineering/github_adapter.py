@@ -127,6 +127,7 @@ from sqlalchemy import text
 
 from ecc.database import SessionFactory
 
+from . import rate_limit_retry, repository_sync
 from .connectors import (
     WORKSPACE_ORIGINAL_OWNER_SQL,
     AdapterAuthorizationError,
@@ -208,83 +209,34 @@ def _content_hash(repo: Mapping[str, Any]) -> str:
 def _upsert_repository(
     *, workspace_id: Any, connector_account_id: Any, provider: str, repo: Mapping[str, Any]
 ) -> None:
-    """Opens and commits its own session -- mirrors `ecc.domains.
-    automation.local_adapters.LocalCreateNoteAdapter.execute`'s identical
-    "no session threaded through the adapter protocol" precedent. Keeping
-    this write on its own short-lived connection (rather than the
-    dispatching request's own pooled session) is part of this task's
-    pool-exhaustion fix: see `connector_accounts.py`'s `sync_connector_
-    endpoint` for the other half (closing its own session before calling
-    into this adapter at all).
+    """GitHub's own field extraction over `repository_sync.upsert_
+    repository`'s shared `repositories` upsert -- see that function's
+    docstring for the pool-exhaustion/own-session reasoning this mirrors,
+    and for why the SQL itself lives there rather than here.
     """
-    now = datetime.now(UTC)
-    provider_updated_at = repo.get("updated_at")
-    with SessionFactory() as session:
-        session.execute(
-            text(
-                f"""
-                INSERT INTO repositories (
-                    id, workspace_id, connector_account_id, provider, external_id,
-                    name, source_url, default_branch, permission_state, freshness_state,
-                    content_hash, provider_updated_at, observed_at, created_at, updated_at,
-                    suggested_team_name, owner_id, visibility
-                ) VALUES (
-                    :id, :workspace_id, :connector_account_id, :provider, :external_id,
-                    :name, :source_url, :default_branch, 'active', 'fresh',
-                    :content_hash, :provider_updated_at, :now, :now, :now,
-                    :suggested_team_name,
-                    {WORKSPACE_ORIGINAL_OWNER_SQL},
-                    'workspace'
-                )
-                ON CONFLICT (workspace_id, connector_account_id, external_id) DO UPDATE SET
-                    name = EXCLUDED.name,
-                    source_url = EXCLUDED.source_url,
-                    default_branch = EXCLUDED.default_branch,
-                    permission_state = 'active',
-                    freshness_state = 'fresh',
-                    content_hash = EXCLUDED.content_hash,
-                    provider_updated_at = EXCLUDED.provider_updated_at,
-                    observed_at = EXCLUDED.observed_at,
-                    updated_at = EXCLUDED.updated_at,
-                    suggested_team_name = EXCLUDED.suggested_team_name,
-                    team_suggestion_dismissed_at = CASE
-                        WHEN repositories.suggested_team_name
-                            IS DISTINCT FROM EXCLUDED.suggested_team_name
-                        THEN NULL
-                        ELSE repositories.team_suggestion_dismissed_at
-                    END
-                """  # noqa: S608 -- WORKSPACE_ORIGINAL_OWNER_SQL is a fixed
-                # module constant, never request-derived; nothing here is
-                # string-interpolated user input.
+    repository_sync.upsert_repository(
+        workspace_id=workspace_id,
+        connector_account_id=connector_account_id,
+        provider=provider,
+        external_id=str(repo["id"]),
+        name=repo.get("full_name") or repo.get("name") or str(repo["id"]),
+        source_url=_safe_source_url(
+            repo.get("html_url"),
+            fallback=(
+                f"{_GITHUB_WEB_BASE_URL}/{repo.get('full_name') or repo.get('name') or repo['id']}"
             ),
-            {
-                "id": uuid4(),
-                "workspace_id": workspace_id,
-                "connector_account_id": connector_account_id,
-                "provider": provider,
-                "external_id": str(repo["id"]),
-                "name": repo.get("full_name") or repo.get("name") or str(repo["id"]),
-                "source_url": _safe_source_url(
-                    repo.get("html_url"),
-                    fallback=(
-                        f"{_GITHUB_WEB_BASE_URL}/"
-                        f"{repo.get('full_name') or repo.get('name') or repo['id']}"
-                    ),
-                ),
-                "default_branch": repo.get("default_branch"),
-                "content_hash": _content_hash(repo),
-                "provider_updated_at": provider_updated_at,
-                "now": now,
-                # GitHub's own `owner.login` -- the org or user this repository
-                # belongs to -- is the closest real signal to "which team owns
-                # this" the repository-list/webhook payload carries. A hint
-                # only, never written to `team_entity_id` (see migration
-                # `0050_phase6_team_linkage.py`'s own docstring for why this
-                # column is sync-writable but the FK column is not).
-                "suggested_team_name": (repo.get("owner") or {}).get("login"),
-            },
-        )
-        session.commit()
+        ),
+        default_branch=repo.get("default_branch"),
+        content_hash=_content_hash(repo),
+        provider_updated_at=repo.get("updated_at"),
+        # GitHub's own `owner.login` -- the org or user this repository
+        # belongs to -- is the closest real signal to "which team owns
+        # this" the repository-list/webhook payload carries. A hint
+        # only, never written to `team_entity_id` (see migration
+        # `0050_phase6_team_linkage.py`'s own docstring for why this
+        # column is sync-writable but the FK column is not).
+        suggested_team_name=(repo.get("owner") or {}).get("login"),
+    )
 
 
 def _content_hash_change(pr: Mapping[str, Any]) -> str:
@@ -600,43 +552,30 @@ class GitHubAdapter:
         headers: dict[str, str],
         params: dict[str, Any] | None = None,
     ) -> httpx.Response | None:
-        """Returns `None` only when rate-limited beyond the bounded wait --
-        callers treat that as "give up for now, resume next sync call."
+        """GitHub's own rate-limit detection (`429`, or `403` with
+        `X-RateLimit-Remaining: 0`) over `rate_limit_retry.bounded_single_
+        retry`'s shared bounded-wait-then-one-retry envelope -- see that
+        function's docstring for the give-up-on-still-limited reasoning.
         """
-        try:
-            response = self._client.request(method, path, headers=headers, params=params)
-        except httpx.HTTPError as exc:
-            raise RuntimeError(f"GitHub request failed: {exc}") from exc
 
-        is_rate_limited = response.status_code == 429 or (
-            response.status_code == 403 and response.headers.get("X-RateLimit-Remaining") == "0"
+        def make_request() -> httpx.Response:
+            try:
+                return self._client.request(method, path, headers=headers, params=params)
+            except httpx.HTTPError as exc:
+                raise RuntimeError(f"GitHub request failed: {exc}") from exc
+
+        def is_rate_limited(response: httpx.Response) -> bool:
+            return response.status_code == 429 or (
+                response.status_code == 403 and response.headers.get("X-RateLimit-Remaining") == "0"
+            )
+
+        return rate_limit_retry.bounded_single_retry(
+            make_request,
+            is_rate_limited=is_rate_limited,
+            wait_seconds=self._rate_limit_wait_seconds,
+            max_wait_seconds=_RATE_LIMIT_MAX_WAIT_SECONDS,
+            sleep=self._sleep,
         )
-        if not is_rate_limited:
-            return response
-
-        wait_seconds = self._rate_limit_wait_seconds(response)
-        if wait_seconds is None or wait_seconds > _RATE_LIMIT_MAX_WAIT_SECONDS:
-            return None
-        self._sleep(wait_seconds)
-        try:
-            retry_response = self._client.request(method, path, headers=headers, params=params)
-        except httpx.HTTPError as exc:
-            raise RuntimeError(f"GitHub request failed: {exc}") from exc
-
-        # A second rate-limit hit right after the bounded wait must not be
-        # trusted as a normal response -- review found this previously fell
-        # through to the caller's own `status_code != 200` branch, which
-        # raises an opaque `RuntimeError` (the whole sync run reported
-        # `failed`) instead of the same clean `partial` + preserved-cursor
-        # outcome a first-hit rate limit gets. One retry is the bound; a
-        # still-limited retry gives up exactly like the first check does.
-        retry_is_rate_limited = retry_response.status_code == 429 or (
-            retry_response.status_code == 403
-            and retry_response.headers.get("X-RateLimit-Remaining") == "0"
-        )
-        if retry_is_rate_limited:
-            return None
-        return retry_response
 
     def _rate_limit_wait_seconds(self, response: httpx.Response) -> float | None:
         retry_after = response.headers.get("Retry-After")

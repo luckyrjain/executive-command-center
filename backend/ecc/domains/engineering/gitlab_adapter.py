@@ -103,16 +103,13 @@ from datetime import UTC, datetime
 from hashlib import sha256
 from json import dumps
 from typing import Any
-from uuid import uuid4
 
 import httpx
-from sqlalchemy import text
 
 from ecc.config import get_settings
-from ecc.database import SessionFactory
 
+from . import rate_limit_retry, repository_sync
 from .connectors import (
-    WORKSPACE_ORIGINAL_OWNER_SQL,
     AdapterAuthorizationError,
     ConnectorAccountContext,
     ConnectorAuthorization,
@@ -304,71 +301,27 @@ def _upsert_repository(
     project: Mapping[str, Any],
     web_base_url: str,
 ) -> None:
-    """Opens and commits its own session -- identical discipline to
-    `github_adapter._upsert_repository`'s own (see that function's
-    docstring for the full "no session threaded through the adapter
-    protocol" reasoning this mirrors).
+    """GitLab's own field extraction over `repository_sync.upsert_
+    repository`'s shared `repositories` upsert -- see that function's
+    docstring for the pool-exhaustion/own-session reasoning this mirrors,
+    and for why the SQL itself lives there rather than here.
     """
-    now = datetime.now(UTC)
-    provider_updated_at = project.get("last_activity_at")
-    suggested_team_name = _suggested_team_name(project)
-    with SessionFactory() as session:
-        session.execute(
-            text(
-                f"""
-                INSERT INTO repositories (
-                    id, workspace_id, connector_account_id, provider, external_id,
-                    name, source_url, default_branch, permission_state, freshness_state,
-                    content_hash, provider_updated_at, observed_at, created_at, updated_at,
-                    suggested_team_name, owner_id, visibility
-                ) VALUES (
-                    :id, :workspace_id, :connector_account_id, :provider, :external_id,
-                    :name, :source_url, :default_branch, 'active', 'fresh',
-                    :content_hash, :provider_updated_at, :now, :now, :now,
-                    :suggested_team_name,
-                    {WORKSPACE_ORIGINAL_OWNER_SQL}, 'workspace'
-                )
-                ON CONFLICT (workspace_id, connector_account_id, external_id) DO UPDATE SET
-                    name = EXCLUDED.name,
-                    source_url = EXCLUDED.source_url,
-                    default_branch = EXCLUDED.default_branch,
-                    permission_state = 'active',
-                    freshness_state = 'fresh',
-                    content_hash = EXCLUDED.content_hash,
-                    provider_updated_at = EXCLUDED.provider_updated_at,
-                    observed_at = EXCLUDED.observed_at,
-                    updated_at = EXCLUDED.updated_at,
-                    suggested_team_name = EXCLUDED.suggested_team_name,
-                    team_suggestion_dismissed_at = CASE
-                        WHEN repositories.suggested_team_name
-                            IS DISTINCT FROM EXCLUDED.suggested_team_name
-                        THEN NULL
-                        ELSE repositories.team_suggestion_dismissed_at
-                    END
-                """  # noqa: S608 -- see github_adapter._upsert_repository's identical note
-            ),
-            {
-                "id": uuid4(),
-                "workspace_id": workspace_id,
-                "connector_account_id": connector_account_id,
-                "provider": provider,
-                "external_id": str(project["id"]),
-                "name": project.get("path_with_namespace") or str(project["id"]),
-                "source_url": _safe_source_url(
-                    project.get("web_url"),
-                    fallback=(
-                        f"{web_base_url}/{project.get('path_with_namespace') or project['id']}"
-                    ),
-                    web_base_url=web_base_url,
-                ),
-                "default_branch": project.get("default_branch"),
-                "content_hash": _content_hash(project),
-                "provider_updated_at": provider_updated_at,
-                "now": now,
-                "suggested_team_name": suggested_team_name,
-            },
-        )
-        session.commit()
+    repository_sync.upsert_repository(
+        workspace_id=workspace_id,
+        connector_account_id=connector_account_id,
+        provider=provider,
+        external_id=str(project["id"]),
+        name=project.get("path_with_namespace") or str(project["id"]),
+        source_url=_safe_source_url(
+            project.get("web_url"),
+            fallback=f"{web_base_url}/{project.get('path_with_namespace') or project['id']}",
+            web_base_url=web_base_url,
+        ),
+        default_branch=project.get("default_branch"),
+        content_hash=_content_hash(project),
+        provider_updated_at=project.get("last_activity_at"),
+        suggested_team_name=_suggested_team_name(project),
+    )
 
 
 def _with_push_event_activity_timestamp(
@@ -467,29 +420,20 @@ class GitLabAdapter:
         constructed without a `base_url` precisely because the host varies
         per credential (self-managed instances).
         """
-        try:
-            response = self._client.request(method, url, headers=headers, params=params)
-        except httpx.HTTPError as exc:
-            raise RuntimeError(f"GitLab request failed: {exc}") from exc
 
-        if response.status_code != 429:
-            return response
+        def make_request() -> httpx.Response:
+            try:
+                return self._client.request(method, url, headers=headers, params=params)
+            except httpx.HTTPError as exc:
+                raise RuntimeError(f"GitLab request failed: {exc}") from exc
 
-        wait_seconds = self._rate_limit_wait_seconds(response)
-        if wait_seconds is None or wait_seconds > _RATE_LIMIT_MAX_WAIT_SECONDS:
-            return None
-        self._sleep(wait_seconds)
-        try:
-            retry_response = self._client.request(method, url, headers=headers, params=params)
-        except httpx.HTTPError as exc:
-            raise RuntimeError(f"GitLab request failed: {exc}") from exc
-
-        # A second rate-limit hit right after the bounded wait must not be
-        # trusted as a normal response -- matches `github_adapter.py`'s
-        # own identical review-fixed reasoning exactly.
-        if retry_response.status_code == 429:
-            return None
-        return retry_response
+        return rate_limit_retry.bounded_single_retry(
+            make_request,
+            is_rate_limited=lambda response: response.status_code == 429,
+            wait_seconds=self._rate_limit_wait_seconds,
+            max_wait_seconds=_RATE_LIMIT_MAX_WAIT_SECONDS,
+            sleep=self._sleep,
+        )
 
     def _rate_limit_wait_seconds(self, response: httpx.Response) -> float | None:
         retry_after = response.headers.get("Retry-After")

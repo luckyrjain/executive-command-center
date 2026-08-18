@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session
 
 from ecc.auth import AuthContext, AuthDep, CsrfDep
 from ecc.database import get_session
-from ecc.domains.governance.risks import RiskResponse, RiskStatus, _project
+from ecc.domains.governance.risks import RiskResponse, RiskStatus, project_risk
 from ecc.observability import (
     queue_lifecycle_event,
     record_audit_outbox_failure,
@@ -206,7 +206,7 @@ def set_risk_status_write(
         raise HTTPException(status_code=409, detail="RISK_TERMINAL")
 
     if new_status == current["status"]:
-        return _project(current, now)
+        return project_risk(current, now)
 
     row = (
         session.execute(
@@ -230,7 +230,7 @@ def set_risk_status_write(
         .mappings()
         .one()
     )
-    response = _project(dict(row), now)
+    response = project_risk(dict(row), now)
     _write_side_effects(
         session, auth, request, "risk.updated", risk_id, response.version, ["status"], now
     )
@@ -305,7 +305,7 @@ def update_risk(
             .mappings()
             .one()
         )
-        response = _project(dict(row), now)
+        response = project_risk(dict(row), now)
         _write_side_effects(
             session,
             auth,
@@ -391,7 +391,7 @@ def _archive_action(
             .mappings()
             .one()
         )
-        response = _project(dict(row), now)
+        response = project_risk(dict(row), now)
         _write_side_effects(
             session,
             auth,

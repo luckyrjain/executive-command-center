@@ -1,7 +1,5 @@
-from base64 import urlsafe_b64decode, urlsafe_b64encode
 from datetime import UTC, datetime, timedelta
-from hmac import compare_digest, new
-from json import dumps, loads
+from json import dumps
 from typing import Annotated, Any, Literal
 from uuid import UUID, uuid4
 
@@ -12,13 +10,12 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from ecc.auth import AuthContext, AuthDep, CsrfDep
-from ecc.config import get_settings
 from ecc.database import get_session
 from ecc.observability import (
     queue_lifecycle_event,
     record_audit_outbox_failure,
 )
-from ecc.platform import authz
+from ecc.platform import authz, cursor_pagination
 from ecc.platform.idempotency import load_cached, lock_idempotency, request_hash, store_idempotency
 
 router = APIRouter(prefix="/api/v1/risks", tags=["risks"])
@@ -177,7 +174,7 @@ def _risk_factors(row: dict[str, Any], now: datetime) -> tuple[int, list[dict[st
     return score, factors, explanation
 
 
-def _project(row: dict[str, Any], now: datetime | None = None) -> RiskResponse:
+def project_risk(row: dict[str, Any], now: datetime | None = None) -> RiskResponse:
     current = now or datetime.now(UTC)
     score, factors, explanation = _risk_factors(row, current)
     return RiskResponse(
@@ -190,21 +187,16 @@ def _project(row: dict[str, Any], now: datetime | None = None) -> RiskResponse:
 
 
 def _encode_cursor(updated_at: datetime, risk_id: UUID) -> str:
-    payload = dumps({"updated_at": updated_at.isoformat(), "id": str(risk_id)}).encode()
-    signature = new(get_settings().session_secret.encode(), payload, "sha256").hexdigest().encode()
-    return urlsafe_b64encode(payload + b"." + signature).decode().rstrip("=")
+    return cursor_pagination.encode_cursor(
+        {"updated_at": updated_at.isoformat(), "id": str(risk_id)}
+    )
 
 
 def _decode_cursor(cursor: str) -> tuple[datetime, UUID]:
+    decoded = cursor_pagination.decode_cursor(cursor)
     try:
-        raw = urlsafe_b64decode((cursor + "=" * (-len(cursor) % 4)).encode())
-        payload, signature = raw.rsplit(b".", 1)
-        expected = new(get_settings().session_secret.encode(), payload, "sha256").hexdigest()
-        if not compare_digest(signature.decode(), expected):
-            raise ValueError
-        decoded = loads(payload)
         return datetime.fromisoformat(decoded["updated_at"]), UUID(decoded["id"])
-    except (ValueError, KeyError, TypeError, UnicodeDecodeError) as exc:
+    except (ValueError, KeyError, TypeError) as exc:
         raise HTTPException(status_code=400, detail="MALFORMED_CURSOR") from exc
 
 
@@ -339,7 +331,7 @@ def insert_risk(
         .mappings()
         .one()
     )
-    response = _project(dict(row), now)
+    response = project_risk(dict(row), now)
     _write_side_effects(session, auth, request, risk_id, 1, now)
     return response
 
@@ -419,7 +411,7 @@ def list_risks(
         last = page[-1]
         next_cursor = _encode_cursor(last["updated_at"], last["id"])
     return RiskListResponse(
-        items=[_project(dict(row)) for row in page],
+        items=[project_risk(dict(row)) for row in page],
         next_cursor=next_cursor,
     )
 
@@ -435,4 +427,4 @@ def get_risk(risk_id: UUID, auth: AuthDep, session: SessionDep) -> RiskResponse:
     row = _get_row(session, auth, risk_id)
     if row is None:
         raise HTTPException(status_code=404, detail="RISK_NOT_FOUND")
-    return _project(row)
+    return project_risk(row)

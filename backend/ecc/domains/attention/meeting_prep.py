@@ -62,6 +62,7 @@ from ecc.config import get_settings
 from ecc.database import get_session
 from ecc.domains.ai_runtime.ollama_client import OllamaAdapter
 from ecc.domains.ai_runtime.runtime import execute_run, get_ollama_adapter
+from ecc.domains.calendar.events import get_calendar_event_summary
 from ecc.observability import (
     queue_lifecycle_event,
     record_audit_outbox_failure,
@@ -586,17 +587,7 @@ def _meeting_input(session: Session, auth: AuthContext, row: dict[str, Any]) -> 
             row["standalone_timezone"],
         )
     else:
-        event = (
-            session.execute(
-                text(
-                    "SELECT starts_at, ends_at, timezone FROM calendar_events "
-                    "WHERE workspace_id = :workspace_id AND id = :event_id"
-                ),
-                {"workspace_id": auth.workspace_id, "event_id": row["calendar_event_id"]},
-            )
-            .mappings()
-            .one_or_none()
-        )
+        event = get_calendar_event_summary(session, auth, row["calendar_event_id"])
         if event is None:
             raise HTTPException(status_code=409, detail="LINKED_CALENDAR_EVENT_MISSING")
         starts_at, ends_at, tz = event["starts_at"], event["ends_at"], event["timezone"]

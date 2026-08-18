@@ -1,8 +1,5 @@
-from base64 import urlsafe_b64decode, urlsafe_b64encode
 from dataclasses import dataclass
 from datetime import datetime
-from hmac import compare_digest, new
-from json import dumps, loads
 from typing import Annotated, Any
 from uuid import UUID, uuid4
 
@@ -12,9 +9,8 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from ecc.auth import AuthDep
-from ecc.config import get_settings
 from ecc.database import get_session
-from ecc.platform import authz
+from ecc.platform import authz, cursor_pagination
 
 router = APIRouter(prefix="/api/v1/knowledge", tags=["knowledge-timeline"])
 SessionDep = Annotated[Session, Depends(get_session)]
@@ -85,21 +81,16 @@ def queue_timeline_entry(
 
 
 def _encode_cursor(effective_at: datetime, entry_id: UUID) -> str:
-    payload = dumps({"effective_at": effective_at.isoformat(), "id": str(entry_id)}).encode()
-    signature = new(get_settings().session_secret.encode(), payload, "sha256").hexdigest().encode()
-    return urlsafe_b64encode(payload + b"." + signature).decode().rstrip("=")
+    return cursor_pagination.encode_cursor(
+        {"effective_at": effective_at.isoformat(), "id": str(entry_id)}
+    )
 
 
 def _decode_cursor(cursor: str) -> tuple[datetime, UUID]:
+    decoded = cursor_pagination.decode_cursor(cursor)
     try:
-        raw = urlsafe_b64decode((cursor + "=" * (-len(cursor) % 4)).encode())
-        payload, signature = raw.rsplit(b".", 1)
-        expected = new(get_settings().session_secret.encode(), payload, "sha256").hexdigest()
-        if not compare_digest(signature.decode(), expected):
-            raise ValueError
-        decoded = loads(payload)
         return datetime.fromisoformat(decoded["effective_at"]), UUID(decoded["id"])
-    except (ValueError, KeyError, TypeError, UnicodeDecodeError) as exc:
+    except (ValueError, KeyError, TypeError) as exc:
         raise HTTPException(status_code=400, detail="MALFORMED_CURSOR") from exc
 
 

@@ -1,7 +1,5 @@
-from base64 import urlsafe_b64decode, urlsafe_b64encode
 from datetime import UTC, date, datetime, time, timedelta
-from hmac import compare_digest, new
-from json import dumps, loads
+from json import dumps
 from typing import Annotated, Any, Literal
 from uuid import UUID, uuid4
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -13,13 +11,12 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from ecc.auth import AuthContext, AuthDep, CsrfDep
-from ecc.config import get_settings
 from ecc.database import get_session
 from ecc.observability import (
     queue_lifecycle_event,
     record_audit_outbox_failure,
 )
-from ecc.platform import authz
+from ecc.platform import authz, cursor_pagination
 from ecc.platform.idempotency import load_cached, lock_idempotency, request_hash, store_idempotency
 
 router = APIRouter(prefix="/api/v1/calendar/events", tags=["calendar-events"])
@@ -229,22 +226,57 @@ def _get_row(
     return dict(row) if row is not None else None
 
 
+def get_calendar_event_summary(
+    session: Session, auth: AuthContext, event_id: UUID
+) -> dict[str, Any] | None:
+    """Visibility-respecting timing read for other domains that link to a
+    calendar event (`scheduling/meetings.py`, `attention/meeting_prep.py`)
+    -- both previously ran their own unfiltered `SELECT ... FROM
+    calendar_events WHERE workspace_id = ...` with no `authz.authorize`
+    check, so a meeting linked to a `visibility='private'` calendar event
+    (or one owned by someone else, per `_resource_access_context`'s own
+    visibility rules) still surfaced that event's own `starts_at`/`ends_
+    at`/`timezone` to anyone who could read the meeting -- disclosing a
+    resource across its own visibility tier via a meeting most workspace
+    members can see (Loop 2 architecture review's "calendar_events shared-
+    read-interface gap" finding).
+
+    Returns `None` both when the event doesn't exist AND when it exists
+    but isn't visible to `auth` -- collapsing "not found" and "not
+    visible" the same way `get_calendar_event`'s own 404 does, so a
+    caller can't use this function's return value to distinguish the two
+    and enumerate private event ids.
+
+    Callable from inside an already-open `with session.begin():` block --
+    `authz.authorize` never touches transaction state itself (see that
+    function's own docstring).
+    """
+    if not authz.authorize(
+        session, auth, resource_type="calendar_events", resource_id=event_id, action="read"
+    ):
+        return None
+    row = _get_row(session, auth, event_id)
+    if row is None:
+        return None
+    return {
+        "starts_at": row["starts_at"],
+        "ends_at": row["ends_at"],
+        "timezone": row["timezone"],
+        "archived_at": row["archived_at"],
+    }
+
+
 def _encode_cursor(starts_at: datetime, event_id: UUID) -> str:
-    payload = dumps({"starts_at": starts_at.isoformat(), "id": str(event_id)}).encode()
-    signature = new(get_settings().session_secret.encode(), payload, "sha256").hexdigest().encode()
-    return urlsafe_b64encode(payload + b"." + signature).decode().rstrip("=")
+    return cursor_pagination.encode_cursor(
+        {"starts_at": starts_at.isoformat(), "id": str(event_id)}
+    )
 
 
 def _decode_cursor(cursor: str) -> tuple[datetime, UUID]:
+    decoded = cursor_pagination.decode_cursor(cursor)
     try:
-        raw = urlsafe_b64decode((cursor + "=" * (-len(cursor) % 4)).encode())
-        payload, signature = raw.rsplit(b".", 1)
-        expected = new(get_settings().session_secret.encode(), payload, "sha256").hexdigest()
-        if not compare_digest(signature.decode(), expected):
-            raise ValueError
-        decoded = loads(payload)
         return datetime.fromisoformat(decoded["starts_at"]), UUID(decoded["id"])
-    except (ValueError, KeyError, TypeError, UnicodeDecodeError) as exc:
+    except (ValueError, KeyError, TypeError) as exc:
         raise HTTPException(status_code=400, detail="MALFORMED_CURSOR") from exc
 
 
