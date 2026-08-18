@@ -114,24 +114,22 @@ intended caller; wiring it here would be speculative.
 
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from json import dumps
 from typing import Annotated, Any, Literal
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import text
-from sqlalchemy.exc import IntegrityError, SQLAlchemyError
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from ecc.auth import AuthContext, AuthDep, CsrfDep
 from ecc.database import SessionFactory, get_session
 from ecc.observability import (
     queue_lifecycle_event,
-    record_audit_outbox_failure,
     record_idempotency_conflict,
 )
-from ecc.platform import authz
+from ecc.platform import audit_outbox, authz
 from ecc.platform.idempotency import load_cached, lock_idempotency, request_hash, store_idempotency
 
 from .connectors import (
@@ -757,80 +755,6 @@ def _to_response(account: ConnectorAccount) -> ConnectorAccountResponse:
     )
 
 
-def _request_ids(request: Request) -> tuple[UUID, UUID]:
-    try:
-        return UUID(request.state.request_id), UUID(request.state.correlation_id)
-    except (AttributeError, TypeError, ValueError):
-        return uuid4(), uuid4()
-
-
-def _write_side_effects(
-    session: Session,
-    auth: AuthContext,
-    request: Request,
-    *,
-    event_type: str,
-    aggregate_id: UUID,
-    version: int,
-    now: datetime,
-) -> None:
-    request_id, correlation_id = _request_ids(request)
-    try:
-        session.execute(
-            text(
-                """
-                INSERT INTO audit_events (
-                    id, workspace_id, event_type, aggregate_type, aggregate_id,
-                    aggregate_version, actor_id, request_id, correlation_id,
-                    changed_fields, authorization_result, source, metadata, occurred_at,
-                    owner_id, visibility
-                ) VALUES (
-                    :id, :workspace_id, :event_type, 'connector_account', :aggregate_id,
-                    :aggregate_version, :actor_id, :request_id, :correlation_id,
-                    ARRAY['*'], 'allowed', 'user', '{}'::jsonb, :occurred_at,
-                    :actor_id, 'workspace'
-                )
-                """
-            ),
-            {
-                "id": uuid4(),
-                "workspace_id": auth.workspace_id,
-                "event_type": event_type,
-                "aggregate_id": aggregate_id,
-                "aggregate_version": version,
-                "actor_id": auth.user_id,
-                "request_id": request_id,
-                "correlation_id": correlation_id,
-                "occurred_at": now,
-            },
-        )
-        session.execute(
-            text(
-                """
-                INSERT INTO event_outbox (
-                    event_id, workspace_id, event_type, event_version,
-                    correlation_id, payload, occurred_at, attempt_count
-                ) VALUES (
-                    :event_id, :workspace_id, :event_type_v1, 1,
-                    :correlation_id, CAST(:payload AS jsonb), :occurred_at, 0
-                )
-                """
-            ),
-            {
-                "event_id": uuid4(),
-                "workspace_id": auth.workspace_id,
-                "event_type_v1": f"{event_type}.v1",
-                "correlation_id": correlation_id,
-                "payload": dumps({"aggregate_id": str(aggregate_id), "version": version}),
-                "occurred_at": now,
-            },
-        )
-    except SQLAlchemyError:
-        record_audit_outbox_failure("engineering_connector_account")
-        raise
-    queue_lifecycle_event(session, "engineering_connector_account", event_type, "allowed")
-
-
 @router.get("/connectors", response_model=ConnectorAccountListResponse)
 def list_connectors_endpoint(auth: AuthDep, session: SessionDep) -> ConnectorAccountListResponse:
     visibility_sql, visibility_params = authz.visible_resource_filter_sql(
@@ -881,7 +805,7 @@ def create_connector_endpoint(
     concurrent conflicting `INSERT` on `uq_connector_accounts_workspace_
     provider_external_id` until the transaction holding the not-yet-
     committed conflicting row commits or rolls back -- so as long as the
-    winner's entire phase 3 (`INSERT` + `_write_side_effects` +
+    winner's entire phase 3 (`INSERT` + `audit_outbox.write_audit_and_outbox` +
     `_store_idempotency`) is genuinely **one transaction** (the `INSERT`
     runs inside a `begin_nested()` SAVEPOINT of the same outer transaction,
     not a separate top-level transaction of its own), a losing
@@ -999,14 +923,21 @@ def create_connector_endpoint(
         created = get_connector_account(create_session, auth.workspace_id, account_id)
         assert created is not None
         response = _to_response(created)
-        _write_side_effects(
+        audit_outbox.write_audit_and_outbox(
             create_session,
             auth,
             request,
             event_type="connector_account.created",
+            aggregate_type="connector_account",
             aggregate_id=created.id,
-            version=created.version,
+            aggregate_version=created.version,
+            changed_fields=["*"],
+            payload={"aggregate_id": str(created.id), "version": created.version},
             now=now,
+            domain="engineering_connector_account",
+        )
+        queue_lifecycle_event(
+            create_session, "engineering_connector_account", "connector_account.created", "allowed"
         )
         store_idempotency(
             create_session,
@@ -1256,14 +1187,24 @@ def sync_connector_endpoint(
                 .one()
             )
             response = SyncRunResponse(**dict(run_row))
-            _write_side_effects(
+            audit_outbox.write_audit_and_outbox(
                 outcome_session,
                 auth,
                 request,
                 event_type="connector_account.sync_failed",
+                aggregate_type="connector_account",
                 aggregate_id=account_id,
-                version=audit_version,
+                aggregate_version=audit_version,
+                changed_fields=["*"],
+                payload={"aggregate_id": str(account_id), "version": audit_version},
                 now=completed_at,
+                domain="engineering_connector_account",
+            )
+            queue_lifecycle_event(
+                outcome_session,
+                "engineering_connector_account",
+                "connector_account.sync_failed",
+                "allowed",
             )
             store_idempotency(
                 outcome_session,
@@ -1362,14 +1303,21 @@ def sync_connector_endpoint(
             .one()
         )
         response = SyncRunResponse(**dict(run_row))
-        _write_side_effects(
+        audit_outbox.write_audit_and_outbox(
             outcome_session,
             auth,
             request,
             event_type="connector_account.synced",
+            aggregate_type="connector_account",
             aggregate_id=account_id,
-            version=audit_version,
+            aggregate_version=audit_version,
+            changed_fields=["*"],
+            payload={"aggregate_id": str(account_id), "version": audit_version},
             now=completed_at,
+            domain="engineering_connector_account",
+        )
+        queue_lifecycle_event(
+            outcome_session, "engineering_connector_account", "connector_account.synced", "allowed"
         )
         store_idempotency(
             outcome_session,
@@ -1633,14 +1581,21 @@ def disable_connector_endpoint(
         updated = get_connector_account(session, auth.workspace_id, account_id)
         assert updated is not None
         response = _to_response(updated)
-        _write_side_effects(
+        audit_outbox.write_audit_and_outbox(
             session,
             auth,
             request,
             event_type="connector_account.disabled",
+            aggregate_type="connector_account",
             aggregate_id=updated.id,
-            version=updated.version,
+            aggregate_version=updated.version,
+            changed_fields=["*"],
+            payload={"aggregate_id": str(updated.id), "version": updated.version},
             now=now,
+            domain="engineering_connector_account",
+        )
+        queue_lifecycle_event(
+            session, "engineering_connector_account", "connector_account.disabled", "allowed"
         )
         store_idempotency(
             session, auth, idempotency_key, req_hash, response.model_dump(mode="json"), now
@@ -2029,16 +1984,20 @@ def confirm_team_suggestion_endpoint(
                         "id": row_id,
                     },
                 ).scalar_one()
-                _write_team_assignment_side_effects(
+                audit_outbox.write_audit_and_outbox(
                     session,
                     auth,
                     request,
-                    aggregate_type=aggregate_type,
                     event_type=event_type,
+                    aggregate_type=aggregate_type,
                     aggregate_id=row_id,
-                    version=new_version,
+                    aggregate_version=new_version,
+                    changed_fields=["team_entity_id"],
+                    payload={"aggregate_id": str(row_id), "version": new_version},
                     now=now,
+                    domain=aggregate_type,
                 )
+                queue_lifecycle_event(session, aggregate_type, event_type, "allowed")
                 updated.append(row_id)
 
         response = TeamSuggestionActionResponse(updated=updated, skipped_unauthorized=skipped)
@@ -2274,85 +2233,6 @@ def _validate_team_entity(session: Session, auth: AuthContext, team_entity_id: U
         raise HTTPException(status_code=422, detail="TEAM_ENTITY_KIND_MISMATCH")
 
 
-def _write_team_assignment_side_effects(
-    session: Session,
-    auth: AuthContext,
-    request: Request,
-    *,
-    aggregate_type: str,
-    event_type: str,
-    aggregate_id: UUID,
-    version: int,
-    now: datetime,
-) -> None:
-    """`repositories`/`engineering_work_items`-scoped sibling of this
-    module's own `_write_side_effects` (used by `create_connector_
-    endpoint`/`sync_connector_endpoint`/`disable_connector_endpoint`) --
-    kept separate rather than adding an `aggregate_type` parameter to that
-    existing function, since its `record_audit_outbox_failure`/`queue_
-    lifecycle_event` calls are hardcoded to the `"engineering_connector_
-    account"` metric name those three call sites all share, and widening
-    an already-tested helper's signature for one new caller family risks
-    touching behavior outside this endpoint's own scope.
-    """
-    request_id, correlation_id = _request_ids(request)
-    try:
-        session.execute(
-            text(
-                """
-                INSERT INTO audit_events (
-                    id, workspace_id, event_type, aggregate_type, aggregate_id,
-                    aggregate_version, actor_id, request_id, correlation_id,
-                    changed_fields, authorization_result, source, metadata, occurred_at,
-                    owner_id, visibility
-                ) VALUES (
-                    :id, :workspace_id, :event_type, :aggregate_type, :aggregate_id,
-                    :aggregate_version, :actor_id, :request_id, :correlation_id,
-                    ARRAY['team_entity_id'], 'allowed', 'user', '{}'::jsonb, :occurred_at,
-                    :actor_id, 'workspace'
-                )
-                """
-            ),
-            {
-                "id": uuid4(),
-                "workspace_id": auth.workspace_id,
-                "event_type": event_type,
-                "aggregate_type": aggregate_type,
-                "aggregate_id": aggregate_id,
-                "aggregate_version": version,
-                "actor_id": auth.user_id,
-                "request_id": request_id,
-                "correlation_id": correlation_id,
-                "occurred_at": now,
-            },
-        )
-        session.execute(
-            text(
-                """
-                INSERT INTO event_outbox (
-                    event_id, workspace_id, event_type, event_version,
-                    correlation_id, payload, occurred_at, attempt_count
-                ) VALUES (
-                    :event_id, :workspace_id, :event_type_v1, 1,
-                    :correlation_id, CAST(:payload AS jsonb), :occurred_at, 0
-                )
-                """
-            ),
-            {
-                "event_id": uuid4(),
-                "workspace_id": auth.workspace_id,
-                "event_type_v1": f"{event_type}.v1",
-                "correlation_id": correlation_id,
-                "payload": dumps({"aggregate_id": str(aggregate_id), "version": version}),
-                "occurred_at": now,
-            },
-        )
-    except SQLAlchemyError:
-        record_audit_outbox_failure(aggregate_type)
-        raise
-    queue_lifecycle_event(session, aggregate_type, event_type, "allowed")
-
-
 @router.post("/repositories/{repository_id}/team", response_model=RepositoryResponse)
 def assign_repository_team_endpoint(
     repository_id: UUID,
@@ -2447,16 +2327,23 @@ def assign_repository_team_endpoint(
             if payload.team_entity_id is None
             else "repository.team_assigned"
         )
-        _write_team_assignment_side_effects(
+        audit_outbox.write_audit_and_outbox(
             session,
             auth,
             request,
-            aggregate_type="repository",
             event_type=event_type,
+            aggregate_type="repository",
             aggregate_id=repository_id,
-            version=response.team_assignment_version,
+            aggregate_version=response.team_assignment_version,
+            changed_fields=["team_entity_id"],
+            payload={
+                "aggregate_id": str(repository_id),
+                "version": response.team_assignment_version,
+            },
             now=now,
+            domain="repository",
         )
+        queue_lifecycle_event(session, "repository", event_type, "allowed")
         store_idempotency(
             session, auth, idempotency_key, req_hash, response.model_dump(mode="json"), now
         )
@@ -2555,16 +2442,23 @@ def assign_work_item_team_endpoint(
             if payload.team_entity_id is None
             else "engineering_work_item.team_assigned"
         )
-        _write_team_assignment_side_effects(
+        audit_outbox.write_audit_and_outbox(
             session,
             auth,
             request,
-            aggregate_type="engineering_work_item",
             event_type=event_type,
+            aggregate_type="engineering_work_item",
             aggregate_id=work_item_id,
-            version=response.team_assignment_version,
+            aggregate_version=response.team_assignment_version,
+            changed_fields=["team_entity_id"],
+            payload={
+                "aggregate_id": str(work_item_id),
+                "version": response.team_assignment_version,
+            },
             now=now,
+            domain="engineering_work_item",
         )
+        queue_lifecycle_event(session, "engineering_work_item", event_type, "allowed")
         store_idempotency(
             session, auth, idempotency_key, req_hash, response.model_dump(mode="json"), now
         )
