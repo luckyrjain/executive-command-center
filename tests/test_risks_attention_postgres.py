@@ -418,6 +418,53 @@ def test_closed_risk_cannot_reopen(
     assert response.json()["error"]["code"] == "RISK_TERMINAL"
 
 
+def test_archive_risk_is_idempotent_on_an_already_archived_risk(
+    risk_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    """Regression test: `_archive_action`'s archive branch used to
+    hard-fail with `409 RISK_ALREADY_ARCHIVED` when the risk was already
+    archived, unlike every sibling lifecycle transition in this codebase
+    (`notes.py`/`calendar/events.py`/`scheduling/meetings.py`/
+    `planning/tasks.py`/`communication/commitments.py`), which treats a
+    repeat archive as an idempotent no-op returning the current state. Restore
+    keeps its strict "must currently be archived" requirement, matching
+    those same siblings' own asymmetric convention -- only archive-on-
+    already-archived is exercised here.
+    """
+    client, _, _, token = risk_test_context
+    created = client.post(
+        "/api/v1/risks",
+        headers=_headers(token, "idempotent-archive-risk"),
+        json={"description": "Idempotent archive target", "probability": 2, "impact": 2},
+    )
+    assert created.status_code == 201, created.text
+    risk_id = created.json()["id"]
+
+    first_archive = client.post(
+        f"/api/v1/risks/{risk_id}/archive",
+        headers=_headers(token, "archive-once"),
+        json={"expected_version": 1},
+    )
+    assert first_archive.status_code == 200, first_archive.text
+    assert first_archive.json()["version"] == 2
+    assert first_archive.json()["archived_at"] is not None
+
+    # A different idempotency key, same target, same current (post-archive)
+    # version -- a repeat archive request, not a cached replay of the
+    # first one. Must be a no-op 200, not a 409.
+    second_archive = client.post(
+        f"/api/v1/risks/{risk_id}/archive",
+        headers=_headers(token, "archive-again"),
+        json={"expected_version": 2},
+    )
+    assert second_archive.status_code == 200, second_archive.text
+    assert second_archive.json()["version"] == 2
+    # Proves the short-circuit actually returns the archived state (not
+    # just a 200 that could pass for an unrelated reason), and that the
+    # original archive timestamp survived the idempotent no-op unchanged.
+    assert second_archive.json()["archived_at"] == first_archive.json()["archived_at"]
+
+
 # Same CI/local split as SEARCH_BUDGET_SECONDS in test_search_performance_postgres.py:
 # GitHub Actions runners are consistently slower than local Docker for this
 # measurement, so the single-retry mitigation below wasn't enough -- a real
