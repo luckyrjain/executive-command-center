@@ -3,7 +3,7 @@ from json import dumps
 from typing import Annotated, Any
 from uuid import UUID, uuid4
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from sqlalchemy import text
 from sqlalchemy.orm import Session
@@ -14,7 +14,7 @@ from ecc.domains.knowledge.embeddings import queue_embedding
 from ecc.domains.knowledge.retrieval import queue_retrieval_document
 from ecc.domains.knowledge.timeline import queue_timeline_entry
 from ecc.observability import queue_lifecycle_event
-from ecc.platform import audit_outbox, authz
+from ecc.platform import audit_outbox, authz, cursor_pagination
 from ecc.platform.idempotency import load_cached, lock_idempotency, request_hash, store_idempotency
 
 router = APIRouter(prefix="/api/v1/knowledge/entities", tags=["knowledge-claims"])
@@ -69,6 +69,21 @@ class ClaimResponse(BaseModel):
 
 class ClaimListResponse(BaseModel):
     items: list[ClaimResponse]
+    next_cursor: str | None = None
+
+
+def _encode_cursor(created_at: datetime, claim_id: UUID) -> str:
+    return cursor_pagination.encode_cursor(
+        {"created_at": created_at.isoformat(), "id": str(claim_id)}
+    )
+
+
+def _decode_cursor(cursor: str) -> tuple[datetime, UUID]:
+    decoded = cursor_pagination.decode_cursor(cursor)
+    try:
+        return datetime.fromisoformat(decoded["created_at"]), UUID(decoded["id"])
+    except (ValueError, KeyError, TypeError) as exc:
+        raise HTTPException(status_code=400, detail="MALFORMED_CURSOR") from exc
 
 
 def _project(row: dict[str, Any]) -> ClaimResponse:
@@ -289,7 +304,13 @@ def create_claim(
 
 
 @router.get("/{entity_id}/claims", response_model=ClaimListResponse)
-def list_claims(entity_id: UUID, auth: AuthDep, session: SessionDep) -> ClaimListResponse:
+def list_claims(
+    entity_id: UUID,
+    auth: AuthDep,
+    session: SessionDep,
+    cursor: str | None = None,
+    limit: int = Query(default=50, ge=1, le=100),
+) -> ClaimListResponse:
     # A cross-workspace/unknown entity_id never 404s here -- this is a list
     # endpoint, and this module's own established convention (see the
     # cross-workspace-isolation tests) returns an empty list, not 404, the
@@ -300,22 +321,41 @@ def list_claims(entity_id: UUID, auth: AuthDep, session: SessionDep) -> ClaimLis
     session.rollback()
     if not visible:
         return ClaimListResponse(items=[])
+    clauses = ["workspace_id = :workspace_id", "subject_id = :entity_id"]
+    params: dict[str, Any] = {
+        "workspace_id": auth.workspace_id,
+        "entity_id": entity_id,
+        "limit": limit + 1,
+    }
+    if cursor is not None:
+        created_at, cursor_id = _decode_cursor(cursor)
+        clauses.append("(created_at, id) < (:cursor_created_at, :cursor_id)")
+        params.update({"cursor_created_at": created_at, "cursor_id": cursor_id})
     rows = (
         session.execute(
             text(
                 f"""
                 SELECT {_CLAIM_FIELDS}
                 FROM knowledge_claims
-                WHERE workspace_id = :workspace_id AND subject_id = :entity_id
-                ORDER BY created_at DESC
+                WHERE {" AND ".join(clauses)}
+                ORDER BY created_at DESC, id DESC
+                LIMIT :limit
                 """
             ),
-            {"workspace_id": auth.workspace_id, "entity_id": entity_id},
+            params,
         )
         .mappings()
         .all()
     )
-    return ClaimListResponse(items=[_project(dict(row)) for row in rows])
+    page = rows[:limit]
+    next_cursor = None
+    if len(rows) > limit and page:
+        last = page[-1]
+        next_cursor = _encode_cursor(last["created_at"], last["id"])
+    return ClaimListResponse(
+        items=[_project(dict(row)) for row in page],
+        next_cursor=next_cursor,
+    )
 
 
 @router.post(

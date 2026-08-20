@@ -77,14 +77,14 @@ from datetime import UTC, datetime, timedelta
 from typing import Annotated, Any
 from uuid import UUID, uuid4
 
-from fastapi import APIRouter, Depends, Header, HTTPException, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from ecc.auth import AuthContext, AuthDep, CsrfDep
 from ecc.database import get_session
-from ecc.platform import authz, idempotency
+from ecc.platform import authz, cursor_pagination, idempotency
 from ecc.platform.authz import UnknownResourceTypeError
 
 router = APIRouter(prefix="/api/v1/delegations", tags=["delegations"])
@@ -132,6 +132,21 @@ class DelegationResponse(BaseModel):
 
 class DelegationListResponse(BaseModel):
     delegations: list[DelegationResponse]
+    next_cursor: str | None = None
+
+
+def _encode_cursor(created_at: datetime, delegation_id: UUID) -> str:
+    return cursor_pagination.encode_cursor(
+        {"created_at": created_at.isoformat(), "id": str(delegation_id)}
+    )
+
+
+def _decode_cursor(cursor: str) -> tuple[datetime, UUID]:
+    decoded = cursor_pagination.decode_cursor(cursor)
+    try:
+        return datetime.fromisoformat(decoded["created_at"]), UUID(decoded["id"])
+    except (ValueError, KeyError, TypeError) as exc:
+        raise HTTPException(status_code=400, detail="MALFORMED_CURSOR") from exc
 
 
 class _EmptyBody(BaseModel):
@@ -654,42 +669,61 @@ def create_delegation_endpoint(
 
 
 @router.get("", response_model=DelegationListResponse)
-def list_delegations_endpoint(auth: AuthDep, session: SessionDep) -> DelegationListResponse:
+def list_delegations_endpoint(
+    auth: AuthDep,
+    session: SessionDep,
+    cursor: str | None = None,
+    limit: int = Query(default=50, ge=1, le=100),
+) -> DelegationListResponse:
     role = authz.require_active_role(session, auth)
     now = datetime.now(UTC)
     with session.begin():
         account_id = _account_id_for(session, workspace_id=auth.workspace_id, users_id=auth.user_id)
+        params: dict[str, Any] = {"workspace_id": auth.workspace_id, "limit": limit + 1}
+        cursor_clause = ""
+        if cursor is not None:
+            cursor_created_at, cursor_id = _decode_cursor(cursor)
+            cursor_clause = " AND (created_at, id) < (:cursor_created_at, :cursor_id)"
+            params.update({"cursor_created_at": cursor_created_at, "cursor_id": cursor_id})
         if role in {"owner", "admin"}:
             _expire_due(session, workspace_id=auth.workspace_id, account_id=None, now=now)
             rows = (
                 session.execute(
                     text(
                         f"SELECT {_DELEGATION_FIELDS} FROM delegations "  # noqa: S608
-                        "WHERE workspace_id = :workspace_id ORDER BY created_at DESC"
+                        f"WHERE workspace_id = :workspace_id{cursor_clause} "
+                        "ORDER BY created_at DESC, id DESC LIMIT :limit"
                     ),
-                    {"workspace_id": auth.workspace_id},
+                    params,
                 )
                 .mappings()
                 .all()
             )
         else:
             _expire_due(session, workspace_id=auth.workspace_id, account_id=account_id, now=now)
+            params["account_id"] = account_id
             rows = (
                 session.execute(
                     text(
                         f"SELECT {_DELEGATION_FIELDS} FROM delegations "  # noqa: S608
                         "WHERE workspace_id = :workspace_id AND "
                         "(delegator_account_id = :account_id "
-                        "OR recipient_account_id = :account_id) "
-                        "ORDER BY created_at DESC"
+                        "OR recipient_account_id = :account_id)"
+                        f"{cursor_clause} "
+                        "ORDER BY created_at DESC, id DESC LIMIT :limit"
                     ),
-                    {"workspace_id": auth.workspace_id, "account_id": account_id},
+                    params,
                 )
                 .mappings()
                 .all()
             )
-        delegations = [_to_response(session, dict(r)) for r in rows]
-    return DelegationListResponse(delegations=delegations)
+        page = rows[:limit]
+        next_cursor = None
+        if len(rows) > limit and page:
+            last = page[-1]
+            next_cursor = _encode_cursor(last["created_at"], last["id"])
+        delegations = [_to_response(session, dict(r)) for r in page]
+    return DelegationListResponse(delegations=delegations, next_cursor=next_cursor)
 
 
 @router.get("/{delegation_id}", response_model=DelegationResponse)
