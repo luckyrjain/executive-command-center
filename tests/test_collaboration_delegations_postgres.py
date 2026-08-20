@@ -571,6 +571,68 @@ def test_workspace_and_party_isolation(delegation_context: _DelegationContext) -
     assert admin_get.status_code == 200, admin_get.text
 
 
+def test_list_delegations_paginates_and_terminates(delegation_context: _DelegationContext) -> None:
+    """Regression test: `list_delegations_endpoint` had no `LIMIT`/cursor
+    at all, in either its owner/admin (workspace-wide) or its ordinary-
+    member (party-scoped) branch.
+    """
+    ctx = delegation_context
+    created_ids: list[str] = []
+    for i in range(3):
+        incident = _create_incident(ctx.delegator.client, ctx.delegator.token, title=f"Ob {i}")
+        delegation = _propose(
+            ctx.delegator.client,
+            ctx.delegator.token,
+            recipient_account_id=ctx.recipient.account_id,
+            obligation_resource_id=incident["id"],
+        )
+        created_ids.append(delegation["id"])
+
+    first_page = ctx.delegator.client.get("/api/v1/delegations", params={"limit": 2})
+    assert first_page.status_code == 200, first_page.text
+    first_body = first_page.json()
+    assert len(first_body["delegations"]) == 2
+    assert first_body["next_cursor"] is not None
+
+    second_page = ctx.delegator.client.get(
+        "/api/v1/delegations", params={"limit": 2, "cursor": first_body["next_cursor"]}
+    )
+    assert second_page.status_code == 200, second_page.text
+    second_body = second_page.json()
+    assert len(second_body["delegations"]) == 1
+    assert second_body["next_cursor"] is None
+
+    seen_ids = {d["id"] for d in first_body["delegations"]} | {
+        d["id"] for d in second_body["delegations"]
+    }
+    assert seen_ids == set(created_ids)
+
+    # The ordinary-member (party-scoped) branch is a separate SQL path --
+    # exercise it fully too, from the recipient's side, not just a first
+    # page (the owner/admin branch above already proves termination and
+    # full-set coverage; this must independently prove the same for the
+    # OR-clause-scoped query, not just that its first page is bounded).
+    recipient_first_page = ctx.recipient.client.get("/api/v1/delegations", params={"limit": 2})
+    assert recipient_first_page.status_code == 200, recipient_first_page.text
+    recipient_first_body = recipient_first_page.json()
+    assert len(recipient_first_body["delegations"]) == 2
+    assert recipient_first_body["next_cursor"] is not None
+
+    recipient_second_page = ctx.recipient.client.get(
+        "/api/v1/delegations",
+        params={"limit": 2, "cursor": recipient_first_body["next_cursor"]},
+    )
+    assert recipient_second_page.status_code == 200, recipient_second_page.text
+    recipient_second_body = recipient_second_page.json()
+    assert len(recipient_second_body["delegations"]) == 1
+    assert recipient_second_body["next_cursor"] is None
+
+    recipient_seen_ids = {d["id"] for d in recipient_first_body["delegations"]} | {
+        d["id"] for d in recipient_second_body["delegations"]
+    }
+    assert recipient_seen_ids == set(created_ids)
+
+
 def test_viewer_cannot_propose_lacking_write_access(delegation_context: _DelegationContext) -> None:
     ctx = delegation_context
     incident = _create_incident(ctx.delegator.client, ctx.delegator.token)

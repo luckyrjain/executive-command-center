@@ -11,7 +11,7 @@ from ecc.auth import AuthContext, AuthDep, CsrfDep
 from ecc.database import get_session
 from ecc.domains.knowledge.timeline import queue_timeline_entry
 from ecc.observability import queue_lifecycle_event
-from ecc.platform import audit_outbox, authz
+from ecc.platform import audit_outbox, authz, cursor_pagination
 from ecc.platform.idempotency import load_cached, lock_idempotency, request_hash, store_idempotency
 
 router = APIRouter(prefix="/api/v1/knowledge", tags=["knowledge-relationships"])
@@ -115,6 +115,24 @@ class RelationshipResponse(BaseModel):
 
 class RelationshipListResponse(BaseModel):
     items: list[RelationshipResponse]
+    next_cursor: str | None = None
+
+
+def _encode_relationship_cursor(edge_id: UUID) -> str:
+    # `pkos_edges` has no `created_at`/`updated_at` column (never added by
+    # any migration) -- every other paginated list in this codebase keys
+    # its cursor on a `(timestamp, id)` pair, but there is no timestamp
+    # available here, so `id` alone (the existing `ORDER BY e.id` sort
+    # key) is the cursor.
+    return cursor_pagination.encode_cursor({"id": str(edge_id)})
+
+
+def _decode_relationship_cursor(cursor: str) -> UUID:
+    decoded = cursor_pagination.decode_cursor(cursor)
+    try:
+        return UUID(decoded["id"])
+    except (ValueError, KeyError, TypeError) as exc:
+        raise HTTPException(status_code=400, detail="MALFORMED_CURSOR") from exc
 
 
 def _project(row: dict[str, Any]) -> RelationshipResponse:
@@ -359,6 +377,8 @@ def list_relationships(
     session: SessionDep,
     relationship_type: Annotated[RelationshipType | None, Query()] = None,
     direction: Annotated[RelationshipDirection | None, Query()] = None,
+    cursor: str | None = None,
+    limit: int = Query(default=50, ge=1, le=100),
 ) -> RelationshipListResponse:
     """`relationship_type`/`direction` are optional, additive filters -- a
     team-concept gap analysis found `MEMBER_OF` was a real, working
@@ -404,11 +424,15 @@ def list_relationships(
     params: dict[str, Any] = {
         "workspace_id": auth.workspace_id,
         "entity_id": entity_id,
+        "limit": limit + 1,
         **src_visibility_params,
     }
     if relationship_type is not None:
         clauses.append("e.edge_type = :relationship_type")
         params["relationship_type"] = relationship_type
+    if cursor is not None:
+        params["cursor_id"] = _decode_relationship_cursor(cursor)
+        clauses.append("e.id > :cursor_id")
 
     rows = (
         session.execute(
@@ -422,6 +446,7 @@ def list_relationships(
                     ON tgt.workspace_id = e.workspace_id AND tgt.id = e.target_node_id
                 WHERE e.workspace_id = :workspace_id AND {" AND ".join(clauses)}
                 ORDER BY e.id
+                LIMIT :limit
                 """
             ),
             params,
@@ -429,4 +454,11 @@ def list_relationships(
         .mappings()
         .all()
     )
-    return RelationshipListResponse(items=[_project(dict(row)) for row in rows])
+    page = rows[:limit]
+    next_cursor = None
+    if len(rows) > limit and page:
+        next_cursor = _encode_relationship_cursor(page[-1]["id"])
+    return RelationshipListResponse(
+        items=[_project(dict(row)) for row in page],
+        next_cursor=next_cursor,
+    )

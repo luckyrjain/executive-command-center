@@ -180,6 +180,69 @@ def test_relationship_create_and_list_from_either_direction(
     assert any(item["id"] == relationship["id"] for item in from_project.json()["items"])
 
 
+def test_relationship_list_paginates_and_terminates(
+    relationships_test_context: tuple[TestClient, UUID, UUID, str, UUID, UUID],
+) -> None:
+    """Regression test: `list_relationships` had no `LIMIT`/cursor at all.
+    `pkos_edges` has no `created_at`/`updated_at` column, so the cursor
+    here keys purely on `id` (the endpoint's own pre-existing `ORDER BY
+    e.id` sort key), unlike every other paginated list in this codebase
+    which keys on a `(timestamp, id)` pair.
+    """
+    client, workspace_id, _user_id, token, person_id, _project_id = relationships_test_context
+    evidence_id = _create_evidence(workspace_id, person_id)
+
+    created_ids: list[str] = []
+    for i in range(3):
+        csrf = new(settings.session_secret.encode(), token.encode(), "sha256").hexdigest()
+        target = client.post(
+            "/api/v1/knowledge/entities",
+            headers={
+                "Idempotency-Key": f"create-target-{i}",
+                "X-CSRF-Token": csrf,
+                "X-Correlation-ID": str(uuid4()),
+            },
+            json={"kind": "project", "canonical_name": f"Target Project {i}"},
+        )
+        target_id = target.json()["id"]
+        create = client.post(
+            f"/api/v1/knowledge/entities/{person_id}/relationships",
+            headers=_headers(token, f"create-relationship-{i}"),
+            json={
+                "relationship_type": "WORKS_ON",
+                "to_entity_id": target_id,
+                "evidence_id": str(evidence_id),
+            },
+        )
+        assert create.status_code == 201, create.text
+        created_ids.append(create.json()["id"])
+
+    first_page = client.get(
+        f"/api/v1/knowledge/entities/{person_id}/relationships",
+        params={"limit": 2},
+        headers=_headers(token, "list-page-1"),
+    )
+    assert first_page.status_code == 200, first_page.text
+    first_body = first_page.json()
+    assert len(first_body["items"]) == 2
+    assert first_body["next_cursor"] is not None
+
+    second_page = client.get(
+        f"/api/v1/knowledge/entities/{person_id}/relationships",
+        params={"limit": 2, "cursor": first_body["next_cursor"]},
+        headers=_headers(token, "list-page-2"),
+    )
+    assert second_page.status_code == 200, second_page.text
+    second_body = second_page.json()
+    assert len(second_body["items"]) == 1
+    assert second_body["next_cursor"] is None
+
+    seen_ids = {item["id"] for item in first_body["items"]} | {
+        item["id"] for item in second_body["items"]
+    }
+    assert seen_ids == set(created_ids)
+
+
 def test_relationship_rejects_self_relationship_by_default(
     relationships_test_context: tuple[TestClient, UUID, UUID, str, UUID, UUID],
 ) -> None:

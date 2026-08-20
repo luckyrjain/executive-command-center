@@ -170,6 +170,58 @@ def test_claim_record_and_list(
     assert any(item["id"] == claim["id"] for item in listed.json()["items"])
 
 
+def test_claim_list_paginates_and_terminates(
+    claims_test_context: tuple[TestClient, UUID, UUID, str, UUID],
+) -> None:
+    """Regression test: `list_claims` had no `LIMIT`/cursor at all --
+    every other list endpoint in this domain (`entities.py`, `notes.py`,
+    `resolution.py`, `timeline.py`) caps its page and returns a
+    `next_cursor`. A heavily-claimed entity would return every claim
+    ever recorded against it on a single call, unbounded.
+    """
+    client, workspace_id, _user_id, token, entity_id = claims_test_context
+    evidence_id = _create_evidence(workspace_id, entity_id)
+
+    created_ids: list[str] = []
+    for i in range(3):
+        create = client.post(
+            f"/api/v1/knowledge/entities/{entity_id}/claims",
+            headers=_headers(token, f"create-claim-{i}"),
+            json={
+                "predicate": f"predicate_{i}",
+                "value": {"n": i},
+                "source_id": str(evidence_id),
+            },
+        )
+        assert create.status_code == 201, create.text
+        created_ids.append(create.json()["id"])
+
+    first_page = client.get(
+        f"/api/v1/knowledge/entities/{entity_id}/claims",
+        params={"limit": 2},
+        headers=_headers(token, "list-page-1"),
+    )
+    assert first_page.status_code == 200, first_page.text
+    first_body = first_page.json()
+    assert len(first_body["items"]) == 2
+    assert first_body["next_cursor"] is not None
+
+    second_page = client.get(
+        f"/api/v1/knowledge/entities/{entity_id}/claims",
+        params={"limit": 2, "cursor": first_body["next_cursor"]},
+        headers=_headers(token, "list-page-2"),
+    )
+    assert second_page.status_code == 200, second_page.text
+    second_body = second_page.json()
+    assert len(second_body["items"]) == 1
+    assert second_body["next_cursor"] is None
+
+    seen_ids = {item["id"] for item in first_body["items"]} | {
+        item["id"] for item in second_body["items"]
+    }
+    assert seen_ids == set(created_ids)
+
+
 def test_claim_supersede_never_destructively_overwrites(
     claims_test_context: tuple[TestClient, UUID, UUID, str, UUID],
 ) -> None:
