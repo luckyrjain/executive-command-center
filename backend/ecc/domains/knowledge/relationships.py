@@ -187,10 +187,6 @@ def _entity_version(session: Session, auth: AuthContext, entity_id: UUID) -> int
     return row[0] if row is not None else None
 
 
-def _entity_exists(session: Session, auth: AuthContext, entity_id: UUID) -> bool:
-    return _entity_version(session, auth, entity_id) is not None
-
-
 def _entity_status(session: Session, auth: AuthContext, entity_id: UUID) -> str | None:
     row = session.execute(
         text(
