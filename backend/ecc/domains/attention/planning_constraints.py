@@ -19,16 +19,14 @@ from uuid import UUID, uuid4
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from sqlalchemy import text
-from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from ecc.auth import AuthContext, AuthDep, CsrfDep
 from ecc.database import get_session
 from ecc.observability import (
     queue_lifecycle_event,
-    record_audit_outbox_failure,
 )
-from ecc.platform import authz, idempotency
+from ecc.platform import audit_outbox, authz, idempotency
 
 router = APIRouter(prefix="/api/v1/planning", tags=["planning"])
 SessionDep = Annotated[Session, Depends(get_session)]
@@ -213,13 +211,6 @@ class PlanningConstraintList(BaseModel):
     items: list[PlanningConstraint]
 
 
-def _request_ids(request: Request) -> tuple[UUID, UUID]:
-    try:
-        return UUID(request.state.request_id), UUID(request.state.correlation_id)
-    except (AttributeError, TypeError, ValueError):
-        return uuid4(), uuid4()
-
-
 def _write_event(
     session: Session,
     auth: AuthContext,
@@ -230,36 +221,20 @@ def _write_event(
 ) -> None:
     """Audit-only, no outbox/catalog event -- a minor sub-action, matching
     meeting_prep.py's participant-linking precedent."""
-    request_id, correlation_id = _request_ids(request)
-    try:
-        session.execute(
-            text(
-                """
-                INSERT INTO audit_events (
-                    id, workspace_id, event_type, aggregate_type, aggregate_id,
-                    aggregate_version, actor_id, request_id, correlation_id,
-                    changed_fields, authorization_result, source, metadata, occurred_at
-                ) VALUES (
-                    :id, :workspace_id, :event_type, 'planning_constraint', :aggregate_id,
-                    1, :actor_id, :request_id, :correlation_id,
-                    ARRAY['*'], 'allowed', 'user', '{}'::jsonb, :occurred_at
-                )
-                """
-            ),
-            {
-                "id": uuid4(),
-                "workspace_id": auth.workspace_id,
-                "event_type": event_type,
-                "aggregate_id": constraint_id,
-                "actor_id": auth.user_id,
-                "request_id": request_id,
-                "correlation_id": correlation_id,
-                "occurred_at": now,
-            },
-        )
-    except SQLAlchemyError:
-        record_audit_outbox_failure("planning_constraints")
-        raise
+    audit_outbox.write_audit_and_outbox(
+        session,
+        auth,
+        request,
+        event_type=event_type,
+        aggregate_type="planning_constraint",
+        aggregate_id=constraint_id,
+        aggregate_version=1,
+        changed_fields=["*"],
+        payload={},
+        now=now,
+        domain="planning_constraints",
+        emit_outbox=False,
+    )
     queue_lifecycle_event(session, "planning_constraint", event_type, "allowed")
 
 
