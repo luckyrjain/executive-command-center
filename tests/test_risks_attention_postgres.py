@@ -424,8 +424,9 @@ def test_archive_risk_is_idempotent_on_an_already_archived_risk(
     """Regression test: `_archive_action`'s archive branch used to
     hard-fail with `409 RISK_ALREADY_ARCHIVED` when the risk was already
     archived, unlike every sibling lifecycle transition in this codebase
-    (`notes.py`/`calendar/events.py`/`scheduling/meetings.py`/`planning/tasks.py`/`communication/commitments.py`), which treats a repeat
-    archive as an idempotent no-op returning the current state. Restore
+    (`notes.py`/`calendar/events.py`/`scheduling/meetings.py`/
+    `planning/tasks.py`/`communication/commitments.py`), which treats a
+    repeat archive as an idempotent no-op returning the current state. Restore
     keeps its strict "must currently be archived" requirement, matching
     those same siblings' own asymmetric convention -- only archive-on-
     already-archived is exercised here.
