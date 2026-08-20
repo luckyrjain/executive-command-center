@@ -290,6 +290,19 @@ def _archive_action(
             raise HTTPException(status_code=404, detail="RISK_NOT_FOUND")
         if current["version"] != payload.expected_version:
             raise HTTPException(status_code=409, detail="VERSION_CONFLICT")
+        if action == "archive" and current["archived_at"] is not None:
+            # Idempotent no-op, matching every sibling lifecycle transition
+            # in this codebase (notes.py/calendar/events.py/scheduling/
+            # meetings.py/planning/tasks.py/commitments.py) -- archiving
+            # an already-archived risk is not an error, it's the
+            # target state already achieved. Restore keeps its strict
+            # "must currently be archived" requirement below, matching
+            # those same siblings' asymmetric convention.
+            response = project_risk(dict(current), now)
+            store_idempotency(
+                session, auth, idempotency_key, req_hash, response.model_dump(mode="json"), now
+            )
+            return response
         if action == "archive":
             if current["archived_at"] is not None:
                 raise HTTPException(status_code=409, detail="RISK_ALREADY_ARCHIVED")

@@ -227,6 +227,19 @@ def _transition_action(
             raise HTTPException(status_code=404, detail="ENTITY_NOT_FOUND")
         if current["version"] != payload.expected_version:
             raise HTTPException(status_code=409, detail="VERSION_CONFLICT")
+        if action == "archive" and current["status"] == "archived":
+            # Idempotent no-op, matching every sibling lifecycle transition
+            # in this codebase (notes.py/calendar/events.py/scheduling/
+            # meetings.py/planning/tasks.py/commitments.py) -- archiving
+            # an already-archived entity is not an error, it's
+            # the target state already achieved. Restore keeps its strict
+            # "must currently be archived" requirement below, matching
+            # those same siblings' asymmetric convention.
+            response = project_entity(dict(current))
+            store_idempotency(
+                session, auth, idempotency_key, req_hash, response.model_dump(mode="json"), now
+            )
+            return response
         if action == "archive":
             if current["status"] != "active":
                 raise HTTPException(status_code=409, detail="ENTITY_NOT_ACTIVE")

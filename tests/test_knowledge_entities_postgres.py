@@ -315,6 +315,49 @@ def test_entity_lifecycle_is_transactional_and_workspace_scoped(
     assert "knowledge_entity.restored.v1" in outbox_types
 
 
+def test_archive_entity_is_idempotent_on_an_already_archived_entity(
+    knowledge_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    """Regression test: `_transition_action`'s archive branch used to
+    hard-fail with `409 ENTITY_NOT_ACTIVE` when the entity was already
+    archived, unlike every sibling lifecycle transition in this codebase
+    (`notes.py`/`calendar/events.py`/`scheduling/meetings.py`/`planning/tasks.py`/`communication/commitments.py`), which treats a repeat
+    archive as an idempotent no-op returning the current state. Restore
+    keeps its strict "must currently be archived" requirement, matching
+    those same siblings' own asymmetric convention -- only archive-on-
+    already-archived is exercised here.
+    """
+    client, _, _, token = knowledge_test_context
+    create = client.post(
+        "/api/v1/knowledge/entities",
+        headers=_headers(token, "create-idempotent-archive-entity"),
+        json={"kind": "project", "canonical_name": "Idempotent Archive Target"},
+    )
+    assert create.status_code == 201, create.text
+    entity_id = create.json()["id"]
+
+    first_archive = client.post(
+        f"/api/v1/knowledge/entities/{entity_id}/archive",
+        headers=_headers(token, "archive-once"),
+        json={"expected_version": 1},
+    )
+    assert first_archive.status_code == 200, first_archive.text
+    assert first_archive.json()["status"] == "archived"
+    assert first_archive.json()["version"] == 2
+
+    # A different idempotency key, same target, same current (post-archive)
+    # version -- a repeat archive request, not a cached replay of the
+    # first one. Must be a no-op 200, not a 409.
+    second_archive = client.post(
+        f"/api/v1/knowledge/entities/{entity_id}/archive",
+        headers=_headers(token, "archive-again"),
+        json={"expected_version": 2},
+    )
+    assert second_archive.status_code == 200, second_archive.text
+    assert second_archive.json()["status"] == "archived"
+    assert second_archive.json()["version"] == 2
+
+
 def test_entity_create_and_filter_supports_team_kind(
     knowledge_test_context: tuple[TestClient, UUID, UUID, str],
 ) -> None:
