@@ -11,6 +11,15 @@ from sqlalchemy.orm import Session
 from ecc.auth import AuthContext, AuthDep, CsrfDep
 from ecc.database import get_session
 from ecc.domains.knowledge.embeddings import queue_embedding
+from ecc.domains.knowledge.entity_lookup import (
+    entity_retrieval_fields as _entity_retrieval_fields,
+)
+from ecc.domains.knowledge.entity_lookup import (
+    entity_status as _entity_status,
+)
+from ecc.domains.knowledge.entity_lookup import (
+    entity_version as _entity_version,
+)
 from ecc.domains.knowledge.retrieval import queue_retrieval_document
 from ecc.domains.knowledge.timeline import queue_timeline_entry
 from ecc.observability import queue_lifecycle_event
@@ -101,26 +110,6 @@ def _project(row: dict[str, Any]) -> ClaimResponse:
     )
 
 
-def _entity_version(session: Session, auth: AuthContext, entity_id: UUID) -> int | None:
-    row = session.execute(
-        text(
-            "SELECT version FROM pkos_nodes WHERE workspace_id = :workspace_id AND id = :entity_id"
-        ),
-        {"workspace_id": auth.workspace_id, "entity_id": entity_id},
-    ).one_or_none()
-    return row[0] if row is not None else None
-
-
-def _entity_status(session: Session, auth: AuthContext, entity_id: UUID) -> str | None:
-    row = session.execute(
-        text(
-            "SELECT status FROM pkos_nodes WHERE workspace_id = :workspace_id AND id = :entity_id"
-        ),
-        {"workspace_id": auth.workspace_id, "entity_id": entity_id},
-    ).one_or_none()
-    return row[0] if row is not None else None
-
-
 def _evidence_state(session: Session, auth: AuthContext, evidence_id: UUID) -> str | None:
     row = session.execute(
         text(
@@ -130,25 +119,6 @@ def _evidence_state(session: Session, auth: AuthContext, evidence_id: UUID) -> s
         {"workspace_id": auth.workspace_id, "evidence_id": evidence_id},
     ).one_or_none()
     return row[0] if row is not None else None
-
-
-def _entity_retrieval_fields(
-    session: Session, auth: AuthContext, entity_id: UUID
-) -> tuple[str, str, str | None, int] | None:
-    row = session.execute(
-        text(
-            """
-            SELECT node_type, canonical_name, attributes, version FROM pkos_nodes
-            WHERE workspace_id = :workspace_id AND id = :entity_id
-            """
-        ),
-        {"workspace_id": auth.workspace_id, "entity_id": entity_id},
-    ).one_or_none()
-    if row is None:
-        return None
-    node_type, canonical_name, attributes, version = row
-    summary = (attributes or {}).get("summary")
-    return node_type, canonical_name, summary, version
 
 
 def _insert_claim(

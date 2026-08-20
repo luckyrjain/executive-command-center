@@ -12,6 +12,7 @@ from sqlalchemy.orm import Session
 
 from ecc.auth import AuthContext, AuthDep, CsrfDep
 from ecc.database import get_session
+from ecc.domains.knowledge.entity_lookup import entity_status as _entity_status
 from ecc.observability import queue_lifecycle_event
 from ecc.platform import audit_outbox, authz, cursor_pagination
 from ecc.platform.idempotency import load_cached, lock_idempotency, request_hash, store_idempotency
@@ -275,16 +276,6 @@ def _entity_row(session: Session, auth: AuthContext, entity_id: UUID) -> dict[st
         .one_or_none()
     )
     return dict(row) if row is not None else None
-
-
-def _entity_status(session: Session, auth: AuthContext, entity_id: UUID) -> str | None:
-    row = session.execute(
-        text(
-            "SELECT status FROM pkos_nodes WHERE workspace_id = :workspace_id AND id = :entity_id"
-        ),
-        {"workspace_id": auth.workspace_id, "entity_id": entity_id},
-    ).one_or_none()
-    return row[0] if row is not None else None
 
 
 def _candidate_entity(session: Session, auth: AuthContext, entity_id: UUID) -> CandidateEntity:
