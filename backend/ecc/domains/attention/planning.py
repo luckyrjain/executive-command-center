@@ -715,6 +715,7 @@ def create_plan(
     _csrf: CsrfDep,
     idempotency_key: IdempotencyHeader,
 ) -> Plan:
+    authz.require_role_action(session, auth, "write")
     request_hash = idempotency.request_hash(payload, "create")
     now = datetime.now(UTC)
     plan_id = uuid4()

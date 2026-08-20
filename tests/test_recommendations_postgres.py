@@ -1029,3 +1029,114 @@ def test_confirm_set_status_recommendation_writes_audit_trail_and_supports_break
     assert commitment["status"] == "broken"
     assert commitment["version"] == 2
     assert audit_count == 1
+
+
+def test_confirm_field_patch_recommendation_denies_a_private_target(
+    recommendation_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    """Regression test for a real authz gap in `execute_target`'s generic
+    column-patch branch (`set_priority`/`set_pinned`/`set_importance`/
+    `set_probability`/`set_impact`): unlike `set_status`, which routes
+    through `lifecycle_write`/`lifecycle_task_write`/`set_risk_status_
+    write` -- each of which `authz.authorize()`s the target before
+    mutating -- the column-patch branch went straight to a raw `UPDATE`
+    scoped only by `workspace_id`/`version`/`archived_at`, never the
+    target's own visibility. A workspace member holding the generic
+    write-role action could confirm a `set_pinned` recommendation against
+    another member's `visibility='private'` task and silently flip
+    `pinned`, even though their own direct `PATCH /api/v1/tasks/{id}`
+    would 404 for that same task.
+    """
+    client, workspace_id, owner_id, owner_token = recommendation_context
+    task_id = _task(workspace_id, owner_id)
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "UPDATE tasks SET visibility = 'private' "
+                "WHERE id = :id AND workspace_id = :workspace_id"
+            ),
+            {"id": task_id, "workspace_id": workspace_id},
+        )
+
+    generated = client.post(
+        "/api/v1/recommendations",
+        headers=_headers(owner_token),
+        json={
+            "recommendation_type": "task_priority",
+            "target_type": "task",
+            "target_id": str(task_id),
+            "proposed_action": {"operation": "set_pinned", "value": True},
+            "expected_version": 1,
+            "rationale": "Task should be pinned for visibility.",
+            "confidence": 0.9,
+            "evidence_ids": [],
+            "expires_at": None,
+            "source": "rule",
+        },
+    )
+    assert generated.status_code == 201, generated.text
+    recommendation_id = generated.json()["id"]
+    published = client.post(
+        f"/api/v1/recommendations/{recommendation_id}/publish",
+        headers=_headers(owner_token),
+        json={"expected_version": 1},
+    )
+    assert published.status_code == 200, published.text
+
+    # A second, non-owner member of the same workspace -- an ordinary
+    # "member" role, holding the generic write-role action but no
+    # ownership of, or explicit grant to, the private task above.
+    member_id = uuid4()
+    member_token = f"session-{uuid4()}"
+    now = datetime.now(UTC)
+    with engine.begin() as connection:
+        create_identity(
+            connection,
+            workspace_id=workspace_id,
+            user_id=member_id,
+            email=f"{member_id}@example.test",
+            now=now,
+            role="member",
+        )
+        connection.execute(
+            text(
+                """
+                INSERT INTO sessions (
+                    id,workspace_id,user_id,token_hash,expires_at,last_seen_at
+                ) VALUES (
+                    :id,:workspace_id,:user_id,:token_hash,:expires_at,:last_seen_at
+                )
+                """
+            ),
+            {
+                "id": uuid4(),
+                "workspace_id": workspace_id,
+                "user_id": member_id,
+                "token_hash": sha256(member_token.encode()).hexdigest(),
+                "expires_at": now + timedelta(hours=2),
+                "last_seen_at": now,
+            },
+        )
+    member_client = TestClient(app)
+    member_client.cookies.set("ecc_session", member_token)
+    try:
+        confirmed = member_client.post(
+            f"/api/v1/recommendations/{recommendation_id}/confirm",
+            headers=_headers(member_token),
+            json={"expected_version": 2, "target_expected_version": 1},
+        )
+        assert confirmed.status_code == 404, confirmed.text
+    finally:
+        member_client.close()
+
+    with engine.connect() as connection:
+        task = (
+            connection.execute(
+                text("SELECT pinned, version FROM tasks WHERE id=:id"),
+                {"id": task_id},
+            )
+            .mappings()
+            .one()
+        )
+    assert task["pinned"] is False
+    assert task["version"] == 1

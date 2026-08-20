@@ -247,6 +247,7 @@ def create_constraint_endpoint(
     _csrf: CsrfDep,
     idempotency_key: IdempotencyHeader,
 ) -> PlanningConstraint:
+    authz.require_role_action(session, auth, "write")
     request_hash = idempotency.request_hash(payload, "create")
     now = datetime.now(UTC)
     with session.begin():

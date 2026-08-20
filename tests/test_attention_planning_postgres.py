@@ -453,6 +453,133 @@ def test_create_plan_rejects_period_over_max_days(
     assert response.status_code == 422
 
 
+def test_create_plan_rejects_viewer_role(
+    planning_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    """Regression test: `create_plan` never called `authz.require_role_
+    action(session, auth, "write")` -- every other create endpoint in this
+    domain (`create_task`, `create_calendar_event`, `create_meeting`,
+    `create_waiting_link`) does. Since a plan always inserts with
+    `visibility='private'` and has no pre-existing `resource_id`, there was
+    no two-phase `authz.authorize()` fallback either -- nothing gated the
+    write at all, so a `viewer`-role member could successfully create a
+    plan.
+    """
+    _, workspace_id, _, _ = planning_test_context
+    viewer_id = uuid4()
+    viewer_token = f"session-{uuid4()}"
+    now = datetime.now(UTC)
+    with engine.begin() as connection:
+        create_identity(
+            connection,
+            workspace_id=workspace_id,
+            user_id=viewer_id,
+            email=f"{viewer_id}@example.test",
+            now=now,
+            role="viewer",
+        )
+        connection.execute(
+            text(
+                "INSERT INTO sessions (id, workspace_id, user_id, token_hash, "
+                "expires_at, last_seen_at) "
+                "VALUES (:id, :workspace_id, :user_id, :token_hash, :expires_at, :last_seen_at)"
+            ),
+            {
+                "id": uuid4(),
+                "workspace_id": workspace_id,
+                "user_id": viewer_id,
+                "token_hash": sha256(viewer_token.encode()).hexdigest(),
+                "expires_at": now + timedelta(hours=1),
+                "last_seen_at": now,
+            },
+        )
+    viewer_client = TestClient(app)
+    viewer_client.cookies.set("ecc_session", viewer_token)
+    try:
+        start = date.today() + timedelta(days=1)
+        response = viewer_client.post(
+            "/api/v1/plans",
+            headers=_headers(viewer_token, "viewer-create-plan"),
+            json={"period_start": start.isoformat(), "period_end": start.isoformat()},
+        )
+        assert response.status_code == 403, response.text
+        assert response.json()["error"]["code"] == "INSUFFICIENT_ROLE"
+    finally:
+        viewer_client.close()
+
+    with engine.connect() as connection:
+        plan_count = connection.execute(
+            text("SELECT count(*) FROM plans WHERE workspace_id = :workspace_id"),
+            {"workspace_id": workspace_id},
+        ).scalar_one()
+    assert plan_count == 0
+
+
+def test_create_constraint_rejects_viewer_role(
+    planning_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    """Same gap as `test_create_plan_rejects_viewer_role`, in
+    `create_constraint_endpoint`: no `authz.require_role_action(...,
+    "write")` call, so a `viewer`-role member could create a planning
+    constraint.
+    """
+    _, workspace_id, _, _ = planning_test_context
+    viewer_id = uuid4()
+    viewer_token = f"session-{uuid4()}"
+    now = datetime.now(UTC)
+    with engine.begin() as connection:
+        create_identity(
+            connection,
+            workspace_id=workspace_id,
+            user_id=viewer_id,
+            email=f"{viewer_id}@example.test",
+            now=now,
+            role="viewer",
+        )
+        connection.execute(
+            text(
+                "INSERT INTO sessions (id, workspace_id, user_id, token_hash, "
+                "expires_at, last_seen_at) "
+                "VALUES (:id, :workspace_id, :user_id, :token_hash, :expires_at, :last_seen_at)"
+            ),
+            {
+                "id": uuid4(),
+                "workspace_id": workspace_id,
+                "user_id": viewer_id,
+                "token_hash": sha256(viewer_token.encode()).hexdigest(),
+                "expires_at": now + timedelta(hours=1),
+                "last_seen_at": now,
+            },
+        )
+    viewer_client = TestClient(app)
+    viewer_client.cookies.set("ecc_session", viewer_token)
+    try:
+        start = datetime.now(UTC) + timedelta(days=1)
+        response = viewer_client.post(
+            "/api/v1/planning/constraints",
+            headers=_headers(viewer_token, "viewer-create-constraint"),
+            json={
+                "kind": "fixed_time",
+                "label": "Should be denied",
+                "starts_at": start.isoformat(),
+                "ends_at": (start + timedelta(minutes=30)).isoformat(),
+                "hardness": "hard",
+                "priority": 50,
+            },
+        )
+        assert response.status_code == 403, response.text
+        assert response.json()["error"]["code"] == "INSUFFICIENT_ROLE"
+    finally:
+        viewer_client.close()
+
+    with engine.connect() as connection:
+        constraint_count = connection.execute(
+            text("SELECT count(*) FROM planning_constraints WHERE workspace_id = :workspace_id"),
+            {"workspace_id": workspace_id},
+        ).scalar_one()
+    assert constraint_count == 0
+
+
 def test_create_plan_idempotent_on_replay(
     planning_test_context: tuple[TestClient, UUID, UUID, str],
 ) -> None:

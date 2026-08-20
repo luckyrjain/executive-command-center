@@ -21,6 +21,7 @@ from ecc.domains.planning.tasks import (
     lifecycle_task_write,
     set_task_status_write,
 )
+from ecc.platform import authz
 
 # Commitment status values a recommendation may target -- "confirmed" is
 # deliberately absent: it's `CommitmentCreate`'s own create-time-only value
@@ -357,6 +358,27 @@ def execute_target(
         ("risk", "set_pinned"): ("risks", "pinned"),
     }
     table, column = columns[(target_type, operation)]
+    # Found in a later architecture review: unlike `set_status` (which
+    # dispatches into `lifecycle_write`/`lifecycle_task_write`/
+    # `set_risk_status_write`, each of which authz.authorize()s the target
+    # itself before mutating), this generic column-patch branch went
+    # straight to a raw UPDATE scoped only by workspace_id/version/
+    # archived_at -- never the target's own visibility. A recommendation
+    # confirmed against another member's private task/commitment/risk
+    # could silently mutate manual_priority/pinned/importance/probability/
+    # impact on a resource the confirming user's own direct PATCH would
+    # 404 for. `resource_type` is the plural of `target_type`, matching
+    # every direct mutation endpoint's own convention (`"tasks"`/
+    # `"commitments"`/`"risks"`).
+    resource_type = f"{target_type}s"
+    if not authz.authorize(
+        session, auth, resource_type=resource_type, resource_id=target_id, action="read"
+    ):
+        raise HTTPException(status_code=404, detail="TARGET_NOT_FOUND")
+    if not authz.authorize(
+        session, auth, resource_type=resource_type, resource_id=target_id, action="write"
+    ):
+        raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
     result = (
         session.execute(
             text(_update_query(table, column)),
