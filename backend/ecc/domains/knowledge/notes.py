@@ -1,19 +1,17 @@
 from datetime import UTC, datetime
 from hashlib import sha256
-from json import dumps
 from typing import Annotated, Any, Literal
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from sqlalchemy import text
-from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from ecc.auth import AuthContext, AuthDep, CsrfDep
 from ecc.database import get_session
-from ecc.observability import queue_lifecycle_event, record_audit_outbox_failure
-from ecc.platform import authz, cursor_pagination
+from ecc.observability import queue_lifecycle_event
+from ecc.platform import audit_outbox, authz, cursor_pagination
 from ecc.platform.idempotency import load_cached, lock_idempotency, request_hash, store_idempotency
 
 router = APIRouter(prefix="/api/v1/notes", tags=["notes"])
@@ -107,13 +105,6 @@ def _to_response(row: dict[str, Any]) -> NoteResponse:
     return NoteResponse.model_validate(row)
 
 
-def _request_ids(request: Request) -> tuple[UUID, UUID]:
-    try:
-        return UUID(request.state.request_id), UUID(request.state.correlation_id)
-    except (AttributeError, TypeError, ValueError):
-        return uuid4(), uuid4()
-
-
 def _body_checksum(body: str) -> str:
     return sha256(body.encode("utf-8")).hexdigest()
 
@@ -131,97 +122,6 @@ def _redacted_snapshot(row: dict[str, Any]) -> dict[str, Any]:
         "version": row["version"],
         "archived_at": row["archived_at"].isoformat() if row.get("archived_at") else None,
     }
-
-
-def _write_audit(
-    session: Session,
-    auth: AuthContext,
-    event_type: str,
-    note_id: UUID,
-    aggregate_version: int,
-    request_id: UUID,
-    correlation_id: UUID,
-    idempotency_key: str,
-    before: dict[str, Any] | None,
-    after: dict[str, Any] | None,
-    changed_fields: list[str],
-    now: datetime,
-) -> None:
-    try:
-        session.execute(
-            text(
-                """
-                INSERT INTO audit_events (
-                    id, workspace_id, event_type, aggregate_type, aggregate_id,
-                    aggregate_version, actor_id, request_id, correlation_id,
-                    idempotency_key_hash, before, after, changed_fields,
-                    authorization_result, source, metadata, occurred_at
-                ) VALUES (
-                    :id, :workspace_id, :event_type, 'note', :aggregate_id,
-                    :aggregate_version, :actor_id, :request_id, :correlation_id,
-                    :key_hash, CAST(:before AS jsonb), CAST(:after AS jsonb),
-                    :changed_fields, 'allowed', 'user', CAST(:metadata AS jsonb), :occurred_at
-                )
-                """
-            ),
-            {
-                "id": uuid4(),
-                "workspace_id": auth.workspace_id,
-                "event_type": event_type,
-                "aggregate_id": note_id,
-                "aggregate_version": aggregate_version,
-                "actor_id": auth.user_id,
-                "request_id": request_id,
-                "correlation_id": correlation_id,
-                "key_hash": sha256(idempotency_key.encode()).hexdigest(),
-                "before": dumps(before) if before is not None else None,
-                "after": dumps(after) if after is not None else None,
-                "changed_fields": changed_fields,
-                "metadata": dumps({"body_redacted": True}),
-                "occurred_at": now,
-            },
-        )
-    except SQLAlchemyError:
-        record_audit_outbox_failure("notes")
-        raise
-    queue_lifecycle_event(session, "note", event_type, "allowed")
-
-
-def _write_outbox(
-    session: Session,
-    auth: AuthContext,
-    event_type: str,
-    note_id: UUID,
-    version: int,
-    correlation_id: UUID,
-    payload: dict[str, Any],
-    now: datetime,
-) -> None:
-    try:
-        session.execute(
-            text(
-                """
-                INSERT INTO event_outbox (
-                    event_id, workspace_id, event_type, event_version,
-                    correlation_id, payload, occurred_at, attempt_count
-                ) VALUES (
-                    :event_id, :workspace_id, :event_type, 1,
-                    :correlation_id, CAST(:payload AS jsonb), :occurred_at, 0
-                )
-                """
-            ),
-            {
-                "event_id": uuid4(),
-                "workspace_id": auth.workspace_id,
-                "event_type": event_type,
-                "correlation_id": correlation_id,
-                "payload": dumps({"note_id": str(note_id), "version": version, **payload}),
-                "occurred_at": now,
-            },
-        )
-    except SQLAlchemyError:
-        record_audit_outbox_failure("notes")
-        raise
 
 
 def _get_row(
@@ -306,7 +206,6 @@ def create_note(
 ) -> NoteResponse:
     authz.require_role_action(session, auth, "write")
     req_hash = request_hash(payload, "create")
-    request_id, correlation_id = _request_ids(request)
     now = datetime.now(UTC)
     note_id = uuid4()
 
@@ -348,33 +247,29 @@ def create_note(
         current = dict(row)
         response = _to_response(current.copy())
         redacted = _redacted_snapshot(current)
-        _write_audit(
+        audit_outbox.write_audit_and_outbox(
             session,
             auth,
-            "note.created",
-            note_id,
-            1,
-            request_id,
-            correlation_id,
-            idempotency_key,
-            None,
-            redacted,
-            ["*"],
-            now,
-        )
-        _write_outbox(
-            session,
-            auth,
-            "note.created.v1",
-            note_id,
-            1,
-            correlation_id,
-            {
+            request,
+            event_type="note.created",
+            aggregate_type="note",
+            aggregate_id=note_id,
+            aggregate_version=1,
+            changed_fields=["*"],
+            payload={
+                "note_id": str(note_id),
+                "version": 1,
                 "note_type": payload.note_type,
                 "meeting_id": str(payload.meeting_id) if payload.meeting_id else None,
             },
-            now,
+            now=now,
+            domain="notes",
+            idempotency_key_hash=sha256(idempotency_key.encode()).hexdigest(),
+            before=None,
+            after=redacted,
+            metadata={"body_redacted": True},
         )
+        queue_lifecycle_event(session, "note", "note.created", "allowed")
         store_idempotency(
             session, auth, idempotency_key, req_hash, response.model_dump(mode="json"), now, 201
         )
@@ -471,7 +366,6 @@ def update_note(
     idempotency_key: IdempotencyHeader,
 ) -> NoteResponse:
     req_hash = request_hash(payload, f"update:{note_id}")
-    request_id, correlation_id = _request_ids(request)
     now = datetime.now(UTC)
 
     with session.begin():
@@ -537,33 +431,29 @@ def update_note(
         response = _to_response(updated.copy())
         before = _redacted_snapshot(current)
         after = _redacted_snapshot(updated)
-        _write_audit(
+        audit_outbox.write_audit_and_outbox(
             session,
             auth,
-            "note.updated",
-            note_id,
-            response.version,
-            request_id,
-            correlation_id,
-            idempotency_key,
-            before,
-            after,
-            changed_fields,
-            now,
-        )
-        _write_outbox(
-            session,
-            auth,
-            "note.updated.v1",
-            note_id,
-            response.version,
-            correlation_id,
-            {
+            request,
+            event_type="note.updated",
+            aggregate_type="note",
+            aggregate_id=note_id,
+            aggregate_version=response.version,
+            changed_fields=changed_fields,
+            payload={
+                "note_id": str(note_id),
+                "version": response.version,
                 "changed_fields": changed_fields,
                 "body_checksum": _body_checksum(updated["body"]),
             },
-            now,
+            now=now,
+            domain="notes",
+            idempotency_key_hash=sha256(idempotency_key.encode()).hexdigest(),
+            before=before,
+            after=after,
+            metadata={"body_redacted": True},
         )
+        queue_lifecycle_event(session, "note", "note.updated", "allowed")
         store_idempotency(
             session, auth, idempotency_key, req_hash, response.model_dump(mode="json"), now
         )
@@ -580,7 +470,6 @@ def _lifecycle(
     action: Literal["archive", "restore"],
 ) -> NoteResponse:
     req_hash = request_hash(payload, f"{action}:{note_id}")
-    request_id, correlation_id = _request_ids(request)
     now = datetime.now(UTC)
 
     with session.begin():
@@ -613,13 +502,11 @@ def _lifecycle(
         if action == "archive":
             assignments = "archived_at = :now, pre_archive_status = 'active'"
             audit_type = "note.archived"
-            event_type = "note.archived.v1"
             event_payload = {"archived_at": now.isoformat()}
             changed_fields = ["archived_at", "pre_archive_status"]
         else:
             assignments = "archived_at = NULL, pre_archive_status = NULL"
             audit_type = "note.restored"
-            event_type = "note.restored.v1"
             event_payload = {}
             changed_fields = ["archived_at", "pre_archive_status"]
         row = (
@@ -645,30 +532,24 @@ def _lifecycle(
         )
         updated = dict(row)
         response = _to_response(updated.copy())
-        _write_audit(
+        audit_outbox.write_audit_and_outbox(
             session,
             auth,
-            audit_type,
-            note_id,
-            response.version,
-            request_id,
-            correlation_id,
-            idempotency_key,
-            _redacted_snapshot(current),
-            _redacted_snapshot(updated),
-            changed_fields,
-            now,
+            request,
+            event_type=audit_type,
+            aggregate_type="note",
+            aggregate_id=note_id,
+            aggregate_version=response.version,
+            changed_fields=changed_fields,
+            payload={"note_id": str(note_id), "version": response.version, **event_payload},
+            now=now,
+            domain="notes",
+            idempotency_key_hash=sha256(idempotency_key.encode()).hexdigest(),
+            before=_redacted_snapshot(current),
+            after=_redacted_snapshot(updated),
+            metadata={"body_redacted": True},
         )
-        _write_outbox(
-            session,
-            auth,
-            event_type,
-            note_id,
-            response.version,
-            correlation_id,
-            event_payload,
-            now,
-        )
+        queue_lifecycle_event(session, "note", audit_type, "allowed")
         store_idempotency(
             session, auth, idempotency_key, req_hash, response.model_dump(mode="json"), now
         )

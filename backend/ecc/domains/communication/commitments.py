@@ -1,22 +1,17 @@
 from datetime import UTC, date, datetime
 from hashlib import sha256
-from json import dumps
 from typing import Annotated, Any, Literal
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from sqlalchemy import text
-from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from ecc.auth import AuthContext, AuthDep, CsrfDep
 from ecc.database import get_session
-from ecc.observability import (
-    queue_lifecycle_event,
-    record_audit_outbox_failure,
-)
-from ecc.platform import authz, cursor_pagination
+from ecc.observability import queue_lifecycle_event
+from ecc.platform import audit_outbox, authz, cursor_pagination
 from ecc.platform.idempotency import load_cached, lock_idempotency, request_hash, store_idempotency
 
 router = APIRouter(prefix="/api/v1/commitments", tags=["commitments"])
@@ -149,98 +144,6 @@ def _request_ids(request: Request) -> tuple[UUID, UUID]:
         return UUID(request.state.request_id), UUID(request.state.correlation_id)
     except (AttributeError, TypeError, ValueError):
         return uuid4(), uuid4()
-
-
-def _write_audit(
-    session: Session,
-    auth: AuthContext,
-    event_type: str,
-    commitment_id: UUID,
-    aggregate_version: int,
-    request_id: UUID,
-    correlation_id: UUID,
-    idempotency_key: str,
-    before: dict[str, Any] | None,
-    after: dict[str, Any] | None,
-    changed_fields: list[str],
-    now: datetime,
-) -> None:
-    try:
-        session.execute(
-            text(
-                """
-                INSERT INTO audit_events (
-                    id, workspace_id, event_type, aggregate_type, aggregate_id,
-                    aggregate_version, actor_id, request_id, correlation_id,
-                    idempotency_key_hash, before, after, changed_fields,
-                    authorization_result, source, metadata, occurred_at
-                ) VALUES (
-                    :id, :workspace_id, :event_type, 'commitment', :aggregate_id,
-                    :aggregate_version, :actor_id, :request_id, :correlation_id,
-                    :key_hash, CAST(:before AS jsonb), CAST(:after AS jsonb),
-                    :changed_fields, 'allowed', 'user', '{}'::jsonb, :occurred_at
-                )
-                """
-            ),
-            {
-                "id": uuid4(),
-                "workspace_id": auth.workspace_id,
-                "event_type": event_type,
-                "aggregate_id": commitment_id,
-                "aggregate_version": aggregate_version,
-                "actor_id": auth.user_id,
-                "request_id": request_id,
-                "correlation_id": correlation_id,
-                "key_hash": sha256(idempotency_key.encode()).hexdigest(),
-                "before": dumps(before) if before is not None else None,
-                "after": dumps(after) if after is not None else None,
-                "changed_fields": changed_fields,
-                "occurred_at": now,
-            },
-        )
-    except SQLAlchemyError:
-        record_audit_outbox_failure("commitments")
-        raise
-    queue_lifecycle_event(session, "commitment", event_type, "allowed")
-
-
-def _write_outbox(
-    session: Session,
-    auth: AuthContext,
-    event_type: str,
-    commitment_id: UUID,
-    version: int,
-    correlation_id: UUID,
-    payload: dict[str, Any],
-    now: datetime,
-) -> None:
-    try:
-        session.execute(
-            text(
-                """
-                INSERT INTO event_outbox (
-                    event_id, workspace_id, event_type, event_version,
-                    correlation_id, payload, occurred_at
-                ) VALUES (
-                    :event_id, :workspace_id, :event_type, 1,
-                    :correlation_id, CAST(:payload AS jsonb), :occurred_at
-                )
-                """
-            ),
-            {
-                "event_id": uuid4(),
-                "workspace_id": auth.workspace_id,
-                "event_type": event_type,
-                "correlation_id": correlation_id,
-                "payload": dumps(
-                    {"commitment_id": str(commitment_id), "version": version, **payload}
-                ),
-                "occurred_at": now,
-            },
-        )
-    except SQLAlchemyError:
-        record_audit_outbox_failure("commitments")
-        raise
 
 
 def _get_row(
@@ -377,38 +280,34 @@ def insert_commitment(
     )
     response = _to_response(dict(row))
     after = response.model_dump(mode="json")
-    _write_audit(
-        session,
-        auth,
-        "commitment.created",
-        commitment_id,
-        1,
-        request_id,
-        correlation_id,
-        idempotency_key,
-        None,
-        after,
-        ["*"],
-        now,
-    )
-    event_type = (
+    outbox_event_type = (
         "commitment.detected.v1" if initial_status == "detected" else "commitment.created.v1"
     )
-    _write_outbox(
+    audit_outbox.write_audit_and_outbox(
         session,
         auth,
-        event_type,
-        commitment_id,
-        1,
-        correlation_id,
-        {
+        (request_id, correlation_id),
+        event_type="commitment.created",
+        aggregate_type="commitment",
+        aggregate_id=commitment_id,
+        aggregate_version=1,
+        changed_fields=["*"],
+        payload={
+            "commitment_id": str(commitment_id),
+            "version": 1,
             "direction": payload.direction,
             "importance": payload.importance,
             "evidence_id": str(payload.evidence_id) if payload.evidence_id else None,
             "confidence": payload.confidence,
         },
-        now,
+        now=now,
+        domain="commitments",
+        idempotency_key_hash=sha256(idempotency_key.encode()).hexdigest(),
+        before=None,
+        after=after,
+        outbox_event_type=outbox_event_type,
     )
+    queue_lifecycle_event(session, "commitment", "commitment.created", "allowed")
     return response
 
 
@@ -582,7 +481,6 @@ def _mutate_commitment(
     idempotency_key: str,
 ) -> CommitmentResponse:
     req_hash = request_hash(payload, f"update:{commitment_id}")
-    request_id, correlation_id = _request_ids(request)
     now = datetime.now(UTC)
     with session.begin():
         lock_idempotency(session, auth, idempotency_key)
@@ -657,30 +555,27 @@ def _mutate_commitment(
         response = _to_response(dict(row))
         before = _to_response(current).model_dump(mode="json")
         after = response.model_dump(mode="json")
-        _write_audit(
+        audit_outbox.write_audit_and_outbox(
             session,
             auth,
-            "commitment.updated",
-            commitment_id,
-            response.version,
-            request_id,
-            correlation_id,
-            idempotency_key,
-            before,
-            after,
-            changed_fields,
-            now,
+            request,
+            event_type="commitment.updated",
+            aggregate_type="commitment",
+            aggregate_id=commitment_id,
+            aggregate_version=response.version,
+            changed_fields=changed_fields,
+            payload={
+                "commitment_id": str(commitment_id),
+                "version": response.version,
+                "changed_fields": changed_fields,
+            },
+            now=now,
+            domain="commitments",
+            idempotency_key_hash=sha256(idempotency_key.encode()).hexdigest(),
+            before=before,
+            after=after,
         )
-        _write_outbox(
-            session,
-            auth,
-            "commitment.updated.v1",
-            commitment_id,
-            response.version,
-            correlation_id,
-            {"changed_fields": changed_fields},
-            now,
-        )
+        queue_lifecycle_event(session, "commitment", "commitment.updated", "allowed")
         store_idempotency(
             session, auth, idempotency_key, req_hash, response.model_dump(mode="json"), now
         )
@@ -748,7 +643,6 @@ def lifecycle_write(
     if action == "confirm":
         assignments = "status = 'active'"
         audit_type = "commitment.confirmed"
-        event_type = "commitment.confirmed.v1"
         event_payload = {
             "owner_id": str(auth.user_id),
             "due_date": str(current["due_date"]) if current["due_date"] else None,
@@ -758,25 +652,21 @@ def lifecycle_write(
     elif action == "fulfil":
         assignments = "status = 'fulfilled', fulfilled_at = :now"
         audit_type = "commitment.fulfilled"
-        event_type = "commitment.fulfilled.v1"
         event_payload = {"fulfilled_at": now.isoformat()}
         changed_fields = ["status", "fulfilled_at"]
     elif action == "cancel":
         assignments = "status = 'cancelled', fulfilled_at = NULL"
         audit_type = "commitment.cancelled"
-        event_type = "commitment.cancelled.v1"
         event_payload = {"reason": reason}
         changed_fields = ["status", "fulfilled_at"]
     elif action == "break":
         assignments = "status = 'broken', fulfilled_at = NULL"
         audit_type = "commitment.broken"
-        event_type = "commitment.broken.v1"
         event_payload = {"reason": reason}
         changed_fields = ["status", "fulfilled_at"]
     elif action == "archive":
         assignments = "archived_at = :now, pre_archive_status = status"
         audit_type = "commitment.archived"
-        event_type = "commitment.archived.v1"
         event_payload = {
             "archived_at": now.isoformat(),
             "pre_archive_status": current["status"],
@@ -786,7 +676,6 @@ def lifecycle_write(
         restored_status = current["pre_archive_status"] or "confirmed"
         assignments = "archived_at = NULL, pre_archive_status = NULL, status = :restored_status"
         audit_type = "commitment.restored"
-        event_type = "commitment.restored.v1"
         event_payload = {"restored_status": restored_status}
         changed_fields = ["archived_at", "pre_archive_status", "status"]
 
@@ -817,30 +706,27 @@ def lifecycle_write(
     response = _to_response(dict(row))
     before = _to_response(current).model_dump(mode="json")
     after = response.model_dump(mode="json")
-    _write_audit(
+    audit_outbox.write_audit_and_outbox(
         session,
         auth,
-        audit_type,
-        commitment_id,
-        response.version,
-        request_id,
-        correlation_id,
-        idempotency_key,
-        before,
-        after,
-        changed_fields,
-        now,
+        (request_id, correlation_id),
+        event_type=audit_type,
+        aggregate_type="commitment",
+        aggregate_id=commitment_id,
+        aggregate_version=response.version,
+        changed_fields=changed_fields,
+        payload={
+            "commitment_id": str(commitment_id),
+            "version": response.version,
+            **event_payload,
+        },
+        now=now,
+        domain="commitments",
+        idempotency_key_hash=sha256(idempotency_key.encode()).hexdigest(),
+        before=before,
+        after=after,
     )
-    _write_outbox(
-        session,
-        auth,
-        event_type,
-        commitment_id,
-        response.version,
-        correlation_id,
-        event_payload,
-        now,
-    )
+    queue_lifecycle_event(session, "commitment", audit_type, "allowed")
     return response
 
 

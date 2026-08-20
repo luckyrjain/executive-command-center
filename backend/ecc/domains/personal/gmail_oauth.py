@@ -76,13 +76,13 @@ from ecc.domains.engineering.connector_accounts import (
     ConnectorAccountResponse,
     _sanitize_adapter_error,
     _to_response,
-    _write_side_effects,
     get_connector_account,
 )
 from ecc.domains.engineering.connectors import AdapterAuthorizationError, ConnectorAccountContext
 from ecc.domains.engineering.crypto import decrypt_credential, encrypt_credential
 from ecc.domains.personal.gmail_adapter import GmailAdapter
-from ecc.platform import authz
+from ecc.observability import queue_lifecycle_event
+from ecc.platform import audit_outbox, authz
 
 router = APIRouter(prefix="/api/v1/personal/gmail", tags=["personal"])
 SessionDep = Annotated[Session, Depends(get_session)]
@@ -462,14 +462,27 @@ def gmail_oauth_callback_endpoint(
                         )
                         assert reactivated is not None
                         response = _to_response(reactivated)
-                        _write_side_effects(
+                        audit_outbox.write_audit_and_outbox(
                             create_session,
                             auth,
                             request,
                             event_type="connector_account.reconnected",
+                            aggregate_type="connector_account",
                             aggregate_id=reactivated.id,
-                            version=reactivated.version,
+                            aggregate_version=reactivated.version,
+                            changed_fields=["*"],
+                            payload={
+                                "aggregate_id": str(reactivated.id),
+                                "version": reactivated.version,
+                            },
                             now=now,
+                            domain="engineering_connector_account",
+                        )
+                        queue_lifecycle_event(
+                            create_session,
+                            "engineering_connector_account",
+                            "connector_account.reconnected",
+                            "allowed",
                         )
                 except Exception:
                     pending_revokes.append(
@@ -518,14 +531,24 @@ def gmail_oauth_callback_endpoint(
                     created = get_connector_account(create_session, auth.workspace_id, account_id)
                     assert created is not None
                     response = _to_response(created)
-                    _write_side_effects(
+                    audit_outbox.write_audit_and_outbox(
                         create_session,
                         auth,
                         request,
                         event_type="connector_account.created",
+                        aggregate_type="connector_account",
                         aggregate_id=created.id,
-                        version=created.version,
+                        aggregate_version=created.version,
+                        changed_fields=["*"],
+                        payload={"aggregate_id": str(created.id), "version": created.version},
                         now=now,
+                        domain="engineering_connector_account",
+                    )
+                    queue_lifecycle_event(
+                        create_session,
+                        "engineering_connector_account",
+                        "connector_account.created",
+                        "allowed",
                     )
                 except Exception:
                     pending_revokes.append(

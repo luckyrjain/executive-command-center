@@ -51,23 +51,18 @@ real scope across PRs when it turns out larger than one reviewable unit
 """
 
 from datetime import UTC, datetime
-from json import dumps
 from typing import Annotated, Any, Literal
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import text
-from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from ecc.auth import AuthContext, AuthDep, CsrfDep
 from ecc.database import get_session
-from ecc.observability import (
-    queue_lifecycle_event,
-    record_audit_outbox_failure,
-)
-from ecc.platform import authz
+from ecc.observability import queue_lifecycle_event
+from ecc.platform import audit_outbox, authz
 from ecc.platform.idempotency import load_cached, lock_idempotency, request_hash, store_idempotency
 
 router = APIRouter(prefix="/api/v1/engineering", tags=["engineering"])
@@ -166,82 +161,6 @@ class DecisionResponse(BaseModel):
 
 class DecisionListResponse(BaseModel):
     decisions: list[DecisionResponse]
-
-
-def _request_ids(request: Request) -> tuple[UUID, UUID]:
-    try:
-        return UUID(request.state.request_id), UUID(request.state.correlation_id)
-    except (AttributeError, TypeError, ValueError):
-        return uuid4(), uuid4()
-
-
-def _write_side_effects(
-    session: Session,
-    auth: AuthContext,
-    request: Request,
-    *,
-    event_type: str,
-    aggregate_type: str,
-    aggregate_id: UUID,
-    version: int,
-    now: datetime,
-) -> None:
-    request_id, correlation_id = _request_ids(request)
-    try:
-        session.execute(
-            text(
-                """
-                INSERT INTO audit_events (
-                    id, workspace_id, event_type, aggregate_type, aggregate_id,
-                    aggregate_version, actor_id, request_id, correlation_id,
-                    changed_fields, authorization_result, source, metadata, occurred_at,
-                    owner_id, visibility
-                ) VALUES (
-                    :id, :workspace_id, :event_type, :aggregate_type, :aggregate_id,
-                    :aggregate_version, :actor_id, :request_id, :correlation_id,
-                    ARRAY['*'], 'allowed', 'user', '{}'::jsonb, :occurred_at,
-                    :actor_id, 'workspace'
-                )
-                """
-            ),
-            {
-                "id": uuid4(),
-                "workspace_id": auth.workspace_id,
-                "event_type": event_type,
-                "aggregate_type": aggregate_type,
-                "aggregate_id": aggregate_id,
-                "aggregate_version": version,
-                "actor_id": auth.user_id,
-                "request_id": request_id,
-                "correlation_id": correlation_id,
-                "occurred_at": now,
-            },
-        )
-        session.execute(
-            text(
-                """
-                INSERT INTO event_outbox (
-                    event_id, workspace_id, event_type, event_version,
-                    correlation_id, payload, occurred_at, attempt_count
-                ) VALUES (
-                    :event_id, :workspace_id, :event_type_v1, 1,
-                    :correlation_id, CAST(:payload AS jsonb), :occurred_at, 0
-                )
-                """
-            ),
-            {
-                "event_id": uuid4(),
-                "workspace_id": auth.workspace_id,
-                "event_type_v1": f"{event_type}.v1",
-                "correlation_id": correlation_id,
-                "payload": dumps({"aggregate_id": str(aggregate_id), "version": version}),
-                "occurred_at": now,
-            },
-        )
-    except SQLAlchemyError:
-        record_audit_outbox_failure("engineering_decisions_incidents")
-        raise
-    queue_lifecycle_event(session, "engineering_decisions_incidents", event_type, "allowed")
 
 
 def _deduplicated(change_ids: list[UUID]) -> list[UUID]:
@@ -427,15 +346,21 @@ def create_incident_endpoint(
         row = _get_incident(session, auth.workspace_id, incident_id)
         assert row is not None  # just inserted, same transaction
         response = _to_incident_response(session, auth, row)
-        _write_side_effects(
+        audit_outbox.write_audit_and_outbox(
             session,
             auth,
             request,
             event_type="incident.created",
             aggregate_type="incident",
             aggregate_id=incident_id,
-            version=1,
+            aggregate_version=1,
+            changed_fields=["*"],
+            payload={"aggregate_id": str(incident_id), "version": 1},
             now=now,
+            domain="engineering_decisions_incidents",
+        )
+        queue_lifecycle_event(
+            session, "engineering_decisions_incidents", "incident.created", "allowed"
         )
         store_idempotency(
             session,
@@ -533,15 +458,21 @@ def resolve_incident_endpoint(
         row = _get_incident(session, auth.workspace_id, incident_id)
         assert row is not None
         response = _to_incident_response(session, auth, row)
-        _write_side_effects(
+        audit_outbox.write_audit_and_outbox(
             session,
             auth,
             request,
             event_type="incident.resolved",
             aggregate_type="incident",
             aggregate_id=incident_id,
-            version=new_version,
+            aggregate_version=new_version,
+            changed_fields=["*"],
+            payload={"aggregate_id": str(incident_id), "version": new_version},
             now=now,
+            domain="engineering_decisions_incidents",
+        )
+        queue_lifecycle_event(
+            session, "engineering_decisions_incidents", "incident.resolved", "allowed"
         )
         store_idempotency(
             session, auth, idempotency_key, req_hash, response.model_dump(mode="json"), now
@@ -649,15 +580,21 @@ def create_decision_endpoint(
         row = _get_decision(session, auth.workspace_id, decision_id)
         assert row is not None
         response = _to_decision_response(session, auth, row)
-        _write_side_effects(
+        audit_outbox.write_audit_and_outbox(
             session,
             auth,
             request,
             event_type="engineering_decision.created",
             aggregate_type="engineering_decision",
             aggregate_id=decision_id,
-            version=1,
+            aggregate_version=1,
+            changed_fields=["*"],
+            payload={"aggregate_id": str(decision_id), "version": 1},
             now=now,
+            domain="engineering_decisions_incidents",
+        )
+        queue_lifecycle_event(
+            session, "engineering_decisions_incidents", "engineering_decision.created", "allowed"
         )
         store_idempotency(
             session,
@@ -756,15 +693,21 @@ def decide_decision_endpoint(
         row = _get_decision(session, auth.workspace_id, decision_id)
         assert row is not None
         response = _to_decision_response(session, auth, row)
-        _write_side_effects(
+        audit_outbox.write_audit_and_outbox(
             session,
             auth,
             request,
             event_type="engineering_decision.decided",
             aggregate_type="engineering_decision",
             aggregate_id=decision_id,
-            version=new_version,
+            aggregate_version=new_version,
+            changed_fields=["*"],
+            payload={"aggregate_id": str(decision_id), "version": new_version},
             now=now,
+            domain="engineering_decisions_incidents",
+        )
+        queue_lifecycle_event(
+            session, "engineering_decisions_incidents", "engineering_decision.decided", "allowed"
         )
         store_idempotency(
             session, auth, idempotency_key, req_hash, response.model_dump(mode="json"), now
