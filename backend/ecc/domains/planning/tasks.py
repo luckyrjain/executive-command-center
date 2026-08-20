@@ -1,6 +1,5 @@
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, date, datetime
 from hashlib import sha256
-from json import dumps
 from typing import Annotated, Any, Literal
 from uuid import UUID, uuid4
 
@@ -11,11 +10,8 @@ from sqlalchemy.orm import Session
 
 from ecc.auth import AuthContext, AuthDep, CsrfDep
 from ecc.database import get_session
-from ecc.observability import (
-    queue_lifecycle_event,
-    record_idempotency_conflict,
-)
-from ecc.platform import audit_outbox, authz, cursor_pagination
+from ecc.observability import queue_lifecycle_event
+from ecc.platform import audit_outbox, authz, cursor_pagination, idempotency
 
 router = APIRouter(prefix="/api/v1/tasks", tags=["tasks"])
 
@@ -139,93 +135,6 @@ def _request_ids(request: Request) -> tuple[UUID, UUID]:
         return UUID(request_id), UUID(correlation_id)
     except (TypeError, ValueError):
         return uuid4(), uuid4()
-
-
-def _request_hash(payload: BaseModel, action: str) -> str:
-    material = {
-        "action": action,
-        "payload": payload.model_dump(mode="json", exclude_none=False),
-    }
-    encoded = dumps(material, sort_keys=True, separators=(",", ":")).encode()
-    return sha256(encoded).hexdigest()
-
-
-def _lock_idempotency_key(session: Session, auth: AuthContext, key: str) -> None:
-    lock_key = f"{auth.workspace_id}:{auth.user_id}:{key}"
-    session.execute(
-        text("SELECT pg_advisory_xact_lock(hashtextextended(:lock_key, 0))"),
-        {"lock_key": lock_key},
-    )
-
-
-def _load_idempotent_response(
-    session: Session,
-    auth: AuthContext,
-    key: str,
-    request_hash: str,
-) -> TaskResponse | None:
-    existing = (
-        session.execute(
-            text(
-                """
-            SELECT request_hash, response_body
-            FROM idempotency_records
-            WHERE workspace_id = :workspace_id
-              AND actor_id = :actor_id
-              AND key = :key
-              AND expires_at > :now
-            """
-            ),
-            {
-                "workspace_id": auth.workspace_id,
-                "actor_id": auth.user_id,
-                "key": key,
-                "now": datetime.now(UTC),
-            },
-        )
-        .mappings()
-        .one_or_none()
-    )
-    if existing is None:
-        return None
-    if existing["request_hash"] != request_hash:
-        record_idempotency_conflict("tasks")
-        raise HTTPException(status_code=409, detail="IDEMPOTENCY_CONFLICT")
-    return TaskResponse.model_validate(existing["response_body"])
-
-
-def _store_idempotency(
-    session: Session,
-    auth: AuthContext,
-    key: str,
-    request_hash: str,
-    response: TaskResponse,
-    response_status: int,
-    now: datetime,
-) -> None:
-    session.execute(
-        text(
-            """
-            INSERT INTO idempotency_records (
-                workspace_id, actor_id, key, request_hash, response_status,
-                response_body, created_at, expires_at
-            ) VALUES (
-                :workspace_id, :actor_id, :key, :request_hash, :response_status,
-                CAST(:response_body AS jsonb), :created_at, :expires_at
-            )
-            """
-        ),
-        {
-            "workspace_id": auth.workspace_id,
-            "actor_id": auth.user_id,
-            "key": key,
-            "request_hash": request_hash,
-            "response_status": response_status,
-            "response_body": dumps(response.model_dump(mode="json")),
-            "created_at": now,
-            "expires_at": now + timedelta(days=365),
-        },
-    )
 
 
 def _get_task_row(
@@ -378,17 +287,19 @@ def create_task(
     idempotency_key: IdempotencyHeader,
 ) -> TaskResponse:
     authz.require_role_action(session, auth, "write")
-    request_hash = _request_hash(payload, "create")
+    request_hash = idempotency.request_hash(payload, "create")
     now = datetime.now(UTC)
     request_id, correlation_id = _request_ids(request)
 
     with session.begin():
-        _lock_idempotency_key(session, auth, idempotency_key)
-        cached = _load_idempotent_response(
+        idempotency.lock_idempotency(session, auth, idempotency_key)
+        cached = idempotency.load_cached(
             session,
             auth,
             idempotency_key,
             request_hash,
+            domain="tasks",
+            response_model=TaskResponse,
         )
         if cached is not None:
             return cached
@@ -402,14 +313,14 @@ def create_task(
             idempotency_key=idempotency_key,
             now=now,
         )
-        _store_idempotency(
+        idempotency.store_idempotency(
             session,
             auth,
             idempotency_key,
             request_hash,
-            response,
-            201,
+            response.model_dump(mode="json"),
             now,
+            response_status=201,
         )
         return response
 
@@ -515,16 +426,18 @@ def update_task(
     _csrf: CsrfDep,
     idempotency_key: IdempotencyHeader,
 ) -> TaskResponse:
-    request_hash = _request_hash(payload, f"update:{task_id}")
+    request_hash = idempotency.request_hash(payload, f"update:{task_id}")
     now = datetime.now(UTC)
 
     with session.begin():
-        _lock_idempotency_key(session, auth, idempotency_key)
-        cached = _load_idempotent_response(
+        idempotency.lock_idempotency(session, auth, idempotency_key)
+        cached = idempotency.load_cached(
             session,
             auth,
             idempotency_key,
             request_hash,
+            domain="tasks",
+            response_model=TaskResponse,
         )
         if cached is not None:
             return cached
@@ -557,14 +470,14 @@ def update_task(
         fields = payload.model_fields_set - {"expected_version"}
         if not fields:
             response = _to_response(current)
-            _store_idempotency(
+            idempotency.store_idempotency(
                 session,
                 auth,
                 idempotency_key,
                 request_hash,
-                response,
-                200,
+                response.model_dump(mode="json"),
                 now,
+                response_status=200,
             )
             return response
 
@@ -638,14 +551,14 @@ def update_task(
             after=after,
         )
         queue_lifecycle_event(session, "task", "task.updated", "allowed")
-        _store_idempotency(
+        idempotency.store_idempotency(
             session,
             auth,
             idempotency_key,
             request_hash,
-            response,
-            200,
+            response.model_dump(mode="json"),
             now,
+            response_status=200,
         )
         return response
 
@@ -876,17 +789,19 @@ def _lifecycle_task(
     idempotency_key: str,
     action: Literal["complete", "cancel", "archive", "restore"],
 ) -> TaskResponse:
-    request_hash = _request_hash(payload, f"{action}:{task_id}")
+    request_hash = idempotency.request_hash(payload, f"{action}:{task_id}")
     now = datetime.now(UTC)
     request_id, correlation_id = _request_ids(request)
 
     with session.begin():
-        _lock_idempotency_key(session, auth, idempotency_key)
-        cached = _load_idempotent_response(
+        idempotency.lock_idempotency(session, auth, idempotency_key)
+        cached = idempotency.load_cached(
             session,
             auth,
             idempotency_key,
             request_hash,
+            domain="tasks",
+            response_model=TaskResponse,
         )
         if cached is not None:
             return cached
@@ -902,14 +817,14 @@ def _lifecycle_task(
             idempotency_key=idempotency_key,
             now=now,
         )
-        _store_idempotency(
+        idempotency.store_idempotency(
             session,
             auth,
             idempotency_key,
             request_hash,
-            response,
-            200,
+            response.model_dump(mode="json"),
             now,
+            response_status=200,
         )
         return response
 

@@ -1,6 +1,4 @@
-from datetime import UTC, datetime, timedelta
-from hashlib import sha256
-from json import dumps
+from datetime import UTC, datetime
 from typing import Any
 from uuid import UUID
 
@@ -12,7 +10,7 @@ from sqlalchemy.orm import Session
 from ecc.auth import AuthContext
 from ecc.domains.governance.recommendation_events import record_event
 from ecc.domains.governance.recommendation_models import RecommendationResponse
-from ecc.observability import record_idempotency_conflict
+from ecc.platform import idempotency
 
 FIELDS = """
 id, recommendation_type, target_type, target_id, proposed_action, proposed_fields,
@@ -29,15 +27,11 @@ def project(row: dict[str, Any]) -> RecommendationResponse:
 
 
 def request_hash(payload: BaseModel, action: str) -> str:
-    material = {"action": action, "payload": payload.model_dump(mode="json")}
-    return sha256(dumps(material, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    return idempotency.request_hash(payload, action)
 
 
 def lock_idempotency(session: Session, auth: AuthContext, key: str) -> None:
-    session.execute(
-        text("SELECT pg_advisory_xact_lock(hashtextextended(:key, 0))"),
-        {"key": f"recommendation:{auth.workspace_id}:{auth.user_id}:{key}"},
-    )
+    idempotency.lock_idempotency(session, auth, key)
 
 
 def load_cached(
@@ -46,34 +40,39 @@ def load_cached(
     key: str,
     digest: str,
 ) -> RecommendationResponse | None:
-    row = (
-        session.execute(
-            text(
-                """
-                SELECT request_hash, response_body
-                FROM idempotency_records
-                WHERE workspace_id=:workspace_id AND actor_id=:actor_id
-                  AND key=:key AND expires_at>:now
-                """
-            ),
-            {
-                "workspace_id": auth.workspace_id,
-                "actor_id": auth.user_id,
-                "key": key,
-                "now": datetime.now(UTC),
-            },
+    """Thin wrapper, not a straight delegation -- every one of this
+    module's own callers (`recommendation_mutations.py`'s `_start`) calls
+    this immediately after `lock_idempotency`, with no `session.begin()`
+    of its own anywhere in between: the `pg_advisory_xact_lock` and this
+    read share one continuous implicit transaction that only ends at the
+    caller's own explicit `session.commit()` after the real mutation
+    runs. A cache HIT (or a conflict) means nothing further happens in
+    this transaction, so `session.rollback()` closes the now-done
+    read-only transaction out cleanly. A cache MISS must NOT roll back --
+    that would release the just-acquired advisory lock immediately,
+    before the mutation it exists to serialize ever runs, defeating the
+    lock's entire purpose for two concurrent requests sharing the same
+    `Idempotency-Key`. The shared `ecc.platform.idempotency.load_cached`
+    itself never rolls back (most of its other callers are already
+    inside their own `session.begin()` block, where a mid-block rollback
+    would incorrectly discard work already done), so this conditional
+    rollback has to stay here rather than move into the shared helper.
+    """
+    try:
+        result = idempotency.load_cached(
+            session,
+            auth,
+            key,
+            digest,
+            domain="recommendations",
+            response_model=RecommendationResponse,
         )
-        .mappings()
-        .one_or_none()
-    )
-    if row is None:
-        return None
-    if row["request_hash"] != digest:
+    except HTTPException:
         session.rollback()
-        record_idempotency_conflict("recommendations")
-        raise HTTPException(status_code=409, detail="IDEMPOTENCY_CONFLICT")
-    session.rollback()
-    return RecommendationResponse.model_validate(row["response_body"])
+        raise
+    if result is not None:
+        session.rollback()
+    return result
 
 
 def save_cached(
@@ -85,28 +84,14 @@ def save_cached(
     status_code: int,
     now: datetime,
 ) -> None:
-    session.execute(
-        text(
-            """
-            INSERT INTO idempotency_records (
-                workspace_id, actor_id, key, request_hash, response_status,
-                response_body, created_at, expires_at
-            ) VALUES (
-                :workspace_id, :actor_id, :key, :request_hash, :response_status,
-                CAST(:response_body AS jsonb), :created_at, :expires_at
-            )
-            """
-        ),
-        {
-            "workspace_id": auth.workspace_id,
-            "actor_id": auth.user_id,
-            "key": key,
-            "request_hash": digest,
-            "response_status": status_code,
-            "response_body": response.model_dump_json(),
-            "created_at": now,
-            "expires_at": now + timedelta(days=365),
-        },
+    idempotency.store_idempotency(
+        session,
+        auth,
+        key,
+        digest,
+        response.model_dump(mode="json"),
+        now,
+        response_status=status_code,
     )
 
 

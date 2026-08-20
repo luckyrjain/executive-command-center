@@ -1,6 +1,4 @@
-from datetime import UTC, datetime, timedelta
-from hashlib import sha256
-from json import dumps
+from datetime import UTC, datetime
 from typing import Annotated
 from uuid import UUID, uuid4
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -10,13 +8,10 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from ecc.auth import AuthContext, AuthDep, CsrfDep
+from ecc.auth import AuthDep, CsrfDep
 from ecc.database import get_session
-from ecc.observability import (
-    queue_lifecycle_event,
-    record_idempotency_conflict,
-)
-from ecc.platform import audit_outbox
+from ecc.observability import queue_lifecycle_event
+from ecc.platform import audit_outbox, idempotency
 
 router = APIRouter(prefix="/api/v1/planning", tags=["planning"])
 SessionDep = Annotated[Session, Depends(get_session)]
@@ -68,83 +63,6 @@ class CapacityProfilePut(BaseModel):
         if weekdays != set(_WEEKDAYS):
             raise ValueError("days must include exactly one entry per weekday (0-6)")
         return self
-
-
-def _request_hash(payload: BaseModel, action: str) -> str:
-    material = {"action": action, "payload": payload.model_dump(mode="json")}
-    return sha256(dumps(material, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
-
-
-def _lock_idempotency(session: Session, auth: AuthContext, key: str) -> None:
-    lock_key = f"{auth.workspace_id}:{auth.user_id}:{key}"
-    session.execute(
-        text("SELECT pg_advisory_xact_lock(hashtextextended(:lock_key, 0))"),
-        {"lock_key": lock_key},
-    )
-
-
-def _load_cached(
-    session: Session, auth: AuthContext, key: str, request_hash: str
-) -> CapacityProfile | None:
-    row = (
-        session.execute(
-            text(
-                """
-                SELECT request_hash, response_body FROM idempotency_records
-                WHERE workspace_id = :workspace_id AND actor_id = :actor_id
-                  AND key = :key AND expires_at > :now
-                """
-            ),
-            {
-                "workspace_id": auth.workspace_id,
-                "actor_id": auth.user_id,
-                "key": key,
-                "now": datetime.now(UTC),
-            },
-        )
-        .mappings()
-        .one_or_none()
-    )
-    if row is None:
-        return None
-    if row["request_hash"] != request_hash:
-        record_idempotency_conflict("capacity")
-        raise HTTPException(status_code=409, detail="IDEMPOTENCY_CONFLICT")
-    return CapacityProfile.model_validate(row["response_body"])
-
-
-def _store_idempotency(
-    session: Session,
-    auth: AuthContext,
-    key: str,
-    request_hash: str,
-    response: CapacityProfile,
-    now: datetime,
-    response_status: int = 200,
-) -> None:
-    session.execute(
-        text(
-            """
-            INSERT INTO idempotency_records (
-                workspace_id, actor_id, key, request_hash, response_status,
-                response_body, created_at, expires_at
-            ) VALUES (
-                :workspace_id, :actor_id, :key, :request_hash, :response_status,
-                CAST(:response_body AS jsonb), :created_at, :expires_at
-            )
-            """
-        ),
-        {
-            "workspace_id": auth.workspace_id,
-            "actor_id": auth.user_id,
-            "key": key,
-            "request_hash": request_hash,
-            "response_status": response_status,
-            "response_body": dumps(response.model_dump(mode="json")),
-            "created_at": now,
-            "expires_at": now + timedelta(days=365),
-        },
-    )
 
 
 def _current_profile(
@@ -229,15 +147,23 @@ def put_capacity_profile(
     payload -- e.g. after a dropped response) replays the original response
     instead of hitting a spurious ``VERSION_CONFLICT`` on its own
     already-applied write. A retry with the same key but a *different*
-    payload still hits ``IDEMPOTENCY_CONFLICT`` in ``_load_cached``, and a
+    payload still hits ``IDEMPOTENCY_CONFLICT`` in ``idempotency.load_cached``,
+    and a
     stale ``expected_version`` with no matching cached key still hits the
     genuine ``VERSION_CONFLICT`` below.
     """
-    request_hash = _request_hash(payload, "put_capacity")
+    request_hash = idempotency.request_hash(payload, "put_capacity")
     now = datetime.now(UTC)
     with session.begin():
-        _lock_idempotency(session, auth, idempotency_key)
-        cached = _load_cached(session, auth, idempotency_key, request_hash)
+        idempotency.lock_idempotency(session, auth, idempotency_key)
+        cached = idempotency.load_cached(
+            session,
+            auth,
+            idempotency_key,
+            request_hash,
+            domain="capacity",
+            response_model=CapacityProfile,
+        )
         if cached is not None:
             return cached
         current = _current_profile(session, auth.workspace_id, auth.user_id, for_update=True)
@@ -302,5 +228,12 @@ def put_capacity_profile(
             domain="capacity",
         )
         queue_lifecycle_event(session, "capacity_profile", "capacity_profile.updated", "allowed")
-        _store_idempotency(session, auth, idempotency_key, request_hash, response, now)
+        idempotency.store_idempotency(
+            session,
+            auth,
+            idempotency_key,
+            request_hash,
+            response.model_dump(mode="json"),
+            now,
+        )
         return response

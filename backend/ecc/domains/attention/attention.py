@@ -18,10 +18,9 @@ from ecc.domains.personal.gmail_shared import normalize_email
 from ecc.observability import (
     queue_lifecycle_event,
     record_audit_outbox_failure,
-    record_idempotency_conflict,
     record_ranking,
 )
-from ecc.platform import authz
+from ecc.platform import authz, idempotency
 
 from .policy import AttentionPolicy, get_active_policy
 
@@ -1222,44 +1221,15 @@ def _feedback_request_hash(payload: AttentionFeedbackCreate) -> str:
 
 
 def _lock_idempotency(session: Session, auth: AuthContext, key: str) -> None:
-    lock_key = f"{auth.workspace_id}:{auth.user_id}:{key}"
-    session.execute(
-        text("SELECT pg_advisory_xact_lock(hashtextextended(:lock_key, 0))"),
-        {"lock_key": lock_key},
-    )
+    idempotency.lock_idempotency(session, auth, key)
 
 
 def _load_cached_feedback(
     session: Session, auth: AuthContext, key: str, request_hash: str
 ) -> AttentionFeedback | None:
-    row = (
-        session.execute(
-            text(
-                """
-                SELECT request_hash, response_body
-                FROM idempotency_records
-                WHERE workspace_id = :workspace_id
-                  AND actor_id = :actor_id
-                  AND key = :key
-                  AND expires_at > :now
-                """
-            ),
-            {
-                "workspace_id": auth.workspace_id,
-                "actor_id": auth.user_id,
-                "key": key,
-                "now": datetime.now(UTC),
-            },
-        )
-        .mappings()
-        .one_or_none()
+    return idempotency.load_cached(
+        session, auth, key, request_hash, domain="attention", response_model=AttentionFeedback
     )
-    if row is None:
-        return None
-    if row["request_hash"] != request_hash:
-        record_idempotency_conflict("attention")
-        raise HTTPException(status_code=409, detail="IDEMPOTENCY_CONFLICT")
-    return AttentionFeedback.model_validate(row["response_body"])
 
 
 @router.post("/{item_id}/feedback", response_model=AttentionFeedback, status_code=201)
@@ -1367,26 +1337,13 @@ def record_attention_feedback(
             record_audit_outbox_failure("attention")
             raise
         queue_lifecycle_event(session, "attention_item", "attention_feedback.recorded", "allowed")
-        session.execute(
-            text(
-                """
-                INSERT INTO idempotency_records (
-                    workspace_id, actor_id, key, request_hash, response_status,
-                    response_body, created_at, expires_at
-                ) VALUES (
-                    :workspace_id, :actor_id, :key, :request_hash, 201,
-                    CAST(:response_body AS jsonb), :created_at, :expires_at
-                )
-                """
-            ),
-            {
-                "workspace_id": auth.workspace_id,
-                "actor_id": auth.user_id,
-                "key": idempotency_key,
-                "request_hash": request_hash,
-                "response_body": dumps(response.model_dump(mode="json")),
-                "created_at": now,
-                "expires_at": now + timedelta(days=365),
-            },
+        idempotency.store_idempotency(
+            session,
+            auth,
+            idempotency_key,
+            request_hash,
+            response.model_dump(mode="json"),
+            now,
+            response_status=201,
         )
         return response
