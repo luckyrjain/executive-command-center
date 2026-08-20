@@ -35,11 +35,8 @@ from sqlalchemy.orm import Session
 
 from ecc.auth import AuthContext, AuthDep, CsrfDep
 from ecc.database import get_session
-from ecc.observability import (
-    queue_lifecycle_event,
-    record_idempotency_conflict,
-)
-from ecc.platform import audit_outbox, authz, cursor_pagination
+from ecc.observability import queue_lifecycle_event
+from ecc.platform import audit_outbox, authz, cursor_pagination, idempotency
 
 _WORKDAY_START = time(9, 0)
 DEFAULT_EFFORT_MINUTES = 30
@@ -457,47 +454,6 @@ class PlanCreate(BaseModel):
         return self
 
 
-def _lock_idempotency(session: Session, auth: AuthContext, key: str) -> None:
-    lock_key = f"{auth.workspace_id}:{auth.user_id}:{key}"
-    session.execute(
-        text("SELECT pg_advisory_xact_lock(hashtextextended(:lock_key, 0))"),
-        {"lock_key": lock_key},
-    )
-
-
-def _request_hash(payload: BaseModel, action: str) -> str:
-    material = {"action": action, "payload": payload.model_dump(mode="json")}
-    return sha256(dumps(material, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
-
-
-def _load_cached(session: Session, auth: AuthContext, key: str, request_hash: str) -> Plan | None:
-    row = (
-        session.execute(
-            text(
-                """
-                SELECT request_hash, response_body FROM idempotency_records
-                WHERE workspace_id = :workspace_id AND actor_id = :actor_id
-                  AND key = :key AND expires_at > :now
-                """
-            ),
-            {
-                "workspace_id": auth.workspace_id,
-                "actor_id": auth.user_id,
-                "key": key,
-                "now": datetime.now(UTC),
-            },
-        )
-        .mappings()
-        .one_or_none()
-    )
-    if row is None:
-        return None
-    if row["request_hash"] != request_hash:
-        record_idempotency_conflict("planning")
-        raise HTTPException(status_code=409, detail="IDEMPOTENCY_CONFLICT")
-    return Plan.model_validate(row["response_body"])
-
-
 def _fetch_capacity_days(session: Session, auth: AuthContext) -> list[CapacityDayInput]:
     rows = session.execute(
         text(
@@ -759,12 +715,14 @@ def create_plan(
     _csrf: CsrfDep,
     idempotency_key: IdempotencyHeader,
 ) -> Plan:
-    request_hash = _request_hash(payload, "create")
+    request_hash = idempotency.request_hash(payload, "create")
     now = datetime.now(UTC)
     plan_id = uuid4()
     with session.begin():
-        _lock_idempotency(session, auth, idempotency_key)
-        cached = _load_cached(session, auth, idempotency_key, request_hash)
+        idempotency.lock_idempotency(session, auth, idempotency_key)
+        cached = idempotency.load_cached(
+            session, auth, idempotency_key, request_hash, domain="planning", response_model=Plan
+        )
         if cached is not None:
             return cached
 
@@ -1061,11 +1019,13 @@ def accept_plan(
     in the first place -- acceptance only updates ECC's own planning
     state, per PLANNING-CONTRACT.md's Proposal and acceptance section).
     """
-    request_hash = _request_hash(payload, f"accept:{plan_id}")
+    request_hash = idempotency.request_hash(payload, f"accept:{plan_id}")
     now = datetime.now(UTC)
     with session.begin():
-        _lock_idempotency(session, auth, idempotency_key)
-        cached = _load_cached(session, auth, idempotency_key, request_hash)
+        idempotency.lock_idempotency(session, auth, idempotency_key)
+        cached = idempotency.load_cached(
+            session, auth, idempotency_key, request_hash, domain="planning", response_model=Plan
+        )
         if cached is not None:
             return cached
 
@@ -1133,7 +1093,9 @@ def accept_plan(
             domain="planning",
         )
         queue_lifecycle_event(session, "plan", "plan.accepted", "allowed")
-        _store_idempotent_plan(session, auth, idempotency_key, request_hash, response, now)
+        idempotency.store_idempotency(
+            session, auth, idempotency_key, request_hash, response.model_dump(mode="json"), now
+        )
         return response
 
 
@@ -1149,11 +1111,13 @@ def supersede_plan(
 ) -> Plan:
     """Manual retirement with no replacement (distinct from ``/propose``,
     which supersedes *and* creates a new proposal in the same call)."""
-    request_hash = _request_hash(payload, f"supersede:{plan_id}")
+    request_hash = idempotency.request_hash(payload, f"supersede:{plan_id}")
     now = datetime.now(UTC)
     with session.begin():
-        _lock_idempotency(session, auth, idempotency_key)
-        cached = _load_cached(session, auth, idempotency_key, request_hash)
+        idempotency.lock_idempotency(session, auth, idempotency_key)
+        cached = idempotency.load_cached(
+            session, auth, idempotency_key, request_hash, domain="planning", response_model=Plan
+        )
         if cached is not None:
             return cached
 
@@ -1212,7 +1176,9 @@ def supersede_plan(
             domain="planning",
         )
         queue_lifecycle_event(session, "plan", "plan.superseded", "allowed")
-        _store_idempotent_plan(session, auth, idempotency_key, request_hash, response, now)
+        idempotency.store_idempotency(
+            session, auth, idempotency_key, request_hash, response.model_dump(mode="json"), now
+        )
         return response
 
 
@@ -1297,12 +1263,14 @@ def replan(
     silently rewriting it (PLANNING-CONTRACT.md's Replanning section) --
     unlike block move/remove, which edit the same plan in place.
     """
-    request_hash = _request_hash(payload, f"propose:{plan_id}")
+    request_hash = idempotency.request_hash(payload, f"propose:{plan_id}")
     now = datetime.now(UTC)
     new_plan_id = uuid4()
     with session.begin():
-        _lock_idempotency(session, auth, idempotency_key)
-        cached = _load_cached(session, auth, idempotency_key, request_hash)
+        idempotency.lock_idempotency(session, auth, idempotency_key)
+        cached = idempotency.load_cached(
+            session, auth, idempotency_key, request_hash, domain="planning", response_model=Plan
+        )
         if cached is not None:
             return cached
 
@@ -1477,44 +1445,16 @@ def replan(
             domain="planning",
         )
         queue_lifecycle_event(session, "plan", "plan.superseded", "allowed")
-        _store_idempotent_plan(
-            session, auth, idempotency_key, request_hash, response, now, response_status=201
+        idempotency.store_idempotency(
+            session,
+            auth,
+            idempotency_key,
+            request_hash,
+            response.model_dump(mode="json"),
+            now,
+            response_status=201,
         )
         return response
-
-
-def _store_idempotent_plan(
-    session: Session,
-    auth: AuthContext,
-    key: str,
-    request_hash: str,
-    response: Plan,
-    now: datetime,
-    response_status: int = 200,
-) -> None:
-    session.execute(
-        text(
-            """
-            INSERT INTO idempotency_records (
-                workspace_id, actor_id, key, request_hash, response_status,
-                response_body, created_at, expires_at
-            ) VALUES (
-                :workspace_id, :actor_id, :key, :request_hash, :response_status,
-                CAST(:response_body AS jsonb), :created_at, :expires_at
-            )
-            """
-        ),
-        {
-            "workspace_id": auth.workspace_id,
-            "actor_id": auth.user_id,
-            "key": key,
-            "request_hash": request_hash,
-            "response_status": response_status,
-            "response_body": dumps(response.model_dump(mode="json")),
-            "created_at": now,
-            "expires_at": now + timedelta(days=365),
-        },
-    )
 
 
 def _blocks_overlap(
@@ -1567,11 +1507,13 @@ def move_block(
     unit" design. Only a 'proposed' plan may be edited: "Accepted plans
     are not silently rewritten" (PLANNING-CONTRACT.md).
     """
-    request_hash = _request_hash(payload, f"move:{plan_id}:{block_id}")
+    request_hash = idempotency.request_hash(payload, f"move:{plan_id}:{block_id}")
     now = datetime.now(UTC)
     with session.begin():
-        _lock_idempotency(session, auth, idempotency_key)
-        cached = _load_cached(session, auth, idempotency_key, request_hash)
+        idempotency.lock_idempotency(session, auth, idempotency_key)
+        cached = idempotency.load_cached(
+            session, auth, idempotency_key, request_hash, domain="planning", response_model=Plan
+        )
         if cached is not None:
             return cached
 
@@ -1691,7 +1633,9 @@ def move_block(
             emit_outbox=False,
         )
         queue_lifecycle_event(session, "plan", "plan.block_moved", "allowed")
-        _store_idempotent_plan(session, auth, idempotency_key, request_hash, response, now)
+        idempotency.store_idempotency(
+            session, auth, idempotency_key, request_hash, response.model_dump(mode="json"), now
+        )
         return response
 
 
@@ -1708,11 +1652,13 @@ def remove_block(
 ) -> Plan:
     """Removing a block, like moving one, edits the same plan row in place
     and bumps its version -- only while the plan is still 'proposed'."""
-    request_hash = _request_hash(payload, f"remove:{plan_id}:{block_id}")
+    request_hash = idempotency.request_hash(payload, f"remove:{plan_id}:{block_id}")
     now = datetime.now(UTC)
     with session.begin():
-        _lock_idempotency(session, auth, idempotency_key)
-        cached = _load_cached(session, auth, idempotency_key, request_hash)
+        idempotency.lock_idempotency(session, auth, idempotency_key)
+        cached = idempotency.load_cached(
+            session, auth, idempotency_key, request_hash, domain="planning", response_model=Plan
+        )
         if cached is not None:
             return cached
 
@@ -1785,5 +1731,7 @@ def remove_block(
             emit_outbox=False,
         )
         queue_lifecycle_event(session, "plan", "plan.block_removed", "allowed")
-        _store_idempotent_plan(session, auth, idempotency_key, request_hash, response, now)
+        idempotency.store_idempotency(
+            session, auth, idempotency_key, request_hash, response.model_dump(mode="json"), now
+        )
         return response

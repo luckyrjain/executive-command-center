@@ -1,6 +1,4 @@
 from datetime import UTC, datetime, timedelta
-from hashlib import sha256
-from json import dumps
 from typing import Annotated, Literal
 from uuid import UUID, uuid4
 
@@ -11,11 +9,8 @@ from sqlalchemy.orm import Session
 
 from ecc.auth import AuthContext, AuthDep, CsrfDep
 from ecc.database import get_session
-from ecc.observability import (
-    queue_lifecycle_event,
-    record_idempotency_conflict,
-)
-from ecc.platform import audit_outbox, authz
+from ecc.observability import queue_lifecycle_event
+from ecc.platform import audit_outbox, authz, idempotency
 
 router = APIRouter(prefix="/api/v1/risks", tags=["risks"])
 SessionDep = Annotated[Session, Depends(get_session)]
@@ -112,49 +107,6 @@ def _validate_evidence_refs(session: Session, auth: AuthContext, evidence_refs: 
             raise HTTPException(status_code=422, detail="EVIDENCE_UNAVAILABLE")
 
 
-def _lock_idempotency(session: Session, auth: AuthContext, key: str) -> None:
-    lock_key = f"{auth.workspace_id}:{auth.user_id}:{key}"
-    session.execute(
-        text("SELECT pg_advisory_xact_lock(hashtextextended(:lock_key, 0))"),
-        {"lock_key": lock_key},
-    )
-
-
-def _request_hash(payload: BaseModel, action: str) -> str:
-    material = {"action": action, "payload": payload.model_dump(mode="json")}
-    return sha256(dumps(material, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
-
-
-def _load_cached(
-    session: Session, auth: AuthContext, key: str, request_hash: str
-) -> RiskReview | None:
-    row = (
-        session.execute(
-            text(
-                """
-                SELECT request_hash, response_body FROM idempotency_records
-                WHERE workspace_id = :workspace_id AND actor_id = :actor_id
-                  AND key = :key AND expires_at > :now
-                """
-            ),
-            {
-                "workspace_id": auth.workspace_id,
-                "actor_id": auth.user_id,
-                "key": key,
-                "now": datetime.now(UTC),
-            },
-        )
-        .mappings()
-        .one_or_none()
-    )
-    if row is None:
-        return None
-    if row["request_hash"] != request_hash:
-        record_idempotency_conflict("risk_reviews")
-        raise HTTPException(status_code=409, detail="IDEMPOTENCY_CONFLICT")
-    return RiskReview.model_validate(row["response_body"])
-
-
 @router.post("/{risk_id}/review", response_model=RiskReview, status_code=status.HTTP_201_CREATED)
 def record_risk_review(
     risk_id: UUID,
@@ -173,12 +125,19 @@ def record_risk_review(
     ``review_due_soon`` scoring factors (already live in
     ``attention.py:_score_risk``) are unmodified by this endpoint.
     """
-    request_hash = _request_hash(payload, f"review:{risk_id}")
+    request_hash = idempotency.request_hash(payload, f"review:{risk_id}")
     now = datetime.now(UTC)
     review_id = uuid4()
     with session.begin():
-        _lock_idempotency(session, auth, idempotency_key)
-        cached = _load_cached(session, auth, idempotency_key, request_hash)
+        idempotency.lock_idempotency(session, auth, idempotency_key)
+        cached = idempotency.load_cached(
+            session,
+            auth,
+            idempotency_key,
+            request_hash,
+            domain="risk_reviews",
+            response_model=RiskReview,
+        )
         if cached is not None:
             return cached
         # A review's authorization boundary is the risk it reviews -- risk_
@@ -296,27 +255,14 @@ def record_risk_review(
         )
         queue_lifecycle_event(session, "risk", "risk_review.recorded", "allowed")
 
-        session.execute(
-            text(
-                """
-                INSERT INTO idempotency_records (
-                    workspace_id, actor_id, key, request_hash, response_status,
-                    response_body, created_at, expires_at
-                ) VALUES (
-                    :workspace_id, :actor_id, :key, :request_hash, 201,
-                    CAST(:response_body AS jsonb), :created_at, :expires_at
-                )
-                """
-            ),
-            {
-                "workspace_id": auth.workspace_id,
-                "actor_id": auth.user_id,
-                "key": idempotency_key,
-                "request_hash": request_hash,
-                "response_body": dumps(response.model_dump(mode="json")),
-                "created_at": now,
-                "expires_at": now + timedelta(days=365),
-            },
+        idempotency.store_idempotency(
+            session,
+            auth,
+            idempotency_key,
+            request_hash,
+            response.model_dump(mode="json"),
+            now,
+            response_status=201,
         )
         return response
 

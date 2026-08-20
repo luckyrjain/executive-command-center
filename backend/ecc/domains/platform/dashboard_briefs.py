@@ -19,9 +19,8 @@ from ecc.observability import (
     queue_lifecycle_event,
     record_audit_outbox_failure,
     record_brief_stale,
-    record_idempotency_conflict,
 )
-from ecc.platform import audit_outbox, authz
+from ecc.platform import audit_outbox, authz, idempotency
 
 router = APIRouter(prefix="/api/v1", tags=["dashboard", "briefs"])
 SessionDep = Annotated[Session, Depends(get_session)]
@@ -763,39 +762,28 @@ def refresh_morning_brief(
     day: DateQuery = None,
 ) -> MorningBriefResponse:
     target = _target_date(day, auth.timezone)
+    # Not `idempotency.request_hash` -- this endpoint's replay key is the
+    # resolved *target date*, not the (bodyless) request payload, so it
+    # keeps its own bespoke hash rather than adopting the shared helper's
+    # `{"action": ..., "payload": ...}` shape.
     request_hash = sha256(target.isoformat().encode()).hexdigest()
     now = datetime.now(UTC)
-    session.execute(
-        text("SELECT pg_advisory_xact_lock(hashtext(:key))"),
-        {"key": (f"brief-refresh:{auth.workspace_id}:{auth.user_id}:{idempotency_key}")},
-    )
-    existing = (
-        session.execute(
-            text(
-                """
-                SELECT request_hash, response_body
-                FROM idempotency_records
-                WHERE workspace_id=:w AND actor_id=:u
-                  AND key=:key AND expires_at > :now
-                """
-            ),
-            {
-                "w": auth.workspace_id,
-                "u": auth.user_id,
-                "key": idempotency_key,
-                "now": now,
-            },
+    idempotency.lock_idempotency(session, auth, idempotency_key)
+    try:
+        cached = idempotency.load_cached(
+            session,
+            auth,
+            idempotency_key,
+            request_hash,
+            domain="briefs",
+            response_model=MorningBriefResponse,
         )
-        .mappings()
-        .one_or_none()
-    )
-    if existing is not None:
-        if existing["request_hash"] != request_hash:
-            session.rollback()
-            record_idempotency_conflict("briefs")
-            raise HTTPException(status_code=409, detail="IDEMPOTENCY_CONFLICT")
+    except HTTPException:
         session.rollback()
-        return MorningBriefResponse.model_validate(existing["response_body"])
+        raise
+    if cached is not None:
+        session.rollback()
+        return cached
 
     response = _generate(
         request,
@@ -806,27 +794,14 @@ def refresh_morning_brief(
         target,
         commit=False,
     )
-    session.execute(
-        text(
-            """
-            INSERT INTO idempotency_records (
-                workspace_id, actor_id, key, request_hash,
-                response_status, response_body, created_at, expires_at
-            ) VALUES (
-                :w, :u, :key, :request_hash, 200,
-                CAST(:body AS jsonb), :now, :expires_at
-            )
-            """
-        ),
-        {
-            "w": auth.workspace_id,
-            "u": auth.user_id,
-            "key": idempotency_key,
-            "request_hash": request_hash,
-            "body": response.model_dump_json(),
-            "now": now,
-            "expires_at": now + timedelta(hours=24),
-        },
+    idempotency.store_idempotency(
+        session,
+        auth,
+        idempotency_key,
+        request_hash,
+        response.model_dump(mode="json"),
+        now,
+        ttl=timedelta(hours=24),
     )
     session.commit()
     return response

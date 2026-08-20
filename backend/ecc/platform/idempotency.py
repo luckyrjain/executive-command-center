@@ -179,7 +179,19 @@ def store_idempotency(
     response_body: dict[str, Any],
     now: datetime,
     response_status: int = 200,
+    ttl: timedelta = timedelta(days=365),
 ) -> None:
+    """`ttl` defaults to the 365-day retention most callers use. Two caller
+    families deliberately pass a shorter `ttl=timedelta(hours=24)` instead.
+    `platform/dashboard_briefs.py`'s `refresh_morning_brief` matches its own
+    daily-cadence semantics (an `Idempotency-Key` for "refresh today's
+    brief" has no reason to keep replaying a cached response a year later).
+    `domains/collaboration/delegations.py`'s five call sites (create/accept/
+    reject/revoke/complete) follow the same reasoning: each is a mutating
+    delegation lifecycle action, not a long-lived record, so none of them
+    need year-long replay protection either. Neither is an oversight to
+    normalize away.
+    """
     session.execute(
         text(
             """
@@ -200,6 +212,6 @@ def store_idempotency(
             "response_status": response_status,
             "response_body": dumps(response_body),
             "created_at": now,
-            "expires_at": now + timedelta(days=365),
+            "expires_at": now + ttl,
         },
     )

@@ -1,6 +1,4 @@
-from datetime import UTC, datetime, timedelta
-from hashlib import sha256
-from json import dumps
+from datetime import UTC, datetime
 from typing import Annotated, Any, Literal
 from uuid import UUID, uuid4
 
@@ -11,11 +9,8 @@ from sqlalchemy.orm import Session
 
 from ecc.auth import AuthContext, AuthDep, CsrfDep
 from ecc.database import get_session
-from ecc.observability import (
-    queue_lifecycle_event,
-    record_idempotency_conflict,
-)
-from ecc.platform import audit_outbox, authz, cursor_pagination
+from ecc.observability import queue_lifecycle_event
+from ecc.platform import audit_outbox, authz, cursor_pagination, idempotency
 
 router = APIRouter(prefix="/api/v1/waiting", tags=["waiting"])
 SessionDep = Annotated[Session, Depends(get_session)]
@@ -93,81 +88,6 @@ class WaitingLinkTerminal(BaseModel):
     expected_version: int
 
 
-def _lock_idempotency(session: Session, auth: AuthContext, key: str) -> None:
-    lock_key = f"{auth.workspace_id}:{auth.user_id}:{key}"
-    session.execute(
-        text("SELECT pg_advisory_xact_lock(hashtextextended(:lock_key, 0))"),
-        {"lock_key": lock_key},
-    )
-
-
-def _request_hash(payload: BaseModel, action: str) -> str:
-    material = {"action": action, "payload": payload.model_dump(mode="json")}
-    return sha256(dumps(material, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
-
-
-def _load_cached(
-    session: Session, auth: AuthContext, key: str, request_hash: str
-) -> WaitingLink | None:
-    row = (
-        session.execute(
-            text(
-                """
-                SELECT request_hash, response_body FROM idempotency_records
-                WHERE workspace_id = :workspace_id AND actor_id = :actor_id
-                  AND key = :key AND expires_at > :now
-                """
-            ),
-            {
-                "workspace_id": auth.workspace_id,
-                "actor_id": auth.user_id,
-                "key": key,
-                "now": datetime.now(UTC),
-            },
-        )
-        .mappings()
-        .one_or_none()
-    )
-    if row is None:
-        return None
-    if row["request_hash"] != request_hash:
-        record_idempotency_conflict("waiting")
-        raise HTTPException(status_code=409, detail="IDEMPOTENCY_CONFLICT")
-    return WaitingLink.model_validate(row["response_body"])
-
-
-def _store_idempotency(
-    session: Session,
-    auth: AuthContext,
-    key: str,
-    request_hash: str,
-    response: WaitingLink,
-    now: datetime,
-) -> None:
-    session.execute(
-        text(
-            """
-            INSERT INTO idempotency_records (
-                workspace_id, actor_id, key, request_hash, response_status,
-                response_body, created_at, expires_at
-            ) VALUES (
-                :workspace_id, :actor_id, :key, :request_hash, 201,
-                CAST(:response_body AS jsonb), :created_at, :expires_at
-            )
-            """
-        ),
-        {
-            "workspace_id": auth.workspace_id,
-            "actor_id": auth.user_id,
-            "key": key,
-            "request_hash": request_hash,
-            "response_body": dumps(response.model_dump(mode="json")),
-            "created_at": now,
-            "expires_at": now + timedelta(days=365),
-        },
-    )
-
-
 # Subject-type -> the authz resource_type it maps to, for the read-only
 # existence-and-visibility check create_waiting_link runs before creating a
 # link -- a waiting_link never mutates its subject/counterparty, so both
@@ -243,7 +163,7 @@ def _would_create_cycle(
     # this read-then-decide check-then-write can't race with another
     # transaction inserting a conflicting link in between (TOCTOU, finding
     # #4): held for the rest of the caller's transaction (pg_advisory_xact_
-    # lock, same pattern as _lock_idempotency but a distinct hash salt so
+    # lock, same pattern as idempotency.lock_idempotency but a distinct hash salt so
     # the two lock keyspaces never collide), so a second concurrent create/
     # direction-change targeting the same workspace's blocked_by graph
     # blocks here until this one commits, then re-reads the now-committed
@@ -300,12 +220,19 @@ def create_waiting_link(
     idempotency_key: IdempotencyHeader,
 ) -> WaitingLink:
     authz.require_role_action(session, auth, "write")
-    request_hash = _request_hash(payload, "create")
+    request_hash = idempotency.request_hash(payload, "create")
     now = datetime.now(UTC)
     link_id = uuid4()
     with session.begin():
-        _lock_idempotency(session, auth, idempotency_key)
-        cached = _load_cached(session, auth, idempotency_key, request_hash)
+        idempotency.lock_idempotency(session, auth, idempotency_key)
+        cached = idempotency.load_cached(
+            session,
+            auth,
+            idempotency_key,
+            request_hash,
+            domain="waiting",
+            response_model=WaitingLink,
+        )
         if cached is not None:
             return cached
         if not _subject_exists(session, auth, payload.subject_type, payload.subject_id):
@@ -391,7 +318,15 @@ def create_waiting_link(
             domain="waiting",
         )
         queue_lifecycle_event(session, "waiting_link", "waiting_link.opened", "allowed")
-        _store_idempotency(session, auth, idempotency_key, request_hash, response, now)
+        idempotency.store_idempotency(
+            session,
+            auth,
+            idempotency_key,
+            request_hash,
+            response.model_dump(mode="json"),
+            now,
+            response_status=201,
+        )
         return response
 
 
@@ -510,11 +445,18 @@ def patch_waiting_link(
     knowledge_claims supersede pattern. Any other field (``note``,
     ``expected_at``) alone is a normal versioned in-place update.
     """
-    request_hash = _request_hash(payload, f"patch:{link_id}")
+    request_hash = idempotency.request_hash(payload, f"patch:{link_id}")
     now = datetime.now(UTC)
     with session.begin():
-        _lock_idempotency(session, auth, idempotency_key)
-        cached = _load_cached(session, auth, idempotency_key, request_hash)
+        idempotency.lock_idempotency(session, auth, idempotency_key)
+        cached = idempotency.load_cached(
+            session,
+            auth,
+            idempotency_key,
+            request_hash,
+            domain="waiting",
+            response_model=WaitingLink,
+        )
         if cached is not None:
             return cached
         if not authz.authorize(
@@ -664,7 +606,15 @@ def patch_waiting_link(
                 .one()
             )
             response = WaitingLink.model_validate(dict(updated))
-        _store_idempotency(session, auth, idempotency_key, request_hash, response, now)
+        idempotency.store_idempotency(
+            session,
+            auth,
+            idempotency_key,
+            request_hash,
+            response.model_dump(mode="json"),
+            now,
+            response_status=201,
+        )
         return response
 
 
