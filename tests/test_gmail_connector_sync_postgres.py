@@ -383,7 +383,7 @@ from ecc.domains.personal.gmail_adapter import (
     GmailAdapter,
     _GmailHistoryCursor,
 )
-from ecc.domains.personal.gmail_shared import _pack_credential
+from ecc.domains.personal.gmail_shared import pack_credential
 
 settings = get_settings()
 pytestmark = pytest.mark.skipif(
@@ -441,7 +441,7 @@ def seeded_gmail_account() -> Iterator[tuple[ConnectorAccountContext, UUID]]:
     account_id = uuid4()
     domain_id = uuid4()
     now = datetime.now(UTC)
-    credential = _pack_credential("access-1", "refresh-1", now + timedelta(hours=1))
+    credential = pack_credential("access-1", "refresh-1", now + timedelta(hours=1))
     with engine.begin() as connection:
         connection.execute(
             text(

@@ -87,7 +87,7 @@ from ecc.domains.ai_runtime.validator import ExplainItemOutput
 from ecc.domains.engineering.crypto import encrypt_credential
 from ecc.domains.knowledge import tools as knowledge_tools
 from ecc.domains.personal.crypto import encrypt_field
-from ecc.domains.personal.gmail_shared import _pack_credential
+from ecc.domains.personal.gmail_shared import pack_credential
 from ecc.main import app
 
 settings = get_settings()
@@ -930,7 +930,7 @@ def _insert_email_thread_with_injected_message_body(
     message_id = uuid4()
     account_id = uuid4()
     now = datetime.now(UTC)
-    credential = _pack_credential("access-1", "refresh-1", now + timedelta(hours=1))
+    credential = pack_credential("access-1", "refresh-1", now + timedelta(hours=1))
     with engine.begin() as connection:
         connection.execute(
             text(

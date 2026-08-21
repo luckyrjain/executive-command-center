@@ -45,7 +45,7 @@ need something to point at. Records the action in `deletion_jobs` with
 task's own schema addition), mirroring `export_deletion.py`'s own
 audit-trail shape at the narrower granularity.
 
-`GET` checks `_email_consent_active` (imported from `gmail_shared.py`,
+`GET` checks `email_consent_active` (imported from `gmail_shared.py`,
 the identical check Task 5's own per-message recheck uses), not `require_
 enabled_domain` -- consistent with Task 5's own precedent (that function
 never separately checks `personal_domains.enabled` either), since a live
@@ -53,7 +53,7 @@ Gmail fetch is exactly what `domain_consents` governs; `personal_domains.
 enabled` is a separate "is this data domain turned on at all" concern this
 task does not newly enforce.
 
-`POST .../forget` deliberately does NOT check `_email_consent_active`:
+`POST .../forget` deliberately does NOT check `email_consent_active`:
 unlike `GET`, it makes no live Gmail call, and a deletion/forget action
 should stay available even without an active consent grant (e.g. right
 after revoking consent, when there is no active grant to check) --
@@ -110,7 +110,7 @@ from ecc.platform.request_models import EmptyBody as _EmptyBody
 from .domains import IdempotencyHeader
 from .email_action_tools import MAX_THREAD_MESSAGES, get_thread_content_tool
 from .gmail_adapter import GmailAdapter
-from .gmail_shared import _bearer_headers, _email_consent_active
+from .gmail_shared import bearer_headers, email_consent_active
 
 router = APIRouter(prefix="/api/v1/personal/gmail", tags=["personal"])
 SessionDep = Annotated[Session, Depends(get_session)]
@@ -156,7 +156,7 @@ class ThreadListResponse(BaseModel):
 
 
 def _require_email_consent(session: Session, auth: AuthContext) -> None:
-    if not _email_consent_active(session, auth.workspace_id, auth.user_id):
+    if not email_consent_active(session, auth.workspace_id, auth.user_id):
         raise HTTPException(status_code=403, detail="EMAIL_CONSENT_NOT_ACTIVE")
 
 
@@ -270,7 +270,7 @@ def get_thread_endpoint(
     if unfetched and connector_status != "disconnected":
         encrypted = get_encrypted_credential(session, auth.workspace_id, connector_account_id)
         credential = decrypt_credential(encrypted)
-        headers = _bearer_headers(credential)
+        headers = bearer_headers(credential)
         for row in unfetched:
             # Best-effort per message, matching `detect_actions_since`'s
             # own "one message's failure never stops the rest" discipline

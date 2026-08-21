@@ -85,7 +85,7 @@ from ecc.domains.personal import gmail_threads
 from ecc.domains.personal.crypto import decrypt_field
 from ecc.domains.personal.crypto import encrypt_field as _encrypt_field
 from ecc.domains.personal.gmail_adapter import GmailAdapter
-from ecc.domains.personal.gmail_shared import _pack_credential
+from ecc.domains.personal.gmail_shared import pack_credential
 from ecc.main import app
 
 settings = get_settings()
@@ -292,7 +292,7 @@ def gmail_threads_context() -> Iterator[dict]:
     account_id = uuid4()
     token = f"session-{uuid4()}"
     now = datetime.now(UTC)
-    credential = _pack_credential("access-1", "refresh-1", now + timedelta(hours=1))
+    credential = pack_credential("access-1", "refresh-1", now + timedelta(hours=1))
 
     with engine.begin() as connection:
         connection.execute(
@@ -663,7 +663,7 @@ def test_get_thread_belonging_to_a_different_workspace_is_404(gmail_threads_cont
                 "id": other_account_id,
                 "workspace_id": other_workspace_id,
                 "encrypted": encrypt_credential(
-                    _pack_credential("access-2", "refresh-2", now + timedelta(hours=1))
+                    pack_credential("access-2", "refresh-2", now + timedelta(hours=1))
                 ),
                 "actor_id": other_owner_id,
                 "now": now,
@@ -1074,7 +1074,7 @@ def test_list_threads_excludes_a_different_owners_thread_in_the_same_workspace(
                 "workspace_id": ctx["workspace_id"],
                 "peer_email": peer_email,
                 "encrypted": encrypt_credential(
-                    _pack_credential("access-peer", "refresh-peer", now + timedelta(hours=1))
+                    pack_credential("access-peer", "refresh-peer", now + timedelta(hours=1))
                 ),
                 "actor_id": peer_owner_id,
                 "now": now,
@@ -1162,7 +1162,7 @@ def test_list_threads_only_returns_callers_own_threads(gmail_threads_context: di
                 "id": other_account_id,
                 "workspace_id": other_workspace_id,
                 "encrypted": encrypt_credential(
-                    _pack_credential("access-2", "refresh-2", now + timedelta(hours=1))
+                    pack_credential("access-2", "refresh-2", now + timedelta(hours=1))
                 ),
                 "actor_id": other_owner_id,
                 "now": now,

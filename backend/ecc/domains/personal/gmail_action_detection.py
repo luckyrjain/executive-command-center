@@ -42,11 +42,11 @@ from ecc.domains.governance.recommendation_mutations import create_recommendatio
 # Plain, real (not TYPE_CHECKING-guarded) imports -- no cycle to avoid;
 # `gmail_adapter.py` only ever reaches back into this module from inside
 # a method body, deferred to call time (see `detect_actions_since`'s own
-# comment there). `_bearer_headers`/`_email_consent_active` come from
+# comment there). `bearer_headers`/`email_consent_active` come from
 # `gmail_shared.py`, not `gmail_adapter.py` -- see that module's own
 # docstring.
 from .gmail_adapter import GmailAdapter, owner_id_for_account, resolve_or_create_person
-from .gmail_shared import _bearer_headers, _email_consent_active
+from .gmail_shared import bearer_headers, email_consent_active
 
 # Task 5's own, much smaller bound -- deliberately not `_MAX_MESSAGES_PER_
 # CALL`. `connector_accounts.py`'s own module docstring justifies its
@@ -206,7 +206,7 @@ def detect_actions_since(
     if owner_id is None:
         return
     with SessionFactory() as session, session.begin():
-        if not _email_consent_active(session, context.workspace_id, owner_id):
+        if not email_consent_active(session, context.workspace_id, owner_id):
             return
 
     with SessionFactory() as session, session.begin():
@@ -248,7 +248,7 @@ def detect_actions_since(
             .all()
         )
 
-    headers = _bearer_headers(context.credential)
+    headers = bearer_headers(context.credential)
     for row in rows:
         # Re-checked per message, not merely once above -- round 7
         # review found this loop never repeated the same recheck
@@ -267,7 +267,7 @@ def detect_actions_since(
         # batch, matching `_sync_messages`' identical "halts the call"
         # semantics, not merely this one row.
         with SessionFactory() as session, session.begin():
-            if not _email_consent_active(session, context.workspace_id, owner_id):
+            if not email_consent_active(session, context.workspace_id, owner_id):
                 return
         try:
             _detect_action_for_message(

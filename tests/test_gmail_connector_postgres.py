@@ -81,7 +81,7 @@ multi-round adversarial review found and required real coverage for:
     what the file actually tested).
 14. `authorize`'s unconditional raise (never called in production --
     `gmail` connects exclusively through `get_authorization_url`/
-    `handle_oauth_callback`); `_unpack_credential`'s shape-validation
+    `handle_oauth_callback`); `unpack_credential`'s shape-validation
     `TypeError` branch (round 5) reached through `refresh_permissions`/
     `disconnect`, not just the raw function in isolation -- both round 6:
     self-evidently-correct code that had no test at all before.
@@ -106,7 +106,7 @@ multi-round adversarial review found and required real coverage for:
     merely huge (an ordinary large integer, no exotic JSON literal needed)
     `expires_in` -- round 8: `float(expires_in)` accepts both cleanly, but
     the resulting Unix timestamp made `datetime.fromtimestamp(...)` raise
-    `OverflowError`/`ValueError` at `_pack_credential`'s call site, which
+    `OverflowError`/`ValueError` at `pack_credential`'s call site, which
     (unlike every other field this method validates) sat on the success
     path *after* the revoke-on-reject guard already exited -- skipping
     revocation for the just-obtained grant entirely, not merely escaping
@@ -1455,7 +1455,7 @@ def test_refresh_permissions_permission_lost_on_malformed_credential() -> None:
 
 def test_refresh_permissions_permission_lost_on_non_object_credential() -> None:
     """Distinct from the malformed-JSON case above -- valid JSON that isn't
-    an object (round 5's `_unpack_credential` shape-validation fix) reaches
+    an object (round 5's `unpack_credential` shape-validation fix) reaches
     this same `except (ValueError, TypeError)` via the `TypeError` branch,
     not `ValueError`. Round 6 review found this specific branch had no
     test exercising it through a real caller, only the raw function in
@@ -1495,7 +1495,7 @@ def test_disconnect_returns_none_for_malformed_credential() -> None:
 
 def test_disconnect_returns_none_for_non_object_credential() -> None:
     """Companion to `test_refresh_permissions_permission_lost_on_non_object_
-    credential` -- same round-5 `_unpack_credential` `TypeError` branch,
+    credential` -- same round-5 `unpack_credential` `TypeError` branch,
     reached through `disconnect` instead.
     """
     adapter = GmailAdapter()
