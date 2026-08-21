@@ -12,6 +12,8 @@ from ecc.auth import AuthContext, AuthDep, CsrfDep
 from ecc.database import get_session
 from ecc.domains.knowledge.embeddings import queue_embedding
 from ecc.domains.knowledge.entities import EntityResponse, project_entity
+from ecc.domains.knowledge.entity_lookup import ENTITY_FIELDS as _ENTITY_FIELDS
+from ecc.domains.knowledge.entity_lookup import get_entity_row as _get_row
 from ecc.domains.knowledge.retrieval import queue_retrieval_document
 from ecc.domains.knowledge.timeline import queue_timeline_entry
 from ecc.observability import queue_lifecycle_event
@@ -24,11 +26,6 @@ IdempotencyHeader = Annotated[
     str,
     Header(alias="Idempotency-Key", min_length=1, max_length=255),
 ]
-
-_ENTITY_FIELDS = """
-id, node_type, canonical_name, attributes, status, confidence,
-version, created_at, updated_at
-"""
 
 
 class EntityPatch(BaseModel):
@@ -50,32 +47,6 @@ class EntityPatch(BaseModel):
 class EntityAction(BaseModel):
     model_config = ConfigDict(extra="forbid")
     expected_version: int = Field(ge=1)
-
-
-def _get_row(
-    session: Session,
-    auth: AuthContext,
-    entity_id: UUID,
-    *,
-    for_update: bool = False,
-) -> dict[str, Any] | None:
-    suffix = " FOR UPDATE" if for_update else ""
-    row = (
-        session.execute(
-            text(
-                f"""
-                SELECT {_ENTITY_FIELDS}
-                FROM pkos_nodes
-                WHERE workspace_id = :workspace_id AND id = :entity_id
-                {suffix}
-                """
-            ),
-            {"workspace_id": auth.workspace_id, "entity_id": entity_id},
-        )
-        .mappings()
-        .one_or_none()
-    )
-    return dict(row) if row is not None else None
 
 
 @router.patch("/{entity_id}", response_model=EntityResponse)

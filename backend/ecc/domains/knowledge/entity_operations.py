@@ -10,8 +10,7 @@ from sqlalchemy.orm import Session
 
 from ecc.auth import AuthContext, AuthDep, CsrfDep
 from ecc.database import get_session
-from ecc.domains.knowledge.embeddings import queue_embedding
-from ecc.domains.knowledge.retrieval import queue_retrieval_document
+from ecc.domains.knowledge.entity_lookup import refresh_projections as _refresh_projections
 from ecc.domains.knowledge.timeline import queue_timeline_entry
 from ecc.observability import queue_lifecycle_event
 from ecc.platform import audit_outbox, authz
@@ -109,42 +108,6 @@ def _lock_entity(session: Session, auth: AuthContext, entity_id: UUID) -> dict[s
         .one_or_none()
     )
     return dict(row) if row is not None else None
-
-
-def _entity_retrieval_fields(
-    session: Session, auth: AuthContext, entity_id: UUID
-) -> tuple[str, str, str | None, int] | None:
-    row = session.execute(
-        text(
-            """
-            SELECT node_type, canonical_name, attributes, version FROM pkos_nodes
-            WHERE workspace_id = :workspace_id AND id = :entity_id
-            """
-        ),
-        {"workspace_id": auth.workspace_id, "entity_id": entity_id},
-    ).one_or_none()
-    if row is None:
-        return None
-    node_type, canonical_name, attributes, version = row
-    summary = (attributes or {}).get("summary")
-    return node_type, canonical_name, summary, version
-
-
-def _refresh_projections(
-    session: Session, auth: AuthContext, entity_id: UUID, now: datetime
-) -> None:
-    """DATA-MODEL.md's split invariant: "invalidate obsolete projections."
-    Split moves claims/relationships between entities via direct UPDATE
-    (not claims.py's/relationships.py's own mutation endpoints), so it must
-    explicitly refresh retrieval_documents/embeddings itself afterward,
-    exactly mirroring what those endpoints already do on every write."""
-    fields = _entity_retrieval_fields(session, auth, entity_id)
-    if fields is not None:
-        kind, canonical_name, summary, version = fields
-        queue_retrieval_document(
-            session, auth.workspace_id, entity_id, kind, canonical_name, summary, version, now
-        )
-        queue_embedding(session, auth.workspace_id, entity_id, now)
 
 
 def _rehome_aliases(

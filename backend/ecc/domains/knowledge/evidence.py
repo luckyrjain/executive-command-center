@@ -7,10 +7,9 @@ from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from ecc.auth import AuthContext, AuthDep, CsrfDep
+from ecc.auth import AuthDep, CsrfDep
 from ecc.database import get_session
-from ecc.domains.knowledge.embeddings import queue_embedding
-from ecc.domains.knowledge.retrieval import queue_retrieval_document
+from ecc.domains.knowledge.entity_lookup import refresh_projections as _refresh_projections
 from ecc.observability import queue_lifecycle_event
 from ecc.platform import audit_outbox, authz
 from ecc.platform.idempotency import load_cached, lock_idempotency, request_hash, store_idempotency
@@ -137,37 +136,6 @@ def resolve_evidence(
             )
     session.rollback()
     return EvidenceListResponse(items=items)
-
-
-def _entity_retrieval_fields(
-    session: Session, auth: AuthContext, entity_id: UUID
-) -> tuple[str, str, str | None, int] | None:
-    row = session.execute(
-        text(
-            """
-            SELECT node_type, canonical_name, attributes, version FROM pkos_nodes
-            WHERE workspace_id = :workspace_id AND id = :entity_id
-            """
-        ),
-        {"workspace_id": auth.workspace_id, "entity_id": entity_id},
-    ).one_or_none()
-    if row is None:
-        return None
-    node_type, canonical_name, attributes, version = row
-    summary = (attributes or {}).get("summary")
-    return node_type, canonical_name, summary, version
-
-
-def _refresh_projections(
-    session: Session, auth: AuthContext, entity_id: UUID, now: datetime
-) -> None:
-    fields = _entity_retrieval_fields(session, auth, entity_id)
-    if fields is not None:
-        kind, canonical_name, summary, version = fields
-        queue_retrieval_document(
-            session, auth.workspace_id, entity_id, kind, canonical_name, summary, version, now
-        )
-        queue_embedding(session, auth.workspace_id, entity_id, now)
 
 
 @router.post("/{evidence_id}/delete", response_model=EvidenceDeleteResponse, status_code=200)
