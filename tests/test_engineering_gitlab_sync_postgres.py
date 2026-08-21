@@ -62,9 +62,9 @@ from ecc.domains.engineering.connectors import (
 from ecc.domains.engineering.crypto import encrypt_credential
 from ecc.domains.engineering.gitlab_adapter import (
     GitLabAdapter,
-    _InvalidCredentialError,
+    InvalidCredentialError,
     _is_private_address,
-    _parse_credential,
+    parse_credential,
 )
 from ecc.main import app
 
@@ -110,8 +110,8 @@ def _token_self_response(
 
 
 def test_parse_credential_splits_host_and_token() -> None:
-    assert _parse_credential("gitlab.com|glpat_test") == ("gitlab.com", "glpat_test")
-    assert _parse_credential("gitlab-ee.mpokket.org|glpat-xyz") == (
+    assert parse_credential("gitlab.com|glpat_test") == ("gitlab.com", "glpat_test")
+    assert parse_credential("gitlab-ee.mpokket.org|glpat-xyz") == (
         "gitlab-ee.mpokket.org",
         "glpat-xyz",
     )
@@ -128,34 +128,34 @@ def test_parse_credential_reads_a_bare_token_as_a_legacy_gitlab_com_credential()
     bare token could only ever have been issued by gitlab.com, since that
     was the sole reachable host before the `host|token` format existed.
     """
-    assert _parse_credential("glpat-legacy-bare-token") == ("gitlab.com", "glpat-legacy-bare-token")
+    assert parse_credential("glpat-legacy-bare-token") == ("gitlab.com", "glpat-legacy-bare-token")
 
 
 def test_parse_credential_rejects_empty_credential() -> None:
-    with pytest.raises(_InvalidCredentialError):
-        _parse_credential("")
+    with pytest.raises(InvalidCredentialError):
+        parse_credential("")
 
 
 def test_parse_credential_rejects_empty_host_or_token() -> None:
-    with pytest.raises(_InvalidCredentialError):
-        _parse_credential("|glpat_test")
-    with pytest.raises(_InvalidCredentialError):
-        _parse_credential("gitlab.com|")
+    with pytest.raises(InvalidCredentialError):
+        parse_credential("|glpat_test")
+    with pytest.raises(InvalidCredentialError):
+        parse_credential("gitlab.com|")
 
 
 def test_parse_credential_rejects_scheme_in_host() -> None:
-    with pytest.raises(_InvalidCredentialError):
-        _parse_credential("https://gitlab.com|glpat_test")
+    with pytest.raises(InvalidCredentialError):
+        parse_credential("https://gitlab.com|glpat_test")
 
 
 def test_parse_credential_rejects_path_in_host() -> None:
-    with pytest.raises(_InvalidCredentialError):
-        _parse_credential("gitlab.com/api|glpat_test")
+    with pytest.raises(InvalidCredentialError):
+        parse_credential("gitlab.com/api|glpat_test")
 
 
 def test_parse_credential_rejects_whitespace_in_host() -> None:
-    with pytest.raises(_InvalidCredentialError):
-        _parse_credential("gitlab.com |glpat_test")
+    with pytest.raises(InvalidCredentialError):
+        parse_credential("gitlab.com |glpat_test")
 
 
 def test_is_private_address_flags_loopback_link_local_and_rfc1918() -> None:

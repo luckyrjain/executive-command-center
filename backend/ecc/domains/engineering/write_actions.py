@@ -133,7 +133,7 @@ from sqlalchemy.orm import Session
 # `connectors.py` is the first of the four to begin loading (the ordering
 # every existing caller, e.g. `connector_accounts.py`, already happens to
 # follow); importing one of the three adapter modules directly first, as
-# this module's own need for `GITHUB_API_BASE_URL`/`_parse_credential`
+# this module's own need for `GITHUB_API_BASE_URL`/`parse_credential`
 # would otherwise do, breaks that invariant and raises `ImportError:
 # cannot import name '...' from partially initialized module` (confirmed
 # directly against a real interpreter while writing this module). This
@@ -142,12 +142,12 @@ from sqlalchemy.orm import Session
 import ecc.domains.engineering.connectors  # noqa: F401
 from ecc.database import SessionFactory
 from ecc.domains.engineering.crypto import decrypt_credential
-from ecc.domains.engineering.github_adapter import GITHUB_API_BASE_URL, _safe_repo_path_segment
+from ecc.domains.engineering.github_adapter import GITHUB_API_BASE_URL, safe_repo_path_segment
 from ecc.domains.engineering.gitlab_adapter import (
-    _InvalidCredentialError as _InvalidGitLabCredentialError,
+    InvalidCredentialError as _InvalidGitLabCredentialError,
 )
-from ecc.domains.engineering.gitlab_adapter import _parse_credential as _parse_gitlab_credential
-from ecc.domains.engineering.jira_adapter import _parse_credential as _parse_jira_credential
+from ecc.domains.engineering.gitlab_adapter import parse_credential as _parse_gitlab_credential
+from ecc.domains.engineering.jira_adapter import parse_credential as _parse_jira_credential
 
 # `TransientAdapterError` is deliberately imported inside `_classify_and_
 # raise`/`_raise_for_write_response` below, not here at module top-level.
@@ -333,7 +333,7 @@ class GitHubAddIssueCommentAdapter:
                 f"repository_id {action_input.repository_id} is not a repository this "
                 f"connector account has synced in this workspace"
             )
-        full_name = _safe_repo_path_segment(repo["name"])
+        full_name = safe_repo_path_segment(repo["name"])
         headers = {
             "Authorization": f"Bearer {credential}",
             "Accept": "application/vnd.github+json",
@@ -448,11 +448,11 @@ class GitLabAddNoteAdapter:
                 connector_account_id=action_input.connector_account_id,
                 expected_provider="gitlab",
             )
-        # `_InvalidCredentialError` is `gitlab_adapter.py`'s own private
-        # exception class -- letting it escape would surface to the caller
-        # (and into `workflow_run_steps.error`) as the raw private class
-        # name, bypassing this module's own established error boundary.
-        # A credential this adapter cannot parse is a data problem with
+        # `InvalidCredentialError` is `gitlab_adapter.py`'s own exception
+        # class -- letting it escape would surface to the caller (and into
+        # `workflow_run_steps.error`) as that raw class name, bypassing
+        # this module's own established error boundary. A credential this
+        # adapter cannot parse is a data problem with
         # the stored connection, never a transient one, so
         # `WriteActionRejected` (this module's "not retry-safe, land the
         # step at 'failed'" type) is the right surface -- the same
@@ -578,14 +578,14 @@ class JiraAddCommentAdapter:
         # {key}` link (`jira_adapter.py`'s own sync code builds it that
         # way); reused here for the output link rather than reconstructed
         # from `external_id`, which would silently produce a broken link.
-        # Same dot-segment path-escape defense as `_safe_repo_path_segment`/
+        # Same dot-segment path-escape defense as `safe_repo_path_segment`/
         # `GitLabAddNoteInput._reject_dot_segments` -- review found this was
         # the one provider write action of the three missing it: `external_id`
         # is ordinarily a purely numeric database key, but nothing enforces
         # that shape, so a compromised or misbehaving connected Jira instance
         # returning a crafted `id` field could otherwise escape the intended
         # `/rest/api/3/issue/{id}/comment` path.
-        issue_id = _safe_repo_path_segment(work_item["external_id"])
+        issue_id = safe_repo_path_segment(work_item["external_id"])
         try:
             response = self._client.post(
                 f"https://{site}/rest/api/3/issue/{issue_id}/comment",

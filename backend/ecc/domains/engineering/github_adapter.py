@@ -156,7 +156,7 @@ _MAX_PAGES_PER_CALL = 10
 _RATE_LIMIT_MAX_WAIT_SECONDS = 5.0
 
 
-def _safe_repo_path_segment(full_name: str) -> str:
+def safe_repo_path_segment(full_name: str) -> str:
     """Defense-in-depth against the same dot-segment path-escape bug class
     `write_actions.py`'s `GitLabAddNoteInput._reject_dot_segments` closed
     for GitLab's user-supplied `project_path` (final Phase 6 review
@@ -816,7 +816,7 @@ class GitHubAdapter:
                 calls_made += 1
                 response = self._request_with_rate_limit_retry(
                     "GET",
-                    f"/repos/{_safe_repo_path_segment(repo['name'])}/pulls",
+                    f"/repos/{safe_repo_path_segment(repo['name'])}/pulls",
                     headers=headers,
                     params={
                         "state": "closed",
@@ -919,7 +919,7 @@ class GitHubAdapter:
             calls_made += 1
             response = self._request_with_rate_limit_retry(
                 "GET",
-                f"/repos/{_safe_repo_path_segment(change['repository_name'])}"
+                f"/repos/{safe_repo_path_segment(change['repository_name'])}"
                 f"/pulls/{change['provider_number']}/reviews",
                 headers=headers,
                 params={"per_page": _PAGE_SIZE},
@@ -946,7 +946,7 @@ class GitHubAdapter:
                 calls_made += 1
                 timeline_response = self._request_with_rate_limit_retry(
                     "GET",
-                    f"/repos/{_safe_repo_path_segment(change['repository_name'])}/issues/"
+                    f"/repos/{safe_repo_path_segment(change['repository_name'])}/issues/"
                     f"{change['provider_number']}/timeline",
                     headers=headers,
                     params={"per_page": _PAGE_SIZE},

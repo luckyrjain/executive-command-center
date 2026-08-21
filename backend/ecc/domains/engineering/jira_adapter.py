@@ -159,7 +159,7 @@ _JIRA_SITE_PATTERN = re.compile(
 )
 
 
-def _parse_credential(credential: str) -> tuple[str, str, str]:
+def parse_credential(credential: str) -> tuple[str, str, str]:
     parts = credential.split("|", 2)
     if len(parts) != 3 or not all(parts):
         raise _InvalidCredentialError("Jira credential must be in the form 'site|email|api_token'")
@@ -361,7 +361,7 @@ class JiraAdapter:
 
     def authorize(self, credential: str) -> ConnectorAuthorization:
         try:
-            site, email, api_token = _parse_credential(credential)
+            site, email, api_token = parse_credential(credential)
         except _InvalidCredentialError as exc:
             raise AdapterAuthorizationError(str(exc)) from exc
 
@@ -413,7 +413,7 @@ class JiraAdapter:
         self, account: ConnectorAccountContext, *, since_cursor: str | None
     ) -> SyncOutcome:
         try:
-            site, email, api_token = _parse_credential(account.credential)
+            site, email, api_token = parse_credential(account.credential)
         except _InvalidCredentialError as exc:
             raise RuntimeError(str(exc)) from exc
         headers = self._headers(email, api_token)
@@ -527,7 +527,7 @@ class JiraAdapter:
                 resource_type="work_item", items_processed=0, status="succeeded", next_cursor=None
             )
         try:
-            site, _email, _api_token = _parse_credential(account.credential)
+            site, _email, _api_token = parse_credential(account.credential)
         except _InvalidCredentialError as exc:
             raise RuntimeError(str(exc)) from exc
         _upsert_work_item(
@@ -543,7 +543,7 @@ class JiraAdapter:
 
     def refresh_permissions(self, account: ConnectorAccountContext) -> PermissionState:
         try:
-            site, email, api_token = _parse_credential(account.credential)
+            site, email, api_token = parse_credential(account.credential)
         except _InvalidCredentialError:
             return "permission_lost"
         try:
