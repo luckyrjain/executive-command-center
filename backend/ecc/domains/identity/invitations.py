@@ -4,10 +4,12 @@
 
 `docs/superpowers/specs/2026-08-01-phase-8-multi-user-design.md` Decision 3.
 Sibling module to `ecc.domains.identity.accounts` within the same `identity`
-domain package -- imports `_normalize_email`/`_EMAIL_PATTERN` from there
-rather than duplicating email validation, the same sibling-module-private-
-import pattern `ecc.domains.engineering.write_actions` already uses for its
-own adapter modules' private helpers.
+domain package -- imports `normalize_email`/`EMAIL_PATTERN` from there
+rather than duplicating email validation. Both are public (no leading
+underscore) in `accounts.py` specifically so this cross-module import is a
+declared dependency, not a fragile reach into another module's internals --
+`accounts.py`'s own deletion once broke this exact file when the helper it
+imported was still private (round of dead-code cleanup earlier this phase).
 
 **Two different acceptance paths, not one, because a brand-new recipient
 cannot present an authenticated session that does not yet exist.**
@@ -77,7 +79,7 @@ from sqlalchemy.orm import Session
 
 from ecc.auth import AuthContext, AuthDep, CsrfDep
 from ecc.database import get_session
-from ecc.domains.identity.accounts import _EMAIL_PATTERN, _normalize_email
+from ecc.domains.identity.accounts import EMAIL_PATTERN, normalize_email
 from ecc.observability import queue_lifecycle_event
 from ecc.platform import audit_outbox
 
@@ -112,8 +114,8 @@ class InvitationCreateRequest(BaseModel):
     @field_validator("email")
     @classmethod
     def _normalize(cls, value: str) -> str:
-        normalized = _normalize_email(value)
-        if not _EMAIL_PATTERN.match(normalized) or len(normalized) > 320:
+        normalized = normalize_email(value)
+        if not EMAIL_PATTERN.match(normalized) or len(normalized) > 320:
             raise ValueError("EMAIL_INVALID")
         return normalized
 
