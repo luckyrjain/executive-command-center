@@ -73,6 +73,32 @@ def lock_idempotency(session: Session, auth: AuthContext, key: str) -> None:
 
 
 @contextmanager
+def held_advisory_lock(lock_key: str) -> Iterator[None]:
+    """The session-scoped `pg_advisory_lock`/`pg_advisory_unlock` primitive
+    behind `held_idempotency_lock` -- extracted so `ai_runtime.evaluation`'s
+    own two synthetic-eval-data serialization locks (unrelated to
+    idempotency keys, but needing this identical dedicated-connection/
+    AUTOCOMMIT/`hashtextextended(key, 0)` shape) can reuse it instead of
+    re-implementing it. Held on its own dedicated connection for this
+    context manager's entire duration; see `held_idempotency_lock`'s own
+    docstring for why (`lock_engine`'s `NullPool`/no-`statement_timeout`
+    reasoning applies identically to every caller of this primitive, not
+    only idempotency-key locking).
+    """
+    with lock_engine.connect().execution_options(isolation_level="AUTOCOMMIT") as connection:
+        connection.execute(
+            text("SELECT pg_advisory_lock(hashtextextended(:lock_key, 0))"), {"lock_key": lock_key}
+        )
+        try:
+            yield
+        finally:
+            connection.execute(
+                text("SELECT pg_advisory_unlock(hashtextextended(:lock_key, 0))"),
+                {"lock_key": lock_key},
+            )
+
+
+@contextmanager
 def held_idempotency_lock(auth: AuthContext, key: str) -> Iterator[None]:
     """A session-scoped `pg_advisory_lock`, held on its own dedicated
     connection for this context manager's entire duration -- unlike
@@ -104,18 +130,8 @@ def held_idempotency_lock(auth: AuthContext, key: str) -> Iterator[None]:
     block indefinitely until the first request releases it. See
     `lock_engine`'s own docstring in `database.py`.
     """
-    lock_key = _lock_key(auth, key)
-    with lock_engine.connect().execution_options(isolation_level="AUTOCOMMIT") as connection:
-        connection.execute(
-            text("SELECT pg_advisory_lock(hashtextextended(:lock_key, 0))"), {"lock_key": lock_key}
-        )
-        try:
-            yield
-        finally:
-            connection.execute(
-                text("SELECT pg_advisory_unlock(hashtextextended(:lock_key, 0))"),
-                {"lock_key": lock_key},
-            )
+    with held_advisory_lock(_lock_key(auth, key)):
+        yield
 
 
 @overload

@@ -99,12 +99,13 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from ecc.auth import AuthContext, AuthDep, CsrfDep
-from ecc.database import get_session, lock_engine
+from ecc.database import get_session
 from ecc.domains.personal.crypto import encrypt_field
 from ecc.domains.personal.domains import classification_for, encrypt_record_payload
 from ecc.observability import record_database_failure
 from ecc.platform import authz
 from ecc.platform.idempotency import (
+    held_advisory_lock,
     held_idempotency_lock,
     load_cached,
     request_hash,
@@ -1735,22 +1736,13 @@ def _synthetic_meeting_serialization_lock(workspace_id: UUID) -> Iterator[None]:
     `IntegrityError`. `attention.explain_item`'s synthetic items use
     random `uuid4()` ids and have no such collision risk, so this lock is
     `meeting.prep_summary`-only -- see `_insert_synthetic_meeting`'s call
-    site in `run_evaluation` below. Same `lock_engine`/`pg_advisory_lock`
-    pattern as `held_idempotency_lock`, held on its own dedicated
-    connection for this context manager's entire duration.
+    site in `run_evaluation` below. Reuses `held_idempotency_lock`'s own
+    `held_advisory_lock` primitive, held on its own dedicated connection
+    for this context manager's entire duration.
     """
     lock_key = f"{workspace_id}:meeting.prep_summary:synthetic-eval-data"
-    with lock_engine.connect().execution_options(isolation_level="AUTOCOMMIT") as connection:
-        connection.execute(
-            text("SELECT pg_advisory_lock(hashtextextended(:lock_key, 0))"), {"lock_key": lock_key}
-        )
-        try:
-            yield
-        finally:
-            connection.execute(
-                text("SELECT pg_advisory_unlock(hashtextextended(:lock_key, 0))"),
-                {"lock_key": lock_key},
-            )
+    with held_advisory_lock(lock_key):
+        yield
 
 
 @contextmanager
@@ -1776,23 +1768,14 @@ def _synthetic_email_thread_serialization_lock(
     own synthetic thread -- mid-run, not merely at cleanup. Scoped by
     `owner_id` in addition to `workspace_id` (unlike the meeting lock,
     scoped workspace-only) because the collision key here is `(workspace_
-    id, owner_id, 'email')`, not workspace-wide. Same `lock_engine`/
-    `pg_advisory_lock` pattern as `_synthetic_meeting_serialization_lock`,
-    held on its own dedicated connection for this context manager's entire
-    duration.
+    id, owner_id, 'email')`, not workspace-wide. Reuses the same
+    `held_advisory_lock` primitive as `_synthetic_meeting_serialization_
+    lock`, held on its own dedicated connection for this context manager's
+    entire duration.
     """
     lock_key = f"{workspace_id}:{owner_id}:email.detect_action:synthetic-eval-data"
-    with lock_engine.connect().execution_options(isolation_level="AUTOCOMMIT") as connection:
-        connection.execute(
-            text("SELECT pg_advisory_lock(hashtextextended(:lock_key, 0))"), {"lock_key": lock_key}
-        )
-        try:
-            yield
-        finally:
-            connection.execute(
-                text("SELECT pg_advisory_unlock(hashtextextended(:lock_key, 0))"),
-                {"lock_key": lock_key},
-            )
+    with held_advisory_lock(lock_key):
+        yield
 
 
 def run_evaluation(
