@@ -7,15 +7,25 @@ and `governance.recommendation_mutations` along the way. The handful of
 helpers below have none of that: they're pure credential (de)serialization,
 one `domain_consents` read, and a `str.strip().casefold()`. Everything here
 used to live in `gmail_adapter.py` and get imported straight out of it by
-`gmail_threads.py` (`_bearer_headers`/`_email_consent_active`) and by
+`gmail_threads.py` (`bearer_headers`/`email_consent_active`) and by
 `ecc.domains.attention.attention` (`normalize_email`, the one cross-domain
 case) -- reaching a sibling/cross-domain module past its adapter class just
 for a stateless helper, and pulling in that module's own heavy import graph
 to do it. `gmail_adapter.py` itself now imports these back from here rather
 than defining them, so its own internal call sites are unaffected.
 `gmail_action_detection.py` (a later, separate architecture-review split)
-is a third consumer of `_bearer_headers`/`_email_consent_active`, for the
+is a third consumer of `bearer_headers`/`email_consent_active`, for the
 identical reason.
+
+Every helper below is public (no leading underscore) precisely because
+every one of them is meant to be imported across module/domain boundaries
+-- this whole module exists for that purpose, so a private name here would
+only misrepresent it as an internal implementation detail. A private name
+on a cross-module dependency is exactly the "fragile private import" bug
+class that broke the build once already this session (a different
+private helper deleted elsewhere silently broke an importer that had
+reached past the underscore) -- see identity/accounts.py's and
+connector_accounts.py's own near-identical fixes for the same class.
 """
 
 from __future__ import annotations
@@ -28,7 +38,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 
-def _pack_credential(access_token: str, refresh_token: str, expires_at: datetime) -> str:
+def pack_credential(access_token: str, refresh_token: str, expires_at: datetime) -> str:
     return dumps(
         {
             "access_token": access_token,
@@ -38,7 +48,7 @@ def _pack_credential(access_token: str, refresh_token: str, expires_at: datetime
     )
 
 
-def _unpack_credential(credential: str) -> dict[str, str]:
+def unpack_credential(credential: str) -> dict[str, str]:
     """Every caller (`GmailAdapter.refresh_permissions`/`disconnect`, plus
     `bearer_headers` below) catches only `(ValueError, TypeError)` around
     this call -- `loads` itself only ever raises `ValueError` (malformed
@@ -58,12 +68,12 @@ def _unpack_credential(credential: str) -> dict[str, str]:
     return data
 
 
-def _bearer_headers(credential: str) -> dict[str, str]:
-    access_token = _unpack_credential(credential).get("access_token", "")
+def bearer_headers(credential: str) -> dict[str, str]:
+    access_token = unpack_credential(credential).get("access_token", "")
     return {"Authorization": f"Bearer {access_token}"}
 
 
-def _email_consent_active(session: Session, workspace_id: UUID, owner_id: UUID) -> bool:
+def email_consent_active(session: Session, workspace_id: UUID, owner_id: UUID) -> bool:
     """Plan Task 2: "each re-invocation re-verifies the `email` domain's
     `domain_consents` row is still active at call time, not merely at
     original connect time" -- `gmail_adapter.py` calls this both before a

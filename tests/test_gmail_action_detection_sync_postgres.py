@@ -72,7 +72,7 @@ from ecc.domains.personal.gmail_adapter import (
     _BodyParseOutcome,
     _parse_message_body_response,
 )
-from ecc.domains.personal.gmail_shared import _pack_credential
+from ecc.domains.personal.gmail_shared import pack_credential
 
 settings = get_settings()
 pytestmark = pytest.mark.skipif(
@@ -112,7 +112,7 @@ def _seed_base_rows(
     account_id = uuid4()
     thread_id = uuid4()
     now = datetime.now(UTC)
-    credential = _pack_credential("access-1", "refresh-1", now + timedelta(hours=1))
+    credential = pack_credential("access-1", "refresh-1", now + timedelta(hours=1))
 
     with engine.begin() as connection:
         connection.execute(

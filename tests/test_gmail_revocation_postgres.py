@@ -176,7 +176,7 @@ from ecc.domains.engineering.connectors import ConnectorAccountContext
 from ecc.domains.engineering.crypto import encrypt_credential
 from ecc.domains.personal import gmail_revocation
 from ecc.domains.personal.gmail_adapter import GmailAdapter
-from ecc.domains.personal.gmail_shared import _pack_credential
+from ecc.domains.personal.gmail_shared import pack_credential
 from ecc.main import app
 
 settings = get_settings()
@@ -479,7 +479,7 @@ def gmail_revocation_context(monkeypatch: pytest.MonkeyPatch) -> Iterator[dict]:
     account_id = uuid4()
     token = f"session-{uuid4()}"
     now = datetime.now(UTC)
-    credential = _pack_credential("access-1", "refresh-1", now + timedelta(hours=1))
+    credential = pack_credential("access-1", "refresh-1", now + timedelta(hours=1))
 
     with engine.begin() as connection:
         connection.execute(
@@ -577,7 +577,7 @@ def _insert_gmail_connector_account(
     connection, *, workspace_id: UUID, owner_id: UUID, external_account_id: str, now: datetime
 ) -> UUID:
     account_id = uuid4()
-    credential = _pack_credential("access-2", "refresh-2", now + timedelta(hours=1))
+    credential = pack_credential("access-2", "refresh-2", now + timedelta(hours=1))
     connection.execute(
         text(
             """
@@ -1253,7 +1253,7 @@ def test_disable_domain_does_not_affect_a_different_owners_gmail_data(
     # unregistered (an orphaned `accounts` row) if any earlier assertion in
     # this test failed.
     ctx["extra_owner_emails"].append(other_email)
-    credential = _pack_credential("other-access", "other-refresh", ctx["now"] + timedelta(hours=1))
+    credential = pack_credential("other-access", "other-refresh", ctx["now"] + timedelta(hours=1))
     with engine.begin() as connection:
         create_identity(
             connection,

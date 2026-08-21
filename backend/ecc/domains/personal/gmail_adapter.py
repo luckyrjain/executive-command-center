@@ -24,8 +24,8 @@ single-host API.
 
 **Credential shape is a JSON string, not a bare token.** Every existing
 adapter's `credential` is a single opaque token string; Gmail's OAuth grant
-is an access/refresh token *pair* plus an expiry. `_pack_credential`/
-`_unpack_credential` (`gmail_shared.py`) serialize/deserialize
+is an access/refresh token *pair* plus an expiry. `pack_credential`/
+`unpack_credential` (`gmail_shared.py`) serialize/deserialize
 `{"access_token", "refresh_token", "expires_at"}` as a JSON string --
 `ConnectorAccountContext.credential` stays `str` (the Protocol's own type),
 `ecc.domains.engineering.crypto.encrypt_credential`/`decrypt_credential`
@@ -131,11 +131,11 @@ from ecc.domains.engineering.connectors import (
 
 from .crypto import encrypt_field
 from .gmail_shared import (
-    _bearer_headers,
-    _email_consent_active,
-    _pack_credential,
-    _unpack_credential,
+    bearer_headers,
+    email_consent_active,
     normalize_email,
+    pack_credential,
+    unpack_credential,
 )
 
 GOOGLE_OAUTH_AUTHORIZE_URL = "https://accounts.google.com/o/oauth2/v2/auth"
@@ -1389,7 +1389,7 @@ class GmailAdapter:
         # (surfacing as an unhandled 500 outside the app's structured error
         # envelope) and, for the same reason every branch inside this guard
         # exists, skipping revoke-on-reject entirely -- the same "shape
-        # trusted without validation" bug class as `_unpack_credential`
+        # trusted without validation" bug class as `unpack_credential`
         # (see that function's own docstring), just one call earlier.
         # `refresh_token` is pre-initialized so the `except` clause below
         # has a value to revoke (empty, if parsing failed before assignment
@@ -1414,7 +1414,7 @@ class GmailAdapter:
             # non-string `access_token`/`refresh_token` doesn't crash
             # anywhere in this method -- it would just get silently
             # embedded in the `Bearer` header and JSON-serialized into the
-            # persisted credential via `_pack_credential`. Guarded anyway,
+            # persisted credential via `pack_credential`. Guarded anyway,
             # for the same reason every other field in this response body
             # already is: a non-string truthy value (a JSON number) passes
             # the bare `if not access_token:` check the same way a non-
@@ -1444,7 +1444,7 @@ class GmailAdapter:
             # value `None`) would still reach `.split()` and raise an
             # uncaught `AttributeError` (round 7 review: the same "shape
             # trusted without validation" gap rounds 5-6 closed for
-            # `_unpack_credential` and the response bodies themselves, one
+            # `unpack_credential` and the response bodies themselves, one
             # field deeper).
             raw_scope = body.get("scope")
             if raw_scope is not None and not isinstance(raw_scope, str):
@@ -1474,7 +1474,7 @@ class GmailAdapter:
                 # `OverflowError`/`OSError`/`ValueError` -- a type this
                 # guard doesn't otherwise anticipate. That call itself only
                 # happens later, on the success path *after* this guard
-                # already exits (`credential = _pack_credential(...)`
+                # already exits (`credential = pack_credential(...)`
                 # below) -- so without this check here, that failure would
                 # both skip revoke-on-reject for the just-obtained grant
                 # and escape uncaught past the router's `AdapterAuthorization
@@ -1528,7 +1528,7 @@ class GmailAdapter:
             self._revoke_best_effort(refresh_token or "")
             raise
 
-        credential = _pack_credential(
+        credential = pack_credential(
             access_token, refresh_token, datetime.fromtimestamp(expires_at, tz=UTC)
         )
         return ConnectorAuthorization(
@@ -1667,10 +1667,10 @@ class GmailAdapter:
         if owner_id is None:
             raise RuntimeError("Gmail connector account has no owner_id on record")
         with SessionFactory() as session, session.begin():
-            if not _email_consent_active(session, account.workspace_id, owner_id):
+            if not email_consent_active(session, account.workspace_id, owner_id):
                 raise RuntimeError("email domain consent is not active")
 
-        headers = _bearer_headers(account.credential)
+        headers = bearer_headers(account.credential)
         now = datetime.now(UTC)
         items_processed = 0
         highest_history_id: int | None = None
@@ -1757,7 +1757,7 @@ class GmailAdapter:
                 # further syncing happens after that, to one message's
                 # worth of lag rather than the whole remaining call.
                 with SessionFactory() as session, session.begin():
-                    if not _email_consent_active(session, account.workspace_id, owner_id):
+                    if not email_consent_active(session, account.workspace_id, owner_id):
                         return SyncOutcome(
                             resource_type="message",
                             items_processed=items_processed,
@@ -1966,7 +1966,7 @@ class GmailAdapter:
         if owner_id is None:
             raise RuntimeError("Gmail connector account has no owner_id on record")
         with SessionFactory() as session, session.begin():
-            if not _email_consent_active(session, account.workspace_id, owner_id):
+            if not email_consent_active(session, account.workspace_id, owner_id):
                 raise RuntimeError("email domain consent is not active")
 
         # Round 13 review: `start_history_id` (this method's own `cursor`
@@ -1987,7 +1987,7 @@ class GmailAdapter:
         pending_stuck_record_id = cursor.stuck_record_id
         pending_skip_count = cursor.stuck_offset
 
-        headers = _bearer_headers(account.credential)
+        headers = bearer_headers(account.credential)
         now = datetime.now(UTC)
         items_processed = 0
         latest_history_id: int | None = None
@@ -2179,7 +2179,7 @@ class GmailAdapter:
                     calls_made += 1
 
                     with SessionFactory() as session, session.begin():
-                        if not _email_consent_active(session, account.workspace_id, owner_id):
+                        if not email_consent_active(session, account.workspace_id, owner_id):
                             return SyncOutcome(
                                 resource_type="message",
                                 items_processed=items_processed,
@@ -2590,7 +2590,7 @@ class GmailAdapter:
         storage is separate work from detecting the loss itself.
         """
         try:
-            credential = _unpack_credential(account.credential)
+            credential = unpack_credential(account.credential)
         except (ValueError, TypeError):
             return "permission_lost"
         settings = get_settings()
@@ -2622,7 +2622,7 @@ class GmailAdapter:
         (disconnect) is satisfied either way.
         """
         try:
-            credential = _unpack_credential(account.credential)
+            credential = unpack_credential(account.credential)
         except (ValueError, TypeError):
             return None
         self._revoke_best_effort(credential.get("refresh_token", ""))
@@ -2665,7 +2665,7 @@ class GmailAdapter:
     # direction, would be circular. Deferring it to call time sidesteps
     # that entirely: by the time anything actually *calls* `detect_
     # actions_since`, both modules have long finished loading.
-    # (`_bearer_headers`/`_email_consent_active`, the other two names
+    # (`bearer_headers`/`email_consent_active`, the other two names
     # that module imports, come from `gmail_shared.py`, not here.) --
 
     def detect_actions_since(
