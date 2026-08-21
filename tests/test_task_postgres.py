@@ -245,6 +245,32 @@ def test_task_lifecycle_is_transactional_and_workspace_scoped(
     assert str(trace.correlation_id) == created["correlation_id"]
 
 
+def test_restore_task_rejects_a_task_that_is_not_archived(
+    task_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    """meetings.py/events.py/notes.py/entities_mutations.py/risk_mutations.py
+    all enforce an idempotent-archive-but-strict-restore asymmetry (restoring
+    a resource that isn't archived is a 409, not a no-op) -- tasks.py's
+    lifecycle_task_write must reject it the same way, not silently treat it
+    as "target already reached"."""
+    client, _workspace_id, _user_id, token = task_test_context
+    created = client.post(
+        "/api/v1/tasks",
+        headers=_headers(token, "create-unarchived-task"),
+        json={"title": "Never archived"},
+    )
+    assert created.status_code == 201
+    task_id = created.json()["id"]
+
+    restore = client.post(
+        f"/api/v1/tasks/{task_id}/restore",
+        headers=_headers(token, "restore-unarchived-task"),
+        json={"expected_version": 1},
+    )
+    assert restore.status_code == 409
+    assert restore.json()["error"]["code"] == "TASK_NOT_ARCHIVED"
+
+
 def test_terminal_transitions_and_workspace_timezone_are_enforced(
     task_test_context: tuple[TestClient, UUID, UUID, str],
 ) -> None:
