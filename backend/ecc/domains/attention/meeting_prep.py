@@ -72,6 +72,7 @@ from ecc.platform.idempotency import (
     request_hash,
     store_idempotency,
 )
+from ecc.platform.request_models import EmptyBody as _EmptyBody
 
 router = APIRouter(prefix="/api/v1/meetings", tags=["meeting-prep"])
 SessionDep = Annotated[Session, Depends(get_session)]
@@ -428,10 +429,6 @@ class MeetingPack(BaseModel):
 # `_store_cached`) moved to `ecc.platform.idempotency` -- see that module's
 # own docstring.
 # ---------------------------------------------------------------------------
-
-
-class _EmptyBody(BaseModel):
-    model_config = ConfigDict(extra="forbid")
 
 
 def _violated_constraint(exc: IntegrityError) -> str | None:

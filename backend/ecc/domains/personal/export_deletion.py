@@ -32,13 +32,14 @@ from typing import Any
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from ecc.auth import AuthContext, AuthDep, CsrfDep
 from ecc.observability import record_idempotency_conflict
 from ecc.platform.idempotency import load_cached, lock_idempotency, request_hash, store_idempotency
+from ecc.platform.request_models import EmptyBody as _EmptyBody
 
 from .domains import (
     DomainKey,
@@ -50,10 +51,6 @@ from .domains import (
 from .gmail_revocation import PendingGmailRevoke, cascade_email_revocation, finish_gmail_revocation
 
 router = APIRouter(prefix="/api/v1/personal", tags=["personal"])
-
-
-class _EmptyBody(BaseModel):
-    model_config = ConfigDict(extra="forbid")
 
 
 # Every table this task's own scope populates under a domain -- deleted in

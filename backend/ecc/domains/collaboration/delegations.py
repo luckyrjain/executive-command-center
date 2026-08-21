@@ -86,6 +86,7 @@ from ecc.auth import AuthContext, AuthDep, CsrfDep
 from ecc.database import get_session
 from ecc.platform import authz, cursor_pagination, idempotency
 from ecc.platform.authz import UnknownResourceTypeError
+from ecc.platform.request_models import EmptyBody as _EmptyBody
 
 router = APIRouter(prefix="/api/v1/delegations", tags=["delegations"])
 SessionDep = Annotated[Session, Depends(get_session)]
@@ -147,10 +148,6 @@ def _decode_cursor(cursor: str) -> tuple[datetime, UUID]:
         return datetime.fromisoformat(decoded["created_at"]), UUID(decoded["id"])
     except (ValueError, KeyError, TypeError) as exc:
         raise HTTPException(status_code=400, detail="MALFORMED_CURSOR") from exc
-
-
-class _EmptyBody(BaseModel):
-    model_config = ConfigDict(extra="forbid")
 
 
 def _account_id_for(session: Session, *, workspace_id: UUID, users_id: UUID) -> UUID:

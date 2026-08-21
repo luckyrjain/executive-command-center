@@ -131,6 +131,7 @@ from ecc.observability import (
 )
 from ecc.platform import audit_outbox, authz
 from ecc.platform.idempotency import load_cached, lock_idempotency, request_hash, store_idempotency
+from ecc.platform.request_models import EmptyBody as _EmptyBody
 
 from .connectors import (
     AdapterAuthorizationError,
@@ -731,10 +732,6 @@ class TeamAssignmentRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     expected_version: int = Field(ge=1)
     team_entity_id: UUID | None = None
-
-
-class _EmptyBody(BaseModel):
-    model_config = ConfigDict(extra="forbid")
 
 
 def _to_response(account: ConnectorAccount) -> ConnectorAccountResponse:

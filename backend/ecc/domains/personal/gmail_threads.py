@@ -95,7 +95,7 @@ from typing import Annotated
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
@@ -105,6 +105,7 @@ from ecc.domains.ai_runtime.tools import ToolNotFound
 from ecc.domains.engineering.connector_accounts import _get_encrypted_credential
 from ecc.domains.engineering.crypto import decrypt_credential
 from ecc.platform.idempotency import load_cached, lock_idempotency, request_hash, store_idempotency
+from ecc.platform.request_models import EmptyBody as _EmptyBody
 
 from .domains import IdempotencyHeader
 from .email_action_tools import MAX_THREAD_MESSAGES, get_thread_content_tool
@@ -117,10 +118,6 @@ SessionDep = Annotated[Session, Depends(get_session)]
 # Module-level singleton, mirroring `gmail_oauth.py`'s own identical
 # "constructed with no arguments, reads `ECC_GMAIL_OAUTH_*` lazily" shape.
 _adapter = GmailAdapter()
-
-
-class _EmptyBody(BaseModel):
-    model_config = ConfigDict(extra="forbid")
 
 
 class ThreadMessageResponse(BaseModel):

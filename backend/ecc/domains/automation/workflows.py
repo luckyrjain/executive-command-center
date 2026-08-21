@@ -46,6 +46,7 @@ from ecc.database import get_session
 from ecc.observability import queue_lifecycle_event
 from ecc.platform import audit_outbox, authz
 from ecc.platform.idempotency import load_cached, lock_idempotency, request_hash, store_idempotency
+from ecc.platform.request_models import EmptyBody as _EmptyBody
 
 from .adapters import ActionAdapter, AdapterRegistry
 from .adapters import registry as _production_adapter_registry
@@ -1103,10 +1104,6 @@ def create_workflow_endpoint(
             status.HTTP_201_CREATED,
         )
         return response
-
-
-class _EmptyBody(BaseModel):
-    model_config = ConfigDict(extra="forbid")
 
 
 @router.post("/workflows/{version_id}/publish", response_model=WorkflowVersionResponse)
