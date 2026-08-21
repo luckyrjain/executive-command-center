@@ -1,7 +1,7 @@
 """`meeting.get_prep_pack` tool handler (Phase 4-consuming wiring of
 `meeting_prep.py`'s "Optional enrichment", `MEETING-PREP-CONTRACT.md`).
 
-Reuses `meeting_prep.py`'s existing `_generate_pack` -- the exact same
+Reuses `meeting_prep.py`'s existing `generate_pack` -- the exact same
 deterministic fetch/compose logic `create_prep`/`refresh_prep` already run
 -- so the AI runtime's view of "what evidence may be summarized" is always
 identical to what the deterministic pack itself contains, never a second,
@@ -9,7 +9,16 @@ independently-computed source of truth that could silently diverge from
 it. Recomputes rather than reading a persisted `meeting_packs` row: this
 tool is dispatched from *inside* `create_prep`/`refresh_prep`, before that
 request's new row exists yet, so there is nothing to read from `meeting_
-packs` at call time regardless.
+packs` at call time regardless. `generate_pack`/`get_meeting_row`/
+`require_meeting_read` are public (no leading underscore) in
+`meeting_prep.py` specifically because this file needs them as a declared
+cross-module dependency -- a private name here would be exactly the
+"fragile private import" bug class that broke the build once already this
+session (see identity/accounts.py's/gmail_shared.py's own near-identical
+fixes for the same class). `get_meeting_row` (not the bare `meeting_row`
+an underscore-drop would otherwise produce) avoids colliding with the
+`meeting_row = ...` local variable name every call site below already
+uses.
 
 Deliberately omits `evidence_gaps`/`open_questions` from the tool's output:
 an evidence gap represents the *absence* of available evidence (nothing a
@@ -18,7 +27,7 @@ empty in this activation (`meeting_prep.py`'s own module docstring) --
 Decision 6's "every tool result ... re-inserted into the model's context"
 principle only applies to content genuinely worth summarizing.
 
-`_meeting_input` (inside `_generate_pack`) can raise `HTTPException(409,
+`_meeting_input` (inside `generate_pack`) can raise `HTTPException(409,
 "LINKED_CALENDAR_EVENT_MISSING")` for a meeting whose linked calendar
 event was deleted out from under it -- a real HTTP-layer exception, never
 raised by any other tool handler in this codebase (`attention.get_item`'s
@@ -38,33 +47,33 @@ from sqlalchemy.orm import Session
 from ecc.auth import AuthContext
 from ecc.domains.ai_runtime.tools import ToolNotFound, ToolResult
 
-from .meeting_prep import _generate_pack, _meeting_row, _require_meeting_read
+from .meeting_prep import generate_pack, get_meeting_row, require_meeting_read
 
 
 def get_prep_pack_tool(
     session: Session, auth: AuthContext, meeting_id: UUID
 ) -> ToolResult | ToolNotFound:
     # Found in the fourth whole-phase review: every real call site in
-    # meeting_prep.py calls `_require_meeting_read` before `_meeting_row` --
-    # this handler called `_meeting_row` alone, skipping the authz check
+    # meeting_prep.py calls `require_meeting_read` before `get_meeting_row` --
+    # this handler called `get_meeting_row` alone, skipping the authz check
     # that helper exists specifically to add. Reachable from runtime.py's
     # own model-controlled second tool-dispatch path, same class of gap as
     # attention/tools.py's and knowledge/tools.py's identical fixes.
-    # `_require_meeting_read` raises HTTPException(404) rather than
+    # `require_meeting_read` raises HTTPException(404) rather than
     # returning a bool, so it folds into the same catch-and-translate-to-
     # ToolNotFound discipline this handler already uses for the 409
     # LINKED_CALENDAR_EVENT_MISSING case below.
     try:
-        _require_meeting_read(session, auth, meeting_id)
+        require_meeting_read(session, auth, meeting_id)
     except HTTPException:
         return ToolNotFound(tool="meeting.get_prep_pack")
 
-    meeting_row = _meeting_row(session, auth, meeting_id)
+    meeting_row = get_meeting_row(session, auth, meeting_id)
     if meeting_row is None:
         return ToolNotFound(tool="meeting.get_prep_pack")
 
     try:
-        generated = _generate_pack(session, auth, meeting_id, meeting_row)
+        generated = generate_pack(session, auth, meeting_id, meeting_row)
     except HTTPException:
         return ToolNotFound(tool="meeting.get_prep_pack")
 

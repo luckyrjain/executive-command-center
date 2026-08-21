@@ -449,7 +449,7 @@ def _violated_constraint(exc: IntegrityError) -> str | None:
 # ---------------------------------------------------------------------------
 
 
-def _require_meeting_read(session: Session, auth: AuthContext, meeting_id: UUID) -> None:
+def require_meeting_read(session: Session, auth: AuthContext, meeting_id: UUID) -> None:
     """Every endpoint in this module takes a meeting_id path parameter and
     treats the meeting as the authorization boundary for the child
     resources it reads or writes (participants, packs) -- the same
@@ -473,7 +473,7 @@ def _require_meeting_write(session: Session, auth: AuthContext, meeting_id: UUID
         raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
 
 
-def _meeting_row(
+def get_meeting_row(
     session: Session, auth: AuthContext, meeting_id: UUID, *, for_update: bool = False
 ) -> dict[str, Any] | None:
     suffix = " FOR UPDATE" if for_update else ""
@@ -882,7 +882,7 @@ class _GeneratedPack:
     fingerprint: dict[str, str]
 
 
-def _generate_pack(
+def generate_pack(
     session: Session, auth: AuthContext, meeting_id: UUID, meeting_row: dict[str, Any]
 ) -> _GeneratedPack:
     meeting = _meeting_input(session, auth, meeting_row)
@@ -986,7 +986,7 @@ def _pack_row_to_response(row: dict[str, Any], snapshot: PackContentSnapshot) ->
     """Merge a ``meeting_packs`` row's own columns with its persisted
     content snapshot. ``snapshot`` always comes from ``row["content"]``
     (the frozen body stored at generation time) -- never from a fresh
-    ``_generate_pack``/``_compute_enrichment`` call, which would defeat
+    ``generate_pack``/``_compute_enrichment`` call, which would defeat
     the point of storing it. ``snapshot.model_dump()`` already supplies
     ``enrichment`` (part of ``PackContentSnapshot`` -- see its docstring),
     so this never recomputes it.
@@ -1012,7 +1012,7 @@ def _is_stale(
 ) -> bool:
     if now >= pack_row["stale_at"]:
         return True
-    generated = _generate_pack(session, auth, meeting_id, meeting_row)
+    generated = generate_pack(session, auth, meeting_id, meeting_row)
     return generated.fingerprint != dict(pack_row["source_versions"])
 
 
@@ -1078,9 +1078,9 @@ def add_participant(
         if cached is not None:
             return ParticipantResponse.model_validate(cached)
 
-        _require_meeting_read(session, auth, meeting_id)
+        require_meeting_read(session, auth, meeting_id)
         _require_meeting_write(session, auth, meeting_id)
-        meeting_row = _meeting_row(session, auth, meeting_id)
+        meeting_row = get_meeting_row(session, auth, meeting_id)
         if meeting_row is None:
             raise HTTPException(status_code=404, detail="MEETING_NOT_FOUND")
         entity = (
@@ -1185,7 +1185,7 @@ def add_participant(
 
 @router.get("/{meeting_id}/participants", response_model=ParticipantList)
 def list_participants(meeting_id: UUID, auth: AuthDep, session: SessionDep) -> ParticipantList:
-    _require_meeting_read(session, auth, meeting_id)
+    require_meeting_read(session, auth, meeting_id)
     rows = _fetch_participants(session, auth, meeting_id)
     session.rollback()
     return ParticipantList(
@@ -1325,9 +1325,9 @@ def create_prep(
             if cached is not None:
                 return MeetingPack.model_validate(cached)
 
-            _require_meeting_read(session, auth, meeting_id)
+            require_meeting_read(session, auth, meeting_id)
             _require_meeting_write(session, auth, meeting_id)
-            meeting_row = _meeting_row(session, auth, meeting_id)
+            meeting_row = get_meeting_row(session, auth, meeting_id)
             if meeting_row is None:
                 raise HTTPException(status_code=404, detail="MEETING_NOT_FOUND")
 
@@ -1337,7 +1337,7 @@ def create_prep(
                     raise HTTPException(status_code=409, detail="STALE_MEETING_PACK")
                 raise HTTPException(status_code=409, detail="MEETING_PACK_EXISTS")
 
-            generated = _generate_pack(session, auth, meeting_id, meeting_row)
+            generated = generate_pack(session, auth, meeting_id, meeting_row)
             enrichment = EnrichmentOut(available=False, summary=None, error_code="feature_disabled")
             return _insert_pack(generated, enrichment)
 
@@ -1348,9 +1348,9 @@ def create_prep(
             return MeetingPack.model_validate(cached)
 
         with session.begin():
-            _require_meeting_read(session, auth, meeting_id)
+            require_meeting_read(session, auth, meeting_id)
             _require_meeting_write(session, auth, meeting_id)
-            meeting_row = _meeting_row(session, auth, meeting_id)
+            meeting_row = get_meeting_row(session, auth, meeting_id)
             if meeting_row is None:
                 raise HTTPException(status_code=404, detail="MEETING_NOT_FOUND")
 
@@ -1360,7 +1360,7 @@ def create_prep(
                     raise HTTPException(status_code=409, detail="STALE_MEETING_PACK")
                 raise HTTPException(status_code=409, detail="MEETING_PACK_EXISTS")
 
-            generated = _generate_pack(session, auth, meeting_id, meeting_row)
+            generated = generate_pack(session, auth, meeting_id, meeting_row)
 
         enrichment = _compute_enrichment(
             session, auth, meeting_id, ollama_adapter=_resolve_ollama_adapter(request)
@@ -1373,8 +1373,8 @@ def create_prep(
 @router.get("/{meeting_id}/prep", response_model=MeetingPack)
 def get_prep(meeting_id: UUID, auth: AuthDep, session: SessionDep) -> MeetingPack:
     with session.begin():
-        _require_meeting_read(session, auth, meeting_id)
-        meeting_row = _meeting_row(session, auth, meeting_id)
+        require_meeting_read(session, auth, meeting_id)
+        meeting_row = get_meeting_row(session, auth, meeting_id)
         if meeting_row is None:
             raise HTTPException(status_code=404, detail="MEETING_NOT_FOUND")
         pack_row = _current_pack_row(session, auth, meeting_id, for_update=True)
@@ -1560,9 +1560,9 @@ def refresh_prep(
                 if cached is not None:
                     return MeetingPack.model_validate(cached)
 
-                _require_meeting_read(session, auth, meeting_id)
+                require_meeting_read(session, auth, meeting_id)
                 _require_meeting_write(session, auth, meeting_id)
-                meeting_row = _meeting_row(session, auth, meeting_id)
+                meeting_row = get_meeting_row(session, auth, meeting_id)
                 if meeting_row is None:
                     raise HTTPException(status_code=404, detail="MEETING_NOT_FOUND")
 
@@ -1570,7 +1570,7 @@ def refresh_prep(
                 if old is None:
                     raise HTTPException(status_code=404, detail="MEETING_PACK_NOT_FOUND")
 
-                generated = _generate_pack(session, auth, meeting_id, meeting_row)
+                generated = generate_pack(session, auth, meeting_id, meeting_row)
                 enrichment = EnrichmentOut(
                     available=False, summary=None, error_code="feature_disabled"
                 )
@@ -1587,9 +1587,9 @@ def refresh_prep(
             return MeetingPack.model_validate(cached)
 
         with session.begin():
-            _require_meeting_read(session, auth, meeting_id)
+            require_meeting_read(session, auth, meeting_id)
             _require_meeting_write(session, auth, meeting_id)
-            meeting_row = _meeting_row(session, auth, meeting_id)
+            meeting_row = get_meeting_row(session, auth, meeting_id)
             if meeting_row is None:
                 raise HTTPException(status_code=404, detail="MEETING_NOT_FOUND")
 
@@ -1597,7 +1597,7 @@ def refresh_prep(
             if old is None:
                 raise HTTPException(status_code=404, detail="MEETING_PACK_NOT_FOUND")
 
-            generated = _generate_pack(session, auth, meeting_id, meeting_row)
+            generated = generate_pack(session, auth, meeting_id, meeting_row)
 
         enrichment = _compute_enrichment(
             session, auth, meeting_id, ollama_adapter=_resolve_ollama_adapter(request)

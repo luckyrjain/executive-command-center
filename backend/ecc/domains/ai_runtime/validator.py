@@ -337,7 +337,7 @@ class ExplainItemReflection(BaseModel):
 # different from `attention.explain_item`: no single scalar "item", a
 # multi-section evidence bundle (participants/timeline/commitments/
 # decisions/notes/risks/dependencies) already fetched deterministically by
-# `meeting_prep.py:_generate_pack` before the AI ever sees it.
+# `meeting_prep.py:generate_pack` before the AI ever sees it.
 # ---------------------------------------------------------------------------
 
 _MAX_SUMMARY_WORDS = 150
