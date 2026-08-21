@@ -96,7 +96,10 @@ SessionDep = Annotated[Session, Depends(get_session)]
 _password_hasher = PasswordHasher()
 _SESSION_MAX_AGE_SECONDS = 7 * 24 * 60 * 60
 _PENDING_LOGIN_TOKEN_MAX_AGE_SECONDS = 5 * 60
-_EMAIL_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+# Public (no leading underscore): also used by invitations.py's own
+# InvitationCreateRequest email validator, which needs the identical
+# normalize+validate rule _EmailPasswordField.validate_email applies here.
+EMAIL_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 # A fixed hash to verify a login attempt against when no account matches the
 # submitted email, so a nonexistent-email attempt pays the same Argon2id
 # verify cost as a wrong-password attempt against a real account -- without
@@ -106,7 +109,7 @@ _EMAIL_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 _DUMMY_PASSWORD_HASH = _password_hasher.hash(secrets.token_urlsafe(32))
 
 
-def _normalize_email(email: str) -> str:
+def normalize_email(email: str) -> str:
     return email.strip().casefold()
 
 
@@ -222,8 +225,8 @@ OptionalAuthDep = Annotated[AuthContext | None, Depends(_optional_auth_context)]
 class _EmailPasswordField:
     @staticmethod
     def validate_email(value: str) -> str:
-        normalized = _normalize_email(value)
-        if not _EMAIL_PATTERN.match(normalized) or len(normalized) > 320:
+        normalized = normalize_email(value)
+        if not EMAIL_PATTERN.match(normalized) or len(normalized) > 320:
             raise ValueError("EMAIL_INVALID")
         return normalized
 
