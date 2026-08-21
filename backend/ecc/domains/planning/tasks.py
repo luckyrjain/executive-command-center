@@ -694,7 +694,6 @@ def lifecycle_task_write(
         (action == "complete" and current["status"] == "completed")
         or (action == "cancel" and current["status"] == "cancelled")
         or (action == "archive" and current["archived_at"] is not None)
-        or (action == "restore" and current["archived_at"] is None)
     )
     if target_reached:
         return _to_response(current)
@@ -704,6 +703,14 @@ def lifecycle_task_write(
 
     if action in {"complete", "cancel"} and current["archived_at"] is not None:
         raise HTTPException(status_code=409, detail="TASK_ARCHIVED")
+
+    # Mirrors meetings.py's/events.py's/notes.py's/entities_mutations.py's/
+    # risk_mutations.py's identical idempotent-archive-but-strict-restore
+    # asymmetry: archiving an already-archived resource is a no-op (handled
+    # by target_reached above), but restoring a resource that was never
+    # archived is a real error, not a silent no-op.
+    if action == "restore" and current["archived_at"] is None:
+        raise HTTPException(status_code=409, detail="TASK_NOT_ARCHIVED")
 
     event_payload: dict[str, Any]
     if action == "complete":
