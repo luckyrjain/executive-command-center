@@ -129,12 +129,12 @@ _MAX_PAGES_PER_CALL = 10
 _RATE_LIMIT_MAX_WAIT_SECONDS = 5.0
 
 
-class _InvalidCredentialError(Exception):
+class InvalidCredentialError(Exception):
     pass
 
 
 # The host a credential with no `|` is assumed to point at -- see
-# `_parse_credential`'s own docstring for why that assumption is safe.
+# `parse_credential`'s own docstring for why that assumption is safe.
 _LEGACY_GITLAB_HOST = "gitlab.com"
 
 
@@ -152,7 +152,7 @@ _GITLAB_HOST_PATTERN = re.compile(
 )
 
 
-def _parse_credential(credential: str) -> tuple[str, str]:
+def parse_credential(credential: str) -> tuple[str, str]:
     """Parses a stored GitLab credential into `(host, token)`.
 
     **A credential containing no `|` is a pre-self-managed-support legacy
@@ -189,13 +189,13 @@ def _parse_credential(credential: str) -> tuple[str, str]:
     """
     if "|" not in credential:
         if not credential:
-            raise _InvalidCredentialError("GitLab credential must not be empty")
+            raise InvalidCredentialError("GitLab credential must not be empty")
         return _LEGACY_GITLAB_HOST, credential
     host, token = credential.split("|", 1)
     if not host or not token:
-        raise _InvalidCredentialError("GitLab credential must be in the form 'host|token'")
+        raise InvalidCredentialError("GitLab credential must be in the form 'host|token'")
     if not _GITLAB_HOST_PATTERN.match(host):
-        raise _InvalidCredentialError(
+        raise InvalidCredentialError(
             "GitLab credential's host must be a bare hostname (e.g. 'gitlab.com' or "
             "'gitlab-ee.example.com') -- no scheme, port, path, or whitespace"
         )
@@ -451,7 +451,7 @@ class GitLabAdapter:
         identity). Raises `AdapterAuthorizationError` for an invalid,
         revoked, inactive, or under-scoped token.
 
-        `credential` is `host|token` (`_parse_credential`; a bare token
+        `credential` is `host|token` (`parse_credential`; a bare token
         with no `|` is read as a legacy gitlab.com credential, see that
         function's own docstring) -- `host` is connect-time SSRF-checked
         (`_reject_private_host`) before any request is made, and every
@@ -461,8 +461,8 @@ class GitLabAdapter:
         `f"{host}:{user_id}"` for both credential forms.
         """
         try:
-            host, token = _parse_credential(credential)
-        except _InvalidCredentialError as exc:
+            host, token = parse_credential(credential)
+        except InvalidCredentialError as exc:
             raise AdapterAuthorizationError(str(exc)) from exc
         self._reject_private_host(host)
         api_base_url = f"https://{host}/api/v4"
@@ -534,8 +534,8 @@ class GitLabAdapter:
         self, account: ConnectorAccountContext, *, since_cursor: str | None
     ) -> SyncOutcome:
         try:
-            host, token = _parse_credential(account.credential)
-        except _InvalidCredentialError as exc:
+            host, token = parse_credential(account.credential)
+        except InvalidCredentialError as exc:
             raise RuntimeError(str(exc)) from exc
         api_base_url = f"https://{host}/api/v4"
         web_base_url = f"https://{host}"
@@ -640,8 +640,8 @@ class GitLabAdapter:
                 resource_type="repository", items_processed=0, status="succeeded", next_cursor=None
             )
         try:
-            host, _token = _parse_credential(account.credential)
-        except _InvalidCredentialError as exc:
+            host, _token = parse_credential(account.credential)
+        except InvalidCredentialError as exc:
             raise RuntimeError(str(exc)) from exc
         _upsert_repository(
             workspace_id=account.workspace_id,
@@ -666,8 +666,8 @@ class GitLabAdapter:
         adapter can only ever distinguish `active` from `permission_lost`.
         """
         try:
-            host, token = _parse_credential(account.credential)
-        except _InvalidCredentialError:
+            host, token = parse_credential(account.credential)
+        except InvalidCredentialError:
             return "active"
         try:
             response = self._client.get(
@@ -693,8 +693,8 @@ class GitLabAdapter:
         never silently absorbed at this layer.
         """
         try:
-            host, token = _parse_credential(account.credential)
-        except _InvalidCredentialError as exc:
+            host, token = parse_credential(account.credential)
+        except InvalidCredentialError as exc:
             raise RuntimeError(str(exc)) from exc
         try:
             response = self._client.delete(

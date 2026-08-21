@@ -709,7 +709,7 @@ def test_gitlab_add_note_execute_with_a_legacy_bare_token_credential(
 ) -> None:
     """A `connector_accounts` row written before self-managed support
     shipped stores a bare token with no `|`. `gitlab.add_note` must keep
-    working against it -- `gitlab_adapter._parse_credential`'s backward-
+    working against it -- `gitlab_adapter.parse_credential`'s backward-
     compatible fallback reads it as a gitlab.com credential, so the request
     goes to gitlab.com with the whole stored value as the token. Without
     that fallback this step would fail permanently (a plain, non-retryable
@@ -744,9 +744,9 @@ def test_gitlab_add_note_execute_with_a_legacy_bare_token_credential(
 def test_gitlab_add_note_execute_surfaces_an_unparseable_credential_as_write_action_rejected(
     write_actions_test_context: tuple[UUID, UUID],
 ) -> None:
-    """`_parse_gitlab_credential` raises `gitlab_adapter.py`'s own private
-    `_InvalidCredentialError`. Letting it escape would surface the raw
-    private class name to the caller (and into `workflow_run_steps.error`)
+    """`_parse_gitlab_credential` raises `gitlab_adapter.py`'s own
+    `InvalidCredentialError`. Letting it escape would surface that raw
+    class name to the caller (and into `workflow_run_steps.error`)
     instead of this module's own error boundary type. A credential this
     adapter cannot parse is a data problem with the stored connection, not
     a transient one, so it must be `WriteActionRejected` -- which
