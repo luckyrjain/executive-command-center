@@ -45,7 +45,7 @@ from .domains import (
     DomainKey,
     IdempotencyHeader,
     SessionDep,
-    _decrypt_payload,
+    decrypt_record_payload,
     get_domain,
 )
 from .gmail_revocation import PendingGmailRevoke, cascade_email_revocation, finish_gmail_revocation
@@ -102,9 +102,10 @@ def export_domain_endpoint(
     JSON shape (clear field names, not a compressed/internal format, keep
     it reasonably legible in the meantime).
 
-    Each `domain_records` row's `payload` is decrypted (Task 4,
-    `ecc.domains.personal.domains._decrypt_payload`) before being included
-    here -- an explicit, user-initiated export of the owner's own data is
+    Each `domain_records` row's `payload` is decrypted (Task 4, via
+    `ecc.domains.personal.domains.decrypt_record_payload`, the public
+    wrapper over `_decrypt_payload`) before being included here -- an
+    explicit, user-initiated export of the owner's own data is
     exactly the kind of single-purpose request design doc Decision 3 means
     by "only a single-record fetch returns the decrypted value"; returning
     ciphertext in a "human-readable" export would defeat the export's own
@@ -138,7 +139,7 @@ def export_domain_endpoint(
             params,
         ),
         domain_records=[
-            {**record, "payload": _decrypt_payload(record["record_type"], record["payload"])}
+            {**record, "payload": decrypt_record_payload(record["record_type"], record["payload"])}
             for record in _rows(
                 session,
                 "SELECT id, record_type, payload, effective_at, created_at FROM domain_records "
