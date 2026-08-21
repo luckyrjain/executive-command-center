@@ -102,7 +102,7 @@ from sqlalchemy.orm import Session
 from ecc.auth import AuthContext, AuthDep, CsrfDep
 from ecc.database import get_session
 from ecc.domains.ai_runtime.tools import ToolNotFound
-from ecc.domains.engineering.connector_accounts import _get_encrypted_credential
+from ecc.domains.engineering.connector_accounts import get_encrypted_credential
 from ecc.domains.engineering.crypto import decrypt_credential
 from ecc.platform.idempotency import load_cached, lock_idempotency, request_hash, store_idempotency
 from ecc.platform.request_models import EmptyBody as _EmptyBody
@@ -268,7 +268,7 @@ def get_thread_endpoint(
     # still lets already-cached content render below, which a disconnected
     # connector should not block reading.
     if unfetched and connector_status != "disconnected":
-        encrypted = _get_encrypted_credential(session, auth.workspace_id, connector_account_id)
+        encrypted = get_encrypted_credential(session, auth.workspace_id, connector_account_id)
         credential = decrypt_credential(encrypted)
         headers = _bearer_headers(credential)
         for row in unfetched:
