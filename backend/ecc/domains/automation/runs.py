@@ -96,6 +96,7 @@ from ecc.database import get_session
 from ecc.observability import queue_lifecycle_event
 from ecc.platform import audit_outbox, authz
 from ecc.platform.idempotency import load_cached, lock_idempotency, request_hash, store_idempotency
+from ecc.platform.request_models import EmptyBody as _EmptyBody
 
 from . import worker as worker_module
 from . import workflows as workflows_module
@@ -206,10 +207,6 @@ class RunDetailResponse(RunResponse):
 
 class RunListResponse(BaseModel):
     runs: list[RunResponse]
-
-
-class _EmptyBody(BaseModel):
-    model_config = ConfigDict(extra="forbid")
 
 
 def _to_response(run: WorkflowRun) -> RunResponse:

@@ -33,6 +33,7 @@ from ecc.auth import AuthContext, AuthDep, CsrfDep
 from ecc.observability import queue_lifecycle_event
 from ecc.platform import audit_outbox
 from ecc.platform.idempotency import load_cached, lock_idempotency, request_hash, store_idempotency
+from ecc.platform.request_models import EmptyBody as _EmptyBody
 
 from .domains import DomainKey, IdempotencyHeader, SessionDep, require_enabled_domain
 
@@ -62,10 +63,6 @@ class GrantResponse(BaseModel):
 
 class GrantListResponse(BaseModel):
     grants: list[GrantResponse]
-
-
-class _EmptyBody(BaseModel):
-    model_config = ConfigDict(extra="forbid")
 
 
 _GRANT_FIELDS = (

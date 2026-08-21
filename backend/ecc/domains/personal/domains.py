@@ -78,6 +78,7 @@ from ecc.domains.personal.gmail_revocation import (
 from ecc.observability import queue_lifecycle_event, record_idempotency_conflict
 from ecc.platform import audit_outbox
 from ecc.platform.idempotency import load_cached, lock_idempotency, request_hash, store_idempotency
+from ecc.platform.request_models import EmptyBody as _EmptyBody
 
 DomainKey = Literal["habits", "learning", "travel", "relationships", "health", "finance", "email"]
 Classification = Literal["standard", "sensitive", "high_stakes"]
@@ -387,10 +388,6 @@ class ConsentResponse(BaseModel):
 
 class ConsentListResponse(BaseModel):
     consents: list[ConsentResponse]
-
-
-class _EmptyBody(BaseModel):
-    model_config = ConfigDict(extra="forbid")
 
 
 def _to_domain_response(domain: PersonalDomain) -> DomainResponse:

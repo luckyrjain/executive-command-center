@@ -85,10 +85,6 @@ IncidentStatus = Literal["open", "resolved"]
 DecisionStatus = Literal["proposed", "decided", "superseded"]
 
 
-class _EmptyBody(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-
 class IncidentCreateRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     title: str = Field(min_length=1, max_length=500)

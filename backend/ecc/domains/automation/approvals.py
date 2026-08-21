@@ -151,6 +151,7 @@ from ecc.observability import queue_lifecycle_event
 from ecc.platform import audit_outbox, authz
 from ecc.platform.authz import WORKSPACE_ORIGINAL_OWNER_SQL
 from ecc.platform.idempotency import load_cached, lock_idempotency, request_hash, store_idempotency
+from ecc.platform.request_models import EmptyBody as _EmptyBody
 
 from .adapters import ActionAdapter
 from .policy import AutomationPolicy
@@ -557,10 +558,6 @@ class ApproveRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     # sha256 hex digest -- worker.compute_action_digest's own output shape.
     action_digest: str = Field(min_length=64, max_length=64)
-
-
-class _EmptyBody(BaseModel):
-    model_config = ConfigDict(extra="forbid")
 
 
 def _to_response(approval: ApprovalRequest) -> ApprovalResponse:
