@@ -400,7 +400,12 @@ def _finalize_account_version(
     )
 
 
-def _get_encrypted_credential(session: Session, workspace_id: UUID, account_id: UUID) -> bytes:
+# Public (no leading underscore): also used by personal/gmail_threads.py
+# and personal/gmail_revocation.py, which each need the raw encrypted
+# credential bytes before decrypting them for a live Gmail API call --
+# declared as a public dependency rather than a fragile private import
+# (the same fix applied to identity/accounts.py's email helpers earlier).
+def get_encrypted_credential(session: Session, workspace_id: UUID, account_id: UUID) -> bytes:
     row = session.execute(
         text(
             "SELECT encrypted_credentials FROM connector_accounts "
@@ -1038,7 +1043,7 @@ def sync_connector_endpoint(
         if adapter is None:
             raise HTTPException(status_code=404, detail="CONNECTOR_PROVIDER_NOT_SUPPORTED")
 
-        encrypted = _get_encrypted_credential(session, auth.workspace_id, account_id)
+        encrypted = get_encrypted_credential(session, auth.workspace_id, account_id)
         credential = decrypt_credential(encrypted)
 
         # Reap a `running` row this account's own *own* earlier request left
@@ -1522,7 +1527,7 @@ def disable_connector_endpoint(
                 # above); only decryption -- a fast, local, no-network
                 # operation -- runs here, inside the transaction.
                 try:
-                    encrypted = _get_encrypted_credential(session, auth.workspace_id, account_id)
+                    encrypted = get_encrypted_credential(session, auth.workspace_id, account_id)
                     pending_revoke = (
                         adapter,
                         ConnectorAccountContext(

@@ -156,7 +156,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from ecc.auth import AuthContext
-from ecc.domains.engineering.connector_accounts import _get_encrypted_credential
+from ecc.domains.engineering.connector_accounts import get_encrypted_credential
 from ecc.domains.engineering.connectors import ConnectorAccountContext
 from ecc.domains.engineering.crypto import decrypt_credential
 
@@ -429,7 +429,7 @@ def cascade_email_revocation(
         # Matches `connector_accounts.py:disable_connector_endpoint`'s
         # own established split exactly -- see module docstring.
         try:
-            encrypted = _get_encrypted_credential(session, auth.workspace_id, account_id)
+            encrypted = get_encrypted_credential(session, auth.workspace_id, account_id)
             pending_revokes.append(
                 (
                     _adapter,
