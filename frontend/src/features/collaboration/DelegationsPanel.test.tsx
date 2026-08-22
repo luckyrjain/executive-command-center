@@ -106,6 +106,41 @@ describe('DelegationsPanel', () => {
     ))
   })
 
+  it('maps DELEGATION_NOT_PROPOSED to a readable sentence, never the raw code, and refetches so the stale row and its now-invalid action buttons don\'t linger', async () => {
+    // Round-trip fixture, not just an error-message assertion: an earlier
+    // draft of this handler had no onError at all, so this row's
+    // Accept/Reject buttons stayed enabled against the stale (still
+    // "proposed") row after a 409 -- a retry click would just 409 again in
+    // a loop. The GET after the 409 returns the row already accepted by
+    // someone else, proving the panel actually re-reads current state.
+    let delegationsGetCount = 0
+    const fetch = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      const method = (init?.method ?? 'GET').toUpperCase()
+      if (method === 'POST' && url.includes('/delegations/delegation-1/accept')) {
+        return response({ error: { code: 'DELEGATION_NOT_PROPOSED', message: 'Delegation Not Proposed' } }, 409)
+      }
+      if (url.endsWith('/identity/me')) return response(ME)
+      if (url.endsWith('/delegations')) {
+        delegationsGetCount += 1
+        if (delegationsGetCount === 1) {
+          return response({ delegations: [delegation({ recipient_account_id: 'account-me', delegator_account_id: 'account-other' })] })
+        }
+        return response({ delegations: [delegation({ recipient_account_id: 'account-me', delegator_account_id: 'account-other', status: 'accepted' })] })
+      }
+      return response({})
+    })
+    vi.stubGlobal('fetch', fetch)
+    renderPanel()
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Accept' }))
+    expect(await screen.findByText('This delegation is no longer awaiting a response.')).toBeTruthy()
+    expect(screen.queryByText('Delegation Not Proposed')).toBeNull()
+
+    await waitFor(() => expect(delegationsGetCount).toBe(2))
+    await waitFor(() => expect(screen.queryByRole('button', { name: 'Accept' })).toBeNull())
+  })
+
   it('disables Propose delegation until the form is filled in', async () => {
     stubFetch({ delegations: [] })
     renderPanel()

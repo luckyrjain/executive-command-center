@@ -2,7 +2,7 @@ import { useState } from 'react'
 
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
-import { apiRequest } from '../../api/client'
+import { ApiError, apiRequest } from '../../api/client'
 import type { EntityList } from '../knowledge/types'
 import type { Repository, RepositoryListResponse, TeamAssignmentRequest } from './types'
 
@@ -55,6 +55,16 @@ function TeamAssignment({
     mutationFn: (teamEntityId: string | null) =>
       assignTeam(repository.id, repository.team_assignment_version, teamEntityId),
     onSuccess: () => { void queryClient.invalidateQueries({ queryKey: ['engineering', 'repositories'] }) },
+    // A VERSION_CONFLICT means this row's team_assignment_version is
+    // already stale -- without a refetch here, the select stays bound to
+    // the stale version, so a retry submits the same now-wrong
+    // expected_version and just 409s again in a loop. Matches
+    // TaskWorkspace.tsx's/RiskWorkspace.tsx's onError-refetch precedent.
+    onError: (error) => {
+      if (error instanceof ApiError && error.code === 'VERSION_CONFLICT') {
+        void queryClient.invalidateQueries({ queryKey: ['engineering', 'repositories'] })
+      }
+    },
   })
 
   // `teamsById` is capped at the first 100 teams (`listTeams`'s own

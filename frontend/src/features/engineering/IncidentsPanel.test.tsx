@@ -137,11 +137,20 @@ describe('IncidentsPanel', () => {
     await waitFor(() => expect(fetch).toHaveBeenCalledWith(expect.stringContaining('/incidents/incident-1/resolve'), expect.objectContaining({ method: 'POST' })))
   })
 
-  it('maps INCIDENT_ALREADY_RESOLVED to a readable sentence, never the raw code', async () => {
+  it('maps INCIDENT_ALREADY_RESOLVED to a readable sentence, never the raw code, and refetches so the stale row and its now-invalid action button don\'t linger', async () => {
+    // Round-trip fixture, not just an error-message assertion: an earlier
+    // draft of this handler had no onError refetch at all, so this row's
+    // "Resolve now" button stayed enabled against the stale (still-open)
+    // row after a 409 -- a retry click would just 409 again in a loop. The
+    // GET after the 409 returns the row already resolved by someone else,
+    // proving the panel actually re-reads current state.
+    let getCount = 0
     const fetch = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input)
       if (url.includes('/resolve')) return response({ error: { code: 'INCIDENT_ALREADY_RESOLVED', message: 'Incident Already Resolved' } }, 409)
-      return response({ incidents: [incident()] })
+      getCount += 1
+      if (getCount === 1) return response({ incidents: [incident()] })
+      return response({ incidents: [incident({ status: 'resolved', resolved_at: '2026-07-27T00:00:00Z' })] })
     })
     vi.stubGlobal('fetch', fetch)
     renderPanel()
@@ -150,6 +159,9 @@ describe('IncidentsPanel', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Resolve now' }))
     expect(await screen.findByText(/This incident was already resolved/)).toBeTruthy()
     expect(screen.queryByText('Incident Already Resolved')).toBeNull()
+
+    await waitFor(() => expect(getCount).toBe(2))
+    await waitFor(() => expect(screen.queryByRole('button', { name: 'Resolve now' })).toBeNull())
   })
 
   it('switches the status filter and refetches accordingly', async () => {
