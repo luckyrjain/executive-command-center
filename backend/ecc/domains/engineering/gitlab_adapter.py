@@ -664,11 +664,21 @@ class GitLabAdapter:
         (like GitHub) has no single call reporting "this account itself
         was deleted" distinct from "this token no longer works," so this
         adapter can only ever distinguish `active` from `permission_lost`.
+
+        A stored credential that no longer parses (e.g. from a botched
+        encryption-key rotation) is a different failure category from a
+        network/API error, and fails closed -- `"permission_lost"`,
+        matching `JiraAdapter`'s/`DatadogAdapter`'s identical
+        `_InvalidCredentialError` branch, not the network-error branch's
+        fail-open tradeoff above. A corrupted credential can never
+        recover on its own the way a transient `5xx` can; reporting
+        `"active"` for it would hide a real, permanent problem behind
+        the same signal a rate limit produces.
         """
         try:
             host, token = parse_credential(account.credential)
         except InvalidCredentialError:
-            return "active"
+            return "permission_lost"
         try:
             response = self._client.get(
                 f"https://{host}/api/v4/personal_access_tokens/self", headers=self._headers(token)
