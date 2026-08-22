@@ -3,7 +3,7 @@ import { useQuery } from '@tanstack/react-query'
 
 import { apiRequest } from './api/client'
 import type { WorkspaceView } from './api/types'
-import { formatTime } from './lib/datetime'
+import { Section, type DashboardItem } from './dashboard/Sections'
 import WorkspaceNavigation from './navigation/WorkspaceNavigation'
 import MorningBrief from './MorningBrief'
 import RecommendationPanel from './RecommendationPanel'
@@ -28,25 +28,6 @@ import PersonalWorkspace from './features/personal/PersonalWorkspace'
 import CollaborationWorkspace from './features/collaboration/CollaborationWorkspace'
 import WorkspaceSwitcher from './features/collaboration/WorkspaceSwitcher'
 
-type DashboardItem = {
-  id?: string
-  entity_id?: string
-  entity_ref?: string
-  entity_type?: string
-  title?: string
-  summary?: string
-  message?: string
-  why?: string
-  explanation?: string
-  status?: string
-  score?: number
-  starts_at?: string
-  due_at?: string
-  due_date?: string
-  occurred_at?: string
-  empty?: boolean
-}
-
 type DashboardResponse = {
   date: string
   timezone: string
@@ -57,45 +38,6 @@ type DashboardResponse = {
 
 function fetchDashboard(): Promise<DashboardResponse> {
   return apiRequest('/api/v1/dashboard/today')
-}
-
-function labelFor(item: DashboardItem): string {
-  return item.title ?? item.summary ?? item.why ?? item.explanation ?? item.message ?? item.entity_ref ?? 'Untitled item'
-}
-
-function visibleItems(items?: DashboardItem[]): DashboardItem[] {
-  return (items ?? []).filter((item) => !item.empty)
-}
-
-function Section({ title, items, emptyMessage }: { title: string; items?: DashboardItem[]; emptyMessage: string }) {
-  const visible = visibleItems(items)
-  const headingId = `section-${title.replaceAll(' ', '-').toLowerCase()}`
-  return (
-    <section className="dashboard-card" aria-labelledby={headingId}>
-      <div className="section-heading">
-        <h2 id={headingId}>{title}</h2>
-        <span aria-label={`${visible.length} items`}>{visible.length}</span>
-      </div>
-      {visible.length ? (
-        <ol className="item-list">
-          {visible.map((item, index) => (
-            <li key={item.id ?? item.entity_id ?? item.entity_ref ?? `${title}-${index}`}>
-              <div>
-                <strong>{labelFor(item)}</strong>
-                {item.status ? <small>{item.status.replaceAll('_', ' ')}</small> : null}
-              </div>
-              <div className="item-meta">
-                {formatTime(item.starts_at ?? item.occurred_at) ? <time>{formatTime(item.starts_at ?? item.occurred_at)}</time> : null}
-                {typeof item.score === 'number' ? <span>{Math.round(item.score)}</span> : null}
-              </div>
-            </li>
-          ))}
-        </ol>
-      ) : (
-        <p className="empty-state">{items?.find((item) => item.empty)?.message ?? emptyMessage}</p>
-      )}
-    </section>
-  )
 }
 
 export default function App() {
