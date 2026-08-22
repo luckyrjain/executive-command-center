@@ -98,6 +98,34 @@ describe('WorkflowList', () => {
     expect(body.trigger_refs).toEqual(['manual'])
   })
 
+  it('maps WORKFLOW_VERSION_CONFLICT to a readable sentence and refetches so a concurrently-created version isn\'t hidden', async () => {
+    // Round-trip fixture, not just an error-message assertion: an earlier
+    // draft of this handler had no onError refetch at all, so the list
+    // never reflected the concurrently-created version that caused the
+    // conflict -- the operator had no visibility into what actually landed
+    // before deciding whether to retry. The GET after the 409 returns a
+    // summary showing that new version, proving the panel actually
+    // re-reads current state rather than only displaying an error string.
+    const conflicted: WorkflowSummary = { ...summary, workflow_id: 'weekly-digest', latest_version: 3, latest_version_id: 'version-3' }
+    const fetch = vi.fn()
+      .mockImplementationOnce(() => response({ workflows: [] }))
+      .mockImplementationOnce(() => response({ error: { code: 'WORKFLOW_VERSION_CONFLICT', message: 'Workflow Version Conflict' } }, 409))
+      .mockImplementationOnce(() => response({ workflows: [conflicted] }))
+    vi.stubGlobal('fetch', fetch)
+    renderList()
+
+    await waitFor(() => expect(screen.getByText('No workflows yet. Draft one below.')).toBeTruthy())
+    fireEvent.change(screen.getByLabelText('Workflow ID'), { target: { value: 'weekly-digest' } })
+    fireEvent.change(screen.getByLabelText('Step ID for step 1'), { target: { value: 's1' } })
+    fireEvent.change(screen.getByLabelText('Action reference for step 1'), { target: { value: 'local.create_note' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Create draft' }))
+
+    expect(await screen.findByText(/Another version was created for this workflow at the same time/)).toBeTruthy()
+    expect(screen.queryByText('Workflow Version Conflict')).toBeNull()
+    await waitFor(() => expect(fetch).toHaveBeenCalledTimes(3))
+    expect(await screen.findByText(/latest v3 \(draft\)/)).toBeTruthy()
+  })
+
   it('rejects invalid JSON in a step input mapping before submitting', async () => {
     vi.stubGlobal('fetch', vi.fn(() => response({ workflows: [] })))
     renderList()

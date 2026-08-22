@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
-import { apiRequest } from '../../api/client'
+import { ApiError, apiRequest } from '../../api/client'
 import { collaborationErrorMessage, formatTimestamp } from './errors'
 import { useMe } from './useMe'
 import type { Delegation, DelegationListResponse } from './types'
@@ -26,6 +26,14 @@ function DelegationRow({
     mutationFn: (action: 'accept' | 'reject' | 'revoke' | 'complete') =>
       apiRequest<Delegation>(`/api/v1/delegations/${delegation.id}/${action}`, { method: 'POST' }),
     onSuccess: onChanged,
+    // DELEGATION_NOT_PROPOSED/DELEGATION_NOT_ACCEPTED (409) mean this
+    // row's status is already stale (someone else acted on it first) --
+    // without a refetch here, the action buttons stay enabled against that
+    // stale state, so a retry click just 409s again in a loop. Broad
+    // status check, not a per-code list, since all four actions
+    // (accept/reject/revoke/complete) each have their own precondition
+    // error code but share the identical "stale state" shape.
+    onError: (error) => { if (error instanceof ApiError && error.status === 409) onChanged() },
   })
 
   return (

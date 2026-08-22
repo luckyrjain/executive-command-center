@@ -176,7 +176,15 @@ describe('RepositoriesPanel', () => {
     expect(JSON.parse(String(postCall?.[1]?.body))).toEqual({ expected_version: 1, team_entity_id: 'team-1' })
   })
 
-  it('surfaces a failed team assignment as an alert next to the dropdown', async () => {
+  it('surfaces a failed team assignment as an alert next to the dropdown, and refetches so the stale expected_version doesn\'t linger', async () => {
+    // Round-trip fixture, not just an error-message assertion: an earlier
+    // draft of this handler had no onError refetch at all, so this row's
+    // team_assignment_version stayed stale after a 409 -- a retry click
+    // would submit the same now-wrong expected_version and just 409 again
+    // in a loop. The GET after the 409 returns a row someone else already
+    // bumped to version 2, proving the panel actually re-reads current
+    // state rather than only displaying an error string.
+    let getCount = 0
     vi.stubGlobal(
       'fetch',
       vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
@@ -185,7 +193,9 @@ describe('RepositoriesPanel', () => {
         if (init?.method === 'POST' && url.includes('/team')) {
           return response({ error: { code: 'VERSION_CONFLICT', message: 'Someone else changed this first.' } }, 409)
         }
-        return response({ repositories: [repository()] })
+        getCount += 1
+        if (getCount === 1) return response({ repositories: [repository()] })
+        return response({ repositories: [repository({ team_assignment_version: 2, suggested_team_name: 'acme' })] })
       }),
     )
     renderPanel()
@@ -193,6 +203,8 @@ describe('RepositoriesPanel', () => {
     fireEvent.change(select, { target: { value: 'team-1' } })
 
     expect(await screen.findByRole('alert')).toBeTruthy()
+    await waitFor(() => expect(getCount).toBe(2))
+    expect(await screen.findByText('suggested: acme')).toBeTruthy()
   })
 
   // --- team filter (read-only view filter, distinct from TeamAssignment) --

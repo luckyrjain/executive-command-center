@@ -135,11 +135,21 @@ describe('DecisionsPanel', () => {
     expect(JSON.parse(String((call?.[1] as RequestInit).body)).rationale).toBe('Consensus reached')
   })
 
-  it('maps DECISION_NOT_PROPOSED to a readable sentence, never the raw code', async () => {
+  it('maps DECISION_NOT_PROPOSED to a readable sentence, never the raw code, and refetches so the stale row and its now-invalid action button don\'t linger', async () => {
+    // Round-trip fixture, not just an error-message assertion: an earlier
+    // draft of this handler had no onError refetch at all, so this row's
+    // "Record decision" button stayed enabled against the stale
+    // (still-proposed) row after a 409 -- a retry click would just 409
+    // again in a loop. The GET after the 409 returns the row already
+    // decided by someone else, proving the panel actually re-reads current
+    // state rather than only displaying an error string.
+    let getCount = 0
     const fetch = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input)
       if (url.includes('/decide')) return response({ error: { code: 'DECISION_NOT_PROPOSED', message: 'Decision Not Proposed' } }, 409)
-      return response({ decisions: [decision()] })
+      getCount += 1
+      if (getCount === 1) return response({ decisions: [decision()] })
+      return response({ decisions: [decision({ status: 'decided', decided_at: '2026-07-27T00:00:00Z', rationale: 'Consensus reached' })] })
     })
     vi.stubGlobal('fetch', fetch)
     renderPanel()
@@ -148,6 +158,10 @@ describe('DecisionsPanel', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Record decision' }))
     expect(await screen.findByText(/This decision has already been decided/)).toBeTruthy()
     expect(screen.queryByText('Decision Not Proposed')).toBeNull()
+
+    await waitFor(() => expect(getCount).toBe(2))
+    await waitFor(() => expect(screen.queryByRole('button', { name: 'Record decision' })).toBeNull())
+    expect(await screen.findByText('Rationale: Consensus reached')).toBeTruthy()
   })
 
   it('maps DECIDED_AT_BEFORE_CREATED_AT to a readable sentence, never the raw code', async () => {

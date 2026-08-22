@@ -87,6 +87,16 @@ export default function WorkflowList({ onSelect }: { onSelect: (versionId: strin
       void queryClient.invalidateQueries({ queryKey: ['automation', 'workflows'] })
       onSelect(created.id)
     },
+    // A WORKFLOW_VERSION_CONFLICT means another version was created for
+    // this workflow_id concurrently -- without a refetch here, the
+    // workflows list doesn't reflect that new version, so the operator has
+    // no visibility into what actually landed before deciding whether to
+    // retry.
+    onError: (error) => {
+      if (error instanceof ApiError && error.code === 'WORKFLOW_VERSION_CONFLICT') {
+        void queryClient.invalidateQueries({ queryKey: ['automation', 'workflows'] })
+      }
+    },
   })
 
   function updateStep(index: number, patch: Partial<StepDraft>) {

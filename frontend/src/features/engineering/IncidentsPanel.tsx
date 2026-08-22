@@ -36,6 +36,13 @@ function IncidentRow({ incident, onChanged }: { incident: Incident; onChanged: (
         body: { resolved_at: new Date().toISOString() },
       }),
     onSuccess: onChanged,
+    // An INCIDENT_ALREADY_RESOLVED conflict means this row's status is
+    // already stale (someone else resolved it first) -- without a refetch
+    // here, the "Resolve" button stays enabled against that stale state, so
+    // a retry click just 409s again in a loop. Matches DecisionsPanel.tsx's
+    // own identical fix, and TaskWorkspace.tsx's/RiskWorkspace.tsx's
+    // onError-refetch precedent for VERSION_CONFLICT.
+    onError: (error) => { if (error instanceof ApiError && error.code === 'INCIDENT_ALREADY_RESOLVED') onChanged() },
   })
 
   return (

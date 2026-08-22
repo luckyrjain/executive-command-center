@@ -2,7 +2,7 @@ import { useState } from 'react'
 
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
-import { apiRequest } from '../../api/client'
+import { ApiError, apiRequest } from '../../api/client'
 import type { EntityList } from '../knowledge/types'
 import type { TeamAssignmentRequest, WorkItem, WorkItemListResponse } from './types'
 
@@ -55,6 +55,15 @@ function TeamAssignment({
     mutationFn: (teamEntityId: string | null) =>
       assignTeam(workItem.id, workItem.team_assignment_version, teamEntityId),
     onSuccess: () => { void queryClient.invalidateQueries({ queryKey: ['engineering', 'work-items'] }) },
+    // See RepositoriesPanel.tsx's identical TeamAssignment onError comment:
+    // a VERSION_CONFLICT means this row's team_assignment_version is
+    // already stale, so refetch to avoid a retry-loop against a version
+    // that's already wrong.
+    onError: (error) => {
+      if (error instanceof ApiError && error.code === 'VERSION_CONFLICT') {
+        void queryClient.invalidateQueries({ queryKey: ['engineering', 'work-items'] })
+      }
+    },
   })
 
   // See RepositoriesPanel.tsx's identical `TeamAssignment` comment: past

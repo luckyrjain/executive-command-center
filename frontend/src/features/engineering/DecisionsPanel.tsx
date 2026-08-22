@@ -36,6 +36,12 @@ function DecisionRow({ decision, onChanged }: { decision: Decision; onChanged: (
         body: { decided_at: new Date().toISOString(), rationale: rationale.trim() || null },
       }),
     onSuccess: onChanged,
+    // A DECISION_NOT_PROPOSED conflict means this row's status is already
+    // stale (someone else decided it first) -- without a refetch here, the
+    // "Record decision" button stays enabled against that stale state, so a
+    // retry click just 409s again in a loop. Matches TaskWorkspace.tsx's/
+    // RiskWorkspace.tsx's own onError-refetch precedent for VERSION_CONFLICT.
+    onError: (error) => { if (error instanceof ApiError && error.code === 'DECISION_NOT_PROPOSED') onChanged() },
   })
 
   return (
