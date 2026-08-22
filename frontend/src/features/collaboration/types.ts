@@ -26,17 +26,6 @@ export type GrantPreview = {
   grantee_gains_actions: Action[]
 }
 
-export type EffectivePermissions = {
-  resource_type: string
-  resource_id: string
-  visibility: string
-  owner_id: string
-  is_owner: boolean
-  role: string
-  via: 'owner' | 'workspace_role' | 'resource_grant'
-  granted_actions: Action[]
-}
-
 export type Role = 'owner' | 'admin' | 'member' | 'viewer'
 
 export type Workspace = {
@@ -148,4 +137,3 @@ export type OwnershipTransfer = {
   completed_at: string | null
 }
 
-export type OwnershipTransferListResponse = { transfers: OwnershipTransfer[] }
