@@ -9,7 +9,7 @@ type Note = {
   id: string
   title?: string | null
   body: string
-  note_type: 'general' | 'meeting' | 'decision' | 'journal' | string
+  note_type: 'general' | 'meeting' | 'decision' | 'journal'
   version: number
   archived_at?: string | null
 }
