@@ -114,7 +114,7 @@ intended caller; wiring it here would be speculative.
 
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Literal, Protocol, cast
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
@@ -2235,6 +2235,145 @@ def _validate_team_entity(session: Session, auth: AuthContext, team_entity_id: U
         raise HTTPException(status_code=422, detail="TEAM_ENTITY_KIND_MISMATCH")
 
 
+class _TeamAssignedResponse(Protocol):
+    """Structural bound for `_assign_team`'s generic response model --
+    `RepositoryResponse`/`WorkItemResponse` both already have this field
+    (migration `0050`'s field-scoped optimistic-concurrency counter);
+    this Protocol exists only so `_assign_team` can reference `response.
+    team_assignment_version` without depending on a shared base class
+    neither response model otherwise needs.
+    """
+
+    team_assignment_version: int
+
+    def model_dump(self, *, mode: str) -> dict[str, Any]: ...
+    @classmethod
+    def model_validate(cls, obj: Any) -> _TeamAssignedResponse: ...
+
+
+def _assign_team[ResponseT: _TeamAssignedResponse](
+    *,
+    session: Session,
+    auth: AuthContext,
+    request: Request,
+    entity_id: UUID,
+    payload: TeamAssignmentRequest,
+    idempotency_key: str,
+    table: Literal["repositories", "engineering_work_items"],
+    idempotency_action: str,
+    not_found_detail: str,
+    returning_fields: str,
+    response_model: type[ResponseT],
+    entity_kind: str,
+) -> ResponseT:
+    """The guard+write+audit path behind both `assign_repository_team_
+    endpoint` and `assign_work_item_team_endpoint` -- byte-for-byte
+    identical control flow between the two (two-phase pre-transaction
+    authz, idempotency lock/cache/store, `_validate_team_entity`,
+    `expected_version`-vs-`team_assignment_version` optimistic-concurrency
+    check, audit/outbox write) discovered as real duplication, not just
+    superficially similar code, before extraction. `table`/`returning_
+    fields`/`response_model` are genuinely different per caller (different
+    columns, different Pydantic response shape) and stay as explicit
+    parameters rather than being derived from `entity_kind`, since e.g.
+    `engineering_work_items`' table name doesn't share a stem with its
+    `entity_kind` ("engineering_work_item") the way `repositories` does
+    with "repository". `idempotency_action` is likewise passed verbatim
+    rather than derived, preserving the exact original `request_hash`
+    scope strings (`"assign_repository_team"`/`"assign_work_item_team"`)
+    so an in-flight idempotency-key replay computes the identical hash
+    this refactor's callers used to compute inline.
+    """
+    if not authz.authorize(
+        session, auth, resource_type=table, resource_id=entity_id, action="read"
+    ):
+        session.rollback()
+        raise HTTPException(status_code=404, detail=not_found_detail)
+    if not authz.authorize(
+        session, auth, resource_type=table, resource_id=entity_id, action="write"
+    ):
+        session.rollback()
+        raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
+    # See sync_connector_endpoint's identical comment -- these pre-checks
+    # must be rolled back before this endpoint's own `with session.begin():`.
+    session.rollback()
+
+    req_hash = request_hash(payload, f"{idempotency_action}:{entity_id}")
+    now = datetime.now(UTC)
+    with session.begin():
+        lock_idempotency(session, auth, idempotency_key)
+        cached = load_cached(
+            session, auth, idempotency_key, req_hash, domain="engineering_connector_account"
+        )
+        if cached is not None:
+            return cast(ResponseT, response_model.model_validate(cached))
+
+        _validate_team_entity(session, auth, payload.team_entity_id)
+
+        current = session.execute(
+            text(
+                f"SELECT team_assignment_version FROM {table} "
+                "WHERE workspace_id = :workspace_id AND id = :id FOR UPDATE"
+            ),
+            {"workspace_id": auth.workspace_id, "id": entity_id},
+        ).one_or_none()
+        if current is None:
+            raise HTTPException(status_code=404, detail=not_found_detail)
+        if current[0] != payload.expected_version:
+            raise HTTPException(status_code=409, detail="VERSION_CONFLICT")
+
+        row = (
+            session.execute(
+                text(
+                    f"""
+                UPDATE {table} SET team_entity_id = :team_entity_id,
+                    team_assignment_version = team_assignment_version + 1,
+                    team_assignment_updated_by = :actor_id,
+                    updated_at = :now
+                WHERE workspace_id = :workspace_id AND id = :id
+                RETURNING {returning_fields}
+                """
+                ),
+                {
+                    "team_entity_id": payload.team_entity_id,
+                    "actor_id": auth.user_id,
+                    "now": now,
+                    "workspace_id": auth.workspace_id,
+                    "id": entity_id,
+                },
+            )
+            .mappings()
+            .one()
+        )
+        response = response_model(**dict(row))
+        event_type = (
+            f"{entity_kind}.team_cleared"
+            if payload.team_entity_id is None
+            else f"{entity_kind}.team_assigned"
+        )
+        audit_outbox.write_audit_and_outbox(
+            session,
+            auth,
+            request,
+            event_type=event_type,
+            aggregate_type=entity_kind,
+            aggregate_id=entity_id,
+            aggregate_version=response.team_assignment_version,
+            changed_fields=["team_entity_id"],
+            payload={
+                "aggregate_id": str(entity_id),
+                "version": response.team_assignment_version,
+            },
+            now=now,
+            domain=entity_kind,
+        )
+        queue_lifecycle_event(session, entity_kind, event_type, "allowed")
+        store_idempotency(
+            session, auth, idempotency_key, req_hash, response.model_dump(mode="json"), now
+        )
+        return response
+
+
 @router.post("/repositories/{repository_id}/team", response_model=RepositoryResponse)
 def assign_repository_team_endpoint(
     repository_id: UUID,
@@ -2257,99 +2396,27 @@ def assign_repository_team_endpoint(
     column), `Idempotency-Key` with the same lock/cache/store pattern
     `create_connector_endpoint`/`sync_connector_endpoint`/`disable_
     connector_endpoint` already use, and an `audit_events`/`event_outbox`
-    write recording who confirmed or cleared the link and when.
+    write recording who confirmed or cleared the link and when. See
+    `_assign_team`'s own docstring for the shared guard+write+audit path
+    this delegates to.
     """
-    if not authz.authorize(
-        session, auth, resource_type="repositories", resource_id=repository_id, action="read"
-    ):
-        session.rollback()
-        raise HTTPException(status_code=404, detail="REPOSITORY_NOT_FOUND")
-    if not authz.authorize(
-        session, auth, resource_type="repositories", resource_id=repository_id, action="write"
-    ):
-        session.rollback()
-        raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
-    # See sync_connector_endpoint's identical comment -- these pre-checks
-    # must be rolled back before this endpoint's own `with session.begin():`.
-    session.rollback()
-
-    req_hash = request_hash(payload, f"assign_repository_team:{repository_id}")
-    now = datetime.now(UTC)
-    with session.begin():
-        lock_idempotency(session, auth, idempotency_key)
-        cached = load_cached(
-            session, auth, idempotency_key, req_hash, domain="engineering_connector_account"
-        )
-        if cached is not None:
-            return RepositoryResponse.model_validate(cached)
-
-        _validate_team_entity(session, auth, payload.team_entity_id)
-
-        current = session.execute(
-            text(
-                "SELECT team_assignment_version FROM repositories "
-                "WHERE workspace_id = :workspace_id AND id = :id FOR UPDATE"
-            ),
-            {"workspace_id": auth.workspace_id, "id": repository_id},
-        ).one_or_none()
-        if current is None:
-            raise HTTPException(status_code=404, detail="REPOSITORY_NOT_FOUND")
-        if current[0] != payload.expected_version:
-            raise HTTPException(status_code=409, detail="VERSION_CONFLICT")
-
-        row = (
-            session.execute(
-                text(
-                    """
-                UPDATE repositories SET team_entity_id = :team_entity_id,
-                    team_assignment_version = team_assignment_version + 1,
-                    team_assignment_updated_by = :actor_id,
-                    updated_at = :now
-                WHERE workspace_id = :workspace_id AND id = :id
-                RETURNING id, connector_account_id, provider, external_id, name, source_url,
-                    default_branch, permission_state, freshness_state, provider_updated_at,
-                    observed_at, created_at, updated_at, team_entity_id, suggested_team_name,
-                    team_assignment_version, team_assignment_updated_by
-                """
-                ),
-                {
-                    "team_entity_id": payload.team_entity_id,
-                    "actor_id": auth.user_id,
-                    "now": now,
-                    "workspace_id": auth.workspace_id,
-                    "id": repository_id,
-                },
-            )
-            .mappings()
-            .one()
-        )
-        response = RepositoryResponse(**dict(row))
-        event_type = (
-            "repository.team_cleared"
-            if payload.team_entity_id is None
-            else "repository.team_assigned"
-        )
-        audit_outbox.write_audit_and_outbox(
-            session,
-            auth,
-            request,
-            event_type=event_type,
-            aggregate_type="repository",
-            aggregate_id=repository_id,
-            aggregate_version=response.team_assignment_version,
-            changed_fields=["team_entity_id"],
-            payload={
-                "aggregate_id": str(repository_id),
-                "version": response.team_assignment_version,
-            },
-            now=now,
-            domain="repository",
-        )
-        queue_lifecycle_event(session, "repository", event_type, "allowed")
-        store_idempotency(
-            session, auth, idempotency_key, req_hash, response.model_dump(mode="json"), now
-        )
-        return response
+    return _assign_team(
+        session=session,
+        auth=auth,
+        request=request,
+        entity_id=repository_id,
+        payload=payload,
+        idempotency_key=idempotency_key,
+        table="repositories",
+        idempotency_action="assign_repository_team",
+        not_found_detail="REPOSITORY_NOT_FOUND",
+        returning_fields="""id, connector_account_id, provider, external_id, name, source_url,
+            default_branch, permission_state, freshness_state, provider_updated_at,
+            observed_at, created_at, updated_at, team_entity_id, suggested_team_name,
+            team_assignment_version, team_assignment_updated_by""",
+        response_model=RepositoryResponse,
+        entity_kind="repository",
+    )
 
 
 @router.post("/work-items/{work_item_id}/team", response_model=WorkItemResponse)
@@ -2363,105 +2430,24 @@ def assign_work_item_team_endpoint(
     idempotency_key: IdempotencyHeader,
 ) -> WorkItemResponse:
     """Identical shape and reasoning to `assign_repository_team_endpoint`
-    above, for `engineering_work_items`.
+    above, for `engineering_work_items`. See `_assign_team`'s own
+    docstring for the shared guard+write+audit path this delegates to.
     """
-    if not authz.authorize(
-        session,
-        auth,
-        resource_type="engineering_work_items",
-        resource_id=work_item_id,
-        action="read",
-    ):
-        session.rollback()
-        raise HTTPException(status_code=404, detail="WORK_ITEM_NOT_FOUND")
-    if not authz.authorize(
-        session,
-        auth,
-        resource_type="engineering_work_items",
-        resource_id=work_item_id,
-        action="write",
-    ):
-        session.rollback()
-        raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
-    # See sync_connector_endpoint's identical comment -- these pre-checks
-    # must be rolled back before this endpoint's own `with session.begin():`.
-    session.rollback()
-
-    req_hash = request_hash(payload, f"assign_work_item_team:{work_item_id}")
-    now = datetime.now(UTC)
-    with session.begin():
-        lock_idempotency(session, auth, idempotency_key)
-        cached = load_cached(
-            session, auth, idempotency_key, req_hash, domain="engineering_connector_account"
-        )
-        if cached is not None:
-            return WorkItemResponse.model_validate(cached)
-
-        _validate_team_entity(session, auth, payload.team_entity_id)
-
-        current = session.execute(
-            text(
-                "SELECT team_assignment_version FROM engineering_work_items "
-                "WHERE workspace_id = :workspace_id AND id = :id FOR UPDATE"
-            ),
-            {"workspace_id": auth.workspace_id, "id": work_item_id},
-        ).one_or_none()
-        if current is None:
-            raise HTTPException(status_code=404, detail="WORK_ITEM_NOT_FOUND")
-        if current[0] != payload.expected_version:
-            raise HTTPException(status_code=409, detail="VERSION_CONFLICT")
-
-        row = (
-            session.execute(
-                text(
-                    """
-                UPDATE engineering_work_items SET team_entity_id = :team_entity_id,
-                    team_assignment_version = team_assignment_version + 1,
-                    team_assignment_updated_by = :actor_id,
-                    updated_at = :now
-                WHERE workspace_id = :workspace_id AND id = :id
-                RETURNING id, connector_account_id, provider, external_id, title, source_url,
-                    item_type, status, reporter_external_id, assignee_external_id,
-                    permission_state, freshness_state, provider_created_at, observed_at,
-                    created_at, updated_at, team_entity_id, suggested_team_name,
-                    team_assignment_version, team_assignment_updated_by
-                """
-                ),
-                {
-                    "team_entity_id": payload.team_entity_id,
-                    "actor_id": auth.user_id,
-                    "now": now,
-                    "workspace_id": auth.workspace_id,
-                    "id": work_item_id,
-                },
-            )
-            .mappings()
-            .one()
-        )
-        response = WorkItemResponse(**dict(row))
-        event_type = (
-            "engineering_work_item.team_cleared"
-            if payload.team_entity_id is None
-            else "engineering_work_item.team_assigned"
-        )
-        audit_outbox.write_audit_and_outbox(
-            session,
-            auth,
-            request,
-            event_type=event_type,
-            aggregate_type="engineering_work_item",
-            aggregate_id=work_item_id,
-            aggregate_version=response.team_assignment_version,
-            changed_fields=["team_entity_id"],
-            payload={
-                "aggregate_id": str(work_item_id),
-                "version": response.team_assignment_version,
-            },
-            now=now,
-            domain="engineering_work_item",
-        )
-        queue_lifecycle_event(session, "engineering_work_item", event_type, "allowed")
-        store_idempotency(
-            session, auth, idempotency_key, req_hash, response.model_dump(mode="json"), now
-        )
-        return response
+    return _assign_team(
+        session=session,
+        auth=auth,
+        request=request,
+        entity_id=work_item_id,
+        payload=payload,
+        idempotency_key=idempotency_key,
+        table="engineering_work_items",
+        idempotency_action="assign_work_item_team",
+        not_found_detail="WORK_ITEM_NOT_FOUND",
+        returning_fields="""id, connector_account_id, provider, external_id, title, source_url,
+            item_type, status, reporter_external_id, assignee_external_id,
+            permission_state, freshness_state, provider_created_at, observed_at,
+            created_at, updated_at, team_entity_id, suggested_team_name,
+            team_assignment_version, team_assignment_updated_by""",
+        response_model=WorkItemResponse,
+        entity_kind="engineering_work_item",
+    )
