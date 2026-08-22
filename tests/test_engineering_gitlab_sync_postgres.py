@@ -1164,6 +1164,32 @@ def test_refresh_permissions_fails_open_on_network_error() -> None:
     assert adapter.refresh_permissions(_account_context()) == "active"
 
 
+def test_refresh_permissions_returns_permission_lost_for_malformed_credential() -> None:
+    """`parse_credential` is called before any network request; a stored
+    credential that no longer parses (e.g. from a botched encryption-key
+    rotation) is a different, permanent failure category from a
+    transient network error, and must not share that branch's fail-open
+    tradeoff. Matches `JiraAdapter`'s/`DatadogAdapter`'s identical
+    `_InvalidCredentialError` branch -- found, during a fresh
+    re-verification of an earlier architecture-review finding, to be the
+    one adapter this specific gap had NOT been fixed on, despite a prior
+    review round adding this exact test to Jira and Datadog.
+    """
+    # Must contain a "|" and fail _GITLAB_HOST_PATTERN's validation --
+    # a credential with no "|" at all is the *legacy bare-token* format
+    # (see parse_credential's own docstring), which is valid, not
+    # malformed, and would make this test silently exercise a real
+    # network call to gitlab.com instead of the parse-failure branch.
+    context = ConnectorAccountContext(
+        workspace_id=uuid4(),
+        connector_account_id=uuid4(),
+        external_account_id="gitlab.com:555",
+        credential="https://gitlab.com|glpat_test",
+    )
+    adapter = GitLabAdapter()
+    assert adapter.refresh_permissions(context) == "permission_lost"
+
+
 def test_disconnect_succeeds_on_204() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.method == "DELETE"
