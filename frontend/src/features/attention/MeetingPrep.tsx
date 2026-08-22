@@ -2,6 +2,7 @@ import { useState, type FormEvent } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
 import { ApiError, apiRequest } from '../../api/client'
+import { apiErrorMessage } from '../../api/errorMessage'
 
 export type MeetingPackParticipant = { id: string; entity_id: string; entity_name: string; role: string }
 export type MeetingPackTimelineEntry = { id: string; entity_id: string; effective_at: string; event_type: string; summary: string }
@@ -61,11 +62,12 @@ function formatInTimeZone(iso: string, timeZone: string, options: Intl.DateTimeF
 }
 
 function errorMessage(error: Error): string {
-  if (error instanceof ApiError && error.code === 'MEETING_NOT_FOUND') return 'No meeting was found with that ID.'
-  if (error instanceof ApiError && error.code === 'MEETING_PACK_NOT_FOUND') return 'No preparation pack exists yet for this meeting. Generate one below.'
-  if (error instanceof ApiError && error.code === 'MEETING_PACK_EXISTS') return 'A preparation pack already exists. Use Refresh to update it.'
-  if (error instanceof ApiError && error.code === 'STALE_MEETING_PACK') return 'The existing pack is stale. Use Refresh to regenerate it.'
-  return error.message
+  return apiErrorMessage(error, {
+    MEETING_NOT_FOUND: 'No meeting was found with that ID.',
+    MEETING_PACK_NOT_FOUND: 'No preparation pack exists yet for this meeting. Generate one below.',
+    MEETING_PACK_EXISTS: 'A preparation pack already exists. Use Refresh to update it.',
+    STALE_MEETING_PACK: 'The existing pack is stale. Use Refresh to regenerate it.',
+  })
 }
 
 export default function MeetingPrep() {

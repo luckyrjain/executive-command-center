@@ -2,6 +2,7 @@ import { useState, type FormEvent } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
 import { ApiError, apiRequest } from '../../api/client'
+import { apiErrorMessage } from '../../api/errorMessage'
 import type { KillSwitchStatus, PolicyListResponse, Run, RunDetail, RunListResponse, RunStatus } from './types'
 
 // This activation's fixed retry ceiling (`worker.MAX_RETRY_ATTEMPTS = 3`,
@@ -51,18 +52,18 @@ function statusDescription(status: RunStatus): string {
 }
 
 function errorMessage(error: unknown): string {
-  if (!(error instanceof ApiError)) return error instanceof Error ? error.message : 'Request failed.'
-  const details = error.current as { workflow_id?: string; status?: string; limit?: number } | undefined
-  if (error.code === 'WORKFLOW_NOT_ACTIVE') return `Workflow "${details?.workflow_id ?? ''}" has no active version -- publish a version before running it.`
-  if (error.code === 'KILL_SWITCH_ACTIVE') return `A kill switch is active for workflow "${details?.workflow_id ?? ''}" -- new runs are rejected until it is deactivated.`
-  // Enqueue-time rate limiting (`worker.RunRateLimited`): the policy's own
-  // runs-per-workflow-per-hour ceiling is already used up for this trailing
-  // hour. Names the limit so an operator can tell "misconfigured policy"
-  // apart from "I really did start that many runs".
-  if (error.code === 'RATE_LIMITED') return `Workflow "${details?.workflow_id ?? ''}" has already used its policy's limit of ${details?.limit ?? 'allowed'} runs per hour -- the next run is rejected until the trailing hour rolls over.`
-  if (error.code === 'RUN_NOT_PAUSED') return `This run is ${details?.status ?? 'not paused'}, so it cannot be resumed.`
-  if (error.code === 'RUN_NOT_FOUND') return 'This run no longer exists in this workspace.'
-  return error.message
+  if (error instanceof ApiError) {
+    const details = error.current as { workflow_id?: string; status?: string; limit?: number } | undefined
+    if (error.code === 'WORKFLOW_NOT_ACTIVE') return `Workflow "${details?.workflow_id ?? ''}" has no active version -- publish a version before running it.`
+    if (error.code === 'KILL_SWITCH_ACTIVE') return `A kill switch is active for workflow "${details?.workflow_id ?? ''}" -- new runs are rejected until it is deactivated.`
+    // Enqueue-time rate limiting (`worker.RunRateLimited`): the policy's own
+    // runs-per-workflow-per-hour ceiling is already used up for this trailing
+    // hour. Names the limit so an operator can tell "misconfigured policy"
+    // apart from "I really did start that many runs".
+    if (error.code === 'RATE_LIMITED') return `Workflow "${details?.workflow_id ?? ''}" has already used its policy's limit of ${details?.limit ?? 'allowed'} runs per hour -- the next run is rejected until the trailing hour rolls over.`
+    if (error.code === 'RUN_NOT_PAUSED') return `This run is ${details?.status ?? 'not paused'}, so it cannot be resumed.`
+  }
+  return apiErrorMessage(error, { RUN_NOT_FOUND: 'This run no longer exists in this workspace.' })
 }
 
 function RunDetailView({ run }: { run: RunDetail }) {

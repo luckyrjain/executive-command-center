@@ -1,7 +1,8 @@
 import { useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
-import { ApiError, apiRequest } from '../../api/client'
+import { apiRequest } from '../../api/client'
+import { apiErrorMessage } from '../../api/errorMessage'
 import type { KillSwitch, KillSwitchStatus } from './types'
 
 /** Real, distinct, readable feedback for every error code the kill-switch
@@ -20,15 +21,16 @@ import type { KillSwitch, KillSwitchStatus } from './types'
  * which is also the entire error surface of the `GET .../kill_switch` read.
  */
 function errorMessage(error: unknown): string {
-  if (!(error instanceof ApiError)) return error instanceof Error ? error.message : 'Request failed.'
-  if (error.code === 'OFFLINE') return 'You are offline, so the kill-switch state could not be read or changed. Nothing was sent.'
-  if (error.code === 'NETWORK_ERROR') return 'Could not reach the server, so the kill-switch state could not be read or changed. Nothing was sent.'
-  if (error.code === 'IDEMPOTENCY_CONFLICT') return 'A different kill-switch request was already recorded under this request key. Nothing was changed by this attempt -- reload and retry.'
-  if (error.code === 'CSRF_TOKEN_REQUIRED' || error.code === 'CSRF_TOKEN_INVALID') return 'Your session\'s security token is missing or stale, so this change was rejected. Reload the page and try again.'
-  if (error.code === 'VALIDATION_ERROR') return 'The server rejected this kill-switch request as invalid -- the reason may be longer than the 2000 characters it accepts.'
-  if (error.status === 401) return 'Your session is no longer valid. Sign in again to read or change kill switches.'
-  if (error.status === 403) return 'You are not permitted to change kill switches in this workspace.'
-  return error.message
+  return apiErrorMessage(error, {
+    OFFLINE: 'You are offline, so the kill-switch state could not be read or changed. Nothing was sent.',
+    NETWORK_ERROR: 'Could not reach the server, so the kill-switch state could not be read or changed. Nothing was sent.',
+    IDEMPOTENCY_CONFLICT: 'A different kill-switch request was already recorded under this request key. Nothing was changed by this attempt -- reload and retry.',
+    CSRF_TOKEN_REQUIRED: 'Your session\'s security token is missing or stale, so this change was rejected. Reload the page and try again.',
+    CSRF_TOKEN_INVALID: 'Your session\'s security token is missing or stale, so this change was rejected. Reload the page and try again.',
+    VALIDATION_ERROR: 'The server rejected this kill-switch request as invalid -- the reason may be longer than the 2000 characters it accepts.',
+    '401': 'Your session is no longer valid. Sign in again to read or change kill switches.',
+    '403': 'You are not permitted to change kill switches in this workspace.',
+  })
 }
 
 function timestamp(value: string | null): string {

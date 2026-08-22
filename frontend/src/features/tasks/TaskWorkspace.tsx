@@ -3,6 +3,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
 import { ApiError, apiRequest } from '../../api/client'
 import { serverInstantToLocalInput } from '../../lib/datetime'
+import { apiErrorMessage } from '../../api/errorMessage'
 
 type Task = {
   id: string
@@ -52,8 +53,7 @@ function taskDraft(task: Task): TaskDraft {
 }
 
 function errorMessage(error: Error): string {
-  if (error instanceof ApiError && error.code === 'VERSION_CONFLICT') return 'This task changed while you were editing it. Review your input and retry with the latest version.'
-  return error.message
+  return apiErrorMessage(error, { VERSION_CONFLICT: 'This task changed while you were editing it. Review your input and retry with the latest version.' })
 }
 
 export default function TaskWorkspace() {

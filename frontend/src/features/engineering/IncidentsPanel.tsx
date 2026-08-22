@@ -2,26 +2,23 @@ import { useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
 import { ApiError, apiRequest } from '../../api/client'
+import { apiErrorMessage } from '../../api/errorMessage'
 import type { Incident, IncidentListResponse, IncidentSeverity } from './types'
 
 const SEVERITIES: ReadonlyArray<IncidentSeverity> = ['low', 'medium', 'high', 'critical']
 
 function errorMessage(error: unknown): string {
-  if (!(error instanceof ApiError)) return error instanceof Error ? error.message : 'Request failed.'
-  if (error.code === 'OFFLINE') return 'You are offline, so this request was not sent.'
-  if (error.code === 'NETWORK_ERROR') return 'Could not reach the server. Nothing was sent.'
-  if (error.code === 'IDEMPOTENCY_CONFLICT') return 'A different request was already recorded under this request key. Reload and retry.'
-  if (error.code === 'CSRF_TOKEN_REQUIRED' || error.code === 'CSRF_TOKEN_INVALID') return 'Your session\'s security token is missing or stale. Reload the page and try again.'
-  if (error.code === 'CHANGE_NOT_FOUND') {
+  if (error instanceof ApiError && error.code === 'CHANGE_NOT_FOUND') {
     const detail = error.current as { change_ids?: string[] } | undefined
     return `One or more change IDs do not exist in this workspace: ${detail?.change_ids?.join(', ') ?? 'unknown'}.`
   }
-  if (error.code === 'INCIDENT_NOT_FOUND') return 'This incident no longer exists in this workspace.'
-  if (error.code === 'INCIDENT_ALREADY_RESOLVED') return 'This incident was already resolved -- reload to see its current state.'
-  if (error.code === 'RESOLVED_AT_BEFORE_DETECTED_AT') return 'The resolved time cannot be before the detected time.'
-  if (error.status === 401) return 'Your session is no longer valid. Sign in again.'
-  if (error.status === 403) return 'You are not permitted to manage incidents in this workspace.'
-  return error.message
+  return apiErrorMessage(error, {
+    INCIDENT_NOT_FOUND: 'This incident no longer exists in this workspace.',
+    INCIDENT_ALREADY_RESOLVED: 'This incident was already resolved -- reload to see its current state.',
+    RESOLVED_AT_BEFORE_DETECTED_AT: 'The resolved time cannot be before the detected time.',
+    '401': 'Your session is no longer valid. Sign in again.',
+    '403': 'You are not permitted to manage incidents in this workspace.',
+  })
 }
 
 function timestamp(value: string | null): string {

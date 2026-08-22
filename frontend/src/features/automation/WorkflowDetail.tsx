@@ -2,26 +2,29 @@ import { useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
 import { ApiError, apiRequest } from '../../api/client'
+import { apiErrorMessage } from '../../api/errorMessage'
 import type { KillSwitchStatus, PolicyListResponse, TriggerListResponse, WorkflowVersion } from './types'
 import SimulationView from './SimulationView'
 
 /** Real, distinct, readable feedback for every documented publish/disable
  * error code (API-SCHEMAS.md) -- never raw JSON. */
 function errorMessage(error: unknown): string {
-  if (!(error instanceof ApiError)) return error instanceof Error ? error.message : 'Request failed.'
-  const details = error.current as { code?: string; violations?: string[]; status?: string } | undefined
-  if (error.code === 'WORKFLOW_VERSION_NOT_DRAFT') return `This version is already ${details?.status ?? 'not a draft'} and cannot be published again from here.`
-  if (error.code === 'WORKFLOW_VERSION_ACTIVE_CONFLICT') return 'Another version became active for this workflow at the same time. Reload and retry.'
-  if (error.code === 'ACTION_REF_NOT_REGISTERED') {
-    const violations = details?.violations
+  if (error instanceof ApiError && error.code === 'WORKFLOW_VERSION_NOT_DRAFT') {
+    const details = error.current as { status?: string } | undefined
+    return `This version is already ${details?.status ?? 'not a draft'} and cannot be published again from here.`
+  }
+  if (error instanceof ApiError && error.code === 'ACTION_REF_NOT_REGISTERED') {
+    const violations = (error.current as { violations?: string[] } | undefined)?.violations
     return violations?.length ? `This graph references an unregistered action: ${violations.join('; ')}` : 'This graph references an action that is not registered.'
   }
-  if (error.code === 'WORKFLOW_NOT_ACTIVE') return 'This version is not currently active, so it cannot be disabled.'
-  if (error.code === 'WORKFLOW_NOT_FOUND') return 'This workflow version no longer exists in this workspace.'
-  if (error.code === 'OFFLINE') return 'You are offline, so this could not be read from or sent to the server.'
-  if (error.code === 'NETWORK_ERROR') return 'Could not reach the server, so this could not be read or changed.'
-  if (error.status === 401) return 'Your session is no longer valid. Sign in again to view or change this workflow.'
-  return error.message
+  return apiErrorMessage(error, {
+    WORKFLOW_VERSION_ACTIVE_CONFLICT: 'Another version became active for this workflow at the same time. Reload and retry.',
+    WORKFLOW_NOT_ACTIVE: 'This version is not currently active, so it cannot be disabled.',
+    WORKFLOW_NOT_FOUND: 'This workflow version no longer exists in this workspace.',
+    OFFLINE: 'You are offline, so this could not be read from or sent to the server.',
+    NETWORK_ERROR: 'Could not reach the server, so this could not be read or changed.',
+    '401': 'Your session is no longer valid. Sign in again to view or change this workflow.',
+  })
 }
 
 function formatSchedule(trigger: TriggerListResponse['triggers'][number]): string {

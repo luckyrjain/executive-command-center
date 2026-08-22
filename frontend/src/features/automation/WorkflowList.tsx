@@ -2,6 +2,7 @@ import { useState, type FormEvent } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
 import { ApiError, apiRequest } from '../../api/client'
+import { apiErrorMessage } from '../../api/errorMessage'
 import type { GraphStep, WorkflowListResponse, WorkflowVersion } from './types'
 
 type StepDraft = {
@@ -49,17 +50,17 @@ function toGraphStep(draft: StepDraft): GraphStep {
 /** Real, distinct, readable feedback for every documented publish/create
  * error code (API-SCHEMAS.md) -- never raw JSON. */
 function errorMessage(error: unknown): string {
-  if (!(error instanceof ApiError)) return error instanceof Error ? error.message : 'Request failed.'
-  if (error.code === 'SCHEMA_INVALID') {
+  if (error instanceof ApiError && error.code === 'SCHEMA_INVALID') {
     const violations = (error.current as { violations?: string[] } | undefined)?.violations
     return violations?.length ? `Workflow graph is invalid: ${violations.join('; ')}` : 'Workflow graph is invalid.'
   }
-  if (error.code === 'WORKFLOW_VERSION_CONFLICT') return 'Another version was created for this workflow at the same time. Reload and retry.'
-  if (error.code === 'POLICY_NOT_FOUND') return 'That policy ID does not exist in this workspace.'
-  if (error.code === 'OFFLINE') return 'You are offline, so workflows could not be read or created.'
-  if (error.code === 'NETWORK_ERROR') return 'Could not reach the server, so workflows could not be read or created.'
-  if (error.status === 401) return 'Your session is no longer valid. Sign in again to view workflows.'
-  return error.message
+  return apiErrorMessage(error, {
+    WORKFLOW_VERSION_CONFLICT: 'Another version was created for this workflow at the same time. Reload and retry.',
+    POLICY_NOT_FOUND: 'That policy ID does not exist in this workspace.',
+    OFFLINE: 'You are offline, so workflows could not be read or created.',
+    NETWORK_ERROR: 'Could not reach the server, so workflows could not be read or created.',
+    '401': 'Your session is no longer valid. Sign in again to view workflows.',
+  })
 }
 
 export default function WorkflowList({ onSelect }: { onSelect: (versionId: string) => void }) {

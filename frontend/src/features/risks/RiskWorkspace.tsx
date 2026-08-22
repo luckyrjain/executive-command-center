@@ -3,6 +3,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
 import { ApiError, apiRequest } from '../../api/client'
 import { serverInstantToLocalInput } from '../../lib/datetime'
+import { apiErrorMessage } from '../../api/errorMessage'
 
 export type RiskStatus = 'identified' | 'assessed' | 'monitoring' | 'mitigating' | 'materialized' | 'closed'
 
@@ -121,9 +122,10 @@ function patchBody(edit: EditState): Record<string, unknown> {
 }
 
 function errorMessage(error: Error): string {
-  if (error instanceof ApiError && error.code === 'VERSION_CONFLICT') return 'This risk changed while you were editing it. Review your input and retry with the latest version.'
-  if (error instanceof ApiError && error.code === 'RISK_TERMINAL') return 'This risk is closed and cannot change status again. Other fields can still be edited.'
-  return error.message
+  return apiErrorMessage(error, {
+    VERSION_CONFLICT: 'This risk changed while you were editing it. Review your input and retry with the latest version.',
+    RISK_TERMINAL: 'This risk is closed and cannot change status again. Other fields can still be edited.',
+  })
 }
 
 export default function RiskWorkspace() {

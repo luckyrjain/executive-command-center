@@ -2,6 +2,7 @@ import { useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
 import { ApiError, apiRequest } from '../../api/client'
+import { apiErrorMessage } from '../../api/errorMessage'
 import type { Approval, ApprovalListResponse, RunDetail } from './types'
 
 function isExpired(approval: Approval, now: Date): boolean {
@@ -20,7 +21,7 @@ function errorMessage(error: unknown): string | { code: string; text: string } {
   if (error.code === 'APPROVAL_ALREADY_DECIDED') {
     return { code: 'APPROVAL_ALREADY_DECIDED', text: `This approval was already ${details?.decision ?? 'decided'}${details?.decided_at ? ` at ${new Date(details.decided_at).toLocaleString()}` : ''}.` }
   }
-  return { code: error.code, text: error.message }
+  return { code: error.code, text: apiErrorMessage(error) }
 }
 
 /** One approval request, expanded with the run/step context a human needs

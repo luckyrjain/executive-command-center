@@ -1,7 +1,8 @@
 import { useMemo, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
-import { ApiError, apiRequest } from '../../api/client'
+import { apiRequest } from '../../api/client'
+import { apiErrorMessage } from '../../api/errorMessage'
 import AttentionExplanation from './AttentionExplanation'
 
 declare global {
@@ -96,8 +97,7 @@ export function groupOf(item: AttentionItem): Group {
 }
 
 function errorMessage(error: Error): string {
-  if (error instanceof ApiError && error.code === 'OFFLINE') return 'You are offline. Reconnect to update attention items.'
-  return error.message
+  return apiErrorMessage(error, { OFFLINE: 'You are offline. Reconnect to update attention items.' })
 }
 
 function formatFreshness(generatedAt: string): string {
