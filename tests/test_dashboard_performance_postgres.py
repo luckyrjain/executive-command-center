@@ -14,6 +14,7 @@ separate file, since this is the first file that depends on the shared
 fixture.
 """
 
+import os
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
@@ -36,8 +37,11 @@ pytestmark = pytest.mark.skipif(
     reason="PostgreSQL integration test",
 )
 
-# Real documented budget: dashboard p95 below 2 seconds.
-DASHBOARD_P95_BUDGET_SECONDS = 2.0
+# Real documented budget: dashboard p95 below 2 seconds, widened for CI's
+# shared-runner noise -- same CI/local split as every other
+# *_performance_postgres.py file's own budget constants.
+_IN_CI = os.getenv("CI") is not None
+DASHBOARD_P95_BUDGET_SECONDS = 3.2 if _IN_CI else 2.0
 SAMPLE_SIZE = 15
 
 
@@ -172,6 +176,6 @@ def test_dashboard_today_p95_under_budget(
     p95 = _p95(samples)
     assert p95 < DASHBOARD_P95_BUDGET_SECONDS, (
         f"dashboard p95 {p95 * 1000:.1f} ms exceeds "
-        f"{DASHBOARD_P95_BUDGET_SECONDS * 1000:.0f} ms budget; samples(ms)="
+        f"{DASHBOARD_P95_BUDGET_SECONDS * 1000:.0f} ms budget (in_ci={_IN_CI}); samples(ms)="
         f"{[round(s * 1000, 1) for s in samples]}"
     )

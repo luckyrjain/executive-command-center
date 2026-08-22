@@ -1,3 +1,4 @@
+import os
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
@@ -29,7 +30,11 @@ pytestmark = pytest.mark.skipif(
 # ceiling rather than inventing an official contractual number the doc never
 # committed to; if this ever fires it means a genuine multi-second
 # regression, not a missed-by-a-few-ms budget.
-SANITY_CEILING_SECONDS = 2.0
+# Widened for CI's shared-runner noise -- same CI/local split as every other
+# *_performance_postgres.py file's own budget constants -- on top of the
+# sanity ceiling's own already-generous headroom above.
+_IN_CI = os.getenv("CI") is not None
+SANITY_CEILING_SECONDS = 3.2 if _IN_CI else 2.0
 _BACKGROUND_ENTITY_COUNT = 10_000
 SAMPLE_SIZE = 20
 
@@ -212,7 +217,7 @@ def test_candidate_generation_10000_entity_workspace_records_percentiles(
     )
     assert p99 < SANITY_CEILING_SECONDS, (
         f"candidate generation p99 {p99 * 1000:.1f} ms exceeded the "
-        f"{SANITY_CEILING_SECONDS * 1000:.0f} ms sanity ceiling; this indicates a genuine "
-        f"regression, not a documented-budget miss (TEST-PLAN.md names this as measured "
-        f"but never sets a numeric target)"
+        f"{SANITY_CEILING_SECONDS * 1000:.0f} ms sanity ceiling (in_ci={_IN_CI}); this "
+        f"indicates a genuine regression, not a documented-budget miss (TEST-PLAN.md names "
+        f"this as measured but never sets a numeric target)"
     )

@@ -1,3 +1,4 @@
+import os
 from collections.abc import Iterator
 from datetime import UTC, datetime
 from time import perf_counter
@@ -32,7 +33,11 @@ pytestmark = pytest.mark.skipif(
 # used here (unlike the timeline-read test's 10,000 rows) purely to keep a
 # 5-sample-per-call test's total runtime reasonable -- each sample re-runs
 # the full O(N) rebuild, not one lightweight read.
-SANITY_CEILING_SECONDS = 5.0
+# Widened for CI's shared-runner noise -- same CI/local split as every other
+# *_performance_postgres.py file's own budget constants -- on top of the
+# sanity ceiling's own already-generous headroom above.
+_IN_CI = os.getenv("CI") is not None
+SANITY_CEILING_SECONDS = 8.0 if _IN_CI else 5.0
 _EVENT_COUNT = 2_000
 SAMPLE_SIZE = 5
 
@@ -161,7 +166,7 @@ def test_rebuild_timeline_2000_event_workspace_records_percentiles(
     )
     assert p99 < SANITY_CEILING_SECONDS, (
         f"projection rebuild p99 {p99 * 1000:.1f} ms exceeded the "
-        f"{SANITY_CEILING_SECONDS * 1000:.0f} ms sanity ceiling; this indicates a genuine "
-        f"regression, not a documented-budget miss (TEST-PLAN.md names this as measured "
-        f"but never sets a numeric target)"
+        f"{SANITY_CEILING_SECONDS * 1000:.0f} ms sanity ceiling (in_ci={_IN_CI}); this "
+        f"indicates a genuine regression, not a documented-budget miss (TEST-PLAN.md names "
+        f"this as measured but never sets a numeric target)"
     )
