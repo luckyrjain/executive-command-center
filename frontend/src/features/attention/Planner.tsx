@@ -2,6 +2,7 @@ import { useState, type FormEvent } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
 import { ApiError, apiRequest } from '../../api/client'
+import { serverInstantToLocalInput } from '../../lib/datetime'
 
 export type PlanBlock = {
   id: string
@@ -53,13 +54,6 @@ function todayIso(offsetDays = 1): string {
   const date = new Date()
   date.setDate(date.getDate() + offsetDays)
   return date.toISOString().slice(0, 10)
-}
-
-function pad(value: number): string { return String(value).padStart(2, '0') }
-function toLocalInputValue(iso: string): string {
-  const instant = new Date(iso)
-  if (Number.isNaN(instant.getTime())) return ''
-  return `${instant.getFullYear()}-${pad(instant.getMonth() + 1)}-${pad(instant.getDate())}T${pad(instant.getHours())}:${pad(instant.getMinutes())}`
 }
 
 export default function Planner() {
@@ -228,7 +222,7 @@ export default function Planner() {
                             type="button"
                             disabled={pending}
                             aria-label={`Move ${block.rationale}`}
-                            onClick={() => setEditingBlock({ blockId: block.id, startsAt: toLocalInputValue(block.starts_at), endsAt: toLocalInputValue(block.ends_at) })}
+                            onClick={() => setEditingBlock({ blockId: block.id, startsAt: serverInstantToLocalInput(block.starts_at), endsAt: serverInstantToLocalInput(block.ends_at) })}
                           >
                             Move
                           </button>

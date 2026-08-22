@@ -2,6 +2,7 @@ import { useState, type FormEvent } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
 import { ApiError, apiRequest } from '../../api/client'
+import { serverInstantToLocalInput } from '../../lib/datetime'
 
 export type RiskStatus = 'identified' | 'assessed' | 'monitoring' | 'mitigating' | 'materialized' | 'closed'
 
@@ -59,13 +60,6 @@ const emptyDraft: Draft = {
 }
 const filters = { include_archived: true }
 const STATUSES: RiskStatus[] = ['identified', 'assessed', 'monitoring', 'mitigating', 'materialized', 'closed']
-
-function pad(value: number): string { return String(value).padStart(2, '0') }
-function serverInstantToLocalInput(value: string): string {
-  const instant = new Date(value)
-  if (Number.isNaN(instant.getTime())) return ''
-  return `${instant.getFullYear()}-${pad(instant.getMonth() + 1)}-${pad(instant.getDate())}T${pad(instant.getHours())}:${pad(instant.getMinutes())}`
-}
 
 /** Frontend-only requirement: mitigation, trigger and review_at must be present before submit,
  * even though the backend RiskCreate/RiskPatch contract leaves them nullable. */
