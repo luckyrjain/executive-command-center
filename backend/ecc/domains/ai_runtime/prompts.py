@@ -58,6 +58,7 @@ from .tools import (
     ToolDefinition,
     ToolVersionNotFound,
     activate_tool_version,
+    activate_versioned_row,
     get_active_tool,
     tool_family_exists,
 )
@@ -177,71 +178,22 @@ def prompt_family_exists(session: Session, prompt_id: str) -> bool:
 def activate_prompt_version(
     session: Session, prompt_id: str, version: int
 ) -> PromptVersion | PromptVersionNotFound:
-    """Explicit administrative activation (design doc Decision 3): retires
-    whichever version is currently `active` for `prompt_id` (if any and if
-    it is not already the target row) and marks the target row `active`,
-    each via an `UPDATE` touching only `status`/`updated_at` -- the two
-    columns `trg_prompt_versions_immutability` never guards, confirmed by
-    reading the trigger this module's migration creates (it only rejects
-    changes to `template`/`template_hash`/`input_schema_ref`/`output_
-    schema_ref` once `OLD.status <> 'draft'`). Never edits `template`
-    content of any row. Caller (the HTTP endpoint below) owns the
-    surrounding transaction, idempotency key and audit event -- this
-    function is the pure data-layer mutation only.
-
-    `FOR UPDATE` locks both the target row and the current active row (if
-    distinct) for the rest of the caller's transaction, mirroring `tools.
-    py:activate_tool_version`'s identical race-closing rationale.
+    """Thin wrapper over `tools.py`'s `activate_versioned_row` for
+    `prompt_versions`, mirroring `activate_tool_version`'s identical
+    shape -- see that shared function's own docstring for the activation
+    mechanics (immutability-trigger reasoning, the `FOR UPDATE` lost-
+    update race it closes).
     """
-    target_row = (
-        session.execute(
-            text(
-                f"SELECT {_PROMPT_FIELDS} FROM prompt_versions "
-                "WHERE prompt_id = :prompt_id AND version = :version FOR UPDATE"
-            ),
-            {"prompt_id": prompt_id, "version": version},
-        )
-        .mappings()
-        .one_or_none()
+    return activate_versioned_row(
+        session=session,
+        table="prompt_versions",
+        id_column="prompt_id",
+        id_value=prompt_id,
+        version=version,
+        fields=_PROMPT_FIELDS,
+        row_mapper=_row_to_prompt,
+        not_found=PromptVersionNotFound,
     )
-    if target_row is None:
-        return PromptVersionNotFound(prompt_id=prompt_id, version=version)
-
-    now = datetime.now(UTC)
-    if target_row["status"] != "active":
-        current_active = (
-            session.execute(
-                text(
-                    "SELECT id FROM prompt_versions "
-                    "WHERE prompt_id = :prompt_id AND status = 'active' FOR UPDATE"
-                ),
-                {"prompt_id": prompt_id},
-            )
-            .mappings()
-            .one_or_none()
-        )
-        if current_active is not None and current_active["id"] != target_row["id"]:
-            session.execute(
-                text(
-                    "UPDATE prompt_versions SET status = 'retired', updated_at = :now "
-                    "WHERE id = :id"
-                ),
-                {"id": current_active["id"], "now": now},
-            )
-        session.execute(
-            text("UPDATE prompt_versions SET status = 'active', updated_at = :now WHERE id = :id"),
-            {"id": target_row["id"], "now": now},
-        )
-
-    final_row = (
-        session.execute(
-            text(f"SELECT {_PROMPT_FIELDS} FROM prompt_versions WHERE id = :id"),
-            {"id": target_row["id"]},
-        )
-        .mappings()
-        .one()
-    )
-    return _row_to_prompt(dict(final_row))
 
 
 # --- POST /api/v1/ai/policies/{prompt_id_or_tool_name}/activate ------------

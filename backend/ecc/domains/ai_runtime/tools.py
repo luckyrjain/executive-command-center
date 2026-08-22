@@ -22,7 +22,7 @@ retroactively change which version any already-completed `ai_run`
 recorded").
 """
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from hashlib import sha256
@@ -158,76 +158,110 @@ def tool_family_exists(session: Session, name: str) -> bool:
     )
 
 
-def activate_tool_version(
-    session: Session, name: str, version: int
-) -> ToolDefinition | ToolVersionNotFound:
+def activate_versioned_row[RowT, NotFoundT](
+    *,
+    session: Session,
+    table: str,
+    id_column: str,
+    id_value: str,
+    version: int,
+    fields: str,
+    row_mapper: Callable[[dict[str, Any]], RowT],
+    not_found: Callable[[str, int], NotFoundT],
+) -> RowT | NotFoundT:
     """Explicit administrative activation (design doc Decision 3): retires
-    whichever version is currently `active` for `name` (if any and if it
-    is not already the target row) and marks the target row `active`, each
-    via an `UPDATE` touching only `status`/`updated_at` -- the two columns
-    `trg_tool_definitions_immutability` never guards, confirmed by reading
-    the trigger this module's migration creates (it only rejects changes to
-    `input_schema`/`output_schema`/`scopes`/`handler_ref`/`definition_hash`
-    once `OLD.status <> 'draft'`). Never edits `template`-equivalent
-    content columns of any row. Caller (the HTTP endpoint in `prompts.py`)
-    is responsible for the surrounding transaction, idempotency key and
-    audit event -- this function is the pure data-layer mutation only.
+    whichever version is currently `active` for `id_value` (if any and if
+    it is not already the target row) and marks the target row `active`,
+    each via an `UPDATE` touching only `status`/`updated_at` -- the two
+    columns `trg_tool_definitions_immutability`/`trg_prompt_versions_
+    immutability` never guard, confirmed by reading the triggers each
+    module's migration creates (they only reject changes to their own
+    content columns -- `input_schema`/`output_schema`/`scopes`/`handler_
+    ref`/`definition_hash` for tools, `template`/`template_hash`/`input_
+    schema_ref`/`output_schema_ref` for prompts -- once `OLD.status <>
+    'draft'`). Never edits `template`-equivalent content of any row.
+    Caller (`activate_tool_version`/`activate_prompt_version`, and beyond
+    them the HTTP endpoint in `prompts.py`) is responsible for the
+    surrounding transaction, idempotency key and audit event -- this
+    function is the pure data-layer mutation only, shared because `tool_
+    definitions`/`prompt_versions`' activation shape turned out to be
+    byte-for-byte identical modulo table/column names once both existed
+    side by side.
 
     `FOR UPDATE` locks both the target row and the current active row (if
     distinct) for the rest of the caller's transaction, closing the same
     lost-update race `attention/capacity.py`'s `_current_profile(for_
     update=True)` documents: two concurrent activations racing to flip the
-    same tool's active pointer.
+    same tool's/prompt's active pointer. `table`/`id_column`/`fields` are
+    interpolated into raw SQL, safe here because this is a private helper
+    called only by `activate_tool_version`/`activate_prompt_version` with
+    hardcoded literal arguments -- no path from user input reaches any of
+    the three.
     """
     target_row = (
         session.execute(
             text(
-                f"SELECT {_TOOL_FIELDS} FROM tool_definitions "
-                "WHERE name = :name AND version = :version FOR UPDATE"
+                f"SELECT {fields} FROM {table} "
+                f"WHERE {id_column} = :id_value AND version = :version FOR UPDATE"
             ),
-            {"name": name, "version": version},
+            {"id_value": id_value, "version": version},
         )
         .mappings()
         .one_or_none()
     )
     if target_row is None:
-        return ToolVersionNotFound(name=name, version=version)
+        return not_found(id_value, version)
 
     now = datetime.now(UTC)
     if target_row["status"] != "active":
         current_active = (
             session.execute(
                 text(
-                    "SELECT id FROM tool_definitions "
-                    "WHERE name = :name AND status = 'active' FOR UPDATE"
+                    f"SELECT id FROM {table} "
+                    f"WHERE {id_column} = :id_value AND status = 'active' FOR UPDATE"
                 ),
-                {"name": name},
+                {"id_value": id_value},
             )
             .mappings()
             .one_or_none()
         )
         if current_active is not None and current_active["id"] != target_row["id"]:
             session.execute(
-                text(
-                    "UPDATE tool_definitions SET status = 'retired', updated_at = :now "
-                    "WHERE id = :id"
-                ),
+                text(f"UPDATE {table} SET status = 'retired', updated_at = :now WHERE id = :id"),
                 {"id": current_active["id"], "now": now},
             )
         session.execute(
-            text("UPDATE tool_definitions SET status = 'active', updated_at = :now WHERE id = :id"),
+            text(f"UPDATE {table} SET status = 'active', updated_at = :now WHERE id = :id"),
             {"id": target_row["id"], "now": now},
         )
 
     final_row = (
         session.execute(
-            text(f"SELECT {_TOOL_FIELDS} FROM tool_definitions WHERE id = :id"),
+            text(f"SELECT {fields} FROM {table} WHERE id = :id"),
             {"id": target_row["id"]},
         )
         .mappings()
         .one()
     )
-    return _row_to_tool(dict(final_row))
+    return row_mapper(dict(final_row))
+
+
+def activate_tool_version(
+    session: Session, name: str, version: int
+) -> ToolDefinition | ToolVersionNotFound:
+    """Thin wrapper over `activate_versioned_row` for `tool_definitions`.
+    See that function's own docstring for the shared activation mechanics.
+    """
+    return activate_versioned_row(
+        session=session,
+        table="tool_definitions",
+        id_column="name",
+        id_value=name,
+        version=version,
+        fields=_TOOL_FIELDS,
+        row_mapper=_row_to_tool,
+        not_found=ToolVersionNotFound,
+    )
 
 
 # ---------------------------------------------------------------------------
