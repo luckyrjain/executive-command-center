@@ -14,13 +14,23 @@ export class ApiError extends Error {
   readonly status: number
   readonly code: string
   readonly current: unknown
+  // Support can look up the exact backend request from either id -- the
+  // backend's response_contract_middleware stamps both onto every error
+  // (X-Request-ID/X-Correlation-ID headers, plus error.request_id and a
+  // top-level correlation_id in the JSON body). Optional because the
+  // client-synthesized OFFLINE/NETWORK_ERROR errors never reach the
+  // backend and so have neither.
+  readonly requestId?: string
+  readonly correlationId?: string
 
-  constructor(status: number, code: string, message: string, current?: unknown) {
+  constructor(status: number, code: string, message: string, current?: unknown, requestId?: string, correlationId?: string) {
     super(message)
     this.name = code
     this.status = status
     this.code = code
     this.current = current
+    this.requestId = requestId
+    this.correlationId = correlationId
   }
 }
 
@@ -79,7 +89,13 @@ export async function apiRequest<T>(path: string, options: ApiRequestOptions = {
     const code = payload.error?.code ?? 'REQUEST_FAILED'
     const message = payload.error?.message
       ?? (response.status === 401 ? 'Authentication required' : 'Request failed')
-    throw new ApiError(response.status, code, message, currentState(payload.error?.details))
+    // Headers are the fallback, not the primary source: the body is only
+    // absent/unparsed for a non-JSON or malformed error response, but the
+    // response_contract_middleware sets both headers on every response
+    // regardless of body shape.
+    const requestId = payload.error?.request_id ?? response.headers.get('X-Request-ID') ?? undefined
+    const correlationId = payload.correlation_id ?? response.headers.get('X-Correlation-ID') ?? undefined
+    throw new ApiError(response.status, code, message, currentState(payload.error?.details), requestId, correlationId)
   }
 
   if (response.status === 204) return undefined as T

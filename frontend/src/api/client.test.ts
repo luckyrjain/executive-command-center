@@ -73,4 +73,42 @@ describe('apiRequest', () => {
       current: { current_version: 4 },
     })
   })
+
+  it('captures the request and correlation ids from the error envelope', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      error: { code: 'REQUEST_FAILED', message: 'Request failed', request_id: 'req-abc' },
+      correlation_id: 'corr-xyz',
+    }), {
+      status: 500,
+      headers: { 'Content-Type': 'application/json', 'X-Request-ID': 'header-req', 'X-Correlation-ID': 'header-corr' },
+    })))
+
+    const error = await apiRequest('/api/v1/tasks').catch((caught: unknown) => caught)
+
+    expect(error).toBeInstanceOf(ApiError)
+    expect(error).toMatchObject({ requestId: 'req-abc', correlationId: 'corr-xyz' })
+  })
+
+  it('falls back to the response headers for the request and correlation ids when the body has neither', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response('not json', {
+      status: 502,
+      headers: { 'X-Request-ID': 'header-req', 'X-Correlation-ID': 'header-corr' },
+    })))
+
+    const error = await apiRequest('/api/v1/tasks').catch((caught: unknown) => caught)
+
+    expect(error).toBeInstanceOf(ApiError)
+    expect(error).toMatchObject({ requestId: 'header-req', correlationId: 'header-corr' })
+  })
+
+  it('leaves the request and correlation ids undefined for a client-synthesized offline error', async () => {
+    vi.stubGlobal('navigator', { onLine: false })
+    vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new TypeError('Failed to fetch')))
+
+    const error = await apiRequest('/api/v1/tasks').catch((caught: unknown) => caught)
+
+    expect(error).toBeInstanceOf(ApiError)
+    expect((error as ApiError).requestId).toBeUndefined()
+    expect((error as ApiError).correlationId).toBeUndefined()
+  })
 })
