@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 
+import { apiRequest } from './api/client'
 import type { WorkspaceView } from './api/types'
 import WorkspaceNavigation from './navigation/WorkspaceNavigation'
 import MorningBrief from './MorningBrief'
@@ -25,8 +26,6 @@ import EngineeringWorkspace from './features/engineering/EngineeringWorkspace'
 import PersonalWorkspace from './features/personal/PersonalWorkspace'
 import CollaborationWorkspace from './features/collaboration/CollaborationWorkspace'
 import WorkspaceSwitcher from './features/collaboration/WorkspaceSwitcher'
-
-const API_BASE = import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:8000'
 
 type DashboardItem = {
   id?: string
@@ -55,27 +54,8 @@ type DashboardResponse = {
   sections: Record<string, DashboardItem[]>
 }
 
-type ErrorEnvelope = {
-  error?: { code?: string; message?: string }
-}
-
-async function api<T>(path: string, init?: RequestInit): Promise<T> {
-  const headers = new Headers(init?.headers)
-  headers.set('Accept', 'application/json')
-  const response = await fetch(`${API_BASE}${path}`, {
-    credentials: 'include',
-    ...init,
-    headers,
-  })
-  if (!response.ok) {
-    const payload = (await response.json().catch(() => ({}))) as ErrorEnvelope
-    throw new Error(payload.error?.message ?? (response.status === 401 ? 'Authentication required' : 'Request failed'))
-  }
-  return response.json()
-}
-
 function fetchDashboard(): Promise<DashboardResponse> {
-  return api('/api/v1/dashboard/today')
+  return apiRequest('/api/v1/dashboard/today')
 }
 
 function labelFor(item: DashboardItem): string {
