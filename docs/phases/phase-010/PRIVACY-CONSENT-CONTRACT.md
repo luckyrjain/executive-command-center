@@ -274,7 +274,7 @@ On-demand human-facing thread reading, and a real (if narrower than Task
 Task 6: `GET /api/v1/personal/gmail/threads/{thread_id}` fetches and
 returns a thread's decrypted content to the authenticated owner directly
 (not gated behind the AI feature flag above -- consent-gated only, per
-`_email_consent_active`), and `POST .../forget` nulls a single thread's
+`email_consent_active`), and `POST .../forget` nulls a single thread's
 own cached `snippet`/`body`/`body_fetched_at`, recorded in `deletion_jobs`
 with `scope='thread'` (migration `0075`, widening the Phase 7 `deletion_
 jobs` table `docs/phases/phase-007/DATA-MODEL.md` documents). **Explicitly
