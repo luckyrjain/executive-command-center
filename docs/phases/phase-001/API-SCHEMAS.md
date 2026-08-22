@@ -29,7 +29,7 @@ Every successful lifecycle action returns `200` with the current entity represen
 - `POST /tasks/{id}/archive`: expected_version.
 - `POST /tasks/{id}/restore`: expected_version; restores pre_archive_status.
 
-Initial status cannot be completed or cancelled. Idempotent completion/cancel/archive/restore returns the current representation when already in the requested state.
+Initial status cannot be completed or cancelled. Idempotent completion/cancel/archive returns the current representation when already in the requested state; restoring a task that is not currently archived is a strict `409 TASK_NOT_ARCHIVED`, matching every other archive/restore resource in this codebase (meetings, calendar events, notes, knowledge entities, risks) -- not an idempotent no-op.
 
 ## Commitment endpoints
 
