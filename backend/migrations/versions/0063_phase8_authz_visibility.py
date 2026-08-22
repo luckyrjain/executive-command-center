@@ -374,7 +374,7 @@ def _drop_visibility(table: str) -> None:
 
 def _drop_owner_and_visibility(table: str) -> None:
     _drop_visibility(table)
-    op.execute(f"DROP TRIGGER trg_{table}_default_owner ON {table}")
+    op.execute(f"DROP TRIGGER IF EXISTS trg_{table}_default_owner ON {table}")
     op.drop_index(f"ix_{table}_workspace_owner", table_name=table)
     op.drop_constraint(f"fk_{table}_workspace_owner", table, type_="foreignkey")
     op.drop_column(table, "owner_id")
@@ -542,11 +542,11 @@ def downgrade() -> None:
     for table in reversed(_NEW_OWNER_FROM_USER_ID):
         _drop_owner_and_visibility(table)
 
-    op.execute(f"DROP FUNCTION {_TRIGGER_FN_FROM_PLAN_USER_ID}()")
-    op.execute(f"DROP FUNCTION {_TRIGGER_FN_FROM_ACTOR_ID}()")
-    op.execute(f"DROP FUNCTION {_TRIGGER_FN_FROM_CREATED_BY}()")
-    op.execute(f"DROP FUNCTION {_TRIGGER_FN_FROM_WORKSPACE_ORIGINAL_USER}()")
-    op.execute(f"DROP FUNCTION {_TRIGGER_FN_FROM_USER_ID}()")
+    op.execute(f"DROP FUNCTION IF EXISTS {_TRIGGER_FN_FROM_PLAN_USER_ID}()")
+    op.execute(f"DROP FUNCTION IF EXISTS {_TRIGGER_FN_FROM_ACTOR_ID}()")
+    op.execute(f"DROP FUNCTION IF EXISTS {_TRIGGER_FN_FROM_CREATED_BY}()")
+    op.execute(f"DROP FUNCTION IF EXISTS {_TRIGGER_FN_FROM_WORKSPACE_ORIGINAL_USER}()")
+    op.execute(f"DROP FUNCTION IF EXISTS {_TRIGGER_FN_FROM_USER_ID}()")
 
     for table in reversed(_EXISTING_OWNER_PRIVATE_HARDCODED):
         _drop_visibility(table)
