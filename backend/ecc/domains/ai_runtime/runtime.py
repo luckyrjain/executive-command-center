@@ -323,7 +323,7 @@ class _MeetingDependencyOut(BaseModel):
 
 class _MeetingGetPrepPackOutput(BaseModel):
     """`meeting.get_prep_pack`'s output -- the same evidence bundle
-    `meeting_prep.py:_generate_pack` composes, minus `evidence_gaps`/
+    `meeting_prep.py:generate_pack` composes, minus `evidence_gaps`/
     `open_questions` (`meeting_prep_tools.py`'s own docstring explains
     why: an absence isn't summarizable content, and the latter is always
     empty in this activation).

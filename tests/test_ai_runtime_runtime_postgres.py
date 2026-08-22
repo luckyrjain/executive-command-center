@@ -283,7 +283,7 @@ def _insert_attention_item(
 def _insert_meeting_with_participant(workspace_id: UUID, user_id: UUID) -> tuple[UUID, UUID]:
     """`meeting.prep_summary`'s own required input: a meeting with at
     least one participant (a `pkos_nodes` row linked via `meeting_
-    participants`), the minimum `meeting_prep.py:_generate_pack` needs to
+    participants`), the minimum `meeting_prep.py:generate_pack` needs to
     produce a non-empty pack. Returns `(meeting_id, participant_id)` --
     the latter is `meeting_participants.id` (the junction row's own id,
     matching `ParticipantRow.id`/`meeting_prep_tools.py:get_prep_pack_
