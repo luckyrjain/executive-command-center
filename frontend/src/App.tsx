@@ -3,6 +3,7 @@ import { useQuery } from '@tanstack/react-query'
 
 import { apiRequest } from './api/client'
 import type { WorkspaceView } from './api/types'
+import { formatTime } from './lib/datetime'
 import WorkspaceNavigation from './navigation/WorkspaceNavigation'
 import MorningBrief from './MorningBrief'
 import RecommendationPanel from './RecommendationPanel'
@@ -60,13 +61,6 @@ function fetchDashboard(): Promise<DashboardResponse> {
 
 function labelFor(item: DashboardItem): string {
   return item.title ?? item.summary ?? item.why ?? item.explanation ?? item.message ?? item.entity_ref ?? 'Untitled item'
-}
-
-function formatTime(value?: string): string | null {
-  if (!value) return null
-  const parsed = new Date(value)
-  if (Number.isNaN(parsed.getTime())) return null
-  return new Intl.DateTimeFormat(undefined, { hour: 'numeric', minute: '2-digit' }).format(parsed)
 }
 
 function visibleItems(items?: DashboardItem[]): DashboardItem[] {

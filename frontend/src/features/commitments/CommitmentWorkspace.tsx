@@ -2,6 +2,7 @@ import { useState, type FormEvent } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
 import { ApiError, apiRequest } from '../../api/client'
+import { serverInstantToLocalInput } from '../../lib/datetime'
 
 type Commitment = {
   id: string; summary: string; description?: string | null; direction: 'made_by_me' | 'made_to_me'
@@ -23,13 +24,6 @@ function duePayload(draft: Draft): Record<string, string | null> {
     return { due_date: null, due_at: dueAt }
   }
   return { due_date: null, due_at: null }
-}
-
-function pad(value: number): string { return String(value).padStart(2, '0') }
-function serverInstantToLocalInput(value: string): string {
-  const instant = new Date(value)
-  if (Number.isNaN(instant.getTime())) return ''
-  return `${instant.getFullYear()}-${pad(instant.getMonth() + 1)}-${pad(instant.getDate())}T${pad(instant.getHours())}:${pad(instant.getMinutes())}`
 }
 
 function fromCommitment(value: Commitment): Draft {

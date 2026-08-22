@@ -2,6 +2,7 @@ import { useState, type FormEvent } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
 import { ApiError, apiRequest } from '../../api/client'
+import { serverInstantToLocalInput } from '../../lib/datetime'
 
 type Task = {
   id: string
@@ -38,13 +39,6 @@ function duePayload(draft: TaskDraft): Record<string, string | null> {
   return { due_date: null, due_at: null }
 }
 
-function pad(value: number): string { return String(value).padStart(2, '0') }
-
-export function serverInstantToLocalInput(value: string): string {
-  const instant = new Date(value)
-  if (Number.isNaN(instant.getTime())) return ''
-  return `${instant.getFullYear()}-${pad(instant.getMonth() + 1)}-${pad(instant.getDate())}T${pad(instant.getHours())}:${pad(instant.getMinutes())}`
-}
 
 function taskDraft(task: Task): TaskDraft {
   return {
