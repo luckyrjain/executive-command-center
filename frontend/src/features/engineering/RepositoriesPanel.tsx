@@ -4,7 +4,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
 import { ApiError, apiRequest } from '../../api/client'
 import type { EntityList } from '../knowledge/types'
-import type { Repository, RepositoryListResponse, TeamAssignmentRequest } from './types'
+import { safeHref, type Repository, type RepositoryListResponse, type TeamAssignmentRequest } from './types'
 
 function badgeClass(state: Repository['permission_state'] | Repository['freshness_state']): string {
   if (state === 'permission_lost' || state === 'deleted' || state === 'disconnected') return 'inline-status error-panel'
@@ -118,7 +118,7 @@ function RepositoryRow({ repository, teamsById }: { repository: Repository; team
         </span>
       </div>
       <TeamAssignment repository={repository} teamsById={teamsById} />
-      <a href={repository.source_url} target="_blank" rel="noreferrer">View on {repository.provider}</a>
+      {safeHref(repository.source_url) ? <a href={safeHref(repository.source_url)} target="_blank" rel="noreferrer">View on {repository.provider}</a> : null}
     </li>
   )
 }

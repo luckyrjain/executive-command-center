@@ -229,6 +229,14 @@ describe('RepositoriesPanel', () => {
     expect(calls.some(([url]) => String(url).includes('team_entity_id=team-1'))).toBe(true)
   })
 
+  it('does not render a link for a repository whose source_url has a dangerous scheme', async () => {
+    stubFetch({ repositories: [repository({ source_url: 'javascript:alert(1)' })] })
+    renderPanel()
+
+    await screen.findByText('acme/widgets')
+    expect(screen.queryByRole('link', { name: 'View on github' })).toBeNull()
+  })
+
   it('shows a team-specific empty state when the filtered team has no repositories', async () => {
     stubFetch({
       repositories: [repository({ team_entity_id: null })],

@@ -196,6 +196,17 @@ export type WorkItemListResponse = { work_items: WorkItem[] }
 
 // --- Team assignment (`POST /engineering/repositories|work-items/{id}/team`) --
 
+// Every adapter that writes `source_url` (github_adapter.py, gitlab_adapter.py)
+// already restricts it to the provider's own https origin before persisting,
+// and Jira/Datadog build it server-side from a fixed https f-string -- but
+// `source_url` is a plain `str` on the wire, not a validated URL type, so
+// this is defense-in-depth against a future write path regressing that
+// discipline, not a fix for a currently-reachable value.
+export function safeHref(sourceUrl: string): string | undefined {
+  const scheme = sourceUrl.toLowerCase()
+  return scheme.startsWith('http://') || scheme.startsWith('https://') ? sourceUrl : undefined
+}
+
 export type TeamAssignmentRequest = { expected_version: number; team_entity_id: string | null }
 
 // --- Team suggestions review (`GET|POST /engineering/team-suggestions*`) --
