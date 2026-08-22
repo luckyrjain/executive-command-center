@@ -3,6 +3,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
 import { ApiError, apiRequest } from '../../api/client'
 import { serverInstantToLocalInput } from '../../lib/datetime'
+import { apiErrorMessage } from '../../api/errorMessage'
 
 export type PlanBlock = {
   id: string
@@ -44,10 +45,11 @@ function usedMinutes(blocks: PlanBlock[]): number {
 }
 
 function errorMessage(error: Error): string {
-  if (error instanceof ApiError && error.code === 'VERSION_CONFLICT') return 'This plan changed since it was loaded. Refresh and try again.'
-  if (error instanceof ApiError && error.code === 'STALE_PLAN') return 'The plan’s sources have changed. Replan before accepting.'
-  if (error instanceof ApiError && error.code === 'CAPACITY_EXCEEDED') return 'This period has no remaining capacity for more work.'
-  return error.message
+  return apiErrorMessage(error, {
+    VERSION_CONFLICT: 'This plan changed since it was loaded. Refresh and try again.',
+    STALE_PLAN: 'The plan’s sources have changed. Replan before accepting.',
+    CAPACITY_EXCEEDED: 'This period has no remaining capacity for more work.',
+  })
 }
 
 function todayIso(offsetDays = 1): string {

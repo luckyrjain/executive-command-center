@@ -1,7 +1,8 @@
 import { useState, type FormEvent } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
-import { ApiError, apiRequest } from '../../api/client'
+import { apiRequest } from '../../api/client'
+import { apiErrorMessage } from '../../api/errorMessage'
 
 export type ReviewOutcome = 'no_change' | 'escalated' | 'mitigated' | 'closed'
 export type ReviewUrgency = 'overdue' | 'due_soon' | 'scheduled' | 'unscheduled'
@@ -37,10 +38,7 @@ const URGENCY_LABEL: Record<ReviewUrgency, string> = {
 }
 
 function errorMessage(error: Error): string {
-  if (error instanceof ApiError && error.code === 'VERSION_CONFLICT') {
-    return 'This risk changed since the queue loaded. Refresh and try again.'
-  }
-  return error.message
+  return apiErrorMessage(error, { VERSION_CONFLICT: 'This risk changed since the queue loaded. Refresh and try again.' })
 }
 
 export default function RiskReviewQueue() {

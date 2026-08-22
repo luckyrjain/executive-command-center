@@ -2,24 +2,21 @@ import { useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
 import { ApiError, apiRequest } from '../../api/client'
+import { apiErrorMessage } from '../../api/errorMessage'
 import type { Decision, DecisionListResponse } from './types'
 
 function errorMessage(error: unknown): string {
-  if (!(error instanceof ApiError)) return error instanceof Error ? error.message : 'Request failed.'
-  if (error.code === 'OFFLINE') return 'You are offline, so this request was not sent.'
-  if (error.code === 'NETWORK_ERROR') return 'Could not reach the server. Nothing was sent.'
-  if (error.code === 'IDEMPOTENCY_CONFLICT') return 'A different request was already recorded under this request key. Reload and retry.'
-  if (error.code === 'CSRF_TOKEN_REQUIRED' || error.code === 'CSRF_TOKEN_INVALID') return 'Your session\'s security token is missing or stale. Reload the page and try again.'
-  if (error.code === 'CHANGE_NOT_FOUND') {
+  if (error instanceof ApiError && error.code === 'CHANGE_NOT_FOUND') {
     const detail = error.current as { change_ids?: string[] } | undefined
     return `One or more change IDs do not exist in this workspace: ${detail?.change_ids?.join(', ') ?? 'unknown'}.`
   }
-  if (error.code === 'DECISION_NOT_FOUND') return 'This decision no longer exists in this workspace.'
-  if (error.code === 'DECISION_NOT_PROPOSED') return 'This decision has already been decided -- reload to see its current state.'
-  if (error.code === 'DECIDED_AT_BEFORE_CREATED_AT') return 'The decided time cannot be before the decision was created.'
-  if (error.status === 401) return 'Your session is no longer valid. Sign in again.'
-  if (error.status === 403) return 'You are not permitted to manage decisions in this workspace.'
-  return error.message
+  return apiErrorMessage(error, {
+    DECISION_NOT_FOUND: 'This decision no longer exists in this workspace.',
+    DECISION_NOT_PROPOSED: 'This decision has already been decided -- reload to see its current state.',
+    DECIDED_AT_BEFORE_CREATED_AT: 'The decided time cannot be before the decision was created.',
+    '401': 'Your session is no longer valid. Sign in again.',
+    '403': 'You are not permitted to manage decisions in this workspace.',
+  })
 }
 
 function timestamp(value: string | null): string {

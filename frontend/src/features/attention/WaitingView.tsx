@@ -2,6 +2,7 @@ import { useState, type FormEvent } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
 import { ApiError, apiRequest } from '../../api/client'
+import { apiErrorMessage } from '../../api/errorMessage'
 
 export type WaitingDirection = 'waiting_on_me' | 'waiting_on_them' | 'blocked_by' | 'delegated'
 export type WaitingSubjectType = 'task' | 'commitment' | 'knowledge_entity'
@@ -49,13 +50,10 @@ export function validateDraft(draft: Draft): string | null {
 }
 
 function errorMessage(error: Error): string {
-  if (error instanceof ApiError && error.code === 'INVALID_WAITING_DIRECTION') {
-    return 'That direction would create a dependency cycle and was rejected.'
-  }
-  if (error instanceof ApiError && error.code === 'VERSION_CONFLICT') {
-    return 'This waiting item changed since it was loaded. Refresh and try again.'
-  }
-  return error.message
+  return apiErrorMessage(error, {
+    INVALID_WAITING_DIRECTION: 'That direction would create a dependency cycle and was rejected.',
+    VERSION_CONFLICT: 'This waiting item changed since it was loaded. Refresh and try again.',
+  })
 }
 
 export default function WaitingView() {

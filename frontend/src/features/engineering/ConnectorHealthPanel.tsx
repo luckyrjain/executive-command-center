@@ -2,6 +2,7 @@ import { useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
 import { ApiError, apiRequest } from '../../api/client'
+import { apiErrorMessage } from '../../api/errorMessage'
 import type {
   ConnectorAccount,
   ConnectorAccountListResponse,
@@ -96,14 +97,7 @@ const RUN_TYPES: ReadonlyArray<Extract<SyncRunType, 'backfill' | 'incremental'>>
 const STALE_AFTER_MS = 24 * 60 * 60 * 1000
 
 function errorMessage(error: unknown): string {
-  if (!(error instanceof ApiError)) return error instanceof Error ? error.message : 'Request failed.'
-  if (error.code === 'OFFLINE') return 'You are offline, so this request was not sent.'
-  if (error.code === 'NETWORK_ERROR') return 'Could not reach the server. Nothing was sent.'
-  if (error.code === 'IDEMPOTENCY_CONFLICT') return 'A different request was already recorded under this request key. Reload and retry.'
-  if (error.code === 'CSRF_TOKEN_REQUIRED' || error.code === 'CSRF_TOKEN_INVALID') return 'Your session\'s security token is missing or stale. Reload the page and try again.'
-  if (error.code === 'CONNECTOR_PROVIDER_NOT_SUPPORTED') return 'This provider has no registered connector adapter.'
-  if (error.code === 'CONNECTOR_ALREADY_CONNECTED') return 'This workspace already has a connector for this account.'
-  if (error.code === 'CONNECTOR_AUTHORIZATION_FAILED') {
+  if (error instanceof ApiError && error.code === 'CONNECTOR_AUTHORIZATION_FAILED') {
     // The backend's own detail dict is `{"code": ..., "error": &lt;sanitized
     // message&gt;}` (`create_connector_endpoint`'s `AdapterAuthorizationError`
     // handler) -- `main.py`'s `_error_payload` strips only `code`/`message`
@@ -112,12 +106,15 @@ function errorMessage(error: unknown): string {
     const detail = error.current as { error?: string } | undefined
     return `The provider rejected this credential${detail?.error ? `: ${detail.error}` : '.'}`
   }
-  if (error.code === 'CONNECTOR_NOT_FOUND') return 'This connector no longer exists in this workspace.'
-  if (error.code === 'CONNECTOR_DISCONNECTED') return 'This connector is already disconnected.'
-  if (error.code === 'CONNECTOR_SYNC_IN_PROGRESS') return 'A sync is already running for this connector -- wait for it to finish before starting another.'
-  if (error.status === 401) return 'Your session is no longer valid. Sign in again.'
-  if (error.status === 403) return 'You are not permitted to manage connectors in this workspace.'
-  return error.message
+  return apiErrorMessage(error, {
+    CONNECTOR_PROVIDER_NOT_SUPPORTED: 'This provider has no registered connector adapter.',
+    CONNECTOR_ALREADY_CONNECTED: 'This workspace already has a connector for this account.',
+    CONNECTOR_NOT_FOUND: 'This connector no longer exists in this workspace.',
+    CONNECTOR_DISCONNECTED: 'This connector is already disconnected.',
+    CONNECTOR_SYNC_IN_PROGRESS: 'A sync is already running for this connector -- wait for it to finish before starting another.',
+    '401': 'Your session is no longer valid. Sign in again.',
+    '403': 'You are not permitted to manage connectors in this workspace.',
+  })
 }
 
 function timestamp(value: string | null): string {

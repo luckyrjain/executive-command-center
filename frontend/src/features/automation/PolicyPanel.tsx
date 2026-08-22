@@ -2,6 +2,7 @@ import { useState, type FormEvent } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
 import { ApiError, apiRequest } from '../../api/client'
+import { apiErrorMessage } from '../../api/errorMessage'
 import type { ApprovalMode, Policy, PolicyListResponse } from './types'
 
 const APPROVAL_MODES: ApprovalMode[] = ['preview_only', 'per_run', 'bounded_recurring']
@@ -19,16 +20,21 @@ type Draft = {
 const emptyDraft: Draft = { workflowId: '', actionTypes: '', dataClasses: '', valueLimit: '0', countLimit: '10', approvalMode: 'per_run', schedule: '' }
 
 function errorMessage(error: unknown): string {
-  if (!(error instanceof ApiError)) return error instanceof Error ? error.message : 'Request failed.'
-  const details = error.current as { revoked_at?: string; expires_at?: string } | undefined
-  if (error.code === 'WORKFLOW_NOT_FOUND') return 'That workflow ID does not exist in this workspace yet -- draft the workflow first.'
-  if (error.code === 'POLICY_REVOKED') return `This policy was already revoked${details?.revoked_at ? ` at ${new Date(details.revoked_at).toLocaleString()}` : ''}.`
-  if (error.code === 'POLICY_EXPIRED') return `This policy already expired${details?.expires_at ? ` at ${new Date(details.expires_at).toLocaleString()}` : ''} and cannot be revoked further.`
-  if (error.code === 'POLICY_NOT_FOUND') return 'That policy no longer exists in this workspace.'
-  if (error.code === 'OFFLINE') return 'You are offline, so policies could not be read or changed.'
-  if (error.code === 'NETWORK_ERROR') return 'Could not reach the server, so policies could not be read or changed.'
-  if (error.status === 401) return 'Your session is no longer valid. Sign in again to review policies.'
-  return error.message
+  if (error instanceof ApiError && error.code === 'POLICY_REVOKED') {
+    const details = error.current as { revoked_at?: string } | undefined
+    return `This policy was already revoked${details?.revoked_at ? ` at ${new Date(details.revoked_at).toLocaleString()}` : ''}.`
+  }
+  if (error instanceof ApiError && error.code === 'POLICY_EXPIRED') {
+    const details = error.current as { expires_at?: string } | undefined
+    return `This policy already expired${details?.expires_at ? ` at ${new Date(details.expires_at).toLocaleString()}` : ''} and cannot be revoked further.`
+  }
+  return apiErrorMessage(error, {
+    WORKFLOW_NOT_FOUND: 'That workflow ID does not exist in this workspace yet -- draft the workflow first.',
+    POLICY_NOT_FOUND: 'That policy no longer exists in this workspace.',
+    OFFLINE: 'You are offline, so policies could not be read or changed.',
+    NETWORK_ERROR: 'Could not reach the server, so policies could not be read or changed.',
+    '401': 'Your session is no longer valid. Sign in again to review policies.',
+  })
 }
 
 /**
