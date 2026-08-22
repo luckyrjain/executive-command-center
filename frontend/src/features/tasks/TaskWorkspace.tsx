@@ -143,6 +143,7 @@ export default function TaskWorkspace() {
 
       {query.isLoading ? <p role="status">Loading tasks…</p> : null}
       {query.isError ? <div role="alert">{query.error.message}</div> : null}
+      {query.data && query.data.items.length === 0 ? <p className="empty-state">No tasks yet. Create one above to get started.</p> : null}
       <ol className="work-list">
         {(query.data?.items ?? []).map((task) => {
           const archived = Boolean(task.archived_at)

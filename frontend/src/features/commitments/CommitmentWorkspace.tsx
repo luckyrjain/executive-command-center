@@ -93,6 +93,7 @@ export default function CommitmentWorkspace() {
     </form>
     {query.isLoading ? <p role="status">Loading commitments…</p> : null}
     {query.isError ? <div role="alert">{query.error.message}</div> : null}
+    {query.data && query.data.items.length === 0 ? <p className="empty-state">No commitments yet. Create one above to get started.</p> : null}
     <ol className="work-list">{(query.data?.items ?? []).map((value) => {
       const archived = Boolean(value.archived_at); const terminal = ['fulfilled', 'broken', 'cancelled'].includes(value.status)
       return <li key={value.id}><div><strong>{value.summary}</strong><small>{value.direction.replaceAll('_', ' ')} · {value.counterparty_name ?? 'No counterparty'} · {value.status}</small></div><div className="work-actions" role="group" aria-label={`Actions for ${value.summary}`}>

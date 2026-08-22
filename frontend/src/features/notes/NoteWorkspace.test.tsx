@@ -390,4 +390,23 @@ describe('NoteWorkspace', () => {
     expect(fetch).toHaveBeenCalledTimes(4)
     expect(fetch.mock.calls.slice(4).some(([url]) => String(url).includes('/notes/note-2'))).toBe(false)
   })
+
+  it('shows an empty state when there are no notes', async () => {
+    vi.stubGlobal('fetch', vi.fn(() => response({ items: [], next_cursor: null })))
+    renderWorkspace()
+
+    expect(await screen.findByText('No notes yet. Create one above to get started.')).toBeTruthy()
+    expect(screen.queryByRole('listitem')).toBeNull()
+  })
+
+  it('shows a distinct empty state when a search matches nothing', async () => {
+    vi.stubGlobal('fetch', vi.fn(() => response({ items: [note], next_cursor: null })))
+    renderWorkspace()
+
+    await screen.findByText('Board preparation')
+    fireEvent.change(screen.getByLabelText('Search notes'), { target: { value: 'no such note' } })
+
+    expect(await screen.findByText('No notes match your search.')).toBeTruthy()
+    expect(screen.queryByText('Board preparation')).toBeNull()
+  })
 })

@@ -206,4 +206,12 @@ describe('RiskWorkspace', () => {
     resolveArchive(new Response(JSON.stringify({ ...risk, archived_at: '2026-07-16T00:00:00Z', version: 3 }), { status: 200, headers: { 'Content-Type': 'application/json' } }))
     await waitFor(() => expect(fetch).toHaveBeenCalledTimes(3))
   })
+
+  it('shows an empty state when there are no risks', async () => {
+    vi.stubGlobal('fetch', vi.fn(() => response({ items: [], next_cursor: null })))
+    renderWorkspace()
+
+    expect(await screen.findByText('No risks yet. Create one above to get started.')).toBeTruthy()
+    expect(screen.queryByRole('listitem')).toBeNull()
+  })
 })
