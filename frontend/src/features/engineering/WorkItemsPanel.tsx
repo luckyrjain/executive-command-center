@@ -4,7 +4,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
 import { ApiError, apiRequest } from '../../api/client'
 import type { EntityList } from '../knowledge/types'
-import type { TeamAssignmentRequest, WorkItem, WorkItemListResponse } from './types'
+import { safeHref, type TeamAssignmentRequest, type WorkItem, type WorkItemListResponse } from './types'
 
 function badgeClass(state: WorkItem['permission_state'] | WorkItem['freshness_state']): string {
   if (state === 'permission_lost' || state === 'deleted' || state === 'disconnected') return 'inline-status error-panel'
@@ -116,7 +116,7 @@ function WorkItemRow({ workItem, teamsById }: { workItem: WorkItem; teamsById: M
         {workItem.status ? <span className="inline-status">{workItem.status}</span> : null}
       </div>
       <TeamAssignment workItem={workItem} teamsById={teamsById} />
-      <a href={workItem.source_url} target="_blank" rel="noreferrer">View on {workItem.provider}</a>
+      {safeHref(workItem.source_url) ? <a href={safeHref(workItem.source_url)} target="_blank" rel="noreferrer">View on {workItem.provider}</a> : null}
     </li>
   )
 }

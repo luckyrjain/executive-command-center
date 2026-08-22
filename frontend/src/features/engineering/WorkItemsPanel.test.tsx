@@ -229,6 +229,14 @@ describe('WorkItemsPanel', () => {
     expect(calls.some(([url]) => String(url).includes('team_entity_id=team-1'))).toBe(true)
   })
 
+  it('does not render a link for a work item whose source_url has a dangerous scheme', async () => {
+    stubFetch({ workItems: [workItem({ source_url: 'javascript:alert(1)' })] })
+    renderPanel()
+
+    await screen.findByText('Fix the widget')
+    expect(screen.queryByRole('link', { name: 'View on jira' })).toBeNull()
+  })
+
   it('shows a team-specific empty state when the filtered team has no work items', async () => {
     stubFetch({
       workItems: [workItem({ team_entity_id: null })],
