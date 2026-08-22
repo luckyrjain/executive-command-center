@@ -66,6 +66,11 @@ export async function run({ page, baseURL }) {
   await searchPanel.getByText('calendar event').waitFor()
   assert.equal(await searchPanel.getByRole('heading', { name: 'Leadership sync' }).count(), 0)
 
+  // The line 50 scan above only covers the pre-query empty state -- rerun it
+  // now that a real result list, score badges and matched-fields text are
+  // on the page, since none of that markup existed for the first scan.
+  await assertNoSeriousAccessibilityViolations(page, { include: '#search-panel' })
+
   // A query flagged degraded surfaces an accessible status banner.
   await searchPanel.getByLabel(/Search tasks, commitments/).fill('legacy')
   await searchPanel.getByRole('button', { name: 'Search', exact: true }).click()

@@ -94,6 +94,13 @@ export async function run({ page, baseURL }) {
   const conflictAlert = risksSection.getByRole('alert')
   await conflictAlert.waitFor()
   assert.match(await conflictAlert.innerText(), /changed while you were editing it/)
+
+  // The line 80 scan above only covers the default list view -- rerun it
+  // now that the dynamic edit form (select/textarea inputs) and the
+  // conflict alert are both on the page at once, neither of which existed
+  // for that first scan.
+  await assertNoSeriousAccessibilityViolations(page, { include: 'section[aria-labelledby="risks-title"]' })
+
   await risksSection.getByRole('button', { name: 'Retry with latest version' }).focus()
   await page.keyboard.press('Enter')
   await risksSection.getByText('Vendor concentration (reviewed)').waitFor()
@@ -141,4 +148,10 @@ export async function run({ page, baseURL }) {
   assert.equal(await page.evaluate(() => document.activeElement?.textContent), 'Load older events')
   await page.keyboard.press('Enter')
   await auditPanel.getByText('Changed: mitigation').waitFor()
+
+  // #audit-panel has no scan anywhere else in the suite -- search-calendar.mjs
+  // only scans #search-panel, and this file's own earlier scans never
+  // touch this nested tab. Covers the filter input, the paginated event
+  // list and the "Load older events" button all in one pass.
+  await assertNoSeriousAccessibilityViolations(page, { include: '#audit-panel' })
 }
