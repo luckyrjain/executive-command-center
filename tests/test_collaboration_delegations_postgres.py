@@ -786,3 +786,100 @@ def test_idempotency_key_replay_returns_identical_response(
             text("SELECT count(*) FROM delegations WHERE id = :id"), {"id": UUID(first["id"])}
         ).scalar_one()
     assert count == 1
+
+
+def test_obligation_not_found_when_resource_does_not_exist(
+    delegation_context: _DelegationContext,
+) -> None:
+    """The propose endpoint's own two-tier authz gate on the obligation
+    resource -- a `read` check (404 OBLIGATION_NOT_FOUND) before a
+    `write` check (403 INSUFFICIENT_ROLE, covered by
+    test_viewer_cannot_propose_lacking_write_access above). Only the
+    write tier had coverage; the read tier -- which fires for a resource
+    that doesn't exist at all, not just one the caller lacks write
+    access to -- did not."""
+    ctx = delegation_context
+    response = ctx.delegator.client.post(
+        "/api/v1/delegations",
+        json={
+            "recipient_account_id": str(ctx.recipient.account_id),
+            "obligation_type": "incidents",
+            "obligation_resource_id": str(uuid4()),
+            "expected_outcome": "Resolve it",
+            "due_at": (datetime.now(UTC) + timedelta(days=1)).isoformat(),
+            "evidence": [],
+        },
+        headers=_headers(ctx.delegator.token, key=str(uuid4())),
+    )
+    assert response.status_code == 404, response.text
+    assert response.json()["error"]["code"] == "OBLIGATION_NOT_FOUND"
+
+
+def test_revoke_rejects_a_delegation_that_is_no_longer_accepted(
+    delegation_context: _DelegationContext,
+) -> None:
+    """DELEGATION_NOT_ACCEPTED (409) guards revoke/complete against any
+    status other than 'accepted' -- covers a second revoke of an
+    already-revoked delegation, the state-machine twin of
+    test_lazy_expiry_transitions_overdue_proposal_and_blocks_accept's
+    DELEGATION_NOT_PROPOSED coverage for accept."""
+    ctx = delegation_context
+    incident = _create_incident(ctx.delegator.client, ctx.delegator.token)
+    delegation = _propose(
+        ctx.delegator.client,
+        ctx.delegator.token,
+        recipient_account_id=ctx.recipient.account_id,
+        obligation_resource_id=incident["id"],
+    )
+    accept = ctx.recipient.client.post(
+        f"/api/v1/delegations/{delegation['id']}/accept",
+        headers=_headers(ctx.recipient.token, key=str(uuid4())),
+    )
+    assert accept.status_code == 200, accept.text
+
+    first_revoke = ctx.delegator.client.post(
+        f"/api/v1/delegations/{delegation['id']}/revoke",
+        headers=_headers(ctx.delegator.token, key=str(uuid4())),
+    )
+    assert first_revoke.status_code == 200, first_revoke.text
+
+    second_revoke = ctx.delegator.client.post(
+        f"/api/v1/delegations/{delegation['id']}/revoke",
+        headers=_headers(ctx.delegator.token, key=str(uuid4())),
+    )
+    assert second_revoke.status_code == 409, second_revoke.text
+    assert second_revoke.json()["error"]["code"] == "DELEGATION_NOT_ACCEPTED"
+
+
+def test_complete_rejects_a_delegation_that_is_no_longer_accepted(
+    delegation_context: _DelegationContext,
+) -> None:
+    """Same DELEGATION_NOT_ACCEPTED guard as the revoke test above, on
+    complete's own status check instead -- covers completing a delegation
+    that was already revoked."""
+    ctx = delegation_context
+    incident = _create_incident(ctx.delegator.client, ctx.delegator.token)
+    delegation = _propose(
+        ctx.delegator.client,
+        ctx.delegator.token,
+        recipient_account_id=ctx.recipient.account_id,
+        obligation_resource_id=incident["id"],
+    )
+    accept = ctx.recipient.client.post(
+        f"/api/v1/delegations/{delegation['id']}/accept",
+        headers=_headers(ctx.recipient.token, key=str(uuid4())),
+    )
+    assert accept.status_code == 200, accept.text
+
+    revoke = ctx.delegator.client.post(
+        f"/api/v1/delegations/{delegation['id']}/revoke",
+        headers=_headers(ctx.delegator.token, key=str(uuid4())),
+    )
+    assert revoke.status_code == 200, revoke.text
+
+    complete = ctx.recipient.client.post(
+        f"/api/v1/delegations/{delegation['id']}/complete",
+        headers=_headers(ctx.recipient.token, key=str(uuid4())),
+    )
+    assert complete.status_code == 409, complete.text
+    assert complete.json()["error"]["code"] == "DELEGATION_NOT_ACCEPTED"

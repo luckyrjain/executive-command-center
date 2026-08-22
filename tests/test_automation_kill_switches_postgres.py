@@ -922,3 +922,83 @@ def test_kill_switch_replay_never_appends_a_duplicate_history_row(
     assert len(history) == 2
     assert sum(1 for row in history if row.active) == 1
     assert {row.reason for row in history} == {"first incident", "second incident"}
+
+
+def test_activating_an_already_active_kill_switch_is_a_no_op(
+    kill_switch_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    """`activate_kill_switch`'s own already-active no-op (`if existing is
+    not None: return existing`), not the idempotency-key cache, is what's
+    under test here -- the neighboring replay test above explicitly notes
+    it only proves the same-key cached-response path is safe. This uses a
+    genuinely different key with the switch already active, which is what
+    actually reaches that no-op branch."""
+    client, workspace_id, user_id, token = kill_switch_test_context
+    workflow_id = f"test.already-active.{uuid4().hex}"
+    _publish_workflow(workspace_id, user_id, workflow_id)
+
+    first = client.post(
+        f"/api/v1/automations/workflows/{workflow_id}/kill_switch",
+        json={"active": True, "reason": "first incident"},
+        headers=_headers(token, key="already-active-1"),
+    )
+    assert first.status_code == 200, first.text
+
+    second = client.post(
+        f"/api/v1/automations/workflows/{workflow_id}/kill_switch",
+        json={"active": True, "reason": "second attempt, different key"},
+        headers=_headers(token, key="already-active-2"),
+    )
+    assert second.status_code == 200, second.text
+    # The existing row is returned unchanged -- same reason/activated_at as
+    # the first activation, not a fresh row with the second call's reason.
+    assert second.json()["reason"] == "first incident"
+    assert second.json()["activated_at"] == first.json()["activated_at"]
+
+    with SessionFactory() as session:
+        history = automation_kill_switches.list_kill_switches(session, workspace_id)
+    # One activation window, not two -- the no-op must not insert a
+    # duplicate row or write a duplicate audit/outbox event.
+    assert len(history) == 1
+
+
+def test_deactivating_an_already_inactive_kill_switch_is_a_no_op(
+    kill_switch_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    """`deactivate_kill_switch`'s own no-active-row no-op (`if existing is
+    None: return False`) -- reached here by deactivating twice under
+    different keys, the second call finding nothing active to touch."""
+    client, workspace_id, user_id, token = kill_switch_test_context
+    workflow_id = f"test.already-inactive.{uuid4().hex}"
+    _publish_workflow(workspace_id, user_id, workflow_id)
+
+    client.post(
+        f"/api/v1/automations/workflows/{workflow_id}/kill_switch",
+        json={"active": True, "reason": "incident"},
+        headers=_headers(token, key="already-inactive-activate"),
+    )
+    first_deactivate = client.post(
+        f"/api/v1/automations/workflows/{workflow_id}/kill_switch",
+        json={"active": False},
+        headers=_headers(token, key="already-inactive-1"),
+    )
+    assert first_deactivate.status_code == 200, first_deactivate.text
+    assert first_deactivate.json()["active"] is False
+
+    second_deactivate = client.post(
+        f"/api/v1/automations/workflows/{workflow_id}/kill_switch",
+        json={"active": False},
+        headers=_headers(token, key="already-inactive-2"),
+    )
+    assert second_deactivate.status_code == 200, second_deactivate.text
+    assert second_deactivate.json()["active"] is False
+    # Same row, not re-touched -- deactivated_at must not have moved to a
+    # later timestamp from the second call.
+    assert second_deactivate.json()["deactivated_at"] == first_deactivate.json()["deactivated_at"]
+
+    with SessionFactory() as session:
+        history = automation_kill_switches.list_kill_switches(session, workspace_id)
+    # One activation window (now deactivated) -- the second deactivate call
+    # must not touch the row again or write a second deactivation event.
+    assert len(history) == 1
+    assert sum(1 for row in history if row.active) == 0
