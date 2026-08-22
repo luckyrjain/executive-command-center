@@ -7,7 +7,7 @@ type Task = {
   id: string
   title: string
   description?: string | null
-  status: 'captured' | 'planned' | 'in_progress' | 'blocked' | 'completed' | 'cancelled' | string
+  status: 'captured' | 'planned' | 'in_progress' | 'blocked' | 'completed' | 'cancelled'
   manual_priority: 'low' | 'medium' | 'high' | 'critical'
   due_date?: string | null
   due_at?: string | null
