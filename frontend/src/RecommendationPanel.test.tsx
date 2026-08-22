@@ -174,6 +174,8 @@ describe('recommendation preview (rendered)', () => {
         items: [
           { id: 'evidence-1', status: 'available', source_type: 'document', label: 'Renewal memo', captured_at: '2026-07-01T00:00:00Z' },
           { id: 'evidence-2', status: 'missing', source_type: null, label: null, captured_at: null },
+          { id: 'evidence-3', status: 'permission_denied', source_type: 'document', label: null, captured_at: null },
+          { id: 'evidence-4', status: 'deleted', source_type: 'document', label: null, captured_at: null },
         ],
       }) },
       { test: (url) => url.includes('/api/v1/risks/risk-9'), respond: () => jsonResponse(riskPreview) },
@@ -186,6 +188,16 @@ describe('recommendation preview (rendered)', () => {
     expect(evidence.textContent).toContain('Renewal memo')
     expect(evidence.textContent).toContain('available')
     expect(evidence.textContent).toContain('missing')
+    // `EvidenceItem['status']` was previously a local, drifted 2-value type
+    // ('available' | 'missing') that silently didn't match the real 4-value
+    // backend contract -- these two assertions guard against that regressing.
+    // Both non-available-but-not-generically-"missing" states render their
+    // own true status text, and both share evidence-missing's CSS grouping
+    // (a deliberate available-vs-not-available binary, not a type omission).
+    expect(evidence.textContent).toContain('permission_denied')
+    expect(evidence.textContent).toContain('deleted')
+    expect(evidence.querySelectorAll('.evidence-missing')).toHaveLength(3)
+    expect(evidence.querySelectorAll('.evidence-available')).toHaveLength(1)
 
     const factors = await screen.findByLabelText('Risk factors for close risk')
     expect(factors.textContent).toContain('Risk impact 20')

@@ -1,6 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
 import { ApiError, apiRequest } from './api/client'
+import type { EvidenceItem } from './features/knowledge/types'
 
 type RecommendationStatus =
   | 'proposed'
@@ -35,14 +36,6 @@ export type Recommendation = {
 type RecommendationList = {
   items: Recommendation[]
   next_cursor?: string | null
-}
-
-type EvidenceItem = {
-  id: string
-  status: 'available' | 'missing'
-  source_type: string | null
-  label: string | null
-  captured_at: string | null
 }
 
 type EvidenceList = { items: EvidenceItem[] }
