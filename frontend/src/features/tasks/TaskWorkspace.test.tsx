@@ -195,4 +195,12 @@ describe('TaskWorkspace', () => {
     expect(screen.queryByLabelText('Edit task title') && (screen.getByLabelText('Edit task title') as HTMLInputElement).value).toBe('Prepare board pack')
     resolveSave(new Response(JSON.stringify({ ...task, version: 5 }), { status: 200 }))
   })
+
+  it('shows an empty state when there are no tasks', async () => {
+    vi.stubGlobal('fetch', vi.fn(() => response({ items: [], next_cursor: null })))
+    renderWorkspace()
+
+    expect(await screen.findByText('No tasks yet. Create one above to get started.')).toBeTruthy()
+    expect(screen.queryByRole('listitem')).toBeNull()
+  })
 })

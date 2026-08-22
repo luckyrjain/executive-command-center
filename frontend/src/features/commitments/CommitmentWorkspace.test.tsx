@@ -176,4 +176,12 @@ describe('CommitmentWorkspace', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Reload latest commitment' }))
     await screen.findByRole('button', { name: 'Retry with latest version' })
   })
+
+  it('shows an empty state when there are no commitments', async () => {
+    vi.stubGlobal('fetch', vi.fn(() => response({ items: [], next_cursor: null })))
+    renderWorkspace()
+
+    expect(await screen.findByText('No commitments yet. Create one above to get started.')).toBeTruthy()
+    expect(screen.queryByRole('listitem')).toBeNull()
+  })
 })

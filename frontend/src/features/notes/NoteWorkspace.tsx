@@ -224,6 +224,11 @@ export default function NoteWorkspace({ recoveryStore }: NoteWorkspaceProps) {
     <label className="note-search">Search notes<input aria-label="Search notes" type="search" value={search} onChange={(event) => setSearch(event.target.value)} /></label>
     {query.isLoading ? <p role="status">Loading notes…</p> : null}
     {query.isError ? <div role="alert">{query.error.message}</div> : null}
+    {query.data && visibleNotes.length === 0 ? (
+      <p className="empty-state">
+        {query.data.items.length === 0 ? 'No notes yet. Create one above to get started.' : 'No notes match your search.'}
+      </p>
+    ) : null}
     <ol className="work-list note-list">{visibleNotes.map((note) => {
       const title = displayTitle(note)
       return <li key={note.id}><div><strong>{title}</strong><small>{note.note_type}{note.archived_at ? ' · archived' : ''}</small><p>{note.body}</p></div><div className="work-actions" role="group" aria-label={`Actions for ${title}`}>

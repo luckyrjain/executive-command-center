@@ -209,6 +209,7 @@ export default function RiskWorkspace() {
     </form>
     {query.isLoading ? <p role="status">Loading risks…</p> : null}
     {query.isError ? <div role="alert">{query.error.message}</div> : null}
+    {query.data && query.data.items.length === 0 ? <p className="empty-state">No risks yet. Create one above to get started.</p> : null}
     <ol className="work-list">{(query.data?.items ?? []).map((value) => {
       const archived = Boolean(value.archived_at)
       return <li key={value.id}>
