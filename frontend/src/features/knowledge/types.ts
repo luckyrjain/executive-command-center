@@ -110,8 +110,6 @@ export type ResolutionCandidate = {
 
 export type ResolutionCandidateList = { items: ResolutionCandidate[]; next_cursor?: string | null }
 
-export type ResolutionCandidateResult = { deterministic: boolean; candidate: ResolutionCandidate | null }
-
 export type EntityOperation = {
   id: string
   operation_type: 'merge' | 'reverse'
