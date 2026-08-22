@@ -1,26 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
 import { apiRequest } from './api/client'
-import { formatTime } from './lib/datetime'
-
-type DashboardItem = {
-  id?: string
-  entity_id?: string
-  entity_ref?: string
-  entity_type?: string
-  title?: string
-  summary?: string
-  message?: string
-  why?: string
-  explanation?: string
-  status?: string
-  score?: number
-  starts_at?: string
-  due_at?: string
-  due_date?: string
-  occurred_at?: string
-  empty?: boolean
-}
+import { Section, type DashboardItem } from './dashboard/Sections'
 
 type MorningBriefResponse = {
   id: string
@@ -43,45 +24,6 @@ function fetchMorningBrief(): Promise<MorningBriefResponse> {
 
 function refreshMorningBrief(): Promise<MorningBriefResponse> {
   return apiRequest('/api/v1/briefs/morning', { method: 'POST' })
-}
-
-function labelFor(item: DashboardItem): string {
-  return item.title ?? item.summary ?? item.why ?? item.explanation ?? item.message ?? item.entity_ref ?? 'Untitled item'
-}
-
-function visibleItems(items?: DashboardItem[]): DashboardItem[] {
-  return (items ?? []).filter((item) => !item.empty)
-}
-
-function Section({ title, items, emptyMessage }: { title: string; items?: DashboardItem[]; emptyMessage: string }) {
-  const visible = visibleItems(items)
-  const headingId = `brief-section-${title.replaceAll(' ', '-').toLowerCase()}`
-  return (
-    <section className="dashboard-card" aria-labelledby={headingId}>
-      <div className="section-heading">
-        <h2 id={headingId}>{title}</h2>
-        <span aria-label={`${visible.length} items`}>{visible.length}</span>
-      </div>
-      {visible.length ? (
-        <ol className="item-list">
-          {visible.map((item, index) => (
-            <li key={item.id ?? item.entity_id ?? item.entity_ref ?? `${title}-${index}`}>
-              <div>
-                <strong>{labelFor(item)}</strong>
-                {item.status ? <small>{item.status.replaceAll('_', ' ')}</small> : null}
-              </div>
-              <div className="item-meta">
-                {formatTime(item.starts_at ?? item.occurred_at) ? <time>{formatTime(item.starts_at ?? item.occurred_at)}</time> : null}
-                {typeof item.score === 'number' ? <span>{Math.round(item.score)}</span> : null}
-              </div>
-            </li>
-          ))}
-        </ol>
-      ) : (
-        <p className="empty-state">{items?.find((item) => item.empty)?.message ?? emptyMessage}</p>
-      )}
-    </section>
-  )
 }
 
 export default function MorningBrief() {
@@ -119,10 +61,10 @@ export default function MorningBrief() {
 
       {brief.data ? (
         <div className="brief-grid">
-          <Section title="Brief schedule" items={brief.data.sections.today_schedule} emptyMessage="No meetings in the brief." />
-          <Section title="Brief priorities" items={brief.data.sections.top_priorities} emptyMessage="No priorities in the brief." />
-          <Section title="Brief commitments" items={brief.data.sections.overdue_commitments} emptyMessage="No overdue commitments." />
-          <Section title="Brief risks" items={brief.data.sections.risks} emptyMessage="No open risks." />
+          <Section headingIdPrefix="brief-section-" title="Brief schedule" items={brief.data.sections.today_schedule} emptyMessage="No meetings in the brief." />
+          <Section headingIdPrefix="brief-section-" title="Brief priorities" items={brief.data.sections.top_priorities} emptyMessage="No priorities in the brief." />
+          <Section headingIdPrefix="brief-section-" title="Brief commitments" items={brief.data.sections.overdue_commitments} emptyMessage="No overdue commitments." />
+          <Section headingIdPrefix="brief-section-" title="Brief risks" items={brief.data.sections.risks} emptyMessage="No open risks." />
         </div>
       ) : null}
     </section>
