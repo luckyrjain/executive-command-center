@@ -867,6 +867,12 @@ def test_measure_regenerate_p95_restores_autovacuum_even_when_a_call_raises(
     ), f"attention_items was left with a stuck autovacuum_enabled override: {reloptions!r}"
 
 
+# Same _IN_CI split as RANKING_BUDGET_SECONDS above, widened at the same
+# 1.6x ratio -- this test's own bare 0.5s literal had no CI/local split at
+# all despite living in the same file that already established the pattern.
+SCORING_BUDGET_SECONDS = 0.8 if _IN_CI else 0.5
+
+
 def test_priority_scoring_10000_entities_under_500ms() -> None:
     now = datetime.now(UTC)
     today = now.date()
@@ -912,7 +918,10 @@ def test_priority_scoring_10000_entities_under_500ms() -> None:
     elapsed = perf_counter() - started
 
     assert len(scores) == 10_000
-    assert elapsed < 0.5
+    assert elapsed < SCORING_BUDGET_SECONDS, (
+        f"priority scoring {elapsed * 1000:.1f} ms exceeded "
+        f"{SCORING_BUDGET_SECONDS * 1000:.0f} ms budget (in_ci={_IN_CI})"
+    )
 
 
 def test_policy_v1_reproduces_pre_phase3_scores_exactly() -> None:

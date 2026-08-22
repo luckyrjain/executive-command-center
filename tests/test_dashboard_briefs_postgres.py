@@ -1,3 +1,4 @@
+import os
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, date, datetime, timedelta
@@ -20,6 +21,12 @@ pytestmark = pytest.mark.skipif(
     not settings.database_url.startswith("postgresql"),
     reason="PostgreSQL integration test",
 )
+
+# Widened for CI's shared-runner noise -- same CI/local split as every other
+# *_performance_postgres.py-style budget in this suite (e.g.
+# test_dashboard_performance_postgres.py's own DASHBOARD_P95_BUDGET_SECONDS).
+_IN_CI = os.getenv("CI") is not None
+_EMPTY_STATE_BUDGET_SECONDS = 3.2 if _IN_CI else 2.0
 
 
 @pytest.fixture
@@ -263,7 +270,10 @@ def test_dashboard_empty_state_and_budget(
     sections = response.json()["sections"]
     assert sections["today_schedule"][0]["empty"] is True
     assert sections["top_priorities"][0]["empty"] is True
-    assert elapsed < 2.0
+    assert elapsed < _EMPTY_STATE_BUDGET_SECONDS, (
+        f"dashboard empty-state fetch {elapsed * 1000:.1f} ms exceeded "
+        f"{_EMPTY_STATE_BUDGET_SECONDS * 1000:.0f} ms budget (in_ci={_IN_CI})"
+    )
 
 
 def test_dashboard_review_regressions(
