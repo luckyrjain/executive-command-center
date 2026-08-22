@@ -1,7 +1,7 @@
 import { FormEvent, KeyboardEvent, useRef, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 
-const API_BASE = import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:8000'
+import { apiRequest } from './api/client'
 
 type SearchResult = {
   entity_type: string
@@ -41,20 +41,7 @@ type AuditResponse = {
   next_cursor?: string | null
 }
 
-type ErrorEnvelope = { error?: { message?: string } }
 type View = 'search' | 'audit'
-
-async function request<T>(path: string): Promise<T> {
-  const response = await fetch(`${API_BASE}${path}`, {
-    credentials: 'include',
-    headers: { Accept: 'application/json' },
-  })
-  if (!response.ok) {
-    const payload = (await response.json().catch(() => ({}))) as ErrorEnvelope
-    throw new Error(payload.error?.message ?? 'Request failed')
-  }
-  return response.json()
-}
 
 function formatDate(value: string): string {
   const parsed = new Date(value)
@@ -80,7 +67,7 @@ export default function SearchAuditPanel() {
     queryFn: () => {
       const params = new URLSearchParams({ q: query, limit: '20' })
       if (searchCursor) params.set('cursor', searchCursor)
-      return request<SearchResponse>(`/api/v1/search?${params}`)
+      return apiRequest<SearchResponse>(`/api/v1/search?${params}`)
     },
     enabled: query.length > 0,
     retry: 1,
@@ -92,7 +79,7 @@ export default function SearchAuditPanel() {
       const params = new URLSearchParams({ limit: '20' })
       if (eventType) params.set('event_type', eventType)
       if (auditCursor) params.set('cursor', auditCursor)
-      return request<AuditResponse>(`/api/v1/audit?${params}`)
+      return apiRequest<AuditResponse>(`/api/v1/audit?${params}`)
     },
     enabled: view === 'audit',
     retry: 1,
