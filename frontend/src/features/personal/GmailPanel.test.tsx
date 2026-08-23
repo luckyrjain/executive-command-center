@@ -163,6 +163,15 @@ describe('GmailPanel', () => {
     expect(document.activeElement).toBe(screen.getByRole('heading', { name: 'What Gmail access gives you' }))
   })
 
+  it('does not steal focus on an ordinary page load -- only a real step transition moves it', async () => {
+    stubFetch({ domains: [], connectors: [] })
+    renderPanel()
+
+    const heading = await screen.findByRole('heading', { name: 'What Gmail access gives you' })
+    expect(document.activeElement).not.toBe(heading)
+    expect(document.activeElement).toBe(document.body)
+  })
+
   it('surfaces an allowlist rejection without offering a bypass', async () => {
     stubFetch({
       domains: [], connectors: [],
