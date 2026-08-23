@@ -54,11 +54,11 @@ function stubFetch(connectors: ConnectorAccount[], syncRuns: SyncRun[] = []) {
 // field per step (provider tile -> one field step per credential part ->
 // review), so every create-flow test below drives it step by step rather
 // than filling one big form.
-function providerRadiogroup() {
-  return screen.getByRole('radiogroup', { name: 'Provider' })
+function providerGroup() {
+  return screen.getByRole('group', { name: 'Provider' })
 }
 function pickProvider(label: string) {
-  fireEvent.click(within(providerRadiogroup()).getByRole('button', { name: label }))
+  fireEvent.click(within(providerGroup()).getByRole('button', { name: label }))
 }
 function clickContinue() {
   fireEvent.click(screen.getByRole('button', { name: 'Continue' }))
@@ -350,6 +350,40 @@ describe('ConnectorHealthPanel', () => {
     expect(screen.getByRole('button', { name: 'Connect' }).hasAttribute('disabled')).toBe(false)
   })
 
+  it('disables Continue on Datadog\'s Application key step until that field is filled too, not just API key', async () => {
+    const fetch = vi.fn(() => response({ connectors: [] }))
+    vi.stubGlobal('fetch', fetch)
+    renderPanel()
+
+    await screen.findByText('No connectors are configured for this workspace yet.')
+    pickProvider('Datadog')
+    clickContinue() // provider -> site
+    clickContinue() // site -> API key
+    fireEvent.change(screen.getByLabelText('API key'), { target: { value: 'dd-api-key' } })
+    clickContinue() // API key -> Application key
+
+    const continueButton = screen.getByRole('button', { name: 'Continue' })
+    expect(continueButton.hasAttribute('disabled')).toBe(true)
+    fireEvent.change(screen.getByLabelText('Application key'), { target: { value: 'dd-app-key' } })
+    expect(continueButton.hasAttribute('disabled')).toBe(false)
+  })
+
+  it('re-clicking the already-selected provider tile is a no-op, not a reset of fields already typed for it', async () => {
+    const fetch = vi.fn(() => response({ connectors: [] }))
+    vi.stubGlobal('fetch', fetch)
+    renderPanel()
+
+    await screen.findByText('No connectors are configured for this workspace yet.')
+    pickProvider('GitHub') // already the default -- re-selecting it must not touch anything
+    clickContinue() // provider -> token
+    fireEvent.change(screen.getByLabelText('Personal access token'), { target: { value: 'ghp_secret' } })
+    clickBack() // token -> provider
+
+    pickProvider('GitHub') // re-click the tile we're already on
+    clickContinue() // provider -> token
+    expect((screen.getByLabelText('Personal access token') as HTMLInputElement).value).toBe('ghp_secret')
+  })
+
   it('offers every real adapter as a clickable, readably-labeled provider tile, alongside dev-only Sandbox', async () => {
     // A team-concept whole-phase review found this list was correctly
     // extended when GitLab/Jira were each added, but the Datadog connector
@@ -360,7 +394,7 @@ describe('ConnectorHealthPanel', () => {
     renderPanel()
 
     await screen.findByText('No connectors are configured for this workspace yet.')
-    const labels = within(providerRadiogroup()).getAllByRole('button').map((button) => button.textContent)
+    const labels = within(providerGroup()).getAllByRole('button').map((button) => button.textContent)
     expect(labels).toEqual(['GitHub', 'GitLab', 'Jira', 'Datadog', 'Sandbox (developer testing only)'])
   })
 
@@ -411,10 +445,10 @@ describe('ConnectorHealthPanel', () => {
     clickConnect()
 
     expect(await screen.findByText('Acme GitHub is connected')).toBeTruthy()
-    expect(screen.queryByRole('radiogroup', { name: 'Provider' })).toBeNull()
+    expect(screen.queryByRole('group', { name: 'Provider' })).toBeNull()
 
     fireEvent.click(screen.getByRole('button', { name: 'Connect another integration' }))
-    expect(screen.getByRole('radiogroup', { name: 'Provider' })).toBeTruthy()
+    expect(screen.getByRole('group', { name: 'Provider' })).toBeTruthy()
   })
 
   it('offers the Datadog resource types (monitor/service_definition/dashboard) for starting a sync', async () => {
@@ -554,6 +588,33 @@ describe('ConnectorHealthPanel', () => {
     // the two steps already passed both read as done (checkmark), not the
     // upcoming step's own bare number
     expect(within(stepper()).getAllByText('✓')).toHaveLength(3)
+  })
+
+  it('marks the current stepper node aria-current="step", not only via color', async () => {
+    const fetch = vi.fn(() => response({ connectors: [] }))
+    vi.stubGlobal('fetch', fetch)
+    renderPanel()
+
+    await screen.findByText('No connectors are configured for this workspace yet.')
+    const stepper = () => screen.getByRole('group', { name: 'Setup progress' })
+
+    expect(within(stepper()).getByText('Provider').closest('[aria-current="step"]')).toBeTruthy()
+    clickContinue() // -> token
+    expect(within(stepper()).getByText('Provider').closest('[aria-current="step"]')).toBeNull()
+    expect(within(stepper()).getByText('Token').closest('[aria-current="step"]')).toBeTruthy()
+  })
+
+  it('moves focus to the new step\'s own heading on Continue/Back, so it is never dropped to the page body', async () => {
+    const fetch = vi.fn(() => response({ connectors: [] }))
+    vi.stubGlobal('fetch', fetch)
+    renderPanel()
+
+    await screen.findByText('No connectors are configured for this workspace yet.')
+    clickContinue() // provider -> token
+    expect(document.activeElement).toBe(screen.getByRole('heading', { name: 'Token' }))
+
+    clickBack() // token -> provider
+    expect(document.activeElement).toBe(screen.getByRole('heading', { name: 'Choose a provider' }))
   })
 
   it('links to the real token-creation page for each credential-based provider, on the step that field appears', async () => {

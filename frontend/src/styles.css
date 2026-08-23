@@ -148,7 +148,7 @@ button:disabled { opacity: .6; cursor: wait; }
 .wizard-step-circle { width: 26px; height: 26px; border-radius: 999px; display: flex; align-items: center; justify-content: center; font-size: 11px; font-weight: 800; flex-shrink: 0; }
 .wizard-step-circle.done { background: #18212f; color: white; }
 .wizard-step-circle.active { background: white; border: 2px solid #18212f; color: #18212f; }
-.wizard-step-circle.upcoming { background: #eef1f5; color: #667085; }
+.wizard-step-circle.upcoming { background: #eef1f5; color: #596579; }
 .wizard-step-label { font-size: 12px; font-weight: 700; color: #667085; white-space: nowrap; }
 .wizard-step-label.on { color: #18212f; }
 .wizard-step-line { flex: 1; height: 2px; margin: 0 8px; min-width: 8px; background: #e3e8ef; }

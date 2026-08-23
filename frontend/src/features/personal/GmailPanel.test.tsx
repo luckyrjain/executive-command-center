@@ -151,6 +151,18 @@ describe('GmailPanel', () => {
     expect(screen.getByRole('button', { name: 'Connect Gmail' })).toBeTruthy()
   })
 
+  it('moves focus to the new step\'s own heading on Continue/Back, so it is never dropped to the page body', async () => {
+    stubFetch({ domains: [], connectors: [] })
+    renderPanel()
+    await screen.findByText('What Gmail access gives you')
+
+    fireEvent.click(screen.getByRole('button', { name: 'Continue' }))
+    expect(document.activeElement).toBe(screen.getByRole('heading', { name: 'Sign in with your Google account' }))
+
+    fireEvent.click(screen.getByRole('button', { name: 'Back' }))
+    expect(document.activeElement).toBe(screen.getByRole('heading', { name: 'What Gmail access gives you' }))
+  })
+
   it('surfaces an allowlist rejection without offering a bypass', async () => {
     stubFetch({
       domains: [], connectors: [],

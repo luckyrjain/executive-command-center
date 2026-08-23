@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
 import { ApiError, apiRequest } from '../../api/client'
@@ -492,6 +492,14 @@ export default function ConnectorHealthPanel() {
   const [fields, setFields] = useState<CredentialFields>(() => emptyCredentialFields('github'))
   const [stepIndex, setStepIndex] = useState(0)
   const [connected, setConnected] = useState<ConnectorAccount | null>(null)
+  // Moves focus to the incoming step's own heading on every step change --
+  // each step is a different conditional branch below, so without this a
+  // keyboard/screen-reader user's focus (on the Continue/Back/tile button
+  // they just activated) is simply dropped to `<body>` when that button
+  // unmounts, same class of problem `MembersPanel.tsx`'s own trigger-focus
+  // effect exists to prevent. `tabIndex={-1}` on the heading (below) is
+  // what makes a non-interactive element a valid `.focus()` target.
+  const stepHeadingRef = useRef<HTMLHeadingElement>(null)
 
   const connectors = useQuery({
     queryKey: ['engineering', 'connectors'],
@@ -518,6 +526,7 @@ export default function ConnectorHealthPanel() {
   })
 
   function selectProvider(next: ConnectorProvider) {
+    if (next === provider) return // re-clicking the already-selected tile must not wipe fields already typed for it
     setProvider(next)
     setFields(emptyCredentialFields(next))
     setStepIndex(0)
@@ -535,6 +544,10 @@ export default function ConnectorHealthPanel() {
 
   const steps = stepsFor(provider)
   const currentStep = steps[stepIndex] ?? 'provider'
+
+  useEffect(() => {
+    stepHeadingRef.current?.focus()
+  }, [currentStep, connected])
 
   function goNext() {
     setStepIndex((i) => Math.min(i + 1, steps.length - 1))
@@ -568,7 +581,7 @@ export default function ConnectorHealthPanel() {
         {connected ? (
           <div>
             <p className="eyebrow">Connected</p>
-            <h4>{connected.display_name} is connected</h4>
+            <h4 ref={stepHeadingRef} tabIndex={-1}>{connected.display_name} is connected</h4>
             <p>The first backfill starts automatically -- no action needed.</p>
             <div className="work-actions">
               <button type="button" onClick={startOver}>Connect another integration</button>
@@ -578,7 +591,7 @@ export default function ConnectorHealthPanel() {
           <>
             <div className="wizard-stepper" role="group" aria-label="Setup progress">
               {steps.map((step, i) => (
-                <div className="wizard-step-node" key={step}>
+                <div className="wizard-step-node" key={step} aria-current={i === stepIndex ? 'step' : undefined}>
                   <span className={i < stepIndex ? 'wizard-step-circle done' : i === stepIndex ? 'wizard-step-circle active' : 'wizard-step-circle upcoming'}>
                     {i < stepIndex ? '✓' : i + 1}
                   </span>
@@ -590,7 +603,9 @@ export default function ConnectorHealthPanel() {
 
             {currentStep === 'provider' ? (
               <div>
-                <div role="radiogroup" aria-label="Provider" className="work-actions">
+                <p className="eyebrow">Step {stepIndex + 1} of {steps.length} · Provider</p>
+                <h4 ref={stepHeadingRef} tabIndex={-1}>Choose a provider</h4>
+                <div role="group" aria-label="Provider" className="work-actions">
                   {PROVIDERS.map((p) => (
                     <button key={p} type="button" aria-pressed={provider === p} onClick={() => selectProvider(p)}>
                       {PROVIDER_LABELS[p]}
@@ -603,7 +618,8 @@ export default function ConnectorHealthPanel() {
               </div>
             ) : currentStep === 'review' ? (
               <div className="wizard-review">
-                <p className="eyebrow">Review</p>
+                <p className="eyebrow">Step {stepIndex + 1} of {steps.length} · Review</p>
+                <h4 ref={stepHeadingRef} tabIndex={-1}>Review and connect</h4>
                 <dl>
                   {reviewRows(provider, fields).map((row) => (
                     <div key={row.label}>
@@ -622,6 +638,8 @@ export default function ConnectorHealthPanel() {
               </div>
             ) : (
               <div>
+                <p className="eyebrow">Step {stepIndex + 1} of {steps.length} · {stepShortLabel(provider, currentStep)}</p>
+                <h4 ref={stepHeadingRef} tabIndex={-1}>{stepShortLabel(provider, currentStep)}</h4>
                 <FieldStepInput provider={provider} step={currentStep} fields={fields} onChange={updateFields} />
                 <FieldHelp provider={provider} step={currentStep} fields={fields} />
                 <div className="work-actions">

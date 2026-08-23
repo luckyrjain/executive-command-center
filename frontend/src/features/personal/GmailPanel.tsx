@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
 import { ApiError, apiRequest } from '../../api/client'
@@ -125,6 +125,15 @@ export default function GmailPanel() {
   // fresh mount, which is correct: this only matters pre-connect, and a
   // real connect is always a full top-level navigation away and back.
   const [connectStep, setConnectStep] = useState<1 | 2>(1)
+  // Moves focus to the incoming step's own heading on Continue/Back, the
+  // same fix `ConnectorHealthPanel.tsx`'s own wizard needed -- without it,
+  // the clicked button unmounts (each step is a different conditional
+  // branch) and a keyboard/screen-reader user's focus silently drops to
+  // `<body>` instead of landing on the new step.
+  const connectStepHeadingRef = useRef<HTMLHeadingElement>(null)
+  useEffect(() => {
+    connectStepHeadingRef.current?.focus()
+  }, [connectStep])
   // Lazy `useState` initializer (the function reference, not its called
   // result) -- React invokes `readOAuthReturnStatus` exactly once, on
   // first render, never again. The setter is intentionally never called:
@@ -326,7 +335,7 @@ export default function GmailPanel() {
       ) : connectStep === 1 ? (
         <div>
           <p className="eyebrow">Step 1 of 2 · What's shared</p>
-          <h3>What Gmail access gives you</h3>
+          <h3 ref={connectStepHeadingRef} tabIndex={-1}>What Gmail access gives you</h3>
           <ul className="work-list">
             <li>
               <strong>Message metadata</strong>
@@ -348,7 +357,7 @@ export default function GmailPanel() {
       ) : (
         <div>
           <p className="eyebrow">Step 2 of 2 · Sign in</p>
-          <h3>Sign in with your Google account</h3>
+          <h3 ref={connectStepHeadingRef} tabIndex={-1}>Sign in with your Google account</h3>
           <p>You'll leave Executive Command Center briefly for Google's own sign-in and consent screen, then land right back here.</p>
           <div className="work-actions">
             <button type="button" onClick={() => setConnectStep(1)}>Back</button>
