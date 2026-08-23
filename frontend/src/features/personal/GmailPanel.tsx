@@ -131,7 +131,17 @@ export default function GmailPanel() {
   // branch) and a keyboard/screen-reader user's focus silently drops to
   // `<body>` instead of landing on the new step.
   const connectStepHeadingRef = useRef<HTMLHeadingElement>(null)
+  // `useEffect` also runs after the very first render, not only on a later
+  // change to `connectStep` -- without this guard, simply opening the
+  // Gmail tab with no account connected yet would yank focus onto "What
+  // Gmail access gives you" on an ordinary page visit, not just a real
+  // Continue/Back click. Mirrors `ConnectorHealthPanel.tsx`'s own guard.
+  const isFirstConnectRenderRef = useRef(true)
   useEffect(() => {
+    if (isFirstConnectRenderRef.current) {
+      isFirstConnectRenderRef.current = false
+      return
+    }
     connectStepHeadingRef.current?.focus()
   }, [connectStep])
   // Lazy `useState` initializer (the function reference, not its called

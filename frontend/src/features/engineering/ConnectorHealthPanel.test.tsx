@@ -617,6 +617,16 @@ describe('ConnectorHealthPanel', () => {
     expect(document.activeElement).toBe(screen.getByRole('heading', { name: 'Choose a provider' }))
   })
 
+  it('does not steal focus on an ordinary page load -- only a real step transition moves it', async () => {
+    stubFetch([])
+    renderPanel()
+
+    await screen.findByText('No connectors are configured for this workspace yet.')
+    expect(screen.getByRole('heading', { name: 'Choose a provider' })).toBeTruthy()
+    expect(document.activeElement).not.toBe(screen.getByRole('heading', { name: 'Choose a provider' }))
+    expect(document.activeElement).toBe(document.body)
+  })
+
   it('links to the real token-creation page for each credential-based provider, on the step that field appears', async () => {
     const fetch = vi.fn(() => response({ connectors: [] }))
     vi.stubGlobal('fetch', fetch)

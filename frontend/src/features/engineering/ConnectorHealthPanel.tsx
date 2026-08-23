@@ -500,6 +500,14 @@ export default function ConnectorHealthPanel() {
   // effect exists to prevent. `tabIndex={-1}` on the heading (below) is
   // what makes a non-interactive element a valid `.focus()` target.
   const stepHeadingRef = useRef<HTMLHeadingElement>(null)
+  // `useEffect` also runs after the component's very first render, not
+  // only on a later change to its deps -- without this guard, simply
+  // opening the Engineering tab (no click at all) would yank focus onto
+  // the wizard's own heading, skipping past the panel's `<h2>`/`<h3>` and
+  // resetting tab order for every ordinary page visit, not just a real
+  // step transition. Mirrors `MembersPanel.tsx`'s own `wasConfirmingRef`
+  // guard for the identical reason.
+  const isFirstRenderRef = useRef(true)
 
   const connectors = useQuery({
     queryKey: ['engineering', 'connectors'],
@@ -546,6 +554,10 @@ export default function ConnectorHealthPanel() {
   const currentStep = steps[stepIndex] ?? 'provider'
 
   useEffect(() => {
+    if (isFirstRenderRef.current) {
+      isFirstRenderRef.current = false
+      return
+    }
     stepHeadingRef.current?.focus()
   }, [currentStep, connected])
 
