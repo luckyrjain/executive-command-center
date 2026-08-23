@@ -14,6 +14,19 @@ import type {
 
 const PROVIDERS: ReadonlyArray<ConnectorProvider> = ['github', 'gitlab', 'jira', 'datadog', 'sandbox']
 
+// `ConnectorProvider` also includes `gmail`, managed entirely by its own
+// Phase 10 `GmailPanel` (OAuth, not a credential this form ever collects) --
+// listed here only so this map satisfies `Record<ConnectorProvider, string>`,
+// never rendered since `PROVIDERS` above omits it.
+const PROVIDER_LABELS: Record<ConnectorProvider, string> = {
+  github: 'GitHub',
+  gitlab: 'GitLab',
+  jira: 'Jira',
+  datadog: 'Datadog',
+  sandbox: 'Sandbox (developer testing only)',
+  gmail: 'Gmail',
+}
+
 // `connector_accounts.ConnectorCreateRequest.credential` is one opaque
 // string per provider, but the shape underneath differs (bare token,
 // `host|token`, `site|email|api_token`, `site|api_key|app_key`) -- see
@@ -81,6 +94,70 @@ function isCredentialComplete(provider: ConnectorProvider, fields: CredentialFie
       return fields.token.trim() !== ''
   }
 }
+// Each hint names the exact scope/field the receiving adapter checks
+// (`github_adapter.py`'s `_REQUIRED_SCOPES`, `gitlab_adapter.py`'s own) and
+// links to the provider's real token-creation page, so filling this form
+// correctly doesn't require reading `docs/SETUP.md` or the adapter source
+// first. GitLab/Datadog build their link from the site/host the operator
+// already chose above; a self-hosted GitLab host's settings path can vary
+// by version, so that case gets guidance text instead of a guessed link.
+function ProviderHelp({ provider, fields }: { provider: ConnectorProvider; fields: CredentialFields }) {
+  switch (provider) {
+    case 'github':
+      return (
+        <p className="field-hint">
+          Create a classic personal access token with the <code>repo</code> scope, then paste it below.{' '}
+          <a
+            href="https://github.com/settings/tokens/new?scopes=repo&description=Executive+Command+Center"
+            target="_blank"
+            rel="noreferrer"
+          >
+            Create a GitHub token
+          </a>
+        </p>
+      )
+    case 'gitlab': {
+      const host = fields.host.trim() || 'gitlab.com'
+      return (
+        <p className="field-hint">
+          Create a personal access token with the <code>read_api</code> and <code>read_repository</code> scopes.{' '}
+          {host === 'gitlab.com' ? (
+            <a href="https://gitlab.com/-/user_settings/personal_access_tokens" target="_blank" rel="noreferrer">
+              Create a GitLab token
+            </a>
+          ) : (
+            <span>Find it under Settings → Access Tokens on {host}.</span>
+          )}
+        </p>
+      )
+    }
+    case 'jira':
+      return (
+        <p className="field-hint">
+          Use the Atlassian account email above plus an API token -- not your account password.{' '}
+          <a href="https://id.atlassian.com/manage-profile/security/api-tokens" target="_blank" rel="noreferrer">
+            Create a Jira API token
+          </a>
+        </p>
+      )
+    case 'datadog':
+      return (
+        <p className="field-hint">
+          Both keys come from your Datadog organization settings.{' '}
+          <a href={`https://${fields.site}/organization-settings/api-keys`} target="_blank" rel="noreferrer">
+            API keys
+          </a>
+          {' · '}
+          <a href={`https://${fields.site}/organization-settings/application-keys`} target="_blank" rel="noreferrer">
+            Application keys
+          </a>
+        </p>
+      )
+    default:
+      return null
+  }
+}
+
 const RESOURCE_TYPES = [
   'repository', 'work_item', 'change', 'review', 'deployment', 'incident',
   'monitor', 'service_definition', 'dashboard',
@@ -308,14 +385,17 @@ export default function ConnectorHealthPanel() {
   return (
     <section className="work-panel" aria-labelledby="engineering-connector-health-title">
       <h2 id="engineering-connector-health-title">Connector health</h2>
-      <p>Every connected GitHub, GitLab, or Jira account, its current status, and its full sync history. A degraded or errored connector is shown here before it silently produces stale data elsewhere.</p>
 
-      <form onSubmit={(event) => { event.preventDefault(); createMutation.mutate() }}>
+      <h3 id="connector-connect-title">Connect an integration</h3>
+      <p>Add a GitHub, GitLab, Jira, or Datadog account to sync its data into this workspace.</p>
+
+      <form aria-labelledby="connector-connect-title" onSubmit={(event) => { event.preventDefault(); createMutation.mutate() }}>
         <label>Provider
           <select aria-label="Provider" value={provider} onChange={(e) => selectProvider(e.target.value as ConnectorProvider)}>
-            {PROVIDERS.map((p) => <option key={p} value={p}>{p}</option>)}
+            {PROVIDERS.map((p) => <option key={p} value={p}>{PROVIDER_LABELS[p]}</option>)}
           </select>
         </label>
+        <ProviderHelp provider={provider} fields={fields} />
         {provider === 'gitlab' ? (
           <label>Host
             <input
@@ -383,11 +463,15 @@ export default function ConnectorHealthPanel() {
       </form>
       {createMutation.isError ? <div role="alert" className="inline-status error-panel">{errorMessage(createMutation.error)}</div> : null}
 
+      <hr />
+      <h3 id="connector-list-title">Connected integrations</h3>
+      <p>Every connected account, its current status, and its full sync history. A degraded or errored connector is shown here before it silently produces stale data elsewhere.</p>
+
       {connectors.isLoading ? <p role="status">Loading connectors…</p> : null}
       {connectors.isError ? <div role="alert" className="inline-status error-panel">{errorMessage(connectors.error)}</div> : null}
       {connectors.data && items.length === 0 ? <p className="empty-state">No connectors are configured for this workspace yet.</p> : null}
 
-      <ul className="work-list">
+      <ul className="work-list" aria-labelledby="connector-list-title">
         {items.map((connector) => (
           <ConnectorCard
             key={connector.id}

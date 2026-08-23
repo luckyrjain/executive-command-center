@@ -439,4 +439,56 @@ describe('ConnectorHealthPanel', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Disconnect' }))
     expect(await screen.findByText('This connector no longer exists in this workspace.')).toBeTruthy()
   })
+
+  it('shows a readable provider name in the Provider select, not the raw provider slug', async () => {
+    const fetch = vi.fn(() => response({ connectors: [] }))
+    vi.stubGlobal('fetch', fetch)
+    renderPanel()
+
+    await screen.findByText('No connectors are configured for this workspace yet.')
+    const labels = [...(screen.getByLabelText('Provider') as HTMLSelectElement).options].map((option) => option.text)
+    expect(labels).toEqual(['GitHub', 'GitLab', 'Jira', 'Datadog', 'Sandbox (developer testing only)'])
+  })
+
+  it('splits the create form and the connected-accounts list under their own headings', async () => {
+    const fetch = vi.fn(() => response({ connectors: [] }))
+    vi.stubGlobal('fetch', fetch)
+    renderPanel()
+
+    await screen.findByText('No connectors are configured for this workspace yet.')
+    expect(screen.getByRole('heading', { name: 'Connect an integration' })).toBeTruthy()
+    expect(screen.getByRole('heading', { name: 'Connected integrations' })).toBeTruthy()
+  })
+
+  it('links to the real token-creation page for each credential-based provider', async () => {
+    const fetch = vi.fn(() => response({ connectors: [] }))
+    vi.stubGlobal('fetch', fetch)
+    renderPanel()
+
+    await screen.findByText('No connectors are configured for this workspace yet.')
+    expect(screen.getByRole('link', { name: 'Create a GitHub token' }).getAttribute('href')).toBe(
+      'https://github.com/settings/tokens/new?scopes=repo&description=Executive+Command+Center',
+    )
+
+    fireEvent.change(screen.getByLabelText('Provider'), { target: { value: 'gitlab' } })
+    expect(screen.getByRole('link', { name: 'Create a GitLab token' }).getAttribute('href')).toBe(
+      'https://gitlab.com/-/user_settings/personal_access_tokens',
+    )
+    fireEvent.change(screen.getByLabelText('Host'), { target: { value: 'gitlab.example.com' } })
+    expect(screen.queryByRole('link', { name: 'Create a GitLab token' })).toBeNull()
+    expect(screen.getByText('Find it under Settings → Access Tokens on gitlab.example.com.')).toBeTruthy()
+
+    fireEvent.change(screen.getByLabelText('Provider'), { target: { value: 'jira' } })
+    expect(screen.getByRole('link', { name: 'Create a Jira API token' }).getAttribute('href')).toBe(
+      'https://id.atlassian.com/manage-profile/security/api-tokens',
+    )
+
+    fireEvent.change(screen.getByLabelText('Provider'), { target: { value: 'datadog' } })
+    expect(screen.getByRole('link', { name: 'API keys' }).getAttribute('href')).toBe(
+      'https://api.datadoghq.com/organization-settings/api-keys',
+    )
+    expect(screen.getByRole('link', { name: 'Application keys' }).getAttribute('href')).toBe(
+      'https://api.datadoghq.com/organization-settings/application-keys',
+    )
+  })
 })
