@@ -115,6 +115,16 @@ export default function GmailPanel() {
   const queryClient = useQueryClient()
   const [selectedThreadId, setSelectedThreadId] = useState<string | null>(null)
   const [sinceInput, setSinceInput] = useState('')
+  // The "Connect Gmail" step -- real-user setup feedback: "should be more
+  // like a wizard, natural click, click" (see the connector-setup-wizard
+  // design mockup this session also produced). Only two steps exist because
+  // OAuth itself needs no data entry from this app; a third "connected" step
+  // isn't modeled here since the real post-connect experience is the full
+  // account panel below (`activeAccount ? ... : ...`), which already shows
+  // far more than a generic confirmation screen would. Resets to 1 on every
+  // fresh mount, which is correct: this only matters pre-connect, and a
+  // real connect is always a full top-level navigation away and back.
+  const [connectStep, setConnectStep] = useState<1 | 2>(1)
   // Lazy `useState` initializer (the function reference, not its called
   // result) -- React invokes `readOAuthReturnStatus` exactly once, on
   // first render, never again. The setter is intentionally never called:
@@ -313,11 +323,39 @@ export default function GmailPanel() {
           {syncMutation.isError ? <div role="alert" className="inline-status error-panel">{personalErrorMessage(syncMutation.error)}</div> : null}
           {disconnectMutation.isError ? <div role="alert" className="inline-status error-panel">{personalErrorMessage(disconnectMutation.error)}</div> : null}
         </div>
+      ) : connectStep === 1 ? (
+        <div>
+          <p className="eyebrow">Step 1 of 2 · What's shared</p>
+          <h3>What Gmail access gives you</h3>
+          <ul className="work-list">
+            <li>
+              <strong>Message metadata</strong>
+              <small>Subjects, senders, timestamps and thread structure, synced automatically once connected.</small>
+            </li>
+            <li>
+              <strong>Message bodies</strong>
+              <small>Only once you enable {DOMAIN_LABELS.email} in the Domains tab -- off by default, and revocable anytime.</small>
+            </li>
+            <li>
+              <strong>Internal allowlist only</strong>
+              <small>Gmail connect is gated to explicitly approved accounts for this workspace.</small>
+            </li>
+          </ul>
+          <div className="work-actions">
+            <button type="button" onClick={() => setConnectStep(2)}>Continue</button>
+          </div>
+        </div>
       ) : (
-        <div className="work-actions">
-          <button type="button" disabled={oauthStartMutation.isPending} onClick={() => oauthStartMutation.mutate()}>
-            {oauthStartMutation.isPending ? 'Redirecting to Google…' : 'Connect Gmail'}
-          </button>
+        <div>
+          <p className="eyebrow">Step 2 of 2 · Sign in</p>
+          <h3>Sign in with your Google account</h3>
+          <p>You'll leave Executive Command Center briefly for Google's own sign-in and consent screen, then land right back here.</p>
+          <div className="work-actions">
+            <button type="button" onClick={() => setConnectStep(1)}>Back</button>
+            <button type="button" disabled={oauthStartMutation.isPending} onClick={() => oauthStartMutation.mutate()}>
+              {oauthStartMutation.isPending ? 'Redirecting to Google…' : 'Connect Gmail'}
+            </button>
+          </div>
         </div>
       )}
       {oauthStartMutation.isError ? <div role="alert" className="inline-status error-panel">{personalErrorMessage(oauthStartMutation.error)}</div> : null}
