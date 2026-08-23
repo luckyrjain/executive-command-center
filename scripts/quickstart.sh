@@ -7,6 +7,14 @@ cd "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 if [[ ! -f .env ]]; then
   cp .env.example .env
+  # ECC_SESSION_SECRET is the HMAC key behind session cookies, CSRF tokens,
+  # and (when the encryption-key vars below are left unset, as they are
+  # here) the deterministic fallback source for the connector-token/
+  # personal-data Fernet keys -- `cp`'s default mode leaves .env
+  # world-readable, so lock it down before -- not after -- the real secret
+  # ever lands in it, closing the window a shared/multi-user host would
+  # otherwise leave open to reading it.
+  chmod 600 .env
   secret="$(python3 -c 'import secrets; print(secrets.token_urlsafe(48))')"
   sed -i.bak "s#^ECC_SESSION_SECRET=.*#ECC_SESSION_SECRET=${secret}#" .env
   rm -f .env.bak
