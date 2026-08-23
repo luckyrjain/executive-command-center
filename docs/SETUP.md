@@ -42,7 +42,11 @@ individually.
 git clone https://github.com/luckyrjain/executive-command-center.git
 cd executive-command-center
 cp .env.example .env
+chmod 600 .env
 ```
+
+`.env` holds `ECC_SESSION_SECRET` once you set it below -- restricting it to
+your own user avoids leaving that secret world-readable on a shared host.
 
 Generate a session secret and place it in `.env`:
 
