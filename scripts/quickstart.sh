@@ -32,6 +32,21 @@ if [[ ${#ECC_SESSION_SECRET} -lt 32 ]]; then
   exit 1
 fi
 
+# .env.example's own placeholder ("replace-with-a-random-secret-at-least-32-
+# characters-long") is 56 characters, so the length check above alone lets
+# an un-edited .env through silently -- this only runs when .env already
+# existed (the block above always overwrites it with a real generated
+# secret), e.g. after `cp .env.example .env` from the manual walkthrough.
+# Mirrors backend/ecc/config.py's own _PLACEHOLDER_SECRET_MARKERS check,
+# which only runs outside development and so never catches this path.
+shopt -s nocasematch
+if [[ "${ECC_SESSION_SECRET}" == *replace-with* || "${ECC_SESSION_SECRET}" == *changeme* || "${ECC_SESSION_SECRET}" == *change-me* || "${ECC_SESSION_SECRET}" == *placeholder* ]]; then
+  shopt -u nocasematch
+  echo "ECC_SESSION_SECRET in .env still looks like the .env.example placeholder. Set a real random secret and re-run." >&2
+  exit 1
+fi
+shopt -u nocasematch
+
 echo "==> Starting PostgreSQL"
 docker compose up -d postgres
 
