@@ -37,12 +37,15 @@ fi
 # an un-edited .env through silently -- this only runs when .env already
 # existed (the block above always overwrites it with a real generated
 # secret), e.g. after `cp .env.example .env` from the manual walkthrough.
-# Mirrors backend/ecc/config.py's own _PLACEHOLDER_SECRET_MARKERS check,
-# which only runs outside development and so never catches this path.
+# Same marker list as backend/ecc/config.py's own _PLACEHOLDER_SECRET_
+# MARKERS, which only runs outside development and so never catches this
+# path -- including docker-compose.yml's own documented ECC_SESSION_SECRET
+# fallback ("development-only-secret-change-before-real-data"), the exact
+# string config.py's marker list docstring cites as its motivating case.
 shopt -s nocasematch
-if [[ "${ECC_SESSION_SECRET}" == *replace-with* || "${ECC_SESSION_SECRET}" == *changeme* || "${ECC_SESSION_SECRET}" == *change-me* || "${ECC_SESSION_SECRET}" == *placeholder* ]]; then
+if [[ "${ECC_SESSION_SECRET}" == *changeme* || "${ECC_SESSION_SECRET}" == *change-me* || "${ECC_SESSION_SECRET}" == *change_me* || "${ECC_SESSION_SECRET}" == *please-change* || "${ECC_SESSION_SECRET}" == *replace-with* || "${ECC_SESSION_SECRET}" == *replace_with* || "${ECC_SESSION_SECRET}" == *development-only* || "${ECC_SESSION_SECRET}" == *placeholder* || "${ECC_SESSION_SECRET}" == *example* || "${ECC_SESSION_SECRET}" == *insecure* || "${ECC_SESSION_SECRET}" == *sample-secret* || "${ECC_SESSION_SECRET}" == *test-secret* || "${ECC_SESSION_SECRET}" == *your-secret* || "${ECC_SESSION_SECRET}" == *secret-change* ]]; then
   shopt -u nocasematch
-  echo "ECC_SESSION_SECRET in .env still looks like the .env.example placeholder. Set a real random secret and re-run." >&2
+  echo "ECC_SESSION_SECRET in .env still looks like a placeholder. Set a real random secret and re-run." >&2
   exit 1
 fi
 shopt -u nocasematch
