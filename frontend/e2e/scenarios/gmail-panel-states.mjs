@@ -106,6 +106,10 @@ export async function run({ page, baseURL }) {
 
   let panel = page.locator('#personal-panel')
   await panel.getByText(/Enable Email in the Domains tab/).waitFor()
+  await panel.getByText('What Gmail access gives you').waitFor()
+  await panel.getByRole('button', { name: 'Continue' }).click()
+  await panel.getByText('Sign in with your Google account').waitFor()
+  await assertNoSeriousAccessibilityViolations(page, { include: '#personal-panel' })
   await panel.getByRole('button', { name: 'Connect Gmail' }).click()
   await panel.getByText(/not on the internal allowlist/).waitFor()
 

@@ -11,13 +11,42 @@ This guide gets Executive Command Center running locally with PostgreSQL, FastAP
 - `pnpm` 10.12.4
 - [Ollama](https://ollama.com), running (`ollama serve`), for AI enrichment features (optional, off by default -- see step 3)
 
-## 1. Configure the repository
+## Fast path
+
+Run everything below in one command:
+
+```bash
+git clone https://github.com/luckyrjain/executive-command-center.git
+cd executive-command-center
+./scripts/quickstart.sh
+```
+
+`quickstart.sh` creates `.env` with a generated session secret (if `.env`
+does not already exist), starts PostgreSQL, installs backend and frontend
+dependencies, runs migrations, and creates a local development session. It
+prints the two commands you still need to run yourself, one per terminal,
+to start the backend and frontend dev servers, plus the one-time bootstrap
+URL to open once both are running.
+
+Re-run `./scripts/quickstart.sh` any time to get a fresh bootstrap URL or
+pick up new dependencies/migrations; it is safe to run repeatedly. If it
+fails partway through, or you want to understand or control each step, work
+through the manual walkthrough below -- it performs the same steps
+individually.
+
+## Manual step-by-step
+
+### 1. Configure the repository
 
 ```bash
 git clone https://github.com/luckyrjain/executive-command-center.git
 cd executive-command-center
 cp .env.example .env
+chmod 600 .env
 ```
+
+`.env` holds `ECC_SESSION_SECRET` once you set it below -- restricting it to
+your own user avoids leaving that secret world-readable on a shared host.
 
 Generate a session secret and place it in `.env`:
 
@@ -33,7 +62,7 @@ source .env
 set +a
 ```
 
-## 2. Start PostgreSQL and migrate
+### 2. Start PostgreSQL and migrate
 
 ```bash
 docker compose up -d postgres
@@ -41,7 +70,7 @@ uv sync --frozen --all-groups --python 3.14
 uv run alembic -c backend/alembic.ini upgrade head
 ```
 
-## 3. Create a local authenticated session
+### 3. Create a local authenticated session
 
 Phase 1 does not include a production login screen. Create or reuse the development workspace and user with:
 
@@ -71,7 +100,7 @@ export ECC_BOOTSTRAP_ALLOW_REMOTE_DATABASE=1
 
 Never enable this override for staging or production data.
 
-## 4. Start the backend
+### 4. Start the backend
 
 ```bash
 uv run uvicorn ecc.main:app --app-dir backend --reload --host 127.0.0.1 --port 8000
@@ -86,7 +115,7 @@ curl http://localhost:8000/health/ready
 
 API documentation is available at `http://localhost:8000/docs`.
 
-## 5. Start the frontend
+### 5. Start the frontend
 
 In another terminal:
 

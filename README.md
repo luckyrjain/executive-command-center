@@ -46,37 +46,19 @@ The recommended development workflow runs PostgreSQL in Docker and the backend/f
 ```bash
 git clone https://github.com/luckyrjain/executive-command-center.git
 cd executive-command-center
-cp .env.example .env
+./scripts/quickstart.sh
 ```
 
-Set a random `ECC_SESSION_SECRET` of at least 32 characters in `.env`, then run:
-
-```bash
-docker compose up -d postgres
-uv sync --frozen --all-groups --python 3.14
-set -a; source .env; set +a
-uv run alembic -c backend/alembic.ini upgrade head
-uv run python scripts/bootstrap_dev.py
-```
-
-Start the backend:
+This creates `.env` with a generated session secret, starts PostgreSQL, installs dependencies, runs migrations, and creates a local development session. It prints the two commands to run next, one per terminal:
 
 ```bash
 uv run uvicorn ecc.main:app --app-dir backend --reload --host 127.0.0.1 --port 8000
-```
-
-Start the frontend in another terminal:
-
-```bash
-corepack enable
-corepack prepare pnpm@10.12.4 --activate
-pnpm install --frozen-lockfile
 pnpm --filter @ecc/frontend dev
 ```
 
-Open the one-time URL printed by `scripts/bootstrap_dev.py`. The backend exchanges the code for an `HttpOnly` seven-day session cookie and redirects to `http://localhost:5173`.
+Then open the one-time URL the script printed. The backend exchanges the code for an `HttpOnly` seven-day session cookie and redirects to `http://localhost:5173`.
 
-For prerequisites, Docker usage, testing, troubleshooting, reset instructions, and first-use guidance, read [Setup and Usage](docs/SETUP.md).
+For the manual step-by-step version of the same setup, prerequisites, Docker usage, testing, troubleshooting, reset instructions, and first-use guidance, read [Setup and Usage](docs/SETUP.md).
 
 Useful endpoints:
 

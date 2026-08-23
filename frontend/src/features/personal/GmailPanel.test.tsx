@@ -117,22 +117,59 @@ beforeEach(() => {
 afterEach(() => { cleanup(); vi.unstubAllGlobals() })
 
 describe('GmailPanel', () => {
-  it('shows a consent-missing hint and a connect action when nothing is set up yet', async () => {
+  it('shows a consent-missing hint and a two-step connect wizard when nothing is set up yet', async () => {
     stubFetch({ domains: [], connectors: [] })
     renderPanel()
     expect(await screen.findByText(/Enable Email in the Domains tab/)).toBeTruthy()
+    expect(screen.getByText('What Gmail access gives you')).toBeTruthy()
+    expect(screen.queryByRole('button', { name: 'Connect Gmail' })).toBeNull()
+    fireEvent.click(screen.getByRole('button', { name: 'Continue' }))
     expect(screen.getByRole('button', { name: 'Connect Gmail' })).toBeTruthy()
   })
 
   it('starts the OAuth flow and redirects the browser to the returned authorization_url', async () => {
     const fetch = stubFetch({ domains: [], connectors: [] })
     renderPanel()
-    fireEvent.click(await screen.findByRole('button', { name: 'Connect Gmail' }))
+    fireEvent.click(await screen.findByRole('button', { name: 'Continue' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Connect Gmail' }))
     await waitFor(() => expect(fetch).toHaveBeenCalledWith(
       expect.stringContaining('/api/v1/personal/gmail/oauth/start'),
       expect.objectContaining({ method: 'POST' }),
     ))
     await waitFor(() => expect(window.location.href).toBe('https://accounts.google.com/o/oauth2/v2/auth?state=abc'))
+  })
+
+  it('returns to the first wizard step on Back, without losing the ability to continue again', async () => {
+    stubFetch({ domains: [], connectors: [] })
+    renderPanel()
+    fireEvent.click(await screen.findByRole('button', { name: 'Continue' }))
+    expect(screen.getByRole('button', { name: 'Connect Gmail' })).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: 'Back' }))
+    expect(screen.getByText('What Gmail access gives you')).toBeTruthy()
+    expect(screen.queryByRole('button', { name: 'Connect Gmail' })).toBeNull()
+    fireEvent.click(screen.getByRole('button', { name: 'Continue' }))
+    expect(screen.getByRole('button', { name: 'Connect Gmail' })).toBeTruthy()
+  })
+
+  it('moves focus to the new step\'s own heading on Continue/Back, so it is never dropped to the page body', async () => {
+    stubFetch({ domains: [], connectors: [] })
+    renderPanel()
+    await screen.findByText('What Gmail access gives you')
+
+    fireEvent.click(screen.getByRole('button', { name: 'Continue' }))
+    expect(document.activeElement).toBe(screen.getByRole('heading', { name: 'Sign in with your Google account' }))
+
+    fireEvent.click(screen.getByRole('button', { name: 'Back' }))
+    expect(document.activeElement).toBe(screen.getByRole('heading', { name: 'What Gmail access gives you' }))
+  })
+
+  it('does not steal focus on an ordinary page load -- only a real step transition moves it', async () => {
+    stubFetch({ domains: [], connectors: [] })
+    renderPanel()
+
+    const heading = await screen.findByRole('heading', { name: 'What Gmail access gives you' })
+    expect(document.activeElement).not.toBe(heading)
+    expect(document.activeElement).toBe(document.body)
   })
 
   it('surfaces an allowlist rejection without offering a bypass', async () => {
@@ -143,7 +180,8 @@ describe('GmailPanel', () => {
         : undefined,
     })
     renderPanel()
-    fireEvent.click(await screen.findByRole('button', { name: 'Connect Gmail' }))
+    fireEvent.click(await screen.findByRole('button', { name: 'Continue' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Connect Gmail' }))
     expect(await screen.findByText(/not on the internal allowlist/)).toBeTruthy()
   })
 
@@ -182,7 +220,7 @@ describe('GmailPanel', () => {
     stubFetch({ domains: [domain()], connectors: [] })
     renderPanel()
 
-    expect(await screen.findByRole('button', { name: 'Connect Gmail' })).toBeTruthy()
+    expect(await screen.findByText('What Gmail access gives you')).toBeTruthy()
     expect(screen.queryByText('Google account connected.')).toBeNull()
     expect(screen.queryByText(/This Gmail sign-in link expired/)).toBeNull()
   })

@@ -1,6 +1,9 @@
 SHELL := /bin/bash
 
-.PHONY: setup dev stop check docs-check test migrate backup restore verify-restore
+.PHONY: quickstart setup dev stop check docs-check test migrate backup restore verify-restore
+
+quickstart:
+	./scripts/quickstart.sh
 
 setup:
 	uv sync --all-groups

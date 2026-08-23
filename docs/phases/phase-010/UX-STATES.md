@@ -2,7 +2,7 @@
 id: PHASE-010-UX-STATES
 title: Phase 10 Gmail UX States
 status: Approved for Implementation
-version: 1.2.0
+version: 1.3.1
 owner: Lucky Jain
 depends_on:
   - PHASE-010
@@ -21,7 +21,7 @@ acceptance coverage) for the concrete implementation.
 
 | State | Current (Tasks 1-2) | Shipped UX behavior (Task 8) |
 |---|---|---|
-| Disconnected | Connector absent or `disconnected` | "Connect Gmail" button (`POST oauth/start`, then a real top-level redirect to the returned `authorization_url`) shown whenever no non-`disconnected` connector exists |
+| Disconnected | Connector absent or `disconnected` | A two-step wizard (later addition, real-user setup feedback: "should be more like a wizard, natural click, click" -- see the connector-setup-wizard design mockup this session also produced), shown whenever no non-`disconnected` connector exists: Step 1 states what Gmail access actually gives (metadata always, bodies only once the `email` domain is enabled, internal-allowlist-only) with a Continue action; Step 2 is the real "Connect Gmail" button (`POST oauth/start`, then a real top-level redirect to the returned `authorization_url`), with a Back action returning to Step 1. No third "connected" step is modeled -- the real post-connect experience is the existing connector-status panel below, reached via the real OAuth redirect-and-return, which already shows far more than a generic confirmation screen would |
 | Consent missing/expired | Sync fails closed before fetch/write | A hint pointing to the Domains tab's own enable action shown whenever the `email` domain is not enabled -- the Connect action still works independently, since OAuth and domain consent are separate grants |
 | OAuth pending | Authorization URL returned; state valid 10 minutes | The Connect button's own `isPending` state never resolves before the real navigation happens, which is what prevents a duplicate click |
 | OAuth error | Structured 403/422 error | `personalErrorMessage` renders `GMAIL_ACCOUNT_NOT_ALLOWLISTED`/`GMAIL_OAUTH_NOT_CONFIGURED`/`GMAIL_OAUTH_STATE_INVALID`/`GMAIL_OAUTH_FAILED` as an alert before any navigation happens, without echoing provider detail or a token |
@@ -49,3 +49,5 @@ copy. Loading and retry actions must not create duplicate syncs.
 | 1.1.0 | 2026-08-11 | Task 8: recorded the shipped `GmailPanel` behavior for every state, replacing the "planned" column; "Deletion pending" documented as not a real state in this activation (the cascade completes synchronously) | Lucky Jain |
 | 1.1.1 | 2026-08-11 | Task 8 Loop 2 round 8 review: this file was never revisited after round 7 changed the "Body unavailable" copy and, per round 7's own finding, disclosed that a null-body detail-view message can never actually occur -- "Body unavailable" row corrected to describe the real `body_cached`/empty-string-sentinel behavior instead of the deleted UI copy | Lucky Jain |
 | 1.2.0 | 2026-08-11 | Later addition: `GET /oauth/complete` now redirects the browser back to the frontend with a `gmail=connected\|error` marker instead of stranding it on raw backend JSON -- new "OAuth return" row; "OAuth pending" row's own stale "no return-to-app guidance screen" claim removed now that one exists | Lucky Jain |
+| 1.3.0 | 2026-08-23 | Later addition, real-user setup feedback: the single "Connect Gmail" button in the "Disconnected" row is now a two-step wizard (what's shared, then sign in) instead of one bare button with no context -- "Disconnected" row rewritten; no backend change, `GmailPanel.test.tsx` grows from 18 to 19 cases (the split step-1/step-2 assertions plus a new Back-then-Continue case) | Lucky Jain |
+| 1.3.1 | 2026-08-23 | Later addition, accessibility review of the 1.3.0 wizard (same review that found `ConnectorHealthPanel.tsx`'s own wizard needed it -- see `phase-006/UX-STATES.md`): Continue/Back moved between the two conditional step branches with no focus management, dropping a keyboard/screen-reader user's focus to `<body>` on every click since the just-activated button unmounts. Fixed with a `connectStepHeadingRef`/`useEffect` pair focusing each step's own `tabIndex={-1}` `<h3>` on every step change. No backend change, `GmailPanel.test.tsx` grows from 19 to 20 cases (the focus-moves-to-the-new-heading proof) | Lucky Jain |
