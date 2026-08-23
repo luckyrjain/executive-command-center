@@ -70,6 +70,70 @@ function emptyCredentialFields(provider: ConnectorProvider): CredentialFields {
   }
 }
 
+// The wizard below asks for one field per step rather than the whole
+// credential at once (real-user setup feedback: "should be more like a
+// wizard, natural click, click" -- see connector-setup-wizard mockup).
+// Each provider's step list is exactly the fields `buildCredential`/
+// `isCredentialComplete` below already know how to join/validate --
+// this only decides what order they're shown in, one at a time.
+type FieldKey = 'host' | 'site' | 'email' | 'token' | 'appKey'
+type WizardStep = 'provider' | FieldKey | 'review'
+
+const PROVIDER_FIELD_STEPS: Record<ConnectorProvider, FieldKey[]> = {
+  github: ['token'],
+  gitlab: ['host', 'token'],
+  jira: ['site', 'email', 'token'],
+  datadog: ['site', 'token', 'appKey'],
+  sandbox: ['token'],
+  gmail: [],
+}
+
+function stepsFor(provider: ConnectorProvider): WizardStep[] {
+  return ['provider', ...PROVIDER_FIELD_STEPS[provider], 'review']
+}
+
+function stepShortLabel(provider: ConnectorProvider, step: WizardStep): string {
+  switch (step) {
+    case 'provider': return 'Provider'
+    case 'host': return 'Host'
+    case 'site': return provider === 'datadog' ? 'Region' : 'Site'
+    case 'email': return 'Email'
+    case 'token': return provider === 'datadog' ? 'API key' : 'Token'
+    case 'appKey': return 'App key'
+    case 'review': return 'Review'
+  }
+}
+
+// `host`/`provider`/`review` are never blocking: `host` always falls back
+// to `gitlab.com` (`buildCredential`), and Datadog's `site` step is a
+// `<select>` that always carries a real value, never free text.
+function isStepComplete(provider: ConnectorProvider, step: WizardStep, fields: CredentialFields): boolean {
+  switch (step) {
+    case 'site': return provider === 'jira' ? fields.site.trim() !== '' : true
+    case 'email': return fields.email.trim() !== ''
+    case 'token': return fields.token.trim() !== ''
+    case 'appKey': return fields.appKey.trim() !== ''
+    default: return true
+  }
+}
+
+function maskTail(value: string): string {
+  if (value.trim() === '') return '—'
+  return '•••• ' + value.slice(-4).padStart(4, '•')
+}
+
+function reviewRows(provider: ConnectorProvider, fields: CredentialFields): Array<{ label: string; value: string }> {
+  const rows = [{ label: 'Provider', value: PROVIDER_LABELS[provider] }]
+  for (const step of PROVIDER_FIELD_STEPS[provider]) {
+    if (step === 'host') rows.push({ label: 'Host', value: fields.host.trim() || 'gitlab.com' })
+    else if (step === 'site') rows.push({ label: stepShortLabel(provider, 'site'), value: fields.site })
+    else if (step === 'email') rows.push({ label: 'Email', value: fields.email })
+    else if (step === 'token') rows.push({ label: tokenFieldLabel(provider), value: maskTail(fields.token) })
+    else if (step === 'appKey') rows.push({ label: 'Application key', value: maskTail(fields.appKey) })
+  }
+  return rows
+}
+
 // The secret/token field's label varies by provider (`datadog_adapter.py`'s
 // own `_parse_credential` calls it an API key, `jira_adapter.py`'s an API
 // token) -- sandbox has no real shape to name, so it keeps the generic
@@ -108,70 +172,142 @@ function isCredentialComplete(provider: ConnectorProvider, fields: CredentialFie
       return fields.token.trim() !== ''
   }
 }
+// One field, and its own input, per wizard step -- `step` is always a
+// `FieldKey` here (the 'provider'/'review' steps render their own markup
+// directly in the wizard body below, never through this component).
+function FieldStepInput({ provider, step, fields, onChange }: {
+  provider: ConnectorProvider
+  step: FieldKey
+  fields: CredentialFields
+  onChange: (patch: Partial<CredentialFields>) => void
+}) {
+  switch (step) {
+    case 'host':
+      return (
+        <label>Host
+          <input aria-label="Host" type="text" value={fields.host} onChange={(e) => onChange({ host: e.target.value })} autoComplete="off" />
+        </label>
+      )
+    case 'site':
+      if (provider === 'datadog') {
+        return (
+          <label>Site
+            <select aria-label="Site" value={fields.site} onChange={(e) => onChange({ site: e.target.value })}>
+              {DATADOG_SITES.map((s) => <option key={s} value={s}>{s}</option>)}
+            </select>
+          </label>
+        )
+      }
+      return (
+        <label>Site
+          <input
+            aria-label="Site"
+            type="text"
+            value={fields.site}
+            onChange={(e) => onChange({ site: e.target.value })}
+            autoComplete="off"
+            placeholder="yoursite.atlassian.net"
+          />
+        </label>
+      )
+    case 'email':
+      return (
+        <label>Email
+          <input aria-label="Email" type="email" value={fields.email} onChange={(e) => onChange({ email: e.target.value })} autoComplete="off" />
+        </label>
+      )
+    case 'token':
+      return (
+        <label>{tokenFieldLabel(provider)}
+          <input
+            aria-label={tokenFieldLabel(provider)}
+            type="password"
+            value={fields.token}
+            onChange={(e) => onChange({ token: e.target.value })}
+            autoComplete="off"
+          />
+        </label>
+      )
+    case 'appKey':
+      return (
+        <label>Application key
+          <input
+            aria-label="Application key"
+            type="password"
+            value={fields.appKey}
+            onChange={(e) => onChange({ appKey: e.target.value })}
+            autoComplete="off"
+          />
+        </label>
+      )
+  }
+}
+
 // Each hint names the exact scope/field the receiving adapter checks
 // (`github_adapter.py`'s `_REQUIRED_SCOPES`, `gitlab_adapter.py`'s own) and
-// links to the provider's real token-creation page, so filling this form
+// links to the provider's real token-creation page, so filling this step
 // correctly doesn't require reading `docs/SETUP.md` or the adapter source
-// first. GitLab/Datadog build their link from the site/host the operator
-// already chose above; a self-hosted GitLab host's settings path can vary
-// by version, so that case gets guidance text instead of a guessed link.
-function ProviderHelp({ provider, fields }: { provider: ConnectorProvider; fields: CredentialFields }) {
-  switch (provider) {
-    case 'github':
-      return (
-        <p className="field-hint">
-          Create a classic personal access token with the <code>repo</code> scope, then paste it below.{' '}
-          <a
-            href="https://github.com/settings/tokens/new?scopes=repo&description=Executive+Command+Center"
-            target="_blank"
-            rel="noreferrer"
-          >
-            Create a GitHub token
-          </a>
-        </p>
-      )
-    case 'gitlab': {
-      const host = fields.host.trim() || 'gitlab.com'
-      return (
-        <p className="field-hint">
-          Create a personal access token with the <code>read_api</code> and <code>read_repository</code> scopes.{' '}
-          {host === 'gitlab.com' ? (
-            <a href="https://gitlab.com/-/user_settings/personal_access_tokens" target="_blank" rel="noreferrer">
-              Create a GitLab token
-            </a>
-          ) : (
-            <span>Find it under Settings → Access Tokens on {host}.</span>
-          )}
-        </p>
-      )
-    }
-    case 'jira':
-      return (
-        <p className="field-hint">
-          Use the Atlassian account email above plus an API token -- not your account password.{' '}
-          <a href="https://id.atlassian.com/manage-profile/security/api-tokens" target="_blank" rel="noreferrer">
-            Create a Jira API token
-          </a>
-        </p>
-      )
-    case 'datadog': {
-      const uiHost = DATADOG_UI_HOSTS[fields.site as (typeof DATADOG_SITES)[number]] ?? fields.site
-      return (
-        <p className="field-hint">
-          Both keys come from your Datadog organization settings.{' '}
-          <a href={`https://${uiHost}/organization-settings/api-keys`} target="_blank" rel="noreferrer">
-            API keys
-          </a>
-          {' · '}
-          <a href={`https://${uiHost}/organization-settings/application-keys`} target="_blank" rel="noreferrer">
-            Application keys
-          </a>
-        </p>
-      )
-    }
-    default:
-      return null
+// first. GitLab's link depends on the host step's own value (already set,
+// since host is always asked before token); a self-hosted host's settings
+// path can vary by version, so that case gets guidance text instead of a
+// guessed link.
+function FieldHelp({ provider, step, fields }: { provider: ConnectorProvider; step: FieldKey; fields: CredentialFields }) {
+  if (provider === 'github' && step === 'token') {
+    return (
+      <p className="field-hint">
+        Create a classic personal access token with the <code>repo</code> scope, then paste it below.{' '}
+        <a
+          href="https://github.com/settings/tokens/new?scopes=repo&description=Executive+Command+Center"
+          target="_blank"
+          rel="noreferrer"
+        >
+          Create a GitHub token
+        </a>
+      </p>
+    )
   }
+  if (provider === 'gitlab' && step === 'token') {
+    const host = fields.host.trim() || 'gitlab.com'
+    return (
+      <p className="field-hint">
+        Create a personal access token with the <code>read_api</code> and <code>read_repository</code> scopes.{' '}
+        {host === 'gitlab.com' ? (
+          <a href="https://gitlab.com/-/user_settings/personal_access_tokens" target="_blank" rel="noreferrer">
+            Create a GitLab token
+          </a>
+        ) : (
+          <span>Find it under Settings → Access Tokens on {host}.</span>
+        )}
+      </p>
+    )
+  }
+  if (provider === 'jira' && step === 'token') {
+    return (
+      <p className="field-hint">
+        Use the Atlassian account email from the last step, plus an API token -- not your account password.{' '}
+        <a href="https://id.atlassian.com/manage-profile/security/api-tokens" target="_blank" rel="noreferrer">
+          Create a Jira API token
+        </a>
+      </p>
+    )
+  }
+  if (provider === 'datadog' && (step === 'token' || step === 'appKey')) {
+    const uiHost = DATADOG_UI_HOSTS[fields.site as (typeof DATADOG_SITES)[number]] ?? fields.site
+    const isAppKey = step === 'appKey'
+    return (
+      <p className="field-hint">
+        Your {isAppKey ? 'application' : 'API'} key comes from your Datadog organization settings.{' '}
+        <a
+          href={`https://${uiHost}/organization-settings/${isAppKey ? 'application-keys' : 'api-keys'}`}
+          target="_blank"
+          rel="noreferrer"
+        >
+          {isAppKey ? 'Open Application keys' : 'Open API keys'}
+        </a>
+      </p>
+    )
+  }
+  return null
 }
 
 const RESOURCE_TYPES = [
@@ -354,6 +490,8 @@ export default function ConnectorHealthPanel() {
   const queryClient = useQueryClient()
   const [provider, setProvider] = useState<ConnectorProvider>('github')
   const [fields, setFields] = useState<CredentialFields>(() => emptyCredentialFields('github'))
+  const [stepIndex, setStepIndex] = useState(0)
+  const [connected, setConnected] = useState<ConnectorAccount | null>(null)
 
   const connectors = useQuery({
     queryKey: ['engineering', 'connectors'],
@@ -372,7 +510,8 @@ export default function ConnectorHealthPanel() {
         method: 'POST',
         body: { provider, credential: buildCredential(provider, fields) },
       }),
-    onSuccess: () => {
+    onSuccess: (data) => {
+      setConnected(data)
       setFields(emptyCredentialFields(provider))
       refresh()
     },
@@ -381,11 +520,31 @@ export default function ConnectorHealthPanel() {
   function selectProvider(next: ConnectorProvider) {
     setProvider(next)
     setFields(emptyCredentialFields(next))
+    setStepIndex(0)
+    setConnected(null)
+  }
+
+  function updateFields(patch: Partial<CredentialFields>) {
+    setFields((f) => ({ ...f, ...patch }))
   }
 
   function refresh() {
     void queryClient.invalidateQueries({ queryKey: ['engineering', 'connectors'] })
     void queryClient.invalidateQueries({ queryKey: ['engineering', 'sync-runs'] })
+  }
+
+  const steps = stepsFor(provider)
+  const currentStep = steps[stepIndex] ?? 'provider'
+
+  function goNext() {
+    setStepIndex((i) => Math.min(i + 1, steps.length - 1))
+  }
+  function goBack() {
+    setStepIndex((i) => Math.max(i - 1, 0))
+  }
+  function startOver() {
+    setConnected(null)
+    setStepIndex(0)
   }
 
   const runsByConnector = new Map<string, SyncRun[]>()
@@ -405,79 +564,75 @@ export default function ConnectorHealthPanel() {
       <h3 id="connector-connect-title">Connect an integration</h3>
       <p>Add a GitHub, GitLab, Jira, or Datadog account to sync its data into this workspace.</p>
 
-      <form aria-labelledby="connector-connect-title" onSubmit={(event) => { event.preventDefault(); createMutation.mutate() }}>
-        <label>Provider
-          <select aria-label="Provider" value={provider} onChange={(e) => selectProvider(e.target.value as ConnectorProvider)}>
-            {PROVIDERS.map((p) => <option key={p} value={p}>{PROVIDER_LABELS[p]}</option>)}
-          </select>
-        </label>
-        <ProviderHelp provider={provider} fields={fields} />
-        {provider === 'gitlab' ? (
-          <label>Host
-            <input
-              aria-label="Host"
-              type="text"
-              value={fields.host}
-              onChange={(e) => setFields({ ...fields, host: e.target.value })}
-              autoComplete="off"
-            />
-          </label>
-        ) : null}
-        {provider === 'jira' ? (
+      <div role="region" aria-labelledby="connector-connect-title">
+        {connected ? (
+          <div>
+            <p className="eyebrow">Connected</p>
+            <h4>{connected.display_name} is connected</h4>
+            <p>The first backfill starts automatically -- no action needed.</p>
+            <div className="work-actions">
+              <button type="button" onClick={startOver}>Connect another integration</button>
+            </div>
+          </div>
+        ) : (
           <>
-            <label>Site
-              <input
-                aria-label="Site"
-                type="text"
-                value={fields.site}
-                onChange={(e) => setFields({ ...fields, site: e.target.value })}
-                autoComplete="off"
-                placeholder="yoursite.atlassian.net"
-              />
-            </label>
-            <label>Email
-              <input
-                aria-label="Email"
-                type="email"
-                value={fields.email}
-                onChange={(e) => setFields({ ...fields, email: e.target.value })}
-                autoComplete="off"
-              />
-            </label>
+            <div className="wizard-stepper" role="group" aria-label="Setup progress">
+              {steps.map((step, i) => (
+                <div className="wizard-step-node" key={step}>
+                  <span className={i < stepIndex ? 'wizard-step-circle done' : i === stepIndex ? 'wizard-step-circle active' : 'wizard-step-circle upcoming'}>
+                    {i < stepIndex ? '✓' : i + 1}
+                  </span>
+                  <span className={i <= stepIndex ? 'wizard-step-label on' : 'wizard-step-label'}>{stepShortLabel(provider, step)}</span>
+                  {i < steps.length - 1 ? <span className={i < stepIndex ? 'wizard-step-line done' : 'wizard-step-line'} /> : null}
+                </div>
+              ))}
+            </div>
+
+            {currentStep === 'provider' ? (
+              <div>
+                <div role="radiogroup" aria-label="Provider" className="work-actions">
+                  {PROVIDERS.map((p) => (
+                    <button key={p} type="button" aria-pressed={provider === p} onClick={() => selectProvider(p)}>
+                      {PROVIDER_LABELS[p]}
+                    </button>
+                  ))}
+                </div>
+                <div className="work-actions">
+                  <button type="button" onClick={goNext}>Continue</button>
+                </div>
+              </div>
+            ) : currentStep === 'review' ? (
+              <div className="wizard-review">
+                <p className="eyebrow">Review</p>
+                <dl>
+                  {reviewRows(provider, fields).map((row) => (
+                    <div key={row.label}>
+                      <dt>{row.label}</dt>
+                      <dd>{row.value}</dd>
+                    </div>
+                  ))}
+                </dl>
+                <div className="work-actions">
+                  <button type="button" onClick={goBack}>Back</button>
+                  <button type="button" disabled={createMutation.isPending || !isCredentialComplete(provider, fields)} onClick={() => createMutation.mutate()}>
+                    {createMutation.isPending ? 'Connecting…' : 'Connect'}
+                  </button>
+                </div>
+                {createMutation.isError ? <div role="alert" className="inline-status error-panel">{errorMessage(createMutation.error)}</div> : null}
+              </div>
+            ) : (
+              <div>
+                <FieldStepInput provider={provider} step={currentStep} fields={fields} onChange={updateFields} />
+                <FieldHelp provider={provider} step={currentStep} fields={fields} />
+                <div className="work-actions">
+                  <button type="button" onClick={goBack}>Back</button>
+                  <button type="button" disabled={!isStepComplete(provider, currentStep, fields)} onClick={goNext}>Continue</button>
+                </div>
+              </div>
+            )}
           </>
-        ) : null}
-        {provider === 'datadog' ? (
-          <label>Site
-            <select aria-label="Site" value={fields.site} onChange={(e) => setFields({ ...fields, site: e.target.value })}>
-              {DATADOG_SITES.map((s) => <option key={s} value={s}>{s}</option>)}
-            </select>
-          </label>
-        ) : null}
-        <label>{tokenFieldLabel(provider)}
-          <input
-            aria-label={tokenFieldLabel(provider)}
-            type="password"
-            value={fields.token}
-            onChange={(e) => setFields({ ...fields, token: e.target.value })}
-            autoComplete="off"
-          />
-        </label>
-        {provider === 'datadog' ? (
-          <label>Application key
-            <input
-              aria-label="Application key"
-              type="password"
-              value={fields.appKey}
-              onChange={(e) => setFields({ ...fields, appKey: e.target.value })}
-              autoComplete="off"
-            />
-          </label>
-        ) : null}
-        <div className="work-actions">
-          <button type="submit" disabled={createMutation.isPending || !isCredentialComplete(provider, fields)}>Connect</button>
-        </div>
-      </form>
-      {createMutation.isError ? <div role="alert" className="inline-status error-panel">{errorMessage(createMutation.error)}</div> : null}
+        )}
+      </div>
 
       <hr />
       <h3 id="connector-list-title">Connected integrations</h3>

@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import ConnectorHealthPanel from './ConnectorHealthPanel'
@@ -48,6 +48,26 @@ function stubFetch(connectors: ConnectorAccount[], syncRuns: SyncRun[] = []) {
     if (url.includes('/connectors')) return response({ connectors })
     return response({}, 404)
   }))
+}
+
+// Wizard navigation helpers -- the "Connect an integration" flow is one
+// field per step (provider tile -> one field step per credential part ->
+// review), so every create-flow test below drives it step by step rather
+// than filling one big form.
+function providerRadiogroup() {
+  return screen.getByRole('radiogroup', { name: 'Provider' })
+}
+function pickProvider(label: string) {
+  fireEvent.click(within(providerRadiogroup()).getByRole('button', { name: label }))
+}
+function clickContinue() {
+  fireEvent.click(screen.getByRole('button', { name: 'Continue' }))
+}
+function clickBack() {
+  fireEvent.click(screen.getByRole('button', { name: 'Back' }))
+}
+function clickConnect() {
+  fireEvent.click(screen.getByRole('button', { name: 'Connect' }))
 }
 
 describe('ConnectorHealthPanel', () => {
@@ -148,7 +168,7 @@ describe('ConnectorHealthPanel', () => {
 
   // --- Actions -------------------------------------------------------------
 
-  it('creates a GitHub connector from a single Personal access token field', async () => {
+  it('creates a GitHub connector by continuing through the single-step Personal access token wizard', async () => {
     const fetch = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input)
       if ((init?.method ?? 'GET').toUpperCase() === 'POST') return response(connector())
@@ -159,15 +179,17 @@ describe('ConnectorHealthPanel', () => {
     renderPanel()
 
     await screen.findByText('No connectors are configured for this workspace yet.')
+    clickContinue() // provider (github, default) -> token
     fireEvent.change(screen.getByLabelText('Personal access token'), { target: { value: 'ghp_secret' } })
-    fireEvent.click(screen.getByRole('button', { name: 'Connect' }))
+    clickContinue() // token -> review
+    clickConnect()
 
     await waitFor(() => expect(fetch).toHaveBeenCalledWith(expect.stringContaining('/api/v1/engineering/connectors'), expect.objectContaining({ method: 'POST' })))
     const call = fetch.mock.calls.find((c) => (c[1] as RequestInit | undefined)?.method === 'POST')
     expect(JSON.parse(String((call?.[1] as RequestInit).body))).toEqual({ provider: 'github', credential: 'ghp_secret' })
   })
 
-  it('creates a GitLab connector from separate Host and token fields, joined as host|token', async () => {
+  it('creates a GitLab connector through the Host-then-token wizard steps, joined as host|token', async () => {
     const fetch = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input)
       if ((init?.method ?? 'GET').toUpperCase() === 'POST') return response(connector({ provider: 'gitlab' }))
@@ -178,11 +200,14 @@ describe('ConnectorHealthPanel', () => {
     renderPanel()
 
     await screen.findByText('No connectors are configured for this workspace yet.')
-    fireEvent.change(screen.getByLabelText('Provider'), { target: { value: 'gitlab' } })
+    pickProvider('GitLab')
+    clickContinue() // provider -> host
     expect((screen.getByLabelText('Host') as HTMLInputElement).value).toBe('gitlab.com')
     fireEvent.change(screen.getByLabelText('Host'), { target: { value: 'gitlab-ee.example.com' } })
+    clickContinue() // host -> token
     fireEvent.change(screen.getByLabelText('Personal access token'), { target: { value: 'glpat-xxxx' } })
-    fireEvent.click(screen.getByRole('button', { name: 'Connect' }))
+    clickContinue() // token -> review
+    clickConnect()
 
     await waitFor(() => expect(fetch).toHaveBeenCalledWith(expect.stringContaining('/api/v1/engineering/connectors'), expect.objectContaining({ method: 'POST' })))
     const call = fetch.mock.calls.find((c) => (c[1] as RequestInit | undefined)?.method === 'POST')
@@ -192,7 +217,7 @@ describe('ConnectorHealthPanel', () => {
     })
   })
 
-  it('creates a Jira connector from Site/Email/API token fields, joined as site|email|token', async () => {
+  it('creates a Jira connector through the Site/Email/API token wizard steps, joined as site|email|token', async () => {
     const fetch = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input)
       if ((init?.method ?? 'GET').toUpperCase() === 'POST') return response(connector({ provider: 'jira' }))
@@ -203,11 +228,15 @@ describe('ConnectorHealthPanel', () => {
     renderPanel()
 
     await screen.findByText('No connectors are configured for this workspace yet.')
-    fireEvent.change(screen.getByLabelText('Provider'), { target: { value: 'jira' } })
+    pickProvider('Jira')
+    clickContinue() // provider -> site
     fireEvent.change(screen.getByLabelText('Site'), { target: { value: 'acme.atlassian.net' } })
+    clickContinue() // site -> email
     fireEvent.change(screen.getByLabelText('Email'), { target: { value: 'ops@acme.com' } })
+    clickContinue() // email -> token
     fireEvent.change(screen.getByLabelText('API token'), { target: { value: 'jira-token' } })
-    fireEvent.click(screen.getByRole('button', { name: 'Connect' }))
+    clickContinue() // token -> review
+    clickConnect()
 
     await waitFor(() => expect(fetch).toHaveBeenCalledWith(expect.stringContaining('/api/v1/engineering/connectors'), expect.objectContaining({ method: 'POST' })))
     const call = fetch.mock.calls.find((c) => (c[1] as RequestInit | undefined)?.method === 'POST')
@@ -217,7 +246,7 @@ describe('ConnectorHealthPanel', () => {
     })
   })
 
-  it('creates a Datadog connector from a Site select plus API/Application key fields, joined as site|api_key|app_key', async () => {
+  it('creates a Datadog connector through the Site/API key/Application key wizard steps, joined as site|api_key|app_key', async () => {
     const fetch = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input)
       if ((init?.method ?? 'GET').toUpperCase() === 'POST') return response(connector({ provider: 'datadog' }))
@@ -228,11 +257,15 @@ describe('ConnectorHealthPanel', () => {
     renderPanel()
 
     await screen.findByText('No connectors are configured for this workspace yet.')
-    fireEvent.change(screen.getByLabelText('Provider'), { target: { value: 'datadog' } })
+    pickProvider('Datadog')
+    clickContinue() // provider -> site
     fireEvent.change(screen.getByLabelText('Site'), { target: { value: 'api.datadoghq.eu' } })
+    clickContinue() // site -> API key
     fireEvent.change(screen.getByLabelText('API key'), { target: { value: 'dd-api-key' } })
+    clickContinue() // API key -> Application key
     fireEvent.change(screen.getByLabelText('Application key'), { target: { value: 'dd-app-key' } })
-    fireEvent.click(screen.getByRole('button', { name: 'Connect' }))
+    clickContinue() // Application key -> review
+    clickConnect()
 
     await waitFor(() => expect(fetch).toHaveBeenCalledWith(expect.stringContaining('/api/v1/engineering/connectors'), expect.objectContaining({ method: 'POST' })))
     const call = fetch.mock.calls.find((c) => (c[1] as RequestInit | undefined)?.method === 'POST')
@@ -248,7 +281,8 @@ describe('ConnectorHealthPanel', () => {
     renderPanel()
 
     await screen.findByText('No connectors are configured for this workspace yet.')
-    fireEvent.change(screen.getByLabelText('Provider'), { target: { value: 'datadog' } })
+    pickProvider('Datadog')
+    clickContinue() // provider -> site
     const options = [...(screen.getByLabelText('Site') as HTMLSelectElement).options].map((option) => option.value)
     expect(options).toEqual([
       'api.datadoghq.com',
@@ -260,44 +294,63 @@ describe('ConnectorHealthPanel', () => {
     ])
   })
 
-  it('resets provider-specific fields when switching provider, so a stale value never leaks into a different shape', async () => {
+  it('resets provider-specific fields when switching provider mid-wizard, so a stale value never leaks into a different shape', async () => {
     const fetch = vi.fn(() => response({ connectors: [] }))
     vi.stubGlobal('fetch', fetch)
     renderPanel()
 
     await screen.findByText('No connectors are configured for this workspace yet.')
-    fireEvent.change(screen.getByLabelText('Provider'), { target: { value: 'jira' } })
+    pickProvider('Jira')
+    clickContinue() // provider -> site
     fireEvent.change(screen.getByLabelText('Site'), { target: { value: 'acme.atlassian.net' } })
+    clickContinue() // site -> email
     fireEvent.change(screen.getByLabelText('Email'), { target: { value: 'ops@acme.com' } })
+    clickBack() // email -> site
+    clickBack() // site -> provider
 
-    fireEvent.change(screen.getByLabelText('Provider'), { target: { value: 'github' } })
-    expect(screen.queryByLabelText('Site')).toBeNull()
-    expect(screen.queryByLabelText('Email')).toBeNull()
+    pickProvider('GitHub')
+    clickContinue() // provider -> token
     expect((screen.getByLabelText('Personal access token') as HTMLInputElement).value).toBe('')
 
-    fireEvent.change(screen.getByLabelText('Provider'), { target: { value: 'jira' } })
+    clickBack() // token -> provider
+    pickProvider('Jira')
+    clickContinue() // provider -> site
     expect((screen.getByLabelText('Site') as HTMLInputElement).value).toBe('')
+    fireEvent.change(screen.getByLabelText('Site'), { target: { value: 'temp.atlassian.net' } }) // fill just enough to advance
+    clickContinue() // site -> email
     expect((screen.getByLabelText('Email') as HTMLInputElement).value).toBe('')
   })
 
-  it('disables Connect until every required field for the selected provider is filled', async () => {
+  it('disables Continue at each wizard step until that step\'s own field is filled, then enables Connect on review', async () => {
     const fetch = vi.fn(() => response({ connectors: [] }))
     vi.stubGlobal('fetch', fetch)
     renderPanel()
 
     await screen.findByText('No connectors are configured for this workspace yet.')
-    const connectButton = screen.getByRole('button', { name: 'Connect' })
+    pickProvider('Jira')
+    const continueButton = () => screen.getByRole('button', { name: 'Continue' })
+    expect(continueButton().hasAttribute('disabled')).toBe(false) // provider always pre-selected
 
-    fireEvent.change(screen.getByLabelText('Provider'), { target: { value: 'jira' } })
-    expect(connectButton.hasAttribute('disabled')).toBe(true)
+    clickContinue() // -> site
+    expect(continueButton().hasAttribute('disabled')).toBe(true)
     fireEvent.change(screen.getByLabelText('Site'), { target: { value: 'acme.atlassian.net' } })
+    expect(continueButton().hasAttribute('disabled')).toBe(false)
+
+    clickContinue() // -> email
+    expect(continueButton().hasAttribute('disabled')).toBe(true)
     fireEvent.change(screen.getByLabelText('Email'), { target: { value: 'ops@acme.com' } })
-    expect(connectButton.hasAttribute('disabled')).toBe(true)
+    expect(continueButton().hasAttribute('disabled')).toBe(false)
+
+    clickContinue() // -> token
+    expect(continueButton().hasAttribute('disabled')).toBe(true)
     fireEvent.change(screen.getByLabelText('API token'), { target: { value: 'jira-token' } })
-    expect(connectButton.hasAttribute('disabled')).toBe(false)
+    expect(continueButton().hasAttribute('disabled')).toBe(false)
+
+    clickContinue() // -> review
+    expect(screen.getByRole('button', { name: 'Connect' }).hasAttribute('disabled')).toBe(false)
   })
 
-  it('offers Datadog as a connectable provider, alongside every other real adapter', async () => {
+  it('offers every real adapter as a clickable, readably-labeled provider tile, alongside dev-only Sandbox', async () => {
     // A team-concept whole-phase review found this list was correctly
     // extended when GitLab/Jira were each added, but the Datadog connector
     // (PR #85) never got the same treatment -- a workspace admin had no UI
@@ -307,31 +360,61 @@ describe('ConnectorHealthPanel', () => {
     renderPanel()
 
     await screen.findByText('No connectors are configured for this workspace yet.')
-    const options = [...(screen.getByLabelText('Provider') as HTMLSelectElement).options].map((option) => option.value)
-    expect(options).toEqual(['github', 'gitlab', 'jira', 'datadog', 'sandbox'])
+    const labels = within(providerRadiogroup()).getAllByRole('button').map((button) => button.textContent)
+    expect(labels).toEqual(['GitHub', 'GitLab', 'Jira', 'Datadog', 'Sandbox (developer testing only)'])
   })
 
-  it('shows separate Host and Personal access token fields when GitLab is selected, not one combined field', async () => {
+  it('shows GitLab\'s Host and Personal access token as separate wizard steps, never combined on one screen', async () => {
     const fetch = vi.fn(() => response({ connectors: [] }))
     vi.stubGlobal('fetch', fetch)
     renderPanel()
 
     await screen.findByText('No connectors are configured for this workspace yet.')
-    fireEvent.change(screen.getByLabelText('Provider'), { target: { value: 'gitlab' } })
+    pickProvider('GitLab')
+    clickContinue() // provider -> host
     expect(screen.getByLabelText('Host')).toBeTruthy()
+    expect(screen.queryByLabelText('Personal access token')).toBeNull()
+    clickContinue() // host -> token
     expect(screen.getByLabelText('Personal access token')).toBeTruthy()
+    expect(screen.queryByLabelText('Host')).toBeNull()
   })
 
-  it('shows a single Personal access token field for GitHub, no host/site fields', async () => {
+  it('shows a single Personal access token step for GitHub, no host/site step at all', async () => {
     const fetch = vi.fn(() => response({ connectors: [] }))
     vi.stubGlobal('fetch', fetch)
     renderPanel()
 
     await screen.findByText('No connectors are configured for this workspace yet.')
-    fireEvent.change(screen.getByLabelText('Provider'), { target: { value: 'github' } })
+    clickContinue() // provider (github, default) -> token
     expect(screen.getByLabelText('Personal access token')).toBeTruthy()
     expect(screen.queryByLabelText('Host')).toBeNull()
     expect(screen.queryByLabelText('Site')).toBeNull()
+    fireEvent.change(screen.getByLabelText('Personal access token'), { target: { value: 'ghp_secret' } })
+    clickContinue() // token -> review (the very next step, nothing in between)
+    expect(screen.getByRole('button', { name: 'Connect' })).toBeTruthy()
+  })
+
+  it('shows a success step after connecting, then returns to the provider step on "Connect another integration"', async () => {
+    const fetch = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input)
+      if ((init?.method ?? 'GET').toUpperCase() === 'POST') return response(connector({ display_name: 'Acme GitHub' }))
+      if (url.includes('/sync-runs')) return response({ sync_runs: [] })
+      return response({ connectors: [] })
+    })
+    vi.stubGlobal('fetch', fetch)
+    renderPanel()
+
+    await screen.findByText('No connectors are configured for this workspace yet.')
+    clickContinue() // provider -> token
+    fireEvent.change(screen.getByLabelText('Personal access token'), { target: { value: 'ghp_secret' } })
+    clickContinue() // token -> review
+    clickConnect()
+
+    expect(await screen.findByText('Acme GitHub is connected')).toBeTruthy()
+    expect(screen.queryByRole('radiogroup', { name: 'Provider' })).toBeNull()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Connect another integration' }))
+    expect(screen.getByRole('radiogroup', { name: 'Provider' })).toBeTruthy()
   })
 
   it('offers the Datadog resource types (monitor/service_definition/dashboard) for starting a sync', async () => {
@@ -369,8 +452,10 @@ describe('ConnectorHealthPanel', () => {
     renderPanel()
 
     await screen.findByText('No connectors are configured for this workspace yet.')
+    clickContinue() // provider -> token
     fireEvent.change(screen.getByLabelText('Personal access token'), { target: { value: 'bad' } })
-    fireEvent.click(screen.getByRole('button', { name: 'Connect' }))
+    clickContinue() // token -> review
+    clickConnect()
 
     expect(await screen.findByText(/The provider rejected this credential: bad token/)).toBeTruthy()
     expect(screen.queryByText('Connector Authorization Failed')).toBeNull()
@@ -440,17 +525,7 @@ describe('ConnectorHealthPanel', () => {
     expect(await screen.findByText('This connector no longer exists in this workspace.')).toBeTruthy()
   })
 
-  it('shows a readable provider name in the Provider select, not the raw provider slug', async () => {
-    const fetch = vi.fn(() => response({ connectors: [] }))
-    vi.stubGlobal('fetch', fetch)
-    renderPanel()
-
-    await screen.findByText('No connectors are configured for this workspace yet.')
-    const labels = [...(screen.getByLabelText('Provider') as HTMLSelectElement).options].map((option) => option.text)
-    expect(labels).toEqual(['GitHub', 'GitLab', 'Jira', 'Datadog', 'Sandbox (developer testing only)'])
-  })
-
-  it('splits the create form and the connected-accounts list under their own headings', async () => {
+  it('splits the create wizard and the connected-accounts list under their own headings', async () => {
     const fetch = vi.fn(() => response({ connectors: [] }))
     vi.stubGlobal('fetch', fetch)
     renderPanel()
@@ -460,39 +535,90 @@ describe('ConnectorHealthPanel', () => {
     expect(screen.getByRole('heading', { name: 'Connected integrations' })).toBeTruthy()
   })
 
-  it('links to the real token-creation page for each credential-based provider', async () => {
+  it('shows the wizard stepper with the current step marked active and completed steps checked off', async () => {
     const fetch = vi.fn(() => response({ connectors: [] }))
     vi.stubGlobal('fetch', fetch)
     renderPanel()
 
     await screen.findByText('No connectors are configured for this workspace yet.')
+    const stepper = () => screen.getByRole('group', { name: 'Setup progress' })
+
+    pickProvider('GitLab')
+    expect(within(stepper()).getByText('Provider').className).toContain('on')
+    clickContinue() // -> host
+    expect(within(stepper()).getByText('Host').className).toContain('on')
+    clickContinue() // -> token
+    fireEvent.change(screen.getByLabelText('Personal access token'), { target: { value: 'glpat-xxxx' } })
+    clickContinue() // -> review
+    expect(within(stepper()).getByText('Review').className).toContain('on')
+    // the two steps already passed both read as done (checkmark), not the
+    // upcoming step's own bare number
+    expect(within(stepper()).getAllByText('✓')).toHaveLength(3)
+  })
+
+  it('links to the real token-creation page for each credential-based provider, on the step that field appears', async () => {
+    const fetch = vi.fn(() => response({ connectors: [] }))
+    vi.stubGlobal('fetch', fetch)
+    renderPanel()
+
+    await screen.findByText('No connectors are configured for this workspace yet.')
+
+    // GitHub: the token step is the only field step
+    clickContinue() // provider -> token
     expect(screen.getByRole('link', { name: 'Create a GitHub token' }).getAttribute('href')).toBe(
       'https://github.com/settings/tokens/new?scopes=repo&description=Executive+Command+Center',
     )
+    clickBack()
 
-    fireEvent.change(screen.getByLabelText('Provider'), { target: { value: 'gitlab' } })
+    // GitLab: no help on the host step; the token step's link depends on
+    // whatever host was set on the step before it
+    pickProvider('GitLab')
+    clickContinue() // provider -> host
+    clickContinue() // host -> token (still gitlab.com)
     expect(screen.getByRole('link', { name: 'Create a GitLab token' }).getAttribute('href')).toBe(
       'https://gitlab.com/-/user_settings/personal_access_tokens',
     )
+    clickBack() // token -> host
     fireEvent.change(screen.getByLabelText('Host'), { target: { value: 'gitlab.example.com' } })
+    clickContinue() // host -> token
     expect(screen.queryByRole('link', { name: 'Create a GitLab token' })).toBeNull()
     expect(screen.getByText('Find it under Settings → Access Tokens on gitlab.example.com.')).toBeTruthy()
+    clickBack() // token -> host
+    clickBack() // host -> provider
 
-    fireEvent.change(screen.getByLabelText('Provider'), { target: { value: 'jira' } })
+    // Jira
+    pickProvider('Jira')
+    clickContinue() // provider -> site
+    fireEvent.change(screen.getByLabelText('Site'), { target: { value: 'acme.atlassian.net' } })
+    clickContinue() // site -> email
+    fireEvent.change(screen.getByLabelText('Email'), { target: { value: 'ops@acme.com' } })
+    clickContinue() // email -> token
     expect(screen.getByRole('link', { name: 'Create a Jira API token' }).getAttribute('href')).toBe(
       'https://id.atlassian.com/manage-profile/security/api-tokens',
     )
+    clickBack()
+    clickBack()
+    clickBack() // -> provider
 
-    fireEvent.change(screen.getByLabelText('Provider'), { target: { value: 'datadog' } })
-    expect(screen.getByRole('link', { name: 'API keys' }).getAttribute('href')).toBe(
+    // Datadog: the API key and Application key steps each link to their
+    // own real settings page, built from whatever site was picked
+    pickProvider('Datadog')
+    clickContinue() // provider -> site
+    clickContinue() // site -> API key
+    expect(screen.getByRole('link', { name: 'Open API keys' }).getAttribute('href')).toBe(
       'https://app.datadoghq.com/organization-settings/api-keys',
     )
-    expect(screen.getByRole('link', { name: 'Application keys' }).getAttribute('href')).toBe(
+    fireEvent.change(screen.getByLabelText('API key'), { target: { value: 'dd-api-key' } })
+    clickContinue() // API key -> Application key
+    expect(screen.getByRole('link', { name: 'Open Application keys' }).getAttribute('href')).toBe(
       'https://app.datadoghq.com/organization-settings/application-keys',
     )
 
+    clickBack() // Application key -> API key
+    clickBack() // API key -> site
     fireEvent.change(screen.getByLabelText('Site'), { target: { value: 'api.us3.datadoghq.com' } })
-    expect(screen.getByRole('link', { name: 'API keys' }).getAttribute('href')).toBe(
+    clickContinue() // site -> API key
+    expect(screen.getByRole('link', { name: 'Open API keys' }).getAttribute('href')).toBe(
       'https://us3.datadoghq.com/organization-settings/api-keys',
     )
   })
