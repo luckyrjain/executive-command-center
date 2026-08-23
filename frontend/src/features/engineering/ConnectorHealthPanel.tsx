@@ -44,6 +44,20 @@ const DATADOG_SITES = [
   'api.ddog-gov.com',
 ] as const
 
+// The API host stored in the credential (above) is not the host that
+// serves Datadog's web UI pages -- mirrors `datadog_adapter.py`'s own
+// `_SITE_TO_UI_HOST` (https://docs.datadoghq.com/getting_started/site/),
+// which exists for the same reason: these two hosts are not
+// interchangeable, and some regions' UI host has no `app.` prefix at all.
+const DATADOG_UI_HOSTS: Record<(typeof DATADOG_SITES)[number], string> = {
+  'api.datadoghq.com': 'app.datadoghq.com',
+  'api.us3.datadoghq.com': 'us3.datadoghq.com',
+  'api.us5.datadoghq.com': 'us5.datadoghq.com',
+  'api.datadoghq.eu': 'app.datadoghq.eu',
+  'api.ap1.datadoghq.com': 'ap1.datadoghq.com',
+  'api.ddog-gov.com': 'app.ddog-gov.com',
+}
+
 type CredentialFields = { host: string; site: string; email: string; token: string; appKey: string }
 
 function emptyCredentialFields(provider: ConnectorProvider): CredentialFields {
@@ -140,19 +154,21 @@ function ProviderHelp({ provider, fields }: { provider: ConnectorProvider; field
           </a>
         </p>
       )
-    case 'datadog':
+    case 'datadog': {
+      const uiHost = DATADOG_UI_HOSTS[fields.site as (typeof DATADOG_SITES)[number]] ?? fields.site
       return (
         <p className="field-hint">
           Both keys come from your Datadog organization settings.{' '}
-          <a href={`https://${fields.site}/organization-settings/api-keys`} target="_blank" rel="noreferrer">
+          <a href={`https://${uiHost}/organization-settings/api-keys`} target="_blank" rel="noreferrer">
             API keys
           </a>
           {' · '}
-          <a href={`https://${fields.site}/organization-settings/application-keys`} target="_blank" rel="noreferrer">
+          <a href={`https://${uiHost}/organization-settings/application-keys`} target="_blank" rel="noreferrer">
             Application keys
           </a>
         </p>
       )
+    }
     default:
       return null
   }

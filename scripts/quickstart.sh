@@ -29,7 +29,12 @@ docker compose up -d postgres
 
 echo "==> Waiting for PostgreSQL to accept connections"
 ready=""
-for _ in $(seq 1 30); do
+# 120 x 1s: at least as generous as docker-compose.yml's own postgres
+# healthcheck (20 retries x 5s interval => ~100s), so this does not time
+# out earlier than the project's own healthcheck would on a slow first
+# start (e.g. a loaded CI shared runner -- see the widened performance
+# budgets elsewhere in this repo for the same class of noise).
+for _ in $(seq 1 120); do
   if docker compose exec -T postgres pg_isready -U "${POSTGRES_USER:-ecc}" -d "${POSTGRES_DB:-ecc}" >/dev/null 2>&1; then
     ready=1
     break

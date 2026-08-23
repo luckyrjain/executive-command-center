@@ -485,10 +485,15 @@ describe('ConnectorHealthPanel', () => {
 
     fireEvent.change(screen.getByLabelText('Provider'), { target: { value: 'datadog' } })
     expect(screen.getByRole('link', { name: 'API keys' }).getAttribute('href')).toBe(
-      'https://api.datadoghq.com/organization-settings/api-keys',
+      'https://app.datadoghq.com/organization-settings/api-keys',
     )
     expect(screen.getByRole('link', { name: 'Application keys' }).getAttribute('href')).toBe(
-      'https://api.datadoghq.com/organization-settings/application-keys',
+      'https://app.datadoghq.com/organization-settings/application-keys',
+    )
+
+    fireEvent.change(screen.getByLabelText('Site'), { target: { value: 'api.us3.datadoghq.com' } })
+    expect(screen.getByRole('link', { name: 'API keys' }).getAttribute('href')).toBe(
+      'https://us3.datadoghq.com/organization-settings/api-keys',
     )
   })
 })
