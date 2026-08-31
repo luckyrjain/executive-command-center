@@ -4,6 +4,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { ApiError, apiRequest } from '../../api/client'
 import { serverInstantToLocalInput } from '../../lib/datetime'
 import { apiErrorMessage } from '../../api/errorMessage'
+import { applyWizardFieldInvalidState } from '../../lib/wizardFocus'
 
 export type RiskStatus = 'identified' | 'assessed' | 'monitoring' | 'mitigating' | 'materialized' | 'closed'
 
@@ -63,6 +64,21 @@ const filters = { include_archived: true }
 const STATUSES: RiskStatus[] = ['identified', 'assessed', 'monitoring', 'mitigating', 'materialized', 'closed']
 const CREATE_STEPS = ['details', 'plan', 'review'] as const
 const CREATE_STEP_LABELS: Record<(typeof CREATE_STEPS)[number], string> = { details: 'Details', plan: 'Plan', review: 'Review' }
+const CREATE_ERROR_ID = 'create-risk-error'
+
+/** Mirrors validateDraft's own check order -- returns the aria-label of the
+ * first invalid field plus the wizard step it lives on, so a failed final
+ * submit can navigate back to it and focus it (DESIGN.md's terminal-validation
+ * error-navigation contract). */
+function firstInvalidField(draft: Draft): { field: string; step: (typeof CREATE_STEPS)[number] } | null {
+  if (!draft.description.trim()) return { field: 'Risk description', step: 'details' }
+  if (!Number.isInteger(draft.probability) || draft.probability < 1 || draft.probability > 5) return { field: 'Probability', step: 'details' }
+  if (!Number.isInteger(draft.impact) || draft.impact < 1 || draft.impact > 5) return { field: 'Impact', step: 'details' }
+  if (!draft.mitigation.trim()) return { field: 'Mitigation', step: 'plan' }
+  if (!draft.trigger.trim()) return { field: 'Trigger', step: 'plan' }
+  if (!draft.reviewAt.trim()) return { field: 'Review at', step: 'plan' }
+  return null
+}
 
 /** Frontend-only requirement: mitigation, trigger and review_at must be present before submit,
  * even though the backend RiskCreate/RiskPatch contract leaves them nullable. */
@@ -138,13 +154,15 @@ export default function RiskWorkspace() {
   const [edit, setEdit] = useState<EditState | null>(null)
   const [formError, setFormError] = useState<string | null>(null)
   const createStepHeadingRef = useRef<HTMLHeadingElement>(null)
+  const createFormRef = useRef<HTMLFormElement>(null)
   const isCreateFirstRenderRef = useRef(true)
   const createStep = CREATE_STEPS[createStepIndex] ?? 'details'
+  const [invalidField, setInvalidField] = useState<string | null>(null)
 
   useEffect(() => {
     if (isCreateFirstRenderRef.current) { isCreateFirstRenderRef.current = false; return }
-    createStepHeadingRef.current?.focus()
-  }, [createStep])
+    applyWizardFieldInvalidState(createFormRef.current, invalidField, CREATE_ERROR_ID, createStepHeadingRef.current)
+  }, [createStep, invalidField])
 
   async function reloadLatestRisk(id: string) {
     try {
@@ -179,16 +197,26 @@ export default function RiskWorkspace() {
   })
   const pending = createMutation.isPending || editMutation.isPending || actionMutation.isPending
 
-  function attemptCreate() {
+  function attemptCreate(event: FormEvent) {
+    event.preventDefault()
     const problem = validateDraft(create)
-    if (problem) { setFormError(problem); return }
+    if (problem) {
+      setFormError(problem)
+      const invalid = firstInvalidField(create)
+      setInvalidField(invalid?.field ?? null)
+      if (invalid) setCreateStepIndex(CREATE_STEPS.indexOf(invalid.step))
+      return
+    }
     setFormError(null)
+    setInvalidField(null)
     createMutation.mutate(create)
   }
   function goCreateNext() {
+    setInvalidField(null)
     setCreateStepIndex((i) => Math.min(i + 1, CREATE_STEPS.length - 1))
   }
   function goCreateBack() {
+    setInvalidField(null)
     setCreateStepIndex((i) => Math.max(i - 1, 0))
   }
   function submitEdit(event?: FormEvent) {
@@ -204,9 +232,9 @@ export default function RiskWorkspace() {
 
   return <section className="work-panel" aria-labelledby="risks-title">
     <div className="work-heading"><div><p className="eyebrow">GOVERNANCE</p><h1 id="risks-title">Risks</h1><p>Track exposure, mitigation, and review cadence.</p></div></div>
-    {formError ? <div role="alert" className="inline-status error-panel">{formError}</div> : null}
+    {formError ? <div id={CREATE_ERROR_ID} role="alert" className="inline-status error-panel">{formError}</div> : null}
     {mutationError ? <div role="alert" className="inline-status error-panel">{errorMessage(mutationError)}</div> : null}
-    <div role="region" aria-labelledby="create-risk-title">
+    <form ref={createFormRef} noValidate onSubmit={attemptCreate} aria-labelledby="create-risk-title">
       <h2 id="create-risk-title">Create risk</h2>
       <div className="wizard-stepper" role="group" aria-label="Create risk progress">
         {CREATE_STEPS.map((step, i) => (
@@ -263,11 +291,11 @@ export default function RiskWorkspace() {
           </dl>
           <div className="work-actions">
             <button type="button" onClick={goCreateBack}>Back</button>
-            <button type="button" disabled={pending} onClick={attemptCreate}>Create risk</button>
+            <button type="submit" disabled={pending}>Create risk</button>
           </div>
         </div>
       )}
-    </div>
+    </form>
     {query.isLoading ? <p role="status">Loading risks…</p> : null}
     {query.isError ? <div role="alert">{query.error.message}</div> : null}
     {query.data && query.data.items.length === 0 ? <p className="empty-state">No risks yet. Create one above to get started.</p> : null}

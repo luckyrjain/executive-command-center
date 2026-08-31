@@ -152,4 +152,23 @@ describe('PolicyPanel', () => {
     expect(body.count_limit).toBe(25)
     expect(body.workflow_id).toBe('weekly-digest')
   })
+
+  it('on failed final submit, navigates back to Scope (where the missing Workflow ID lives) and focuses it', async () => {
+    vi.stubGlobal('fetch', vi.fn(() => response({ policies: [] })))
+    renderPanel()
+
+    // Reach Review without ever filling Workflow ID.
+    await waitFor(() => expect(screen.getByText('No policies recorded yet.')).toBeTruthy())
+    fireEvent.click(screen.getByRole('button', { name: 'Continue' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Continue' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Create policy' }))
+
+    const alert = await screen.findByRole('alert')
+    expect(alert.textContent).toMatch(/workflow id is required/i)
+    const workflowIdField = await screen.findByLabelText('Workflow ID')
+    expect(document.activeElement).toBe(workflowIdField)
+    expect(workflowIdField.getAttribute('aria-invalid')).toBe('true')
+    expect(workflowIdField.getAttribute('aria-describedby')).toBe(alert.id)
+    expect(screen.queryByLabelText('Value limit')).toBeNull()
+  })
 })
