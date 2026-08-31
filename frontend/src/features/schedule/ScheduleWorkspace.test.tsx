@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import ScheduleWorkspace, { wallTimeToInstant } from './ScheduleWorkspace'
@@ -34,6 +34,16 @@ function renderWorkspace() {
   return render(<QueryClientProvider client={client}><ScheduleWorkspace /></QueryClientProvider>)
 }
 
+// Both create wizards render "Continue"/"Back" simultaneously, so a bare
+// screen.getByRole('button', { name: 'Continue' }) is ambiguous -- scope to
+// the wizard's own panel via its heading.
+function eventPanel() {
+  return within(screen.getByRole('heading', { name: 'Create calendar event' }).closest('section') as HTMLElement)
+}
+function meetingPanel() {
+  return within(screen.getByRole('heading', { name: 'Create meeting' }).closest('section') as HTMLElement)
+}
+
 beforeEach(() => {
   document.cookie = 'ecc_csrf=test-token; Secure; SameSite=Strict'
   vi.stubGlobal('crypto', { randomUUID: vi.fn(() => 'request-id') })
@@ -54,7 +64,9 @@ describe('ScheduleWorkspace', () => {
     fireEvent.change(screen.getByLabelText('Event start'), { target: { value: '2026-07-20T10:00' } })
     fireEvent.change(screen.getByLabelText('Event end'), { target: { value: '2026-07-20T11:00' } })
     fireEvent.change(screen.getByLabelText('Event timezone'), { target: { value: 'Asia/Kolkata' } })
-    fireEvent.click(screen.getByRole('button', { name: 'Create event' }))
+    fireEvent.click(eventPanel().getByRole('button', { name: 'Continue' }))
+    fireEvent.click(eventPanel().getByRole('button', { name: 'Continue' }))
+    fireEvent.click(eventPanel().getByRole('button', { name: 'Create event' }))
 
     await waitFor(() => expect(fetch).toHaveBeenCalledTimes(4))
     expect(JSON.parse(String((fetch.mock.calls[2][1] as RequestInit).body))).toEqual({
@@ -77,7 +89,9 @@ describe('ScheduleWorkspace', () => {
     fireEvent.change(screen.getByLabelText('Event start'), { target: { value: '2026-07-20T10:00' } })
     fireEvent.change(screen.getByLabelText('Event end'), { target: { value: '2026-07-20T11:00' } })
     fireEvent.change(screen.getByLabelText('Event timezone'), { target: { value: 'Asia/Kolkata' } })
-    fireEvent.click(screen.getByRole('button', { name: 'Create event' }))
+    fireEvent.click(eventPanel().getByRole('button', { name: 'Continue' }))
+    fireEvent.click(eventPanel().getByRole('button', { name: 'Continue' }))
+    fireEvent.click(eventPanel().getByRole('button', { name: 'Create event' }))
 
     await waitFor(() => expect(fetch).toHaveBeenCalledTimes(4))
     const invalidatedKeys = invalidateSpy.mock.calls.map((call) => call[0]?.queryKey)
@@ -99,7 +113,9 @@ describe('ScheduleWorkspace', () => {
     fireEvent.change(screen.getByLabelText('Meeting start'), { target: { value: '2026-07-20T10:00' } })
     fireEvent.change(screen.getByLabelText('Meeting end'), { target: { value: '2026-07-20T11:00' } })
     fireEvent.change(screen.getByLabelText('Meeting timezone'), { target: { value: 'Asia/Kolkata' } })
-    fireEvent.click(screen.getByRole('button', { name: 'Create standalone meeting' }))
+    fireEvent.click(meetingPanel().getByRole('button', { name: 'Continue' }))
+    fireEvent.click(meetingPanel().getByRole('button', { name: 'Continue' }))
+    fireEvent.click(meetingPanel().getByRole('button', { name: 'Create standalone meeting' }))
 
     await waitFor(() => expect(fetch).toHaveBeenCalledTimes(4))
     const invalidatedKeys = invalidateSpy.mock.calls.map((call) => call[0]?.queryKey)
@@ -156,10 +172,12 @@ describe('ScheduleWorkspace', () => {
     fireEvent.change(screen.getByLabelText('Meeting start'), { target: { value: '2026-07-20T10:00' } })
     fireEvent.change(screen.getByLabelText('Meeting end'), { target: { value: '2026-07-20T11:00' } })
     fireEvent.change(screen.getByLabelText('Meeting timezone'), { target: { value: 'Asia/Kolkata' } })
+    fireEvent.click(meetingPanel().getByRole('button', { name: 'Continue' }))
     fireEvent.change(screen.getByLabelText('Meeting agenda'), { target: { value: 'Goals' } })
     fireEvent.change(screen.getByLabelText('Meeting preparation'), { target: { value: 'Reflect' } })
     fireEvent.change(screen.getByLabelText('Meeting notes summary'), { target: { value: 'Next steps' } })
-    fireEvent.click(screen.getByRole('button', { name: 'Create standalone meeting' }))
+    fireEvent.click(meetingPanel().getByRole('button', { name: 'Continue' }))
+    fireEvent.click(meetingPanel().getByRole('button', { name: 'Create standalone meeting' }))
     await waitFor(() => expect(fetch).toHaveBeenCalledTimes(4))
     expect(JSON.parse(String((fetch.mock.calls[2][1] as RequestInit).body))).toEqual({
       calendar_event_id: null, title: 'Coaching session', starts_at: '2026-07-20T04:30:00.000Z', ends_at: '2026-07-20T05:30:00.000Z',
