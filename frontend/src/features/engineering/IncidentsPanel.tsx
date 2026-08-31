@@ -97,7 +97,7 @@ export default function IncidentsPanel() {
       <h2 id="engineering-incidents-title">Incidents</h2>
       <p>Workspace-authored incidents, correlated to changes where known. There is no automatic incident-management connector in this activation -- every incident here was captured by hand.</p>
 
-      <form onSubmit={(event) => { event.preventDefault(); createMutation.mutate() }}>
+      <form className="field-form" onSubmit={(event) => { event.preventDefault(); createMutation.mutate() }}>
         <label>Title
           <input aria-label="Incident title" value={title} onChange={(e) => setTitle(e.target.value)} />
         </label>

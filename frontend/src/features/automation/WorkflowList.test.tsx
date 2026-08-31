@@ -85,8 +85,10 @@ describe('WorkflowList', () => {
 
     await waitFor(() => expect(screen.getByText('No workflows yet. Draft one below.')).toBeTruthy())
     fireEvent.change(screen.getByLabelText('Workflow ID'), { target: { value: 'new-flow' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Continue' }))
     fireEvent.change(screen.getByLabelText('Step ID for step 1'), { target: { value: 's1' } })
     fireEvent.change(screen.getByLabelText('Action reference for step 1'), { target: { value: 'local.create_note' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Continue' }))
     fireEvent.click(screen.getByRole('button', { name: 'Create draft' }))
 
     await waitFor(() => expect(onSelect).toHaveBeenCalledWith('new-version-1'))
@@ -116,8 +118,10 @@ describe('WorkflowList', () => {
 
     await waitFor(() => expect(screen.getByText('No workflows yet. Draft one below.')).toBeTruthy())
     fireEvent.change(screen.getByLabelText('Workflow ID'), { target: { value: 'weekly-digest' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Continue' }))
     fireEvent.change(screen.getByLabelText('Step ID for step 1'), { target: { value: 's1' } })
     fireEvent.change(screen.getByLabelText('Action reference for step 1'), { target: { value: 'local.create_note' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Continue' }))
     fireEvent.click(screen.getByRole('button', { name: 'Create draft' }))
 
     expect(await screen.findByText(/Another version was created for this workflow at the same time/)).toBeTruthy()
@@ -132,8 +136,10 @@ describe('WorkflowList', () => {
     await waitFor(() => expect(screen.getByText('No workflows yet. Draft one below.')).toBeTruthy())
 
     fireEvent.change(screen.getByLabelText('Workflow ID'), { target: { value: 'bad-json-flow' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Continue' }))
     fireEvent.change(screen.getByLabelText('Step ID for step 1'), { target: { value: 's1' } })
     fireEvent.change(screen.getByLabelText('Input mapping (JSON object) for step 1'), { target: { value: '{not valid json' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Continue' }))
     fireEvent.click(screen.getByRole('button', { name: 'Create draft' }))
 
     expect(await screen.findByText(/input mapping must be valid JSON/)).toBeTruthy()
@@ -148,6 +154,7 @@ describe('WorkflowList', () => {
     // disambiguation is needed...
     expect(screen.getByLabelText('Trigger references (comma separated)')).toBeTruthy()
     expect(screen.getByLabelText('Policy ID (optional -- attach after creating one from the Policies tab)')).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: 'Continue' }))
     // ...and is the *prefix* of it where a step number must disambiguate one
     // of several identical fields. The old "Step 1 ID"/"Step 1 type" names did
     // not contain their own visible label text at all.
@@ -194,7 +201,9 @@ describe('WorkflowList', () => {
     await waitFor(() => expect(screen.getByText('No workflows yet. Draft one below.')).toBeTruthy())
 
     fireEvent.change(screen.getByLabelText('Workflow ID'), { target: { value: 'invalid-flow' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Continue' }))
     fireEvent.change(screen.getByLabelText('Step ID for step 1'), { target: { value: 's1' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Continue' }))
     fireEvent.click(screen.getByRole('button', { name: 'Create draft' }))
 
     expect(await screen.findByText(/action_ref required for action/)).toBeTruthy()

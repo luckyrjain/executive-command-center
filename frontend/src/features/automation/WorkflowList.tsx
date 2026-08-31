@@ -1,4 +1,4 @@
-import { useState, type FormEvent } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
 import { ApiError, apiRequest } from '../../api/client'
@@ -26,6 +26,8 @@ const emptyStep: StepDraft = {
 }
 
 const STEP_TYPES: GraphStep['step_type'][] = ['action', 'approval_gate', 'condition', 'compensation']
+const CREATE_STEPS = ['basics', 'build', 'review'] as const
+const CREATE_STEP_LABELS: Record<(typeof CREATE_STEPS)[number], string> = { basics: 'Basics', build: 'Build', review: 'Review' }
 
 function toGraphStep(draft: StepDraft): GraphStep {
   let input_mapping: Record<string, unknown> = {}
@@ -76,6 +78,15 @@ export default function WorkflowList({ onSelect }: { onSelect: (versionId: strin
   const [triggerRefs, setTriggerRefs] = useState('manual')
   const [steps, setSteps] = useState<StepDraft[]>([{ ...emptyStep }])
   const [formError, setFormError] = useState<string | null>(null)
+  const [createStepIndex, setCreateStepIndex] = useState(0)
+  const createStepHeadingRef = useRef<HTMLHeadingElement>(null)
+  const isCreateFirstRenderRef = useRef(true)
+  const createStep = CREATE_STEPS[createStepIndex] ?? 'basics'
+
+  useEffect(() => {
+    if (isCreateFirstRenderRef.current) { isCreateFirstRenderRef.current = false; return }
+    createStepHeadingRef.current?.focus()
+  }, [createStep])
 
   const createMutation = useMutation({
     mutationFn: (body: { workflow_id: string; graph: { steps: GraphStep[] }; trigger_refs: string[]; policy_ref: string | null }) =>
@@ -85,6 +96,7 @@ export default function WorkflowList({ onSelect }: { onSelect: (versionId: strin
       setPolicyRef('')
       setTriggerRefs('manual')
       setSteps([{ ...emptyStep }])
+      setCreateStepIndex(0)
       void queryClient.invalidateQueries({ queryKey: ['automation', 'workflows'] })
       onSelect(created.id)
     },
@@ -104,8 +116,7 @@ export default function WorkflowList({ onSelect }: { onSelect: (versionId: strin
     setSteps((current) => current.map((step, i) => (i === index ? { ...step, ...patch } : step)))
   }
 
-  function submit(event: FormEvent) {
-    event.preventDefault()
+  function attemptCreate() {
     setFormError(null)
     if (!workflowId.trim()) {
       setFormError('Workflow ID is required.')
@@ -129,6 +140,12 @@ export default function WorkflowList({ onSelect }: { onSelect: (versionId: strin
       trigger_refs: triggerRefs.split(',').map((ref) => ref.trim()).filter(Boolean),
       policy_ref: policyRef.trim() || null,
     })
+  }
+  function goCreateNext() {
+    setCreateStepIndex((i) => Math.min(i + 1, CREATE_STEPS.length - 1))
+  }
+  function goCreateBack() {
+    setCreateStepIndex((i) => Math.max(i - 1, 0))
   }
 
   const pending = createMutation.isPending
@@ -166,72 +183,121 @@ export default function WorkflowList({ onSelect }: { onSelect: (versionId: strin
         ))}
       </ol>
 
-      <form onSubmit={submit}>
-        <h3>Draft a new workflow (or a new version)</h3>
+      <div role="region" aria-labelledby="draft-workflow-title">
+        <h3 id="draft-workflow-title">Draft a new workflow (or a new version)</h3>
         <p>The builder is a structured step list, not a visual graph editor -- each step's type, action reference and routing are set explicitly below.</p>
         {formError ? <div role="alert" className="inline-status error-panel">{formError}</div> : null}
         {createMutation.isError ? <div role="alert" className="inline-status error-panel">{errorMessage(createMutation.error)}</div> : null}
 
-        {/* These three inputs take their accessible name from their own
-            wrapping label's visible text (WCAG 2.5.3 Label in Name). "Trigger
-            references"/"Policy ID" as `aria-label`s did *not* contain the
-            visible "Trigger references (comma separated)"/"Policy ID (optional
-            -- …)" text, and "Workflow ID" merely duplicated it. */}
-        <label>Workflow ID
-          <input required value={workflowId} onChange={(e) => setWorkflowId(e.target.value)} placeholder="e.g. weekly-note-digest" />
-        </label>
-        <label>Trigger references (comma separated)
-          <input value={triggerRefs} onChange={(e) => setTriggerRefs(e.target.value)} />
-        </label>
-        <label>Policy ID (optional -- attach after creating one from the Policies tab)
-          <input value={policyRef} onChange={(e) => setPolicyRef(e.target.value)} placeholder="policy UUID" />
-        </label>
-
-        <fieldset>
-          <legend>Steps</legend>
-          {/* Each step field keeps an `aria-label` -- with several steps in one
-              form, "Step ID" alone would name every step's id field identically
-              -- but the label now *starts with* the field's own visible text and
-              only appends the step number after it ("Step ID for step 1", not
-              "Step 1 ID"), so the visible text is contained in the accessible
-              name as WCAG 2.5.3 requires. */}
-          {steps.map((step, index) => (
-            <div key={index} className="work-panel automation-step-editor">
-              <label>Step ID
-                <input aria-label={`Step ID for step ${index + 1}`} required value={step.step_id} onChange={(e) => updateStep(index, { step_id: e.target.value })} />
-              </label>
-              <label>Step type
-                <select aria-label={`Step type for step ${index + 1}`} value={step.step_type} onChange={(e) => updateStep(index, { step_type: e.target.value as GraphStep['step_type'] })}>
-                  {STEP_TYPES.map((type) => <option key={type} value={type}>{type.replaceAll('_', ' ')}</option>)}
-                </select>
-              </label>
-              <label>Action reference
-                <input aria-label={`Action reference for step ${index + 1}`} value={step.action_ref} onChange={(e) => updateStep(index, { action_ref: e.target.value })} placeholder="e.g. local.create_note" />
-              </label>
-              <label>Input mapping (JSON object)
-                <textarea aria-label={`Input mapping (JSON object) for step ${index + 1}`} value={step.input_mapping} onChange={(e) => updateStep(index, { input_mapping: e.target.value })} />
-              </label>
-              <label>On success
-                <input aria-label={`On success for step ${index + 1}`} value={step.on_success} onChange={(e) => updateStep(index, { on_success: e.target.value })} placeholder="succeeded, failed, or another step_id" />
-              </label>
-              <label>On failure
-                <input aria-label={`On failure for step ${index + 1}`} value={step.on_failure} onChange={(e) => updateStep(index, { on_failure: e.target.value })} placeholder="succeeded, failed, or another step_id" />
-              </label>
-              <label>Compensate reference (action steps only)
-                <input aria-label={`Compensate reference (action steps only) for step ${index + 1}`} value={step.compensate_ref} onChange={(e) => updateStep(index, { compensate_ref: e.target.value })} placeholder="a compensation step_id" />
-              </label>
-              {steps.length > 1 ? (
-                <button type="button" onClick={() => setSteps((current) => current.filter((_, i) => i !== index))}>
-                  Remove step {index + 1}
-                </button>
-              ) : null}
+        <div className="wizard-stepper" role="group" aria-label="Draft workflow progress">
+          {CREATE_STEPS.map((step, i) => (
+            <div className="wizard-step-node" key={step} aria-current={i === createStepIndex ? 'step' : undefined}>
+              <span className={i < createStepIndex ? 'wizard-step-circle done' : i === createStepIndex ? 'wizard-step-circle active' : 'wizard-step-circle upcoming'}>
+                {i < createStepIndex ? '✓' : i + 1}
+              </span>
+              <span className={i <= createStepIndex ? 'wizard-step-label on' : 'wizard-step-label'}>{CREATE_STEP_LABELS[step]}</span>
+              {i < CREATE_STEPS.length - 1 ? <span className={i < createStepIndex ? 'wizard-step-line done' : 'wizard-step-line'} /> : null}
             </div>
           ))}
-          <button type="button" onClick={() => setSteps((current) => [...current, { ...emptyStep }])}>Add step</button>
-        </fieldset>
+        </div>
 
-        <button type="submit" disabled={pending}>{pending ? 'Creating…' : 'Create draft'}</button>
-      </form>
+        {createStep === 'basics' ? (
+          <div className="field-form">
+            <p className="eyebrow">Step {createStepIndex + 1} of {CREATE_STEPS.length} · Basics</p>
+            <h4 ref={createStepHeadingRef} tabIndex={-1}>Name and trigger this workflow</h4>
+            {/* These three inputs take their accessible name from their own
+                wrapping label's visible text (WCAG 2.5.3 Label in Name). "Trigger
+                references"/"Policy ID" as `aria-label`s did *not* contain the
+                visible "Trigger references (comma separated)"/"Policy ID (optional
+                -- …)" text, and "Workflow ID" merely duplicated it. */}
+            <label>Workflow ID
+              <input value={workflowId} onChange={(e) => setWorkflowId(e.target.value)} placeholder="e.g. weekly-note-digest" />
+            </label>
+            <label>Trigger references (comma separated)
+              <input value={triggerRefs} onChange={(e) => setTriggerRefs(e.target.value)} />
+            </label>
+            <label>Policy ID (optional -- attach after creating one from the Policies tab)
+              <input value={policyRef} onChange={(e) => setPolicyRef(e.target.value)} placeholder="policy UUID" />
+            </label>
+            <div className="work-actions">
+              <button type="button" onClick={goCreateNext}>Continue</button>
+            </div>
+          </div>
+        ) : createStep === 'build' ? (
+          <div className="field-form">
+            <p className="eyebrow">Step {createStepIndex + 1} of {CREATE_STEPS.length} · Build</p>
+            <h4 ref={createStepHeadingRef} tabIndex={-1}>Define the workflow steps</h4>
+            <fieldset>
+              <legend>Workflow steps</legend>
+              {/* Each step field keeps an `aria-label` -- with several steps in one
+                  form, "Step ID" alone would name every step's id field identically
+                  -- but the label now *starts with* the field's own visible text and
+                  only appends the step number after it ("Step ID for step 1", not
+                  "Step 1 ID"), so the visible text is contained in the accessible
+                  name as WCAG 2.5.3 requires. */}
+              {steps.map((step, index) => (
+                <div key={index} className="work-panel automation-step-editor field-form">
+                  <label>Step ID
+                    <input aria-label={`Step ID for step ${index + 1}`} value={step.step_id} onChange={(e) => updateStep(index, { step_id: e.target.value })} />
+                  </label>
+                  <label>Step type
+                    <select aria-label={`Step type for step ${index + 1}`} value={step.step_type} onChange={(e) => updateStep(index, { step_type: e.target.value as GraphStep['step_type'] })}>
+                      {STEP_TYPES.map((type) => <option key={type} value={type}>{type.replaceAll('_', ' ')}</option>)}
+                    </select>
+                  </label>
+                  <label>Action reference
+                    <input aria-label={`Action reference for step ${index + 1}`} value={step.action_ref} onChange={(e) => updateStep(index, { action_ref: e.target.value })} placeholder="e.g. local.create_note" />
+                  </label>
+                  <label>Input mapping (JSON object)
+                    <textarea aria-label={`Input mapping (JSON object) for step ${index + 1}`} value={step.input_mapping} onChange={(e) => updateStep(index, { input_mapping: e.target.value })} />
+                  </label>
+                  <label>On success
+                    <input aria-label={`On success for step ${index + 1}`} value={step.on_success} onChange={(e) => updateStep(index, { on_success: e.target.value })} placeholder="succeeded, failed, or another step_id" />
+                  </label>
+                  <label>On failure
+                    <input aria-label={`On failure for step ${index + 1}`} value={step.on_failure} onChange={(e) => updateStep(index, { on_failure: e.target.value })} placeholder="succeeded, failed, or another step_id" />
+                  </label>
+                  <label>Compensate reference (action steps only)
+                    <input aria-label={`Compensate reference (action steps only) for step ${index + 1}`} value={step.compensate_ref} onChange={(e) => updateStep(index, { compensate_ref: e.target.value })} placeholder="a compensation step_id" />
+                  </label>
+                  {steps.length > 1 ? (
+                    <button type="button" onClick={() => setSteps((current) => current.filter((_, i) => i !== index))}>
+                      Remove step {index + 1}
+                    </button>
+                  ) : null}
+                </div>
+              ))}
+              <button type="button" onClick={() => setSteps((current) => [...current, { ...emptyStep }])}>Add step</button>
+            </fieldset>
+            <div className="work-actions">
+              <button type="button" onClick={goCreateBack}>Back</button>
+              <button type="button" onClick={goCreateNext}>Continue</button>
+            </div>
+          </div>
+        ) : (
+          <div className="wizard-review">
+            <p className="eyebrow">Step {createStepIndex + 1} of {CREATE_STEPS.length} · Review</p>
+            <h4 ref={createStepHeadingRef} tabIndex={-1}>Review and create</h4>
+            <dl>
+              <div><dt>Workflow ID</dt><dd>{workflowId || '—'}</dd></div>
+              <div><dt>Trigger references</dt><dd>{triggerRefs || '—'}</dd></div>
+              <div><dt>Policy ID</dt><dd>{policyRef || '—'}</dd></div>
+            </dl>
+            <ol className="work-list">
+              {steps.map((step, index) => (
+                <li key={index}>
+                  <strong>{step.step_id || `Step ${index + 1}`}</strong>
+                  <small>{step.step_type.replaceAll('_', ' ')}{step.action_ref ? ` · ${step.action_ref}` : ''}</small>
+                </li>
+              ))}
+            </ol>
+            <div className="work-actions">
+              <button type="button" onClick={goCreateBack}>Back</button>
+              <button type="button" disabled={pending} onClick={attemptCreate}>{pending ? 'Creating…' : 'Create draft'}</button>
+            </div>
+          </div>
+        )}
+      </div>
     </section>
   )
 }

@@ -103,7 +103,7 @@ export default function DecisionsPanel() {
       <h2 id="engineering-decisions-title">Decisions</h2>
       <p>Engineering decisions proposed and decided by this workspace, correlated to changes where known.</p>
 
-      <form onSubmit={(event) => { event.preventDefault(); createMutation.mutate() }}>
+      <form className="field-form" onSubmit={(event) => { event.preventDefault(); createMutation.mutate() }}>
         <label>Title
           <input aria-label="Decision title" value={title} onChange={(e) => setTitle(e.target.value)} />
         </label>

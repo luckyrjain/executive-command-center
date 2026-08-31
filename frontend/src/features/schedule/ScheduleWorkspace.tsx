@@ -169,7 +169,7 @@ export default function ScheduleWorkspace() {
     {formError ? <div role="alert" className="inline-status error-panel">{formError}</div> : null}
     {mutationError ? <div role="alert" className="inline-status error-panel">{mutationError instanceof ApiError && mutationError.code === 'VERSION_CONFLICT' ? 'This schedule item changed while you were editing it. Your input is preserved; retry after the latest version loads.' : mutationError.message}</div> : null}
     <div className="work-grid">
-      <section className="work-panel"><form onSubmit={submitEvent}><h2>Create calendar event</h2>
+      <section className="work-panel"><form className="field-form" onSubmit={submitEvent}><h2>Create calendar event</h2>
         <label>Event title<input aria-label="Event title" required value={createEvent.title} onChange={(e) => setCreateEvent({ ...createEvent, title: e.target.value })} /></label>
         <TimingFields prefix="Event" draft={createEvent} onChange={setCreateEvent} />
         <label><input type="checkbox" checked={createEvent.allDay} onChange={(e) => setCreateEvent({ ...createEvent, allDay: e.target.checked })} /> All day</label>
@@ -177,7 +177,7 @@ export default function ScheduleWorkspace() {
         <label>Description<textarea value={createEvent.description} onChange={(e) => setCreateEvent({ ...createEvent, description: e.target.value })} /></label>
         <button type="submit" disabled={pending}>Create event</button>
       </form></section>
-      <section className="work-panel"><form onSubmit={submitMeeting}><h2>Create meeting</h2>
+      <section className="work-panel"><form className="field-form" onSubmit={submitMeeting}><h2>Create meeting</h2>
         <label>Linked calendar event<select aria-label="Linked calendar event" value={createMeeting.calendarEventId} onChange={(e) => setCreateMeeting({ ...createMeeting, calendarEventId: e.target.value })}><option value="">Standalone meeting</option>{(events.data?.items ?? []).filter((item) => !item.archived_at).map((item) => <option key={item.id} value={item.id}>{item.title}</option>)}</select></label>
         <label>Meeting title<input aria-label="Meeting title" required value={createMeeting.title} onChange={(e) => setCreateMeeting({ ...createMeeting, title: e.target.value })} /></label>
         {createMeeting.calendarEventId ? <p className="inline-status">Timing will be projected from the selected calendar event.</p> : <TimingFields prefix="Meeting" draft={createMeeting} onChange={setCreateMeeting} />}
@@ -199,7 +199,7 @@ export default function ScheduleWorkspace() {
         </div></li>)}</ol>
       </section>
     </div>
-    {editEvent ? <section className="work-panel"><form onSubmit={submitEventEdit}><h2>Edit calendar event</h2><p>This calendar event is the authoritative timing record.</p>
+    {editEvent ? <section className="work-panel"><form className="field-form" onSubmit={submitEventEdit}><h2>Edit calendar event</h2><p>This calendar event is the authoritative timing record.</p>
       <label>Edit event title<input aria-label="Edit event title" value={editEvent.title} onChange={(e) => setEditEvent({ ...editEvent, title: e.target.value })} /></label><TimingFields prefix="Edit event" draft={editEvent} onChange={(value) => setEditEvent({ ...editEvent, ...value })} />
       <label><input aria-label="Edit event all day" type="checkbox" checked={editEvent.allDay} onChange={(e) => setEditEvent({ ...editEvent, allDay: e.target.checked })} /> All day</label>
       <label>Edit event location<input aria-label="Edit event location" value={editEvent.location} onChange={(e) => setEditEvent({ ...editEvent, location: e.target.value })} /></label>
@@ -208,7 +208,7 @@ export default function ScheduleWorkspace() {
       {editEvent.reloadFailed ? <><p role="alert">Could not reload the latest event. Your edits are preserved.</p><button type="button" disabled={pending} onClick={() => void reloadEvent(editEvent.record.id)}>Reload latest event</button></> : editEvent.conflict ? <button type="button" disabled={pending} onClick={() => submitEventEdit()}>Retry event with latest version</button> : <button type="submit" disabled={pending}>Save event</button>}
       <button type="button" disabled={pending} onClick={() => setEditEvent(null)}>Discard event edit</button>
     </form></section> : null}
-    {editMeeting ? <section className="work-panel"><form onSubmit={submitMeetingEdit}><h2>Edit meeting</h2>
+    {editMeeting ? <section className="work-panel"><form className="field-form" onSubmit={submitMeetingEdit}><h2>Edit meeting</h2>
       {editMeeting.record.calendar_event_id ? <><p className="inline-status">Linked meeting timing is controlled by its calendar event and is display-only here.</p><button type="button" disabled={pending} onClick={() => { const eventId = editMeeting.record.calendar_event_id; if (!eventId) return; const authoritative = events.data?.items.find((item) => item.id === eventId); if (authoritative) setEditEvent({ record: authoritative, ...eventDraft(authoritative), latestVersion: authoritative.version, conflict: false, reloadFailed: false }); else eventLookup.mutate(eventId) }}>Reschedule {editMeeting.record.title}</button></> : <TimingFields prefix="Edit meeting" draft={editMeeting} onChange={(value) => setEditMeeting({ ...editMeeting, ...value })} />}
       <label>Edit meeting title<input value={editMeeting.title} onChange={(e) => setEditMeeting({ ...editMeeting, title: e.target.value })} /></label><MeetingFields draft={editMeeting} onChange={(value) => setEditMeeting({ ...editMeeting, ...value })} />
       {editMeeting.reloadFailed ? <><p role="alert">Could not reload the latest meeting. Your edits are preserved.</p><button type="button" disabled={pending} onClick={() => void reloadMeeting(editMeeting.record.id)}>Reload latest meeting</button></> : editMeeting.conflict ? <button type="button" disabled={pending} onClick={() => submitMeetingEdit()}>Retry meeting with latest version</button> : <button type="submit" disabled={pending}>Save meeting</button>}

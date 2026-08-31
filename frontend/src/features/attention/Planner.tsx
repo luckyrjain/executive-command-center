@@ -151,7 +151,7 @@ export default function Planner() {
 
       {mutationError ? <div role="alert" className="inline-status error-panel">{errorMessage(mutationError)}</div> : null}
 
-      <form onSubmit={submitCreate}>
+      <form className="field-form" onSubmit={submitCreate}>
         <h2>Propose a plan</h2>
         <label>Period start<input aria-label="Period start" type="date" value={periodStart} onChange={(e) => setPeriodStart(e.target.value)} /></label>
         <label>Period end<input aria-label="Period end" type="date" value={periodEnd} onChange={(e) => setPeriodEnd(e.target.value)} /></label>

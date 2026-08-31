@@ -88,9 +88,11 @@ describe('RiskWorkspace', () => {
     const invalidateSpy = vi.spyOn(client, 'invalidateQueries')
 
     fireEvent.change(screen.getByLabelText('Risk description'), { target: { value: 'Vendor renewal may lapse' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Continue' }))
     fireEvent.change(screen.getByLabelText('Mitigation'), { target: { value: 'Confirm renewal terms' } })
     fireEvent.change(screen.getByLabelText('Trigger'), { target: { value: 'No signed contract' } })
     fireEvent.change(screen.getByLabelText('Review at'), { target: { value: '2026-08-01T00:00' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Continue' }))
     fireEvent.click(screen.getByRole('button', { name: 'Create risk' }))
 
     await waitFor(() => expect(fetch).toHaveBeenCalledTimes(3))
@@ -108,9 +110,11 @@ describe('RiskWorkspace', () => {
     renderWorkspace()
 
     fireEvent.change(screen.getByLabelText('Risk description'), { target: { value: 'Vendor renewal may lapse' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Continue' }))
     fireEvent.change(screen.getByLabelText('Mitigation'), { target: { value: 'Confirm renewal terms' } })
     fireEvent.change(screen.getByLabelText('Trigger'), { target: { value: 'No signed contract' } })
     fireEvent.change(screen.getByLabelText('Review at'), { target: { value: '2026-08-01T00:00' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Continue' }))
     fireEvent.click(screen.getByRole('button', { name: 'Create risk' }))
 
     await waitFor(() => expect(fetch).toHaveBeenCalledTimes(3))
@@ -130,6 +134,8 @@ describe('RiskWorkspace', () => {
     renderWorkspace()
 
     fireEvent.change(screen.getByLabelText('Risk description'), { target: { value: 'Missing mitigation' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Continue' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Continue' }))
     fireEvent.click(screen.getByRole('button', { name: 'Create risk' }))
 
     await screen.findByRole('alert')

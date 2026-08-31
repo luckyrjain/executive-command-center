@@ -169,6 +169,7 @@ export default function RecordsPanel() {
       {domains.data && enabled ? (
         <>
           <form
+            className="field-form"
             onSubmit={(event) => {
               event.preventDefault()
               createMutation.mutate({
@@ -238,7 +239,7 @@ export default function RecordsPanel() {
           </form>
           {createMutation.isError ? <div role="alert" className="inline-status error-panel">{personalErrorMessage(createMutation.error)}</div> : null}
 
-          <fieldset>
+          <fieldset className="field-form">
             <legend>Filter by effective date</legend>
             <label>From
               <input

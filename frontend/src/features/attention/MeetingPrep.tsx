@@ -114,7 +114,7 @@ export default function MeetingPrep() {
         </div>
       </div>
 
-      <form onSubmit={submit}>
+      <form className="field-form" onSubmit={submit}>
         <label>Meeting ID<input aria-label="Meeting ID" value={meetingId} onChange={(e) => setMeetingId(e.target.value)} /></label>
         <button type="submit" disabled={pending}>Load meeting prep</button>
       </form>

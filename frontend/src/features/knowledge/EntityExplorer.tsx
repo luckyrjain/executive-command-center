@@ -148,7 +148,7 @@ export default function EntityExplorer() {
       {createMutation.error ? (
         <div role="alert" className="inline-status error-panel">{createMutation.error.message}</div>
       ) : null}
-      <form onSubmit={submitCreate}>
+      <form className="field-form" onSubmit={submitCreate}>
         <h2>Create entity</h2>
         <label>
           Entity kind

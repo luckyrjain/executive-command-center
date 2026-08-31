@@ -301,7 +301,7 @@ export default function EntityDetail({ entityId, onClose }: EntityDetailProps) {
                 {claim.superseded_by ? <small> · superseded</small> : null}
                 {!claim.superseded_by ? (
                   correctingClaimId === claim.id ? (
-                    <form onSubmit={submitCorrection}>
+                    <form className="field-form" onSubmit={submitCorrection}>
                       <h4>Correct claim</h4>
                       <label>
                         Predicate
@@ -368,7 +368,7 @@ export default function EntityDetail({ entityId, onClose }: EntityDetailProps) {
         {recordClaimMutation.error ? (
           <div role="alert" className="inline-status error-panel">{recordClaimMutation.error.message}</div>
         ) : null}
-        <form onSubmit={submitClaim}>
+        <form className="field-form" onSubmit={submitClaim}>
           <h4>Record claim</h4>
           <label>
             Predicate
@@ -439,7 +439,7 @@ export default function EntityDetail({ entityId, onClose }: EntityDetailProps) {
         {addRelationshipMutation.error ? (
           <div role="alert" className="inline-status error-panel">{addRelationshipMutation.error.message}</div>
         ) : null}
-        <form onSubmit={submitRelationship}>
+        <form className="field-form" onSubmit={submitRelationship}>
           <h4>Add relationship</h4>
           <label>
             Relationship type
@@ -495,7 +495,7 @@ export default function EntityDetail({ entityId, onClose }: EntityDetailProps) {
           {addMemberMutation.error ? (
             <div role="alert" className="inline-status error-panel">{addMemberMutation.error.message}</div>
           ) : null}
-          <form onSubmit={submitMember}>
+          <form className="field-form" onSubmit={submitMember}>
             <h4>Add member</h4>
             <label>
               Person entity ID

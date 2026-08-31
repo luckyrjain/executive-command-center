@@ -1,4 +1,4 @@
-import { useState, type FormEvent } from 'react'
+import { useEffect, useRef, useState, type FormEvent } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
 import { ApiError, apiRequest } from '../../api/client'
@@ -61,6 +61,8 @@ const emptyDraft: Draft = {
 }
 const filters = { include_archived: true }
 const STATUSES: RiskStatus[] = ['identified', 'assessed', 'monitoring', 'mitigating', 'materialized', 'closed']
+const CREATE_STEPS = ['details', 'plan', 'review'] as const
+const CREATE_STEP_LABELS: Record<(typeof CREATE_STEPS)[number], string> = { details: 'Details', plan: 'Plan', review: 'Review' }
 
 /** Frontend-only requirement: mitigation, trigger and review_at must be present before submit,
  * even though the backend RiskCreate/RiskPatch contract leaves them nullable. */
@@ -132,8 +134,17 @@ export default function RiskWorkspace() {
   const queryClient = useQueryClient()
   const query = useQuery({ queryKey: ['risks', filters], queryFn: () => apiRequest<RiskList>('/api/v1/risks?include_archived=true&limit=100'), retry: 1 })
   const [create, setCreate] = useState<Draft>(emptyDraft)
+  const [createStepIndex, setCreateStepIndex] = useState(0)
   const [edit, setEdit] = useState<EditState | null>(null)
   const [formError, setFormError] = useState<string | null>(null)
+  const createStepHeadingRef = useRef<HTMLHeadingElement>(null)
+  const isCreateFirstRenderRef = useRef(true)
+  const createStep = CREATE_STEPS[createStepIndex] ?? 'details'
+
+  useEffect(() => {
+    if (isCreateFirstRenderRef.current) { isCreateFirstRenderRef.current = false; return }
+    createStepHeadingRef.current?.focus()
+  }, [createStep])
 
   async function reloadLatestRisk(id: string) {
     try {
@@ -151,7 +162,7 @@ export default function RiskWorkspace() {
 
   const createMutation = useMutation({
     mutationFn: (draft: Draft) => apiRequest<Risk>('/api/v1/risks', { method: 'POST', body: createBody(draft) }),
-    onSuccess: () => { setCreate(emptyDraft); void refresh() },
+    onSuccess: () => { setCreate(emptyDraft); setCreateStepIndex(0); void refresh() },
   })
   const editMutation = useMutation({
     mutationFn: ({ draft, version }: { draft: EditState; version: number }) => apiRequest<Risk>(`/api/v1/risks/${draft.risk.id}`, { method: 'PATCH', body: { expected_version: version, ...patchBody(draft) } }),
@@ -168,12 +179,17 @@ export default function RiskWorkspace() {
   })
   const pending = createMutation.isPending || editMutation.isPending || actionMutation.isPending
 
-  function submitCreate(event: FormEvent) {
-    event.preventDefault()
+  function attemptCreate() {
     const problem = validateDraft(create)
     if (problem) { setFormError(problem); return }
     setFormError(null)
     createMutation.mutate(create)
+  }
+  function goCreateNext() {
+    setCreateStepIndex((i) => Math.min(i + 1, CREATE_STEPS.length - 1))
+  }
+  function goCreateBack() {
+    setCreateStepIndex((i) => Math.max(i - 1, 0))
   }
   function submitEdit(event?: FormEvent) {
     event?.preventDefault()
@@ -190,19 +206,68 @@ export default function RiskWorkspace() {
     <div className="work-heading"><div><p className="eyebrow">GOVERNANCE</p><h1 id="risks-title">Risks</h1><p>Track exposure, mitigation, and review cadence.</p></div></div>
     {formError ? <div role="alert" className="inline-status error-panel">{formError}</div> : null}
     {mutationError ? <div role="alert" className="inline-status error-panel">{errorMessage(mutationError)}</div> : null}
-    <form onSubmit={submitCreate}>
-      <h2>Create risk</h2>
-      <label>Risk description<textarea aria-label="Risk description" value={create.description} onChange={(e) => setCreate({ ...create, description: e.target.value })} /></label>
-      <label>Probability (1-5)<input aria-label="Probability" type="number" min={1} max={5} value={create.probability} onChange={(e) => setCreate({ ...create, probability: Number(e.target.value) })} /></label>
-      <label>Impact (1-5)<input aria-label="Impact" type="number" min={1} max={5} value={create.impact} onChange={(e) => setCreate({ ...create, impact: Number(e.target.value) })} /></label>
-      <label>Status<select aria-label="Status" value={create.status} onChange={(e) => setCreate({ ...create, status: e.target.value as RiskStatus })}>{STATUSES.map((status) => <option key={status} value={status}>{status}</option>)}</select></label>
-      <label>Mitigation<textarea aria-label="Mitigation" value={create.mitigation} onChange={(e) => setCreate({ ...create, mitigation: e.target.value })} /></label>
-      <label>Trigger<input aria-label="Trigger" value={create.trigger} onChange={(e) => setCreate({ ...create, trigger: e.target.value })} /></label>
-      <label>Review at<input aria-label="Review at" type="datetime-local" value={create.reviewAt} onChange={(e) => setCreate({ ...create, reviewAt: e.target.value })} /></label>
-      <label>Project ID<input aria-label="Project ID" value={create.projectId} onChange={(e) => setCreate({ ...create, projectId: e.target.value })} /></label>
-      <label><input type="checkbox" checked={create.pinned} onChange={(e) => setCreate({ ...create, pinned: e.target.checked })} /> Pinned</label>
-      <button type="submit" disabled={pending}>Create risk</button>
-    </form>
+    <div role="region" aria-labelledby="create-risk-title">
+      <h2 id="create-risk-title">Create risk</h2>
+      <div className="wizard-stepper" role="group" aria-label="Create risk progress">
+        {CREATE_STEPS.map((step, i) => (
+          <div className="wizard-step-node" key={step} aria-current={i === createStepIndex ? 'step' : undefined}>
+            <span className={i < createStepIndex ? 'wizard-step-circle done' : i === createStepIndex ? 'wizard-step-circle active' : 'wizard-step-circle upcoming'}>
+              {i < createStepIndex ? '✓' : i + 1}
+            </span>
+            <span className={i <= createStepIndex ? 'wizard-step-label on' : 'wizard-step-label'}>{CREATE_STEP_LABELS[step]}</span>
+            {i < CREATE_STEPS.length - 1 ? <span className={i < createStepIndex ? 'wizard-step-line done' : 'wizard-step-line'} /> : null}
+          </div>
+        ))}
+      </div>
+
+      {createStep === 'details' ? (
+        <div className="field-form">
+          <p className="eyebrow">Step {createStepIndex + 1} of {CREATE_STEPS.length} · Details</p>
+          <h3 ref={createStepHeadingRef} tabIndex={-1}>What is the risk?</h3>
+          <label>Risk description<textarea aria-label="Risk description" value={create.description} onChange={(e) => setCreate({ ...create, description: e.target.value })} /></label>
+          <label>Probability (1-5)<input aria-label="Probability" type="number" min={1} max={5} value={create.probability} onChange={(e) => setCreate({ ...create, probability: Number(e.target.value) })} /></label>
+          <label>Impact (1-5)<input aria-label="Impact" type="number" min={1} max={5} value={create.impact} onChange={(e) => setCreate({ ...create, impact: Number(e.target.value) })} /></label>
+          <label>Status<select aria-label="Status" value={create.status} onChange={(e) => setCreate({ ...create, status: e.target.value as RiskStatus })}>{STATUSES.map((status) => <option key={status} value={status}>{status}</option>)}</select></label>
+          <div className="work-actions">
+            <button type="button" onClick={goCreateNext}>Continue</button>
+          </div>
+        </div>
+      ) : createStep === 'plan' ? (
+        <div className="field-form">
+          <p className="eyebrow">Step {createStepIndex + 1} of {CREATE_STEPS.length} · Plan</p>
+          <h3 ref={createStepHeadingRef} tabIndex={-1}>How is it handled?</h3>
+          <label>Mitigation<textarea aria-label="Mitigation" value={create.mitigation} onChange={(e) => setCreate({ ...create, mitigation: e.target.value })} /></label>
+          <label>Trigger<input aria-label="Trigger" value={create.trigger} onChange={(e) => setCreate({ ...create, trigger: e.target.value })} /></label>
+          <label>Review at<input aria-label="Review at" type="datetime-local" value={create.reviewAt} onChange={(e) => setCreate({ ...create, reviewAt: e.target.value })} /></label>
+          <label>Project ID<input aria-label="Project ID" value={create.projectId} onChange={(e) => setCreate({ ...create, projectId: e.target.value })} /></label>
+          <label><input type="checkbox" checked={create.pinned} onChange={(e) => setCreate({ ...create, pinned: e.target.checked })} /> Pinned</label>
+          <div className="work-actions">
+            <button type="button" onClick={goCreateBack}>Back</button>
+            <button type="button" onClick={goCreateNext}>Continue</button>
+          </div>
+        </div>
+      ) : (
+        <div className="wizard-review">
+          <p className="eyebrow">Step {createStepIndex + 1} of {CREATE_STEPS.length} · Review</p>
+          <h3 ref={createStepHeadingRef} tabIndex={-1}>Review and create</h3>
+          <dl>
+            <div><dt>Description</dt><dd>{create.description || '—'}</dd></div>
+            <div><dt>Probability</dt><dd>{create.probability}</dd></div>
+            <div><dt>Impact</dt><dd>{create.impact}</dd></div>
+            <div><dt>Status</dt><dd>{create.status}</dd></div>
+            <div><dt>Mitigation</dt><dd>{create.mitigation || '—'}</dd></div>
+            <div><dt>Trigger</dt><dd>{create.trigger || '—'}</dd></div>
+            <div><dt>Review at</dt><dd>{create.reviewAt || '—'}</dd></div>
+            <div><dt>Project ID</dt><dd>{create.projectId || '—'}</dd></div>
+            <div><dt>Pinned</dt><dd>{create.pinned ? 'Yes' : 'No'}</dd></div>
+          </dl>
+          <div className="work-actions">
+            <button type="button" onClick={goCreateBack}>Back</button>
+            <button type="button" disabled={pending} onClick={attemptCreate}>Create risk</button>
+          </div>
+        </div>
+      )}
+    </div>
     {query.isLoading ? <p role="status">Loading risks…</p> : null}
     {query.isError ? <div role="alert">{query.error.message}</div> : null}
     {query.data && query.data.items.length === 0 ? <p className="empty-state">No risks yet. Create one above to get started.</p> : null}
@@ -220,7 +285,7 @@ export default function RiskWorkspace() {
         </div>
       </li>
     })}</ol>
-    {edit ? <form onSubmit={submitEdit}><h2>Edit risk</h2>
+    {edit ? <form className="field-form" onSubmit={submitEdit}><h2>Edit risk</h2>
       <label>Edit risk description<textarea aria-label="Edit risk description" value={edit.description} onChange={(e) => setEdit({ ...edit, description: e.target.value })} /></label>
       <label>Edit probability<input aria-label="Edit probability" type="number" min={1} max={5} value={edit.probability} onChange={(e) => setEdit({ ...edit, probability: Number(e.target.value) })} /></label>
       <label>Edit impact<input aria-label="Edit impact" type="number" min={1} max={5} value={edit.impact} onChange={(e) => setEdit({ ...edit, impact: Number(e.target.value) })} /></label>

@@ -104,8 +104,20 @@ export async function run({ page, baseURL }) {
   // --- Draft a workflow -----------------------------------------------
   const automationPanel = page.locator('#automation-panel')
   await automationPanel.getByLabel('Workflow ID').fill(WORKFLOW_ID)
+  await automationPanel.getByRole('button', { name: 'Continue' }).click()
+
+  // The scan at line 102 only covers the wizard's default first step
+  // (Basics) -- the Build step (step-editor fieldset) is a genuinely
+  // different DOM state with no coverage of its own.
+  await assertNoSeriousAccessibilityViolations(page, { include: '#automation-panel' })
+
   await automationPanel.getByLabel('Step ID for step 1').fill('create-note')
   await automationPanel.getByLabel('Action reference for step 1').fill('local.create_note')
+  await automationPanel.getByRole('button', { name: 'Continue' }).click()
+
+  // Same for the Review step (summary dl + step list), never scanned above.
+  await assertNoSeriousAccessibilityViolations(page, { include: '#automation-panel' })
+
   await automationPanel.getByRole('button', { name: 'Create draft' }).click()
 
   const detail = automationPanel.locator('section[aria-labelledby="automation-workflow-detail-title"]')
