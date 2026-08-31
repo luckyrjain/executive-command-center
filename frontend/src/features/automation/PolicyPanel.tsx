@@ -1,4 +1,4 @@
-import { useState, type FormEvent } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
 import { ApiError, apiRequest } from '../../api/client'
@@ -18,6 +18,8 @@ type Draft = {
 }
 
 const emptyDraft: Draft = { workflowId: '', actionTypes: '', dataClasses: '', valueLimit: '0', countLimit: '10', approvalMode: 'per_run', schedule: '' }
+const CREATE_STEPS = ['scope', 'limits', 'review'] as const
+const CREATE_STEP_LABELS: Record<(typeof CREATE_STEPS)[number], string> = { scope: 'Scope', limits: 'Limits', review: 'Review' }
 
 function errorMessage(error: unknown): string {
   if (error instanceof ApiError && error.code === 'POLICY_REVOKED') {
@@ -48,6 +50,15 @@ export default function PolicyPanel() {
   const [workflowFilter, setWorkflowFilter] = useState('')
   const [draft, setDraft] = useState<Draft>(emptyDraft)
   const [formError, setFormError] = useState<string | null>(null)
+  const [createStepIndex, setCreateStepIndex] = useState(0)
+  const createStepHeadingRef = useRef<HTMLHeadingElement>(null)
+  const isCreateFirstRenderRef = useRef(true)
+  const createStep = CREATE_STEPS[createStepIndex] ?? 'scope'
+
+  useEffect(() => {
+    if (isCreateFirstRenderRef.current) { isCreateFirstRenderRef.current = false; return }
+    createStepHeadingRef.current?.focus()
+  }, [createStep])
 
   const query = useQuery({
     queryKey: ['automation', 'policies', workflowFilter],
@@ -59,6 +70,7 @@ export default function PolicyPanel() {
     mutationFn: (body: Record<string, unknown>) => apiRequest<Policy>('/api/v1/automations/policies', { method: 'POST', body }),
     onSuccess: () => {
       setDraft(emptyDraft)
+      setCreateStepIndex(0)
       void queryClient.invalidateQueries({ queryKey: ['automation', 'policies'] })
     },
   })
@@ -68,8 +80,7 @@ export default function PolicyPanel() {
     onSuccess: () => { void queryClient.invalidateQueries({ queryKey: ['automation', 'policies'] }) },
   })
 
-  function submit(event: FormEvent) {
-    event.preventDefault()
+  function attemptCreate() {
     setFormError(null)
     if (!draft.workflowId.trim()) { setFormError('Workflow ID is required.'); return }
     const valueLimit = Number(draft.valueLimit)
@@ -87,6 +98,8 @@ export default function PolicyPanel() {
       rate_limit: null,
     })
   }
+  function goCreateNext() { setCreateStepIndex((i) => Math.min(i + 1, CREATE_STEPS.length - 1)) }
+  function goCreateBack() { setCreateStepIndex((i) => Math.max(i - 1, 0)) }
 
   const pending = createMutation.isPending || revokeMutation.isPending
   const policies = query.data?.policies ?? []
@@ -137,36 +150,73 @@ export default function PolicyPanel() {
         ))}
       </ol>
 
-      <form className="field-form" onSubmit={submit}>
-        <h3>Create a policy</h3>
+      <div role="region" aria-labelledby="create-policy-title">
+        <h3 id="create-policy-title">Create a policy</h3>
         {formError ? <div role="alert" className="inline-status error-panel">{formError}</div> : null}
         {createMutation.isError ? <div role="alert" className="inline-status error-panel">{errorMessage(createMutation.error)}</div> : null}
 
-        <label>Workflow ID
-          <input required value={draft.workflowId} onChange={(e) => setDraft({ ...draft, workflowId: e.target.value })} />
-        </label>
-        <label>Action types (comma separated)
-          <input value={draft.actionTypes} onChange={(e) => setDraft({ ...draft, actionTypes: e.target.value })} />
-        </label>
-        <label>Data classes (comma separated)
-          <input value={draft.dataClasses} onChange={(e) => setDraft({ ...draft, dataClasses: e.target.value })} />
-        </label>
-        <label>Value limit
-          <input type="number" min={0} step="0.01" value={draft.valueLimit} onChange={(e) => setDraft({ ...draft, valueLimit: e.target.value })} />
-        </label>
-        <label>Count limit
-          <input type="number" min={0} step={1} value={draft.countLimit} onChange={(e) => setDraft({ ...draft, countLimit: e.target.value })} />
-        </label>
-        <label>Approval mode
-          <select value={draft.approvalMode} onChange={(e) => setDraft({ ...draft, approvalMode: e.target.value as ApprovalMode })}>
-            {APPROVAL_MODES.map((mode) => <option key={mode} value={mode}>{mode.replaceAll('_', ' ')}</option>)}
-          </select>
-        </label>
-        <label>Schedule note (optional)
-          <input value={draft.schedule} onChange={(e) => setDraft({ ...draft, schedule: e.target.value })} />
-        </label>
-        <button type="submit" disabled={pending}>{createMutation.isPending ? 'Creating…' : 'Create policy'}</button>
-      </form>
+        <div className="wizard-stepper" role="group" aria-label="Create policy progress">
+          {CREATE_STEPS.map((step, i) => (
+            <div className="wizard-step-node" key={step} aria-current={i === createStepIndex ? 'step' : undefined}>
+              <span className={i < createStepIndex ? 'wizard-step-circle done' : i === createStepIndex ? 'wizard-step-circle active' : 'wizard-step-circle upcoming'}>{i < createStepIndex ? '✓' : i + 1}</span>
+              <span className={i <= createStepIndex ? 'wizard-step-label on' : 'wizard-step-label'}>{CREATE_STEP_LABELS[step]}</span>
+              {i < CREATE_STEPS.length - 1 ? <span className={i < createStepIndex ? 'wizard-step-line done' : 'wizard-step-line'} /> : null}
+            </div>
+          ))}
+        </div>
+
+        {createStep === 'scope' ? (
+          <div className="field-form">
+            <p className="eyebrow">Step {createStepIndex + 1} of {CREATE_STEPS.length} · Scope</p>
+            <h4 ref={createStepHeadingRef} tabIndex={-1}>What does this policy govern?</h4>
+            <label>Workflow ID
+              <input value={draft.workflowId} onChange={(e) => setDraft({ ...draft, workflowId: e.target.value })} />
+            </label>
+            <label>Action types (comma separated)
+              <input value={draft.actionTypes} onChange={(e) => setDraft({ ...draft, actionTypes: e.target.value })} />
+            </label>
+            <label>Data classes (comma separated)
+              <input value={draft.dataClasses} onChange={(e) => setDraft({ ...draft, dataClasses: e.target.value })} />
+            </label>
+            <div className="work-actions"><button type="button" onClick={goCreateNext}>Continue</button></div>
+          </div>
+        ) : createStep === 'limits' ? (
+          <div className="field-form">
+            <p className="eyebrow">Step {createStepIndex + 1} of {CREATE_STEPS.length} · Limits</p>
+            <h4 ref={createStepHeadingRef} tabIndex={-1}>What are the bounds?</h4>
+            <label>Value limit
+              <input type="number" min={0} step="0.01" value={draft.valueLimit} onChange={(e) => setDraft({ ...draft, valueLimit: e.target.value })} />
+            </label>
+            <label>Count limit
+              <input type="number" min={0} step={1} value={draft.countLimit} onChange={(e) => setDraft({ ...draft, countLimit: e.target.value })} />
+            </label>
+            <label>Approval mode
+              <select value={draft.approvalMode} onChange={(e) => setDraft({ ...draft, approvalMode: e.target.value as ApprovalMode })}>
+                {APPROVAL_MODES.map((mode) => <option key={mode} value={mode}>{mode.replaceAll('_', ' ')}</option>)}
+              </select>
+            </label>
+            <label>Schedule note (optional)
+              <input value={draft.schedule} onChange={(e) => setDraft({ ...draft, schedule: e.target.value })} />
+            </label>
+            <div className="work-actions"><button type="button" onClick={goCreateBack}>Back</button><button type="button" onClick={goCreateNext}>Continue</button></div>
+          </div>
+        ) : (
+          <div className="wizard-review">
+            <p className="eyebrow">Step {createStepIndex + 1} of {CREATE_STEPS.length} · Review</p>
+            <h4 ref={createStepHeadingRef} tabIndex={-1}>Review and create</h4>
+            <dl>
+              <div><dt>Workflow ID</dt><dd>{draft.workflowId || '—'}</dd></div>
+              <div><dt>Action types</dt><dd>{draft.actionTypes || '—'}</dd></div>
+              <div><dt>Data classes</dt><dd>{draft.dataClasses || '—'}</dd></div>
+              <div><dt>Value limit</dt><dd>{draft.valueLimit}</dd></div>
+              <div><dt>Count limit</dt><dd>{draft.countLimit}</dd></div>
+              <div><dt>Approval mode</dt><dd>{draft.approvalMode.replaceAll('_', ' ')}</dd></div>
+              <div><dt>Schedule note</dt><dd>{draft.schedule || '—'}</dd></div>
+            </dl>
+            <div className="work-actions"><button type="button" onClick={goCreateBack}>Back</button><button type="button" disabled={pending} onClick={attemptCreate}>{createMutation.isPending ? 'Creating…' : 'Create policy'}</button></div>
+          </div>
+        )}
+      </div>
     </section>
   )
 }

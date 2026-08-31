@@ -186,7 +186,16 @@ export async function run({ page, baseURL }) {
   await assertNoSeriousAccessibilityViolations(page, { include: '#automation-panel' })
   const policiesPanel = automationPanel.locator('section[aria-labelledby="automation-policy-title"]')
   await policiesPanel.getByLabel('Workflow ID', { exact: true }).fill(WORKFLOW_ID)
+  await policiesPanel.getByRole('button', { name: 'Continue' }).click()
+
+  // Line 186's scan only covers the wizard's default Scope step -- Limits
+  // and Review are distinct DOM states with no coverage of their own.
+  await assertNoSeriousAccessibilityViolations(page, { include: '#automation-panel' })
+
   await policiesPanel.getByLabel('Count limit', { exact: true }).fill('5')
+  await policiesPanel.getByRole('button', { name: 'Continue' }).click()
+  await assertNoSeriousAccessibilityViolations(page, { include: '#automation-panel' })
+
   await policiesPanel.getByRole('button', { name: 'Create policy' }).click()
   await policiesPanel.getByText(WORKFLOW_ID, { exact: true }).waitFor()
 
