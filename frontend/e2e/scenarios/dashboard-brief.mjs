@@ -52,4 +52,10 @@ export async function run({ page, baseURL }) {
   await briefPanel.getByText('Generation 4 · disabled').waitFor()
   assert.equal(await briefPanel.getByText(/This brief is stale/).count(), 0, 'refreshing the brief should clear the stale banner')
   assert.equal(fixtures.brief.generation_version, 4)
+
+  // The scan above (line 22) ran once, before either refresh click -- it
+  // never covered the post-refresh state: the stale banner gone, "Refreshing…"
+  // having come and gone, and the dashboard grid re-rendered from its second
+  // GET. Genuinely different DOM from what line 22 saw, never scanned until now.
+  await assertNoSeriousAccessibilityViolations(page, { include: '#workspace-panel' })
 }
