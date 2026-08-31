@@ -75,6 +75,47 @@ describe('ScheduleWorkspace', () => {
     })
   })
 
+  it('on failed final event submit, navigates back to Basics (where the missing title lives) and focuses it', async () => {
+    const fetch = initial(vi.fn(), [], [])
+    vi.stubGlobal('fetch', fetch)
+    renderWorkspace()
+    await screen.findByText('No calendar events.')
+
+    // Reach Review without ever filling Event title.
+    fireEvent.change(screen.getByLabelText('Event start'), { target: { value: '2026-07-20T10:00' } })
+    fireEvent.change(screen.getByLabelText('Event end'), { target: { value: '2026-07-20T11:00' } })
+    fireEvent.click(eventPanel().getByRole('button', { name: 'Continue' }))
+    fireEvent.click(eventPanel().getByRole('button', { name: 'Continue' }))
+    fireEvent.click(eventPanel().getByRole('button', { name: 'Create event' }))
+
+    const alert = await screen.findByRole('alert')
+    expect(alert.textContent).toMatch(/event title is required/i)
+    const titleField = await screen.findByLabelText('Event title')
+    expect(document.activeElement).toBe(titleField)
+    expect(titleField.getAttribute('aria-invalid')).toBe('true')
+    expect(titleField.getAttribute('aria-describedby')).toBe(alert.id)
+    expect(screen.queryByLabelText('Location')).toBeNull()
+  })
+
+  it('on a blank Event end (start filled), targets the end field specifically -- not start, not timezone', async () => {
+    const fetch = initial(vi.fn(), [], [])
+    vi.stubGlobal('fetch', fetch)
+    renderWorkspace()
+    await screen.findByText('No calendar events.')
+
+    fireEvent.change(screen.getByLabelText('Event title'), { target: { value: 'Board review' } })
+    fireEvent.change(screen.getByLabelText('Event start'), { target: { value: '2026-07-20T10:00' } })
+    fireEvent.click(eventPanel().getByRole('button', { name: 'Continue' }))
+    fireEvent.click(eventPanel().getByRole('button', { name: 'Continue' }))
+    fireEvent.click(eventPanel().getByRole('button', { name: 'Create event' }))
+
+    await screen.findByRole('alert')
+    const endField = await screen.findByLabelText('Event end')
+    expect(document.activeElement).toBe(endField)
+    expect(endField.getAttribute('aria-invalid')).toBe('true')
+    expect(screen.getByLabelText('Event start').getAttribute('aria-invalid')).toBeNull()
+  })
+
   it('invalidates the dashboard and morning brief caches on event mutation success', async () => {
     const fetch = initial(vi.fn(), [], [])
       .mockImplementationOnce(() => response(event, 201))
@@ -183,6 +224,43 @@ describe('ScheduleWorkspace', () => {
       calendar_event_id: null, title: 'Coaching session', starts_at: '2026-07-20T04:30:00.000Z', ends_at: '2026-07-20T05:30:00.000Z',
       timezone: 'Asia/Kolkata', status: 'planned', agenda: 'Goals', preparation: 'Reflect', notes_summary: 'Next steps',
     })
+  })
+
+  it('on failed final meeting submit, navigates back to Basics (where the missing title lives) and focuses it', async () => {
+    const fetch = initial(vi.fn(), [], [])
+    vi.stubGlobal('fetch', fetch); renderWorkspace(); await screen.findByText('No meetings.')
+
+    // Reach Review without ever filling Meeting title.
+    fireEvent.change(screen.getByLabelText('Meeting start'), { target: { value: '2026-07-20T10:00' } })
+    fireEvent.change(screen.getByLabelText('Meeting end'), { target: { value: '2026-07-20T11:00' } })
+    fireEvent.click(meetingPanel().getByRole('button', { name: 'Continue' }))
+    fireEvent.click(meetingPanel().getByRole('button', { name: 'Continue' }))
+    fireEvent.click(meetingPanel().getByRole('button', { name: 'Create standalone meeting' }))
+
+    const alert = await screen.findByRole('alert')
+    expect(alert.textContent).toMatch(/meeting title is required/i)
+    const titleField = await screen.findByLabelText('Meeting title')
+    expect(document.activeElement).toBe(titleField)
+    expect(titleField.getAttribute('aria-invalid')).toBe('true')
+    expect(titleField.getAttribute('aria-describedby')).toBe(alert.id)
+    expect(screen.queryByLabelText('Meeting agenda')).toBeNull()
+  })
+
+  it('on a blank Meeting end (start filled), targets the end field specifically -- not start, not timezone', async () => {
+    const fetch = initial(vi.fn(), [], [])
+    vi.stubGlobal('fetch', fetch); renderWorkspace(); await screen.findByText('No meetings.')
+
+    fireEvent.change(screen.getByLabelText('Meeting title'), { target: { value: 'Coaching session' } })
+    fireEvent.change(screen.getByLabelText('Meeting start'), { target: { value: '2026-07-20T10:00' } })
+    fireEvent.click(meetingPanel().getByRole('button', { name: 'Continue' }))
+    fireEvent.click(meetingPanel().getByRole('button', { name: 'Continue' }))
+    fireEvent.click(meetingPanel().getByRole('button', { name: 'Create standalone meeting' }))
+
+    await screen.findByRole('alert')
+    const endField = await screen.findByLabelText('Meeting end')
+    expect(document.activeElement).toBe(endField)
+    expect(endField.getAttribute('aria-invalid')).toBe('true')
+    expect(screen.getByLabelText('Meeting start').getAttribute('aria-invalid')).toBeNull()
   })
 
   it('preserves event edits across a conflict and retries only after loading the current version', async () => {

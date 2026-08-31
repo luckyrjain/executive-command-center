@@ -2,6 +2,7 @@ import { useEffect, useRef, useState, type FormEvent } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
 import { ApiError, apiRequest } from '../../api/client'
+import { applyWizardFieldInvalidState } from '../../lib/wizardFocus'
 import type { CalendarEvent, EntityList, EventDraft, Meeting, MeetingDraft } from './scheduleTypes'
 
 const emptyEvent: EventDraft = { title: '', startsAt: '', endsAt: '', timezone: 'UTC', allDay: false, location: '', description: '', status: 'confirmed' }
@@ -10,6 +11,7 @@ const CREATE_EVENT_STEPS = ['basics', 'details', 'review'] as const
 const CREATE_EVENT_STEP_LABELS: Record<(typeof CREATE_EVENT_STEPS)[number], string> = { basics: 'Basics', details: 'Details', review: 'Review' }
 const CREATE_MEETING_STEPS = ['basics', 'notes', 'review'] as const
 const CREATE_MEETING_STEP_LABELS: Record<(typeof CREATE_MEETING_STEPS)[number], string> = { basics: 'Basics', notes: 'Notes', review: 'Review' }
+const SCHEDULE_ERROR_ID = 'schedule-form-error'
 type EventEdit = EventDraft & { record: CalendarEvent; latestVersion: number; conflict: boolean; reloadFailed: boolean }
 type MeetingEdit = Pick<MeetingDraft, 'title' | 'status' | 'agenda' | 'preparation' | 'notesSummary' | 'startsAt' | 'endsAt' | 'timezone'> & { record: Meeting; latestVersion: number; conflict: boolean; reloadFailed: boolean }
 
@@ -105,19 +107,23 @@ export default function ScheduleWorkspace() {
   const [createMeetingStepIndex, setCreateMeetingStepIndex] = useState(0)
   const createEventStepHeadingRef = useRef<HTMLHeadingElement>(null)
   const createMeetingStepHeadingRef = useRef<HTMLHeadingElement>(null)
+  const createEventFormRef = useRef<HTMLFormElement>(null)
+  const createMeetingFormRef = useRef<HTMLFormElement>(null)
   const isCreateEventFirstRenderRef = useRef(true)
   const isCreateMeetingFirstRenderRef = useRef(true)
   const createEventStep = CREATE_EVENT_STEPS[createEventStepIndex] ?? 'basics'
   const createMeetingStep = CREATE_MEETING_STEPS[createMeetingStepIndex] ?? 'basics'
+  const [invalidEventField, setInvalidEventField] = useState<string | null>(null)
+  const [invalidMeetingField, setInvalidMeetingField] = useState<string | null>(null)
 
   useEffect(() => {
     if (isCreateEventFirstRenderRef.current) { isCreateEventFirstRenderRef.current = false; return }
-    createEventStepHeadingRef.current?.focus()
-  }, [createEventStep])
+    applyWizardFieldInvalidState(createEventFormRef.current, invalidEventField, SCHEDULE_ERROR_ID, createEventStepHeadingRef.current)
+  }, [createEventStep, invalidEventField])
   useEffect(() => {
     if (isCreateMeetingFirstRenderRef.current) { isCreateMeetingFirstRenderRef.current = false; return }
-    createMeetingStepHeadingRef.current?.focus()
-  }, [createMeetingStep])
+    applyWizardFieldInvalidState(createMeetingFormRef.current, invalidMeetingField, SCHEDULE_ERROR_ID, createMeetingStepHeadingRef.current)
+  }, [createMeetingStep, invalidMeetingField])
   const refreshEvents = () => Promise.all([
     client.invalidateQueries({ queryKey: ['calendar-events'] }),
     client.invalidateQueries({ queryKey: ['dashboard', 'today'] }),
@@ -144,7 +150,7 @@ export default function ScheduleWorkspace() {
 
   const createEventMutation = useMutation({
     mutationFn: (draft: EventDraft) => apiRequest<CalendarEvent>('/api/v1/calendar/events', { method: 'POST', body: { ...eventBody(draft), external_id: null } }),
-    onSuccess: () => { setCreateEvent(emptyEvent); setCreateEventStepIndex(0); void refreshEvents() },
+    onSuccess: () => { setCreateEvent(emptyEvent); setCreateEventStepIndex(0); setInvalidEventField(null); void refreshEvents() },
   })
   const saveEventMutation = useMutation({
     mutationFn: ({ draft, version }: { draft: EventEdit; version: number }) => apiRequest<CalendarEvent>(`/api/v1/calendar/events/${draft.record.id}`, { method: 'PATCH', body: { expected_version: version, ...eventPatchBody(draft) } }),
@@ -161,7 +167,7 @@ export default function ScheduleWorkspace() {
     } : {
       calendar_event_id: null, title: draft.title.trim(), starts_at: wallTimeToInstant(draft.startsAt, draft.timezone), ends_at: wallTimeToInstant(draft.endsAt, draft.timezone), timezone: draft.timezone.trim(), status: draft.status, agenda: draft.agenda.trim() || null, preparation: draft.preparation.trim() || null, notes_summary: draft.notesSummary.trim() || null,
     } }),
-    onSuccess: () => { setCreateMeeting(emptyMeeting); setCreateMeetingStepIndex(0); void refreshMeetings() },
+    onSuccess: () => { setCreateMeeting(emptyMeeting); setCreateMeetingStepIndex(0); setInvalidMeetingField(null); void refreshMeetings() },
   })
   const saveMeetingMutation = useMutation({
     mutationFn: ({ draft, version }: { draft: MeetingEdit; version: number }) => apiRequest<Meeting>(`/api/v1/meetings/${draft.record.id}`, { method: 'PATCH', body: { expected_version: version, ...meetingContentBody(draft) } }),
@@ -180,22 +186,90 @@ export default function ScheduleWorkspace() {
   const mutationError = createEventMutation.error ?? saveEventMutation.error ?? eventAction.error ?? createMeetingMutation.error ?? saveMeetingMutation.error ?? meetingAction.error ?? eventLookup.error
 
   function safeSubmit(work: () => void) { setFormError(null); try { work() } catch (error) { setFormError(error instanceof Error ? error.message : 'Invalid schedule input.') } }
-  function attemptCreateEvent() { if (createEvent.title.trim()) safeSubmit(() => createEventMutation.mutate(createEvent)) }
+  function failEvent(message: string, field: string, step: (typeof CREATE_EVENT_STEPS)[number]) {
+    setFormError(message)
+    setInvalidEventField(field)
+    setCreateEventStepIndex(CREATE_EVENT_STEPS.indexOf(step))
+  }
+  function attemptCreateEvent(event: FormEvent) {
+    event.preventDefault()
+    if (!createEvent.title.trim()) { failEvent('Event title is required.', 'Event title', 'basics'); return }
+    // wallTimeToInstant throws the same "Enter a complete date and time."
+    // message for a blank/malformed start or end, so it's called once per
+    // field, in order, to know which one is actually invalid -- a single
+    // call inside eventBody (as createEventMutation's mutationFn does) can't
+    // distinguish start from end from a bad timezone.
+    try {
+      wallTimeToInstant(createEvent.startsAt, createEvent.timezone)
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Invalid schedule input.'
+      failEvent(message, message.toLowerCase().includes('timezone') ? 'Event timezone' : 'Event start', 'basics')
+      return
+    }
+    try {
+      wallTimeToInstant(createEvent.endsAt, createEvent.timezone)
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Invalid schedule input.'
+      failEvent(message, message.toLowerCase().includes('timezone') ? 'Event timezone' : 'Event end', 'basics')
+      return
+    }
+    setFormError(null)
+    setInvalidEventField(null)
+    try {
+      createEventMutation.mutate(createEvent)
+    } catch (error) {
+      setFormError(error instanceof Error ? error.message : 'Invalid schedule input.')
+    }
+  }
   function submitEventEdit(event?: FormEvent) { event?.preventDefault(); if (editEvent?.title.trim() && editEvent.latestVersion > 0) safeSubmit(() => saveEventMutation.mutate({ draft: editEvent, version: editEvent.latestVersion })) }
-  function attemptCreateMeeting() { if (createMeeting.title.trim()) safeSubmit(() => createMeetingMutation.mutate(createMeeting)) }
+  function failMeeting(message: string, field: string, step: (typeof CREATE_MEETING_STEPS)[number]) {
+    setFormError(message)
+    setInvalidMeetingField(field)
+    setCreateMeetingStepIndex(CREATE_MEETING_STEPS.indexOf(step))
+  }
+  function attemptCreateMeeting(event: FormEvent) {
+    event.preventDefault()
+    if (!createMeeting.title.trim()) { failMeeting('Meeting title is required.', 'Meeting title', 'basics'); return }
+    // Timing only applies to a standalone meeting -- a linked meeting's
+    // timing is projected from its calendar event and isn't even rendered.
+    if (!createMeeting.calendarEventId) {
+      try {
+        wallTimeToInstant(createMeeting.startsAt, createMeeting.timezone)
+      } catch (error) {
+        const message = error instanceof Error ? error.message : 'Invalid schedule input.'
+        failMeeting(message, message.toLowerCase().includes('timezone') ? 'Meeting timezone' : 'Meeting start', 'basics')
+        return
+      }
+      try {
+        wallTimeToInstant(createMeeting.endsAt, createMeeting.timezone)
+      } catch (error) {
+        const message = error instanceof Error ? error.message : 'Invalid schedule input.'
+        failMeeting(message, message.toLowerCase().includes('timezone') ? 'Meeting timezone' : 'Meeting end', 'basics')
+        return
+      }
+    }
+    setFormError(null)
+    setInvalidMeetingField(null)
+    try {
+      createMeetingMutation.mutate(createMeeting)
+    } catch (error) {
+      setFormError(error instanceof Error ? error.message : 'Invalid schedule input.')
+    }
+  }
   function submitMeetingEdit(event?: FormEvent) { event?.preventDefault(); if (editMeeting?.title.trim() && editMeeting.latestVersion > 0) saveMeetingMutation.mutate({ draft: editMeeting, version: editMeeting.latestVersion }) }
-  function goCreateEventNext() { setCreateEventStepIndex((i) => Math.min(i + 1, CREATE_EVENT_STEPS.length - 1)) }
-  function goCreateEventBack() { setCreateEventStepIndex((i) => Math.max(i - 1, 0)) }
-  function goCreateMeetingNext() { setCreateMeetingStepIndex((i) => Math.min(i + 1, CREATE_MEETING_STEPS.length - 1)) }
-  function goCreateMeetingBack() { setCreateMeetingStepIndex((i) => Math.max(i - 1, 0)) }
+  function goCreateEventNext() { setInvalidEventField(null); setCreateEventStepIndex((i) => Math.min(i + 1, CREATE_EVENT_STEPS.length - 1)) }
+  function goCreateEventBack() { setInvalidEventField(null); setCreateEventStepIndex((i) => Math.max(i - 1, 0)) }
+  function goCreateMeetingNext() { setInvalidMeetingField(null); setCreateMeetingStepIndex((i) => Math.min(i + 1, CREATE_MEETING_STEPS.length - 1)) }
+  function goCreateMeetingBack() { setInvalidMeetingField(null); setCreateMeetingStepIndex((i) => Math.max(i - 1, 0)) }
 
   return <section className="schedule-workspace" aria-labelledby="schedule-title">
     <div className="work-heading"><div><p className="eyebrow">SCHEDULE</p><h1 id="schedule-title">Calendar & meetings</h1><p>Calendar events own linked timing. Meeting records own agenda, preparation and notes.</p></div></div>
-    {formError ? <div role="alert" className="inline-status error-panel">{formError}</div> : null}
+    {formError ? <div id={SCHEDULE_ERROR_ID} role="alert" className="inline-status error-panel">{formError}</div> : null}
     {mutationError ? <div role="alert" className="inline-status error-panel">{mutationError instanceof ApiError && mutationError.code === 'VERSION_CONFLICT' ? 'This schedule item changed while you were editing it. Your input is preserved; retry after the latest version loads.' : mutationError.message}</div> : null}
     <div className="work-grid">
       <section className="work-panel">
-        <h2>Create calendar event</h2>
+        <h2 id="create-event-title">Create calendar event</h2>
+        <form ref={createEventFormRef} noValidate onSubmit={attemptCreateEvent} aria-labelledby="create-event-title">
         <div className="wizard-stepper" role="group" aria-label="Create event progress">
           {CREATE_EVENT_STEPS.map((step, i) => (
             <div className="wizard-step-node" key={step} aria-current={i === createEventStepIndex ? 'step' : undefined}>
@@ -210,7 +284,7 @@ export default function ScheduleWorkspace() {
             <p className="eyebrow">Step {createEventStepIndex + 1} of {CREATE_EVENT_STEPS.length} · Basics</p>
             <h3 ref={createEventStepHeadingRef} tabIndex={-1}>What and when?</h3>
             <label>Event title<input aria-label="Event title" value={createEvent.title} onChange={(e) => setCreateEvent({ ...createEvent, title: e.target.value })} /></label>
-            <TimingFields prefix="Event" draft={createEvent} onChange={setCreateEvent} required={false} />
+            <TimingFields prefix="Event" draft={createEvent} onChange={setCreateEvent} />
             <label><input type="checkbox" checked={createEvent.allDay} onChange={(e) => setCreateEvent({ ...createEvent, allDay: e.target.checked })} /> All day</label>
             <div className="work-actions"><button type="button" onClick={goCreateEventNext}>Continue</button></div>
           </div>
@@ -235,12 +309,14 @@ export default function ScheduleWorkspace() {
               <div><dt>Location</dt><dd>{createEvent.location || '—'}</dd></div>
               <div><dt>Description</dt><dd>{createEvent.description || '—'}</dd></div>
             </dl>
-            <div className="work-actions"><button type="button" onClick={goCreateEventBack}>Back</button><button type="button" disabled={pending} onClick={attemptCreateEvent}>Create event</button></div>
+            <div className="work-actions"><button type="button" onClick={goCreateEventBack}>Back</button><button type="submit" disabled={pending}>Create event</button></div>
           </div>
         )}
+        </form>
       </section>
       <section className="work-panel">
-        <h2>Create meeting</h2>
+        <h2 id="create-meeting-title">Create meeting</h2>
+        <form ref={createMeetingFormRef} noValidate onSubmit={attemptCreateMeeting} aria-labelledby="create-meeting-title">
         <div className="wizard-stepper" role="group" aria-label="Create meeting progress">
           {CREATE_MEETING_STEPS.map((step, i) => (
             <div className="wizard-step-node" key={step} aria-current={i === createMeetingStepIndex ? 'step' : undefined}>
@@ -256,7 +332,7 @@ export default function ScheduleWorkspace() {
             <h3 ref={createMeetingStepHeadingRef} tabIndex={-1}>What and when?</h3>
             <label>Linked calendar event<select aria-label="Linked calendar event" value={createMeeting.calendarEventId} onChange={(e) => setCreateMeeting({ ...createMeeting, calendarEventId: e.target.value })}><option value="">Standalone meeting</option>{(events.data?.items ?? []).filter((item) => !item.archived_at).map((item) => <option key={item.id} value={item.id}>{item.title}</option>)}</select></label>
             <label>Meeting title<input aria-label="Meeting title" value={createMeeting.title} onChange={(e) => setCreateMeeting({ ...createMeeting, title: e.target.value })} /></label>
-            {createMeeting.calendarEventId ? <p className="inline-status">Timing will be projected from the selected calendar event.</p> : <TimingFields prefix="Meeting" draft={createMeeting} onChange={setCreateMeeting} required={false} />}
+            {createMeeting.calendarEventId ? <p className="inline-status">Timing will be projected from the selected calendar event.</p> : <TimingFields prefix="Meeting" draft={createMeeting} onChange={setCreateMeeting} />}
             <label>Meeting status<select value={createMeeting.status} onChange={(e) => setCreateMeeting({ ...createMeeting, status: e.target.value as MeetingDraft['status'] })}><option value="planned">planned</option><option value="in_progress">in progress</option><option value="completed">completed</option><option value="cancelled">cancelled</option></select></label>
             <div className="work-actions"><button type="button" onClick={goCreateMeetingNext}>Continue</button></div>
           </div>
@@ -286,9 +362,10 @@ export default function ScheduleWorkspace() {
               <div><dt>Preparation</dt><dd>{createMeeting.preparation || '—'}</dd></div>
               <div><dt>Notes summary</dt><dd>{createMeeting.notesSummary || '—'}</dd></div>
             </dl>
-            <div className="work-actions"><button type="button" onClick={goCreateMeetingBack}>Back</button><button type="button" disabled={pending} onClick={attemptCreateMeeting}>{createMeeting.calendarEventId ? 'Create linked meeting' : 'Create standalone meeting'}</button></div>
+            <div className="work-actions"><button type="button" onClick={goCreateMeetingBack}>Back</button><button type="submit" disabled={pending}>{createMeeting.calendarEventId ? 'Create linked meeting' : 'Create standalone meeting'}</button></div>
           </div>
         )}
+        </form>
       </section>
     </div>
     <div className="work-grid">
@@ -323,8 +400,8 @@ export default function ScheduleWorkspace() {
   </section>
 }
 
-function TimingFields<T extends { startsAt: string; endsAt: string; timezone: string }>({ prefix, draft, onChange, required = true }: { prefix: string; draft: T; onChange: (value: T) => void; required?: boolean }) {
-  return <><label>{prefix} start<input aria-label={`${prefix} start`} type="datetime-local" required={required} value={draft.startsAt} onChange={(e) => onChange({ ...draft, startsAt: e.target.value })} /></label><label>{prefix} end<input aria-label={`${prefix} end`} type="datetime-local" required={required} value={draft.endsAt} onChange={(e) => onChange({ ...draft, endsAt: e.target.value })} /></label><label>{prefix} timezone<input aria-label={`${prefix} timezone`} required={required} value={draft.timezone} onChange={(e) => onChange({ ...draft, timezone: e.target.value })} /></label></>
+function TimingFields<T extends { startsAt: string; endsAt: string; timezone: string }>({ prefix, draft, onChange }: { prefix: string; draft: T; onChange: (value: T) => void }) {
+  return <><label>{prefix} start<input aria-label={`${prefix} start`} type="datetime-local" required value={draft.startsAt} onChange={(e) => onChange({ ...draft, startsAt: e.target.value })} /></label><label>{prefix} end<input aria-label={`${prefix} end`} type="datetime-local" required value={draft.endsAt} onChange={(e) => onChange({ ...draft, endsAt: e.target.value })} /></label><label>{prefix} timezone<input aria-label={`${prefix} timezone`} required value={draft.timezone} onChange={(e) => onChange({ ...draft, timezone: e.target.value })} /></label></>
 }
 
 function MeetingFields<T extends { status: MeetingDraft['status']; agenda: string; preparation: string; notesSummary: string }>({ draft, onChange }: { draft: T; onChange: (value: T) => void }) {
