@@ -116,6 +116,17 @@ export async function run({ page, baseURL }) {
   await page.keyboard.press('Enter')
   await risksSection.getByRole('button', { name: 'Archive Vendor concentration (reviewed)' }).waitFor()
 
+  // formError has no coverage anywhere else in the suite. The create form
+  // was never touched above, so it still holds its empty initial draft --
+  // submitting it fails client-side validation without needing any fixture
+  // setup, and mutationError is null here (the last mutation succeeded).
+  await risksSection.getByRole('button', { name: 'Create risk' }).focus()
+  await page.keyboard.press('Enter')
+  const formErrorAlert = risksSection.getByRole('alert')
+  await formErrorAlert.waitFor()
+  assert.match(await formErrorAlert.innerText(), /Description is required/)
+  await assertNoSeriousAccessibilityViolations(page, { include: 'section[aria-labelledby="risks-title"]' })
+
   // Continue keyboard navigation: risks(4) -> knowledge(5) -> recommendations(6) -> search-audit(7).
   await page.getByRole('tab', { name: 'Risks' }).focus()
   await page.keyboard.press('ArrowRight')
@@ -153,5 +164,25 @@ export async function run({ page, baseURL }) {
   // only scans #search-panel, and this file's own earlier scans never
   // touch this nested tab. Covers the filter input, the paginated event
   // list and the "Load older events" button all in one pass.
+  await assertNoSeriousAccessibilityViolations(page, { include: '#audit-panel' })
+
+  // "No audit events match this filter" is a genuinely different DOM state
+  // from the scan above (list gone, empty-state text in) and had no
+  // coverage of its own -- refine the filter to a value with zero matches
+  // in the seeded corpus rather than needing any new fixture.
+  await page.getByLabel('Filter by event type').fill('nonexistent.event')
+  await auditPanel.getByText('No audit events match this filter.').waitFor()
+  await assertNoSeriousAccessibilityViolations(page, { include: '#audit-panel' })
+
+  // audit.isError has no coverage anywhere else in the suite. Same
+  // technique tasks.mjs uses for its offline-mutation check: fixtures.setOffline
+  // aborts every intercepted request, so changing the filter again (a new
+  // queryKey, forcing a fresh fetch) reliably drives the query to its error
+  // state -- retry:1 means one extra round-trip before it settles.
+  fixtures.setOffline(true)
+  await page.getByLabel('Filter by event type').fill('another.event')
+  const auditErrorAlert = auditPanel.getByRole('alert')
+  await auditErrorAlert.waitFor()
+  fixtures.setOffline(false)
   await assertNoSeriousAccessibilityViolations(page, { include: '#audit-panel' })
 }
