@@ -102,10 +102,11 @@ describe('PolicyPanel', () => {
     // The old accessible names ("Filter policies by workflow ID", "Policy
     // value limit", …) did not contain the visible label text a speech-input
     // user reads off the screen.
-    for (const visible of [
-      'Filter by workflow ID', 'Workflow ID', 'Action types (comma separated)', 'Data classes (comma separated)',
-      'Value limit', 'Count limit', 'Approval mode', 'Schedule note (optional)',
-    ]) {
+    for (const visible of ['Filter by workflow ID', 'Workflow ID', 'Action types (comma separated)', 'Data classes (comma separated)']) {
+      expect(screen.getByLabelText(visible).hasAttribute('aria-label')).toBe(false)
+    }
+    fireEvent.click(screen.getByRole('button', { name: 'Continue' }))
+    for (const visible of ['Value limit', 'Count limit', 'Approval mode', 'Schedule note (optional)']) {
       expect(screen.getByLabelText(visible).hasAttribute('aria-label')).toBe(false)
     }
   })
@@ -141,7 +142,9 @@ describe('PolicyPanel', () => {
 
     await waitFor(() => expect(screen.getByText('No policies recorded yet.')).toBeTruthy())
     fireEvent.change(screen.getByLabelText('Workflow ID'), { target: { value: 'weekly-digest' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Continue' }))
     fireEvent.change(screen.getByLabelText('Count limit'), { target: { value: '25' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Continue' }))
     fireEvent.click(screen.getByRole('button', { name: 'Create policy' }))
 
     await waitFor(() => expect(fetch).toHaveBeenCalledTimes(3))

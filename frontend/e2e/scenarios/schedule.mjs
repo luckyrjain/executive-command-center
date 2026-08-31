@@ -38,28 +38,52 @@ export async function run({ page, baseURL }) {
 
   await assertNoSeriousAccessibilityViolations(page, { include: 'section[aria-labelledby="schedule-title"]' })
 
+  // Both create wizards render their own "Continue"/"Back" simultaneously,
+  // so bare role lookups are ambiguous -- scope each to its own panel.
+  const eventPanel = section.locator('.work-panel', { has: page.getByRole('heading', { name: 'Create calendar event' }) })
+  const meetingPanel = section.locator('.work-panel', { has: page.getByRole('heading', { name: 'Create meeting' }) })
+
   // Create a standalone calendar event.
-  await section.getByLabel('Event title').fill('Budget review')
-  await section.getByLabel('Event start').fill('2026-08-01T09:00')
-  await section.getByLabel('Event end').fill('2026-08-01T10:00')
-  await section.getByRole('button', { name: 'Create event' }).click()
+  await eventPanel.getByLabel('Event title').fill('Budget review')
+  await eventPanel.getByLabel('Event start').fill('2026-08-01T09:00')
+  await eventPanel.getByLabel('Event end').fill('2026-08-01T10:00')
+  await eventPanel.getByRole('button', { name: 'Continue' }).click()
+
+  // Line 39's scan only covers the wizard's default Basics step -- Details
+  // and Review are distinct DOM states with no coverage of their own.
+  await assertNoSeriousAccessibilityViolations(page, { include: 'section[aria-labelledby="schedule-title"]' })
+
+  await eventPanel.getByRole('button', { name: 'Continue' }).click()
+  await assertNoSeriousAccessibilityViolations(page, { include: 'section[aria-labelledby="schedule-title"]' })
+
+  await eventPanel.getByRole('button', { name: 'Create event' }).click()
   await section.locator('.work-list strong', { hasText: 'Budget review' }).waitFor()
 
   // Create a standalone meeting (no linked calendar event).
-  await section.getByLabel('Meeting title').fill('1:1 with CFO')
-  await section.getByLabel('Meeting start').fill('2026-08-02T14:00')
-  await section.getByLabel('Meeting end').fill('2026-08-02T14:30')
-  await section.getByLabel('Meeting agenda').fill('Runway review')
-  await section.getByRole('button', { name: 'Create standalone meeting' }).click()
+  await meetingPanel.getByLabel('Meeting title').fill('1:1 with CFO')
+  await meetingPanel.getByLabel('Meeting start').fill('2026-08-02T14:00')
+  await meetingPanel.getByLabel('Meeting end').fill('2026-08-02T14:30')
+  await meetingPanel.getByRole('button', { name: 'Continue' }).click()
+
+  // Same for the meeting wizard's Notes and Review steps.
+  await assertNoSeriousAccessibilityViolations(page, { include: 'section[aria-labelledby="schedule-title"]' })
+
+  await meetingPanel.getByLabel('Meeting agenda').fill('Runway review')
+  await meetingPanel.getByRole('button', { name: 'Continue' }).click()
+  await assertNoSeriousAccessibilityViolations(page, { include: 'section[aria-labelledby="schedule-title"]' })
+
+  await meetingPanel.getByRole('button', { name: 'Create standalone meeting' }).click()
   await section.getByText('1:1 with CFO').waitFor()
   await section.getByText(/standalone timing/).waitFor()
 
   // Create a meeting linked to the seeded calendar event; timing projects
   // from the event rather than being entered here.
-  await section.getByLabel('Linked calendar event').selectOption({ label: 'Leadership sync' })
-  await section.getByText('Timing will be projected from the selected calendar event.').waitFor()
-  await section.getByLabel('Meeting title').fill('Leadership sync prep')
-  await section.getByRole('button', { name: 'Create linked meeting' }).click()
+  await meetingPanel.getByLabel('Linked calendar event').selectOption({ label: 'Leadership sync' })
+  await meetingPanel.getByText('Timing will be projected from the selected calendar event.').waitFor()
+  await meetingPanel.getByLabel('Meeting title').fill('Leadership sync prep')
+  await meetingPanel.getByRole('button', { name: 'Continue' }).click()
+  await meetingPanel.getByRole('button', { name: 'Continue' }).click()
+  await meetingPanel.getByRole('button', { name: 'Create linked meeting' }).click()
   await section.getByText('Leadership sync prep').waitFor()
   const linkedMeetingRow = section.locator('li', { hasText: 'Leadership sync prep' })
   await linkedMeetingRow.getByText(/timing from calendar event/).waitFor()
