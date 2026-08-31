@@ -1,8 +1,9 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useRef, useState, type FormEvent } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
 import { ApiError, apiRequest } from '../../api/client'
 import { apiErrorMessage } from '../../api/errorMessage'
+import { applyWizardFieldInvalidState } from '../../lib/wizardFocus'
 import type { ApprovalMode, Policy, PolicyListResponse } from './types'
 
 const APPROVAL_MODES: ApprovalMode[] = ['preview_only', 'per_run', 'bounded_recurring']
@@ -20,6 +21,7 @@ type Draft = {
 const emptyDraft: Draft = { workflowId: '', actionTypes: '', dataClasses: '', valueLimit: '0', countLimit: '10', approvalMode: 'per_run', schedule: '' }
 const CREATE_STEPS = ['scope', 'limits', 'review'] as const
 const CREATE_STEP_LABELS: Record<(typeof CREATE_STEPS)[number], string> = { scope: 'Scope', limits: 'Limits', review: 'Review' }
+const CREATE_ERROR_ID = 'create-policy-error'
 
 function errorMessage(error: unknown): string {
   if (error instanceof ApiError && error.code === 'POLICY_REVOKED') {
@@ -52,13 +54,15 @@ export default function PolicyPanel() {
   const [formError, setFormError] = useState<string | null>(null)
   const [createStepIndex, setCreateStepIndex] = useState(0)
   const createStepHeadingRef = useRef<HTMLHeadingElement>(null)
+  const createFormRef = useRef<HTMLFormElement>(null)
   const isCreateFirstRenderRef = useRef(true)
   const createStep = CREATE_STEPS[createStepIndex] ?? 'scope'
+  const [invalidField, setInvalidField] = useState<string | null>(null)
 
   useEffect(() => {
     if (isCreateFirstRenderRef.current) { isCreateFirstRenderRef.current = false; return }
-    createStepHeadingRef.current?.focus()
-  }, [createStep])
+    applyWizardFieldInvalidState(createFormRef.current, invalidField, CREATE_ERROR_ID, createStepHeadingRef.current)
+  }, [createStep, invalidField])
 
   const query = useQuery({
     queryKey: ['automation', 'policies', workflowFilter],
@@ -71,6 +75,7 @@ export default function PolicyPanel() {
     onSuccess: () => {
       setDraft(emptyDraft)
       setCreateStepIndex(0)
+      setInvalidField(null)
       void queryClient.invalidateQueries({ queryKey: ['automation', 'policies'] })
     },
   })
@@ -80,13 +85,20 @@ export default function PolicyPanel() {
     onSuccess: () => { void queryClient.invalidateQueries({ queryKey: ['automation', 'policies'] }) },
   })
 
-  function attemptCreate() {
-    setFormError(null)
-    if (!draft.workflowId.trim()) { setFormError('Workflow ID is required.'); return }
+  function fail(message: string, field: string, step: (typeof CREATE_STEPS)[number]) {
+    setFormError(message)
+    setInvalidField(field)
+    setCreateStepIndex(CREATE_STEPS.indexOf(step))
+  }
+  function attemptCreate(event: FormEvent) {
+    event.preventDefault()
+    if (!draft.workflowId.trim()) { fail('Workflow ID is required.', 'Workflow ID', 'scope'); return }
     const valueLimit = Number(draft.valueLimit)
     const countLimit = Number(draft.countLimit)
-    if (!Number.isFinite(valueLimit) || valueLimit < 0) { setFormError('Value limit must be zero or a positive number.'); return }
-    if (!Number.isInteger(countLimit) || countLimit < 0) { setFormError('Count limit must be zero or a positive whole number.'); return }
+    if (!Number.isFinite(valueLimit) || valueLimit < 0) { fail('Value limit must be zero or a positive number.', 'Value limit', 'limits'); return }
+    if (!Number.isInteger(countLimit) || countLimit < 0) { fail('Count limit must be zero or a positive whole number.', 'Count limit', 'limits'); return }
+    setFormError(null)
+    setInvalidField(null)
     createMutation.mutate({
       workflow_id: draft.workflowId.trim(),
       action_types: draft.actionTypes.split(',').map((v) => v.trim()).filter(Boolean),
@@ -98,8 +110,8 @@ export default function PolicyPanel() {
       rate_limit: null,
     })
   }
-  function goCreateNext() { setCreateStepIndex((i) => Math.min(i + 1, CREATE_STEPS.length - 1)) }
-  function goCreateBack() { setCreateStepIndex((i) => Math.max(i - 1, 0)) }
+  function goCreateNext() { setInvalidField(null); setCreateStepIndex((i) => Math.min(i + 1, CREATE_STEPS.length - 1)) }
+  function goCreateBack() { setInvalidField(null); setCreateStepIndex((i) => Math.max(i - 1, 0)) }
 
   const pending = createMutation.isPending || revokeMutation.isPending
   const policies = query.data?.policies ?? []
@@ -150,9 +162,9 @@ export default function PolicyPanel() {
         ))}
       </ol>
 
-      <div role="region" aria-labelledby="create-policy-title">
+      <form ref={createFormRef} noValidate onSubmit={attemptCreate} aria-labelledby="create-policy-title">
         <h3 id="create-policy-title">Create a policy</h3>
-        {formError ? <div role="alert" className="inline-status error-panel">{formError}</div> : null}
+        {formError ? <div id={CREATE_ERROR_ID} role="alert" className="inline-status error-panel">{formError}</div> : null}
         {createMutation.isError ? <div role="alert" className="inline-status error-panel">{errorMessage(createMutation.error)}</div> : null}
 
         <div className="wizard-stepper" role="group" aria-label="Create policy progress">
@@ -213,10 +225,10 @@ export default function PolicyPanel() {
               <div><dt>Approval mode</dt><dd>{draft.approvalMode.replaceAll('_', ' ')}</dd></div>
               <div><dt>Schedule note</dt><dd>{draft.schedule || '—'}</dd></div>
             </dl>
-            <div className="work-actions"><button type="button" onClick={goCreateBack}>Back</button><button type="button" disabled={pending} onClick={attemptCreate}>{createMutation.isPending ? 'Creating…' : 'Create policy'}</button></div>
+            <div className="work-actions"><button type="button" onClick={goCreateBack}>Back</button><button type="submit" disabled={pending}>{createMutation.isPending ? 'Creating…' : 'Create policy'}</button></div>
           </div>
         )}
-      </div>
+      </form>
     </section>
   )
 }
