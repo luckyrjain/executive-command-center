@@ -116,10 +116,16 @@ export async function run({ page, baseURL }) {
   await page.keyboard.press('Enter')
   await risksSection.getByRole('button', { name: 'Archive Vendor concentration (reviewed)' }).waitFor()
 
-  // formError has no coverage anywhere else in the suite. The create form
+  // formError has no coverage anywhere else in the suite. The create wizard
   // was never touched above, so it still holds its empty initial draft --
   // submitting it fails client-side validation without needing any fixture
   // setup, and mutationError is null here (the last mutation succeeded).
+  // Advance through the Details/Plan steps (Continue doesn't validate) to
+  // reach the Review step where "Create risk" lives.
+  await risksSection.getByRole('button', { name: 'Continue' }).focus()
+  await page.keyboard.press('Enter')
+  await risksSection.getByRole('button', { name: 'Continue' }).focus()
+  await page.keyboard.press('Enter')
   await risksSection.getByRole('button', { name: 'Create risk' }).focus()
   await page.keyboard.press('Enter')
   const formErrorAlert = risksSection.getByRole('alert')
