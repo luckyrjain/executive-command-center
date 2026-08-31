@@ -11,6 +11,7 @@ import * as recommendationExecution from './scenarios/recommendation-execution.m
 import * as recommendationDecisions from './scenarios/recommendation-decisions.mjs'
 import * as recommendationTerminals from './scenarios/recommendation-terminals.mjs'
 import * as conflictAuditKeyboard from './scenarios/conflict-audit-keyboard.mjs'
+import * as risksEmptyState from './scenarios/risks-empty-state.mjs'
 import * as knowledgeEntities from './scenarios/knowledge-entities.mjs'
 import * as knowledgeResolution from './scenarios/knowledge-resolution.mjs'
 import * as knowledgeKeyboard from './scenarios/knowledge-keyboard.mjs'
@@ -37,6 +38,7 @@ const scenarios = [
   { name: 'recommendation-decisions', module: recommendationDecisions },
   { name: 'recommendation-terminals', module: recommendationTerminals },
   { name: 'conflict-audit-keyboard', module: conflictAuditKeyboard },
+  { name: 'risks-empty-state', module: risksEmptyState },
   { name: 'knowledge-entities', module: knowledgeEntities },
   { name: 'knowledge-resolution', module: knowledgeResolution },
   { name: 'knowledge-keyboard', module: knowledgeKeyboard },
