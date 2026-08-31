@@ -74,7 +74,7 @@ export default function CommitmentWorkspace() {
   return <section className="work-panel" aria-labelledby="commitments-title">
     <div className="work-heading"><div><p className="eyebrow">WORK</p><h1 id="commitments-title">Commitments</h1><p>Track promises made by you and to you.</p></div></div>
     {mutationError ? <div role="alert" className="inline-status error-panel">{mutationError instanceof ApiError && mutationError.code === 'VERSION_CONFLICT' ? 'This commitment changed while you were editing it. Review your input and retry with the latest version.' : mutationError.message}</div> : null}
-    <form onSubmit={submitCreate}>
+    <form className="field-form" onSubmit={submitCreate}>
       <h2>Create commitment</h2>
       <label>Commitment summary<input aria-label="Commitment summary" value={create.summary} onChange={(e) => setCreate({ ...create, summary: e.target.value })} /></label>
       <label>Description<textarea value={create.description} onChange={(e) => setCreate({ ...create, description: e.target.value })} /></label>
@@ -98,7 +98,7 @@ export default function CommitmentWorkspace() {
         {!archived ? <button type="button" disabled={actionMutation.isPending || editMutation.isPending} aria-label={`Archive ${value.summary}`} onClick={() => actionMutation.mutate({ commitment: value, action: 'archive' })}>Archive</button> : <button type="button" disabled={actionMutation.isPending || editMutation.isPending} aria-label={`Restore ${value.summary}`} onClick={() => actionMutation.mutate({ commitment: value, action: 'restore' })}>Restore</button>}
       </div></li>
     })}</ol>
-    {edit ? <form onSubmit={submitEdit}><h2>Edit commitment</h2>
+    {edit ? <form className="field-form" onSubmit={submitEdit}><h2>Edit commitment</h2>
       <label>Edit commitment summary<input aria-label="Edit commitment summary" value={edit.summary} onChange={(e) => setEdit({ ...edit, summary: e.target.value })} /></label>
       <label>Edit description<textarea value={edit.description} onChange={(e) => setEdit({ ...edit, description: e.target.value })} /></label>
       <label>Edit counterparty<input value={edit.counterpartyName} onChange={(e) => setEdit({ ...edit, counterpartyName: e.target.value })} /></label>

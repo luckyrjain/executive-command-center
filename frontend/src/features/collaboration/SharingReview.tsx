@@ -163,6 +163,7 @@ export default function SharingReview() {
       </p>
 
       <form
+        className="field-form"
         onSubmit={(event) => {
           event.preventDefault()
           previewMutation.mutate(form)

@@ -125,7 +125,7 @@ export default function TaskWorkspace() {
     <section className="work-panel" aria-labelledby="tasks-title">
       <div className="work-heading"><div><p className="eyebrow">WORK</p><h1 id="tasks-title">Tasks</h1><p>Create, edit and move tasks through their lifecycle.</p></div></div>
       {mutationError ? <div className="inline-status error-panel" role="alert">{errorMessage(mutationError)}</div> : null}
-      <form onSubmit={submitCreate}>
+      <form className="field-form" onSubmit={submitCreate}>
         <h2>Create task</h2>
         <label>Task title<input aria-label="Task title" value={create.title} onChange={(event) => setCreate({ ...create, title: event.target.value })} /></label>
         <label>Description<textarea value={create.description} onChange={(event) => setCreate({ ...create, description: event.target.value })} /></label>
@@ -152,7 +152,7 @@ export default function TaskWorkspace() {
         })}
       </ol>
 
-      {edit ? <form onSubmit={submitEdit}>
+      {edit ? <form className="field-form" onSubmit={submitEdit}>
         <h2>Edit task</h2>
         <label>Edit task title<input aria-label="Edit task title" value={edit.title} onChange={(event) => setEdit({ ...edit, title: event.target.value })} /></label>
         <label>Edit description<textarea value={edit.description} onChange={(event) => setEdit({ ...edit, description: event.target.value })} /></label>

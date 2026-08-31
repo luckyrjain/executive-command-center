@@ -319,6 +319,7 @@ export default function GmailPanel() {
           ) : null}
 
           <form
+            className="field-form"
             onSubmit={(event) => {
               event.preventDefault()
               if (!sinceInput) return

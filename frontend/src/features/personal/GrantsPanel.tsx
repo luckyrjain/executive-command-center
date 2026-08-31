@@ -109,6 +109,7 @@ export default function GrantsPanel() {
       <p>A grant lets an AI-generated insight draw specific categories of one enabled domain's data for a named purpose. Nothing is combined across domains without an active grant.</p>
 
       <form
+        className="field-form"
         onSubmit={(event) => {
           event.preventDefault()
           createMutation.mutate({

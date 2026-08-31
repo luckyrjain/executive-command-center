@@ -458,7 +458,7 @@ function ConnectorCard({ connector, syncRuns, now, onChanged }: {
         </details>
       ) : null}
 
-      <form onSubmit={(event) => { event.preventDefault(); syncMutation.mutate() }}>
+      <form className="field-form" onSubmit={(event) => { event.preventDefault(); syncMutation.mutate() }}>
         <label>Run type
           <select aria-label={`Run type for ${connector.display_name}`} value={runType} onChange={(e) => setRunType(e.target.value as typeof runType)}>
             {RUN_TYPES.map((type) => <option key={type} value={type}>{type}</option>)}

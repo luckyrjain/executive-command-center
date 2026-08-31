@@ -117,7 +117,7 @@ export default function RiskReviewQueue() {
       </ol>
 
       {reviewing ? (
-        <form onSubmit={submit}>
+        <form className="field-form" onSubmit={submit}>
           <h2>Record review: {reviewing.item.description}</h2>
           <label>Outcome
             <select aria-label="Review outcome" value={reviewing.draft.outcome} onChange={(e) => setReviewing({ ...reviewing, draft: { ...reviewing.draft, outcome: e.target.value as ReviewOutcome } })}>

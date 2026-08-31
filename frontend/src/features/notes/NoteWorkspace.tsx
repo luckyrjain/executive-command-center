@@ -213,7 +213,7 @@ export default function NoteWorkspace({ recoveryStore }: NoteWorkspaceProps) {
   return <section className="work-panel note-workspace" aria-labelledby="notes-title">
     <div className="work-heading"><div><p className="eyebrow">KNOWLEDGE</p><h1 id="notes-title">Notes</h1><p>Capture and safely refine your working context.</p></div></div>
     {mutationError ? <div role="alert" className="inline-status error-panel">{mutationError.message}</div> : null}
-    <form onSubmit={submitCreate} className="note-create-form">
+    <form onSubmit={submitCreate} className="field-form">
       <h2>Create note</h2>
       <label>Note title<input aria-label="Note title" value={create.title} onChange={(event) => setCreate({ ...create, title: event.target.value })} /></label>
       <label>Note body<textarea aria-label="Note body" required value={create.body} onChange={(event) => setCreate({ ...create, body: event.target.value })} /></label>
@@ -237,7 +237,7 @@ export default function NoteWorkspace({ recoveryStore }: NoteWorkspaceProps) {
       </div></li>
     })}</ol>
 
-    {editing ? <section className="note-editor" aria-labelledby="note-editor-title"><h2 id="note-editor-title">Edit {displayTitle(editing)}</h2>
+    {editing ? <section className="field-form note-editor" aria-labelledby="note-editor-title"><h2 id="note-editor-title">Edit {displayTitle(editing)}</h2>
       <label>Edit note body<textarea aria-label="Edit note body" value={body} onChange={(event) => updateBody(event.target.value)} onBlur={() => { void controller.current?.flush() }} /></label>
       {saveMessage ? <div role={saveState.status === 'error' ? 'alert' : 'status'} aria-live={saveState.status === 'error' ? 'assertive' : 'polite'} className={`inline-status${saveState.status === 'error' ? ' error-panel' : ''}`}>{saveMessage}</div> : null}
       {saveState.status === 'error' && conflictVersion === null && !conflictReloadFailed ? <button type="button" onClick={() => { void controller.current?.flush() }}>Retry save</button> : null}

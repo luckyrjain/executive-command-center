@@ -120,7 +120,7 @@ export default function WaitingView() {
       {formError ? <div role="alert" className="inline-status error-panel">{formError}</div> : null}
       {mutationError ? <div role="alert" className="inline-status error-panel">{errorMessage(mutationError)}</div> : null}
 
-      <form onSubmit={submit}>
+      <form className="field-form" onSubmit={submit}>
         <h2>Record a waiting item</h2>
         <label>Subject type
           <select aria-label="Subject type" value={draft.subjectType} onChange={(e) => setDraft({ ...draft, subjectType: e.target.value as WaitingSubjectType })}>

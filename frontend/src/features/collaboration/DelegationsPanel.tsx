@@ -140,6 +140,7 @@ export default function DelegationsPanel() {
       <p>Obligations you have delegated, and obligations delegated to you.</p>
 
       <form
+        className="field-form"
         onSubmit={(event) => {
           event.preventDefault()
           proposeMutation.mutate(form)

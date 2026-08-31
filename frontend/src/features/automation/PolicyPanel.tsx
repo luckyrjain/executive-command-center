@@ -137,7 +137,7 @@ export default function PolicyPanel() {
         ))}
       </ol>
 
-      <form onSubmit={submit}>
+      <form className="field-form" onSubmit={submit}>
         <h3>Create a policy</h3>
         {formError ? <div role="alert" className="inline-status error-panel">{formError}</div> : null}
         {createMutation.isError ? <div role="alert" className="inline-status error-panel">{errorMessage(createMutation.error)}</div> : null}

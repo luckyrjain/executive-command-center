@@ -246,6 +246,7 @@ function MemberRow({
             {blocked.map((item) => <li key={item.resource_type}>{item.count} × {item.resource_type}</li>)}
           </ul>
           <form
+            className="field-form"
             onSubmit={(event) => {
               event.preventDefault()
               transferMutation.mutate(transferForm)
@@ -331,6 +332,7 @@ function AcceptInvitationForm({ onAccepted }: { onAccepted: () => void }) {
       <h3 id="accept-invitation-title">Accept an invitation</h3>
       <p>Have an invitation ID and token from another workspace? Accept it here, then use the workspace switcher above to open it.</p>
       <form
+        className="field-form"
         aria-labelledby="accept-invitation-title"
         onSubmit={(event) => {
           event.preventDefault()
@@ -478,6 +480,7 @@ export default function MembersPanel() {
           <hr />
           <h3 id="invitations-title">Invitations</h3>
           <form
+            className="field-form"
             aria-labelledby="invitations-title"
             onSubmit={(event) => {
               event.preventDefault()

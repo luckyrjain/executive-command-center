@@ -216,7 +216,7 @@ export default function RunWorkspace() {
     <div className="schedule-workspace">
       <section className="work-panel" aria-labelledby="automation-runs-title">
         <h2 id="automation-runs-title">Run history</h2>
-        <form onSubmit={submit}>
+        <form className="field-form" onSubmit={submit}>
           <label>Run a workflow (manual trigger)
             <input aria-label="Workflow ID to run" value={workflowId} onChange={(e) => setWorkflowId(e.target.value)} placeholder="workflow ID" />
           </label>
