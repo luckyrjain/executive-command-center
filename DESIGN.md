@@ -83,11 +83,26 @@ Read one before building a new wizard: `ConnectorHealthPanel.tsx` (the original)
 
 **Each non-review step** is a `<div className="field-form">`: eyebrow (`Step {i+1} of {N} · {Label}`), the step's ref'd heading, its fields, then `.work-actions` with `Back`/`Continue` — both `type="button"`, never `type="submit"`. Continue is non-blocking by design; no per-step validation gate.
 
-**The review step** is a `<div className="wizard-review">`: a `<dl>` of every field as `<dt>`/`<dd>` pairs, then `.work-actions` with `Back` and the terminal action button, `type="button"`, calling the mutation directly.
+**The review step** is a `<div className="wizard-review">`: a `<dl>` of every field as `<dt>`/`<dd>` pairs, then `.work-actions` with `Back` and the terminal action button — `type="submit"`.
 
-**No `<form>` anywhere in a wizard.** The old `submit(event: FormEvent)` becomes `attemptCreate()` — same validation, minus `event.preventDefault()`, wired to the terminal button's `onClick`. Drop any `required` attribute that only worked because of the removed `<form>`'s native validation. If the same field component is shared with a real, still-`<form>`-wrapped edit view (e.g. `ScheduleWorkspace.tsx`'s `TimingFields`), give it a `required` prop defaulting to `true` and pass `required={false}` only from the wizard call site — don't drop it for the edit form too.
+**A wizard IS a `<form>`.** It creates a resource; it's semantically a form regardless of how many steps it takes to fill out, and removing `<form>` throws away real behavior for no reason: Enter-to-submit, form landmark semantics for assistive tech, and the native submit event conventional tests rely on. Wrap the whole wizard — stepper and every step's content — in one `<form ref={formRef} noValidate onSubmit={attemptCreate} aria-labelledby="...">`. Only the terminal action is `type="submit"`; Continue/Back stay `type="button"` so they never trigger a submit. `attemptCreate` takes `(event: FormEvent)` and calls `event.preventDefault()`, same as any other form handler in this codebase.
 
-**Reset on success.** `createStepIndex` back to `0` in the mutation's `onSuccess`, alongside the field-state reset.
+**`noValidate`, not `required` removal.** A multi-step draft's fields aren't all mounted at once, so the browser's native constraint validation can't find "the first invalid field" the way this app's own validation does (below) — it would just silently block a submit from a step where nothing looks wrong, or, worse, refuse to report a required field that isn't currently rendered at all. Put `noValidate` on the form so custom JS validation owns the UX; leave `required` attributes in place (they're inert under `noValidate`, but still a correct semantic hint for assistive tech that doesn't run this component's JS, e.g. a screen reader's forms-list view). Don't strip `required` just because the enclosing element used to be a `<div>`.
+
+**Reset on success.** `createStepIndex` back to `0` in the mutation's `onSuccess`, alongside the field-state reset and the invalid-field state (below).
+
+### Terminal validation and error navigation
+
+Continue never validates, so a failed final submit can discover an invalid field several steps back — the wizard must handle that gracefully, not just show a banner and strand the user wherever they happened to be. The contract: **on a failed submit, find the first invalid field, jump the wizard to the step it lives on, focus it, and mark it up so assistive tech can find it too.**
+
+Mechanically, reuse `frontend/src/lib/wizardFocus.ts`:
+
+- `findWizardField(container, label)` looks a field up by `aria-label`, or — for the fields that rely on native label association instead of a redundant `aria-label` (WCAG 2.5.3) — by its wrapping `<label>`'s visible text.
+- `applyWizardFieldInvalidState(container, invalidField, errorId, fallbackRef)` clears stale `aria-invalid`/`aria-describedby` from the whole form, then applies both to the field matching `invalidField` and focuses it, or falls back to focusing `fallbackRef` (the current step's heading) when there's no invalid field to redirect to. Call it from the same step-change `useEffect` that already handles heading focus — pass it `invalidField` as an extra dependency.
+
+Per wizard: keep a `const [invalidField, setInvalidField] = useState<string | null>(null)`, and change every validation-failure branch to set three things together — the error message, `invalidField` (the field's accessible name, exactly as `findWizardField` will look it up), and `createStepIndex` (via `CREATE_STEPS.indexOf(step)`). A small `fail(message, field, step)` closure per wizard keeps this from turning into three-line repetition at every check. **Keep the validation logic's check order and the failure-branch order in lock step** — if a field's own validator (e.g. `validateDraft`) checks fields in a different order than the failure branches that report which step to jump to, the error *message* stays right but the navigation can point at the wrong field. Clear `invalidField` on `goNext`/`goBack` (manual navigation shouldn't leave a stale field marked invalid) and in the mutation's `onSuccess`.
+
+A thrown error that isn't tied to one obvious field (e.g. `ScheduleWorkspace.tsx`'s `wallTimeToInstant` can fail for a bad start, a bad end, or a bad timezone, and throws the same generic message for a malformed value) still needs per-field attribution, not a single hardcoded guess — validate the individual fields in a defined order before attempting the mutation, and inspect the specific error to decide which field it actually points at.
 
 **Two wizards on one screen** (Schedule's Create event + Create meeting) means their `Continue`/`Back` labels collide. Scope test queries to each wizard's own panel — `within()` in Vitest, a locator scoped to the panel in Playwright — not a bare role/name query.
 
@@ -97,6 +112,10 @@ Read one before building a new wizard: `ConnectorHealthPanel.tsx` (the original)
 
 Clean today, worth re-checking on any large new surface: no purple/gradient backgrounds, no 3-column icon-in-circle feature grids, no centered-everything, no decorative blobs or emoji-as-design, no generic hero copy. The palette and type scale above are the real system — don't default to unstyled `Inter` or a bootstrap-template look for anything new.
 
+## Known follow-ups (deferred, not forgotten)
+
+An external design-system review of this document raised a longer list of P1/P2 issues beyond the P0s folded in above: design tokens (CSS custom properties) instead of raw hex values, `.field`/`.field-label`/`.field-control` primitives to replace the `.field-form label:has(...)` DOM-shape dependency, `<ol>`/`<li>` stepper semantics instead of `role="group"`, a centralized focus-management hook instead of one per wizard, a documented interaction-states catalogue (hover/active/disabled/loading/selected), a responsive-behavior spec, and scoping `.wizard-review dd`'s monospace treatment to genuinely machine-shaped values (IDs, timestamps) rather than every review value. None of that is implemented yet — deliberately scoped out to land the P0 fixes (semantic form, terminal-validation navigation, field a11y) first. Treat this list as the next pass, not as settled behavior to build against.
+
 ## Provenance
 
-Extracted 2026-08-31 from the live app during a design pass (#203) and the wizard sweep that followed (#204).
+Extracted 2026-08-31 from the live app during a design pass (#203) and the wizard sweep that followed (#204). P0 fixes (semantic `<form>`, terminal-validation error navigation) applied the same day after an external design-system review.
