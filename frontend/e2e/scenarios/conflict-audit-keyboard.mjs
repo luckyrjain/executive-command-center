@@ -124,8 +124,15 @@ export async function run({ page, baseURL }) {
   // reach the Review step where "Create risk" lives.
   await risksSection.getByRole('button', { name: 'Continue' }).focus()
   await page.keyboard.press('Enter')
+
+  // Line 80's scan only covers the wizard's default Details step -- Plan
+  // and Review are distinct DOM states with no coverage of their own.
+  await assertNoSeriousAccessibilityViolations(page, { include: 'section[aria-labelledby="risks-title"]' })
+
   await risksSection.getByRole('button', { name: 'Continue' }).focus()
   await page.keyboard.press('Enter')
+  await assertNoSeriousAccessibilityViolations(page, { include: 'section[aria-labelledby="risks-title"]' })
+
   await risksSection.getByRole('button', { name: 'Create risk' }).focus()
   await page.keyboard.press('Enter')
   const formErrorAlert = risksSection.getByRole('alert')
