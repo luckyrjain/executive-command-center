@@ -6,13 +6,14 @@ The frontend's actual, rendered design system — not aspirational, not a wishli
 
 ## Typography
 
-One font, everywhere: `Inter, ui-sans-serif, system-ui, -apple-system, "system-ui", "Segoe UI", sans-serif`.
+One font, everywhere: `Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif`.
 
 | Element | Size | Notes |
 |---|---|---|
 | Panel title (`.work-heading h2`) | `clamp(28px, 4vw, 44px)` | `letter-spacing: -.035em` |
 | Section heading | `18px` | weight `700` |
 | Eyebrow label | small, uppercase, muted | sits above a heading, or above a wizard step (`Step N of M · Label`) |
+| Wizard review value (`.wizard-review dd`) | `13px` | `ui-monospace, SFMono-Regular, Menlo, monospace` — the one deliberate exception to "one font," for tabular/ID-shaped review values |
 
 ## Color
 
@@ -84,7 +85,7 @@ Read one before building a new wizard: `ConnectorHealthPanel.tsx` (the original)
 
 **The review step** is a `<div className="wizard-review">`: a `<dl>` of every field as `<dt>`/`<dd>` pairs, then `.work-actions` with `Back` and the terminal action button, `type="button"`, calling the mutation directly.
 
-**No `<form>` anywhere in a wizard.** The old `submit(event: FormEvent)` becomes `attemptCreate()` — same validation, minus `event.preventDefault()`, wired to the terminal button's `onClick`. Drop any `required` attribute that only worked because of the removed `<form>`'s native validation.
+**No `<form>` anywhere in a wizard.** The old `submit(event: FormEvent)` becomes `attemptCreate()` — same validation, minus `event.preventDefault()`, wired to the terminal button's `onClick`. Drop any `required` attribute that only worked because of the removed `<form>`'s native validation. If the same field component is shared with a real, still-`<form>`-wrapped edit view (e.g. `ScheduleWorkspace.tsx`'s `TimingFields`), give it a `required` prop defaulting to `true` and pass `required={false}` only from the wizard call site — don't drop it for the edit form too.
 
 **Reset on success.** `createStepIndex` back to `0` in the mutation's `onSuccess`, alongside the field-state reset.
 

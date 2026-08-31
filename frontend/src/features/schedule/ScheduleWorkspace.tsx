@@ -210,7 +210,7 @@ export default function ScheduleWorkspace() {
             <p className="eyebrow">Step {createEventStepIndex + 1} of {CREATE_EVENT_STEPS.length} · Basics</p>
             <h3 ref={createEventStepHeadingRef} tabIndex={-1}>What and when?</h3>
             <label>Event title<input aria-label="Event title" value={createEvent.title} onChange={(e) => setCreateEvent({ ...createEvent, title: e.target.value })} /></label>
-            <TimingFields prefix="Event" draft={createEvent} onChange={setCreateEvent} />
+            <TimingFields prefix="Event" draft={createEvent} onChange={setCreateEvent} required={false} />
             <label><input type="checkbox" checked={createEvent.allDay} onChange={(e) => setCreateEvent({ ...createEvent, allDay: e.target.checked })} /> All day</label>
             <div className="work-actions"><button type="button" onClick={goCreateEventNext}>Continue</button></div>
           </div>
@@ -256,7 +256,7 @@ export default function ScheduleWorkspace() {
             <h3 ref={createMeetingStepHeadingRef} tabIndex={-1}>What and when?</h3>
             <label>Linked calendar event<select aria-label="Linked calendar event" value={createMeeting.calendarEventId} onChange={(e) => setCreateMeeting({ ...createMeeting, calendarEventId: e.target.value })}><option value="">Standalone meeting</option>{(events.data?.items ?? []).filter((item) => !item.archived_at).map((item) => <option key={item.id} value={item.id}>{item.title}</option>)}</select></label>
             <label>Meeting title<input aria-label="Meeting title" value={createMeeting.title} onChange={(e) => setCreateMeeting({ ...createMeeting, title: e.target.value })} /></label>
-            {createMeeting.calendarEventId ? <p className="inline-status">Timing will be projected from the selected calendar event.</p> : <TimingFields prefix="Meeting" draft={createMeeting} onChange={setCreateMeeting} />}
+            {createMeeting.calendarEventId ? <p className="inline-status">Timing will be projected from the selected calendar event.</p> : <TimingFields prefix="Meeting" draft={createMeeting} onChange={setCreateMeeting} required={false} />}
             <label>Meeting status<select value={createMeeting.status} onChange={(e) => setCreateMeeting({ ...createMeeting, status: e.target.value as MeetingDraft['status'] })}><option value="planned">planned</option><option value="in_progress">in progress</option><option value="completed">completed</option><option value="cancelled">cancelled</option></select></label>
             <div className="work-actions"><button type="button" onClick={goCreateMeetingNext}>Continue</button></div>
           </div>
@@ -323,8 +323,8 @@ export default function ScheduleWorkspace() {
   </section>
 }
 
-function TimingFields<T extends { startsAt: string; endsAt: string; timezone: string }>({ prefix, draft, onChange }: { prefix: string; draft: T; onChange: (value: T) => void }) {
-  return <><label>{prefix} start<input aria-label={`${prefix} start`} type="datetime-local" required value={draft.startsAt} onChange={(e) => onChange({ ...draft, startsAt: e.target.value })} /></label><label>{prefix} end<input aria-label={`${prefix} end`} type="datetime-local" required value={draft.endsAt} onChange={(e) => onChange({ ...draft, endsAt: e.target.value })} /></label><label>{prefix} timezone<input aria-label={`${prefix} timezone`} required value={draft.timezone} onChange={(e) => onChange({ ...draft, timezone: e.target.value })} /></label></>
+function TimingFields<T extends { startsAt: string; endsAt: string; timezone: string }>({ prefix, draft, onChange, required = true }: { prefix: string; draft: T; onChange: (value: T) => void; required?: boolean }) {
+  return <><label>{prefix} start<input aria-label={`${prefix} start`} type="datetime-local" required={required} value={draft.startsAt} onChange={(e) => onChange({ ...draft, startsAt: e.target.value })} /></label><label>{prefix} end<input aria-label={`${prefix} end`} type="datetime-local" required={required} value={draft.endsAt} onChange={(e) => onChange({ ...draft, endsAt: e.target.value })} /></label><label>{prefix} timezone<input aria-label={`${prefix} timezone`} required={required} value={draft.timezone} onChange={(e) => onChange({ ...draft, timezone: e.target.value })} /></label></>
 }
 
 function MeetingFields<T extends { status: MeetingDraft['status']; agenda: string; preparation: string; notesSummary: string }>({ draft, onChange }: { draft: T; onChange: (value: T) => void }) {
