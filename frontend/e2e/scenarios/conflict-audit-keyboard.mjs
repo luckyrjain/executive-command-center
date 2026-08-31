@@ -138,6 +138,17 @@ export async function run({ page, baseURL }) {
   const formErrorAlert = risksSection.getByRole('alert')
   await formErrorAlert.waitFor()
   assert.match(await formErrorAlert.innerText(), /Description is required/)
+
+  // The failed submit should have hopped back from Review to the Details
+  // step (where the invalid field lives) and focused it directly, rather
+  // than leaving the user stranded on Review with only a generic banner.
+  await risksSection.getByRole('heading', { name: 'What is the risk?' }).waitFor()
+  const descriptionField = risksSection.getByLabel('Risk description')
+  assert.equal(await page.evaluate(() => document.activeElement?.getAttribute('aria-label')), 'Risk description')
+  assert.equal(await descriptionField.getAttribute('aria-invalid'), 'true')
+  const errorId = await formErrorAlert.getAttribute('id')
+  assert.equal(await descriptionField.getAttribute('aria-describedby'), errorId)
+
   await assertNoSeriousAccessibilityViolations(page, { include: 'section[aria-labelledby="risks-title"]' })
 
   // Continue keyboard navigation: risks(4) -> knowledge(5) -> recommendations(6) -> search-audit(7).

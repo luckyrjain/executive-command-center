@@ -142,6 +142,30 @@ describe('RiskWorkspace', () => {
     expect(screen.getByRole('alert').textContent).toMatch(/mitigation/i)
   })
 
+  it('on failed final submit, navigates back to the first invalid step and focuses that field', async () => {
+    vi.stubGlobal('fetch', vi.fn(() => response({ items: [], next_cursor: null })))
+    renderWorkspace()
+
+    // Fill everything through the Details step, then reach Review without
+    // ever touching Mitigation (which lives on the earlier Plan step).
+    fireEvent.change(screen.getByLabelText('Risk description'), { target: { value: 'Vendor lapse' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Continue' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Continue' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Create risk' }))
+
+    const alert = await screen.findByRole('alert')
+    expect(alert.textContent).toMatch(/mitigation/i)
+
+    // Submitting from Review should have hopped back to Plan (where
+    // Mitigation lives) and put focus + aria-invalid on that field, not left
+    // the user stranded on Review looking at a generic banner.
+    const mitigationField = await screen.findByLabelText('Mitigation')
+    expect(document.activeElement).toBe(mitigationField)
+    expect(mitigationField.getAttribute('aria-invalid')).toBe('true')
+    expect(mitigationField.getAttribute('aria-describedby')).toBe(alert.id)
+    expect(screen.queryByLabelText('Risk description')).toBeNull()
+  })
+
   it('disables the status control once a risk is closed and shows its factors', async () => {
     const closed = { ...risk, id: 'closed-risk', description: 'Lapsed contract', status: 'closed', factors: [] }
     vi.stubGlobal('fetch', vi.fn(() => response({ items: [risk, closed], next_cursor: null })))
