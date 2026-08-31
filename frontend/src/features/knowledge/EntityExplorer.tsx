@@ -180,7 +180,7 @@ export default function EntityExplorer() {
         <button type="submit" disabled={createMutation.isPending}>Create entity</button>
       </form>
 
-      <form onSubmit={submitSearch} role="search">
+      <form className="field-form" onSubmit={submitSearch} role="search">
         <label>
           Search entities
           <input
