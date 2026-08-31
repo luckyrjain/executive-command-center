@@ -491,8 +491,29 @@ def test_archive_risk_is_idempotent_on_an_already_archived_risk(
 # (retry-pass p95: 815.9 ms and 827.7 ms -- the noise-filtered numbers this
 # test's own retry mechanism exists to surface), with headroom above the
 # worst of those, not merely above the CI budget's old value.
+#
+# Widened again from 0.95 (issue #198): 0.95 stopped holding. 13 independent
+# CI failures were collected across this test's own retry-pass p95 (the
+# noise-filtered number, same as above) between 2026-08-21 and 2026-08-23,
+# none touching this endpoint, the ranking query, or the schema:
+# 951/957/959/976/978/979/981/983/1004/1085/1095/1106/1309 ms -- every
+# single one over the 950 ms budget, median ~980 ms, worst 1309 ms. Checked
+# for a real regression first, not assumed away: every table `regenerate_
+# attention` queries (`tasks`/`commitments`/`risks`/`waiting_links`) still
+# has the composite `(workspace_id, status)`-shaped index this query needs,
+# and `_upsert_batch`'s own already-optimized jsonb-batch path (see above)
+# is unchanged. No missing index, no reverted optimization -- this is
+# CI-runner steady-state having moved, not a code-level slowdown to chase.
+# 1.5s carries real headroom above the worst of those 13 samples (1309 ms),
+# matching the same "headroom above the worst observed, not merely above
+# the old budget" methodology the 0.8->0.95 escalation above used, just
+# applied to a much larger sample than that one had. The single-retry
+# mechanism itself was reconsidered, not left as-is by default: kept at one
+# retry, since at 1.5s every one of the 13 observed retry-pass p95 samples
+# above would already pass with margin -- the budget was the miscalibrated
+# part, not the retry count.
 _IN_CI = os.getenv("CI") is not None
-RANKING_BUDGET_SECONDS = 0.95 if _IN_CI else 0.6
+RANKING_BUDGET_SECONDS = 1.5 if _IN_CI else 0.6
 # More samples than the ~10-15 used elsewhere so the nearest-rank p95 index
 # can discount a couple of worst-case outliers -- with fewer samples, "p95"
 # and "max" are numerically close to identical, which made this specific
