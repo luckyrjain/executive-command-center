@@ -38,11 +38,43 @@ pytestmark = pytest.mark.skipif(
 )
 
 _IN_CI = os.getenv("CI") is not None
-# MEETING-PREP-CONTRACT.md's own ceiling is <2s p95; measured local p95
-# against this test's dataset (200 timeline entries, 50 commitments, 50
-# notes, one participant) is ~20-33ms, so these budgets keep real headroom
-# rather than testing against the 2s ceiling itself.
-_PACK_BUDGET_SECONDS = 0.2 if _IN_CI else 0.1
+# PHASE-003-human-attention-engine.md's own ceiling is <2s p95; measured
+# local p95 against this test's dataset (200 timeline entries, 50
+# commitments, 50 notes, one participant) on a quiet machine is ~20-33ms,
+# which is what originally set the CI budget at 200ms -- 6-10x that
+# baseline, looking generous on paper.
+#
+# That headroom was calculated against best-case conditions, not the tail
+# this test actually needs to survive: it's `max(10 samples)`, not a true
+# percentile, so a single GC pause or scheduler preemption during any one
+# of the ten `/prep/refresh` calls produces the whole result. This test has
+# been flagged as a known, sandbox-load-sensitive flake on four separate
+# occasions across three phase reports since (see
+# docs/phases/phase-004/IMPLEMENTATION-STATUS.md, phase-005's, and
+# phase-010's own "full regression" sections) -- always "passes standalone,
+# unrelated to this task", never previously re-evidenced or fixed. (It has
+# also once caught a real regression, phase-004's own Task-14 history --
+# it isn't purely noise-prone, just under-budgeted for its own tail.)
+#
+# Reproduced directly rather than left as another dismissal: 35 local runs
+# with CI=1 forced (i.e. exercising the CI budget on local hardware) failed
+# 6/35 (~17%), worst observed p95 361ms -- comfortably clear of the
+# *quiet-baseline* 200ms headroom calculation above, but not of the real
+# contention this budget is supposed to survive. Real (non-simulated) local
+# contention matters too, not just CI: running this test as part of its own
+# file (34 tests, real adjacent Postgres seeding) rather than standalone
+# failed 2/5 runs against the old 100ms local budget, worst observed 124.7ms
+# -- a smaller overshoot than CI's, but the same underlying problem, so both
+# budgets get real headroom now, not just CI's.
+#
+# 600ms (CI) keeps headroom above the worst sample actually observed (361ms
+# locally under simulated CI-budget load, 310ms in two independent real CI
+# failures) while staying 3x tighter than the 2s product ceiling, so it
+# still catches a genuine regression rather than deferring to that ceiling
+# outright. 200ms (local) keeps headroom above the worst same-file
+# contended sample (124.7ms) while staying well under the CI value, since a
+# local dev machine's own tests run against real, less-shared hardware.
+_PACK_BUDGET_SECONDS = 0.6 if _IN_CI else 0.2
 
 
 # ---------------------------------------------------------------------------
