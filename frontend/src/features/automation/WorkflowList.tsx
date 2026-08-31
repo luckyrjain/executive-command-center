@@ -1,8 +1,9 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useRef, useState, type FormEvent } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
 import { ApiError, apiRequest } from '../../api/client'
 import { apiErrorMessage } from '../../api/errorMessage'
+import { applyWizardFieldInvalidState } from '../../lib/wizardFocus'
 import type { GraphStep, WorkflowListResponse, WorkflowVersion } from './types'
 
 type StepDraft = {
@@ -28,6 +29,7 @@ const emptyStep: StepDraft = {
 const STEP_TYPES: GraphStep['step_type'][] = ['action', 'approval_gate', 'condition', 'compensation']
 const CREATE_STEPS = ['basics', 'build', 'review'] as const
 const CREATE_STEP_LABELS: Record<(typeof CREATE_STEPS)[number], string> = { basics: 'Basics', build: 'Build', review: 'Review' }
+const CREATE_ERROR_ID = 'draft-workflow-error'
 
 function toGraphStep(draft: StepDraft): GraphStep {
   let input_mapping: Record<string, unknown> = {}
@@ -80,13 +82,15 @@ export default function WorkflowList({ onSelect }: { onSelect: (versionId: strin
   const [formError, setFormError] = useState<string | null>(null)
   const [createStepIndex, setCreateStepIndex] = useState(0)
   const createStepHeadingRef = useRef<HTMLHeadingElement>(null)
+  const createFormRef = useRef<HTMLFormElement>(null)
   const isCreateFirstRenderRef = useRef(true)
   const createStep = CREATE_STEPS[createStepIndex] ?? 'basics'
+  const [invalidField, setInvalidField] = useState<string | null>(null)
 
   useEffect(() => {
     if (isCreateFirstRenderRef.current) { isCreateFirstRenderRef.current = false; return }
-    createStepHeadingRef.current?.focus()
-  }, [createStep])
+    applyWizardFieldInvalidState(createFormRef.current, invalidField, CREATE_ERROR_ID, createStepHeadingRef.current)
+  }, [createStep, invalidField])
 
   const createMutation = useMutation({
     mutationFn: (body: { workflow_id: string; graph: { steps: GraphStep[] }; trigger_refs: string[]; policy_ref: string | null }) =>
@@ -116,24 +120,32 @@ export default function WorkflowList({ onSelect }: { onSelect: (versionId: strin
     setSteps((current) => current.map((step, i) => (i === index ? { ...step, ...patch } : step)))
   }
 
-  function attemptCreate() {
-    setFormError(null)
+  function fail(message: string, field: string, step: (typeof CREATE_STEPS)[number]) {
+    setFormError(message)
+    setInvalidField(field)
+    setCreateStepIndex(CREATE_STEPS.indexOf(step))
+  }
+  function attemptCreate(event: FormEvent) {
+    event.preventDefault()
     if (!workflowId.trim()) {
-      setFormError('Workflow ID is required.')
+      fail('Workflow ID is required.', 'Workflow ID', 'basics')
       return
     }
-    for (const step of steps) {
+    for (let i = 0; i < steps.length; i += 1) {
+      const step = steps[i]
       if (!step.step_id.trim()) {
-        setFormError('Every step needs a step ID.')
+        fail('Every step needs a step ID.', `Step ID for step ${i + 1}`, 'build')
         return
       }
       try {
         JSON.parse(step.input_mapping || '{}')
       } catch {
-        setFormError(`Step "${step.step_id}": input mapping must be valid JSON.`)
+        fail(`Step "${step.step_id}": input mapping must be valid JSON.`, `Input mapping (JSON object) for step ${i + 1}`, 'build')
         return
       }
     }
+    setFormError(null)
+    setInvalidField(null)
     createMutation.mutate({
       workflow_id: workflowId.trim(),
       graph: { steps: steps.map(toGraphStep) },
@@ -142,9 +154,11 @@ export default function WorkflowList({ onSelect }: { onSelect: (versionId: strin
     })
   }
   function goCreateNext() {
+    setInvalidField(null)
     setCreateStepIndex((i) => Math.min(i + 1, CREATE_STEPS.length - 1))
   }
   function goCreateBack() {
+    setInvalidField(null)
     setCreateStepIndex((i) => Math.max(i - 1, 0))
   }
 
@@ -183,10 +197,10 @@ export default function WorkflowList({ onSelect }: { onSelect: (versionId: strin
         ))}
       </ol>
 
-      <div role="region" aria-labelledby="draft-workflow-title">
+      <form ref={createFormRef} noValidate onSubmit={attemptCreate} aria-labelledby="draft-workflow-title">
         <h3 id="draft-workflow-title">Draft a new workflow (or a new version)</h3>
         <p>The builder is a structured step list, not a visual graph editor -- each step's type, action reference and routing are set explicitly below.</p>
-        {formError ? <div role="alert" className="inline-status error-panel">{formError}</div> : null}
+        {formError ? <div id={CREATE_ERROR_ID} role="alert" className="inline-status error-panel">{formError}</div> : null}
         {createMutation.isError ? <div role="alert" className="inline-status error-panel">{errorMessage(createMutation.error)}</div> : null}
 
         <div className="wizard-stepper" role="group" aria-label="Draft workflow progress">
@@ -293,11 +307,11 @@ export default function WorkflowList({ onSelect }: { onSelect: (versionId: strin
             </ol>
             <div className="work-actions">
               <button type="button" onClick={goCreateBack}>Back</button>
-              <button type="button" disabled={pending} onClick={attemptCreate}>{pending ? 'Creating…' : 'Create draft'}</button>
+              <button type="submit" disabled={pending}>{pending ? 'Creating…' : 'Create draft'}</button>
             </div>
           </div>
         )}
-      </div>
+      </form>
     </section>
   )
 }

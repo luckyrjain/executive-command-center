@@ -100,6 +100,28 @@ describe('WorkflowList', () => {
     expect(body.trigger_refs).toEqual(['manual'])
   })
 
+  it('on failed final submit, navigates back to the step with the missing step ID and focuses it', async () => {
+    vi.stubGlobal('fetch', vi.fn(() => response({ workflows: [] })))
+    renderList()
+
+    // Fill Workflow ID (Basics) and reach Review without ever giving the
+    // one draft step an ID -- that field lives on the earlier Build step.
+    await waitFor(() => expect(screen.getByText('No workflows yet. Draft one below.')).toBeTruthy())
+    fireEvent.change(screen.getByLabelText('Workflow ID'), { target: { value: 'new-flow' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Continue' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Continue' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Create draft' }))
+
+    const alert = await screen.findByRole('alert')
+    expect(alert.textContent).toMatch(/step needs a step ID/i)
+
+    const stepIdField = await screen.findByLabelText('Step ID for step 1')
+    expect(document.activeElement).toBe(stepIdField)
+    expect(stepIdField.getAttribute('aria-invalid')).toBe('true')
+    expect(stepIdField.getAttribute('aria-describedby')).toBe(alert.id)
+    expect(screen.queryByLabelText('Workflow ID')).toBeNull()
+  })
+
   it('maps WORKFLOW_VERSION_CONFLICT to a readable sentence and refetches so a concurrently-created version isn\'t hidden', async () => {
     // Round-trip fixture, not just an error-message assertion: an earlier
     // draft of this handler had no onError refetch at all, so the list
