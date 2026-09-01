@@ -142,9 +142,9 @@ function RunDetailView({ run }: { run: RunDetail }) {
 
       {mutate.isError ? <div role="alert" className="inline-status error-panel">{errorMessage(mutate.error)}</div> : null}
       <div className="work-actions">
-        {['queued', 'leased', 'running', 'waiting_approval'].includes(run.status) ? <button type="button" disabled={pending} onClick={() => mutate.mutate('pause')}>Pause</button> : null}
-        {run.status === 'paused' ? <button type="button" disabled={pending} onClick={() => mutate.mutate('resume')}>Resume</button> : null}
-        {!TERMINAL_RUN_STATUSES.includes(run.status) ? <button type="button" disabled={pending} onClick={() => mutate.mutate('cancel')}>Cancel</button> : null}
+        {['queued', 'leased', 'running', 'waiting_approval'].includes(run.status) ? <button type="button" disabled={pending} onClick={() => mutate.mutate('pause')}>{pending && mutate.variables === 'pause' ? 'Pausing…' : 'Pause'}</button> : null}
+        {run.status === 'paused' ? <button type="button" disabled={pending} onClick={() => mutate.mutate('resume')}>{pending && mutate.variables === 'resume' ? 'Resuming…' : 'Resume'}</button> : null}
+        {!TERMINAL_RUN_STATUSES.includes(run.status) ? <button type="button" className="btn-destructive" disabled={pending} onClick={() => mutate.mutate('cancel')}>{pending && mutate.variables === 'cancel' ? 'Cancelling…' : 'Cancel'}</button> : null}
       </div>
 
       <h4>Steps</h4>
@@ -224,12 +224,14 @@ export default function RunWorkspace() {
         </form>
         {createMutation.isError ? <div role="alert" className="inline-status error-panel">{errorMessage(createMutation.error)}</div> : null}
 
-        <label>Filter by status
-          <select aria-label="Filter runs by status" value={statusFilter} onChange={(e) => setStatusFilter(e.target.value as RunStatus | '')}>
-            <option value="">All statuses</option>
-            {RUN_STATUSES.map((status) => <option key={status} value={status}>{status.replaceAll('_', ' ')}</option>)}
-          </select>
-        </label>
+        <div className="field-form">
+          <label>Filter by status
+            <select aria-label="Filter runs by status" value={statusFilter} onChange={(e) => setStatusFilter(e.target.value as RunStatus | '')}>
+              <option value="">All statuses</option>
+              {RUN_STATUSES.map((status) => <option key={status} value={status}>{status.replaceAll('_', ' ')}</option>)}
+            </select>
+          </label>
+        </div>
 
         {runsQuery.isLoading ? <p role="status">Loading runs…</p> : null}
         {runsQuery.isError ? <div role="alert" className="inline-status error-panel">{runsQuery.error.message}</div> : null}

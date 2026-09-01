@@ -41,6 +41,7 @@ export default function DeliveryPanel() {
 
       {query.isLoading ? <p role="status">Loading delivery metrics…</p> : null}
       {query.isError ? <div role="alert" className="inline-status error-panel">{query.error.message}</div> : null}
+      {query.data && metrics.length === 0 ? <p className="empty-state">No delivery metrics yet.</p> : null}
 
       <ul className="work-list">
         {metrics.map((metric) => <MetricCard key={metric.id} metric={metric} />)}

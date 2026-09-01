@@ -66,14 +66,16 @@ function ResolutionCandidateRow({ candidate }: ResolutionCandidateRowProps) {
       {deferMutation.error ? (
         <div role="alert" className="inline-status error-panel">{deferMutation.error.message}</div>
       ) : null}
-      <label>
-        {`Reason for ${candidate.id}`}
-        <input
-          aria-label={`Reason for ${candidate.id}`}
-          value={reason}
-          onChange={(event) => setReason(event.target.value)}
-        />
-      </label>
+      <div className="field-form">
+        <label>
+          {`Reason for ${candidate.id}`}
+          <input
+            aria-label={`Reason for ${candidate.id}`}
+            value={reason}
+            onChange={(event) => setReason(event.target.value)}
+          />
+        </label>
+      </div>
       <div className="work-actions" role="group" aria-label={`Actions for candidate ${candidate.id}`}>
         <button
           type="button"
@@ -119,7 +121,7 @@ export default function ResolutionInbox() {
       </div>
 
       {query.isLoading ? <p role="status">Loading resolution candidates…</p> : null}
-      {query.isError ? <div role="alert">{query.error.message}</div> : null}
+      {query.isError ? <div role="alert" className="inline-status error-panel">{query.error.message}</div> : null}
       {query.data?.items.length ? (
         <ul className="work-list">
           {query.data.items.map((candidate) => (

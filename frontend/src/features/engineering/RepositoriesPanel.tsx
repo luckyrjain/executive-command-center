@@ -79,21 +79,23 @@ function TeamAssignment({
 
   return (
     <div className="work-actions">
-      <label>
-        {`Team for ${repository.name}`}
-        <select
-          aria-label={`Team for ${repository.name}`}
-          value={repository.team_entity_id ?? ''}
-          disabled={mutation.isPending}
-          onChange={(event) => mutation.mutate(event.target.value === '' ? null : event.target.value)}
-        >
-          <option value="">Unassigned</option>
-          {assignedTeamMissing ? (
-            <option value={repository.team_entity_id ?? ''}>Assigned team (not in first 100)</option>
-          ) : null}
-          {[...teamsById.entries()].map(([id, name]) => <option key={id} value={id}>{name}</option>)}
-        </select>
-      </label>
+      <div className="field-form">
+        <label>
+          {`Team for ${repository.name}`}
+          <select
+            aria-label={`Team for ${repository.name}`}
+            value={repository.team_entity_id ?? ''}
+            disabled={mutation.isPending}
+            onChange={(event) => mutation.mutate(event.target.value === '' ? null : event.target.value)}
+          >
+            <option value="">Unassigned</option>
+            {assignedTeamMissing ? (
+              <option value={repository.team_entity_id ?? ''}>Assigned team (not in first 100)</option>
+            ) : null}
+            {[...teamsById.entries()].map(([id, name]) => <option key={id} value={id}>{name}</option>)}
+          </select>
+        </label>
+      </div>
       {!repository.team_entity_id && repository.suggested_team_name ? (
         <small>suggested: {repository.suggested_team_name}</small>
       ) : null}
@@ -157,17 +159,19 @@ export default function RepositoriesPanel() {
       <h2 id="engineering-repositories-title">Repositories</h2>
       <p>Every repository synced from a connected GitHub or GitLab account, with its own permission and freshness state -- never rolled up into the connector account's own status.</p>
 
-      <label>
-        Filter by team
-        <select
-          aria-label="Filter repositories by team"
-          value={teamFilter}
-          onChange={(event) => setTeamFilter(event.target.value)}
-        >
-          <option value="">All teams</option>
-          {[...teamsById.entries()].map(([id, name]) => <option key={id} value={id}>{name}</option>)}
-        </select>
-      </label>
+      <div className="field-form">
+        <label>
+          Filter by team
+          <select
+            aria-label="Filter repositories by team"
+            value={teamFilter}
+            onChange={(event) => setTeamFilter(event.target.value)}
+          >
+            <option value="">All teams</option>
+            {[...teamsById.entries()].map(([id, name]) => <option key={id} value={id}>{name}</option>)}
+          </select>
+        </label>
+      </div>
 
       {query.isLoading ? <p role="status">Loading repositories…</p> : null}
       {query.isError ? <div role="alert" className="inline-status error-panel">{query.error.message}</div> : null}

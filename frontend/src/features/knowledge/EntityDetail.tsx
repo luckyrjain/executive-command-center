@@ -260,14 +260,14 @@ export default function EntityDetail({ entityId, onClose }: EntityDetailProps) {
       </div>
 
       {entityQuery.isLoading ? <p role="status">Loading entity…</p> : null}
-      {entityQuery.isError ? <div role="alert">{entityQuery.error.message}</div> : null}
+      {entityQuery.isError ? <div role="alert" className="inline-status error-panel">{entityQuery.error.message}</div> : null}
       {entity?.summary ? <p>{entity.summary}</p> : null}
 
       <section aria-labelledby={`aliases-heading-${entityId}`}>
         <h3 id={`aliases-heading-${entityId}`}>Aliases</h3>
         {aliasesQuery.isLoading ? <p role="status">Loading aliases…</p> : null}
         {aliasesQuery.isError ? (
-          <div role="alert">{aliasesQuery.error.message}</div>
+          <div role="alert" className="inline-status error-panel">{aliasesQuery.error.message}</div>
         ) : aliasesQuery.data?.items.length ? (
           <ul>
             {aliasesQuery.data.items.map((alias) => (
@@ -285,7 +285,7 @@ export default function EntityDetail({ entityId, onClose }: EntityDetailProps) {
         <h3 id={`claims-heading-${entityId}`}>Claims</h3>
         {claimsQuery.isLoading ? <p role="status">Loading claims…</p> : null}
         {claimsQuery.isError ? (
-          <div role="alert">{claimsQuery.error.message}</div>
+          <div role="alert" className="inline-status error-panel">{claimsQuery.error.message}</div>
         ) : claimsQuery.data?.items.length ? (
           <ul>
             {claimsQuery.data.items.map((claim) => (
@@ -414,7 +414,7 @@ export default function EntityDetail({ entityId, onClose }: EntityDetailProps) {
         <h3 id={`relationships-heading-${entityId}`}>Relationships</h3>
         {relationshipsQuery.isLoading ? <p role="status">Loading relationships…</p> : null}
         {relationshipsQuery.isError ? (
-          <div role="alert">{relationshipsQuery.error.message}</div>
+          <div role="alert" className="inline-status error-panel">{relationshipsQuery.error.message}</div>
         ) : relationshipsQuery.data?.items.length ? (
           <ul>
             {relationshipsQuery.data.items.map((relationship) => (
@@ -480,7 +480,7 @@ export default function EntityDetail({ entityId, onClose }: EntityDetailProps) {
           <h3 id={`members-heading-${entityId}`}>Members</h3>
           {membersQuery.isLoading ? <p role="status">Loading members…</p> : null}
           {membersQuery.isError ? (
-            <div role="alert">{membersQuery.error.message}</div>
+            <div role="alert" className="inline-status error-panel">{membersQuery.error.message}</div>
           ) : membersQuery.data?.items.length ? (
             <ul>
               {membersQuery.data.items.map((member) => (
@@ -522,7 +522,7 @@ export default function EntityDetail({ entityId, onClose }: EntityDetailProps) {
         <h3 id={`timeline-heading-${entityId}`}>Timeline</h3>
         {timelineQuery.isLoading ? <p role="status">Loading timeline…</p> : null}
         {timelineQuery.isError ? (
-          <div role="alert">{timelineQuery.error.message}</div>
+          <div role="alert" className="inline-status error-panel">{timelineQuery.error.message}</div>
         ) : timelineQuery.data?.items.length ? (
           <ol>
             {timelineQuery.data.items.map((entry) => (

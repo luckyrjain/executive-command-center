@@ -86,7 +86,7 @@ export default function CommitmentWorkspace() {
       <button type="submit" disabled={createMutation.isPending}>Create commitment</button>
     </form>
     {query.isLoading ? <p role="status">Loading commitments…</p> : null}
-    {query.isError ? <div role="alert">{query.error.message}</div> : null}
+    {query.isError ? <div className="inline-status error-panel" role="alert">{query.error.message}</div> : null}
     {query.data && query.data.items.length === 0 ? <p className="empty-state">No commitments yet. Create one above to get started.</p> : null}
     <ol className="work-list">{(query.data?.items ?? []).map((value) => {
       const archived = Boolean(value.archived_at); const terminal = ['fulfilled', 'broken', 'cancelled'].includes(value.status)
@@ -94,7 +94,7 @@ export default function CommitmentWorkspace() {
         {!archived && !terminal ? <button type="button" disabled={actionMutation.isPending || editMutation.isPending} aria-label={`Edit ${value.summary}`} onClick={() => setEdit({ commitment: value, ...fromCommitment(value), latestVersion: value.version, conflict: false, reloadFailed: false })}>Edit</button> : null}
         {!archived && ['detected', 'confirmed'].includes(value.status) ? <button type="button" disabled={actionMutation.isPending || editMutation.isPending} aria-label={`Confirm ${value.summary}`} onClick={() => actionMutation.mutate({ commitment: value, action: 'confirm' })}>Confirm</button> : null}
         {!archived && ['confirmed', 'active'].includes(value.status) ? <button type="button" disabled={actionMutation.isPending || editMutation.isPending} aria-label={`Fulfil ${value.summary}`} onClick={() => actionMutation.mutate({ commitment: value, action: 'fulfil' })}>Fulfil</button> : null}
-        {!archived && !terminal ? <button type="button" disabled={actionMutation.isPending || editMutation.isPending} aria-label={`Cancel ${value.summary}`} onClick={() => actionMutation.mutate({ commitment: value, action: 'cancel' })}>Cancel</button> : null}
+        {!archived && !terminal ? <button type="button" className="btn-destructive" disabled={actionMutation.isPending || editMutation.isPending} aria-label={`Cancel ${value.summary}`} onClick={() => actionMutation.mutate({ commitment: value, action: 'cancel' })}>Cancel</button> : null}
         {!archived ? <button type="button" disabled={actionMutation.isPending || editMutation.isPending} aria-label={`Archive ${value.summary}`} onClick={() => actionMutation.mutate({ commitment: value, action: 'archive' })}>Archive</button> : <button type="button" disabled={actionMutation.isPending || editMutation.isPending} aria-label={`Restore ${value.summary}`} onClick={() => actionMutation.mutate({ commitment: value, action: 'restore' })}>Restore</button>}
       </div></li>
     })}</ol>

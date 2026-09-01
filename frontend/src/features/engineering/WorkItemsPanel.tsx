@@ -76,21 +76,23 @@ function TeamAssignment({
 
   return (
     <div className="work-actions">
-      <label>
-        {`Team for ${workItem.title}`}
-        <select
-          aria-label={`Team for ${workItem.title}`}
-          value={workItem.team_entity_id ?? ''}
-          disabled={mutation.isPending}
-          onChange={(event) => mutation.mutate(event.target.value === '' ? null : event.target.value)}
-        >
-          <option value="">Unassigned</option>
-          {assignedTeamMissing ? (
-            <option value={workItem.team_entity_id ?? ''}>Assigned team (not in first 100)</option>
-          ) : null}
-          {[...teamsById.entries()].map(([id, name]) => <option key={id} value={id}>{name}</option>)}
-        </select>
-      </label>
+      <div className="field-form">
+        <label>
+          {`Team for ${workItem.title}`}
+          <select
+            aria-label={`Team for ${workItem.title}`}
+            value={workItem.team_entity_id ?? ''}
+            disabled={mutation.isPending}
+            onChange={(event) => mutation.mutate(event.target.value === '' ? null : event.target.value)}
+          >
+            <option value="">Unassigned</option>
+            {assignedTeamMissing ? (
+              <option value={workItem.team_entity_id ?? ''}>Assigned team (not in first 100)</option>
+            ) : null}
+            {[...teamsById.entries()].map(([id, name]) => <option key={id} value={id}>{name}</option>)}
+          </select>
+        </label>
+      </div>
       {!workItem.team_entity_id && workItem.suggested_team_name ? (
         <small>suggested: {workItem.suggested_team_name}</small>
       ) : null}
@@ -154,17 +156,19 @@ export default function WorkItemsPanel() {
       <h2 id="engineering-work-items-title">Work items</h2>
       <p>Every work item synced from a connected Jira account (the only provider that populates work items), with its own permission and freshness state -- never rolled up into the connector account's own status.</p>
 
-      <label>
-        Filter by team
-        <select
-          aria-label="Filter work items by team"
-          value={teamFilter}
-          onChange={(event) => setTeamFilter(event.target.value)}
-        >
-          <option value="">All teams</option>
-          {[...teamsById.entries()].map(([id, name]) => <option key={id} value={id}>{name}</option>)}
-        </select>
-      </label>
+      <div className="field-form">
+        <label>
+          Filter by team
+          <select
+            aria-label="Filter work items by team"
+            value={teamFilter}
+            onChange={(event) => setTeamFilter(event.target.value)}
+          >
+            <option value="">All teams</option>
+            {[...teamsById.entries()].map(([id, name]) => <option key={id} value={id}>{name}</option>)}
+          </select>
+        </label>
+      </div>
 
       {query.isLoading ? <p role="status">Loading work items…</p> : null}
       {query.isError ? <div role="alert" className="inline-status error-panel">{query.error.message}</div> : null}

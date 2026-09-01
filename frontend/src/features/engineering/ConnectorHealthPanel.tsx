@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useState, type FormEvent } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
 import { ApiError, apiRequest } from '../../api/client'
@@ -478,6 +478,7 @@ function ConnectorCard({ connector, syncRuns, now, onChanged }: {
           <button type="submit" disabled={syncMutation.isPending || connector.status === 'disconnected'}>Start sync</button>
           <button
             type="button"
+            className="btn-destructive"
             disabled={disableMutation.isPending || connector.status === 'disconnected'}
             onClick={() => disableMutation.mutate()}
           >
@@ -541,6 +542,27 @@ export default function ConnectorHealthPanel() {
   const steps = stepsFor(provider)
   const currentStep = steps[stepIndex] ?? 'provider'
 
+  // No per-field `invalidField` navigation here (unlike the terminal-validation
+  // wizards in DESIGN.md) -- every step's own Continue button already gates on
+  // `isStepComplete`, so a user can't reach Review with an incomplete required
+  // field the way those wizards' non-blocking Continue allows.
+  //
+  // The `currentStep === 'review'` check below is load-bearing, not
+  // defensive redundancy: a field step with exactly one text/password input
+  // and no submit button in the DOM (Continue/Back are both type="button")
+  // still triggers the browser's legacy single-field implicit-submission on
+  // Enter (WHATWG HTML "implicit submission" -- a form with no submit
+  // button but one blocking text field submits anyway). Without this guard,
+  // pressing Enter while filling in, say, GitHub's only field (`token`)
+  // would fire this handler as soon as `isCredentialComplete` turns true --
+  // skipping the Review step's confirmation entirely, the one thing this
+  // wizard's whole step/review structure exists to force.
+  function attemptCreate(event: FormEvent) {
+    event.preventDefault()
+    if (currentStep !== 'review' || !isCredentialComplete(provider, fields)) return
+    createMutation.mutate()
+  }
+
   // Moves focus to the incoming step's own heading on every step change --
   // each step is a different conditional branch below, so without this a
   // keyboard/screen-reader user's focus (on the Continue/Back/tile button
@@ -592,7 +614,7 @@ export default function ConnectorHealthPanel() {
             </div>
           </div>
         ) : (
-          <>
+          <form noValidate onSubmit={attemptCreate} aria-labelledby="connector-connect-title">
             <ol className="wizard-stepper" aria-label="Setup progress">
               {steps.map((step, i) => (
                 <li className="wizard-step-node" key={step} aria-current={i === stepIndex ? 'step' : undefined}>
@@ -634,7 +656,7 @@ export default function ConnectorHealthPanel() {
                 </dl>
                 <div className="work-actions">
                   <button type="button" onClick={goBack}>Back</button>
-                  <button type="button" disabled={createMutation.isPending || !isCredentialComplete(provider, fields)} onClick={() => createMutation.mutate()}>
+                  <button type="submit" disabled={createMutation.isPending || !isCredentialComplete(provider, fields)}>
                     {createMutation.isPending ? 'Connecting…' : 'Connect'}
                   </button>
                 </div>
@@ -652,7 +674,7 @@ export default function ConnectorHealthPanel() {
                 </div>
               </div>
             )}
-          </>
+          </form>
         )}
       </div>
 

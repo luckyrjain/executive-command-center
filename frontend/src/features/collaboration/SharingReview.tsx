@@ -39,7 +39,7 @@ function GrantRow({ grant, now, onChanged }: { grant: Grant; now: Date; onChange
       </div>
       {state !== 'revoked' ? (
         <div className="work-actions">
-          <button type="button" disabled={revokeMutation.isPending} onClick={() => revokeMutation.mutate()}>Revoke</button>
+          <button type="button" className="btn-destructive" disabled={revokeMutation.isPending} onClick={() => revokeMutation.mutate()}>Revoke</button>
         </div>
       ) : null}
       {revokeMutation.isError ? <div role="alert" className="inline-status error-panel">{sharingErrorMessage(revokeMutation.error)}</div> : null}

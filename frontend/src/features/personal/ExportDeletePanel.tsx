@@ -49,11 +49,13 @@ export default function ExportDeletePanel() {
       <h2 id="personal-export-title">Export &amp; delete</h2>
       <p>Every domain can be exported as machine-readable JSON, or permanently deleted, independently of every other domain.</p>
 
-      <label>Domain
-        <select aria-label="Export domain" value={domainKey} onChange={(event) => selectDomain(event.target.value as DomainKey)}>
-          {DOMAIN_KEYS.map((key) => <option key={key} value={key}>{DOMAIN_LABELS[key]}</option>)}
-        </select>
-      </label>
+      <div className="field-form">
+        <label>Domain
+          <select aria-label="Export domain" value={domainKey} onChange={(event) => selectDomain(event.target.value as DomainKey)}>
+            {DOMAIN_KEYS.map((key) => <option key={key} value={key}>{DOMAIN_LABELS[key]}</option>)}
+          </select>
+        </label>
+      </div>
 
       <div className="work-actions">
         <button type="button" disabled={exportMutation.isPending} onClick={() => exportMutation.mutate(domainKey)}>
@@ -74,13 +76,16 @@ export default function ExportDeletePanel() {
 
       <hr />
 
-      <label>
-        <input type="checkbox" checked={deleteConfirmed} onChange={(event) => setDeleteConfirmed(event.target.checked)} />
-        {' '}I understand deleting {DOMAIN_LABELS[domainKey]} permanently removes its records and cannot be undone.
-      </label>
+      <div className="field-form">
+        <label className="field-checkbox">
+          <input type="checkbox" checked={deleteConfirmed} onChange={(event) => setDeleteConfirmed(event.target.checked)} />
+          {' '}I understand deleting {DOMAIN_LABELS[domainKey]} permanently removes its records and cannot be undone.
+        </label>
+      </div>
       <div className="work-actions">
         <button
           type="button"
+          className="btn-destructive"
           disabled={!deleteConfirmed || deleteMutation.isPending}
           onClick={() => deleteMutation.mutate(domainKey)}
         >

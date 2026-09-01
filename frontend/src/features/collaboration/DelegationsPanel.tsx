@@ -63,7 +63,7 @@ function DelegationRow({
       ) : null}
       {delegation.status === 'accepted' && isDelegator ? (
         <div className="work-actions">
-          <button type="button" disabled={actionMutation.isPending} onClick={() => actionMutation.mutate('revoke')}>Revoke</button>
+          <button type="button" className="btn-destructive" disabled={actionMutation.isPending} onClick={() => actionMutation.mutate('revoke')}>Revoke</button>
         </div>
       ) : null}
 

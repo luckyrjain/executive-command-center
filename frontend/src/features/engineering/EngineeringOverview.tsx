@@ -109,12 +109,16 @@ export default function EngineeringOverview({ onNavigate }: { onNavigate: (view:
           {metrics.isError ? <div role="alert" className="inline-status error-panel">{metrics.error.message}</div> : null}
           {metrics.data ? (
             <>
-              {headline.map((metric) => (
-                <p key={metric.id}>
-                  {METRIC_LABELS[metric.metric_key]}: {formatValue(metric)}
-                  {' '}(coverage: {metric.coverage_status.replaceAll('_', ' ')})
-                </p>
-              ))}
+              {headline.length === 0 ? (
+                <p className="empty-state">No headline metrics yet.</p>
+              ) : (
+                headline.map((metric) => (
+                  <p key={metric.id}>
+                    {METRIC_LABELS[metric.metric_key]} ({metric.window_label}): {formatValue(metric)}
+                    {' '}(coverage: {metric.coverage_status.replaceAll('_', ' ')})
+                  </p>
+                ))
+              )}
               <div className="work-actions">
                 <button type="button" onClick={() => onNavigate('delivery')}>View delivery</button>
                 <button type="button" onClick={() => onNavigate('reliability')}>View reliability</button>

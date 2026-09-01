@@ -170,7 +170,7 @@ export default function WorkflowDetail({ versionId }: { versionId: string }) {
           {workflowKillActive ? ' This workflow also has its own switch active; deactivating it below leaves the global block in place.' : ''}
         </p>
       ) : null}
-      <div className="work-actions">
+      <div className="field-form">
         {/* No `aria-label`: the wrapping label's visible text is the accessible
             name (WCAG 2.5.3 -- "Kill switch reason" did not contain the visible
             "Kill switch reason (optional)"), and it is the only reason field on
@@ -178,9 +178,11 @@ export default function WorkflowDetail({ versionId }: { versionId: string }) {
         <label>Kill switch reason (optional)
           <input value={killSwitchReason} onChange={(e) => setKillSwitchReason(e.target.value)} disabled={!workflowId || killSwitchUnknown} />
         </label>
-        <button type="button" disabled={pending || !workflowId || killSwitchUnknown} onClick={() => killSwitchMutation.mutate(true)}>Activate kill switch for this workflow</button>
+      </div>
+      <div className="work-actions">
+        <button type="button" className="btn-destructive" disabled={pending || !workflowId || killSwitchUnknown} onClick={() => killSwitchMutation.mutate(true)}>{killSwitchMutation.isPending && killSwitchMutation.variables === true ? 'Activating…' : 'Activate kill switch for this workflow'}</button>
         {globalKillActive && !workflowKillActive ? null : (
-          <button type="button" disabled={pending || !workflowId || killSwitchUnknown} onClick={() => killSwitchMutation.mutate(false)}>Deactivate kill switch for this workflow</button>
+          <button type="button" disabled={pending || !workflowId || killSwitchUnknown} onClick={() => killSwitchMutation.mutate(false)}>{killSwitchMutation.isPending && killSwitchMutation.variables === false ? 'Deactivating…' : 'Deactivate kill switch for this workflow'}</button>
         )}
       </div>
 
@@ -228,10 +230,10 @@ export default function WorkflowDetail({ versionId }: { versionId: string }) {
 
       <div className="work-actions">
         {version.status === 'draft' ? (
-          <button type="button" disabled={pending || killSwitchUnknown} onClick={() => publishMutation.mutate()}>Publish this version</button>
+          <button type="button" disabled={pending || killSwitchUnknown} onClick={() => publishMutation.mutate()}>{publishMutation.isPending ? 'Publishing…' : 'Publish this version'}</button>
         ) : null}
         {version.status === 'active' ? (
-          <button type="button" disabled={pending} onClick={() => disableMutation.mutate()}>Disable this version</button>
+          <button type="button" className="btn-destructive" disabled={pending} onClick={() => disableMutation.mutate()}>{disableMutation.isPending ? 'Disabling…' : 'Disable this version'}</button>
         ) : null}
         <button type="button" onClick={() => setShowSimulation((current) => !current)}>
           {showSimulation ? 'Hide simulation' : 'Simulate this version'}

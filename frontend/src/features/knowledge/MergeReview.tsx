@@ -85,17 +85,20 @@ function MergeCandidateRow({ candidate, onMerged }: MergeCandidateRowProps) {
       {mergeMutation.error ? (
         <div role="alert" className="inline-status error-panel">{mergeErrorMessage(mergeMutation.error)}</div>
       ) : null}
-      <label>
-        {`Merge reason for ${candidate.id}`}
-        <input
-          aria-label={`Merge reason for ${candidate.id}`}
-          value={reason}
-          onChange={(event) => setReason(event.target.value)}
-        />
-      </label>
+      <div className="field-form">
+        <label>
+          {`Merge reason for ${candidate.id}`}
+          <input
+            aria-label={`Merge reason for ${candidate.id}`}
+            value={reason}
+            onChange={(event) => setReason(event.target.value)}
+          />
+        </label>
+      </div>
       <div className="work-actions" role="group" aria-label={`Merge actions for ${candidate.id}`}>
         <button
           type="button"
+          className="btn-destructive"
           disabled={mergeMutation.isPending || left.isFetching || right.isFetching || !reason.trim()}
           onClick={() => mergeMutation.mutate(left.data!.id)}
         >
@@ -103,6 +106,7 @@ function MergeCandidateRow({ candidate, onMerged }: MergeCandidateRowProps) {
         </button>
         <button
           type="button"
+          className="btn-destructive"
           disabled={mergeMutation.isPending || left.isFetching || right.isFetching || !reason.trim()}
           onClick={() => mergeMutation.mutate(right.data!.id)}
         >
@@ -145,14 +149,16 @@ function CompletedMergeRow({ operation, onReversed }: CompletedMergeRowProps) {
       {reverseMutation.error ? (
         <div role="alert" className="inline-status error-panel">{reverseMutation.error.message}</div>
       ) : null}
-      <label>
-        {`Reversal reason for ${operation.id}`}
-        <input
-          aria-label={`Reversal reason for ${operation.id}`}
-          value={reason}
-          onChange={(event) => setReason(event.target.value)}
-        />
-      </label>
+      <div className="field-form">
+        <label>
+          {`Reversal reason for ${operation.id}`}
+          <input
+            aria-label={`Reversal reason for ${operation.id}`}
+            value={reason}
+            onChange={(event) => setReason(event.target.value)}
+          />
+        </label>
+      </div>
       <button type="button" disabled={reverseMutation.isPending || !reason.trim()} onClick={() => reverseMutation.mutate()}>
         Reverse merge
       </button>
@@ -190,7 +196,7 @@ export default function MergeReview() {
       </div>
 
       {query.isLoading ? <p role="status">Loading confirmed candidates…</p> : null}
-      {query.isError ? <div role="alert">{query.error.message}</div> : null}
+      {query.isError ? <div role="alert" className="inline-status error-panel">{query.error.message}</div> : null}
       {query.data?.items.length ? (
         <ul className="work-list">
           {query.data.items.map((candidate) => (

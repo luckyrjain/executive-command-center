@@ -54,7 +54,7 @@ describe('EngineeringOverview', () => {
     expect(await screen.findByText('1 connected. 1 need attention.')).toBeTruthy()
     expect(await screen.findByText('1 open.')).toBeTruthy()
     expect(await screen.findByText('0 awaiting a decision.')).toBeTruthy()
-    expect(await screen.findByText(/Delivery frequency: 0.03/)).toBeTruthy()
+    expect(await screen.findByText(/Delivery frequency \(30d\): 0.03/)).toBeTruthy()
   })
 
   it('renders time_to_restore in the headline metrics converted from raw seconds to days, not a bare seconds count', async () => {
@@ -75,7 +75,7 @@ describe('EngineeringOverview', () => {
       return emptyResponseFor(url)
     }))
     renderOverview()
-    expect(await screen.findByText(/Time to restore: 0\.2 days/)).toBeTruthy()
+    expect(await screen.findByText(/Time to restore \(30d\): 0\.2 days/)).toBeTruthy()
     expect(screen.queryByText(/14400/)).toBeNull()
   })
 

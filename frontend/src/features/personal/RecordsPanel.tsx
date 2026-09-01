@@ -150,15 +150,17 @@ export default function RecordsPanel() {
       <h2 id="personal-records-title">Records</h2>
       <p>Capture and review the records you have entered for one domain at a time.</p>
 
-      <label>Domain
-        <select
-          aria-label="Domain"
-          value={domainKey}
-          onChange={(event) => setDomainKey(event.target.value as DomainKey)}
-        >
-          {DOMAIN_KEYS.map((key) => <option key={key} value={key}>{DOMAIN_LABELS[key]}</option>)}
-        </select>
-      </label>
+      <div className="field-form">
+        <label>Domain
+          <select
+            aria-label="Domain"
+            value={domainKey}
+            onChange={(event) => setDomainKey(event.target.value as DomainKey)}
+          >
+            {DOMAIN_KEYS.map((key) => <option key={key} value={key}>{DOMAIN_LABELS[key]}</option>)}
+          </select>
+        </label>
+      </div>
 
       {domains.isLoading ? <p role="status">Loading domains…</p> : null}
       {domains.isError ? <div role="alert" className="inline-status error-panel">{personalErrorMessage(domains.error)}</div> : null}

@@ -136,7 +136,7 @@ export default function TaskWorkspace() {
       </form>
 
       {query.isLoading ? <p role="status">Loading tasks…</p> : null}
-      {query.isError ? <div role="alert">{query.error.message}</div> : null}
+      {query.isError ? <div className="inline-status error-panel" role="alert">{query.error.message}</div> : null}
       {query.data && query.data.items.length === 0 ? <p className="empty-state">No tasks yet. Create one above to get started.</p> : null}
       <ol className="work-list">
         {(query.data?.items ?? []).map((task) => {
@@ -145,7 +145,7 @@ export default function TaskWorkspace() {
           return <li key={task.id}>
             <div><strong>{task.title}</strong><small>{task.status.replaceAll('_', ' ')} · {task.manual_priority}</small></div>
             <div className="work-actions" role="group" aria-label={`Actions for ${task.title}`}>
-              {!archived && !terminal ? <><button type="button" disabled={actionMutation.isPending || editMutation.isPending} aria-label={`Edit ${task.title}`} onClick={() => setEdit({ task, ...taskDraft(task), latestVersion: task.version, conflict: false, reloadFailed: false })}>Edit</button><button type="button" disabled={actionMutation.isPending || editMutation.isPending} aria-label={`Complete ${task.title}`} onClick={() => actionMutation.mutate({ task, action: 'complete' })}>Complete</button><button type="button" disabled={actionMutation.isPending || editMutation.isPending} aria-label={`Cancel ${task.title}`} onClick={() => actionMutation.mutate({ task, action: 'cancel' })}>Cancel</button></> : null}
+              {!archived && !terminal ? <><button type="button" disabled={actionMutation.isPending || editMutation.isPending} aria-label={`Edit ${task.title}`} onClick={() => setEdit({ task, ...taskDraft(task), latestVersion: task.version, conflict: false, reloadFailed: false })}>Edit</button><button type="button" disabled={actionMutation.isPending || editMutation.isPending} aria-label={`Complete ${task.title}`} onClick={() => actionMutation.mutate({ task, action: 'complete' })}>Complete</button><button type="button" className="btn-destructive" disabled={actionMutation.isPending || editMutation.isPending} aria-label={`Cancel ${task.title}`} onClick={() => actionMutation.mutate({ task, action: 'cancel' })}>Cancel</button></> : null}
               {!archived ? <button type="button" disabled={actionMutation.isPending || editMutation.isPending} aria-label={`Archive ${task.title}`} onClick={() => actionMutation.mutate({ task, action: 'archive' })}>Archive</button> : <button type="button" disabled={actionMutation.isPending || editMutation.isPending} aria-label={`Restore ${task.title}`} onClick={() => actionMutation.mutate({ task, action: 'restore' })}>Restore</button>}
             </div>
           </li>
