@@ -150,7 +150,7 @@ export default function PolicyPanel() {
             </div>
             <div className="work-actions">
               {policy.status === 'active' ? (
-                <button type="button" disabled={pending} aria-label={`Revoke policy for ${policy.workflow_id}`} onClick={() => revokeMutation.mutate(policy.id)}>
+                <button type="button" className="btn-destructive" disabled={pending} aria-label={`Revoke policy for ${policy.workflow_id}`} onClick={() => revokeMutation.mutate(policy.id)}>
                   Revoke
                 </button>
               ) : null}

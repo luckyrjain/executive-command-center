@@ -219,7 +219,7 @@ function MemberRow({
               : `Removing ${member.display_name} ends their access immediately and revokes their active sessions. This cannot be undone.`}
           </p>
           <div className="work-actions">
-            <button type="button" disabled={removeMutation.isPending} onClick={() => removeMutation.mutate()}>
+            <button type="button" className="btn-destructive" disabled={removeMutation.isPending} onClick={() => removeMutation.mutate()}>
               {removeMutation.isPending ? 'Removing…' : 'Confirm removal'}
             </button>
             <button
@@ -293,7 +293,7 @@ function InvitationRow({ invitation, onChanged }: { invitation: Invitation; onCh
       </div>
       {invStatus === 'Pending' ? (
         <div className="work-actions">
-          <button type="button" disabled={revokeMutation.isPending} onClick={() => revokeMutation.mutate()}>Revoke</button>
+          <button type="button" className="btn-destructive" disabled={revokeMutation.isPending} onClick={() => revokeMutation.mutate()}>Revoke</button>
         </div>
       ) : null}
       {revokeMutation.isError ? <div role="alert" className="inline-status error-panel">{collaborationErrorMessage(revokeMutation.error)}</div> : null}

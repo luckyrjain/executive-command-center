@@ -59,7 +59,7 @@ function DomainRow({ domainKey, domain, onChanged }: {
 
       <div className="work-actions">
         {enabled ? (
-          <button type="button" disabled={disableMutation.isPending} onClick={() => disableMutation.mutate()}>
+          <button type="button" className="btn-destructive" disabled={disableMutation.isPending} onClick={() => disableMutation.mutate()}>
             Disable
           </button>
         ) : (

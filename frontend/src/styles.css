@@ -49,16 +49,60 @@
   --shadow-card: 0 14px 36px rgba(24, 33, 47, .05);
   --shadow-panel: 0 18px 48px rgba(24, 33, 47, .06);
   --focus-ring: rgba(71, 104, 255, .28);
+
+  /* Spacing scale -- gap/padding/margin values in new CSS should reference
+   * one of these rather than a new arbitrary number. Existing rules predate
+   * the scale and were not force-migrated where the nearest token would
+   * change the rendered value. */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --space-6: 24px;
+  --space-8: 32px;
+  --space-10: 40px;
+  --space-12: 48px;
+  --space-16: 64px;
+  --space-20: 80px;
+  --space-24: 96px;
+
+  /* Container/grid -- .app-shell is the only page frame in the app; these
+   * tokens name its actual values rather than introduce new ones. */
+  --page-gutter: clamp(20px, 4vw, 64px);
+  --content-max: 1440px;
+  --content-reading: 720px;
+  --content-form: 680px;
+
+  /* Radius -- the two systematic radii in use. A handful of components
+   * (`.dashboard-card` 20px, `.wizard-stepper`-adjacent panels 18px, the
+   * mobile-collapsed panel radius 16px) use one-off intermediate values that
+   * predate this scale and are not yet part of a formal three-tier system;
+   * left as raw numbers rather than forced into a token that would misname
+   * them. */
+  --radius-control: 14px;
+  --radius-panel: 28px;
+
+  /* Motion -- state-change transitions only; see the button hover rule
+   * below and the reduced-motion query near the end of this file. */
+  --motion-fast: 120ms;
+  --motion-standard: 180ms;
+  --motion-slow: 280ms;
+  --ease-standard: cubic-bezier(.2, .8, .2, 1);
 }
 
 * { box-sizing: border-box; }
-body { margin: 0; min-width: 320px; min-height: 100vh; }
+body { margin: 0; min-width: 320px; min-height: 100vh; font-size: 16px; line-height: 1.55; }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; }
+}
 button, input, textarea, select { font: inherit; }
 
 .app-shell {
-  width: min(1440px, 100%);
+  width: min(var(--content-max), 100%);
   margin: 0 auto;
-  padding: 40px clamp(20px, 4vw, 64px) 72px;
+  padding: 40px var(--page-gutter) 72px;
 }
 
 .topbar,
@@ -92,6 +136,7 @@ button {
   color: var(--color-ink);
   padding: 11px 18px;
   cursor: pointer;
+  transition: border-color var(--motion-fast) var(--ease-standard);
 }
 button:hover:not(:disabled) { border-color: var(--color-text-muted); }
 button:focus-visible,
@@ -100,12 +145,18 @@ textarea:focus-visible,
 select:focus-visible { outline: 3px solid var(--focus-ring); outline-offset: 3px; }
 button:disabled { opacity: .6; cursor: wait; }
 
+/* Destructive actions (delete/revoke/disable/kill-switch) never look like an
+ * ordinary button -- muted danger tokens, not a loud red, to stay
+ * near-monochrome. */
+.btn-destructive { border-color: var(--color-border-danger); color: var(--color-text-danger-strong); }
+.btn-destructive:hover:not(:disabled) { border-color: var(--color-text-danger-strong); }
+
 .status-panel,
 .inline-status {
   display: grid;
   gap: 4px;
   border: 1px solid var(--color-border-panel);
-  border-radius: 14px;
+  border-radius: var(--radius-control);
   background: var(--color-white);
   padding: 16px 18px;
 }
@@ -162,7 +213,7 @@ button:disabled { opacity: .6; cursor: wait; }
 
 .brief-panel {
   margin-top: 36px;
-  border-radius: 28px;
+  border-radius: var(--radius-panel);
   background: var(--color-ink);
   color: var(--color-white);
   padding: clamp(24px, 4vw, 42px);
@@ -180,7 +231,7 @@ button:disabled { opacity: .6; cursor: wait; }
 .work-panel {
   margin-top: 36px;
   border: 1px solid var(--color-border-panel-2);
-  border-radius: 28px;
+  border-radius: var(--radius-panel);
   background: var(--color-white);
   padding: clamp(24px, 4vw, 42px);
   box-shadow: var(--shadow-panel);
@@ -212,7 +263,7 @@ button:disabled { opacity: .6; cursor: wait; }
 .work-heading h2 { margin: 0; font-size: clamp(28px, 4vw, 44px); letter-spacing: -.035em; }
 .recommendation-heading p:not(.eyebrow),
 .explore-heading p:not(.eyebrow),
-.work-heading p:not(.eyebrow) { max-width: 720px; margin: 10px 0 0; color: var(--color-text-muted); }
+.work-heading p:not(.eyebrow) { max-width: var(--content-reading); margin: 10px 0 0; color: var(--color-text-muted); }
 .recommendation-list { list-style: none; margin: 26px 0 0; padding: 0; }
 .recommendation-list > li {
   display: grid;
@@ -266,7 +317,7 @@ button:disabled { opacity: .6; cursor: wait; }
  * list above it (PHASE-004-ai-runtime.md's frontend-changes requirement) --
  * a dashed border and a tinted background, never the same solid-card
  * treatment `.dashboard-card`/`.item-list` use for deterministic content. */
-.ai-explanation { margin-top: 12px; padding: 14px 16px; border: 1px dashed var(--color-border-ai); border-radius: 14px; background: var(--color-bg-ai); display: grid; gap: 8px; }
+.ai-explanation { margin-top: 12px; padding: 14px 16px; border: 1px dashed var(--color-border-ai); border-radius: var(--radius-control); background: var(--color-bg-ai); display: grid; gap: 8px; }
 .ai-explanation-badge { margin: 0; font-size: 11px; font-weight: 800; letter-spacing: .04em; text-transform: uppercase; color: var(--color-text-ai-accent); }
 .ai-explanation p { margin: 0; }
 .ai-explanation ul { margin: 0; padding-left: 18px; }
@@ -284,14 +335,14 @@ button:disabled { opacity: .6; cursor: wait; }
 .risk-factor-preview ul { list-style: none; margin: 8px 0 0; padding: 0; display: flex; flex-wrap: wrap; gap: 6px; }
 .risk-factor-preview li { border: 1px solid var(--color-border-subtle); border-radius: 999px; padding: 4px 11px; font-size: 12px; color: var(--color-text-copy); }
 
-.field-form { display: grid; gap: 14px; margin-top: 28px; }
+.field-form { display: grid; gap: 14px; margin-top: 28px; max-width: var(--content-form); }
 .field-form label,
 .note-search { display: grid; gap: 7px; color: var(--color-text-secondary); font-size: 13px; font-weight: 700; }
 .field-form label.field-checkbox { display: flex; align-items: center; gap: 8px; font-weight: 400; }
 .field-form input,
 .field-form textarea,
 .field-form select,
-.note-search input { width: 100%; border: 1px solid var(--color-border-default); border-radius: 14px; background: var(--color-white); padding: 12px 14px; color: var(--color-ink); }
+.note-search input { width: 100%; border: 1px solid var(--color-border-default); border-radius: var(--radius-control); background: var(--color-white); padding: 12px 14px; color: var(--color-ink); }
 .field-form input[type="checkbox"] { width: auto; }
 .field-form textarea { min-height: 150px; resize: vertical; }
 .field-form button { justify-self: start; }
@@ -310,7 +361,7 @@ button:disabled { opacity: .6; cursor: wait; }
 .audit-toolbar input {
   width: 100%;
   border: 1px solid var(--color-border-default);
-  border-radius: 14px;
+  border-radius: var(--radius-control);
   background: var(--color-white);
   padding: 12px 14px;
   color: var(--color-ink);

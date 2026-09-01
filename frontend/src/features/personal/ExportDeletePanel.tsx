@@ -81,6 +81,7 @@ export default function ExportDeletePanel() {
       <div className="work-actions">
         <button
           type="button"
+          className="btn-destructive"
           disabled={!deleteConfirmed || deleteMutation.isPending}
           onClick={() => deleteMutation.mutate(domainKey)}
         >

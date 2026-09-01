@@ -123,7 +123,7 @@ export default function KillSwitchPanel() {
 
       {globalMutation.isError ? <div role="alert" className="inline-status error-panel">{errorMessage(globalMutation.error)}</div> : null}
       <div className="work-actions">
-        <button type="button" disabled={pending} onClick={() => globalMutation.mutate(true)}>Activate global kill switch</button>
+        <button type="button" className="btn-destructive" disabled={pending} onClick={() => globalMutation.mutate(true)}>Activate global kill switch</button>
         <button type="button" disabled={pending} onClick={() => globalMutation.mutate(false)}>Deactivate global kill switch</button>
       </div>
       {/* Read straight off the server's own response row for the global
@@ -153,7 +153,7 @@ export default function KillSwitchPanel() {
       </label>
       <div className="work-actions">
         <button type="button" onClick={() => setLookupId(workflowId.trim() || null)} disabled={!workflowId.trim()}>Check current status</button>
-        <button type="button" disabled={pending || !workflowId.trim()} onClick={() => workflowMutation.mutate({ id: workflowId.trim(), active: true })}>Activate for this workflow</button>
+        <button type="button" className="btn-destructive" disabled={pending || !workflowId.trim()} onClick={() => workflowMutation.mutate({ id: workflowId.trim(), active: true })}>Activate for this workflow</button>
         <button type="button" disabled={pending || !workflowId.trim()} onClick={() => workflowMutation.mutate({ id: workflowId.trim(), active: false })}>Deactivate for this workflow</button>
       </div>
       {workflowMutation.isError ? <div role="alert" className="inline-status error-panel">{errorMessage(workflowMutation.error)}</div> : null}

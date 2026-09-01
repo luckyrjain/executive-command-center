@@ -478,6 +478,7 @@ function ConnectorCard({ connector, syncRuns, now, onChanged }: {
           <button type="submit" disabled={syncMutation.isPending || connector.status === 'disconnected'}>Start sync</button>
           <button
             type="button"
+            className="btn-destructive"
             disabled={disableMutation.isPending || connector.status === 'disconnected'}
             onClick={() => disableMutation.mutate()}
           >

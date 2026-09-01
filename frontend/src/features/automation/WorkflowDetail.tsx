@@ -178,7 +178,7 @@ export default function WorkflowDetail({ versionId }: { versionId: string }) {
         <label>Kill switch reason (optional)
           <input value={killSwitchReason} onChange={(e) => setKillSwitchReason(e.target.value)} disabled={!workflowId || killSwitchUnknown} />
         </label>
-        <button type="button" disabled={pending || !workflowId || killSwitchUnknown} onClick={() => killSwitchMutation.mutate(true)}>Activate kill switch for this workflow</button>
+        <button type="button" className="btn-destructive" disabled={pending || !workflowId || killSwitchUnknown} onClick={() => killSwitchMutation.mutate(true)}>Activate kill switch for this workflow</button>
         {globalKillActive && !workflowKillActive ? null : (
           <button type="button" disabled={pending || !workflowId || killSwitchUnknown} onClick={() => killSwitchMutation.mutate(false)}>Deactivate kill switch for this workflow</button>
         )}
@@ -231,7 +231,7 @@ export default function WorkflowDetail({ versionId }: { versionId: string }) {
           <button type="button" disabled={pending || killSwitchUnknown} onClick={() => publishMutation.mutate()}>Publish this version</button>
         ) : null}
         {version.status === 'active' ? (
-          <button type="button" disabled={pending} onClick={() => disableMutation.mutate()}>Disable this version</button>
+          <button type="button" className="btn-destructive" disabled={pending} onClick={() => disableMutation.mutate()}>Disable this version</button>
         ) : null}
         <button type="button" onClick={() => setShowSimulation((current) => !current)}>
           {showSimulation ? 'Hide simulation' : 'Simulate this version'}
