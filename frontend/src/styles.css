@@ -75,11 +75,11 @@
   --content-form: 680px;
 
   /* Radius -- the two systematic radii in use. A handful of components
-   * (`.dashboard-card` 20px, `.wizard-stepper`-adjacent panels 18px, the
-   * mobile-collapsed panel radius 16px) use one-off intermediate values that
-   * predate this scale and are not yet part of a formal three-tier system;
-   * left as raw numbers rather than forced into a token that would misname
-   * them. */
+   * (`.dashboard-card` 20px, `.recommendation-list > li.is-pinned` and
+   * `.simulation-panel` 18px, the mobile-collapsed panel radius 16px) use
+   * one-off intermediate values that predate this scale and are not yet
+   * part of a formal three-tier system; left as raw numbers rather than
+   * forced into a token that would misname them. */
   --radius-control: 14px;
   --radius-panel: 28px;
 

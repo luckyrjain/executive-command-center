@@ -2,9 +2,11 @@
 
 The frontend's actual, rendered design system — not aspirational, not a wishlist — plus process guidance for whoever is building the next page with it. Read this before styling anything new; it tells you the palette, the two reusable patterns (`.field-form`, wizards), how to compose a whole page out of them, and when to reach for each. Update it when the system itself changes, not for one-off feature work.
 
-**Quick answer:** styling a labeled field? Use `.field-form`. Building a multi-field create flow? Check "When to wizardize" below before reaching for a flat form. Building a whole new page? Start at "Building a new page" below.
+**Quick answer:** styling a labeled field? Use `.field-form`. Building a multi-field create flow? Check "When to wizardize" below before reaching for a flat form. Adding a new top-level view or in-page tab? Check Navigation below. Building a whole new page? Start at "Building a new page" below.
 
 Two kinds of content live here, and they're marked differently. Most of this doc documents CSS that exists — a class, a token, a value you can go read in `styles.css` right now. **Building a new page** is different: it's judgment calls (what's the primary anchor, how many cards is too many) that no CSS enforces, written down so those calls stay consistent across pages instead of being reinvented per feature. Nothing in that section is a class you can apply; it's what to do with the classes above.
+
+**Contents:** [Typography](#typography) · [Color](#color) · [Spacing](#spacing) · [Container & grid](#container--grid) · [Layout primitives](#layout-primitives) · [Navigation](#navigation) · [Geometry](#geometry-radius--elevation) · [Buttons](#buttons-action-hierarchy) · [Forms](#forms-field-form) · [Wizards](#wizards-when-and-how) · [Interaction states](#interaction-states) · [Responsive behavior](#responsive-behavior) · [Motion](#motion) · [Not yet part of the system](#not-yet-part-of-the-system) · [Building a new page](#building-a-new-page) · [Anti-patterns](#anti-patterns) · [Known follow-ups](#known-follow-ups-deferred-not-forgotten) · [Provenance](#provenance)
 
 ## Typography
 
@@ -28,6 +30,7 @@ Every color is a CSS custom property on `:root` in `styles.css` — style new wo
 - **Borders:** `--color-border-default`, `--color-border-subtle`, `--color-border-hairline`
 - **Surfaces:** `--color-white` (cards), `--color-page-bg` (page), `--color-surface-recessed` (recessed/upcoming)
 - **Error:** `--color-border-error` / `--color-bg-error` (`.error-panel`)
+- **Elevation:** `--shadow-card` (`.dashboard-card`) and `--shadow-panel` (`.recommendation-panel`/`.explore-panel`/`.work-panel`) — the app's only two shadow values, see Geometry below for when each applies
 
 Token names describe role, not shade — `--color-border-panel` and `--color-border-panel-alt` are two visually-close-but-distinct border colors kept as separate tokens rather than merged, because the token migration was a pure refactor (every raw value mapped 1:1) and consolidating near-duplicates is a separate design decision nobody's made yet.
 
@@ -50,10 +53,21 @@ A global scale, `--space-1` (4px) through `--space-24` (96px), doubling roughly 
 | `.work-actions` | Button row: `flex`, `wrap`, `gap: 8px` |
 | `.empty-state` | Centered muted text for a zero-item list |
 | `.inline-status` / `.error-panel` | Status and error banners (`role="status"` / `role="alert"`) |
+| `.dashboard-grid` / `.dashboard-card` | 12-column grid of `--shadow-card`-elevated cards (`grid-column: span 6` by default), used by the Today dashboard and the brief panel |
+
+## Navigation
+
+Two distinct, real navigation systems — both ARIA-tab-based, neither optional decoration.
+
+**Top-level workspace nav** (`frontend/src/navigation/WorkspaceNavigation.tsx`): the pill row across the very top of every page (Today, Attention, Work, … Team). A single `WORKSPACES` array drives it, with full roving-tabindex keyboard support (`Home`/`End`/`ArrowLeft`/`ArrowRight`, see `nextWorkspaceIndex`/`moveWorkspaceFocus` in that file). **New entries go at the end of the array, never inserted earlier** — the array's position feeds fixed `ArrowRight`-count assertions in `frontend/e2e/scenarios/`, and several existing entries have inline comments explaining label choices made specifically to avoid substring-colliding with an existing `getByRole('tab', {name})` query (e.g. `'Team'` instead of `'Workspace'`, since `'Work'` is already taken). Adding a workspace means appending to `WORKSPACES` and checking for that same substring-collision risk against every existing label, not just picking a name that reads well on its own.
+
+**In-workspace tabs** (`.tab-list`, `role="tablist"`): sub-navigation within a single workspace, used identically in `PersonalWorkspace.tsx`, `CollaborationWorkspace.tsx`, `AutomationWorkspace.tsx`, and `EngineeringWorkspace.tsx`. The contract: a `role="tablist"` with an `aria-label` naming the group, each tab is `role="tab"` with `aria-selected` driving both the visual state (Interaction states above) and the accessible state together, and exactly one `role="tabpanel"` below it with `aria-labelledby` pointing at the active tab's id. Copy this pattern for a new workspace's sub-navigation rather than reaching for `.tab-list` styling without the ARIA structure behind it — the CSS alone isn't the pattern.
+
+There is no breadcrumb or pagination component (see Not yet part of the system below) — neither navigation system needs one today.
 
 ## Geometry: radius & elevation
 
-Two systematic radii: `--radius-control: 14px` (every text input, textarea, select, and the two dashed-border content panels `.ai-explanation`/form inputs) and `--radius-panel: 28px` (`.brief-panel`, `.recommendation-panel`/`.explore-panel`/`.work-panel`). Buttons and pill-shaped chips (`.item-meta span`, `.recommendation-meta span`, wizard step circles) use `999px` for a true pill, which isn't part of this two-tier scale because it isn't a size choice — it's "fully round" regardless of the element's dimensions. A handful of components — `.dashboard-card` (20px), the mobile-collapsed panel radius (16px), `.evidence-preview li`/`.risk-factors li` (also 999px) — use one-off values that predate this scale; they're left as raw numbers rather than forced into a token that would misname them. Elevation is two shadow tokens, `--shadow-card` and `--shadow-panel`, already defined in Color above — a panel earns one of these only when it's a distinct surface over the page background, never stacked on top of another already-elevated surface.
+Two systematic radii: `--radius-control: 14px` (every text input/textarea/select, `.status-panel`/`.inline-status`, and the dashed-border `.ai-explanation` panel) and `--radius-panel: 28px` (`.brief-panel`, `.recommendation-panel`/`.explore-panel`/`.work-panel`). Buttons and pill-shaped chips (`.item-meta span`, `.recommendation-meta span`, wizard step circles) use `999px` for a true pill, which isn't part of this two-tier scale because it isn't a size choice — it's "fully round" regardless of the element's dimensions. A handful of components — `.dashboard-card` (20px), `.recommendation-list > li.is-pinned` and `.simulation-panel` (18px), the mobile-collapsed panel radius (16px), `.evidence-preview li`/`.risk-factors li` (also 999px) — use one-off values that predate this scale; they're left as raw numbers rather than forced into a token that would misname them. Elevation is the two shadow tokens defined in Color above — a panel earns one of these only when it's a distinct surface over the page background, never stacked on top of another already-elevated surface.
 
 ## Buttons: action hierarchy
 
@@ -61,7 +75,9 @@ Every button in the app is the same shape by default (see Interaction states bel
 
 ## Forms: `.field-form`
 
-Every labeled-fields block in the app uses one class. Single column, `gap: 14px`, label text stacked above its input — no exceptions, no bespoke form CSS anywhere else.
+Every labeled-fields block in the app should use one class. Single column, `gap: 14px`, label text stacked above its input.
+
+**One real exception exists today:** `SearchAuditPanel.tsx`'s `.search-form`/`.audit-toolbar` (styles.css, near the `.field-form` rules) duplicate `.field-form`'s label and input styling by hand instead of using the class — same border, radius, padding, and label weight, declared a second time under different selectors. This predates being caught; it isn't a second sanctioned form pattern. Use `.field-form` for anything new, including a search/filter toolbar — don't treat `.search-form` as a second precedent the way `.field-form` is documented here.
 
 ```css
 .field-form { display: grid; gap: 14px; margin-top: 28px; }
@@ -81,7 +97,9 @@ Every labeled-fields block in the app uses one class. Single column, `gap: 14px`
 
 ### When to wizardize
 
-5+ fields on one screen, or real structural complexity — a dynamic array of multi-field sub-items, genuine conditional branching between field groups. A 2-4 field form stays a single page; don't wizardize for its own sake. Edit forms stay flat even when their create-form sibling is a wizard — that's the established call across Risk, Task, Commitment, and Schedule.
+5+ fields on one screen, or real structural complexity — a dynamic array of multi-field sub-items, genuine conditional branching between field groups. A 2-4 field form stays a single page; don't wizardize for its own sake. Edit forms stay flat even when their create-form sibling is a wizard — that's the established call across Risk, Workflow, Policy, Connector, and Schedule (the five actual wizards; see Reference implementations below).
+
+**Task and Commitment are the field-count rule's real exceptions, not confirmations of it.** `TaskWorkspace.tsx`'s create form has 5 fields and `CommitmentWorkspace.tsx`'s has 7 — both clear the "5+ fields" threshold above — yet both stay flat single-page `.field-form`s, create and edit alike, with no wizard anywhere in either file. Nobody has revisited whether they should wizardize; they predate the wizard pattern and haven't been touched since. Don't copy this as precedent for a new 5+ field form — it's undocumented debt, not a second valid path.
 
 ### Reference implementations
 
@@ -166,8 +184,8 @@ Two breakpoints, both in `styles.css`'s trailing media queries — there's no se
 
 | Breakpoint | What changes |
 |---|---|
-| `max-width: 800px` | Dashboard/brief cards go full-width (`grid-column: 1 / -1`); `.recommendation-list` items and `.work-grid` collapse to a single column; `.recommendation-actions` and `.audit-list` items switch from column to row layout (or the reverse) to fit the narrower measure |
-| `max-width: 520px` | Panel heading rows (`.topbar`, `.brief-heading`, etc.) stack vertically instead of side-by-side; panel corner radius shrinks; `.search-form > div` and `.tab-list` go full-width and stack |
+| `max-width: 800px` | Dashboard/brief cards go full-width (`grid-column: 1 / -1`); `.recommendation-list` items and `.work-grid` collapse to a single column; `.recommendation-actions` switches from its default column layout to row (wraps), `.audit-list` items switch from row to column, to fit the narrower measure |
+| `max-width: 520px` | Panel heading rows (`.topbar`, `.brief-heading`, etc.) stack vertically instead of side-by-side; panel corner radius shrinks; `.recommendation-actions` flips back to column (a real double-flip: column at rest → row at 800px → column again at 520px, not a typo); `.search-form > div` and `.tab-list` go full-width and stack |
 
 No component-level responsive behavior beyond this — a wizard, a `.field-form`, and a stepper all render identically from mobile through desktop widths; only the surrounding page chrome (headings, card grids, action rows) reflows. If a new surface needs its own breakpoint behavior, it's a deviation from the current pattern, not an extension of it — call that out explicitly rather than adding a third silent breakpoint.
 
@@ -251,3 +269,5 @@ An external design-system review of this document raised a P1/P2 list beyond the
 ## Provenance
 
 Extracted 2026-08-31 from the live app during a design pass (#203) and the wizard sweep that followed (#204). P0 fixes (semantic `<form>`, terminal-validation error navigation) applied the same day after an external design-system review. P1/P2 follow-ups (design tokens, list-semantic stepper, centralized focus hook, monospace scoping, interaction-states/responsive documentation, and the checkbox-field selector fix) applied 2026-09-01. A second external review the same day proposed a broader foundational/aesthetic extension (spacing scale, container/grid, geometry, action hierarchy, motion, and a page-composition philosophy); the token- and primitive-level parts of it were implemented the same day — spacing scale, container/grid tokens applied to `.app-shell` and `.field-form`, radius tokens formalized for the two systematic values, a `.btn-destructive` class applied to the app's 13 genuinely irreversible/high-risk actions, motion tokens plus a previously-absent `prefers-reduced-motion` query, and semantic color roles documented under Color. Speculative additions for patterns nothing in the app uses yet (tables, icons, breadcrumbs/pagination, a generic info color) were deliberately not built — see Not yet part of the system. Page-anatomy/composition, content-density, and aesthetic-QA-gate guidance from that review was initially left out on the grounds that this doc's stated job is documenting the actual rendered system, and process guidance has no corresponding CSS to verify against. On revisiting the same day, that was too narrow a reading — a design system that only tells you what a class does, and never how to arrange those classes into a page, doesn't actually help someone build a page. Building a new page, Anti-patterns (expanded from the original AI-slop check), and the content-design/quality-gate guidance were added as explicitly-marked process sections, distinct from the CSS-backed sections above them, rather than silently blended in as if they were also "the actual rendered system."
+
+A full correctness/completeness/usability/navigation review the same day, cross-checked line by line against `styles.css` and the actual `features/*` components rather than taken on faith, found and fixed four factual errors this doc had accumulated: the Geometry section claimed shadow tokens were "defined in Color above" when Color never mentioned them (fixed by adding an Elevation bullet to Color); the same section, and this file's own `:root` comment, misattributed the 18px radius to "wizard-stepper-adjacent panels" when no wizard element uses it — the real users are `.recommendation-list > li.is-pinned` and `.simulation-panel`; "When to wizardize" claimed Task and Commitment have wizard create-forms with flat edit siblings, but neither has a wizard at all despite both exceeding the stated 5-field threshold; and Forms claimed `.field-form` had "no exceptions, no bespoke form CSS anywhere else" when `SearchAuditPanel.tsx`'s `.search-form`/`.audit-toolbar` duplicate it by hand. The review also found a real completeness gap — no Navigation section existed despite two load-bearing, ARIA-tab-based nav systems in the app (`WorkspaceNavigation.tsx`'s top-level roving-tabindex bar and the in-workspace `.tab-list` pattern used across 4 workspaces) — and added one. A table of contents was added for the same reason: at 20+ sections, the doc itself had no navigation.
