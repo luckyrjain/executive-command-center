@@ -21,12 +21,17 @@ export async function run({ page, baseURL }) {
 
   await assertNoSeriousAccessibilityViolations(page, { include: '#workspace-panel' })
 
-  // Dashboard sections sourced from GET /api/v1/dashboard/today.
+  // Dashboard sections sourced from GET /api/v1/dashboard/today. "Top
+  // priorities" is the page's promoted dominant anchor (DESIGN.md's
+  // "Building a new page" Hierarchy rules) -- its own standalone .work-panel,
+  // rendered before .dashboard-grid, not one of the grid's .dashboard-cards.
+  const topPriorities = page.locator('section[aria-labelledby="section-top-priorities"]')
+  await topPriorities.getByRole('heading', { name: 'Top priorities' }).waitFor()
+  await topPriorities.getByText('Approve hiring plan').waitFor()
+  await topPriorities.getByText('92').waitFor()
+
   const dashboardGrid = page.locator('.dashboard-grid')
   await dashboardGrid.getByText('Leadership review').waitFor()
-  await dashboardGrid.getByRole('heading', { name: 'Top priorities' }).waitFor()
-  await dashboardGrid.getByText('Approve hiring plan').waitFor()
-  await dashboardGrid.getByText('92').waitFor()
   await dashboardGrid.getByText('Send board metrics').waitFor()
   await dashboardGrid.getByText('Vendor concentration').waitFor()
   await dashboardGrid.getByText('Legal approval').waitFor()
