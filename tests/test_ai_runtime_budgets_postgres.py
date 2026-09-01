@@ -747,39 +747,41 @@ def test_generate_without_override_still_uses_the_instance_default_deadline() ->
 
 
 def test_run_budget_meeting_prep_summary_per_model_call_seconds_diverges_from_default() -> None:
-    """`meeting.prep_summary`'s own declared timeout (40.0s, `router.py:
-    TASK_REQUIREMENTS`, phase H fix -- raised again from phase G's 32.0s
-    after real CI kept clearing the timeout cleanly but missing the
-    latency promotion floor) is deliberately *not* equal to `ollama_
-    client.py`'s default constant. `attention.explain_item` has since
-    diverged too (30.0s, migration `0077_phase4_expl_item_timeout.py`) --
-    the coincidental "matches the shared default" cross-check this task
-    type used to have was removed once that stopped being true; both
-    registered task types now genuinely diverge from the shared default,
-    each in their own direction.
+    """`meeting.prep_summary`'s own declared timeout (45.0s, `router.py:
+    TASK_REQUIREMENTS`, phase O follow-up -- raised again from phase H's
+    40.0s after four fresh real CI runs on PR #215 measured two genuine
+    overshoots against the old 35.0s promotion-floor ceiling) is
+    deliberately *not* equal to `ollama_client.py`'s default constant.
+    `attention.explain_item` has since diverged too (30.0s, migration
+    `0077_phase4_expl_item_timeout.py`) -- the coincidental "matches the
+    shared default" cross-check this task type used to have was removed
+    once that stopped being true; both registered task types now
+    genuinely diverge from the shared default, each in their own
+    direction.
     """
     with SessionFactory() as session:
         policy = air.get_policy(session, "meeting.prep_summary")
     assert policy is not None
     budget = RunBudget.from_policy(policy)
-    assert budget.per_model_call_seconds == 40.0
+    assert budget.per_model_call_seconds == 45.0
     assert budget.per_model_call_seconds != DEFAULT_PER_MODEL_CALL_TIMEOUT_SECONDS
 
 
 def test_run_budget_meeting_prep_summary_total_wall_clock_seconds_diverges_from_default() -> None:
-    """`meeting.prep_summary`'s total per-run wall-clock budget (91.0s,
-    phase H fix) was raised in lockstep with its per-model-call timeout
-    (40.0s) so a schema-repair retry still fits twice alongside routing/
-    tool-dispatch/validation overhead -- deliberately *not* equal to
-    `attention.explain_item`'s 80.0s (`test_run_budget_from_policy_reads_
-    the_seeded_routing_policy_row` above), confirming the two task types'
-    total budgets now genuinely diverge too, not just their per-call ones.
+    """`meeting.prep_summary`'s total per-run wall-clock budget (101.0s,
+    phase O follow-up) was raised in lockstep with its per-model-call
+    timeout (45.0s) so a schema-repair retry still fits twice alongside
+    routing/tool-dispatch/validation overhead -- deliberately *not* equal
+    to `attention.explain_item`'s 80.0s (`test_run_budget_from_policy_
+    reads_the_seeded_routing_policy_row` above), confirming the two task
+    types' total budgets now genuinely diverge too, not just their
+    per-call ones.
     """
     with SessionFactory() as session:
         policy = air.get_policy(session, "meeting.prep_summary")
     assert policy is not None
     budget = RunBudget.from_policy(policy)
-    assert budget.total_wall_clock_seconds == 91.0
+    assert budget.total_wall_clock_seconds == 101.0
 
 
 def test_httpx_transport_timeout_stays_ahead_of_every_registered_task_timeout() -> None:

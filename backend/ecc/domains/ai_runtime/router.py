@@ -156,7 +156,21 @@ TASK_REQUIREMENTS: dict[str, TaskRequirements] = {
         # timeout that has crept past the transport-level backstop, which
         # would otherwise fire first and silently cap real latency below
         # the intended value.
-        timeout_seconds=40.0,
+        #
+        # Raised again (phase O follow-up, migration
+        # `0078_phase4_meeting_timeout4.py`) 40s -> 45s, in lockstep with the
+        # promotion-floor ceiling's own 35.0 -> 40.0 raise
+        # (`evaluation.py:_LATENCY_P95_CEILING_SECONDS_BY_TASK_TYPE`, see its
+        # own comment for the four fresh real measurements this is sized
+        # against) -- same 5s margin between floor and timeout every prior
+        # raise here preserved, so a call that only just clears the new 40s
+        # floor is not then at risk of being killed by a timeout barely
+        # above it. `total_run_budget_seconds` raised 91s -> 101s in
+        # lockstep (same migration), preserving the "two full-length calls
+        # plus slack" invariant (2 x 45s + 11s slack). Also requires raising
+        # `ollama_client.py:_HTTPX_TRANSPORT_TIMEOUT_SECONDS` (46.0 -> 51.0)
+        # in the same commit.
+        timeout_seconds=45.0,
         # Deliberately *below* explain_item's 512, not above it, despite
         # this task's larger 150-word cap (vs. explain_item's 60) -- 768
         # was tried first on the same reasoning the comment this replaces

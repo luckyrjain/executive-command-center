@@ -2684,21 +2684,20 @@ def test_execute_run_meeting_prep_summary_objective_block_states_it_has_no_citab
     assert original_begin_line in sent_prompt
 
 
-def test_execute_run_meeting_prep_summary_passes_its_own_40s_timeout_to_the_adapter(
+def test_execute_run_meeting_prep_summary_passes_its_own_45s_timeout_to_the_adapter(
     run_context: dict,
 ) -> None:
     """`meeting.prep_summary`'s own declared per-model-call timeout
-    (40.0s, `router.py:TASK_REQUIREMENTS`, phase H fix -- raised again
-    from phase G's 32.0s after real CI kept clearing the timeout cleanly
-    but four consecutive live runs still missed the latency promotion
-    floor at p95 ~30.9-31.4s, `EVALUATION-CONTRACT.md`'s "Sandbox
-    constraint" section) genuinely reaches the adapter's real per-call
-    deadline via `execute_run`, not just `budgets.py:RunBudget.per_model_
-    call_seconds` (a value that, before Phase C's fix, was computed
-    correctly but never actually consumed anywhere -- the real production
-    adapter, `runtime.py:get_ollama_adapter`'s single shared FastAPI-DI
-    instance, always used its own fixed constructor default regardless of
-    task type).
+    (45.0s, `router.py:TASK_REQUIREMENTS`, phase O follow-up -- raised
+    again from phase H's 40.0s after four fresh real CI runs on PR #215
+    measured two genuine overshoots against the old 35.0s promotion-floor
+    ceiling, `EVALUATION-CONTRACT.md`'s Phase O record) genuinely reaches
+    the adapter's real per-call deadline via `execute_run`, not just
+    `budgets.py:RunBudget.per_model_call_seconds` (a value that, before
+    Phase C's fix, was computed correctly but never actually consumed
+    anywhere -- the real production adapter, `runtime.py:get_ollama_
+    adapter`'s single shared FastAPI-DI instance, always used its own
+    fixed constructor default regardless of task type).
     """
     meeting_id, participant_id = _insert_meeting_with_participant(
         run_context["workspace_id"], run_context["user_id"]
@@ -2722,7 +2721,7 @@ def test_execute_run_meeting_prep_summary_passes_its_own_40s_timeout_to_the_adap
         )
 
     assert run.status == "completed"
-    assert spy.observed_timeout_seconds == [40.0]
+    assert spy.observed_timeout_seconds == [45.0]
 
 
 def test_execute_run_attention_explain_item_still_passes_its_own_30s_timeout(

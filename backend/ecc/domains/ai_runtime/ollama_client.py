@@ -91,7 +91,10 @@ DEFAULT_PER_MODEL_CALL_TIMEOUT_SECONDS = 20.0
 # actually fires first. Raised again, 37.0 -> 46.0, in lockstep with
 # `meeting.prep_summary`'s own 32s -> 40s raise (phase H, `router.py`'s own
 # updated comment on that field has the full real-CI-measurement history).
-_HTTPX_TRANSPORT_TIMEOUT_SECONDS = 46.0
+# Raised again, 46.0 -> 51.0, in lockstep with `meeting.prep_summary`'s own
+# 40s -> 45s raise (phase O follow-up, `router.py`'s own updated comment has
+# the four fresh real measurements this is sized against).
+_HTTPX_TRANSPORT_TIMEOUT_SECONDS = 51.0
 
 
 class OllamaCallTimeout(Exception):
