@@ -31,6 +31,7 @@ export default function ReliabilityPanel() {
 
       {query.isLoading ? <p role="status">Loading reliability metrics…</p> : null}
       {query.isError ? <div role="alert" className="inline-status error-panel">{query.error.message}</div> : null}
+      {query.data && metrics.length === 0 ? <p className="empty-state">No reliability metrics yet.</p> : null}
 
       <ul className="work-list">
         {metrics.map((metric) => <MetricCard key={metric.id} metric={metric} />)}

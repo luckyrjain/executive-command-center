@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useRef, useState, type FormEvent } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
 import { ApiError, apiRequest } from '../../api/client'
@@ -498,6 +498,7 @@ export default function ConnectorHealthPanel() {
   const [fields, setFields] = useState<CredentialFields>(() => emptyCredentialFields('github'))
   const [stepIndex, setStepIndex] = useState(0)
   const [connected, setConnected] = useState<ConnectorAccount | null>(null)
+  const formRef = useRef<HTMLFormElement>(null)
   const connectors = useQuery({
     queryKey: ['engineering', 'connectors'],
     queryFn: () => apiRequest<ConnectorAccountListResponse>('/api/v1/engineering/connectors'),
@@ -537,6 +538,18 @@ export default function ConnectorHealthPanel() {
   function refresh() {
     void queryClient.invalidateQueries({ queryKey: ['engineering', 'connectors'] })
     void queryClient.invalidateQueries({ queryKey: ['engineering', 'sync-runs'] })
+  }
+
+  // No per-field `invalidField` navigation here (unlike the terminal-validation
+  // wizards in DESIGN.md) -- every step's own Continue button already gates on
+  // `isStepComplete`, so a user can't reach Review with an incomplete required
+  // field the way those wizards' non-blocking Continue allows. The `disabled`
+  // check is repeated here as a guard against a stray Enter-to-submit, not
+  // because the UI can otherwise reach this handler incomplete.
+  function attemptCreate(event: FormEvent) {
+    event.preventDefault()
+    if (!isCredentialComplete(provider, fields)) return
+    createMutation.mutate()
   }
 
   const steps = stepsFor(provider)
@@ -593,7 +606,7 @@ export default function ConnectorHealthPanel() {
             </div>
           </div>
         ) : (
-          <>
+          <form ref={formRef} noValidate onSubmit={attemptCreate} aria-labelledby="connector-connect-title">
             <ol className="wizard-stepper" aria-label="Setup progress">
               {steps.map((step, i) => (
                 <li className="wizard-step-node" key={step} aria-current={i === stepIndex ? 'step' : undefined}>
@@ -635,7 +648,7 @@ export default function ConnectorHealthPanel() {
                 </dl>
                 <div className="work-actions">
                   <button type="button" onClick={goBack}>Back</button>
-                  <button type="button" disabled={createMutation.isPending || !isCredentialComplete(provider, fields)} onClick={() => createMutation.mutate()}>
+                  <button type="submit" disabled={createMutation.isPending || !isCredentialComplete(provider, fields)}>
                     {createMutation.isPending ? 'Connecting…' : 'Connect'}
                   </button>
                 </div>
@@ -653,7 +666,7 @@ export default function ConnectorHealthPanel() {
                 </div>
               </div>
             )}
-          </>
+          </form>
         )}
       </div>
 

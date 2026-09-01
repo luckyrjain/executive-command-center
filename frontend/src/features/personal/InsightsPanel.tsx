@@ -23,9 +23,11 @@ function FeedbackForm({ insight }: { insight: Insight }) {
 
   return (
     <div>
-      <label>Comment (optional)
-        <input aria-label={`Feedback comment for ${insight.title}`} value={comment} onChange={(event) => setComment(event.target.value)} maxLength={1000} />
-      </label>
+      <div className="field-form">
+        <label>Comment (optional)
+          <input aria-label={`Feedback comment for ${insight.title}`} value={comment} onChange={(event) => setComment(event.target.value)} maxLength={1000} />
+        </label>
+      </div>
       <div className="work-actions">
         <button type="button" disabled={feedbackMutation.isPending} onClick={() => feedbackMutation.mutate(true)}>Useful</button>
         <button type="button" disabled={feedbackMutation.isPending} onClick={() => feedbackMutation.mutate(false)}>Not useful</button>
@@ -114,10 +116,10 @@ export default function InsightsPanel() {
       <h2 id="personal-insights-title">Insights</h2>
       <p>Deterministic and AI-generated insights across every domain you have enabled. Health and finance insights always name a professional to talk to when relevant.</p>
 
-      <fieldset>
+      <fieldset className="field-form">
         <legend>Generate an insight from</legend>
         {DOMAIN_KEYS.map((domainKey) => (
-          <label key={domainKey}>
+          <label key={domainKey} className="field-checkbox">
             <input
               type="checkbox"
               checked={sourceDomains.includes(domainKey)}

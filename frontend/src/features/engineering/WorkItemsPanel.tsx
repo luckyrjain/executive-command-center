@@ -75,7 +75,7 @@ function TeamAssignment({
   const assignedTeamMissing = workItem.team_entity_id !== null && !teamsById.has(workItem.team_entity_id)
 
   return (
-    <div className="work-actions">
+    <div className="work-actions field-form">
       <label>
         {`Team for ${workItem.title}`}
         <select
@@ -154,17 +154,19 @@ export default function WorkItemsPanel() {
       <h2 id="engineering-work-items-title">Work items</h2>
       <p>Every work item synced from a connected Jira account (the only provider that populates work items), with its own permission and freshness state -- never rolled up into the connector account's own status.</p>
 
-      <label>
-        Filter by team
-        <select
-          aria-label="Filter work items by team"
-          value={teamFilter}
-          onChange={(event) => setTeamFilter(event.target.value)}
-        >
-          <option value="">All teams</option>
-          {[...teamsById.entries()].map(([id, name]) => <option key={id} value={id}>{name}</option>)}
-        </select>
-      </label>
+      <div className="field-form">
+        <label>
+          Filter by team
+          <select
+            aria-label="Filter work items by team"
+            value={teamFilter}
+            onChange={(event) => setTeamFilter(event.target.value)}
+          >
+            <option value="">All teams</option>
+            {[...teamsById.entries()].map(([id, name]) => <option key={id} value={id}>{name}</option>)}
+          </select>
+        </label>
+      </div>
 
       {query.isLoading ? <p role="status">Loading work items…</p> : null}
       {query.isError ? <div role="alert" className="inline-status error-panel">{query.error.message}</div> : null}

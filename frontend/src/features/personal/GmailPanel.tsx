@@ -63,7 +63,7 @@ function ThreadDetail({ threadId, onForgotten }: { threadId: string; onForgotten
   })
 
   return (
-    <div className="work-panel" role="region" aria-label={thread.data?.subject ?? 'Thread'}>
+    <div style={{ marginTop: 'var(--space-8)' }} role="region" aria-label={thread.data?.subject ?? 'Thread'}>
       {thread.isLoading ? <p role="status">Loading thread…</p> : null}
       {thread.isError ? <div role="alert" className="inline-status error-panel">{personalErrorMessage(thread.error)}</div> : null}
       {thread.data ? (
@@ -271,7 +271,7 @@ export default function GmailPanel() {
       {connectors.isError ? <div role="alert" className="inline-status error-panel">{personalErrorMessage(connectors.error)}</div> : null}
 
       {activeAccount ? (
-        <div className="work-panel">
+        <div style={{ marginTop: 'var(--space-8)' }}>
           <div>
             <strong>{activeAccount.display_name}</strong>
             <small> · last synced {formatTimestamp(activeAccount.last_synced_at)}</small>
@@ -310,7 +310,7 @@ export default function GmailPanel() {
             >
               {syncMutation.isPending ? 'Syncing…' : neverSynced ? 'Run first sync' : 'Sync now'}
             </button>
-            <button type="button" disabled={disconnectMutation.isPending} onClick={() => disconnectMutation.mutate()}>
+            <button type="button" className="btn-destructive" disabled={disconnectMutation.isPending} onClick={() => disconnectMutation.mutate()}>
               {disconnectMutation.isPending ? 'Disconnecting…' : 'Disconnect'}
             </button>
           </div>

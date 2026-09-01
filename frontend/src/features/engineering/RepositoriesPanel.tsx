@@ -78,7 +78,7 @@ function TeamAssignment({
   const assignedTeamMissing = repository.team_entity_id !== null && !teamsById.has(repository.team_entity_id)
 
   return (
-    <div className="work-actions">
+    <div className="work-actions field-form">
       <label>
         {`Team for ${repository.name}`}
         <select
@@ -157,17 +157,19 @@ export default function RepositoriesPanel() {
       <h2 id="engineering-repositories-title">Repositories</h2>
       <p>Every repository synced from a connected GitHub or GitLab account, with its own permission and freshness state -- never rolled up into the connector account's own status.</p>
 
-      <label>
-        Filter by team
-        <select
-          aria-label="Filter repositories by team"
-          value={teamFilter}
-          onChange={(event) => setTeamFilter(event.target.value)}
-        >
-          <option value="">All teams</option>
-          {[...teamsById.entries()].map(([id, name]) => <option key={id} value={id}>{name}</option>)}
-        </select>
-      </label>
+      <div className="field-form">
+        <label>
+          Filter by team
+          <select
+            aria-label="Filter repositories by team"
+            value={teamFilter}
+            onChange={(event) => setTeamFilter(event.target.value)}
+          >
+            <option value="">All teams</option>
+            {[...teamsById.entries()].map(([id, name]) => <option key={id} value={id}>{name}</option>)}
+          </select>
+        </label>
+      </div>
 
       {query.isLoading ? <p role="status">Loading repositories…</p> : null}
       {query.isError ? <div role="alert" className="inline-status error-panel">{query.error.message}</div> : null}

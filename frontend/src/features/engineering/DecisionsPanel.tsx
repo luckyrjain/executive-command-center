@@ -54,9 +54,11 @@ function DecisionRow({ decision, onChanged }: { decision: Decision; onChanged: (
       ) : null}
       {decision.status === 'proposed' ? (
         <>
-          <label>Rationale (optional)
-            <input aria-label={`Rationale for ${decision.title}`} value={rationale} onChange={(e) => setRationale(e.target.value)} />
-          </label>
+          <div className="field-form">
+            <label>Rationale (optional)
+              <input aria-label={`Rationale for ${decision.title}`} value={rationale} onChange={(e) => setRationale(e.target.value)} />
+            </label>
+          </div>
           <div className="work-actions">
             <button type="button" disabled={decideMutation.isPending} onClick={() => decideMutation.mutate()}>Record decision</button>
           </div>

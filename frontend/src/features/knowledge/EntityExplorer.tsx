@@ -233,7 +233,7 @@ export default function EntityExplorer() {
           <h2 id="search-results-heading">Search results for “{submittedQuery}”</h2>
           {retrievalQuery.isLoading ? <p role="status">Searching…</p> : null}
           {retrievalQuery.isError ? (
-            <div role="alert">{retrievalQuery.error.message}</div>
+            <div role="alert" className="inline-status error-panel">{retrievalQuery.error.message}</div>
           ) : retrievalQuery.data?.items.length ? (
             <ul className="work-list">
               {retrievalQuery.data.items.map((result) => (
@@ -260,17 +260,21 @@ export default function EntityExplorer() {
       <section aria-labelledby="entity-list-heading">
         <h2 id="entity-list-heading">All entities</h2>
         {entitiesQuery.isLoading ? <p role="status">Loading entities…</p> : null}
-        {entitiesQuery.isError ? <div role="alert">{entitiesQuery.error.message}</div> : null}
-        <ol className="work-list">
-          {(entitiesQuery.data?.items ?? []).map((entity) => (
-            <li key={entity.id}>
-              <button type="button" onClick={() => setSelectedEntityId(entity.id)}>
-                {entity.canonical_name}
-              </button>
-              <small> · {entity.kind}{entity.status !== 'active' ? ` · ${entity.status}` : ''}</small>
-            </li>
-          ))}
-        </ol>
+        {entitiesQuery.isError ? <div role="alert" className="inline-status error-panel">{entitiesQuery.error.message}</div> : null}
+        {entitiesQuery.data?.items.length ? (
+          <ol className="work-list">
+            {entitiesQuery.data.items.map((entity) => (
+              <li key={entity.id}>
+                <button type="button" onClick={() => setSelectedEntityId(entity.id)}>
+                  {entity.canonical_name}
+                </button>
+                <small> · {entity.kind}{entity.status !== 'active' ? ` · ${entity.status}` : ''}</small>
+              </li>
+            ))}
+          </ol>
+        ) : entitiesQuery.isSuccess ? (
+          <p className="empty-state">No entities yet.</p>
+        ) : null}
       </section>
 
       {selectedEntityId ? (

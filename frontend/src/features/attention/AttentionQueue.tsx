@@ -163,10 +163,12 @@ export default function AttentionQueue() {
         <div role="alert" className="inline-status error-panel">{errorMessage(actionMutation.error)}</div>
       ) : null}
 
-      <label>
-        Reason for dismiss or defer (optional)
-        <input aria-label="Reason for dismiss or defer" value={reason} onChange={(e) => setReason(e.target.value)} />
-      </label>
+      <div className="field-form">
+        <label>
+          Reason for dismiss or defer (optional)
+          <input aria-label="Reason for dismiss or defer" value={reason} onChange={(e) => setReason(e.target.value)} />
+        </label>
+      </div>
 
       {query.data ? GROUP_ORDER.map((group) => {
         const items = groups[group]

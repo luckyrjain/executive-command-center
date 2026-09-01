@@ -328,7 +328,7 @@ function AcceptInvitationForm({ onAccepted }: { onAccepted: () => void }) {
   })
 
   return (
-    <div className="work-panel">
+    <div>
       <h3 id="accept-invitation-title">Accept an invitation</h3>
       <p>Have an invitation ID and token from another workspace? Accept it here, then use the workspace switcher above to open it.</p>
       <form

@@ -117,14 +117,16 @@ export default function KillSwitchPanel() {
           previous "Kill switch reason" accessible name did not contain this
           visible text at all. There is only one reason field in this panel,
           so no disambiguating context is needed on top of it. */}
-      <label>Reason (optional, recorded on the switch)
-        <input value={reason} onChange={(e) => setReason(e.target.value)} />
-      </label>
+      <div className="field-form">
+        <label>Reason (optional, recorded on the switch)
+          <input value={reason} onChange={(e) => setReason(e.target.value)} />
+        </label>
+      </div>
 
       {globalMutation.isError ? <div role="alert" className="inline-status error-panel">{errorMessage(globalMutation.error)}</div> : null}
       <div className="work-actions">
-        <button type="button" className="btn-destructive" disabled={pending} onClick={() => globalMutation.mutate(true)}>Activate global kill switch</button>
-        <button type="button" disabled={pending} onClick={() => globalMutation.mutate(false)}>Deactivate global kill switch</button>
+        <button type="button" className="btn-destructive" disabled={pending} onClick={() => globalMutation.mutate(true)}>{globalMutation.isPending && globalMutation.variables === true ? 'Activating…' : 'Activate global kill switch'}</button>
+        <button type="button" disabled={pending} onClick={() => globalMutation.mutate(false)}>{globalMutation.isPending && globalMutation.variables === false ? 'Deactivating…' : 'Deactivate global kill switch'}</button>
       </div>
       {/* Read straight off the server's own response row for the global
           scope, which has no per-workflow lookup display of its own to
@@ -148,13 +150,15 @@ export default function KillSwitchPanel() {
       {/* "Workflow ID to check" already starts with the exact visible label
           text ("Workflow ID"), so it satisfies WCAG 2.5.3 while keeping the
           disambiguation from this panel's other id-shaped inputs. */}
-      <label>Workflow ID
-        <input aria-label="Workflow ID to check" value={workflowId} onChange={(e) => setWorkflowId(e.target.value)} />
-      </label>
+      <div className="field-form">
+        <label>Workflow ID
+          <input aria-label="Workflow ID to check" value={workflowId} onChange={(e) => setWorkflowId(e.target.value)} />
+        </label>
+      </div>
       <div className="work-actions">
         <button type="button" onClick={() => setLookupId(workflowId.trim() || null)} disabled={!workflowId.trim()}>Check current status</button>
-        <button type="button" className="btn-destructive" disabled={pending || !workflowId.trim()} onClick={() => workflowMutation.mutate({ id: workflowId.trim(), active: true })}>Activate for this workflow</button>
-        <button type="button" disabled={pending || !workflowId.trim()} onClick={() => workflowMutation.mutate({ id: workflowId.trim(), active: false })}>Deactivate for this workflow</button>
+        <button type="button" className="btn-destructive" disabled={pending || !workflowId.trim()} onClick={() => workflowMutation.mutate({ id: workflowId.trim(), active: true })}>{workflowMutation.isPending && workflowMutation.variables?.active === true ? 'Activating…' : 'Activate for this workflow'}</button>
+        <button type="button" disabled={pending || !workflowId.trim()} onClick={() => workflowMutation.mutate({ id: workflowId.trim(), active: false })}>{workflowMutation.isPending && workflowMutation.variables?.active === false ? 'Deactivating…' : 'Deactivate for this workflow'}</button>
       </div>
       {workflowMutation.isError ? <div role="alert" className="inline-status error-panel">{errorMessage(workflowMutation.error)}</div> : null}
 

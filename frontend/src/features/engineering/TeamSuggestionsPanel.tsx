@@ -87,7 +87,7 @@ function SuggestionRow({ group, teamsById }: { group: TeamSuggestionGroup; teams
           <li key={`${item.resource_type}-${item.id}`}>{`${item.name} (${item.resource_type})`}</li>
         ))}
       </ul>
-      <div className="work-actions">
+      <div className="work-actions field-form">
         <label>
           {`Assign team for ${group.suggested_team_name}`}
           <select
@@ -107,7 +107,7 @@ function SuggestionRow({ group, teamsById }: { group: TeamSuggestionGroup; teams
           Dismiss
         </button>
       </div>
-      <div className="work-actions">
+      <div className="work-actions field-form">
         <label>
           {`New team name for ${group.suggested_team_name}`}
           <input

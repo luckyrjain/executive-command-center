@@ -177,7 +177,7 @@ export default function RiskWorkspace() {
 
   const createMutation = useMutation({
     mutationFn: (draft: Draft) => apiRequest<Risk>('/api/v1/risks', { method: 'POST', body: createBody(draft) }),
-    onSuccess: () => { setCreate(emptyDraft); setCreateStepIndex(0); void refresh() },
+    onSuccess: () => { setCreate(emptyDraft); setCreateStepIndex(0); setInvalidField(null); void refresh() },
   })
   const editMutation = useMutation({
     mutationFn: ({ draft, version }: { draft: EditState; version: number }) => apiRequest<Risk>(`/api/v1/risks/${draft.risk.id}`, { method: 'PATCH', body: { expected_version: version, ...patchBody(draft) } }),
@@ -294,7 +294,7 @@ export default function RiskWorkspace() {
       )}
     </form>
     {query.isLoading ? <p role="status">Loading risks…</p> : null}
-    {query.isError ? <div role="alert">{query.error.message}</div> : null}
+    {query.isError ? <div className="inline-status error-panel" role="alert">{query.error.message}</div> : null}
     {query.data && query.data.items.length === 0 ? <p className="empty-state">No risks yet. Create one above to get started.</p> : null}
     <ol className="work-list">{(query.data?.items ?? []).map((value) => {
       const archived = Boolean(value.archived_at)

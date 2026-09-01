@@ -247,7 +247,7 @@ export default function WorkflowList({ onSelect }: { onSelect: (versionId: strin
                   "Step 1 ID"), so the visible text is contained in the accessible
                   name as WCAG 2.5.3 requires. */}
               {steps.map((step, index) => (
-                <div key={index} className="work-panel automation-step-editor field-form">
+                <div key={index} className="automation-step-editor field-form">
                   <label>Step ID
                     <input aria-label={`Step ID for step ${index + 1}`} value={step.step_id} onChange={(e) => updateStep(index, { step_id: e.target.value })} />
                   </label>

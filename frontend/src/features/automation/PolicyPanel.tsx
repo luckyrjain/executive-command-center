@@ -125,9 +125,11 @@ export default function PolicyPanel() {
           them needs extra disambiguating context. `Revoke policy for {id}` on
           the revoke button below stays -- there it is one visible "Revoke"
           per row and the visible text *is* a substring of the name. */}
-      <label>Filter by workflow ID
-        <input value={workflowFilter} onChange={(e) => setWorkflowFilter(e.target.value)} />
-      </label>
+      <div className="field-form">
+        <label>Filter by workflow ID
+          <input value={workflowFilter} onChange={(e) => setWorkflowFilter(e.target.value)} />
+        </label>
+      </div>
 
       {query.isLoading ? <p role="status">Loading policies…</p> : null}
       {query.isError ? <div role="alert" className="inline-status error-panel">{errorMessage(query.error)}</div> : null}
@@ -151,7 +153,7 @@ export default function PolicyPanel() {
             <div className="work-actions">
               {policy.status === 'active' ? (
                 <button type="button" className="btn-destructive" disabled={pending} aria-label={`Revoke policy for ${policy.workflow_id}`} onClick={() => revokeMutation.mutate(policy.id)}>
-                  Revoke
+                  {revokeMutation.isPending && revokeMutation.variables === policy.id ? 'Revoking…' : 'Revoke'}
                 </button>
               ) : null}
             </div>

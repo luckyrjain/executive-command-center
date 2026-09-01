@@ -173,6 +173,7 @@ export default function SearchAuditPanel() {
           </form>
 
           {!query ? <p className="explore-empty">Enter a query to search all Phase 1 entities.</p> : null}
+          {search.isLoading ? <div className="inline-status" role="status">Loading search results…</div> : null}
           {search.isError ? <div className="inline-status error-panel" role="alert">{search.error.message}</div> : null}
           {search.data?.degraded ? (
             <div className="inline-status degraded-panel" role="status">Search is using degraded prefix matching.</div>
