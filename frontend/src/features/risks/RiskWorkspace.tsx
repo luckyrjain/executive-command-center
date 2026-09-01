@@ -1,10 +1,10 @@
-import { useEffect, useRef, useState, type FormEvent } from 'react'
+import { useRef, useState, type FormEvent } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
 import { ApiError, apiRequest } from '../../api/client'
 import { serverInstantToLocalInput } from '../../lib/datetime'
 import { apiErrorMessage } from '../../api/errorMessage'
-import { applyWizardFieldInvalidState } from '../../lib/wizardFocus'
+import { applyWizardFieldInvalidState, useWizardStepFocus } from '../../lib/wizardFocus'
 
 export type RiskStatus = 'identified' | 'assessed' | 'monitoring' | 'mitigating' | 'materialized' | 'closed'
 
@@ -153,16 +153,13 @@ export default function RiskWorkspace() {
   const [createStepIndex, setCreateStepIndex] = useState(0)
   const [edit, setEdit] = useState<EditState | null>(null)
   const [formError, setFormError] = useState<string | null>(null)
-  const createStepHeadingRef = useRef<HTMLHeadingElement>(null)
   const createFormRef = useRef<HTMLFormElement>(null)
-  const isCreateFirstRenderRef = useRef(true)
   const createStep = CREATE_STEPS[createStepIndex] ?? 'details'
   const [invalidField, setInvalidField] = useState<string | null>(null)
-
-  useEffect(() => {
-    if (isCreateFirstRenderRef.current) { isCreateFirstRenderRef.current = false; return }
-    applyWizardFieldInvalidState(createFormRef.current, invalidField, CREATE_ERROR_ID, createStepHeadingRef.current)
-  }, [createStep, invalidField])
+  const createStepHeadingRef = useWizardStepFocus(
+    () => applyWizardFieldInvalidState(createFormRef.current, invalidField, CREATE_ERROR_ID, createStepHeadingRef.current),
+    [createStep, invalidField],
+  )
 
   async function reloadLatestRisk(id: string) {
     try {
@@ -236,17 +233,17 @@ export default function RiskWorkspace() {
     {mutationError ? <div role="alert" className="inline-status error-panel">{errorMessage(mutationError)}</div> : null}
     <form ref={createFormRef} noValidate onSubmit={attemptCreate} aria-labelledby="create-risk-title">
       <h2 id="create-risk-title">Create risk</h2>
-      <div className="wizard-stepper" role="group" aria-label="Create risk progress">
+      <ol className="wizard-stepper" aria-label="Create risk progress">
         {CREATE_STEPS.map((step, i) => (
-          <div className="wizard-step-node" key={step} aria-current={i === createStepIndex ? 'step' : undefined}>
+          <li className="wizard-step-node" key={step} aria-current={i === createStepIndex ? 'step' : undefined}>
             <span className={i < createStepIndex ? 'wizard-step-circle done' : i === createStepIndex ? 'wizard-step-circle active' : 'wizard-step-circle upcoming'}>
               {i < createStepIndex ? '✓' : i + 1}
             </span>
             <span className={i <= createStepIndex ? 'wizard-step-label on' : 'wizard-step-label'}>{CREATE_STEP_LABELS[step]}</span>
             {i < CREATE_STEPS.length - 1 ? <span className={i < createStepIndex ? 'wizard-step-line done' : 'wizard-step-line'} /> : null}
-          </div>
+          </li>
         ))}
-      </div>
+      </ol>
 
       {createStep === 'details' ? (
         <div className="field-form">
@@ -268,7 +265,7 @@ export default function RiskWorkspace() {
           <label>Trigger<input aria-label="Trigger" value={create.trigger} onChange={(e) => setCreate({ ...create, trigger: e.target.value })} /></label>
           <label>Review at<input aria-label="Review at" type="datetime-local" value={create.reviewAt} onChange={(e) => setCreate({ ...create, reviewAt: e.target.value })} /></label>
           <label>Project ID<input aria-label="Project ID" value={create.projectId} onChange={(e) => setCreate({ ...create, projectId: e.target.value })} /></label>
-          <label><input type="checkbox" checked={create.pinned} onChange={(e) => setCreate({ ...create, pinned: e.target.checked })} /> Pinned</label>
+          <label className="field-checkbox"><input type="checkbox" checked={create.pinned} onChange={(e) => setCreate({ ...create, pinned: e.target.checked })} /> Pinned</label>
           <div className="work-actions">
             <button type="button" onClick={goCreateBack}>Back</button>
             <button type="button" onClick={goCreateNext}>Continue</button>
@@ -285,8 +282,8 @@ export default function RiskWorkspace() {
             <div><dt>Status</dt><dd>{create.status}</dd></div>
             <div><dt>Mitigation</dt><dd>{create.mitigation || '—'}</dd></div>
             <div><dt>Trigger</dt><dd>{create.trigger || '—'}</dd></div>
-            <div><dt>Review at</dt><dd>{create.reviewAt || '—'}</dd></div>
-            <div><dt>Project ID</dt><dd>{create.projectId || '—'}</dd></div>
+            <div><dt>Review at</dt><dd className="is-machine-value">{create.reviewAt || '—'}</dd></div>
+            <div><dt>Project ID</dt><dd className="is-machine-value">{create.projectId || '—'}</dd></div>
             <div><dt>Pinned</dt><dd>{create.pinned ? 'Yes' : 'No'}</dd></div>
           </dl>
           <div className="work-actions">
@@ -322,7 +319,7 @@ export default function RiskWorkspace() {
       <label>Edit trigger<input aria-label="Edit trigger" value={edit.trigger} onChange={(e) => setEdit({ ...edit, trigger: e.target.value })} /></label>
       <label>Edit review at<input aria-label="Edit review at" type="datetime-local" value={edit.reviewAt} onChange={(e) => setEdit({ ...edit, reviewAt: e.target.value })} /></label>
       <label>Edit project ID<input aria-label="Edit project ID" value={edit.projectId} onChange={(e) => setEdit({ ...edit, projectId: e.target.value })} /></label>
-      <label><input aria-label="Edit pinned" type="checkbox" checked={edit.pinned} onChange={(e) => setEdit({ ...edit, pinned: e.target.checked })} /> Pinned</label>
+      <label className="field-checkbox"><input aria-label="Edit pinned" type="checkbox" checked={edit.pinned} onChange={(e) => setEdit({ ...edit, pinned: e.target.checked })} /> Pinned</label>
       {edit.reloadFailed ? <><p role="alert">Could not reload the latest risk. Your edits are preserved.</p><button type="button" disabled={pending} onClick={() => void reloadLatestRisk(edit.risk.id)}>Reload latest risk</button></> : edit.conflict ? <button type="button" disabled={pending} onClick={() => submitEdit()}>Retry with latest version</button> : <button type="submit" disabled={pending}>Save risk</button>}
       <button type="button" disabled={pending} onClick={() => setEdit(null)}>Discard edit</button>
     </form> : null}

@@ -180,10 +180,10 @@ export default function SharingReview() {
         </label>
         <fieldset>
           <legend>Actions to grant</legend>
-          <label>
+          <label className="field-checkbox">
             <input type="checkbox" checked={form.actions.includes('read')} onChange={() => toggleAction('read')} /> Read
           </label>
-          <label>
+          <label className="field-checkbox">
             <input type="checkbox" checked={form.actions.includes('write')} onChange={() => toggleAction('write')} /> Write
           </label>
         </fieldset>

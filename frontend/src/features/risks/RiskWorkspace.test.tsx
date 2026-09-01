@@ -242,6 +242,8 @@ describe('RiskWorkspace', () => {
     renderWorkspace()
 
     expect(await screen.findByText('No risks yet. Create one above to get started.')).toBeTruthy()
-    expect(screen.queryByRole('listitem')).toBeNull()
+    // scoped to the risk list itself, not `listitem` globally -- the wizard
+    // stepper above it is also a real `<ol>`/`<li>` list now
+    expect(document.querySelector('.work-list')?.children.length).toBe(0)
   })
 })

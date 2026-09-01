@@ -1,8 +1,8 @@
-import { useEffect, useRef, useState, type FormEvent } from 'react'
+import { useRef, useState, type FormEvent } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
 import { ApiError, apiRequest } from '../../api/client'
-import { applyWizardFieldInvalidState } from '../../lib/wizardFocus'
+import { applyWizardFieldInvalidState, useWizardStepFocus } from '../../lib/wizardFocus'
 import type { CalendarEvent, EntityList, EventDraft, Meeting, MeetingDraft } from './scheduleTypes'
 
 const emptyEvent: EventDraft = { title: '', startsAt: '', endsAt: '', timezone: 'UTC', allDay: false, location: '', description: '', status: 'confirmed' }
@@ -105,25 +105,20 @@ export default function ScheduleWorkspace() {
   const [formError, setFormError] = useState<string | null>(null)
   const [createEventStepIndex, setCreateEventStepIndex] = useState(0)
   const [createMeetingStepIndex, setCreateMeetingStepIndex] = useState(0)
-  const createEventStepHeadingRef = useRef<HTMLHeadingElement>(null)
-  const createMeetingStepHeadingRef = useRef<HTMLHeadingElement>(null)
   const createEventFormRef = useRef<HTMLFormElement>(null)
   const createMeetingFormRef = useRef<HTMLFormElement>(null)
-  const isCreateEventFirstRenderRef = useRef(true)
-  const isCreateMeetingFirstRenderRef = useRef(true)
   const createEventStep = CREATE_EVENT_STEPS[createEventStepIndex] ?? 'basics'
   const createMeetingStep = CREATE_MEETING_STEPS[createMeetingStepIndex] ?? 'basics'
   const [invalidEventField, setInvalidEventField] = useState<string | null>(null)
   const [invalidMeetingField, setInvalidMeetingField] = useState<string | null>(null)
-
-  useEffect(() => {
-    if (isCreateEventFirstRenderRef.current) { isCreateEventFirstRenderRef.current = false; return }
-    applyWizardFieldInvalidState(createEventFormRef.current, invalidEventField, SCHEDULE_ERROR_ID, createEventStepHeadingRef.current)
-  }, [createEventStep, invalidEventField])
-  useEffect(() => {
-    if (isCreateMeetingFirstRenderRef.current) { isCreateMeetingFirstRenderRef.current = false; return }
-    applyWizardFieldInvalidState(createMeetingFormRef.current, invalidMeetingField, SCHEDULE_ERROR_ID, createMeetingStepHeadingRef.current)
-  }, [createMeetingStep, invalidMeetingField])
+  const createEventStepHeadingRef = useWizardStepFocus(
+    () => applyWizardFieldInvalidState(createEventFormRef.current, invalidEventField, SCHEDULE_ERROR_ID, createEventStepHeadingRef.current),
+    [createEventStep, invalidEventField],
+  )
+  const createMeetingStepHeadingRef = useWizardStepFocus(
+    () => applyWizardFieldInvalidState(createMeetingFormRef.current, invalidMeetingField, SCHEDULE_ERROR_ID, createMeetingStepHeadingRef.current),
+    [createMeetingStep, invalidMeetingField],
+  )
   const refreshEvents = () => Promise.all([
     client.invalidateQueries({ queryKey: ['calendar-events'] }),
     client.invalidateQueries({ queryKey: ['dashboard', 'today'] }),
@@ -270,22 +265,22 @@ export default function ScheduleWorkspace() {
       <section className="work-panel">
         <h2 id="create-event-title">Create calendar event</h2>
         <form ref={createEventFormRef} noValidate onSubmit={attemptCreateEvent} aria-labelledby="create-event-title">
-        <div className="wizard-stepper" role="group" aria-label="Create event progress">
+        <ol className="wizard-stepper" aria-label="Create event progress">
           {CREATE_EVENT_STEPS.map((step, i) => (
-            <div className="wizard-step-node" key={step} aria-current={i === createEventStepIndex ? 'step' : undefined}>
+            <li className="wizard-step-node" key={step} aria-current={i === createEventStepIndex ? 'step' : undefined}>
               <span className={i < createEventStepIndex ? 'wizard-step-circle done' : i === createEventStepIndex ? 'wizard-step-circle active' : 'wizard-step-circle upcoming'}>{i < createEventStepIndex ? '✓' : i + 1}</span>
               <span className={i <= createEventStepIndex ? 'wizard-step-label on' : 'wizard-step-label'}>{CREATE_EVENT_STEP_LABELS[step]}</span>
               {i < CREATE_EVENT_STEPS.length - 1 ? <span className={i < createEventStepIndex ? 'wizard-step-line done' : 'wizard-step-line'} /> : null}
-            </div>
+            </li>
           ))}
-        </div>
+        </ol>
         {createEventStep === 'basics' ? (
           <div className="field-form">
             <p className="eyebrow">Step {createEventStepIndex + 1} of {CREATE_EVENT_STEPS.length} · Basics</p>
             <h3 ref={createEventStepHeadingRef} tabIndex={-1}>What and when?</h3>
             <label>Event title<input aria-label="Event title" value={createEvent.title} onChange={(e) => setCreateEvent({ ...createEvent, title: e.target.value })} /></label>
             <TimingFields prefix="Event" draft={createEvent} onChange={setCreateEvent} />
-            <label><input type="checkbox" checked={createEvent.allDay} onChange={(e) => setCreateEvent({ ...createEvent, allDay: e.target.checked })} /> All day</label>
+            <label className="field-checkbox"><input type="checkbox" checked={createEvent.allDay} onChange={(e) => setCreateEvent({ ...createEvent, allDay: e.target.checked })} /> All day</label>
             <div className="work-actions"><button type="button" onClick={goCreateEventNext}>Continue</button></div>
           </div>
         ) : createEventStep === 'details' ? (
@@ -302,9 +297,9 @@ export default function ScheduleWorkspace() {
             <h3 ref={createEventStepHeadingRef} tabIndex={-1}>Review and create</h3>
             <dl>
               <div><dt>Title</dt><dd>{createEvent.title || '—'}</dd></div>
-              <div><dt>Start</dt><dd>{createEvent.startsAt || '—'}</dd></div>
-              <div><dt>End</dt><dd>{createEvent.endsAt || '—'}</dd></div>
-              <div><dt>Timezone</dt><dd>{createEvent.timezone || '—'}</dd></div>
+              <div><dt>Start</dt><dd className="is-machine-value">{createEvent.startsAt || '—'}</dd></div>
+              <div><dt>End</dt><dd className="is-machine-value">{createEvent.endsAt || '—'}</dd></div>
+              <div><dt>Timezone</dt><dd className="is-machine-value">{createEvent.timezone || '—'}</dd></div>
               <div><dt>All day</dt><dd>{createEvent.allDay ? 'Yes' : 'No'}</dd></div>
               <div><dt>Location</dt><dd>{createEvent.location || '—'}</dd></div>
               <div><dt>Description</dt><dd>{createEvent.description || '—'}</dd></div>
@@ -317,15 +312,15 @@ export default function ScheduleWorkspace() {
       <section className="work-panel">
         <h2 id="create-meeting-title">Create meeting</h2>
         <form ref={createMeetingFormRef} noValidate onSubmit={attemptCreateMeeting} aria-labelledby="create-meeting-title">
-        <div className="wizard-stepper" role="group" aria-label="Create meeting progress">
+        <ol className="wizard-stepper" aria-label="Create meeting progress">
           {CREATE_MEETING_STEPS.map((step, i) => (
-            <div className="wizard-step-node" key={step} aria-current={i === createMeetingStepIndex ? 'step' : undefined}>
+            <li className="wizard-step-node" key={step} aria-current={i === createMeetingStepIndex ? 'step' : undefined}>
               <span className={i < createMeetingStepIndex ? 'wizard-step-circle done' : i === createMeetingStepIndex ? 'wizard-step-circle active' : 'wizard-step-circle upcoming'}>{i < createMeetingStepIndex ? '✓' : i + 1}</span>
               <span className={i <= createMeetingStepIndex ? 'wizard-step-label on' : 'wizard-step-label'}>{CREATE_MEETING_STEP_LABELS[step]}</span>
               {i < CREATE_MEETING_STEPS.length - 1 ? <span className={i < createMeetingStepIndex ? 'wizard-step-line done' : 'wizard-step-line'} /> : null}
-            </div>
+            </li>
           ))}
-        </div>
+        </ol>
         {createMeetingStep === 'basics' ? (
           <div className="field-form">
             <p className="eyebrow">Step {createMeetingStepIndex + 1} of {CREATE_MEETING_STEPS.length} · Basics</p>
@@ -353,9 +348,9 @@ export default function ScheduleWorkspace() {
               <div><dt>Title</dt><dd>{createMeeting.title || '—'}</dd></div>
               <div><dt>Linked event</dt><dd>{createMeeting.calendarEventId ? (events.data?.items ?? []).find((item) => item.id === createMeeting.calendarEventId)?.title ?? createMeeting.calendarEventId : 'Standalone'}</dd></div>
               {!createMeeting.calendarEventId ? <>
-                <div><dt>Start</dt><dd>{createMeeting.startsAt || '—'}</dd></div>
-                <div><dt>End</dt><dd>{createMeeting.endsAt || '—'}</dd></div>
-                <div><dt>Timezone</dt><dd>{createMeeting.timezone || '—'}</dd></div>
+                <div><dt>Start</dt><dd className="is-machine-value">{createMeeting.startsAt || '—'}</dd></div>
+                <div><dt>End</dt><dd className="is-machine-value">{createMeeting.endsAt || '—'}</dd></div>
+                <div><dt>Timezone</dt><dd className="is-machine-value">{createMeeting.timezone || '—'}</dd></div>
               </> : null}
               <div><dt>Status</dt><dd>{createMeeting.status}</dd></div>
               <div><dt>Agenda</dt><dd>{createMeeting.agenda || '—'}</dd></div>
@@ -384,7 +379,7 @@ export default function ScheduleWorkspace() {
     </div>
     {editEvent ? <section className="work-panel"><form className="field-form" onSubmit={submitEventEdit}><h2>Edit calendar event</h2><p>This calendar event is the authoritative timing record.</p>
       <label>Edit event title<input aria-label="Edit event title" value={editEvent.title} onChange={(e) => setEditEvent({ ...editEvent, title: e.target.value })} /></label><TimingFields prefix="Edit event" draft={editEvent} onChange={(value) => setEditEvent({ ...editEvent, ...value })} />
-      <label><input aria-label="Edit event all day" type="checkbox" checked={editEvent.allDay} onChange={(e) => setEditEvent({ ...editEvent, allDay: e.target.checked })} /> All day</label>
+      <label className="field-checkbox"><input aria-label="Edit event all day" type="checkbox" checked={editEvent.allDay} onChange={(e) => setEditEvent({ ...editEvent, allDay: e.target.checked })} /> All day</label>
       <label>Edit event location<input aria-label="Edit event location" value={editEvent.location} onChange={(e) => setEditEvent({ ...editEvent, location: e.target.value })} /></label>
       <label>Edit event description<textarea aria-label="Edit event description" value={editEvent.description} onChange={(e) => setEditEvent({ ...editEvent, description: e.target.value })} /></label>
       <label>Edit event status<select aria-label="Edit event status" value={editEvent.status} onChange={(e) => setEditEvent({ ...editEvent, status: e.target.value as EventDraft['status'] })}><option value="confirmed">confirmed</option><option value="tentative">tentative</option><option value="cancelled">cancelled</option></select></label>

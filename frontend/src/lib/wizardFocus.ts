@@ -1,3 +1,26 @@
+import { useEffect, useRef, type DependencyList, type RefObject } from 'react'
+
+/** Every wizard's step-heading focus management is the same three pieces --
+ * a heading ref, a first-render guard (so mounting the wizard doesn't yank
+ * focus onto its own heading before any real step change happened), and an
+ * effect that runs `onStepChange` on every later change to `deps`. Centralizes
+ * what used to be duplicated per wizard (`RiskWorkspace`, `WorkflowList`,
+ * `PolicyPanel`, `ScheduleWorkspace` x2, `ConnectorHealthPanel`). `deps` is
+ * forwarded straight to the internal `useEffect`, so pass exactly what that
+ * wizard's step change actually depends on -- `[step]`, `[step, invalidField]`,
+ * or (`ConnectorHealthPanel`) `[step, connected]`. */
+export function useWizardStepFocus(onStepChange: () => void, deps: DependencyList): RefObject<HTMLHeadingElement | null> {
+  const headingRef = useRef<HTMLHeadingElement>(null)
+  const isFirstRenderRef = useRef(true)
+  useEffect(() => {
+    if (isFirstRenderRef.current) { isFirstRenderRef.current = false; return }
+    onStepChange()
+    // deps is caller-supplied on purpose -- each wizard passes exactly its own step-change dependencies.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, deps)
+  return headingRef
+}
+
 /** Finds a wizard field by its accessible name -- either an explicit
  * `aria-label`, or the visible text of its wrapping `<label>` (WCAG 2.5.3
  * fields that rely on native label association instead of a redundant
