@@ -1373,7 +1373,7 @@ def _prepare_meeting_prep_request(
     rendered_prompt = _render_meeting_prep_prompt(
         prompt.template,
         objective=(
-            'Meeting objective (background only, not itself a citable item -- '
+            "Meeting objective (background only, not itself a citable item -- "
             'every citable id is formatted id="..." in a section below):\n'
             + _wrap_untrusted_data(
                 "the meeting's objective, sourced from its workspace-record "

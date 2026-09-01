@@ -2656,7 +2656,7 @@ def test_execute_run_meeting_prep_summary_objective_block_states_it_has_no_citab
     sent_prompt = json.loads(captured_requests[0].content)["prompt"]
 
     disambiguation = (
-        'Meeting objective (background only, not itself a citable item -- '
+        "Meeting objective (background only, not itself a citable item -- "
         'every citable id is formatted id="..." in a section below):'
     )
     assert disambiguation in sent_prompt
@@ -2669,8 +2669,7 @@ def test_execute_run_meeting_prep_summary_objective_block_states_it_has_no_citab
     first_begin = sent_prompt.index("BEGIN UNTRUSTED DATA")
     disambiguation_index = sent_prompt.index(disambiguation)
     assert disambiguation_index < first_begin, (
-        "the clarifying line must precede the objective's own delimiter pair, "
-        "not live inside it"
+        "the clarifying line must precede the objective's own delimiter pair, not live inside it"
     )
 
     # The delimiter's own BEGIN line -- the exact text Phase N's live-Ollama
