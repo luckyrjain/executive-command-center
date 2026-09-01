@@ -118,17 +118,20 @@ export default function App() {
         {dashboard.data?.stale ? <div className="status-panel degraded-panel" role="status">Dashboard data may be stale.</div> : null}
 
         {sections ? (
+          <Section title="Top priorities" items={sections.top_priorities} emptyMessage="No ranked priorities need attention." variant="panel" />
+        ) : null}
+
+        <MorningBrief />
+
+        {sections ? (
           <div className="dashboard-grid">
             <Section title="Schedule" items={sections.today_schedule} emptyMessage="No meetings scheduled for today." />
-            <Section title="Top priorities" items={sections.top_priorities} emptyMessage="No ranked priorities need attention." />
             <Section title="Overdue commitments" items={sections.overdue_commitments} emptyMessage="No overdue commitments." />
             <Section title="Open risks" items={sections.risks} emptyMessage="No active risks." />
             <Section title="Waiting on" items={sections.waiting_on} emptyMessage="Nothing is currently blocked on others." />
             <Section title="Recent changes" items={sections.recently_changed} emptyMessage="No recent changes." />
           </div>
         ) : null}
-
-        <MorningBrief />
         </>}
       </div>
     </main>

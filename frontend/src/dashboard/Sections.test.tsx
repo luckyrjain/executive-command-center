@@ -32,4 +32,14 @@ describe('Section', () => {
     render(<Section title="Schedule" items={[]} emptyMessage="No meetings scheduled for today." />)
     expect(screen.getByText('No meetings scheduled for today.')).toBeTruthy()
   })
+
+  it('defaults to the dashboard-card surface', () => {
+    render(<Section title="Schedule" items={[]} emptyMessage="Nothing here." />)
+    expect(document.getElementById('section-schedule')?.closest('section')?.className).toBe('dashboard-card')
+  })
+
+  it('renders as the promoted work-panel surface when variant="panel"', () => {
+    render(<Section title="Top priorities" items={[]} emptyMessage="Nothing here." variant="panel" />)
+    expect(document.getElementById('section-top-priorities')?.closest('section')?.className).toBe('work-panel')
+  })
 })

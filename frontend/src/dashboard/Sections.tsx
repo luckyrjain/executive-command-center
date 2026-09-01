@@ -40,13 +40,19 @@ type SectionProps = {
   // `brief-section-` -- distinct ids since both can render on the same
   // page (the 'today' tab mounts both).
   headingIdPrefix?: string
+  // 'panel' promotes this section to the page's single dominant anchor
+  // (DESIGN.md's "Building a new page" Hierarchy rules) -- same .work-panel
+  // primitive every other page's primary content uses, not a new one.
+  // Everything else about the section (heading, item list, empty state)
+  // stays identical; only the outer surface changes weight.
+  variant?: 'card' | 'panel'
 }
 
-export function Section({ title, items, emptyMessage, headingIdPrefix = 'section-' }: SectionProps) {
+export function Section({ title, items, emptyMessage, headingIdPrefix = 'section-', variant = 'card' }: SectionProps) {
   const visible = visibleItems(items)
   const headingId = `${headingIdPrefix}${title.replaceAll(' ', '-').toLowerCase()}`
   return (
-    <section className="dashboard-card" aria-labelledby={headingId}>
+    <section className={variant === 'panel' ? 'work-panel' : 'dashboard-card'} aria-labelledby={headingId}>
       <div className="section-heading">
         <h2 id={headingId}>{title}</h2>
         <span aria-label={`${visible.length} items`}>{visible.length}</span>
