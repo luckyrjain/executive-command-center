@@ -223,7 +223,7 @@ export default function RecordsPanel() {
             </fieldset>
 
             {classification === 'high_stakes' ? (
-              <label>
+              <label className="field-checkbox">
                 <input
                   type="checkbox"
                   checked={retentionAcknowledged}

@@ -575,7 +575,7 @@ describe('ConnectorHealthPanel', () => {
     renderPanel()
 
     await screen.findByText('No connectors are configured for this workspace yet.')
-    const stepper = () => screen.getByRole('group', { name: 'Setup progress' })
+    const stepper = () => screen.getByRole('list', { name: 'Setup progress' })
 
     pickProvider('GitLab')
     expect(within(stepper()).getByText('Provider').className).toContain('on')
@@ -596,7 +596,7 @@ describe('ConnectorHealthPanel', () => {
     renderPanel()
 
     await screen.findByText('No connectors are configured for this workspace yet.')
-    const stepper = () => screen.getByRole('group', { name: 'Setup progress' })
+    const stepper = () => screen.getByRole('list', { name: 'Setup progress' })
 
     expect(within(stepper()).getByText('Provider').closest('[aria-current="step"]')).toBeTruthy()
     clickContinue() // -> token

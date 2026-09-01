@@ -1,9 +1,9 @@
-import { useEffect, useRef, useState, type FormEvent } from 'react'
+import { useRef, useState, type FormEvent } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
 import { ApiError, apiRequest } from '../../api/client'
 import { apiErrorMessage } from '../../api/errorMessage'
-import { applyWizardFieldInvalidState } from '../../lib/wizardFocus'
+import { applyWizardFieldInvalidState, useWizardStepFocus } from '../../lib/wizardFocus'
 import type { ApprovalMode, Policy, PolicyListResponse } from './types'
 
 const APPROVAL_MODES: ApprovalMode[] = ['preview_only', 'per_run', 'bounded_recurring']
@@ -53,16 +53,13 @@ export default function PolicyPanel() {
   const [draft, setDraft] = useState<Draft>(emptyDraft)
   const [formError, setFormError] = useState<string | null>(null)
   const [createStepIndex, setCreateStepIndex] = useState(0)
-  const createStepHeadingRef = useRef<HTMLHeadingElement>(null)
   const createFormRef = useRef<HTMLFormElement>(null)
-  const isCreateFirstRenderRef = useRef(true)
   const createStep = CREATE_STEPS[createStepIndex] ?? 'scope'
   const [invalidField, setInvalidField] = useState<string | null>(null)
-
-  useEffect(() => {
-    if (isCreateFirstRenderRef.current) { isCreateFirstRenderRef.current = false; return }
-    applyWizardFieldInvalidState(createFormRef.current, invalidField, CREATE_ERROR_ID, createStepHeadingRef.current)
-  }, [createStep, invalidField])
+  const createStepHeadingRef = useWizardStepFocus(
+    () => applyWizardFieldInvalidState(createFormRef.current, invalidField, CREATE_ERROR_ID, createStepHeadingRef.current),
+    [createStep, invalidField],
+  )
 
   const query = useQuery({
     queryKey: ['automation', 'policies', workflowFilter],
@@ -167,15 +164,15 @@ export default function PolicyPanel() {
         {formError ? <div id={CREATE_ERROR_ID} role="alert" className="inline-status error-panel">{formError}</div> : null}
         {createMutation.isError ? <div role="alert" className="inline-status error-panel">{errorMessage(createMutation.error)}</div> : null}
 
-        <div className="wizard-stepper" role="group" aria-label="Create policy progress">
+        <ol className="wizard-stepper" aria-label="Create policy progress">
           {CREATE_STEPS.map((step, i) => (
-            <div className="wizard-step-node" key={step} aria-current={i === createStepIndex ? 'step' : undefined}>
+            <li className="wizard-step-node" key={step} aria-current={i === createStepIndex ? 'step' : undefined}>
               <span className={i < createStepIndex ? 'wizard-step-circle done' : i === createStepIndex ? 'wizard-step-circle active' : 'wizard-step-circle upcoming'}>{i < createStepIndex ? '✓' : i + 1}</span>
               <span className={i <= createStepIndex ? 'wizard-step-label on' : 'wizard-step-label'}>{CREATE_STEP_LABELS[step]}</span>
               {i < CREATE_STEPS.length - 1 ? <span className={i < createStepIndex ? 'wizard-step-line done' : 'wizard-step-line'} /> : null}
-            </div>
+            </li>
           ))}
-        </div>
+        </ol>
 
         {createStep === 'scope' ? (
           <div className="field-form">
@@ -217,7 +214,7 @@ export default function PolicyPanel() {
             <p className="eyebrow">Step {createStepIndex + 1} of {CREATE_STEPS.length} · Review</p>
             <h4 ref={createStepHeadingRef} tabIndex={-1}>Review and create</h4>
             <dl>
-              <div><dt>Workflow ID</dt><dd>{draft.workflowId || '—'}</dd></div>
+              <div><dt>Workflow ID</dt><dd className="is-machine-value">{draft.workflowId || '—'}</dd></div>
               <div><dt>Action types</dt><dd>{draft.actionTypes || '—'}</dd></div>
               <div><dt>Data classes</dt><dd>{draft.dataClasses || '—'}</dd></div>
               <div><dt>Value limit</dt><dd>{draft.valueLimit}</dd></div>

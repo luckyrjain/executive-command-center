@@ -1,8 +1,9 @@
-import { useEffect, useRef, useState } from 'react'
+import { useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
 import { ApiError, apiRequest } from '../../api/client'
 import { apiErrorMessage } from '../../api/errorMessage'
+import { useWizardStepFocus } from '../../lib/wizardFocus'
 import type {
   ConnectorAccount,
   ConnectorAccountListResponse,
@@ -122,14 +123,18 @@ function maskTail(value: string): string {
   return '•••• ' + value.slice(-4).padStart(4, '•')
 }
 
-function reviewRows(provider: ConnectorProvider, fields: CredentialFields): Array<{ label: string; value: string }> {
-  const rows = [{ label: 'Provider', value: PROVIDER_LABELS[provider] }]
+function reviewRows(provider: ConnectorProvider, fields: CredentialFields): Array<{ label: string; value: string; machine?: boolean }> {
+  // `Provider` is a human display name (PROVIDER_LABELS), not a machine-shaped
+  // value, so it's the one row that stays off `machine: true` -- everything
+  // else here (host, site, email, masked token/app key) is genuinely
+  // ID/credential-shaped and gets the review step's monospace treatment.
+  const rows: Array<{ label: string; value: string; machine?: boolean }> = [{ label: 'Provider', value: PROVIDER_LABELS[provider] }]
   for (const step of PROVIDER_FIELD_STEPS[provider]) {
-    if (step === 'host') rows.push({ label: 'Host', value: fields.host.trim() || 'gitlab.com' })
-    else if (step === 'site') rows.push({ label: stepShortLabel(provider, 'site'), value: fields.site })
-    else if (step === 'email') rows.push({ label: 'Email', value: fields.email })
-    else if (step === 'token') rows.push({ label: tokenFieldLabel(provider), value: maskTail(fields.token) })
-    else if (step === 'appKey') rows.push({ label: 'Application key', value: maskTail(fields.appKey) })
+    if (step === 'host') rows.push({ label: 'Host', value: fields.host.trim() || 'gitlab.com', machine: true })
+    else if (step === 'site') rows.push({ label: stepShortLabel(provider, 'site'), value: fields.site, machine: true })
+    else if (step === 'email') rows.push({ label: 'Email', value: fields.email, machine: true })
+    else if (step === 'token') rows.push({ label: tokenFieldLabel(provider), value: maskTail(fields.token), machine: true })
+    else if (step === 'appKey') rows.push({ label: 'Application key', value: maskTail(fields.appKey), machine: true })
   }
   return rows
 }
@@ -492,23 +497,6 @@ export default function ConnectorHealthPanel() {
   const [fields, setFields] = useState<CredentialFields>(() => emptyCredentialFields('github'))
   const [stepIndex, setStepIndex] = useState(0)
   const [connected, setConnected] = useState<ConnectorAccount | null>(null)
-  // Moves focus to the incoming step's own heading on every step change --
-  // each step is a different conditional branch below, so without this a
-  // keyboard/screen-reader user's focus (on the Continue/Back/tile button
-  // they just activated) is simply dropped to `<body>` when that button
-  // unmounts, same class of problem `MembersPanel.tsx`'s own trigger-focus
-  // effect exists to prevent. `tabIndex={-1}` on the heading (below) is
-  // what makes a non-interactive element a valid `.focus()` target.
-  const stepHeadingRef = useRef<HTMLHeadingElement>(null)
-  // `useEffect` also runs after the component's very first render, not
-  // only on a later change to its deps -- without this guard, simply
-  // opening the Engineering tab (no click at all) would yank focus onto
-  // the wizard's own heading, skipping past the panel's `<h2>`/`<h3>` and
-  // resetting tab order for every ordinary page visit, not just a real
-  // step transition. Mirrors `MembersPanel.tsx`'s own `wasConfirmingRef`
-  // guard for the identical reason.
-  const isFirstRenderRef = useRef(true)
-
   const connectors = useQuery({
     queryKey: ['engineering', 'connectors'],
     queryFn: () => apiRequest<ConnectorAccountListResponse>('/api/v1/engineering/connectors'),
@@ -553,13 +541,17 @@ export default function ConnectorHealthPanel() {
   const steps = stepsFor(provider)
   const currentStep = steps[stepIndex] ?? 'provider'
 
-  useEffect(() => {
-    if (isFirstRenderRef.current) {
-      isFirstRenderRef.current = false
-      return
-    }
-    stepHeadingRef.current?.focus()
-  }, [currentStep, connected])
+  // Moves focus to the incoming step's own heading on every step change --
+  // each step is a different conditional branch below, so without this a
+  // keyboard/screen-reader user's focus (on the Continue/Back/tile button
+  // they just activated) is simply dropped to `<body>` when that button
+  // unmounts, same class of problem `MembersPanel.tsx`'s own trigger-focus
+  // effect exists to prevent. `tabIndex={-1}` on the heading (below) is
+  // what makes a non-interactive element a valid `.focus()` target. The
+  // first-render guard (mounting the Engineering tab must not yank focus
+  // onto the wizard before any real step change happened) lives inside
+  // `useWizardStepFocus` itself now.
+  const stepHeadingRef = useWizardStepFocus(() => stepHeadingRef.current?.focus(), [currentStep, connected])
 
   function goNext() {
     setStepIndex((i) => Math.min(i + 1, steps.length - 1))
@@ -601,17 +593,17 @@ export default function ConnectorHealthPanel() {
           </div>
         ) : (
           <>
-            <div className="wizard-stepper" role="group" aria-label="Setup progress">
+            <ol className="wizard-stepper" aria-label="Setup progress">
               {steps.map((step, i) => (
-                <div className="wizard-step-node" key={step} aria-current={i === stepIndex ? 'step' : undefined}>
+                <li className="wizard-step-node" key={step} aria-current={i === stepIndex ? 'step' : undefined}>
                   <span className={i < stepIndex ? 'wizard-step-circle done' : i === stepIndex ? 'wizard-step-circle active' : 'wizard-step-circle upcoming'}>
                     {i < stepIndex ? '✓' : i + 1}
                   </span>
                   <span className={i <= stepIndex ? 'wizard-step-label on' : 'wizard-step-label'}>{stepShortLabel(provider, step)}</span>
                   {i < steps.length - 1 ? <span className={i < stepIndex ? 'wizard-step-line done' : 'wizard-step-line'} /> : null}
-                </div>
+                </li>
               ))}
-            </div>
+            </ol>
 
             {currentStep === 'provider' ? (
               <div>
@@ -636,7 +628,7 @@ export default function ConnectorHealthPanel() {
                   {reviewRows(provider, fields).map((row) => (
                     <div key={row.label}>
                       <dt>{row.label}</dt>
-                      <dd>{row.value}</dd>
+                      <dd className={row.machine ? 'is-machine-value' : undefined}>{row.value}</dd>
                     </div>
                   ))}
                 </dl>
