@@ -87,7 +87,7 @@ function SuggestionRow({ group, teamsById }: { group: TeamSuggestionGroup; teams
           <li key={`${item.resource_type}-${item.id}`}>{`${item.name} (${item.resource_type})`}</li>
         ))}
       </ul>
-      <div className="work-actions field-form">
+      <div className="field-form">
         <label>
           {`Assign team for ${group.suggested_team_name}`}
           <select
@@ -100,6 +100,8 @@ function SuggestionRow({ group, teamsById }: { group: TeamSuggestionGroup; teams
             {[...teamsById.entries()].map(([id, name]) => <option key={id} value={id}>{name}</option>)}
           </select>
         </label>
+      </div>
+      <div className="work-actions">
         <button type="button" disabled={!teamEntityId || busy} onClick={() => confirmMutation.mutate()}>
           Confirm
         </button>
@@ -107,7 +109,7 @@ function SuggestionRow({ group, teamsById }: { group: TeamSuggestionGroup; teams
           Dismiss
         </button>
       </div>
-      <div className="work-actions field-form">
+      <div className="field-form">
         <label>
           {`New team name for ${group.suggested_team_name}`}
           <input
@@ -118,6 +120,8 @@ function SuggestionRow({ group, teamsById }: { group: TeamSuggestionGroup; teams
             onChange={(event) => setNewTeamName(event.target.value)}
           />
         </label>
+      </div>
+      <div className="work-actions">
         <button
           type="button"
           disabled={!newTeamName.trim() || busy}

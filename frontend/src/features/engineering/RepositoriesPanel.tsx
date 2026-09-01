@@ -78,22 +78,24 @@ function TeamAssignment({
   const assignedTeamMissing = repository.team_entity_id !== null && !teamsById.has(repository.team_entity_id)
 
   return (
-    <div className="work-actions field-form">
-      <label>
-        {`Team for ${repository.name}`}
-        <select
-          aria-label={`Team for ${repository.name}`}
-          value={repository.team_entity_id ?? ''}
-          disabled={mutation.isPending}
-          onChange={(event) => mutation.mutate(event.target.value === '' ? null : event.target.value)}
-        >
-          <option value="">Unassigned</option>
-          {assignedTeamMissing ? (
-            <option value={repository.team_entity_id ?? ''}>Assigned team (not in first 100)</option>
-          ) : null}
-          {[...teamsById.entries()].map(([id, name]) => <option key={id} value={id}>{name}</option>)}
-        </select>
-      </label>
+    <div className="work-actions">
+      <div className="field-form">
+        <label>
+          {`Team for ${repository.name}`}
+          <select
+            aria-label={`Team for ${repository.name}`}
+            value={repository.team_entity_id ?? ''}
+            disabled={mutation.isPending}
+            onChange={(event) => mutation.mutate(event.target.value === '' ? null : event.target.value)}
+          >
+            <option value="">Unassigned</option>
+            {assignedTeamMissing ? (
+              <option value={repository.team_entity_id ?? ''}>Assigned team (not in first 100)</option>
+            ) : null}
+            {[...teamsById.entries()].map(([id, name]) => <option key={id} value={id}>{name}</option>)}
+          </select>
+        </label>
+      </div>
       {!repository.team_entity_id && repository.suggested_team_name ? (
         <small>suggested: {repository.suggested_team_name}</small>
       ) : null}

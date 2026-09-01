@@ -1,4 +1,4 @@
-import { useRef, useState, type FormEvent } from 'react'
+import { useState, type FormEvent } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
 import { ApiError, apiRequest } from '../../api/client'
@@ -498,7 +498,6 @@ export default function ConnectorHealthPanel() {
   const [fields, setFields] = useState<CredentialFields>(() => emptyCredentialFields('github'))
   const [stepIndex, setStepIndex] = useState(0)
   const [connected, setConnected] = useState<ConnectorAccount | null>(null)
-  const formRef = useRef<HTMLFormElement>(null)
   const connectors = useQuery({
     queryKey: ['engineering', 'connectors'],
     queryFn: () => apiRequest<ConnectorAccountListResponse>('/api/v1/engineering/connectors'),
@@ -540,20 +539,29 @@ export default function ConnectorHealthPanel() {
     void queryClient.invalidateQueries({ queryKey: ['engineering', 'sync-runs'] })
   }
 
+  const steps = stepsFor(provider)
+  const currentStep = steps[stepIndex] ?? 'provider'
+
   // No per-field `invalidField` navigation here (unlike the terminal-validation
   // wizards in DESIGN.md) -- every step's own Continue button already gates on
   // `isStepComplete`, so a user can't reach Review with an incomplete required
-  // field the way those wizards' non-blocking Continue allows. The `disabled`
-  // check is repeated here as a guard against a stray Enter-to-submit, not
-  // because the UI can otherwise reach this handler incomplete.
+  // field the way those wizards' non-blocking Continue allows.
+  //
+  // The `currentStep === 'review'` check below is load-bearing, not
+  // defensive redundancy: a field step with exactly one text/password input
+  // and no submit button in the DOM (Continue/Back are both type="button")
+  // still triggers the browser's legacy single-field implicit-submission on
+  // Enter (WHATWG HTML "implicit submission" -- a form with no submit
+  // button but one blocking text field submits anyway). Without this guard,
+  // pressing Enter while filling in, say, GitHub's only field (`token`)
+  // would fire this handler as soon as `isCredentialComplete` turns true --
+  // skipping the Review step's confirmation entirely, the one thing this
+  // wizard's whole step/review structure exists to force.
   function attemptCreate(event: FormEvent) {
     event.preventDefault()
-    if (!isCredentialComplete(provider, fields)) return
+    if (currentStep !== 'review' || !isCredentialComplete(provider, fields)) return
     createMutation.mutate()
   }
-
-  const steps = stepsFor(provider)
-  const currentStep = steps[stepIndex] ?? 'provider'
 
   // Moves focus to the incoming step's own heading on every step change --
   // each step is a different conditional branch below, so without this a
@@ -606,7 +614,7 @@ export default function ConnectorHealthPanel() {
             </div>
           </div>
         ) : (
-          <form ref={formRef} noValidate onSubmit={attemptCreate} aria-labelledby="connector-connect-title">
+          <form noValidate onSubmit={attemptCreate} aria-labelledby="connector-connect-title">
             <ol className="wizard-stepper" aria-label="Setup progress">
               {steps.map((step, i) => (
                 <li className="wizard-step-node" key={step} aria-current={i === stepIndex ? 'step' : undefined}>

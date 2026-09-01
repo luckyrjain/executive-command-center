@@ -63,7 +63,7 @@ function ThreadDetail({ threadId, onForgotten }: { threadId: string; onForgotten
   })
 
   return (
-    <div style={{ marginTop: 'var(--space-8)' }} role="region" aria-label={thread.data?.subject ?? 'Thread'}>
+    <div className="nested-section" role="region" aria-label={thread.data?.subject ?? 'Thread'}>
       {thread.isLoading ? <p role="status">Loading thread…</p> : null}
       {thread.isError ? <div role="alert" className="inline-status error-panel">{personalErrorMessage(thread.error)}</div> : null}
       {thread.data ? (
@@ -271,7 +271,7 @@ export default function GmailPanel() {
       {connectors.isError ? <div role="alert" className="inline-status error-panel">{personalErrorMessage(connectors.error)}</div> : null}
 
       {activeAccount ? (
-        <div style={{ marginTop: 'var(--space-8)' }}>
+        <div className="nested-section">
           <div>
             <strong>{activeAccount.display_name}</strong>
             <small> · last synced {formatTimestamp(activeAccount.last_synced_at)}</small>
