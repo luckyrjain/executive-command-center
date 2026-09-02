@@ -142,6 +142,14 @@ export default function RecordsPanel() {
     setFields((current) => current.map((field, fieldIndex) => (fieldIndex === index ? { ...field, ...patch } : field)))
   }
 
+  // Removing the last remaining row resets to one empty row rather than
+  // zero -- an empty fieldset with only an "Add field" button gives no
+  // visual sign a row is expected, the same affordance the initial state
+  // (one empty row) already establishes.
+  function removeField(index: number) {
+    setFields((current) => (current.length > 1 ? current.filter((_, fieldIndex) => fieldIndex !== index) : [{ key: '', value: '' }]))
+  }
+
   const items = records.data?.records ?? []
   const canSubmit = recordType.trim().length > 0 && (classification !== 'high_stakes' || retentionAcknowledged)
 
@@ -217,6 +225,9 @@ export default function RecordsPanel() {
                     value={field.value}
                     onChange={(event) => updateField(index, { value: event.target.value })}
                   />
+                  <button type="button" aria-label={`Remove field ${index + 1}`} onClick={() => removeField(index)}>
+                    Remove
+                  </button>
                 </div>
               ))}
               <button type="button" onClick={() => setFields((current) => [...current, { key: '', value: '' }])}>

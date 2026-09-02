@@ -145,6 +145,29 @@ describe('RecordsPanel', () => {
     })
   })
 
+  it('removes a field row, and leaves one empty row behind when removing the last one', async () => {
+    vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url.includes('/records')) return response({ records: [] })
+      return response({ domains: [domain({ domain_key: 'habits', enabled: true })] })
+    }))
+    renderPanel()
+
+    await screen.findByText('No records yet for Habits.')
+    fireEvent.click(screen.getByRole('button', { name: 'Add field' }))
+    expect(screen.getByLabelText('Field name 2')).toBeTruthy()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Remove field 2' }))
+    expect(screen.queryByLabelText('Field name 2')).toBeNull()
+    expect(screen.getByLabelText('Field name 1')).toBeTruthy()
+
+    fireEvent.change(screen.getByLabelText('Field name 1'), { target: { value: 'text' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Remove field 1' }))
+    // Removing the last remaining row resets to one empty row, not zero --
+    // the field name/value inputs are still there, just cleared.
+    expect((screen.getByLabelText('Field name 1') as HTMLInputElement).value).toBe('')
+  })
+
   it('surfaces RETENTION_ACKNOWLEDGEMENT_REQUIRED as a readable sentence', async () => {
     const fetch = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input)
