@@ -157,20 +157,20 @@ def test_check_promotion_floors_latency_ceiling_is_task_type_specific() -> None:
 
 
 def test_check_promotion_floors_meeting_prep_summary_fails_at_or_above_its_own_ceiling() -> None:
-    """35.0s (phase H, raised from 25.0s -- four consistent live-model
-    runs all landed p95 30.9-31.4s with every other floor clearing
-    cleanly each time; see `evaluation.py`'s own updated comment on
-    `_LATENCY_P95_CEILING_SECONDS_BY_TASK_TYPE`).
+    """40.0s (phase O follow-up, raised from 35.0s -- four fresh live-model
+    runs on PR #215 measured p95 32.10s, 31.27s, 36.53s, 36.03s, two
+    genuinely over the old ceiling; see `evaluation.py`'s own updated
+    comment on `_LATENCY_P95_CEILING_SECONDS_BY_TASK_TYPE`).
     """
     assert (
         check_promotion_floors(
-            _run(_metrics(latency_p95_seconds=35.0), task_type="meeting.prep_summary")
+            _run(_metrics(latency_p95_seconds=40.0), task_type="meeting.prep_summary")
         )
         is False
     )
     assert (
         check_promotion_floors(
-            _run(_metrics(latency_p95_seconds=34.999), task_type="meeting.prep_summary")
+            _run(_metrics(latency_p95_seconds=39.999), task_type="meeting.prep_summary")
         )
         is True
     )
