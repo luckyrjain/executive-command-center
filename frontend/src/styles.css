@@ -127,6 +127,15 @@ button, input, textarea, select { font: inherit; }
 }
 
 h1 { margin: 0; font-size: clamp(42px, 7vw, 78px); line-height: .94; letter-spacing: -.045em; }
+/* The dashboard's own "Today" h1 -- scoped to `.topbar` (used nowhere else)
+ * rather than changing the shared h1 rule above, which every other
+ * workspace page's title also uses. At the full 78px hero size, "Today"
+ * visually outweighed the page's own primary content (the promoted Top
+ * priorities panel, a `.work-panel h2` at clamp(28px, 4vw, 44px)) by
+ * nearly 2x for one orienting word with no informational payload of its
+ * own. Still clearly the largest text on the page -- a title should
+ * outrank its content -- just not by that much. */
+.topbar h1 { font-size: clamp(32px, 5vw, 56px); line-height: 1.05; letter-spacing: -.035em; }
 .subtitle { margin: 14px 0 0; color: var(--color-text-muted); }
 
 button {
