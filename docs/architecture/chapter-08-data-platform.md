@@ -35,6 +35,23 @@ This allows storage technologies to evolve independently of application logic.
 
 ---
 
+# Implementation Status (as of 2026-09-04, see SCR-0001)
+
+This chapter is a Draft RFC-004 chapter describing the target architecture. As built, the storage layer is
+**Postgres + pgvector only** (`docker-compose.yml`, `pyproject.toml`) — no Neo4j, Qdrant, or Redis service
+or client dependency exists in this repository. "PKOS" in code (`pkos_nodes`, `pkos_evidence` tables in
+`backend/ecc/domains/knowledge/`) names two Postgres tables, not a storage-abstraction layer: this chapter's
+fitness functions DP-... below (no business domain imports a database client; every query executes through
+PKOS) do not hold — 73 of ~104 non-test files under `backend/ecc/domains/` import `sqlalchemy.text` and
+execute hand-written SQL directly inside route handlers, with no repository or PKOS-API layer between them
+and Postgres. Caching, rate limiting, and session state (described below as Redis's responsibility) are each
+implemented as in-process Python state local to one instance (`backend/ecc/domains/ai_runtime/router.py`,
+`runtime.py`, `backend/ecc/http_security.py`) — correct for the current single-instance deployment topology,
+but not backed by any shared store, so they would not survive a move to multiple replicas without further
+work. This is the actual current data architecture; the sections below remain the target design.
+
+---
+
 # Design Philosophy
 
 The storage architecture optimizes for

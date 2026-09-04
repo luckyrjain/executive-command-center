@@ -35,6 +35,17 @@ Domains may reference another domain’s entity ID but may not directly mutate a
 
 Backend package note (Phase 3, approved 2026-07-23): `AttentionItem` moves from `backend/ecc/domains/governance/attention.py` to a dedicated `backend/ecc/domains/attention/` package, which also owns Phase 3's new WaitingLink, RiskReview (history), CapacityProfile, PlanningConstraint, Plan/PlanBlock and MeetingPack records — all still conceptually within the Executive Intelligence domain above, just their own backend package since Phase 3 substantially extends and owns that surface. `Risk`'s CRUD stays in `governance/risks.py`; Phase 3 only adds the `risk_reviews` history table and a review endpoint reading/writing it.
 
+Backend package note (architecture review, 2026-09-04, see SCR-0001): Person and Organization are
+Identity-owned per the ownership map above, but `identity/person_organizations.py` has no persistence logic
+of its own — `create_person`/`create_organization` build an `EntityCreate` and call
+`create_entity_core` in `backend/ecc/domains/knowledge/entities.py`, which writes to Knowledge's own
+`pkos_nodes` table and applies Knowledge's own read-side wiring (embeddings, retrieval, timeline). This is a
+deliberate, documented tradeoff (`entities.py`'s own docstring acknowledges the tension) rather than an
+accidental violation of the "domains may not directly mutate another domain's storage" rule above, but it
+means all business rules, validation, and storage schema for these two "Identity-owned" concepts are
+actually defined and evolve inside Knowledge — a reader relying on this table to find where Person
+validation lives should look in `knowledge/entities.py`, not `identity/`.
+
 Backend package note (Phase 4, approved 2026-07-23): the AI Platform row's entities are the concrete `phase-004/DATA-MODEL.md` records (renamed from this document's earlier placeholder names -- `PromptDefinition`/`ModelExecution`/`EvaluationResult`/`AgentRun` -- to match what `docs/superpowers/specs/2026-07-23-phase-4-ai-runtime-design.md` actually specified), owned by a new `backend/ecc/domains/ai_runtime/` package. Domain modules never import a model-provider SDK directly (`ADR-0004`, `ADR-0007`, `ADR-0012`) or call a model outside the AI Runtime's Model Router; `attention/tools.py` and `knowledge/tools.py` add thin read-only tool-handler wrappers in their own existing packages, not new domain ownership.
 
 ## Core entities

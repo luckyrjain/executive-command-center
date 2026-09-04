@@ -706,6 +706,16 @@ PII is masked where appropriate.
 
 ---
 
+**Implementation Status (as of 2026-09-04, see SCR-0001):** the five-tier classification and automatic
+PII detection/masking above are not built. What exists instead is a narrower, different mechanism: a
+three-tier `Classification` (`standard`/`sensitive`/`high_stakes`, `backend/ecc/domains/personal/domains.py`)
+scoped only to the six Phase-7 personal-domain `domain_key`s, driving field-level encryption
+(`personal/crypto.py`) — not the search/sharing/AI-access/export gating described above. Sender/recipient
+email addresses in ingested Gmail data are stored and indexed as plaintext; only the message body passes
+through field-level encryption.
+
+---
+
 # AI Access Control
 
 AI Runtime receives
