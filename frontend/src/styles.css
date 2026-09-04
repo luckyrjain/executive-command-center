@@ -179,8 +179,7 @@ button:disabled { opacity: .6; cursor: wait; }
 .error-panel { border-color: var(--color-border-error); background: var(--color-bg-error); }
 .degraded-panel { border-color: var(--color-border-degraded); background: var(--color-bg-degraded); }
 
-.dashboard-grid,
-.brief-grid {
+.dashboard-grid {
   display: grid;
   grid-template-columns: repeat(12, minmax(0, 1fr));
   gap: 18px;
@@ -236,8 +235,11 @@ button:disabled { opacity: .6; cursor: wait; }
 .brief-heading p:not(.eyebrow) { margin: 10px 0 0; color: var(--color-text-on-dark-muted); }
 .brief-heading .eyebrow { color: var(--color-text-on-dark-faint); }
 .brief-panel button { background: transparent; color: var(--color-white); border-color: var(--color-border-on-dark); }
-.brief-panel .dashboard-card { grid-column: span 6; min-height: 220px; color: var(--color-ink); box-shadow: none; }
 .brief-panel .inline-status { color: var(--color-ink); }
+
+.brief-stats { display: flex; flex-wrap: wrap; gap: 28px; margin: 22px 0 0; }
+.brief-stats dt { margin: 0; color: var(--color-text-on-dark-faint); font-size: 12px; font-weight: 800; letter-spacing: .04em; text-transform: uppercase; }
+.brief-stats dd { margin: 4px 0 0; font-size: 28px; font-weight: 650; letter-spacing: -.02em; font-variant-numeric: tabular-nums; }
 
 .recommendation-panel,
 .explore-panel,
@@ -447,8 +449,7 @@ button:disabled { opacity: .6; cursor: wait; }
 @media (max-width: 800px) {
   .app-shell { padding-top: 28px; }
   .topbar { align-items: center; }
-  .dashboard-card,
-  .brief-panel .dashboard-card { grid-column: 1 / -1; min-height: auto; }
+  .dashboard-card { grid-column: 1 / -1; min-height: auto; }
   .recommendation-list > li { grid-template-columns: 1fr; }
   .recommendation-actions { min-width: 0; flex-direction: row; flex-wrap: wrap; }
   .audit-list li { flex-direction: column; }

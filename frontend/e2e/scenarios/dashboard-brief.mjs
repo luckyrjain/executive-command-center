@@ -50,8 +50,16 @@ export async function run({ page, baseURL }) {
   await briefPanel.getByText('Generation 3 · disabled').waitFor()
   await briefPanel.getByText('AI-assisted sections are disabled; showing deterministic results only.').waitFor()
   await briefPanel.getByText(/This brief is stale: source version changed\. Refresh to regenerate it\./).waitFor()
-  await briefPanel.getByRole('heading', { name: 'Brief schedule' }).waitFor()
-  await briefPanel.locator('.brief-grid').getByText('Leadership review').waitFor()
+  // The brief's item lists duplicated the live dashboard grid one-for-one
+  // (same categories, same items, styled as identical cards) with nothing
+  // distinguishing "live" from "persisted snapshot" -- replaced with a
+  // compact count strip; full item detail already lives in the dashboard
+  // sections above.
+  const briefStats = briefPanel.locator('.brief-stats')
+  await briefStats.getByText('Schedule').waitFor()
+  await briefStats.getByText('Priorities').waitFor()
+  await briefStats.getByText('Overdue').waitFor()
+  await briefStats.getByText('Risks').waitFor()
 
   await briefPanel.getByRole('button', { name: 'Refresh brief' }).click()
   await briefPanel.getByText('Generation 4 · disabled').waitFor()
