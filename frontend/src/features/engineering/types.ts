@@ -175,8 +175,9 @@ export type WorkItem = {
   status: string | null
   // Raw, never-resolved provider identifiers -- there is no resolution-
   // candidate mechanism for engineering identities (unlike Phase 2's
-  // `resolution_candidates`), so these are shown as a disclosure, not
-  // resolved to a person.
+  // `resolution_candidates`), so these stay unresolved raw IDs. Not
+  // currently rendered anywhere (`WorkItemsPanel.tsx`'s `WorkItemRow`
+  // doesn't surface them) -- fetched but unused.
   reporter_external_id: string | null
   assignee_external_id: string | null
   permission_state: PermissionState
