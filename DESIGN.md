@@ -198,7 +198,7 @@ No component-level responsive behavior beyond this — a wizard, a `.field-form`
 
 ## Motion
 
-Three durations and one easing curve: `--motion-fast: 120ms; --motion-standard: 180ms; --motion-slow: 280ms; --ease-standard: cubic-bezier(.2, .8, .2, 1);`. Usage today is deliberately small — the button hover border-color transition (Interaction states above) and the pre-existing `.ai-explanation-progress-fill` width transition are the only two. A global `prefers-reduced-motion: reduce` query collapses every animation/transition duration to near-zero; this was previously absent and is a real gap fix, not a restatement of existing behavior. Reach for a token when a new state change needs a transition; this app has no ambient/decorative animation and shouldn't grow any.
+Three durations and one easing curve: `--motion-fast: 100ms; --motion-standard: 180ms; --motion-slow: 280ms; --ease-standard: cubic-bezier(.2, .8, .2, 1);` (`--motion-fast` tightened from `120ms` as part of Visual Foundation v2, `docs/superpowers/specs/2026-09-04-visual-foundation-v2-design.md`, for a snappier feel consistent with the reference products' own micro-interactions). Usage today is deliberately small — the button hover border-color transition (Interaction states above) and the pre-existing `.ai-explanation-progress-fill` width transition are the only two. A global `prefers-reduced-motion: reduce` query collapses every animation/transition duration to near-zero; this was previously absent and is a real gap fix, not a restatement of existing behavior. Reach for a token when a new state change needs a transition; this app has no ambient/decorative animation and shouldn't grow any.
 
 ## Not yet part of the system
 

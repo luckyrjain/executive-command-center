@@ -86,7 +86,7 @@
 
   /* Motion -- state-change transitions only; see the button hover rule
    * below and the reduced-motion query near the end of this file. */
-  --motion-fast: 120ms;
+  --motion-fast: 100ms;
   --motion-standard: 180ms;
   --motion-slow: 280ms;
   --ease-standard: cubic-bezier(.2, .8, .2, 1);
