@@ -161,6 +161,8 @@ button:disabled { opacity: .6; cursor: wait; }
  * near-monochrome. */
 .btn-destructive { border-color: var(--color-border-danger); color: var(--color-text-danger-strong); }
 .btn-destructive:hover:not(:disabled) { border-color: var(--color-text-danger-strong); }
+.btn-quiet { border-color: transparent; background: transparent; }
+.btn-quiet:hover:not(:disabled) { background: var(--color-surface-recessed); }
 
 .status-panel,
 .inline-status {
