@@ -272,6 +272,15 @@ button:disabled { opacity: .6; cursor: wait; }
 .wizard-review dd { margin: 0; color: var(--color-text-mono); font-size: 13px; }
 .wizard-review dd.is-machine-value { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
 
+/* Same read-only labeled-field layout as .wizard-review dl above, under a
+ * plain name so it's usable outside a wizard's review step -- e.g. a list
+ * item's own <details> disclosure (RiskWorkspace.tsx). */
+.detail-fields { display: flex; flex-wrap: wrap; gap: 14px 28px; margin: 16px 0 0; }
+.detail-fields div { display: grid; gap: 3px; }
+.detail-fields dt { color: var(--color-text-tertiary); font-size: 11px; font-weight: 800; letter-spacing: .08em; text-transform: uppercase; }
+.detail-fields dd { margin: 0; color: var(--color-text-mono); font-size: 13px; }
+.detail-fields dd.is-machine-value { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+
 .schedule-workspace { display: grid; gap: 24px; }
 .schedule-workspace > .work-panel { max-width: none; }
 .recommendation-heading h2,

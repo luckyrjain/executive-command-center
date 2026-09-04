@@ -178,6 +178,24 @@ describe('RiskWorkspace', () => {
     expect((screen.getByLabelText('Edit risk status') as HTMLSelectElement).disabled).toBe(true)
   })
 
+  it('discloses owner, score rationale, mitigation, and trigger without entering edit mode', async () => {
+    // Previously the only way to see mitigation/trigger was to click Edit
+    // (which opens a full edit form), and owner_id/explanation were fetched
+    // but never rendered anywhere at all.
+    vi.stubGlobal('fetch', vi.fn(() => response({ items: [risk], next_cursor: null })))
+    renderWorkspace()
+
+    await screen.findByText('Vendor renewal may lapse')
+    const summary = screen.getByText('Details for Vendor renewal may lapse')
+    fireEvent.click(summary)
+
+    expect(summary.closest('details')?.querySelector('.detail-fields')?.textContent).toContain('owner-1')
+    expect(summary.closest('details')?.textContent).toContain('Risk impact 12')
+    expect(summary.closest('details')?.textContent).toContain('Confirm renewal terms with vendor')
+    expect(summary.closest('details')?.textContent).toContain('No signed contract by review date')
+    expect(screen.queryByRole('button', { name: 'Edit Vendor renewal may lapse' })).toBeTruthy()
+  })
+
   it('archives and restores risks with expected_version', async () => {
     const fetch = vi.fn()
       .mockImplementationOnce(() => response({ items: [risk], next_cursor: null }))
