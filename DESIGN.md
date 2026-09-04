@@ -21,7 +21,7 @@ One font, everywhere: `Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacS
 
 ## Color
 
-Near-monochrome grayscale plus one dark-navy anchor. No secondary accent in general use — don't introduce one without a reason.
+Near-monochrome grayscale, one dark-navy anchor, and one deliberate accent (`--color-accent`, `#2C4A87`) — part of this app's Visual Foundation v2 redesign (see `docs/superpowers/specs/2026-09-04-visual-foundation-v2-design.md`), chosen to feel like the restraint of Linear/Stripe's own dashboards without literally cloning either product's actual brand hue. As of this token landing, no component consumes it yet — that's deliberately deferred to the redesign's later sub-projects (navigation, dashboard). Still near-monochrome everywhere else: don't reach for a second accent without a reason.
 
 Every color is a CSS custom property on `:root` in `styles.css` — style new work against a token (`var(--color-ink)`, `var(--color-border-default)`), never a raw hex value. The full token list lives in that `:root` block; the groups below are the ones you'll reach for most:
 
@@ -31,10 +31,13 @@ Every color is a CSS custom property on `:root` in `styles.css` — style new wo
 - **Surfaces:** `--color-white` (cards), `--color-page-bg` (page), `--color-surface-recessed` (recessed/upcoming)
 - **Error:** `--color-border-error` / `--color-bg-error` (`.error-panel`)
 - **Elevation:** `--shadow-card` (`.dashboard-card`) and `--shadow-panel` (`.recommendation-panel`/`.explore-panel`/`.work-panel`) — the app's only two shadow values, see Geometry below for when each applies
+- **Accent:** `--color-accent` (`#2C4A87`) — not yet consumed by any component; reserved for the redesign's navigation/primary-action work
 
 Token names describe role, not shade — `--color-border-panel` and `--color-border-panel-alt` are two visually-close-but-distinct border colors kept as separate tokens rather than merged, because the token migration was a pure refactor (every raw value mapped 1:1) and consolidating near-duplicates is a separate design decision nobody's made yet.
 
 Semantic state colors beyond error: **success** (`--color-text-success`, `--color-border-success`/`--color-bg-success`, used in `.evidence-preview .evidence-available`) and **danger** (`--color-border-danger`/`--color-bg-danger`/`--color-text-danger-strong`, used in `.evidence-preview .evidence-missing` and the destructive button variant below) both exist and are muted enough to sit next to the grayscale palette without reading as decoration. `--color-border-degraded`/`--color-bg-degraded` (`.degraded-panel`) fills the **warning** role under a name specific to how it's actually used (a kill-switch-unknown or confirm-before-destructive state), not a renamed generic token. There is no **info** token — no surface in the app currently needs a generic informational banner distinct from status/error/degraded, so none was invented; add one only when a real surface needs it.
+
+**Priority language.** The three families above are also documented as one deliberate 4-tier vocabulary for "how urgent is this" — **Critical** (the danger family), **Needs attention** (the degraded family), **Healthy** (the success family), and **Normal** (no color — default ink/border; "nothing to report" is not a hue). This is a naming/documentation layer only: the underlying `--color-*` custom property names are unchanged, so a new surface reaches for "Critical" or "Needs attention" as a named concept instead of reinventing the choice the way `EngineeringOverview.tsx`'s `.degraded-panel` usage already does informally, without any selector needing to change.
 
 ## Spacing
 

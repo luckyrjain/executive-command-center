@@ -49,6 +49,7 @@
   --shadow-card: 0 14px 36px rgba(24, 33, 47, .05);
   --shadow-panel: 0 18px 48px rgba(24, 33, 47, .06);
   --focus-ring: rgba(71, 104, 255, .28);
+  --color-accent: #2C4A87;
 
   /* Spacing scale -- gap/padding/margin values in new CSS should reference
    * one of these rather than a new arbitrary number. Existing rules predate
