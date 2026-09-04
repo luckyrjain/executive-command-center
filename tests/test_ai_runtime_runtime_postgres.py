@@ -1365,6 +1365,13 @@ def test_execute_run_repairs_on_second_attempt(run_context: dict) -> None:
 
 
 def test_execute_run_permanently_fails_after_bounded_repair_exhausted(run_context: dict) -> None:
+    """Phase Q widened the bound to two repair retries (three total
+    attempts) -- three consecutive invalid responses now exhaust it, not
+    two. `_adapter_with_responses` repeats its last supplied text for any
+    call beyond those given (its own docstring), so the third call here
+    genuinely reuses "still not json either" rather than this test needing
+    a third distinct string.
+    """
     item_id = _insert_attention_item(run_context["workspace_id"], factors=_DEFAULT_FACTORS)
     adapter = _adapter_with_responses("still not json", "still not json either")
 
@@ -1380,7 +1387,7 @@ def test_execute_run_permanently_fails_after_bounded_repair_exhausted(run_contex
 
     assert run.status == "failed"
     assert run.error_code == "schema_invalid"
-    assert run.attempts == 2
+    assert run.attempts == 3
 
     # The redacted validation-error summary (field path + Pydantic error
     # type only -- see validator.py's SchemaInvalid docstring) is recorded
@@ -1815,8 +1822,8 @@ def test_execute_run_reflection_revision_fails_grounding_is_discarded(
 def test_execute_run_reflection_schema_invalid_response_skipped_no_repair_attempted(
     run_context: dict, reflection_enabled_policy: None
 ) -> None:
-    """`validate_with_bounded_repair`'s one-retry mechanism is specific to
-    the *primary* answer -- a reflection response is validated with the
+    """`validate_with_bounded_repair`'s bounded-repair mechanism is specific
+    to the *primary* answer -- a reflection response is validated with the
     plain `validate_output`, never repaired. Counts actual outbound HTTP
     requests (not just the step-kind list, which a silent extra call
     folded into the same step would not change) to prove exactly two
@@ -2612,6 +2619,23 @@ def test_execute_run_meeting_prep_summary_objective_block_states_it_has_no_citab
     the prompt ahead of the objective's delimiter pair specifically (not
     smuggled into a later section), and the delimiter line itself is
     unchanged.
+
+    Phase R reworded the clarifying line itself from "every citable id is
+    formatted `id=\"...\"`" to "every citable id appears after `id=`" --
+    the Participants section's own bullet no longer quotes its id (a
+    different real live-Ollama capture: the model echoing that whole
+    quoted bullet into `cited_evidence_ids`, breaking JSON), so the old
+    wording would now describe only six of the seven sections, not all of
+    them.
+
+    A Phase S attempt appended "cite only that value itself, never the
+    `id=` marker or any other field on the same line" to try to close the
+    remaining `sparse_pack`/`grounding_failed` gap Phase R's own four
+    runs left open -- reverted. Four further real live-Ollama runs against
+    it showed `grounding_rate` drop from Phase R's consistent 0.9 to 0.8
+    twice, with two *new* examples failing that Phase R never touched.
+    Recorded in `EVALUATION-CONTRACT.md`'s Phase S; this prompt text is
+    back to Phase R's exact wording.
     """
     meeting_id, _participant_id = _insert_meeting_with_participant(
         run_context["workspace_id"], run_context["user_id"]
@@ -2657,7 +2681,7 @@ def test_execute_run_meeting_prep_summary_objective_block_states_it_has_no_citab
 
     disambiguation = (
         "Meeting objective (background only, not itself a citable item -- "
-        'every citable id is formatted id="..." in a section below):'
+        "every citable id appears after `id=` in a section below):"
     )
     assert disambiguation in sent_prompt
 

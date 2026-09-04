@@ -309,7 +309,10 @@ def test_run_budget_from_policy_reads_the_seeded_routing_policy_row() -> None:
     seeds -- not a second hardcoded copy.
     """
     budget = RunBudget.from_policy(_seeded_policy())
-    assert budget.total_wall_clock_seconds == 80.0
+    # 110.0s (migration `0079_phase4_repair_retry_budget.py`:
+    # 3 x 30s + 20s slack), not the original 80.0s (2 x 30s + 20s slack) --
+    # raised in lockstep with `validator.py`'s widened repair bound.
+    assert budget.total_wall_clock_seconds == 110.0
     assert budget.per_model_call_seconds == 30.0
     assert budget.per_tool_call_seconds == 5.0
     assert budget.max_input_tokens == 3072
@@ -528,7 +531,7 @@ def test_run_guard_within_budget_stays_running() -> None:
 def test_run_guard_exceeding_total_budget_marks_degraded_never_left_running() -> None:
     clock = _FakeClock()
     guard = RunGuard(RunBudget.from_policy(_seeded_policy()), clock=clock)
-    clock.advance(81.0)
+    clock.advance(111.0)  # just over the seeded 110.0s budget (Phase Q)
     with pytest.raises(RunBudgetExceeded) as exc_info:
         guard.check_total_budget()
     assert guard.status == "degraded"
@@ -540,7 +543,7 @@ def test_run_guard_exceeding_total_budget_cancels_the_token() -> None:
     clock = _FakeClock()
     guard = RunGuard(RunBudget.from_policy(_seeded_policy()), clock=clock)
     token = CancellationToken()
-    clock.advance(81.0)
+    clock.advance(111.0)
     with pytest.raises(RunBudgetExceeded):
         guard.check_total_budget(token)
     assert token.is_cancelled()
@@ -554,7 +557,7 @@ def test_run_guard_degraded_run_cannot_be_completed_afterwards() -> None:
     """
     clock = _FakeClock()
     guard = RunGuard(RunBudget.from_policy(_seeded_policy()), clock=clock)
-    clock.advance(81.0)
+    clock.advance(111.0)
     with pytest.raises(RunBudgetExceeded):
         guard.check_total_budget()
     guard.complete()
@@ -768,20 +771,21 @@ def test_run_budget_meeting_prep_summary_per_model_call_seconds_diverges_from_de
 
 
 def test_run_budget_meeting_prep_summary_total_wall_clock_seconds_diverges_from_default() -> None:
-    """`meeting.prep_summary`'s total per-run wall-clock budget (101.0s,
-    phase O follow-up) was raised in lockstep with its per-model-call
-    timeout (45.0s) so a schema-repair retry still fits twice alongside
-    routing/tool-dispatch/validation overhead -- deliberately *not* equal
-    to `attention.explain_item`'s 80.0s (`test_run_budget_from_policy_
-    reads_the_seeded_routing_policy_row` above), confirming the two task
-    types' total budgets now genuinely diverge too, not just their
-    per-call ones.
+    """`meeting.prep_summary`'s total per-run wall-clock budget (146.0s,
+    Phase Q -- migration `0079_phase4_repair_retry_budget.py`, up
+    from 101.0s) was raised in lockstep with `validator.py`'s widened
+    repair bound (one retry -> two) so a schema-repair retry still fits
+    *three* times (3 x 45.0s + 11s slack) alongside routing/tool-dispatch/
+    validation overhead -- deliberately *not* equal to `attention.
+    explain_item`'s 110.0s (`test_run_budget_from_policy_reads_the_seeded_
+    routing_policy_row` above), confirming the two task types' total
+    budgets still genuinely diverge, not just their per-call ones.
     """
     with SessionFactory() as session:
         policy = air.get_policy(session, "meeting.prep_summary")
     assert policy is not None
     budget = RunBudget.from_policy(policy)
-    assert budget.total_wall_clock_seconds == 101.0
+    assert budget.total_wall_clock_seconds == 146.0
 
 
 def test_httpx_transport_timeout_stays_ahead_of_every_registered_task_timeout() -> None:
