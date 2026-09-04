@@ -456,7 +456,7 @@ button:disabled { opacity: .6; cursor: wait; }
   .brief-panel,
   .recommendation-panel,
   .explore-panel,
-  .work-panel { border-radius: 20px; }
+  .work-panel { border-radius: 12px; }
   .recommendation-actions { flex-direction: column; }
   .search-form > div,
   .tab-list { width: 100%; flex-direction: column; }
