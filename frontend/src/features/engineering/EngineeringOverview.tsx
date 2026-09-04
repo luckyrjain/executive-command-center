@@ -18,6 +18,17 @@ import { formatValue } from './MetricCard'
  * own coverage state, never a bare number without it. Every count here
  * links to the tab that has the real detail; nothing here is itself an
  * editable surface.
+ *
+ * The first three rows (connectors/incidents/decisions) are each an
+ * action queue -- something is genuinely waiting on a person -- so their
+ * status line picks up the app's existing `.degraded-panel` treatment
+ * whenever that row's count is nonzero (degraded connectors, any open
+ * incident, any decision awaiting one), the same semantic this app
+ * already uses elsewhere for "needs attention, not broken." Headline
+ * metrics stays neutral regardless of coverage state -- it's a
+ * disclosure, not a queue with a zero state to return to. This is
+ * deliberately dynamic, not a fixed "promote row X" choice: on a calm
+ * day every row looks identical, correctly.
  */
 export default function EngineeringOverview({ onNavigate }: { onNavigate: (view: EngineeringView) => void }) {
   const connectors = useQuery({
@@ -67,7 +78,9 @@ export default function EngineeringOverview({ onNavigate }: { onNavigate: (view:
           {connectors.isError ? <div role="alert" className="inline-status error-panel">{connectors.error.message}</div> : null}
           {connectors.data ? (
             <>
-              <p>{connectedConnectors.length} connected. {degradedConnectors.length > 0 ? `${degradedConnectors.length} need attention.` : 'All healthy.'}</p>
+              <p role="status" className={degradedConnectors.length > 0 ? 'inline-status degraded-panel' : undefined}>
+                {connectedConnectors.length} connected. {degradedConnectors.length > 0 ? `${degradedConnectors.length} need attention.` : 'All healthy.'}
+              </p>
               <div className="work-actions">
                 <button type="button" onClick={() => onNavigate('connector-health')}>View connector health</button>
               </div>
@@ -81,7 +94,9 @@ export default function EngineeringOverview({ onNavigate }: { onNavigate: (view:
           {incidents.isError ? <div role="alert" className="inline-status error-panel">{incidents.error.message}</div> : null}
           {incidents.data ? (
             <>
-              <p>{incidents.data.incidents.length} open.</p>
+              <p role="status" className={incidents.data.incidents.length > 0 ? 'inline-status degraded-panel' : undefined}>
+                {incidents.data.incidents.length} open.
+              </p>
               <div className="work-actions">
                 <button type="button" onClick={() => onNavigate('incidents')}>View incidents</button>
               </div>
@@ -95,7 +110,9 @@ export default function EngineeringOverview({ onNavigate }: { onNavigate: (view:
           {decisions.isError ? <div role="alert" className="inline-status error-panel">{decisions.error.message}</div> : null}
           {decisions.data ? (
             <>
-              <p>{decisions.data.decisions.length} awaiting a decision.</p>
+              <p role="status" className={decisions.data.decisions.length > 0 ? 'inline-status degraded-panel' : undefined}>
+                {decisions.data.decisions.length} awaiting a decision.
+              </p>
               <div className="work-actions">
                 <button type="button" onClick={() => onNavigate('decisions')}>View decisions</button>
               </div>

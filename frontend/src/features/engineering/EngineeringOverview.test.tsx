@@ -51,10 +51,39 @@ describe('EngineeringOverview', () => {
     }))
     renderOverview()
 
-    expect(await screen.findByText('1 connected. 1 need attention.')).toBeTruthy()
-    expect(await screen.findByText('1 open.')).toBeTruthy()
-    expect(await screen.findByText('0 awaiting a decision.')).toBeTruthy()
+    const connectorsStatus = await screen.findByText('1 connected. 1 need attention.')
+    expect(connectorsStatus.className).toBe('inline-status degraded-panel')
+    const incidentsStatus = await screen.findByText('1 open.')
+    expect(incidentsStatus.className).toBe('inline-status degraded-panel')
+    // Zero decisions awaiting -- a calm row, so it must NOT pick up the
+    // attention treatment the two rows above (correctly) did.
+    const decisionsStatus = await screen.findByText('0 awaiting a decision.')
+    expect(decisionsStatus.className).toBe('')
     expect(await screen.findByText(/Delivery frequency \(30d\): 0.03/)).toBeTruthy()
+  })
+
+  it('flags the proposed-decisions row when at least one decision is awaiting a call, the same treatment connectors/incidents already get', async () => {
+    vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url.includes('/decisions')) return response({ decisions: [{ id: 'd1', title: 'Adopt new linter', status: 'proposed', description: null, rationale: null, decided_at: null, change_ids: [], version: 1, created_at: '2026-07-01T00:00:00Z', updated_at: '2026-07-01T00:00:00Z' }] })
+      return emptyResponseFor(url)
+    }))
+    renderOverview()
+    const decisionsStatus = await screen.findByText('1 awaiting a decision.')
+    expect(decisionsStatus.className).toBe('inline-status degraded-panel')
+  })
+
+  it('never flags headline metrics regardless of coverage state -- it is a disclosure, not an action queue', async () => {
+    vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url.includes('/metrics')) {
+        return response({ metrics: [{ id: 'm1', metric_key: 'delivery_frequency', window_label: '30d', population: 1, numerator: 1, denominator: 30, value: 0.03, details: null, coverage_status: 'insufficient_data', coverage_percentage: 10, coverage_gap_description: 'sparse window', computed_at: '2026-07-27T00:00:00Z' }] })
+      }
+      return emptyResponseFor(url)
+    }))
+    renderOverview()
+    expect(await screen.findByText(/Delivery frequency \(30d\)/)).toBeTruthy()
+    expect(document.querySelector('.degraded-panel')).toBeNull()
   })
 
   it('renders time_to_restore in the headline metrics converted from raw seconds to days, not a bare seconds count', async () => {
@@ -106,7 +135,8 @@ describe('EngineeringOverview', () => {
       return emptyResponseFor(url)
     }))
     renderOverview()
-    expect(await screen.findByText('1 connected. All healthy.')).toBeTruthy()
+    const connectorsStatus = await screen.findByText('1 connected. All healthy.')
+    expect(connectorsStatus.className).toBe('')
   })
 
   it('does not count a disconnected connector as connected or needing attention', async () => {
