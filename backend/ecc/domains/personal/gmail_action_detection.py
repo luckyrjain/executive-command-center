@@ -25,6 +25,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from hashlib import sha256
+from typing import TYPE_CHECKING
 from uuid import UUID, uuid4
 
 from sqlalchemy import text
@@ -33,9 +34,22 @@ from sqlalchemy.orm import Session
 from ecc.auth import AuthContext
 from ecc.config import get_settings
 from ecc.database import SessionFactory
-from ecc.domains.ai_runtime.ollama_client import OllamaAdapter
-from ecc.domains.ai_runtime.runtime import execute_run
 from ecc.domains.engineering.connectors import ConnectorAccountContext
+
+# `OllamaAdapter` is a type-annotation-only reference (`from __future__
+# import annotations` makes every annotation a string at runtime) and
+# `execute_run` is imported inside `_detect_action_for_message`, the one
+# place it's actually called -- both deliberately not imported at module
+# top-level here. `ai_runtime.evaluation` imports back into this
+# package's siblings (`personal.crypto`, `personal.domains`) at its own
+# top level; nothing today makes that a real transitive cycle with this
+# module specifically, but this module has no need to import eagerly
+# either, so it doesn't add a second edge an unrelated future refactor
+# on either side could turn into one (architecture review, 2026-09-04 --
+# see `write_actions.py`'s near-identical, already-real instance of this
+# exact shape for what it looks like once it does bite).
+if TYPE_CHECKING:
+    from ecc.domains.ai_runtime.ollama_client import OllamaAdapter
 from ecc.domains.governance.recommendation_models import RecommendationCreate
 from ecc.domains.governance.recommendation_mutations import create_recommendation, synthetic_request
 
@@ -331,6 +345,8 @@ def _detect_action_for_message(
     # (see `execute_run`'s own docstring on why it is "deliberately
     # not wrapped"; `ai_insights.py:generate_insight_endpoint`'s
     # identical three-phase shape is the precedent this mirrors).
+    from ecc.domains.ai_runtime.runtime import execute_run
+
     with SessionFactory() as session:
         run = execute_run(
             "email.detect_action",
