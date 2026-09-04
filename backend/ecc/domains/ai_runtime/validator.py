@@ -22,16 +22,39 @@ can satisfy or fail independently (a well-formed JSON object can still cite
 a nonexistent factor), and conflating them into one path would make it
 impossible to tell, from the result alone, which property actually failed.
 
-**Bounded repair retry (Decision 4/5).** `validate_with_bounded_repair`
-implements "one bounded repair retry ... allowed on `schema_invalid`
-specifically": exactly one re-attempt, no more, regardless of the second
-attempt's outcome. This module does not persist the attempt count anywhere
--- `ai_run_steps` (where Decision 4 says a retry would be "recorded on the
-trace") is a Task 4 table (migration `0030_phase4_ai_runs.py`, not yet
-created as of Task 2). `RepairAttemptResult.attempts` is returned so Task
-4's orchestration loop (`runtime.py`) can wire it into a real `ai_run_steps`
-row once that table exists; Task 2 tests this counting/bounding logic in
-isolation, against no database at all.
+**Bounded repair retry (Decision 4/5, widened Phase Q).** `validate_with_
+bounded_repair` implements a bounded repair loop on `schema_invalid`
+specifically: up to `_MAX_REPAIR_ATTEMPTS - 1` re-attempts (originally
+exactly one; widened to two, `_MAX_REPAIR_ATTEMPTS = 3`), stopping the
+moment any attempt validates, or once the bound is reached regardless of
+the final attempt's outcome. This module does not persist the attempt
+count anywhere -- `ai_run_steps` (where Decision 4 says a retry would be
+"recorded on the trace") is a Task 4 table (migration
+`0030_phase4_ai_runs.py`, not yet created as of Task 2).
+`RepairAttemptResult.attempts` is returned so Task 4's orchestration loop
+(`runtime.py`) can wire it into a real `ai_run_steps` row once that table
+exists; Task 2 tests this counting/bounding logic in isolation, against no
+database at all.
+
+**Why widened (Phase Q, `EVALUATION-CONTRACT.md`).** Phases C/G/J/K/N/P
+tracked a recurring `schema_invalid`/`<root>:json_invalid` intermittency on
+`meeting.prep_summary`'s sparsest/densest examples (`sparse_pack`, and
+newly `decisions_and_notes_heavy`) without ever guess-fixing it -- no raw
+response was available to diagnose until phase K's `RFC-005` diagnostic
+window captured *indirect* evidence via `attention.explain_item`: 19 of 20
+first-attempt failures were the model writing plain prose instead of JSON,
+with the single existing repair retry rescuing all but one. Phase K's own
+conclusion was "twice-unlucky" -- both the first attempt and the one
+repair retry producing unparseable output, a rarer but real event for a
+small instruction-following model. This widens the *bound*, not the
+prompt: a strictly mechanical, evidence-backed response to "the repair
+retry usually, but not always, corrects it" that avoids the specific
+failure mode of `attention.explain_item`'s two reverted prompt-wording
+attempts (this document's own precedent for why a wording change is
+riskier than a bound change). Every task type's `total_run_budget_seconds`
+is raised in lockstep (migration `0079_phase4_repair_retry_budget.py`) so
+a third attempt is not itself starved by the total wall-clock budget
+before it can run.
 """
 
 import re
@@ -48,6 +71,12 @@ from pydantic import (
     field_validator,
     model_validator,
 )
+
+# Total raw responses `validate_with_bounded_repair` will validate for one
+# call before giving up: the first attempt plus up to two repair retries.
+# See this module's docstring ("Why widened, Phase Q") for the evidence
+# behind raising this from 2 (one retry) to 3 (two retries).
+_MAX_REPAIR_ATTEMPTS = 3
 
 _MAX_EXPLANATION_WORDS = 60
 
@@ -173,10 +202,11 @@ def validate_output(
 
 @dataclass(frozen=True, slots=True)
 class RepairAttemptResult:
-    """`outcome` is the final validation result after at most one repair
-    retry; `attempts` (1 or 2) is how many raw responses were actually
-    validated. Task 4's orchestration loop is expected to record `attempts`
-    on the eventual `ai_run_steps` trace row (see this module's docstring).
+    """`outcome` is the final validation result after at most `_MAX_REPAIR_
+    ATTEMPTS - 1` repair retries; `attempts` (1 through `_MAX_REPAIR_
+    ATTEMPTS`) is how many raw responses were actually validated. Task 4's
+    orchestration loop is expected to record `attempts` on the eventual
+    `ai_run_steps` trace row (see this module's docstring).
     """
 
     outcome: ValidatedOutput | SchemaInvalid
@@ -188,23 +218,25 @@ def validate_with_bounded_repair(
     first_raw_response: str,
     reattempt: Callable[[], str],
 ) -> RepairAttemptResult:
-    """Validate `first_raw_response`; if (and only if) it is
-    `schema_invalid`, call `reattempt()` exactly once for a second raw
-    response and validate that instead. `reattempt` is never called a
-    second time regardless of the second attempt's own outcome -- Decision
-    4's "one bounded repair retry", not an open-ended retry loop. A caller
+    """Validate `first_raw_response`; each time (and only when) the most
+    recent attempt is `schema_invalid`, call `reattempt()` for another raw
+    response and validate that instead, up to `_MAX_REPAIR_ATTEMPTS` total
+    attempts (Decision 4/5's "bounded repair retry", widened Phase Q from
+    one retry to two -- see this module's docstring). `reattempt` is never
+    called once the bound is reached, regardless of the final attempt's own
+    outcome -- still a bounded loop, not an open-ended one. A caller
     supplies `reattempt` as a closure over "re-prompt with the validation
-    error appended" (Decision 4); this function has no opinion on how the
-    second raw response is produced, only that it is requested at most
-    once.
+    error appended" (Decision 4); this function has no opinion on how each
+    further raw response is produced, only how many times it may be
+    requested.
     """
-    first_result = validate_output(schema_ref, first_raw_response)
-    if not isinstance(first_result, SchemaInvalid):
-        return RepairAttemptResult(outcome=first_result, attempts=1)
-
-    second_raw_response = reattempt()
-    second_result = validate_output(schema_ref, second_raw_response)
-    return RepairAttemptResult(outcome=second_result, attempts=2)
+    result = validate_output(schema_ref, first_raw_response)
+    attempts = 1
+    while isinstance(result, SchemaInvalid) and attempts < _MAX_REPAIR_ATTEMPTS:
+        raw_response = reattempt()
+        result = validate_output(schema_ref, raw_response)
+        attempts += 1
+    return RepairAttemptResult(outcome=result, attempts=attempts)
 
 
 # ---------------------------------------------------------------------------

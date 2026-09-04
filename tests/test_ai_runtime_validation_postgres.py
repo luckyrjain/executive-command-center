@@ -11,11 +11,12 @@ Task 2:
    check layered on top of schema validation, not conflated with it: a
    schema-valid response citing a factor code absent from the source
    item's real factors is caught here, distinctly from a schema failure.
-3. `validator.py:validate_with_bounded_repair` -- exactly one repair retry
-   on `schema_invalid`, never a second (Task 2 Step 6's caveat: this tests
-   the retry-*counting* logic itself, in isolation, since `ai_run_steps`
-   -- where a real orchestration loop would record the attempt count --
-   is a Task 4 table this task does not create).
+3. `validator.py:validate_with_bounded_repair` -- up to two repair retries
+   on `schema_invalid` (widened Phase Q, `EVALUATION-CONTRACT.md`, from
+   the original one retry), never a third (Task 2 Step 6's caveat: this
+   tests the retry-*counting* logic itself, in isolation, since
+   `ai_run_steps` -- where a real orchestration loop would record the
+   attempt count -- is a Task 4 table this task does not create).
 
 Kept in the Postgres-only test suite (matching this codebase's `_postgres`
 naming convention for every Phase 4 Task 2 test file) even though none of
@@ -316,7 +317,7 @@ def test_grounding_check_empty_citations_always_grounded() -> None:
 
 
 # ---------------------------------------------------------------------------
-# validate_with_bounded_repair -- exactly one retry, bounded.
+# validate_with_bounded_repair -- up to two retries, bounded (Phase Q).
 # ---------------------------------------------------------------------------
 
 
@@ -335,7 +336,7 @@ def test_bounded_repair_first_attempt_valid_no_retry_attempted() -> None:
     assert calls["count"] == 0  # reattempt never invoked
 
 
-def test_bounded_repair_invalid_then_valid_succeeds_with_exactly_one_retry() -> None:
+def test_bounded_repair_invalid_then_valid_succeeds_after_one_retry() -> None:
     valid_raw = dumps({"explanation_text": "fixed", "cited_factor_codes": ["a"]})
     calls = {"count": 0}
 
@@ -350,7 +351,30 @@ def test_bounded_repair_invalid_then_valid_succeeds_with_exactly_one_retry() -> 
     assert calls["count"] == 1
 
 
-def test_bounded_repair_invalid_then_invalid_fails_permanently_no_third_attempt() -> None:
+def test_bounded_repair_invalid_twice_then_valid_succeeds_after_two_retries() -> None:
+    """Phase Q's widened case: the first repair retry is *also*
+    `schema_invalid`, but the second (new) retry finally validates -- the
+    exact "twice-unlucky, not permanently broken" mechanism `EVALUATION-
+    CONTRACT.md` phase K's evidence pointed at.
+    """
+    valid_raw = dumps(
+        {"explanation_text": "fixed on the second retry", "cited_factor_codes": ["a"]}
+    )
+    responses = iter(["{still not valid", valid_raw])
+    calls = {"count": 0}
+
+    def _reattempt() -> str:
+        calls["count"] += 1
+        return next(responses)
+
+    result = validate_with_bounded_repair(ExplainItemOutput, "{not valid either", _reattempt)
+    assert result.attempts == 3
+    assert isinstance(result.outcome, ValidatedOutput)
+    assert result.outcome.value.explanation_text == "fixed on the second retry"
+    assert calls["count"] == 2
+
+
+def test_bounded_repair_invalid_three_times_fails_permanently_no_fourth_attempt() -> None:
     calls = {"count": 0}
 
     def _reattempt() -> str:
@@ -358,16 +382,16 @@ def test_bounded_repair_invalid_then_invalid_fails_permanently_no_third_attempt(
         return "{still not valid"
 
     result = validate_with_bounded_repair(ExplainItemOutput, "{not valid either", _reattempt)
-    assert result.attempts == 2
+    assert result.attempts == 3
     assert isinstance(result.outcome, SchemaInvalid)
-    assert calls["count"] == 1  # reattempt called exactly once, never a third time
+    assert calls["count"] == 2  # reattempt called exactly twice, never a third time
 
 
-def test_bounded_repair_reattempt_callback_never_called_more_than_once() -> None:
+def test_bounded_repair_reattempt_callback_never_called_more_than_the_bound() -> None:
     """Even if a buggy `reattempt` callback were willing to be called
-    repeatedly, `validate_with_bounded_repair`'s own control flow only
-    ever invokes it inside the single `if SchemaInvalid` branch -- there is
-    no loop that could call it again."""
+    indefinitely, `validate_with_bounded_repair`'s own `while attempts <
+    _MAX_REPAIR_ATTEMPTS` loop stops calling it once the bound (two calls,
+    for three total attempts) is reached."""
     call_log: list[int] = []
 
     def _reattempt() -> str:
@@ -375,7 +399,7 @@ def test_bounded_repair_reattempt_callback_never_called_more_than_once() -> None
         return "{also invalid"
 
     validate_with_bounded_repair(ExplainItemOutput, "{invalid", _reattempt)
-    assert call_log == [0]
+    assert call_log == [0, 1]
 
 
 # ---------------------------------------------------------------------------

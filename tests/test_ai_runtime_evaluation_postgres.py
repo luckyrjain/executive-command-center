@@ -355,16 +355,21 @@ def _flat_responses(
     """One flat, ordered response list spanning every example in
     `EXAMPLES`, matching the exact sequence `run_evaluation` will call
     `.generate()` in (dataset order, one call per example except the
-    deliberately schema-invalid one, which consumes two -- the bounded
-    repair retry, Task 2's `validate_with_bounded_repair`, unmodified).
-    At most one of the three override keys is exercised per test, mirroring
-    Task 5 Step 3's four scenarios (a fully valid run needs none of them).
+    deliberately schema-invalid one, which consumes three -- the bounded
+    repair retry, `validator.py:validate_with_bounded_repair`, widened
+    Phase Q from one retry to two, so a permanently-invalid example must
+    now supply three invalid responses, not two, or its third attempt
+    would silently consume the *next* example's response off this flat
+    queue and spuriously validate). At most one of the three override keys
+    is exercised per test, mirroring Task 5 Step 3's four scenarios (a
+    fully valid run needs none of them).
     """
     responses: list[str] = []
     for example in EXAMPLES:
         if example["key"] == invalid_key:
             responses.append("not valid json at all")
             responses.append("still not valid json either")
+            responses.append("still not valid json on the third attempt")
             continue
         responses.append(
             _valid_response(
