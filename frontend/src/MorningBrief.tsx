@@ -1,7 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
 import { apiRequest } from './api/client'
-import { Section, type DashboardItem } from './dashboard/Sections'
+import type { DashboardItem } from './dashboard/Sections'
 
 type MorningBriefResponse = {
   id: string
@@ -60,12 +60,24 @@ export default function MorningBrief() {
       ) : null}
 
       {brief.data ? (
-        <div className="brief-grid">
-          <Section headingIdPrefix="brief-section-" title="Brief schedule" items={brief.data.sections.today_schedule} emptyMessage="No meetings in the brief." />
-          <Section headingIdPrefix="brief-section-" title="Brief priorities" items={brief.data.sections.top_priorities} emptyMessage="No priorities in the brief." />
-          <Section headingIdPrefix="brief-section-" title="Brief commitments" items={brief.data.sections.overdue_commitments} emptyMessage="No overdue commitments." />
-          <Section headingIdPrefix="brief-section-" title="Brief risks" items={brief.data.sections.risks} emptyMessage="No open risks." />
-        </div>
+        <dl className="brief-stats">
+          <div>
+            <dt>Schedule</dt>
+            <dd>{brief.data.sections.today_schedule?.length ?? 0}</dd>
+          </div>
+          <div>
+            <dt>Priorities</dt>
+            <dd>{brief.data.sections.top_priorities?.length ?? 0}</dd>
+          </div>
+          <div>
+            <dt>Overdue</dt>
+            <dd>{brief.data.sections.overdue_commitments?.length ?? 0}</dd>
+          </div>
+          <div>
+            <dt>Risks</dt>
+            <dd>{brief.data.sections.risks?.length ?? 0}</dd>
+          </div>
+        </dl>
       ) : null}
     </section>
   )

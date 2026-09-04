@@ -35,6 +35,10 @@ function renderBrief() {
   return render(<QueryClientProvider client={client}><MorningBrief /></QueryClientProvider>)
 }
 
+function statValue(label: string) {
+  return screen.getByText(label).nextElementSibling?.textContent
+}
+
 beforeEach(() => {
   document.cookie = 'ecc_csrf=brief-token; Secure; SameSite=Strict'
   vi.stubGlobal('crypto', { randomUUID: vi.fn(() => 'brief-request-id') })
@@ -50,7 +54,7 @@ describe('MorningBrief', () => {
     vi.stubGlobal('fetch', fetch)
     renderBrief()
 
-    await screen.findByText('Board sync')
+    await screen.findByText(/Generation 1/)
     fireEvent.click(screen.getByRole('button', { name: 'Refresh brief' }))
 
     await waitFor(() => expect(fetch).toHaveBeenCalledTimes(2))
@@ -62,7 +66,7 @@ describe('MorningBrief', () => {
     await screen.findByText(/Generation 2/)
   })
 
-  it('replaces a stale brief with fresh sections after refresh', async () => {
+  it('clears the stale banner and reflects the refreshed generation number', async () => {
     const stale = { ...baseBrief, stale: true, stale_reason: 'source_data_changed' }
     const fresh = {
       ...baseBrief,
@@ -78,7 +82,30 @@ describe('MorningBrief', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Refresh brief' }))
 
     await waitFor(() => expect(screen.queryByText(/this brief is stale/i)).toBeNull())
-    await screen.findByText('Investor call')
+    await screen.findByText(/Generation 2/)
+  })
+
+  it('renders a compact count per brief category instead of duplicating full item lists', async () => {
+    const populated = {
+      ...baseBrief,
+      sections: {
+        today_schedule: [
+          { id: 'evt-1', title: 'Board sync', starts_at: '2026-07-16T14:00:00Z' },
+          { id: 'evt-2', title: 'Standup', starts_at: '2026-07-16T15:00:00Z' },
+        ],
+        top_priorities: [{ entity_id: 't1', title: 'Ship report', score: 90, status: 'in_progress' }],
+        overdue_commitments: [],
+        risks: [],
+      },
+    }
+    vi.stubGlobal('fetch', vi.fn(() => response(populated)))
+    renderBrief()
+
+    await screen.findByText(/Generation 1/)
+    expect(statValue('Schedule')).toBe('2')
+    expect(statValue('Priorities')).toBe('1')
+    expect(statValue('Overdue')).toBe('0')
+    expect(statValue('Risks')).toBe('0')
     expect(screen.queryByText('Board sync')).toBeNull()
   })
 
@@ -94,7 +121,7 @@ describe('MorningBrief', () => {
     vi.stubGlobal('fetch', vi.fn(() => response(baseBrief)))
     renderBrief()
 
-    await screen.findByText('Board sync')
+    await screen.findByText(/Generation 1/)
     expect(screen.queryByText(/AI-assisted sections are disabled/i)).toBeNull()
   })
 
@@ -105,12 +132,12 @@ describe('MorningBrief', () => {
     vi.stubGlobal('fetch', fetch)
     renderBrief()
 
-    await screen.findByText('Board sync')
+    await screen.findByText(/Generation 1/)
     fireEvent.click(screen.getByRole('button', { name: 'Refresh brief' }))
 
     await screen.findByRole('alert')
     expect(screen.getByRole('alert').textContent).toContain('Refresh temporarily unavailable')
-    expect(screen.getByText('Board sync')).toBeTruthy()
+    expect(screen.getByText(/Generation 1/)).toBeTruthy()
     expect((screen.getByRole('button', { name: 'Refresh brief' }) as HTMLButtonElement).disabled).toBe(false)
   })
 })
