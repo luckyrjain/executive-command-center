@@ -46,8 +46,8 @@
   --color-bg-simulation-a: #fff8ec;
   --color-bg-simulation-b: #fef2da;
   --surface-translucent: rgba(255, 255, 255, .92);
-  --shadow-card: 0 14px 36px rgba(24, 33, 47, .05);
-  --shadow-panel: 0 18px 48px rgba(24, 33, 47, .06);
+  --shadow-card: 0 8px 20px rgba(24, 33, 47, .06);
+  --shadow-panel: 0 10px 28px rgba(24, 33, 47, .07);
   --focus-ring: rgba(71, 104, 255, .28);
   --color-accent: #2C4A87;
 
@@ -81,8 +81,8 @@
    * one-off intermediate values that predate this scale and are not yet
    * part of a formal three-tier system; left as raw numbers rather than
    * forced into a token that would misname them. */
-  --radius-control: 14px;
-  --radius-panel: 28px;
+  --radius-control: 8px;
+  --radius-panel: 16px;
 
   /* Motion -- state-change transitions only; see the button hover rule
    * below and the reduced-motion query near the end of this file. */
