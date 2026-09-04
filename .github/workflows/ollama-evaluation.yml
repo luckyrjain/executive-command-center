@@ -123,7 +123,35 @@ jobs:
         # test against the second model, proving it can be invoked
         # end to end for real -- not a full 20-example floor check, which
         # is a separate promotion decision from "this model works at all".
+        #
+        # Non-blocking on pull requests, blocking on main (repository-owner
+        # decision, 2026-09-04, EVALUATION-CONTRACT.md Phase V). From #215
+        # (2026-09-02) on, every run on main failed on the one already-tracked
+        # example (`sparse_pack`, a 1.5B-model padding behaviour on a
+        # deliberately one-item input): 1 pass in 16 runs. A check that is red
+        # on ~95% of PRs regardless of their diff carries no signal, and the
+        # contract's own Phases J/K/O/U already say it is not a reason to hold
+        # a merge. It still RUNS on every PR -- ai_runtime changes rely on
+        # their own PR's live run as their confirmation bar (Phases H, O, R)
+        # -- but a floor miss surfaces as a warning annotation plus the job
+        # summary below rather than a failed check. On `push` to main and on
+        # `workflow_dispatch` the step fails normally: this is the promotion-
+        # evidence job, and main's run history must keep telling the truth.
+        id: floors
+        continue-on-error: ${{ github.event_name == 'pull_request' }}
         run: uv run pytest -v tests/test_ai_runtime_evaluation_live_ollama.py
+
+      - name: Surface a floor miss on a pull request without failing the check
+        if: github.event_name == 'pull_request' && steps.floors.outcome == 'failure'
+        run: |
+          echo "::warning title=ollama-evaluation floors not met::tests/test_ai_runtime_evaluation_live_ollama.py failed on this PR. Non-blocking on pull requests (EVALUATION-CONTRACT.md Phase V); see the step log above for the per-example failures. The same run on main would fail the check."
+          {
+            echo "## ollama-evaluation: promotion floors not met"
+            echo
+            echo "Non-blocking on pull requests. See the **Run the live-Ollama evaluation floor check** step log for \`EvaluationMetrics\` and the per-example \`failures\` list."
+            echo
+            echo "Expected on the already-tracked \`sparse_pack\`/\`grounding_failed\` signature; anything else is new and worth reading (EVALUATION-CONTRACT.md, Phase V)."
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Stop the Ollama server container
         if: always()
