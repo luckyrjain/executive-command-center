@@ -699,6 +699,108 @@ def test_cross_workspace_isolation(
         _cleanup_workspace(workspace_b)
 
 
+def test_same_workspace_second_user_cannot_read_others_records(
+    personal_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    """Fitness function for an architecture-review finding: this domain
+    scopes every query by `(workspace_id, owner_id)` rather than going
+    through `platform.authz`'s centralized decision engine like most other
+    domains do (`UNGRANTABLE_RESOURCE_TYPES` hardcodes personal data as
+    never workspace-shareable). That's correct in every query sampled by
+    the review, but nothing structural stops a future personal-domain
+    endpoint from filtering on `workspace_id` alone and silently becoming
+    workspace-wide instead of user-private -- unlike a cross-*workspace*
+    regression (`test_cross_workspace_isolation` above), a cross-*user*
+    regression within one workspace would not even 404, since the target
+    workspace_id is genuinely correct. This test creates a second, unrelated
+    user in the *same* workspace as `personal_test_context`'s own user and
+    asserts that user cannot list, read, or check in against the first
+    user's habits domain, routine, or record -- the same three surfaces
+    `test_cross_workspace_isolation` exercises, this time holding
+    workspace_id constant and varying only the user.
+    """
+    client_a, workspace_id, _user_a, token_a = personal_test_context
+    _enable_habits(client_a, token_a)
+    record = client_a.post(
+        "/api/v1/personal/records",
+        json={"domain_key": "habits", "record_type": "note", "payload": {"text": "private"}},
+        headers=_headers(token_a, str(uuid4())),
+    ).json()
+    routine = client_a.post(
+        "/api/v1/personal/routines",
+        json={"domain_key": "habits", "title": "Meditate", "cadence": "daily"},
+        headers=_headers(token_a, str(uuid4())),
+    ).json()
+
+    user_b = uuid4()
+    token_b = f"session-{uuid4()}"
+    now = datetime.now(UTC)
+    with engine.begin() as connection:
+        create_identity(
+            connection,
+            workspace_id=workspace_id,
+            user_id=user_b,
+            email=f"{user_b}@example.test",
+            now=now,
+            role="member",
+        )
+        connection.execute(
+            text(
+                "INSERT INTO sessions (id, workspace_id, user_id, token_hash, "
+                "expires_at, last_seen_at) "
+                "VALUES (:id, :workspace_id, :user_id, :token_hash, :expires_at, :now)"
+            ),
+            {
+                "id": uuid4(),
+                "workspace_id": workspace_id,
+                "user_id": user_b,
+                "token_hash": sha256(token_b.encode()).hexdigest(),
+                "expires_at": now + timedelta(hours=1),
+                "now": now,
+            },
+        )
+    client_b = TestClient(app)
+    client_b.cookies.set("ecc_session", token_b)
+    try:
+        # B has no domain of their own enabled -- A's habits domain, and
+        # everything under it, must not be visible to B despite sharing
+        # A's workspace_id.
+        assert (
+            client_b.get("/api/v1/personal/domains", headers=_headers(token_b)).json()["domains"]
+            == []
+        )
+        assert client_b.get(
+            f"/api/v1/personal/records/{record['id']}", headers=_headers(token_b)
+        ).status_code == 404
+        # list_records_endpoint has no domain-enabled gate (it's a pure
+        # read, scoped only by workspace_id+owner_id) -- B gets 200 with
+        # an empty list, not a 403/404, since B genuinely has zero records
+        # of their own. The privacy invariant under test is that A's
+        # record never appears in it, not the status code.
+        listed_by_b = client_b.get(
+            "/api/v1/personal/records?domain_key=habits", headers=_headers(token_b)
+        )
+        assert listed_by_b.status_code == 200
+        assert listed_by_b.json()["records"] == []
+        resp = client_b.post(
+            "/api/v1/personal/check-ins",
+            json={"routine_id": routine["id"]},
+            headers=_headers(token_b, str(uuid4())),
+        )
+        assert resp.status_code == 404
+    finally:
+        client_b.close()
+        with engine.begin() as connection:
+            connection.execute(
+                text("DELETE FROM sessions WHERE user_id = :user_id"), {"user_id": user_b}
+            )
+            connection.execute(
+                text("DELETE FROM workspace_memberships WHERE users_id = :user_id"),
+                {"user_id": user_b},
+            )
+            connection.execute(text("DELETE FROM users WHERE id = :user_id"), {"user_id": user_b})
+
+
 # --- CHECK constraint rejections ---------------------------------------------
 
 
