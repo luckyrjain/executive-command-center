@@ -70,7 +70,7 @@ export default function WorkspaceNavigation({ currentView, onNavigate }: Workspa
 
   return (
     <nav aria-label="Workspace">
-      <div role="tablist" aria-label="Executive workspaces">
+      <div className="workspace-nav" role="tablist" aria-label="Executive workspaces">
         {WORKSPACES.map(({ view, label }, index) => {
           const selected = currentView === view
           return (

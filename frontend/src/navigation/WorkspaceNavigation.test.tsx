@@ -86,6 +86,16 @@ describe('WorkspaceNavigation', () => {
     expect(tabs.filter((tab) => tab.getAttribute('aria-selected') === 'true')).toHaveLength(1)
   })
 
+  it('renders the tablist with the .workspace-nav class carrying the selected-state styling', () => {
+    // Previously this div had no className at all, so the app's only
+    // selected-state rule (.tab-list button[aria-selected="true"]) never
+    // matched it -- every top-level pill looked identical regardless of
+    // which page was active.
+    render(<NavigationHarness />)
+    const tablist = screen.getByRole('tablist')
+    expect(tablist.className).toBe('workspace-nav')
+  })
+
   it('controls a labelled tab panel distinct from the application main landmark', () => {
     render(<NavigationHarness />)
 

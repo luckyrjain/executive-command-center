@@ -366,6 +366,20 @@ button:disabled { opacity: .6; cursor: wait; }
 
 .tab-list { display: flex; gap: 8px; }
 .tab-list button[aria-selected="true"] { border-color: var(--color-ink); background: var(--color-ink); color: var(--color-white); }
+
+/* The top-level workspace nav (WorkspaceNavigation.tsx) previously had no
+ * className at all -- not just missing a selected-state rule, no explicit
+ * layout either, just the bare `button` rule and default block flow. Its
+ * selected state is the app's first real use of --color-accent (Visual
+ * Foundation v2): distinct from .tab-list's ink fill above, so the app's
+ * one deliberate accent has a single, meaningful job -- the most prominent
+ * recurring navigation moment -- rather than being scattered around.
+ * Deliberately not copying .tab-list's mobile column-stack treatment
+ * (Responsive behavior, below) -- that fits .tab-list's typical 2-4 tabs;
+ * forcing this nav's 15 tabs into one vertical column would be worse than
+ * the wrapped rows flex-wrap already gives it at any width. */
+.workspace-nav { display: flex; flex-wrap: wrap; gap: 8px; }
+.workspace-nav button[aria-selected="true"] { border-color: var(--color-accent); background: var(--color-accent); color: var(--color-white); }
 .search-form,
 .audit-toolbar { display: grid; gap: 10px; margin-top: 28px; }
 .search-form label,
