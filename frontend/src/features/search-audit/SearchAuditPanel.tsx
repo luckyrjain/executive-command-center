@@ -1,7 +1,7 @@
 import { FormEvent, KeyboardEvent, useRef, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 
-import { apiRequest } from './api/client'
+import { apiRequest } from '../../api/client'
 
 type SearchResult = {
   entity_type: string

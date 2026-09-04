@@ -1,7 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
-import { ApiError, apiRequest } from './api/client'
-import type { EvidenceItem } from './features/knowledge/types'
+import { ApiError, apiRequest } from '../../api/client'
+import type { EvidenceItem } from '../knowledge/types'
 
 type RecommendationStatus =
   | 'proposed'
