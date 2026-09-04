@@ -19,6 +19,28 @@ services:
       timeout: 5s
       retries: 20
 
+  # One-shot: runs migrations against `postgres` and exits. `backend`
+  # depends on this completing successfully (not merely on `postgres`
+  # being healthy) -- an architecture review found that without this,
+  # `docker compose up`/`make dev` against a fresh, unmigrated database
+  # started a `backend` whose `/health/live` reports healthy the whole
+  # time (a pure liveness check, no DB query) while every real request
+  # fails against a schema that was never created. `quickstart.sh` (the
+  # documented one-command setup) already runs migrations as an explicit
+  # host-side step before it starts the backend at all, so it was never
+  # exposed to this gap -- this closes the same gap for the docker-compose
+  # full-stack path.
+  migrate:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    environment:
+      ECC_DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-ecc}:${POSTGRES_PASSWORD:-ecc}@postgres:5432/${POSTGRES_DB:-ecc}
+    command: ["/app/.venv/bin/alembic", "-c", "backend/alembic.ini", "upgrade", "head"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+
   backend:
     build:
       context: .
@@ -36,6 +58,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health/live')"]
       interval: 10s
