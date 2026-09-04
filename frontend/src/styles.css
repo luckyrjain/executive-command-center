@@ -42,6 +42,7 @@
   --color-border-danger: #e3c8c8;
   --color-bg-danger: #fdf1f1;
   --color-text-danger-strong: #8a2c2c;
+  --color-accent: #2c4a87;
   --color-accent-simulation: #9a5b00;
   --color-bg-simulation-a: #fff8ec;
   --color-bg-simulation-b: #fef2da;
@@ -49,7 +50,6 @@
   --shadow-card: 0 8px 20px rgba(24, 33, 47, .06);
   --shadow-panel: 0 10px 28px rgba(24, 33, 47, .07);
   --focus-ring: rgba(71, 104, 255, .28);
-  --color-accent: #2C4A87;
 
   /* Spacing scale -- gap/padding/margin values in new CSS should reference
    * one of these rather than a new arbitrary number. Existing rules predate

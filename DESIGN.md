@@ -52,7 +52,7 @@ A global scale, `--space-1` (4px) through `--space-24` (96px), doubling roughly 
 
 | Class | What it does |
 |---|---|
-| `.work-panel` | Standard card: `border-radius: 28px`, soft shadow, `padding: clamp(24px, 4vw, 42px)` |
+| `.work-panel` | Standard card: `border-radius: var(--radius-panel)`, `--shadow-panel` elevation, `padding: clamp(24px, 4vw, 42px)` |
 | `.work-heading` | Panel title block: eyebrow + h1/h2 + description |
 | `.work-actions` | Button row: `flex`, `wrap`, `gap: 8px` |
 | `.empty-state` | Centered muted text for a zero-item list |
@@ -84,10 +84,10 @@ Every labeled-fields block in the app should use one class. Single column, `gap:
 **One real exception exists today:** `SearchAuditPanel.tsx`'s `.search-form`/`.audit-toolbar` (styles.css, near the `.field-form` rules) duplicate `.field-form`'s label and input styling by hand instead of using the class — same border, radius, padding, and label weight, declared a second time under different selectors. This predates being caught; it isn't a second sanctioned form pattern. Use `.field-form` for anything new, including a search/filter toolbar — don't treat `.search-form` as a second precedent the way `.field-form` is documented here.
 
 ```css
-.field-form { display: grid; gap: 14px; margin-top: 28px; }
+.field-form { display: grid; gap: 14px; margin-top: 28px; max-width: var(--content-form); }
 .field-form label { display: grid; gap: 7px; color: var(--color-text-secondary); font-size: 13px; font-weight: 700; }
 .field-form label.field-checkbox { display: flex; align-items: center; gap: 8px; font-weight: 400; }
-.field-form input, .field-form textarea, .field-form select { width: 100%; border: 1px solid var(--color-border-default); border-radius: 14px; background: var(--color-white); padding: 12px 14px; color: var(--color-ink); }
+.field-form input, .field-form textarea, .field-form select { width: 100%; border: 1px solid var(--color-border-default); border-radius: var(--radius-control); background: var(--color-white); padding: 12px 14px; color: var(--color-ink); }
 .field-form input[type="checkbox"] { width: auto; }
 .field-form textarea { min-height: 150px; resize: vertical; }
 .field-form button { justify-self: start; }
@@ -203,7 +203,7 @@ Three durations and one easing curve: `--motion-fast: 100ms; --motion-standard: 
 
 ## Not yet part of the system
 
-Named explicitly so a new feature doesn't invent one of these ad hoc: no table component (no surface in the app renders tabular data — every list is `<ul>`/`<ol>` with `.item-list`/`.work-list`/`.audit-list`-style rows; build one only when a real dataset needs row/column comparison, and base it on the left-align-text/right-align-numeric/quiet-header conventions rather than reinventing them from scratch), no icon library (zero icons anywhere in the app today — text labels do this work; picking a library is a real decision to make once a surface actually needs one, not before), no breadcrumbs or pagination (nothing in the app is deep enough or long-enough-listed to need either yet), no generic **info** semantic color (see Color above), no tertiary/quiet or link-action button variant (see Buttons above). This list will get shorter as real surfaces need these things — it should not get shorter by adding speculative CSS for a pattern nothing uses yet.
+Named explicitly so a new feature doesn't invent one of these ad hoc: no table component (no surface in the app renders tabular data — every list is `<ul>`/`<ol>` with `.item-list`/`.work-list`/`.audit-list`-style rows; build one only when a real dataset needs row/column comparison, and base it on the left-align-text/right-align-numeric/quiet-header conventions rather than reinventing them from scratch), no icon library (zero icons anywhere in the app today — text labels do this work; picking a library is a real decision to make once a surface actually needs one, not before), no breadcrumbs or pagination (nothing in the app is deep enough or long-enough-listed to need either yet), no generic **info** semantic color (see Color above), no link-action button variant (see Buttons above). This list will get shorter as real surfaces need these things — it should not get shorter by adding speculative CSS for a pattern nothing uses yet.
 
 ## Building a new page
 
@@ -279,6 +279,7 @@ A full app-wide conformance audit against this document (all 47 feature files, c
 - **Three more unwizardized 5+-field forms** — done. `WaitingView.tsx`, `DelegationsPanel.tsx`'s propose-delegation form, and `RecordsPanel.tsx`'s dynamic field array were each reviewed case-by-case against "When to wizardize" above (not left as unexamined debt the way Task/Commitment were) and deliberately kept flat, each for its own stated reason — see that section. `RecordsPanel.tsx` also got a small, unrelated fix found during the review: its field array had an "Add field" button but no way to remove a row once added; it now has one, resetting to a single empty row rather than zero when the last one is removed.
 - **No single dominant anchor on the Today dashboard** — done. "Top priorities" is the primary anchor (the actual reason this page gets opened, per product judgment call — not derivable from the code alone), promoted out of `.dashboard-grid` into its own full-width `.work-panel`, positioned first. `MorningBrief` sits directly after it; the remaining 5 sections (Schedule, Overdue commitments, Open risks, Waiting on, Recent changes) stay in `.dashboard-grid` as the clearly secondary zone. No new CSS — `Section` (`dashboard/Sections.tsx`) gained one prop, `variant?: 'card' | 'panel'`, that swaps its outer wrapper between the two existing primitives; everything else about a section (heading, item list, empty state) is identical between variants.
 - **A milder, related issue in `EngineeringOverview.tsx`** — done, differently than the dashboard's fix. Its 4 summary rows aren't competing panels the way the dashboard's cards were (it's already one `.work-panel`), and no single row deserves permanent promotion — which one matters changes day to day. Instead, each of the first three rows (Connectors, Open incidents, Proposed decisions — each a genuine action queue, something waiting on a person) picks up the app's existing `.degraded-panel` treatment on its own status line whenever that row's count is nonzero; Headline metrics stays neutral always, since it's a disclosure, not a queue with a zero state. No new CSS or component — same semantic this app already uses elsewhere for "needs attention, not broken." Dynamic and honest: on a calm day every row still looks identical, correctly.
+- **The one-off intermediate radii (Geometry above) now sit at or above `--radius-panel`, inverting their old size relationship to it.** `.dashboard-card` (20px), `.recommendation-list > li.is-pinned`/`.simulation-panel` (18px), and the mobile-collapsed `.dashboard-card` radius (16px) predate Visual Foundation v2 and were left as raw numbers on the reasoning that they sat between `--radius-control` (then 14px) and `--radius-panel` (then 28px) as a coherent intermediate tier. Now that `--radius-panel` is 16px, panel is smaller than nearly all of them — the tier no longer reads as "intermediate," and these values need reconciling (new one-offs, folded into the two-tier scale, or something else) once a later sub-project (the planned "card/component system" sub-project) actually touches those specific components. Not fixed speculatively here — flagged so it isn't rediscovered as a surprise.
 
 ## Provenance
 
