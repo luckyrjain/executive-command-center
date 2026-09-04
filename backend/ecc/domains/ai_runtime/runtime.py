@@ -1313,7 +1313,7 @@ def _prepare_meeting_prep_request(
                 # or any other section's rendering -- scoped to the one
                 # bullet this evidence names, not a guess extended to the
                 # other six.
-                f'- id={p["id"]} name={p["entity_name"]} role={p["role"]}'
+                f"- id={p['id']} name={p['entity_name']} role={p['role']}"
                 for p in pack["participants"]
             ],
         ),
