@@ -18,6 +18,7 @@ One font, everywhere: `Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacS
 | Section heading | `18px` | weight `700` |
 | Eyebrow label | small, uppercase, muted | sits above a heading, or above a wizard step (`Step N of M · Label`) |
 | Wizard review value (`.wizard-review dd.is-machine-value`) | `13px` | `ui-monospace, SFMono-Regular, Menlo, monospace` — the one deliberate exception to "one font," scoped to genuinely machine-shaped review values (IDs, timestamps, timezones, credential secrets) via an explicit class, not applied to every review value |
+| KPI/metric value (`.kpi-value`) | inherits surrounding font-size | `font-variant-numeric: tabular-nums; font-weight: 650; letter-spacing: -.02em` — Visual Foundation v2's numeric role for large standalone metric numbers (Inter's own tabular figures, not a second typeface); not yet consumed by any component, reserved for the redesign's KPI/metric sub-project |
 
 ## Color
 
