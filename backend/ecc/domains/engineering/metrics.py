@@ -200,21 +200,20 @@ def _coverage_for(
             f"No connected, active {provider_label} account for this metric's population",
         )
     now = datetime.now(UTC)
-    fresh = 0
-    for account_id in account_ids:
-        updated_at = session.execute(
-            text(
-                "SELECT updated_at FROM sync_cursors WHERE workspace_id = :workspace_id "
-                "AND connector_account_id = :account_id AND resource_type = :resource_type"
-            ),
-            {
-                "workspace_id": workspace_id,
-                "account_id": account_id,
-                "resource_type": resource_type,
-            },
-        ).scalar_one_or_none()
-        if updated_at is not None and updated_at >= now - _FRESHNESS_WINDOW:
-            fresh += 1
+    freshness_cutoff = now - _FRESHNESS_WINDOW
+    fresh = session.execute(
+        text(
+            "SELECT count(*) FROM sync_cursors WHERE workspace_id = :workspace_id "
+            "AND connector_account_id = ANY(:account_ids) AND resource_type = :resource_type "
+            "AND updated_at >= :freshness_cutoff"
+        ),
+        {
+            "workspace_id": workspace_id,
+            "account_ids": list(account_ids),
+            "resource_type": resource_type,
+            "freshness_cutoff": freshness_cutoff,
+        },
+    ).scalar_one()
     percentage = (fresh / total) * 100
     if percentage >= _COMPLETE_COVERAGE_THRESHOLD:
         return "complete", percentage, None
