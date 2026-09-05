@@ -1,7 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
-import { apiRequest } from './api/client'
-import type { DashboardItem } from './dashboard/Sections'
+import { apiRequest } from '../api/client'
+import type { DashboardItem } from './Sections'
 
 type MorningBriefResponse = {
   id: string

@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
 import { ApiError, apiRequest } from '../../api/client'
-import RecommendationPanel from '../../RecommendationPanel'
+import RecommendationPanel from '../governance/RecommendationPanel'
 import type { ConnectorAccount, ConnectorAccountListResponse, SyncRun, SyncRunListResponse } from '../engineering/types'
 import { personalErrorMessage, formatTimestamp } from './errors'
 import { DOMAIN_LABELS } from './types'

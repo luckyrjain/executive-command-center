@@ -4,7 +4,7 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { cleanup, render, screen, fireEvent, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-import { ApiError } from './api/client'
+import { ApiError } from '../../api/client'
 import RecommendationPanel, {
   actionPayload,
   actionSummary,
