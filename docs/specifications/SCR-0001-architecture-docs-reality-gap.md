@@ -2,6 +2,8 @@
 id: SCR-0001
 title: Reconcile RFC-004 architecture chapters and ADR-0005 with the as-built system
 status: Approved
+version: 1.0.0
+owner: Lucky Jain
 requester: Matt architecture review (2026-09-04)
 date: 2026-09-04
 affected_documents:
