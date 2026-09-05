@@ -1968,24 +1968,39 @@ def confirm_team_suggestion_endpoint(
                 session, auth, table=table, suggested_team_name=payload.suggested_team_name
             )
             skipped.extend(skipped_ids)
-            for row_id in authorized_ids:
-                new_version = session.execute(
+            if not authorized_ids:
+                continue
+            # One UPDATE per table (id = ANY(:ids)), not one per row -- a
+            # batch authorizing hundreds of suggestions after e.g. a team
+            # rename previously ran hundreds of serialized single-row
+            # UPDATEs (plus their own audit writes) inside one transaction,
+            # each holding a lock on a workspace_id-scoped row longer than
+            # necessary (architecture review). The audit write itself still
+            # has to happen once per aggregate -- `write_audit_and_outbox`
+            # has no batch form -- but the row mutation it's built from no
+            # longer does.
+            new_versions = {
+                row.id: row.team_assignment_version
+                for row in session.execute(
                     text(
                         f"UPDATE {table} SET team_entity_id = :team_entity_id, "  # noqa: S608
                         "team_assignment_version = team_assignment_version + 1, "
                         "team_assignment_updated_by = :actor_id, updated_at = :now "
-                        "WHERE workspace_id = :workspace_id AND id = :id "
+                        "WHERE workspace_id = :workspace_id AND id = ANY(:ids) "
                         "AND team_entity_id IS NULL AND team_suggestion_dismissed_at IS NULL "
-                        "RETURNING team_assignment_version"
+                        "RETURNING id, team_assignment_version"
                     ),
                     {
                         "team_entity_id": payload.team_entity_id,
                         "actor_id": auth.user_id,
                         "now": now,
                         "workspace_id": auth.workspace_id,
-                        "id": row_id,
+                        "ids": authorized_ids,
                     },
-                ).scalar_one()
+                )
+            }
+            for row_id in authorized_ids:
+                new_version = new_versions[row_id]
                 audit_outbox.write_audit_and_outbox(
                     session,
                     auth,
@@ -2041,16 +2056,20 @@ def dismiss_team_suggestion_endpoint(
                 session, auth, table=table, suggested_team_name=payload.suggested_team_name
             )
             skipped.extend(skipped_ids)
-            for row_id in authorized_ids:
-                session.execute(
-                    text(
-                        f"UPDATE {table} SET team_suggestion_dismissed_at = :now "  # noqa: S608
-                        "WHERE workspace_id = :workspace_id AND id = :id "
-                        "AND team_entity_id IS NULL AND team_suggestion_dismissed_at IS NULL"
-                    ),
-                    {"now": now, "workspace_id": auth.workspace_id, "id": row_id},
-                )
-                updated.append(row_id)
+            if not authorized_ids:
+                continue
+            # One UPDATE per table (id = ANY(:ids)), not one per row --
+            # see confirm_team_suggestion_endpoint's identical fix above
+            # (architecture review).
+            session.execute(
+                text(
+                    f"UPDATE {table} SET team_suggestion_dismissed_at = :now "  # noqa: S608
+                    "WHERE workspace_id = :workspace_id AND id = ANY(:ids) "
+                    "AND team_entity_id IS NULL AND team_suggestion_dismissed_at IS NULL"
+                ),
+                {"now": now, "workspace_id": auth.workspace_id, "ids": authorized_ids},
+            )
+            updated.extend(authorized_ids)
 
         response = TeamSuggestionActionResponse(updated=updated, skipped_unauthorized=skipped)
         store_idempotency(
