@@ -769,9 +769,12 @@ def test_same_workspace_second_user_cannot_read_others_records(
             client_b.get("/api/v1/personal/domains", headers=_headers(token_b)).json()["domains"]
             == []
         )
-        assert client_b.get(
-            f"/api/v1/personal/records/{record['id']}", headers=_headers(token_b)
-        ).status_code == 404
+        assert (
+            client_b.get(
+                f"/api/v1/personal/records/{record['id']}", headers=_headers(token_b)
+            ).status_code
+            == 404
+        )
         # list_records_endpoint has no domain-enabled gate (it's a pure
         # read, scoped only by workspace_id+owner_id) -- B gets 200 with
         # an empty list, not a 403/404, since B genuinely has zero records
