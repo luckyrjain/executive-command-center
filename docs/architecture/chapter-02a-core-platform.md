@@ -47,6 +47,28 @@ Every subsystem is independently replaceable.
 
 ---
 
+# Implementation Status (as of 2026-09-04, see SCR-0001)
+
+This chapter is a Draft RFC-004 chapter describing the target architecture. The sections below describe
+what was actually built as of the date above; where they diverge from the rest of this chapter, the rest of
+this chapter is the aspirational design, not the current system.
+
+- **Application Gateway** — not built. `backend/ecc/main.py` mounts every domain router directly on the
+  FastAPI app; there is no separate gateway service. Authentication and authorization are enforced through
+  a shared dependency (`ecc/auth.py`'s `AuthDep`, `ecc/platform/authz.py`'s `authorize()`) imported by each
+  router, which is a real, centralized, fail-closed seam — but it is not the standalone Gateway service
+  this chapter describes, and rate limiting/API aggregation/response normalization live in ASGI middleware
+  (`ecc/http_security.py`, `ecc/main.py`'s `response_contract_middleware`), not a gateway.
+- **Memory Engine** — not built. No module, table, or class implementing working/long-term/semantic/
+  episodic memory exists anywhere in the codebase.
+- **Planning Engine, Attention Engine, Knowledge Platform, AI Platform** — built, under different names and
+  boundaries than this chapter's diagram: see `backend/ecc/domains/{planning,attention,knowledge,ai_runtime}`
+  plus `governance`, `automation`, `communication`, `identity`, `personal`, `engineering`, `calendar`,
+  `collaboration`, `scheduling` domains this chapter does not mention.
+- **Event Bus** — see `ADR-0005`'s Implementation Note; not built as described.
+
+---
+
 # Architectural Goals
 
 The platform architecture is designed to satisfy the following goals.
