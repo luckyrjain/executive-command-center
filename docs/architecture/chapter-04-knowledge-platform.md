@@ -558,6 +558,9 @@ using
 
 Neo4j
 
+(illustrative — as built, this is a Postgres + pgvector row, not a Neo4j graph; see
+`chapter-08-data-platform.md`'s Implementation Status section)
+
 This understanding exists independently of individual emails.
 
 ---
