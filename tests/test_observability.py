@@ -204,6 +204,21 @@ def test_log_includes_method_status_and_duration(capture_request_logs: _CaptureH
     assert logged.duration_ms >= 0  # type: ignore[attr-defined]
 
 
+def test_success_path_log_line_has_no_exc_info(capture_request_logs: _CaptureHandler) -> None:
+    """The exc_info=True upgrade (round 3 architecture review) is scoped to
+    the two exception branches only -- an ordinary successful request must
+    stay at INFO with no exc_info, unchanged.
+    """
+    client = TestClient(_build_test_app())
+
+    response = client.get("/api/v1/widgets/abc")
+
+    assert response.status_code == 200
+    logged = capture_request_logs.records[0]
+    assert logged.levelname == "INFO"
+    assert logged.exc_info is None
+
+
 # ---------------------------------------------------------------------------
 # Logging: authenticated workspace identifier.
 # ---------------------------------------------------------------------------
@@ -290,6 +305,26 @@ def test_database_failure_path_emits_request_log_line(
     assert logged.request_id is not None  # type: ignore[attr-defined]
 
 
+def test_database_failure_path_log_line_carries_the_traceback(
+    capture_request_logs: _CaptureHandler,
+) -> None:
+    """Round 3 architecture review: the request_handled log line for this
+    path previously carried no exc_info at all, so ecc.logging.JsonFormatter
+    had nothing to serialize a traceback from -- the failure was "logged"
+    (status_code=500, route, duration) but its actual cause was
+    unrecoverable from structured logs alone.
+    """
+    client = TestClient(_build_test_app())
+
+    with pytest.raises(SQLAlchemyError):
+        client.get("/api/v1/db-failure")
+
+    logged = capture_request_logs.records[0]
+    assert logged.levelname == "ERROR"
+    assert logged.exc_info is not None
+    assert logged.exc_info[0] is SQLAlchemyError
+
+
 def test_database_failure_path_increments_request_metric() -> None:
     label_prefix = 'ecc_http_requests_total{route="/api/v1/db-failure",method="GET",status="500"}'
     before_rendered = render_metrics()
@@ -340,6 +375,22 @@ def test_generic_exception_path_emits_request_log_line(
     assert isinstance(logged.duration_ms, float)  # type: ignore[attr-defined]
     assert logged.duration_ms >= 0  # type: ignore[attr-defined]
     assert logged.request_id is not None  # type: ignore[attr-defined]
+
+
+def test_generic_exception_path_log_line_carries_the_traceback(
+    capture_request_logs: _CaptureHandler,
+) -> None:
+    """See test_database_failure_path_log_line_carries_the_traceback --
+    identical gap, the non-database exception branch."""
+    client = TestClient(_build_test_app())
+
+    with pytest.raises(TypeError):
+        client.get("/api/v1/generic-failure")
+
+    logged = capture_request_logs.records[0]
+    assert logged.levelname == "ERROR"
+    assert logged.exc_info is not None
+    assert logged.exc_info[0] is TypeError
 
 
 def test_generic_exception_path_increments_request_metric() -> None:

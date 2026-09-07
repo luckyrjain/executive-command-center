@@ -25,6 +25,15 @@ class JsonFormatter(logging.Formatter):
             "workspace_id": getattr(record, "workspace_id", None),
             "message": record.getMessage(),
         }
+        # logger.exception()/logger.warning(exc_info=True) compute the
+        # traceback onto the record, but it was silently dropped here --
+        # every field above still reached stdout, so the failure looked
+        # "logged" while its actual cause (the one thing a trace gives an
+        # on-call engineer that correlation_id/workspace_id/route don't)
+        # was unrecoverable from logs alone. Same key every other
+        # structured-logging call in this codebase expects.
+        if record.exc_info:
+            payload["exception"] = self.formatException(record.exc_info)
         return json.dumps(payload, separators=(",", ":"))
 
 
