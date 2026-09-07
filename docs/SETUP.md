@@ -176,10 +176,12 @@ embeddings`, then `tests/test_knowledge_embeddings_postgres.py` and
 `tests/test_knowledge_retrieval_benchmark_postgres.py` -- the `embeddings`
 extra pulls in `sentence-transformers`/`torch`, ~1-2GB, so it's isolated
 from the default `backend` job rather than folded into `uv run pytest`
-above) and a `security` job (`docker build` of both `backend/Dockerfile`
-and `frontend/Dockerfile` plus a boot smoke test, a Trivy image scan, a
-Gitleaks secret scan, and an SBOM export via `anchore/sbom-action`). These
-need Docker and the `trivy`/`gitleaks` CLIs respectively; see
+above), a `containers` job (`docker build` of both `backend/Dockerfile` and
+`frontend/Dockerfile`, a boot smoke test of each, then a Trivy **image**
+scan), and a separate `security` job (a Gitleaks secret scan, an SBOM
+export via `anchore/sbom-action`, and a Trivy **filesystem** scan of the
+repository -- not the same scan as the `containers` job's). These need
+Docker and the `trivy`/`gitleaks` CLIs respectively; see
 `.github/workflows/ci.yml` for the exact invocations if you need to
 reproduce one locally -- they're intentionally not Makefile targets since
 most contributors won't have that tooling installed by default.
