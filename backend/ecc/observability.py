@@ -180,7 +180,12 @@ def _record_and_log_request(
             "duration_ms": round(duration_seconds * 1000.0, 3),
             "workspace_id": str(workspace_id) if workspace_id else None,
         },
-        exc_info=exc_info,
+        # `exc_info=exc_info` alone would set record.exc_info to the literal
+        # `False` on the success path (Python's logging passes a falsy-but-
+        # not-None exc_info straight through to the LogRecord unchanged,
+        # instead of normalizing it) -- `or None` keeps that path's record
+        # identical to pre-fix behavior (exc_info=None), not merely falsy.
+        exc_info=exc_info or None,
     )
 
 
