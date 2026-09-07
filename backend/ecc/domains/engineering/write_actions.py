@@ -75,8 +75,8 @@ alone -- getting this wrong is the single most likely way this module
 could double-post.** A connection failure *before* the request reaches
 the wire (`httpx.ConnectError`/`httpx.ConnectTimeout`) is genuinely safe
 to retry -- nothing was sent -- and raises `TransientAdapterError`
-(`ecc.domains.automation.adapters`), the one exception class `worker.
-run_step` treats as retry-safe. A **read timeout on a POST is NOT
+(`ecc.domains.automation.adapter_contract`), the one exception class
+`worker.run_step` treats as retry-safe. A **read timeout on a POST is NOT
 retry-safe** -- the provider may have already created the comment before
 the response was lost -- so it raises a plain exception, landing the
 step at `'failed'` for a human to review rather than a bounded automatic
@@ -141,6 +141,7 @@ from sqlalchemy.orm import Session
 # uses the `connectors` module itself.
 import ecc.domains.engineering.connectors  # noqa: F401
 from ecc.database import SessionFactory
+from ecc.domains.automation.adapter_contract import TransientAdapterError
 from ecc.domains.engineering.crypto import decrypt_credential
 from ecc.domains.engineering.github_adapter import GITHUB_API_BASE_URL, safe_repo_path_segment
 from ecc.domains.engineering.gitlab_adapter import (
@@ -149,23 +150,16 @@ from ecc.domains.engineering.gitlab_adapter import (
 from ecc.domains.engineering.gitlab_adapter import parse_credential as _parse_gitlab_credential
 from ecc.domains.engineering.jira_adapter import parse_credential as _parse_jira_credential
 
-# `TransientAdapterError` is deliberately imported inside `_classify_and_
-# raise`/`_raise_for_write_response` below, not here at module top-level.
-# A top-level `from ecc.domains.automation.adapters import
-# TransientAdapterError` would recreate a genuine two-way circular import
-# with that exact module (`adapters.py` registers this module's three
-# adapters at its own bottom) -- and, unlike the `connectors`-ordering
-# fix immediately above, no import ordering resolves it: reproduced
-# directly against a real interpreter, `import ecc.domains.engineering.
-# write_actions` as the very first touch of either module raises
-# `ImportError: cannot import name 'GitHubAddIssueCommentAdapter' from
-# partially initialized module`, regardless of whether `connectors` was
-# already loaded. Deferring the import into the two functions that
-# actually use the exception class (called only at runtime, long after
-# both modules have finished loading) removes this module's import-time
-# dependency on `automation.adapters` entirely, closing the cycle
-# unconditionally rather than relying on which module happens to import
-# first.
+# `TransientAdapterError` is imported above from `automation.adapter_
+# contract`, not from `automation.adapters`. `adapters.py` is the
+# composition root that imports this module's three adapters to register
+# them (a real, intended dependency in that direction); importing
+# `TransientAdapterError` from that same module here would recreate the
+# two-way circular import that used to force a function-local workaround
+# in this exact spot (architecture review, 2026-09-07, CAR-1).
+# `adapter_contract.py` holds only the adapter contract itself -- no
+# import of this module or any other adapter implementation -- so this is
+# an ordinary, cycle-free top-level import.
 
 
 class WriteActionRejected(ValueError):
@@ -210,12 +204,6 @@ def _load_credential(
 
 
 def _classify_and_raise(provider: str, exc: httpx.HTTPError) -> None:
-    # Imported here, not at module top -- see this module's own docstring
-    # ("no top-level dependency on `ecc.domains.automation.adapters`") for
-    # why a lazy import is the actual fix for the write_actions<->adapters
-    # circular import, not merely an import-ordering workaround.
-    from ecc.domains.automation.adapters import TransientAdapterError
-
     if isinstance(exc, httpx.ConnectError | httpx.ConnectTimeout):
         raise TransientAdapterError(
             f"{provider} write request failed before it was sent: {exc}"
@@ -226,8 +214,6 @@ def _classify_and_raise(provider: str, exc: httpx.HTTPError) -> None:
 
 
 def _raise_for_write_response(provider: str, response: httpx.Response) -> None:
-    from ecc.domains.automation.adapters import TransientAdapterError
-
     if response.status_code == 429:
         raise TransientAdapterError(
             f"{provider} write request rejected (rate limited, never reached the write path): "
