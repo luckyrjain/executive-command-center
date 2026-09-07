@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
 import { ApiError, apiRequest } from '../../api/client'
+import { isStale, statusPanelClass } from '../../lib/connectorStatus'
 import RecommendationPanel from '../governance/RecommendationPanel'
 import type { ConnectorAccount, ConnectorAccountListResponse, SyncRun, SyncRunListResponse } from '../engineering/types'
 import { personalErrorMessage, formatTimestamp } from './errors'
@@ -14,22 +15,6 @@ import type {
   GmailThreadListResponse,
   GmailThreadSummary,
 } from './types'
-
-// This activation has no periodic freshness monitor for Gmail either --
-// same disclosed heuristic `ConnectorHealthPanel.tsx`'s `STALE_AFTER_MS`
-// uses for every other provider.
-const STALE_AFTER_MS = 24 * 60 * 60 * 1000
-
-function isStale(connector: ConnectorAccount, now: Date): boolean {
-  if (!connector.last_synced_at) return false
-  return now.getTime() - new Date(connector.last_synced_at).getTime() > STALE_AFTER_MS
-}
-
-function statusPanelClass(status: ConnectorAccount['status']): string {
-  if (status === 'error' || status === 'disconnected') return 'inline-status error-panel'
-  if (status === 'permission_lost' || status === 'rate_limited') return 'inline-status degraded-panel'
-  return 'inline-status'
-}
 
 function statusLabel(status: ConnectorAccount['status']): string {
   if (status === 'pending') return 'first sync not yet run'

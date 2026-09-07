@@ -3,6 +3,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
 import { ApiError, apiRequest } from '../../api/client'
 import { apiErrorMessage } from '../../api/errorMessage'
+import { isStale, statusPanelClass } from '../../lib/connectorStatus'
 import { useWizardStepFocus } from '../../lib/wizardFocus'
 import type {
   ConnectorAccount,
@@ -321,15 +322,6 @@ const RESOURCE_TYPES = [
 ] as const
 const RUN_TYPES: ReadonlyArray<Extract<SyncRunType, 'backfill' | 'incremental'>> = ['backfill', 'incremental']
 
-// This activation has no periodic freshness monitor -- "stale connector"
-// (UX-STATES.md) is derived client-side from `last_synced_at`'s own age,
-// not a separate backend field. 24 hours is a disclosed, deliberately
-// conservative heuristic (`repositories`/`engineering_work_items`'s own
-// `freshness_state` uses the identical concept per-row, computed by the
-// sync adapters themselves -- this is the account-level analogue where no
-// equivalent field exists).
-const STALE_AFTER_MS = 24 * 60 * 60 * 1000
-
 function errorMessage(error: unknown): string {
   if (error instanceof ApiError && error.code === 'CONNECTOR_AUTHORIZATION_FAILED') {
     // The backend's own detail dict is `{"code": ..., "error": &lt;sanitized
@@ -353,23 +345,6 @@ function errorMessage(error: unknown): string {
 
 function timestamp(value: string | null): string {
   return value ? new Date(value).toLocaleString() : 'never'
-}
-
-function isStale(connector: ConnectorAccount, now: Date): boolean {
-  if (!connector.last_synced_at) return false
-  return now.getTime() - new Date(connector.last_synced_at).getTime() > STALE_AFTER_MS
-}
-
-/** Maps `ConnectorAccountResponse.status` (the one field this backend
- * exposes -- there is no separate "degraded" flag) onto the UX-STATES.md
- * required states this single enum must carry: `pending` is "first sync
- * not yet run", `permission_lost` is "partial permissions",
- * `rate_limited`/`disconnected` are named directly, and `error` is
- * "provider unavailable" (paired with `last_error`). */
-function statusPanelClass(status: ConnectorAccount['status']): string {
-  if (status === 'error' || status === 'disconnected') return 'inline-status error-panel'
-  if (status === 'permission_lost' || status === 'rate_limited') return 'inline-status degraded-panel'
-  return 'inline-status'
 }
 
 function statusLabel(status: ConnectorAccount['status']): string {
