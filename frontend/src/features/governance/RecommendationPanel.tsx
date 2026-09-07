@@ -1,6 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
 import { ApiError, apiRequest } from '../../api/client'
+import { apiErrorMessage } from '../../api/errorMessage'
 import type { EvidenceItem } from '../knowledge/types'
 
 type RecommendationStatus =
@@ -129,11 +130,11 @@ export function confidenceLabel(confidence: number): string {
   return `${Math.round(confidence * 100)}% confidence`
 }
 
-export function recommendationErrorMessage(error: Error): string {
-  if (error instanceof ApiError && (error.code === 'VERSION_CONFLICT' || error.code === 'TARGET_VERSION_CONFLICT')) {
-    return 'This recommendation changed while you were reviewing it. The latest version has been reloaded.'
-  }
-  return error.message
+export function recommendationErrorMessage(error: unknown): string {
+  return apiErrorMessage(error, {
+    VERSION_CONFLICT: 'This recommendation changed while you were reviewing it. The latest version has been reloaded.',
+    TARGET_VERSION_CONFLICT: 'This recommendation changed while you were reviewing it. The latest version has been reloaded.',
+  })
 }
 
 export function evidenceQueryPath(evidenceIds: string[]): string {

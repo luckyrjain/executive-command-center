@@ -689,6 +689,55 @@ def test_list_incidents_is_workspace_isolated(
         assert own_incident_id not in other_ids
 
 
+def test_list_incidents_reports_each_incidents_own_change_ids(
+    engineering_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    """`GET /incidents` batch-fetches `change_ids` for the whole page in
+    one query (round 2 architecture review's N+1 finding) instead of one
+    query per row -- this proves the batched lookup keys each response by
+    the correct incident, not just that it doesn't crash: one incident
+    with two change_ids, one with one, one with none, in the same list
+    call, mis-keying any of them would fail this.
+    """
+    client, workspace_id, user_id, token = engineering_test_context
+    now = datetime.now(UTC)
+    change_a = _insert_change(workspace_id, user_id, external_id="a")
+    change_b = _insert_change(workspace_id, user_id, external_id="b")
+
+    two_changes_response = client.post(
+        "/api/v1/engineering/incidents",
+        json={
+            "title": "Two changes",
+            "detected_at": now.isoformat(),
+            "change_ids": [str(change_a), str(change_b)],
+        },
+        headers=_headers(token, key=str(uuid4())),
+    )
+    assert two_changes_response.status_code == 201, two_changes_response.text
+    two_changes_id = two_changes_response.json()["id"]
+
+    one_change_response = client.post(
+        "/api/v1/engineering/incidents",
+        json={
+            "title": "One change",
+            "detected_at": now.isoformat(),
+            "change_ids": [str(change_a)],
+        },
+        headers=_headers(token, key=str(uuid4())),
+    )
+    assert one_change_response.status_code == 201, one_change_response.text
+    one_change_id = one_change_response.json()["id"]
+
+    no_changes_id = _create_incident(client, token, detected_at=now)
+
+    listed = client.get("/api/v1/engineering/incidents", headers={"X-Correlation-ID": str(uuid4())})
+    assert listed.status_code == 200
+    by_id = {row["id"]: row["change_ids"] for row in listed.json()["incidents"]}
+    assert set(by_id[two_changes_id]) == {str(change_a), str(change_b)}
+    assert by_id[one_change_id] == [str(change_a)]
+    assert by_id[no_changes_id] == []
+
+
 def test_create_incident_deduplicates_repeated_change_ids(
     engineering_test_context: tuple[TestClient, UUID, UUID, str],
 ) -> None:
@@ -1183,6 +1232,42 @@ def test_list_decisions_is_workspace_isolated(
         other_ids = {row["id"] for row in other_response.json()["decisions"]}
         assert other_decision_id in other_ids
         assert own_decision_id not in other_ids
+
+
+def test_list_decisions_reports_each_decisions_own_change_ids(
+    engineering_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    """See `test_list_incidents_reports_each_incidents_own_change_ids` --
+    identical batched-lookup correctness check for `GET /decisions`.
+    """
+    client, workspace_id, user_id, token = engineering_test_context
+    change_a = _insert_change(workspace_id, user_id, external_id="a")
+    change_b = _insert_change(workspace_id, user_id, external_id="b")
+
+    two_changes_response = client.post(
+        "/api/v1/engineering/decisions",
+        json={"title": "Two changes", "change_ids": [str(change_a), str(change_b)]},
+        headers=_headers(token, key=str(uuid4())),
+    )
+    assert two_changes_response.status_code == 201, two_changes_response.text
+    two_changes_id = two_changes_response.json()["id"]
+
+    one_change_response = client.post(
+        "/api/v1/engineering/decisions",
+        json={"title": "One change", "change_ids": [str(change_a)]},
+        headers=_headers(token, key=str(uuid4())),
+    )
+    assert one_change_response.status_code == 201, one_change_response.text
+    one_change_id = one_change_response.json()["id"]
+
+    no_changes_id = _create_decision(client, token, title="No changes")
+
+    listed = client.get("/api/v1/engineering/decisions", headers={"X-Correlation-ID": str(uuid4())})
+    assert listed.status_code == 200
+    by_id = {row["id"]: row["change_ids"] for row in listed.json()["decisions"]}
+    assert set(by_id[two_changes_id]) == {str(change_a), str(change_b)}
+    assert by_id[one_change_id] == [str(change_a)]
+    assert by_id[no_changes_id] == []
 
 
 # --- direct-SQL CHECK constraint tests -----------------------------------------

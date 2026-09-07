@@ -2,6 +2,7 @@ import { useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
 import { ApiError, apiRequest } from '../../api/client'
+import { apiErrorMessage } from '../../api/errorMessage'
 import type { EntityOperation, KnowledgeEntity, ResolutionCandidate, ResolutionCandidateList } from './types'
 
 // Mirrors RiskWorkspace.tsx's errorMessage/VERSION_CONFLICT pattern: a
@@ -9,11 +10,10 @@ import type { EntityOperation, KnowledgeEntity, ResolutionCandidate, ResolutionC
 // or a concurrent merge redirected it) since this row's data was loaded --
 // not a generic failure, and not something retrying with the same stale
 // version can ever fix.
-function mergeErrorMessage(error: Error): string {
-  if (error instanceof ApiError && error.code === 'VERSION_CONFLICT') {
-    return 'One of these entities changed since this page loaded. Refreshing the latest version below.'
-  }
-  return error.message
+function mergeErrorMessage(error: unknown): string {
+  return apiErrorMessage(error, {
+    VERSION_CONFLICT: 'One of these entities changed since this page loaded. Refreshing the latest version below.',
+  })
 }
 
 function listConfirmedCandidates(): Promise<ResolutionCandidateList> {

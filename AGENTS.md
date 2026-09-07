@@ -13,19 +13,25 @@ design — see that chapter's Implementation Status section and `docs/specificat
 - **Backend domains** (`backend/ecc/domains/<name>/`, one directory per business domain — routers, models,
   and hand-written SQL live together per file, there is no separate repository/service layer):
   `ai_runtime`, `attention`, `automation`, `calendar`, `collaboration`, `communication`, `engineering`,
-  `governance`, `identity`, `knowledge`, `personal`, `planning`, `platform` (shared infra: auth, authz,
-  config, crypto, events, observability — not a business domain), `scheduling`.
+  `governance`, `identity`, `knowledge`, `personal`, `planning`, `platform` (despite the name, a real
+  business domain — cross-domain read endpoints: `dashboard_briefs.py`, `audit_queries.py` — not infra;
+  see the next bullet for the other, unrelated `platform`), `scheduling`.
 - **Frontend features** (`frontend/src/features/<name>/`): `attention`, `automation`, `collaboration`,
   `commitments`, `engineering`, `knowledge`, `notes`, `personal`, `risks`, `schedule`, `tasks`. This
   vocabulary does **not** map 1:1 onto the backend domain list above — e.g. backend `governance` splits
-  across frontend `risks/` and three components that live at `frontend/src/` root instead of under
-  `features/` (`RecommendationPanel.tsx`, `MorningBrief.tsx`, `SearchAuditPanel.tsx` — check there if a
-  `features/` search comes up empty). Backend `communication`, `scheduling`, and `platform` have no
-  directly-named frontend feature folder.
+  across frontend `features/governance/` and `features/risks/`. `MorningBrief.tsx`/`Sections.tsx` live
+  under `frontend/src/dashboard/` and `SearchAuditPanel.tsx` under `features/search-audit/` — check there
+  if a `features/<backend-domain-name>/` search comes up empty. Backend `communication`, `scheduling`, and
+  `domains/platform` have no directly-named frontend feature folder.
 - **Auth/authz seam**: `backend/ecc/auth.py` (`AuthDep`, the one FastAPI dependency every router imports)
   and `backend/ecc/platform/authz.py` (`authorize()`/`require_role_action()`, the one decision engine most
   domains call rather than reimplementing checks — `domains/personal/*` is the deliberate exception, see
-  that package's own `workspace_id`+`owner_id` scoping instead).
+  that package's own `workspace_id`+`owner_id` scoping instead). **`backend/ecc/platform/`** (`authz.py`,
+  `authz_grants.py`, `audit_outbox.py`, `idempotency.py`, `notifications.py`, `events/`) is shared infra
+  living beside `domains/`, not inside it — unrelated to the business-domain `domains/platform/` two
+  bullets up despite the identical name; a "platform" search should check both. Other cross-cutting
+  infra (`auth.py`, `config.py`, `observability.py`, `logging.py`) lives directly at `backend/ecc/*`,
+  outside either `platform/`.
 - **Tests**: backend tests live centrally under `tests/` at the repo root (not colocated with
   `backend/ecc/domains/`), named `test_<domain>_<feature>_postgres.py`, and run against a real Postgres.
   Frontend tests are colocated next to the component they test (`Foo.tsx` + `Foo.test.tsx`).

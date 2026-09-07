@@ -367,6 +367,70 @@ def test_review_outcome_closed_also_closes_the_risk(
     assert updated.json()["status"] == "closed"
 
 
+def test_review_outcome_closed_records_status_in_audit_changed_fields(
+    risk_review_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    """A review that closes the risk must record ``status`` in the audit
+    trail's ``changed_fields`` alongside ``review_at``/``version`` -- not
+    just the review row's own fields -- since ``GET /api/v1/audit`` exposes
+    ``changed_fields`` directly and a compliance query or an automation
+    trigger (``triggers.event_type_filter``) filtering on risk status
+    changes must not silently miss a risk closed via the review flow.
+    """
+    client, workspace_id, _, token = risk_review_test_context
+    risk = _create_risk(client, token, "create-risk-close-audit")
+
+    review = client.post(
+        f"/api/v1/risks/{risk['id']}/review",
+        headers=_headers(token, "close-via-review-audit"),
+        json={"expected_version": 1, "outcome": "closed"},
+    )
+    assert review.status_code == 201, review.text
+
+    with engine.connect() as connection:
+        audit = connection.execute(
+            text(
+                """
+                SELECT changed_fields FROM audit_events
+                WHERE workspace_id = :workspace_id AND aggregate_id = :risk_id
+                  AND event_type = 'risk_review.recorded'
+                """
+            ),
+            {"workspace_id": workspace_id, "risk_id": risk["id"]},
+        ).one()
+    assert set(audit.changed_fields) == {"review_at", "version", "status"}
+
+
+def test_review_outcome_not_closed_omits_status_from_audit_changed_fields(
+    risk_review_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    """A review that does not close the risk (status column untouched by
+    the ``UPDATE``) must not claim ``status`` changed.
+    """
+    client, workspace_id, _, token = risk_review_test_context
+    risk = _create_risk(client, token, "create-risk-not-closed-audit")
+
+    review = client.post(
+        f"/api/v1/risks/{risk['id']}/review",
+        headers=_headers(token, "mitigate-via-review-audit"),
+        json={"expected_version": 1, "outcome": "mitigated"},
+    )
+    assert review.status_code == 201, review.text
+
+    with engine.connect() as connection:
+        audit = connection.execute(
+            text(
+                """
+                SELECT changed_fields FROM audit_events
+                WHERE workspace_id = :workspace_id AND aggregate_id = :risk_id
+                  AND event_type = 'risk_review.recorded'
+                """
+            ),
+            {"workspace_id": workspace_id, "risk_id": risk["id"]},
+        ).one()
+    assert set(audit.changed_fields) == {"review_at", "version"}
+
+
 def test_review_rejects_stale_version(
     risk_review_test_context: tuple[TestClient, UUID, UUID, str],
 ) -> None:

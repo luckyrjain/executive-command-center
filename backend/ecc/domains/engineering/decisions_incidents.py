@@ -218,6 +218,49 @@ def _decision_change_ids(session: Session, decision_id: UUID) -> list[UUID]:
     )
 
 
+def _incident_change_ids_by_incident(
+    session: Session, incident_ids: list[UUID]
+) -> dict[UUID, list[UUID]]:
+    """Batched form of `_incident_change_ids` for list endpoints -- one
+    query for the whole page instead of one per row (round 2 architecture
+    review's N+1 finding on `list_incidents_endpoint`).
+    """
+    result: dict[UUID, list[UUID]] = {incident_id: [] for incident_id in incident_ids}
+    if not incident_ids:
+        return result
+    rows = session.execute(
+        text(
+            "SELECT incident_id, change_id FROM incident_changes "
+            "WHERE incident_id = ANY(:incident_ids) ORDER BY incident_id, change_id"
+        ),
+        {"incident_ids": incident_ids},
+    ).all()
+    for incident_id, change_id in rows:
+        result[incident_id].append(change_id)
+    return result
+
+
+def _decision_change_ids_by_decision(
+    session: Session, decision_ids: list[UUID]
+) -> dict[UUID, list[UUID]]:
+    """Batched form of `_decision_change_ids` for list endpoints -- see
+    `_incident_change_ids_by_incident`.
+    """
+    result: dict[UUID, list[UUID]] = {decision_id: [] for decision_id in decision_ids}
+    if not decision_ids:
+        return result
+    rows = session.execute(
+        text(
+            "SELECT decision_id, change_id FROM decision_changes "
+            "WHERE decision_id = ANY(:decision_ids) ORDER BY decision_id, change_id"
+        ),
+        {"decision_ids": decision_ids},
+    ).all()
+    for decision_id, change_id in rows:
+        result[decision_id].append(change_id)
+    return result
+
+
 def _get_incident(session: Session, workspace_id: UUID, incident_id: UUID) -> dict[str, Any] | None:
     row = (
         session.execute(
@@ -251,25 +294,39 @@ def _get_decision(session: Session, workspace_id: UUID, decision_id: UUID) -> di
 
 
 def _to_incident_response(
-    session: Session, auth: AuthContext, row: dict[str, Any]
+    session: Session,
+    auth: AuthContext,
+    row: dict[str, Any],
+    *,
+    change_ids: list[UUID] | None = None,
 ) -> IncidentResponse:
+    """`change_ids`, when given (a list endpoint's pre-batched lookup),
+    skips the per-row `_incident_change_ids` query -- every other caller
+    (single-resource create/get/resolve) leaves it `None` and pays that
+    one query, unchanged.
+    """
     sharing = authz.effective_permissions(
         session, auth, resource_type="incidents", resource_id=row["id"]
     )
-    return IncidentResponse(
-        **row, change_ids=_incident_change_ids(session, row["id"]), sharing=sharing
-    )
+    if change_ids is None:
+        change_ids = _incident_change_ids(session, row["id"])
+    return IncidentResponse(**row, change_ids=change_ids, sharing=sharing)
 
 
 def _to_decision_response(
-    session: Session, auth: AuthContext, row: dict[str, Any]
+    session: Session,
+    auth: AuthContext,
+    row: dict[str, Any],
+    *,
+    change_ids: list[UUID] | None = None,
 ) -> DecisionResponse:
+    """See `_to_incident_response`'s identical `change_ids` parameter."""
     sharing = authz.effective_permissions(
         session, auth, resource_type="engineering_decisions", resource_id=row["id"]
     )
-    return DecisionResponse(
-        **row, change_ids=_decision_change_ids(session, row["id"]), sharing=sharing
-    )
+    if change_ids is None:
+        change_ids = _decision_change_ids(session, row["id"])
+    return DecisionResponse(**row, change_ids=change_ids, sharing=sharing)
 
 
 @router.post("/incidents", response_model=IncidentResponse, status_code=status.HTTP_201_CREATED)
@@ -502,7 +559,13 @@ def list_incidents_endpoint(
         .mappings()
         .all()
     )
-    incidents = [_to_incident_response(session, auth, dict(row)) for row in rows]
+    change_ids_by_incident = _incident_change_ids_by_incident(session, [row["id"] for row in rows])
+    incidents = [
+        _to_incident_response(
+            session, auth, dict(row), change_ids=change_ids_by_incident[row["id"]]
+        )
+        for row in rows
+    ]
     session.rollback()
     return IncidentListResponse(incidents=incidents)
 
@@ -741,6 +804,12 @@ def list_decisions_endpoint(
         .mappings()
         .all()
     )
-    decisions = [_to_decision_response(session, auth, dict(row)) for row in rows]
+    change_ids_by_decision = _decision_change_ids_by_decision(session, [row["id"] for row in rows])
+    decisions = [
+        _to_decision_response(
+            session, auth, dict(row), change_ids=change_ids_by_decision[row["id"]]
+        )
+        for row in rows
+    ]
     session.rollback()
     return DecisionListResponse(decisions=decisions)

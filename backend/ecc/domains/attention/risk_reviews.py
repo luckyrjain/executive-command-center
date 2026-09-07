@@ -248,7 +248,7 @@ def record_risk_review(
             aggregate_type="risk",
             aggregate_id=risk_id,
             aggregate_version=risk["version"] + 1,
-            changed_fields=["review_at", "version"],
+            changed_fields=["review_at", "version"] + (["status"] if new_status else []),
             payload={"risk_id": str(risk_id), "review_id": str(review_id)},
             now=now,
             domain="risk_reviews",
