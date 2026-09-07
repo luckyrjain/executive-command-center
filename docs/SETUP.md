@@ -141,15 +141,23 @@ Open the one-time bootstrap URL printed by `scripts/bootstrap_dev.py`. After the
 
 ## Tests and quality gates
 
+`make check` and `make test` (see `Makefile`) cover ruff/mypy/pytest/frontend
+lint+typecheck+test -- the fast, no-extra-tooling subset of what CI runs on
+every PR. The remaining CI gates, run individually below, need either a
+package not in the default install (`pip-audit`, Playwright's browser) or
+external CLI tools most local setups won't have -- so they're not folded
+into `make check`/`make test`.
+
 Backend:
 
 ```bash
 make docs-check
-uv run ruff check backend tests scripts
-uv run ruff format --check backend tests scripts
+uv run ruff check backend tests
+uv run ruff format --check backend tests
 uv run mypy backend
 uv run pytest
 uv run pip-audit
+python scripts/check_phase3_prohibited_signals.py
 ```
 
 Frontend:
@@ -158,9 +166,23 @@ Frontend:
 pnpm --filter @ecc/frontend typecheck
 pnpm --filter @ecc/frontend test -- --run
 pnpm --filter @ecc/frontend build
+pnpm audit --audit-level=high
 pnpm --filter @ecc/frontend exec playwright install --with-deps chromium
 pnpm --filter @ecc/frontend test:e2e
 ```
+
+CI additionally runs an `embeddings-benchmark` job (`uv sync --extra
+embeddings`, then `tests/test_knowledge_embeddings_postgres.py` and
+`tests/test_knowledge_retrieval_benchmark_postgres.py` -- the `embeddings`
+extra pulls in `sentence-transformers`/`torch`, ~1-2GB, so it's isolated
+from the default `backend` job rather than folded into `uv run pytest`
+above) and a `security` job (`docker build` of both `backend/Dockerfile`
+and `frontend/Dockerfile` plus a boot smoke test, a Trivy image scan, a
+Gitleaks secret scan, and an SBOM export via `anchore/sbom-action`). These
+need Docker and the `trivy`/`gitleaks` CLIs respectively; see
+`.github/workflows/ci.yml` for the exact invocations if you need to
+reproduce one locally -- they're intentionally not Makefile targets since
+most contributors won't have that tooling installed by default.
 
 ## Docker Compose
 

@@ -20,6 +20,7 @@ check:
 	uv run ruff check backend tests
 	uv run ruff format --check backend tests
 	uv run mypy backend
+	python scripts/check_phase3_prohibited_signals.py
 	pnpm --filter @ecc/frontend lint
 	pnpm --filter @ecc/frontend typecheck
 
