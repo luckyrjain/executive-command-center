@@ -130,12 +130,12 @@ async def request_observability_middleware(
         route = _route_template(request)
         record_database_failure(route)
         duration_seconds = time.monotonic() - start
-        _record_and_log_request(request, route, duration_seconds, status_code=500)
+        _record_and_log_request(request, route, duration_seconds, status_code=500, exc_info=True)
         raise
     except Exception:
         route = _route_template(request)
         duration_seconds = time.monotonic() - start
-        _record_and_log_request(request, route, duration_seconds, status_code=500)
+        _record_and_log_request(request, route, duration_seconds, status_code=500, exc_info=True)
         raise
 
     duration_seconds = time.monotonic() - start
@@ -146,8 +146,21 @@ async def request_observability_middleware(
 
 
 def _record_and_log_request(
-    request: Request, route: str, duration_seconds: float, *, status_code: int
+    request: Request,
+    route: str,
+    duration_seconds: float,
+    *,
+    status_code: int,
+    exc_info: bool = False,
 ) -> None:
+    """``exc_info=True`` (only from the two ``except`` branches above, where
+    Python's logging machinery is inside the active ``except`` block and can
+    still capture ``sys.exc_info()``) attaches the traceback that ``ecc.
+    logging.JsonFormatter`` now serializes under an ``"exception"`` key --
+    otherwise a request that 500s for a reason other than the caller's own
+    domain code logging it (a bug ``SQLAlchemyError``/``except Exception``
+    catches here first) left no traceback anywhere in the structured logs.
+    """
     method = request.method
     request_id = getattr(request.state, "request_id", None)
     correlation_id = getattr(request.state, "correlation_id", None)
@@ -155,7 +168,8 @@ def _record_and_log_request(
 
     record_request(route, method, status_code, duration_seconds)
 
-    _request_logger.info(
+    log = _request_logger.error if exc_info else _request_logger.info
+    log(
         "request_handled",
         extra={
             "request_id": request_id,
@@ -166,6 +180,12 @@ def _record_and_log_request(
             "duration_ms": round(duration_seconds * 1000.0, 3),
             "workspace_id": str(workspace_id) if workspace_id else None,
         },
+        # `exc_info=exc_info` alone would set record.exc_info to the literal
+        # `False` on the success path (Python's logging passes a falsy-but-
+        # not-None exc_info straight through to the LogRecord unchanged,
+        # instead of normalizing it) -- `or None` keeps that path's record
+        # identical to pre-fix behavior (exc_info=None), not merely falsy.
+        exc_info=exc_info or None,
     )
 
 

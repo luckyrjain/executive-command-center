@@ -19,10 +19,19 @@ design — see that chapter's Implementation Status section and `docs/specificat
 - **Frontend features** (`frontend/src/features/<name>/`): `attention`, `automation`, `collaboration`,
   `commitments`, `engineering`, `knowledge`, `notes`, `personal`, `risks`, `schedule`, `tasks`. This
   vocabulary does **not** map 1:1 onto the backend domain list above — e.g. backend `governance` splits
-  across frontend `features/governance/` and `features/risks/`. `MorningBrief.tsx`/`Sections.tsx` live
-  under `frontend/src/dashboard/` and `SearchAuditPanel.tsx` under `features/search-audit/` — check there
-  if a `features/<backend-domain-name>/` search comes up empty. Backend `communication`, `scheduling`, and
-  `domains/platform` have no directly-named frontend feature folder.
+  across frontend `features/governance/` and `features/risks/`, and backend `knowledge` splits the same
+  way: `features/knowledge/` (entities/relationships/resolution — most of the domain) plus a separate
+  `features/notes/` for `knowledge.notes` specifically. `MorningBrief.tsx`/`Sections.tsx` live under
+  `frontend/src/dashboard/` and `SearchAuditPanel.tsx` under `features/search-audit/` — check there if a
+  `features/<backend-domain-name>/` search comes up empty. `communication` and `planning` are
+  consumer-facing under a differently-named folder, not absent: `communication.commitments` →
+  `features/commitments/`, `planning.tasks` → `features/tasks/`.
+  **`scheduling` is the one real false-friend**: `features/schedule/` (singular, no "ing") calls *both*
+  `scheduling.meetings` and `calendar.events` — grepping backend for "schedule" and stopping at
+  `domains/scheduling/` misses `domains/calendar/` entirely, and vice versa. Backend `domains/platform`
+  (the business domain, not `platform/` the infra package — see the next bullet) has no frontend feature
+  folder at all; its `dashboard_briefs`/`audit_queries` endpoints are consumed from `dashboard/` and
+  `features/search-audit/` respectively, not a `features/platform/`.
 - **Auth/authz seam**: `backend/ecc/auth.py` (`AuthDep`, the one FastAPI dependency every router imports)
   and `backend/ecc/platform/authz.py` (`authorize()`/`require_role_action()`, the one decision engine most
   domains call rather than reimplementing checks — `domains/personal/*` is the deliberate exception, see
