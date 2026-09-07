@@ -31,5 +31,5 @@ backups/
 .vscode/
 .claude*/*
 .playwright-mcp/*
-graphify*/*
+graphify*/
 .gstack/
