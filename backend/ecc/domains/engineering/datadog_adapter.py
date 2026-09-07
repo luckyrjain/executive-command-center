@@ -142,6 +142,7 @@ from .connectors import (
     ConnectorAuthorization,
     PermissionState,
     SyncOutcome,
+    safe_source_url,
 )
 
 _PAGE_SIZE = 100
@@ -394,19 +395,28 @@ def _upsert_dashboard(
     dashboard_id = dashboard["id"]
     # Every other resource type's `source_url` is built entirely server-side
     # from `ui_host`; dashboards are the one exception, since Datadog's own
-    # `url` field is normally a relative path. Unlike monitors/service
-    # definitions, a provider-returned string that is neither a relative
+    # `url` field is normally a relative path. `connectors.safe_source_url`
+    # is the same allow-list decision `github_adapter`/`gitlab_adapter` use
+    # for their own provider-returned URL fields (architecture review,
+    # 2026-09-07, CAR-2 -- previously three independent copies of this
+    # exact check): a provider-returned string that is neither a relative
     # path nor already scoped to this connection's own `ui_host` is never
     # trusted verbatim (it could be `javascript:`/`data:`/an arbitrary
     # external host if the connected Datadog tenant were compromised or
     # malicious) -- fall back to the safe, server-constructed default.
+    # `safe_source_url` returns the trusted value in its original shape
+    # (relative as-is, or the full `https://{ui_host}/...` form), so an
+    # absolute-but-trusted result is stripped back to a relative path here,
+    # same as before this was shared.
     raw_url = dashboard.get("url")
-    if raw_url and raw_url.startswith("/"):
-        url = raw_url
-    elif raw_url and raw_url.startswith(f"https://{ui_host}/"):
-        url = raw_url[len(f"https://{ui_host}") :]
-    else:
-        url = f"/dashboard/{dashboard_id}"
+    url = safe_source_url(
+        raw_url,
+        fallback=f"/dashboard/{dashboard_id}",
+        web_base_url=f"https://{ui_host}",
+        allow_relative=True,
+    )
+    if url.startswith(f"https://{ui_host}/"):
+        url = url[len(f"https://{ui_host}") :]
     # `tags` is not confirmed present on the list endpoint's own summary
     # shape (see module docstring) -- `.get` is defensive, not load-bearing.
     tags = dashboard.get("tags") or []

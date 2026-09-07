@@ -115,6 +115,7 @@ from .connectors import (
     ConnectorAuthorization,
     PermissionState,
     SyncOutcome,
+    safe_source_url,
 )
 
 # `CONNECTOR-CONTRACT.md`'s resolved GitLab read scopes -- unlike GitHub's
@@ -225,25 +226,6 @@ def _default_resolve_host(host: str) -> list[str]:
     return [str(info[4][0]) for info in addr_info]
 
 
-def _safe_source_url(raw_url: str | None, *, fallback: str, web_base_url: str) -> str:
-    """Same allow-list defense `datadog_adapter.py`'s `_upsert_dashboard`
-    already applies to its own provider-returned `url` field, and
-    `github_adapter.py`'s identical `_safe_source_url` applies to
-    `html_url` (review found this adapter's own `web_url` field never
-    received it): a value not scoped to GitLab's own web host is never
-    trusted verbatim -- it could be `javascript:`/`data:`/an arbitrary
-    external host if the connected GitLab instance were compromised or
-    malicious -- falling back to a safe, server-constructed default
-    instead of rendering it as a clickable link. `web_base_url` is the
-    parsed-per-credential host's own web origin (e.g.
-    `https://gitlab-ee.example.com`), not a fixed constant -- self-managed
-    hosts each have their own web origin to allow-list against.
-    """
-    if raw_url and raw_url.startswith(f"{web_base_url}/"):
-        return raw_url
-    return fallback
-
-
 def _content_hash(project: Mapping[str, Any]) -> str:
     material = dumps(
         {
@@ -312,7 +294,7 @@ def _upsert_repository(
         provider=provider,
         external_id=str(project["id"]),
         name=project.get("path_with_namespace") or str(project["id"]),
-        source_url=_safe_source_url(
+        source_url=safe_source_url(
             project.get("web_url"),
             fallback=f"{web_base_url}/{project.get('path_with_namespace') or project['id']}",
             web_base_url=web_base_url,
