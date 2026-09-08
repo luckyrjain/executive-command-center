@@ -1,8 +1,9 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
 import { ApiError, apiRequest } from '../../api/client'
 import { isStale, statusPanelClass } from '../../lib/connectorStatus'
+import { useWizardStepFocus } from '../../lib/wizardFocus'
 import RecommendationPanel from '../governance/RecommendationPanel'
 import type { ConnectorAccount, ConnectorAccountListResponse, SyncRun, SyncRunListResponse } from '../engineering/types'
 import { personalErrorMessage, formatTimestamp } from './errors'
@@ -114,21 +115,14 @@ export default function GmailPanel() {
   // same fix `ConnectorHealthPanel.tsx`'s own wizard needed -- without it,
   // the clicked button unmounts (each step is a different conditional
   // branch) and a keyboard/screen-reader user's focus silently drops to
-  // `<body>` instead of landing on the new step.
-  const connectStepHeadingRef = useRef<HTMLHeadingElement>(null)
-  // `useEffect` also runs after the very first render, not only on a later
-  // change to `connectStep` -- without this guard, simply opening the
-  // Gmail tab with no account connected yet would yank focus onto "What
-  // Gmail access gives you" on an ordinary page visit, not just a real
-  // Continue/Back click. Mirrors `ConnectorHealthPanel.tsx`'s own guard.
-  const isFirstConnectRenderRef = useRef(true)
-  useEffect(() => {
-    if (isFirstConnectRenderRef.current) {
-      isFirstConnectRenderRef.current = false
-      return
-    }
-    connectStepHeadingRef.current?.focus()
-  }, [connectStep])
+  // `<body>` instead of landing on the new step. The first-render guard
+  // (opening the Gmail tab with no account connected yet must not yank
+  // focus onto "What Gmail access gives you" on an ordinary page visit)
+  // lives inside `useWizardStepFocus` itself.
+  const connectStepHeadingRef = useWizardStepFocus(
+    () => connectStepHeadingRef.current?.focus(),
+    [connectStep],
+  )
   // Lazy `useState` initializer (the function reference, not its called
   // result) -- React invokes `readOAuthReturnStatus` exactly once, on
   // first render, never again. The setter is intentionally never called:
