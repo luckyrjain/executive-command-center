@@ -2,7 +2,7 @@
 id: PHASE-2-DEPLOYMENT
 title: Phase 2 Deployment Runbook
 status: Active
-version: 1.0.0
+version: 1.1.0
 owner: Lucky Jain
 ---
 
@@ -32,6 +32,7 @@ assumes it.
   `retrieval_documents`. Applied the same way as any Phase 1 migration —
   `uv run alembic -c backend/alembic.ini upgrade head` picks these up with
   no separate step.
+- **Migrations `0015`-`0021`, shipped after this section was first written, also belong to Phase 2** and are picked up by the same `upgrade head` call: `0015_phase2_embeddings.py` (adds `pgvector`/the `vector` extension and embedding columns — see "Embeddings deployment" below, the reason this environment specifically needs the `pgvector/pgvector:pg18` image, not plain `postgres:18`), `0016_phase2_require_evidence.py`, `0017_phase2_resolution_defer.py`, `0018_phase2_split_operation.py`, `0019_phase2_mutable_versioning.py`, `0020_phase2_drop_dead_entity_id.py`, and `0021_phase2_drop_observed_at.py` (schema-correction migrations refining the `0010`-`0014` tables above, not new tables of their own). This list was previously undercounted at `0010`-`0014` only.
 - **No new environment variables.** Phase 2 introduces no new required or
   recommended settings; `backend/ecc/config.py`'s `Settings` and
   `validate_production_settings` are unchanged. The full table in

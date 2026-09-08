@@ -2,7 +2,7 @@
 id: PHASE-1-DEPLOYMENT
 title: Phase 1 Deployment Runbook
 status: Active
-version: 1.0.0
+version: 1.1.0
 owner: Lucky Jain
 ---
 
@@ -15,8 +15,14 @@ Phase 0's technology boundary (`README.md`) defers cloud infrastructure and
 Kubernetes; Phase 1 has no live hosted environment. The commands below are
 the exact, runnable commands for building, migrating, running, smoke
 checking, rolling back and recovering the application — usable today
-against any host that can run Docker and reach a PostgreSQL 18 instance,
-local or otherwise. They are not placeholders.
+against any host that can run Docker and reach a **`pgvector/pgvector:pg18`**
+instance specifically, local or otherwise — not plain `postgres:18`.
+Migration `0015_phase2_embeddings.py` runs `CREATE EXTENSION IF NOT EXISTS
+vector` unconditionally as part of `alembic upgrade head`, regardless of
+whether the embeddings feature is enabled, so `alembic upgrade head` fails
+against a plain PostgreSQL image at any current `HEAD`. `docker-compose.yml`
+already uses the `pgvector/pgvector:pg18` image for exactly this reason.
+They are not placeholders.
 
 ## Environment variables
 
@@ -26,6 +32,9 @@ local or otherwise. They are not placeholders.
 | `ECC_DATABASE_URL` | yes | SQLAlchemy/psycopg connection string, e.g. `postgresql+psycopg://ecc:ecc@127.0.0.1:5432/ecc`. | Must point at the real production PostgreSQL 18 instance; never the default local value. **Not checked by `validate_production_settings`** (see note below the table) — an operator misconfiguration here fails only when a query actually runs, not at startup. |
 | `ECC_SESSION_SECRET` | yes | Session/CSRF signing secret. | Must be at least 32 characters, cryptographically random, and not one of the recognized development placeholder strings — `validate_production_settings` rejects both a too-short value and a known placeholder outside development. Rotation owner: see above. |
 | `ECC_CORS_ORIGINS` | yes | Comma-separated allowed browser origins. | Must be non-empty, must not contain a wildcard (`*`), and every origin must use `https://` outside development. |
+| `ECC_FRONTEND_URL` | yes | Frontend origin used for OAuth-completion redirects (e.g. Gmail connector callback). | Must be non-empty and use `https://` outside development; `validate_production_settings` rejects an empty or non-`https://` value. |
+| `ECC_CONNECTOR_TOKEN_ENCRYPTION_KEY` | yes | Fernet key encrypting stored connector OAuth/PAT credentials at rest. | Must be set (not the empty default), not a recognized development placeholder, and must decode from urlsafe-base64 to exactly 32 bytes — `validate_production_settings` rejects a missing, placeholder, malformed, or wrong-length key outside development. |
+| `ECC_PERSONAL_DATA_ENCRYPTION_KEY` | yes | Fernet key encrypting Phase 7 personal-domain field-level data at rest. | Same structural requirements as `ECC_CONNECTOR_TOKEN_ENCRYPTION_KEY` above (set, non-placeholder, valid 32-byte urlsafe-base64 Fernet key), enforced identically. |
 | `POSTGRES_DB` / `POSTGRES_USER` / `POSTGRES_PASSWORD` | yes (for the `postgres` container/service) | Database provisioning credentials. | Must not be the `ecc`/`ecc`/`ecc` development defaults in any shared or production environment. **Not part of `Settings`/`validate_production_settings` at all** (see note below the table) — these are `docker-compose.yml`-only provisioning variables the backend process never reads directly; nothing in the application enforces this requirement. |
 | `ECC_METRICS_TOKEN` | recommended | Shared-secret token gating `GET /metrics`. | Optional, but strongly recommended in production: `/metrics` is a `GET` route and is intentionally outside `mutation_rate_limit_middleware`'s scope (it's meant to be scrape-friendly), and each scrape runs a live DB query. If unset, the endpoint stays open to anyone who can reach it -- **only acceptable if the port/route is firewalled off from the public internet** (e.g. restricted to an internal scrape network). If set, Prometheus/scrapers must send `Authorization: Bearer <token>`. |
 | `ECC_TRUSTED_PROXY_COUNT` | conditionally required | Number of trusted reverse proxies/load balancers in front of `ecc-backend`. | Defaults to `0` (trust only the raw socket peer), which is correct for the direct `docker run -p 8000:8000` exposure shown above. This app does not terminate TLS itself, so any deployment that actually satisfies `ECC_CORS_ORIGINS`'s `https://`-only requirement puts a TLS-terminating reverse proxy or load balancer in front of it -- at that point **this must be set to the exact hop count** (usually `1`), or `mutation_rate_limit_middleware`'s per-IP ceiling collapses every distinct client into one shared bucket (they all arrive from the proxy's address) instead of limiting individual clients. **Do not set this higher than the real hop count "to be safe"** -- an over-counted value lets a client pad `X-Forwarded-For` with its own fabricated hops and get treated as whatever IP it fabricates, bypassing the rate limit entirely. See `backend/ecc/http_security.py`'s `_client_host`. |
@@ -33,10 +42,14 @@ local or otherwise. They are not placeholders.
 
 `validate_production_settings` (`backend/ecc/config.py`), called
 unconditionally at import time in `backend/ecc/main.py`, actually validates
-only three fields: `ECC_ENV`, `ECC_SESSION_SECRET`, and `ECC_CORS_ORIGINS`
-(confirmed by reading the function directly — it never touches
-`database_url`, and `POSTGRES_DB`/`POSTGRES_USER`/`POSTGRES_PASSWORD` aren't
-even part of the `Settings` model it validates). For those three, the
+six fields: `ECC_ENV`, `ECC_SESSION_SECRET`, `ECC_CORS_ORIGINS`,
+`ECC_FRONTEND_URL`, `ECC_CONNECTOR_TOKEN_ENCRYPTION_KEY`, and
+`ECC_PERSONAL_DATA_ENCRYPTION_KEY` (confirmed by reading the function
+directly — it never touches `database_url`, and
+`POSTGRES_DB`/`POSTGRES_USER`/`POSTGRES_PASSWORD` aren't even part of the
+`Settings` model it validates; the two encryption-key validators were added
+after this section was first written and are easy to miss since neither
+looks like a "security setting" by name). For those six, the
 application refuses to start under an insecure production configuration
 rather than starting and failing later (Task 7; `tests/test_production_security.py`).
 The `ECC_DATABASE_URL` and `POSTGRES_*` "Production requirement" cells above

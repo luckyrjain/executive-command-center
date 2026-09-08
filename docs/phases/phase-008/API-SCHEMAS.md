@@ -2,7 +2,7 @@
 id: PHASE-008-API-SCHEMAS
 title: Phase 8 Multi-user API
 status: Approved for Implementation
-version: 0.8.0
+version: 0.9.0
 owner: Lucky Jain
 ---
 
@@ -51,6 +51,8 @@ The authenticated user selects an allowed workspace through a server-validated s
 `ecc.domains.engineering`'s 19 existing endpoints (`decisions_incidents.py`'s 6, `connector_accounts.py`'s 13) are this task's reference wiring: every mutate endpoint calls `authz.require_role_action`/`authz.authorize` before touching a resource (a two-step read-then-write check on endpoints identified by path parameter, so a resource that exists but the caller cannot see returns `404`, never `403` -- this document's own top-level "existence cannot be inferred from an authorization failure" rule, now enforced by the general mechanism rather than domain-specific `workspace_id` scoping); every list endpoint calls `authz.visible_resource_filter_sql` and embeds the returned fragment in its own `WHERE` clause, filtering server-side rather than returning then hiding rows client-side. `GET /workspaces/{id}/members`, `PATCH|DELETE /workspaces/{id}/members/{user_id}`, `GET|POST /delegations`, `POST /delegations/{id}/accept|reject|revoke|complete`, `GET /shared/activity` remain out of scope, Tasks 4/6/7's own work respectively -- Task 4 also widens the `authorize()`/`visible_resource_filter_sql` wiring pattern demonstrated here to every remaining domain's existing endpoints, mechanically, no new mechanism.
 
 ## Task 5 status
+
+**Since relocated (2026-08-14, PR #142/#143), applies to every mention below and in later sections:** the grants/ownership-transfer endpoint functions (`create_grant_endpoint`, `revoke_grant_endpoint`, `create_ownership_transfer_endpoint`) described in this file as living "under `ecc.platform.authz`" now live in a new module, `ecc.platform.authz_grants`, split out of `authz.py` to leave that module as the pure decision-engine. Routes, request/response shapes and behavior are unchanged -- only the module moved. Not repeated at each later mention.
 
 **Shipped**, under `ecc.platform.authz`: `POST /sharing/grants/preview` and `GET /sharing/resources/{resource_type}/{resource_id}`, plus a real fix to `POST /sharing/grants` itself.
 

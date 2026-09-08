@@ -2,7 +2,7 @@
 id: PHASE-1-RELEASE-GATE
 title: Phase 1 Production Release Gate
 status: Open
-version: 1.0.0
+version: 1.1.0
 owner: Lucky Jain
 ---
 
@@ -33,7 +33,7 @@ owner: Lucky Jain
 - [x] Security headers are emitted by the frontend and backend entry points. (Task 7: `backend/ecc/http_security.py`, `frontend/nginx.conf.template`, `task-7-review.md`)
 - [x] Request size and rate limits are defined for authenticated and mutation routes. (Task 7: non-buffering 413 body-size limit and bounded 429 rate limiting, `task-7-review.md`)
 - [x] Session cookies remain secure, HTTP-only and same-site constrained in production. (Task 7: the only cookie-issuing code path, `backend/ecc/dev_bootstrap.py`, is gated to `ECC_ENV=development` only — no cookie is ever issued outside development — `task-7-review.md`)
-- [x] Dependency, secret, container and SBOM scans pass. (Task 11: `pnpm audit --audit-level=high` and `pip-audit` in scope; independently re-verified live against the branch's final commit `c79afb3` via the `security` job (gitleaks, Syft SBOM, Trivy filesystem scan) and the `containers` job (Trivy image scan of both built images at `HIGH,CRITICAL` severity, `exit-code: 1` on any finding) on GitHub Actions run IDs `29804619977`/`29804620011` — both completed with conclusion `success`, not merely re-scanned locally. `react-router` was bumped to `7.18.1` and the backend base image switched to `python:3.14.6-alpine` with an explicit `apk upgrade` step to reach this state; see PR #15's description for the full remediation history.)
+- [x] Dependency, secret, container and SBOM scans pass. (Task 11: `pnpm audit --audit-level=high` and `pip-audit` in scope; independently re-verified live against the branch's final commit `c79afb3` via the `security` job (gitleaks, Syft SBOM, Trivy filesystem scan) and the `containers` job (Trivy image scan of both built images at `HIGH,CRITICAL` severity, `exit-code: 1` on any finding) on GitHub Actions run IDs `29804619977`/`29804620011` — both completed with conclusion `success`, not merely re-scanned locally. `react-router` was bumped to `7.18.1` and the backend base image switched to `python:3.14.6-alpine` with an explicit `apk upgrade` step to reach this state; see PR #15's description for the full remediation history. **Note (2026-09-08 doc audit):** `react-router` is not a dependency in `frontend/package.json` today and has no imports anywhere in `frontend/src` — either it was later removed as unused, or this evidence line was already wrong at merge time; this remediation-evidence trail can no longer be verified against current dependencies, though the scan results and other remediations (the Alpine base image bump) it describes are independently confirmed by the CI run IDs above.)
 
 ### Observability
 

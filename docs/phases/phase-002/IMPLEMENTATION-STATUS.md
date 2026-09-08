@@ -2,9 +2,9 @@
 id: PHASE-002-IMPLEMENTATION-STATUS
 title: Phase 2 Implementation Status
 status: Active
-version: 0.12.0
+version: 0.13.0
 owner: Lucky Jain
-updated: 2026-07-22
+updated: 2026-09-08
 ---
 
 # Phase 2 Implementation Status
@@ -38,7 +38,7 @@ Phase 2 implementation has started on `feature/phase-2-knowledge-platform`. This
 ## Known gaps
 
 - **Adversarial and property-test coverage is representative, not exhaustive.** The completeness-audit fix pass added a canonical-name max-length boundary test and a SQL-injection-shaped-input test (`test_entity_create_canonical_name_max_length_boundary`, `test_entity_create_handles_sql_injection_shaped_canonical_name` in `tests/test_knowledge_entities_postgres.py`) as representative proof that field-length constraints and parameterized-query safety hold end-to-end. It deliberately did not attempt exhaustive coverage of every adversarial category an audit could name -- relationship cycles beyond three nodes, Unicode edge cases beyond NFC-normalization and combining-character equivalence (already covered), or concurrency races beyond the ones with a real code path to race (merge/reverse/split). That space is open-ended; closing one representative case per category and documenting the rest as scoped out is a deliberate stopping point, not an oversight.
-- **`entity_aliases` has no write path.** `GET /entities/{id}/aliases` (Slice 1) is the only HTTP endpoint touching the table; merge's `_rehome_aliases` (Slice 5) only moves existing rows between entities on merge. No shipped endpoint ever inserts one, so in a real deployment the table stays permanently empty, and the read paths that depend on it (resolution scoring's alias-overlap factor, retrieval's exact-alias-match tier) never actually fire outside of tests that seed rows directly via SQL. Building the write path -- an "attach an alias or external identifier" endpoint -- is a real feature addition (its own request/response contract, validation rules, UI), not a bug fix, and is intentionally out of scope for the completeness-audit fix pass that closed the other gaps tracked in this document. See `DATA-MODEL.md`'s `entity_aliases` row for the same note.
+- **`entity_aliases` had no write path as of this phase's own delivery.** No endpoint shipped in Phase 2 itself ever inserted a row -- `GET /entities/{id}/aliases` (Slice 1) only reads, and merge's `_rehome_aliases` (Slice 5) only moves existing rows between entities. **Since closed by a later phase, not by this one:** Phase 10's Gmail connector (`backend/ecc/domains/personal/gmail_adapter.py`, `INSERT INTO entity_aliases` around line 813) now writes real rows during backfill/incremental sync, so the table is no longer guaranteed empty in a deployment with Gmail connected, and the read paths that depend on it (resolution scoring's alias-overlap factor, retrieval's exact-alias-match tier) can fire outside of tests. No Phase-2-owned endpoint ("attach an alias or external identifier" as a direct user action) exists yet -- that remains out of this phase's own scope. See `DATA-MODEL.md`'s `entity_aliases` row for the matching note.
 
 ## Exit evidence
 
