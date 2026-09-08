@@ -105,6 +105,24 @@ from .validator import (
 
 RunStatus = Literal["running", "completed", "degraded", "failed", "cancelled"]
 
+# The complete, real error-code vocabulary `execute_run` can ever return via
+# `AiRun.error_code` -- previously only discoverable by reading every
+# `fail(...)` call site and `_NO_ELIGIBLE_REASON_TO_ERROR_CODE`'s values.
+# `None` (success, or a cancelled run) is expressed by `AiRun.error_code`'s
+# own `| None`, not included in this literal itself.
+AiRunErrorCode = Literal[
+    "feature_disabled",
+    "tool_not_allowlisted",
+    "not_found",
+    "schema_invalid",
+    "budget_exceeded",
+    "timeout",
+    "circuit_open",
+    "provider_error",
+    "grounding_failed",
+    "remote_not_configured",
+]
+
 
 # ---------------------------------------------------------------------------
 # Task ports -- THE allowlist. Application code, not a prompt-render-time
@@ -175,7 +193,7 @@ TASK_PORTS: dict[str, TaskPort] = {
     ),
 }
 
-_NO_ELIGIBLE_REASON_TO_ERROR_CODE: dict[str, str] = {
+_NO_ELIGIBLE_REASON_TO_ERROR_CODE: dict[str, AiRunErrorCode] = {
     "data_class_not_eligible": "remote_not_configured",
     "capability_not_supported": "feature_disabled",
     "structured_output_not_supported": "feature_disabled",
@@ -770,7 +788,7 @@ class AiRun:
     prompt_version: int | None
     evidence: list[str]
     output: dict[str, Any] | None
-    error_code: str | None
+    error_code: AiRunErrorCode | None
     prompt_tokens: int | None
     output_tokens: int | None
     cost: float
@@ -825,7 +843,7 @@ def _persist_terminal(
     task_type: str,
     data_class: str,
     status: RunStatus,
-    error_code: str | None,
+    error_code: AiRunErrorCode | None,
     started_at: datetime,
     policy_version: int | None,
     model_id: str | None,
@@ -1664,7 +1682,7 @@ def execute_run(
     run_id = uuid4()
 
     def fail(
-        error_code: str | None,
+        error_code: AiRunErrorCode | None,
         *,
         status: RunStatus = "failed",
         steps: list[dict[str, Any]] | None = None,
@@ -1713,7 +1731,9 @@ def execute_run(
     if isinstance(prepared, ToolNotAllowlisted):
         return fail("tool_not_allowlisted", steps=steps)
     if isinstance(prepared, ToolDispatchFailed):
-        error_code = "not_found" if prepared.reason == "not_found" else "schema_invalid"
+        error_code: AiRunErrorCode = (
+            "not_found" if prepared.reason == "not_found" else "schema_invalid"
+        )
         return fail(error_code, steps=steps)
     if prepared is None:
         return fail("feature_disabled", steps=steps)
@@ -2150,7 +2170,7 @@ class AiRunResponse(BaseModel):
     prompt_version: int | None
     evidence: list[str]
     output: dict[str, Any] | None
-    error_code: str | None
+    error_code: AiRunErrorCode | None
     usage: AiRunUsage
     attempts: int
     started_at: datetime
