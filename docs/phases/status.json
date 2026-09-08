@@ -13,7 +13,7 @@
       "promotion_status": "promoted",
       "open_gates": [],
       "implementation_status": null,
-      "last_verified_commit": "0919ca4fd7a5fbd6c2199606a61652cdc3ff9ade"
+      "last_verified_commit": "5e6873121c093fd91e47ef01fd62c10b207361f6"
     },
     {
       "id": "PHASE-001",
@@ -30,7 +30,7 @@
         "human change-review sign-off"
       ],
       "implementation_status": "docs/phases/phase-001/IMPLEMENTATION-STATUS.md",
-      "last_verified_commit": "0919ca4fd7a5fbd6c2199606a61652cdc3ff9ade"
+      "last_verified_commit": "0523fe1c1eeed8bb6b378bdde18216ac451d1de2"
     },
     {
       "id": "PHASE-002",
@@ -48,7 +48,7 @@
         "Phase 1 predecessor exit accepted only by parallel-start exception"
       ],
       "implementation_status": "docs/phases/phase-002/IMPLEMENTATION-STATUS.md",
-      "last_verified_commit": "0919ca4fd7a5fbd6c2199606a61652cdc3ff9ade"
+      "last_verified_commit": "0523fe1c1eeed8bb6b378bdde18216ac451d1de2"
     },
     {
       "id": "PHASE-003",
@@ -66,7 +66,7 @@
         "predecessor exits accepted only by parallel-start exception"
       ],
       "implementation_status": "docs/phases/phase-003/IMPLEMENTATION-STATUS.md",
-      "last_verified_commit": "0919ca4fd7a5fbd6c2199606a61652cdc3ff9ade"
+      "last_verified_commit": "0523fe1c1eeed8bb6b378bdde18216ac451d1de2"
     },
     {
       "id": "PHASE-004",
@@ -84,7 +84,7 @@
         "promotion decision"
       ],
       "implementation_status": "docs/phases/phase-004/IMPLEMENTATION-STATUS.md",
-      "last_verified_commit": "0919ca4fd7a5fbd6c2199606a61652cdc3ff9ade"
+      "last_verified_commit": "566a4ca53ce7a3a747c36186ccff72cfb7e20f53"
     },
     {
       "id": "PHASE-005",
@@ -102,7 +102,7 @@
         "promotion decision"
       ],
       "implementation_status": "docs/phases/phase-005/IMPLEMENTATION-STATUS.md",
-      "last_verified_commit": "0919ca4fd7a5fbd6c2199606a61652cdc3ff9ade"
+      "last_verified_commit": "0523fe1c1eeed8bb6b378bdde18216ac451d1de2"
     },
     {
       "id": "PHASE-006",
@@ -120,7 +120,7 @@
         "independent change review and promotion decision"
       ],
       "implementation_status": "docs/phases/phase-006/IMPLEMENTATION-STATUS.md",
-      "last_verified_commit": "0919ca4fd7a5fbd6c2199606a61652cdc3ff9ade"
+      "last_verified_commit": "93f617baafca53fad344956c05d63c9b26b698a3"
     },
     {
       "id": "PHASE-007",
@@ -138,7 +138,7 @@
         "independent change review and promotion decision"
       ],
       "implementation_status": "docs/phases/phase-007/IMPLEMENTATION-STATUS.md",
-      "last_verified_commit": "0919ca4fd7a5fbd6c2199606a61652cdc3ff9ade"
+      "last_verified_commit": "0523fe1c1eeed8bb6b378bdde18216ac451d1de2"
     },
     {
       "id": "PHASE-008",
@@ -156,7 +156,7 @@
         "independent change review and promotion decision"
       ],
       "implementation_status": "docs/phases/phase-008/IMPLEMENTATION-STATUS.md",
-      "last_verified_commit": "0919ca4fd7a5fbd6c2199606a61652cdc3ff9ade"
+      "last_verified_commit": "0523fe1c1eeed8bb6b378bdde18216ac451d1de2"
     },
     {
       "id": "PHASE-009",
@@ -173,7 +173,7 @@
         "predecessor production-readiness and promotion decisions"
       ],
       "implementation_status": "docs/phases/phase-009/IMPLEMENTATION-STATUS.md",
-      "last_verified_commit": "0919ca4fd7a5fbd6c2199606a61652cdc3ff9ade"
+      "last_verified_commit": "5e6873121c093fd91e47ef01fd62c10b207361f6"
     },
     {
       "id": "PHASE-010",
@@ -191,7 +191,7 @@
         "independent change review"
       ],
       "implementation_status": "docs/phases/phase-010/IMPLEMENTATION-STATUS.md",
-      "last_verified_commit": "d6eb91906b98cf96d71e2b2f4a44cc238f33b1b3"
+      "last_verified_commit": "9b5b3742c4ba6aaa4f45b6b4704dde2c14bf96bc"
     }
   ]
 }
