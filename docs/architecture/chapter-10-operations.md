@@ -38,6 +38,56 @@ Engineering teams should spend time improving the platform—not recovering from
 
 ---
 
+# Implementation Status (as of 2026-09-08, see SCR-0001)
+
+This chapter is a Draft RFC-004 chapter describing the target architecture — and, of every chapter in this
+set, it diverges from the real system the most, with no prior correction of any kind. It reads throughout as
+an aspirational enterprise-operations design for a distributed system that was never built; the actual
+platform is a single Docker Compose deployment of a modular monolith. Where the sections below diverge from
+the rest of this chapter, the rest of this chapter is the aspirational design, not the current system.
+
+- **"Container Architecture"** (independently deployable containers: gateway, planner, knowledge, attention,
+  communication, engineering, platform, scheduler, connectors, frontend, ollama) — not built. The real
+  `docker-compose.yml` defines only `postgres`, `migrate`, `backend`, and `frontend`; every domain
+  (`ai_runtime`, `attention`, `automation`, `calendar`, `collaboration`, `communication`, `engineering`,
+  `governance`, `identity`, `knowledge`, `personal`, `planning`, `platform`, `scheduling`) is a Python module
+  inside one `backend` container, not a separate service. There is no `ollama`, `gateway`, `connectors`, or
+  `scheduler` container.
+- **"Health Checks"** (every service exposing `/live`, `/ready`, `/health`, `/metrics`) — built with different
+  paths: `backend/ecc/main.py` exposes `/health/live`, `/health/ready`, `/version`, and `/metrics` — there are
+  no bare `/live`, `/ready`, or `/health` routes.
+- **"Distributed Tracing"** (Trace ID → Span ID → Correlation ID → User ID → Session ID propagated across
+  every service) — not built. `main.py`/`observability.py` generate only `X-Request-ID` and
+  `X-Correlation-ID`; there is no trace/span concept and no OpenTelemetry, Jaeger, or any tracing library
+  anywhere in the codebase.
+- **Metrics/monitoring stack** (implying a full Prometheus-backed dashboard tier) — built with a much smaller
+  mechanism: `observability.py` explicitly notes this project has no `prometheus_client` dependency; hand-
+  rolled counters/histograms are exposed at `/metrics` with no Grafana/Datadog/Prometheus server anywhere in
+  the repository.
+- **"Backup Strategy"** (Daily snapshot → Incremental backup → Verification → Encryption → Retention →
+  Recovery test) — built much more simply: `scripts/backup.sh` performs a single full `pg_dump` plus a
+  `sha256sum` checksum file — no incremental backup, no encryption, and no retention policy in code.
+- **"Infrastructure as Code"** (Docker Compose / Kubernetes / Helm / Terraform) — only `docker-compose.yml`
+  plus two Dockerfiles exist; there are no Kubernetes manifests, Helm charts, or Terraform anywhere in this
+  repository.
+- **"Continuous Integration"** (a generic Build/Lint/Unit/Contract/Architecture-Rules/Security-Scan/
+  Dependency-Scan/Prompt-Validation/Documentation-Validation pipeline) — the real `.github/workflows/ci.yml`
+  runs a different, more specific set of jobs (ruff, mypy, pytest, pip-audit, Trivy, gitleaks, an SBOM step,
+  a `check_phase3_prohibited_signals.py` gate, and `docs_status.py`/`check_docs.py` doc-governance checks).
+  This section also omits two entire real workflows: `phase1-acceptance.yml` (acceptance-contract and
+  backup-restore jobs) and `ollama-evaluation.yml` (live-Ollama model evaluation, tracked in
+  `docs/phases/phase-004/EVALUATION-CONTRACT.md`).
+- **"Feature Flags"** (a general system with enable/disable, percentage rollout, user rollout, and workspace
+  rollout for named features like "New AI Agent" and "Knowledge Graph v2") — not built. Only one ad-hoc
+  boolean flag exists in the entire codebase (`meeting_prep.py`'s AI-enrichment flag); there is no general
+  flag infrastructure and no rollout mechanism of any kind.
+- SLO numbers, RTO/RPO targets, the phase-evolution narrative, and alerting tiers elsewhere in this chapter
+  are aspirational targets with no corresponding implementation found in `backend/ecc`,
+  `.github/workflows/`, `scripts/`, or `docker-compose.yml` — they can't be confirmed false the way the items
+  above can, but they aren't backed by anything real today either.
+
+---
+
 # Operational Philosophy
 
 The platform follows five principles.

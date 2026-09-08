@@ -46,6 +46,28 @@ Infrastructure is temporary.
 
 ---
 
+# Implementation Status (as of 2026-09-08, see SCR-0001)
+
+This chapter is a Draft RFC-004 chapter describing the target architecture. It is the most stale chapter in
+this set — it carries no prior correction of any kind, and diverges from the real system more than any other
+chapter's own Implementation Status note has needed to disclose. Where the sections below diverge from the
+rest of this chapter, the rest of this chapter is the aspirational design, not the current system.
+
+- **"Repository Structure"** (`backend/domains/{executive,knowledge,planning,communication,engineering,
+  personal,platform}`, plus top-level `shared`/`contracts`/`events`/`common`) — not built. The real path is
+  `backend/ecc/domains/`; there is no `executive` domain and no top-level `shared`, `contracts`, `events`, or
+  `common` directory anywhere in the repository.
+- **"Domain Ownership"** (7 domains: Executive Intelligence, Knowledge Platform, Planning, Communication,
+  Engineering, Personal OS, Platform) — not built under these names. `Executive Intelligence` does not exist
+  as a domain; 7 real domains this list omits entirely also exist (`ai_runtime`, `attention`, `automation`,
+  `calendar`, `collaboration`, `governance`, `identity`, `scheduling` — 8, not 7).
+- **"Package Structure"** (a `planning/application,domain,infrastructure,contracts,api,tests` layered example)
+  — not built anywhere. `backend/ecc/domains/planning/` contains only `tasks.py`; every real domain is a flat
+  module directory (e.g. `attention/attention.py`, `capacity.py`, ...) with no application/domain/
+  infrastructure layering anywhere in the codebase.
+
+---
+
 ## RP-002
 
 Services communicate through contracts.

@@ -50,6 +50,18 @@ implemented as in-process Python state local to one instance (`backend/ecc/domai
 but not backed by any shared store, so they would not survive a move to multiple replicas without further
 work. This is the actual current data architecture; the sections below remain the target design.
 
+**Update (2026-09-08): the "Data Ownership" table below is also stale**, in a way the note above does not
+cover. Real domain ownership does not match several of its rows: `Meeting` is attributed to `Communication`,
+but the real `meetings_router` lives in `domains/scheduling/meetings.py` (meeting-prep is in `attention`, not
+`communication`). `Risk` is attributed solely to `Attention`, but the real risk routers/mutations live in
+`domains/governance/`; `attention` only owns the review-queue workflow (`attention/risk_reviews.py`) — this
+also contradicts the table's own "ownership never overlaps" claim. `Recommendation` is attributed to
+`AI Runtime`, but all `recommendation_*` routers are registered from `domains/governance/`, not `ai_runtime`.
+`Calendar` is attributed to `Planning`, but `calendar_events_router` lives in its own top-level
+`domains/calendar/`. Separately, `backend/ecc/platform/audit_outbox.py` (a real, widely-used append-only
+audit + outbox implementation) is a partial working analog of the "Event Store" this chapter treats as pure
+target design, and isn't mentioned anywhere in this note.
+
 ---
 
 # Design Philosophy

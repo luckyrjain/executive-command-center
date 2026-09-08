@@ -86,6 +86,26 @@ Action
 
 ---
 
+# Implementation Status (as of 2026-09-08, see SCR-0001)
+
+This chapter is a Draft RFC-004 chapter describing the target architecture. Where the sections below diverge
+from the rest of this chapter, the rest of this chapter is the aspirational design, not the current system.
+
+- **"Priority Formula" / "Cognitive Load Model" / "Executive State Model"** (a multi-signal weighted formula —
+  Urgency + Importance + Strategic Value + Relationship Impact + Risk − Cognitive Load − Commitments — plus an
+  Idle/Focus/Meeting/Recovery executive state machine) — not built. `backend/ecc/domains/attention/attention.py`
+  and `policy.py` implement a simple deterministic points system (due date, pinned, blocked, importance tier,
+  recency/deferral) summed and capped; there is no cognitive-load term and no executive-state machine
+  anywhere in `attention/` or `personal/`.
+- **"Executive Priority Levels" (P0–P4)** — not built. `attention_items` carries only `score`/`confidence`/
+  `factors`; no discrete priority-level field or vocabulary exists in the schema or code.
+- **"Waiting Engine"** (described as 2 queues) — built with a different shape: `waiting.py` has 4 directions
+  (`waiting_on_me`, `waiting_on_them`, `blocked_by`, `delegated`), not 2 queues.
+- **"Risk Engine"** (8 named risk categories) — not built as a taxonomy. `risk_reviews.py` models review
+  outcomes and urgency only; no category taxonomy matching this chapter's list exists anywhere in the domain.
+
+---
+
 # Design Goals
 
 ## HAE-001

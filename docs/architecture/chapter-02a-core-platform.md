@@ -66,6 +66,15 @@ this chapter is the aspirational design, not the current system.
   plus `governance`, `automation`, `communication`, `identity`, `personal`, `engineering`, `calendar`,
   `collaboration`, `scheduling` domains this chapter does not mention.
 - **Event Bus** — see `ADR-0005`'s Implementation Note; not built as described.
+- **Update (2026-09-08): "Model Router" and "Scheduler" also not built as described, previously undisclosed.**
+  "Model Router" describes a dedicated cross-domain service every domain calls into — the real routing logic
+  (`route()`, `RoutingPolicy`, `RoutingDecision`) lives entirely inside `domains/ai_runtime/router.py`, one
+  domain's own module, not a separate service. "Scheduler" describes a unified job runner firing connector
+  sync, memory indexing, embedding generation, the daily brief, and reflection jobs — the real
+  `domains/automation/scheduler.py`'s `run_scheduler_once()` only fires automation workflow triggers; none of
+  the other job types this chapter names exist. "Notification Service" similarly overclaims:
+  `platform/notifications.py` is a thin notification-inbox/activity-feed module (list/mark-read/list-shared-
+  activity), not a service generating Daily Brief content, meeting reminders, or risk alerts.
 
 ---
 

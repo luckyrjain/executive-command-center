@@ -54,6 +54,25 @@ Those are fundamentally different problems.
 
 ---
 
+# Implementation Status (as of 2026-09-08, see SCR-0001)
+
+This chapter is a Draft RFC-004 chapter describing the target architecture. Where the sections below diverge
+from the rest of this chapter, the rest of this chapter is the aspirational design, not the current system.
+
+- **"Primary Entity Types"** (Person, Project, Meeting, Decision, Task, Document) — built under a different
+  taxonomy. The real `EntityKind` (`backend/ecc/domains/knowledge/entities.py`) is `person`, `organization`,
+  `project`, `topic`, `decision`, `document`, `team` — there is no `Meeting` or `Task` entity kind, and
+  `Organization`/`Topic`/`Team` are omitted from this chapter's list entirely.
+- **"Search Strategy"** (Keyword, Semantic, Graph, and Temporal search modes, "all four execute together")
+  and the "Graph Traversal" example — not built as described. `retrieval.py` implements only a lexical +
+  semantic hybrid search; `relationships.py` only lists one entity's direct relationships (no multi-hop graph
+  traversal endpoint exists), and `timeline.py` is a flat per-entity event list, not a distinct temporal
+  search mode.
+- The Neo4j references elsewhere in this chapter already carry their own accurate inline correction to
+  Postgres + pgvector (see below) — not repeated here.
+
+---
+
 # Core Principles
 
 ## KP-001

@@ -64,6 +64,36 @@ ECC owns
 
 ---
 
+# Implementation Status (as of 2026-09-08, see SCR-0001)
+
+This chapter is a Draft RFC-004 chapter describing the target architecture. Where the sections below diverge
+from the rest of this chapter, the rest of this chapter is the aspirational design, not the current system.
+
+- **The "Connector SDK" interface** (a unified TypeScript-shaped `connect`/`disconnect`/`sync`/`webhook`/
+  `health`/`capabilities` contract) — not built. The real connector abstraction is a Python `Protocol`,
+  `ConnectorAdapter` (`backend/ecc/domains/engineering/connectors.py`), with different methods entirely
+  (`authorize`, `backfill`, `incremental_sync`, `handle_webhook`, `refresh_permissions`, `disconnect`) plus a
+  separate `OAuth2ConnectorAdapter`; there is no `health()`, `capabilities()`, `connect()`, or `sync()`.
+- **"Supported Connector Types"** (Gmail/Outlook/Slack/Teams under Communication; Drive/Notion/Confluence/
+  local files under Documents; Dropbox/OneDrive under Storage; plus an MCP connector) — presented as currently
+  supported but almost entirely not built. Real connectors are GitHub, GitLab, Jira, Datadog
+  (`backend/ecc/domains/engineering/{github,gitlab,jira,datadog}_adapter.py`) and Gmail. There is no Outlook,
+  Slack, Teams, Drive, Notion, Confluence, Dropbox, OneDrive, local-file-watch, or MCP connector anywhere in
+  the codebase.
+- **Gmail placed under a "Communication" connector grouping** — misfiled. The real Gmail implementation
+  (`gmail_adapter.py`, `gmail_oauth.py`, `gmail_threads.py`, etc.) lives under `backend/ecc/domains/personal/`;
+  the real `communication` domain contains only `commitments.py` (internal commitment tracking), unrelated to
+  email/Slack/Teams sync.
+- **"Calendar Connector"** (syncing Google/Microsoft Calendar via `MeetingCreated`/`Updated`/`Cancelled`
+  events) — not built. `backend/ecc/domains/calendar/events.py` is an internal CRUD API for ECC's own calendar
+  events; there is no external Google/Microsoft Calendar sync of any kind.
+- **A distinct "Connector Framework" architectural layer** — not built as a separate layer. Connector code is
+  embedded inside the `engineering` domain (plus Gmail in `personal`); there is no standalone connector-
+  framework package. This chapter and Chapter 7 also both omit the real `planning` domain (`tasks.py`)
+  entirely.
+
+---
+
 # Architectural Goals
 
 ## CFG-001
