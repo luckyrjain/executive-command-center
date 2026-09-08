@@ -60,6 +60,38 @@ The UI should disappear behind the workflow.
 
 ---
 
+# Implementation Status (as of 2026-09-08, see SCR-0001)
+
+This chapter is a Draft RFC-004 chapter describing the target architecture. Where the sections below diverge
+from the rest of this chapter, the rest of this chapter is the aspirational design, not the current system.
+
+- **"Primary Workspaces"** (Dashboard, Planner, Knowledge, Engineering, Communication, Personal, Settings) —
+  built with a much more granular, different shape. `frontend/src/navigation/WorkspaceNavigation.tsx` defines
+  15 real tabs (today, attention, work, notes, schedule, planner, meeting-prep, risks, knowledge,
+  recommendations, search-audit, automation, engineering, personal, collaboration). There is no
+  "Communication" or "Settings" tab.
+- **"Widget Framework"** (a `Widget` TypeScript interface with `id`/`title`/`priority`/`permissions`/
+  `refresh()`/`render()`/`actions()`) — not built. There is no such interface anywhere in `frontend/src`;
+  dashboard sections are plain `DashboardItem` data objects rendered by shared functions in
+  `frontend/src/dashboard/Sections.tsx`, with no lifecycle/priority/permissions concept of their own.
+- **"Command Palette" (⌘+K)** — not built. No command-palette, `kbar`, or `cmd+k` implementation exists
+  anywhere in `frontend/src`.
+- **"Offline Experience"**, described as a first-class feature with cached Search/Knowledge/Notes/Dashboard/
+  Planner surfaces — not built. Only a generic `OFFLINE` error code and banner exist (`api/client.ts`,
+  `errorMessage.ts`); no offline caching of any listed surface exists.
+- **"Global Search"** (a unified cross-domain search grouped by entity type) — built differently:
+  `frontend/src/features/search-audit/SearchAuditPanel.tsx` combines search with an audit-log viewer under
+  one panel scoped to the `search-audit` tab, not a standalone ⌘K-accessible global search.
+- **"Entity Pages"** (a claim that every entity type shares one identical layout) — only partly true. Only
+  `features/knowledge/EntityDetail.tsx` implements this pattern (aliases/claims/relationships/members/
+  timeline); there is no evidence of a shared entity-page layout for People/Projects/Meetings/Tasks/Decisions
+  beyond that one feature.
+- **Coverage gap, not a contradiction:** this chapter's "Design System" section does not mention the real,
+  pervasive wizard UI pattern (`lib/wizardFocus.ts`, shared by `RiskWorkspace`, `WorkflowList`, `PolicyPanel`,
+  `ScheduleWorkspace`, `ConnectorHealthPanel`, `GmailPanel`, and other real panels).
+
+---
+
 # Design Goals
 
 ## UX-001

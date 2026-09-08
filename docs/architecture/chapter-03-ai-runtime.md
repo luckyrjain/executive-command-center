@@ -63,6 +63,36 @@ It consumes structured context and produces recommendations.
 
 ---
 
+# Implementation Status (as of 2026-09-08, see SCR-0001)
+
+This chapter is a Draft RFC-004 chapter describing the target architecture. Where the sections below diverge
+from the rest of this chapter, the rest of this chapter is the aspirational design, not the current system.
+
+- **"AI Runtime Components" / "Agent Runtime" / the Multi-Agent Architecture diagram** (a Planner→Coordinator→
+  Model Router topology with named agents: Morning Brief Agent, Meeting Preparation Agent, Task Extraction
+  Agent, Relationship Agent) — not built. `backend/ecc/domains/ai_runtime/runtime.py` has no Agent,
+  Coordinator, or Planner class of any kind. Execution is a single `execute_run()` dispatching on a fixed,
+  small `TASK_PORTS` allowlist of task-type strings (`attention.explain_item`, `meeting.prep_summary`,
+  `personal.generate_insight`, `email.detect_action`) via per-type `_prepare_*_request` functions — there is
+  no multi-agent collaboration of any kind.
+- **"Supported Model Types"** (a 5-model roster including Qwen Coder, DeepSeek, Llama, and Nomic for
+  embeddings) — not built. Only two general-purpose Ollama models are registered (`qwen2.5:1.5b-instruct`,
+  `qwen2.5:3b-instruct`, migrations `0028`/`0032`); `llama3.2` was evaluated and explicitly rejected; there is
+  no DeepSeek model and no dedicated coding task type. Embeddings use `sentence-transformers/all-MiniLM-L6-v2`
+  loaded directly in-process, not served through Ollama — this contradicts this chapter's own AIR-001 goal
+  below ("every core capability... using Ollama").
+- **"Context Builder" / "Memory Retrieval"** — not built as separate components. Context assembly for each
+  task type is inlined per-type inside `runtime.py`; no dedicated context-builder or memory-retrieval module
+  exists in `ai_runtime/`.
+- **The Validator pipeline presented as clean and deterministic** — real behavior is more contested than this
+  chapter suggests. `validator.py`/`runtime.py` carry extensive engineering-log comments (cross-referenced in
+  `docs/phases/phase-004/EVALUATION-CONTRACT.md`'s phase-by-phase record) documenting a real, still-open
+  `grounding_failed`/`schema_invalid` reliability gap on the `meeting.prep_summary` task's sparsest example —
+  as of the most recent real CI history, this is the majority outcome on a real evaluation run against that
+  task type, not a rare edge case, after many real fix attempts across multiple categories.
+
+---
+
 # AI Runtime Goals
 
 The AI Runtime SHALL satisfy the following goals.

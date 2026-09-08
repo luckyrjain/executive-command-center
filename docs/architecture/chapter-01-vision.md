@@ -57,6 +57,24 @@ The system shall remain fully functional without continuous cloud connectivity.
 
 ---
 
+# Implementation Status (as of 2026-09-08, see SCR-0001)
+
+This chapter is a Draft RFC-004 chapter describing the target architecture. Unlike Chapters 2A/8/9, which
+carry their own scoped Implementation Status notes, no part of this chapter has been reconciled with the
+real system before now. Where the sections below diverge from the rest of this chapter, the rest of this
+chapter is the aspirational design, not the current system.
+
+- **The "Primary Architectural Domains" model** (Planner, Human Attention Engine, Executive Brain, Knowledge
+  Graph, Memory Engine, and the rest of this chapter's named domains) — not built under these names or this
+  shape. The real backend has 14 domains under `backend/ecc/domains/`: `ai_runtime`, `attention`,
+  `automation`, `calendar`, `collaboration`, `communication`, `engineering`, `governance`, `identity`,
+  `knowledge`, `personal`, `planning`, `platform`, `scheduling`. No `Memory Engine` or `Executive Brain`
+  module, class, or table exists anywhere in the codebase.
+- **Goals, principles, layers, and trust boundaries** elsewhere in this chapter are abstract statements of
+  intent, not concrete claims about running code — nothing here rules those out or in.
+
+---
+
 ## AG-002
 
 AI-native.

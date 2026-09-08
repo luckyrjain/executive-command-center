@@ -53,6 +53,30 @@ The architecture follows **Zero Trust**, **Least Privilege**, and **Local First*
 
 ---
 
+# Implementation Status (as of 2026-09-08, see SCR-0001)
+
+This chapter is a Draft RFC-004 chapter describing the target architecture. Its PII/Privacy Model section
+already carries its own accurate, scoped Implementation Status correction (added 2026-09-04) — not repeated
+here. The rest of this chapter has no prior correction of any kind. Where the sections below diverge from the
+rest of this chapter, the rest of this chapter is the aspirational design, not the current system.
+
+- **Authentication** (local account, OAuth, passkeys, hardware security keys) — mostly not built. Only email +
+  password login exists (`identity/accounts.py`, Argon2id hash, cookie-based session in a `sessions` table).
+  No passkey/WebAuthn code exists anywhere in the repository. OAuth exists only for connector integrations
+  (Gmail/GitHub/GitLab/Jira), never as a user-login method.
+- **Authorization** (a capability-based model with fine-grained action tokens like "Read Calendar", "Execute
+  Tool") — not built. `platform/authz.py` implements plain RBAC (`owner`/`admin`/`member`/`viewer` ×
+  read/write), gated by resource ownership, visibility, and grants — there is no capability-token concept.
+- **Identity Model** (three identity classes: Human, Service, and AI, including named identities like
+  "Planner Agent" and a "Scheduler" service identity) — not built. Only `accounts`/`users`/
+  `workspace_memberships` exist; no service-identity or AI-agent authentication scheme exists anywhere.
+- **Encryption At Rest** (AES-256 applied to Database, Object Storage, Secrets, and Local cache) — not built
+  as described. What exists is field-level Fernet (AES-128-CBC + HMAC-SHA256) applied narrowly to specific
+  columns (personal-domain records, Gmail bodies, connector credentials) — there is no whole-database, object-
+  storage, or cache encryption, and no `AES-256` usage anywhere in the codebase.
+
+---
+
 # Security Principles
 
 ## SEC-001
