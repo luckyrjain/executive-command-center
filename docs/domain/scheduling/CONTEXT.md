@@ -1,3 +1,11 @@
+---
+id: CONTEXT-SCHEDULING
+title: Scheduling Context
+status: Approved
+version: 1.0.0
+owner: Lucky Jain
+---
+
 # Scheduling
 
 Meetings and what's needed to prepare for them.

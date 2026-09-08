@@ -1,3 +1,11 @@
+---
+id: CONTEXT-KNOWLEDGE
+title: Knowledge Context
+status: Approved
+version: 1.0.0
+owner: Lucky Jain
+---
+
 # Knowledge
 
 The entity graph: people, organizations, and everything known and evidenced about them.

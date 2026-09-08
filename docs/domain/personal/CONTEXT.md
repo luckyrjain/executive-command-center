@@ -1,3 +1,11 @@
+---
+id: CONTEXT-PERSONAL
+title: Personal Context
+status: Approved
+version: 1.0.0
+owner: Lucky Jain
+---
+
 # Personal
 
 This package holds two genuinely separate sub-areas sharing only an outer package boundary — see the open

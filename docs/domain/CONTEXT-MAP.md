@@ -1,3 +1,11 @@
+---
+id: CONTEXT-MAP
+title: Domain Context Map
+status: Approved
+version: 1.0.0
+owner: Lucky Jain
+---
+
 # Context Map
 
 Real bounded contexts in Executive Command Center's backend, one per `backend/ecc/domains/*` grouping,

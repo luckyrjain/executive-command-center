@@ -1,3 +1,11 @@
+---
+id: CONTEXT-AUTOMATION
+title: Automation Context
+status: Approved
+version: 1.0.0
+owner: Lucky Jain
+---
+
 # Automation
 
 Durable, resumable execution of multi-step workflows, with human approval where required.

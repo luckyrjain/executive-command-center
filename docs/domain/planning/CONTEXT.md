@@ -1,3 +1,11 @@
+---
+id: CONTEXT-PLANNING
+title: Planning Context
+status: Approved
+version: 1.0.0
+owner: Lucky Jain
+---
+
 # Planning
 
 Capturing and tracking discrete units of work.

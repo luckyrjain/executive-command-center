@@ -1,3 +1,11 @@
+---
+id: CONTEXT-GOVERNANCE
+title: Governance Context
+status: Approved
+version: 1.0.0
+owner: Lucky Jain
+---
+
 # Governance
 
 The risk register, and proposed actions on domain state.

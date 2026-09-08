@@ -1,3 +1,11 @@
+---
+id: CONTEXT-ATTENTION
+title: Attention Context
+status: Approved
+version: 1.0.0
+owner: Lucky Jain
+---
+
 # Attention
 
 The ranked projection of what needs a human's attention right now, and the supporting machinery around it.
