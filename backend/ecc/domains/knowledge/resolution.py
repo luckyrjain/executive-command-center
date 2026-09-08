@@ -510,35 +510,34 @@ def list_candidates(
     # authority (third review) -- fixed here by joining the live source
     # rows and filtering on those too, additive to the candidate's own
     # filter above.
-    left_visibility_sql, entity_visibility_params = authz.visible_resource_filter_sql(
-        session, auth, resource_type="pkos_nodes", action="read", table_alias="left_entity"
+    # Two further calls need distinct bind-parameter names from `visibility_sql`
+    # above (a different `resource_type`, `"pkos_nodes"` vs `"resolution_candidates"`)
+    # and from each other (`left_entity`/`right_entity` are separate rows, each
+    # needing their own visibility check) -- `param_prefix` keeps every call's
+    # parameters genuinely distinct instead of colliding under one shared
+    # `__authz_*` key. Before `param_prefix` existed, this collision had to be
+    # patched by hand after the fact (string-replacing `:__authz_resource_type`),
+    # caught only by hand-verification against a real Postgres database: an
+    # entity visible to the caller only through an explicit `pkos_nodes` grant
+    # (not ownership) was silently hidden, because the grant subquery ended up
+    # checking `resource_type = 'resolution_candidates'` instead of `'pkos_nodes'`.
+    left_visibility_sql, left_visibility_params = authz.visible_resource_filter_sql(
+        session,
+        auth,
+        resource_type="pkos_nodes",
+        action="read",
+        table_alias="left_entity",
+        param_prefix="left_entity_",
     )
-    right_visibility_sql, _ = authz.visible_resource_filter_sql(
-        session, auth, resource_type="pkos_nodes", action="read", table_alias="right_entity"
+    right_visibility_sql, right_visibility_params = authz.visible_resource_filter_sql(
+        session,
+        auth,
+        resource_type="pkos_nodes",
+        action="read",
+        table_alias="right_entity",
+        param_prefix="right_entity_",
     )
-    # `entity_visibility_params`'s `__authz_resource_type` binds to
-    # `"pkos_nodes"`, which collides under the identical bind name with
-    # `visibility_params`' own `__authz_resource_type` (`"resolution_candidates"`)
-    # -- unlike `relationships.py`'s `list_relationships` (two calls sharing
-    # one `resource_type`, genuinely safe to reuse one params dict verbatim,
-    # per `visible_resource_filter_sql`'s own docstring), this query combines
-    # fragments from *two different* `resource_type` values, so merging both
-    # params dicts under the shared key would silently let one clobber the
-    # other. Renamed here rather than merged verbatim, after this exact
-    # collision was caught by hand-verification against a real Postgres
-    # database: an entity visible to the caller only through an explicit
-    # `pkos_nodes` grant (not ownership) was silently hidden, because the
-    # grant subquery ended up checking `resource_type = 'resolution_candidates'`
-    # instead of `'pkos_nodes'`.
-    left_visibility_sql = left_visibility_sql.replace(
-        ":__authz_resource_type", ":__authz_entity_resource_type"
-    )
-    right_visibility_sql = right_visibility_sql.replace(
-        ":__authz_resource_type", ":__authz_entity_resource_type"
-    )
-    entity_visibility_params["__authz_entity_resource_type"] = entity_visibility_params.pop(
-        "__authz_resource_type"
-    )
+    entity_visibility_params = {**left_visibility_params, **right_visibility_params}
     clauses = [
         "resolution_candidates.workspace_id = :workspace_id",
         "(resolution_candidates.deferred_until IS NULL "
