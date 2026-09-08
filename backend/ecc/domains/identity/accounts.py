@@ -206,6 +206,61 @@ def _create_session_for(
     return session_token, csrf_token
 
 
+def require_invitation_still_pending(invitation: dict[str, Any], now: datetime) -> None:
+    """Shared by both real invitation-accept entry points (`create_account_
+    endpoint` here and `invitations.accept_invitation_endpoint`) -- before
+    this extraction, this exact check was two separately-written, byte-
+    identical copies. `invitation` needs only `expires_at`/`accepted_at`/
+    `rejected_at`/`revoked_at`; both callers' own `SELECT ... FOR UPDATE`
+    fetches always include these four columns.
+    """
+    if invitation["expires_at"] <= now:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="INVITATION_EXPIRED")
+    if (
+        invitation["accepted_at"] is not None
+        or invitation["rejected_at"] is not None
+        or invitation["revoked_at"] is not None
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT, detail="INVITATION_ALREADY_RESOLVED"
+        )
+
+
+def require_inviter_still_authorized(session: Session, invitation: dict[str, Any]) -> None:
+    """Shared by both real invitation-accept entry points. Found in the
+    third whole-phase review: an `owner`-role invitation's grant was
+    checked only once, against `create_invitation_endpoint`'s caller at
+    creation time, and never re-verified against that same inviter's
+    *current* authority at accept time -- an invitation can sit pending
+    for up to `_INVITATION_MAX_AGE_SECONDS` (7 days), long enough for the
+    inviting owner to be demoted or removed in the meantime. Before this
+    extraction, the fix for this had to be written twice, once per accept
+    entry point, as both docstrings once noted -- the exact failure mode
+    this extraction exists to prevent from recurring a third time.
+    """
+    if invitation["role"] != "owner":
+        return
+    inviter_membership = (
+        session.execute(
+            text(
+                "SELECT role FROM workspace_memberships "
+                "WHERE workspace_id = :workspace_id AND users_id = :users_id "
+                "AND status = 'active'"
+            ),
+            {
+                "workspace_id": invitation["workspace_id"],
+                "users_id": invitation["invited_by"],
+            },
+        )
+        .mappings()
+        .one_or_none()
+    )
+    if inviter_membership is None or inviter_membership["role"] != "owner":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT, detail="INVITER_NO_LONGER_AUTHORIZED"
+        )
+
+
 def _optional_auth_context(
     request: Request,
     session: SessionDep,
@@ -361,48 +416,12 @@ def create_account_endpoint(
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED, detail="INVITATION_TOKEN_INVALID"
             )
-        if invitation["expires_at"] <= now:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED, detail="INVITATION_EXPIRED"
-            )
-        if (
-            invitation["accepted_at"] is not None
-            or invitation["rejected_at"] is not None
-            or invitation["revoked_at"] is not None
-        ):
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT, detail="INVITATION_ALREADY_RESOLVED"
-            )
+        require_invitation_still_pending(dict(invitation), now)
         if payload.email != invitation["email"]:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN, detail="INVITATION_EMAIL_MISMATCH"
             )
-
-        # See `invitations.py`'s own `accept_invitation_endpoint` for why:
-        # found in the third whole-phase review, the identical stale-
-        # authority gap exists on this brand-new-recipient path too -- an
-        # `owner`-role invitation is never re-verified against its inviter's
-        # current membership at this, the *other* accept call site.
-        if invitation["role"] == "owner":
-            inviter_membership = (
-                session.execute(
-                    text(
-                        "SELECT role FROM workspace_memberships "
-                        "WHERE workspace_id = :workspace_id AND users_id = :users_id "
-                        "AND status = 'active'"
-                    ),
-                    {
-                        "workspace_id": invitation["workspace_id"],
-                        "users_id": invitation["invited_by"],
-                    },
-                )
-                .mappings()
-                .one_or_none()
-            )
-            if inviter_membership is None or inviter_membership["role"] != "owner":
-                raise HTTPException(
-                    status_code=status.HTTP_409_CONFLICT, detail="INVITER_NO_LONGER_AUTHORIZED"
-                )
+        require_inviter_still_authorized(session, dict(invitation))
 
         try:
             session.execute(
