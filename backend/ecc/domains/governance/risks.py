@@ -1,4 +1,4 @@
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from typing import Annotated, Any, Literal
 from uuid import UUID, uuid4
 
@@ -9,6 +9,8 @@ from sqlalchemy.orm import Session
 
 from ecc.auth import AuthContext, AuthDep, CsrfDep
 from ecc.database import get_session
+from ecc.domains.attention.attention import score_risk
+from ecc.domains.attention.policy import get_active_policy
 from ecc.observability import queue_lifecycle_event
 from ecc.platform import audit_outbox, authz, cursor_pagination
 from ecc.platform.idempotency import load_cached, lock_idempotency, request_hash, store_idempotency
@@ -86,76 +88,22 @@ class RiskListResponse(BaseModel):
 
 
 def _risk_factors(row: dict[str, Any], now: datetime) -> tuple[int, list[dict[str, Any]], str]:
-    factors: list[dict[str, Any]] = []
-    risk_impact = int(row["probability"]) * int(row["impact"])
-    if risk_impact >= 20:
-        points = 25
-    elif risk_impact >= 12:
-        points = 15
-    elif risk_impact >= 6:
-        points = 8
-    else:
-        points = 0
-    if points:
-        factors.append(
-            {
-                "code": "risk_impact",
-                "label": f"Risk impact {risk_impact}",
-                "points": points,
-                "source_field": "probability,impact",
-            }
-        )
-    if row["pinned"]:
-        factors.append(
-            {
-                "code": "pinned",
-                "label": "Explicitly pinned",
-                "points": 20,
-                "source_field": "pinned",
-            }
-        )
-    review_at = row.get("review_at")
-    if review_at is not None:
-        delta = review_at - now
-        if delta.total_seconds() < 0:
-            factors.append(
-                {
-                    "code": "review_overdue",
-                    "label": "Risk review overdue",
-                    "points": 35,
-                    "source_field": "review_at",
-                }
-            )
-        elif delta <= timedelta(hours=48):
-            factors.append(
-                {
-                    "code": "review_due_soon",
-                    "label": "Risk review due within 48 hours",
-                    "points": 15,
-                    "source_field": "review_at",
-                }
-            )
-    age = now - row["updated_at"]
-    if age >= timedelta(days=14):
-        factors.append(
-            {
-                "code": "stale_14d",
-                "label": "No movement for 14 days",
-                "points": 8,
-                "source_field": "updated_at",
-            }
-        )
-    elif age >= timedelta(days=7):
-        factors.append(
-            {
-                "code": "stale_7d",
-                "label": "No movement for 7 days",
-                "points": 4,
-                "source_field": "updated_at",
-            }
-        )
-    score = sum(int(factor["points"]) for factor in factors)
-    score = min(100 if row["pinned"] else 95, score)
+    """Delegates to `attention.attention.score_risk` against the active
+    `AttentionPolicy` instead of a second, hand-maintained copy of the same
+    formula. Before this fix, this function and the Attention feed's own
+    risk scoring were two independent implementations that happened to
+    agree on today's literal point values -- a policy change (or a future
+    policy version) would silently update what the Attention feed shows
+    for a risk while this endpoint kept displaying the old, hardcoded
+    numbers. `score_risk` returns confidence too (irrelevant here, `RiskResponse`
+    has no such field) and additionally applies `AttentionPolicy`'s
+    recently-created/previously-deferred factors, which this function
+    never computed before -- a deliberate behavior change, not an
+    oversight: it's the correct outcome of using one real source of truth
+    instead of two.
+    """
+    policy = get_active_policy()
+    score, _confidence, factors = score_risk(row, now, policy)
     explanation = (
         "; ".join(str(factor["label"]) for factor in factors) or "No active priority factors"
     )

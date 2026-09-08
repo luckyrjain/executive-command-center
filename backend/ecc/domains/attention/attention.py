@@ -247,7 +247,7 @@ def _score_commitment(
     return score, round(confidence, 2), factors
 
 
-def _score_risk(
+def score_risk(
     row: dict[str, Any], now: datetime, policy: AttentionPolicy
 ) -> tuple[int, float, list[dict[str, Any]]]:
     factors: list[dict[str, Any]] = []
@@ -918,7 +918,7 @@ def regenerate_attention(auth: AuthDep, session: SessionDep, _csrf: CsrfDep) -> 
             auth,
             "risk",
             risk_rows,
-            [_score_risk(row, now, policy) for row in risk_rows],
+            [score_risk(row, now, policy) for row in risk_rows],
             now,
             expires_at,
             policy.version,
