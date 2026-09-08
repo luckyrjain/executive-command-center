@@ -79,7 +79,12 @@ from sqlalchemy.orm import Session
 
 from ecc.auth import AuthContext, AuthDep, CsrfDep
 from ecc.database import get_session
-from ecc.domains.identity.accounts import EMAIL_PATTERN, normalize_email
+from ecc.domains.identity.accounts import (
+    EMAIL_PATTERN,
+    normalize_email,
+    require_invitation_still_pending,
+    require_inviter_still_authorized,
+)
 from ecc.observability import queue_lifecycle_event
 from ecc.platform import audit_outbox
 
@@ -384,51 +389,15 @@ def accept_invitation_endpoint(
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED, detail="INVITATION_TOKEN_INVALID"
             )
-        if invitation["expires_at"] <= now:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED, detail="INVITATION_EXPIRED"
-            )
-        if (
-            invitation["accepted_at"] is not None
-            or invitation["rejected_at"] is not None
-            or invitation["revoked_at"] is not None
-        ):
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT, detail="INVITATION_ALREADY_RESOLVED"
-            )
-
-        # Found in the third whole-phase review, the same "re-authorize at
-        # use-time, not trust proposal-time" bug class `delegations.py`'s own
-        # `_grant_evidence` was fixed for in the second review: an
-        # `owner`-role invitation's grant was checked only once, against
-        # `create_invitation_endpoint`'s caller at creation time
-        # (`payload.role == "owner" and caller_role != "owner"`), and never
-        # re-verified against that same inviter's *current* authority here at
-        # accept time -- an invitation can sit pending for up to
-        # `_INVITATION_MAX_AGE_SECONDS` (7 days), long enough for the
-        # inviting owner to be demoted or removed in the meantime, after
-        # which accepting still mints a fresh co-owner nobody currently
-        # holding owner authority approved.
-        if invitation["role"] == "owner":
-            inviter_membership = (
-                session.execute(
-                    text(
-                        "SELECT role FROM workspace_memberships "
-                        "WHERE workspace_id = :workspace_id AND users_id = :users_id "
-                        "AND status = 'active'"
-                    ),
-                    {
-                        "workspace_id": invitation["workspace_id"],
-                        "users_id": invitation["invited_by"],
-                    },
-                )
-                .mappings()
-                .one_or_none()
-            )
-            if inviter_membership is None or inviter_membership["role"] != "owner":
-                raise HTTPException(
-                    status_code=status.HTTP_409_CONFLICT, detail="INVITER_NO_LONGER_AUTHORIZED"
-                )
+        require_invitation_still_pending(dict(invitation), now)
+        # `require_inviter_still_authorized` (shared with `accounts.
+        # create_account_endpoint`, this bug's other real accept entry
+        # point) fixes the same "re-authorize at use-time, not trust
+        # proposal-time" class `delegations.py`'s own `_grant_evidence` was
+        # fixed for in the second review: an `owner`-role invitation's grant
+        # was checked only once, at creation time, and never re-verified
+        # against the inviter's *current* authority at accept time.
+        require_inviter_still_authorized(session, dict(invitation))
 
         account_row = (
             session.execute(
@@ -621,18 +590,7 @@ def reject_invitation_endpoint(
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED, detail="INVITATION_TOKEN_INVALID"
             )
-        if invitation["expires_at"] <= now:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED, detail="INVITATION_EXPIRED"
-            )
-        if (
-            invitation["accepted_at"] is not None
-            or invitation["rejected_at"] is not None
-            or invitation["revoked_at"] is not None
-        ):
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT, detail="INVITATION_ALREADY_RESOLVED"
-            )
+        require_invitation_still_pending(dict(invitation), now)
 
         account_row = (
             session.execute(

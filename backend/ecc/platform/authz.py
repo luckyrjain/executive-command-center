@@ -776,6 +776,7 @@ def visible_resource_filter_sql(
     resource_type: str,
     action: Action,
     table_alias: str,
+    param_prefix: str = "",
 ) -> tuple[str, dict[str, object]]:
     """The list-endpoint counterpart to `authorize()` -- Decision 2's own
     "a denied list endpoint filters visibility server-side in the WHERE
@@ -796,9 +797,21 @@ def visible_resource_filter_sql(
     shape (every current caller passes a hardcoded literal alias, so this
     is defense-in-depth against a future caller building one dynamically,
     not a fix for a live injection path).
+
+    `param_prefix` (default `""`, byte-identical to every parameter name
+    below with no prefix) exists for a caller that needs to embed two or
+    more calls' fragments into one query -- pass a distinct prefix per
+    call (e.g. `"left_"`/`"right_"`) so each call's own bind parameters get
+    genuinely distinct names instead of colliding under the same
+    `__authz_*` key. Before this parameter existed, `resolution.py`'s
+    `list_candidates` had to string-replace `:__authz_resource_type` by
+    hand after the fact to avoid exactly this collision -- caught only by
+    hand-verification against a real Postgres database, not by review.
     """
     require_known_resource_type(resource_type)
     require_safe_sql_identifier(table_alias, label="table_alias")
+    if param_prefix:
+        require_safe_sql_identifier(param_prefix.rstrip("_"), label="param_prefix")
     role = current_role(session, workspace_id=auth.workspace_id, users_id=auth.user_id)
     if role is None:
         # Not an active member -- no row should ever match; a false
@@ -809,23 +822,26 @@ def visible_resource_filter_sql(
     role_permits_workspace = action in ROLE_PERMISSIONS[role]
     account_id = account_id_for(session, workspace_id=auth.workspace_id, users_id=auth.user_id)
 
+    def _p(name: str) -> str:
+        return f"__authz_{param_prefix}{name}"
+
     workspace_clause = "TRUE" if role_permits_workspace else "FALSE"
     sql = (
-        f"({table_alias}.owner_id = :__authz_user_id "
+        f"({table_alias}.owner_id = :{_p('user_id')} "
         f"OR ({table_alias}.visibility = 'workspace' AND {workspace_clause}) "
         f"OR ({table_alias}.visibility = 'shared_explicitly' AND {table_alias}.id IN ("
         "SELECT resource_id FROM resource_grants "
-        "WHERE workspace_id = :__authz_workspace_id AND grantee_account_id = :__authz_account_id "
-        "AND resource_type = :__authz_resource_type AND :__authz_action = ANY(actions) "
-        "AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at > :__authz_now)"
+        f"WHERE workspace_id = :{_p('workspace_id')} AND grantee_account_id = :{_p('account_id')} "
+        f"AND resource_type = :{_p('resource_type')} AND :{_p('action')} = ANY(actions) "
+        f"AND revoked_at IS NULL AND (expires_at IS NULL OR expires_at > :{_p('now')})"
         ")))"
     )
     params: dict[str, object] = {
-        "__authz_user_id": auth.user_id,
-        "__authz_workspace_id": auth.workspace_id,
-        "__authz_account_id": account_id,
-        "__authz_resource_type": resource_type,
-        "__authz_action": action,
-        "__authz_now": datetime.now(UTC),
+        _p("user_id"): auth.user_id,
+        _p("workspace_id"): auth.workspace_id,
+        _p("account_id"): account_id,
+        _p("resource_type"): resource_type,
+        _p("action"): action,
+        _p("now"): datetime.now(UTC),
     }
     return sql, params

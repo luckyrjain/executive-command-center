@@ -22,7 +22,7 @@ from sqlalchemy import text
 
 from ecc.config import get_settings
 from ecc.database import engine
-from ecc.domains.attention.attention import _score_commitment, _score_risk, _score_task
+from ecc.domains.attention.attention import _score_commitment, _score_task, score_risk
 from ecc.domains.attention.policy import get_active_policy
 from ecc.main import app
 
@@ -254,7 +254,12 @@ def test_risk_lifecycle_and_attention_controls(
     assert create.status_code == 201
     risk = create.json()
     risk_id = risk["id"]
-    assert risk["score"] == 80
+    # 25 (risk_impact 5*5=25 -> high tier) + 20 (pinned) + 35 (review_overdue) + 3
+    # (recently_created, POLICY_V1.recently_created_points -- newly added now that
+    # `_risk_factors` delegates to `attention.score_risk`/the real AttentionPolicy
+    # instead of a second, hand-maintained copy of the same formula that never
+    # computed this factor) = 83.
+    assert risk["score"] == 83
 
     stale = client.patch(
         f"/api/v1/risks/{risk_id}",
@@ -935,7 +940,7 @@ def test_priority_scoring_10000_entities_under_500ms() -> None:
         elif selector == 1:
             scores.append(_score_commitment(commitment, today, now, policy)[0])
         else:
-            scores.append(_score_risk(risk, now, policy)[0])
+            scores.append(score_risk(risk, now, policy)[0])
     elapsed = perf_counter() - started
 
     assert len(scores) == 10_000
@@ -947,7 +952,7 @@ def test_priority_scoring_10000_entities_under_500ms() -> None:
 
 def test_policy_v1_reproduces_pre_phase3_scores_exactly() -> None:
     """The safety net for Task 1's refactor: policy-v1, applied through the
-    refactored ``_score_task``/``_score_commitment``/``_score_risk``, must
+    refactored ``_score_task``/``_score_commitment``/``score_risk``, must
     reproduce the pre-refactor Phase 1 scores byte-for-byte for every
     scenario in ``tests/fixtures/phase3_attention_scenarios.py`` -- captured
     from the actual pre-refactor code (see that module's docstring), not
@@ -968,7 +973,7 @@ def test_policy_v1_reproduces_pre_phase3_scores_exactly() -> None:
         assert score == expected["score"], f"{name}: score {score} != {expected['score']}"
         assert confidence == expected["confidence"], name
     for name, row in RISK_SCENARIOS.items():
-        score, confidence, _ = _score_risk(row, SCENARIO_NOW, policy)
+        score, confidence, _ = score_risk(row, SCENARIO_NOW, policy)
         expected = GOLDEN_SCORES["risks"][name]
         assert score == expected["score"], f"{name}: score {score} != {expected['score']}"
         assert confidence == expected["confidence"], name
