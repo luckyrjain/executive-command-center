@@ -60,6 +60,16 @@ set) when the delegation reaches `completed`/`revoked`, not by a time
 limit (`rejected`/`expired` both only ever happen from `proposed`, before
 any grant exists, so neither needs a revocation step).
 
+**Every transition also writes the shared `audit_events` row, not just
+`delegation_events`** (architecture review, 2026-09-08, CAR-5). Previously
+this module wrote only its own private `delegation_events` table, making
+the entire delegation lifecycle invisible to the workspace-wide admin
+`GET /api/v1/audit` -- unlike `decisions_incidents.py`, this module's own
+cited precedent for the state-machine shape, which already writes both.
+`delegation_events` is unchanged and still the source for anything
+delegation-specific (e.g. a future participant-facing history view);
+`audit_events` is additive, not a replacement.
+
 **Lazy expiry, no background job.** `_maybe_expire_single`/`_expire_due`
 transition an overdue `proposed` delegation to `expired` the moment any
 endpoint next reads or mutates it -- no scheduler is named in this task's
@@ -77,14 +87,14 @@ from datetime import UTC, datetime, timedelta
 from typing import Annotated, Any
 from uuid import UUID, uuid4
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from ecc.auth import AuthContext, AuthDep, CsrfDep
 from ecc.database import get_session
-from ecc.platform import authz, cursor_pagination, idempotency
+from ecc.platform import audit_outbox, authz, cursor_pagination, idempotency
 from ecc.platform.authz import UnknownResourceTypeError
 from ecc.platform.request_models import EmptyBody as _EmptyBody
 
@@ -229,6 +239,54 @@ def _write_event(
     )
 
 
+def _write_system_audit(
+    session: Session,
+    *,
+    workspace_id: UUID,
+    delegation_id: UUID,
+    event_type: str,
+    before: dict[str, Any] | None,
+    after: dict[str, Any] | None,
+    now: datetime,
+) -> None:
+    """The shared, workspace-wide `audit_events` row for a system-initiated
+    delegation transition (lazy expiry, or the member-removal cancellation
+    cascade) -- alongside `_write_event`'s own private `delegation_events`
+    row (architecture review, 2026-09-08, CAR-5: `decisions_incidents.py`,
+    this module's own cited precedent for the state-machine shape, already
+    writes both for its own transitions; delegations previously only wrote
+    the first, leaving the entire lifecycle invisible to the shared admin
+    `GET /api/v1/audit`). `actor_id=None` makes `audit_events.actor_id` a
+    real `NULL`, matching `_write_event`'s own `actor_account_id=None` for
+    these same two transitions -- neither is any party's own action.
+    `request=None`: there is no `Request` to correlate this system-initiated
+    write to (see `write_audit_and_outbox`'s own docstring on this exact
+    case). `user_id` on the throwaway `AuthContext` below is never read
+    once `actor_id=None` is passed explicitly -- the identical "a real
+    value would be a wasted query" placeholder `_grant_evidence`'s own
+    `timezone` argument already uses. `aggregate_version=1`: `delegations`
+    has no optimistic-concurrency `version` column, the same shape
+    `identity/membership_removal.py`'s own `workspace_membership` audit
+    rows already use for the identical reason.
+    """
+    audit_outbox.write_audit_and_outbox(
+        session,
+        AuthContext(workspace_id=workspace_id, user_id=uuid4(), timezone="UTC"),
+        None,
+        event_type=f"delegation.{event_type}",
+        aggregate_type="delegation",
+        aggregate_id=delegation_id,
+        aggregate_version=1,
+        changed_fields=["status"],
+        payload={"delegation_id": str(delegation_id), "status": event_type},
+        now=now,
+        domain="collaboration_delegations",
+        actor_id=None,
+        before=before,
+        after=after,
+    )
+
+
 def _notify_member(
     session: Session,
     *,
@@ -314,6 +372,15 @@ def _maybe_expire_single(
         assert refreshed is not None  # the row cannot vanish, only change status
         return refreshed
     _write_event(session, delegation["id"], "expired", None, now)
+    _write_system_audit(
+        session,
+        workspace_id=workspace_id,
+        delegation_id=delegation["id"],
+        event_type="expired",
+        before={"status": "proposed"},
+        after={"status": "expired"},
+        now=now,
+    )
     _notify_expired(session, workspace_id=workspace_id, delegation=dict(updated), now=now)
     return dict(updated)
 
@@ -347,6 +414,15 @@ def _expire_due(
     )
     for row in expired_rows:
         _write_event(session, row["id"], "expired", None, now)
+        _write_system_audit(
+            session,
+            workspace_id=workspace_id,
+            delegation_id=row["id"],
+            event_type="expired",
+            before={"status": "proposed"},
+            after={"status": "expired"},
+            now=now,
+        )
         _notify_expired(
             session,
             workspace_id=workspace_id,
@@ -389,6 +465,15 @@ def cancel_delegations_for_removed_member(
     )
     for row in rows:
         _write_event(session, row["id"], "cancelled", None, now)
+        _write_system_audit(
+            session,
+            workspace_id=workspace_id,
+            delegation_id=row["id"],
+            event_type="cancelled",
+            before=None,
+            after={"status": "cancelled"},
+            now=now,
+        )
         _revoke_evidence_grants(
             session,
             workspace_id=workspace_id,
@@ -514,6 +599,7 @@ def _revoke_evidence_grants(
 @router.post("", response_model=DelegationResponse, status_code=status.HTTP_201_CREATED)
 def create_delegation_endpoint(
     payload: DelegationCreateRequest,
+    request: Request,
     auth: AuthDep,
     session: SessionDep,
     _csrf: CsrfDep,
@@ -640,6 +726,20 @@ def create_delegation_endpoint(
             )
 
         _write_event(session, delegation_id, "proposed", delegator_account_id, now)
+        audit_outbox.write_audit_and_outbox(
+            session,
+            auth,
+            request,
+            event_type="delegation.proposed",
+            aggregate_type="delegation",
+            aggregate_id=delegation_id,
+            aggregate_version=1,
+            changed_fields=["status"],
+            payload={"delegation_id": str(delegation_id), "status": "proposed"},
+            now=now,
+            domain="collaboration_delegations",
+            after={"status": "proposed"},
+        )
         _notify_member(
             session,
             workspace_id=auth.workspace_id,
@@ -744,6 +844,7 @@ def get_delegation_endpoint(
 @router.post("/{delegation_id}/accept", response_model=DelegationResponse)
 def accept_delegation_endpoint(
     delegation_id: UUID,
+    request: Request,
     auth: AuthDep,
     session: SessionDep,
     _csrf: CsrfDep,
@@ -807,6 +908,21 @@ def accept_delegation_endpoint(
             now=now,
         )
         _write_event(session, delegation_id, "accepted", account_id, now)
+        audit_outbox.write_audit_and_outbox(
+            session,
+            auth,
+            request,
+            event_type="delegation.accepted",
+            aggregate_type="delegation",
+            aggregate_id=delegation_id,
+            aggregate_version=1,
+            changed_fields=["status"],
+            payload={"delegation_id": str(delegation_id), "status": "accepted"},
+            now=now,
+            domain="collaboration_delegations",
+            before={"status": "proposed"},
+            after={"status": "accepted"},
+        )
         _notify_member(
             session,
             workspace_id=auth.workspace_id,
@@ -832,6 +948,7 @@ def accept_delegation_endpoint(
 @router.post("/{delegation_id}/reject", response_model=DelegationResponse)
 def reject_delegation_endpoint(
     delegation_id: UUID,
+    request: Request,
     auth: AuthDep,
     session: SessionDep,
     _csrf: CsrfDep,
@@ -875,6 +992,21 @@ def reject_delegation_endpoint(
             raise HTTPException(status_code=409, detail="DELEGATION_NOT_PROPOSED")
 
         _write_event(session, delegation_id, "rejected", account_id, now)
+        audit_outbox.write_audit_and_outbox(
+            session,
+            auth,
+            request,
+            event_type="delegation.rejected",
+            aggregate_type="delegation",
+            aggregate_id=delegation_id,
+            aggregate_version=1,
+            changed_fields=["status"],
+            payload={"delegation_id": str(delegation_id), "status": "rejected"},
+            now=now,
+            domain="collaboration_delegations",
+            before={"status": "proposed"},
+            after={"status": "rejected"},
+        )
         _notify_member(
             session,
             workspace_id=auth.workspace_id,
@@ -900,6 +1032,7 @@ def reject_delegation_endpoint(
 @router.post("/{delegation_id}/revoke", response_model=DelegationResponse)
 def revoke_delegation_endpoint(
     delegation_id: UUID,
+    request: Request,
     auth: AuthDep,
     session: SessionDep,
     _csrf: CsrfDep,
@@ -952,6 +1085,21 @@ def revoke_delegation_endpoint(
             now=now,
         )
         _write_event(session, delegation_id, "revoked", account_id, now)
+        audit_outbox.write_audit_and_outbox(
+            session,
+            auth,
+            request,
+            event_type="delegation.revoked",
+            aggregate_type="delegation",
+            aggregate_id=delegation_id,
+            aggregate_version=1,
+            changed_fields=["status"],
+            payload={"delegation_id": str(delegation_id), "status": "revoked"},
+            now=now,
+            domain="collaboration_delegations",
+            before={"status": "accepted"},
+            after={"status": "revoked"},
+        )
         _notify_member(
             session,
             workspace_id=auth.workspace_id,
@@ -977,6 +1125,7 @@ def revoke_delegation_endpoint(
 @router.post("/{delegation_id}/complete", response_model=DelegationResponse)
 def complete_delegation_endpoint(
     delegation_id: UUID,
+    request: Request,
     auth: AuthDep,
     session: SessionDep,
     _csrf: CsrfDep,
@@ -1026,6 +1175,21 @@ def complete_delegation_endpoint(
             now=now,
         )
         _write_event(session, delegation_id, "completed", account_id, now)
+        audit_outbox.write_audit_and_outbox(
+            session,
+            auth,
+            request,
+            event_type="delegation.completed",
+            aggregate_type="delegation",
+            aggregate_id=delegation_id,
+            aggregate_version=1,
+            changed_fields=["status"],
+            payload={"delegation_id": str(delegation_id), "status": "completed"},
+            now=now,
+            domain="collaboration_delegations",
+            before={"status": "accepted"},
+            after={"status": "completed"},
+        )
         _notify_member(
             session,
             workspace_id=auth.workspace_id,

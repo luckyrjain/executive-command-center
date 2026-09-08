@@ -61,6 +61,44 @@ WORKSPACE_ORIGINAL_OWNER_SQL = (
 )
 
 
+def safe_source_url(
+    raw_url: str | None,
+    *,
+    fallback: str,
+    web_base_url: str,
+    allow_relative: bool = False,
+) -> str:
+    """Allow-list guard for a provider-returned URL before it is trusted
+    and stored as a `source_url` value shown to a user as a clickable link
+    (architecture review, 2026-09-07, CAR-2 -- previously three separate,
+    independently-maintained copies of this exact decision:
+    `github_adapter._safe_source_url`, `gitlab_adapter._safe_source_url`,
+    and an inline equivalent in `datadog_adapter._upsert_dashboard`;
+    `github_adapter`'s own history is the reason this is shared now, not
+    just tidiness -- a prior review found its `html_url` field had shipped
+    without this guard at all before the duplicate-but-separate function
+    was added to cover it).
+
+    A value not scoped to `web_base_url` (this connection's own web host)
+    -- and, when `allow_relative` is set, not already a site-relative path
+    starting with `/` -- is never trusted verbatim: it could be
+    `javascript:`/`data:`/an arbitrary external host if the connected
+    provider tenant were compromised or malicious. `fallback` (a safe,
+    server-constructed default) is returned in that case instead.
+
+    Returns `raw_url` itself when trusted (in whatever absolute/relative
+    form it arrived in -- this function does not normalize it), never a
+    modified copy, so a caller that needs a particular shape (e.g.
+    `datadog_adapter`'s host-stripped relative path) still does that
+    shaping itself afterward.
+    """
+    if raw_url and allow_relative and raw_url.startswith("/"):
+        return raw_url
+    if raw_url and raw_url.startswith(f"{web_base_url}/"):
+        return raw_url
+    return fallback
+
+
 @dataclass(frozen=True, slots=True)
 class ConnectorAuthorization:
     """What `ConnectorAdapter.authorize` returns on success -- never the

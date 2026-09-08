@@ -21,7 +21,7 @@ from ecc.domains.planning.tasks import (
     lifecycle_task_write,
     set_task_status_write,
 )
-from ecc.platform import authz
+from ecc.platform import audit_outbox, authz
 
 # Commitment status values a recommendation may target -- "confirmed" is
 # deliberately absent: it's `CommitmentCreate`'s own create-time-only value
@@ -379,12 +379,35 @@ def execute_target(
         session, auth, resource_type=resource_type, resource_id=target_id, action="write"
     ):
         raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
+    # Found in a later architecture review (CAR-4): this generic column-patch
+    # branch is the only one of `execute_target`'s operations that never
+    # wrote a target-scoped audit row -- `set_status` and `create` both
+    # dispatch into `lifecycle_write`/`lifecycle_task_write`/`set_task_
+    # status_write`/`set_risk_status_write`/`insert_*`, each of which
+    # already calls `audit_outbox.write_audit_and_outbox` itself, but the
+    # raw `UPDATE` below had no equivalent, so a priority/pin/importance/
+    # probability/impact change made via a confirmed recommendation was
+    # invisible to `GET /api/v1/audit?aggregate_type={task,commitment,risk}`
+    # even though the identical field change via a direct `PATCH` endpoint
+    # is not. `old_value` is read just before the update so the audit row
+    # can carry a real `before`/`after`, matching what a direct `PATCH`
+    # would record for the same field.
+    old_value = session.execute(
+        text(
+            f"""
+            SELECT {column} FROM {table}
+            WHERE workspace_id=:workspace_id AND id=:target_id AND archived_at IS NULL
+            """
+        ),
+        {"workspace_id": auth.workspace_id, "target_id": target_id},
+    ).scalar_one_or_none()
+    now = datetime.now(UTC)
     result = (
         session.execute(
             text(_update_query(table, column)),
             {
                 "value": action["value"],
-                "now": datetime.now(UTC),
+                "now": now,
                 "actor": auth.user_id,
                 "workspace_id": auth.workspace_id,
                 "target_id": target_id,
@@ -399,6 +422,21 @@ def execute_target(
         if current is None:
             raise HTTPException(status_code=404, detail="TARGET_NOT_FOUND")
         raise HTTPException(status_code=409, detail="TARGET_VERSION_CONFLICT")
+    audit_outbox.write_audit_and_outbox(
+        session,
+        auth,
+        request,
+        event_type=f"{target_type}.updated",
+        aggregate_type=target_type,
+        aggregate_id=target_id,
+        aggregate_version=int(result["version"]),
+        changed_fields=[column],
+        payload={"target_id": str(target_id), "operation": operation, "column": column},
+        now=now,
+        domain=resource_type,
+        before={column: old_value},
+        after={column: action["value"]},
+    )
     return {
         "target_type": target_type,
         "target_id": str(result["id"]),

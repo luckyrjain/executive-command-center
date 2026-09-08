@@ -1,230 +1,82 @@
-"""Connector-independent action-adapter contract and in-process registry
+"""Composition root for the shared production adapter registry
 (`docs/superpowers/specs/2026-07-25-phase-5-automation-design.md` Decision
 8, resolving `docs/phases/PHASE-REVIEW.md`'s F-03).
 
-**This module (Task 2) defines the contract shape**; `local_adapters.py`
-(Task 5, "Connector action adapters and sandbox tests") implements the
-three local/fake adapters this activation registers -- `local.create_note`,
-`local.send_test_notification`, `fake.external_action` -- and this module's
-own bottom section performs the actual `registry.register(...)` calls, so
-the shared production `registry` instance below is no longer empty as of
-Task 5. Every future adapter (this activation's own three; Phase 6's
-production GitHub/GitLab/Jira connectors) must satisfy the `ActionAdapter`
-Protocol below, and the small in-process registry `ecc.domains.automation.
-worker` resolves a workflow step's `action_ref` against is exactly this
-module's `registry`. Task 2's own tests (`tests/test_automation_worker_
-postgres.py`) still define their own minimal fake adapters directly in that
-test module rather than importing the three real ones here, matching how
-Task 1's own tests constructed workspace/user fixtures directly rather than
-through a product registration flow -- unchanged by this task.
+**The contract itself (`ActionAdapter`, `AdapterRegistry`,
+`TransientAdapterError`, `HIGH_IMPACT_CATEGORIES`, `compensable`/
+`call_compensate`) lives in `adapter_contract.py`, not here** -- this
+module re-exports all of it below so every existing `from ecc.domains.
+automation.adapters import ...` call site keeps working unchanged. This
+module's own job is narrower: import every concrete `ActionAdapter`
+implementation from wherever it actually lives (`local_adapters.py` in
+this package; `engineering.write_actions` for the GitHub/GitLab/Jira write
+adapters) and register each one into the one shared `registry` instance
+`ecc.domains.automation.worker` resolves a workflow step's `action_ref`
+against.
 
-**Contract shape (design doc Decision 8, verbatim).** An adapter declares:
-`adapter_id` (str), `input_schema`/`output_schema` (both Pydantic models --
-the same structured-output validation idiom Phase 4's `ai_runtime.runtime`
-already uses for tool input/output, no new validation mechanism), `reversible`
-(bool), `high_impact_categories` (`frozenset[str]`, a subset of
-`HIGH_IMPACT_CATEGORIES` below, Decision 5's closed enumeration -- static
-per adapter, evaluated at registration time, never computed at runtime
-from a step's input), `simulate(action_input) -> BaseModel` and
-`execute(action_input) -> BaseModel`. `compensate(action_input) ->
-BaseModel` is deliberately **not** part of the `ActionAdapter` protocol
-itself -- Decision 9 makes it optional, present only for an adapter with a
-genuine compensating action, so a caller checks `hasattr(adapter,
-"compensate")` rather than every adapter being forced to implement a
-no-op. `ActionAdapter` is a `typing.Protocol`, not an ABC -- matching this
-codebase's existing preference for structural typing over an inheritance
-hierarchy where the shape, not the lineage, is what a registered object
-must satisfy (a fake test adapter needs to be *shaped* like an adapter, it
-does not need to inherit from one).
+**Why the split (architecture review, 2026-09-07, CAR-1).** Before this
+split, this single module both defined `TransientAdapterError` and
+imported `engineering.write_actions`'s three concrete adapters to register
+them -- while `write_actions.py` needed `TransientAdapterError` back,
+producing a genuine two-way import cycle closed only by importing that
+exception function-locally inside `write_actions.py`, documented there at
+length. Moving the contract to a separate, dependency-free `adapter_contract.
+py` removes the cycle unconditionally: `write_actions.py` now imports
+`TransientAdapterError` from `adapter_contract` at its own top level, this
+module still imports `write_actions`'s concrete adapters (that direction
+was always the intended one -- a composition root importing implementations
+to wire them up), and nothing here is imported back by `write_actions.py`
+or any other adapter-implementing module.
 
-**`simulate()` is never reachable from a real-execution code path** --
-that guarantee is `ecc.domains.automation.worker`'s responsibility (it is
-the only caller of `execute()`, and nothing in this task's own scope calls
-`simulate()` at all, since the simulation entrypoint itself is Decision
-4's `/simulate` endpoint, out of this task's scope). This module only
-shapes the contract both methods must satisfy; it does not enforce that an
-adapter author's own `simulate()` body is actually side-effect-free
-(design doc Decision 4's own stated, honest limitation -- "an adapter-
-author contract obligation the runtime cannot mechanically prove").
+Task 2's own tests (`tests/test_automation_worker_postgres.py`) still
+define their own minimal fake adapters directly in that test module rather
+than importing the three real ones here, matching how Task 1's own tests
+constructed workspace/user fixtures directly rather than through a product
+registration flow -- unchanged by this task.
 """
 
-from typing import Any, Protocol, runtime_checkable
+from .adapter_contract import (
+    HIGH_IMPACT_CATEGORIES,
+    ActionAdapter,
+    AdapterAlreadyRegistered,
+    AdapterCategoryInvalid,
+    AdapterRegistry,
+    TransientAdapterError,
+    call_compensate,
+    compensable,
+)
 
-from pydantic import BaseModel
+__all__ = [
+    "HIGH_IMPACT_CATEGORIES",
+    "ActionAdapter",
+    "AdapterAlreadyRegistered",
+    "AdapterCategoryInvalid",
+    "AdapterRegistry",
+    "TransientAdapterError",
+    "call_compensate",
+    "compensable",
+    "registry",
+]
 
 # Phase 6 Engineering Workspace Task 7 ("Approved write actions") --
-# GitHub/GitLab/Jira write adapters. Safe to import here, at this
-# module's own top, alongside `local_adapters`: `write_actions.py` has no
-# top-level dependency on this module at all (its own need for
-# `TransientAdapterError` is a lazy, inside-the-function import, not a
-# module-level one -- see that module's own docstring for why a plain
-# top-level import here would otherwise recreate a genuine, direction-
-# independent circular import between these two exact modules). See
-# `write_actions.py`'s own docstring for the full scope, containment, and
-# retry-safety reasoning behind these three adapters.
-from ecc.domains.engineering.write_actions import (
+# GitHub/GitLab/Jira write adapters. Importing them here, at this
+# composition root's own top, is now a plain, ordinary import: this module
+# depends on `write_actions.py`, but (as of the CAR-1 split above)
+# `write_actions.py` no longer depends on this module at all, only on the
+# contract-only `adapter_contract.py` -- so there is no cycle to order
+# around. See `write_actions.py`'s own docstring for the full scope,
+# containment, and retry-safety reasoning behind these three adapters.
+from ecc.domains.engineering.write_actions import (  # noqa: E402
     GitHubAddIssueCommentAdapter,
     GitLabAddNoteAdapter,
     JiraAddCommentAdapter,
 )
 
-from .local_adapters import (
+from .local_adapters import (  # noqa: E402
     FakeExternalActionAdapter,
     LocalCreateNoteAdapter,
     LocalSendTestNotificationAdapter,
 )
-
-# design doc Decision 5 / `docs/phases/phase-005/APPROVAL-POLICY.md`'s
-# closed, seven-category high-impact action taxonomy. `policy-limit-
-# exceeding` is the one cross-cutting category evaluated per-run against
-# the authorizing policy (design doc Decision 5), not statically declared
-# by an adapter the way the other six are -- included here anyway so
-# `AdapterRegistry.register`'s validation below (a real, not merely
-# documented, guard) accepts it without special-casing.
-HIGH_IMPACT_CATEGORIES: frozenset[str] = frozenset(
-    {
-        "destructive",
-        "financial",
-        "legal",
-        "credential",
-        "person-directed",
-        "public",
-        "policy-limit-exceeding",
-    }
-)
-
-
-@runtime_checkable
-class ActionAdapter(Protocol):
-    """Structural contract every registered action adapter satisfies
-    (design doc Decision 8). `@runtime_checkable` so `AdapterRegistry.
-    register` can `isinstance()`-check a candidate object before accepting
-    it, catching a malformed test fake at registration time rather than at
-    first dispatch.
-    """
-
-    adapter_id: str
-    input_schema: type[BaseModel]
-    output_schema: type[BaseModel]
-    reversible: bool
-    high_impact_categories: frozenset[str]
-
-    def simulate(self, action_input: BaseModel) -> BaseModel:
-        """Must not perform the real side effect, by contract (Decision 4)
-        -- returns a preview of what `execute()` would do.
-        """
-        ...
-
-    def execute(self, action_input: BaseModel) -> BaseModel:
-        """The real side effect. `ecc.domains.automation.worker.run_step`
-        is this activation's only caller.
-        """
-        ...
-
-
-class TransientAdapterError(Exception):
-    """Task 6's own addition to the adapter contract surface (`docs/phases/
-    phase-005/EXECUTION-CONTRACT.md`: "Retries use bounded exponential
-    backoff only for classified transient failures ... never for a step
-    whose side effect may have already partially occurred"). An adapter's
-    `execute()` raises this specific exception class -- and no other -- to
-    assert "this failure (a connection error, a timeout) definitely
-    occurred *before* any side effect, so a bounded automatic retry is
-    safe." Every other exception an adapter's `execute()` raises keeps
-    `ecc.domains.automation.worker.run_step`'s pre-existing, unconditional
-    behavior exactly: immediate, non-retried `'failed'` -- `run_step` never
-    guesses retry-safety for an unclassified error; only an adapter author,
-    who alone knows whether their own `execute()` body could have partially
-    run before raising, may assert it via this specific class. Declared
-    here, alongside `ActionAdapter`, rather than in `worker.py` -- an
-    adapter author needs to know about this class to use it correctly, and
-    this module (not `worker.py`) is the adapter-contract surface an
-    adapter author actually imports from.
-    """
-
-
-class AdapterAlreadyRegistered(ValueError):
-    """Raised by `AdapterRegistry.register` when `adapter_id` is already
-    taken -- a registration-time programming error (two adapters cannot
-    share an `action_ref`), not a runtime condition a workflow author's
-    graph can trigger.
-    """
-
-
-class AdapterCategoryInvalid(ValueError):
-    """Raised by `AdapterRegistry.register` when `high_impact_categories`
-    contains a value outside `HIGH_IMPACT_CATEGORIES` -- fail-closed at
-    registration time (design doc Decision 5: "An adapter that cannot
-    classify itself into any category still defaults to requiring per-run
-    approval") rather than silently accepting an adapter author's typo
-    that a later policy-evaluation task would otherwise trust blindly.
-    """
-
-
-class AdapterRegistry:
-    """A small in-process `dict[str, ActionAdapter]`-backed registry
-    (design doc Decision 8) `ecc.domains.automation.worker` resolves a
-    workflow step's `action_ref` against. Deliberately an instance, not a
-    single module-level global a test would have to mutate-and-restore --
-    each test builds its own registry with whatever fake adapter(s) it
-    needs (this task's own instruction), and the shared production
-    registry below (`registry`) is simply one particular empty instance no
-    product adapter is registered into by this task.
-    """
-
-    def __init__(self) -> None:
-        self._by_id: dict[str, ActionAdapter] = {}
-
-    def register(self, adapter: ActionAdapter) -> None:
-        if not isinstance(adapter, ActionAdapter):
-            raise TypeError(
-                f"object registered for adapter_id={adapter.adapter_id!r} does not satisfy "
-                "the ActionAdapter protocol (missing a required attribute or method)"
-            )
-        if adapter.adapter_id in self._by_id:
-            raise AdapterAlreadyRegistered(
-                f"adapter_id '{adapter.adapter_id}' is already registered"
-            )
-        invalid = adapter.high_impact_categories - HIGH_IMPACT_CATEGORIES
-        if invalid:
-            raise AdapterCategoryInvalid(
-                f"adapter '{adapter.adapter_id}' declares unknown high_impact_categories "
-                f"{sorted(invalid)}; must be a subset of {sorted(HIGH_IMPACT_CATEGORIES)}"
-            )
-        self._by_id[adapter.adapter_id] = adapter
-
-    def get(self, adapter_id: str) -> ActionAdapter | None:
-        return self._by_id.get(adapter_id)
-
-    def adapter_ids(self) -> tuple[str, ...]:
-        return tuple(sorted(self._by_id))
-
-    def __contains__(self, adapter_id: object) -> bool:
-        return adapter_id in self._by_id
-
-    def __len__(self) -> int:
-        return len(self._by_id)
-
-
-def compensable(adapter: ActionAdapter) -> bool:
-    """Whether `adapter` declares a genuine compensating action (Decision
-    9) -- `hasattr` is the actual mechanism (`compensate` is deliberately
-    absent from `ActionAdapter` itself, see module docstring), this
-    function exists only so a caller does not need to know that detail.
-    """
-    return hasattr(adapter, "compensate") and callable(adapter.compensate)
-
-
-def call_compensate(adapter: ActionAdapter, action_input: BaseModel) -> BaseModel:
-    """Invoke `adapter.compensate(action_input)` -- raises `AttributeError`
-    if `adapter` does not declare one; callers must check `compensable`
-    first (matches this codebase's existing "check before calling" style
-    for other optional capabilities rather than a silent no-op).
-    """
-    compensate: Any = adapter.compensate  # type: ignore[attr-defined]
-    result: BaseModel = compensate(action_input)
-    return result
-
 
 # Shared production registry. Task 2 left this empty by design (module
 # docstring, historical); Task 5 ("Connector action adapters and sandbox
