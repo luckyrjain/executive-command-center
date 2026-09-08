@@ -1,3 +1,11 @@
+---
+id: CONTEXT-AI-RUNTIME
+title: AI Runtime Context
+status: Approved
+version: 1.0.0
+owner: Lucky Jain
+---
+
 # AI Runtime
 
 Routing a task to a model, running it under budget, and evaluating the result.

@@ -1,3 +1,11 @@
+---
+id: CONTEXT-CALENDAR
+title: Calendar Context
+status: Approved
+version: 1.0.0
+owner: Lucky Jain
+---
+
 # Calendar
 
 Scheduled time intervals.

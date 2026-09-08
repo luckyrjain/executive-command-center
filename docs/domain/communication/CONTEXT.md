@@ -1,3 +1,11 @@
+---
+id: CONTEXT-COMMUNICATION
+title: Communication Context
+status: Approved
+version: 1.0.0
+owner: Lucky Jain
+---
+
 # Communication
 
 Tracking promises made between people. Despite the name, this context has no relationship to messaging.
