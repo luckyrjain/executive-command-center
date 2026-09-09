@@ -1527,9 +1527,7 @@ def test_ensure_fresh_credential_refreshes_when_within_the_margin() -> None:
         return _json_response(_token_response(access_token="new-access", refresh_token=None))
 
     adapter = GmailAdapter(transport=httpx.MockTransport(handler))
-    credential = _credential(
-        expires_at=(datetime.now(UTC) + timedelta(seconds=30)).isoformat()
-    )
+    credential = _credential(expires_at=(datetime.now(UTC) + timedelta(seconds=30)).isoformat())
     refreshed = adapter.ensure_fresh_credential(credential)
     assert refreshed != credential
     parsed = loads(refreshed)
@@ -1537,9 +1535,7 @@ def test_ensure_fresh_credential_refreshes_when_within_the_margin() -> None:
     # No `refresh_token` in Google's own response -- the original is
     # preserved, not dropped.
     assert parsed["refresh_token"] == "refresh-1"
-    assert datetime.fromisoformat(parsed["expires_at"]) > datetime.now(UTC) + timedelta(
-        minutes=30
-    )
+    assert datetime.fromisoformat(parsed["expires_at"]) > datetime.now(UTC) + timedelta(minutes=30)
 
 
 def test_ensure_fresh_credential_refreshes_when_already_expired() -> None:

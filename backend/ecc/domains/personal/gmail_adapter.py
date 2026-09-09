@@ -2793,8 +2793,7 @@ class GmailAdapter:
             ) from exc
         if not isinstance(body, dict):
             raise AdapterAuthorizationError(
-                "Gmail token refresh returned a non-object response body: "
-                f"{type(body).__name__}"
+                f"Gmail token refresh returned a non-object response body: {type(body).__name__}"
             )
         new_access_token = body.get("access_token")
         new_expires_in = body.get("expires_in")
