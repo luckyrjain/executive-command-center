@@ -359,7 +359,8 @@ def _insert_pkos_node(connection, *, workspace_id: UUID, owner_id: UUID, now: da
 
 def _insert_pkos_evidence(
     connection, *, workspace_id: UUID, node_id: UUID, source_ref: str, now: datetime
-) -> None:
+) -> UUID:
+    evidence_id = uuid4()
     connection.execute(
         text(
             """
@@ -371,7 +372,7 @@ def _insert_pkos_evidence(
             """
         ),
         {
-            "id": uuid4(),
+            "id": evidence_id,
             "workspace_id": workspace_id,
             "node_id": node_id,
             "source_ref": source_ref,
@@ -379,6 +380,7 @@ def _insert_pkos_evidence(
             "now": now,
         },
     )
+    return evidence_id
 
 
 def _insert_recommendation(
@@ -437,6 +439,15 @@ def _cleanup_workspace(workspace_id: UUID, *, emails: list[str]) -> None:
             "audit_events",
             "event_outbox",
             "recommendations",
+            # These four each hold a `RESTRICT` (no `ondelete`) FK into
+            # `pkos_evidence` -- must be gone before that DELETE below, for
+            # tests (like `test_disable_domain_does_not_delete_evidence_
+            # still_referenced_downstream`) that deliberately leave
+            # evidence behind because one of these still references it.
+            "commitments",
+            "entity_aliases",
+            "knowledge_claims",
+            "timeline_entries",
             "pkos_evidence",
             "pkos_nodes",
             "attention_items",
@@ -820,6 +831,146 @@ def test_disable_domain_does_not_delete_pkos_node(gmail_revocation_context: dict
         ).one_or_none()
     assert row is not None
     assert _row_count("pkos_evidence", ctx["workspace_id"]) == 0
+
+
+def test_disable_domain_does_not_delete_evidence_still_referenced_downstream(
+    gmail_revocation_context: dict,
+) -> None:
+    """`commitments.evidence_id`, `entity_aliases.source_id`, `knowledge_
+    claims.source_id` and `timeline_entries.source_id` are each a `RESTRICT`
+    FK into `pkos_evidence` -- none of them were among the tables this
+    cascade already knew to leave alone (`pkos_nodes`, an `executed`
+    recommendation, an ambiguous cross-owner id). Before the `NOT EXISTS`
+    guard this test locks in, deleting a `gmail_sync` evidence row any one
+    of the four still referenced raised an uncaught `IntegrityError`
+    (`ForeignKeyViolation`) that aborted this cascade's entire transaction
+    -- reproduced live against the running dev app: disabling the domain
+    for an account whose Gmail sync had fed a knowledge-entity alias 500'd
+    outright, leaving the domain enabled and the connector still connected,
+    for exactly the owners whose data the knowledge/commitment-extraction
+    features (the point of syncing Gmail at all) had actually used.
+
+    Seeds one evidence row referenced by each of the four tables, plus one
+    unreferenced control row from `_seed_full_cascade_fixture`'s own pair --
+    the disable call must still succeed, the four referenced rows must
+    survive, and the two unreferenced ones must still be purged exactly as
+    every other test in this file already expects.
+    """
+    ctx = gmail_revocation_context
+    seeded = _seed_full_cascade_fixture(ctx)
+
+    with engine.begin() as connection:
+        thread_id = seeded["thread_id"]
+        node_id = seeded["node_id"]
+
+        def seed_evidence(tag: str) -> UUID:
+            external_message_id = f"msg-{tag}-{uuid4()}"
+            _insert_message(
+                connection,
+                workspace_id=ctx["workspace_id"],
+                owner_id=ctx["owner_id"],
+                thread_id=thread_id,
+                external_message_id=external_message_id,
+                now=ctx["now"],
+            )
+            return _insert_pkos_evidence(
+                connection,
+                workspace_id=ctx["workspace_id"],
+                node_id=node_id,
+                source_ref=f"gmail:{external_message_id}",
+                now=ctx["now"],
+            )
+
+        commitment_evidence_id = seed_evidence("commitment")
+        alias_evidence_id = seed_evidence("alias")
+        claim_evidence_id = seed_evidence("claim")
+        timeline_evidence_id = seed_evidence("timeline")
+
+        connection.execute(
+            text(
+                "INSERT INTO commitments (id, workspace_id, owner_id, summary, description, "
+                "direction, status, importance, confidence, evidence_id, created_by, updated_by, "
+                "created_at, updated_at, version) VALUES (:id, :workspace_id, :owner_id, "
+                "'Renew the contract', 'Renew the contract', 'made_by_me', 'active', 'medium', "
+                "0.9, :evidence_id, :owner_id, :owner_id, :now, :now, 1)"
+            ),
+            {
+                "id": uuid4(),
+                "workspace_id": ctx["workspace_id"],
+                "owner_id": ctx["owner_id"],
+                "evidence_id": commitment_evidence_id,
+                "now": ctx["now"],
+            },
+        )
+        connection.execute(
+            text(
+                "INSERT INTO entity_aliases (id, workspace_id, entity_id, alias_type, "
+                "normalized_value, source_id, created_at) VALUES (:id, :workspace_id, :entity_id, "
+                "'email', :normalized_value, :source_id, :now)"
+            ),
+            {
+                "id": uuid4(),
+                "workspace_id": ctx["workspace_id"],
+                "entity_id": node_id,
+                "normalized_value": f"alias-{uuid4()}@example.test",
+                "source_id": alias_evidence_id,
+                "now": ctx["now"],
+            },
+        )
+        connection.execute(
+            text(
+                "INSERT INTO knowledge_claims (id, workspace_id, subject_id, predicate, "
+                "value_json, source_id, confidence, created_at) VALUES (:id, :workspace_id, "
+                ":subject_id, 'title', '{}'::jsonb, :source_id, 1.0, :now)"
+            ),
+            {
+                "id": uuid4(),
+                "workspace_id": ctx["workspace_id"],
+                "subject_id": node_id,
+                "source_id": claim_evidence_id,
+                "now": ctx["now"],
+            },
+        )
+        connection.execute(
+            text(
+                "INSERT INTO timeline_entries (id, workspace_id, entity_id, effective_at, "
+                "recorded_at, event_type, source_id, summary) VALUES (:id, :workspace_id, "
+                ":entity_id, :now, :now, 'knowledge_entity.created', :source_id, 'seeded entry')"
+            ),
+            {
+                "id": uuid4(),
+                "workspace_id": ctx["workspace_id"],
+                "entity_id": node_id,
+                "source_id": timeline_evidence_id,
+                "now": ctx["now"],
+            },
+        )
+
+    resp = ctx["client"].post(
+        "/api/v1/personal/domains/email/disable",
+        headers=_headers(ctx["token"], str(uuid4())),
+    )
+    assert resp.status_code == 200, resp.text
+
+    with engine.begin() as connection:
+        remaining_ids = {
+            row[0]
+            for row in connection.execute(
+                text("SELECT id FROM pkos_evidence WHERE workspace_id = :workspace_id"),
+                {"workspace_id": ctx["workspace_id"]},
+            )
+        }
+    assert remaining_ids == {
+        commitment_evidence_id,
+        alias_evidence_id,
+        claim_evidence_id,
+        timeline_evidence_id,
+    }
+    # `_seed_full_cascade_fixture`'s own pair of unreferenced evidence rows
+    # -- proves the guard excludes only what's actually referenced, not
+    # every row wholesale.
+    assert _row_count("email_messages", ctx["workspace_id"]) == 0
+    assert _connector_status(ctx["workspace_id"], ctx["account_id"]) == "disconnected"
 
 
 def test_revoke_consent_endpoint_reaches_the_same_cascade(gmail_revocation_context: dict) -> None:

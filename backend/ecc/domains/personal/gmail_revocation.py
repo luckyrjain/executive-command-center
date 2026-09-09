@@ -146,6 +146,15 @@ endpoint`), not here -- see that function's own updated comment.
   it could destroy the other owner's own still-live evidence -- see the
   ambiguity check's own inline comments below for the full mechanism,
   including the sequential-disable case migration `0076` closes.
+- A `pkos_evidence` row still referenced by `commitments.evidence_id`,
+  `entity_aliases.source_id`, `knowledge_claims.source_id` or `timeline_
+  entries.source_id` (each a `RESTRICT` FK into `pkos_evidence`, migrations
+  `0003`/`0011`/`0012`): left alone for the identical reason `pkos_nodes`
+  is -- it is what real, still-live entity-resolution/commitment state was
+  *built from*, not a byproduct of it. See the `pkos_evidence` DELETE's own
+  inline comment below for the full mechanism (before this guard existed,
+  deleting one of these rows raised an uncaught `IntegrityError` that
+  aborted the entire cascade).
 """
 
 from __future__ import annotations
@@ -357,10 +366,54 @@ def cascade_email_revocation(
             refs = [f"gmail:{mid}" for mid in safe_ids] + [
                 f"gmail:detect_action:{mid}" for mid in safe_ids
             ]
+            # `commitments.evidence_id`, `entity_aliases.source_id`,
+            # `knowledge_claims.source_id` and `timeline_entries.source_id`
+            # are each a `RESTRICT` (no `ondelete`) FK into `pkos_evidence`
+            # (migrations `0003`/`0011`/`0011`/`0012`) -- none of the four
+            # tables this cascade already knows to leave alone (see module
+            # docstring's "what is deliberately NOT deleted" section).
+            # A `gmail_sync` evidence row that fed the entity-resolution or
+            # commitment-extraction pipeline downstream is real, still-live
+            # state built *from* that evidence, not a byproduct of it -- the
+            # same reasoning the docstring already gives for never deleting
+            # `pkos_nodes` themselves. Before this guard, deleting such a
+            # row raised an uncaught `IntegrityError` (`ForeignKeyViolation`)
+            # that aborted this entire cascade's transaction: not just this
+            # DELETE, but every purge and the connector disconnect already
+            # written earlier in the same transaction, and the domain stayed
+            # enabled -- silently turning "disable email consent" into a
+            # guaranteed 500 for any owner whose Gmail data had actually
+            # been used by the knowledge/commitment features it exists to
+            # feed. `NOT EXISTS` excludes exactly the rows still referenced
+            # by one of the four, so everything else this owner's Gmail
+            # sync produced still purges normally -- a strictly safer
+            # failure mode than the alternative (leaving a handful of rows
+            # behind, per the module docstring's own established
+            # philosophy, beats crashing the whole revocation).
             session.execute(
                 text(
-                    "DELETE FROM pkos_evidence WHERE workspace_id = :workspace_id "
-                    "AND source_type = 'gmail_sync' AND source_ref = ANY(:refs)"
+                    """
+                    DELETE FROM pkos_evidence e
+                    WHERE e.workspace_id = :workspace_id
+                      AND e.source_type = 'gmail_sync'
+                      AND e.source_ref = ANY(:refs)
+                      AND NOT EXISTS (
+                        SELECT 1 FROM commitments c
+                        WHERE c.workspace_id = e.workspace_id AND c.evidence_id = e.id
+                      )
+                      AND NOT EXISTS (
+                        SELECT 1 FROM entity_aliases ea
+                        WHERE ea.workspace_id = e.workspace_id AND ea.source_id = e.id
+                      )
+                      AND NOT EXISTS (
+                        SELECT 1 FROM knowledge_claims kc
+                        WHERE kc.workspace_id = e.workspace_id AND kc.source_id = e.id
+                      )
+                      AND NOT EXISTS (
+                        SELECT 1 FROM timeline_entries te
+                        WHERE te.workspace_id = e.workspace_id AND te.source_id = e.id
+                      )
+                    """
                 ),
                 {"workspace_id": auth.workspace_id, "refs": refs},
             )
