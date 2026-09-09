@@ -180,7 +180,7 @@ def search(
 
             UNION ALL
             SELECT 'meeting'::text, m.id, m.title,
-                   concat_ws(' ', m.agenda, m.preparation, m.notes_summary),
+                   concat_ws('. ', m.agenda, m.preparation, m.notes_summary),
                    m.updated_at, coalesce(ce.starts_at, m.standalone_starts_at),
                    'local'::text, m.archived_at, false, lower(m.title),
                    similarity(lower(m.title), :query),
@@ -196,7 +196,7 @@ def search(
             WHERE m.workspace_id = :workspace_id
 
             UNION ALL
-            SELECT 'calendar_event'::text, id, title, concat_ws(' ', description, location),
+            SELECT 'calendar_event'::text, id, title, concat_ws('. ', description, location),
                    updated_at, starts_at, external_source::text, archived_at, false,
                    lower(title), similarity(lower(title), :query),
                    ts_rank_cd(
@@ -209,7 +209,7 @@ def search(
 
             UNION ALL
             SELECT 'risk'::text, id, left(description, 500),
-                   concat_ws(' ', description, mitigation, trigger), updated_at, review_at,
+                   concat_ws('. ', description, mitigation, trigger), updated_at, review_at,
                    'local'::text, archived_at, pinned, lower(description),
                    similarity(lower(description), :query),
                    ts_rank_cd(
