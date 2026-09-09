@@ -318,6 +318,21 @@ class OAuth2ConnectorAdapter(Protocol):
         """
         ...
 
+    def ensure_fresh_credential(self, credential: str) -> str:
+        """Returns `credential` unchanged if it is not close to expiring,
+        or a newly-obtained (and not yet persisted) credential string if
+        it refreshed one. `sync_connector_endpoint` is this method's one
+        caller, immediately before dispatching `backfill`/`incremental_
+        sync` -- a PAT-based `ConnectorAdapter` has no access-token expiry
+        to refresh at all, which is exactly why this lives on this
+        Protocol, not that one. Raises `AdapterAuthorizationError` when the
+        credential cannot be refreshed (malformed, or the provider itself
+        rejects the refresh) -- the caller records that the same way it
+        records any other adapter failure, never proceeding to a sync call
+        with a credential it could not confirm is current.
+        """
+        ...
+
 
 class AdapterAlreadyRegistered(ValueError):
     """Raised by `ConnectorRegistry.register` when `provider` is already

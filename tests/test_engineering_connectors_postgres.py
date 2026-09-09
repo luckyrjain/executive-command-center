@@ -537,6 +537,68 @@ class _MessageCursorAdapter:
 
 
 @dataclass
+class _OAuth2SpyAdapter:
+    """Structurally satisfies both `ConnectorAdapter` and `OAuth2Connector
+    Adapter` (`GmailAdapter`'s own shape) -- the only two methods `sync_
+    connector_endpoint`'s new credential-refresh phase actually cares
+    about are `isinstance(adapter, OAuth2ConnectorAdapter)` and `ensure_
+    fresh_credential` itself; every other method here is a minimal stub so
+    the fake registers and dispatches like any other. `provider = "gmail"`
+    for the same reason `_MessageCursorAdapter` above uses it: the real
+    provider slug `ck_connector_accounts_provider` accepts, so these tests
+    exercise `sync_connector_endpoint`'s actual code path rather than one
+    only reachable through a synthetic provider.
+    """
+
+    provider: str = "gmail"
+    required_scopes: frozenset[str] = field(default_factory=frozenset)
+    refreshed_credential: str | None = None
+    refresh_error: str | None = None
+    ensure_fresh_credential_calls: list[str] = field(default_factory=list)
+    sync_calls: list[ConnectorAccountContext] = field(default_factory=list)
+
+    def authorize(self, credential: str) -> ConnectorAuthorization:
+        raise NotImplementedError
+
+    def backfill(
+        self, account: ConnectorAccountContext, resource_type: str, since: datetime | None = None
+    ) -> SyncOutcome:
+        self.sync_calls.append(account)
+        return SyncOutcome(
+            resource_type=resource_type, items_processed=1, status="succeeded", next_cursor=None
+        )
+
+    def incremental_sync(
+        self, account: ConnectorAccountContext, resource_type: str, cursor: str | None
+    ) -> SyncOutcome:
+        return self.backfill(account, resource_type)
+
+    def handle_webhook(
+        self, account: ConnectorAccountContext, payload: bytes, headers: object
+    ) -> SyncOutcome:
+        raise NotImplementedError
+
+    def refresh_permissions(self, account: ConnectorAccountContext) -> str:
+        return "active"
+
+    def disconnect(self, account: ConnectorAccountContext) -> None:
+        return None
+
+    # -- OAuth2ConnectorAdapter --
+    def get_authorization_url(self, state: str) -> str:
+        raise NotImplementedError
+
+    def handle_oauth_callback(self, code: str, state: str) -> ConnectorAuthorization:
+        raise NotImplementedError
+
+    def ensure_fresh_credential(self, credential: str) -> str:
+        self.ensure_fresh_credential_calls.append(credential)
+        if self.refresh_error is not None:
+            raise AdapterAuthorizationError(self.refresh_error)
+        return credential if self.refreshed_credential is None else self.refreshed_credential
+
+
+@dataclass
 class _ActionDetectionSpyAdapter(_MessageCursorAdapter):
     """Phase 10 Task 5 review finding: `sync_connector_endpoint`'s own
     proactive-action-detection hook (`connector_accounts.py`, "Task 5:
@@ -1424,6 +1486,120 @@ def test_sync_backfill_passes_since_through_to_adapter(
     )
     assert response.status_code == 201, response.text
     assert adapter.since_calls == [since]
+
+
+def test_sync_refreshes_an_oauth2_credential_before_dispatching(
+    engineering_test_context: tuple[TestClient, UUID, UUID, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`sync_connector_endpoint`'s phase 1: an `OAuth2ConnectorAdapter`
+    (only `GmailAdapter`, structurally, in production) gets a chance to
+    refresh its own credential before phase 2 ever dispatches `backfill`/
+    `incremental_sync` with it. Proven two ways here, not just one: the
+    refreshed value is what the adapter call itself actually received
+    (`adapter.sync_calls[0].credential`), and it's what got persisted back
+    to `connector_accounts.encrypted_credentials` (so the *next* sync call
+    also starts from the fresh value, not the stale one this call started
+    with).
+    """
+    client, workspace_id, user_id, token = engineering_test_context
+    adapter = _OAuth2SpyAdapter(refreshed_credential="fresh-credential")
+    monkeypatch.setattr(connector_accounts_module, "connector_registry", _registry_with(adapter))
+    account_id = _insert_connector_account(
+        workspace_id, user_id, provider="gmail", credential="stale-credential"
+    )
+
+    response = client.post(
+        f"/api/v1/engineering/connectors/{account_id}/sync",
+        json={"run_type": "backfill", "resource_type": "message"},
+        headers=_headers(token, key=str(uuid4())),
+    )
+    assert response.status_code == 201, response.text
+    assert response.json()["status"] == "succeeded"
+
+    assert adapter.ensure_fresh_credential_calls == ["stale-credential"]
+    assert len(adapter.sync_calls) == 1
+    assert adapter.sync_calls[0].credential == "fresh-credential"
+
+    with engine.begin() as connection:
+        encrypted = connection.execute(
+            text("SELECT encrypted_credentials FROM connector_accounts WHERE id = :id"),
+            {"id": account_id},
+        ).scalar_one()
+    assert decrypt_credential(encrypted) == "fresh-credential"
+
+
+def test_sync_does_not_refresh_a_credential_that_is_not_near_expiry(
+    engineering_test_context: tuple[TestClient, UUID, UUID, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The common case: `ensure_fresh_credential` is still called every
+    time (that decision belongs to the adapter, not this endpoint), but
+    when it reports nothing changed, the stored credential is left alone
+    -- no needless UPDATE/re-encryption on every single sync.
+    """
+    client, workspace_id, user_id, token = engineering_test_context
+    adapter = _OAuth2SpyAdapter(refreshed_credential=None)
+    monkeypatch.setattr(connector_accounts_module, "connector_registry", _registry_with(adapter))
+    account_id = _insert_connector_account(
+        workspace_id, user_id, provider="gmail", credential="still-fresh-credential"
+    )
+
+    response = client.post(
+        f"/api/v1/engineering/connectors/{account_id}/sync",
+        json={"run_type": "backfill", "resource_type": "message"},
+        headers=_headers(token, key=str(uuid4())),
+    )
+    assert response.status_code == 201, response.text
+    assert adapter.sync_calls[0].credential == "still-fresh-credential"
+
+    with engine.begin() as connection:
+        encrypted = connection.execute(
+            text("SELECT encrypted_credentials FROM connector_accounts WHERE id = :id"),
+            {"id": account_id},
+        ).scalar_one()
+    assert decrypt_credential(encrypted) == "still-fresh-credential"
+
+
+def test_sync_records_a_failed_run_when_oauth2_credential_refresh_is_rejected(
+    engineering_test_context: tuple[TestClient, UUID, UUID, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A refresh rejection (Google's own `invalid_grant`, in production)
+    must never reach `backfill`/`incremental_sync` at all -- there is no
+    valid credential to call it with. Recorded the same way any other
+    adapter failure is: a normal `failed` `sync_runs` row with an `error_
+    summary`, the same Connector Health UI surface every other sync
+    failure already uses, not a bare unhandled error.
+    """
+    client, workspace_id, user_id, token = engineering_test_context
+    adapter = _OAuth2SpyAdapter(refresh_error="refresh token was rejected -- reconnect")
+    monkeypatch.setattr(connector_accounts_module, "connector_registry", _registry_with(adapter))
+    account_id = _insert_connector_account(
+        workspace_id, user_id, provider="gmail", credential="stale-credential"
+    )
+
+    response = client.post(
+        f"/api/v1/engineering/connectors/{account_id}/sync",
+        json={"run_type": "backfill", "resource_type": "message"},
+        headers=_headers(token, key=str(uuid4())),
+    )
+    assert response.status_code == 201, response.text
+    body = response.json()
+    assert body["status"] == "failed"
+    assert body["error_summary"] is not None and "reconnect" in body["error_summary"]
+
+    # Never dispatched -- the whole point of failing fast in phase 1.
+    assert adapter.sync_calls == []
+
+    # The stored credential is untouched: a rejected refresh produced
+    # nothing worth persisting.
+    with engine.begin() as connection:
+        encrypted = connection.execute(
+            text("SELECT encrypted_credentials FROM connector_accounts WHERE id = :id"),
+            {"id": account_id},
+        ).scalar_one()
+    assert decrypt_credential(encrypted) == "stale-credential"
 
 
 def test_sync_backfill_without_since_passes_none_to_adapter(
