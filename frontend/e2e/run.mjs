@@ -26,6 +26,7 @@ import * as engineeringLifecycle from './scenarios/engineering-lifecycle.mjs'
 import * as personalDomainLifecycle from './scenarios/personal-domain-lifecycle.mjs'
 import * as gmailPanelStates from './scenarios/gmail-panel-states.mjs'
 import * as multiIdentityCollaborationLifecycle from './scenarios/multi-identity-collaboration-lifecycle.mjs'
+import * as membersPanelTextRendering from './scenarios/members-panel-text-rendering.mjs'
 
 const scenarios = [
   { name: 'tasks', module: tasks },
@@ -65,6 +66,7 @@ const scenarios = [
   { name: 'personal-domain-lifecycle', module: personalDomainLifecycle },
   { name: 'gmail-panel-states', module: gmailPanelStates },
   { name: 'multi-identity-collaboration-lifecycle', module: multiIdentityCollaborationLifecycle },
+  { name: 'members-panel-text-rendering', module: membersPanelTextRendering },
 ]
 
 async function main() {
