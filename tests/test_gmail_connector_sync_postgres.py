@@ -2685,11 +2685,98 @@ def test_backfill_reports_partial_not_succeeded_when_budget_exhausted_mid_page(
 
     assert outcome.status == "partial"
     assert outcome.items_processed == 3
-    assert outcome.next_cursor is None
+    # Not `None` -- a resumable `_GmailBackfillCursor` (see
+    # `test_backfill_makes_forward_progress_through_an_oversized_message_
+    # window`, immediately below): a bare `None` here is what previously
+    # sent every retry back to a fresh `backfill` over a window recomputed
+    # from `now()`, re-walking (and re-hitting the same budget on) the
+    # same leading messages every time, for any window whose own message
+    # count exceeds the budget.
+    assert outcome.next_cursor is not None
     assert outcome.error_summary is not None and "per-call bound" in outcome.error_summary
 
     rows = _threads_and_messages(context.workspace_id)
     assert len(rows) == 3
+
+
+def test_backfill_makes_forward_progress_through_an_oversized_message_window(
+    seeded_gmail_account: tuple[ConnectorAccountContext, UUID],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Companion to `test_incremental_sync_makes_forward_progress_through_a_
+    single_oversized_history_record`, same livelock class, one level
+    earlier: `_sync_history`'s own `_GmailHistoryCursor` never helped a
+    mailbox that hasn't backfilled a first `historyId` yet, because
+    `_sync_messages` (the code path `backfill`, and `incremental_sync`
+    with a `None` cursor, both funnel through) always returned
+    `next_cursor=None` on a budget-exhausted partial result -- deliberately
+    so, since `messages.list` order doesn't correlate to `historyId` order
+    (see that method's own long comment), so no `historyId`-based cursor
+    was ever safe to hand out from a partial pass. But a `None` cursor
+    means `incremental_sync` falls back to a fresh `backfill`, which
+    recomputes its own search window from `datetime.now(UTC)` -- so a
+    mailbox with more messages in its backfill window than
+    `_MAX_MESSAGES_PER_CALL` re-walked the same leading messages, hit the
+    same budget boundary, and reported the same "will resume next call"
+    forever, no matter how many times it was retried. `_GmailBackfillCursor`
+    fixes this the same way `_GmailHistoryCursor` fixed the `history.list`
+    case: a resume cursor built from Gmail's own `pageToken` (safe --
+    unlike `historyId`, it's not claiming anything about ordering) plus how
+    far into that page a prior call got, so a resumed call skips exactly
+    what a prior call already wrote instead of redoing it.
+    """
+    import ecc.domains.personal.gmail_adapter as gmail_adapter_module
+
+    monkeypatch.setattr(gmail_adapter_module, "_MAX_MESSAGES_PER_CALL", 3)
+
+    context, _owner_id = seeded_gmail_account
+    now_ms = int(datetime.now(UTC).timestamp() * 1000)
+    message_ids = [f"msg-{i}" for i in range(5)]
+    bodies = {
+        message_id: _message_body(
+            message_id=message_id,
+            thread_id=f"thread-{message_id}",
+            from_addr="alice@example.test",
+            to_addrs=[_OWNER_EMAIL],
+            internal_date_ms=now_ms + i,
+        )
+        for i, message_id in enumerate(message_ids)
+    }
+    # ONE page, all five messages, no `nextPageToken` -- more than the
+    # (monkeypatched) budget of 3, same shape as the sibling test above.
+    fetch_counts: dict[str, int] = {message_id: 0 for message_id in message_ids}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/gmail/v1/users/me/messages":
+            assert "pageToken" not in request.url.params, (
+                "this fixture's window has exactly one page -- a `pageToken` "
+                "here would mean the resumed call regressed to asking Gmail "
+                "for a *different* page instead of re-walking this one"
+            )
+            return _json_response({"messages": [{"id": m} for m in message_ids]})
+        if request.url.path.startswith("/gmail/v1/users/me/messages/"):
+            message_id = request.url.path.rsplit("/", 1)[-1]
+            fetch_counts[message_id] += 1
+            return _json_response(bodies[message_id])
+        raise AssertionError(f"unexpected request to {request.url}")
+
+    adapter = GmailAdapter(transport=httpx.MockTransport(handler))
+
+    outcome_1 = adapter.backfill(context, "message", since=datetime.now(UTC) - timedelta(days=1))
+    assert outcome_1.status == "partial"
+    assert outcome_1.items_processed == 3
+    assert outcome_1.next_cursor is not None
+
+    outcome_2 = adapter.incremental_sync(context, "message", outcome_1.next_cursor)
+    assert outcome_2.status == "succeeded"
+    assert outcome_2.items_processed == 2
+
+    # Every message fetched exactly once total across both calls -- the
+    # resumed call skipped the three a prior call already wrote rather
+    # than merely being safe (idempotent) to re-fetch them.
+    assert fetch_counts == {message_id: 1 for message_id in message_ids}
+    rows = _threads_and_messages(context.workspace_id)
+    assert len(rows) == 5
 
 
 def test_incremental_sync_reports_partial_not_succeeded_when_budget_exhausted_mid_page(

@@ -1488,6 +1488,219 @@ def test_refresh_permissions_fails_open_on_network_error() -> None:
     assert adapter.refresh_permissions(_account_context(credential)) == "active"
 
 
+# --- GmailAdapter.ensure_fresh_credential -----------------------------------
+
+
+def _credential(
+    *, access_token: str = "old-access", refresh_token: str = "refresh-1", expires_at: str
+) -> str:
+    return dumps(
+        {"access_token": access_token, "refresh_token": refresh_token, "expires_at": expires_at}
+    )
+
+
+def test_ensure_fresh_credential_returns_unchanged_when_not_near_expiry() -> None:
+    """The common case, on every sync call whose token isn't stale --
+    proven here by a transport that raises on *any* request: a network
+    call at all (not just a wrong one) would mean this method churned an
+    HTTP round trip and a re-encryption on every single sync, not only the
+    ones that actually need a refresh.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError(f"unexpected request to {request.url}")
+
+    adapter = GmailAdapter(transport=httpx.MockTransport(handler))
+    credential = _credential(expires_at=(datetime.now(UTC) + timedelta(hours=1)).isoformat())
+    assert adapter.ensure_fresh_credential(credential) == credential
+
+
+def test_ensure_fresh_credential_refreshes_when_within_the_margin() -> None:
+    """`_TOKEN_REFRESH_MARGIN` (60s): a token that hasn't technically
+    expired yet, but will before this call's own caller finishes using it,
+    is refreshed anyway rather than handed out to 401 partway through a
+    sync.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/token"
+        return _json_response(_token_response(access_token="new-access", refresh_token=None))
+
+    adapter = GmailAdapter(transport=httpx.MockTransport(handler))
+    credential = _credential(
+        expires_at=(datetime.now(UTC) + timedelta(seconds=30)).isoformat()
+    )
+    refreshed = adapter.ensure_fresh_credential(credential)
+    assert refreshed != credential
+    parsed = loads(refreshed)
+    assert parsed["access_token"] == "new-access"
+    # No `refresh_token` in Google's own response -- the original is
+    # preserved, not dropped.
+    assert parsed["refresh_token"] == "refresh-1"
+    assert datetime.fromisoformat(parsed["expires_at"]) > datetime.now(UTC) + timedelta(
+        minutes=30
+    )
+
+
+def test_ensure_fresh_credential_refreshes_when_already_expired() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return _json_response(_token_response(access_token="new-access", refresh_token=None))
+
+    adapter = GmailAdapter(transport=httpx.MockTransport(handler))
+    credential = _credential(expires_at="2020-01-01T00:00:00+00:00")
+    refreshed = adapter.ensure_fresh_credential(credential)
+    assert loads(refreshed)["access_token"] == "new-access"
+
+
+def test_ensure_fresh_credential_uses_a_rotated_refresh_token_when_provider_sends_one() -> None:
+    """Rare (Google does not normally rotate on a plain refresh), but if
+    it ever does, the new one must win -- continuing to use the old,
+    provider-invalidated one would strand the account on its *next*
+    refresh instead of this one.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return _json_response(_token_response(access_token="new-access", refresh_token="new-rt"))
+
+    adapter = GmailAdapter(transport=httpx.MockTransport(handler))
+    credential = _credential(expires_at="2020-01-01T00:00:00+00:00")
+    refreshed = adapter.ensure_fresh_credential(credential)
+    assert loads(refreshed)["refresh_token"] == "new-rt"
+
+
+def test_ensure_fresh_credential_raises_on_malformed_credential() -> None:
+    adapter = GmailAdapter()
+    with pytest.raises(AdapterAuthorizationError):
+        adapter.ensure_fresh_credential("not-json")
+
+
+def test_ensure_fresh_credential_raises_on_non_object_credential() -> None:
+    adapter = GmailAdapter()
+    with pytest.raises(AdapterAuthorizationError):
+        adapter.ensure_fresh_credential("[1, 2, 3]")
+
+
+def test_ensure_fresh_credential_raises_on_missing_expires_at() -> None:
+    adapter = GmailAdapter()
+    credential = dumps({"access_token": "old", "refresh_token": "refresh-1"})
+    with pytest.raises(AdapterAuthorizationError):
+        adapter.ensure_fresh_credential(credential)
+
+
+def test_ensure_fresh_credential_raises_on_unparseable_expires_at() -> None:
+    adapter = GmailAdapter()
+    credential = _credential(expires_at="not-a-timestamp")
+    with pytest.raises(AdapterAuthorizationError):
+        adapter.ensure_fresh_credential(credential)
+
+
+def test_ensure_fresh_credential_raises_on_missing_refresh_token() -> None:
+    """Caught before any network call -- there is nothing to refresh
+    *with*."""
+    adapter = GmailAdapter()
+    credential = dumps({"access_token": "old", "expires_at": "2020-01-01T00:00:00+00:00"})
+    with pytest.raises(AdapterAuthorizationError):
+        adapter.ensure_fresh_credential(credential)
+
+
+def test_ensure_fresh_credential_raises_when_provider_rejects_the_refresh() -> None:
+    """`invalid_grant` -- the refresh token was revoked, e.g. the user
+    removed this app's access from their Google Account settings. Unlike
+    `refresh_permissions`'s own identical case, this must raise (not
+    fail open/report a state) -- there is no fresher credential to
+    dispatch a sync call with.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return _json_response({"error": "invalid_grant"}, status_code=400)
+
+    adapter = GmailAdapter(transport=httpx.MockTransport(handler))
+    credential = _credential(refresh_token="revoked", expires_at="2020-01-01T00:00:00+00:00")
+    with pytest.raises(AdapterAuthorizationError, match="reconnect"):
+        adapter.ensure_fresh_credential(credential)
+
+
+def test_ensure_fresh_credential_raises_on_non_200_non_400_status() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return _json_response({}, status_code=500)
+
+    adapter = GmailAdapter(transport=httpx.MockTransport(handler))
+    credential = _credential(expires_at="2020-01-01T00:00:00+00:00")
+    with pytest.raises(AdapterAuthorizationError):
+        adapter.ensure_fresh_credential(credential)
+
+
+def test_ensure_fresh_credential_raises_on_network_error() -> None:
+    """Unlike `refresh_permissions`'s deliberate fail-open (a permission
+    *check* that can't reach the provider assumes nothing changed) --
+    this method has no state to fail open *to*: its only two outcomes are
+    "here is a credential to sync with" or "here is why there isn't
+    one", and a network error truthfully belongs to the second.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("boom", request=request)
+
+    adapter = GmailAdapter(transport=httpx.MockTransport(handler))
+    credential = _credential(expires_at="2020-01-01T00:00:00+00:00")
+    with pytest.raises(AdapterAuthorizationError):
+        adapter.ensure_fresh_credential(credential)
+
+
+def test_ensure_fresh_credential_raises_on_missing_access_token_in_response() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return _json_response({"expires_in": 3600})
+
+    adapter = GmailAdapter(transport=httpx.MockTransport(handler))
+    credential = _credential(expires_at="2020-01-01T00:00:00+00:00")
+    with pytest.raises(AdapterAuthorizationError):
+        adapter.ensure_fresh_credential(credential)
+
+
+def test_ensure_fresh_credential_raises_on_boolean_expires_in() -> None:
+    """`bool` is an `int` subtype -- `"expires_in": true` must not
+    silently pass a bare `is None` check and coerce to `1.0` seconds.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return _json_response({"access_token": "new-access", "expires_in": True})
+
+    adapter = GmailAdapter(transport=httpx.MockTransport(handler))
+    credential = _credential(expires_at="2020-01-01T00:00:00+00:00")
+    with pytest.raises(AdapterAuthorizationError):
+        adapter.ensure_fresh_credential(credential)
+
+
+def test_ensure_fresh_credential_raises_on_infinite_expires_in() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return _json_response({"access_token": "new-access", "expires_in": float("inf")})
+
+    adapter = GmailAdapter(transport=httpx.MockTransport(handler))
+    credential = _credential(expires_at="2020-01-01T00:00:00+00:00")
+    with pytest.raises(AdapterAuthorizationError):
+        adapter.ensure_fresh_credential(credential)
+
+
+def test_ensure_fresh_credential_raises_on_non_json_response() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(status_code=200, content="not json")
+
+    adapter = GmailAdapter(transport=httpx.MockTransport(handler))
+    credential = _credential(expires_at="2020-01-01T00:00:00+00:00")
+    with pytest.raises(AdapterAuthorizationError):
+        adapter.ensure_fresh_credential(credential)
+
+
+def test_ensure_fresh_credential_raises_on_non_object_response() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return _json_response([1, 2, 3])
+
+    adapter = GmailAdapter(transport=httpx.MockTransport(handler))
+    credential = _credential(expires_at="2020-01-01T00:00:00+00:00")
+    with pytest.raises(AdapterAuthorizationError):
+        adapter.ensure_fresh_credential(credential)
+
+
 def test_disconnect_returns_none_for_malformed_credential() -> None:
     adapter = GmailAdapter()
     assert adapter.disconnect(_account_context("not-json")) is None

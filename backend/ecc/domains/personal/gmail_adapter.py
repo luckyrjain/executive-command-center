@@ -168,6 +168,14 @@ _MAX_MESSAGES_PER_CALL = 200
 _RATE_LIMIT_MAX_WAIT_SECONDS = 5.0
 _DEFAULT_BACKFILL_WINDOW = timedelta(days=30)
 
+# `ensure_fresh_credential` refreshes an access token this far ahead of its
+# own stored `expires_at`, not exactly at expiry -- gives whatever sync call
+# it was refreshed for a window that can't shave past zero and 401 anyway
+# purely from the refresh-vs-use call's own latency. Matches `_RATE_LIMIT_
+# MAX_WAIT_SECONDS`'s own "small, bounded, not worth architecting a tighter
+# number around" sizing, just for a margin rather than a wait.
+_TOKEN_REFRESH_MARGIN = timedelta(seconds=60)
+
 # Gmail's own quota-error shape (`{"error": {"errors": [{"reason": ...}]}}`)
 # distinguishes rate limiting from every other 403 (insufficient scope,
 # account suspended, ...) only by `reason` -- treating every 403 as
@@ -1274,6 +1282,85 @@ class _GmailHistoryCursor:
         return replace(self, stuck_record_id=record_id, stuck_offset=offset)
 
 
+# `_sync_messages`' own per-call budget (`_MAX_MESSAGES_PER_CALL`) never
+# hands out a `historyId`-based cursor on a partial pass -- see that
+# method's own long comment on why (`messages.list` order doesn't
+# correlate to `historyId` order, so a `max()` over messages actually
+# reached is not a safe resume point). Before this type existed, that
+# meant a partial `_sync_messages` call reported `next_cursor=None`
+# unconditionally, and `incremental_sync` treats a `None` cursor as "start
+# a fresh `backfill`" -- which recomputes its own search window from
+# `datetime.now(UTC)` on every call. For any mailbox whose window holds
+# more than `_MAX_MESSAGES_PER_CALL` messages, every retry therefore
+# re-walks `messages.list` from Gmail's own newest message, re-spends the
+# entire budget on the same leading messages already written by the
+# previous call, and hits the identical exhaustion point again -- the same
+# livelock class `_GmailHistoryCursor` (above) exists to close for
+# `_sync_history`, left open here because `_sync_messages` had no resume
+# state of its own to carry forward.
+#
+# This type carries exactly that state: the fixed `query` the walk is
+# over (pinned once, by whichever call first computed it -- never
+# recomputed against `now()` on a resumed call, so a resumed walk stays
+# over the same window instead of drifting forward in time), Gmail's own
+# opaque `pageToken` for the *next* `messages.list` request, and how many
+# entries of that page a prior call already consumed. All three are safe
+# to trust exactly because none of them claim anything about `historyId`
+# ordering: `pageToken` is Gmail's own continuation token for a fixed
+# query, and "skip the first N entries of this page" is a fact about a
+# page Gmail already returned once, not a guess about ordering it never
+# promised.
+@dataclass(frozen=True, slots=True)
+class _GmailBackfillCursor:
+    """Parses from, and serializes back to, the single opaque `str`
+    `ConnectorAdapter.incremental_sync` contracts for. Distinguished from
+    a bare `historyId` (always digits, optionally in `_GmailHistoryCursor`'s
+    own `id:record:skip` form) by a `"list:"` prefix no real `historyId`
+    string can ever start with.
+    """
+
+    query: str
+    page_token: str | None = None
+    skip_count: int = 0
+
+    _PREFIX = "list:"
+
+    @classmethod
+    def from_str(cls, cursor: str) -> _GmailBackfillCursor | None:
+        """`None` for anything not produced by this type's own `__str__`
+        -- including a malformed `"list:"`-prefixed string, which would
+        otherwise risk silently resuming the wrong query or skip point.
+        Callers fall back to treating `cursor` as a plain historyId in
+        that case, matching `_GmailHistoryCursor.from_str`'s own
+        degrade-safely convention.
+        """
+        if not cursor.startswith(cls._PREFIX):
+            return None
+        parts = cursor[len(cls._PREFIX) :].split(":", 2)
+        if len(parts) != 3:
+            return None
+        query_b64, page_token_b64, skip_count_str = parts
+        skip_count = _coerce_int(skip_count_str)
+        if skip_count is None or skip_count < 0:
+            return None
+        try:
+            query = base64.urlsafe_b64decode(query_b64 + "=" * (-len(query_b64) % 4)).decode()
+            page_token = (
+                base64.urlsafe_b64decode(page_token_b64 + "=" * (-len(page_token_b64) % 4)).decode()
+                or None
+            )
+        except (ValueError, UnicodeDecodeError):
+            return None
+        return cls(query, page_token=page_token, skip_count=skip_count)
+
+    def __str__(self) -> str:
+        query_b64 = base64.urlsafe_b64encode(self.query.encode()).decode().rstrip("=")
+        page_token_b64 = (
+            base64.urlsafe_b64encode((self.page_token or "").encode()).decode().rstrip("=")
+        )
+        return f"{self._PREFIX}{query_b64}:{page_token_b64}:{self.skip_count}"
+
+
 class GmailAdapter:
     provider = "gmail"
     required_scopes: frozenset[str] = REQUIRED_SCOPES
@@ -1588,13 +1675,14 @@ class GmailAdapter:
     def incremental_sync(
         self, account: ConnectorAccountContext, resource_type: str, cursor: str | None
     ) -> SyncOutcome:
-        """`cursor` is a Gmail `historyId` (a string-encoded integer), or --
+        """`cursor` is a Gmail `historyId` (a string-encoded integer), --
         round 13 review -- `_sync_history`'s own compound `"{historyId}:
         {record_id}:{skip_count}"` form (see `_GmailHistoryCursor`'s own
-        module-level comment); either way it's still a single opaque `str`
-        from this method's own point of view, per `ConnectorAdapter.
-        incremental_sync`'s own "resumes from cursor, or behaves like a
-        fresh backfill if cursor is None" contract.
+        module-level comment), or a `_GmailBackfillCursor`'s own `"list:"`-
+        prefixed form (see that type's own module-level comment); still a
+        single opaque `str` from this method's own point of view, per
+        `ConnectorAdapter.incremental_sync`'s own "resumes from cursor, or
+        behaves like a fresh backfill if cursor is None" contract.
         """
         if resource_type != "message":
             return SyncOutcome(
@@ -1605,6 +1693,14 @@ class GmailAdapter:
             )
         if cursor is None:
             return self.backfill(account, resource_type, since=None)
+        backfill_cursor = _GmailBackfillCursor.from_str(cursor)
+        if backfill_cursor is not None:
+            return self._sync_messages(
+                account,
+                query=backfill_cursor.query,
+                page_token=backfill_cursor.page_token,
+                skip_count=backfill_cursor.skip_count,
+            )
         return self._sync_history(account, start_history_id=cursor)
 
     def _request_with_rate_limit_retry(
@@ -1659,7 +1755,14 @@ class GmailAdapter:
         # enough to ride out a short reset window inline" framing.
         return 1.0
 
-    def _sync_messages(self, account: ConnectorAccountContext, *, query: str) -> SyncOutcome:
+    def _sync_messages(
+        self,
+        account: ConnectorAccountContext,
+        *,
+        query: str,
+        page_token: str | None = None,
+        skip_count: int = 0,
+    ) -> SyncOutcome:
         with SessionFactory() as session, session.begin():
             owner_id = owner_id_for_account(
                 session, account.workspace_id, account.connector_account_id
@@ -1674,8 +1777,14 @@ class GmailAdapter:
         now = datetime.now(UTC)
         items_processed = 0
         highest_history_id: int | None = None
-        page_token: str | None = None
         calls_made = 0
+        # `page_token`/`skip_count` resume a prior call's own budget-
+        # exhausted walk (see `_GmailBackfillCursor`'s own module-level
+        # comment) -- `is_first_page` bounds that resume skip to the one
+        # page it actually describes; every later page this call fetches
+        # starts fresh, same as a plain, non-resumed call always has.
+        is_first_page = True
+        resume_skip = 0
 
         while calls_made < _MAX_MESSAGES_PER_CALL:
             list_response = self._request_with_rate_limit_retry(
@@ -1725,7 +1834,13 @@ class GmailAdapter:
                 message_refs = []
 
             budget_exhausted = False
-            for ref in message_refs:
+            for page_index, ref in enumerate(message_refs):
+                if is_first_page and page_index < skip_count:
+                    # Already consumed by whichever earlier call's own
+                    # `_GmailBackfillCursor` this call resumed from --
+                    # re-fetching this exact page (same `page_token`) is
+                    # how a resume re-obtains it, not a signal to redo it.
+                    continue
                 if calls_made >= _MAX_MESSAGES_PER_CALL:
                     # Round 1 review: this page's own `message_refs` still
                     # had unprocessed entries when the shared budget ran
@@ -1743,7 +1858,15 @@ class GmailAdapter:
                     # trust as "nothing older remains." `budget_exhausted`
                     # forces the same bounded partial outcome the
                     # multiple-page case already gets correctly.
+                    #
+                    # `resume_skip = page_index` -- not `page_index + 1` --
+                    # is a raw position in *this* page's own `message_refs`
+                    # (`skip_count`'s own contract, consulted the same way
+                    # above): a resumed call skips everything strictly
+                    # before it, so pointing at this exact still-unprocessed
+                    # entry is correct, not off-by-one.
                     budget_exhausted = True
+                    resume_skip = page_index
                     break
                 message_id = ref.get("id") if isinstance(ref, dict) else None
                 if not isinstance(message_id, str) or not message_id:
@@ -1881,6 +2004,7 @@ class GmailAdapter:
             if budget_exhausted:
                 break
 
+            is_first_page = False
             page_token = list_body.get("nextPageToken")
             if not isinstance(page_token, str) or not page_token:
                 # No further pages -- fully caught up to `query`. Only now
@@ -1945,14 +2069,28 @@ class GmailAdapter:
                     next_cursor=str(highest_history_id) if highest_history_id is not None else None,
                 )
 
+        # `page_token` here is exactly the token the next `messages.list`
+        # call needs -- either reassigned above to Gmail's own
+        # `nextPageToken` (this call finished its current page exactly as
+        # the budget ran out) or, when `budget_exhausted` broke out of the
+        # `for` loop mid-page, still the token that fetched the page this
+        # call got stuck on, paired with `resume_skip` marking how far
+        # into it. Either way a `_GmailBackfillCursor` built from them
+        # resumes this exact walk -- not a fresh `backfill` over a window
+        # recomputed from `now()`, which is what a bare `next_cursor=None`
+        # here used to force, and why a mailbox with more than
+        # `_MAX_MESSAGES_PER_CALL` messages in one window could never
+        # finish backfilling no matter how many times this ran.
         return SyncOutcome(
             resource_type="message",
             items_processed=items_processed,
             status="partial",
-            next_cursor=None,
+            next_cursor=str(
+                _GmailBackfillCursor(query=query, page_token=page_token, skip_count=resume_skip)
+            ),
             error_summary=(
                 f"Gmail message sync hit the {_MAX_MESSAGES_PER_CALL}-message per-call bound "
-                "with more messages remaining; sync paused, will resume next call"
+                "with more messages remaining; sync paused here -- run sync again to continue"
             ),
         )
 
@@ -2299,7 +2437,7 @@ class GmailAdapter:
             ),
             error_summary=(
                 f"Gmail history sync hit the {_MAX_MESSAGES_PER_CALL}-message per-call bound "
-                "with more messages remaining; sync paused, will resume next call"
+                "with more messages remaining; sync paused here -- run sync again to continue"
             ),
         )
 
@@ -2576,18 +2714,143 @@ class GmailAdapter:
             resource_type="thread", items_processed=0, status="succeeded", next_cursor=None
         )
 
+    def ensure_fresh_credential(self, credential: str) -> str:
+        """Called once by `connector_accounts.sync_connector_endpoint`,
+        before every `backfill`/`incremental_sync` dispatch -- returns
+        `credential` unchanged when its own stored `expires_at` is still
+        comfortably (`_TOKEN_REFRESH_MARGIN`) in the future, or a freshly
+        `pack_credential`-d string (a new access token, the same
+        `refresh_token` unless Google's own response actually rotated it,
+        a new `expires_at`) when it isn't. Every sync method in this file
+        trusts whatever `ConnectorAccountContext.credential` it's handed at
+        call time (`bearer_headers(account.credential)`) -- this is the one
+        place that trust is earned, not each sync call independently
+        re-deriving it (or, before this method existed, not re-deriving it
+        at all: a token that expired between connect time and whenever the
+        next sync call happened just 401ed, indefinitely, until someone
+        manually disconnected and reconnected the account).
+
+        Raises `AdapterAuthorizationError` -- caught by `connector_
+        accounts.py` and recorded as a failed sync run, the same as any
+        other adapter failure -- when: the stored credential itself is
+        malformed; Google rejects the refresh (`400` -- `invalid_grant`,
+        typically a revoked grant, e.g. the user removed this app's access
+        from their Google Account settings); or Google's own response is
+        missing/malformed. In every one of these cases there is no fresher
+        credential to fall back to, and the stored access token is (by
+        this method's own premise for even attempting a refresh) already
+        expired or about to be -- proceeding with it would only trade one
+        failure mode (a clear, attributable refresh error) for a less
+        legible one (an unexplained `401` deep inside the sync call
+        itself).
+        """
+        try:
+            parsed = unpack_credential(credential)
+        except (ValueError, TypeError) as exc:
+            raise AdapterAuthorizationError(f"Gmail credential is malformed: {exc}") from exc
+        raw_expires_at = parsed.get("expires_at")
+        if not isinstance(raw_expires_at, str) or not raw_expires_at:
+            raise AdapterAuthorizationError("Gmail credential is missing expires_at")
+        try:
+            expires_at = datetime.fromisoformat(raw_expires_at)
+        except ValueError as exc:
+            raise AdapterAuthorizationError(
+                f"Gmail credential has an unparseable expires_at: {raw_expires_at!r}"
+            ) from exc
+        if datetime.now(UTC) < expires_at - _TOKEN_REFRESH_MARGIN:
+            return credential
+
+        refresh_token = parsed.get("refresh_token")
+        if not isinstance(refresh_token, str) or not refresh_token:
+            raise AdapterAuthorizationError("Gmail credential is missing refresh_token")
+
+        settings = get_settings()
+        try:
+            response = self._oauth_client.post(
+                "/token",
+                data={
+                    "refresh_token": refresh_token,
+                    "client_id": settings.gmail_oauth_client_id,
+                    "client_secret": settings.gmail_oauth_client_secret,
+                    "grant_type": "refresh_token",
+                },
+            )
+        except httpx.HTTPError as exc:
+            raise AdapterAuthorizationError(f"Gmail token refresh failed: {exc}") from exc
+        if response.status_code == 400:
+            raise AdapterAuthorizationError(
+                "Gmail refresh token was rejected -- reconnect this Gmail account"
+            )
+        if response.status_code != 200:
+            raise AdapterAuthorizationError(
+                f"Gmail token refresh failed with status {response.status_code}"
+            )
+        try:
+            body = response.json()
+        except ValueError as exc:
+            raise AdapterAuthorizationError(
+                f"Gmail token refresh returned a non-JSON response body: {exc}"
+            ) from exc
+        if not isinstance(body, dict):
+            raise AdapterAuthorizationError(
+                "Gmail token refresh returned a non-object response body: "
+                f"{type(body).__name__}"
+            )
+        new_access_token = body.get("access_token")
+        new_expires_in = body.get("expires_in")
+        # `isinstance(new_expires_in, bool)`: same `bool`-is-an-`int`-subtype
+        # guard `handle_oauth_callback` already applies to this exact field
+        # (see that method's own round-9-review comment) -- a literal
+        # `"expires_in": true` would otherwise silently store a credential
+        # that claims to expire in ~1 second.
+        if (
+            not isinstance(new_access_token, str)
+            or not new_access_token
+            or new_expires_in is None
+            or isinstance(new_expires_in, bool)
+        ):
+            raise AdapterAuthorizationError(
+                "Gmail token refresh response missing access_token/expires_in"
+            )
+        try:
+            new_expires_in_seconds = float(new_expires_in)
+        except (TypeError, ValueError) as exc:
+            raise AdapterAuthorizationError(
+                f"Gmail token refresh returned a non-numeric expires_in: {new_expires_in!r}"
+            ) from exc
+        new_expires_at_epoch = datetime.now(UTC).timestamp() + new_expires_in_seconds
+        try:
+            new_expires_at = datetime.fromtimestamp(new_expires_at_epoch, tz=UTC)
+        except (OverflowError, OSError, ValueError) as exc:
+            raise AdapterAuthorizationError(
+                f"Gmail token refresh returned an out-of-range expires_in: {new_expires_in!r}"
+            ) from exc
+
+        # A refresh-token grant does not normally return a new
+        # `refresh_token` -- only a fresh consent (`handle_oauth_callback`)
+        # does. Preserve the existing one unless Google's response actually
+        # includes a (string, non-empty) replacement, rather than treating
+        # its absence as "the credential no longer has one."
+        new_refresh_token = body.get("refresh_token")
+        if not isinstance(new_refresh_token, str) or not new_refresh_token:
+            new_refresh_token = refresh_token
+
+        return pack_credential(new_access_token, new_refresh_token, new_expires_at)
+
     def refresh_permissions(self, account: ConnectorAccountContext) -> PermissionState:
         """A still-valid access token, or one this call successfully
         refreshes via the stored `refresh_token`, is `active`; a refresh
         that Google itself rejects (`invalid_grant` -- the refresh token
         was revoked, e.g. the user removed this app's access from their
-        Google Account settings) is `permission_lost`. Does not persist a
-        refreshed access token anywhere -- `ecc.domains.engineering.
-        connector_accounts` has no call site wired to this method's return
-        value yet beyond the `PermissionState` itself (matching every other
-        adapter's identical "no HTTP caller yet" disclosed gap from Phase 6
-        Task 1); a future task threading a refreshed credential back into
-        storage is separate work from detecting the loss itself.
+        Google Account settings) is `permission_lost`. A standalone health
+        check, not `ensure_fresh_credential`'s caller or vice versa -- this
+        method never persists a refreshed access token either (`ecc.
+        domains.engineering.connector_accounts` has no call site wired to
+        this method's own return value yet beyond the `PermissionState`
+        itself, matching every other adapter's identical "no HTTP caller
+        yet" disclosed gap from Phase 6 Task 1); unlike that gap,
+        *`sync_connector_endpoint`'s own credential staleness* is no longer
+        one -- see `ensure_fresh_credential`, its actual caller.
         """
         try:
             credential = unpack_credential(account.credential)

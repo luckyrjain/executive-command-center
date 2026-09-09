@@ -137,6 +137,7 @@ from .connectors import (
     AdapterAuthorizationError,
     ConnectorAccountContext,
     ConnectorAdapter,
+    OAuth2ConnectorAdapter,
     SyncOutcome,
 )
 from .connectors import (
@@ -1046,6 +1047,48 @@ def sync_connector_endpoint(
         encrypted = get_encrypted_credential(session, auth.workspace_id, account_id)
         credential = decrypt_credential(encrypted)
 
+        # OAuth2 providers (Gmail, the sole implementer as of this fix) have
+        # an access token that can simply expire between one sync call and
+        # the next -- unlike a PAT-based `ConnectorAdapter`, which has
+        # nothing here to refresh. Before this, every sync call trusted
+        # whatever credential was already stored, so an account idle longer
+        # than its own access token's lifetime 401ed on every subsequent
+        # sync attempt indefinitely, recoverable only by disconnecting and
+        # reconnecting -- even though its `refresh_token` (right there in
+        # the same credential) could have produced a working one. A refresh
+        # failure (malformed credential, or the provider itself rejecting
+        # it) is recorded below, not raised here directly -- phase 2
+        # deliberately skips the adapter call in that case but still
+        # reaches phase 3, so the failure is recorded as a normal failed
+        # `sync_runs` row (the same path, and the same Connector Health UI
+        # surface, every other adapter failure already uses) rather than a
+        # bare HTTP error with no run to show for it.
+        credential_refresh_error: str | None = None
+        if isinstance(adapter, OAuth2ConnectorAdapter):
+            try:
+                refreshed_credential = adapter.ensure_fresh_credential(credential)
+            except AdapterAuthorizationError as exc:
+                credential_refresh_error = str(exc)
+            else:
+                if refreshed_credential != credential:
+                    credential = refreshed_credential
+                    _finalize_account_version(
+                        session,
+                        account_id,
+                        update_sql=(
+                            "UPDATE connector_accounts SET "
+                            "encrypted_credentials = :encrypted_credentials, "
+                            "updated_at = :now, version = version + 1 "
+                            "WHERE id = :id AND status != 'disconnected' "
+                            "RETURNING version"
+                        ),
+                        params={
+                            "encrypted_credentials": encrypt_credential(credential),
+                            "now": now,
+                            "id": account_id,
+                        },
+                    )
+
         # Reap a `running` row this account's own *own* earlier request left
         # behind by crashing/being killed between phase 1's commit and phase
         # 3's outcome-recording (a real availability regression: unlike the
@@ -1138,14 +1181,24 @@ def sync_connector_endpoint(
     adapter_failed = False
     outcome: SyncOutcome | None = None
     failure_summary: str | None = None
-    try:
-        if payload.run_type == "backfill":
-            outcome = adapter.backfill(context, payload.resource_type, since=payload.since)
-        else:
-            outcome = adapter.incremental_sync(context, payload.resource_type, prior_cursor)
-    except Exception as exc:  # noqa: BLE001 -- classified as a failed sync run, not a crash
+    if credential_refresh_error is not None:
+        # No adapter call at all -- there is no credential to make it
+        # with. `_sanitize_adapter_error` is the same untrusted-content
+        # treatment `outcome.error_summary`/a caught adapter exception
+        # already get below; `credential_refresh_error` is just as much a
+        # provider-originated string (Google's own token-endpoint error, in
+        # the common case) as either of those.
         adapter_failed = True
-        failure_summary = _sanitize_adapter_error(str(exc))
+        failure_summary = _sanitize_adapter_error(credential_refresh_error)
+    else:
+        try:
+            if payload.run_type == "backfill":
+                outcome = adapter.backfill(context, payload.resource_type, since=payload.since)
+            else:
+                outcome = adapter.incremental_sync(context, payload.resource_type, prior_cursor)
+        except Exception as exc:  # noqa: BLE001 -- classified as a failed sync run, not a crash
+            adapter_failed = True
+            failure_summary = _sanitize_adapter_error(str(exc))
 
     # --- Phase 3: record the outcome, on a fresh connection ---------------
     completed_at = datetime.now(UTC)
