@@ -179,7 +179,7 @@ export default function RepositoriesPanel() {
         <p className="empty-state">
           {teamFilter
             ? 'No repositories are assigned to this team yet.'
-            : 'No repositories have synced yet. Connect a GitHub or GitLab account and run a backfill from Connector health.'}
+            : "No repositories have synced yet. Connecting a GitHub or GitLab account backfills automatically -- this can take a moment. If it's been a while, open Connector health and run \"Sync now.\""}
         </p>
       ) : null}
 

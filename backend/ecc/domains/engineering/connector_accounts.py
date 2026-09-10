@@ -27,6 +27,25 @@ method call with no multi-step graph to crash-recover mid-way through.
 `sync_runs.status` still records `running` before the call and
 `succeeded`/`failed`/`partial` after, so a stuck run remains visible.
 
+**`create_connector_endpoint` auto-triggers the first backfill, via
+`BackgroundTasks`, not that same durable worker either.** Before this,
+connecting a provider created the `connector_accounts` row and nothing
+else -- a separate, easy-to-miss manual `POST .../sync` call was required
+before any data (repositories, work items, ...) showed up anywhere, while
+the connect wizard's own UI claimed a first sync "starts automatically."
+`_run_auto_backfill` makes that claim true for every `_AUTO_SYNC_
+RESOURCE_TYPES`-allowlisted provider, by calling `_run_connector_sync`
+(the same reserve/call/record core `sync_connector_endpoint` itself now
+delegates to, extracted so both callers share one implementation) once
+per allowlisted resource type, in the background, right after creation
+commits. `BackgroundTasks` -- not `workflow_runs`/`worker.py` -- because
+this is a single best-effort kick-off, not a crash-recoverable multi-step
+graph: no new deployed process, and the existing manual "Sync now" UI is
+already the correct fallback if the background attempt never runs at all
+(a process restart between the creation commit and the task executing) or
+only gets partway (the exact same per-call budget/pagination limits every
+manual sync already has).
+
 **Phase 10 Task 5's proactive-detection hook (below) rides on that same
 synchronous premise, imperfectly.** Unlike a plain `backfill`/`incremental_
 sync` call, `GmailAdapter.detect_actions_since` -- reached via this
@@ -112,12 +131,22 @@ job, most plausibly alongside real GitHub/GitLab/Jira sync) is the
 intended caller; wiring it here would be speculative.
 """
 
+import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Annotated, Any, Literal, Protocol, cast
 from uuid import UUID, uuid4
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
+from fastapi import (
+    APIRouter,
+    BackgroundTasks,
+    Depends,
+    Header,
+    HTTPException,
+    Query,
+    Request,
+    status,
+)
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
@@ -190,6 +219,31 @@ ResourceType = Literal[
     # actually requests, not every table a sync call happens to write to.
     "message",
 ]
+
+_logger = logging.getLogger(__name__)
+
+# `create_connector_endpoint`'s own auto-backfill hook (see `_run_auto_
+# backfill` below) loops over exactly these `resource_type`s for a newly-
+# connected provider -- every other `resource_type` a given adapter's
+# `backfill()` accepts is a zero-item no-op (verified directly against
+# each adapter's own dispatch: `github_adapter.py`, `gitlab_adapter.py`,
+# `jira_adapter.py`, `datadog_adapter.py`), so looping over anything wider
+# would just be `sync_runs` churn with nothing to show for it.
+#
+# `sandbox` (a test/dev fixture with no real "backfill" concept, and not
+# offered by the connect wizard UI at all) and `gmail` (created through a
+# wholly separate OAuth callback, `gmail_oauth.py`'s `gmail_oauth_
+# callback_endpoint`, never through this endpoint) are both deliberately
+# absent -- an unlisted provider means `_run_auto_backfill` does nothing.
+_AUTO_SYNC_RESOURCE_TYPES: dict[str, tuple[ResourceType, ...]] = {
+    # Order matters for github: `_sync_changes` fans out over repository
+    # rows `_sync_repositories` already wrote, and `_sync_reviews` walks
+    # changes `_sync_changes` already wrote (`github_adapter.py`).
+    "github": ("repository", "change", "review"),
+    "gitlab": ("repository",),
+    "jira": ("work_item",),
+    "datadog": ("monitor", "service_definition", "dashboard"),
+}
 
 _MAX_ADAPTER_ERROR_LENGTH = 300
 # `uq_sync_runs_running_per_account` (migration 0046) makes a `running`
@@ -787,6 +841,7 @@ def create_connector_endpoint(
     session: SessionDep,
     _csrf: CsrfDep,
     idempotency_key: IdempotencyHeader,
+    background_tasks: BackgroundTasks,
 ) -> ConnectorAccountResponse:
     """Two phases across two pooled connections, mirroring `sync_connector_
     endpoint`'s own pool-exhaustion fix. `adapter.authorize()` is a real
@@ -951,28 +1006,88 @@ def create_connector_endpoint(
             now,
             response_status=status.HTTP_201_CREATED,
         )
+        # Fired only here, on the genuine new-INSERT path -- never from
+        # the phase-1 cache-hit return above, or the `IntegrityError`
+        # cache-recheck return just above this block, both of which are
+        # idempotency replays of an *already-created* connection whose own
+        # original `create_connector_endpoint` call already scheduled
+        # this. `_run_auto_backfill` (defined near `sync_connector_
+        # endpoint`, below) is a no-op for any provider not in `_AUTO_
+        # SYNC_RESOURCE_TYPES` (`sandbox`, `gmail`, or any future provider
+        # this endpoint doesn't yet know how to auto-backfill).
+        background_tasks.add_task(
+            _run_auto_backfill,
+            workspace_id=auth.workspace_id,
+            user_id=auth.user_id,
+            timezone=auth.timezone,
+            account_id=account_id,
+            provider=payload.provider,
+        )
         return response
 
 
-@router.post(
-    "/connectors/{account_id}/sync",
-    response_model=SyncRunResponse,
-    status_code=status.HTTP_201_CREATED,
-)
-def sync_connector_endpoint(
+class SyncSkipped(Exception):
+    """Reifies one of `_run_connector_sync`'s phase-1 short-circuits (each
+    an `HTTPException` when reached through `sync_connector_endpoint`) so
+    a non-HTTP caller -- `_run_auto_backfill` below -- can catch it
+    without FastAPI/Starlette in scope. `code`/`status_code` are exactly
+    the `detail`/`status_code` `sync_connector_endpoint`'s own `except
+    SyncSkipped` re-raises as an `HTTPException` with, so the two stay in
+    lockstep by construction rather than by two independently-maintained
+    string tables.
+    """
+
+    def __init__(self, code: str, status_code: int) -> None:
+        super().__init__(code)
+        self.code = code
+        self.status_code = status_code
+
+
+@dataclass(frozen=True, slots=True)
+class _IdempotencyArgs:
+    """`sync_connector_endpoint`'s own `Idempotency-Key`/`request_hash`
+    pair, threaded into `_run_connector_sync` as one optional parameter --
+    `None` for `_run_auto_backfill`'s own call, which has no HTTP request
+    (and therefore no idempotency key) to replay-protect at all.
+    """
+
+    key: str
+    req_hash: str
+
+
+def _run_connector_sync(
+    session: Session,
+    auth: AuthContext,
     account_id: UUID,
-    payload: SyncRequest,
-    request: Request,
-    auth: AuthDep,
-    session: SessionDep,
-    _csrf: CsrfDep,
-    idempotency_key: IdempotencyHeader,
+    run_type: ManualSyncRunType,
+    resource_type: ResourceType,
+    since: datetime | None,
+    *,
+    request: Request | None,
+    now: datetime,
+    idempotency: _IdempotencyArgs | None = None,
+    source: str = "user",
 ) -> SyncRunResponse:
-    """Three phases, deliberately on **two separate pooled connections**
-    rather than one transaction spanning the whole handler -- the fix
-    Task 1's own module docstring flagged as required before a real,
-    network-calling adapter (`github_adapter.GitHubAdapter`, Task 2)
-    could be dispatched from here:
+    """The reserve/call/record core of `POST .../sync`, extracted so
+    `_run_auto_backfill` (below) can run it without an HTTP request at
+    all. Two callers: `sync_connector_endpoint`, wrapping this in its own
+    `Idempotency-Key`/authz-checked, `HTTPException`-raising HTTP contract;
+    and `_run_auto_backfill`, calling it directly once per allowlisted
+    `resource_type` right after a connector account is first created,
+    with `idempotency=None` and `request=None`.
+
+    `session` must not have an open transaction yet -- the HTTP path's
+    `SessionDep` arrives that way already; the background path opens a
+    fresh `SessionFactory()` for each call and is responsible for closing
+    it itself (this function does not close `session`, matching phase 1's
+    pre-existing `session.close()` being the *caller's* own explicit
+    phase boundary, not something buried in here).
+
+    Three phases, deliberately on **two separate pooled connections**
+    rather than one transaction spanning the whole call -- the fix Task
+    1's own module docstring flagged as required before a real, network-
+    calling adapter (`github_adapter.GitHubAdapter`, Task 2) could be
+    dispatched from here:
 
     1. Validate the account/adapter, read the prior cursor, and insert the
        `running` `sync_runs` row -- inside `session`'s own transaction.
@@ -991,41 +1106,30 @@ def sync_connector_endpoint(
     _upsert_repository`) already follow this same discipline independently
     -- see that function's own docstring.
 
-    Raises `409 CONNECTOR_SYNC_IN_PROGRESS` if another sync for this
-    account is still `running` (`uq_sync_runs_running_per_account`,
-    migration `0046`) -- see the module docstring's "closing a pooled
-    connection between phases" section for why this, not a held lock,
-    is what serializes concurrent syncs here.
+    Raises `SyncSkipped("CONNECTOR_SYNC_IN_PROGRESS", 409)` if another
+    sync for this account is still `running`
+    (`uq_sync_runs_running_per_account`, migration `0046`) -- see the
+    module docstring's "closing a pooled connection between phases"
+    section for why this, not a held lock, is what serializes concurrent
+    syncs here. Authz (the HTTP path's own 404/403 pre-checks) is
+    deliberately not this function's concern at all -- see
+    `sync_connector_endpoint`'s own body for where that lives; `_run_auto_
+    backfill`'s call has no separate actor to authorize against, only the
+    same one who just created the connector account this call is for.
     """
-    if not authz.authorize(
-        session, auth, resource_type="connector_accounts", resource_id=account_id, action="read"
-    ):
-        session.rollback()
-        raise HTTPException(status_code=404, detail="CONNECTOR_NOT_FOUND")
-    if not authz.authorize(
-        session, auth, resource_type="connector_accounts", resource_id=account_id, action="write"
-    ):
-        session.rollback()
-        raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
-    # `authorize()` never touches transaction state itself (it is also
-    # called from *inside* an open transaction elsewhere in this
-    # codebase) -- these two pre-checks each autobegin their own read-only
-    # transaction, which must be rolled back before phase 1's own `with
-    # session.begin():` below, or SQLAlchemy raises `InvalidRequestError:
-    # A transaction is already begun on this Session`.
-    session.rollback()
-
-    req_hash = request_hash(payload, f"sync:{account_id}")
-    now = datetime.now(UTC)
-
     # --- Phase 1: validate, reserve the run, read the cursor -------------
     with session.begin():
-        lock_idempotency(session, auth, idempotency_key)
-        cached = load_cached(
-            session, auth, idempotency_key, req_hash, domain="engineering_connector_account"
-        )
-        if cached is not None:
-            return SyncRunResponse.model_validate(cached)
+        if idempotency is not None:
+            lock_idempotency(session, auth, idempotency.key)
+            cached = load_cached(
+                session,
+                auth,
+                idempotency.key,
+                idempotency.req_hash,
+                domain="engineering_connector_account",
+            )
+            if cached is not None:
+                return SyncRunResponse.model_validate(cached)
 
         # `for_update=True`: locks this account's row for this short
         # transaction, serializing a second concurrent `/sync` call for the
@@ -1036,13 +1140,13 @@ def sync_connector_endpoint(
         # in phase 3.
         account = get_connector_account(session, auth.workspace_id, account_id, for_update=True)
         if account is None:
-            raise HTTPException(status_code=404, detail="CONNECTOR_NOT_FOUND")
+            raise SyncSkipped("CONNECTOR_NOT_FOUND", 404)
         if account.status == "disconnected":
-            raise HTTPException(status_code=409, detail="CONNECTOR_DISCONNECTED")
+            raise SyncSkipped("CONNECTOR_DISCONNECTED", 409)
 
         adapter = connector_registry.get(account.provider)
         if adapter is None:
-            raise HTTPException(status_code=404, detail="CONNECTOR_PROVIDER_NOT_SUPPORTED")
+            raise SyncSkipped("CONNECTOR_PROVIDER_NOT_SUPPORTED", 404)
 
         encrypted = get_encrypted_credential(session, auth.workspace_id, account_id)
         credential = decrypt_credential(encrypted)
@@ -1133,7 +1237,7 @@ def sync_connector_endpoint(
                     "id": run_id,
                     "workspace_id": auth.workspace_id,
                     "connector_account_id": account_id,
-                    "run_type": payload.run_type,
+                    "run_type": run_type,
                     "started_at": now,
                     "actor_id": auth.user_id,
                 },
@@ -1146,7 +1250,7 @@ def sync_connector_endpoint(
             # bare `FOR UPDATE` lock can no longer prevent by itself once
             # this handler releases its connection before phase 2's slow
             # adapter call -- see this function's own docstring.
-            raise HTTPException(status_code=409, detail="CONNECTOR_SYNC_IN_PROGRESS") from exc
+            raise SyncSkipped("CONNECTOR_SYNC_IN_PROGRESS", 409) from exc
 
         cursor_row = (
             session.execute(
@@ -1158,7 +1262,7 @@ def sync_connector_endpoint(
                 {
                     "workspace_id": auth.workspace_id,
                     "connector_account_id": account_id,
-                    "resource_type": payload.resource_type,
+                    "resource_type": resource_type,
                 },
             )
             .mappings()
@@ -1192,10 +1296,10 @@ def sync_connector_endpoint(
         failure_summary = _sanitize_adapter_error(credential_refresh_error)
     else:
         try:
-            if payload.run_type == "backfill":
-                outcome = adapter.backfill(context, payload.resource_type, since=payload.since)
+            if run_type == "backfill":
+                outcome = adapter.backfill(context, resource_type, since=since)
             else:
-                outcome = adapter.incremental_sync(context, payload.resource_type, prior_cursor)
+                outcome = adapter.incremental_sync(context, resource_type, prior_cursor)
         except Exception as exc:  # noqa: BLE001 -- classified as a failed sync run, not a crash
             adapter_failed = True
             failure_summary = _sanitize_adapter_error(str(exc))
@@ -1254,6 +1358,7 @@ def sync_connector_endpoint(
                 payload={"aggregate_id": str(account_id), "version": audit_version},
                 now=completed_at,
                 domain="engineering_connector_account",
+                source=source,
             )
             queue_lifecycle_event(
                 outcome_session,
@@ -1261,14 +1366,15 @@ def sync_connector_endpoint(
                 "connector_account.sync_failed",
                 "allowed",
             )
-            store_idempotency(
-                outcome_session,
-                auth,
-                idempotency_key,
-                req_hash,
-                response.model_dump(mode="json"),
-                now,
-            )
+            if idempotency is not None:
+                store_idempotency(
+                    outcome_session,
+                    auth,
+                    idempotency.key,
+                    idempotency.req_hash,
+                    response.model_dump(mode="json"),
+                    now,
+                )
             return response
 
         assert outcome is not None
@@ -1323,7 +1429,7 @@ def sync_connector_endpoint(
                     "id": uuid4(),
                     "workspace_id": auth.workspace_id,
                     "connector_account_id": account_id,
-                    "resource_type": payload.resource_type,
+                    "resource_type": resource_type,
                     "cursor_value": outcome.next_cursor,
                     "now": completed_at,
                     "actor_id": auth.user_id,
@@ -1393,18 +1499,20 @@ def sync_connector_endpoint(
             payload={"aggregate_id": str(account_id), "version": audit_version},
             now=completed_at,
             domain="engineering_connector_account",
+            source=source,
         )
         queue_lifecycle_event(
             outcome_session, "engineering_connector_account", "connector_account.synced", "allowed"
         )
-        store_idempotency(
-            outcome_session,
-            auth,
-            idempotency_key,
-            req_hash,
-            response.model_dump(mode="json"),
-            now,
-        )
+        if idempotency is not None:
+            store_idempotency(
+                outcome_session,
+                auth,
+                idempotency.key,
+                idempotency.req_hash,
+                response.model_dump(mode="json"),
+                now,
+            )
 
     # Phase 10 Task 5: proactive Gmail action detection, run only after
     # phase 3's own transaction has committed -- `detect_actions_since`
@@ -1454,6 +1562,132 @@ def sync_connector_endpoint(
             pass
 
     return response
+
+
+@router.post(
+    "/connectors/{account_id}/sync",
+    response_model=SyncRunResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def sync_connector_endpoint(
+    account_id: UUID,
+    payload: SyncRequest,
+    request: Request,
+    auth: AuthDep,
+    session: SessionDep,
+    _csrf: CsrfDep,
+    idempotency_key: IdempotencyHeader,
+) -> SyncRunResponse:
+    """The HTTP contract around `_run_connector_sync` (above): authz,
+    `Idempotency-Key`/`request_hash`, and mapping a `SyncSkipped` back to
+    the `HTTPException` this endpoint has always raised for each of those
+    codes -- see that function's own docstring for the actual reserve/
+    call/record logic.
+    """
+    if not authz.authorize(
+        session, auth, resource_type="connector_accounts", resource_id=account_id, action="read"
+    ):
+        session.rollback()
+        raise HTTPException(status_code=404, detail="CONNECTOR_NOT_FOUND")
+    if not authz.authorize(
+        session, auth, resource_type="connector_accounts", resource_id=account_id, action="write"
+    ):
+        session.rollback()
+        raise HTTPException(status_code=403, detail="INSUFFICIENT_ROLE")
+    # `authorize()` never touches transaction state itself (it is also
+    # called from *inside* an open transaction elsewhere in this
+    # codebase) -- these two pre-checks each autobegin their own read-only
+    # transaction, which must be rolled back before `_run_connector_sync`'s
+    # own `with session.begin():`, or SQLAlchemy raises
+    # `InvalidRequestError: A transaction is already begun on this Session`.
+    session.rollback()
+
+    req_hash = request_hash(payload, f"sync:{account_id}")
+    now = datetime.now(UTC)
+    try:
+        return _run_connector_sync(
+            session,
+            auth,
+            account_id,
+            payload.run_type,
+            payload.resource_type,
+            payload.since,
+            request=request,
+            now=now,
+            idempotency=_IdempotencyArgs(key=idempotency_key, req_hash=req_hash),
+        )
+    except SyncSkipped as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.code) from exc
+
+
+def _run_auto_backfill(
+    *, workspace_id: UUID, user_id: UUID, timezone: str, account_id: UUID, provider: str
+) -> None:
+    """`create_connector_endpoint`'s own `BackgroundTasks.add_task` target
+    -- fires once, right after a new connector account is created, one
+    full `_run_connector_sync("backfill", ...)` call per `_AUTO_SYNC_
+    RESOURCE_TYPES`-allowlisted resource type for `provider` (nothing at
+    all for an unlisted provider, e.g. `sandbox`/`gmail`). Sequential, not
+    concurrent, by requirement, not just convenience:
+    `uq_sync_runs_running_per_account` (migration `0046`) allows only one
+    `running` row per *account* -- a second resource type dispatched
+    before the first's row leaves `running` would just raise
+    `SyncSkipped("CONNECTOR_SYNC_IN_PROGRESS", 409)`, caught below like
+    every other skip, so this loop always runs every resource type to
+    completion (success or failure), never short-circuits the rest.
+
+    No `AuthDep`/`Request`/`Idempotency-Key` in scope -- there is no HTTP
+    request here at all, only whichever actor's own `POST /connectors`
+    call happened to create this account, reconstructed as a plain
+    `AuthContext`. `source="system"` on the resulting audit trail
+    distinguishes an auto-triggered sync from one a user explicitly
+    clicked "Sync now" for.
+
+    Best-effort, deliberately: `BackgroundTasks` is in-process, not
+    durable (see this module's own docstring for why a full durable-
+    queue-and-poller was judged disproportionate for "kick off the first
+    sync"). If the process restarts between the connector-creation commit
+    and this function actually running, the auto-backfill silently never
+    fires for that connection -- the existing manual "Sync now" UI is the
+    fallback either way, so this failure mode is "back to pre-auto-
+    backfill behavior," not data loss or a stuck state.
+    """
+    resource_types = _AUTO_SYNC_RESOURCE_TYPES.get(provider)
+    if not resource_types:
+        return
+    auth = AuthContext(workspace_id=workspace_id, user_id=user_id, timezone=timezone)
+    for resource_type in resource_types:
+        session = SessionFactory()
+        try:
+            _run_connector_sync(
+                session,
+                auth,
+                account_id,
+                "backfill",
+                resource_type,
+                since=None,
+                request=None,
+                now=datetime.now(UTC),
+                idempotency=None,
+                source="system",
+            )
+        except SyncSkipped as exc:
+            _logger.info(
+                "auto-backfill skipped provider=%s resource_type=%s account_id=%s code=%s",
+                provider,
+                resource_type,
+                account_id,
+                exc.code,
+            )
+        except Exception:  # noqa: BLE001 -- must never crash a BackgroundTask silently
+            _logger.exception(
+                "auto-backfill failed provider=%s resource_type=%s account_id=%s",
+                provider,
+                resource_type,
+                account_id,
+            )
+        finally:
+            session.close()
 
 
 @router.post("/connectors/{account_id}/disable", response_model=ConnectorAccountResponse)

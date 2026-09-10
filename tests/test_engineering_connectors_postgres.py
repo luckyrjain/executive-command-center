@@ -666,6 +666,59 @@ class _ActionDetectionSpyAdapter(_MessageCursorAdapter):
         self.detect_actions_since_calls.append((context, since))
 
 
+@dataclass
+class _AutoBackfillSpyAdapter:
+    """Registers under a real, `_AUTO_SYNC_RESOURCE_TYPES`-allowlisted
+    provider slug (`provider` field -- `"gitlab"`/`"github"` in practice)
+    so `create_connector_endpoint`'s own `BackgroundTasks`-driven `_run_
+    auto_backfill` trigger actually recognizes it, and its own `authorize`
+    returns a real `ConnectorAuthorization` (unlike `_MessageCursorAdapter`
+    above) so the full `POST /connectors` HTTP flow -- not just a directly
+    -inserted row -- can be exercised end to end. `fail_for` lets a test
+    make exactly one resource type's own `backfill()` raise, to prove one
+    failing resource type doesn't block the others in `_run_auto_
+    backfill`'s own sequential loop.
+    """
+
+    provider: str
+    required_scopes: frozenset[str] = field(default_factory=frozenset)
+    fail_for: frozenset[str] = field(default_factory=frozenset)
+    backfill_calls: list[str] = field(default_factory=list)
+
+    def authorize(self, credential: str) -> ConnectorAuthorization:
+        return ConnectorAuthorization(
+            external_account_id="auto-backfill-account",
+            display_name="Auto-backfill spy",
+            granted_scopes=self.required_scopes,
+        )
+
+    def backfill(
+        self, account: ConnectorAccountContext, resource_type: str, since: datetime | None = None
+    ) -> SyncOutcome:
+        self.backfill_calls.append(resource_type)
+        if resource_type in self.fail_for:
+            raise RuntimeError(f"simulated failure for {resource_type}")
+        return SyncOutcome(
+            resource_type=resource_type, items_processed=1, status="succeeded", next_cursor=None
+        )
+
+    def incremental_sync(
+        self, account: ConnectorAccountContext, resource_type: str, cursor: str | None
+    ) -> SyncOutcome:
+        return self.backfill(account, resource_type)
+
+    def handle_webhook(
+        self, account: ConnectorAccountContext, payload: bytes, headers: object
+    ) -> SyncOutcome:
+        raise NotImplementedError
+
+    def refresh_permissions(self, account: ConnectorAccountContext) -> str:
+        return "active"
+
+    def disconnect(self, account: ConnectorAccountContext) -> None:
+        return None
+
+
 # --- unit-level: sandbox adapter / registry / crypto (no database) ---------
 
 
@@ -1017,6 +1070,223 @@ def test_create_connector_idempotency_replay_and_conflict(
             {"workspace_id": _workspace_id},
         ).scalar_one()
         assert count == 1
+
+
+# --- create_connector_endpoint: auto-backfill on connect --------------------
+
+
+def test_create_connector_auto_backfill_populates_data_for_allowlisted_provider(
+    engineering_test_context: tuple[TestClient, UUID, UUID, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`gitlab` is in `_AUTO_SYNC_RESOURCE_TYPES` with exactly one real
+    resource type -- connecting one should, with no separate manual
+    `/sync` call, produce a `succeeded` `sync_runs` row and a non-null
+    `last_synced_at`, proving `create_connector_endpoint`'s own
+    `BackgroundTasks.add_task(_run_auto_backfill, ...)` actually fires
+    (`TestClient` runs `BackgroundTasks` synchronously inside `client.
+    post(...)`, so no polling is needed here).
+    """
+    client, _workspace_id, _user_id, token = engineering_test_context
+    adapter = _AutoBackfillSpyAdapter(provider="gitlab")
+    monkeypatch.setattr(connector_accounts_module, "connector_registry", _registry_with(adapter))
+
+    response = client.post(
+        "/api/v1/engineering/connectors",
+        json={"provider": "gitlab", "credential": "gitlab-token"},
+        headers=_headers(token, key=str(uuid4())),
+    )
+    assert response.status_code == 201, response.text
+    account_id = response.json()["id"]
+
+    assert adapter.backfill_calls == ["repository"]
+
+    with engine.begin() as connection:
+        run = (
+            connection.execute(
+                text(
+                    "SELECT status, items_processed FROM sync_runs WHERE connector_account_id = :id"
+                ),
+                {"id": account_id},
+            )
+            .mappings()
+            .one()
+        )
+        last_synced_at = connection.execute(
+            text("SELECT last_synced_at FROM connector_accounts WHERE id = :id"),
+            {"id": account_id},
+        ).scalar_one()
+    assert run["status"] == "succeeded"
+    assert run["items_processed"] == 1
+    assert last_synced_at is not None
+
+
+def test_create_connector_auto_backfill_fires_one_run_per_allowlisted_resource_type(
+    engineering_test_context: tuple[TestClient, UUID, UUID, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`github` has three real resource types, order-dependent
+    (`_AUTO_SYNC_RESOURCE_TYPES`'s own comment: `change` depends on
+    `repository` rows already existing, `review` on `change` rows already
+    existing) -- one `sync_runs` row per type, in that exact order.
+    """
+    client, _workspace_id, _user_id, token = engineering_test_context
+    adapter = _AutoBackfillSpyAdapter(provider="github")
+    monkeypatch.setattr(connector_accounts_module, "connector_registry", _registry_with(adapter))
+
+    response = client.post(
+        "/api/v1/engineering/connectors",
+        json={"provider": "github", "credential": "github-token"},
+        headers=_headers(token, key=str(uuid4())),
+    )
+    assert response.status_code == 201, response.text
+    account_id = response.json()["id"]
+
+    assert adapter.backfill_calls == ["repository", "change", "review"]
+
+    with engine.begin() as connection:
+        rows = (
+            connection.execute(
+                text(
+                    "SELECT status FROM sync_runs WHERE connector_account_id = :id "
+                    "ORDER BY started_at ASC"
+                ),
+                {"id": account_id},
+            )
+            .mappings()
+            .all()
+        )
+    assert [row["status"] for row in rows] == ["succeeded", "succeeded", "succeeded"]
+
+
+def test_create_connector_auto_backfill_one_resource_type_failure_does_not_block_others(
+    engineering_test_context: tuple[TestClient, UUID, UUID, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`_run_auto_backfill`'s own loop is sequential and independently
+    try/excepted per resource type -- a `change` backfill that raises
+    must not prevent `review` (the type after it) from still running.
+    """
+    client, _workspace_id, _user_id, token = engineering_test_context
+    adapter = _AutoBackfillSpyAdapter(provider="github", fail_for=frozenset({"change"}))
+    monkeypatch.setattr(connector_accounts_module, "connector_registry", _registry_with(adapter))
+
+    response = client.post(
+        "/api/v1/engineering/connectors",
+        json={"provider": "github", "credential": "github-token"},
+        headers=_headers(token, key=str(uuid4())),
+    )
+    assert response.status_code == 201, response.text
+    account_id = response.json()["id"]
+
+    assert adapter.backfill_calls == ["repository", "change", "review"]
+
+    with engine.begin() as connection:
+        rows = (
+            connection.execute(
+                text(
+                    "SELECT status, error_summary FROM sync_runs "
+                    "WHERE connector_account_id = :id ORDER BY started_at ASC"
+                ),
+                {"id": account_id},
+            )
+            .mappings()
+            .all()
+        )
+    assert len(rows) == 3
+    assert [row["status"] for row in rows] == ["succeeded", "failed", "succeeded"]
+    assert rows[1]["error_summary"] is not None and "change" in rows[1]["error_summary"]
+
+
+def test_create_connector_sandbox_provider_does_not_auto_sync(
+    engineering_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    """`sandbox` -- a test/dev fixture, not offered by the connect wizard,
+    not in `_AUTO_SYNC_RESOURCE_TYPES` -- must produce zero `sync_runs`
+    rows on connect. Uses the real registered `SandboxGithubAdapter` (no
+    monkeypatch), matching every other `provider: "sandbox"` test in this
+    file.
+    """
+    client, _workspace_id, _user_id, token = engineering_test_context
+    response = client.post(
+        "/api/v1/engineering/connectors",
+        json={"provider": "sandbox", "credential": "token-no-auto-sync"},
+        headers=_headers(token, key=str(uuid4())),
+    )
+    assert response.status_code == 201, response.text
+    account_id = response.json()["id"]
+
+    with engine.begin() as connection:
+        count = connection.execute(
+            text("SELECT count(*) FROM sync_runs WHERE connector_account_id = :id"),
+            {"id": account_id},
+        ).scalar_one()
+    assert count == 0
+
+
+def test_run_auto_backfill_is_a_noop_for_an_unlisted_provider(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Protects `_AUTO_SYNC_RESOURCE_TYPES.get(provider)`'s own early
+    return directly: monkeypatches `_run_connector_sync` itself to a spy,
+    so this proves the allowlist gate independent of whatever `_run_
+    connector_sync` would otherwise do for a nonexistent `account_id`
+    (which would *also* produce zero `sync_runs` rows on its own, via
+    `SyncSkipped("CONNECTOR_NOT_FOUND", ...)` -- too weak a signal to
+    prove the gate itself is what's responsible).
+    """
+    calls: list[str] = []
+    monkeypatch.setattr(
+        connector_accounts_module,
+        "_run_connector_sync",
+        lambda *args, **kwargs: calls.append("called"),
+    )
+    connector_accounts_module._run_auto_backfill(
+        workspace_id=uuid4(),
+        user_id=uuid4(),
+        timezone="Asia/Kolkata",
+        account_id=uuid4(),
+        provider="sandbox",
+    )
+    assert calls == []
+
+
+def test_create_connector_idempotency_replay_does_not_trigger_a_second_auto_backfill(
+    engineering_test_context: tuple[TestClient, UUID, UUID, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`background_tasks.add_task(_run_auto_backfill, ...)` is called only
+    from the genuine new-INSERT path in `create_connector_endpoint`'s own
+    phase 3 -- never from the phase-1 cache-hit or phase-3 `IntegrityError`
+    cache-recheck early returns, both idempotency replays of an *already-
+    created* connection. A same-key replay must not fire a second
+    auto-backfill.
+    """
+    client, _workspace_id, _user_id, token = engineering_test_context
+    adapter = _AutoBackfillSpyAdapter(provider="gitlab")
+    monkeypatch.setattr(connector_accounts_module, "connector_registry", _registry_with(adapter))
+    key = str(uuid4())
+    payload = {"provider": "gitlab", "credential": "gitlab-token-replay"}
+
+    first = client.post(
+        "/api/v1/engineering/connectors", json=payload, headers=_headers(token, key=key)
+    )
+    assert first.status_code == 201, first.text
+    account_id = first.json()["id"]
+
+    replay = client.post(
+        "/api/v1/engineering/connectors", json=payload, headers=_headers(token, key=key)
+    )
+    assert replay.status_code == 201, replay.text
+    assert replay.json()["id"] == account_id
+
+    assert adapter.backfill_calls == ["repository"]
+    with engine.begin() as connection:
+        count = connection.execute(
+            text("SELECT count(*) FROM sync_runs WHERE connector_account_id = :id"),
+            {"id": account_id},
+        ).scalar_one()
+    assert count == 1
 
 
 def test_list_connectors_cross_workspace_isolation(

@@ -1,4 +1,4 @@
-import { useState, type FormEvent } from 'react'
+import { useRef, useState, type FormEvent } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
 import { ApiError, apiRequest } from '../../api/client'
@@ -15,6 +15,10 @@ import type {
 } from './types'
 
 const PROVIDERS: ReadonlyArray<ConnectorProvider> = ['github', 'gitlab', 'jira', 'datadog', 'sandbox']
+
+// See the `syncRuns` query's own `refetchInterval` comment below.
+const AUTO_BACKFILL_POLL_INTERVAL_MS = 2_500
+const AUTO_BACKFILL_POLL_TIMEOUT_MS = 25_000
 
 // `ConnectorProvider` also includes `gmail`, managed entirely by its own
 // Phase 10 `GmailPanel` (OAuth, not a credential this form ever collects) --
@@ -473,6 +477,10 @@ export default function ConnectorHealthPanel() {
   const [fields, setFields] = useState<CredentialFields>(() => emptyCredentialFields('github'))
   const [stepIndex, setStepIndex] = useState(0)
   const [connected, setConnected] = useState<ConnectorAccount | null>(null)
+  // Set alongside `connected` -- bounds how long `syncRuns` polls below to a
+  // real wall-clock window, not "however long `connected` happens to stay
+  // truthy" (which is "until the user navigates away," e.g. overnight).
+  const connectedAtRef = useRef<number | null>(null)
   const connectors = useQuery({
     queryKey: ['engineering', 'connectors'],
     queryFn: () => apiRequest<ConnectorAccountListResponse>('/api/v1/engineering/connectors'),
@@ -482,6 +490,28 @@ export default function ConnectorHealthPanel() {
     queryKey: ['engineering', 'sync-runs'],
     queryFn: () => apiRequest<SyncRunListResponse>('/api/v1/engineering/sync-runs'),
     retry: 1,
+    // `create_connector_endpoint`'s own auto-backfill (backend/ecc/domains/
+    // engineering/connector_accounts.py's `_run_auto_backfill`) fires in a
+    // `BackgroundTasks` callback that, under a real ASGI server (unlike
+    // this repo's own test harness), genuinely runs *after* the response
+    // is sent -- the one-shot `refresh()` below, fired from `createMutation
+    // .onSuccess`, will usually race ahead of it even starting. Without
+    // this, a freshly-connected provider showed "the first backfill starts
+    // automatically" over an empty "Connected integrations" list with no
+    // sign anything was happening. Polls only while there's a just-
+    // connected account with no `sync_runs` row of its own yet, and only
+    // for `AUTO_BACKFILL_POLL_TIMEOUT_MS` -- a real, still-in-flight sync
+    // (or one that never fires at all, e.g. `sandbox`/an unlisted
+    // provider, or the background task simply never running) does not
+    // poll forever.
+    refetchInterval: (query) => {
+      if (!connected || connectedAtRef.current === null) return false
+      if (Date.now() - connectedAtRef.current > AUTO_BACKFILL_POLL_TIMEOUT_MS) return false
+      const hasRunForConnected = (query.state.data?.sync_runs ?? []).some(
+        (run) => run.connector_account_id === connected.id,
+      )
+      return hasRunForConnected ? false : AUTO_BACKFILL_POLL_INTERVAL_MS
+    },
   })
 
   const createMutation = useMutation({
@@ -492,6 +522,7 @@ export default function ConnectorHealthPanel() {
       }),
     onSuccess: (data) => {
       setConnected(data)
+      connectedAtRef.current = Date.now()
       setFields(emptyCredentialFields(provider))
       refresh()
     },
@@ -503,6 +534,7 @@ export default function ConnectorHealthPanel() {
     setFields(emptyCredentialFields(next))
     setStepIndex(0)
     setConnected(null)
+    connectedAtRef.current = null
   }
 
   function updateFields(patch: Partial<CredentialFields>) {
@@ -558,6 +590,7 @@ export default function ConnectorHealthPanel() {
   }
   function startOver() {
     setConnected(null)
+    connectedAtRef.current = null
     setStepIndex(0)
   }
 
