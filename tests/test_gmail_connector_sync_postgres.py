@@ -1152,6 +1152,64 @@ def test_backfill_succeeds_after_one_rate_limited_retry(
     assert outcome.items_processed == 1
 
 
+def test_backfill_skips_a_message_that_404s_and_continues(
+    seeded_gmail_account: tuple[ConnectorAccountContext, UUID],
+) -> None:
+    """A message `messages.list` returned can be gone (deleted/expunged)
+    by the time this call reaches its own `messages.get` -- a real,
+    expected race in any mail sync, not a server error. Reproduced live
+    against a real Gmail account mid-backfill: one `404` on a single
+    message aborted the entire call (an uncaught `RuntimeError`) instead
+    of skipping that one message and finishing the rest of the page.
+    """
+    context, _owner_id = seeded_gmail_account
+    now_ms = int(datetime.now(UTC).timestamp() * 1000)
+    body = _message_body(
+        message_id="msg-live",
+        thread_id="thread-live",
+        from_addr="alice@example.test",
+        to_addrs=["owner@example.test"],
+        internal_date_ms=now_ms,
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/gmail/v1/users/me/messages":
+            return _json_response({"messages": [{"id": "msg-deleted"}, {"id": "msg-live"}]})
+        if request.url.path == "/gmail/v1/users/me/messages/msg-deleted":
+            return httpx.Response(404, json={"error": {"code": 404, "message": "Not Found"}})
+        if request.url.path == "/gmail/v1/users/me/messages/msg-live":
+            return _json_response(body)
+        raise AssertionError(f"unexpected request to {request.url}")
+
+    adapter = GmailAdapter(transport=httpx.MockTransport(handler))
+    outcome = adapter.backfill(context, "message", since=datetime.now(UTC) - timedelta(days=1))
+    assert outcome.status == "succeeded"
+    assert outcome.items_processed == 1
+
+    rows = _threads_and_messages(context.workspace_id)
+    assert len(rows) == 1
+    assert rows[0]["external_message_id"] == "msg-live"
+
+
+def test_backfill_other_message_fetch_errors_still_raise(
+    seeded_gmail_account: tuple[ConnectorAccountContext, UUID],
+) -> None:
+    """The `404` skip above must not widen into swallowing a real,
+    non-transient server error too."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/gmail/v1/users/me/messages":
+            return _json_response({"messages": [{"id": "msg-1"}]})
+        if request.url.path == "/gmail/v1/users/me/messages/msg-1":
+            return httpx.Response(500, json={})
+        raise AssertionError(f"unexpected request to {request.url}")
+
+    context, _owner_id = seeded_gmail_account
+    adapter = GmailAdapter(transport=httpx.MockTransport(handler))
+    with pytest.raises(RuntimeError, match="status 500"):
+        adapter.backfill(context, "message", since=datetime.now(UTC) - timedelta(days=1))
+
+
 def test_a_genuine_403_is_not_treated_as_rate_limiting(
     seeded_gmail_account: tuple[ConnectorAccountContext, UUID],
 ) -> None:
@@ -1448,6 +1506,79 @@ def test_incremental_sync_resumes_from_history_cursor(
     rows = _threads_and_messages(context.workspace_id)
     assert len(rows) == 1
     assert rows[0]["external_message_id"] == "msg-9"
+
+
+def test_incremental_sync_skips_a_message_that_404s_and_continues(
+    seeded_gmail_account: tuple[ConnectorAccountContext, UUID],
+) -> None:
+    """Same fix as `test_backfill_skips_a_message_that_404s_and_continues`,
+    in `_sync_history`'s own identical loop shape -- worth its own test
+    since a `404` here is a stricter case: unlike `_sync_messages`
+    (which always falls back to a fresh `backfill` on any interruption),
+    a message reachable only via `history.list` that always 404s would,
+    without `record_stuck_offset` also advancing past it, retry the exact
+    same message forever -- a livelock, not merely a crash.
+    """
+    context, _owner_id = seeded_gmail_account
+    now_ms = int(datetime.now(UTC).timestamp() * 1000)
+    body = _message_body(
+        message_id="msg-live",
+        thread_id="thread-live",
+        from_addr="carol@example.test",
+        to_addrs=["owner@example.test"],
+        internal_date_ms=now_ms,
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/gmail/v1/users/me/history":
+            return _json_response(
+                {
+                    "history": [
+                        {
+                            "messagesAdded": [
+                                {"message": {"id": "msg-deleted"}},
+                                {"message": {"id": "msg-live"}},
+                            ]
+                        }
+                    ],
+                    "historyId": 150,
+                }
+            )
+        if request.url.path == "/gmail/v1/users/me/messages/msg-deleted":
+            return httpx.Response(404, json={"error": {"code": 404, "message": "Not Found"}})
+        if request.url.path == "/gmail/v1/users/me/messages/msg-live":
+            return _json_response(body)
+        raise AssertionError(f"unexpected request to {request.url}")
+
+    adapter = GmailAdapter(transport=httpx.MockTransport(handler))
+    outcome = adapter.incremental_sync(context, "message", "100")
+    assert outcome.status == "succeeded"
+    assert outcome.items_processed == 1
+
+    rows = _threads_and_messages(context.workspace_id)
+    assert len(rows) == 1
+    assert rows[0]["external_message_id"] == "msg-live"
+
+
+def test_incremental_sync_other_message_fetch_errors_still_raise(
+    seeded_gmail_account: tuple[ConnectorAccountContext, UUID],
+) -> None:
+    """The `404` skip above must not widen into swallowing a real,
+    non-transient server error too."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/gmail/v1/users/me/history":
+            return _json_response(
+                {"history": [{"messagesAdded": [{"message": {"id": "msg-1"}}]}], "historyId": 150}
+            )
+        if request.url.path == "/gmail/v1/users/me/messages/msg-1":
+            return httpx.Response(500, json={})
+        raise AssertionError(f"unexpected request to {request.url}")
+
+    context, _owner_id = seeded_gmail_account
+    adapter = GmailAdapter(transport=httpx.MockTransport(handler))
+    with pytest.raises(RuntimeError, match="status 500"):
+        adapter.incremental_sync(context, "message", "100")
 
 
 def test_incremental_sync_clears_a_stuck_record_even_when_an_intervening_page_has_no_entries(
