@@ -1977,6 +1977,17 @@ class GmailAdapter:
                         next_cursor=None,
                         error_summary=_RATE_LIMIT_ERROR_SUMMARY,
                     )
+                if get_response.status_code == 404:
+                    # The message this id pointed to when `messages.list`
+                    # returned it no longer exists by the time this call
+                    # reaches it -- deleted or expunged between the list
+                    # call and this one, a real and expected race in any
+                    # mail sync, not a server error. Skips this ref and
+                    # keeps walking the rest of the page rather than
+                    # aborting the whole call over one message that will
+                    # never successfully fetch no matter how many times
+                    # it's retried.
+                    continue
                 if get_response.status_code != 200:
                     raise RuntimeError(
                         f"Gmail message fetch failed with status {get_response.status_code}"
@@ -2347,6 +2358,21 @@ class GmailAdapter:
                             ),
                             error_summary=_RATE_LIMIT_ERROR_SUMMARY,
                         )
+                    if get_response.status_code == 404:
+                        # Same reasoning as `_sync_messages`' own identical
+                        # guard: the message no longer exists by the time
+                        # this call reaches it, a real and expected race,
+                        # not a server error. `record_stuck_offset += 1`
+                        # (not left at its pre-skip value) still advances
+                        # past it -- otherwise a resumed call would land on
+                        # this exact offset again, re-fetch the same
+                        # permanently-gone message, 404 again, forever: the
+                        # same livelock class `record_stuck_offset` itself
+                        # exists to close for a budget interruption,
+                        # reopened here for a 404 if this skip didn't also
+                        # advance it.
+                        record_stuck_offset += 1
+                        continue
                     if get_response.status_code != 200:
                         raise RuntimeError(
                             f"Gmail message fetch failed with status {get_response.status_code}"
