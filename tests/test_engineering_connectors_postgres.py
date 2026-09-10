@@ -1281,6 +1281,70 @@ def test_sync_adapter_failure_marks_run_and_account_failed(
         assert audit_count == 1
 
 
+def test_sync_success_resets_account_status_to_active_after_a_prior_failure(
+    engineering_test_context: tuple[TestClient, UUID, UUID, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Companion to `test_sync_adapter_failure_marks_run_and_account_failed`
+    above: that test proves a failure sets `status = 'error'`; this one
+    proves a *later* success actually clears it back. Before this fix,
+    nothing on the success path ever wrote `status` at all -- only the
+    failure branch did (to `'error'`) -- so one past failure left an
+    account's `status` stuck at `'error'` forever, no matter how many
+    later syncs succeeded: `last_error` correctly cleared to `None` each
+    time, but `status` itself never moved. Reproduced live against a real
+    Gmail connector: it failed once (an expired token, before
+    reconnecting), then completed 13 consecutive successful/partial
+    backfill calls, and still showed `status = 'error'` ("Gmail
+    unavailable" in the UI) throughout. `metrics.py`'s own `WHERE status =
+    'active'` filters mean this silently excluded any connector with a
+    past-but-since-recovered failure from delivery/reliability metrics
+    too, not just the UI banner.
+    """
+    client, workspace_id, user_id, token = engineering_test_context
+    account_id = _insert_connector_account(workspace_id, user_id)
+
+    monkeypatch.setattr(
+        connector_accounts_module, "connector_registry", _registry_with(_RaisingAdapter())
+    )
+    failed_response = client.post(
+        f"/api/v1/engineering/connectors/{account_id}/sync",
+        json={"run_type": "backfill", "resource_type": "repository"},
+        headers=_headers(token, key=str(uuid4())),
+    )
+    assert failed_response.status_code == 201, failed_response.text
+    assert failed_response.json()["status"] == "failed"
+
+    with engine.begin() as connection:
+        status_after_failure = connection.execute(
+            text("SELECT status FROM connector_accounts WHERE id = :id"), {"id": account_id}
+        ).scalar_one()
+    assert status_after_failure == "error"
+
+    monkeypatch.setattr(
+        connector_accounts_module, "connector_registry", _registry_with(_SpyDisconnectAdapter())
+    )
+    success_response = client.post(
+        f"/api/v1/engineering/connectors/{account_id}/sync",
+        json={"run_type": "backfill", "resource_type": "repository"},
+        headers=_headers(token, key=str(uuid4())),
+    )
+    assert success_response.status_code == 201, success_response.text
+    assert success_response.json()["status"] == "succeeded"
+
+    with engine.begin() as connection:
+        account_row = (
+            connection.execute(
+                text("SELECT status, last_error FROM connector_accounts WHERE id = :id"),
+                {"id": account_id},
+            )
+            .mappings()
+            .one()
+        )
+    assert account_row["status"] == "active"
+    assert account_row["last_error"] is None
+
+
 def test_sync_success_sets_updated_by(
     engineering_test_context: tuple[TestClient, UUID, UUID, str],
 ) -> None:

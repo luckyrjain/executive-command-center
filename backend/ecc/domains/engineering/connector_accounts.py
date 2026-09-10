@@ -1329,12 +1329,35 @@ def sync_connector_endpoint(
                     "actor_id": auth.user_id,
                 },
             )
+        # `status = 'active'`, not left untouched: reaching this branch at
+        # all (as opposed to the `adapter_failed` branch above) means the
+        # adapter call actually reached the provider and returned a real
+        # `SyncOutcome` -- true whether `outcome.status` is `succeeded` or
+        # merely `partial` (a budget-exhausted call still proves the
+        # credential and connection both work, it just has more to fetch).
+        # Before this, only the failure branch above ever wrote `status`
+        # (to `'error'`) -- nothing on this, the *success* path, ever
+        # wrote it back to `'active'`, so one past failure permanently
+        # stuck an account's status at `'error'` no matter how many
+        # subsequent syncs succeeded: `last_error` correctly cleared to
+        # `None` each time, but `status` itself never moved, leaving the
+        # Connector Health / Gmail panel UI (`status === 'error'` ->
+        # "Gmail unavailable") stuck reporting a connector as broken
+        # indefinitely after it had actually recovered. Reproduced live: a
+        # Gmail connector that failed once (an expired token, before
+        # reconnecting) then completed 13 consecutive successful/partial
+        # backfill calls still showed "Gmail unavailable" throughout, with
+        # `last_error` already `None`. Also fed `metrics.py`'s own
+        # `WHERE status = 'active'` filters, so this silently excluded any
+        # connector with a past-but-since-recovered failure from delivery/
+        # reliability metrics too, not just the UI banner.
         audit_version = _finalize_account_version(
             outcome_session,
             account_id,
             update_sql=(
-                "UPDATE connector_accounts SET last_synced_at = :now, last_error = :error, "
-                "updated_at = :now, updated_by = :actor_id, version = version + 1 "
+                "UPDATE connector_accounts SET status = 'active', last_synced_at = :now, "
+                "last_error = :error, updated_at = :now, updated_by = :actor_id, "
+                "version = version + 1 "
                 "WHERE id = :id AND status != 'disconnected' "
                 "RETURNING version"
             ),
