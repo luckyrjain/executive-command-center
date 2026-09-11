@@ -1,7 +1,6 @@
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
-from hmac import new
 from uuid import UUID, uuid4
 
 import pytest
@@ -66,8 +65,14 @@ def recommendation_count_context() -> Iterator[tuple[TestClient, UUID, UUID, str
         client.close()
         with engine.begin() as connection:
             for table in (
-                "recommendations", "recommendation_feedback", "tasks", "commitments",
-                "risks", "sessions", "users", "workspaces",
+                "recommendations",
+                "recommendation_feedback",
+                "tasks",
+                "commitments",
+                "risks",
+                "sessions",
+                "users",
+                "workspaces",
             ):
                 connection.execute(
                     text(f"DELETE FROM {table} WHERE id = :workspace_id")

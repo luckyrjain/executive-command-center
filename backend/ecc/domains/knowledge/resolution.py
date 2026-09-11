@@ -614,16 +614,27 @@ def count_candidates(
     auth: AuthDep, session: SessionDep, status: CandidateStatus | None = "open"
 ) -> ResolutionCandidateCount:
     visibility_sql, visibility_params = authz.visible_resource_filter_sql(
-        session, auth, resource_type="resolution_candidates", action="read",
+        session,
+        auth,
+        resource_type="resolution_candidates",
+        action="read",
         table_alias="resolution_candidates",
     )
     left_visibility_sql, left_visibility_params = authz.visible_resource_filter_sql(
-        session, auth, resource_type="pkos_nodes", action="read",
-        table_alias="left_entity", param_prefix="left_entity_",
+        session,
+        auth,
+        resource_type="pkos_nodes",
+        action="read",
+        table_alias="left_entity",
+        param_prefix="left_entity_",
     )
     right_visibility_sql, right_visibility_params = authz.visible_resource_filter_sql(
-        session, auth, resource_type="pkos_nodes", action="read",
-        table_alias="right_entity", param_prefix="right_entity_",
+        session,
+        auth,
+        resource_type="pkos_nodes",
+        action="read",
+        table_alias="right_entity",
+        param_prefix="right_entity_",
     )
     clauses = [
         "resolution_candidates.workspace_id = :workspace_id",
