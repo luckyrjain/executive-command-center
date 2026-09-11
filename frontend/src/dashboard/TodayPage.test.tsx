@@ -32,7 +32,7 @@ describe('TodayPage', () => {
     vi.stubGlobal('crypto', { randomUUID: vi.fn(() => 'test-uuid') })
 
     renderPage()
-    expect(screen.getByText('Loading today\'s command center…')).toBeTruthy()
+    expect(screen.getByText('Loading today’s command center…')).toBeTruthy()
     await waitFor(() => expect(screen.getByRole('heading', { name: 'Today' })).toBeTruthy())
   })
 
