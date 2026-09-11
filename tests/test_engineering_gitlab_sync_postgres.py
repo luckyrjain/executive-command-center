@@ -23,10 +23,11 @@ Task 2's own GitHub scope):
    wait, giving up beyond it (`partial`), giving up the same way when the
    one retry is itself still rate-limited, and the `_MAX_PAGES_PER_CALL`
    bound reporting `partial` rather than a silent `succeeded`.
-3. `refresh_permissions`/`disconnect`/`handle_webhook` contract coverage,
-   including `disconnect`'s real (not no-op) revocation attempt -- both
-   the success (204) and the expected-in-practice-failure (403, this
-   connector's own read-only scopes) paths.
+3. `refresh_permissions`/`disconnect` (documented no-op, like GitHub's/
+   Jira's -- see `gitlab_adapter.py`'s own module docstring for why the
+   real self-revocation attempt this used to make was reverted after a
+   live-account test proved its "expected to 403" assumption false)/
+   `handle_webhook` contract coverage.
 4. End-to-end through the real `/sync` endpoint (monkeypatched registry
    substituting a mock-transport `GitLabAdapter` for `"gitlab"`):
    backfill writes `repositories` rows correctly, an incremental sync
@@ -1190,56 +1191,21 @@ def test_refresh_permissions_returns_permission_lost_for_malformed_credential() 
     assert adapter.refresh_permissions(context) == "permission_lost"
 
 
-def test_disconnect_succeeds_on_204() -> None:
-    def handler(request: httpx.Request) -> httpx.Response:
-        assert request.method == "DELETE"
-        assert request.url.path == "/api/v4/personal_access_tokens/self"
-        return httpx.Response(status_code=204)
-
-    adapter = GitLabAdapter(transport=httpx.MockTransport(handler))
-    assert adapter.disconnect(_account_context()) is None
-
-
-def test_disconnect_raises_on_expected_insufficient_scope_failure() -> None:
-    """Unlike GitHub's hard no-op, GitLab's self-revocation endpoint is
-    real -- and, per this connector's own read-only default scopes
-    (`CONNECTOR-CONTRACT.md`), realistically expected to reject the
-    attempt (403) rather than silently succeed. This proves the attempt is
-    genuinely made (not silently skipped) and that a real failure
-    surfaces as an exception -- `disable_connector_endpoint`'s own
-    best-effort try/except is what actually absorbs it in production, not
-    this adapter method itself.
+def test_disconnect_is_a_no_op() -> None:
+    """Used to attempt real self-revocation via `DELETE /personal_access_
+    tokens/self` -- reverted after a live-account test against a real
+    GitLab EE instance proved the "expected to 403 for a read-only-scoped
+    token" assumption behind it false (it returned a genuine `204`,
+    actually revoking the user's real PAT on every disconnect). Now a
+    documented no-op, like `GitHubAdapter`'s/`JiraAdapter`'s: no request
+    of any kind is issued.
     """
 
     def handler(request: httpx.Request) -> httpx.Response:
-        return _json_response({"message": "403 Forbidden"}, status_code=403)
-
-    adapter = GitLabAdapter(transport=httpx.MockTransport(handler))
-    with pytest.raises(RuntimeError, match="403"):
-        adapter.disconnect(_account_context())
-
-
-def test_disconnect_succeeds_on_404_already_revoked() -> None:
-    """`404` (token already deleted/revoked out-of-band, e.g. through
-    GitLab's own settings UI) is treated as success alongside GitLab's
-    documented `204` -- disconnecting must not fail just because the
-    provider-side token no longer exists to revoke.
-    """
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        return _json_response({"message": "404 Not Found"}, status_code=404)
+        raise AssertionError(f"disconnect() must not make any request, got {request.url}")
 
     adapter = GitLabAdapter(transport=httpx.MockTransport(handler))
     assert adapter.disconnect(_account_context()) is None
-
-
-def test_disconnect_raises_on_network_error() -> None:
-    def handler(request: httpx.Request) -> httpx.Response:
-        raise httpx.ConnectError("connection refused")
-
-    adapter = GitLabAdapter(transport=httpx.MockTransport(handler))
-    with pytest.raises(RuntimeError, match="revocation request failed"):
-        adapter.disconnect(_account_context())
 
 
 def test_handle_webhook_ignores_non_push_hook_events() -> None:

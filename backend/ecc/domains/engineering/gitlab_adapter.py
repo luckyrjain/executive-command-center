@@ -79,17 +79,24 @@ token storage a real signature check needs) is disclosed as deferred,
 identical to `github_adapter.py`'s own deferral. Do not wire this method
 to a public route before that gap is closed.
 
-**`disconnect()` attempts real revocation, unlike GitHub's hard no-op.**
-GitLab exposes `DELETE /personal_access_tokens/self`, a genuine self-
-revocation endpoint classic GitHub PATs have no equivalent of. This
-connector's own default read-only scopes (`read_api`, `read_repository`,
-per `CONNECTOR-CONTRACT.md`) do not include the `api`/`self_rotate` scope
-GitLab requires for this call in practice, so the attempt is expected to
-fail (403) for a connection authorized at this connector's own default
-scope -- attempted anyway (never silently skipped, matching this
-connector's own scope-honesty design elsewhere in this module), and the
-caller (`connector_accounts.disable_connector_endpoint`) already treats
-any `disconnect()` failure as best-effort, never blocking disconnection.
+**`disconnect()` is a documented no-op, like GitHub's/Jira's -- it used to
+attempt real self-revocation, reverted after a live-account test proved
+the assumption behind it wrong.** GitLab exposes `DELETE /personal_
+access_tokens/self`, a genuine self-revocation endpoint classic GitHub
+PATs have no equivalent of, and this adapter used to call it on every
+disconnect on the theory that this connector's own default read-only
+scopes (`read_api`, `read_repository`, per `CONNECTOR-CONTRACT.md`)
+don't include whatever elevated scope GitLab requires for this call, so
+it was expected to harmlessly 403 in the common case. Confirmed live
+against a real GitLab EE instance: this is false -- `/personal_access_
+tokens/self` let a plain `read_api`/`read_repository` token revoke
+*itself* with a genuine `204`, no elevated scope needed. So every
+"Disconnect" in this app's UI was silently killing the user's real,
+possibly-elsewhere-in-use PAT at GitLab, not just this app's own record
+of the connection -- the opposite of the intended best-effort, usually-
+inert behavior. Disabling a connector here must only ever change this
+app's own state; it has no business reaching out and revoking a
+credential it didn't mint and doesn't own the lifecycle of.
 """
 
 from __future__ import annotations
@@ -676,23 +683,11 @@ class GitLabAdapter:
         return "active"
 
     def disconnect(self, account: ConnectorAccountContext) -> None:
-        """Best-effort self-revocation -- see module docstring for why
-        this connector's own default read-only scopes make this call
-        expected to fail (403) in practice, and why it is attempted
-        anyway rather than skipped. The caller (`disable_connector_
-        endpoint`) already treats any exception here as best-effort, so
-        both a network failure and a non-2xx status simply raise --
-        never silently absorbed at this layer.
+        """Documented no-op, like `GitHubAdapter`'s and `JiraAdapter`'s --
+        see module docstring for why this used to attempt real self-
+        revocation via `DELETE /personal_access_tokens/self`, and why that
+        was reverted. Disabling a connector in this app must only ever
+        change this app's own record of it; it must never reach out and
+        revoke a credential the user created and may be using elsewhere.
         """
-        try:
-            host, token = parse_credential(account.credential)
-        except InvalidCredentialError as exc:
-            raise RuntimeError(str(exc)) from exc
-        try:
-            response = self._client.delete(
-                f"https://{host}/api/v4/personal_access_tokens/self", headers=self._headers(token)
-            )
-        except httpx.HTTPError as exc:
-            raise RuntimeError(f"GitLab token revocation request failed: {exc}") from exc
-        if response.status_code not in (204, 404):
-            raise RuntimeError(f"GitLab token revocation failed with status {response.status_code}")
+        return None
