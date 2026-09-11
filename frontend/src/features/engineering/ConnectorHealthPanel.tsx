@@ -218,7 +218,6 @@ function FieldStepInput({ provider, step, fields, onChange }: {
         <>
           <label>Host
             <input
-              aria-label="Host"
               type="text"
               value={fields.host}
               onChange={(e) => onChange({ host: e.target.value })}
@@ -239,7 +238,7 @@ function FieldStepInput({ provider, step, fields, onChange }: {
       if (provider === 'datadog') {
         return (
           <label>Site
-            <select aria-label="Site" value={fields.site} onChange={(e) => onChange({ site: e.target.value })}>
+            <select value={fields.site} onChange={(e) => onChange({ site: e.target.value })}>
               {DATADOG_SITES.map((s) => <option key={s} value={s}>{s}</option>)}
             </select>
           </label>
@@ -248,7 +247,6 @@ function FieldStepInput({ provider, step, fields, onChange }: {
       return (
         <label>Site
           <input
-            aria-label="Site"
             type="text"
             value={fields.site}
             onChange={(e) => onChange({ site: e.target.value })}
@@ -260,14 +258,13 @@ function FieldStepInput({ provider, step, fields, onChange }: {
     case 'email':
       return (
         <label>Email
-          <input aria-label="Email" type="email" value={fields.email} onChange={(e) => onChange({ email: e.target.value })} autoComplete="off" />
+          <input type="email" value={fields.email} onChange={(e) => onChange({ email: e.target.value })} autoComplete="off" />
         </label>
       )
     case 'token':
       return (
         <label>{tokenFieldLabel(provider)}
           <input
-            aria-label={tokenFieldLabel(provider)}
             type="password"
             value={fields.token}
             onChange={(e) => onChange({ token: e.target.value })}
@@ -279,7 +276,6 @@ function FieldStepInput({ provider, step, fields, onChange }: {
       return (
         <label>Application key
           <input
-            aria-label="Application key"
             type="password"
             value={fields.appKey}
             onChange={(e) => onChange({ appKey: e.target.value })}
@@ -495,10 +491,11 @@ function ConnectorCard({ connector, syncRuns, now, onChanged }: {
           </select>
         </label>
         <div className="work-actions">
-          <button type="submit" disabled={syncMutation.isPending || connector.status === 'disconnected'}>Start sync</button>
+          <button type="submit" aria-busy={syncMutation.isPending} disabled={syncMutation.isPending || connector.status === 'disconnected'}>Start sync</button>
           <button
             type="button"
             className="btn-destructive"
+            aria-busy={disableMutation.isPending}
             disabled={disableMutation.isPending || connector.status === 'disconnected'}
             onClick={() => disableMutation.mutate()}
           >

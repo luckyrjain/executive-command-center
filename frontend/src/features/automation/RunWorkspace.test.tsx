@@ -67,7 +67,7 @@ describe('RunWorkspace', () => {
     renderWorkspace()
 
     await waitFor(() => expect(screen.getByText('No runs match this filter.')).toBeTruthy())
-    fireEvent.change(screen.getByLabelText('Workflow ID to run'), { target: { value: 'weekly-digest' } })
+    fireEvent.change(screen.getByLabelText('Run a workflow (manual trigger)'), { target: { value: 'weekly-digest' } })
     fireEvent.click(screen.getByRole('button', { name: 'Start run' }))
 
     await waitFor(() => expect(fetch.mock.calls.length).toBeGreaterThanOrEqual(2))
@@ -84,7 +84,7 @@ describe('RunWorkspace', () => {
     renderWorkspace()
 
     await waitFor(() => expect(screen.getByText('No runs match this filter.')).toBeTruthy())
-    fireEvent.change(screen.getByLabelText('Workflow ID to run'), { target: { value: 'weekly-digest' } })
+    fireEvent.change(screen.getByLabelText('Run a workflow (manual trigger)'), { target: { value: 'weekly-digest' } })
     fireEvent.click(screen.getByRole('button', { name: 'Start run' }))
 
     expect(await screen.findByText(/A kill switch is active for workflow "weekly-digest"/)).toBeTruthy()
@@ -168,6 +168,30 @@ describe('RunWorkspace', () => {
     await waitFor(() => expect(screen.getByText(/This run's own policy is currently revoked/)).toBeTruthy())
   })
 
+  it('says the kill-switch/policy cause could not be confirmed when those fetches fail, never implying it is clean', async () => {
+    const detail: RunDetail = {
+      ...baseRun,
+      status: 'needs_review',
+      policy_id: 'policy-1',
+      steps: [],
+      compensation_steps: [],
+    }
+    vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url.includes('/api/v1/automations/runs/run-1')) return response(detail)
+      if (url.includes('/api/v1/automations/runs')) return response({ runs: [{ ...baseRun, status: 'needs_review' }] })
+      if (url.includes('/kill_switch') || url.includes('/policies')) return response({ error: { code: 'INTERNAL', message: 'boom' } }, 500)
+      return response({ error: { code: 'NOT_FOUND', message: 'no fixture route' } }, 404)
+    }))
+    renderWorkspace()
+
+    await waitFor(() => expect(screen.getByRole('button', { name: 'View' })).toBeTruthy())
+    fireEvent.click(screen.getByRole('button', { name: 'View' }))
+
+    await waitFor(() => expect(screen.getByText(/could not be confirmed/)).toBeTruthy())
+    expect(screen.queryByText(/No further cause is determinable/)).toBeNull()
+  })
+
   it('shows a preview_blocked run as a normal finished outcome, not an error, and offers no stop actions', async () => {
     // The docs-vs-code fix for `preview_only`: a run under a preview-only
     // policy terminates in `preview_blocked` having dispatched nothing. This
@@ -212,7 +236,7 @@ describe('RunWorkspace', () => {
     renderWorkspace()
 
     await waitFor(() => expect(screen.getByText('No runs match this filter.')).toBeTruthy())
-    fireEvent.change(screen.getByLabelText('Workflow ID to run'), { target: { value: 'weekly-digest' } })
+    fireEvent.change(screen.getByLabelText('Run a workflow (manual trigger)'), { target: { value: 'weekly-digest' } })
     fireEvent.click(screen.getByRole('button', { name: 'Start run' }))
 
     expect(await screen.findByText(/already used its policy's limit of 10 runs per hour/)).toBeTruthy()

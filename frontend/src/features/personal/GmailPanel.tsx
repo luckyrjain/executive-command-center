@@ -65,7 +65,7 @@ function ThreadDetail({ threadId, onForgotten }: { threadId: string; onForgotten
             {thread.data.messages.length === 0 ? <li className="empty-state">No message bodies are cached for this thread yet.</li> : null}
           </ul>
           <div className="work-actions">
-            <button type="button" disabled={forgetMutation.isPending} onClick={() => forgetMutation.mutate()}>
+            <button type="button" aria-busy={forgetMutation.isPending} disabled={forgetMutation.isPending} onClick={() => forgetMutation.mutate()}>
               {forgetMutation.isPending ? 'Forgetting…' : 'Forget cached content for this thread'}
             </button>
           </div>
@@ -227,6 +227,7 @@ export default function GmailPanel() {
   const stale = activeAccount ? isStale(activeAccount, now) : false
 
   return (
+    <>
     <section className="work-panel" aria-labelledby="personal-gmail-title">
       <h2 id="personal-gmail-title">Gmail</h2>
       <p>Read-only Gmail access, gated by an internal allowlist and your own explicit email-domain consent. Nothing here is visible to another workspace member unless they share it directly.</p>
@@ -248,6 +249,8 @@ export default function GmailPanel() {
 
       {connectors.isLoading ? <p role="status">Loading connector status…</p> : null}
       {connectors.isError ? <div role="alert" className="inline-status error-panel">{personalErrorMessage(connectors.error)}</div> : null}
+      {activeAccount && syncRuns.isLoading ? <p role="status">Loading sync history…</p> : null}
+      {syncRuns.isError ? <div role="alert" className="inline-status error-panel">{personalErrorMessage(syncRuns.error)}</div> : null}
 
       {activeAccount ? (
         <div className="nested-section">
@@ -284,12 +287,13 @@ export default function GmailPanel() {
           <div className="work-actions">
             <button
               type="button"
+              aria-busy={syncMutation.isPending}
               disabled={syncMutation.isPending || activeAccount.status === 'disconnected' || activeAccount.status === 'permission_lost' || latestRun?.status === 'running'}
               onClick={() => syncMutation.mutate(null)}
             >
               {syncMutation.isPending ? 'Syncing…' : neverSynced ? 'Run first sync' : 'Sync now'}
             </button>
-            <button type="button" className="btn-destructive" disabled={disconnectMutation.isPending} onClick={() => disconnectMutation.mutate()}>
+            <button type="button" className="btn-destructive" aria-busy={disconnectMutation.isPending} disabled={disconnectMutation.isPending} onClick={() => disconnectMutation.mutate()}>
               {disconnectMutation.isPending ? 'Disconnecting…' : 'Disconnect'}
             </button>
           </div>
@@ -314,7 +318,7 @@ export default function GmailPanel() {
               />
             </label>
             <div className="work-actions">
-              <button type="submit" disabled={syncMutation.isPending || !sinceInput || activeAccount.status === 'disconnected' || activeAccount.status === 'permission_lost' || latestRun?.status === 'running'}>
+              <button type="submit" aria-busy={syncMutation.isPending} disabled={syncMutation.isPending || !sinceInput || activeAccount.status === 'disconnected' || activeAccount.status === 'permission_lost' || latestRun?.status === 'running'}>
                 Sync from this date
               </button>
             </div>
@@ -351,7 +355,7 @@ export default function GmailPanel() {
           <p>You'll leave Executive Command Center briefly for Google's own sign-in and consent screen, then land right back here.</p>
           <div className="work-actions">
             <button type="button" onClick={() => setConnectStep(1)}>Back</button>
-            <button type="button" disabled={oauthStartMutation.isPending} onClick={() => oauthStartMutation.mutate()}>
+            <button type="button" aria-busy={oauthStartMutation.isPending} disabled={oauthStartMutation.isPending} onClick={() => oauthStartMutation.mutate()}>
               {oauthStartMutation.isPending ? 'Redirecting to Google…' : 'Connect Gmail'}
             </button>
           </div>
@@ -382,10 +386,10 @@ export default function GmailPanel() {
           {selectedThreadId ? (
             <ThreadDetail threadId={selectedThreadId} onForgotten={() => setSelectedThreadId(null)} />
           ) : null}
-
-          <RecommendationPanel recommendationType="email_action_detected" title="Pending email actions" />
         </>
       ) : null}
     </section>
+    {consentActive ? <RecommendationPanel recommendationType="email_action_detected" title="Pending email actions" /> : null}
+    </>
   )
 }

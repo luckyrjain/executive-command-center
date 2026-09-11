@@ -125,8 +125,8 @@ export default function KillSwitchPanel() {
 
       {globalMutation.isError ? <div role="alert" className="inline-status error-panel">{errorMessage(globalMutation.error)}</div> : null}
       <div className="work-actions">
-        <button type="button" className="btn-destructive" disabled={pending} onClick={() => globalMutation.mutate(true)}>{globalMutation.isPending && globalMutation.variables === true ? 'Activating…' : 'Activate global kill switch'}</button>
-        <button type="button" disabled={pending} onClick={() => globalMutation.mutate(false)}>{globalMutation.isPending && globalMutation.variables === false ? 'Deactivating…' : 'Deactivate global kill switch'}</button>
+        <button type="button" className="btn-destructive" aria-busy={globalMutation.isPending && globalMutation.variables === true} disabled={pending} onClick={() => globalMutation.mutate(true)}>{globalMutation.isPending && globalMutation.variables === true ? 'Activating…' : 'Activate global kill switch'}</button>
+        <button type="button" aria-busy={globalMutation.isPending && globalMutation.variables === false} disabled={pending} onClick={() => globalMutation.mutate(false)}>{globalMutation.isPending && globalMutation.variables === false ? 'Deactivating…' : 'Deactivate global kill switch'}</button>
       </div>
       {/* Read straight off the server's own response row for the global
           scope, which has no per-workflow lookup display of its own to
@@ -157,8 +157,8 @@ export default function KillSwitchPanel() {
       </div>
       <div className="work-actions">
         <button type="button" onClick={() => setLookupId(workflowId.trim() || null)} disabled={!workflowId.trim()}>Check current status</button>
-        <button type="button" className="btn-destructive" disabled={pending || !workflowId.trim()} onClick={() => workflowMutation.mutate({ id: workflowId.trim(), active: true })}>{workflowMutation.isPending && workflowMutation.variables?.active === true ? 'Activating…' : 'Activate for this workflow'}</button>
-        <button type="button" disabled={pending || !workflowId.trim()} onClick={() => workflowMutation.mutate({ id: workflowId.trim(), active: false })}>{workflowMutation.isPending && workflowMutation.variables?.active === false ? 'Deactivating…' : 'Deactivate for this workflow'}</button>
+        <button type="button" className="btn-destructive" aria-busy={workflowMutation.isPending && workflowMutation.variables?.active === true} disabled={pending || !workflowId.trim()} onClick={() => workflowMutation.mutate({ id: workflowId.trim(), active: true })}>{workflowMutation.isPending && workflowMutation.variables?.active === true ? 'Activating…' : 'Activate for this workflow'}</button>
+        <button type="button" aria-busy={workflowMutation.isPending && workflowMutation.variables?.active === false} disabled={pending || !workflowId.trim()} onClick={() => workflowMutation.mutate({ id: workflowId.trim(), active: false })}>{workflowMutation.isPending && workflowMutation.variables?.active === false ? 'Deactivating…' : 'Deactivate for this workflow'}</button>
       </div>
       {workflowMutation.isError ? <div role="alert" className="inline-status error-panel">{errorMessage(workflowMutation.error)}</div> : null}
 

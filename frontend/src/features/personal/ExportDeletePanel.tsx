@@ -58,7 +58,7 @@ export default function ExportDeletePanel() {
       </div>
 
       <div className="work-actions">
-        <button type="button" disabled={exportMutation.isPending} onClick={() => exportMutation.mutate(domainKey)}>
+        <button type="button" aria-busy={exportMutation.isPending} disabled={exportMutation.isPending} onClick={() => exportMutation.mutate(domainKey)}>
           {exportMutation.isPending ? 'Exporting…' : `Export ${DOMAIN_LABELS[domainKey]}`}
         </button>
       </div>
@@ -86,6 +86,7 @@ export default function ExportDeletePanel() {
         <button
           type="button"
           className="btn-destructive"
+          aria-busy={deleteMutation.isPending}
           disabled={!deleteConfirmed || deleteMutation.isPending}
           onClick={() => deleteMutation.mutate(domainKey)}
         >

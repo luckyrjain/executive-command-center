@@ -3,6 +3,7 @@ import { useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
 import { ApiError, apiRequest } from '../../api/client'
+import { apiErrorMessage } from '../../api/errorMessage'
 import type { EntityList } from '../knowledge/types'
 import { safeHref, type TeamAssignmentRequest, type WorkItem, type WorkItemListResponse } from './types'
 
@@ -80,7 +81,6 @@ function TeamAssignment({
         <label>
           {`Team for ${workItem.title}`}
           <select
-            aria-label={`Team for ${workItem.title}`}
             value={workItem.team_entity_id ?? ''}
             disabled={mutation.isPending}
             onChange={(event) => mutation.mutate(event.target.value === '' ? null : event.target.value)}
@@ -96,7 +96,7 @@ function TeamAssignment({
       {!workItem.team_entity_id && workItem.suggested_team_name ? (
         <small>suggested: {workItem.suggested_team_name}</small>
       ) : null}
-      {mutation.isError ? <span role="alert" className="inline-status error-panel">{mutation.error.message}</span> : null}
+      {mutation.isError ? <span role="alert" className="inline-status error-panel">{apiErrorMessage(mutation.error)}</span> : null}
     </div>
   )
 }
@@ -171,7 +171,7 @@ export default function WorkItemsPanel() {
       </div>
 
       {query.isLoading ? <p role="status">Loading work items…</p> : null}
-      {query.isError ? <div role="alert" className="inline-status error-panel">{query.error.message}</div> : null}
+      {query.isError ? <div role="alert" className="inline-status error-panel">{apiErrorMessage(query.error)}</div> : null}
       {query.data && workItems.length === 0 ? (
         <p className="empty-state">
           {teamFilter

@@ -161,7 +161,7 @@ export default function PolicyPanel() {
             </div>
             <div className="work-actions">
               {policy.status === 'active' ? (
-                <button type="button" className="btn-destructive" disabled={pending} aria-label={`Revoke policy for ${policy.workflow_id}`} onClick={() => revokeMutation.mutate(policy.id)}>
+                <button type="button" className="btn-destructive" aria-busy={revokeMutation.isPending && revokeMutation.variables === policy.id} disabled={pending} aria-label={`Revoke policy for ${policy.workflow_id}`} onClick={() => revokeMutation.mutate(policy.id)}>
                   {revokeMutation.isPending && revokeMutation.variables === policy.id ? 'Revoking…' : 'Revoke'}
                 </button>
               ) : null}
@@ -233,7 +233,7 @@ export default function PolicyPanel() {
               <div><dt>Approval mode</dt><dd>{draft.approvalMode.replaceAll('_', ' ')}</dd></div>
               <div><dt>Schedule note</dt><dd>{draft.schedule || '—'}</dd></div>
             </dl>
-            <div className="work-actions"><button type="button" onClick={goCreateBack}>Back</button><button type="submit" aria-busy={pending} disabled={pending}>{createMutation.isPending ? 'Creating…' : 'Create policy'}</button></div>
+            <div className="work-actions"><button type="button" onClick={goCreateBack}>Back</button><button type="submit" aria-busy={createMutation.isPending} disabled={pending}>{createMutation.isPending ? 'Creating…' : 'Create policy'}</button></div>
           </div>
         )}
       </form>
