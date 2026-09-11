@@ -84,6 +84,22 @@ services:
     read_only: true
     tmpfs:
       - /tmp
+      # Vite bundles vite.config.ts into a temp .mjs next to node_modules on
+      # every dev-server start (unconditional for a .ts config, not
+      # something project code controls), and separately keeps its own
+      # dependency-pre-bundling cache under node_modules/.vite -- both
+      # writes fail outright under read_only otherwise (confirmed via a
+      # real container run: `EROFS: read-only file system, open
+      # '/app/frontend/node_modules/.vite-temp/vite.config.ts.timestamp-...'`).
+      # Scoped to exactly these two Vite-owned subdirectories, not all of
+      # node_modules, so the actual installed dependencies stay the
+      # image-baked, read-only copy `pnpm install` produced at build time.
+      # `mode=1777` (not Docker's tmpfs default, which mounts root:root and
+      # isn't writable by the container's own non-root `node` user) --
+      # confirmed necessary via a real container run that still failed with
+      # `EACCES` against an unmodified-mode tmpfs mount at these same paths.
+      - /app/frontend/node_modules/.vite:mode=1777
+      - /app/frontend/node_modules/.vite-temp:mode=1777
     security_opt:
       - no-new-privileges:true
 
