@@ -15,12 +15,16 @@ only, Jira is not a source-control provider"):
 2. `JiraAdapter._sync_work_items` (`httpx.MockTransport` for the Jira API
    call; a real seeded workspace/connector_account row is still required,
    since `_upsert_work_item` genuinely writes to `engineering_work_
-   items`): single page, offset-based pagination (`startAt`/`maxResults`/
-   `total`, not a `Link` header), the incremental-cursor stop-early
-   condition, rate-limit handling succeeding after a bounded wait, giving
-   up beyond it (`partial`), giving up the same way when the one retry is
-   itself still rate-limited, and the `_MAX_PAGES_PER_CALL` bound
-   reporting `partial` rather than a silent `succeeded`.
+   items`): single page, cursor-based pagination against `/rest/api/3/
+   search/jql` (`nextPageToken`/`maxResults`, not offset-based and not a
+   `Link` header -- see `jira_adapter.py`'s own module docstring for why
+   the older offset-based `/rest/api/3/search` endpoint this originally
+   tested against is gone, a real `410 Gone` in production), the
+   incremental-cursor stop-early condition, rate-limit handling
+   succeeding after a bounded wait, giving up beyond it (`partial`),
+   giving up the same way when the one retry is itself still rate-
+   limited, and the `_MAX_PAGES_PER_CALL` bound reporting `partial`
+   rather than a silent `succeeded`.
 3. `refresh_permissions`/`disconnect`(documented no-op)/`handle_webhook`
    contract coverage.
 4. End-to-end through the real `/sync` endpoint (monkeypatched registry
@@ -96,14 +100,17 @@ def _issue(
 
 
 def _search_response(
-    issues: list[dict[str, Any]], *, start_at: int = 0, total: int | None = None
+    issues: list[dict[str, Any]], *, next_page_token: str | None = None
 ) -> dict[str, Any]:
-    return {
-        "issues": issues,
-        "startAt": start_at,
-        "maxResults": 100,
-        "total": total if total is not None else start_at + len(issues),
-    }
+    """Mirrors `/rest/api/3/search/jql`'s real response shape: no `total`,
+    no `startAt` -- `nextPageToken` is present only when more pages
+    remain, and is absent (not `null`) on the last page, matching how a
+    real Jira Cloud response omits the key entirely.
+    """
+    body: dict[str, Any] = {"issues": issues}
+    if next_page_token is not None:
+        body["nextPageToken"] = next_page_token
+    return body
 
 
 def _json_response(
@@ -309,7 +316,7 @@ def test_backfill_single_page(seeded_account_context: ConnectorAccountContext) -
     ]
 
     def handler(request: httpx.Request) -> httpx.Response:
-        assert request.url.path == "/rest/api/3/search"
+        assert request.url.path == "/rest/api/3/search/jql"
         return _json_response(_search_response(issues))
 
     adapter = JiraAdapter(transport=httpx.MockTransport(handler))
@@ -341,7 +348,7 @@ def test_backfill_populates_suggested_team_name_from_project_name(
     ]
 
     def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/rest/api/3/search":
+        if request.url.path == "/rest/api/3/search/jql":
             assert "project" in request.url.params.get("fields", "")
         return _json_response(_search_response(issues))
 
@@ -477,17 +484,21 @@ def test_incremental_resync_refreshes_suggestion_without_touching_confirmed_team
             )
 
 
-def test_backfill_paginates_via_offset(seeded_account_context: ConnectorAccountContext) -> None:
+def test_backfill_paginates_via_next_page_token(
+    seeded_account_context: ConnectorAccountContext,
+) -> None:
     page1 = [_issue(1, key="ACME-1", summary="First", updated="2024-01-05T00:00:00.000+0000")]
     page2 = [_issue(2, key="ACME-2", summary="Second", updated="2024-01-04T00:00:00.000+0000")]
 
     def handler(request: httpx.Request) -> httpx.Response:
-        start_at = int(request.url.params["startAt"])
-        if start_at == 0:
-            return _json_response(_search_response(page1, start_at=0, total=2))
-        if start_at == 1:
-            return _json_response(_search_response(page2, start_at=1, total=2))
-        raise AssertionError(f"unexpected startAt {start_at}")
+        token = request.url.params.get("nextPageToken")
+        if token is None:
+            # First request never sends the param at all -- `_sync_work_
+            # items` only adds it once a prior response has supplied one.
+            return _json_response(_search_response(page1, next_page_token="page-2"))
+        if token == "page-2":
+            return _json_response(_search_response(page2))
+        raise AssertionError(f"unexpected nextPageToken {token}")
 
     adapter = JiraAdapter(transport=httpx.MockTransport(handler))
     outcome = adapter.backfill(seeded_account_context, "work_item")
@@ -596,7 +607,7 @@ def test_incremental_sync_stops_at_prior_cursor(
     ]
 
     def handler(request: httpx.Request) -> httpx.Response:
-        return _json_response(_search_response(issues, total=100))
+        return _json_response(_search_response(issues))
 
     adapter = JiraAdapter(transport=httpx.MockTransport(handler))
     outcome = adapter.incremental_sync(
@@ -627,7 +638,7 @@ def test_incremental_sync_cursor_comparison_is_dst_safe(
     )
 
     def handler(request: httpx.Request) -> httpx.Response:
-        return _json_response(_search_response([later_issue_smaller_string], total=1))
+        return _json_response(_search_response([later_issue_smaller_string]))
 
     adapter = JiraAdapter(transport=httpx.MockTransport(handler))
     outcome = adapter.incremental_sync(seeded_account_context, "work_item", cursor=cursor)
@@ -751,20 +762,26 @@ def test_page_cap_reports_partial_with_more_pages_remaining(
 ) -> None:
     from ecc.domains.engineering import jira_adapter as jira_adapter_module
 
+    calls = {"count": 0}
+
     def handler(request: httpx.Request) -> httpx.Response:
-        start_at = int(request.url.params["startAt"])
+        # Always returns a `nextPageToken` -- there is always another page,
+        # so the only thing that can stop this loop is the adapter's own
+        # `_MAX_PAGES_PER_CALL` bound, which is exactly what this test
+        # verifies.
+        page = calls["count"]
+        calls["count"] += 1
         return _json_response(
             _search_response(
                 [
                     _issue(
-                        start_at + 1,
-                        key=f"ACME-{start_at + 1}",
+                        page + 1,
+                        key=f"ACME-{page + 1}",
                         summary="Issue",
-                        updated=f"2024-01-{(start_at % 28) + 1:02d}T00:00:00.000+0000",
+                        updated=f"2024-01-{(page % 28) + 1:02d}T00:00:00.000+0000",
                     )
                 ],
-                start_at=start_at,
-                total=100_000,
+                next_page_token=f"page-{page + 1}",
             )
         )
 
