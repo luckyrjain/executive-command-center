@@ -56,8 +56,7 @@ export async function run({ page, baseURL }) {
     evidence: { 'evidence-memo': { source_type: 'document', label: 'Renewal memo', captured_at: '2026-07-01T00:00:00Z' } },
   })
 
-  await page.goto(baseURL)
-  await page.getByRole('tab', { name: 'Recommendations' }).click()
+  await page.goto(`${baseURL}/recommendations`)
   const panel = page.locator('section[aria-labelledby="recommendations-title"]')
   const item = panel.locator('li', { hasText: 'close risk' })
   await item.getByText('pending confirmation').waitFor()

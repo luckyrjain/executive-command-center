@@ -50,8 +50,7 @@ export async function run({ page, baseURL }) {
     },
   })
 
-  await page.goto(baseURL)
-  await page.getByRole('tab', { name: 'Personal' }).click()
+  await page.goto(`${baseURL}/personal`)
   await page.getByRole('heading', { name: 'Personal workspace', level: 1 }).waitFor()
   await assertNoSeriousAccessibilityViolations(page, { include: '#personal-panel' })
 

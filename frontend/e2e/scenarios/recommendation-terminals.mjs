@@ -69,8 +69,7 @@ const rejectedButFilteredOut = {
 export async function run({ page, baseURL }) {
   await createFixtureApi(page, { recommendations: [executed, failed, rejectedButFilteredOut] })
 
-  await page.goto(baseURL)
-  await page.getByRole('tab', { name: 'Recommendations' }).click()
+  await page.goto(`${baseURL}/recommendations`)
   const panel = page.locator('section[aria-labelledby="recommendations-title"]')
   await panel.getByRole('heading', { name: 'archive note' }).waitFor()
 

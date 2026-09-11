@@ -37,8 +37,7 @@ const seedProject = {
 export async function run({ page, baseURL }) {
   const fixtures = await createFixtureApi(page, { knowledgeEntities: [seedEntity, seedProject] })
 
-  await page.goto(baseURL)
-  await page.getByRole('tab', { name: 'Knowledge' }).click()
+  await page.goto(`${baseURL}/knowledge`)
   const explorer = page.locator('section[aria-labelledby="knowledge-title"]')
   await explorer.getByRole('heading', { name: 'Knowledge', level: 1 }).waitFor()
   await explorer.getByText('Ada Lovelace').waitFor()

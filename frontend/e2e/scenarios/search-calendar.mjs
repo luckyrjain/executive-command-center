@@ -41,8 +41,7 @@ export async function run({ page, baseURL }) {
     searchDegradedQueries: ['legacy'],
   })
 
-  await page.goto(baseURL)
-  await page.getByRole('tab', { name: 'Search & audit' }).click()
+  await page.goto(`${baseURL}/search-audit`)
   const searchPanel = page.locator('#search-panel')
   await searchPanel.waitFor()
   await searchPanel.getByText('Enter a query to search all Phase 1 entities.').waitFor()

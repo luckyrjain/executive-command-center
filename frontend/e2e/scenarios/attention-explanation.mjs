@@ -78,8 +78,7 @@ export async function run({ page, baseURL }) {
     await page.addInitScript(() => { window.__ECC_AI_EXPLANATIONS_ENABLED__ = false })
   }
 
-  await page.goto(baseURL)
-  await page.getByRole('tab', { name: 'Attention' }).click()
+  await page.goto(`${baseURL}/attention`)
   const section = page.locator('section[aria-labelledby="attention-title"]')
   await section.getByRole('heading', { name: 'Attention queue', level: 1 }).waitFor()
   await section.getByText('Finish the board memo').waitFor()

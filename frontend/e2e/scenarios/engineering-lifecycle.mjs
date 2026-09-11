@@ -44,8 +44,7 @@ export async function run({ page, baseURL }) {
     },
   })
 
-  await page.goto(baseURL)
-  await page.getByRole('tab', { name: 'Engineering' }).click()
+  await page.goto(`${baseURL}/engineering`)
   await page.getByRole('heading', { name: 'Engineering workspace', level: 1 }).waitFor()
   await assertNoSeriousAccessibilityViolations(page, { include: '#engineering-panel' })
 

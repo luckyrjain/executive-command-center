@@ -11,8 +11,7 @@ import { assertNoSeriousAccessibilityViolations } from '../accessibility.mjs'
 export async function run({ page, baseURL }) {
   await createFixtureApi(page)
 
-  await page.goto(baseURL)
-  await page.getByRole('tab', { name: 'Risks' }).click()
+  await page.goto(`${baseURL}/risks`)
 
   const risksSection = page.locator('section[aria-labelledby="risks-title"]')
   await risksSection.getByRole('heading', { name: 'Risks', level: 1 }).waitFor()

@@ -1,11 +1,7 @@
 import { useState } from 'react'
-import { useQuery } from '@tanstack/react-query'
+import { BrowserRouter, Navigate, Route, Routes, useLocation } from 'react-router-dom'
 
-import { apiRequest } from './api/client'
-import type { WorkspaceView } from './api/types'
-import { Section, type DashboardItem } from './dashboard/Sections'
-import WorkspaceNavigation from './navigation/WorkspaceNavigation'
-import MorningBrief from './dashboard/MorningBrief'
+import TodayPage from './dashboard/TodayPage'
 import RecommendationPanel from './features/governance/RecommendationPanel'
 import SearchAuditPanel from './features/search-audit/SearchAuditPanel'
 import CommitmentWorkspace from './features/commitments/CommitmentWorkspace'
@@ -27,113 +23,95 @@ import EngineeringWorkspace from './features/engineering/EngineeringWorkspace'
 import PersonalWorkspace from './features/personal/PersonalWorkspace'
 import CollaborationWorkspace from './features/collaboration/CollaborationWorkspace'
 import WorkspaceSwitcher from './features/collaboration/WorkspaceSwitcher'
+import MobileWorkspaceNav from './navigation/MobileWorkspaceNav'
+import SidebarNavigation from './navigation/SidebarNavigation'
+import { viewForPath } from './navigation/workspaces'
+import type { NoteDraftRecoveryStore } from './features/notes/draftRecovery'
 
-type DashboardResponse = {
-  date: string
-  timezone: string
-  generated_at: string
-  stale: boolean
-  sections: Record<string, DashboardItem[]>
+type AppShellProps = {
+  noteDraftRecovery: NoteDraftRecoveryStore
 }
 
-function fetchDashboard(): Promise<DashboardResponse> {
-  return apiRequest('/api/v1/dashboard/today')
+/** Everything below WorkspaceSwitcher -- split out from App() because
+ * computing the ARIA-labelling tab id below needs the current route, and
+ * useLocation() only works inside <BrowserRouter>, which App() itself
+ * renders (same pattern MobileWorkspaceNav.tsx already uses). */
+function AppShell({ noteDraftRecovery }: AppShellProps) {
+  const location = useLocation()
+  // Mirrors MobileWorkspaceNav.tsx's own fallback: an unmatched route (the
+  // "*" catch-all below) has no workspace view, so default to 'today' rather
+  // than leaving the tabpanel unlabelled.
+  const currentWorkspaceView = viewForPath(location.pathname) ?? 'today'
+
+  return (
+    <div className="app-frame">
+      <SidebarNavigation />
+      <MobileWorkspaceNav />
+      <main id="workspace-main" className="app-shell">
+        {/* This id/role/aria-labelledby trio is what WorkspaceNavigation.tsx's
+            mobile pill tabs (aria-controls="workspace-panel") actually point
+            at -- keeping it on an inner div rather than <main> itself lets
+            <main> stay the page's one landmark while this div carries the
+            tab/tabpanel contract WorkspaceNavigation.test.tsx already
+            exercises against a synthetic harness with this same shape. */}
+        <div
+          id="workspace-panel"
+          role="tabpanel"
+          aria-labelledby={`workspace-tab-${currentWorkspaceView}`}
+        >
+          <Routes>
+            <Route path="/" element={<Navigate to="/today" replace />} />
+            <Route path="/today" element={<TodayPage />} />
+            <Route
+              path="/attention"
+              element={<div className="work-grid"><AttentionQueue /><WaitingView /></div>}
+            />
+            <Route
+              path="/work"
+              element={<div className="work-grid"><TaskWorkspace /><CommitmentWorkspace /></div>}
+            />
+            <Route path="/notes" element={<NoteWorkspace recoveryStore={noteDraftRecovery} />} />
+            <Route path="/schedule" element={<ScheduleWorkspace />} />
+            <Route path="/planner" element={<Planner />} />
+            <Route path="/meeting-prep" element={<MeetingPrep />} />
+            <Route
+              path="/risks"
+              element={<div className="work-grid"><RiskWorkspace /><RiskReviewQueue /></div>}
+            />
+            <Route
+              path="/knowledge"
+              element={<div className="work-grid"><EntityExplorer /><ResolutionInbox /><MergeReview /></div>}
+            />
+            <Route path="/recommendations" element={<RecommendationPanel />} />
+            <Route path="/search-audit" element={<SearchAuditPanel />} />
+            <Route path="/automation" element={<AutomationWorkspace />} />
+            <Route path="/engineering" element={<EngineeringWorkspace />} />
+            <Route path="/personal" element={<PersonalWorkspace />} />
+            <Route path="/team" element={<CollaborationWorkspace />} />
+            <Route
+              path="*"
+              element={<p role="alert">Page not found. <a href="/today">Go to Today</a>.</p>}
+            />
+          </Routes>
+        </div>
+      </main>
+    </div>
+  )
 }
 
 export default function App() {
-  const [currentView, setCurrentView] = useState<WorkspaceView>('today')
   const [noteDraftRecovery] = useState(() => createNoteDraftRecoveryStore({ namespace: crypto.randomUUID() }))
-  const dashboard = useQuery({
-    queryKey: ['dashboard', 'today'],
-    queryFn: fetchDashboard,
-    refetchInterval: 60_000,
-    retry: 1,
-  })
-
-  const sections = dashboard.data?.sections
 
   return (
-    <main id="workspace-main" className="app-shell">
-      {/* Mounted globally, above the tab list -- which company workspace an
-          account is viewing applies to every tab, not just the
-          collaboration one; see WorkspaceSwitcher.tsx's own docstring. */}
+    <BrowserRouter>
+      {/* Mounted globally, above the sidebar -- which company workspace an
+          account is viewing applies to every route, not just one; see
+          WorkspaceSwitcher.tsx's own docstring. Framed via its own
+          `.workspace-switcher` CSS rule (styles.css) rather than by nesting
+          it inside `.app-shell`/`.app-frame` -- it's a global org-switcher,
+          not part of either nav or the sidebar+content row. */}
       <WorkspaceSwitcher />
-      <WorkspaceNavigation currentView={currentView} onNavigate={setCurrentView} />
-      <div id="workspace-panel" role="tabpanel" aria-labelledby={`workspace-tab-${currentView}`}>
-        {currentView === 'work' ? (
-          <div className="work-grid">
-            <TaskWorkspace />
-            <CommitmentWorkspace />
-          </div>
-        ) : currentView === 'notes' ? <NoteWorkspace recoveryStore={noteDraftRecovery} />
-        : currentView === 'schedule' ? <ScheduleWorkspace />
-        : currentView === 'attention' ? (
-          <div className="work-grid">
-            <AttentionQueue />
-            <WaitingView />
-          </div>
-        )
-        : currentView === 'planner' ? <Planner />
-        : currentView === 'meeting-prep' ? <MeetingPrep />
-        : currentView === 'risks' ? (
-          <div className="work-grid">
-            <RiskWorkspace />
-            <RiskReviewQueue />
-          </div>
-        )
-        : currentView === 'knowledge' ? (
-          <div className="work-grid">
-            <EntityExplorer />
-            <ResolutionInbox />
-            <MergeReview />
-          </div>
-        )
-        : currentView === 'recommendations' ? <RecommendationPanel />
-        : currentView === 'search-audit' ? <SearchAuditPanel />
-        : currentView === 'automation' ? <AutomationWorkspace />
-        : currentView === 'engineering' ? <EngineeringWorkspace />
-        : currentView === 'personal' ? <PersonalWorkspace />
-        : currentView === 'collaboration' ? <CollaborationWorkspace />
-        : <><header className="topbar">
-          <div>
-            <p className="eyebrow">EXECUTIVE COMMAND CENTER</p>
-            <h1>Today</h1>
-            <p className="subtitle">
-              {dashboard.data?.date ?? 'Your schedule, priorities, commitments and risks'}
-              {dashboard.data?.timezone ? ` · ${dashboard.data.timezone}` : ''}
-            </p>
-          </div>
-          <button type="button" onClick={() => dashboard.refetch()} disabled={dashboard.isFetching}>
-            {dashboard.isFetching ? 'Refreshing…' : 'Refresh dashboard'}
-          </button>
-        </header>
-
-        {dashboard.isLoading ? <div className="status-panel" role="status">Loading today’s command center…</div> : null}
-        {dashboard.isError ? (
-          <div className="status-panel error-panel" role="alert">
-            <strong>{dashboard.error.message}</strong>
-            <span>Check your session and backend connection, then retry.</span>
-          </div>
-        ) : null}
-        {dashboard.data?.stale ? <div className="status-panel degraded-panel" role="status">Dashboard data may be stale.</div> : null}
-
-        {sections ? (
-          <Section title="Top priorities" items={sections.top_priorities} emptyMessage="No ranked priorities need attention." variant="panel" />
-        ) : null}
-
-        <MorningBrief />
-
-        {sections ? (
-          <div className="dashboard-grid">
-            <Section title="Schedule" items={sections.today_schedule} emptyMessage="No meetings scheduled for today." />
-            <Section title="Overdue commitments" items={sections.overdue_commitments} emptyMessage="No overdue commitments." />
-            <Section title="Open risks" items={sections.risks} emptyMessage="No active risks." />
-            <Section title="Waiting on" items={sections.waiting_on} emptyMessage="Nothing is currently blocked on others." />
-            <Section title="Recent changes" items={sections.recently_changed} emptyMessage="No recent changes." />
-          </div>
-        ) : null}
-        </>}
-      </div>
-    </main>
+      <AppShell noteDraftRecovery={noteDraftRecovery} />
+    </BrowserRouter>
   )
 }
