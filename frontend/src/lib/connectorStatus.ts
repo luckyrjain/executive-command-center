@@ -27,3 +27,17 @@ export function statusPanelClass(status: ConnectorAccount['status']): string {
   if (status === 'permission_lost' || status === 'rate_limited') return 'inline-status degraded-panel'
   return 'inline-status'
 }
+
+/** Same status enum as `statusPanelClass` above, mapped onto the compact
+ * `.status-badge` treatment instead -- `disconnected` gets its own neutral
+ * tone here rather than `statusPanelClass`'s red `error-panel`: it's an
+ * expected, often user-initiated state, not a fault, and a bright red
+ * badge on every disconnected-but-otherwise-fine connector overstated it.
+ * `active` gets a real success tone, absent from `statusPanelClass`
+ * entirely (which only ever colors the bad states). */
+export function statusBadgeClass(status: ConnectorAccount['status']): string {
+  if (status === 'active') return 'status-badge is-active'
+  if (status === 'error') return 'status-badge is-error'
+  if (status === 'permission_lost' || status === 'rate_limited') return 'status-badge is-degraded'
+  return 'status-badge is-neutral' // pending, disconnected
+}

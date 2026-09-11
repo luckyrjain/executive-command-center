@@ -3,7 +3,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
 import { ApiError, apiRequest } from '../../api/client'
 import { apiErrorMessage } from '../../api/errorMessage'
-import { isStale, statusPanelClass } from '../../lib/connectorStatus'
+import { isStale, statusBadgeClass } from '../../lib/connectorStatus'
 import { useWizardStepFocus } from '../../lib/wizardFocus'
 import type {
   ConnectorAccount,
@@ -64,6 +64,19 @@ const DATADOG_UI_HOSTS: Record<(typeof DATADOG_SITES)[number], string> = {
   'api.ddog-gov.com': 'app.ddog-gov.com',
 }
 
+// Mirrors `gitlab_adapter.py`'s own `_GITLAB_HOST_PATTERN` exactly (RFC 1035
+// dot-separated labels) -- the wizard's Host step used to accept literally
+// anything (`isStepComplete`'s 'host' case fell through to its `default:
+// true`) and only found out a scheme/port/path/whitespace was smuggled in
+// when the backend's own `parse_credential` rejected it at submit time,
+// several steps later. Checking the same shape client-side, live as the
+// field is typed, surfaces that immediately instead.
+const GITLAB_HOST_PATTERN = /^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$/
+
+function isValidGitlabHost(host: string): boolean {
+  return GITLAB_HOST_PATTERN.test(host)
+}
+
 type CredentialFields = { host: string; site: string; email: string; token: string; appKey: string }
 
 function emptyCredentialFields(provider: ConnectorProvider): CredentialFields {
@@ -110,11 +123,17 @@ function stepShortLabel(provider: ConnectorProvider, step: WizardStep): string {
   }
 }
 
-// `host`/`provider`/`review` are never blocking: `host` always falls back
-// to `gitlab.com` (`buildCredential`), and Datadog's `site` step is a
-// `<select>` that always carries a real value, never free text.
+// `provider`/`review` are never blocking. `host` blocks only on a
+// non-empty value that fails `isValidGitlabHost` -- an empty field still
+// falls back to `gitlab.com` (`buildCredential`), so leaving it untouched
+// stays valid. Datadog's `site` step is a `<select>` that always carries a
+// real value, never free text.
 function isStepComplete(provider: ConnectorProvider, step: WizardStep, fields: CredentialFields): boolean {
   switch (step) {
+    case 'host': {
+      const trimmed = fields.host.trim()
+      return trimmed === '' || isValidGitlabHost(trimmed)
+    }
     case 'site': return provider === 'jira' ? fields.site.trim() !== '' : true
     case 'email': return fields.email.trim() !== ''
     case 'token': return fields.token.trim() !== ''
@@ -192,12 +211,30 @@ function FieldStepInput({ provider, step, fields, onChange }: {
   onChange: (patch: Partial<CredentialFields>) => void
 }) {
   switch (step) {
-    case 'host':
+    case 'host': {
+      const trimmed = fields.host.trim()
+      const invalid = trimmed !== '' && !isValidGitlabHost(trimmed)
       return (
-        <label>Host
-          <input aria-label="Host" type="text" value={fields.host} onChange={(e) => onChange({ host: e.target.value })} autoComplete="off" />
-        </label>
+        <>
+          <label>Host
+            <input
+              aria-label="Host"
+              type="text"
+              value={fields.host}
+              onChange={(e) => onChange({ host: e.target.value })}
+              autoComplete="off"
+              aria-invalid={invalid || undefined}
+              aria-describedby={invalid ? 'gitlab-host-error' : undefined}
+            />
+          </label>
+          {invalid ? (
+            <p id="gitlab-host-error" role="alert" className="field-error">
+              Enter a bare hostname like gitlab.com or gitlab-ee.example.com -- no https://, port, path, or spaces.
+            </p>
+          ) : null}
+        </>
       )
+    }
     case 'site':
       if (provider === 'datadog') {
         return (
@@ -411,16 +448,20 @@ function ConnectorCard({ connector, syncRuns, now, onChanged }: {
   const neverSynced = syncRuns.length === 0
 
   return (
-    <li>
-      <div>
-        <strong>{connector.display_name}</strong>
-        <small>{connector.provider} · last synced {timestamp(connector.last_synced_at)}</small>
+    <li className="connector-card">
+      <div className="connector-card-header">
+        <div className="connector-identity">
+          <span className="connector-glyph" aria-hidden="true">{connector.provider.slice(0, 2)}</span>
+          <div>
+            <strong>{connector.display_name}</strong>
+            <small>{connector.provider} · last synced {timestamp(connector.last_synced_at)}</small>
+          </div>
+        </div>
+        <span role="status" className={statusBadgeClass(connector.status)}>
+          {statusLabel(connector.status)}
+        </span>
       </div>
-
-      <div role="status" className={statusPanelClass(connector.status)}>
-        {statusLabel(connector.status)}
-        {connector.status_detail ? ` -- ${connector.status_detail}` : ''}
-      </div>
+      {connector.status_detail ? <p className="field-hint">{connector.status_detail}</p> : null}
       {connector.status === 'error' && connector.last_error ? (
         <p role="alert" className="inline-status error-panel">{connector.last_error}</p>
       ) : null}
@@ -639,15 +680,16 @@ export default function ConnectorHealthPanel() {
               <div>
                 <p className="eyebrow">Step {stepIndex + 1} of {steps.length} · Provider</p>
                 <h4 ref={stepHeadingRef} tabIndex={-1}>Choose a provider</h4>
-                <div role="group" aria-label="Provider" className="work-actions">
+                <div role="group" aria-label="Provider" className="provider-picker">
                   {PROVIDERS.map((p) => (
                     <button key={p} type="button" aria-pressed={provider === p} onClick={() => selectProvider(p)}>
+                      <span className="provider-glyph" aria-hidden="true">{p.slice(0, 2)}</span>
                       {PROVIDER_LABELS[p]}
                     </button>
                   ))}
                 </div>
-                <div className="work-actions">
-                  <button type="button" onClick={goNext}>Continue</button>
+                <div className="work-actions wizard-actions">
+                  <button type="button" className="btn-primary" onClick={goNext}>Continue</button>
                 </div>
               </div>
             ) : currentStep === 'review' ? (
@@ -662,9 +704,9 @@ export default function ConnectorHealthPanel() {
                     </div>
                   ))}
                 </dl>
-                <div className="work-actions">
+                <div className="work-actions wizard-actions">
                   <button type="button" onClick={goBack}>Back</button>
-                  <button type="submit" disabled={createMutation.isPending || !isCredentialComplete(provider, fields)}>
+                  <button type="submit" className="btn-primary" aria-busy={createMutation.isPending} disabled={createMutation.isPending || !isCredentialComplete(provider, fields)}>
                     {createMutation.isPending ? 'Connecting…' : 'Connect'}
                   </button>
                 </div>
@@ -676,9 +718,9 @@ export default function ConnectorHealthPanel() {
                 <h4 ref={stepHeadingRef} tabIndex={-1}>{stepShortLabel(provider, currentStep)}</h4>
                 <FieldStepInput provider={provider} step={currentStep} fields={fields} onChange={updateFields} />
                 <FieldHelp provider={provider} step={currentStep} fields={fields} />
-                <div className="work-actions">
+                <div className="work-actions wizard-actions">
                   <button type="button" onClick={goBack}>Back</button>
-                  <button type="button" disabled={!isStepComplete(provider, currentStep, fields)} onClick={goNext}>Continue</button>
+                  <button type="button" className="btn-primary" disabled={!isStepComplete(provider, currentStep, fields)} onClick={goNext}>Continue</button>
                 </div>
               </div>
             )}
@@ -694,7 +736,7 @@ export default function ConnectorHealthPanel() {
       {connectors.isError ? <div role="alert" className="inline-status error-panel">{errorMessage(connectors.error)}</div> : null}
       {connectors.data && items.length === 0 ? <p className="empty-state">No connectors are configured for this workspace yet.</p> : null}
 
-      <ul className="work-list" aria-labelledby="connector-list-title">
+      <ul className="connector-list" aria-labelledby="connector-list-title">
         {items.map((connector) => (
           <ConnectorCard
             key={connector.id}

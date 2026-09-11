@@ -173,7 +173,15 @@ button:focus-visible,
 input:focus-visible,
 textarea:focus-visible,
 select:focus-visible { outline: 3px solid var(--focus-ring); outline-offset: 3px; }
-button:disabled { opacity: .6; cursor: wait; }
+/* Generic disabled -- permission denied, a prerequisite missing, or an
+ * unavailable action. `cursor: wait` is reserved for `aria-busy`, below --
+ * it implies "this is happening, hold on," which is false for a button
+ * that's simply not actionable right now. */
+button:disabled { opacity: .6; cursor: not-allowed; }
+/* Loading -- an in-flight mutation. Set alongside `disabled` (Interaction
+ * states: Loading), never on its own; `disabled` still carries the visual
+ * dimming above, this only swaps the cursor to reflect "in progress." */
+button[aria-busy="true"]:disabled { cursor: wait; }
 
 /* Destructive actions (delete/revoke/disable/kill-switch) never look like an
  * ordinary button -- muted danger tokens, not a loud red, to stay
@@ -274,6 +282,18 @@ button:disabled { opacity: .6; cursor: wait; }
 
 .field-hint { margin: -8px 0 14px; color: var(--color-text-muted); font-size: 13px; }
 .field-hint code { background: var(--color-surface-recessed); color: var(--color-text-secondary); border-radius: 4px; padding: 1px 5px; }
+.field-error { margin: -8px 0 14px; color: var(--color-text-danger-strong); font-size: 13px; font-weight: 700; }
+
+/* `aria-invalid="true"` is set both by this per-field-as-you-type
+ * validation (ConnectorHealthPanel's Host step) and by every other
+ * wizard's own terminal-validation-on-submit path (RiskWorkspace,
+ * ScheduleWorkspace, WorkflowList, PolicyPanel -- `wizardFocus.ts`'s
+ * `applyWizardFieldInvalidState`) -- neither had ever gotten a visible
+ * style anywhere in this file, so a field marked invalid looked identical
+ * to a valid one. */
+input[aria-invalid="true"],
+textarea[aria-invalid="true"],
+select[aria-invalid="true"] { border-color: var(--color-border-danger); background: var(--color-bg-danger); }
 .nested-section { margin-top: var(--space-8); }
 
 .wizard-stepper { display: flex; align-items: center; margin: 20px 0 24px; padding: 0; list-style: none; }
@@ -291,6 +311,27 @@ button:disabled { opacity: .6; cursor: wait; }
 .wizard-review dt { color: var(--color-text-tertiary); font-size: 11px; font-weight: 800; letter-spacing: .08em; text-transform: uppercase; }
 .wizard-review dd { margin: 0; color: var(--color-text-mono); font-size: 13px; }
 .wizard-review dd.is-machine-value { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+
+/* ConnectorHealthPanel's provider step: a flat row of unstyled `button`s
+ * (identical in appearance to the "Continue" action right after them) --
+ * a proper card grid with room for a glyph reads as "pick one of these,"
+ * not "here are six equivalent buttons." */
+.provider-picker { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 10px; margin: 16px 0 0; }
+.provider-picker button { display: flex; align-items: center; gap: 10px; padding: 13px 16px; text-align: left; border-radius: var(--radius-control); }
+.provider-picker button[aria-pressed="true"] { box-shadow: var(--shadow-card); }
+.provider-glyph {
+  display: flex; align-items: center; justify-content: center; flex-shrink: 0;
+  width: 28px; height: 28px; border-radius: 8px;
+  background: var(--color-surface-recessed); color: var(--color-text-secondary);
+  font-weight: 800; font-size: 12px; letter-spacing: -.02em; text-transform: uppercase;
+}
+.provider-picker button[aria-pressed="true"] .provider-glyph { background: rgba(255, 255, 255, .18); color: var(--color-white); } /* design-tokens-allow: translucent white tint over the accent fill, not a standalone color -- no token would name this correctly */
+
+/* Separates the wizard's one primary action (Continue/Connect) from
+ * whatever selectable row sits above it -- previously both lived in the
+ * same flush `.work-actions` div with no visual break between "these are
+ * choices" and "this moves you forward." */
+.wizard-actions { margin-top: 22px; padding-top: 18px; border-top: 1px solid var(--color-border-hairline); }
 
 /* Same read-only labeled-field layout as .wizard-review dl above, under a
  * plain name so it's usable outside a wizard's review step -- e.g. a list
@@ -340,7 +381,6 @@ button:disabled { opacity: .6; cursor: wait; }
 .execution-result { margin-top: 14px !important; color: var(--color-text-success) !important; font-weight: 700; }
 .recommendation-actions { display: flex; min-width: 190px; flex-direction: column; align-items: stretch; gap: 9px; }
 .recommendation-actions button { text-align: center; }
-.recommendation-actions .primary-action { border-color: var(--color-ink); background: var(--color-ink); color: var(--color-white); }
 .recommendation-actions span { color: var(--color-text-muted); font-size: 12px; text-align: center; }
 .recommendation-empty { margin: 32px 0 0; }
 
@@ -353,6 +393,33 @@ button:disabled { opacity: .6; cursor: wait; }
 .work-list small { display: block; margin-top: 5px; color: var(--color-text-muted); }
 .work-actions { display: flex; flex-wrap: wrap; gap: 8px; }
 .work-actions button { padding: 8px 13px; }
+
+/* Connected-integrations list (ConnectorHealthPanel): each account was a
+ * bare `.work-list li` -- text separated only by a hairline -- with its
+ * status rendered as a full-width colored block (`.inline-status.error-
+ * panel` for `disconnected`, indistinguishable in weight from a genuine
+ * `error`). A real bordered card plus a compact color-coded badge reads at
+ * a glance instead of shouting a bright red box for a deliberate,
+ * expected state. */
+.connector-list { list-style: none; margin: 20px 0 0; padding: 0; display: grid; gap: 14px; }
+.connector-card { border: 1px solid var(--color-border-panel); border-radius: var(--radius-panel); background: var(--color-white); padding: 20px 22px; display: grid; gap: 12px; }
+.connector-card-header { display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
+.connector-identity { display: flex; align-items: center; gap: 12px; }
+.connector-glyph {
+  display: flex; align-items: center; justify-content: center; flex-shrink: 0;
+  width: 38px; height: 38px; border-radius: 10px;
+  background: var(--color-surface-recessed); color: var(--color-text-secondary);
+  font-weight: 800; font-size: 14px; letter-spacing: -.02em; text-transform: uppercase;
+}
+.connector-identity strong { display: block; font-size: 15px; }
+.connector-identity small { display: block; margin-top: 2px; color: var(--color-text-tertiary); }
+
+.status-badge { display: inline-flex; align-items: center; gap: 6px; flex-shrink: 0; border-radius: 999px; padding: 5px 12px; font-size: 12px; font-weight: 700; white-space: nowrap; }
+.status-badge::before { content: ''; width: 7px; height: 7px; border-radius: 999px; background: currentColor; flex-shrink: 0; }
+.status-badge.is-active { background: var(--color-bg-success); border: 1px solid var(--color-border-success); color: var(--color-text-success-strong); }
+.status-badge.is-neutral { background: var(--color-surface-recessed); border: 1px solid var(--color-border-panel); color: var(--color-text-secondary); }
+.status-badge.is-degraded { background: var(--color-bg-degraded); border: 1px solid var(--color-border-degraded); color: var(--color-accent-simulation); }
+.status-badge.is-error { background: var(--color-bg-danger); border: 1px solid var(--color-border-danger); color: var(--color-text-danger-strong); }
 
 .risk-factors { list-style: none; margin: 8px 0 0; padding: 0; display: flex; flex-wrap: wrap; gap: 6px; }
 .risk-factors li { border: 1px solid var(--color-border-subtle); border-radius: 999px; padding: 4px 11px; font-size: 12px; color: var(--color-text-copy); }
@@ -396,6 +463,22 @@ button:disabled { opacity: .6; cursor: wait; }
 
 .tab-list { display: flex; gap: 8px; }
 .tab-list button[aria-selected="true"] { border-color: var(--color-ink); background: var(--color-ink); color: var(--color-white); }
+
+/* A toggle button (`aria-pressed`) previously had no selected-state style
+ * at all anywhere in this file -- ConnectorHealthPanel's provider picker,
+ * DecisionsPanel's and IncidentsPanel's status filters all click through
+ * silently with zero visible feedback despite `aria-pressed` flipping to
+ * `true` in the DOM. Same ink-fill idiom as `.tab-list`/`.workspace-nav`
+ * above, just keyed on the pressed state instead of a selected tab. */
+button[aria-pressed="true"] { border-color: var(--color-ink); background: var(--color-ink); color: var(--color-white); }
+
+/* A single reusable "this is the primary action in this row" treatment --
+ * previously only defined scoped under `.recommendation-actions`, so every
+ * other button row (a wizard's own Continue/Connect included) had no way
+ * to visually distinguish its one primary action from secondary ones
+ * without duplicating the rule. */
+.btn-primary { border-color: var(--color-ink); background: var(--color-ink); color: var(--color-white); }
+.btn-primary:hover:not(:disabled) { opacity: .88; }
 
 /* The top-level workspace nav (WorkspaceNavigation.tsx) previously had no
  * className at all -- not just missing a selected-state rule, no explicit

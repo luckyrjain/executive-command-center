@@ -186,8 +186,17 @@ export default function ScheduleWorkspace() {
     setInvalidEventField(field)
     setCreateEventStepIndex(CREATE_EVENT_STEPS.indexOf(step))
   }
+  // `createEventStep !== 'review'` guard is load-bearing, not defensive
+  // redundancy -- see the identical guard's comment in
+  // ConnectorHealthPanel.tsx's own attemptCreate. A step with exactly one
+  // field and no submit button mounted (Continue/Back are both
+  // type="button") still triggers the browser's implicit single-field
+  // form submission on Enter; without this, an early step's Enter key
+  // could run full terminal validation before the user ever reaches
+  // Review.
   function attemptCreateEvent(event: FormEvent) {
     event.preventDefault()
+    if (createEventStep !== 'review') return
     if (!createEvent.title.trim()) { failEvent('Event title is required.', 'Event title', 'basics'); return }
     // wallTimeToInstant throws the same "Enter a complete date and time."
     // message for a blank/malformed start or end, so it's called once per
@@ -222,8 +231,17 @@ export default function ScheduleWorkspace() {
     setInvalidMeetingField(field)
     setCreateMeetingStepIndex(CREATE_MEETING_STEPS.indexOf(step))
   }
+  // `createMeetingStep !== 'review'` guard is load-bearing, not defensive
+  // redundancy -- see the identical guard's comment in
+  // ConnectorHealthPanel.tsx's own attemptCreate. A step with exactly one
+  // field and no submit button mounted (Continue/Back are both
+  // type="button") still triggers the browser's implicit single-field
+  // form submission on Enter; without this, an early step's Enter key
+  // could run full terminal validation before the user ever reaches
+  // Review.
   function attemptCreateMeeting(event: FormEvent) {
     event.preventDefault()
+    if (createMeetingStep !== 'review') return
     if (!createMeeting.title.trim()) { failMeeting('Meeting title is required.', 'Meeting title', 'basics'); return }
     // Timing only applies to a standalone meeting -- a linked meeting's
     // timing is projected from its calendar event and isn't even rendered.
@@ -304,7 +322,7 @@ export default function ScheduleWorkspace() {
               <div><dt>Location</dt><dd>{createEvent.location || '—'}</dd></div>
               <div><dt>Description</dt><dd>{createEvent.description || '—'}</dd></div>
             </dl>
-            <div className="work-actions"><button type="button" onClick={goCreateEventBack}>Back</button><button type="submit" disabled={pending}>Create event</button></div>
+            <div className="work-actions"><button type="button" onClick={goCreateEventBack}>Back</button><button type="submit" aria-busy={pending} disabled={pending}>Create event</button></div>
           </div>
         )}
         </form>
@@ -357,7 +375,7 @@ export default function ScheduleWorkspace() {
               <div><dt>Preparation</dt><dd>{createMeeting.preparation || '—'}</dd></div>
               <div><dt>Notes summary</dt><dd>{createMeeting.notesSummary || '—'}</dd></div>
             </dl>
-            <div className="work-actions"><button type="button" onClick={goCreateMeetingBack}>Back</button><button type="submit" disabled={pending}>{createMeeting.calendarEventId ? 'Create linked meeting' : 'Create standalone meeting'}</button></div>
+            <div className="work-actions"><button type="button" onClick={goCreateMeetingBack}>Back</button><button type="submit" aria-busy={pending} disabled={pending}>{createMeeting.calendarEventId ? 'Create linked meeting' : 'Create standalone meeting'}</button></div>
           </div>
         )}
         </form>

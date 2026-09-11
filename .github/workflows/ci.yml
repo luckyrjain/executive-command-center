@@ -150,6 +150,7 @@ jobs:
       - run: corepack enable
       - run: corepack prepare pnpm@10.12.4 --activate
       - run: pnpm install --frozen-lockfile
+      - run: pnpm --filter @ecc/frontend check:tokens
       - run: pnpm --filter @ecc/frontend typecheck
       - run: pnpm --filter @ecc/frontend test -- --run
       - run: pnpm --filter @ecc/frontend build
