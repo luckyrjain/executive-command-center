@@ -402,6 +402,28 @@ def list_tasks(
     return TaskListResponse(items=items, next_cursor=next_cursor)
 
 
+class TaskCount(BaseModel):
+    count: int
+
+
+@router.get("/count", response_model=TaskCount)
+def count_tasks(auth: AuthDep, session: SessionDep) -> TaskCount:
+    visibility_sql, visibility_params = authz.visible_resource_filter_sql(
+        session, auth, resource_type="tasks", action="read", table_alias="tasks"
+    )
+    count = session.execute(
+        text(f"""
+            SELECT COUNT(*) FROM tasks
+            WHERE workspace_id = :workspace_id
+              AND ({visibility_sql})
+              AND archived_at IS NULL
+              AND status NOT IN ('completed', 'cancelled')
+        """),
+        {"workspace_id": auth.workspace_id, **visibility_params},
+    ).scalar_one()
+    return TaskCount(count=count)
+
+
 @router.get("/{task_id}", response_model=TaskResponse)
 def get_task(task_id: UUID, auth: AuthDep, session: SessionDep) -> TaskResponse:
     visible = authz.authorize(
