@@ -10,7 +10,7 @@
 
 **Spec:** [docs/superpowers/specs/2026-09-11-navigation-redesign-design.md](../specs/2026-09-11-navigation-redesign-design.md)
 
-**Depends on:** [docs/superpowers/plans/2026-09-11-nav-badge-count-endpoints.md](2026-09-11-nav-badge-count-endpoints.md) (separate worktree/branch `feat/nav-badge-count-endpoints`, off `main`). The 4 new backend count endpoints don't need to be merged before this plan's frontend tasks are implemented and unit-tested (unit tests mock `fetch`, matching this codebase's existing convention — see `RiskWorkspace.test.tsx` etc.), but they must be merged before this branch's own e2e suite (Task 7) can pass against a real backend, since e2e hits the real API.
+**Depends on:** `docs/superpowers/plans/2026-09-11-nav-badge-count-endpoints.md` (lives only on its own branch, `feat/nav-badge-count-endpoints`, off `main` — not a relative link since that file doesn't exist on this branch). The 4 new backend count endpoints don't need to be merged before this plan's frontend tasks are implemented and unit-tested (unit tests mock `fetch`, matching this codebase's existing convention — see `RiskWorkspace.test.tsx` etc.), but they must be merged before this branch's own e2e suite (Task 7) can pass against a real backend, since e2e hits the real API.
 
 ## Global Constraints
 
