@@ -278,9 +278,7 @@ def test_list_candidates_shows_candidate_via_explicit_entity_grant(
     assert candidate_id in {UUID(item["id"]) for item in response.json()["items"]}
 
     # Verify count endpoint includes the granted candidate for grantee
-    grantee_count_response = ctx.grantee.client.get(
-        "/api/v1/knowledge/resolution/candidates/count"
-    )
+    grantee_count_response = ctx.grantee.client.get("/api/v1/knowledge/resolution/candidates/count")
     assert grantee_count_response.status_code == 200, grantee_count_response.text
     assert grantee_count_response.json()["count"] == 1
 
