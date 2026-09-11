@@ -208,6 +208,10 @@ class ResolutionCandidateListResponse(BaseModel):
     next_cursor: str | None = None
 
 
+class ResolutionCandidateCount(BaseModel):
+    count: int
+
+
 class ResolutionCandidateResult(BaseModel):
     """create_candidate's response shape. ENTITY-RESOLUTION-CONTRACT.md's
     match hierarchy levels 1-4 (user-confirmed mapping, trusted external
@@ -603,6 +607,59 @@ def list_candidates(
     return ResolutionCandidateListResponse(
         items=[_project(dict(row)) for row in page], next_cursor=next_cursor
     )
+
+
+@router.get("/candidates/count", response_model=ResolutionCandidateCount)
+def count_candidates(
+    auth: AuthDep, session: SessionDep, status: CandidateStatus | None = "open"
+) -> ResolutionCandidateCount:
+    visibility_sql, visibility_params = authz.visible_resource_filter_sql(
+        session, auth, resource_type="resolution_candidates", action="read",
+        table_alias="resolution_candidates",
+    )
+    left_visibility_sql, left_visibility_params = authz.visible_resource_filter_sql(
+        session, auth, resource_type="pkos_nodes", action="read",
+        table_alias="left_entity", param_prefix="left_entity_",
+    )
+    right_visibility_sql, right_visibility_params = authz.visible_resource_filter_sql(
+        session, auth, resource_type="pkos_nodes", action="read",
+        table_alias="right_entity", param_prefix="right_entity_",
+    )
+    clauses = [
+        "resolution_candidates.workspace_id = :workspace_id",
+        "(resolution_candidates.deferred_until IS NULL "
+        "OR resolution_candidates.deferred_until <= :now)",
+        f"({visibility_sql})",
+        f"({left_visibility_sql})",
+        f"({right_visibility_sql})",
+    ]
+    params: dict[str, object] = {
+        "workspace_id": auth.workspace_id,
+        "now": datetime.now(UTC),
+        **visibility_params,
+        **left_visibility_params,
+        **right_visibility_params,
+    }
+    if status is not None:
+        clauses.append("resolution_candidates.status = :status")
+        params["status"] = status
+
+    count = session.execute(
+        text(f"""
+            SELECT COUNT(*)
+            FROM resolution_candidates
+            JOIN pkos_nodes left_entity
+              ON left_entity.workspace_id = resolution_candidates.workspace_id
+             AND left_entity.id = resolution_candidates.left_entity_id
+            JOIN pkos_nodes right_entity
+              ON right_entity.workspace_id = resolution_candidates.workspace_id
+             AND right_entity.id = resolution_candidates.right_entity_id
+            WHERE {" AND ".join(clauses)}
+        """),
+        params,
+    ).scalar_one()
+    session.rollback()
+    return ResolutionCandidateCount(count=count)
 
 
 def _encode_cursor(created_at: datetime, candidate_id: UUID) -> str:
