@@ -444,6 +444,8 @@ button:disabled { opacity: .6; cursor: wait; }
 }
 .sidebar-nav a[aria-current="page"] .sidebar-nav-badge { background: var(--color-white); }
 
+.mobile-workspace-nav { display: none; }
+
 .search-form,
 .audit-toolbar { display: grid; gap: 10px; margin-top: 28px; }
 .search-form label,
@@ -517,6 +519,9 @@ button:disabled { opacity: .6; cursor: wait; }
   .audit-list li { flex-direction: column; }
   .audit-meta { min-width: 0; text-align: left; }
   .work-grid { grid-template-columns: 1fr; }
+  .sidebar-nav { display: none; }
+  .mobile-workspace-nav { display: block; }
+  .app-frame { display: block; }
 }
 
 @media (max-width: 520px) {
