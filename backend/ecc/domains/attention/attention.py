@@ -1017,6 +1017,33 @@ def list_attention(
     return AttentionList(items=[AttentionItem.model_validate(dict(row)) for row in rows])
 
 
+class AttentionCount(BaseModel):
+    count: int
+
+
+@router.get("/count", response_model=AttentionCount)
+def count_attention(auth: AuthDep, session: SessionDep) -> AttentionCount:
+    now = datetime.now(UTC)
+    visibility_sql, visibility_params = authz.visible_resource_filter_sql(
+        session, auth, resource_type="attention_items", action="read", table_alias="ai"
+    )
+    count = session.execute(
+        text(f"""
+            SELECT COUNT(*)
+            FROM attention_items ai
+            WHERE ai.workspace_id = :workspace_id
+              AND ai.expires_at > :now
+              AND (ai.dismissed_at IS NULL
+                   OR ai.dismissed_entity_version <> ai.source_entity_version)
+              AND (ai.deferred_until IS NULL OR ai.deferred_until <= :now)
+              AND ({visibility_sql})
+        """),
+        {"workspace_id": auth.workspace_id, "now": now, **visibility_params},
+    ).scalar_one()
+    session.rollback()
+    return AttentionCount(count=count)
+
+
 @router.get("/{item_id}", response_model=AttentionItem)
 def get_attention_item(item_id: UUID, auth: AuthDep, session: SessionDep) -> AttentionItem:
     visible = authz.authorize(

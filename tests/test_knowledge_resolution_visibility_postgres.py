@@ -235,6 +235,11 @@ def test_list_candidates_hides_candidate_after_entity_narrowed_with_no_grant(
     assert response.status_code == 200, response.text
     assert candidate_id not in {UUID(item["id"]) for item in response.json()["items"]}
 
+    # Verify count endpoint also excludes the hidden candidate
+    count_response = ctx.outsider.client.get("/api/v1/knowledge/resolution/candidates/count")
+    assert count_response.status_code == 200, count_response.text
+    assert count_response.json()["count"] == 0
+
 
 def test_list_candidates_shows_candidate_via_explicit_entity_grant(
     visibility_context: _VisibilityContext,
@@ -272,6 +277,18 @@ def test_list_candidates_shows_candidate_via_explicit_entity_grant(
     assert response.status_code == 200, response.text
     assert candidate_id in {UUID(item["id"]) for item in response.json()["items"]}
 
+    # Verify count endpoint includes the granted candidate for grantee
+    grantee_count_response = ctx.grantee.client.get("/api/v1/knowledge/resolution/candidates/count")
+    assert grantee_count_response.status_code == 200, grantee_count_response.text
+    assert grantee_count_response.json()["count"] == 1
+
     outsider_response = ctx.outsider.client.get("/api/v1/knowledge/resolution/candidates")
     assert outsider_response.status_code == 200, outsider_response.text
     assert candidate_id not in {UUID(item["id"]) for item in outsider_response.json()["items"]}
+
+    # Verify count endpoint excludes the candidate from outsider
+    outsider_count_response = ctx.outsider.client.get(
+        "/api/v1/knowledge/resolution/candidates/count"
+    )
+    assert outsider_count_response.status_code == 200, outsider_count_response.text
+    assert outsider_count_response.json()["count"] == 0

@@ -142,3 +142,7 @@ class RecommendationResponse(BaseModel):
 class RecommendationListResponse(BaseModel):
     items: list[RecommendationResponse]
     next_cursor: str | None = None
+
+
+class RecommendationCount(BaseModel):
+    count: int
