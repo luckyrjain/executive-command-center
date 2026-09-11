@@ -106,6 +106,25 @@ button, input, textarea, select { font: inherit; }
   padding: 40px var(--page-gutter) 72px;
 }
 
+/* WorkspaceSwitcher.tsx is mounted globally above `.app-frame`, not inside
+ * `.app-shell` -- it's a cross-cutting org-switcher, not part of the
+ * sidebar+content row. Reuses `.app-shell`'s own width/horizontal-padding
+ * tokens so it still lines up with the page frame instead of rendering
+ * flush against the viewport edge.
+ *
+ * `div.workspace-switcher`, not `.workspace-switcher` -- the component's
+ * loading/error variants add `.inline-status`/`.error-panel` alongside this
+ * class (WorkspaceSwitcher.tsx), and `.inline-status` below also declares
+ * `padding`/`margin-top` at the same single-class specificity; qualifying
+ * with the element type outranks that combination regardless of which rule
+ * comes first in the file, so this framing survives in every one of the
+ * component's three render states, not just its default one. */
+div.workspace-switcher {
+  width: min(var(--content-max), 100%);
+  margin: 0 auto;
+  padding: 40px var(--page-gutter) var(--space-4);
+}
+
 .topbar,
 .brief-heading,
 .recommendation-heading,
@@ -513,6 +532,7 @@ button:disabled { opacity: .6; cursor: wait; }
 
 @media (max-width: 800px) {
   .app-shell { padding-top: 28px; }
+  div.workspace-switcher { padding-top: 28px; }
   .topbar { align-items: center; }
   .dashboard-card { grid-column: 1 / -1; min-height: auto; }
   .recommendation-list > li { grid-template-columns: 1fr; }
