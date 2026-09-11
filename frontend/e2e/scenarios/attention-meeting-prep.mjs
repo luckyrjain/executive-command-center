@@ -49,8 +49,7 @@ export async function run({ page, baseURL }) {
     attention: { buildMeetingPack: buildPack, aiEnrichmentEnabled },
   })
 
-  await page.goto(baseURL)
-  await page.getByRole('tab', { name: 'Meeting prep' }).click()
+  await page.goto(`${baseURL}/meeting-prep`)
   const section = page.locator('section[aria-labelledby="meeting-prep-title"]')
   await section.getByRole('heading', { name: 'Meeting prep', level: 1 }).waitFor()
 

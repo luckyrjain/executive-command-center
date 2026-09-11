@@ -106,27 +106,32 @@ export async function run({ page, baseURL }) {
     },
   })
 
-  await page.goto(baseURL)
+  await page.goto(`${baseURL}/automation`)
 
-  // Reach the Automation workspace tab via the top-level roving-tabindex
-  // tablist, keyboard only.
-  const todayTab = page.getByRole('tab', { name: 'Today' })
-  await todayTab.focus()
-  for (let step = 0; step < 11; step += 1) await page.keyboard.press('ArrowRight')
-  assert.equal(await page.evaluate(() => document.activeElement?.textContent), 'Automation')
-  // ArrowRight/moveWorkspaceFocus already switches the view as focus moves
-  // (WorkspaceNavigation.tsx's own `onMove` callback) -- no separate Enter
-  // needed, matching `conflict-audit-keyboard.mjs`'s identical precedent.
-  assert.equal(await page.getByRole('tab', { name: 'Automation' }).getAttribute('aria-selected'), 'true')
+  // Top-level navigation is now real route links (SidebarNavigation.tsx),
+  // not a roving-tabindex widget -- reaching this workspace is a direct
+  // page.goto, matching every other scenario's own migration off the old
+  // tablist. Seeding focus on the active link gives the next real Tab
+  // press below (into the nested Workflows/Approvals tablist) a known
+  // starting point.
+  const automationLink = page.getByRole('link', { name: 'Automation' })
+  await automationLink.waitFor()
+  assert.equal(await automationLink.getAttribute('aria-current'), 'page')
+  await automationLink.focus()
 
   await page.getByRole('heading', { name: 'Workflows & approvals', level: 1 }).waitFor()
 
-  // Tab from the now-focused outer tablist into the nested Workflows/
-  // Approvals tablist (real Tab press, matching `conflict-audit-
-  // keyboard.mjs`'s identical outer-to-nested-tablist transition), then
-  // reach the Approvals sub-tab via that nested tablist's own roving
-  // tabindex, keyboard only.
-  await page.keyboard.press('Tab')
+  // Deviation from the brief's prescribed single `page.keyboard.press('Tab')`:
+  // verified against the real SidebarNavigation.tsx, real Tab order runs
+  // through the rest of the sidebar's own links (Engineering, Personal,
+  // Team) before reaching the main panel at all -- unlike the old single
+  // top-level tablist widget, where the active tab was the only stop
+  // before the panel. `tabTo()` (defined above for the payload-summary
+  // toggle below) presses real Tab keys until the nested tablist's own
+  // default Workflows tab is reached, then its own roving tabindex reaches
+  // the Approvals sub-tab, keyboard only.
+  const workflowsTab = page.getByRole('tab', { name: 'Workflows' })
+  await tabTo(page, workflowsTab)
   await page.keyboard.press('ArrowRight')
   assert.equal(await page.evaluate(() => document.activeElement?.textContent), 'Approvals')
   assert.equal(await page.getByRole('tab', { name: 'Approvals' }).getAttribute('aria-selected'), 'true')

@@ -63,8 +63,7 @@ export async function run({ page, baseURL }) {
 
   try {
     // --- Invite: Alice invites bob@example.test into Northwind -------------
-    await page.goto(baseURL)
-    await page.getByRole('tab', { name: 'Team' }).click()
+    await page.goto(`${baseURL}/team`)
     await page.getByRole('heading', { name: 'Workspace collaboration', level: 1 }).waitFor()
     await assertNoSeriousAccessibilityViolations(page, { include: '#workspace-panel' })
 
@@ -77,8 +76,7 @@ export async function run({ page, baseURL }) {
     assert.equal(invitation.email, BOB.email)
 
     // --- Accept: Bob, starting from his own workspace, joins Northwind -----
-    await bobPage.goto(baseURL)
-    await bobPage.getByRole('tab', { name: 'Team' }).click()
+    await bobPage.goto(`${baseURL}/team`)
     await bobPage.getByRole('heading', { name: 'Workspace collaboration', level: 1 }).waitFor()
     await assertNoSeriousAccessibilityViolations(bobPage, { include: '#workspace-panel' })
 
@@ -100,12 +98,14 @@ export async function run({ page, baseURL }) {
       bobPage.waitForEvent('load'),
       bobPage.getByLabel('Switch workspace').selectOption({ label: 'Northwind' }),
     ])
-    await bobPage.getByRole('tab', { name: 'Team' }).click()
     await bobPage.getByRole('heading', { name: 'Workspace collaboration', level: 1 }).waitFor()
 
     // --- Alice now sees Bob as a Northwind member ---------------------------
+    // Real routing (SidebarNavigation.tsx) means a full reload at the same
+    // /team URL lands back on this workspace directly -- no top-level nav
+    // click needed to get back here, unlike the old roving-tabindex tablist
+    // that reset to Today on every full page load.
     await page.reload()
-    await page.getByRole('tab', { name: 'Team' }).click()
     await alicePanel.getByText('Bob', { exact: true }).waitFor()
 
     // --- Share: Alice grants Bob read access to an engineering resource ----
@@ -138,8 +138,9 @@ export async function run({ page, baseURL }) {
     await alicePanel.getByText('Resolve incident-42').waitFor()
     assert.equal(store.delegations.length, 1)
 
+    // Same reload-is-reload-safe reasoning as Alice's reload above -- Bob
+    // lands back on /team directly, no top-level nav click needed.
     await bobPage.reload()
-    await bobPage.getByRole('tab', { name: 'Team' }).click()
     await bobPage.getByRole('tab', { name: 'Delegations' }).click()
     await bobPanel.getByText('Resolve incident-42').waitFor()
     await bobPanel.getByRole('button', { name: 'Accept' }).click()

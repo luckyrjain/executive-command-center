@@ -55,8 +55,7 @@ export async function run({ page, baseURL }) {
     resolutionCandidates: [seedCandidate],
   })
 
-  await page.goto(baseURL)
-  await page.getByRole('tab', { name: 'Knowledge' }).click()
+  await page.goto(`${baseURL}/knowledge`)
   const inbox = page.locator('section[aria-labelledby="resolution-inbox-title"]')
   await inbox.getByText(targetEntity.id, { exact: false }).waitFor()
   await inbox.getByText(/name_similarity/).waitFor()

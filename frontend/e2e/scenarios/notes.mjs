@@ -19,8 +19,7 @@ const seedNote = {
 export async function run({ page, baseURL }) {
   const fixtures = await createFixtureApi(page, { notes: [seedNote] })
 
-  await page.goto(baseURL)
-  await page.getByRole('tab', { name: 'Notes' }).click()
+  await page.goto(`${baseURL}/notes`)
   const section = page.locator('section[aria-labelledby="notes-title"]')
   await section.getByRole('heading', { name: 'Notes', level: 1 }).waitFor()
   await section.getByText('Draft memo body').waitFor()

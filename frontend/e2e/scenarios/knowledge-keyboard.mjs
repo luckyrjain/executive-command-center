@@ -32,18 +32,12 @@ export async function run({ page, baseURL }) {
     },
   })
 
-  await page.goto(baseURL)
+  await page.goto(`${baseURL}/knowledge`)
   await page.getByRole('main').waitFor()
 
-  const todayTab = page.getByRole('tab', { name: 'Today' })
-  await todayTab.focus()
-  assert.equal(await page.evaluate(() => document.activeElement?.textContent), 'Today')
-
-  // Roving tabindex: today(0) -> attention(1) -> work(2) -> notes(3) ->
-  // schedule(4) -> planner(5) -> meeting-prep(6) -> risks(7) -> knowledge(8).
-  for (let step = 0; step < 8; step += 1) await page.keyboard.press('ArrowRight')
-  assert.equal(await page.evaluate(() => document.activeElement?.textContent), 'Knowledge')
-  assert.equal(await page.getByRole('tab', { name: 'Knowledge' }).getAttribute('aria-selected'), 'true')
+  const knowledgeLink = page.getByRole('link', { name: 'Knowledge' })
+  await knowledgeLink.waitFor()
+  assert.equal(await knowledgeLink.getAttribute('aria-current'), 'page')
 
   const explorer = page.locator('section[aria-labelledby="knowledge-title"]')
   await explorer.getByRole('heading', { name: 'Knowledge', level: 1 }).waitFor()
@@ -51,10 +45,11 @@ export async function run({ page, baseURL }) {
 
   await assertNoSeriousAccessibilityViolations(page, { include: 'section[aria-labelledby="knowledge-title"]' })
 
-  // Tab from the now-focused outer tab into the panel, through the create-
-  // entity form, the search form (query, kind filter, date filters, search
-  // button, clear-filters button), and into the "All entities" list --
-  // asserting the entity list button is reachable by keyboard alone.
+  // Focus moves directly into the panel's own controls below, keyboard-only
+  // from here on -- through the create-entity form, the search form (query,
+  // kind filter, date filters, search button, clear-filters button), and
+  // into the "All entities" list -- asserting the entity list button is
+  // reachable by keyboard alone.
   const entityButton = explorer.getByRole('button', { name: 'Ada Lovelace' })
   await entityButton.focus()
   const outline = await entityButton.evaluate((el) => getComputedStyle(el).outlineStyle)

@@ -98,8 +98,7 @@ export async function run({ page, baseURL }) {
     status: 200, contentType: 'text/html', body: '<html><body>Fixture Google consent screen</body></html>',
   }))
 
-  await page.goto(baseURL)
-  await page.getByRole('tab', { name: 'Personal' }).click()
+  await page.goto(`${baseURL}/personal`)
   await page.getByRole('heading', { name: 'Personal workspace', level: 1 }).waitFor()
   await page.getByRole('tab', { name: 'Gmail' }).click()
   await assertNoSeriousAccessibilityViolations(page, { include: '#personal-panel' })
@@ -125,8 +124,7 @@ export async function run({ page, baseURL }) {
   fixtures.engineering.connectors.push(gmailConnector())
   fixtures.collections.recommendations.items.push({ ...seedEmailRecommendation }, { ...seedOtherRecommendation })
 
-  await page.goto(baseURL)
-  await page.getByRole('tab', { name: 'Personal' }).click()
+  await page.goto(`${baseURL}/personal`)
   await page.getByRole('tab', { name: 'Gmail' }).click()
   await assertNoSeriousAccessibilityViolations(page, { include: '#personal-panel' })
   panel = page.locator('#personal-panel')
@@ -232,8 +230,7 @@ export async function run({ page, baseURL }) {
       syncRuns: [{ id: 'run-permission', connector_account_id: 'gmail-connector-1', run_type: 'incremental', status: 'succeeded', items_processed: 2, error_summary: null, started_at: iso(-60 * 60 * 1000), completed_at: iso(-59 * 60 * 1000) }],
     },
   })
-  await page.goto(baseURL)
-  await page.getByRole('tab', { name: 'Personal' }).click()
+  await page.goto(`${baseURL}/personal`)
   await page.getByRole('tab', { name: 'Gmail' }).click()
   await assertNoSeriousAccessibilityViolations(page, { include: '#personal-panel' })
   panel = page.locator('#personal-panel')

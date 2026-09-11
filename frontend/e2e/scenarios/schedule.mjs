@@ -30,8 +30,7 @@ const seedEvent = {
 export async function run({ page, baseURL }) {
   const fixtures = await createFixtureApi(page, { calendarEvents: [seedEvent] })
 
-  await page.goto(baseURL)
-  await page.getByRole('tab', { name: 'Schedule' }).click()
+  await page.goto(`${baseURL}/schedule`)
   const section = page.locator('section[aria-labelledby="schedule-title"]')
   await section.getByRole('heading', { name: 'Calendar & meetings', level: 1 }).waitFor()
   await section.locator('.work-list strong', { hasText: 'Leadership sync' }).waitFor()

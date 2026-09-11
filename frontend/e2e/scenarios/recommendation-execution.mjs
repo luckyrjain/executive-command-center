@@ -32,8 +32,7 @@ export async function run({ page, baseURL }) {
     evidence: { 'evidence-checklist': { source_type: 'document', label: 'Acceptance checklist', captured_at: '2026-07-14T00:00:00Z' } },
   })
 
-  await page.goto(baseURL)
-  await page.getByRole('tab', { name: 'Recommendations' }).click()
+  await page.goto(`${baseURL}/recommendations`)
   const panel = page.locator('section[aria-labelledby="recommendations-title"]')
   await panel.getByRole('heading', { name: 'complete task' }).waitFor()
 

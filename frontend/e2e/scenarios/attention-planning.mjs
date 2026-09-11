@@ -31,8 +31,7 @@ export async function run({ page, baseURL }) {
     },
   })
 
-  await page.goto(baseURL)
-  await page.getByRole('tab', { name: 'Planner' }).click()
+  await page.goto(`${baseURL}/planner`)
   const section = page.locator('section[aria-labelledby="planner-title"]')
   await section.getByRole('heading', { name: 'Planner', level: 1 }).waitFor()
 

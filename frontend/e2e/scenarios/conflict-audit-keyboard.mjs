@@ -3,6 +3,26 @@ import assert from 'node:assert/strict'
 import { createFixtureApi } from '../fixtures.mjs'
 import { assertNoSeriousAccessibilityViolations } from '../accessibility.mjs'
 
+// Presses real `Tab` keys (never `.focus()`) until `locator` becomes the
+// focused element, up to `maxPresses` attempts. Needed since SidebarNavigation.tsx
+// renders every workspace link in one flat list -- after focusing this
+// scenario's own active "Search & audit" link, real Tab order runs through
+// whatever sidebar links come after it (Automation, Engineering, Personal,
+// Team) before ever reaching the main panel, unlike the old single
+// top-level tablist widget where the active tab was the only stop before
+// the panel. Mirrors automation-approvals-keyboard.mjs's own identical
+// helper and its own identical reasoning.
+async function tabTo(page, locator, maxPresses = 15) {
+  for (let attempt = 0; attempt < maxPresses; attempt += 1) {
+    if (await locator.evaluate((el) => el === document.activeElement).catch(() => false)) return
+    await page.keyboard.press('Tab')
+  }
+  assert.ok(
+    await locator.evaluate((el) => el === document.activeElement),
+    `expected to reach the target element via real Tab presses within ${maxPresses} attempts`,
+  )
+}
+
 const seedRisk = {
   id: 'risk-1',
   description: 'Vendor concentration',
@@ -42,36 +62,27 @@ const auditCorpus = [
 export async function run({ page, baseURL }) {
   const fixtures = await createFixtureApi(page, { risks: [seedRisk], auditCorpus, auditPageSize: 1 })
 
-  await page.goto(baseURL)
+  await page.goto(`${baseURL}/risks`)
   assert.equal(await page.title(), 'Executive Command Center')
 
-  // Landmarks: one main region and a named navigation region for the
-  // workspace tablist.
+  // Landmarks: one main region and a named navigation region for the sidebar.
   await page.getByRole('main').waitFor()
-  await page.getByRole('navigation', { name: 'Workspace' }).waitFor()
+  const risksLink = page.getByRole('link', { name: 'Risks' })
+  await risksLink.waitFor()
 
-  // The persistent workspace tablist lives outside every other scenario's
-  // `include:` scan (it's a sibling of #workspace-panel/#search-panel, never
-  // inside them), so it otherwise has no automated a11y regression coverage.
-  await assertNoSeriousAccessibilityViolations(page, { include: 'nav[aria-label="Workspace"]' })
+  // The persistent sidebar lives outside every other scenario's `include:`
+  // scan, so it otherwise has no automated a11y regression coverage.
+  await assertNoSeriousAccessibilityViolations(page, { include: 'nav[aria-label="Workspaces"]' })
 
-  // `.focus()` seeds initial focus into the tablist the way a user who has
-  // just Tabbed in from the browser chrome would land on it; every
-  // subsequent step below drives the UI with keyboard presses only.
-  const todayTab = page.getByRole('tab', { name: 'Today' })
-  await todayTab.focus()
-  assert.equal(await page.evaluate(() => document.activeElement?.textContent), 'Today')
-
-  // Visible focus: the focused tab must carry a real focus outline, not just
-  // programmatic focus.
-  const outline = await todayTab.evaluate((el) => getComputedStyle(el).outlineStyle)
+  // Visible focus: a keyboard user must be able to reach and see focus on
+  // the active sidebar link. Seeding focus here (rather than a bare
+  // assertion) also gives the next real Tab press in this file a known
+  // starting point, same discipline as automation-approvals-keyboard.mjs's
+  // own tabTo() helper.
+  await risksLink.focus()
+  const outline = await risksLink.evaluate((el) => getComputedStyle(el).outlineStyle)
   assert.notEqual(outline, 'none')
-
-  // Roving tabindex: today(0) -> attention(1) -> work(2) -> notes(3) ->
-  // schedule(4) -> planner(5) -> meeting-prep(6) -> risks(7).
-  for (let step = 0; step < 7; step += 1) await page.keyboard.press('ArrowRight')
-  assert.equal(await page.evaluate(() => document.activeElement?.textContent), 'Risks')
-  assert.equal(await page.getByRole('tab', { name: 'Risks' }).getAttribute('aria-selected'), 'true')
+  assert.equal(await risksLink.getAttribute('aria-current'), 'page')
 
   const risksSection = page.locator('section[aria-labelledby="risks-title"]')
   await risksSection.getByRole('heading', { name: 'Risks', level: 1 }).waitFor()
@@ -151,16 +162,27 @@ export async function run({ page, baseURL }) {
 
   await assertNoSeriousAccessibilityViolations(page, { include: 'section[aria-labelledby="risks-title"]' })
 
-  // Continue keyboard navigation: risks(4) -> knowledge(5) -> recommendations(6) -> search-audit(7).
-  await page.getByRole('tab', { name: 'Risks' }).focus()
-  await page.keyboard.press('ArrowRight')
-  await page.keyboard.press('ArrowRight')
-  await page.keyboard.press('ArrowRight')
-  assert.equal(await page.getByRole('tab', { name: 'Search & audit' }).getAttribute('aria-selected'), 'true')
+  // Continue keyboard navigation: real routing means reaching Search & audit
+  // is a direct page.goto, not an ArrowRight traversal across the old
+  // roving-tabindex tablist -- matching automation-approvals-keyboard.mjs's
+  // identical precedent for migrating a top-level workspace transition
+  // inside a keyboard-only scenario. Seeding focus on the active link gives
+  // the next real Tab press below (into the nested Search/Audit tablist) a
+  // known starting point.
+  await page.goto(`${baseURL}/search-audit`)
+  const searchAuditLink = page.getByRole('link', { name: 'Search & audit' })
+  await searchAuditLink.waitFor()
+  assert.equal(await searchAuditLink.getAttribute('aria-current'), 'page')
+  await searchAuditLink.focus()
 
-  // Tab from the now-focused outer tab into the nested Search/Audit tablist,
-  // then use its own ArrowRight handler to reach Audit history.
-  await page.keyboard.press('Tab')
+  // Deviation from the brief's prescribed single `page.keyboard.press('Tab')`:
+  // verified against the real SidebarNavigation.tsx, real Tab order runs
+  // through the rest of the sidebar's own links (Automation, Engineering,
+  // Personal, Team) before reaching the main panel at all. `tabTo()`
+  // (defined above) presses real Tab keys until the nested tablist's own
+  // default Search tab is reached, then its own roving tabindex reaches
+  // Audit history.
+  await tabTo(page, page.locator('#search-tab'))
   assert.equal(await page.evaluate(() => document.activeElement?.id), 'search-tab')
   await page.keyboard.press('ArrowRight')
   assert.equal(await page.evaluate(() => document.activeElement?.id), 'audit-tab')

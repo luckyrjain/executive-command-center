@@ -96,8 +96,7 @@ export async function run({ page, baseURL }) {
     },
   })
 
-  await page.goto(baseURL)
-  await page.getByRole('tab', { name: 'Automation' }).click()
+  await page.goto(`${baseURL}/automation`)
   await page.getByRole('heading', { name: 'Workflows & approvals', level: 1 }).waitFor()
   await assertNoSeriousAccessibilityViolations(page, { include: '#automation-panel' })
 

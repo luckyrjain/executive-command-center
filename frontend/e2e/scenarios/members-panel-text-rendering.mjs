@@ -36,8 +36,7 @@ export async function run({ page, baseURL }) {
   }
   await createFixtureApi(page, { collaborationStore, collaborationSelf })
 
-  await page.goto(baseURL)
-  await page.getByRole('tab', { name: 'Team' }).click()
+  await page.goto(`${baseURL}/team`)
 
   const membersSection = page.locator('section[aria-labelledby="members-title"]')
   await membersSection.getByRole('heading', { name: 'Members', level: 2 }).waitFor()

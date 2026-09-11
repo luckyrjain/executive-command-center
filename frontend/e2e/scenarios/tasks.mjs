@@ -23,10 +23,9 @@ const seedTask = {
 export async function run({ page, baseURL }) {
   const fixtures = await createFixtureApi(page, { tasks: [seedTask] })
 
-  await page.goto(baseURL)
+  await page.goto(`${baseURL}/work`)
   assert.equal(await page.title(), 'Executive Command Center')
 
-  await page.getByRole('tab', { name: 'Work' }).click()
   const tasksSection = page.locator('section[aria-labelledby="tasks-title"]')
   await tasksSection.getByRole('heading', { name: 'Tasks', level: 1 }).waitFor()
   await page.getByText('Prepare board pack').waitFor()

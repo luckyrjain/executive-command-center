@@ -25,8 +25,7 @@ const seedCommitment = {
 export async function run({ page, baseURL }) {
   const fixtures = await createFixtureApi(page, { commitments: [seedCommitment] })
 
-  await page.goto(baseURL)
-  await page.getByRole('tab', { name: 'Work' }).click()
+  await page.goto(`${baseURL}/work`)
   const section = page.locator('section[aria-labelledby="commitments-title"]')
   await section.getByRole('heading', { name: 'Commitments', level: 1 }).waitFor()
   await section.getByText('Send board metrics').waitFor()
