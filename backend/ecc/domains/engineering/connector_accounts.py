@@ -976,7 +976,112 @@ def create_connector_endpoint(
             )
             if cached_after_conflict is not None:
                 return ConnectorAccountResponse.model_validate(cached_after_conflict)
-            raise HTTPException(status_code=409, detail="CONNECTOR_ALREADY_CONNECTED") from None
+
+            # Not a replay -- a real pre-existing row for this identity.
+            # `uq_connector_accounts_workspace_provider_external_id` is a
+            # plain (non-partial) unique constraint, so it still blocks
+            # this INSERT even when that row is `disconnected` -- unlike
+            # `gmail_oauth.py`'s own OAuth-callback flow, nothing on this
+            # generic PAT-based path ever reactivates it, permanently
+            # stranding a disconnected GitLab/GitHub/Jira/Datadog account
+            # with no way back in short of a raw DB edit. `FOR UPDATE`
+            # here mirrors that same gmail_oauth.py precedent: it blocks
+            # behind a concurrent racer's own reactivation of this exact
+            # row until that racer's transaction commits, so the `status`
+            # read below is never stale.
+            existing = (
+                create_session.execute(
+                    text(
+                        "SELECT id, status FROM connector_accounts "
+                        "WHERE workspace_id = :workspace_id AND provider = :provider "
+                        "AND external_account_id = :external_account_id FOR UPDATE"
+                    ),
+                    {
+                        "workspace_id": auth.workspace_id,
+                        "provider": payload.provider,
+                        "external_account_id": authorization.external_account_id,
+                    },
+                )
+                .mappings()
+                .one_or_none()
+            )
+            # `existing is None` is not currently reachable (nothing hard-
+            # deletes a `connector_accounts` row, and Postgres guarantees
+            # the conflicting row's own transaction already committed
+            # before this `IntegrityError` fired), kept only for safety.
+            # A `status` other than `disconnected` (active, or one of the
+            # transient `error`/`permission_lost`/`rate_limited` states,
+            # none of which this generic connect flow has ever offered a
+            # reactivate path for) is a genuine already-connected
+            # duplicate -- unchanged from this endpoint's prior behavior.
+            if existing is None or existing["status"] != "disconnected":
+                raise HTTPException(status_code=409, detail="CONNECTOR_ALREADY_CONNECTED") from None
+
+            create_session.execute(
+                text(
+                    """
+                    UPDATE connector_accounts SET
+                        display_name = :display_name,
+                        granted_scopes = :granted_scopes,
+                        encrypted_credentials = :encrypted_credentials,
+                        status = 'active', status_detail = NULL, last_error = NULL,
+                        disconnected_at = NULL, updated_by = :actor_id,
+                        updated_at = :now, version = version + 1
+                    WHERE id = :id
+                    """
+                ),
+                {
+                    "id": existing["id"],
+                    "display_name": authorization.display_name,
+                    "granted_scopes": list(authorization.granted_scopes),
+                    "encrypted_credentials": encrypt_credential(payload.credential),
+                    "actor_id": auth.user_id,
+                    "now": now,
+                },
+            )
+            reactivated = get_connector_account(create_session, auth.workspace_id, existing["id"])
+            assert reactivated is not None
+            reactivated_response = _to_response(reactivated)
+            audit_outbox.write_audit_and_outbox(
+                create_session,
+                auth,
+                request,
+                event_type="connector_account.reconnected",
+                aggregate_type="connector_account",
+                aggregate_id=reactivated.id,
+                aggregate_version=reactivated.version,
+                changed_fields=["*"],
+                payload={"aggregate_id": str(reactivated.id), "version": reactivated.version},
+                now=now,
+                domain="engineering_connector_account",
+            )
+            queue_lifecycle_event(
+                create_session,
+                "engineering_connector_account",
+                "connector_account.reconnected",
+                "allowed",
+            )
+            store_idempotency(
+                create_session,
+                auth,
+                idempotency_key,
+                req_hash,
+                reactivated_response.model_dump(mode="json"),
+                now,
+                response_status=status.HTTP_201_CREATED,
+            )
+            # Same reasoning as the genuine-INSERT path's own trigger below:
+            # a reactivated account has the same stale/empty data a brand
+            # new one does, so it earns the same auto-backfill kick-off.
+            background_tasks.add_task(
+                _run_auto_backfill,
+                workspace_id=auth.workspace_id,
+                user_id=auth.user_id,
+                timezone=auth.timezone,
+                account_id=existing["id"],
+                provider=payload.provider,
+            )
+            return reactivated_response
 
         created = get_connector_account(create_session, auth.workspace_id, account_id)
         assert created is not None

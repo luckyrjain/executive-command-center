@@ -1289,6 +1289,143 @@ def test_create_connector_idempotency_replay_does_not_trigger_a_second_auto_back
     assert count == 1
 
 
+# --- create_connector_endpoint: reactivate a disconnected account on reconnect --
+
+
+def test_create_connector_reactivates_a_disconnected_account_on_reconnect(
+    engineering_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    """`uq_connector_accounts_workspace_provider_external_id` is a plain
+    (non-partial) unique constraint, so reconnecting the same identity
+    used to always 409 `CONNECTOR_ALREADY_CONNECTED` even once the prior
+    row was `disconnected` -- permanently stranding it, unlike
+    `gmail_oauth.py`'s own OAuth-callback reactivation path. Reconnecting
+    must now revive the same row instead of staying stuck.
+    """
+    client, workspace_id, _user_id, token = engineering_test_context
+    credential = "token-reactivate"
+    created = client.post(
+        "/api/v1/engineering/connectors",
+        json={"provider": "sandbox", "credential": credential},
+        headers=_headers(token, key=str(uuid4())),
+    )
+    assert created.status_code == 201, created.text
+    account_id = created.json()["id"]
+
+    disable = client.post(
+        f"/api/v1/engineering/connectors/{account_id}/disable",
+        headers=_headers(token, key=str(uuid4())),
+    )
+    assert disable.status_code == 200
+    assert disable.json()["status"] == "disconnected"
+
+    reconnect = client.post(
+        "/api/v1/engineering/connectors",
+        json={"provider": "sandbox", "credential": credential},
+        headers=_headers(token, key=str(uuid4())),
+    )
+    assert reconnect.status_code == 201, reconnect.text
+    body = reconnect.json()
+    assert body["id"] == account_id
+    assert body["status"] == "active"
+    assert body["disconnected_at"] is None
+
+    with engine.begin() as connection:
+        count = connection.execute(
+            text("SELECT count(*) FROM connector_accounts WHERE workspace_id = :workspace_id"),
+            {"workspace_id": workspace_id},
+        ).scalar_one()
+        row = (
+            connection.execute(
+                text(
+                    "SELECT status, status_detail, last_error, disconnected_at, version, "
+                    "encrypted_credentials FROM connector_accounts WHERE id = :id"
+                ),
+                {"id": account_id},
+            )
+            .mappings()
+            .one()
+        )
+    assert count == 1
+    assert row["status"] == "active"
+    assert row["status_detail"] is None
+    assert row["last_error"] is None
+    assert row["disconnected_at"] is None
+    assert row["version"] == 3  # 1: created, 2: disabled, 3: reactivated
+    assert decrypt_credential(bytes(row["encrypted_credentials"])) == credential
+
+
+def test_create_connector_reconnect_of_an_active_account_still_conflicts(
+    engineering_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    """The reactivation path added above must only fire for a `disconnected`
+    row -- an `active` duplicate (never disabled) is still a genuine
+    already-connected conflict, unchanged from prior behavior.
+    """
+    client, _workspace_id, _user_id, token = engineering_test_context
+    credential = "token-still-active"
+    first = client.post(
+        "/api/v1/engineering/connectors",
+        json={"provider": "sandbox", "credential": credential},
+        headers=_headers(token, key=str(uuid4())),
+    )
+    assert first.status_code == 201
+
+    second = client.post(
+        "/api/v1/engineering/connectors",
+        json={"provider": "sandbox", "credential": credential},
+        headers=_headers(token, key=str(uuid4())),
+    )
+    assert second.status_code == 409
+    assert second.json()["error"]["code"] == "CONNECTOR_ALREADY_CONNECTED"
+
+
+def test_create_connector_reactivation_triggers_auto_backfill(
+    engineering_test_context: tuple[TestClient, UUID, UUID, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A reactivated account has the same stale/empty data a brand new one
+    does, so reconnecting it should earn the same `_run_auto_backfill`
+    kick-off `create_connector_endpoint`'s genuine-INSERT path already
+    gets -- this is what actually lets a live GitLab/GitHub/Jira/Datadog
+    disconnect-then-reconnect exercise the auto-backfill feature.
+    """
+    client, _workspace_id, _user_id, token = engineering_test_context
+    adapter = _AutoBackfillSpyAdapter(provider="gitlab")
+    monkeypatch.setattr(connector_accounts_module, "connector_registry", _registry_with(adapter))
+
+    created = client.post(
+        "/api/v1/engineering/connectors",
+        json={"provider": "gitlab", "credential": "gitlab-token-reactivate"},
+        headers=_headers(token, key=str(uuid4())),
+    )
+    assert created.status_code == 201, created.text
+    account_id = created.json()["id"]
+    assert adapter.backfill_calls == ["repository"]
+
+    disable = client.post(
+        f"/api/v1/engineering/connectors/{account_id}/disable",
+        headers=_headers(token, key=str(uuid4())),
+    )
+    assert disable.status_code == 200
+
+    reconnect = client.post(
+        "/api/v1/engineering/connectors",
+        json={"provider": "gitlab", "credential": "gitlab-token-reactivate"},
+        headers=_headers(token, key=str(uuid4())),
+    )
+    assert reconnect.status_code == 201, reconnect.text
+    assert reconnect.json()["id"] == account_id
+
+    assert adapter.backfill_calls == ["repository", "repository"]
+    with engine.begin() as connection:
+        count = connection.execute(
+            text("SELECT count(*) FROM sync_runs WHERE connector_account_id = :id"),
+            {"id": account_id},
+        ).scalar_one()
+    assert count == 2
+
+
 def test_list_connectors_cross_workspace_isolation(
     engineering_test_context: tuple[TestClient, UUID, UUID, str],
 ) -> None:
