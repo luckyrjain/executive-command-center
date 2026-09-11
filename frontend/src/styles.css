@@ -390,6 +390,60 @@ button:disabled { opacity: .6; cursor: wait; }
  * the wrapped rows flex-wrap already gives it at any width. */
 .workspace-nav { display: flex; flex-wrap: wrap; gap: 8px; }
 .workspace-nav button[aria-selected="true"] { border-color: var(--color-accent); background: var(--color-accent); color: var(--color-white); }
+
+.app-frame { display: flex; align-items: flex-start; gap: 0; }
+.app-shell { flex: 1 1 auto; min-width: 0; }
+
+.sidebar-nav {
+  flex: 0 0 224px;
+  background: var(--color-surface-recessed);
+  border-right: 1px solid var(--color-border-hairline);
+  padding: var(--space-6) var(--space-4);
+  min-height: 100vh;
+}
+.sidebar-nav-group { margin-top: var(--space-6); }
+.sidebar-nav-group:first-child { margin-top: 0; }
+.sidebar-nav-group-label {
+  margin: 0 0 var(--space-2);
+  padding: 0 var(--space-3);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: .04em;
+  text-transform: uppercase;
+  color: var(--color-text-tertiary);
+}
+.sidebar-nav ul { list-style: none; margin: 0; padding: 0; display: grid; gap: 2px; }
+.sidebar-nav a {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+  border-radius: var(--radius-control);
+  padding: 8px 12px;
+  color: var(--color-text-secondary);
+  text-decoration: none;
+  font-weight: 500;
+  border-left: 3px solid transparent;
+  transition: background var(--motion-fast) var(--ease-standard);
+}
+.sidebar-nav a:hover { background: var(--color-white); }
+.sidebar-nav a[aria-current="page"] {
+  background: color-mix(in srgb, var(--color-accent) 12%, var(--color-white));
+  border-left-color: var(--color-accent);
+  color: var(--color-ink);
+  font-weight: 650;
+}
+.sidebar-nav a:focus-visible { outline: 3px solid var(--focus-ring); outline-offset: -3px; }
+.sidebar-nav-badge {
+  border-radius: 999px;
+  background: var(--color-surface-recessed);
+  color: var(--color-text-secondary);
+  font-size: 12px;
+  font-weight: 700;
+  padding: 1px 7px;
+}
+.sidebar-nav a[aria-current="page"] .sidebar-nav-badge { background: var(--color-white); }
+
 .search-form,
 .audit-toolbar { display: grid; gap: 10px; margin-top: 28px; }
 .search-form label,
