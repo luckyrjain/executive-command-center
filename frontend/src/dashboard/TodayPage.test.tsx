@@ -2,13 +2,10 @@
 
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { cleanup, render, screen, waitFor } from '@testing-library/react'
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import TodayPage from './TodayPage'
 
-beforeEach(() => {
-  document.cookie = 'ecc_csrf=today-token; Secure; SameSite=Strict'
-})
 afterEach(() => { cleanup(); vi.unstubAllGlobals() })
 
 function renderPage() {
@@ -39,15 +36,17 @@ describe('TodayPage', () => {
     await waitFor(() => expect(screen.getByRole('heading', { name: 'Today' })).toBeTruthy())
   })
 
-  it('renders the page header even when there is an error', async () => {
+  it('surfaces a dashboard fetch failure as an alert', async () => {
     const errorResponse = { error: { code: 'INTERNAL', message: 'boom' } }
     vi.stubGlobal('fetch', vi.fn(() => Promise.resolve(new Response(JSON.stringify(errorResponse), { status: 500, headers: { 'Content-Type': 'application/json' } }))))
     vi.stubGlobal('crypto', { randomUUID: vi.fn(() => 'test-uuid') })
 
     renderPage()
-    // Even if queries fail, the page header should still render
+    // Dashboard error UI should render after retry completes (retry: 1 adds latency)
     await waitFor(() => {
-      expect(screen.getByRole('heading', { name: 'Today' })).toBeTruthy()
-    }, { timeout: 500 })
+      const alerts = screen.getAllByRole('alert')
+      const dashboardAlert = alerts.find(alert => alert.textContent?.includes('boom'))
+      expect(dashboardAlert).toBeTruthy()
+    }, { timeout: 3000 })
   })
 })
