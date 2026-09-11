@@ -52,11 +52,17 @@ match, matching this codebase's now-established "never claim a scope
 grant this adapter cannot actually observe" precedent from `github_
 adapter.py`'s own review-fixed history.
 
-**Pagination is offset-based (`startAt`/`maxResults`/`total`), not
-`Link`-header-based** -- Jira's `/rest/api/3/search` endpoint has no
-concept of a `Link` header; a response reports its own `total` count,
-and a caller advances `startAt` by `maxResults` until it has seen `total`
-issues or a page comes back empty.
+**Pagination is cursor-based (`nextPageToken`/`maxResults`), not offset- or
+`Link`-header-based.** Atlassian retired `GET /rest/api/3/search` (the
+offset-based `startAt`/`maxResults`/`total` endpoint this adapter
+originally used) in favor of `GET /rest/api/3/search/jql` -- the old
+endpoint now returns `410 Gone` for every request, confirmed live against
+a real Jira Cloud site. The replacement has no `total` count and no
+`startAt` at all: a response carries `nextPageToken` (opaque, echoed back
+verbatim on the next request) when more results remain, and omits it on
+the last page. A caller advances by threading `nextPageToken` through,
+not an offset -- `start_at`/`total` bookkeeping is gone from `_sync_work_
+items` entirely, replaced by `next_page_token: str | None`.
 
 **Incremental cursor strategy.** JQL's `ORDER BY updated DESC` plus
 walking pages until an issue's own `fields.updated` falls at or before
@@ -133,6 +139,14 @@ _PAGE_SIZE = 100
 _MAX_PAGES_PER_CALL = 10
 _RATE_LIMIT_MAX_WAIT_SECONDS = 5.0
 _SEARCH_FIELDS = "summary,issuetype,status,reporter,assignee,created,updated,project"
+# `/rest/api/3/search/jql` rejects a bare `ORDER BY ...` with no filter
+# clause outright -- `400`, `"Unbounded JQL queries are not allowed here.
+# Please add a search restriction to your query."` -- confirmed live
+# against a real Jira Cloud site. `project is not EMPTY` is a real
+# restriction every genuine issue satisfies (every issue belongs to a
+# project) and therefore narrows nothing; it exists purely to make the
+# query "bounded" in the sense this endpoint's own guard checks for.
+_JQL_QUERY = "project is not EMPTY ORDER BY updated DESC"
 
 
 class _InvalidCredentialError(Exception):
@@ -421,21 +435,23 @@ class JiraAdapter:
         newest_updated_at = since_cursor
         newest_updated_dt = _parse_jira_timestamp(since_cursor)
         since_cursor_dt = _parse_jira_timestamp(since_cursor)
-        start_at = 0
+        next_page_token: str | None = None
         page = 1
         stopped_early = False
 
         while page <= _MAX_PAGES_PER_CALL:
+            params: dict[str, Any] = {
+                "jql": _JQL_QUERY,
+                "fields": _SEARCH_FIELDS,
+                "maxResults": _PAGE_SIZE,
+            }
+            if next_page_token is not None:
+                params["nextPageToken"] = next_page_token
             response = self._request_with_rate_limit_retry(
                 "GET",
-                f"https://{site}/rest/api/3/search",
+                f"https://{site}/rest/api/3/search/jql",
                 headers=headers,
-                params={
-                    "jql": "ORDER BY updated DESC",
-                    "fields": _SEARCH_FIELDS,
-                    "startAt": start_at,
-                    "maxResults": _PAGE_SIZE,
-                },
+                params=params,
             )
             if response is None:
                 return SyncOutcome(
@@ -450,7 +466,6 @@ class JiraAdapter:
 
             body = response.json()
             issues = body.get("issues") or []
-            total = body.get("total", 0)
             if not issues:
                 break
 
@@ -479,8 +494,8 @@ class JiraAdapter:
                     newest_updated_at = updated_at
                     newest_updated_dt = updated_dt
 
-            start_at += len(issues)
-            if stopped_early or start_at >= total:
+            next_page_token = body.get("nextPageToken")
+            if stopped_early or next_page_token is None:
                 break
             page += 1
         else:

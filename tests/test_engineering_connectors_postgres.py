@@ -1289,6 +1289,143 @@ def test_create_connector_idempotency_replay_does_not_trigger_a_second_auto_back
     assert count == 1
 
 
+# --- create_connector_endpoint: reactivate a disconnected account on reconnect --
+
+
+def test_create_connector_reactivates_a_disconnected_account_on_reconnect(
+    engineering_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    """`uq_connector_accounts_workspace_provider_external_id` is a plain
+    (non-partial) unique constraint, so reconnecting the same identity
+    used to always 409 `CONNECTOR_ALREADY_CONNECTED` even once the prior
+    row was `disconnected` -- permanently stranding it, unlike
+    `gmail_oauth.py`'s own OAuth-callback reactivation path. Reconnecting
+    must now revive the same row instead of staying stuck.
+    """
+    client, workspace_id, _user_id, token = engineering_test_context
+    credential = "token-reactivate"
+    created = client.post(
+        "/api/v1/engineering/connectors",
+        json={"provider": "sandbox", "credential": credential},
+        headers=_headers(token, key=str(uuid4())),
+    )
+    assert created.status_code == 201, created.text
+    account_id = created.json()["id"]
+
+    disable = client.post(
+        f"/api/v1/engineering/connectors/{account_id}/disable",
+        headers=_headers(token, key=str(uuid4())),
+    )
+    assert disable.status_code == 200
+    assert disable.json()["status"] == "disconnected"
+
+    reconnect = client.post(
+        "/api/v1/engineering/connectors",
+        json={"provider": "sandbox", "credential": credential},
+        headers=_headers(token, key=str(uuid4())),
+    )
+    assert reconnect.status_code == 201, reconnect.text
+    body = reconnect.json()
+    assert body["id"] == account_id
+    assert body["status"] == "active"
+    assert body["disconnected_at"] is None
+
+    with engine.begin() as connection:
+        count = connection.execute(
+            text("SELECT count(*) FROM connector_accounts WHERE workspace_id = :workspace_id"),
+            {"workspace_id": workspace_id},
+        ).scalar_one()
+        row = (
+            connection.execute(
+                text(
+                    "SELECT status, status_detail, last_error, disconnected_at, version, "
+                    "encrypted_credentials FROM connector_accounts WHERE id = :id"
+                ),
+                {"id": account_id},
+            )
+            .mappings()
+            .one()
+        )
+    assert count == 1
+    assert row["status"] == "active"
+    assert row["status_detail"] is None
+    assert row["last_error"] is None
+    assert row["disconnected_at"] is None
+    assert row["version"] == 3  # 1: created, 2: disabled, 3: reactivated
+    assert decrypt_credential(bytes(row["encrypted_credentials"])) == credential
+
+
+def test_create_connector_reconnect_of_an_active_account_still_conflicts(
+    engineering_test_context: tuple[TestClient, UUID, UUID, str],
+) -> None:
+    """The reactivation path added above must only fire for a `disconnected`
+    row -- an `active` duplicate (never disabled) is still a genuine
+    already-connected conflict, unchanged from prior behavior.
+    """
+    client, _workspace_id, _user_id, token = engineering_test_context
+    credential = "token-still-active"
+    first = client.post(
+        "/api/v1/engineering/connectors",
+        json={"provider": "sandbox", "credential": credential},
+        headers=_headers(token, key=str(uuid4())),
+    )
+    assert first.status_code == 201
+
+    second = client.post(
+        "/api/v1/engineering/connectors",
+        json={"provider": "sandbox", "credential": credential},
+        headers=_headers(token, key=str(uuid4())),
+    )
+    assert second.status_code == 409
+    assert second.json()["error"]["code"] == "CONNECTOR_ALREADY_CONNECTED"
+
+
+def test_create_connector_reactivation_triggers_auto_backfill(
+    engineering_test_context: tuple[TestClient, UUID, UUID, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A reactivated account has the same stale/empty data a brand new one
+    does, so reconnecting it should earn the same `_run_auto_backfill`
+    kick-off `create_connector_endpoint`'s genuine-INSERT path already
+    gets -- this is what actually lets a live GitLab/GitHub/Jira/Datadog
+    disconnect-then-reconnect exercise the auto-backfill feature.
+    """
+    client, _workspace_id, _user_id, token = engineering_test_context
+    adapter = _AutoBackfillSpyAdapter(provider="gitlab")
+    monkeypatch.setattr(connector_accounts_module, "connector_registry", _registry_with(adapter))
+
+    created = client.post(
+        "/api/v1/engineering/connectors",
+        json={"provider": "gitlab", "credential": "gitlab-token-reactivate"},
+        headers=_headers(token, key=str(uuid4())),
+    )
+    assert created.status_code == 201, created.text
+    account_id = created.json()["id"]
+    assert adapter.backfill_calls == ["repository"]
+
+    disable = client.post(
+        f"/api/v1/engineering/connectors/{account_id}/disable",
+        headers=_headers(token, key=str(uuid4())),
+    )
+    assert disable.status_code == 200
+
+    reconnect = client.post(
+        "/api/v1/engineering/connectors",
+        json={"provider": "gitlab", "credential": "gitlab-token-reactivate"},
+        headers=_headers(token, key=str(uuid4())),
+    )
+    assert reconnect.status_code == 201, reconnect.text
+    assert reconnect.json()["id"] == account_id
+
+    assert adapter.backfill_calls == ["repository", "repository"]
+    with engine.begin() as connection:
+        count = connection.execute(
+            text("SELECT count(*) FROM sync_runs WHERE connector_account_id = :id"),
+            {"id": account_id},
+        ).scalar_one()
+    assert count == 2
+
+
 def test_list_connectors_cross_workspace_isolation(
     engineering_test_context: tuple[TestClient, UUID, UUID, str],
 ) -> None:
@@ -2918,3 +3055,83 @@ def test_create_connector_idempotent_retry_racing_phase_three_replays_response(
             {"workspace_id": _workspace_id},
         ).scalar_one()
     assert account_count == 1
+
+
+def test_create_connector_idempotent_retry_racing_reactivation_replays_response(
+    engineering_test_context: tuple[TestClient, UUID, UUID, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Multi-persona review of the reactivation fix (below) found a real gap
+    the test above doesn't cover: a same-Idempotency-Key replay racing a
+    *reactivation*, not a genuine new-row create.
+
+    The two races differ in when the conflicting row starts existing. In
+    the genuine-create race above, neither concurrent request's row exists
+    until one of them `INSERT`s it -- so the loser's `IntegrityError` only
+    fires *after* the winner has already committed its idempotency record,
+    which is exactly what makes that race's single cache-recheck (`except
+    IntegrityError:`'s first `load_cached` call) sufficient. Reactivation
+    breaks that assumption: the conflicting row already exists *before
+    either request starts* (this test seeds it directly), so **both**
+    requests can hit their first cache-recheck while it's still empty --
+    neither has stored anything yet. The race instead resolves later, at
+    the `FOR UPDATE` lock on the re-`SELECT`: the loser blocks there,
+    unblocks once the winner's `UPDATE` + `store_idempotency` have
+    committed, and -- without a *second* cache-recheck at that point --
+    would incorrectly fall through to `409 CONNECTOR_ALREADY_CONNECTED`
+    instead of replaying the winner's response, breaking this endpoint's
+    own documented `Idempotency-Key` contract for this one specific race.
+    """
+    client, workspace_id, user_id, token = engineering_test_context
+    _insert_connector_account(
+        workspace_id,
+        user_id,
+        provider="sandbox",
+        external_account_id="slow-authorize-account",
+        status="disconnected",
+    )
+    slow_adapter = _SlowAuthorizeAdapter()
+    monkeypatch.setattr(
+        connector_accounts_module, "connector_registry", _registry_with(slow_adapter)
+    )
+    idempotency_key = str(uuid4())
+
+    def _create(create_client: TestClient) -> Any:
+        return create_client.post(
+            "/api/v1/engineering/connectors",
+            json={"provider": "sandbox", "credential": "token-reactivation-race"},
+            headers=_headers(token, key=idempotency_key),
+        )
+
+    client_a = TestClient(app)
+    client_a.cookies.set("ecc_session", token)
+    client_b = TestClient(app)
+    client_b.cookies.set("ecc_session", token)
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            future_a = pool.submit(_create, client_a)
+            future_b = pool.submit(_create, client_b)
+            response_a = future_a.result(timeout=10)
+            response_b = future_b.result(timeout=10)
+    finally:
+        client_a.close()
+        client_b.close()
+
+    assert response_a.status_code == 201, response_a.text
+    assert response_b.status_code == 201, response_b.text
+    ignored = {"request_id", "correlation_id"}
+    body_a = {k: v for k, v in response_a.json().items() if k not in ignored}
+    body_b = {k: v for k, v in response_b.json().items() if k not in ignored}
+    assert body_a == body_b
+
+    with engine.begin() as connection:
+        rows = connection.execute(
+            text(
+                "SELECT status, version FROM connector_accounts WHERE workspace_id = :workspace_id "
+                "AND provider = 'sandbox' AND external_account_id = 'slow-authorize-account'"
+            ),
+            {"workspace_id": workspace_id},
+        ).all()
+    assert len(rows) == 1
+    assert rows[0].status == "active"
+    assert rows[0].version == 2  # 1: seeded disconnected, 2: reactivated -- never a third write
