@@ -1,6 +1,7 @@
 import { useQuery } from '@tanstack/react-query'
 
 import { apiRequest } from '../../api/client'
+import { apiErrorMessage } from '../../api/errorMessage'
 import MetricCard from './MetricCard'
 import type { MetricsListResponse } from './types'
 
@@ -30,7 +31,7 @@ export default function ReliabilityPanel() {
       <p>How quickly this workspace recovers from incidents. Delivery frequency, lead time for changes, and change failure rate all still require a deployments source this phase has not added yet -- see Delivery for their current, disclosed insufficient-coverage state.</p>
 
       {query.isLoading ? <p role="status">Loading reliability metrics…</p> : null}
-      {query.isError ? <div role="alert" className="inline-status error-panel">{query.error.message}</div> : null}
+      {query.isError ? <div role="alert" className="inline-status error-panel">{apiErrorMessage(query.error)}</div> : null}
       {query.data && metrics.length === 0 ? <p className="empty-state">No reliability metrics yet.</p> : null}
 
       <ul className="work-list">

@@ -112,7 +112,7 @@ export default function IncidentsPanel() {
       </form>
       {createMutation.isError ? <div role="alert" className="inline-status error-panel">{errorMessage(createMutation.error)}</div> : null}
 
-      <div role="radiogroup" aria-label="Filter by status" className="work-actions">
+      <div role="group" aria-label="Filter by status" className="work-actions">
         {(['', 'open', 'resolved'] as const).map((value) => (
           <button
             key={value || 'all'}

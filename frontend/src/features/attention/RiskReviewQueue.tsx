@@ -91,7 +91,7 @@ export default function RiskReviewQueue() {
       </div>
 
       {query.isLoading ? <p role="status">Loading review queue…</p> : null}
-      {query.isError ? <div role="alert" className="inline-status error-panel">{query.error.message}</div> : null}
+      {query.isError ? <div role="alert" className="inline-status error-panel">{errorMessage(query.error)}</div> : null}
       {reviewMutation.isError ? <div role="alert" className="inline-status error-panel">{errorMessage(reviewMutation.error)}</div> : null}
       {query.data && items.length === 0 ? <p className="empty-state">No risks are due for review.</p> : null}
 
@@ -106,6 +106,7 @@ export default function RiskReviewQueue() {
               <button
                 type="button"
                 disabled={pending}
+                aria-busy={pending}
                 aria-label={`Record review for ${item.description}`}
                 onClick={() => setReviewing({ item, draft: emptyDraft, version: item.version })}
               >
@@ -125,9 +126,9 @@ export default function RiskReviewQueue() {
             </select>
           </label>
           <label>Notes<textarea aria-label="Review notes" value={reviewing.draft.notes} onChange={(e) => setReviewing({ ...reviewing, draft: { ...reviewing.draft, notes: e.target.value } })} /></label>
-          <label>Next review at<input aria-label="Next review at" type="datetime-local" value={reviewing.draft.nextReviewAt} onChange={(e) => setReviewing({ ...reviewing, draft: { ...reviewing.draft, nextReviewAt: e.target.value } })} /></label>
-          <button type="submit" disabled={pending}>Save review</button>
-          <button type="button" disabled={pending} onClick={() => setReviewing(null)}>Discard</button>
+          <label>Next review at<input type="datetime-local" value={reviewing.draft.nextReviewAt} onChange={(e) => setReviewing({ ...reviewing, draft: { ...reviewing.draft, nextReviewAt: e.target.value } })} /></label>
+          <button type="submit" disabled={pending} aria-busy={pending}>Save review</button>
+          <button type="button" disabled={pending} aria-busy={pending} onClick={() => setReviewing(null)}>Discard</button>
         </form>
       ) : null}
     </section>

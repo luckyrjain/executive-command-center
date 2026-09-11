@@ -1,6 +1,7 @@
 import { useQuery } from '@tanstack/react-query'
 
 import { apiRequest } from '../../api/client'
+import { apiErrorMessage } from '../../api/errorMessage'
 import MetricCard from './MetricCard'
 import type { MetricKey, MetricsListResponse } from './types'
 
@@ -40,7 +41,7 @@ export default function DeliveryPanel() {
       <p>How change and work move through this workspace's connected repositories -- delivery frequency, lead time, change failure rate, review latency, and open-work-item health. Every number shows its own coverage; a metric below 50% source coverage is never shown as if it were complete.</p>
 
       {query.isLoading ? <p role="status">Loading delivery metrics…</p> : null}
-      {query.isError ? <div role="alert" className="inline-status error-panel">{query.error.message}</div> : null}
+      {query.isError ? <div role="alert" className="inline-status error-panel">{apiErrorMessage(query.error)}</div> : null}
       {query.data && metrics.length === 0 ? <p className="empty-state">No delivery metrics yet.</p> : null}
 
       <ul className="work-list">

@@ -1,6 +1,7 @@
 import { useQuery } from '@tanstack/react-query'
 
 import { apiRequest } from '../../api/client'
+import { apiErrorMessage } from '../../api/errorMessage'
 import type {
   ConnectorAccountListResponse,
   DecisionListResponse,
@@ -75,7 +76,7 @@ export default function EngineeringOverview({ onNavigate }: { onNavigate: (view:
         <li>
           <strong>Connectors</strong>
           {connectors.isLoading ? <p role="status">Loading…</p> : null}
-          {connectors.isError ? <div role="alert" className="inline-status error-panel">{connectors.error.message}</div> : null}
+          {connectors.isError ? <div role="alert" className="inline-status error-panel">{apiErrorMessage(connectors.error)}</div> : null}
           {connectors.data ? (
             <>
               <p role="status" className={degradedConnectors.length > 0 ? 'inline-status degraded-panel' : undefined}>
@@ -91,7 +92,7 @@ export default function EngineeringOverview({ onNavigate }: { onNavigate: (view:
         <li>
           <strong>Open incidents</strong>
           {incidents.isLoading ? <p role="status">Loading…</p> : null}
-          {incidents.isError ? <div role="alert" className="inline-status error-panel">{incidents.error.message}</div> : null}
+          {incidents.isError ? <div role="alert" className="inline-status error-panel">{apiErrorMessage(incidents.error)}</div> : null}
           {incidents.data ? (
             <>
               <p role="status" className={incidents.data.incidents.length > 0 ? 'inline-status degraded-panel' : undefined}>
@@ -107,7 +108,7 @@ export default function EngineeringOverview({ onNavigate }: { onNavigate: (view:
         <li>
           <strong>Proposed decisions</strong>
           {decisions.isLoading ? <p role="status">Loading…</p> : null}
-          {decisions.isError ? <div role="alert" className="inline-status error-panel">{decisions.error.message}</div> : null}
+          {decisions.isError ? <div role="alert" className="inline-status error-panel">{apiErrorMessage(decisions.error)}</div> : null}
           {decisions.data ? (
             <>
               <p role="status" className={decisions.data.decisions.length > 0 ? 'inline-status degraded-panel' : undefined}>
@@ -123,7 +124,7 @@ export default function EngineeringOverview({ onNavigate }: { onNavigate: (view:
         <li>
           <strong>Headline metrics</strong>
           {metrics.isLoading ? <p role="status">Loading…</p> : null}
-          {metrics.isError ? <div role="alert" className="inline-status error-panel">{metrics.error.message}</div> : null}
+          {metrics.isError ? <div role="alert" className="inline-status error-panel">{apiErrorMessage(metrics.error)}</div> : null}
           {metrics.data ? (
             <>
               {headline.length === 0 ? (

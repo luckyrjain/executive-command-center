@@ -127,26 +127,27 @@ export default function TaskWorkspace() {
       {mutationError ? <div className="inline-status error-panel" role="alert">{errorMessage(mutationError)}</div> : null}
       <form className="field-form" onSubmit={submitCreate}>
         <h2>Create task</h2>
-        <label>Task title<input aria-label="Task title" value={create.title} onChange={(event) => setCreate({ ...create, title: event.target.value })} /></label>
+        <label>Task title<input value={create.title} onChange={(event) => setCreate({ ...create, title: event.target.value })} /></label>
         <label>Description<textarea value={create.description} onChange={(event) => setCreate({ ...create, description: event.target.value })} /></label>
         <label>Priority<select value={create.priority} onChange={(event) => setCreate({ ...create, priority: event.target.value as Task['manual_priority'] })}><option>low</option><option>medium</option><option>high</option><option>critical</option></select></label>
-        <label>Due date<input aria-label="Due date" type="date" value={create.dueDate} disabled={Boolean(create.dueAt)} onChange={(event) => setCreate({ ...create, dueDate: event.target.value })} /></label>
-        <label>Due time<input aria-label="Due time" type="datetime-local" value={create.dueAt} disabled={Boolean(create.dueDate)} onChange={(event) => setCreate({ ...create, dueAt: event.target.value })} /></label>
-        <button type="submit" disabled={createMutation.isPending}>Create task</button>
+        <label>Due date<input type="date" value={create.dueDate} disabled={Boolean(create.dueAt)} onChange={(event) => setCreate({ ...create, dueDate: event.target.value })} /></label>
+        <label>Due time<input type="datetime-local" value={create.dueAt} disabled={Boolean(create.dueDate)} onChange={(event) => setCreate({ ...create, dueAt: event.target.value })} /></label>
+        <button type="submit" disabled={createMutation.isPending} aria-busy={createMutation.isPending}>Create task</button>
       </form>
 
       {query.isLoading ? <p role="status">Loading tasks…</p> : null}
-      {query.isError ? <div className="inline-status error-panel" role="alert">{query.error.message}</div> : null}
+      {query.isError ? <div className="inline-status error-panel" role="alert">{errorMessage(query.error)}</div> : null}
       {query.data && query.data.items.length === 0 ? <p className="empty-state">No tasks yet. Create one above to get started.</p> : null}
       <ol className="work-list">
         {(query.data?.items ?? []).map((task) => {
           const archived = Boolean(task.archived_at)
           const terminal = ['completed', 'cancelled'].includes(task.status)
+          const rowBusy = actionMutation.isPending || editMutation.isPending
           return <li key={task.id}>
             <div><strong>{task.title}</strong><small>{task.status.replaceAll('_', ' ')} · {task.manual_priority}</small></div>
             <div className="work-actions" role="group" aria-label={`Actions for ${task.title}`}>
-              {!archived && !terminal ? <><button type="button" disabled={actionMutation.isPending || editMutation.isPending} aria-label={`Edit ${task.title}`} onClick={() => setEdit({ task, ...taskDraft(task), latestVersion: task.version, conflict: false, reloadFailed: false })}>Edit</button><button type="button" disabled={actionMutation.isPending || editMutation.isPending} aria-label={`Complete ${task.title}`} onClick={() => actionMutation.mutate({ task, action: 'complete' })}>Complete</button><button type="button" className="btn-destructive" disabled={actionMutation.isPending || editMutation.isPending} aria-label={`Cancel ${task.title}`} onClick={() => actionMutation.mutate({ task, action: 'cancel' })}>Cancel</button></> : null}
-              {!archived ? <button type="button" disabled={actionMutation.isPending || editMutation.isPending} aria-label={`Archive ${task.title}`} onClick={() => actionMutation.mutate({ task, action: 'archive' })}>Archive</button> : <button type="button" disabled={actionMutation.isPending || editMutation.isPending} aria-label={`Restore ${task.title}`} onClick={() => actionMutation.mutate({ task, action: 'restore' })}>Restore</button>}
+              {!archived && !terminal ? <><button type="button" disabled={rowBusy} aria-busy={rowBusy} aria-label={`Edit ${task.title}`} onClick={() => setEdit({ task, ...taskDraft(task), latestVersion: task.version, conflict: false, reloadFailed: false })}>Edit</button><button type="button" disabled={rowBusy} aria-busy={rowBusy} aria-label={`Complete ${task.title}`} onClick={() => actionMutation.mutate({ task, action: 'complete' })}>Complete</button><button type="button" className="btn-destructive" disabled={rowBusy} aria-busy={rowBusy} aria-label={`Cancel ${task.title}`} onClick={() => actionMutation.mutate({ task, action: 'cancel' })}>Cancel</button></> : null}
+              {!archived ? <button type="button" disabled={rowBusy} aria-busy={rowBusy} aria-label={`Archive ${task.title}`} onClick={() => actionMutation.mutate({ task, action: 'archive' })}>Archive</button> : <button type="button" disabled={rowBusy} aria-busy={rowBusy} aria-label={`Restore ${task.title}`} onClick={() => actionMutation.mutate({ task, action: 'restore' })}>Restore</button>}
             </div>
           </li>
         })}
@@ -154,12 +155,12 @@ export default function TaskWorkspace() {
 
       {edit ? <form className="field-form" onSubmit={submitEdit}>
         <h2>Edit task</h2>
-        <label>Edit task title<input aria-label="Edit task title" value={edit.title} onChange={(event) => setEdit({ ...edit, title: event.target.value })} /></label>
+        <label>Edit task title<input value={edit.title} onChange={(event) => setEdit({ ...edit, title: event.target.value })} /></label>
         <label>Edit description<textarea value={edit.description} onChange={(event) => setEdit({ ...edit, description: event.target.value })} /></label>
         <label>Edit priority<select value={edit.priority} onChange={(event) => setEdit({ ...edit, priority: event.target.value as Task['manual_priority'] })}><option>low</option><option>medium</option><option>high</option><option>critical</option></select></label>
         <label>Edit due date<input type="date" value={edit.dueDate} disabled={Boolean(edit.dueAt)} onChange={(event) => setEdit({ ...edit, dueDate: event.target.value })} /></label>
         <label>Edit due time<input type="datetime-local" value={edit.dueAt} disabled={Boolean(edit.dueDate)} onChange={(event) => setEdit({ ...edit, dueAt: event.target.value })} /></label>
-        {edit.reloadFailed ? <><p role="alert">Could not reload the latest task. Your edits are preserved.</p><button type="button" onClick={() => void reloadLatestTask(edit.task.id)}>Reload latest task</button></> : edit.conflict ? <button type="button" disabled={editMutation.isPending} onClick={() => submitEdit()}>Retry with latest version</button> : <button type="submit" disabled={editMutation.isPending}>Save task</button>}
+        {edit.reloadFailed ? <><div role="alert" className="inline-status error-panel">Could not reload the latest task. Your edits are preserved.</div><button type="button" onClick={() => void reloadLatestTask(edit.task.id)}>Reload latest task</button></> : edit.conflict ? <button type="button" disabled={editMutation.isPending} aria-busy={editMutation.isPending} onClick={() => submitEdit()}>Retry with latest version</button> : <button type="submit" disabled={editMutation.isPending} aria-busy={editMutation.isPending}>Save task</button>}
         <button type="button" disabled={editMutation.isPending} onClick={() => setEdit(null)}>Discard edit</button>
       </form> : null}
     </section>
