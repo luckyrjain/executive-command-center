@@ -15,6 +15,18 @@
 
 FROM node:22.17.0-alpine AS deps
 WORKDIR /app
+# Corepack's own package store lives under $COREPACK_HOME (default
+# $HOME/.cache/node/corepack), which otherwise differs between this RUN
+# (root, $HOME=/root) and the `dev` stage's runtime user (`node`,
+# $HOME=/home/node) -- the pnpm shim then finds no cached copy under the
+# node user's own $HOME and tries to fetch/verify one at container start,
+# which fails outright once docker-compose.yml's `read_only: true` +
+# `tmpfs: [/tmp]` makes everywhere outside /tmp non-writable (confirmed via
+# a real container run: `mkdir '/home/node/.cache/node/corepack/v1'` ENOENT).
+# Pinning COREPACK_HOME to a fixed, world-readable path makes every stage
+# and every user look in the same already-populated directory, so the
+# runtime lookup is a cache hit with nothing left to write.
+ENV COREPACK_HOME=/opt/corepack-cache
 RUN corepack enable && corepack prepare pnpm@10.12.4 --activate
 COPY package.json pnpm-workspace.yaml pnpm-lock.yaml ./
 COPY frontend/package.json ./frontend/package.json
