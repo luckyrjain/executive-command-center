@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Annotated
 from uuid import UUID
 
@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 from ecc.auth import AuthDep
 from ecc.database import get_session
 from ecc.domains.governance.recommendation_models import (
+    RecommendationCount,
     RecommendationListResponse,
     RecommendationResponse,
     RecommendationStatus,
@@ -110,6 +111,29 @@ def list_recommendations(
         last = items[-1]
         next_cursor = _encode_cursor(last.created_at, last.id)
     return RecommendationListResponse(items=items, next_cursor=next_cursor)
+
+
+@router.get("/count", response_model=RecommendationCount)
+def count_recommendations(auth: AuthDep, session: SessionDep) -> RecommendationCount:
+    visibility_sql, visibility_params = authz.visible_resource_filter_sql(
+        session, auth, resource_type="recommendations", action="read", table_alias="recommendations"
+    )
+    count = session.execute(
+        text(f"""
+            SELECT COUNT(*) FROM recommendations
+            WHERE workspace_id = :workspace_id
+              AND ({visibility_sql})
+              AND archived_at IS NULL
+              AND status = ANY(CAST(:statuses AS text[]))
+        """),
+        {
+            "workspace_id": auth.workspace_id,
+            "statuses": ["proposed", "pending_confirmation"],
+            **visibility_params,
+        },
+    ).scalar_one()
+    session.rollback()
+    return RecommendationCount(count=count)
 
 
 @router.get("/{recommendation_id}", response_model=RecommendationResponse)
