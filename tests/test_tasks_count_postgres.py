@@ -108,6 +108,9 @@ def test_tasks_count_excludes_completed_and_archived(
     _create_task(client, token, "open task one")
     _create_task(client, token, "open task two")
     completed_id = _create_task(client, token, "will be completed")
+    archived_id = _create_task(client, token, "will be archived")
+
+    # Complete one task
     complete_response = client.post(
         f"/api/v1/tasks/{completed_id}/complete",
         json={"expected_version": 1},
@@ -115,6 +118,15 @@ def test_tasks_count_excludes_completed_and_archived(
     )
     assert complete_response.status_code == 200, complete_response.text
 
+    # Archive another task
+    archive_response = client.post(
+        f"/api/v1/tasks/{archived_id}/archive",
+        json={"expected_version": 1},
+        headers=_headers(token, f"count-test-{uuid4()}"),
+    )
+    assert archive_response.status_code == 200, archive_response.text
+
+    # Count should only include the 2 open tasks
     counted = client.get("/api/v1/tasks/count")
     assert counted.status_code == 200
     assert counted.json()["count"] == 2
