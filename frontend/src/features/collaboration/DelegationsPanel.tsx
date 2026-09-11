@@ -50,7 +50,7 @@ function DelegationRow({
       {delegation.status === 'proposed' && isRecipient ? (
         <div className="work-actions">
           <button type="button" disabled={actionMutation.isPending} aria-busy={actionMutation.isPending} onClick={() => actionMutation.mutate('accept')}>Accept</button>
-          <button type="button" disabled={actionMutation.isPending} aria-busy={actionMutation.isPending} onClick={() => actionMutation.mutate('reject')}>Reject</button>
+          <button type="button" className="btn-destructive" disabled={actionMutation.isPending} aria-busy={actionMutation.isPending} onClick={() => actionMutation.mutate('reject')}>Reject</button>
         </div>
       ) : null}
       {delegation.status === 'proposed' && isDelegator ? (
