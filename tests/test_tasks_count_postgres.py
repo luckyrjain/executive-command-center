@@ -65,13 +65,22 @@ def tasks_count_context() -> Iterator[tuple[TestClient, UUID, UUID, str]]:
     finally:
         client.close()
         with engine.begin() as connection:
-            for table in ("tasks", "sessions", "users", "workspaces"):
+            for table in (
+                "tasks",
+                "event_outbox",
+                "audit_events",
+                "idempotency_records",
+                "sessions",
+                "users",
+            ):
                 connection.execute(
-                    text(f"DELETE FROM {table} WHERE id = :workspace_id")
-                    if table == "workspaces"
-                    else text(f"DELETE FROM {table} WHERE workspace_id = :workspace_id"),
+                    text(f"DELETE FROM {table} WHERE workspace_id = :workspace_id"),
                     {"workspace_id": workspace_id},
                 )
+            connection.execute(
+                text("DELETE FROM workspaces WHERE id = :workspace_id"),
+                {"workspace_id": workspace_id},
+            )
 
 
 def _headers(token: str, key: str) -> dict[str, str]:
@@ -99,11 +108,13 @@ def test_tasks_count_excludes_completed_and_archived(
     _create_task(client, token, "open task one")
     _create_task(client, token, "open task two")
     completed_id = _create_task(client, token, "will be completed")
-    client.post(
+    complete_response = client.post(
         f"/api/v1/tasks/{completed_id}/complete",
+        json={"expected_version": 1},
         headers=_headers(token, f"count-test-{uuid4()}"),
     )
+    assert complete_response.status_code == 200, complete_response.text
 
     counted = client.get("/api/v1/tasks/count")
     assert counted.status_code == 200
-    assert counted.json() == {"count": 2}
+    assert counted.json()["count"] == 2

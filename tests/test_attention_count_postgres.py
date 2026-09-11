@@ -64,13 +64,22 @@ def attention_count_context() -> Iterator[tuple[TestClient, UUID, UUID, str]]:
     finally:
         client.close()
         with engine.begin() as connection:
-            for table in ("attention_items", "sessions", "users", "workspaces"):
+            for table in (
+                "attention_items",
+                "event_outbox",
+                "audit_events",
+                "idempotency_records",
+                "sessions",
+                "users",
+            ):
                 connection.execute(
-                    text(f"DELETE FROM {table} WHERE workspace_id = :workspace_id")
-                    if table != "workspaces"
-                    else text(f"DELETE FROM {table} WHERE id = :workspace_id"),
+                    text(f"DELETE FROM {table} WHERE workspace_id = :workspace_id"),
                     {"workspace_id": workspace_id},
                 )
+            connection.execute(
+                text("DELETE FROM workspaces WHERE id = :workspace_id"),
+                {"workspace_id": workspace_id},
+            )
 
 
 def _insert_attention_item(workspace_id: UUID, owner_id: UUID, now: datetime) -> None:
@@ -114,7 +123,7 @@ def test_attention_count_matches_list_length(
 
     counted = client.get("/api/v1/attention/count")
     assert counted.status_code == 200
-    assert counted.json() == {"count": 2}
+    assert counted.json()["count"] == 2
 
 
 def test_attention_count_is_zero_for_an_empty_workspace(
@@ -123,4 +132,4 @@ def test_attention_count_is_zero_for_an_empty_workspace(
     client, _workspace_id, _user_id, _token = attention_count_context
     counted = client.get("/api/v1/attention/count")
     assert counted.status_code == 200
-    assert counted.json() == {"count": 0}
+    assert counted.json()["count"] == 0

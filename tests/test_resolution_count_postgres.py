@@ -65,13 +65,23 @@ def resolution_count_context() -> Iterator[tuple[TestClient, UUID, UUID, str]]:
     finally:
         client.close()
         with engine.begin() as connection:
-            for table in ("resolution_candidates", "pkos_nodes", "sessions", "users", "workspaces"):
+            for table in (
+                "resolution_candidates",
+                "pkos_nodes",
+                "event_outbox",
+                "audit_events",
+                "idempotency_records",
+                "sessions",
+                "users",
+            ):
                 connection.execute(
-                    text(f"DELETE FROM {table} WHERE id = :workspace_id")
-                    if table == "workspaces"
-                    else text(f"DELETE FROM {table} WHERE workspace_id = :workspace_id"),
+                    text(f"DELETE FROM {table} WHERE workspace_id = :workspace_id"),
                     {"workspace_id": workspace_id},
                 )
+            connection.execute(
+                text("DELETE FROM workspaces WHERE id = :workspace_id"),
+                {"workspace_id": workspace_id},
+            )
 
 
 def _headers(token: str, key: str) -> dict[str, str]:
@@ -109,7 +119,7 @@ def test_resolution_count_matches_open_candidates(
 
     counted = client.get("/api/v1/knowledge/resolution/candidates/count")
     assert counted.status_code == 200
-    assert counted.json() == {"count": 1}
+    assert counted.json()["count"] == 1
 
     listed = client.get("/api/v1/knowledge/resolution/candidates", params={"status": "open"})
     assert len(listed.json()["items"]) == counted.json()["count"]

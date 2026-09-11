@@ -70,16 +70,20 @@ def recommendation_count_context() -> Iterator[tuple[TestClient, UUID, UUID, str
                 "tasks",
                 "commitments",
                 "risks",
+                "event_outbox",
+                "audit_events",
+                "idempotency_records",
                 "sessions",
                 "users",
-                "workspaces",
             ):
                 connection.execute(
-                    text(f"DELETE FROM {table} WHERE id = :workspace_id")
-                    if table == "workspaces"
-                    else text(f"DELETE FROM {table} WHERE workspace_id = :workspace_id"),
+                    text(f"DELETE FROM {table} WHERE workspace_id = :workspace_id"),
                     {"workspace_id": workspace_id},
                 )
+            connection.execute(
+                text("DELETE FROM workspaces WHERE id = :workspace_id"),
+                {"workspace_id": workspace_id},
+            )
 
 
 def _insert_recommendation(workspace_id: UUID, user_id: UUID, status: str, now: datetime) -> None:
@@ -125,4 +129,4 @@ def test_recommendations_count_only_counts_pending_statuses(
 
     counted = client.get("/api/v1/recommendations/count")
     assert counted.status_code == 200
-    assert counted.json() == {"count": 2}
+    assert counted.json()["count"] == 2
