@@ -198,8 +198,8 @@ export default function SearchAuditPanel() {
             </ol>
           ) : null}
           {search.data?.next_cursor ? (
-            <button type="button" onClick={() => setSearchCursor(search.data?.next_cursor ?? null)}>
-              Load more results
+            <button type="button" disabled={search.isFetching} aria-busy={search.isFetching} onClick={() => setSearchCursor(search.data?.next_cursor ?? null)}>
+              {search.isFetching ? 'Loading…' : 'Load more results'}
             </button>
           ) : null}
         </div>
@@ -238,8 +238,8 @@ export default function SearchAuditPanel() {
             </ol>
           ) : null}
           {audit.data?.next_cursor ? (
-            <button type="button" onClick={() => setAuditCursor(audit.data?.next_cursor ?? null)}>
-              Load older events
+            <button type="button" disabled={audit.isFetching} aria-busy={audit.isFetching} onClick={() => setAuditCursor(audit.data?.next_cursor ?? null)}>
+              {audit.isFetching ? 'Loading…' : 'Load older events'}
             </button>
           ) : null}
         </div>
