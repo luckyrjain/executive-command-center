@@ -8,7 +8,7 @@
 
 **Tech Stack:** FastAPI, SQLAlchemy Core (`sqlalchemy.text`), Pydantic, pytest against a real PostgreSQL instance (existing `pytestmark = pytest.mark.skipif(not settings.database_url.startswith("postgresql"), ...)` convention).
 
-**Spec:** [docs/superpowers/specs/2026-09-11-navigation-redesign-design.md](../specs/2026-09-11-navigation-redesign-design.md) — "Badge counts" section. This plan covers only the 4 backend endpoints that section lists as needing new work; it does not touch the frontend sidebar, routing, or the 2 free (Risks/Automation) counts.
+**Spec:** `docs/superpowers/specs/2026-09-11-navigation-redesign-design.md` (lives only on the `navigation-redesign-sidebar` branch, not this one — not a relative link) — "Badge counts" section. This plan covers only the 4 backend endpoints that section lists as needing new work; it does not touch the frontend sidebar, routing, or the 2 free (Risks/Automation) counts.
 
 ## Global Constraints
 
