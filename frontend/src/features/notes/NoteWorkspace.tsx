@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState, type FormEvent } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
 import { ApiError, apiRequest } from '../../api/client'
+import { apiErrorMessage } from '../../api/errorMessage'
 import { createAutosaveController, type AutosaveController, type AutosaveState } from './autosave'
 import { createNoteDraftRecoveryStore, type NoteDraftRecoveryStore } from './draftRecovery'
 
@@ -212,18 +213,18 @@ export default function NoteWorkspace({ recoveryStore }: NoteWorkspaceProps) {
 
   return <section className="work-panel note-workspace" aria-labelledby="notes-title">
     <div className="work-heading"><div><p className="eyebrow">KNOWLEDGE</p><h1 id="notes-title">Notes</h1><p>Capture and safely refine your working context.</p></div></div>
-    {mutationError ? <div role="alert" className="inline-status error-panel">{mutationError.message}</div> : null}
+    {mutationError ? <div role="alert" className="inline-status error-panel">{apiErrorMessage(mutationError)}</div> : null}
     <form onSubmit={submitCreate} className="field-form">
       <h2>Create note</h2>
-      <label>Note title<input aria-label="Note title" value={create.title} onChange={(event) => setCreate({ ...create, title: event.target.value })} /></label>
-      <label>Note body<textarea aria-label="Note body" required value={create.body} onChange={(event) => setCreate({ ...create, body: event.target.value })} /></label>
-      <label>Note type<select aria-label="Note type" value={create.noteType} onChange={(event) => setCreate({ ...create, noteType: event.target.value as NoteDraft['noteType'] })}><option value="general">General</option><option value="decision">Decision</option><option value="journal">Journal</option></select></label>
-      <button type="submit" disabled={createMutation.isPending}>Create note</button>
+      <label>Note title<input value={create.title} onChange={(event) => setCreate({ ...create, title: event.target.value })} /></label>
+      <label>Note body<textarea required value={create.body} onChange={(event) => setCreate({ ...create, body: event.target.value })} /></label>
+      <label>Note type<select value={create.noteType} onChange={(event) => setCreate({ ...create, noteType: event.target.value as NoteDraft['noteType'] })}><option value="general">General</option><option value="decision">Decision</option><option value="journal">Journal</option></select></label>
+      <button type="submit" disabled={createMutation.isPending} aria-busy={createMutation.isPending}>Create note</button>
     </form>
 
-    <label className="note-search">Search notes<input aria-label="Search notes" type="search" value={search} onChange={(event) => setSearch(event.target.value)} /></label>
+    <label className="note-search">Search notes<input type="search" value={search} onChange={(event) => setSearch(event.target.value)} /></label>
     {query.isLoading ? <p role="status">Loading notes…</p> : null}
-    {query.isError ? <div className="inline-status error-panel" role="alert">{query.error.message}</div> : null}
+    {query.isError ? <div className="inline-status error-panel" role="alert">{apiErrorMessage(query.error)}</div> : null}
     {query.data && visibleNotes.length === 0 ? (
       <p className="empty-state">
         {query.data.items.length === 0 ? 'No notes yet. Create one above to get started.' : 'No notes match your search.'}
@@ -233,12 +234,12 @@ export default function NoteWorkspace({ recoveryStore }: NoteWorkspaceProps) {
       const title = displayTitle(note)
       return <li key={note.id}><div><strong>{title}</strong><small>{note.note_type}{note.archived_at ? ' · archived' : ''}</small><p>{note.body}</p></div><div className="work-actions" role="group" aria-label={`Actions for ${title}`}>
         {!note.archived_at ? <button type="button" aria-label={`Edit ${title}`} onClick={() => { void beginEditing(note) }}>Edit</button> : null}
-        {!note.archived_at ? <button type="button" aria-label={`Archive ${title}`} disabled={actionMutation.isPending} onClick={() => actionMutation.mutate({ note, action: 'archive' })}>Archive</button> : <button type="button" aria-label={`Restore ${title}`} disabled={actionMutation.isPending} onClick={() => actionMutation.mutate({ note, action: 'restore' })}>Restore</button>}
+        {!note.archived_at ? <button type="button" aria-label={`Archive ${title}`} disabled={actionMutation.isPending} aria-busy={actionMutation.isPending} onClick={() => actionMutation.mutate({ note, action: 'archive' })}>Archive</button> : <button type="button" aria-label={`Restore ${title}`} disabled={actionMutation.isPending} aria-busy={actionMutation.isPending} onClick={() => actionMutation.mutate({ note, action: 'restore' })}>Restore</button>}
       </div></li>
     })}</ol>
 
     {editing ? <section className="field-form note-editor" aria-labelledby="note-editor-title"><h2 id="note-editor-title">Edit {displayTitle(editing)}</h2>
-      <label>Edit note body<textarea aria-label="Edit note body" value={body} onChange={(event) => updateBody(event.target.value)} onBlur={() => { void controller.current?.flush() }} /></label>
+      <label>Edit note body<textarea value={body} onChange={(event) => updateBody(event.target.value)} onBlur={() => { void controller.current?.flush() }} /></label>
       {saveMessage ? <div role={saveState.status === 'error' ? 'alert' : 'status'} aria-live={saveState.status === 'error' ? 'assertive' : 'polite'} className={`inline-status${saveState.status === 'error' ? ' error-panel' : ''}`}>{saveMessage}</div> : null}
       {saveState.status === 'error' && conflictVersion === null && !conflictReloadFailed ? <button type="button" onClick={() => { void controller.current?.flush() }}>Retry save</button> : null}
       {conflictReloadFailed ? <><p>Your note changed elsewhere, but the latest version could not be loaded. Your text is preserved.</p><button type="button" onClick={() => { void reloadLatestNote(editing.id) }}>Reload latest note</button></> : null}

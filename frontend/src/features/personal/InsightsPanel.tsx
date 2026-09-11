@@ -29,8 +29,8 @@ function FeedbackForm({ insight }: { insight: Insight }) {
         </label>
       </div>
       <div className="work-actions">
-        <button type="button" disabled={feedbackMutation.isPending} onClick={() => feedbackMutation.mutate(true)}>Useful</button>
-        <button type="button" disabled={feedbackMutation.isPending} onClick={() => feedbackMutation.mutate(false)}>Not useful</button>
+        <button type="button" aria-busy={feedbackMutation.isPending} disabled={feedbackMutation.isPending} onClick={() => feedbackMutation.mutate(true)}>Useful</button>
+        <button type="button" aria-busy={feedbackMutation.isPending} disabled={feedbackMutation.isPending} onClick={() => feedbackMutation.mutate(false)}>Not useful</button>
       </div>
       {feedbackMutation.isError ? <div role="alert" className="inline-status error-panel">{personalErrorMessage(feedbackMutation.error)}</div> : null}
     </div>
@@ -71,7 +71,7 @@ function InsightCard({ insight, onDismissed }: { insight: Insight; onDismissed: 
           than tracking a terminal state client-side that the server itself
           never sends back. */}
       <div className="work-actions">
-        <button type="button" disabled={dismissMutation.isPending} onClick={() => dismissMutation.mutate()}>Dismiss</button>
+        <button type="button" aria-busy={dismissMutation.isPending} disabled={dismissMutation.isPending} onClick={() => dismissMutation.mutate()}>Dismiss</button>
       </div>
       {dismissMutation.isError ? <div role="alert" className="inline-status error-panel">{personalErrorMessage(dismissMutation.error)}</div> : null}
 
@@ -129,7 +129,7 @@ export default function InsightsPanel() {
           </label>
         ))}
         <div className="work-actions">
-          <button type="button" disabled={generateMutation.isPending || sourceDomains.length === 0} onClick={() => generateMutation.mutate()}>
+          <button type="button" aria-busy={generateMutation.isPending} disabled={generateMutation.isPending || sourceDomains.length === 0} onClick={() => generateMutation.mutate()}>
             Generate insight
           </button>
         </div>

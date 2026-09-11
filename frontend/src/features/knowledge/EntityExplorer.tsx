@@ -2,6 +2,7 @@ import { Fragment, useState, type FormEvent, type ReactNode } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
 import { apiRequest } from '../../api/client'
+import { apiErrorMessage } from '../../api/errorMessage'
 import EntityDetail from './EntityDetail'
 import type { EntityKind, EntityList, KnowledgeEntity, RetrievalResponse } from './types'
 
@@ -84,6 +85,10 @@ function listEntities(): Promise<EntityList> {
   return apiRequest('/api/v1/knowledge/entities?limit=100')
 }
 
+function errorMessage(error: Error): string {
+  return apiErrorMessage(error)
+}
+
 export default function EntityExplorer() {
   const queryClient = useQueryClient()
   const [create, setCreate] = useState<CreateDraft>(emptyDraft)
@@ -146,15 +151,14 @@ export default function EntityExplorer() {
       </div>
 
       {createMutation.error ? (
-        <div role="alert" className="inline-status error-panel">{createMutation.error.message}</div>
+        <div role="alert" className="inline-status error-panel">{errorMessage(createMutation.error)}</div>
       ) : null}
       <form className="field-form" onSubmit={submitCreate}>
         <h2>Create entity</h2>
         <label>
           Entity kind
           <select
-            aria-label="Entity kind"
-            value={create.kind}
+                        value={create.kind}
             onChange={(event) => setCreate({ ...create, kind: event.target.value as EntityKind })}
           >
             {ENTITY_KINDS.map((kind) => <option key={kind} value={kind}>{kind}</option>)}
@@ -163,8 +167,7 @@ export default function EntityExplorer() {
         <label>
           Canonical name
           <input
-            aria-label="Canonical name"
-            required
+                        required
             value={create.canonicalName}
             onChange={(event) => setCreate({ ...create, canonicalName: event.target.value })}
           />
@@ -172,20 +175,18 @@ export default function EntityExplorer() {
         <label>
           Summary
           <textarea
-            aria-label="Summary"
-            value={create.summary}
+                        value={create.summary}
             onChange={(event) => setCreate({ ...create, summary: event.target.value })}
           />
         </label>
-        <button type="submit" disabled={createMutation.isPending}>Create entity</button>
+        <button type="submit" disabled={createMutation.isPending} aria-busy={createMutation.isPending}>Create entity</button>
       </form>
 
       <form className="field-form" onSubmit={submitSearch} role="search">
         <label>
           Search entities
           <input
-            aria-label="Search entities"
-            type="search"
+                        type="search"
             value={query}
             onChange={(event) => setQuery(event.target.value)}
           />
@@ -193,8 +194,7 @@ export default function EntityExplorer() {
         <label>
           Filter by kind
           <select
-            aria-label="Filter by kind"
-            value={filters.kind}
+                        value={filters.kind}
             onChange={(event) => setFilters({ ...filters, kind: event.target.value as EntityKind | '' })}
           >
             <option value="">All kinds</option>
@@ -204,8 +204,7 @@ export default function EntityExplorer() {
         <label>
           Updated from
           <input
-            aria-label="Updated from"
-            type="date"
+                        type="date"
             value={filters.updatedFrom}
             onChange={(event) => setFilters({ ...filters, updatedFrom: event.target.value })}
           />
@@ -213,8 +212,7 @@ export default function EntityExplorer() {
         <label>
           Updated to
           <input
-            aria-label="Updated to"
-            type="date"
+                        type="date"
             value={filters.updatedTo}
             onChange={(event) => setFilters({ ...filters, updatedTo: event.target.value })}
           />
@@ -233,7 +231,7 @@ export default function EntityExplorer() {
           <h2 id="search-results-heading">Search results for “{submittedQuery}”</h2>
           {retrievalQuery.isLoading ? <p role="status">Searching…</p> : null}
           {retrievalQuery.isError ? (
-            <div role="alert" className="inline-status error-panel">{retrievalQuery.error.message}</div>
+            <div role="alert" className="inline-status error-panel">{errorMessage(retrievalQuery.error)}</div>
           ) : retrievalQuery.data?.items.length ? (
             <ul className="work-list">
               {retrievalQuery.data.items.map((result) => (
@@ -260,7 +258,7 @@ export default function EntityExplorer() {
       <section aria-labelledby="entity-list-heading">
         <h2 id="entity-list-heading">All entities</h2>
         {entitiesQuery.isLoading ? <p role="status">Loading entities…</p> : null}
-        {entitiesQuery.isError ? <div role="alert" className="inline-status error-panel">{entitiesQuery.error.message}</div> : null}
+        {entitiesQuery.isError ? <div role="alert" className="inline-status error-panel">{errorMessage(entitiesQuery.error)}</div> : null}
         {entitiesQuery.data?.items.length ? (
           <ol className="work-list">
             {entitiesQuery.data.items.map((entity) => (

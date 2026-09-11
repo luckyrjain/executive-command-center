@@ -186,8 +186,17 @@ export default function ScheduleWorkspace() {
     setInvalidEventField(field)
     setCreateEventStepIndex(CREATE_EVENT_STEPS.indexOf(step))
   }
+  // `createEventStep !== 'review'` guard is load-bearing, not defensive
+  // redundancy -- see the identical guard's comment in
+  // ConnectorHealthPanel.tsx's own attemptCreate. A step with exactly one
+  // field and no submit button mounted (Continue/Back are both
+  // type="button") still triggers the browser's implicit single-field
+  // form submission on Enter; without this, an early step's Enter key
+  // could run full terminal validation before the user ever reaches
+  // Review.
   function attemptCreateEvent(event: FormEvent) {
     event.preventDefault()
+    if (createEventStep !== 'review') return
     if (!createEvent.title.trim()) { failEvent('Event title is required.', 'Event title', 'basics'); return }
     // wallTimeToInstant throws the same "Enter a complete date and time."
     // message for a blank/malformed start or end, so it's called once per
@@ -222,8 +231,17 @@ export default function ScheduleWorkspace() {
     setInvalidMeetingField(field)
     setCreateMeetingStepIndex(CREATE_MEETING_STEPS.indexOf(step))
   }
+  // `createMeetingStep !== 'review'` guard is load-bearing, not defensive
+  // redundancy -- see the identical guard's comment in
+  // ConnectorHealthPanel.tsx's own attemptCreate. A step with exactly one
+  // field and no submit button mounted (Continue/Back are both
+  // type="button") still triggers the browser's implicit single-field
+  // form submission on Enter; without this, an early step's Enter key
+  // could run full terminal validation before the user ever reaches
+  // Review.
   function attemptCreateMeeting(event: FormEvent) {
     event.preventDefault()
+    if (createMeetingStep !== 'review') return
     if (!createMeeting.title.trim()) { failMeeting('Meeting title is required.', 'Meeting title', 'basics'); return }
     // Timing only applies to a standalone meeting -- a linked meeting's
     // timing is projected from its calendar event and isn't even rendered.
@@ -278,7 +296,7 @@ export default function ScheduleWorkspace() {
           <div className="field-form">
             <p className="eyebrow">Step {createEventStepIndex + 1} of {CREATE_EVENT_STEPS.length} · Basics</p>
             <h3 ref={createEventStepHeadingRef} tabIndex={-1}>What and when?</h3>
-            <label>Event title<input aria-label="Event title" value={createEvent.title} onChange={(e) => setCreateEvent({ ...createEvent, title: e.target.value })} /></label>
+            <label>Event title<input value={createEvent.title} onChange={(e) => setCreateEvent({ ...createEvent, title: e.target.value })} /></label>
             <TimingFields prefix="Event" draft={createEvent} onChange={setCreateEvent} />
             <label className="field-checkbox"><input type="checkbox" checked={createEvent.allDay} onChange={(e) => setCreateEvent({ ...createEvent, allDay: e.target.checked })} /> All day</label>
             <div className="work-actions"><button type="button" onClick={goCreateEventNext}>Continue</button></div>
@@ -304,7 +322,7 @@ export default function ScheduleWorkspace() {
               <div><dt>Location</dt><dd>{createEvent.location || '—'}</dd></div>
               <div><dt>Description</dt><dd>{createEvent.description || '—'}</dd></div>
             </dl>
-            <div className="work-actions"><button type="button" onClick={goCreateEventBack}>Back</button><button type="submit" disabled={pending}>Create event</button></div>
+            <div className="work-actions"><button type="button" onClick={goCreateEventBack}>Back</button><button type="submit" aria-busy={pending} disabled={pending}>Create event</button></div>
           </div>
         )}
         </form>
@@ -325,8 +343,8 @@ export default function ScheduleWorkspace() {
           <div className="field-form">
             <p className="eyebrow">Step {createMeetingStepIndex + 1} of {CREATE_MEETING_STEPS.length} · Basics</p>
             <h3 ref={createMeetingStepHeadingRef} tabIndex={-1}>What and when?</h3>
-            <label>Linked calendar event<select aria-label="Linked calendar event" value={createMeeting.calendarEventId} onChange={(e) => setCreateMeeting({ ...createMeeting, calendarEventId: e.target.value })}><option value="">Standalone meeting</option>{(events.data?.items ?? []).filter((item) => !item.archived_at).map((item) => <option key={item.id} value={item.id}>{item.title}</option>)}</select></label>
-            <label>Meeting title<input aria-label="Meeting title" value={createMeeting.title} onChange={(e) => setCreateMeeting({ ...createMeeting, title: e.target.value })} /></label>
+            <label>Linked calendar event<select value={createMeeting.calendarEventId} onChange={(e) => setCreateMeeting({ ...createMeeting, calendarEventId: e.target.value })}><option value="">Standalone meeting</option>{(events.data?.items ?? []).filter((item) => !item.archived_at).map((item) => <option key={item.id} value={item.id}>{item.title}</option>)}</select></label>
+            <label>Meeting title<input value={createMeeting.title} onChange={(e) => setCreateMeeting({ ...createMeeting, title: e.target.value })} /></label>
             {createMeeting.calendarEventId ? <p className="inline-status">Timing will be projected from the selected calendar event.</p> : <TimingFields prefix="Meeting" draft={createMeeting} onChange={setCreateMeeting} />}
             <label>Meeting status<select value={createMeeting.status} onChange={(e) => setCreateMeeting({ ...createMeeting, status: e.target.value as MeetingDraft['status'] })}><option value="planned">planned</option><option value="in_progress">in progress</option><option value="completed">completed</option><option value="cancelled">cancelled</option></select></label>
             <div className="work-actions"><button type="button" onClick={goCreateMeetingNext}>Continue</button></div>
@@ -357,7 +375,7 @@ export default function ScheduleWorkspace() {
               <div><dt>Preparation</dt><dd>{createMeeting.preparation || '—'}</dd></div>
               <div><dt>Notes summary</dt><dd>{createMeeting.notesSummary || '—'}</dd></div>
             </dl>
-            <div className="work-actions"><button type="button" onClick={goCreateMeetingBack}>Back</button><button type="submit" disabled={pending}>{createMeeting.calendarEventId ? 'Create linked meeting' : 'Create standalone meeting'}</button></div>
+            <div className="work-actions"><button type="button" onClick={goCreateMeetingBack}>Back</button><button type="submit" aria-busy={pending} disabled={pending}>{createMeeting.calendarEventId ? 'Create linked meeting' : 'Create standalone meeting'}</button></div>
           </div>
         )}
         </form>
@@ -378,11 +396,11 @@ export default function ScheduleWorkspace() {
       </section>
     </div>
     {editEvent ? <section className="work-panel"><form className="field-form" onSubmit={submitEventEdit}><h2>Edit calendar event</h2><p>This calendar event is the authoritative timing record.</p>
-      <label>Edit event title<input aria-label="Edit event title" value={editEvent.title} onChange={(e) => setEditEvent({ ...editEvent, title: e.target.value })} /></label><TimingFields prefix="Edit event" draft={editEvent} onChange={(value) => setEditEvent({ ...editEvent, ...value })} />
+      <label>Edit event title<input value={editEvent.title} onChange={(e) => setEditEvent({ ...editEvent, title: e.target.value })} /></label><TimingFields prefix="Edit event" draft={editEvent} onChange={(value) => setEditEvent({ ...editEvent, ...value })} />
       <label className="field-checkbox"><input aria-label="Edit event all day" type="checkbox" checked={editEvent.allDay} onChange={(e) => setEditEvent({ ...editEvent, allDay: e.target.checked })} /> All day</label>
-      <label>Edit event location<input aria-label="Edit event location" value={editEvent.location} onChange={(e) => setEditEvent({ ...editEvent, location: e.target.value })} /></label>
-      <label>Edit event description<textarea aria-label="Edit event description" value={editEvent.description} onChange={(e) => setEditEvent({ ...editEvent, description: e.target.value })} /></label>
-      <label>Edit event status<select aria-label="Edit event status" value={editEvent.status} onChange={(e) => setEditEvent({ ...editEvent, status: e.target.value as EventDraft['status'] })}><option value="confirmed">confirmed</option><option value="tentative">tentative</option><option value="cancelled">cancelled</option></select></label>
+      <label>Edit event location<input value={editEvent.location} onChange={(e) => setEditEvent({ ...editEvent, location: e.target.value })} /></label>
+      <label>Edit event description<textarea value={editEvent.description} onChange={(e) => setEditEvent({ ...editEvent, description: e.target.value })} /></label>
+      <label>Edit event status<select value={editEvent.status} onChange={(e) => setEditEvent({ ...editEvent, status: e.target.value as EventDraft['status'] })}><option value="confirmed">confirmed</option><option value="tentative">tentative</option><option value="cancelled">cancelled</option></select></label>
       {editEvent.reloadFailed ? <><p role="alert">Could not reload the latest event. Your edits are preserved.</p><button type="button" disabled={pending} onClick={() => void reloadEvent(editEvent.record.id)}>Reload latest event</button></> : editEvent.conflict ? <button type="button" disabled={pending} onClick={() => submitEventEdit()}>Retry event with latest version</button> : <button type="submit" disabled={pending}>Save event</button>}
       <button type="button" disabled={pending} onClick={() => setEditEvent(null)}>Discard event edit</button>
     </form></section> : null}
@@ -396,7 +414,7 @@ export default function ScheduleWorkspace() {
 }
 
 function TimingFields<T extends { startsAt: string; endsAt: string; timezone: string }>({ prefix, draft, onChange }: { prefix: string; draft: T; onChange: (value: T) => void }) {
-  return <><label>{prefix} start<input aria-label={`${prefix} start`} type="datetime-local" required value={draft.startsAt} onChange={(e) => onChange({ ...draft, startsAt: e.target.value })} /></label><label>{prefix} end<input aria-label={`${prefix} end`} type="datetime-local" required value={draft.endsAt} onChange={(e) => onChange({ ...draft, endsAt: e.target.value })} /></label><label>{prefix} timezone<input aria-label={`${prefix} timezone`} required value={draft.timezone} onChange={(e) => onChange({ ...draft, timezone: e.target.value })} /></label></>
+  return <><label>{prefix} start<input type="datetime-local" required value={draft.startsAt} onChange={(e) => onChange({ ...draft, startsAt: e.target.value })} /></label><label>{prefix} end<input type="datetime-local" required value={draft.endsAt} onChange={(e) => onChange({ ...draft, endsAt: e.target.value })} /></label><label>{prefix} timezone<input required value={draft.timezone} onChange={(e) => onChange({ ...draft, timezone: e.target.value })} /></label></>
 }
 
 function MeetingFields<T extends { status: MeetingDraft['status']; agenda: string; preparation: string; notesSummary: string }>({ draft, onChange }: { draft: T; onChange: (value: T) => void }) {
