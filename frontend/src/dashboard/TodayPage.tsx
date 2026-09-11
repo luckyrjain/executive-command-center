@@ -42,7 +42,7 @@ export default function TodayPage() {
         </button>
       </header>
 
-      {dashboard.isLoading ? <div className="status-panel" role="status">Loading today's command center…</div> : null}
+      {dashboard.isLoading ? <div className="status-panel" role="status">Loading today’s command center…</div> : null}
       {dashboard.isError ? (
         <div className="status-panel error-panel" role="alert">
           <strong>{dashboard.error.message}</strong>
