@@ -303,7 +303,7 @@ export default function RecommendationPanel({ recommendationType, title }: {
                   ) : null}
                   {canDecide ? (
                     <>
-                      <button className="primary-action" type="button" onClick={() => mutation.mutate({ item, action: 'confirm' })} disabled={busy || (!isCreateRecommendation(item) && item.expected_version == null)}>Confirm and execute</button>
+                      <button className="btn-primary" type="button" onClick={() => mutation.mutate({ item, action: 'confirm' })} disabled={busy || (!isCreateRecommendation(item) && item.expected_version == null)}>Confirm and execute</button>
                       <button type="button" onClick={() => mutation.mutate({ item, action: 'reject' })} disabled={busy}>Reject</button>
                       <button type="button" onClick={() => mutation.mutate({ item, action: 'defer' })} disabled={busy}>Defer 24h</button>
                     </>

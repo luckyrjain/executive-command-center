@@ -122,8 +122,17 @@ export default function WorkflowList({ onSelect }: { onSelect: (versionId: strin
     setInvalidField(field)
     setCreateStepIndex(CREATE_STEPS.indexOf(step))
   }
+  // `createStep !== 'review'` guard is load-bearing, not defensive
+  // redundancy -- see the identical guard's comment in
+  // ConnectorHealthPanel.tsx's own attemptCreate. A step with exactly one
+  // field and no submit button mounted (Continue/Back are both
+  // type="button") still triggers the browser's implicit single-field
+  // form submission on Enter; without this, an early step's Enter key
+  // could run full terminal validation before the user ever reaches
+  // Review.
   function attemptCreate(event: FormEvent) {
     event.preventDefault()
+    if (createStep !== 'review') return
     if (!workflowId.trim()) {
       fail('Workflow ID is required.', 'Workflow ID', 'basics')
       return
@@ -304,7 +313,7 @@ export default function WorkflowList({ onSelect }: { onSelect: (versionId: strin
             </ol>
             <div className="work-actions">
               <button type="button" onClick={goCreateBack}>Back</button>
-              <button type="submit" disabled={pending}>{pending ? 'Creating…' : 'Create draft'}</button>
+              <button type="submit" aria-busy={pending} disabled={pending}>{pending ? 'Creating…' : 'Create draft'}</button>
             </div>
           </div>
         )}

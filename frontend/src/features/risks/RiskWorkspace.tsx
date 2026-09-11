@@ -194,8 +194,18 @@ export default function RiskWorkspace() {
   })
   const pending = createMutation.isPending || editMutation.isPending || actionMutation.isPending
 
+  // `createStep !== 'review'` guard is load-bearing, not defensive
+  // redundancy -- see the identical guard's comment in
+  // ConnectorHealthPanel.tsx's own attemptCreate. A step with exactly one
+  // field and no submit button mounted (Continue/Back are both
+  // type="button") still triggers the browser's implicit single-field
+  // form submission on Enter; without this, an early step's Enter key
+  // could run full terminal validation (and, if every other field already
+  // happens to be valid, actually create the risk) before the user ever
+  // reaches Review.
   function attemptCreate(event: FormEvent) {
     event.preventDefault()
+    if (createStep !== 'review') return
     const problem = validateDraft(create)
     if (problem) {
       setFormError(problem)
@@ -288,7 +298,7 @@ export default function RiskWorkspace() {
           </dl>
           <div className="work-actions">
             <button type="button" onClick={goCreateBack}>Back</button>
-            <button type="submit" disabled={pending}>Create risk</button>
+            <button type="submit" aria-busy={pending} disabled={pending}>Create risk</button>
           </div>
         </div>
       )}
