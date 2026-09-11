@@ -49,8 +49,8 @@ function DelegationRow({
 
       {delegation.status === 'proposed' && isRecipient ? (
         <div className="work-actions">
-          <button type="button" disabled={actionMutation.isPending} onClick={() => actionMutation.mutate('accept')}>Accept</button>
-          <button type="button" disabled={actionMutation.isPending} onClick={() => actionMutation.mutate('reject')}>Reject</button>
+          <button type="button" disabled={actionMutation.isPending} aria-busy={actionMutation.isPending} onClick={() => actionMutation.mutate('accept')}>Accept</button>
+          <button type="button" disabled={actionMutation.isPending} aria-busy={actionMutation.isPending} onClick={() => actionMutation.mutate('reject')}>Reject</button>
         </div>
       ) : null}
       {delegation.status === 'proposed' && isDelegator ? (
@@ -58,12 +58,12 @@ function DelegationRow({
       ) : null}
       {delegation.status === 'accepted' && isRecipient ? (
         <div className="work-actions">
-          <button type="button" disabled={actionMutation.isPending} onClick={() => actionMutation.mutate('complete')}>Mark complete</button>
+          <button type="button" disabled={actionMutation.isPending} aria-busy={actionMutation.isPending} onClick={() => actionMutation.mutate('complete')}>Mark complete</button>
         </div>
       ) : null}
       {delegation.status === 'accepted' && isDelegator ? (
         <div className="work-actions">
-          <button type="button" className="btn-destructive" disabled={actionMutation.isPending} onClick={() => actionMutation.mutate('revoke')}>Revoke</button>
+          <button type="button" className="btn-destructive" disabled={actionMutation.isPending} aria-busy={actionMutation.isPending} onClick={() => actionMutation.mutate('revoke')}>Revoke</button>
         </div>
       ) : null}
 
@@ -147,22 +147,22 @@ export default function DelegationsPanel() {
         }}
       >
         <label>Recipient account ID
-          <input aria-label="Recipient account ID" value={form.recipientAccountId} onChange={(event) => setForm((f) => ({ ...f, recipientAccountId: event.target.value }))} />
+          <input value={form.recipientAccountId} onChange={(event) => setForm((f) => ({ ...f, recipientAccountId: event.target.value }))} />
         </label>
         <label>Obligation resource type
-          <input aria-label="Obligation resource type" value={form.obligationType} onChange={(event) => setForm((f) => ({ ...f, obligationType: event.target.value }))} />
+          <input value={form.obligationType} onChange={(event) => setForm((f) => ({ ...f, obligationType: event.target.value }))} />
         </label>
         <label>Obligation resource ID
-          <input aria-label="Obligation resource ID" value={form.obligationResourceId} onChange={(event) => setForm((f) => ({ ...f, obligationResourceId: event.target.value }))} />
+          <input value={form.obligationResourceId} onChange={(event) => setForm((f) => ({ ...f, obligationResourceId: event.target.value }))} />
         </label>
         <label>Expected outcome
-          <input aria-label="Expected outcome" value={form.expectedOutcome} onChange={(event) => setForm((f) => ({ ...f, expectedOutcome: event.target.value }))} />
+          <input value={form.expectedOutcome} onChange={(event) => setForm((f) => ({ ...f, expectedOutcome: event.target.value }))} />
         </label>
         <label>Due
           <input aria-label="Due date" type="datetime-local" value={form.dueAt} onChange={(event) => setForm((f) => ({ ...f, dueAt: event.target.value }))} />
         </label>
         <div className="work-actions">
-          <button type="submit" disabled={!canPropose || proposeMutation.isPending}>Propose delegation</button>
+          <button type="submit" disabled={!canPropose || proposeMutation.isPending} aria-busy={proposeMutation.isPending}>Propose delegation</button>
         </div>
       </form>
       {proposeMutation.isError ? <div role="alert" className="inline-status error-panel">{collaborationErrorMessage(proposeMutation.error)}</div> : null}

@@ -1,6 +1,7 @@
 import { useMutation } from '@tanstack/react-query'
 
 import { apiRequest } from '../../api/client'
+import { apiErrorMessage } from '../../api/errorMessage'
 import type { DispatchGate, SimulateResponse } from './types'
 
 const GATE_LABEL: Record<DispatchGate, string> = {
@@ -31,15 +32,19 @@ export default function SimulationView({ versionId }: { versionId: string }) {
         SIMULATION -- preview only. No step below has produced or will produce a real side effect.
       </p>
       <h3 id="automation-simulation-title">Simulate this version</h3>
-      <button type="button" disabled={simulateMutation.isPending} onClick={() => simulateMutation.mutate()}>
+      <button type="button" aria-busy={simulateMutation.isPending} disabled={simulateMutation.isPending} onClick={() => simulateMutation.mutate()}>
         {simulateMutation.isPending ? 'Simulating…' : 'Run simulation'}
       </button>
 
       {simulateMutation.isError ? (
-        <div role="alert" className="inline-status error-panel">{simulateMutation.error instanceof Error ? simulateMutation.error.message : 'Simulation failed.'}</div>
+        <div role="alert" className="inline-status error-panel">{apiErrorMessage(simulateMutation.error)}</div>
       ) : null}
 
-      {simulateMutation.data ? (
+      {simulateMutation.data && simulateMutation.data.steps.length === 0 ? (
+        <p className="empty-state">This version has no steps to simulate.</p>
+      ) : null}
+
+      {simulateMutation.data && simulateMutation.data.steps.length > 0 ? (
         <ol className="work-list" aria-label="Simulated steps">
           {simulateMutation.data.steps.map((step) => (
             <li key={step.step_index}>

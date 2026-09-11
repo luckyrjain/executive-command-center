@@ -3,6 +3,7 @@ import { useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
 import { apiRequest } from '../../api/client'
+import { apiErrorMessage } from '../../api/errorMessage'
 import type { EntityList, KnowledgeEntity } from '../knowledge/types'
 import type {
   TeamSuggestionActionResponse,
@@ -91,7 +92,6 @@ function SuggestionRow({ group, teamsById }: { group: TeamSuggestionGroup; teams
         <label>
           {`Assign team for ${group.suggested_team_name}`}
           <select
-            aria-label={`Assign team for ${group.suggested_team_name}`}
             value={teamEntityId}
             disabled={busy}
             onChange={(event) => setTeamEntityId(event.target.value)}
@@ -102,10 +102,10 @@ function SuggestionRow({ group, teamsById }: { group: TeamSuggestionGroup; teams
         </label>
       </div>
       <div className="work-actions">
-        <button type="button" disabled={!teamEntityId || busy} onClick={() => confirmMutation.mutate()}>
+        <button type="button" aria-busy={confirmMutation.isPending} disabled={!teamEntityId || busy} onClick={() => confirmMutation.mutate()}>
           Confirm
         </button>
-        <button type="button" disabled={busy} onClick={() => dismissMutation.mutate()}>
+        <button type="button" aria-busy={dismissMutation.isPending} disabled={busy} onClick={() => dismissMutation.mutate()}>
           Dismiss
         </button>
       </div>
@@ -113,7 +113,6 @@ function SuggestionRow({ group, teamsById }: { group: TeamSuggestionGroup; teams
         <label>
           {`New team name for ${group.suggested_team_name}`}
           <input
-            aria-label={`New team name for ${group.suggested_team_name}`}
             type="text"
             value={newTeamName}
             disabled={busy}
@@ -124,15 +123,16 @@ function SuggestionRow({ group, teamsById }: { group: TeamSuggestionGroup; teams
       <div className="work-actions">
         <button
           type="button"
+          aria-busy={createAndConfirmMutation.isPending}
           disabled={!newTeamName.trim() || busy}
           onClick={() => createAndConfirmMutation.mutate()}
         >
           Create & confirm
         </button>
       </div>
-      {confirmMutation.isError ? <span role="alert" className="inline-status error-panel">{confirmMutation.error.message}</span> : null}
-      {dismissMutation.isError ? <span role="alert" className="inline-status error-panel">{dismissMutation.error.message}</span> : null}
-      {createAndConfirmMutation.isError ? <span role="alert" className="inline-status error-panel">{createAndConfirmMutation.error.message}</span> : null}
+      {confirmMutation.isError ? <span role="alert" className="inline-status error-panel">{apiErrorMessage(confirmMutation.error)}</span> : null}
+      {dismissMutation.isError ? <span role="alert" className="inline-status error-panel">{apiErrorMessage(dismissMutation.error)}</span> : null}
+      {createAndConfirmMutation.isError ? <span role="alert" className="inline-status error-panel">{apiErrorMessage(createAndConfirmMutation.error)}</span> : null}
       {lastResult && lastResult.skipped_unauthorized.length > 0 ? (
         <p role="status">
           {`Applied to ${lastResult.updated.length} of ${lastResult.updated.length + lastResult.skipped_unauthorized.length} — ${lastResult.skipped_unauthorized.length} skipped: insufficient permission.`}
@@ -168,13 +168,13 @@ export default function TeamSuggestionsPanel() {
       <p>Repositories and work items still waiting on a confirmed team, grouped by their suggested name so you can confirm or dismiss every one sharing a name in one action.</p>
 
       {query.isLoading ? <p role="status">Loading team suggestions…</p> : null}
-      {query.isError ? <div role="alert" className="inline-status error-panel">{query.error.message}</div> : null}
+      {query.isError ? <div role="alert" className="inline-status error-panel">{apiErrorMessage(query.error)}</div> : null}
       {query.data && items.length === 0 ? <p className="empty-state">No pending team suggestions.</p> : null}
 
       {teamsQuery.isLoading ? <p role="status">Loading teams…</p> : null}
       {teamsQuery.isError ? (
         <div role="alert" className="inline-status error-panel">
-          {`Could not load teams to assign: ${teamsQuery.error.message}. Confirm is unavailable until this loads -- Create & confirm and Dismiss still work.`}
+          {`Could not load teams to assign: ${apiErrorMessage(teamsQuery.error)}. Confirm is unavailable until this loads -- Create & confirm and Dismiss still work.`}
         </div>
       ) : null}
 

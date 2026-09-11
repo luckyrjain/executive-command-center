@@ -202,8 +202,8 @@ export default function AttentionQueue() {
                     ) : null}
                     {AI_EXPLANATIONS_ENABLED ? <AttentionExplanation item={item} /> : null}
                     <div className="work-actions" role="group" aria-label={`Actions for ${item.explanation}`}>
-                      <button type="button" disabled={pending} aria-label={`Defer ${item.explanation}`} onClick={() => actionMutation.mutate({ item, action: 'defer' })}>Defer</button>
-                      <button type="button" disabled={pending} aria-label={`Dismiss ${item.explanation}`} onClick={() => actionMutation.mutate({ item, action: 'dismiss' })}>Dismiss</button>
+                      <button type="button" disabled={pending} aria-busy={pending} aria-label={`Defer ${item.explanation}`} onClick={() => actionMutation.mutate({ item, action: 'defer' })}>Defer</button>
+                      <button type="button" disabled={pending} aria-busy={pending} aria-label={`Dismiss ${item.explanation}`} onClick={() => actionMutation.mutate({ item, action: 'dismiss' })}>Dismiss</button>
                     </div>
                   </li>
                 ))}
@@ -222,7 +222,7 @@ export default function AttentionQueue() {
             {(query.data.items ?? []).filter((item) => item.dismissed_at || item.deferred_until).map((item) => (
               <li key={item.id}>
                 <div><strong>{item.explanation}</strong>{item.override_reason ? <small>{item.override_reason}</small> : null}</div>
-                <button type="button" disabled={pending} aria-label={`Restore ${item.explanation}`} onClick={() => actionMutation.mutate({ item, action: 'restore' })}>Restore</button>
+                <button type="button" disabled={pending} aria-busy={pending} aria-label={`Restore ${item.explanation}`} onClick={() => actionMutation.mutate({ item, action: 'restore' })}>Restore</button>
               </li>
             ))}
           </ol>

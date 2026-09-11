@@ -166,7 +166,7 @@ export default function SearchAuditPanel() {
                 maxLength={500}
                 placeholder="Search the command center"
               />
-              <button type="submit" disabled={!draftQuery.trim() || search.isFetching}>
+              <button type="submit" disabled={!draftQuery.trim() || search.isFetching} aria-busy={search.isFetching}>
                 {search.isFetching ? 'Searching…' : 'Search'}
               </button>
             </div>
