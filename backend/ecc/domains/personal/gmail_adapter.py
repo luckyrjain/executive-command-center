@@ -1646,6 +1646,7 @@ class GmailAdapter:
         account: ConnectorAccountContext,
         resource_type: str,
         since: datetime | None = None,
+        resume_cursor: str | None = None,
     ) -> SyncOutcome:
         """`message` is the only resource type `gmail` accounts ever sync
         (see `connector_accounts.py`'s `ResourceType` widening); any other
@@ -1656,7 +1657,17 @@ class GmailAdapter:
         Task 2 -- explicit callers (`SyncRequest.since`, the "expand
         history" UI built in Task 8) pass a real value for a wider or
         narrower window.
+
+        `resume_cursor` (the generic `sync_cursors.backfill_resume_cursor`
+        mechanism `connector_accounts.py`'s own `_run_connector_sync`
+        threads into every `backfill()` call) is accepted for protocol
+        conformance but unused -- Gmail never goes through that generic
+        path at all (its own OAuth callback flow creates/reconnects
+        accounts directly), and already has its own, separate, real
+        resumable-pagination mechanism (`_GmailBackfillCursor`) encoded
+        entirely within `since_cursor`/`next_cursor` above.
         """
+        del resume_cursor
         if resource_type != "message":
             return SyncOutcome(
                 resource_type=resource_type, items_processed=0, status="succeeded", next_cursor=None

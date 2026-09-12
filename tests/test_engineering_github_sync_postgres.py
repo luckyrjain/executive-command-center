@@ -736,6 +736,63 @@ def test_page_cap_reports_partial_with_more_pages_remaining(
     assert "page" in outcome.error_summary.lower()
 
 
+def test_backfill_resumes_across_multiple_calls_instead_of_repeating(
+    seeded_account_context: ConnectorAccountContext,
+) -> None:
+    """The actual regression this whole fix exists for: a page-capped
+    backfill call used to always restart at page 1 next time (`since_
+    cursor=None` on every `backfill()` call, no other persisted state),
+    so a workspace with more repositories than one call's page budget
+    covers could never have its older backlog reached by any sequence of
+    calls -- every later call just re-fetched the same newest page range.
+    A second `backfill()` call, passing the first call's own returned
+    `backfill_resume_cursor`, must fetch *further* pages, not repeat page
+    1-10, and the incremental watermark established by call 1's own page
+    1 must not regress even though call 2 only ever sees older items.
+    """
+    from ecc.domains.engineering import github_adapter as github_adapter_module
+
+    total_pages = 15
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        page = int(request.url.params["page"])
+        headers = {}
+        if page < total_pages:
+            headers["Link"] = f'<https://api.github.com/user/repos?page={page + 1}>; rel="next"'
+        updated_at = f"2024-01-{28 - page:02d}T00:00:00Z"
+        return _json_response(
+            [_repo(page, full_name=f"acme/r{page}", updated_at=updated_at)],
+            headers=headers,
+        )
+
+    adapter = GitHubAdapter(transport=httpx.MockTransport(handler))
+    first = adapter.backfill(seeded_account_context, "repository")
+    assert first.status == "partial"
+    assert first.items_processed == github_adapter_module._MAX_PAGES_PER_CALL
+    assert first.backfill_resume_cursor == str(github_adapter_module._MAX_PAGES_PER_CALL + 1)
+    assert first.next_cursor == "2024-01-27T00:00:00Z"  # page 1's own updated_at
+
+    second = adapter.backfill(
+        seeded_account_context, "repository", resume_cursor=first.backfill_resume_cursor
+    )
+    assert second.status == "succeeded"
+    assert second.backfill_resume_cursor is None
+    assert second.items_processed == total_pages - github_adapter_module._MAX_PAGES_PER_CALL
+    # Call 2 only ever sees older pages -- it must not report a (lower,
+    # regressed) watermark of its own; the caller keeps call 1's value.
+    assert second.next_cursor is None
+
+    with engine.begin() as connection:
+        names = {
+            row[0]
+            for row in connection.execute(
+                text("SELECT name FROM repositories WHERE workspace_id = :workspace_id"),
+                {"workspace_id": seeded_account_context.workspace_id},
+            )
+        }
+    assert names == {f"acme/r{p}" for p in range(1, total_pages + 1)}
+
+
 def test_link_header_next_url_containing_comma_still_paginates(
     seeded_account_context: ConnectorAccountContext,
 ) -> None:
@@ -1098,6 +1155,71 @@ def test_changes_page_cap_reports_partial_with_progress_preserved(
     assert outcome.error_summary is not None
 
 
+def test_changes_backfill_resumes_without_rewalking_already_done_repos(
+    seeded_account_context: ConnectorAccountContext,
+) -> None:
+    """A workspace with more repositories than one call's shared page
+    budget must not burn its entire budget every call re-confirming
+    already-finished repos are finished -- that would starve every repo
+    past the budget from ever making progress across repeated calls.
+    Each repo here has exactly one page (no `Link: next`), so the only
+    thing that can make call 2 skip repos 1-10 at zero cost and spend its
+    whole budget on repos 11-12 instead is the per-repository `"done"`
+    marker in `backfill_resume_cursor`.
+    """
+    from ecc.domains.engineering import github_adapter as github_adapter_module
+
+    total_repos = 12
+    for i in range(1, total_repos + 1):
+        _seed_repository(
+            workspace_id=seeded_account_context.workspace_id,
+            connector_account_id=seeded_account_context.connector_account_id,
+            external_id=str(100 + i),
+            name=f"acme/repo{i}",
+        )
+    path_to_num = {f"/repos/acme/repo{i}/pulls": i for i in range(1, total_repos + 1)}
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.url.path)
+        repo_num = path_to_num[request.url.path]
+        return _json_response(
+            [
+                _pr(
+                    repo_num,
+                    number=repo_num,
+                    title=f"Fix {repo_num}",
+                    merged_at=f"2024-01-{repo_num:02d}T00:00:00Z",
+                    updated_at=f"2024-01-{repo_num:02d}T00:00:00Z",
+                )
+            ]
+        )
+
+    adapter = GitHubAdapter(transport=httpx.MockTransport(handler))
+    first = adapter.backfill(seeded_account_context, "change")
+    assert first.status == "partial"
+    assert len(calls) == github_adapter_module._MAX_PAGES_PER_CALL
+    assert first.backfill_resume_cursor is not None
+
+    calls.clear()
+    second = adapter.backfill(
+        seeded_account_context, "change", resume_cursor=first.backfill_resume_cursor
+    )
+    assert second.status == "succeeded"
+    assert second.backfill_resume_cursor is None
+    # Only the two repos never touched by call 1 -- no re-confirmation of
+    # the ten already-"done" repos, which the bug this test guards
+    # against would have re-spent the whole budget on.
+    assert set(calls) == {"/repos/acme/repo11/pulls", "/repos/acme/repo12/pulls"}
+
+    with engine.begin() as connection:
+        count = connection.execute(
+            text("SELECT count(*) FROM changes WHERE workspace_id = :workspace_id"),
+            {"workspace_id": seeded_account_context.workspace_id},
+        ).scalar_one()
+    assert count == total_repos
+
+
 def test_changes_rate_limit_gives_up_reports_partial(
     seeded_account_context: ConnectorAccountContext,
 ) -> None:
@@ -1365,6 +1487,79 @@ def test_reviews_rate_limit_on_timeline_call_gives_up_without_advancing_cursor(
             {"workspace_id": seeded_account_context.workspace_id},
         ).scalar_one()
     assert count == 0
+
+
+def test_reviews_backfill_resumes_across_multiple_calls(
+    seeded_account_context: ConnectorAccountContext,
+) -> None:
+    """Unlike repositories/changes, this resource type's own cursor
+    already *is* a valid resume position (it walks our own already-
+    synced `changes` table oldest-uncovered-first, not live provider
+    pagination) -- the fix here is simply threading `backfill()`'s
+    `resume_cursor` into the same `since_cursor` `_sync_reviews` already
+    accepts. Seven changes needing review, each costing two calls
+    (reviews + timeline), forces the shared 10-call budget to page-cap
+    mid-way through change 5 -- proving call 2 covers changes 6-7, not a
+    repeat of 1-5.
+    """
+    from ecc.domains.engineering import github_adapter as github_adapter_module
+
+    repo = _seed_repository(
+        workspace_id=seeded_account_context.workspace_id,
+        connector_account_id=seeded_account_context.connector_account_id,
+        external_id="101",
+        name="acme/repo1",
+    )
+    for i in range(1, 8):
+        _seed_change(
+            workspace_id=seeded_account_context.workspace_id,
+            connector_account_id=seeded_account_context.connector_account_id,
+            repository_id=repo,
+            external_id=f"900{i}",
+            provider_number=str(i),
+            merged_at=datetime(2024, 1, i, tzinfo=UTC),
+        )
+    reviewed: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.startswith("/repos/acme/repo1/pulls/") and request.url.path.endswith(
+            "/reviews"
+        ):
+            number = request.url.path.split("/")[-2]
+            reviewed.append(number)
+            review = _review(int(number), state="APPROVED", submitted_at="2024-02-01T00:00:00Z")
+            return _json_response([review])
+        if request.url.path.startswith("/repos/acme/repo1/issues/") and request.url.path.endswith(
+            "/timeline"
+        ):
+            return _json_response([])
+        raise AssertionError(f"unexpected path {request.url.path}")
+
+    adapter = GitHubAdapter(transport=httpx.MockTransport(handler))
+    first = adapter.backfill(seeded_account_context, "review")
+    assert first.status == "partial"
+    assert reviewed == ["1", "2", "3", "4", "5"]
+    assert first.backfill_resume_cursor is not None
+
+    reviewed.clear()
+    second = adapter.backfill(
+        seeded_account_context, "review", resume_cursor=first.backfill_resume_cursor
+    )
+    assert second.status == "succeeded"
+    # The actual regression: without threading resume_cursor through,
+    # this call would restart at change 1 (the oldest) and repeat
+    # `reviewed == ["1", "2", ...]` forever, never reaching 6/7.
+    assert reviewed == ["6", "7"]
+
+    with engine.begin() as connection:
+        count = connection.execute(
+            text("SELECT count(*) FROM reviews WHERE workspace_id = :workspace_id"),
+            {"workspace_id": seeded_account_context.workspace_id},
+        ).scalar_one()
+    assert count == 7
+    # Underlying assumption this test's "7 changes, page-cap after 5"
+    # arithmetic relies on -- fails loudly if that bound ever changes.
+    assert github_adapter_module._MAX_PAGES_PER_CALL == 10
 
 
 def test_refresh_permissions() -> None:
