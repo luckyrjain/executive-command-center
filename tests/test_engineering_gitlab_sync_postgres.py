@@ -1131,6 +1131,62 @@ def test_page_cap_reports_partial_with_more_pages_remaining(
     assert "page" in outcome.error_summary.lower()
 
 
+def test_backfill_resumes_across_multiple_calls_instead_of_repeating(
+    seeded_account_context: ConnectorAccountContext,
+) -> None:
+    """The actual regression this whole fix exists for: a page-capped
+    backfill call used to always restart at page 1 next time (`since_
+    cursor=None` on every `backfill()` call, no other persisted state),
+    so a workspace with more projects than one call's page budget covers
+    could never have its older backlog reached by any sequence of calls.
+    A second `backfill()` call, passing the first call's own returned
+    `backfill_resume_cursor`, must fetch *further* pages, not repeat page
+    1-10, and the incremental watermark established by call 1's own page
+    1 must not regress even though call 2 only ever sees older items.
+    """
+    from ecc.domains.engineering import gitlab_adapter as gitlab_adapter_module
+
+    total_pages = 15
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        page = int(request.url.params["page"])
+        headers = {}
+        if page < total_pages:
+            headers["Link"] = f'<https://gitlab.com/api/v4/projects?page={page + 1}>; rel="next"'
+        updated_at = f"2024-01-{28 - page:02d}T00:00:00Z"
+        return _json_response(
+            [_project(page, path=f"acme/r{page}", updated_at=updated_at)],
+            headers=headers,
+        )
+
+    adapter = GitLabAdapter(transport=httpx.MockTransport(handler))
+    first = adapter.backfill(seeded_account_context, "repository")
+    assert first.status == "partial"
+    assert first.items_processed == gitlab_adapter_module._MAX_PAGES_PER_CALL
+    assert first.backfill_resume_cursor == str(gitlab_adapter_module._MAX_PAGES_PER_CALL + 1)
+    assert first.next_cursor == "2024-01-27T00:00:00Z"  # page 1's own updated_at
+
+    second = adapter.backfill(
+        seeded_account_context, "repository", resume_cursor=first.backfill_resume_cursor
+    )
+    assert second.status == "succeeded"
+    assert second.backfill_resume_cursor is None
+    assert second.items_processed == total_pages - gitlab_adapter_module._MAX_PAGES_PER_CALL
+    # Call 2 only ever sees older pages -- it must not report a (lower,
+    # regressed) watermark of its own; the caller keeps call 1's value.
+    assert second.next_cursor is None
+
+    with engine.begin() as connection:
+        names = {
+            row[0]
+            for row in connection.execute(
+                text("SELECT name FROM repositories WHERE workspace_id = :workspace_id"),
+                {"workspace_id": seeded_account_context.workspace_id},
+            )
+        }
+    assert names == {f"acme/r{p}" for p in range(1, total_pages + 1)}
+
+
 def test_refresh_permissions() -> None:
     def unauthorized(request: httpx.Request) -> httpx.Response:
         return _json_response({"message": "401 Unauthorized"}, status_code=401)

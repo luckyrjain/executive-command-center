@@ -1385,7 +1385,8 @@ def _run_connector_sync(
         cursor_row = (
             session.execute(
                 text(
-                    "SELECT cursor_value FROM sync_cursors WHERE workspace_id = :workspace_id "
+                    "SELECT cursor_value, backfill_resume_cursor FROM sync_cursors "
+                    "WHERE workspace_id = :workspace_id "
                     "AND connector_account_id = :connector_account_id "
                     "AND resource_type = :resource_type"
                 ),
@@ -1399,6 +1400,13 @@ def _run_connector_sync(
             .one_or_none()
         )
         prior_cursor = cursor_row["cursor_value"] if cursor_row is not None else None
+        # Distinct from `prior_cursor` above -- see `SyncOutcome.backfill_
+        # resume_cursor`'s own docstring for why these are two genuinely
+        # different concepts that must not be conflated. Only ever
+        # threaded into a `backfill` call below, never `incremental_sync`.
+        prior_resume_cursor = (
+            cursor_row["backfill_resume_cursor"] if cursor_row is not None else None
+        )
 
     # Phase 1's transaction has committed. Release the connection back to
     # the pool before the (potentially slow) adapter call in phase 2 --
@@ -1427,7 +1435,9 @@ def _run_connector_sync(
     else:
         try:
             if run_type == "backfill":
-                outcome = adapter.backfill(context, resource_type, since=since)
+                outcome = adapter.backfill(
+                    context, resource_type, since=since, resume_cursor=prior_resume_cursor
+                )
             else:
                 outcome = adapter.incremental_sync(context, resource_type, prior_cursor)
         except Exception as exc:  # noqa: BLE001 -- classified as a failed sync run, not a crash
@@ -1561,6 +1571,43 @@ def _run_connector_sync(
                     "connector_account_id": account_id,
                     "resource_type": resource_type,
                     "cursor_value": outcome.next_cursor,
+                    "now": completed_at,
+                    "actor_id": auth.user_id,
+                },
+            )
+        if run_type == "backfill":
+            # Unconditional -- unlike the `cursor_value` UPSERT above,
+            # this one must run even when `outcome.backfill_resume_cursor`
+            # is `None`: that value specifically means "clear whatever
+            # resume state was stored," either because this resource
+            # type's backfill just genuinely finished, or because nothing
+            # was ever in progress. Skipping the write on `None` (the way
+            # `cursor_value`'s own guard does, correctly, for its own
+            # different meaning of `None`) would leave a stale resume
+            # position in place forever, wrongly resuming a future
+            # backfill from history that's already fully covered.
+            # `incremental_sync` never reads or writes this column at all.
+            outcome_session.execute(
+                text(
+                    """
+                    INSERT INTO sync_cursors (
+                        id, workspace_id, connector_account_id, resource_type,
+                        backfill_resume_cursor, updated_at, owner_id, visibility
+                    ) VALUES (
+                        :id, :workspace_id, :connector_account_id, :resource_type,
+                        :backfill_resume_cursor, :now, :actor_id, 'workspace'
+                    )
+                    ON CONFLICT (workspace_id, connector_account_id, resource_type)
+                    DO UPDATE SET backfill_resume_cursor = EXCLUDED.backfill_resume_cursor,
+                        updated_at = EXCLUDED.updated_at
+                    """
+                ),
+                {
+                    "id": uuid4(),
+                    "workspace_id": auth.workspace_id,
+                    "connector_account_id": account_id,
+                    "resource_type": resource_type,
+                    "backfill_resume_cursor": outcome.backfill_resume_cursor,
                     "now": completed_at,
                     "actor_id": auth.user_id,
                 },
