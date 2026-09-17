@@ -155,6 +155,13 @@ jobs:
       - run: pnpm --filter @ecc/frontend build
       - run: pnpm --filter @ecc/frontend exec playwright install --with-deps chromium
       - run: pnpm --filter @ecc/frontend test:e2e
+      - name: Upload Playwright traces for any failed e2e scenario
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: e2e-traces
+          path: frontend/e2e/test-results/
+          if-no-files-found: ignore
       # Last, not first: this is the one step here that depends on a third
       # party at run time (registry.npmjs.org's /-/npm/v1/security/audits
       # endpoint). On 2026-09-04 that endpoint answered 500 / ERR_SOCKET_TIMEOUT

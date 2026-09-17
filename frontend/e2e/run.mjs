@@ -1,3 +1,5 @@
+import { mkdir } from 'node:fs/promises'
+
 import { chromium } from 'playwright'
 
 import { startPreviewServer } from './server.mjs'
@@ -69,6 +71,16 @@ const scenarios = [
   { name: 'members-panel-text-rendering', module: membersPanelTextRendering },
 ]
 
+// Where a failing scenario's Playwright trace (DOM snapshots + screenshots
+// + actions, viewable via `npx playwright show-trace <file>.zip`) gets
+// written. A passing scenario's trace is started and stopped but never
+// written to disk -- no point paying the write cost for runs nobody needs
+// to inspect. CI uploads this directory as an artifact so a run that only
+// fails on a Linux runner (never locally) leaves behind something to open,
+// instead of just a locator timeout with no visibility into what the page
+// actually looked like.
+const TRACE_DIR = new URL('./test-results/', import.meta.url)
+
 async function main() {
   const server = await startPreviewServer()
   // PLAYWRIGHT_CHROMIUM_EXECUTABLE lets a sandboxed dev environment point at
@@ -80,18 +92,25 @@ async function main() {
   const browser = await chromium.launch({ headless: true, ...(executablePath ? { executablePath } : {}) })
   const failures = []
 
+  await mkdir(TRACE_DIR, { recursive: true })
+
   try {
     for (const scenario of scenarios) {
       const context = await browser.newContext()
       const page = await context.newPage()
+      await context.tracing.start({ screenshots: true, snapshots: true })
       const startedAt = Date.now()
       try {
         await scenario.module.run({ page, baseURL: server.baseURL })
         console.log(`✓ ${scenario.name} (${Date.now() - startedAt}ms)`)
+        await context.tracing.stop()
       } catch (error) {
         console.error(`✗ ${scenario.name}`)
         console.error(error)
         failures.push(scenario.name)
+        const traceFile = new URL(`./${scenario.name.replace(/[^a-z0-9-]+/gi, '_')}.zip`, TRACE_DIR)
+        await context.tracing.stop({ path: traceFile.pathname })
+        console.error(`  trace: ${traceFile.pathname}`)
       } finally {
         await context.close()
       }

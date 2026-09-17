@@ -16,6 +16,7 @@ __pycache__/
 # Node
 node_modules/
 frontend/dist/
+frontend/e2e/test-results/
 coverage/
 *.tsbuildinfo
 
