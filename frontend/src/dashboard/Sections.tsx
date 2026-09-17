@@ -55,6 +55,14 @@ type SectionProps = {
   title: string
   items?: DashboardItem[]
   emptyMessage: string
+  // Names what this section's badge counts, e.g. "risk"/"risks", so the
+  // badge's aria-label reads "2 risks" instead of a generic "2 items"
+  // (Contextual Live Badge Updates: a count's accessible name should say
+  // what's being counted). Plural defaults to singular + "s"; pass it
+  // explicitly when that doesn't hold (e.g. "meeting"/"meetings" is fine,
+  // but a noun phrase like "item you're waiting on" needs its own plural).
+  itemNounSingular: string
+  itemNounPlural?: string
   // App.tsx's own sections use `section-`; MorningBrief.tsx's use
   // `brief-section-` -- distinct ids since both can render on the same
   // page (the 'today' tab mounts both).
@@ -67,14 +75,23 @@ type SectionProps = {
   variant?: 'card' | 'panel'
 }
 
-export function Section({ title, items, emptyMessage, headingIdPrefix = 'section-', variant = 'card' }: SectionProps) {
+export function Section({
+  title,
+  items,
+  emptyMessage,
+  itemNounSingular,
+  itemNounPlural = `${itemNounSingular}s`,
+  headingIdPrefix = 'section-',
+  variant = 'card',
+}: SectionProps) {
   const visible = visibleItems(items)
   const headingId = `${headingIdPrefix}${title.replaceAll(' ', '-').toLowerCase()}`
+  const countLabel = `${visible.length} ${visible.length === 1 ? itemNounSingular : itemNounPlural}`
   return (
     <section className={variant === 'panel' ? 'work-panel' : 'dashboard-card'} aria-labelledby={headingId}>
       <div className="section-heading">
         <h2 id={headingId}>{title}</h2>
-        <span aria-label={`${visible.length} items`}>{visible.length}</span>
+        <span aria-label={countLabel}>{visible.length}</span>
       </div>
       {visible.length ? (
         <ol className="item-list">
