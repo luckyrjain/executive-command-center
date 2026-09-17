@@ -10,6 +10,7 @@ export type DashboardItem = {
   entity_id?: string
   entity_ref?: string
   entity_type?: string
+  event_type?: string
   title?: string
   summary?: string
   message?: string
@@ -24,8 +25,26 @@ export type DashboardItem = {
   empty?: boolean
 }
 
+// "morning_brief.generated" -> "Morning brief generated"; "risk" -> "Risk".
+function humanizeType(value?: string): string | undefined {
+  if (!value) return undefined
+  const words = value.replaceAll(/[._]/g, ' ').trim()
+  if (!words) return undefined
+  return words.charAt(0).toUpperCase() + words.slice(1)
+}
+
 export function labelFor(item: DashboardItem): string {
-  return item.title ?? item.summary ?? item.why ?? item.explanation ?? item.message ?? item.entity_ref ?? 'Untitled item'
+  return (
+    item.title ??
+    item.summary ??
+    item.why ??
+    item.explanation ??
+    item.message ??
+    item.entity_ref ??
+    humanizeType(item.event_type) ??
+    humanizeType(item.entity_type) ??
+    'Untitled item'
+  )
 }
 
 export function visibleItems(items?: DashboardItem[]): DashboardItem[] {
@@ -67,7 +86,7 @@ export function Section({ title, items, emptyMessage, headingIdPrefix = 'section
               </div>
               <div className="item-meta">
                 {formatTime(item.starts_at ?? item.occurred_at) ? <time>{formatTime(item.starts_at ?? item.occurred_at)}</time> : null}
-                {typeof item.score === 'number' ? <span>{Math.round(item.score)}</span> : null}
+                {typeof item.score === 'number' ? <span>{`Score ${Math.round(item.score)}`}</span> : null}
               </div>
             </li>
           ))}

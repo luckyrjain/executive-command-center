@@ -18,7 +18,9 @@ export default function SidebarNavigation() {
               <li key={entry.view}>
                 <NavLink to={entry.path} end>
                   <span>{entry.label}</span>
-                  {counts[entry.view] ? <span className="sidebar-nav-badge">{counts[entry.view]}</span> : null}
+                  {counts[entry.view] ? (
+                    <span className="sidebar-nav-badge" aria-label={`${counts[entry.view]} items`}>{counts[entry.view]}</span>
+                  ) : null}
                 </NavLink>
               </li>
             ))}
