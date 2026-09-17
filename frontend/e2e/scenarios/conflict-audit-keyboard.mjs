@@ -114,7 +114,11 @@ export async function run({ page, baseURL }) {
 
   await risksSection.getByRole('button', { name: 'Retry with latest version' }).focus()
   await page.keyboard.press('Enter')
-  await risksSection.getByText('Vendor concentration (reviewed)').waitFor()
+  // exact: true -- RiskWorkspace.tsx's own <summary>Details for {description}</summary>
+  // contains this string as a substring, so a non-exact match resolves to 2
+  // elements (strict-mode violation). Line 89's identical wait already gets
+  // this right; this one didn't.
+  await risksSection.getByText('Vendor concentration (reviewed)', { exact: true }).waitFor()
 
   // Archive then restore, still keyboard-only. Neither action has any
   // other scenario coverage for risks (tasks.mjs covers archive/restore
