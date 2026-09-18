@@ -578,7 +578,13 @@ class DatadogAdapter:
         account: ConnectorAccountContext,
         resource_type: str,
         since: datetime | None = None,
+        resume_cursor: str | None = None,
     ) -> SyncOutcome:
+        # `resume_cursor` accepted (protocol conformance) but unused --
+        # none of the three resource types this adapter syncs are
+        # paginated at all (see module docstring), so there is never
+        # anything to resume.
+        del resume_cursor
         return self._sync(account, resource_type)
 
     def incremental_sync(

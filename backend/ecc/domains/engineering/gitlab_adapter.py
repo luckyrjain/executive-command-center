@@ -500,12 +500,15 @@ class GitLabAdapter:
         account: ConnectorAccountContext,
         resource_type: str,
         since: datetime | None = None,
+        resume_cursor: str | None = None,
     ) -> SyncOutcome:
         if resource_type != "repository":
             return SyncOutcome(
                 resource_type=resource_type, items_processed=0, status="succeeded", next_cursor=None
             )
-        return self._sync_repositories(account, since_cursor=None)
+        return self._sync_repositories(
+            account, since_cursor=None, resume_cursor=resume_cursor, apply_watermark_stop=False
+        )
 
     def incremental_sync(
         self, account: ConnectorAccountContext, resource_type: str, cursor: str | None
@@ -520,8 +523,23 @@ class GitLabAdapter:
         return self._sync_repositories(account, since_cursor=cursor)
 
     def _sync_repositories(
-        self, account: ConnectorAccountContext, *, since_cursor: str | None
+        self,
+        account: ConnectorAccountContext,
+        *,
+        since_cursor: str | None,
+        resume_cursor: str | None = None,
+        apply_watermark_stop: bool = True,
     ) -> SyncOutcome:
+        """`apply_watermark_stop=False` (the `backfill()` path only): see
+        `github_adapter.py`'s own `_sync_repositories` docstring for the
+        full reasoning this mirrors exactly -- resumes from `resume_
+        cursor` (a page number) instead of always restarting at page 1,
+        never stops early on a watermark, and only reports `next_cursor`
+        back on the very first backfill call (`resume_cursor is None`),
+        since every later page can, by construction, only contain items
+        at or older than what that first call's own page 1 already
+        established as the true newest.
+        """
         try:
             host, token = parse_credential(account.credential)
         except InvalidCredentialError as exc:
@@ -531,10 +549,18 @@ class GitLabAdapter:
         headers = self._headers(token)
         items_processed = 0
         newest_updated_at = since_cursor
-        page = 1
+        # `page` (the real, absolute page number, carrying across calls
+        # via `resume_cursor`) is deliberately a *different* variable from
+        # the loop's own per-call budget below -- see `github_adapter.py`'s
+        # own `_sync_repositories` for why conflating the two (the
+        # original `while page <= _MAX_PAGES_PER_CALL` condition) breaks
+        # the moment a resumed call starts past page `_MAX_PAGES_PER_CALL`.
+        page = int(resume_cursor) if resume_cursor else 1
+        pages_fetched_this_call = 0
         stopped_early = False
 
-        while page <= _MAX_PAGES_PER_CALL:
+        while pages_fetched_this_call < _MAX_PAGES_PER_CALL:
+            pages_fetched_this_call += 1
             response = self._request_with_rate_limit_retry(
                 "GET",
                 f"{api_base_url}/projects",
@@ -552,8 +578,9 @@ class GitLabAdapter:
                     resource_type="repository",
                     items_processed=items_processed,
                     status="partial",
-                    next_cursor=newest_updated_at,
+                    next_cursor=newest_updated_at if resume_cursor is None else None,
                     error_summary="GitLab rate limit exceeded; sync paused, will resume next call",
+                    backfill_resume_cursor=str(page),
                 )
             if response.status_code != 200:
                 raise RuntimeError(f"GitLab project list failed with status {response.status_code}")
@@ -565,7 +592,8 @@ class GitLabAdapter:
             for project in projects:
                 updated_at = project.get("last_activity_at")
                 if (
-                    since_cursor is not None
+                    apply_watermark_stop
+                    and since_cursor is not None
                     and updated_at is not None
                     and updated_at <= since_cursor
                 ):
@@ -592,24 +620,28 @@ class GitLabAdapter:
             # The loop ran `_MAX_PAGES_PER_CALL` iterations without ever
             # `break`-ing -- the last page fetched still had further pages
             # available. `partial`, not `succeeded` -- identical reasoning
-            # to `github_adapter.py`'s own equivalent bound.
+            # to `github_adapter.py`'s own equivalent bound. `page` here
+            # already names the next page to resume from -- the loop's
+            # own `page += 1` already advanced past the last page fetched.
             return SyncOutcome(
                 resource_type="repository",
                 items_processed=items_processed,
                 status="partial",
-                next_cursor=newest_updated_at,
+                next_cursor=newest_updated_at if resume_cursor is None else None,
                 error_summary=(
                     f"GitLab project sync hit the {_MAX_PAGES_PER_CALL}-page "
                     "per-call bound with more pages remaining; sync paused, "
                     "will resume next call"
                 ),
+                backfill_resume_cursor=str(page),
             )
 
         return SyncOutcome(
             resource_type="repository",
             items_processed=items_processed,
             status="succeeded",
-            next_cursor=newest_updated_at,
+            next_cursor=newest_updated_at if resume_cursor is None else None,
+            backfill_resume_cursor=None,
         )
 
     def handle_webhook(
