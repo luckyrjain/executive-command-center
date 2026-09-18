@@ -47,7 +47,7 @@ describe('WorkspaceSwitcher', () => {
     vi.stubGlobal('fetch', fetch)
     renderSwitcher()
 
-    const select = await screen.findByLabelText('Switch workspace') as HTMLSelectElement
+    const select = await screen.findByLabelText('Workspace') as HTMLSelectElement
     expect(select.value).toBe('workspace-1')
     expect(screen.getByRole('option', { name: 'Beta Co' })).toBeTruthy()
 
