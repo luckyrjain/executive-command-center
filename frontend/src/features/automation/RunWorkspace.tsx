@@ -226,7 +226,7 @@ export default function RunWorkspace() {
         <h2 id="automation-runs-title">Run history</h2>
         <form className="field-form" onSubmit={submit}>
           <label>Run a workflow (manual trigger)
-            <input aria-label="Workflow ID to run" value={workflowId} onChange={(e) => setWorkflowId(e.target.value)} placeholder="workflow ID" />
+            <input value={workflowId} onChange={(e) => setWorkflowId(e.target.value)} placeholder="workflow ID" />
           </label>
           <button type="submit" aria-busy={createMutation.isPending} disabled={createMutation.isPending || !workflowId.trim()}>{createMutation.isPending ? 'Starting…' : 'Start run'}</button>
         </form>
@@ -234,7 +234,7 @@ export default function RunWorkspace() {
 
         <div className="field-form">
           <label>Filter by status
-            <select aria-label="Filter runs by status" value={statusFilter} onChange={(e) => setStatusFilter(e.target.value as RunStatus | '')}>
+            <select value={statusFilter} onChange={(e) => setStatusFilter(e.target.value as RunStatus | '')}>
               <option value="">All statuses</option>
               {RUN_STATUSES.map((status) => <option key={status} value={status}>{status.replaceAll('_', ' ')}</option>)}
             </select>

@@ -143,7 +143,7 @@ export async function run({ page, baseURL }) {
   // --- Manually run: hits the approval gate -----------------------------
   await page.getByRole('tab', { name: 'Runs' }).click()
   const runsPanel = automationPanel.locator('section[aria-labelledby="automation-runs-title"]')
-  await runsPanel.getByLabel('Workflow ID to run').fill(WORKFLOW_ID)
+  await runsPanel.getByLabel('Run a workflow (manual trigger)').fill(WORKFLOW_ID)
   await runsPanel.getByRole('button', { name: 'Start run' }).click()
 
   const runDetail = automationPanel.locator('section[aria-labelledby="automation-run-detail-title"]')
@@ -159,7 +159,7 @@ export async function run({ page, baseURL }) {
   await approvalsPanel.getByText('Payload summary (redacted)').click()
   await approvalsPanel.getByText(/Weekly digest note/).waitFor()
 
-  const digestInput = approvalsPanel.getByLabel(`Echo action digest for run ${RUN_ID} step 0`)
+  const digestInput = approvalsPanel.getByLabel(`Echo the action digest above to approve, run ${RUN_ID} step 0`)
   await digestInput.fill(DIGEST)
   await approvalsPanel.getByRole('button', { name: 'Approve' }).click()
   await approvalsPanel.getByText('No approvals are waiting on you.').waitFor()
@@ -246,7 +246,7 @@ export async function run({ page, baseURL }) {
   await detail.getByText(/Kill switch active/).waitFor()
 
   await page.getByRole('tab', { name: 'Runs' }).click()
-  await runsPanel.getByLabel('Workflow ID to run').fill(WORKFLOW_ID)
+  await runsPanel.getByLabel('Run a workflow (manual trigger)').fill(WORKFLOW_ID)
   await runsPanel.getByRole('button', { name: 'Start run' }).click()
   await runsPanel.getByText(/A kill switch is active for workflow "weekly-digest"/).waitFor()
 }

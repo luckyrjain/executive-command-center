@@ -104,7 +104,7 @@ function ApprovalCard({ approval, onDecided }: { approval: Approval; onDecided: 
       {!decided ? (
         <form className="field-form" onSubmit={(event) => { event.preventDefault(); setAttemptedApprove(true); if (digestInput.trim()) decideMutation.mutate({ decision: 'approve', digest: digestInput.trim() }) }}>
           <label>Echo the action digest above to approve
-            <input aria-label={`Echo action digest for run ${approval.run_id} step ${approval.step_index}`} value={digestInput} onChange={(e) => setDigestInput(e.target.value)} disabled={expired || pending} autoComplete="off" />
+            <input aria-label={`Echo the action digest above to approve, run ${approval.run_id} step ${approval.step_index}`} value={digestInput} onChange={(e) => setDigestInput(e.target.value)} disabled={expired || pending} autoComplete="off" />
           </label>
           {attemptedApprove && !digestInput.trim() ? <p role="alert">Enter the exact action digest before approving.</p> : null}
           <div className="work-actions">
