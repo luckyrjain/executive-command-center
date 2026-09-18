@@ -98,14 +98,16 @@ widen it, but callers should not rely on that as a safety net.
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Literal
+from typing import Any, Literal
 from uuid import UUID
 
 from fastapi import HTTPException, status
 from pydantic import BaseModel
 from sqlalchemy import text
+from sqlalchemy.engine import RowMapping
 from sqlalchemy.orm import Session
 
 from ecc.auth import AuthContext
@@ -785,6 +787,12 @@ def visible_resource_filter_sql(
     re-deriving it (Task 4 reuses this unchanged for every remaining
     domain, per the design doc's own "no new mechanism" framing).
 
+    **For a plain single-table list endpoint, prefer `list_visible_resources`
+    (below) over calling this directly** -- it wraps this function plus the
+    base workspace clause and query execution. Call this function directly
+    only for what that helper can't express: multi-table joins, CTEs,
+    aggregates, or several calls in one query (`param_prefix`).
+
     Returns `(sql_fragment, params)` -- the caller embeds `sql_fragment`
     into their own query's `WHERE` clause (already parenthesized, safe to
     `AND`/`OR` with other conditions) using `table_alias` as the alias for
@@ -845,3 +853,80 @@ def visible_resource_filter_sql(
         _p("now"): datetime.now(UTC),
     }
     return sql, params
+
+
+def list_visible_resources(
+    session: Session,
+    auth: AuthContext,
+    *,
+    resource_type: str,
+    columns: str,
+    order_by: str,
+    extra_clauses: Sequence[str] = (),
+    extra_params: Mapping[str, Any] | None = None,
+    limit_clause: str = "",
+    action: Action = "read",
+) -> Sequence[RowMapping]:
+    """Runs `SELECT {columns} FROM {resource_type} WHERE workspace_id =
+    :workspace_id AND (<visible_resource_filter_sql>) AND <extra_clauses...>
+    ORDER BY {order_by} {limit_clause}` -- the boilerplate a simple,
+    single-table list endpoint otherwise repeats: call `visible_resource_
+    filter_sql`, fold it into a base workspace+visibility clause, run the
+    query. Prefer this over the inline pattern for a new single-table list
+    endpoint; use `visible_resource_filter_sql` directly for anything it
+    can't express (multi-table joins, CTEs, aggregates, or several calls in
+    one query needing `param_prefix`).
+
+    `resource_type` is both the authz resource type and the table queried:
+    `_RESOURCE_TABLES` is a set of table names, so the two are the same
+    string by construction (an unknown or unsafe value raises before any
+    query runs). It is also used as the table alias inside the visibility
+    fragment, so it must be queried unaliased and unqualified.
+
+    Deliberately does NOT own pagination or row-to-response mapping -- both
+    differ per call site (keyset cursor columns/types; a plain Pydantic
+    constructor vs. a domain projection function). A keyset cursor
+    condition is just one more entry in `extra_clauses`. To paginate, pass
+    `limit_clause="LIMIT :limit"` AND put `limit` in `extra_params`
+    (callers here pass `limit + 1` so they can tell whether another page
+    exists); `order_by` should end in a unique tiebreak such as `id`.
+
+    **Raw SQL params.** `columns`, `order_by`, `limit_clause` and every
+    string in `extra_clauses` are interpolated into the query text with no
+    validation (unlike `resource_type`, which is allowlisted): pass string
+    literals or module constants only, never anything request-derived. Every
+    *value* must be a bound parameter in `extra_params`. `extra_params` may
+    not reuse a reserved name (`workspace_id` or any `__authz_*` key) -- that
+    raises `ValueError` rather than silently overriding the tenant scoping.
+    """
+    reserved = {"workspace_id"}
+    collisions = [
+        key for key in (extra_params or {}) if key in reserved or key.startswith("__authz_")
+    ]
+    if collisions:
+        raise ValueError(
+            f"extra_params may not override reserved bind params: {sorted(collisions)}"
+        )
+    visibility_sql, visibility_params = visible_resource_filter_sql(
+        session, auth, resource_type=resource_type, action=action, table_alias=resource_type
+    )
+    clauses = ["workspace_id = :workspace_id", f"({visibility_sql})", *extra_clauses]
+    params: dict[str, Any] = {
+        **(extra_params or {}),
+        **visibility_params,
+        "workspace_id": auth.workspace_id,
+    }
+    return (
+        session.execute(
+            text(
+                f"SELECT {columns} FROM {resource_type} "  # noqa: S608 -- resource_type is
+                # allowlisted by visible_resource_filter_sql above; columns/order_by/
+                # limit_clause/extra_clauses are literals from call sites, never
+                # request-derived (see docstring); every value is a bound param.
+                f"WHERE {' AND '.join(clauses)} ORDER BY {order_by} {limit_clause}"
+            ),
+            params,
+        )
+        .mappings()
+        .all()
+    )

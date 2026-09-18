@@ -2216,32 +2216,27 @@ def list_repositories_endpoint(
     team-scoped-view filter that addition exists to enable -- a plain
     equality match against the confirmed link, never the suggestion.
     """
-    visibility_sql, visibility_params = authz.visible_resource_filter_sql(
-        session, auth, resource_type="repositories", action="read", table_alias="repositories"
-    )
-    clauses = []
-    params: dict[str, Any] = {"workspace_id": auth.workspace_id, **visibility_params}
+    extra_clauses = []
+    extra_params: dict[str, Any] = {}
     if connector_account_id:
-        clauses.append("AND connector_account_id = :connector_account_id")
-        params["connector_account_id"] = connector_account_id
+        extra_clauses.append("connector_account_id = :connector_account_id")
+        extra_params["connector_account_id"] = connector_account_id
     if team_entity_id:
-        clauses.append("AND team_entity_id = :team_entity_id")
-        params["team_entity_id"] = team_entity_id
-    rows = (
-        session.execute(
-            text(
-                "SELECT id, connector_account_id, provider, external_id, name, source_url, "
-                "default_branch, permission_state, freshness_state, provider_updated_at, "
-                "observed_at, created_at, updated_at, team_entity_id, suggested_team_name, "
-                "team_assignment_version, team_assignment_updated_by "
-                "FROM repositories "
-                f"WHERE workspace_id = :workspace_id AND ({visibility_sql}) "  # noqa: S608
-                f"{' '.join(clauses)} ORDER BY name ASC"
-            ),
-            params,
-        )
-        .mappings()
-        .all()
+        extra_clauses.append("team_entity_id = :team_entity_id")
+        extra_params["team_entity_id"] = team_entity_id
+    rows = authz.list_visible_resources(
+        session,
+        auth,
+        columns=(
+            "id, connector_account_id, provider, external_id, name, source_url, "
+            "default_branch, permission_state, freshness_state, provider_updated_at, "
+            "observed_at, created_at, updated_at, team_entity_id, suggested_team_name, "
+            "team_assignment_version, team_assignment_updated_by"
+        ),
+        resource_type="repositories",
+        order_by="name ASC",
+        extra_clauses=extra_clauses,
+        extra_params=extra_params,
     )
     return RepositoryListResponse(repositories=[RepositoryResponse(**dict(row)) for row in rows])
 
@@ -2264,40 +2259,31 @@ def list_work_items_endpoint(
     cannot honestly enumerate as a closed set. `team_entity_id` mirrors
     `list_repositories_endpoint`'s identical filter.
     """
-    visibility_sql, visibility_params = authz.visible_resource_filter_sql(
+    extra_clauses = []
+    extra_params: dict[str, Any] = {}
+    if connector_account_id:
+        extra_clauses.append("connector_account_id = :connector_account_id")
+        extra_params["connector_account_id"] = connector_account_id
+    if status_filter:
+        extra_clauses.append("status = :status_filter")
+        extra_params["status_filter"] = status_filter
+    if team_entity_id:
+        extra_clauses.append("team_entity_id = :team_entity_id")
+        extra_params["team_entity_id"] = team_entity_id
+    rows = authz.list_visible_resources(
         session,
         auth,
+        columns=(
+            "id, connector_account_id, provider, external_id, title, source_url, "
+            "item_type, status, reporter_external_id, assignee_external_id, "
+            "permission_state, freshness_state, provider_created_at, observed_at, "
+            "created_at, updated_at, team_entity_id, suggested_team_name, "
+            "team_assignment_version, team_assignment_updated_by"
+        ),
         resource_type="engineering_work_items",
-        action="read",
-        table_alias="engineering_work_items",
-    )
-    clauses = []
-    params: dict[str, Any] = {"workspace_id": auth.workspace_id, **visibility_params}
-    if connector_account_id:
-        clauses.append("AND connector_account_id = :connector_account_id")
-        params["connector_account_id"] = connector_account_id
-    if status_filter:
-        clauses.append("AND status = :status_filter")
-        params["status_filter"] = status_filter
-    if team_entity_id:
-        clauses.append("AND team_entity_id = :team_entity_id")
-        params["team_entity_id"] = team_entity_id
-    rows = (
-        session.execute(
-            text(
-                "SELECT id, connector_account_id, provider, external_id, title, source_url, "
-                "item_type, status, reporter_external_id, assignee_external_id, "
-                "permission_state, freshness_state, provider_created_at, observed_at, "
-                "created_at, updated_at, team_entity_id, suggested_team_name, "
-                "team_assignment_version, team_assignment_updated_by "
-                "FROM engineering_work_items "
-                f"WHERE workspace_id = :workspace_id AND ({visibility_sql}) "  # noqa: S608
-                f"{' '.join(clauses)} ORDER BY title ASC"
-            ),
-            params,
-        )
-        .mappings()
-        .all()
+        order_by="title ASC",
+        extra_clauses=extra_clauses,
+        extra_params=extra_params,
     )
     return WorkItemListResponse(work_items=[WorkItemResponse(**dict(row)) for row in rows])
 
@@ -2605,36 +2591,27 @@ def list_monitors_endpoint(
     Datadog connector's `datadog_monitors` projection (migration
     `0051_phase6_datadog_connector.py`).
     """
-    visibility_sql, visibility_params = authz.visible_resource_filter_sql(
+    extra_clauses = []
+    extra_params: dict[str, Any] = {}
+    if connector_account_id:
+        extra_clauses.append("connector_account_id = :connector_account_id")
+        extra_params["connector_account_id"] = connector_account_id
+    if team_entity_id:
+        extra_clauses.append("team_entity_id = :team_entity_id")
+        extra_params["team_entity_id"] = team_entity_id
+    rows = authz.list_visible_resources(
         session,
         auth,
+        columns=(
+            "id, connector_account_id, provider, external_id, source_url, "
+            "name, monitor_type, query, overall_state, permission_state, "
+            "freshness_state, provider_updated_at, observed_at, created_at, "
+            "updated_at, team_entity_id, suggested_team_name"
+        ),
         resource_type="datadog_monitors",
-        action="read",
-        table_alias="datadog_monitors",
-    )
-    clauses = []
-    params: dict[str, Any] = {"workspace_id": auth.workspace_id, **visibility_params}
-    if connector_account_id:
-        clauses.append("AND connector_account_id = :connector_account_id")
-        params["connector_account_id"] = connector_account_id
-    if team_entity_id:
-        clauses.append("AND team_entity_id = :team_entity_id")
-        params["team_entity_id"] = team_entity_id
-    rows = (
-        session.execute(
-            text(
-                "SELECT id, connector_account_id, provider, external_id, source_url, "
-                "name, monitor_type, query, overall_state, permission_state, "
-                "freshness_state, provider_updated_at, observed_at, created_at, "
-                "updated_at, team_entity_id, suggested_team_name "
-                "FROM datadog_monitors "
-                f"WHERE workspace_id = :workspace_id AND ({visibility_sql}) "  # noqa: S608
-                f"{' '.join(clauses)} ORDER BY name ASC"
-            ),
-            params,
-        )
-        .mappings()
-        .all()
+        order_by="name ASC",
+        extra_clauses=extra_clauses,
+        extra_params=extra_params,
     )
     return MonitorListResponse(monitors=[MonitorResponse(**dict(row)) for row in rows])
 
@@ -2649,35 +2626,26 @@ def list_service_definitions_endpoint(
     """Mirrors `list_repositories_endpoint`'s shape exactly, for the
     Datadog connector's `datadog_service_definitions` projection.
     """
-    visibility_sql, visibility_params = authz.visible_resource_filter_sql(
+    extra_clauses = []
+    extra_params: dict[str, Any] = {}
+    if connector_account_id:
+        extra_clauses.append("connector_account_id = :connector_account_id")
+        extra_params["connector_account_id"] = connector_account_id
+    if team_entity_id:
+        extra_clauses.append("team_entity_id = :team_entity_id")
+        extra_params["team_entity_id"] = team_entity_id
+    rows = authz.list_visible_resources(
         session,
         auth,
+        columns=(
+            "id, connector_account_id, provider, external_id, source_url, "
+            "name, team, tier, description, permission_state, freshness_state, "
+            "observed_at, created_at, updated_at, team_entity_id, suggested_team_name"
+        ),
         resource_type="datadog_service_definitions",
-        action="read",
-        table_alias="datadog_service_definitions",
-    )
-    clauses = []
-    params: dict[str, Any] = {"workspace_id": auth.workspace_id, **visibility_params}
-    if connector_account_id:
-        clauses.append("AND connector_account_id = :connector_account_id")
-        params["connector_account_id"] = connector_account_id
-    if team_entity_id:
-        clauses.append("AND team_entity_id = :team_entity_id")
-        params["team_entity_id"] = team_entity_id
-    rows = (
-        session.execute(
-            text(
-                "SELECT id, connector_account_id, provider, external_id, source_url, "
-                "name, team, tier, description, permission_state, freshness_state, "
-                "observed_at, created_at, updated_at, team_entity_id, suggested_team_name "
-                "FROM datadog_service_definitions "
-                f"WHERE workspace_id = :workspace_id AND ({visibility_sql}) "  # noqa: S608
-                f"{' '.join(clauses)} ORDER BY name ASC"
-            ),
-            params,
-        )
-        .mappings()
-        .all()
+        order_by="name ASC",
+        extra_clauses=extra_clauses,
+        extra_params=extra_params,
     )
     return ServiceDefinitionListResponse(
         service_definitions=[ServiceDefinitionResponse(**dict(row)) for row in rows]
@@ -2694,36 +2662,27 @@ def list_dashboards_endpoint(
     """Mirrors `list_repositories_endpoint`'s shape exactly, for the
     Datadog connector's `datadog_dashboards` projection.
     """
-    visibility_sql, visibility_params = authz.visible_resource_filter_sql(
+    extra_clauses = []
+    extra_params: dict[str, Any] = {}
+    if connector_account_id:
+        extra_clauses.append("connector_account_id = :connector_account_id")
+        extra_params["connector_account_id"] = connector_account_id
+    if team_entity_id:
+        extra_clauses.append("team_entity_id = :team_entity_id")
+        extra_params["team_entity_id"] = team_entity_id
+    rows = authz.list_visible_resources(
         session,
         auth,
+        columns=(
+            "id, connector_account_id, provider, external_id, source_url, "
+            "title, description, permission_state, freshness_state, "
+            "provider_updated_at, observed_at, created_at, updated_at, "
+            "team_entity_id, suggested_team_name"
+        ),
         resource_type="datadog_dashboards",
-        action="read",
-        table_alias="datadog_dashboards",
-    )
-    clauses = []
-    params: dict[str, Any] = {"workspace_id": auth.workspace_id, **visibility_params}
-    if connector_account_id:
-        clauses.append("AND connector_account_id = :connector_account_id")
-        params["connector_account_id"] = connector_account_id
-    if team_entity_id:
-        clauses.append("AND team_entity_id = :team_entity_id")
-        params["team_entity_id"] = team_entity_id
-    rows = (
-        session.execute(
-            text(
-                "SELECT id, connector_account_id, provider, external_id, source_url, "
-                "title, description, permission_state, freshness_state, "
-                "provider_updated_at, observed_at, created_at, updated_at, "
-                "team_entity_id, suggested_team_name "
-                "FROM datadog_dashboards "
-                f"WHERE workspace_id = :workspace_id AND ({visibility_sql}) "  # noqa: S608
-                f"{' '.join(clauses)} ORDER BY title ASC"
-            ),
-            params,
-        )
-        .mappings()
-        .all()
+        order_by="title ASC",
+        extra_clauses=extra_clauses,
+        extra_params=extra_params,
     )
     return DashboardListResponse(dashboards=[DashboardResponse(**dict(row)) for row in rows])
 

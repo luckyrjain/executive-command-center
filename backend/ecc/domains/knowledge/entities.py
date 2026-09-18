@@ -231,40 +231,27 @@ def list_entities(
     cursor: str | None = None,
     limit: int = Query(default=50, ge=1, le=100),
 ) -> EntityListResponse:
-    visibility_sql, visibility_params = authz.visible_resource_filter_sql(
-        session, auth, resource_type="pkos_nodes", action="read", table_alias="pkos_nodes"
-    )
-    clauses = ["workspace_id = :workspace_id", f"({visibility_sql})"]
-    params: dict[str, Any] = {
-        "workspace_id": auth.workspace_id,
-        "limit": limit + 1,
-        **visibility_params,
-    }
+    extra_clauses = []
+    extra_params: dict[str, Any] = {"limit": limit + 1}
     if kind is not None:
-        clauses.append("node_type = :kind")
-        params["kind"] = kind
+        extra_clauses.append("node_type = :kind")
+        extra_params["kind"] = kind
     if status_filter is not None:
-        clauses.append("status = :status")
-        params["status"] = status_filter
+        extra_clauses.append("status = :status")
+        extra_params["status"] = status_filter
     if cursor is not None:
         updated_at, cursor_id = _decode_cursor(cursor)
-        clauses.append("(updated_at, id) < (:cursor_updated_at, :cursor_id)")
-        params.update({"cursor_updated_at": updated_at, "cursor_id": cursor_id})
-    rows = (
-        session.execute(
-            text(
-                f"""
-                SELECT {_ENTITY_FIELDS}
-                FROM pkos_nodes
-                WHERE {" AND ".join(clauses)}
-                ORDER BY updated_at DESC, id DESC
-                LIMIT :limit
-                """
-            ),
-            params,
-        )
-        .mappings()
-        .all()
+        extra_clauses.append("(updated_at, id) < (:cursor_updated_at, :cursor_id)")
+        extra_params.update({"cursor_updated_at": updated_at, "cursor_id": cursor_id})
+    rows = authz.list_visible_resources(
+        session,
+        auth,
+        columns=_ENTITY_FIELDS,
+        resource_type="pkos_nodes",
+        order_by="updated_at DESC, id DESC",
+        extra_clauses=extra_clauses,
+        extra_params=extra_params,
+        limit_clause="LIMIT :limit",
     )
     session.rollback()
     page = rows[:limit]

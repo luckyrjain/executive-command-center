@@ -1842,7 +1842,7 @@ def test_bounded_step_dispatches_without_any_approval_under_usable_policy(
 
     auth = AuthContext(workspace_id=workspace_id, user_id=user_id, timezone="UTC")
     with SessionFactory() as session, session.begin():
-        approvals = automation_approvals.list_approvals(session, auth, workspace_id)
+        approvals = automation_approvals.list_approvals(session, auth)
     assert approvals == []
 
 
@@ -2002,7 +2002,7 @@ def test_preview_only_never_dispatches_even_after_an_approved_digest(
     # an operator's own record of the decision they practised.
     auth = AuthContext(workspace_id=workspace_id, user_id=user_id, timezone="UTC")
     with SessionFactory() as session, session.begin():
-        approvals_after = automation_approvals.list_approvals(session, auth, workspace_id)
+        approvals_after = automation_approvals.list_approvals(session, auth)
     assert len(approvals_after) == 1
     assert approvals_after[0].status == "approved"
     assert approvals_after[0].decided_by == user_id
@@ -2180,7 +2180,7 @@ def test_bounded_recurring_mode_is_unaffected_by_the_preview_only_block(
     assert adapter.execute_calls == 2
     auth = AuthContext(workspace_id=workspace_id, user_id=user_id, timezone="UTC")
     with SessionFactory() as session, session.begin():
-        assert automation_approvals.list_approvals(session, auth, workspace_id) == []
+        assert automation_approvals.list_approvals(session, auth) == []
 
 
 def test_no_policy_blocks_dispatch_as_needs_review(worker_test_context: tuple[UUID, UUID]) -> None:
@@ -2506,7 +2506,7 @@ def test_workspace_isolation_for_approval_requests(
     try:
         with SessionFactory() as session, session.begin():
             assert automation_approvals.get_approval(session, workspace_b, pending.id) is None
-            assert automation_approvals.list_approvals(session, auth_b, workspace_b) == []
+            assert automation_approvals.list_approvals(session, auth_b) == []
             wrong_workspace_decision = automation_approvals.decide_approval(
                 session,
                 workspace_b,

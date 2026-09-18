@@ -305,32 +305,22 @@ def get_approval(session: Session, workspace_id: UUID, approval_id: UUID) -> App
 def list_approvals(
     session: Session,
     auth: AuthContext,
-    workspace_id: UUID,
     *,
     status_filter: StoredStatus | None = None,
 ) -> list[ApprovalRequest]:
-    visibility_sql, visibility_params = authz.visible_resource_filter_sql(
+    extra_clauses = []
+    extra_params: dict[str, Any] = {}
+    if status_filter is not None:
+        extra_clauses.append("status = :status_filter")
+        extra_params["status_filter"] = status_filter
+    rows = authz.list_visible_resources(
         session,
         auth,
+        columns=_APPROVAL_FIELDS,
         resource_type="approval_requests",
-        action="read",
-        table_alias="approval_requests",
-    )
-    clause = "AND status = :status_filter" if status_filter is not None else ""
-    params: dict[str, Any] = {"workspace_id": workspace_id, **visibility_params}
-    if status_filter is not None:
-        params["status_filter"] = status_filter
-    rows = (
-        session.execute(
-            text(
-                f"SELECT {_APPROVAL_FIELDS} FROM approval_requests "
-                f"WHERE workspace_id = :workspace_id AND ({visibility_sql}) "
-                f"{clause} ORDER BY requested_at ASC"
-            ),
-            params,
-        )
-        .mappings()
-        .all()
+        order_by="requested_at ASC",
+        extra_clauses=extra_clauses,
+        extra_params=extra_params,
     )
     return [_row_to_approval(dict(row)) for row in rows]
 
@@ -719,7 +709,7 @@ def list_approvals_endpoint(
     session: SessionDep,
     approval_status: Annotated[StoredStatus | None, Query(alias="status")] = None,
 ) -> ApprovalListResponse:
-    approvals = list_approvals(session, auth, auth.workspace_id, status_filter=approval_status)
+    approvals = list_approvals(session, auth, status_filter=approval_status)
     session.rollback()
     return ApprovalListResponse(approvals=[_to_response(a) for a in approvals])
 

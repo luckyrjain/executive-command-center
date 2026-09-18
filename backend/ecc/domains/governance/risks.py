@@ -259,39 +259,26 @@ def list_risks(
     cursor: str | None = None,
     limit: int = Query(default=50, ge=1, le=100),
 ) -> RiskListResponse:
-    visibility_sql, visibility_params = authz.visible_resource_filter_sql(
-        session, auth, resource_type="risks", action="read", table_alias="risks"
-    )
-    clauses = ["workspace_id = :workspace_id", f"({visibility_sql})"]
-    params: dict[str, Any] = {
-        "workspace_id": auth.workspace_id,
-        "limit": limit + 1,
-        **visibility_params,
-    }
+    extra_clauses = []
+    extra_params: dict[str, Any] = {"limit": limit + 1}
     if not include_archived:
-        clauses.append("archived_at IS NULL")
+        extra_clauses.append("archived_at IS NULL")
     if status_filter is not None:
-        clauses.append("status = :status")
-        params["status"] = status_filter
+        extra_clauses.append("status = :status")
+        extra_params["status"] = status_filter
     if cursor is not None:
         updated_at, risk_id = _decode_cursor(cursor)
-        clauses.append("(updated_at, id) < (:cursor_updated_at, :cursor_id)")
-        params.update({"cursor_updated_at": updated_at, "cursor_id": risk_id})
-    rows = (
-        session.execute(
-            text(
-                f"""
-                SELECT {_RISK_FIELDS}
-                FROM risks
-                WHERE {" AND ".join(clauses)}
-                ORDER BY updated_at DESC, id DESC
-                LIMIT :limit
-                """
-            ),
-            params,
-        )
-        .mappings()
-        .all()
+        extra_clauses.append("(updated_at, id) < (:cursor_updated_at, :cursor_id)")
+        extra_params.update({"cursor_updated_at": updated_at, "cursor_id": risk_id})
+    rows = authz.list_visible_resources(
+        session,
+        auth,
+        columns=_RISK_FIELDS,
+        resource_type="risks",
+        order_by="updated_at DESC, id DESC",
+        extra_clauses=extra_clauses,
+        extra_params=extra_params,
+        limit_clause="LIMIT :limit",
     )
     page = rows[:limit]
     next_cursor = None
