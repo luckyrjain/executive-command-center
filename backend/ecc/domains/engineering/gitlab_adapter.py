@@ -115,7 +115,7 @@ import httpx
 
 from ecc.config import get_settings
 
-from . import rate_limit_retry, repository_sync
+from . import paginated_resume_walk, rate_limit_retry, repository_sync
 from .connectors import (
     AdapterAuthorizationError,
     ConnectorAccountContext,
@@ -530,15 +530,12 @@ class GitLabAdapter:
         resume_cursor: str | None = None,
         apply_watermark_stop: bool = True,
     ) -> SyncOutcome:
-        """`apply_watermark_stop=False` (the `backfill()` path only): see
-        `github_adapter.py`'s own `_sync_repositories` docstring for the
-        full reasoning this mirrors exactly -- resumes from `resume_
-        cursor` (a page number) instead of always restarting at page 1,
-        never stops early on a watermark, and only reports `next_cursor`
-        back on the very first backfill call (`resume_cursor is None`),
-        since every later page can, by construction, only contain items
-        at or older than what that first call's own page 1 already
-        established as the true newest.
+        """The page-walk/resume-cursor/watermark loop itself lives in
+        `paginated_resume_walk.walk_paginated_resource` -- shared
+        byte-for-byte with `github_adapter.py`'s own `_sync_repositories`
+        (see that module's docstring for the full reasoning and the bug
+        this extraction gives one home instead of two). This method's own
+        job is just GitLab's request shape, field name, and upsert call.
         """
         try:
             host, token = parse_credential(account.credential)
@@ -547,21 +544,9 @@ class GitLabAdapter:
         api_base_url = f"https://{host}/api/v4"
         web_base_url = f"https://{host}"
         headers = self._headers(token)
-        items_processed = 0
-        newest_updated_at = since_cursor
-        # `page` (the real, absolute page number, carrying across calls
-        # via `resume_cursor`) is deliberately a *different* variable from
-        # the loop's own per-call budget below -- see `github_adapter.py`'s
-        # own `_sync_repositories` for why conflating the two (the
-        # original `while page <= _MAX_PAGES_PER_CALL` condition) breaks
-        # the moment a resumed call starts past page `_MAX_PAGES_PER_CALL`.
-        page = int(resume_cursor) if resume_cursor else 1
-        pages_fetched_this_call = 0
-        stopped_early = False
 
-        while pages_fetched_this_call < _MAX_PAGES_PER_CALL:
-            pages_fetched_this_call += 1
-            response = self._request_with_rate_limit_retry(
+        def fetch_page(page: int, page_size: int) -> httpx.Response | None:
+            return self._request_with_rate_limit_retry(
                 "GET",
                 f"{api_base_url}/projects",
                 headers=headers,
@@ -569,79 +554,32 @@ class GitLabAdapter:
                     "membership": "true",
                     "order_by": "last_activity_at",
                     "sort": "desc",
-                    "per_page": _PAGE_SIZE,
+                    "per_page": page_size,
                     "page": page,
                 },
             )
-            if response is None:
-                return SyncOutcome(
-                    resource_type="repository",
-                    items_processed=items_processed,
-                    status="partial",
-                    next_cursor=newest_updated_at if resume_cursor is None else None,
-                    error_summary="GitLab rate limit exceeded; sync paused, will resume next call",
-                    backfill_resume_cursor=str(page),
-                )
-            if response.status_code != 200:
-                raise RuntimeError(f"GitLab project list failed with status {response.status_code}")
 
-            projects = response.json()
-            if not projects:
-                break
-
-            for project in projects:
-                updated_at = project.get("last_activity_at")
-                if (
-                    apply_watermark_stop
-                    and since_cursor is not None
-                    and updated_at is not None
-                    and updated_at <= since_cursor
-                ):
-                    stopped_early = True
-                    break
-                _upsert_repository(
-                    workspace_id=account.workspace_id,
-                    connector_account_id=account.connector_account_id,
-                    provider=self.provider,
-                    project=project,
-                    web_base_url=web_base_url,
-                )
-                items_processed += 1
-                if newest_updated_at is None or (updated_at and updated_at > newest_updated_at):
-                    newest_updated_at = updated_at
-
-            # `response.links` (httpx's own RFC 8288 `Link`-header parser)
-            # -- matches `github_adapter.py`'s own review-fixed choice over
-            # a hand-rolled comma-split.
-            if stopped_early or "next" not in response.links:
-                break
-            page += 1
-        else:
-            # The loop ran `_MAX_PAGES_PER_CALL` iterations without ever
-            # `break`-ing -- the last page fetched still had further pages
-            # available. `partial`, not `succeeded` -- identical reasoning
-            # to `github_adapter.py`'s own equivalent bound. `page` here
-            # already names the next page to resume from -- the loop's
-            # own `page += 1` already advanced past the last page fetched.
-            return SyncOutcome(
-                resource_type="repository",
-                items_processed=items_processed,
-                status="partial",
-                next_cursor=newest_updated_at if resume_cursor is None else None,
-                error_summary=(
-                    f"GitLab project sync hit the {_MAX_PAGES_PER_CALL}-page "
-                    "per-call bound with more pages remaining; sync paused, "
-                    "will resume next call"
-                ),
-                backfill_resume_cursor=str(page),
+        def upsert(project: Mapping[str, Any]) -> None:
+            _upsert_repository(
+                workspace_id=account.workspace_id,
+                connector_account_id=account.connector_account_id,
+                provider=self.provider,
+                project=project,
+                web_base_url=web_base_url,
             )
 
-        return SyncOutcome(
+        return paginated_resume_walk.walk_paginated_resource(
             resource_type="repository",
-            items_processed=items_processed,
-            status="succeeded",
-            next_cursor=newest_updated_at if resume_cursor is None else None,
-            backfill_resume_cursor=None,
+            provider_label="GitLab",
+            resource_label="project",
+            since_cursor=since_cursor,
+            resume_cursor=resume_cursor,
+            apply_watermark_stop=apply_watermark_stop,
+            fetch_page=fetch_page,
+            extract_timestamp=lambda project: project.get("last_activity_at"),
+            upsert=upsert,
+            max_pages_per_call=_MAX_PAGES_PER_CALL,
+            page_size=_PAGE_SIZE,
         )
 
     def handle_webhook(

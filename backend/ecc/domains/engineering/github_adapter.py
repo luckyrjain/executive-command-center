@@ -127,7 +127,7 @@ from sqlalchemy import text
 
 from ecc.database import SessionFactory
 
-from . import rate_limit_retry, repository_sync
+from . import paginated_resume_walk, rate_limit_retry, repository_sync
 from .connectors import (
     WORKSPACE_ORIGINAL_OWNER_SQL,
     AdapterAuthorizationError,
@@ -692,127 +692,48 @@ class GitHubAdapter:
         resume_cursor: str | None = None,
         apply_watermark_stop: bool = True,
     ) -> SyncOutcome:
-        """`apply_watermark_stop=False` (the `backfill()` path only) means
-        this call never stops early on `since_cursor` -- it walks purely
-        by page, resuming from `resume_cursor` (the page to continue
-        from) and stopping only on natural exhaustion or the page-cap
-        bound. `since_cursor` is always `None` on that path (`backfill()`
-        never threads a watermark in), so `next_cursor` is only ever
-        reported back to the caller on the very first backfill call
-        (`resume_cursor is None`) -- every page beyond page 1 can, by
-        construction (results are strictly newest-first), only contain
-        items at or older than what page 1 of *that same walk's first
-        call* already established as the true newest, so a resumed call
-        has nothing new to teach the watermark and must not overwrite it
-        with a lower value computed from a page deep in the walk.
+        """The page-walk/resume-cursor/watermark loop itself lives in
+        `paginated_resume_walk.walk_paginated_resource` -- shared
+        byte-for-byte with `gitlab_adapter.py`'s own `_sync_repositories`
+        (see that module's docstring for the full reasoning and the bug
+        this extraction gives one home instead of two). This method's own
+        job is just GitHub's request shape, field name, and upsert call.
         """
         headers = self._headers(account.credential)
-        items_processed = 0
-        newest_updated_at = since_cursor
-        # `page` is the real, absolute page number requested from GitHub
-        # (carries across calls via `resume_cursor`) -- deliberately a
-        # *different* variable from the loop bound below. The original
-        # version of this method conflated the two (the loop condition
-        # was `page <= _MAX_PAGES_PER_CALL` directly), which happened to
-        # work only because every call started at page 1; resuming at
-        # page 11 made that same condition false immediately, ending the
-        # call with zero requests made. `pages_fetched_this_call` is the
-        # actual per-call budget; `page` is free to start anywhere.
-        page = int(resume_cursor) if resume_cursor else 1
-        pages_fetched_this_call = 0
-        stopped_early = False
 
-        while pages_fetched_this_call < _MAX_PAGES_PER_CALL:
-            pages_fetched_this_call += 1
-            response = self._request_with_rate_limit_retry(
+        def fetch_page(page: int, page_size: int) -> httpx.Response | None:
+            return self._request_with_rate_limit_retry(
                 "GET",
                 "/user/repos",
                 headers=headers,
                 params={
                     "sort": "updated",
                     "direction": "desc",
-                    "per_page": _PAGE_SIZE,
+                    "per_page": page_size,
                     "page": page,
                 },
             )
-            if response is None:
-                return SyncOutcome(
-                    resource_type="repository",
-                    items_processed=items_processed,
-                    status="partial",
-                    next_cursor=newest_updated_at if resume_cursor is None else None,
-                    error_summary="GitHub rate limit exceeded; sync paused, will resume next call",
-                    backfill_resume_cursor=str(page),
-                )
-            if response.status_code != 200:
-                raise RuntimeError(
-                    f"GitHub repository list failed with status {response.status_code}"
-                )
 
-            repos = response.json()
-            if not repos:
-                break
-
-            for repo in repos:
-                updated_at = repo.get("updated_at")
-                if (
-                    apply_watermark_stop
-                    and since_cursor is not None
-                    and updated_at is not None
-                    and updated_at <= since_cursor
-                ):
-                    stopped_early = True
-                    break
-                _upsert_repository(
-                    workspace_id=account.workspace_id,
-                    connector_account_id=account.connector_account_id,
-                    provider=self.provider,
-                    repo=repo,
-                )
-                items_processed += 1
-                if newest_updated_at is None or (updated_at and updated_at > newest_updated_at):
-                    newest_updated_at = updated_at
-
-            # `response.links` (httpx's own RFC 8288 `Link`-header parser)
-            # replaces a hand-rolled comma-split here -- review found the
-            # naive split could mis-parse a `Link` header whose URL itself
-            # contains a comma (a legal, if unusual, query-string value),
-            # silently truncating pagination early.
-            if stopped_early or "next" not in response.links:
-                break
-            page += 1
-        else:
-            # The loop ran `_MAX_PAGES_PER_CALL` iterations without ever
-            # `break`-ing -- i.e. the last page fetched still had further
-            # pages available (`response.links` still had `"next"`). Review
-            # found this previously fell through to the same `succeeded`
-            # return below, silently capping a large account's backfill at
-            # ~`_MAX_PAGES_PER_CALL * _PAGE_SIZE` repositories with no
-            # signal that more remained. `next_cursor` is still the newest
-            # `updated_at` observed so far, so a subsequent *incremental*
-            # sync call resumes -- this is `partial`, not `failed`.
-            # `backfill_resume_cursor=str(page)`: the loop's own `page +=
-            # 1` already advanced past the last page actually fetched, so
-            # `page` here already names the next page to resume from.
-            return SyncOutcome(
-                resource_type="repository",
-                items_processed=items_processed,
-                status="partial",
-                next_cursor=newest_updated_at if resume_cursor is None else None,
-                error_summary=(
-                    f"GitHub repository sync hit the {_MAX_PAGES_PER_CALL}-page "
-                    "per-call bound with more pages remaining; sync paused, "
-                    "will resume next call"
-                ),
-                backfill_resume_cursor=str(page),
+        def upsert(repo: Mapping[str, Any]) -> None:
+            _upsert_repository(
+                workspace_id=account.workspace_id,
+                connector_account_id=account.connector_account_id,
+                provider=self.provider,
+                repo=repo,
             )
 
-        return SyncOutcome(
+        return paginated_resume_walk.walk_paginated_resource(
             resource_type="repository",
-            items_processed=items_processed,
-            status="succeeded",
-            next_cursor=newest_updated_at if resume_cursor is None else None,
-            backfill_resume_cursor=None,
+            provider_label="GitHub",
+            resource_label="repository",
+            since_cursor=since_cursor,
+            resume_cursor=resume_cursor,
+            apply_watermark_stop=apply_watermark_stop,
+            fetch_page=fetch_page,
+            extract_timestamp=lambda repo: repo.get("updated_at"),
+            upsert=upsert,
+            max_pages_per_call=_MAX_PAGES_PER_CALL,
+            page_size=_PAGE_SIZE,
         )
 
     def _sync_changes(
