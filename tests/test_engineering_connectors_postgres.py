@@ -251,7 +251,11 @@ class _RaisingAdapter:
         )
 
     def backfill(
-        self, account: ConnectorAccountContext, resource_type: str, since: datetime | None = None
+        self,
+        account: ConnectorAccountContext,
+        resource_type: str,
+        since: datetime | None = None,
+        resume_cursor: str | None = None,
     ) -> SyncOutcome:
         raise RuntimeError("simulated adapter failure")
 
@@ -290,7 +294,11 @@ class _SpyDisconnectAdapter:
         )
 
     def backfill(
-        self, account: ConnectorAccountContext, resource_type: str, since: datetime | None = None
+        self,
+        account: ConnectorAccountContext,
+        resource_type: str,
+        since: datetime | None = None,
+        resume_cursor: str | None = None,
     ) -> SyncOutcome:
         return SyncOutcome(
             resource_type=resource_type, items_processed=1, status="succeeded", next_cursor="1"
@@ -352,7 +360,11 @@ class _SlowDisconnectAdapter:
         )
 
     def backfill(
-        self, account: ConnectorAccountContext, resource_type: str, since: datetime | None = None
+        self,
+        account: ConnectorAccountContext,
+        resource_type: str,
+        since: datetime | None = None,
+        resume_cursor: str | None = None,
     ) -> SyncOutcome:
         raise NotImplementedError
 
@@ -396,7 +408,11 @@ class _SlowAdapter:
         )
 
     def backfill(
-        self, account: ConnectorAccountContext, resource_type: str, since: datetime | None = None
+        self,
+        account: ConnectorAccountContext,
+        resource_type: str,
+        since: datetime | None = None,
+        resume_cursor: str | None = None,
     ) -> SyncOutcome:
         self.entered_phase2.set()
         self.release.wait(timeout=5)
@@ -454,7 +470,11 @@ class _SlowAuthorizeAdapter:
         )
 
     def backfill(
-        self, account: ConnectorAccountContext, resource_type: str, since: datetime | None = None
+        self,
+        account: ConnectorAccountContext,
+        resource_type: str,
+        since: datetime | None = None,
+        resume_cursor: str | None = None,
     ) -> SyncOutcome:
         raise NotImplementedError
 
@@ -510,7 +530,11 @@ class _MessageCursorAdapter:
         raise NotImplementedError
 
     def backfill(
-        self, account: ConnectorAccountContext, resource_type: str, since: datetime | None = None
+        self,
+        account: ConnectorAccountContext,
+        resource_type: str,
+        since: datetime | None = None,
+        resume_cursor: str | None = None,
     ) -> SyncOutcome:
         self.since_calls.append(since)
         return SyncOutcome(
@@ -523,6 +547,67 @@ class _MessageCursorAdapter:
         return SyncOutcome(
             resource_type=resource_type, items_processed=1, status="succeeded", next_cursor="12346"
         )
+
+    def handle_webhook(
+        self, account: ConnectorAccountContext, payload: bytes, headers: object
+    ) -> SyncOutcome:
+        raise NotImplementedError
+
+    def refresh_permissions(self, account: ConnectorAccountContext) -> str:
+        return "active"
+
+    def disconnect(self, account: ConnectorAccountContext) -> None:
+        return None
+
+
+@dataclass
+class _ResumeCursorSpyAdapter:
+    """Registers under a real provider slug so `POST /connectors/{id}/
+    sync` genuinely dispatches to it. Records every `resume_cursor` its
+    own `backfill()` was called with; returns a page-capped `partial`
+    outcome (with its own `backfill_resume_cursor`) whenever called with
+    `resume_cursor=None`, and `succeeded` (clearing it) on any call that
+    receives a non-`None` `resume_cursor` -- proving `_run_connector_
+    sync` genuinely reads/threads/persists `sync_cursors.backfill_resume_
+    cursor` across two real HTTP `/sync` calls, the same way `test_sync_
+    backfill_passes_since_through_to_adapter` proves it for `since`.
+    """
+
+    provider: str = "gitlab"
+    required_scopes: frozenset[str] = field(default_factory=frozenset)
+    resume_cursor_calls: list[str | None] = field(default_factory=list)
+
+    def authorize(self, credential: str) -> ConnectorAuthorization:
+        raise NotImplementedError
+
+    def backfill(
+        self,
+        account: ConnectorAccountContext,
+        resource_type: str,
+        since: datetime | None = None,
+        resume_cursor: str | None = None,
+    ) -> SyncOutcome:
+        self.resume_cursor_calls.append(resume_cursor)
+        if resume_cursor is None:
+            return SyncOutcome(
+                resource_type=resource_type,
+                items_processed=1,
+                status="partial",
+                next_cursor="watermark-1",
+                backfill_resume_cursor="page-2",
+            )
+        return SyncOutcome(
+            resource_type=resource_type,
+            items_processed=1,
+            status="succeeded",
+            next_cursor=None,
+            backfill_resume_cursor=None,
+        )
+
+    def incremental_sync(
+        self, account: ConnectorAccountContext, resource_type: str, cursor: str | None
+    ) -> SyncOutcome:
+        raise NotImplementedError
 
     def handle_webhook(
         self, account: ConnectorAccountContext, payload: bytes, headers: object
@@ -561,7 +646,11 @@ class _OAuth2SpyAdapter:
         raise NotImplementedError
 
     def backfill(
-        self, account: ConnectorAccountContext, resource_type: str, since: datetime | None = None
+        self,
+        account: ConnectorAccountContext,
+        resource_type: str,
+        since: datetime | None = None,
+        resume_cursor: str | None = None,
     ) -> SyncOutcome:
         self.sync_calls.append(account)
         return SyncOutcome(
@@ -646,7 +735,11 @@ class _ActionDetectionSpyAdapter(_MessageCursorAdapter):
     items_processed: int = 1
 
     def backfill(
-        self, account: ConnectorAccountContext, resource_type: str, since: datetime | None = None
+        self,
+        account: ConnectorAccountContext,
+        resource_type: str,
+        since: datetime | None = None,
+        resume_cursor: str | None = None,
     ) -> SyncOutcome:
         return SyncOutcome(
             resource_type=resource_type,
@@ -693,7 +786,11 @@ class _AutoBackfillSpyAdapter:
         )
 
     def backfill(
-        self, account: ConnectorAccountContext, resource_type: str, since: datetime | None = None
+        self,
+        account: ConnectorAccountContext,
+        resource_type: str,
+        since: datetime | None = None,
+        resume_cursor: str | None = None,
     ) -> SyncOutcome:
         self.backfill_calls.append(resource_type)
         if resource_type in self.fail_for:
@@ -1957,6 +2054,67 @@ def test_sync_backfill_passes_since_through_to_adapter(
     )
     assert response.status_code == 201, response.text
     assert adapter.since_calls == [since]
+
+
+def test_sync_backfill_threads_and_persists_backfill_resume_cursor(
+    engineering_test_context: tuple[TestClient, UUID, UUID, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """End-to-end proof that `_run_connector_sync` actually reads,
+    threads, and persists `sync_cursors.backfill_resume_cursor` across
+    two real `POST /sync` calls -- not just that the underlying adapter
+    method accepts the parameter (already covered per-adapter). Mirrors
+    `test_sync_backfill_passes_since_through_to_adapter` above, one level
+    up: this state persists across calls via the database, `since` never
+    needed to.
+    """
+    client, workspace_id, user_id, token = engineering_test_context
+    adapter = _ResumeCursorSpyAdapter()
+    monkeypatch.setattr(connector_accounts_module, "connector_registry", _registry_with(adapter))
+    account_id = _insert_connector_account(workspace_id, user_id, provider="gitlab")
+
+    first = client.post(
+        f"/api/v1/engineering/connectors/{account_id}/sync",
+        json={"run_type": "backfill", "resource_type": "repository"},
+        headers=_headers(token, key=str(uuid4())),
+    )
+    assert first.status_code == 201, first.text
+    assert first.json()["status"] == "partial"
+    assert adapter.resume_cursor_calls == [None]
+
+    with engine.begin() as connection:
+        stored = connection.execute(
+            text(
+                "SELECT backfill_resume_cursor FROM sync_cursors "
+                "WHERE workspace_id = :workspace_id AND connector_account_id = :account_id "
+                "AND resource_type = 'repository'"
+            ),
+            {"workspace_id": workspace_id, "account_id": account_id},
+        ).scalar_one()
+    assert stored == "page-2"
+
+    second = client.post(
+        f"/api/v1/engineering/connectors/{account_id}/sync",
+        json={"run_type": "backfill", "resource_type": "repository"},
+        headers=_headers(token, key=str(uuid4())),
+    )
+    assert second.status_code == 201, second.text
+    assert second.json()["status"] == "succeeded"
+    # The second call's own adapter invocation received exactly what the
+    # first call's outcome persisted -- proving the read/thread half of
+    # the wiring, not just the write half asserted above.
+    assert adapter.resume_cursor_calls == [None, "page-2"]
+
+    with engine.begin() as connection:
+        cleared = connection.execute(
+            text(
+                "SELECT backfill_resume_cursor FROM sync_cursors "
+                "WHERE workspace_id = :workspace_id AND connector_account_id = :account_id "
+                "AND resource_type = 'repository'"
+            ),
+            {"workspace_id": workspace_id, "account_id": account_id},
+        ).scalar_one()
+    assert cleared is None
 
 
 def test_sync_refreshes_an_oauth2_credential_before_dispatching(

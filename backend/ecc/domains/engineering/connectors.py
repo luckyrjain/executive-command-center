@@ -140,9 +140,26 @@ class ConnectorAccountContext:
 class SyncOutcome:
     """Result of a backfill/incremental/webhook sync call.
     `items_processed` and `status` are written to `sync_runs`;
-    `next_cursor` (when not `None`) is written to `sync_cursors` for the
-    given `resource_type`, resuming from that position on the next call --
-    `CONNECTOR-CONTRACT.md`: "Sync is incremental, idempotent, resumable."
+    `next_cursor` (when not `None`) is written to `sync_cursors.cursor_
+    value` for the given `resource_type`, resuming from that position on
+    the next call -- `CONNECTOR-CONTRACT.md`: "Sync is incremental,
+    idempotent, resumable."
+
+    `backfill_resume_cursor` is a second, independent piece of state --
+    opaque, adapter-defined, written to `sync_cursors.backfill_resume_
+    cursor` by `run_type == "backfill"` calls only (`incremental_sync`
+    never sets or consumes it). `next_cursor` is the "newest item seen"
+    watermark `incremental_sync` uses to stop early; `backfill_resume_
+    cursor` is "where to continue this historical walk" -- a genuinely
+    different concept (a page number, a provider-issued page token, or a
+    small per-sub-resource map), conflating the two is exactly the bug
+    this field exists to fix (a `backfill()` call used to always restart
+    at page 1, since the only persisted state was the watermark, which is
+    the wrong thing to resume a backfill from). `None` means either
+    "nothing to resume yet" or "this resource type's backfill is
+    genuinely, fully complete" -- the two are indistinguishable from this
+    field alone by design, since either way the correct next action is
+    the same: a fresh call starts from page 1 again.
     """
 
     resource_type: str
@@ -150,6 +167,7 @@ class SyncOutcome:
     status: SyncStatus
     next_cursor: str | None
     error_summary: str | None = None
+    backfill_resume_cursor: str | None = None
 
 
 class AdapterAuthorizationError(Exception):
@@ -191,23 +209,43 @@ class ConnectorAdapter(Protocol):
         account: ConnectorAccountContext,
         resource_type: str,
         since: datetime | None = None,
+        resume_cursor: str | None = None,
     ) -> SyncOutcome:
-        """Full historical sync for one resource type, from no prior
-        cursor. `CONNECTOR-CONTRACT.md`: "Backfill resumes without
-        duplicate projections" -- an adapter implementing real pagination
-        must itself be resumable if interrupted mid-backfill; this task's
-        sandbox adapter is small enough to complete in one call.
+        """Full historical sync for one resource type. `CONNECTOR-
+        CONTRACT.md`: "Backfill resumes without duplicate projections" --
+        an adapter implementing real pagination must itself be resumable
+        if interrupted mid-backfill, via `resume_cursor` below; this
+        task's sandbox adapter is small enough to complete in one call.
 
         `since` (Phase 10 Gmail Connector Task 1, design doc Decision 1):
         an optional lower bound on how far back this call should sync.
         Every adapter through Phase 6 accepts and ignores this parameter
         (full backfill regardless, matching their existing one-shot-at-
-        connect-time behavior -- `isinstance`-based Protocol conformance
-        does not check method signatures, only attribute presence, so
-        widening this signature does not itself require touching any
-        existing adapter) -- `GmailAdapter` is the first to act on it,
-        re-invoked with a narrower or wider window on an explicit "expand
-        history" request rather than only once at connect time.
+        connect-time behavior) -- `GmailAdapter` is the first to act on
+        it, re-invoked with a narrower or wider window on an explicit
+        "expand history" request rather than only once at connect time.
+
+        `resume_cursor`: the previous backfill call's own returned
+        `SyncOutcome.backfill_resume_cursor` for this exact `(account,
+        resource_type)`, or `None` on the very first call (or once a
+        prior call reported backfill as fully complete). Distinct from
+        `incremental_sync`'s own `cursor` parameter below -- that one is a
+        "stop once you're caught up" watermark; this one is "continue
+        this historical walk from here." An adapter with real pagination
+        must honor this to make forward progress across repeated calls
+        rather than restarting at page 1 every time -- see `SyncOutcome.
+        backfill_resume_cursor`'s own docstring for the full contract.
+
+        **Every concrete adapter's `backfill()` must accept this keyword,
+        even if it has nothing to resume** (`isinstance`-based Protocol
+        conformance does not check method signatures, only attribute
+        presence, so widening this Protocol signature does not itself
+        force every adapter to change -- but `_run_connector_sync`
+        (`connector_accounts.py`) always passes it as a keyword argument
+        on every backfill call, so an adapter that doesn't accept it
+        raises `TypeError` the moment it's registered and actually
+        called). Datadog and the sandbox adapter accept and ignore it --
+        neither has real multi-call pagination to resume.
         """
         ...
 

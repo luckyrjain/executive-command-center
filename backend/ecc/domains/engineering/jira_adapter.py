@@ -404,12 +404,15 @@ class JiraAdapter:
         account: ConnectorAccountContext,
         resource_type: str,
         since: datetime | None = None,
+        resume_cursor: str | None = None,
     ) -> SyncOutcome:
         if resource_type != "work_item":
             return SyncOutcome(
                 resource_type=resource_type, items_processed=0, status="succeeded", next_cursor=None
             )
-        return self._sync_work_items(account, since_cursor=None)
+        return self._sync_work_items(
+            account, since_cursor=None, resume_cursor=resume_cursor, apply_watermark_stop=False
+        )
 
     def incremental_sync(
         self, account: ConnectorAccountContext, resource_type: str, cursor: str | None
@@ -424,8 +427,37 @@ class JiraAdapter:
         return self._sync_work_items(account, since_cursor=cursor)
 
     def _sync_work_items(
-        self, account: ConnectorAccountContext, *, since_cursor: str | None
+        self,
+        account: ConnectorAccountContext,
+        *,
+        since_cursor: str | None,
+        resume_cursor: str | None = None,
+        apply_watermark_stop: bool = True,
     ) -> SyncOutcome:
+        """`apply_watermark_stop=False` (the `backfill()` path only):
+        see `github_adapter.py`'s own `_sync_repositories` docstring for
+        the full reasoning this mirrors -- resumes from `resume_cursor`
+        (a provider-issued `nextPageToken`, not a page number) instead of
+        always restarting at page 1, never stops early on the watermark,
+        and only reports `next_cursor` back on the very first backfill
+        call, since every later page can, by construction, only contain
+        issues at or older than what that first call's own page 1 already
+        established as the true newest.
+
+        **Stale resume-token fallback.** Atlassian does not document
+        `nextPageToken` as long-lived across requests separated by time --
+        a token persisted from a page-capped backfill call may be
+        rejected as stale if reused much later. If the very first request
+        of this call carries a `resume_cursor`-derived token and gets a
+        `400` (this endpoint's only error-status precedent -- see `_JQL_
+        QUERY`'s own comment above), retry once with no token at all
+        (degrading to a fresh page-1 walk for this call) rather than
+        failing the whole sync run over an expired token. The retry draws
+        from the same `_MAX_PAGES_PER_CALL` budget, not a fresh one, so a
+        repeatedly-stale token can't double a workspace's per-call rate-
+        limit exposure. A second, non-token-related failure still raises
+        normally.
+        """
         try:
             site, email, api_token = parse_credential(account.credential)
         except _InvalidCredentialError as exc:
@@ -435,9 +467,10 @@ class JiraAdapter:
         newest_updated_at = since_cursor
         newest_updated_dt = _parse_jira_timestamp(since_cursor)
         since_cursor_dt = _parse_jira_timestamp(since_cursor)
-        next_page_token: str | None = None
+        next_page_token = resume_cursor
         page = 1
         stopped_early = False
+        stale_token_retried = False
 
         while page <= _MAX_PAGES_PER_CALL:
             params: dict[str, Any] = {
@@ -458,9 +491,20 @@ class JiraAdapter:
                     resource_type="work_item",
                     items_processed=items_processed,
                     status="partial",
-                    next_cursor=newest_updated_at,
+                    next_cursor=newest_updated_at if resume_cursor is None else None,
                     error_summary="Jira rate limit exceeded; sync paused, will resume next call",
+                    backfill_resume_cursor=next_page_token,
                 )
+            is_stale_token_candidate = (
+                response.status_code == 400
+                and next_page_token is not None
+                and not stale_token_retried
+            )
+            if is_stale_token_candidate:
+                stale_token_retried = True
+                next_page_token = None
+                page += 1
+                continue
             if response.status_code != 200:
                 raise RuntimeError(f"Jira issue search failed with status {response.status_code}")
 
@@ -474,7 +518,8 @@ class JiraAdapter:
                 updated_at = fields.get("updated")
                 updated_dt = _parse_jira_timestamp(updated_at)
                 if (
-                    since_cursor_dt is not None
+                    apply_watermark_stop
+                    and since_cursor_dt is not None
                     and updated_dt is not None
                     and updated_dt <= since_cursor_dt
                 ):
@@ -500,26 +545,30 @@ class JiraAdapter:
             page += 1
         else:
             # The loop ran `_MAX_PAGES_PER_CALL` iterations without ever
-            # `break`-ing -- more issues remain beyond `start_at`. `partial`,
+            # `break`-ing -- more issues remain beyond this page. `partial`,
             # not `succeeded` -- identical reasoning to `github_adapter.py`/
-            # `gitlab_adapter.py`'s own equivalent bound.
+            # `gitlab_adapter.py`'s own equivalent bound. `next_page_token`
+            # here already names the next page to resume from -- it was
+            # just returned by the last successful response.
             return SyncOutcome(
                 resource_type="work_item",
                 items_processed=items_processed,
                 status="partial",
-                next_cursor=newest_updated_at,
+                next_cursor=newest_updated_at if resume_cursor is None else None,
                 error_summary=(
                     f"Jira work-item sync hit the {_MAX_PAGES_PER_CALL}-page "
                     "per-call bound with more issues remaining; sync paused, "
                     "will resume next call"
                 ),
+                backfill_resume_cursor=next_page_token,
             )
 
         return SyncOutcome(
             resource_type="work_item",
             items_processed=items_processed,
             status="succeeded",
-            next_cursor=newest_updated_at,
+            next_cursor=newest_updated_at if resume_cursor is None else None,
+            backfill_resume_cursor=None,
         )
 
     def handle_webhook(

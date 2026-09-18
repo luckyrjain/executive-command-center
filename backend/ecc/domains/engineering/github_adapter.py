@@ -636,13 +636,34 @@ class GitHubAdapter:
         account: ConnectorAccountContext,
         resource_type: str,
         since: datetime | None = None,
+        resume_cursor: str | None = None,
     ) -> SyncOutcome:
         if resource_type == "repository":
-            return self._sync_repositories(account, since_cursor=None)
+            return self._sync_repositories(
+                account, since_cursor=None, resume_cursor=resume_cursor, apply_watermark_stop=False
+            )
         if resource_type == "change":
-            return self._sync_changes(account, since_cursor=None)
+            return self._sync_changes(
+                account, since_cursor=None, resume_cursor=resume_cursor, apply_watermark_stop=False
+            )
         if resource_type == "review":
-            return self._sync_reviews(account, since_cursor=None)
+            # This resource type's own cursor already *is* a valid resume
+            # position (see `_sync_reviews`'s own docstring, and this
+            # module's "Reviews" section) -- it walks our own already-
+            # synced `changes` table oldest-uncovered-first, not live
+            # provider pagination, so there is no separate concept to
+            # resume from. Threading `resume_cursor` straight into the
+            # same `since_cursor` `_sync_reviews` already accepts is the
+            # whole fix for this resource type.
+            outcome = self._sync_reviews(account, since_cursor=resume_cursor)
+            return SyncOutcome(
+                resource_type=outcome.resource_type,
+                items_processed=outcome.items_processed,
+                status=outcome.status,
+                next_cursor=outcome.next_cursor,
+                error_summary=outcome.error_summary,
+                backfill_resume_cursor=outcome.next_cursor,
+            )
         return SyncOutcome(
             resource_type=resource_type, items_processed=0, status="succeeded", next_cursor=None
         )
@@ -664,15 +685,45 @@ class GitHubAdapter:
         )
 
     def _sync_repositories(
-        self, account: ConnectorAccountContext, *, since_cursor: str | None
+        self,
+        account: ConnectorAccountContext,
+        *,
+        since_cursor: str | None,
+        resume_cursor: str | None = None,
+        apply_watermark_stop: bool = True,
     ) -> SyncOutcome:
+        """`apply_watermark_stop=False` (the `backfill()` path only) means
+        this call never stops early on `since_cursor` -- it walks purely
+        by page, resuming from `resume_cursor` (the page to continue
+        from) and stopping only on natural exhaustion or the page-cap
+        bound. `since_cursor` is always `None` on that path (`backfill()`
+        never threads a watermark in), so `next_cursor` is only ever
+        reported back to the caller on the very first backfill call
+        (`resume_cursor is None`) -- every page beyond page 1 can, by
+        construction (results are strictly newest-first), only contain
+        items at or older than what page 1 of *that same walk's first
+        call* already established as the true newest, so a resumed call
+        has nothing new to teach the watermark and must not overwrite it
+        with a lower value computed from a page deep in the walk.
+        """
         headers = self._headers(account.credential)
         items_processed = 0
         newest_updated_at = since_cursor
-        page = 1
+        # `page` is the real, absolute page number requested from GitHub
+        # (carries across calls via `resume_cursor`) -- deliberately a
+        # *different* variable from the loop bound below. The original
+        # version of this method conflated the two (the loop condition
+        # was `page <= _MAX_PAGES_PER_CALL` directly), which happened to
+        # work only because every call started at page 1; resuming at
+        # page 11 made that same condition false immediately, ending the
+        # call with zero requests made. `pages_fetched_this_call` is the
+        # actual per-call budget; `page` is free to start anywhere.
+        page = int(resume_cursor) if resume_cursor else 1
+        pages_fetched_this_call = 0
         stopped_early = False
 
-        while page <= _MAX_PAGES_PER_CALL:
+        while pages_fetched_this_call < _MAX_PAGES_PER_CALL:
+            pages_fetched_this_call += 1
             response = self._request_with_rate_limit_retry(
                 "GET",
                 "/user/repos",
@@ -689,8 +740,9 @@ class GitHubAdapter:
                     resource_type="repository",
                     items_processed=items_processed,
                     status="partial",
-                    next_cursor=newest_updated_at,
+                    next_cursor=newest_updated_at if resume_cursor is None else None,
                     error_summary="GitHub rate limit exceeded; sync paused, will resume next call",
+                    backfill_resume_cursor=str(page),
                 )
             if response.status_code != 200:
                 raise RuntimeError(
@@ -704,7 +756,8 @@ class GitHubAdapter:
             for repo in repos:
                 updated_at = repo.get("updated_at")
                 if (
-                    since_cursor is not None
+                    apply_watermark_stop
+                    and since_cursor is not None
                     and updated_at is not None
                     and updated_at <= since_cursor
                 ):
@@ -736,32 +789,61 @@ class GitHubAdapter:
             # return below, silently capping a large account's backfill at
             # ~`_MAX_PAGES_PER_CALL * _PAGE_SIZE` repositories with no
             # signal that more remained. `next_cursor` is still the newest
-            # `updated_at` observed so far, so a subsequent sync call
-            # resumes -- this is `partial`, not `failed`.
+            # `updated_at` observed so far, so a subsequent *incremental*
+            # sync call resumes -- this is `partial`, not `failed`.
+            # `backfill_resume_cursor=str(page)`: the loop's own `page +=
+            # 1` already advanced past the last page actually fetched, so
+            # `page` here already names the next page to resume from.
             return SyncOutcome(
                 resource_type="repository",
                 items_processed=items_processed,
                 status="partial",
-                next_cursor=newest_updated_at,
+                next_cursor=newest_updated_at if resume_cursor is None else None,
                 error_summary=(
                     f"GitHub repository sync hit the {_MAX_PAGES_PER_CALL}-page "
                     "per-call bound with more pages remaining; sync paused, "
                     "will resume next call"
                 ),
+                backfill_resume_cursor=str(page),
             )
 
         return SyncOutcome(
             resource_type="repository",
             items_processed=items_processed,
             status="succeeded",
-            next_cursor=newest_updated_at,
+            next_cursor=newest_updated_at if resume_cursor is None else None,
+            backfill_resume_cursor=None,
         )
 
     def _sync_changes(
-        self, account: ConnectorAccountContext, *, since_cursor: str | None
+        self,
+        account: ConnectorAccountContext,
+        *,
+        since_cursor: str | None,
+        resume_cursor: str | None = None,
+        apply_watermark_stop: bool = True,
     ) -> SyncOutcome:
         """See this module's own docstring ("Changes: per-repository
         fan-out") for the cursor shape and budget-sharing rationale.
+
+        `resume_cursor`/`apply_watermark_stop=False` (the `backfill()`
+        path only): a second, independent per-repository JSON map tracks
+        backfill progress -- `{"repos": {external_id: "done" | {"page":
+        int, "newest": str | None}}}` -- distinct from `per_repo_cursor`
+        (the incremental watermark map `since_cursor`/`next_cursor` use).
+        A repo marked `"done"` is skipped with **zero** budget spent, so a
+        workspace with more repos than one call's budget covers doesn't
+        burn its entire budget every call re-confirming already-finished
+        repos are finished, starving the rest of forward progress. A
+        repo's own `"newest"` is only folded into `per_repo_cursor` (and
+        therefore `next_cursor`) once that repo is genuinely `"done"` --
+        a repo's own first page is always its true newest (results are
+        newest-first), but a resumed page deep into that repo's history
+        is not, so committing an in-progress repo's partial `"newest"` to
+        the incremental watermark early would risk a caller reading a
+        regressed value; withholding it until `"done"` sidesteps that
+        entirely rather than needing to reason about whether any specific
+        partial value happens to still be safe.
         """
         headers = self._headers(account.credential)
         repos = _list_synced_repositories(
@@ -786,20 +868,38 @@ class GitHubAdapter:
             if isinstance(parsed, dict) and isinstance(parsed.get("repos"), dict):
                 per_repo_cursor = dict(parsed["repos"])
 
+        per_repo_resume: dict[str, Any] = {}
+        if resume_cursor:
+            try:
+                parsed_resume = loads(resume_cursor)
+            except ValueError:
+                parsed_resume = None
+            if isinstance(parsed_resume, dict) and isinstance(parsed_resume.get("repos"), dict):
+                per_repo_resume = dict(parsed_resume["repos"])
+
         items_processed = 0
         calls_made = 0
         any_incomplete = False
 
         for repo in repos:
+            repo_external_id = repo["external_id"]
+            resume_entry = per_repo_resume.get(repo_external_id)
+            if resume_entry == "done":
+                continue
+
             if calls_made >= _MAX_PAGES_PER_CALL:
                 any_incomplete = True
                 break
 
-            repo_external_id = repo["external_id"]
             repo_cursor = per_repo_cursor.get(repo_external_id)
-            newest_for_repo = repo_cursor
-            page = 1
+            if isinstance(resume_entry, dict):
+                page = int(resume_entry.get("page") or 1)
+                newest_for_repo = resume_entry.get("newest")
+            else:
+                page = 1
+                newest_for_repo = repo_cursor
             stopped_early = False
+            repo_done = False
 
             while calls_made < _MAX_PAGES_PER_CALL:
                 calls_made += 1
@@ -826,12 +926,14 @@ class GitHubAdapter:
 
                 prs = response.json()
                 if not prs:
+                    repo_done = True
                     break
 
                 for pr in prs:
                     updated_at = pr.get("updated_at")
                     if (
-                        repo_cursor is not None
+                        apply_watermark_stop
+                        and repo_cursor is not None
                         and updated_at is not None
                         and updated_at <= repo_cursor
                     ):
@@ -851,18 +953,38 @@ class GitHubAdapter:
                         newest_for_repo = updated_at
 
                 if stopped_early or "next" not in response.links:
+                    repo_done = True
                     break
                 page += 1
             else:
                 # Ran out of the shared per-call budget mid-repository --
-                # this repository is not yet caught up; its own cursor
-                # below still reflects real progress for the next call.
+                # this repository is not yet caught up; its own resume
+                # state below still reflects real progress for the next
+                # call.
                 any_incomplete = True
 
-            if newest_for_repo is not None:
-                per_repo_cursor[repo_external_id] = newest_for_repo
+            if apply_watermark_stop:
+                # Unchanged from before this fix: a real incremental call
+                # always commits per-repo progress every time, exactly as
+                # it always has.
+                if newest_for_repo is not None:
+                    per_repo_cursor[repo_external_id] = newest_for_repo
+            elif repo_done:
+                per_repo_resume[repo_external_id] = "done"
+                if newest_for_repo is not None:
+                    per_repo_cursor[repo_external_id] = newest_for_repo
+            else:
+                per_repo_resume[repo_external_id] = {"page": page, "newest": newest_for_repo}
 
         next_cursor = dumps({"repos": per_repo_cursor}, sort_keys=True, separators=(",", ":"))
+        backfill_all_done = all(
+            per_repo_resume.get(repo["external_id"]) == "done" for repo in repos
+        )
+        backfill_resume_cursor = (
+            None
+            if backfill_all_done
+            else dumps({"repos": per_repo_resume}, sort_keys=True, separators=(",", ":"))
+        )
         if any_incomplete:
             return SyncOutcome(
                 resource_type="change",
@@ -873,12 +995,14 @@ class GitHubAdapter:
                     "GitHub change sync hit its per-call budget or a rate limit before "
                     "every repository was caught up; sync paused, will resume next call"
                 ),
+                backfill_resume_cursor=backfill_resume_cursor,
             )
         return SyncOutcome(
             resource_type="change",
             items_processed=items_processed,
             status="succeeded",
             next_cursor=next_cursor,
+            backfill_resume_cursor=backfill_resume_cursor,
         )
 
     def _sync_reviews(

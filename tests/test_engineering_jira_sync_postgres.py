@@ -794,6 +794,145 @@ def test_page_cap_reports_partial_with_more_pages_remaining(
     assert "page" in outcome.error_summary.lower()
 
 
+def test_backfill_resumes_across_multiple_calls_instead_of_repeating(
+    seeded_account_context: ConnectorAccountContext,
+) -> None:
+    """The actual regression this whole fix exists for: a page-capped
+    backfill call used to always restart at page 1 next time (`since_
+    cursor=None` on every `backfill()` call, no other persisted state),
+    so a workspace with more issues than one call's page budget covers
+    could never have its older backlog reached by any sequence of calls.
+    A second `backfill()` call, passing the first call's own returned
+    `backfill_resume_cursor` (a `nextPageToken`), must fetch *further*
+    pages, not repeat the same ones, and the incremental watermark
+    established by call 1's own first page must not regress even though
+    call 2 only ever sees older items. The handler also asserts on the
+    exact `nextPageToken` it receives each request, proving the token is
+    genuinely threaded through -- not merely that the shared item counter
+    happens to advance.
+    """
+    from ecc.domains.engineering import jira_adapter as jira_adapter_module
+
+    total_issues = 15
+    calls = {"count": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        page = calls["count"]
+        token = request.url.params.get("nextPageToken")
+        expected_token = None if page == 0 else f"page-{page}"
+        assert token == expected_token, f"expected {expected_token!r}, got {token!r}"
+        calls["count"] += 1
+        next_token = f"page-{page + 1}" if page + 1 < total_issues else None
+        return _json_response(
+            _search_response(
+                [
+                    _issue(
+                        page + 1,
+                        key=f"ACME-{page + 1}",
+                        summary="Issue",
+                        updated=f"2024-01-{28 - page:02d}T00:00:00.000+0000",
+                    )
+                ],
+                next_page_token=next_token,
+            )
+        )
+
+    adapter = JiraAdapter(transport=httpx.MockTransport(handler))
+    first = adapter.backfill(seeded_account_context, "work_item")
+    assert first.status == "partial"
+    assert first.items_processed == jira_adapter_module._MAX_PAGES_PER_CALL
+    assert first.backfill_resume_cursor == "page-10"
+    assert first.next_cursor == "2024-01-28T00:00:00.000+0000"  # page 0's own updated
+
+    second = adapter.backfill(
+        seeded_account_context, "work_item", resume_cursor=first.backfill_resume_cursor
+    )
+    assert second.status == "succeeded"
+    assert second.backfill_resume_cursor is None
+    assert second.items_processed == total_issues - jira_adapter_module._MAX_PAGES_PER_CALL
+    # Call 2 only ever sees older issues -- it must not report a (lower,
+    # regressed) watermark of its own; the caller keeps call 1's value.
+    assert second.next_cursor is None
+
+    with engine.begin() as connection:
+        external_ids = {
+            row[0]
+            for row in connection.execute(
+                text(
+                    "SELECT external_id FROM engineering_work_items "
+                    "WHERE workspace_id = :workspace_id"
+                ),
+                {"workspace_id": seeded_account_context.workspace_id},
+            )
+        }
+    assert external_ids == {str(i) for i in range(1, total_issues + 1)}
+
+
+def test_backfill_stale_resume_token_falls_back_to_a_fresh_walk(
+    seeded_account_context: ConnectorAccountContext,
+) -> None:
+    """Atlassian doesn't document `nextPageToken` as long-lived across
+    requests separated by time -- a token persisted from an earlier
+    page-capped backfill call may be rejected as stale (`400`) if reused
+    much later. The adapter must retry once, degrading to a fresh page-1
+    walk, rather than failing the whole sync run over an expired token.
+    """
+    issue = _issue(1, key="ACME-1", summary="Fresh", updated="2024-01-01T00:00:00.000+0000")
+    tokens_seen: list[str | None] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        token = request.url.params.get("nextPageToken")
+        tokens_seen.append(token)
+        if token == "stale-token":
+            return _json_response({"errorMessages": ["stale token"]}, status_code=400)
+        return _json_response(_search_response([issue]))
+
+    adapter = JiraAdapter(transport=httpx.MockTransport(handler))
+    outcome = adapter.backfill(seeded_account_context, "work_item", resume_cursor="stale-token")
+    assert outcome.status == "succeeded"
+    assert outcome.items_processed == 1
+    # Exactly one retry: the stale attempt, then a fresh page-1 request
+    # with no token at all.
+    assert tokens_seen == ["stale-token", None]
+
+
+def test_backfill_stale_resume_token_retry_draws_from_the_same_budget(
+    seeded_account_context: ConnectorAccountContext,
+) -> None:
+    """The wasted stale-token attempt must count against `_MAX_PAGES_PER_
+    CALL`, not be refunded -- otherwise a repeatedly-stale token could be
+    used to double a workspace's effective per-call page budget.
+    """
+    from ecc.domains.engineering import jira_adapter as jira_adapter_module
+
+    calls = {"count": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        token = request.url.params.get("nextPageToken")
+        if token == "stale-token":
+            return _json_response({"errorMessages": ["stale token"]}, status_code=400)
+        page = calls["count"]
+        calls["count"] += 1
+        return _json_response(
+            _search_response(
+                [
+                    _issue(
+                        page + 1,
+                        key=f"ACME-{page + 1}",
+                        summary="Issue",
+                        updated=f"2024-01-{(page % 28) + 1:02d}T00:00:00.000+0000",
+                    )
+                ],
+                next_page_token=f"page-{page + 1}",
+            )
+        )
+
+    adapter = JiraAdapter(transport=httpx.MockTransport(handler))
+    outcome = adapter.backfill(seeded_account_context, "work_item", resume_cursor="stale-token")
+    assert outcome.status == "partial"
+    assert outcome.items_processed == jira_adapter_module._MAX_PAGES_PER_CALL - 1
+
+
 def test_refresh_permissions() -> None:
     def unauthorized(request: httpx.Request) -> httpx.Response:
         return _json_response({"message": "Unauthorized"}, status_code=401)

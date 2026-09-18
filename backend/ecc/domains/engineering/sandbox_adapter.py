@@ -74,7 +74,14 @@ class SandboxGithubAdapter:
         account: ConnectorAccountContext,
         resource_type: str,
         since: datetime | None = None,
+        resume_cursor: str | None = None,
     ) -> SyncOutcome:
+        """Accepts and ignores `resume_cursor` -- this fake always
+        completes in one call (`_ITEMS_PER_BACKFILL`, small by design),
+        so it has no real multi-call pagination to resume. Required only
+        so `_run_connector_sync`'s now-always-keyword `resume_cursor=`
+        call doesn't raise `TypeError` for this provider.
+        """
         return SyncOutcome(
             resource_type=resource_type,
             items_processed=_ITEMS_PER_BACKFILL,
