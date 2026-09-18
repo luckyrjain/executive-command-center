@@ -1201,18 +1201,21 @@ def _save_sync_cursor(
     incremental watermark) and `backfill_resume_cursor` (a separate,
     independent piece of state; see `SyncOutcome`'s own docstring for why
     conflating the two is exactly the bug that field exists to fix).
-    Architecture review (2026-09-18) verified every read and write of
-    `sync_cursors` already lives in this one function -- not scattered
-    across the 4+ provider adapters `docs/domain/engineering/CONTEXT.md`'s
-    own "SyncCursor... no dedicated class" open question speculated about
-    -- so this stays a small helper, not a promotion to a first-class
+    Architecture review (2026-09-18) verified every *write* to
+    `sync_cursors`, and the read that threads a cursor into an adapter
+    call, already live in this one function -- not scattered across the
+    4+ provider adapters `docs/domain/engineering/CONTEXT.md`'s own
+    "SyncCursor... no dedicated class" open question speculated about --
+    so this stays a small helper, not a promotion to a first-class
     `SyncCursor` object; see that doc's Open question section (now
-    closed) for the full reasoning.
+    closed) for the full reasoning, including the one independent read
+    this claim doesn't cover (`metrics.py`'s coverage calculation).
 
     `column` is always one of these two literal, file-local constants,
     never request-derived, so interpolating it into the SQL text below is
-    safe -- the same fixed-constant-interpolation pattern this file's own
-    `WORKSPACE_ORIGINAL_OWNER_SQL` already uses elsewhere.
+    safe -- the same fixed-constant-interpolation pattern `connectors.
+    WORKSPACE_ORIGINAL_OWNER_SQL` already uses elsewhere in this domain
+    (e.g. `github_adapter.py`, `repository_sync.py`).
     """
     session.execute(
         text(
