@@ -28,9 +28,20 @@ A ConnectorAdapter variant for providers needing three-legged OAuth. Gmail today
 
 ## Open question
 
-`docs/domain/DOMAIN-MODEL.md` names SourceRecord and SyncCursor as first-class entities this context owns.
-SourceRecord doesn't exist anywhere in code — synced data lives in named per-provider tables instead
-(repositories, changes, reviews, work items, and Datadog's own monitor/service/dashboard tables). SyncCursor
-does have a real table, but no dedicated class — it's manipulated as raw rows, not a first-class object the
-way ConnectorAccount is. Whether SyncCursor deserves promotion to a real class, and whether SourceRecord
-should be built or dropped from the canonical model, are open decisions.
+`docs/domain/DOMAIN-MODEL.md` names SourceRecord as a first-class entity this context owns. SourceRecord
+doesn't exist anywhere in code — synced data lives in named per-provider tables instead (repositories,
+changes, reviews, work items, and Datadog's own monitor/service/dashboard tables). Whether SourceRecord
+should be built or dropped from the canonical model is an open decision.
+
+**Resolved (architecture review, 2026-09-18): SyncCursor stays raw rows, not a class.** `DOMAIN-MODEL.md`
+also names SyncCursor as first-class; this doc previously left promoting it to a real class as an open
+question, on the theory that its "manipulated as raw rows" status meant read/write logic was duplicated
+somewhere. Verified directly: every *write* to `sync_cursors`, and the read that threads a cursor into an
+adapter call, live in one function, `_run_connector_sync` (`connector_accounts.py`) — not scattered across
+the 4+ provider adapters. The real, narrower duplication (two near-identical UPSERTs for `cursor_value` and
+`backfill_resume_cursor` inside that one function) was collapsed into a small `_save_sync_cursor` helper.
+(A second, independent read exists — `metrics.py`'s coverage calculation counts `sync_cursors.updated_at`
+rows to compute connector-freshness percentage — but it never writes, and doesn't participate in the
+adapter's own read-cursor-then-write-cursor cycle this review was about.) A `SyncCursor` class would have
+nothing left to concentrate on the write side — it would gain a second write adapter (a real seam) only if
+some other write path emerged, which none has.
