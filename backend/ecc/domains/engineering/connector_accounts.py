@@ -1185,6 +1185,62 @@ class _IdempotencyArgs:
     req_hash: str
 
 
+def _save_sync_cursor(
+    session: Session,
+    *,
+    workspace_id: UUID,
+    connector_account_id: UUID,
+    resource_type: str,
+    column: Literal["cursor_value", "backfill_resume_cursor"],
+    value: str | None,
+    now: datetime,
+    actor_id: UUID,
+) -> None:
+    """Collapses the two near-identical `sync_cursors` UPSERTs `_run_
+    connector_sync` used to write inline -- `cursor_value` (the
+    incremental watermark) and `backfill_resume_cursor` (a separate,
+    independent piece of state; see `SyncOutcome`'s own docstring for why
+    conflating the two is exactly the bug that field exists to fix).
+    Architecture review (2026-09-18) verified every read and write of
+    `sync_cursors` already lives in this one function -- not scattered
+    across the 4+ provider adapters `docs/domain/engineering/CONTEXT.md`'s
+    own "SyncCursor... no dedicated class" open question speculated about
+    -- so this stays a small helper, not a promotion to a first-class
+    `SyncCursor` object; see that doc's Open question section (now
+    closed) for the full reasoning.
+
+    `column` is always one of these two literal, file-local constants,
+    never request-derived, so interpolating it into the SQL text below is
+    safe -- the same fixed-constant-interpolation pattern this file's own
+    `WORKSPACE_ORIGINAL_OWNER_SQL` already uses elsewhere.
+    """
+    session.execute(
+        text(
+            f"""
+            INSERT INTO sync_cursors (
+                id, workspace_id, connector_account_id, resource_type,
+                {column}, updated_at, owner_id, visibility
+            ) VALUES (
+                :id, :workspace_id, :connector_account_id, :resource_type,
+                :value, :now, :actor_id, 'workspace'
+            )
+            ON CONFLICT (workspace_id, connector_account_id, resource_type)
+            DO UPDATE SET {column} = EXCLUDED.{column},
+                updated_at = EXCLUDED.updated_at
+            """  # noqa: S608 -- `column` is one of two fixed literals from this file, never request-derived.
+        ),
+        {
+            "id": uuid4(),
+            "workspace_id": workspace_id,
+            "connector_account_id": connector_account_id,
+            "resource_type": resource_type,
+            "value": value,
+            "now": now,
+            "actor_id": actor_id,
+        },
+    )
+
+
 def _run_connector_sync(
     session: Session,
     auth: AuthContext,
@@ -1550,35 +1606,20 @@ def _run_connector_sync(
             },
         )
         if outcome.next_cursor is not None:
-            outcome_session.execute(
-                text(
-                    """
-                    INSERT INTO sync_cursors (
-                        id, workspace_id, connector_account_id, resource_type,
-                        cursor_value, updated_at, owner_id, visibility
-                    ) VALUES (
-                        :id, :workspace_id, :connector_account_id, :resource_type,
-                        :cursor_value, :now, :actor_id, 'workspace'
-                    )
-                    ON CONFLICT (workspace_id, connector_account_id, resource_type)
-                    DO UPDATE SET cursor_value = EXCLUDED.cursor_value,
-                        updated_at = EXCLUDED.updated_at
-                    """
-                ),
-                {
-                    "id": uuid4(),
-                    "workspace_id": auth.workspace_id,
-                    "connector_account_id": account_id,
-                    "resource_type": resource_type,
-                    "cursor_value": outcome.next_cursor,
-                    "now": completed_at,
-                    "actor_id": auth.user_id,
-                },
+            _save_sync_cursor(
+                outcome_session,
+                workspace_id=auth.workspace_id,
+                connector_account_id=account_id,
+                resource_type=resource_type,
+                column="cursor_value",
+                value=outcome.next_cursor,
+                now=completed_at,
+                actor_id=auth.user_id,
             )
         if run_type == "backfill":
-            # Unconditional -- unlike the `cursor_value` UPSERT above,
-            # this one must run even when `outcome.backfill_resume_cursor`
-            # is `None`: that value specifically means "clear whatever
+            # Unconditional -- unlike the `cursor_value` write above, this
+            # one must run even when `outcome.backfill_resume_cursor` is
+            # `None`: that value specifically means "clear whatever
             # resume state was stored," either because this resource
             # type's backfill just genuinely finished, or because nothing
             # was ever in progress. Skipping the write on `None` (the way
@@ -1587,30 +1628,15 @@ def _run_connector_sync(
             # position in place forever, wrongly resuming a future
             # backfill from history that's already fully covered.
             # `incremental_sync` never reads or writes this column at all.
-            outcome_session.execute(
-                text(
-                    """
-                    INSERT INTO sync_cursors (
-                        id, workspace_id, connector_account_id, resource_type,
-                        backfill_resume_cursor, updated_at, owner_id, visibility
-                    ) VALUES (
-                        :id, :workspace_id, :connector_account_id, :resource_type,
-                        :backfill_resume_cursor, :now, :actor_id, 'workspace'
-                    )
-                    ON CONFLICT (workspace_id, connector_account_id, resource_type)
-                    DO UPDATE SET backfill_resume_cursor = EXCLUDED.backfill_resume_cursor,
-                        updated_at = EXCLUDED.updated_at
-                    """
-                ),
-                {
-                    "id": uuid4(),
-                    "workspace_id": auth.workspace_id,
-                    "connector_account_id": account_id,
-                    "resource_type": resource_type,
-                    "backfill_resume_cursor": outcome.backfill_resume_cursor,
-                    "now": completed_at,
-                    "actor_id": auth.user_id,
-                },
+            _save_sync_cursor(
+                outcome_session,
+                workspace_id=auth.workspace_id,
+                connector_account_id=account_id,
+                resource_type=resource_type,
+                column="backfill_resume_cursor",
+                value=outcome.backfill_resume_cursor,
+                now=completed_at,
+                actor_id=auth.user_id,
             )
         # `status = 'active'`, not left untouched: reaching this branch at
         # all (as opposed to the `adapter_failed` branch above) means the
