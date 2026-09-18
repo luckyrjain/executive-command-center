@@ -159,7 +159,10 @@ export async function run({ page, baseURL }) {
   // than leaving the user stranded on Review with only a generic banner.
   await risksSection.getByRole('heading', { name: 'What is the risk?' }).waitFor()
   const descriptionField = risksSection.getByLabel('Risk description')
-  assert.equal(await page.evaluate(() => document.activeElement?.getAttribute('aria-label')), 'Risk description')
+  assert.ok(
+    await descriptionField.evaluate((el) => el === document.activeElement),
+    'expected focus to land on the Risk description field after the failed submit hops back to Details',
+  )
   assert.equal(await descriptionField.getAttribute('aria-invalid'), 'true')
   const errorId = await formErrorAlert.getAttribute('id')
   assert.equal(await descriptionField.getAttribute('aria-describedby'), errorId)

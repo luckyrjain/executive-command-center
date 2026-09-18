@@ -151,7 +151,7 @@ export async function run({ page, baseURL }) {
 
   // Tab forward into the digest-echo field -- never pre-filled -- and type
   // the correct digest read directly off the page, keyboard only.
-  const digestInput = approvalsPanel.getByLabel(`Echo action digest for run ${RUN_ID} step 0`)
+  const digestInput = approvalsPanel.getByLabel(`Echo the action digest above to approve, run ${RUN_ID} step 0`)
   await tabTo(page, digestInput)
   assert.equal(await digestInput.inputValue(), '')
   await page.keyboard.type(DIGEST)

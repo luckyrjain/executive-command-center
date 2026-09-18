@@ -38,7 +38,7 @@ export default function WorkspaceSwitcher() {
     },
   })
 
-  if (workspaces.isLoading) return <div className="workspace-switcher" role="status">Loading workspace…</div>
+  if (workspaces.isLoading) return <div className="workspace-switcher inline-status" role="status">Loading workspace…</div>
   if (workspaces.isError) {
     return <div className="workspace-switcher inline-status error-panel" role="alert">{collaborationErrorMessage(workspaces.error)}</div>
   }
