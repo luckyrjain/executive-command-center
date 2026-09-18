@@ -123,23 +123,23 @@ export default function WaitingView() {
       <form className="field-form" onSubmit={submit}>
         <h2>Record a waiting item</h2>
         <label>Subject type
-          <select aria-label="Subject type" value={draft.subjectType} onChange={(e) => setDraft({ ...draft, subjectType: e.target.value as WaitingSubjectType })}>
+          <select value={draft.subjectType} onChange={(e) => setDraft({ ...draft, subjectType: e.target.value as WaitingSubjectType })}>
             {SUBJECT_TYPES.map((type) => <option key={type} value={type}>{type.replaceAll('_', ' ')}</option>)}
           </select>
         </label>
-        <label>Subject ID<input aria-label="Subject ID" value={draft.subjectId} onChange={(e) => setDraft({ ...draft, subjectId: e.target.value })} /></label>
-        <label>Counterparty entity ID<input aria-label="Counterparty entity ID" value={draft.counterpartyEntityId} onChange={(e) => setDraft({ ...draft, counterpartyEntityId: e.target.value })} /></label>
+        <label>Subject ID<input value={draft.subjectId} onChange={(e) => setDraft({ ...draft, subjectId: e.target.value })} /></label>
+        <label>Counterparty entity ID<input value={draft.counterpartyEntityId} onChange={(e) => setDraft({ ...draft, counterpartyEntityId: e.target.value })} /></label>
         <label>Direction
-          <select aria-label="Direction" value={draft.direction} onChange={(e) => setDraft({ ...draft, direction: e.target.value as WaitingDirection })}>
+          <select value={draft.direction} onChange={(e) => setDraft({ ...draft, direction: e.target.value as WaitingDirection })}>
             {DIRECTIONS.map((direction) => <option key={direction} value={direction}>{direction.replaceAll('_', ' ')}</option>)}
           </select>
         </label>
         <label>Note<input aria-label="Waiting note" value={draft.note} onChange={(e) => setDraft({ ...draft, note: e.target.value })} /></label>
-        <button type="submit" disabled={pending}>Record waiting item</button>
+        <button type="submit" disabled={pending} aria-busy={pending}>Record waiting item</button>
       </form>
 
       {query.isLoading ? <p role="status">Loading waiting items…</p> : null}
-      {query.isError ? <div role="alert" className="inline-status error-panel">{query.error.message}</div> : null}
+      {query.isError ? <div role="alert" className="inline-status error-panel">{errorMessage(query.error)}</div> : null}
       {query.data && open.length === 0 ? <p className="empty-state">Nothing is currently waiting.</p> : null}
       <ol className="work-list">
         {open.map((link) => (
@@ -150,8 +150,8 @@ export default function WaitingView() {
               {link.note ? <p>{link.note}</p> : null}
             </div>
             <div className="work-actions" role="group" aria-label={`Actions for waiting item ${link.id}`}>
-              <button type="button" disabled={pending} aria-label={`Fulfil waiting item ${link.id}`} onClick={() => terminalMutation.mutate({ link, action: 'fulfil' })}>Fulfil</button>
-              <button type="button" disabled={pending} aria-label={`Cancel waiting item ${link.id}`} onClick={() => terminalMutation.mutate({ link, action: 'cancel' })}>Cancel</button>
+              <button type="button" disabled={pending} aria-busy={pending} aria-label={`Fulfil waiting item ${link.id}`} onClick={() => terminalMutation.mutate({ link, action: 'fulfil' })}>Fulfil</button>
+              <button type="button" disabled={pending} aria-busy={pending} aria-label={`Cancel waiting item ${link.id}`} onClick={() => terminalMutation.mutate({ link, action: 'cancel' })}>Cancel</button>
             </div>
           </li>
         ))}

@@ -180,9 +180,9 @@ export default function WorkflowDetail({ versionId }: { versionId: string }) {
         </label>
       </div>
       <div className="work-actions">
-        <button type="button" className="btn-destructive" disabled={pending || !workflowId || killSwitchUnknown} onClick={() => killSwitchMutation.mutate(true)}>{killSwitchMutation.isPending && killSwitchMutation.variables === true ? 'Activating…' : 'Activate kill switch for this workflow'}</button>
+        <button type="button" className="btn-destructive" aria-busy={killSwitchMutation.isPending && killSwitchMutation.variables === true} disabled={pending || !workflowId || killSwitchUnknown} onClick={() => killSwitchMutation.mutate(true)}>{killSwitchMutation.isPending && killSwitchMutation.variables === true ? 'Activating…' : 'Activate kill switch for this workflow'}</button>
         {globalKillActive && !workflowKillActive ? null : (
-          <button type="button" disabled={pending || !workflowId || killSwitchUnknown} onClick={() => killSwitchMutation.mutate(false)}>{killSwitchMutation.isPending && killSwitchMutation.variables === false ? 'Deactivating…' : 'Deactivate kill switch for this workflow'}</button>
+          <button type="button" aria-busy={killSwitchMutation.isPending && killSwitchMutation.variables === false} disabled={pending || !workflowId || killSwitchUnknown} onClick={() => killSwitchMutation.mutate(false)}>{killSwitchMutation.isPending && killSwitchMutation.variables === false ? 'Deactivating…' : 'Deactivate kill switch for this workflow'}</button>
         )}
       </div>
 
@@ -205,6 +205,7 @@ export default function WorkflowDetail({ versionId }: { versionId: string }) {
       </ul>
 
       <h3>Steps</h3>
+      {version.graph.steps.length === 0 ? <p className="empty-state">This version has no steps defined.</p> : null}
       <ol className="work-list">
         {version.graph.steps.map((step) => (
           <li key={step.step_id}>
@@ -230,10 +231,10 @@ export default function WorkflowDetail({ versionId }: { versionId: string }) {
 
       <div className="work-actions">
         {version.status === 'draft' ? (
-          <button type="button" disabled={pending || killSwitchUnknown} onClick={() => publishMutation.mutate()}>{publishMutation.isPending ? 'Publishing…' : 'Publish this version'}</button>
+          <button type="button" aria-busy={publishMutation.isPending} disabled={pending || killSwitchUnknown} onClick={() => publishMutation.mutate()}>{publishMutation.isPending ? 'Publishing…' : 'Publish this version'}</button>
         ) : null}
         {version.status === 'active' ? (
-          <button type="button" className="btn-destructive" disabled={pending} onClick={() => disableMutation.mutate()}>{disableMutation.isPending ? 'Disabling…' : 'Disable this version'}</button>
+          <button type="button" className="btn-destructive" aria-busy={disableMutation.isPending} disabled={pending} onClick={() => disableMutation.mutate()}>{disableMutation.isPending ? 'Disabling…' : 'Disable this version'}</button>
         ) : null}
         <button type="button" onClick={() => setShowSimulation((current) => !current)}>
           {showSimulation ? 'Hide simulation' : 'Simulate this version'}

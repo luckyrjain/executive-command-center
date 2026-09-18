@@ -24,6 +24,13 @@ function errorMessage(error: unknown): string | { code: string; text: string } {
   return { code: error.code, text: apiErrorMessage(error) }
 }
 
+/** Plain-text form of `errorMessage()`, for surfaces (a fetch's `role="alert"`
+ * banner) that don't need the `{ code, text }` shape's code-specific handling. */
+function errorText(error: unknown): string {
+  const message = errorMessage(error)
+  return typeof message === 'string' ? message : message.text
+}
+
 /** One approval request, expanded with the run/step context a human needs
  * before the approve action is reachable (UX-STATES.md: "the exact target,
  * payload summary, high-impact category, reversible status and expiry are
@@ -74,12 +81,12 @@ function ApprovalCard({ approval, onDecided }: { approval: Approval; onDecided: 
         <ul aria-label={`High-impact categories for run ${approval.run_id} step ${approval.step_index}`}>
           {approval.high_impact_categories.map((category) => <li key={category}>{category.replaceAll('_', ' ')}</li>)}
         </ul>
-      ) : <p>No high-impact category declared for this step.</p>}
+      ) : <p className="empty-state">No high-impact category declared for this step.</p>}
 
       <p>Reversibility is not exposed at this decision surface by this activation's data model -- check the workflow's Simulate view for this adapter's declared reversible/irreversible status before approving a step you are unsure about.</p>
 
       {runDetail.isLoading ? <p role="status">Loading step payload…</p> : null}
-      {runDetail.isError ? <div role="alert" className="inline-status error-panel">Could not load this step's payload ({runDetail.error.message}). Do not approve blind -- retry loading before deciding.</div> : null}
+      {runDetail.isError ? <div role="alert" className="inline-status error-panel">Could not load this step's payload ({errorText(runDetail.error)}). Do not approve blind -- retry loading before deciding.</div> : null}
       {step ? (
         <>
           <p>Target: <strong>{step.action_ref ?? 'unknown -- could not resolve this step\'s adapter'}</strong></p>
@@ -97,12 +104,12 @@ function ApprovalCard({ approval, onDecided }: { approval: Approval; onDecided: 
       {!decided ? (
         <form className="field-form" onSubmit={(event) => { event.preventDefault(); setAttemptedApprove(true); if (digestInput.trim()) decideMutation.mutate({ decision: 'approve', digest: digestInput.trim() }) }}>
           <label>Echo the action digest above to approve
-            <input aria-label={`Echo action digest for run ${approval.run_id} step ${approval.step_index}`} value={digestInput} onChange={(e) => setDigestInput(e.target.value)} disabled={expired || pending} autoComplete="off" />
+            <input aria-label={`Echo the action digest above to approve, run ${approval.run_id} step ${approval.step_index}`} value={digestInput} onChange={(e) => setDigestInput(e.target.value)} disabled={expired || pending} autoComplete="off" />
           </label>
           {attemptedApprove && !digestInput.trim() ? <p role="alert">Enter the exact action digest before approving.</p> : null}
           <div className="work-actions">
-            <button type="submit" disabled={expired || pending}>{pending && decideMutation.variables?.decision === 'approve' ? 'Approving…' : 'Approve'}</button>
-            <button type="button" disabled={expired || pending} onClick={() => decideMutation.mutate({ decision: 'reject' })}>{pending && decideMutation.variables?.decision === 'reject' ? 'Rejecting…' : 'Reject'}</button>
+            <button type="submit" aria-busy={pending && decideMutation.variables?.decision === 'approve'} disabled={expired || pending}>{pending && decideMutation.variables?.decision === 'approve' ? 'Approving…' : 'Approve'}</button>
+            <button type="button" aria-busy={pending && decideMutation.variables?.decision === 'reject'} disabled={expired || pending} onClick={() => decideMutation.mutate({ decision: 'reject' })}>{pending && decideMutation.variables?.decision === 'reject' ? 'Rejecting…' : 'Reject'}</button>
           </div>
         </form>
       ) : null}
@@ -131,7 +138,7 @@ export default function ApprovalInbox() {
       <p>Every pending, digest-bound approval request. Nothing here is pre-filled or auto-decided -- read the target and payload before deciding.</p>
 
       {query.isLoading ? <p role="status">Loading approvals…</p> : null}
-      {query.isError ? <div role="alert" className="inline-status error-panel">{query.error.message}</div> : null}
+      {query.isError ? <div role="alert" className="inline-status error-panel">{errorText(query.error)}</div> : null}
       {query.data && approvals.length === 0 ? <p className="empty-state">No approvals are waiting on you.</p> : null}
 
       <ol className="work-list">

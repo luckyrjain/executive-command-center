@@ -219,7 +219,7 @@ function MemberRow({
               : `Removing ${member.display_name} ends their access immediately and revokes their active sessions. This cannot be undone.`}
           </p>
           <div className="work-actions">
-            <button type="button" className="btn-destructive" disabled={removeMutation.isPending} onClick={() => removeMutation.mutate()}>
+            <button type="button" className="btn-destructive" disabled={removeMutation.isPending} aria-busy={removeMutation.isPending} onClick={() => removeMutation.mutate()}>
               {removeMutation.isPending ? 'Removing…' : 'Confirm removal'}
             </button>
             <button
@@ -262,7 +262,7 @@ function MemberRow({
               <input aria-label="Transfer to account ID" value={transferForm.toAccountId} onChange={(event) => setTransferForm((f) => ({ ...f, toAccountId: event.target.value }))} />
             </label>
             <div className="work-actions">
-              <button type="submit" disabled={transferMutation.isPending}>Transfer ownership</button>
+              <button type="submit" disabled={transferMutation.isPending} aria-busy={transferMutation.isPending}>Transfer ownership</button>
             </div>
           </form>
           {transferMutation.isError ? <div role="alert" className="inline-status error-panel">{collaborationErrorMessage(transferMutation.error)}</div> : null}
@@ -293,7 +293,7 @@ function InvitationRow({ invitation, onChanged }: { invitation: Invitation; onCh
       </div>
       {invStatus === 'Pending' ? (
         <div className="work-actions">
-          <button type="button" className="btn-destructive" disabled={revokeMutation.isPending} onClick={() => revokeMutation.mutate()}>Revoke</button>
+          <button type="button" className="btn-destructive" disabled={revokeMutation.isPending} aria-busy={revokeMutation.isPending} onClick={() => revokeMutation.mutate()}>Revoke</button>
         </div>
       ) : null}
       {revokeMutation.isError ? <div role="alert" className="inline-status error-panel">{collaborationErrorMessage(revokeMutation.error)}</div> : null}
@@ -340,13 +340,13 @@ function AcceptInvitationForm({ onAccepted }: { onAccepted: () => void }) {
         }}
       >
         <label>Invitation ID
-          <input aria-label="Invitation ID" value={form.invitationId} onChange={(event) => setForm((f) => ({ ...f, invitationId: event.target.value }))} />
+          <input value={form.invitationId} onChange={(event) => setForm((f) => ({ ...f, invitationId: event.target.value }))} />
         </label>
         <label>Token
           <input aria-label="Invitation token" value={form.token} onChange={(event) => setForm((f) => ({ ...f, token: event.target.value }))} />
         </label>
         <div className="work-actions">
-          <button type="submit" disabled={acceptMutation.isPending || form.invitationId.trim() === '' || form.token.trim() === ''}>
+          <button type="submit" disabled={acceptMutation.isPending || form.invitationId.trim() === '' || form.token.trim() === ''} aria-busy={acceptMutation.isPending}>
             {acceptMutation.isPending ? 'Accepting…' : 'Accept invitation'}
           </button>
         </div>
@@ -496,7 +496,7 @@ export default function MembersPanel() {
               </select>
             </label>
             <div className="work-actions">
-              <button type="submit" disabled={inviteMutation.isPending || inviteForm.email.trim() === ''}>Invite</button>
+              <button type="submit" disabled={inviteMutation.isPending || inviteForm.email.trim() === ''} aria-busy={inviteMutation.isPending}>Invite</button>
             </div>
           </form>
           {inviteMutation.isError ? <div role="alert" className="inline-status error-panel">{collaborationErrorMessage(inviteMutation.error)}</div> : null}

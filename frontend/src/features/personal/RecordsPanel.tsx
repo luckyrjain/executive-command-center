@@ -59,6 +59,7 @@ function RecordRow({ record }: { record: PersonalRecord }) {
         <div className="work-actions">
           <button
             type="button"
+            aria-busy={decryptMutation.isPending}
             disabled={decryptMutation.isPending}
             onClick={() => decryptMutation.mutate()}
           >
@@ -161,7 +162,6 @@ export default function RecordsPanel() {
       <div className="field-form">
         <label>Domain
           <select
-            aria-label="Domain"
             value={domainKey}
             onChange={(event) => setDomainKey(event.target.value as DomainKey)}
           >
@@ -193,7 +193,6 @@ export default function RecordsPanel() {
           >
             <label>Record type
               <input
-                aria-label="Record type"
                 value={recordType}
                 onChange={(event) => setRecordType(event.target.value)}
                 maxLength={50}
@@ -247,7 +246,7 @@ export default function RecordsPanel() {
             ) : null}
 
             <div className="work-actions">
-              <button type="submit" disabled={createMutation.isPending || !canSubmit}>Save record</button>
+              <button type="submit" aria-busy={createMutation.isPending} disabled={createMutation.isPending || !canSubmit}>Save record</button>
             </div>
           </form>
           {createMutation.isError ? <div role="alert" className="inline-status error-panel">{personalErrorMessage(createMutation.error)}</div> : null}

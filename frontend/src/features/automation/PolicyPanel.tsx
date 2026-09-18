@@ -87,8 +87,17 @@ export default function PolicyPanel() {
     setInvalidField(field)
     setCreateStepIndex(CREATE_STEPS.indexOf(step))
   }
+  // `createStep !== 'review'` guard is load-bearing, not defensive
+  // redundancy -- see the identical guard's comment in
+  // ConnectorHealthPanel.tsx's own attemptCreate. A step with exactly one
+  // field and no submit button mounted (Continue/Back are both
+  // type="button") still triggers the browser's implicit single-field
+  // form submission on Enter; without this, an early step's Enter key
+  // could run full terminal validation before the user ever reaches
+  // Review.
   function attemptCreate(event: FormEvent) {
     event.preventDefault()
+    if (createStep !== 'review') return
     if (!draft.workflowId.trim()) { fail('Workflow ID is required.', 'Workflow ID', 'scope'); return }
     const valueLimit = Number(draft.valueLimit)
     const countLimit = Number(draft.countLimit)
@@ -152,7 +161,7 @@ export default function PolicyPanel() {
             </div>
             <div className="work-actions">
               {policy.status === 'active' ? (
-                <button type="button" className="btn-destructive" disabled={pending} aria-label={`Revoke policy for ${policy.workflow_id}`} onClick={() => revokeMutation.mutate(policy.id)}>
+                <button type="button" className="btn-destructive" aria-busy={revokeMutation.isPending && revokeMutation.variables === policy.id} disabled={pending} aria-label={`Revoke policy for ${policy.workflow_id}`} onClick={() => revokeMutation.mutate(policy.id)}>
                   {revokeMutation.isPending && revokeMutation.variables === policy.id ? 'Revoking…' : 'Revoke'}
                 </button>
               ) : null}
@@ -224,7 +233,7 @@ export default function PolicyPanel() {
               <div><dt>Approval mode</dt><dd>{draft.approvalMode.replaceAll('_', ' ')}</dd></div>
               <div><dt>Schedule note</dt><dd>{draft.schedule || '—'}</dd></div>
             </dl>
-            <div className="work-actions"><button type="button" onClick={goCreateBack}>Back</button><button type="submit" disabled={pending}>{createMutation.isPending ? 'Creating…' : 'Create policy'}</button></div>
+            <div className="work-actions"><button type="button" onClick={goCreateBack}>Back</button><button type="submit" aria-busy={createMutation.isPending} disabled={pending}>{createMutation.isPending ? 'Creating…' : 'Create policy'}</button></div>
           </div>
         )}
       </form>

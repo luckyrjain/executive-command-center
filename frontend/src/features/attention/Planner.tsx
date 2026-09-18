@@ -153,13 +153,13 @@ export default function Planner() {
 
       <form className="field-form" onSubmit={submitCreate}>
         <h2>Propose a plan</h2>
-        <label>Period start<input aria-label="Period start" type="date" value={periodStart} onChange={(e) => setPeriodStart(e.target.value)} /></label>
-        <label>Period end<input aria-label="Period end" type="date" value={periodEnd} onChange={(e) => setPeriodEnd(e.target.value)} /></label>
-        <button type="submit" disabled={pending}>Propose plan</button>
+        <label>Period start<input type="date" value={periodStart} onChange={(e) => setPeriodStart(e.target.value)} /></label>
+        <label>Period end<input type="date" value={periodEnd} onChange={(e) => setPeriodEnd(e.target.value)} /></label>
+        <button type="submit" disabled={pending} aria-busy={pending}>Propose plan</button>
       </form>
 
       {query.isLoading ? <p role="status">Loading plans…</p> : null}
-      {query.isError ? <div role="alert" className="inline-status error-panel">{query.error.message}</div> : null}
+      {query.isError ? <div role="alert" className="inline-status error-panel">{errorMessage(query.error)}</div> : null}
       {query.data && plans.length === 0 ? <p className="empty-state">No active plans for this period.</p> : null}
 
       {pendingDiff ? (
@@ -173,8 +173,8 @@ export default function Planner() {
               </li>
             ))}
           </ol>
-          <button type="button" disabled={pending} onClick={() => { acceptMutation.mutate(pendingDiff); setPendingDiff(null) }}>Accept new plan</button>
-          <button type="button" disabled={pending} onClick={() => setPendingDiff(null)}>Keep reviewing</button>
+          <button type="button" disabled={pending} aria-busy={pending} onClick={() => { acceptMutation.mutate(pendingDiff); setPendingDiff(null) }}>Accept new plan</button>
+          <button type="button" disabled={pending} aria-busy={pending} onClick={() => setPendingDiff(null)}>Keep reviewing</button>
         </section>
       ) : null}
 
@@ -212,23 +212,25 @@ export default function Planner() {
                           <button
                             type="button"
                             disabled={pending}
+                            aria-busy={pending}
                             onClick={() => { moveBlockMutation.mutate({ plan, block, startsAt: editingBlock.startsAt, endsAt: editingBlock.endsAt }); setEditingBlock(null) }}
                           >
                             Save new time
                           </button>
-                          <button type="button" disabled={pending} onClick={() => setEditingBlock(null)}>Cancel</button>
+                          <button type="button" disabled={pending} aria-busy={pending} onClick={() => setEditingBlock(null)}>Cancel</button>
                         </span>
                       ) : (
                         <span className="work-actions" role="group" aria-label={`Actions for ${block.rationale}`}>
                           <button
                             type="button"
                             disabled={pending}
+                            aria-busy={pending}
                             aria-label={`Move ${block.rationale}`}
                             onClick={() => setEditingBlock({ blockId: block.id, startsAt: serverInstantToLocalInput(block.starts_at), endsAt: serverInstantToLocalInput(block.ends_at) })}
                           >
                             Move
                           </button>
-                          <button type="button" disabled={pending} aria-label={`Remove ${block.rationale}`} onClick={() => removeBlockMutation.mutate({ plan, block })}>Remove</button>
+                          <button type="button" disabled={pending} aria-busy={pending} aria-label={`Remove ${block.rationale}`} onClick={() => removeBlockMutation.mutate({ plan, block })}>Remove</button>
                         </span>
                       )
                     ) : null}
@@ -236,9 +238,9 @@ export default function Planner() {
                 ))}
               </ol>
               <div className="work-actions" role="group" aria-label={`Actions for plan ${plan.period_start}`}>
-                {plan.status === 'proposed' ? <button type="button" disabled={pending} aria-label={`Accept plan ${plan.period_start}`} onClick={() => acceptMutation.mutate(plan)}>Accept</button> : null}
-                {plan.status === 'proposed' || plan.status === 'accepted' ? <button type="button" disabled={pending} aria-label={`Replan ${plan.period_start}`} onClick={() => replanMutation.mutate(plan)}>Replan</button> : null}
-                {plan.status === 'proposed' || plan.status === 'accepted' ? <button type="button" disabled={pending} aria-label={`Supersede plan ${plan.period_start}`} onClick={() => supersedeMutation.mutate(plan)}>Supersede</button> : null}
+                {plan.status === 'proposed' ? <button type="button" disabled={pending} aria-busy={pending} aria-label={`Accept plan ${plan.period_start}`} onClick={() => acceptMutation.mutate(plan)}>Accept</button> : null}
+                {plan.status === 'proposed' || plan.status === 'accepted' ? <button type="button" disabled={pending} aria-busy={pending} aria-label={`Replan ${plan.period_start}`} onClick={() => replanMutation.mutate(plan)}>Replan</button> : null}
+                {plan.status === 'proposed' || plan.status === 'accepted' ? <button type="button" disabled={pending} aria-busy={pending} aria-label={`Supersede plan ${plan.period_start}`} onClick={() => supersedeMutation.mutate(plan)}>Supersede</button> : null}
               </div>
             </li>
           )

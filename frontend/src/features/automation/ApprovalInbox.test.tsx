@@ -100,7 +100,7 @@ describe('ApprovalInbox', () => {
     renderInbox()
 
     await waitFor(() => expect(screen.getByText(/Run run-1 · step 0/)).toBeTruthy())
-    const digestInput = screen.getByLabelText('Echo action digest for run run-1 step 0') as HTMLInputElement
+    const digestInput = screen.getByLabelText('Echo the action digest above to approve, run run-1 step 0') as HTMLInputElement
     expect(digestInput.value).toBe('')
 
     fireEvent.click(screen.getByRole('button', { name: 'Approve' }))
@@ -123,7 +123,7 @@ describe('ApprovalInbox', () => {
     renderInbox()
 
     await waitFor(() => expect(screen.getByText(/Run run-1 · step 0/)).toBeTruthy())
-    fireEvent.change(screen.getByLabelText('Echo action digest for run run-1 step 0'), { target: { value: 'digest-abc123' } })
+    fireEvent.change(screen.getByLabelText('Echo the action digest above to approve, run run-1 step 0'), { target: { value: 'digest-abc123' } })
     fireEvent.click(screen.getByRole('button', { name: 'Approve' }))
 
     await waitFor(() => expect(fetch).toHaveBeenCalledTimes(5))
@@ -141,7 +141,7 @@ describe('ApprovalInbox', () => {
     renderInbox()
 
     await waitFor(() => expect(screen.getByText(/Run run-1 · step 0/)).toBeTruthy())
-    fireEvent.change(screen.getByLabelText('Echo action digest for run run-1 step 0'), { target: { value: 'wrong-digest' } })
+    fireEvent.change(screen.getByLabelText('Echo the action digest above to approve, run run-1 step 0'), { target: { value: 'wrong-digest' } })
     fireEvent.click(screen.getByRole('button', { name: 'Approve' }))
 
     expect(await screen.findByText(/does not match this approval's current action digest/)).toBeTruthy()
@@ -207,7 +207,7 @@ describe('ApprovalInbox', () => {
     renderInbox()
 
     await waitFor(() => expect(screen.getByText(/Run run-1 · step 0/)).toBeTruthy())
-    fireEvent.change(screen.getByLabelText('Echo action digest for run run-1 step 0'), { target: { value: 'digest-abc123' } })
+    fireEvent.change(screen.getByLabelText('Echo the action digest above to approve, run run-1 step 0'), { target: { value: 'digest-abc123' } })
     fireEvent.click(screen.getByRole('button', { name: 'Approve' }))
 
     // The mapped sentence names *which* decision already happened -- the one

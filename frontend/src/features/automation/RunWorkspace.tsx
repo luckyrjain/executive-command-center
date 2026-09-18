@@ -90,6 +90,13 @@ function RunDetailView({ run }: { run: RunDetail }) {
   })
   const pending = mutate.isPending
 
+  // Mirrors WorkflowDetail.tsx's own `killSwitchUnknown` guard for the
+  // identical kill-switch query: a failed/still-loading fetch must not
+  // silently read as "no kill switch is active" below -- that would
+  // misreport an unconfirmed state as a confirmed clean one for a run
+  // that's already stopped for human review.
+  const killSwitchUnknown = killSwitch.isLoading || killSwitch.isError
+  const policiesUnknown = run.status === 'needs_review' && (policies.isLoading || policies.isError)
   const runningPolicy = policies.data?.policies.find((policy) => policy.id === run.policy_id) ?? null
   const lastStep = run.steps.length ? run.steps[run.steps.length - 1] : null
   const retryingStep = run.steps.find((step) => step.status === 'retrying')
@@ -110,10 +117,11 @@ function RunDetailView({ run }: { run: RunDetail }) {
       {run.status === 'needs_review' ? (
         <div role="alert" className="inline-status error-panel">
           <strong>This run needs human review before it can proceed.</strong>
-          {killSwitch.data?.killed ? <p>A kill switch is currently active for this workflow ({killSwitch.data.active_global ? 'global' : ''}{killSwitch.data.active_global && killSwitch.data.active_workflow ? ' and ' : ''}{killSwitch.data.active_workflow ? 'per-workflow' : ''}) -- this may be why this run stopped, though the timing is not a guarantee of cause.</p> : null}
-          {runningPolicy && runningPolicy.status !== 'active' ? <p>This run's own policy is currently {runningPolicy.status} -- a likely, directly attributable cause.</p> : null}
+          {killSwitchUnknown || policiesUnknown ? <p>Whether a kill switch or this run's policy caused this could not be confirmed -- the {killSwitchUnknown && policiesUnknown ? 'kill switch and policy status' : killSwitchUnknown ? 'kill switch status' : 'policy status'} could not be read. Treat the cause as unknown, not ruled out, until this loads.</p> : null}
+          {!killSwitchUnknown && killSwitch.data?.killed ? <p>A kill switch is currently active for this workflow ({killSwitch.data.active_global ? 'global' : ''}{killSwitch.data.active_global && killSwitch.data.active_workflow ? ' and ' : ''}{killSwitch.data.active_workflow ? 'per-workflow' : ''}) -- this may be why this run stopped, though the timing is not a guarantee of cause.</p> : null}
+          {!policiesUnknown && runningPolicy && runningPolicy.status !== 'active' ? <p>This run's own policy is currently {runningPolicy.status} -- a likely, directly attributable cause.</p> : null}
           {lastStep?.status === 'unknown' ? <p>The last dispatched step's outcome is unknown -- the underlying action may or may not have happened. Inspect the target system directly before resolving this manually (see the recovery runbook).</p> : null}
-          {!killSwitch.data?.killed && (!runningPolicy || runningPolicy.status === 'active') && lastStep?.status !== 'unknown' ? <p>No further cause is determinable from data available to this view.</p> : null}
+          {!killSwitchUnknown && !policiesUnknown && !killSwitch.data?.killed && (!runningPolicy || runningPolicy.status === 'active') && lastStep?.status !== 'unknown' ? <p>No further cause is determinable from data available to this view.</p> : null}
         </div>
       ) : null}
 
@@ -142,9 +150,9 @@ function RunDetailView({ run }: { run: RunDetail }) {
 
       {mutate.isError ? <div role="alert" className="inline-status error-panel">{errorMessage(mutate.error)}</div> : null}
       <div className="work-actions">
-        {['queued', 'leased', 'running', 'waiting_approval'].includes(run.status) ? <button type="button" disabled={pending} onClick={() => mutate.mutate('pause')}>{pending && mutate.variables === 'pause' ? 'Pausing…' : 'Pause'}</button> : null}
-        {run.status === 'paused' ? <button type="button" disabled={pending} onClick={() => mutate.mutate('resume')}>{pending && mutate.variables === 'resume' ? 'Resuming…' : 'Resume'}</button> : null}
-        {!TERMINAL_RUN_STATUSES.includes(run.status) ? <button type="button" className="btn-destructive" disabled={pending} onClick={() => mutate.mutate('cancel')}>{pending && mutate.variables === 'cancel' ? 'Cancelling…' : 'Cancel'}</button> : null}
+        {['queued', 'leased', 'running', 'waiting_approval'].includes(run.status) ? <button type="button" aria-busy={pending && mutate.variables === 'pause'} disabled={pending} onClick={() => mutate.mutate('pause')}>{pending && mutate.variables === 'pause' ? 'Pausing…' : 'Pause'}</button> : null}
+        {run.status === 'paused' ? <button type="button" aria-busy={pending && mutate.variables === 'resume'} disabled={pending} onClick={() => mutate.mutate('resume')}>{pending && mutate.variables === 'resume' ? 'Resuming…' : 'Resume'}</button> : null}
+        {!TERMINAL_RUN_STATUSES.includes(run.status) ? <button type="button" className="btn-destructive" aria-busy={pending && mutate.variables === 'cancel'} disabled={pending} onClick={() => mutate.mutate('cancel')}>{pending && mutate.variables === 'cancel' ? 'Cancelling…' : 'Cancel'}</button> : null}
       </div>
 
       <h4>Steps</h4>
@@ -218,15 +226,15 @@ export default function RunWorkspace() {
         <h2 id="automation-runs-title">Run history</h2>
         <form className="field-form" onSubmit={submit}>
           <label>Run a workflow (manual trigger)
-            <input aria-label="Workflow ID to run" value={workflowId} onChange={(e) => setWorkflowId(e.target.value)} placeholder="workflow ID" />
+            <input value={workflowId} onChange={(e) => setWorkflowId(e.target.value)} placeholder="workflow ID" />
           </label>
-          <button type="submit" disabled={createMutation.isPending || !workflowId.trim()}>{createMutation.isPending ? 'Starting…' : 'Start run'}</button>
+          <button type="submit" aria-busy={createMutation.isPending} disabled={createMutation.isPending || !workflowId.trim()}>{createMutation.isPending ? 'Starting…' : 'Start run'}</button>
         </form>
         {createMutation.isError ? <div role="alert" className="inline-status error-panel">{errorMessage(createMutation.error)}</div> : null}
 
         <div className="field-form">
           <label>Filter by status
-            <select aria-label="Filter runs by status" value={statusFilter} onChange={(e) => setStatusFilter(e.target.value as RunStatus | '')}>
+            <select value={statusFilter} onChange={(e) => setStatusFilter(e.target.value as RunStatus | '')}>
               <option value="">All statuses</option>
               {RUN_STATUSES.map((status) => <option key={status} value={status}>{status.replaceAll('_', ' ')}</option>)}
             </select>
@@ -234,7 +242,7 @@ export default function RunWorkspace() {
         </div>
 
         {runsQuery.isLoading ? <p role="status">Loading runs…</p> : null}
-        {runsQuery.isError ? <div role="alert" className="inline-status error-panel">{runsQuery.error.message}</div> : null}
+        {runsQuery.isError ? <div role="alert" className="inline-status error-panel">{errorMessage(runsQuery.error)}</div> : null}
         {runsQuery.data && runs.length === 0 ? <p className="empty-state">No runs match this filter.</p> : null}
 
         <ol className="work-list">
@@ -253,7 +261,7 @@ export default function RunWorkspace() {
       </section>
 
       {selectedRunId && runDetailQuery.isLoading ? <p role="status">Loading run detail…</p> : null}
-      {selectedRunId && runDetailQuery.isError ? <div role="alert" className="inline-status error-panel">{runDetailQuery.error.message}</div> : null}
+      {selectedRunId && runDetailQuery.isError ? <div role="alert" className="inline-status error-panel">{errorMessage(runDetailQuery.error)}</div> : null}
       {runDetailQuery.data ? <RunDetailView run={runDetailQuery.data} /> : null}
     </div>
   )

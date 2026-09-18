@@ -71,7 +71,16 @@ function MergeCandidateRow({ candidate, onMerged }: MergeCandidateRowProps) {
     },
   })
 
-  if (left.isLoading || right.isLoading) return <li>Loading entity details…</li>
+  if (left.isLoading || right.isLoading) return <li role="status">Loading entity details…</li>
+  if (left.isError || right.isError) {
+    return (
+      <li>
+        <div role="alert" className="inline-status error-panel">
+          {mergeErrorMessage(left.error ?? right.error)}
+        </div>
+      </li>
+    )
+  }
   if (!left.data || !right.data) return null
 
   const isVersionConflict = mergeMutation.error instanceof ApiError && mergeMutation.error.code === 'VERSION_CONFLICT'
@@ -89,7 +98,6 @@ function MergeCandidateRow({ candidate, onMerged }: MergeCandidateRowProps) {
         <label>
           {`Merge reason for ${candidate.id}`}
           <input
-            aria-label={`Merge reason for ${candidate.id}`}
             value={reason}
             onChange={(event) => setReason(event.target.value)}
           />
@@ -147,13 +155,12 @@ function CompletedMergeRow({ operation, onReversed }: CompletedMergeRowProps) {
     <li>
       <div>Merged {operation.source_entity_id} into {operation.target_entity_id}</div>
       {reverseMutation.error ? (
-        <div role="alert" className="inline-status error-panel">{reverseMutation.error.message}</div>
+        <div role="alert" className="inline-status error-panel">{apiErrorMessage(reverseMutation.error)}</div>
       ) : null}
       <div className="field-form">
         <label>
           {`Reversal reason for ${operation.id}`}
           <input
-            aria-label={`Reversal reason for ${operation.id}`}
             value={reason}
             onChange={(event) => setReason(event.target.value)}
           />
@@ -196,7 +203,7 @@ export default function MergeReview() {
       </div>
 
       {query.isLoading ? <p role="status">Loading confirmed candidates…</p> : null}
-      {query.isError ? <div role="alert" className="inline-status error-panel">{query.error.message}</div> : null}
+      {query.isError ? <div role="alert" className="inline-status error-panel">{apiErrorMessage(query.error)}</div> : null}
       {query.data?.items.length ? (
         <ul className="work-list">
           {query.data.items.map((candidate) => (

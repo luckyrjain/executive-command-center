@@ -1,6 +1,7 @@
 import { useQuery } from '@tanstack/react-query'
 
 import { apiRequest } from '../../api/client'
+import { apiErrorMessage } from '../../api/errorMessage'
 import type {
   ConnectorAccount,
   ConnectorAccountListResponse,
@@ -102,7 +103,7 @@ export default function CoveragePanel() {
       <p>How much of this workspace's engineering data has actually synced, and how fresh it is, per connector.</p>
 
       {loading ? <p role="status">Loading source coverage…</p> : null}
-      {anyError ? <div role="alert" className="inline-status error-panel">{anyError instanceof Error ? anyError.message : 'Request failed.'}</div> : null}
+      {anyError ? <div role="alert" className="inline-status error-panel">{apiErrorMessage(anyError)}</div> : null}
       {!loading && !anyError && connectorList.length === 0 ? (
         <p className="empty-state">No connectors are configured yet -- connect one from Connector health to see coverage here.</p>
       ) : null}

@@ -2,6 +2,7 @@ import { useMemo, useState, type FormEvent } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
 import { apiRequest } from '../../api/client'
+import { apiErrorMessage } from '../../api/errorMessage'
 import {
   RELATIONSHIP_TYPES,
   type Claim,
@@ -49,6 +50,10 @@ function claimValueText(claim: Claim): string {
   const value = claim.value as Record<string, unknown>
   if (typeof value.text === 'string') return value.text
   return formatClaimValue(claim)
+}
+
+function errorMessage(error: Error): string {
+  return apiErrorMessage(error)
 }
 
 function evidenceLabel(status: EvidenceStatus | undefined): string {
@@ -260,14 +265,14 @@ export default function EntityDetail({ entityId, onClose }: EntityDetailProps) {
       </div>
 
       {entityQuery.isLoading ? <p role="status">Loading entity…</p> : null}
-      {entityQuery.isError ? <div role="alert" className="inline-status error-panel">{entityQuery.error.message}</div> : null}
+      {entityQuery.isError ? <div role="alert" className="inline-status error-panel">{errorMessage(entityQuery.error)}</div> : null}
       {entity?.summary ? <p>{entity.summary}</p> : null}
 
       <section aria-labelledby={`aliases-heading-${entityId}`}>
         <h3 id={`aliases-heading-${entityId}`}>Aliases</h3>
         {aliasesQuery.isLoading ? <p role="status">Loading aliases…</p> : null}
         {aliasesQuery.isError ? (
-          <div role="alert" className="inline-status error-panel">{aliasesQuery.error.message}</div>
+          <div role="alert" className="inline-status error-panel">{errorMessage(aliasesQuery.error)}</div>
         ) : aliasesQuery.data?.items.length ? (
           <ul>
             {aliasesQuery.data.items.map((alias) => (
@@ -285,7 +290,7 @@ export default function EntityDetail({ entityId, onClose }: EntityDetailProps) {
         <h3 id={`claims-heading-${entityId}`}>Claims</h3>
         {claimsQuery.isLoading ? <p role="status">Loading claims…</p> : null}
         {claimsQuery.isError ? (
-          <div role="alert" className="inline-status error-panel">{claimsQuery.error.message}</div>
+          <div role="alert" className="inline-status error-panel">{errorMessage(claimsQuery.error)}</div>
         ) : claimsQuery.data?.items.length ? (
           <ul>
             {claimsQuery.data.items.map((claim) => (
@@ -347,7 +352,7 @@ export default function EntityDetail({ entityId, onClose }: EntityDetailProps) {
                           }
                         />
                       </label>
-                      <button type="submit" disabled={correctClaimMutation.isPending}>Save correction</button>
+                      <button type="submit" disabled={correctClaimMutation.isPending} aria-busy={correctClaimMutation.isPending}>Save correction</button>
                       <button type="button" onClick={() => setCorrectingClaimId(null)}>Cancel</button>
                     </form>
                   ) : (
@@ -363,10 +368,10 @@ export default function EntityDetail({ entityId, onClose }: EntityDetailProps) {
           <p className="empty-state">No claims recorded for this entity.</p>
         ) : null}
         {correctClaimMutation.error ? (
-          <div role="alert" className="inline-status error-panel">{correctClaimMutation.error.message}</div>
+          <div role="alert" className="inline-status error-panel">{errorMessage(correctClaimMutation.error)}</div>
         ) : null}
         {recordClaimMutation.error ? (
-          <div role="alert" className="inline-status error-panel">{recordClaimMutation.error.message}</div>
+          <div role="alert" className="inline-status error-panel">{errorMessage(recordClaimMutation.error)}</div>
         ) : null}
         <form className="field-form" onSubmit={submitClaim}>
           <h4>Record claim</h4>
@@ -406,7 +411,7 @@ export default function EntityDetail({ entityId, onClose }: EntityDetailProps) {
               onChange={(event) => setClaimDraft({ ...claimDraft, confidence: event.target.value })}
             />
           </label>
-          <button type="submit" disabled={recordClaimMutation.isPending}>Record claim</button>
+          <button type="submit" disabled={recordClaimMutation.isPending} aria-busy={recordClaimMutation.isPending}>Record claim</button>
         </form>
       </section>
 
@@ -414,7 +419,7 @@ export default function EntityDetail({ entityId, onClose }: EntityDetailProps) {
         <h3 id={`relationships-heading-${entityId}`}>Relationships</h3>
         {relationshipsQuery.isLoading ? <p role="status">Loading relationships…</p> : null}
         {relationshipsQuery.isError ? (
-          <div role="alert" className="inline-status error-panel">{relationshipsQuery.error.message}</div>
+          <div role="alert" className="inline-status error-panel">{errorMessage(relationshipsQuery.error)}</div>
         ) : relationshipsQuery.data?.items.length ? (
           <ul>
             {relationshipsQuery.data.items.map((relationship) => (
@@ -437,14 +442,13 @@ export default function EntityDetail({ entityId, onClose }: EntityDetailProps) {
           <p className="empty-state">No relationships recorded for this entity.</p>
         ) : null}
         {addRelationshipMutation.error ? (
-          <div role="alert" className="inline-status error-panel">{addRelationshipMutation.error.message}</div>
+          <div role="alert" className="inline-status error-panel">{errorMessage(addRelationshipMutation.error)}</div>
         ) : null}
         <form className="field-form" onSubmit={submitRelationship}>
           <h4>Add relationship</h4>
           <label>
             Relationship type
             <select
-              aria-label="Relationship type"
               value={relationshipDraft.relationshipType}
               onChange={(event) =>
                 setRelationshipDraft({ ...relationshipDraft, relationshipType: event.target.value as RelationshipType })
@@ -458,7 +462,6 @@ export default function EntityDetail({ entityId, onClose }: EntityDetailProps) {
           <label>
             Related entity ID
             <input
-              aria-label="Related entity ID"
               value={relationshipDraft.toEntityId}
               onChange={(event) => setRelationshipDraft({ ...relationshipDraft, toEntityId: event.target.value })}
             />
@@ -466,12 +469,11 @@ export default function EntityDetail({ entityId, onClose }: EntityDetailProps) {
           <label>
             Evidence ID
             <input
-              aria-label="Evidence ID"
               value={relationshipDraft.evidenceId}
               onChange={(event) => setRelationshipDraft({ ...relationshipDraft, evidenceId: event.target.value })}
             />
           </label>
-          <button type="submit" disabled={addRelationshipMutation.isPending}>Add relationship</button>
+          <button type="submit" disabled={addRelationshipMutation.isPending} aria-busy={addRelationshipMutation.isPending}>Add relationship</button>
         </form>
       </section>
 
@@ -480,7 +482,7 @@ export default function EntityDetail({ entityId, onClose }: EntityDetailProps) {
           <h3 id={`members-heading-${entityId}`}>Members</h3>
           {membersQuery.isLoading ? <p role="status">Loading members…</p> : null}
           {membersQuery.isError ? (
-            <div role="alert" className="inline-status error-panel">{membersQuery.error.message}</div>
+            <div role="alert" className="inline-status error-panel">{errorMessage(membersQuery.error)}</div>
           ) : membersQuery.data?.items.length ? (
             <ul>
               {membersQuery.data.items.map((member) => (
@@ -493,7 +495,7 @@ export default function EntityDetail({ entityId, onClose }: EntityDetailProps) {
             <p className="empty-state">No members recorded for this team yet.</p>
           ) : null}
           {addMemberMutation.error ? (
-            <div role="alert" className="inline-status error-panel">{addMemberMutation.error.message}</div>
+            <div role="alert" className="inline-status error-panel">{errorMessage(addMemberMutation.error)}</div>
           ) : null}
           <form className="field-form" onSubmit={submitMember}>
             <h4>Add member</h4>
@@ -513,7 +515,7 @@ export default function EntityDetail({ entityId, onClose }: EntityDetailProps) {
                 onChange={(event) => setMemberDraft({ ...memberDraft, evidenceId: event.target.value })}
               />
             </label>
-            <button type="submit" disabled={addMemberMutation.isPending}>Add member</button>
+            <button type="submit" disabled={addMemberMutation.isPending} aria-busy={addMemberMutation.isPending}>Add member</button>
           </form>
         </section>
       ) : null}
@@ -522,7 +524,7 @@ export default function EntityDetail({ entityId, onClose }: EntityDetailProps) {
         <h3 id={`timeline-heading-${entityId}`}>Timeline</h3>
         {timelineQuery.isLoading ? <p role="status">Loading timeline…</p> : null}
         {timelineQuery.isError ? (
-          <div role="alert" className="inline-status error-panel">{timelineQuery.error.message}</div>
+          <div role="alert" className="inline-status error-panel">{errorMessage(timelineQuery.error)}</div>
         ) : timelineQuery.data?.items.length ? (
           <ol>
             {timelineQuery.data.items.map((entry) => (

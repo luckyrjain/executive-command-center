@@ -394,8 +394,18 @@ describe('ConnectorHealthPanel', () => {
     renderPanel()
 
     await screen.findByText('No connectors are configured for this workspace yet.')
-    const labels = within(providerGroup()).getAllByRole('button').map((button) => button.textContent)
-    expect(labels).toEqual(['GitHub', 'GitLab', 'Jira', 'Datadog', 'Sandbox (developer testing only)'])
+    // Each tile now also carries a decorative, `aria-hidden` provider-glyph
+    // span (Connector health's redesign) ahead of its label -- raw
+    // `textContent` would include that hidden text with no separating
+    // space ("giGitHub"), so this asserts on accessible name (which
+    // correctly excludes `aria-hidden` content, same as `pickProvider`'s
+    // own `getByRole('button', { name })` lookup above) instead.
+    const expectedLabels = ['GitHub', 'GitLab', 'Jira', 'Datadog', 'Sandbox (developer testing only)']
+    const buttons = within(providerGroup()).getAllByRole('button')
+    expect(buttons).toHaveLength(expectedLabels.length)
+    expectedLabels.forEach((label, i) => {
+      expect(within(providerGroup()).getByRole('button', { name: label })).toBe(buttons[i])
+    })
   })
 
   it('shows GitLab\'s Host and Personal access token as separate wizard steps, never combined on one screen', async () => {
@@ -411,6 +421,35 @@ describe('ConnectorHealthPanel', () => {
     clickContinue() // host -> token
     expect(screen.getByLabelText('Personal access token')).toBeTruthy()
     expect(screen.queryByLabelText('Host')).toBeNull()
+  })
+
+  it('validates the GitLab Host field inline as it is typed, blocking Continue on a malformed host', async () => {
+    // Previously `isStepComplete`'s 'host' case fell through to `default:
+    // true` -- literally any input (a scheme, a port, a path, whitespace)
+    // passed the wizard and only surfaced as a rejection from the backend's
+    // own `parse_credential` at submit time, several steps later.
+    const fetch = vi.fn(() => response({ connectors: [] }))
+    vi.stubGlobal('fetch', fetch)
+    renderPanel()
+
+    await screen.findByText('No connectors are configured for this workspace yet.')
+    pickProvider('GitLab')
+    clickContinue() // provider -> host
+    const hostInput = screen.getByLabelText('Host')
+    const continueButton = () => screen.getByRole('button', { name: 'Continue' })
+
+    fireEvent.change(hostInput, { target: { value: 'https://gitlab.com' } })
+    expect(continueButton().hasAttribute('disabled')).toBe(true)
+    expect(hostInput.getAttribute('aria-invalid')).toBe('true')
+    expect(screen.getByRole('alert').textContent).toMatch(/bare hostname/)
+
+    fireEvent.change(hostInput, { target: { value: 'gitlab-ee.example.com' } })
+    expect(continueButton().hasAttribute('disabled')).toBe(false)
+    expect(hostInput.getAttribute('aria-invalid')).toBeNull()
+    expect(screen.queryByRole('alert')).toBeNull()
+
+    fireEvent.change(hostInput, { target: { value: '' } })
+    expect(continueButton().hasAttribute('disabled')).toBe(false) // empty still falls back to gitlab.com
   })
 
   it('shows a single Personal access token step for GitHub, no host/site step at all', async () => {

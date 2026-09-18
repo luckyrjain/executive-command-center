@@ -2,6 +2,7 @@ import { useState, type FormEvent } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
 import { ApiError, apiRequest } from '../../api/client'
+import { apiErrorMessage } from '../../api/errorMessage'
 import { serverInstantToLocalInput } from '../../lib/datetime'
 
 type Commitment = {
@@ -24,6 +25,10 @@ function duePayload(draft: Draft): Record<string, string | null> {
     return { due_date: null, due_at: dueAt }
   }
   return { due_date: null, due_at: null }
+}
+
+function errorMessage(error: Error): string {
+  return apiErrorMessage(error, { VERSION_CONFLICT: 'This commitment changed while you were editing it. Review your input and retry with the latest version.' })
 }
 
 function fromCommitment(value: Commitment): Draft {
@@ -73,39 +78,40 @@ export default function CommitmentWorkspace() {
 
   return <section className="work-panel" aria-labelledby="commitments-title">
     <div className="work-heading"><div><p className="eyebrow">WORK</p><h1 id="commitments-title">Commitments</h1><p>Track promises made by you and to you.</p></div></div>
-    {mutationError ? <div role="alert" className="inline-status error-panel">{mutationError instanceof ApiError && mutationError.code === 'VERSION_CONFLICT' ? 'This commitment changed while you were editing it. Review your input and retry with the latest version.' : mutationError.message}</div> : null}
+    {mutationError ? <div role="alert" className="inline-status error-panel">{errorMessage(mutationError)}</div> : null}
     <form className="field-form" onSubmit={submitCreate}>
       <h2>Create commitment</h2>
-      <label>Commitment summary<input aria-label="Commitment summary" value={create.summary} onChange={(e) => setCreate({ ...create, summary: e.target.value })} /></label>
+      <label>Commitment summary<input value={create.summary} onChange={(e) => setCreate({ ...create, summary: e.target.value })} /></label>
       <label>Description<textarea value={create.description} onChange={(e) => setCreate({ ...create, description: e.target.value })} /></label>
-      <label>Direction<select aria-label="Direction" value={create.direction} onChange={(e) => setCreate({ ...create, direction: e.target.value as Draft['direction'] })}><option value="made_by_me">Made by me</option><option value="made_to_me">Made to me</option></select></label>
-      <label>Counterparty name<input aria-label="Counterparty name" value={create.counterpartyName} onChange={(e) => setCreate({ ...create, counterpartyName: e.target.value })} /></label>
+      <label>Direction<select value={create.direction} onChange={(e) => setCreate({ ...create, direction: e.target.value as Draft['direction'] })}><option value="made_by_me">Made by me</option><option value="made_to_me">Made to me</option></select></label>
+      <label>Counterparty name<input value={create.counterpartyName} onChange={(e) => setCreate({ ...create, counterpartyName: e.target.value })} /></label>
       <label>Importance<select value={create.importance} onChange={(e) => setCreate({ ...create, importance: e.target.value as Draft['importance'] })}><option>low</option><option>medium</option><option>high</option><option>critical</option></select></label>
       <label>Due date<input type="date" value={create.dueDate} disabled={Boolean(create.dueAt)} onChange={(e) => setCreate({ ...create, dueDate: e.target.value })} /></label>
       <label>Due time<input type="datetime-local" value={create.dueAt} disabled={Boolean(create.dueDate)} onChange={(e) => setCreate({ ...create, dueAt: e.target.value })} /></label>
-      <button type="submit" disabled={createMutation.isPending}>Create commitment</button>
+      <button type="submit" disabled={createMutation.isPending} aria-busy={createMutation.isPending}>Create commitment</button>
     </form>
     {query.isLoading ? <p role="status">Loading commitments…</p> : null}
-    {query.isError ? <div className="inline-status error-panel" role="alert">{query.error.message}</div> : null}
+    {query.isError ? <div className="inline-status error-panel" role="alert">{apiErrorMessage(query.error)}</div> : null}
     {query.data && query.data.items.length === 0 ? <p className="empty-state">No commitments yet. Create one above to get started.</p> : null}
     <ol className="work-list">{(query.data?.items ?? []).map((value) => {
       const archived = Boolean(value.archived_at); const terminal = ['fulfilled', 'broken', 'cancelled'].includes(value.status)
+      const rowBusy = actionMutation.isPending || editMutation.isPending
       return <li key={value.id}><div><strong>{value.summary}</strong><small>{value.direction.replaceAll('_', ' ')} · {value.counterparty_name ?? 'No counterparty'} · {value.status}</small></div><div className="work-actions" role="group" aria-label={`Actions for ${value.summary}`}>
-        {!archived && !terminal ? <button type="button" disabled={actionMutation.isPending || editMutation.isPending} aria-label={`Edit ${value.summary}`} onClick={() => setEdit({ commitment: value, ...fromCommitment(value), latestVersion: value.version, conflict: false, reloadFailed: false })}>Edit</button> : null}
-        {!archived && ['detected', 'confirmed'].includes(value.status) ? <button type="button" disabled={actionMutation.isPending || editMutation.isPending} aria-label={`Confirm ${value.summary}`} onClick={() => actionMutation.mutate({ commitment: value, action: 'confirm' })}>Confirm</button> : null}
-        {!archived && ['confirmed', 'active'].includes(value.status) ? <button type="button" disabled={actionMutation.isPending || editMutation.isPending} aria-label={`Fulfil ${value.summary}`} onClick={() => actionMutation.mutate({ commitment: value, action: 'fulfil' })}>Fulfil</button> : null}
-        {!archived && !terminal ? <button type="button" className="btn-destructive" disabled={actionMutation.isPending || editMutation.isPending} aria-label={`Cancel ${value.summary}`} onClick={() => actionMutation.mutate({ commitment: value, action: 'cancel' })}>Cancel</button> : null}
-        {!archived ? <button type="button" disabled={actionMutation.isPending || editMutation.isPending} aria-label={`Archive ${value.summary}`} onClick={() => actionMutation.mutate({ commitment: value, action: 'archive' })}>Archive</button> : <button type="button" disabled={actionMutation.isPending || editMutation.isPending} aria-label={`Restore ${value.summary}`} onClick={() => actionMutation.mutate({ commitment: value, action: 'restore' })}>Restore</button>}
+        {!archived && !terminal ? <button type="button" disabled={rowBusy} aria-busy={rowBusy} aria-label={`Edit ${value.summary}`} onClick={() => setEdit({ commitment: value, ...fromCommitment(value), latestVersion: value.version, conflict: false, reloadFailed: false })}>Edit</button> : null}
+        {!archived && ['detected', 'confirmed'].includes(value.status) ? <button type="button" disabled={rowBusy} aria-busy={rowBusy} aria-label={`Confirm ${value.summary}`} onClick={() => actionMutation.mutate({ commitment: value, action: 'confirm' })}>Confirm</button> : null}
+        {!archived && ['confirmed', 'active'].includes(value.status) ? <button type="button" disabled={rowBusy} aria-busy={rowBusy} aria-label={`Fulfil ${value.summary}`} onClick={() => actionMutation.mutate({ commitment: value, action: 'fulfil' })}>Fulfil</button> : null}
+        {!archived && !terminal ? <button type="button" className="btn-destructive" disabled={rowBusy} aria-busy={rowBusy} aria-label={`Cancel ${value.summary}`} onClick={() => actionMutation.mutate({ commitment: value, action: 'cancel' })}>Cancel</button> : null}
+        {!archived ? <button type="button" disabled={rowBusy} aria-busy={rowBusy} aria-label={`Archive ${value.summary}`} onClick={() => actionMutation.mutate({ commitment: value, action: 'archive' })}>Archive</button> : <button type="button" disabled={rowBusy} aria-busy={rowBusy} aria-label={`Restore ${value.summary}`} onClick={() => actionMutation.mutate({ commitment: value, action: 'restore' })}>Restore</button>}
       </div></li>
     })}</ol>
     {edit ? <form className="field-form" onSubmit={submitEdit}><h2>Edit commitment</h2>
-      <label>Edit commitment summary<input aria-label="Edit commitment summary" value={edit.summary} onChange={(e) => setEdit({ ...edit, summary: e.target.value })} /></label>
+      <label>Edit commitment summary<input value={edit.summary} onChange={(e) => setEdit({ ...edit, summary: e.target.value })} /></label>
       <label>Edit description<textarea value={edit.description} onChange={(e) => setEdit({ ...edit, description: e.target.value })} /></label>
       <label>Edit counterparty<input value={edit.counterpartyName} onChange={(e) => setEdit({ ...edit, counterpartyName: e.target.value })} /></label>
       <label>Edit importance<select value={edit.importance} onChange={(e) => setEdit({ ...edit, importance: e.target.value as Draft['importance'] })}><option>low</option><option>medium</option><option>high</option><option>critical</option></select></label>
-      <label>Edit commitment due date<input aria-label="Edit commitment due date" type="date" value={edit.dueDate} disabled={Boolean(edit.dueAt)} onChange={(e) => setEdit({ ...edit, dueDate: e.target.value })} /></label>
-      <label>Edit commitment due time<input aria-label="Edit commitment due time" type="datetime-local" value={edit.dueAt} disabled={Boolean(edit.dueDate)} onChange={(e) => setEdit({ ...edit, dueAt: e.target.value })} /></label>
-      {edit.reloadFailed ? <><p role="alert">Could not reload the latest commitment. Your edits are preserved.</p><button type="button" onClick={() => void reloadLatestCommitment(edit.commitment.id)}>Reload latest commitment</button></> : edit.conflict ? <button type="button" disabled={editMutation.isPending} onClick={() => submitEdit()}>Retry with latest version</button> : <button type="submit" disabled={editMutation.isPending}>Save commitment</button>}
+      <label>Edit commitment due date<input type="date" value={edit.dueDate} disabled={Boolean(edit.dueAt)} onChange={(e) => setEdit({ ...edit, dueDate: e.target.value })} /></label>
+      <label>Edit commitment due time<input type="datetime-local" value={edit.dueAt} disabled={Boolean(edit.dueDate)} onChange={(e) => setEdit({ ...edit, dueAt: e.target.value })} /></label>
+      {edit.reloadFailed ? <><div role="alert" className="inline-status error-panel">Could not reload the latest commitment. Your edits are preserved.</div><button type="button" onClick={() => void reloadLatestCommitment(edit.commitment.id)}>Reload latest commitment</button></> : edit.conflict ? <button type="button" disabled={editMutation.isPending} aria-busy={editMutation.isPending} onClick={() => submitEdit()}>Retry with latest version</button> : <button type="submit" disabled={editMutation.isPending} aria-busy={editMutation.isPending}>Save commitment</button>}
       <button type="button" disabled={editMutation.isPending} onClick={() => setEdit(null)}>Discard edit</button>
     </form> : null}
   </section>

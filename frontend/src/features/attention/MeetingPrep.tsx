@@ -115,14 +115,14 @@ export default function MeetingPrep() {
       </div>
 
       <form className="field-form" onSubmit={submit}>
-        <label>Meeting ID<input aria-label="Meeting ID" value={meetingId} onChange={(e) => setMeetingId(e.target.value)} /></label>
-        <button type="submit" disabled={pending}>Load meeting prep</button>
+        <label>Meeting ID<input value={meetingId} onChange={(e) => setMeetingId(e.target.value)} /></label>
+        <button type="submit" disabled={pending} aria-busy={pending}>Load meeting prep</button>
       </form>
 
       {activeMeetingId ? (
         <div className="work-actions" role="group" aria-label="Preparation pack actions">
-          <button type="button" disabled={pending} onClick={() => createMutation.mutate(activeMeetingId)}>Generate pack</button>
-          <button type="button" disabled={pending} onClick={() => refreshMutation.mutate(activeMeetingId)}>Refresh pack</button>
+          <button type="button" disabled={pending} aria-busy={pending} onClick={() => createMutation.mutate(activeMeetingId)}>Generate pack</button>
+          <button type="button" disabled={pending} aria-busy={pending} onClick={() => refreshMutation.mutate(activeMeetingId)}>Refresh pack</button>
         </div>
       ) : null}
 
@@ -135,7 +135,7 @@ export default function MeetingPrep() {
         <>
           {pack.status === 'stale' ? (
             <div className="inline-status degraded-panel" role="status">
-              This pack may be out of date. <button type="button" disabled={pending} onClick={() => refreshMutation.mutate(pack.meeting_id)}>Refresh now</button>
+              This pack may be out of date. <button type="button" disabled={pending} aria-busy={pending} onClick={() => refreshMutation.mutate(pack.meeting_id)}>Refresh now</button>
             </div>
           ) : null}
           {!pack.enrichment.available ? (

@@ -39,7 +39,7 @@ function GrantRow({ grant, now, onChanged }: { grant: Grant; now: Date; onChange
       </div>
       {state !== 'revoked' ? (
         <div className="work-actions">
-          <button type="button" className="btn-destructive" disabled={revokeMutation.isPending} onClick={() => revokeMutation.mutate()}>Revoke</button>
+          <button type="button" className="btn-destructive" disabled={revokeMutation.isPending} aria-busy={revokeMutation.isPending} onClick={() => revokeMutation.mutate()}>Revoke</button>
         </div>
       ) : null}
       {revokeMutation.isError ? <div role="alert" className="inline-status error-panel">{sharingErrorMessage(revokeMutation.error)}</div> : null}
@@ -170,13 +170,13 @@ export default function SharingReview() {
         }}
       >
         <label>Resource type
-          <input aria-label="Resource type" value={form.resourceType} onChange={(event) => updateField('resourceType', event.target.value)} />
+          <input value={form.resourceType} onChange={(event) => updateField('resourceType', event.target.value)} />
         </label>
         <label>Resource ID
-          <input aria-label="Resource ID" value={form.resourceId} onChange={(event) => updateField('resourceId', event.target.value)} />
+          <input value={form.resourceId} onChange={(event) => updateField('resourceId', event.target.value)} />
         </label>
         <label>Grantee account ID
-          <input aria-label="Grantee account ID" value={form.granteeAccountId} onChange={(event) => updateField('granteeAccountId', event.target.value)} />
+          <input value={form.granteeAccountId} onChange={(event) => updateField('granteeAccountId', event.target.value)} />
         </label>
         <fieldset>
           <legend>Actions to grant</legend>
@@ -188,7 +188,7 @@ export default function SharingReview() {
           </label>
         </fieldset>
         <div className="work-actions">
-          <button type="submit" disabled={!canPreview || previewMutation.isPending}>Preview sharing</button>
+          <button type="submit" disabled={!canPreview || previewMutation.isPending} aria-busy={previewMutation.isPending}>Preview sharing</button>
         </div>
       </form>
       {previewMutation.isError ? <div role="alert" className="inline-status error-panel">{sharingErrorMessage(previewMutation.error)}</div> : null}
@@ -216,6 +216,7 @@ export default function SharingReview() {
             <button
               type="button"
               disabled={createMutation.isPending}
+              aria-busy={createMutation.isPending}
               onClick={() => createMutation.mutate({ form, narrowVisibility: preview.requires_narrow_visibility_confirmation })}
             >
               Confirm and share

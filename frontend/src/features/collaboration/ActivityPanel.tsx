@@ -56,7 +56,7 @@ export default function ActivityPanel() {
       <div className="work-actions">
         {cursors.length > 1 ? <button type="button" onClick={reset}>Back to latest</button> : null}
         {activity.data?.next_cursor ? (
-          <button type="button" disabled={activity.isFetching} onClick={loadMore}>
+          <button type="button" disabled={activity.isFetching} aria-busy={activity.isFetching} onClick={loadMore}>
             {activity.isFetching ? 'Loading…' : 'Load more'}
           </button>
         ) : null}

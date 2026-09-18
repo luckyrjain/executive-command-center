@@ -288,6 +288,7 @@ export default function AttentionExplanation({ item, aiEnabled = true }: { item:
           type="button"
           aria-label="Cancel AI explanation request"
           disabled={cancelRunMutation.isPending}
+          aria-busy={cancelRunMutation.isPending}
           onClick={() => cancelRunMutation.mutate(run.id)}
         >
           Cancel

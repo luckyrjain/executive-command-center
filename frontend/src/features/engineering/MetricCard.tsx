@@ -69,7 +69,7 @@ export default function MetricCard({ metric }: { metric: MetricSnapshot }) {
 
       <details>
         <summary>Evidence</summary>
-        <dl>
+        <dl className="detail-fields">
           <dt>Population</dt>
           <dd>{metric.population}</dd>
           <dt>Numerator</dt>

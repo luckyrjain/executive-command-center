@@ -194,8 +194,18 @@ export default function RiskWorkspace() {
   })
   const pending = createMutation.isPending || editMutation.isPending || actionMutation.isPending
 
+  // `createStep !== 'review'` guard is load-bearing, not defensive
+  // redundancy -- see the identical guard's comment in
+  // ConnectorHealthPanel.tsx's own attemptCreate. A step with exactly one
+  // field and no submit button mounted (Continue/Back are both
+  // type="button") still triggers the browser's implicit single-field
+  // form submission on Enter; without this, an early step's Enter key
+  // could run full terminal validation (and, if every other field already
+  // happens to be valid, actually create the risk) before the user ever
+  // reaches Review.
   function attemptCreate(event: FormEvent) {
     event.preventDefault()
+    if (createStep !== 'review') return
     const problem = validateDraft(create)
     if (problem) {
       setFormError(problem)
@@ -249,10 +259,10 @@ export default function RiskWorkspace() {
         <div className="field-form">
           <p className="eyebrow">Step {createStepIndex + 1} of {CREATE_STEPS.length} · Details</p>
           <h3 ref={createStepHeadingRef} tabIndex={-1}>What is the risk?</h3>
-          <label>Risk description<textarea aria-label="Risk description" value={create.description} onChange={(e) => setCreate({ ...create, description: e.target.value })} /></label>
+          <label>Risk description<textarea value={create.description} onChange={(e) => setCreate({ ...create, description: e.target.value })} /></label>
           <label>Probability (1-5)<input aria-label="Probability" type="number" min={1} max={5} value={create.probability} onChange={(e) => setCreate({ ...create, probability: Number(e.target.value) })} /></label>
           <label>Impact (1-5)<input aria-label="Impact" type="number" min={1} max={5} value={create.impact} onChange={(e) => setCreate({ ...create, impact: Number(e.target.value) })} /></label>
-          <label>Status<select aria-label="Status" value={create.status} onChange={(e) => setCreate({ ...create, status: e.target.value as RiskStatus })}>{STATUSES.map((status) => <option key={status} value={status}>{status}</option>)}</select></label>
+          <label>Status<select value={create.status} onChange={(e) => setCreate({ ...create, status: e.target.value as RiskStatus })}>{STATUSES.map((status) => <option key={status} value={status}>{status}</option>)}</select></label>
           <div className="work-actions">
             <button type="button" onClick={goCreateNext}>Continue</button>
           </div>
@@ -261,10 +271,10 @@ export default function RiskWorkspace() {
         <div className="field-form">
           <p className="eyebrow">Step {createStepIndex + 1} of {CREATE_STEPS.length} · Plan</p>
           <h3 ref={createStepHeadingRef} tabIndex={-1}>How is it handled?</h3>
-          <label>Mitigation<textarea aria-label="Mitigation" value={create.mitigation} onChange={(e) => setCreate({ ...create, mitigation: e.target.value })} /></label>
-          <label>Trigger<input aria-label="Trigger" value={create.trigger} onChange={(e) => setCreate({ ...create, trigger: e.target.value })} /></label>
-          <label>Review at<input aria-label="Review at" type="datetime-local" value={create.reviewAt} onChange={(e) => setCreate({ ...create, reviewAt: e.target.value })} /></label>
-          <label>Project ID<input aria-label="Project ID" value={create.projectId} onChange={(e) => setCreate({ ...create, projectId: e.target.value })} /></label>
+          <label>Mitigation<textarea value={create.mitigation} onChange={(e) => setCreate({ ...create, mitigation: e.target.value })} /></label>
+          <label>Trigger<input value={create.trigger} onChange={(e) => setCreate({ ...create, trigger: e.target.value })} /></label>
+          <label>Review at<input type="datetime-local" value={create.reviewAt} onChange={(e) => setCreate({ ...create, reviewAt: e.target.value })} /></label>
+          <label>Project ID<input value={create.projectId} onChange={(e) => setCreate({ ...create, projectId: e.target.value })} /></label>
           <label className="field-checkbox"><input type="checkbox" checked={create.pinned} onChange={(e) => setCreate({ ...create, pinned: e.target.checked })} /> Pinned</label>
           <div className="work-actions">
             <button type="button" onClick={goCreateBack}>Back</button>
@@ -288,7 +298,7 @@ export default function RiskWorkspace() {
           </dl>
           <div className="work-actions">
             <button type="button" onClick={goCreateBack}>Back</button>
-            <button type="submit" disabled={pending}>Create risk</button>
+            <button type="submit" aria-busy={pending} disabled={pending}>Create risk</button>
           </div>
         </div>
       )}
@@ -320,14 +330,14 @@ export default function RiskWorkspace() {
       </li>
     })}</ol>
     {edit ? <form className="field-form" onSubmit={submitEdit}><h2>Edit risk</h2>
-      <label>Edit risk description<textarea aria-label="Edit risk description" value={edit.description} onChange={(e) => setEdit({ ...edit, description: e.target.value })} /></label>
-      <label>Edit probability<input aria-label="Edit probability" type="number" min={1} max={5} value={edit.probability} onChange={(e) => setEdit({ ...edit, probability: Number(e.target.value) })} /></label>
-      <label>Edit impact<input aria-label="Edit impact" type="number" min={1} max={5} value={edit.impact} onChange={(e) => setEdit({ ...edit, impact: Number(e.target.value) })} /></label>
-      <label>Edit risk status<select aria-label="Edit risk status" disabled={edit.risk.status === 'closed'} value={edit.status} onChange={(e) => setEdit({ ...edit, status: e.target.value as RiskStatus })}>{STATUSES.map((status) => <option key={status} value={status}>{status}</option>)}</select></label>
-      <label>Edit mitigation<textarea aria-label="Edit mitigation" value={edit.mitigation} onChange={(e) => setEdit({ ...edit, mitigation: e.target.value })} /></label>
-      <label>Edit trigger<input aria-label="Edit trigger" value={edit.trigger} onChange={(e) => setEdit({ ...edit, trigger: e.target.value })} /></label>
-      <label>Edit review at<input aria-label="Edit review at" type="datetime-local" value={edit.reviewAt} onChange={(e) => setEdit({ ...edit, reviewAt: e.target.value })} /></label>
-      <label>Edit project ID<input aria-label="Edit project ID" value={edit.projectId} onChange={(e) => setEdit({ ...edit, projectId: e.target.value })} /></label>
+      <label>Edit risk description<textarea value={edit.description} onChange={(e) => setEdit({ ...edit, description: e.target.value })} /></label>
+      <label>Edit probability<input type="number" min={1} max={5} value={edit.probability} onChange={(e) => setEdit({ ...edit, probability: Number(e.target.value) })} /></label>
+      <label>Edit impact<input type="number" min={1} max={5} value={edit.impact} onChange={(e) => setEdit({ ...edit, impact: Number(e.target.value) })} /></label>
+      <label>Edit risk status<select disabled={edit.risk.status === 'closed'} value={edit.status} onChange={(e) => setEdit({ ...edit, status: e.target.value as RiskStatus })}>{STATUSES.map((status) => <option key={status} value={status}>{status}</option>)}</select></label>
+      <label>Edit mitigation<textarea value={edit.mitigation} onChange={(e) => setEdit({ ...edit, mitigation: e.target.value })} /></label>
+      <label>Edit trigger<input value={edit.trigger} onChange={(e) => setEdit({ ...edit, trigger: e.target.value })} /></label>
+      <label>Edit review at<input type="datetime-local" value={edit.reviewAt} onChange={(e) => setEdit({ ...edit, reviewAt: e.target.value })} /></label>
+      <label>Edit project ID<input value={edit.projectId} onChange={(e) => setEdit({ ...edit, projectId: e.target.value })} /></label>
       <label className="field-checkbox"><input aria-label="Edit pinned" type="checkbox" checked={edit.pinned} onChange={(e) => setEdit({ ...edit, pinned: e.target.checked })} /> Pinned</label>
       {edit.reloadFailed ? <><p role="alert">Could not reload the latest risk. Your edits are preserved.</p><button type="button" disabled={pending} onClick={() => void reloadLatestRisk(edit.risk.id)}>Reload latest risk</button></> : edit.conflict ? <button type="button" disabled={pending} onClick={() => submitEdit()}>Retry with latest version</button> : <button type="submit" disabled={pending}>Save risk</button>}
       <button type="button" disabled={pending} onClick={() => setEdit(null)}>Discard edit</button>

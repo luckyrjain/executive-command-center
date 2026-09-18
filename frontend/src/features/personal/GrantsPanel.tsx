@@ -40,7 +40,7 @@ function GrantRow({ grant, now, onChanged }: { grant: Grant; now: Date; onChange
       </div>
       {state !== 'revoked' ? (
         <div className="work-actions">
-          <button type="button" className="btn-destructive" disabled={revokeMutation.isPending} onClick={() => revokeMutation.mutate()}>Revoke</button>
+          <button type="button" className="btn-destructive" aria-busy={revokeMutation.isPending} disabled={revokeMutation.isPending} onClick={() => revokeMutation.mutate()}>Revoke</button>
         </div>
       ) : null}
       {revokeMutation.isError ? <div role="alert" className="inline-status error-panel">{personalErrorMessage(revokeMutation.error)}</div> : null}
@@ -120,12 +120,12 @@ export default function GrantsPanel() {
         }}
       >
         <label>Source domain
-          <select aria-label="Source domain" value={sourceDomainKey} onChange={(event) => setSourceDomainKey(event.target.value as DomainKey)}>
+          <select value={sourceDomainKey} onChange={(event) => setSourceDomainKey(event.target.value as DomainKey)}>
             {DOMAIN_KEYS.map((key) => <option key={key} value={key}>{DOMAIN_LABELS[key]}</option>)}
           </select>
         </label>
         <label>Purpose
-          <input aria-label="Purpose" value="insight_generation" readOnly />
+          <input value="insight_generation" readOnly />
         </label>
         {/* No `aria-label` override here, unlike the sibling inputs above --
             the full wrapping label text ("Granted categories (comma-
@@ -144,7 +144,7 @@ export default function GrantsPanel() {
           <p className="empty-state">Enable {DOMAIN_LABELS[sourceDomainKey]} in the Domains tab before granting access to its data.</p>
         ) : null}
         <div className="work-actions">
-          <button type="submit" disabled={createMutation.isPending || !canSubmit}>Create grant</button>
+          <button type="submit" aria-busy={createMutation.isPending} disabled={createMutation.isPending || !canSubmit}>Create grant</button>
         </div>
       </form>
       {createMutation.isError ? <div role="alert" className="inline-status error-panel">{personalErrorMessage(createMutation.error)}</div> : null}

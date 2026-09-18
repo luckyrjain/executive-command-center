@@ -153,7 +153,7 @@ function EvidencePreview({ label, evidenceIds }: { label: string; evidenceIds: s
 
   if (!evidenceIds.length) return null
   if (query.isLoading) return <p role="status">Loading evidence…</p>
-  if (query.isError) return <p role="alert">{query.error.message}</p>
+  if (query.isError) return <div className="inline-status error-panel" role="alert">{recommendationErrorMessage(query.error)}</div>
 
   return (
     <ul className="evidence-preview" aria-label={`Evidence for ${label}`}>
@@ -177,7 +177,7 @@ function RiskFactorsPreview({ label, riskId }: { label: string; riskId: string }
   })
 
   if (query.isLoading) return <p role="status">Loading risk factors…</p>
-  if (query.isError) return <p role="alert">{query.error.message}</p>
+  if (query.isError) return <div className="inline-status error-panel" role="alert">{recommendationErrorMessage(query.error)}</div>
   const risk = query.data
   if (!risk) return null
 
@@ -246,13 +246,13 @@ export default function RecommendationPanel({ recommendationType, title }: {
           <h2 id={headingId}>{title ?? 'Recommendations'}</h2>
           <p>Review rationale and evidence metadata before any authoritative change executes.</p>
         </div>
-        <button type="button" onClick={() => recommendations.refetch()} disabled={recommendations.isFetching}>
+        <button type="button" onClick={() => recommendations.refetch()} disabled={recommendations.isFetching} aria-busy={recommendations.isFetching}>
           {recommendations.isFetching ? 'Refreshing…' : 'Refresh recommendations'}
         </button>
       </div>
 
       {recommendations.isLoading ? <div className="inline-status" role="status">Loading recommendations…</div> : null}
-      {recommendations.isError ? <div className="inline-status error-panel" role="alert">{recommendations.error.message}</div> : null}
+      {recommendations.isError ? <div className="inline-status error-panel" role="alert">{recommendationErrorMessage(recommendations.error)}</div> : null}
       {mutation.isError ? (
         <div className="inline-status error-panel" role="alert">
           {recommendationErrorMessage(mutation.error)}
@@ -299,17 +299,17 @@ export default function RecommendationPanel({ recommendationType, title }: {
                 </div>
                 <div className="recommendation-actions" role="group" aria-label={`Actions for ${item.recommendation_type}`}>
                   {canPublish ? (
-                    <button type="button" onClick={() => mutation.mutate({ item, action: 'publish' })} disabled={busy}>Publish for confirmation</button>
+                    <button type="button" onClick={() => mutation.mutate({ item, action: 'publish' })} disabled={busy} aria-busy={busy}>Publish for confirmation</button>
                   ) : null}
                   {canDecide ? (
                     <>
-                      <button className="primary-action" type="button" onClick={() => mutation.mutate({ item, action: 'confirm' })} disabled={busy || (!isCreateRecommendation(item) && item.expected_version == null)}>Confirm and execute</button>
-                      <button type="button" onClick={() => mutation.mutate({ item, action: 'reject' })} disabled={busy}>Reject</button>
-                      <button type="button" onClick={() => mutation.mutate({ item, action: 'defer' })} disabled={busy}>Defer 24h</button>
+                      <button className="btn-primary" type="button" onClick={() => mutation.mutate({ item, action: 'confirm' })} disabled={busy || (!isCreateRecommendation(item) && item.expected_version == null)} aria-busy={busy}>Confirm and execute</button>
+                      <button type="button" onClick={() => mutation.mutate({ item, action: 'reject' })} disabled={busy} aria-busy={busy}>Reject</button>
+                      <button type="button" onClick={() => mutation.mutate({ item, action: 'defer' })} disabled={busy} aria-busy={busy}>Defer 24h</button>
                     </>
                   ) : null}
                   {(canPublish || canDecide) ? (
-                    <button type="button" onClick={() => mutation.mutate({ item, action: 'pin' })} disabled={busy}>{item.pinned ? 'Unpin' : 'Pin'}</button>
+                    <button type="button" onClick={() => mutation.mutate({ item, action: 'pin' })} disabled={busy} aria-busy={busy}>{item.pinned ? 'Unpin' : 'Pin'}</button>
                   ) : null}
                   {busy ? <span role="status">Applying…</span> : null}
                 </div>

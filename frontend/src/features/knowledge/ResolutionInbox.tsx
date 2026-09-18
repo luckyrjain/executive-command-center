@@ -2,6 +2,7 @@ import { useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
 import { apiRequest } from '../../api/client'
+import { apiErrorMessage } from '../../api/errorMessage'
 import type { ResolutionCandidate, ResolutionCandidateList } from './types'
 
 type Decision = 'confirm' | 'reject'
@@ -14,6 +15,10 @@ function factorSummary(candidate: ResolutionCandidate): string {
   return Object.entries(candidate.factors)
     .map(([factor, value]) => `${factor}: ${value.toFixed(2)}`)
     .join(', ')
+}
+
+function errorMessage(error: Error): string {
+  return apiErrorMessage(error)
 }
 
 type ResolutionCandidateRowProps = { candidate: ResolutionCandidate }
@@ -61,16 +66,15 @@ function ResolutionCandidateRow({ candidate }: ResolutionCandidateRowProps) {
         <small> · score {candidate.score.toFixed(2)} ({factorSummary(candidate)})</small>
       </div>
       {decisionMutation.error ? (
-        <div role="alert" className="inline-status error-panel">{decisionMutation.error.message}</div>
+        <div role="alert" className="inline-status error-panel">{errorMessage(decisionMutation.error)}</div>
       ) : null}
       {deferMutation.error ? (
-        <div role="alert" className="inline-status error-panel">{deferMutation.error.message}</div>
+        <div role="alert" className="inline-status error-panel">{errorMessage(deferMutation.error)}</div>
       ) : null}
       <div className="field-form">
         <label>
           {`Reason for ${candidate.id}`}
           <input
-            aria-label={`Reason for ${candidate.id}`}
             value={reason}
             onChange={(event) => setReason(event.target.value)}
           />
@@ -94,6 +98,7 @@ function ResolutionCandidateRow({ candidate }: ResolutionCandidateRowProps) {
         <button
           type="button"
           disabled={deferMutation.isPending}
+          aria-busy={deferMutation.isPending}
           onClick={() => deferMutation.mutate()}
         >
           Defer
@@ -121,7 +126,7 @@ export default function ResolutionInbox() {
       </div>
 
       {query.isLoading ? <p role="status">Loading resolution candidates…</p> : null}
-      {query.isError ? <div role="alert" className="inline-status error-panel">{query.error.message}</div> : null}
+      {query.isError ? <div role="alert" className="inline-status error-panel">{errorMessage(query.error)}</div> : null}
       {query.data?.items.length ? (
         <ul className="work-list">
           {query.data.items.map((candidate) => (

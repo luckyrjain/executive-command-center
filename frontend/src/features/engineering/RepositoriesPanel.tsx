@@ -3,6 +3,7 @@ import { useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
 import { ApiError, apiRequest } from '../../api/client'
+import { apiErrorMessage } from '../../api/errorMessage'
 import type { EntityList } from '../knowledge/types'
 import { safeHref, type Repository, type RepositoryListResponse, type TeamAssignmentRequest } from './types'
 
@@ -83,7 +84,6 @@ function TeamAssignment({
         <label>
           {`Team for ${repository.name}`}
           <select
-            aria-label={`Team for ${repository.name}`}
             value={repository.team_entity_id ?? ''}
             disabled={mutation.isPending}
             onChange={(event) => mutation.mutate(event.target.value === '' ? null : event.target.value)}
@@ -99,7 +99,7 @@ function TeamAssignment({
       {!repository.team_entity_id && repository.suggested_team_name ? (
         <small>suggested: {repository.suggested_team_name}</small>
       ) : null}
-      {mutation.isError ? <span role="alert" className="inline-status error-panel">{mutation.error.message}</span> : null}
+      {mutation.isError ? <span role="alert" className="inline-status error-panel">{apiErrorMessage(mutation.error)}</span> : null}
     </div>
   )
 }
@@ -174,7 +174,7 @@ export default function RepositoriesPanel() {
       </div>
 
       {query.isLoading ? <p role="status">Loading repositories…</p> : null}
-      {query.isError ? <div role="alert" className="inline-status error-panel">{query.error.message}</div> : null}
+      {query.isError ? <div role="alert" className="inline-status error-panel">{apiErrorMessage(query.error)}</div> : null}
       {query.data && repositories.length === 0 ? (
         <p className="empty-state">
           {teamFilter
