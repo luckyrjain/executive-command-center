@@ -405,7 +405,7 @@ def test_due_schedule_trigger_fires_exactly_once_and_sets_trigger_ref(
     assert any(o.trigger_id == trigger.id for o in fired)
 
     with SessionFactory() as session, session.begin():
-        runs = automation_worker.list_runs(session, auth, workspace_id)
+        runs = automation_worker.list_runs(session, auth)
     matching = [r for r in runs if r.trigger_ref == f"schedule:{trigger.id}"]
     assert len(matching) == 1
     assert matching[0].status == "queued"
@@ -417,7 +417,7 @@ def test_due_schedule_trigger_fires_exactly_once_and_sets_trigger_ref(
     fired_again = [o for o in outcomes_again if isinstance(o, automation_scheduler.TriggerFired)]
     assert not any(o.trigger_id == trigger.id for o in fired_again)
     with SessionFactory() as session, session.begin():
-        runs_after = automation_worker.list_runs(session, auth, workspace_id)
+        runs_after = automation_worker.list_runs(session, auth)
     matching_after = [r for r in runs_after if r.trigger_ref == f"schedule:{trigger.id}"]
     assert len(matching_after) == 1  # still exactly one, not two
 
@@ -485,7 +485,7 @@ def test_misfire_backlog_fires_exactly_once_not_once_per_missed_window(
     assert len([o for o in fired if o.trigger_id == trigger.id]) == 1
 
     with SessionFactory() as session, session.begin():
-        runs = automation_worker.list_runs(session, auth, workspace_id)
+        runs = automation_worker.list_runs(session, auth)
     matching = [r for r in runs if r.trigger_ref == f"schedule:{trigger.id}"]
     assert len(matching) == 1  # exactly one run, not six
 
@@ -513,7 +513,7 @@ def test_skip_missed_true_does_not_catch_up_the_backlog(
     assert any(o.trigger_id == trigger.id for o in skipped)
 
     with SessionFactory() as session, session.begin():
-        runs = automation_worker.list_runs(session, auth, workspace_id)
+        runs = automation_worker.list_runs(session, auth)
     matching = [r for r in runs if r.trigger_ref == f"schedule:{trigger.id}"]
     assert matching == []  # no catch-up fire at all
 
@@ -524,7 +524,7 @@ def test_skip_missed_true_does_not_catch_up_the_backlog(
     fired_next = [o for o in outcomes_next if isinstance(o, automation_scheduler.TriggerFired)]
     assert any(o.trigger_id == trigger.id for o in fired_next)
     with SessionFactory() as session, session.begin():
-        runs_after = automation_worker.list_runs(session, auth, workspace_id)
+        runs_after = automation_worker.list_runs(session, auth)
     matching_after = [r for r in runs_after if r.trigger_ref == f"schedule:{trigger.id}"]
     assert len(matching_after) == 1
 
@@ -567,7 +567,7 @@ def test_event_trigger_never_auto_fired_by_scheduler_tick(
     assert manual_trigger.id not in outcome_ids
 
     with SessionFactory() as session, session.begin():
-        runs = automation_worker.list_runs(session, auth, workspace_id)
+        runs = automation_worker.list_runs(session, auth)
     assert runs == []
 
 
@@ -689,7 +689,7 @@ def test_rate_limited_scheduled_fire_advances_the_anchor_and_reports_its_own_out
     assert refreshed.last_fired_at == tick_now
 
     with SessionFactory() as session, session.begin():
-        runs = automation_worker.list_runs(session, auth, workspace_id)
+        runs = automation_worker.list_runs(session, auth)
     assert len([run for run in runs if run.workflow_id == workflow_id]) == 1
 
 
@@ -736,7 +736,7 @@ def test_crash_between_enqueue_and_anchor_advance_rolls_back_atomically(
         automation_scheduler.run_scheduler_once(SessionFactory, now=tick_now)
 
     with SessionFactory() as session, session.begin():
-        runs = automation_worker.list_runs(session, auth, workspace_id)
+        runs = automation_worker.list_runs(session, auth)
         refreshed = automation_triggers.get_trigger(session, workspace_id, trigger.id)
     matching = [r for r in runs if r.trigger_ref == f"schedule:{trigger.id}"]
     assert matching == []  # the enqueue_run INSERT was rolled back too
@@ -750,7 +750,7 @@ def test_crash_between_enqueue_and_anchor_advance_rolls_back_atomically(
     fired = [o for o in outcomes if isinstance(o, automation_scheduler.TriggerFired)]
     assert any(o.trigger_id == trigger.id for o in fired)
     with SessionFactory() as session, session.begin():
-        runs_after = automation_worker.list_runs(session, auth, workspace_id)
+        runs_after = automation_worker.list_runs(session, auth)
     matching_after = [r for r in runs_after if r.trigger_ref == f"schedule:{trigger.id}"]
     assert len(matching_after) == 1
 
@@ -873,7 +873,7 @@ def test_two_concurrent_ticks_racing_the_same_due_trigger_fire_exactly_once(
     )
 
     with SessionFactory() as session, session.begin():
-        runs = automation_worker.list_runs(session, auth, workspace_id)
+        runs = automation_worker.list_runs(session, auth)
     matching = [r for r in runs if r.trigger_ref == f"schedule:{trigger.id}"]
     assert len(matching) == 1  # exactly one workflow_runs row, not two
 
@@ -917,11 +917,11 @@ def test_scheduler_never_writes_a_run_into_the_wrong_workspace(
         automation_scheduler.run_scheduler_once(SessionFactory, now=tick_now)
 
         with SessionFactory() as session, session.begin():
-            runs_b = automation_worker.list_runs(session, auth_b, workspace_b)
+            runs_b = automation_worker.list_runs(session, auth_b)
         assert runs_b == []
 
         with SessionFactory() as session, session.begin():
-            runs_a = automation_worker.list_runs(session, auth_a, workspace_a)
+            runs_a = automation_worker.list_runs(session, auth_a)
         assert any(r.trigger_ref == f"schedule:{trigger.id}" for r in runs_a)
     finally:
         with engine.begin() as connection:

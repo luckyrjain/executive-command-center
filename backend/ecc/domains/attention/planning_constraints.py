@@ -141,27 +141,13 @@ def list_active_constraints(session: Session, auth: AuthContext) -> list[Plannin
     # widen visibility beyond today's per-(workspace, user) behavior if
     # relied on unchanged) while replacing the ad hoc `user_id =` filter
     # with the standard visible_resource_filter_sql mechanism.
-    visibility_sql, visibility_params = authz.visible_resource_filter_sql(
+    rows = authz.list_visible_resources(
         session,
         auth,
         resource_type="planning_constraints",
-        action="read",
-        table_alias="planning_constraints",
-    )
-    rows = (
-        session.execute(
-            text(
-                f"""
-                SELECT {_FIELDS} FROM planning_constraints
-                WHERE workspace_id = :workspace_id AND ({visibility_sql})
-                  AND archived_at IS NULL
-                ORDER BY starts_at ASC NULLS LAST, priority DESC, created_at ASC
-                """
-            ),
-            {"workspace_id": auth.workspace_id, **visibility_params},
-        )
-        .mappings()
-        .all()
+        columns=_FIELDS,
+        order_by="starts_at ASC NULLS LAST, priority DESC, created_at ASC",
+        extra_clauses=["archived_at IS NULL"],
     )
     return [PlanningConstraint.model_validate(dict(row)) for row in rows]
 

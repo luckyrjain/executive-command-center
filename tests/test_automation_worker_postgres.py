@@ -599,7 +599,7 @@ def test_eleventh_run_within_an_hour_under_a_ten_per_hour_policy_is_rate_limited
 
     auth = AuthContext(workspace_id=workspace_id, user_id=user_id, timezone="UTC")
     with SessionFactory() as session, session.begin():
-        runs = automation_worker.list_runs(session, auth, workspace_id)
+        runs = automation_worker.list_runs(session, auth)
     assert len([run for run in runs if run.workflow_id == workflow_id]) == 10
 
 

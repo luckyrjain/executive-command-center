@@ -539,25 +539,22 @@ def list_incidents_endpoint(
     session: SessionDep,
     status_filter: Annotated[IncidentStatus | None, Query(alias="status")] = None,
 ) -> IncidentListResponse:
-    visibility_sql, visibility_params = authz.visible_resource_filter_sql(
-        session, auth, resource_type="incidents", action="read", table_alias="incidents"
-    )
-    clause = "AND status = :status_filter" if status_filter else ""
-    params: dict[str, Any] = {"workspace_id": auth.workspace_id, **visibility_params}
+    extra_clauses = []
+    extra_params: dict[str, Any] = {}
     if status_filter:
-        params["status_filter"] = status_filter
-    rows = (
-        session.execute(
-            text(
-                "SELECT id, title, description, severity, status, detected_at, "
-                "resolved_at, version, created_at, updated_at FROM incidents "
-                f"WHERE workspace_id = :workspace_id AND ({visibility_sql}) "  # noqa: S608
-                f"{clause} ORDER BY detected_at DESC"
-            ),
-            params,
-        )
-        .mappings()
-        .all()
+        extra_clauses.append("status = :status_filter")
+        extra_params["status_filter"] = status_filter
+    rows = authz.list_visible_resources(
+        session,
+        auth,
+        resource_type="incidents",
+        columns=(
+            "id, title, description, severity, status, detected_at, "
+            "resolved_at, version, created_at, updated_at"
+        ),
+        order_by="detected_at DESC",
+        extra_clauses=extra_clauses,
+        extra_params=extra_params,
     )
     change_ids_by_incident = _incident_change_ids_by_incident(session, [row["id"] for row in rows])
     incidents = [
@@ -780,29 +777,21 @@ def list_decisions_endpoint(
     session: SessionDep,
     status_filter: Annotated[DecisionStatus | None, Query(alias="status")] = None,
 ) -> DecisionListResponse:
-    visibility_sql, visibility_params = authz.visible_resource_filter_sql(
+    extra_clauses = []
+    extra_params: dict[str, Any] = {}
+    if status_filter:
+        extra_clauses.append("status = :status_filter")
+        extra_params["status_filter"] = status_filter
+    rows = authz.list_visible_resources(
         session,
         auth,
         resource_type="engineering_decisions",
-        action="read",
-        table_alias="engineering_decisions",
-    )
-    clause = "AND status = :status_filter" if status_filter else ""
-    params: dict[str, Any] = {"workspace_id": auth.workspace_id, **visibility_params}
-    if status_filter:
-        params["status_filter"] = status_filter
-    rows = (
-        session.execute(
-            text(
-                "SELECT id, title, description, rationale, status, decided_at, "
-                "version, created_at, updated_at FROM engineering_decisions "
-                f"WHERE workspace_id = :workspace_id AND ({visibility_sql}) "  # noqa: S608
-                f"{clause} ORDER BY created_at DESC"
-            ),
-            params,
-        )
-        .mappings()
-        .all()
+        columns=(
+            "id, title, description, rationale, status, decided_at, version, created_at, updated_at"
+        ),
+        order_by="created_at DESC",
+        extra_clauses=extra_clauses,
+        extra_params=extra_params,
     )
     change_ids_by_decision = _decision_change_ids_by_decision(session, [row["id"] for row in rows])
     decisions = [
