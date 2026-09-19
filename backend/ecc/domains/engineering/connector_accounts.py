@@ -402,34 +402,6 @@ def _personal_email_domain_exists(session: Session, workspace_id: UUID, account_
     )
 
 
-def list_connector_accounts(
-    session: Session,
-    workspace_id: UUID,
-    *,
-    visibility_sql: str = "TRUE",
-    visibility_params: dict[str, Any] | None = None,
-) -> list[ConnectorAccount]:
-    """`visibility_sql`/`visibility_params` default to no filtering (every
-    row in the workspace) so this stays a plain workspace-scoped list for
-    any caller that doesn't need authz filtering; `list_connectors_
-    endpoint` is this module's own authz-aware caller, passing `ecc.
-    platform.authz.visible_resource_filter_sql`'s own output through.
-    """
-    rows = (
-        session.execute(
-            text(
-                f"SELECT {_ACCOUNT_FIELDS} FROM connector_accounts "  # noqa: S608
-                f"WHERE workspace_id = :workspace_id AND ({visibility_sql}) "
-                "ORDER BY created_at ASC"
-            ),
-            {"workspace_id": workspace_id, **(visibility_params or {})},
-        )
-        .mappings()
-        .all()
-    )
-    return [_row_to_account(dict(row)) for row in rows]
-
-
 def _finalize_account_version(
     session: Session, account_id: UUID, *, update_sql: str, params: dict[str, Any]
 ) -> int:
@@ -814,21 +786,17 @@ def _to_response(account: ConnectorAccount) -> ConnectorAccountResponse:
 
 @router.get("/connectors", response_model=ConnectorAccountListResponse)
 def list_connectors_endpoint(auth: AuthDep, session: SessionDep) -> ConnectorAccountListResponse:
-    visibility_sql, visibility_params = authz.visible_resource_filter_sql(
+    rows = authz.list_visible_resources(
         session,
         auth,
         resource_type="connector_accounts",
-        action="read",
-        table_alias="connector_accounts",
-    )
-    accounts = list_connector_accounts(
-        session,
-        auth.workspace_id,
-        visibility_sql=visibility_sql,
-        visibility_params=visibility_params,
+        columns=_ACCOUNT_FIELDS,
+        order_by="created_at ASC",
     )
     session.rollback()
-    return ConnectorAccountListResponse(connectors=[_to_response(a) for a in accounts])
+    return ConnectorAccountListResponse(
+        connectors=[_to_response(_row_to_account(dict(row))) for row in rows]
+    )
 
 
 @router.post(
