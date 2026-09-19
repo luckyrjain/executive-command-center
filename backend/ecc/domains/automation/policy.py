@@ -215,30 +215,21 @@ def get_policy(session: Session, workspace_id: UUID, policy_id: UUID) -> Automat
 
 
 def list_policies(
-    session: Session, auth: AuthContext, workspace_id: UUID, *, workflow_id: str | None = None
+    session: Session, auth: AuthContext, *, workflow_id: str | None = None
 ) -> list[AutomationPolicy]:
-    visibility_sql, visibility_params = authz.visible_resource_filter_sql(
+    extra_clauses = []
+    extra_params: dict[str, Any] = {}
+    if workflow_id is not None:
+        extra_clauses.append("workflow_id = :workflow_id")
+        extra_params["workflow_id"] = workflow_id
+    rows = authz.list_visible_resources(
         session,
         auth,
         resource_type="automation_policies",
-        action="read",
-        table_alias="automation_policies",
-    )
-    clause = "AND workflow_id = :workflow_id" if workflow_id is not None else ""
-    params: dict[str, Any] = {"workspace_id": workspace_id, **visibility_params}
-    if workflow_id is not None:
-        params["workflow_id"] = workflow_id
-    rows = (
-        session.execute(
-            text(
-                f"SELECT {_POLICY_FIELDS} FROM automation_policies "
-                f"WHERE workspace_id = :workspace_id AND ({visibility_sql}) "
-                f"{clause} ORDER BY created_at ASC"
-            ),
-            params,
-        )
-        .mappings()
-        .all()
+        columns=_POLICY_FIELDS,
+        order_by="created_at ASC",
+        extra_clauses=extra_clauses,
+        extra_params=extra_params,
     )
     session.rollback()
     return [_row_to_policy(dict(row)) for row in rows]
@@ -439,7 +430,7 @@ def list_policies_endpoint(
     session: SessionDep,
     workflow_id: Annotated[str | None, Query(max_length=200)] = None,
 ) -> PolicyListResponse:
-    policies = list_policies(session, auth, auth.workspace_id, workflow_id=workflow_id)
+    policies = list_policies(session, auth, workflow_id=workflow_id)
     return PolicyListResponse(policies=[_to_response(policy) for policy in policies])
 
 

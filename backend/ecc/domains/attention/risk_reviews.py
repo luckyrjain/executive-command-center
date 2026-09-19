@@ -272,26 +272,15 @@ def list_review_queue(
     auth: AuthDep, session: SessionDep, limit: int = Query(default=50, ge=1, le=100)
 ) -> ReviewQueueList:
     now = datetime.now(UTC)
-    visibility_sql, visibility_params = authz.visible_resource_filter_sql(
-        session, auth, resource_type="risks", action="read", table_alias="risks"
-    )
-    rows = (
-        session.execute(
-            text(
-                f"""
-                SELECT id, description, status, review_at, version
-                FROM risks
-                WHERE workspace_id = :workspace_id AND archived_at IS NULL
-                  AND status <> 'closed' AND review_at IS NOT NULL
-                  AND ({visibility_sql})
-                ORDER BY review_at ASC
-                LIMIT :limit
-                """
-            ),
-            {"workspace_id": auth.workspace_id, "limit": limit, **visibility_params},
-        )
-        .mappings()
-        .all()
+    rows = authz.list_visible_resources(
+        session,
+        auth,
+        resource_type="risks",
+        columns="id, description, status, review_at, version",
+        order_by="review_at ASC",
+        extra_clauses=["archived_at IS NULL", "status <> 'closed'", "review_at IS NOT NULL"],
+        extra_params={"limit": limit},
+        limit_clause="LIMIT :limit",
     )
     session.rollback()
     items: list[ReviewQueueItem] = []
