@@ -309,7 +309,7 @@ def test_global_kill_switch_blocks_every_workflow_via_http(
 
     auth = AuthContext(workspace_id=workspace_id, user_id=user_id, timezone="UTC")
     with SessionFactory() as session:
-        runs = automation_worker.list_runs(session, auth, workspace_id)
+        runs = automation_worker.list_runs(session, auth)
     assert runs == []
 
 
@@ -753,8 +753,7 @@ def test_activating_a_global_kill_switch_parks_every_workflows_queued_runs(
     auth = AuthContext(workspace_id=workspace_id, user_id=user_id, timezone="UTC")
     with SessionFactory() as session:
         statuses = {
-            run.workflow_id: run.status
-            for run in automation_worker.list_runs(session, auth, workspace_id)
+            run.workflow_id: run.status for run in automation_worker.list_runs(session, auth)
         }
     assert statuses == {workflow_a: "needs_review", workflow_b: "needs_review"}
 
@@ -764,9 +763,7 @@ def test_activating_a_global_kill_switch_parks_every_workflows_queued_runs(
     with SessionFactory() as session:
         assert automation_worker.claim_next_run(session, "worker-a") is None
     with SessionFactory() as session:
-        still_parked = {
-            run.status for run in automation_worker.list_runs(session, auth, workspace_id)
-        }
+        still_parked = {run.status for run in automation_worker.list_runs(session, auth)}
     assert still_parked == {"needs_review"}
 
     # And each is now individually actionable by an operator (`cancel_run`'s

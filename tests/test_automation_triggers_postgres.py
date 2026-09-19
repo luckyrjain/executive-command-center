@@ -202,9 +202,7 @@ def test_list_triggers_filters_by_workflow_id(trigger_test_context: tuple[UUID, 
 
     auth = AuthContext(workspace_id=workspace_id, user_id=user_id, timezone="UTC")
     with SessionFactory() as session:
-        results = automation_triggers.list_triggers(
-            session, auth, workspace_id, workflow_id=workflow_a
-        )
+        results = automation_triggers.list_triggers(session, auth, workflow_id=workflow_a)
     assert [t.workflow_id for t in results] == [workflow_a]
 
 

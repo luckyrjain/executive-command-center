@@ -308,7 +308,7 @@ def test_create_run_endpoint_rejects_caller_supplied_policy_id(
 
     auth = AuthContext(workspace_id=workspace_id, user_id=user_id, timezone="UTC")
     with SessionFactory() as session, session.begin():
-        runs = automation_worker.list_runs(session, auth, workspace_id)
+        runs = automation_worker.list_runs(session, auth)
     assert runs == []
 
 
@@ -363,7 +363,7 @@ def test_create_run_endpoint_rate_limited_is_409(
     # Rejected *before* any row was written -- exactly one run exists.
     auth = AuthContext(workspace_id=workspace_id, user_id=user_id, timezone="UTC")
     with SessionFactory() as session, session.begin():
-        runs = automation_worker.list_runs(session, auth, workspace_id)
+        runs = automation_worker.list_runs(session, auth)
     assert len([run for run in runs if run.workflow_id == workflow_id]) == 1
 
 
@@ -415,7 +415,7 @@ def test_create_run_endpoint_idempotency_key_replays_cached_response(
 
     auth = AuthContext(workspace_id=workspace_id, user_id=user_id, timezone="UTC")
     with SessionFactory() as session, session.begin():
-        runs = automation_worker.list_runs(session, auth, workspace_id)
+        runs = automation_worker.list_runs(session, auth)
     assert len(runs) == 1  # only one run was ever actually enqueued
 
 

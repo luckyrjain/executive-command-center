@@ -1299,7 +1299,6 @@ def get_run(session: Session, workspace_id: UUID, run_id: UUID) -> WorkflowRun |
 def list_runs(
     session: Session,
     auth: AuthContext,
-    workspace_id: UUID,
     *,
     status_filter: RunStatus | None = None,
 ) -> list[WorkflowRun]:
@@ -1310,24 +1309,19 @@ def list_runs(
     (`approvals.list_approvals`, `policy.list_policies`), with the router
     module itself staying a thin HTTP-shape layer.
     """
-    visibility_sql, visibility_params = authz.visible_resource_filter_sql(
-        session, auth, resource_type="workflow_runs", action="read", table_alias="workflow_runs"
-    )
-    clause = "AND status = :status_filter" if status_filter is not None else ""
-    params: dict[str, Any] = {"workspace_id": workspace_id, **visibility_params}
+    extra_clauses = []
+    extra_params: dict[str, Any] = {}
     if status_filter is not None:
-        params["status_filter"] = status_filter
-    rows = (
-        session.execute(
-            text(
-                f"SELECT {_RUN_FIELDS} FROM workflow_runs "
-                f"WHERE workspace_id = :workspace_id AND ({visibility_sql}) "
-                f"{clause} ORDER BY queued_at DESC"
-            ),
-            params,
-        )
-        .mappings()
-        .all()
+        extra_clauses.append("status = :status_filter")
+        extra_params["status_filter"] = status_filter
+    rows = authz.list_visible_resources(
+        session,
+        auth,
+        resource_type="workflow_runs",
+        columns=_RUN_FIELDS,
+        order_by="queued_at DESC",
+        extra_clauses=extra_clauses,
+        extra_params=extra_params,
     )
     return [_row_to_run(dict(row)) for row in rows]
 

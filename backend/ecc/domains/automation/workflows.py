@@ -538,9 +538,7 @@ def get_active_workflow_version(
     return _row_to_workflow_version(dict(row)) if row is not None else None
 
 
-def list_workflows(
-    session: Session, auth: AuthContext, workspace_id: UUID
-) -> list[WorkflowSummary]:
+def list_workflows(session: Session, auth: AuthContext) -> list[WorkflowSummary]:
     """One summary per `workflow_id` family in the caller's workspace,
     ordered by slug. Derived entirely from `workflow_versions` (every
     `workflow_definitions` row always has at least one version -- the two
@@ -549,24 +547,12 @@ def list_workflows(
     than a window-function query, since this activation's per-workspace
     workflow count is small.
     """
-    visibility_sql, visibility_params = authz.visible_resource_filter_sql(
+    rows = authz.list_visible_resources(
         session,
         auth,
         resource_type="workflow_versions",
-        action="read",
-        table_alias="workflow_versions",
-    )
-    rows = (
-        session.execute(
-            text(
-                f"SELECT {_WORKFLOW_VERSION_FIELDS} FROM workflow_versions "
-                f"WHERE workspace_id = :workspace_id AND ({visibility_sql}) "
-                "ORDER BY workflow_id ASC, version ASC"
-            ),
-            {"workspace_id": workspace_id, **visibility_params},
-        )
-        .mappings()
-        .all()
+        columns=_WORKFLOW_VERSION_FIELDS,
+        order_by="workflow_id ASC, version ASC",
     )
     session.rollback()
     by_workflow: dict[str, list[WorkflowVersion]] = {}
@@ -987,7 +973,7 @@ def _policy_ref_exists(session: Session, workspace_id: UUID, policy_ref: UUID) -
 
 @router.get("/workflows", response_model=WorkflowListResponse)
 def list_workflows_endpoint(auth: AuthDep, session: SessionDep) -> WorkflowListResponse:
-    summaries = list_workflows(session, auth, auth.workspace_id)
+    summaries = list_workflows(session, auth)
     return WorkflowListResponse(
         workflows=[
             WorkflowSummaryResponse(

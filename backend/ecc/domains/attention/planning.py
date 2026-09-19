@@ -884,38 +884,26 @@ def list_plans(
     cursor: str | None = None,
     limit: int = Query(default=20, ge=1, le=100),
 ) -> PlanList:
-    visibility_sql, visibility_params = authz.visible_resource_filter_sql(
-        session, auth, resource_type="plans", action="read", table_alias="plans"
-    )
-    clauses = ["workspace_id = :workspace_id", f"({visibility_sql})"]
-    params: dict[str, Any] = {
-        "workspace_id": auth.workspace_id,
-        "limit": limit + 1,
-        **visibility_params,
-    }
+    extra_clauses = []
+    extra_params: dict[str, Any] = {"limit": limit + 1}
     if status_filter:
-        clauses.append("status = :status")
-        params["status"] = status_filter
+        extra_clauses.append("status = :status")
+        extra_params["status"] = status_filter
     if cursor:
         cursor_created_at, cursor_id = _decode_cursor(cursor)
-        clauses.append("(created_at, id) < (:cursor_created_at, :cursor_id)")
-        params["cursor_created_at"] = cursor_created_at
-        params["cursor_id"] = cursor_id
+        extra_clauses.append("(created_at, id) < (:cursor_created_at, :cursor_id)")
+        extra_params["cursor_created_at"] = cursor_created_at
+        extra_params["cursor_id"] = cursor_id
 
-    rows = (
-        session.execute(
-            text(
-                f"""
-                SELECT {_PLAN_FIELDS} FROM plans
-                WHERE {" AND ".join(clauses)}
-                ORDER BY created_at DESC, id DESC
-                LIMIT :limit
-                """
-            ),
-            params,
-        )
-        .mappings()
-        .all()
+    rows = authz.list_visible_resources(
+        session,
+        auth,
+        resource_type="plans",
+        columns=_PLAN_FIELDS,
+        order_by="created_at DESC, id DESC",
+        extra_clauses=extra_clauses,
+        extra_params=extra_params,
+        limit_clause="LIMIT :limit",
     )
     has_more = len(rows) > limit
     page = rows[:limit]

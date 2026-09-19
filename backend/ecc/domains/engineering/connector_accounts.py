@@ -2139,25 +2139,22 @@ def list_sync_runs_endpoint(
     session: SessionDep,
     connector_account_id: Annotated[UUID | None, Query()] = None,
 ) -> SyncRunListResponse:
-    visibility_sql, visibility_params = authz.visible_resource_filter_sql(
-        session, auth, resource_type="sync_runs", action="read", table_alias="sync_runs"
-    )
-    clause = "AND connector_account_id = :connector_account_id" if connector_account_id else ""
-    params: dict[str, Any] = {"workspace_id": auth.workspace_id, **visibility_params}
+    extra_clauses = []
+    extra_params: dict[str, Any] = {}
     if connector_account_id:
-        params["connector_account_id"] = connector_account_id
-    rows = (
-        session.execute(
-            text(
-                "SELECT id, connector_account_id, run_type, status, items_processed, "
-                "error_summary, started_at, completed_at FROM sync_runs "
-                f"WHERE workspace_id = :workspace_id AND ({visibility_sql}) "  # noqa: S608
-                f"{clause} ORDER BY started_at DESC"
-            ),
-            params,
-        )
-        .mappings()
-        .all()
+        extra_clauses.append("connector_account_id = :connector_account_id")
+        extra_params["connector_account_id"] = connector_account_id
+    rows = authz.list_visible_resources(
+        session,
+        auth,
+        resource_type="sync_runs",
+        columns=(
+            "id, connector_account_id, run_type, status, items_processed, "
+            "error_summary, started_at, completed_at"
+        ),
+        order_by="started_at DESC",
+        extra_clauses=extra_clauses,
+        extra_params=extra_params,
     )
     return SyncRunListResponse(sync_runs=[SyncRunResponse(**dict(row)) for row in rows])
 
