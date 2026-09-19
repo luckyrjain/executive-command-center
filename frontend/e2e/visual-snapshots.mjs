@@ -1,4 +1,4 @@
-import { mkdir, readdir, readFile, writeFile } from 'node:fs/promises'
+import { mkdir, readdir, readFile } from 'node:fs/promises'
 import path from 'node:path'
 
 import { chromium } from 'playwright'
@@ -44,7 +44,9 @@ async function capture(outDir) {
       await page.waitForLoadState('networkidle')
       if (swatch) {
         await page.evaluate((html) => {
-          document.querySelector('#workspace-main')?.insertAdjacentHTML('beforeend', html)
+          const main = document.querySelector('#workspace-main')
+          if (!main) throw new Error('#workspace-main not found; cannot inject the token swatch')
+          main.insertAdjacentHTML('beforeend', html)
         }, SWATCH_HTML)
       }
       await page.screenshot({ path: path.join(outDir, `${name}.png`), fullPage: true })
