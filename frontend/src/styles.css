@@ -5,7 +5,8 @@
   font-synthesis: none;
 
   /* Design tokens -- every raw color in this file maps to exactly one of
-   * these role-based tokens. Near-duplicate greys were merged within a 7-step
+   * these role-based tokens, except the one `design-tokens-allow` exception
+   * noted where it is used. Near-duplicate greys were merged within a 7-step
    * per-channel bound (plus two named exceptions: text-mono into ink, and the
    * error tints into danger), so expect sub-perceptual shifts, not a palette
    * redesign. */
