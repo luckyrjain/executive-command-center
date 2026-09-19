@@ -532,9 +532,9 @@ class GitLabAdapter:
     ) -> SyncOutcome:
         """The page-walk/resume-cursor/watermark loop itself lives in
         `paginated_resume_walk.walk_paginated_resource` -- shared
-        byte-for-byte with `github_adapter.py`'s own `_sync_repositories`
-        (see that module's docstring for the full reasoning and the bug
-        this extraction gives one home instead of two). This method's own
+        with `github_adapter.py` and `jira_adapter.py` (see that module's
+        docstring for the full reasoning and the bug this extraction gives
+        one home instead of three). This method's own
         job is just GitLab's request shape, field name, and upsert call.
         """
         try:
@@ -545,7 +545,7 @@ class GitLabAdapter:
         web_base_url = f"https://{host}"
         headers = self._headers(token)
 
-        def fetch_page(page: int, page_size: int) -> httpx.Response | None:
+        def fetch_page(cursor: str | None, page_size: int) -> httpx.Response | None:
             return self._request_with_rate_limit_retry(
                 "GET",
                 f"{api_base_url}/projects",
@@ -555,7 +555,7 @@ class GitLabAdapter:
                     "order_by": "last_activity_at",
                     "sort": "desc",
                     "per_page": page_size,
-                    "page": page,
+                    "page": paginated_resume_walk.link_header_page_number(cursor),
                 },
             )
 
@@ -574,8 +574,10 @@ class GitLabAdapter:
             resource_label="project",
             since_cursor=since_cursor,
             resume_cursor=resume_cursor,
+            start_cursor=resume_cursor or paginated_resume_walk.LINK_HEADER_FIRST_CURSOR,
             apply_watermark_stop=apply_watermark_stop,
             fetch_page=fetch_page,
+            parse_page=paginated_resume_walk.parse_link_header_page,
             extract_timestamp=lambda project: project.get("last_activity_at"),
             upsert=upsert,
             max_pages_per_call=_MAX_PAGES_PER_CALL,

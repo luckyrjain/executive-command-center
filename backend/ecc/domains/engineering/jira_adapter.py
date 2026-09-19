@@ -62,7 +62,8 @@ a real Jira Cloud site. The replacement has no `total` count and no
 verbatim on the next request) when more results remain, and omits it on
 the last page. A caller advances by threading `nextPageToken` through,
 not an offset -- `start_at`/`total` bookkeeping is gone from `_sync_work_
-items` entirely, replaced by `next_page_token: str | None`.
+items` entirely, replaced by an opaque cursor the shared walker threads
+through (`paginated_resume_walk.py`).
 
 **Incremental cursor strategy.** JQL's `ORDER BY updated DESC` plus
 walking pages until an issue's own `fields.updated` falls at or before
@@ -123,7 +124,7 @@ from sqlalchemy import text
 
 from ecc.database import SessionFactory
 
-from . import rate_limit_retry
+from . import paginated_resume_walk, rate_limit_retry
 from .connectors import (
     WORKSPACE_ORIGINAL_OWNER_SQL,
     AdapterAuthorizationError,
@@ -193,8 +194,9 @@ def _parse_jira_timestamp(value: str | None) -> datetime | None:
     instant can serialize with a *smaller* numeric offset and therefore
     sort as lexicographically earlier. Parsing into a real timezone-aware
     `datetime` and comparing those instead avoids that. Returns `None` on
-    an unparseable value rather than raising -- `_sync_work_items` treats
-    that as "not comparable," never stopping early on it, which is the
+    an unparseable value rather than raising -- the shared walker (this
+    function is its `timestamp_key`) treats that as "not comparable,"
+    never stopping early on it, which is the
     safe direction to fail in (a possible extra sync, never a silently
     dropped update).
     """
@@ -434,141 +436,86 @@ class JiraAdapter:
         resume_cursor: str | None = None,
         apply_watermark_stop: bool = True,
     ) -> SyncOutcome:
-        """`apply_watermark_stop=False` (the `backfill()` path only):
-        see `github_adapter.py`'s own `_sync_repositories` docstring for
-        the full reasoning this mirrors -- resumes from `resume_cursor`
-        (a provider-issued `nextPageToken`, not a page number) instead of
-        always restarting at page 1, never stops early on the watermark,
-        and only reports `next_cursor` back on the very first backfill
-        call, since every later page can, by construction, only contain
-        issues at or older than what that first call's own page 1 already
-        established as the true newest.
+        """The page-walk/resume-cursor/watermark loop lives in
+        `paginated_resume_walk.walk_paginated_resource`, shared with
+        `github_adapter.py`/`gitlab_adapter.py` (see that module's docstring
+        for the full contract). This method's own job is Jira's request
+        shape and the three ways Jira genuinely differs from those two:
 
-        **Stale resume-token fallback.** Atlassian does not document
-        `nextPageToken` as long-lived across requests separated by time --
-        a token persisted from a page-capped backfill call may be
-        rejected as stale if reused much later. If the very first request
-        of this call carries a `resume_cursor`-derived token and gets a
-        `400` (this endpoint's only error-status precedent -- see `_JQL_
-        QUERY`'s own comment above), retry once with no token at all
-        (degrading to a fresh page-1 walk for this call) rather than
-        failing the whole sync run over an expired token. The retry draws
-        from the same `_MAX_PAGES_PER_CALL` budget, not a fresh one, so a
-        repeatedly-stale token can't double a workspace's per-call rate-
-        limit exposure. A second, non-token-related failure still raises
-        normally.
+        - **A provider-issued token, not a page number.** `resume_cursor` is
+          a `nextPageToken`; the walker treats every cursor as opaque, and
+          the first page is simply "no token".
+        - **Timestamps compared as datetimes.** `fields.updated` carries the
+          issuing site's own configured UTC offset, so comparing two such
+          strings lexicographically is unsound across a DST transition;
+          `timestamp_key=_parse_jira_timestamp` makes the walker compare
+          parsed, timezone-aware datetimes (an unparseable value is "not
+          comparable" and never stops the walk early).
+        - **Stale resume-token fallback.** Atlassian does not document
+          `nextPageToken` as long-lived across requests separated by time --
+          a token persisted from a page-capped backfill call may be
+          rejected as stale if reused much later. On a `400` for a request
+          that carried a token, the walker retries once with no token at all
+          (degrading to a fresh page-1 walk for this call) rather than
+          failing the whole sync run over an expired token. The retry draws
+          from the same `_MAX_PAGES_PER_CALL` budget, not a fresh one, so a
+          repeatedly-stale token can't double a workspace's per-call rate-
+          limit exposure. A second, non-token-related failure still raises.
         """
         try:
             site, email, api_token = parse_credential(account.credential)
         except _InvalidCredentialError as exc:
             raise RuntimeError(str(exc)) from exc
         headers = self._headers(email, api_token)
-        items_processed = 0
-        newest_updated_at = since_cursor
-        newest_updated_dt = _parse_jira_timestamp(since_cursor)
-        since_cursor_dt = _parse_jira_timestamp(since_cursor)
-        next_page_token = resume_cursor
-        page = 1
-        stopped_early = False
-        stale_token_retried = False
 
-        while page <= _MAX_PAGES_PER_CALL:
+        def fetch_page(cursor: str | None, page_size: int) -> httpx.Response | None:
             params: dict[str, Any] = {
                 "jql": _JQL_QUERY,
                 "fields": _SEARCH_FIELDS,
-                "maxResults": _PAGE_SIZE,
+                "maxResults": page_size,
             }
-            if next_page_token is not None:
-                params["nextPageToken"] = next_page_token
-            response = self._request_with_rate_limit_retry(
+            if cursor is not None:
+                params["nextPageToken"] = cursor
+            return self._request_with_rate_limit_retry(
                 "GET",
                 f"https://{site}/rest/api/3/search/jql",
                 headers=headers,
                 params=params,
             )
-            if response is None:
-                return SyncOutcome(
-                    resource_type="work_item",
-                    items_processed=items_processed,
-                    status="partial",
-                    next_cursor=newest_updated_at if resume_cursor is None else None,
-                    error_summary="Jira rate limit exceeded; sync paused, will resume next call",
-                    backfill_resume_cursor=next_page_token,
-                )
-            is_stale_token_candidate = (
-                response.status_code == 400
-                and next_page_token is not None
-                and not stale_token_retried
-            )
-            if is_stale_token_candidate:
-                stale_token_retried = True
-                next_page_token = None
-                page += 1
-                continue
-            if response.status_code != 200:
-                raise RuntimeError(f"Jira issue search failed with status {response.status_code}")
 
+        def parse_page(
+            response: httpx.Response, *, cursor: str | None
+        ) -> paginated_resume_walk.Page:
             body = response.json()
-            issues = body.get("issues") or []
-            if not issues:
-                break
-
-            for issue in issues:
-                fields = issue.get("fields") or {}
-                updated_at = fields.get("updated")
-                updated_dt = _parse_jira_timestamp(updated_at)
-                if (
-                    apply_watermark_stop
-                    and since_cursor_dt is not None
-                    and updated_dt is not None
-                    and updated_dt <= since_cursor_dt
-                ):
-                    stopped_early = True
-                    break
-                _upsert_work_item(
-                    workspace_id=account.workspace_id,
-                    connector_account_id=account.connector_account_id,
-                    provider=self.provider,
-                    site=site,
-                    issue=issue,
-                )
-                items_processed += 1
-                if updated_dt is not None and (
-                    newest_updated_dt is None or updated_dt > newest_updated_dt
-                ):
-                    newest_updated_at = updated_at
-                    newest_updated_dt = updated_dt
-
-            next_page_token = body.get("nextPageToken")
-            if stopped_early or next_page_token is None:
-                break
-            page += 1
-        else:
-            # The loop ran `_MAX_PAGES_PER_CALL` iterations without ever
-            # `break`-ing -- more issues remain beyond this page. `partial`,
-            # not `succeeded` -- identical reasoning to `github_adapter.py`/
-            # `gitlab_adapter.py`'s own equivalent bound. `next_page_token`
-            # here already names the next page to resume from -- it was
-            # just returned by the last successful response.
-            return SyncOutcome(
-                resource_type="work_item",
-                items_processed=items_processed,
-                status="partial",
-                next_cursor=newest_updated_at if resume_cursor is None else None,
-                error_summary=(
-                    f"Jira work-item sync hit the {_MAX_PAGES_PER_CALL}-page "
-                    "per-call bound with more issues remaining; sync paused, "
-                    "will resume next call"
-                ),
-                backfill_resume_cursor=next_page_token,
+            return paginated_resume_walk.Page(
+                items=body.get("issues") or [], next_cursor=body.get("nextPageToken")
             )
 
-        return SyncOutcome(
+        def upsert(issue: Mapping[str, Any]) -> None:
+            _upsert_work_item(
+                workspace_id=account.workspace_id,
+                connector_account_id=account.connector_account_id,
+                provider=self.provider,
+                site=site,
+                issue=issue,
+            )
+
+        return paginated_resume_walk.walk_paginated_resource(
             resource_type="work_item",
-            items_processed=items_processed,
-            status="succeeded",
-            next_cursor=newest_updated_at if resume_cursor is None else None,
-            backfill_resume_cursor=None,
+            provider_label="Jira",
+            resource_label="work item",
+            since_cursor=since_cursor,
+            resume_cursor=resume_cursor,
+            start_cursor=resume_cursor,
+            apply_watermark_stop=apply_watermark_stop,
+            fetch_page=fetch_page,
+            parse_page=parse_page,
+            extract_timestamp=lambda issue: (issue.get("fields") or {}).get("updated"),
+            upsert=upsert,
+            timestamp_key=_parse_jira_timestamp,
+            retry_without_cursor=lambda response: response.status_code == 400,
+            max_pages_per_call=_MAX_PAGES_PER_CALL,
+            page_size=_PAGE_SIZE,
         )
 
     def handle_webhook(
