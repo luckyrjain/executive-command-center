@@ -372,55 +372,46 @@ def list_commitments(
     cursor: str | None = None,
     limit: int = Query(default=20, ge=1, le=100),
 ) -> CommitmentListResponse:
-    visibility_sql, visibility_params = authz.visible_resource_filter_sql(
-        session, auth, resource_type="commitments", action="read", table_alias="commitments"
-    )
-    clauses = ["workspace_id = :workspace_id", f"({visibility_sql})"]
-    params: dict[str, Any] = {
-        "workspace_id": auth.workspace_id,
-        "limit": limit + 1,
-        **visibility_params,
-    }
+    extra_clauses = []
+    extra_params: dict[str, Any] = {"limit": limit + 1}
     if not include_archived:
-        clauses.append("archived_at IS NULL")
+        extra_clauses.append("archived_at IS NULL")
     if status_filter:
-        clauses.append("status = ANY(:statuses)")
-        params["statuses"] = status_filter
+        extra_clauses.append("status = ANY(:statuses)")
+        extra_params["statuses"] = status_filter
     if importance_filter:
-        clauses.append("importance = ANY(:importance)")
-        params["importance"] = importance_filter
+        extra_clauses.append("importance = ANY(:importance)")
+        extra_params["importance"] = importance_filter
     if direction:
-        clauses.append("direction = :direction")
-        params["direction"] = direction
+        extra_clauses.append("direction = :direction")
+        extra_params["direction"] = direction
     if due_before:
-        clauses.append("COALESCE(due_date, (due_at AT TIME ZONE :timezone)::date) <= :due_before")
-        params.update({"timezone": auth.timezone, "due_before": due_before})
+        extra_clauses.append(
+            "COALESCE(due_date, (due_at AT TIME ZONE :timezone)::date) <= :due_before"
+        )
+        extra_params.update({"timezone": auth.timezone, "due_before": due_before})
     if due_after:
-        clauses.append("COALESCE(due_date, (due_at AT TIME ZONE :timezone)::date) >= :due_after")
-        params.update({"timezone": auth.timezone, "due_after": due_after})
+        extra_clauses.append(
+            "COALESCE(due_date, (due_at AT TIME ZONE :timezone)::date) >= :due_after"
+        )
+        extra_params.update({"timezone": auth.timezone, "due_after": due_after})
     if pinned is not None:
-        clauses.append("pinned = :pinned")
-        params["pinned"] = pinned
+        extra_clauses.append("pinned = :pinned")
+        extra_params["pinned"] = pinned
     if cursor:
         cursor_created_at, cursor_id = _decode_cursor(cursor)
-        clauses.append("(created_at, id) < (:cursor_created_at, :cursor_id)")
-        params["cursor_created_at"] = cursor_created_at
-        params["cursor_id"] = cursor_id
-    rows = (
-        session.execute(
-            text(
-                f"""
-                SELECT {_SELECT_FIELDS}
-                FROM commitments
-                WHERE {" AND ".join(clauses)}
-                ORDER BY created_at DESC, id DESC
-                LIMIT :limit
-                """
-            ),
-            params,
-        )
-        .mappings()
-        .all()
+        extra_clauses.append("(created_at, id) < (:cursor_created_at, :cursor_id)")
+        extra_params["cursor_created_at"] = cursor_created_at
+        extra_params["cursor_id"] = cursor_id
+    rows = authz.list_visible_resources(
+        session,
+        auth,
+        columns=_SELECT_FIELDS,
+        resource_type="commitments",
+        order_by="created_at DESC, id DESC",
+        extra_clauses=extra_clauses,
+        extra_params=extra_params,
+        limit_clause="LIMIT :limit",
     )
     has_more = len(rows) > limit
     page = rows[:limit]

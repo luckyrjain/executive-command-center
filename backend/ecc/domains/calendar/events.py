@@ -298,47 +298,30 @@ def list_calendar_events(
     cursor: str | None = None,
     limit: int = Query(default=20, ge=1, le=100),
 ) -> CalendarEventListResponse:
-    visibility_sql, visibility_params = authz.visible_resource_filter_sql(
-        session,
-        auth,
-        resource_type="calendar_events",
-        action="read",
-        table_alias="calendar_events",
-    )
-    clauses = ["workspace_id = :workspace_id", f"({visibility_sql})"]
-    params: dict[str, Any] = {
-        "workspace_id": auth.workspace_id,
-        "limit": limit + 1,
-        **visibility_params,
-    }
+    extra_clauses = []
+    extra_params: dict[str, Any] = {"limit": limit + 1}
     if not include_archived:
-        clauses.append("archived_at IS NULL")
+        extra_clauses.append("archived_at IS NULL")
     if day is not None:
         if timezone is None:
             raise HTTPException(status_code=422, detail="TIMEZONE_REQUIRED")
         _validate_timezone(timezone)
         start, end = _workspace_day_bounds(day, timezone)
-        clauses.append("starts_at < :day_end AND ends_at > :day_start")
-        params.update({"day_start": start, "day_end": end})
+        extra_clauses.append("starts_at < :day_end AND ends_at > :day_start")
+        extra_params.update({"day_start": start, "day_end": end})
     if cursor:
         starts_at, event_id = _decode_cursor(cursor)
-        clauses.append("(starts_at, id) > (:cursor_starts_at, :cursor_id)")
-        params.update({"cursor_starts_at": starts_at, "cursor_id": event_id})
-    rows = (
-        session.execute(
-            text(
-                f"""
-                SELECT {_SELECT_FIELDS}
-                FROM calendar_events
-                WHERE {" AND ".join(clauses)}
-                ORDER BY starts_at ASC, id ASC
-                LIMIT :limit
-                """
-            ),
-            params,
-        )
-        .mappings()
-        .all()
+        extra_clauses.append("(starts_at, id) > (:cursor_starts_at, :cursor_id)")
+        extra_params.update({"cursor_starts_at": starts_at, "cursor_id": event_id})
+    rows = authz.list_visible_resources(
+        session,
+        auth,
+        columns=_SELECT_FIELDS,
+        resource_type="calendar_events",
+        order_by="starts_at ASC, id ASC",
+        extra_clauses=extra_clauses,
+        extra_params=extra_params,
+        limit_clause="LIMIT :limit",
     )
     session.rollback()
     page = rows[:limit]
