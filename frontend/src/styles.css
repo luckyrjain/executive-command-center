@@ -236,6 +236,14 @@ button[aria-busy="true"]:disabled { cursor: wait; }
 
 .section-heading { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
 .section-heading h2 { margin: 0; font-size: var(--text-lg); letter-spacing: -.01em; }
+
+/* A sub-grouping inside a `.work-panel` that needs its own heading without
+ * becoming a second card -- DESIGN.md: "don't nest bordered panels inside
+ * bordered panels ... reach for a heading + spacing, not another card."
+ * Replaces `.dashboard-card` (a distinct, boxed 12-column grid cell) where
+ * it had been reused purely for its box styling inside an already-boxed
+ * `.work-panel` (AttentionQueue.tsx, MeetingPrep.tsx, Planner.tsx). */
+.work-subsection { margin-top: var(--space-8); }
 .section-heading > span {
   min-width: 28px;
   border-radius: 999px;
@@ -356,8 +364,18 @@ select[aria-invalid="true"] { border-color: var(--color-border-danger); backgrou
 
 .schedule-workspace { display: grid; gap: 24px; }
 .schedule-workspace > .work-panel { max-width: none; }
+/* `.work-heading h1` alongside `h2` -- most workspace pages (Tasks,
+ * Commitments, Risks, Personal, Engineering, ...) use `<h1>` for their own
+ * page title, which this selector never covered; those titles fell
+ * through to the bare `h1` rule below (clamp(42px, 7vw, 78px), meant for
+ * Today's page-hero title) instead of this panel-title scale. At that
+ * larger size, a page rendered two-up in `.work-grid` (e.g. Tasks next to
+ * Commitments) could overflow its own column -- "Commitments" alone
+ * forced a 430px-wide heading into a ~260px column, causing real
+ * page-wide horizontal scroll around 900-1150px viewports. */
 .recommendation-heading h2,
 .explore-heading h2,
+.work-heading h1,
 .work-heading h2 { margin: 0; font-size: var(--text-display-sm); letter-spacing: -.035em; }
 .recommendation-heading p:not(.eyebrow),
 .explore-heading p:not(.eyebrow),
@@ -473,7 +491,9 @@ select[aria-invalid="true"] { border-color: var(--color-border-danger); backgrou
 .note-list p { margin: 10px 0 0; color: var(--color-text-body); line-height: 1.55; white-space: pre-wrap; overflow-wrap: anywhere; }
 .note-editor { border-top: 1px solid var(--color-border-subtle); padding-top: 28px; }
 
-.tab-list { display: flex; gap: 8px; }
+/* flex-wrap: a `.tab-list` with more tabs than fit (Engineering's 10) wraps
+ * to a second row instead of overflowing off-edge with no scroll affordance. */
+.tab-list { display: flex; flex-wrap: wrap; gap: 8px; }
 .tab-list button[aria-selected="true"] { border-color: var(--color-ink); background: var(--color-ink); color: var(--color-text-on-ink); }
 
 /* A toggle button (`aria-pressed`) previously had no selected-state style

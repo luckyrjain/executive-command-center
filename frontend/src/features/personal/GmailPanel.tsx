@@ -65,7 +65,7 @@ function ThreadDetail({ threadId, onForgotten }: { threadId: string; onForgotten
             {thread.data.messages.length === 0 ? <li className="empty-state">No message bodies are cached for this thread yet.</li> : null}
           </ul>
           <div className="work-actions">
-            <button type="button" aria-busy={forgetMutation.isPending} disabled={forgetMutation.isPending} onClick={() => forgetMutation.mutate()}>
+            <button type="button" className="btn-destructive" aria-busy={forgetMutation.isPending} disabled={forgetMutation.isPending} onClick={() => forgetMutation.mutate()}>
               {forgetMutation.isPending ? 'Forgetting…' : 'Forget cached content for this thread'}
             </button>
           </div>

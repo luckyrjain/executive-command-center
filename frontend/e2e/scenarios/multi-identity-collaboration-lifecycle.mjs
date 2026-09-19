@@ -96,7 +96,7 @@ export async function run({ page, baseURL }) {
     // starts waiting for it.
     await Promise.all([
       bobPage.waitForEvent('load'),
-      bobPage.getByLabel('Switch workspace').selectOption({ label: 'Northwind' }),
+      bobPage.getByRole('combobox', { name: 'Workspace', exact: true }).selectOption({ label: 'Northwind' }),
     ])
     await bobPage.getByRole('heading', { name: 'Workspace collaboration', level: 1 }).waitFor()
 

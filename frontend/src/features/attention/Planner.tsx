@@ -163,7 +163,7 @@ export default function Planner() {
       {query.data && plans.length === 0 ? <p className="empty-state">No active plans for this period.</p> : null}
 
       {pendingDiff ? (
-        <section className="dashboard-card" aria-labelledby="replan-diff-title">
+        <section className="work-subsection" aria-labelledby="replan-diff-title">
           <h2 id="replan-diff-title">Review replan before accepting</h2>
           <ol className="item-list">
             {(pendingDiff.diff ?? []).map((entry, index) => (
