@@ -5,8 +5,10 @@
   font-synthesis: none;
 
   /* Design tokens -- every raw color in this file maps to exactly one of
-   * these; values are unchanged from the pre-token file, so this block is a
-   * pure refactor (no visual diff), not a palette redesign. */
+   * these role-based tokens. Near-duplicate greys were merged within a 7-step
+   * per-channel bound (plus two named exceptions: text-mono into ink, and the
+   * error tints into danger), so expect sub-perceptual shifts, not a palette
+   * redesign. */
   --color-ink: #18212f;
   --color-surface-panel: #ffffff;
   --color-surface-page: #f3f5f7;
