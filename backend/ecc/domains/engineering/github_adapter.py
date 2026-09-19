@@ -694,14 +694,14 @@ class GitHubAdapter:
     ) -> SyncOutcome:
         """The page-walk/resume-cursor/watermark loop itself lives in
         `paginated_resume_walk.walk_paginated_resource` -- shared
-        byte-for-byte with `gitlab_adapter.py`'s own `_sync_repositories`
-        (see that module's docstring for the full reasoning and the bug
-        this extraction gives one home instead of two). This method's own
+        with `gitlab_adapter.py` and `jira_adapter.py` (see that module's
+        docstring for the full reasoning and the bug this extraction gives
+        one home instead of three). This method's own
         job is just GitHub's request shape, field name, and upsert call.
         """
         headers = self._headers(account.credential)
 
-        def fetch_page(page: int, page_size: int) -> httpx.Response | None:
+        def fetch_page(cursor: str | None, page_size: int) -> httpx.Response | None:
             return self._request_with_rate_limit_retry(
                 "GET",
                 "/user/repos",
@@ -710,7 +710,7 @@ class GitHubAdapter:
                     "sort": "updated",
                     "direction": "desc",
                     "per_page": page_size,
-                    "page": page,
+                    "page": paginated_resume_walk.link_header_page_number(cursor),
                 },
             )
 
@@ -728,8 +728,10 @@ class GitHubAdapter:
             resource_label="repository",
             since_cursor=since_cursor,
             resume_cursor=resume_cursor,
+            start_cursor=resume_cursor or paginated_resume_walk.LINK_HEADER_FIRST_CURSOR,
             apply_watermark_stop=apply_watermark_stop,
             fetch_page=fetch_page,
+            parse_page=paginated_resume_walk.parse_link_header_page,
             extract_timestamp=lambda repo: repo.get("updated_at"),
             upsert=upsert,
             max_pages_per_call=_MAX_PAGES_PER_CALL,
