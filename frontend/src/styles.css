@@ -537,12 +537,19 @@ button[aria-pressed="true"] { border-color: var(--color-ink); background: var(--
 .app-frame { display: flex; align-items: flex-start; gap: 0; }
 .app-shell { flex: 1 1 auto; min-width: 0; }
 
+/* Pinned to the viewport so the tinted column stays full-height while a tall
+ * page scrolls. Without this it scrolls away and, on a canvas page (white
+ * content area), leaves a visible step where the sidebar ends. At scroll
+ * position 0 the box is identical to the old `min-height: 100vh`. */
 .sidebar-nav {
   flex: 0 0 224px;
   background: var(--color-surface-recessed);
   border-right: 1px solid var(--color-border-subtle);
   padding: var(--space-6) var(--space-4);
-  min-height: 100vh;
+  position: sticky;
+  top: 0;
+  height: 100vh;
+  overflow-y: auto;
 }
 .sidebar-nav-group { margin-top: var(--space-6); }
 .sidebar-nav-group:first-child { margin-top: 0; }
