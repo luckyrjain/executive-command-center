@@ -60,3 +60,25 @@ describe('App routing', () => {
     },
   )
 })
+
+describe('App composition', () => {
+  it.each([
+    ['/notes', 'canvas'],
+    ['/engineering', 'canvas'],
+    ['/today', 'cards'],
+    ['/risks', 'cards'],
+    ['/does-not-exist', 'cards'],
+  ] as const)('%s renders data-composition="%s" on .app-root', (path, expected) => {
+    const { container } = renderAppAt(path)
+    expect(container.querySelector('.app-root')?.getAttribute('data-composition')).toBe(expected)
+  })
+
+  it('keeps WorkspaceSwitcher first and .app-frame second inside .app-root', () => {
+    const { container } = renderAppAt('/notes')
+    const root = container.querySelector('.app-root')
+    expect(root).not.toBeNull()
+    // The switcher renders its loading state on first paint, so it is present here.
+    expect(root?.children[0]?.classList.contains('workspace-switcher')).toBe(true)
+    expect(root?.children[1]?.classList.contains('app-frame')).toBe(true)
+  })
+})
