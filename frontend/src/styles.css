@@ -292,6 +292,34 @@ button[aria-busy="true"]:disabled { cursor: wait; }
   box-shadow: var(--shadow-panel);
 }
 
+/* Composition (DESIGN.md, Composition). `cards` is the default look above.
+ * Under `canvas`, a page's content stacks vertically, so its panels drop the
+ * card chrome and the whole app body (including the switcher band) sits on
+ * the white panel surface. White, not the grey page: every chip, recessed
+ * pill and row divider was designed to sit on the white panel. Attribute plus
+ * class specificity beats the mobile radius overrides for these selectors. */
+.app-root[data-composition="canvas"] {
+  background: var(--color-surface-panel);
+}
+
+.app-root[data-composition="canvas"] :is(.work-panel, .recommendation-panel, .explore-panel) {
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+  padding: 0;
+}
+
+/* A panel directly followed by another (Gmail consent, a selected workflow
+ * version, a run detail) reads as a stacked block, separated by a hairline
+ * instead of a second box. */
+.app-root[data-composition="canvas"]
+  :is(.work-panel, .recommendation-panel, .explore-panel)
+  + :is(.work-panel, .recommendation-panel, .explore-panel) {
+  border-top: 1px solid var(--color-border-subtle);
+  padding-top: var(--space-6);
+}
+
 .field-hint { margin: -8px 0 14px; color: var(--color-text-muted); font-size: var(--text-sm); }
 .field-hint code { background: var(--color-surface-recessed); color: var(--color-text-secondary); border-radius: 4px; padding: 1px 5px; }
 .field-error { margin: -8px 0 14px; color: var(--color-text-danger-strong); font-size: var(--text-sm); font-weight: 700; }
