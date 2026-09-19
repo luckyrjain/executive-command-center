@@ -115,7 +115,7 @@ Every labeled-fields block in the app should use one class. Single column, `gap:
 
 ```css
 .field-form { display: grid; gap: 14px; margin-top: 28px; max-width: var(--content-form); }
-.field-form label { display: grid; gap: 7px; color: var(--color-text-secondary); font-size: 13px; font-weight: 700; }
+.field-form label { display: grid; gap: 7px; color: var(--color-text-secondary); font-size: var(--text-sm); font-weight: 700; }
 .field-form label.field-checkbox { display: flex; align-items: center; gap: 8px; font-weight: 400; }
 .field-form input, .field-form textarea, .field-form select { width: 100%; border: 1px solid var(--color-border-strong); border-radius: var(--radius-control); background: var(--color-surface-panel); padding: 12px 14px; color: var(--color-ink); }
 .field-form input[type="checkbox"] { width: auto; }
