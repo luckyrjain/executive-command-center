@@ -60,49 +60,30 @@ def list_recommendations(
     cursor_id: UUID | None = None
     if cursor:
         cursor_created, cursor_id = _decode_cursor(cursor)
-    visibility_sql, visibility_params = authz.visible_resource_filter_sql(
-        session, auth, resource_type="recommendations", action="read", table_alias="recommendations"
-    )
-    rows = (
-        session.execute(
-            text(
-                f"""
-                SELECT {FIELDS} FROM recommendations
-                WHERE workspace_id=:workspace_id
-                  AND ({visibility_sql})
-                  AND (:include_archived OR archived_at IS NULL)
-                  AND (
-                    CAST(:statuses AS text[]) IS NULL
-                    OR status=ANY(CAST(:statuses AS text[]))
-                  )
-                  AND (
-                    CAST(:recommendation_type AS text) IS NULL
-                    OR recommendation_type=CAST(:recommendation_type AS text)
-                  )
-                  AND (
-                    CAST(:cursor_created AS timestamptz) IS NULL
-                    OR (created_at,id)<(
-                        CAST(:cursor_created AS timestamptz),
-                        CAST(:cursor_id AS uuid)
-                    )
-                  )
-                ORDER BY created_at DESC,id DESC
-                LIMIT :fetch_limit
-                """
-            ),
-            {
-                "workspace_id": auth.workspace_id,
-                "include_archived": include_archived,
-                "statuses": statuses,
-                "recommendation_type": recommendation_type,
-                "cursor_created": cursor_created,
-                "cursor_id": cursor_id,
-                "fetch_limit": limit + 1,
-                **visibility_params,
-            },
-        )
-        .mappings()
-        .all()
+    rows = authz.list_visible_resources(
+        session,
+        auth,
+        resource_type="recommendations",
+        columns=FIELDS,
+        order_by="created_at DESC,id DESC",
+        extra_clauses=[
+            "(:include_archived OR archived_at IS NULL)",
+            "(CAST(:statuses AS text[]) IS NULL OR status=ANY(CAST(:statuses AS text[])))",
+            "(CAST(:recommendation_type AS text) IS NULL"
+            " OR recommendation_type=CAST(:recommendation_type AS text))",
+            "(CAST(:cursor_created AS timestamptz) IS NULL"
+            " OR (created_at,id)<(CAST(:cursor_created AS timestamptz),"
+            " CAST(:cursor_id AS uuid)))",
+        ],
+        extra_params={
+            "include_archived": include_archived,
+            "statuses": statuses,
+            "recommendation_type": recommendation_type,
+            "cursor_created": cursor_created,
+            "cursor_id": cursor_id,
+            "fetch_limit": limit + 1,
+        },
+        limit_clause="LIMIT :fetch_limit",
     )
     session.rollback()
     items = [project(dict(row)) for row in rows[:limit]]

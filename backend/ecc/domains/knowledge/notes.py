@@ -287,46 +287,33 @@ def list_notes(
     cursor: str | None = None,
     limit: int = Query(default=20, ge=1, le=100),
 ) -> NoteListResponse:
-    visibility_sql, visibility_params = authz.visible_resource_filter_sql(
-        session, auth, resource_type="notes", action="read", table_alias="notes"
-    )
-    clauses = ["workspace_id = :workspace_id", f"({visibility_sql})"]
-    params: dict[str, Any] = {
-        "workspace_id": auth.workspace_id,
-        "limit": limit + 1,
-        **visibility_params,
-    }
+    extra_clauses = []
+    extra_params: dict[str, Any] = {"limit": limit + 1}
     if not include_archived:
-        clauses.append("archived_at IS NULL")
+        extra_clauses.append("archived_at IS NULL")
     if note_type_filter:
-        clauses.append("note_type = ANY(:note_types)")
-        params["note_types"] = note_type_filter
+        extra_clauses.append("note_type = ANY(:note_types)")
+        extra_params["note_types"] = note_type_filter
     if meeting_id is not None:
-        clauses.append("meeting_id = :meeting_id")
-        params["meeting_id"] = meeting_id
+        extra_clauses.append("meeting_id = :meeting_id")
+        extra_params["meeting_id"] = meeting_id
     if q:
-        clauses.append("search_document @@ websearch_to_tsquery('simple', :query)")
-        params["query"] = q
+        extra_clauses.append("search_document @@ websearch_to_tsquery('simple', :query)")
+        extra_params["query"] = q
     if cursor:
         cursor_updated_at, cursor_id = _decode_cursor(cursor)
-        clauses.append("(updated_at, id) < (:cursor_updated_at, :cursor_id)")
-        params["cursor_updated_at"] = cursor_updated_at
-        params["cursor_id"] = cursor_id
-    rows = (
-        session.execute(
-            text(
-                f"""
-                SELECT {_SELECT_FIELDS}
-                FROM notes
-                WHERE {" AND ".join(clauses)}
-                ORDER BY updated_at DESC, id DESC
-                LIMIT :limit
-                """
-            ),
-            params,
-        )
-        .mappings()
-        .all()
+        extra_clauses.append("(updated_at, id) < (:cursor_updated_at, :cursor_id)")
+        extra_params["cursor_updated_at"] = cursor_updated_at
+        extra_params["cursor_id"] = cursor_id
+    rows = authz.list_visible_resources(
+        session,
+        auth,
+        resource_type="notes",
+        columns=_SELECT_FIELDS,
+        order_by="updated_at DESC, id DESC",
+        extra_clauses=extra_clauses,
+        extra_params=extra_params,
+        limit_clause="LIMIT :limit",
     )
     session.rollback()
     has_more = len(rows) > limit
