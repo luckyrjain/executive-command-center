@@ -1,61 +1,89 @@
 """`paginated_resume_walk.walk_paginated_resource` -- the page-walk/resume-
-cursor/watermark loop extracted from `github_adapter.py`'s and
-`gitlab_adapter.py`'s own byte-identical `_sync_repositories` methods
+cursor/watermark loop shared by the GitHub, GitLab and Jira adapters
 (architecture review, 2026-09-18; see that module's own docstring for the
 full duplication history). Pure unit tests against fake `fetch_page`/
-`extract_timestamp`/`upsert` callables -- no HTTP, no database, no
-Postgres -- since the whole point of the extraction is that these
+`parse_page`/`extract_timestamp`/`upsert` callables -- no HTTP, no database,
+no Postgres -- since the whole point of the extraction is that these
 invariants no longer need either to exercise directly.
 
-Covers exactly the invariants `93ceaf3` ("make backfill genuinely
-resumable across GitHub/GitLab/Jira") found broken and fixed once in
-GitHub's copy, then had to re-derive in GitLab's: resuming a backfill
-from a page other than 1, the page-vs-budget counter split, the
-per-call page bound reporting `partial` (not a silent `succeeded`) with
+Covers the invariants `93ceaf3` ("make backfill genuinely resumable across
+GitHub/GitLab/Jira") found broken and fixed once per provider: resuming a
+backfill from a cursor other than the first, the cursor-vs-budget split,
+the per-call page bound reporting `partial` (not a silent `succeeded`) with
 more pages remaining, and `next_cursor` only ever being reported back on
-the very first backfill call.
+the very first backfill call -- plus the opaque-cursor, `timestamp_key` and
+`retry_without_cursor` hooks Jira needs.
 """
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from typing import Any
 
 import httpx
 import pytest
 
-from ecc.domains.engineering.paginated_resume_walk import walk_paginated_resource
+from ecc.domains.engineering import paginated_resume_walk as walk
+from ecc.domains.engineering.connectors import SyncOutcome
 
 
-def _page_response(
-    items: list[dict[str, object]], *, next_page: int | None = None
+def _link_response(
+    items: list[dict[str, object]], *, next_page: int | None = None, status: int = 200
 ) -> httpx.Response:
     headers = {}
     if next_page is not None:
         headers["Link"] = f'<https://example.test/items?page={next_page}>; rel="next"'
-    return httpx.Response(200, json=items, headers=headers)
+    return httpx.Response(status, json=items, headers=headers)
 
 
 def _item(id_: int, updated_at: str | None) -> dict[str, object]:
     return {"id": id_, "updated_at": updated_at}
 
 
-def test_single_page_reports_succeeded_and_the_newest_timestamp() -> None:
-    upserted: list[Mapping[str, Any]] = []
-    pages = {
-        1: _page_response([_item(1, "2026-01-01T00:00:00Z"), _item(2, "2026-01-02T00:00:00Z")])
-    }
+def _ts(item: Mapping[str, Any]) -> str | None:
+    value = item["updated_at"]
+    return value if isinstance(value, str) or value is None else str(value)
 
-    outcome = walk_paginated_resource(
+
+def _run_link(
+    pages: Mapping[int, httpx.Response] | Callable[[int], httpx.Response | None],
+    *,
+    since_cursor: str | None = None,
+    resume_cursor: str | None = None,
+    apply_watermark_stop: bool = True,
+    upserted: list[Mapping[str, Any]] | None = None,
+    requested: list[int] | None = None,
+    **kwargs: Any,
+) -> SyncOutcome:
+    """GitHub/GitLab-shaped walk: page-number cursors over a `Link` header."""
+
+    def fetch_page(*, cursor: str | None, page_size: int) -> httpx.Response | None:
+        number = walk.link_header_page_number(cursor)
+        if requested is not None:
+            requested.append(number)
+        return pages(number) if callable(pages) else pages[number]
+
+    return walk.walk_paginated_resource(
         resource_type="repository",
         provider_label="TestProvider",
         resource_label="repository",
-        since_cursor=None,
-        resume_cursor=None,
-        apply_watermark_stop=True,
-        fetch_page=lambda page, page_size: pages[page],
-        extract_timestamp=lambda item: item["updated_at"],
-        upsert=upserted.append,
+        since_cursor=since_cursor,
+        resume_cursor=resume_cursor,
+        start_cursor=resume_cursor or walk.LINK_HEADER_FIRST_CURSOR,
+        apply_watermark_stop=apply_watermark_stop,
+        fetch_page=fetch_page,
+        parse_page=walk.parse_link_header_page,
+        extract_timestamp=_ts,
+        upsert=(upserted.append if upserted is not None else lambda item: None),
+        **kwargs,
+    )
+
+
+def test_single_page_reports_succeeded_and_the_newest_timestamp() -> None:
+    upserted: list[Mapping[str, Any]] = []
+    outcome = _run_link(
+        {1: _link_response([_item(1, "2026-01-01T00:00:00Z"), _item(2, "2026-01-02T00:00:00Z")])},
+        upserted=upserted,
     )
 
     assert outcome.status == "succeeded"
@@ -67,21 +95,12 @@ def test_single_page_reports_succeeded_and_the_newest_timestamp() -> None:
 
 def test_pagination_follows_the_link_header_across_multiple_pages() -> None:
     upserted: list[Mapping[str, Any]] = []
-    pages = {
-        1: _page_response([_item(1, "2026-01-01T00:00:00Z")], next_page=2),
-        2: _page_response([_item(2, "2026-01-02T00:00:00Z")]),
-    }
-
-    outcome = walk_paginated_resource(
-        resource_type="repository",
-        provider_label="TestProvider",
-        resource_label="repository",
-        since_cursor=None,
-        resume_cursor=None,
-        apply_watermark_stop=True,
-        fetch_page=lambda page, page_size: pages[page],
-        extract_timestamp=lambda item: item["updated_at"],
-        upsert=upserted.append,
+    outcome = _run_link(
+        {
+            1: _link_response([_item(1, "2026-01-01T00:00:00Z")], next_page=2),
+            2: _link_response([_item(2, "2026-01-02T00:00:00Z")]),
+        },
+        upserted=upserted,
     )
 
     assert outcome.status == "succeeded"
@@ -91,23 +110,14 @@ def test_pagination_follows_the_link_header_across_multiple_pages() -> None:
 
 def test_watermark_stop_only_upserts_items_newer_than_since_cursor() -> None:
     upserted: list[Mapping[str, Any]] = []
-    # Newest-first, as every real provider returns them.
-    pages = {
-        1: _page_response(
-            [_item(2, "2026-01-05T00:00:00Z"), _item(1, "2026-01-01T00:00:00Z")], next_page=2
-        )
-    }
-
-    outcome = walk_paginated_resource(
-        resource_type="repository",
-        provider_label="TestProvider",
-        resource_label="repository",
+    outcome = _run_link(
+        {
+            1: _link_response(
+                [_item(2, "2026-01-05T00:00:00Z"), _item(1, "2026-01-01T00:00:00Z")], next_page=2
+            )
+        },
         since_cursor="2026-01-01T00:00:00Z",
-        resume_cursor=None,
-        apply_watermark_stop=True,
-        fetch_page=lambda page, page_size: pages[page],
-        extract_timestamp=lambda item: item["updated_at"],
-        upsert=upserted.append,
+        upserted=upserted,
     )
 
     assert outcome.status == "succeeded"
@@ -115,33 +125,21 @@ def test_watermark_stop_only_upserts_items_newer_than_since_cursor() -> None:
     assert outcome.next_cursor == "2026-01-05T00:00:00Z"
 
 
-def test_backfill_resumes_from_the_given_page_not_page_1() -> None:
-    """The exact bug `93ceaf3` fixed: resuming a backfill call must
-    request the resume page, not restart at page 1, and the page-vs-
-    budget counter must be independent of the loop's own bound.
+def test_backfill_resumes_from_the_given_cursor_not_the_first_page() -> None:
+    """The exact bug `93ceaf3` fixed: resuming a backfill call must request
+    the resume page, not restart at page 1, and the page-vs-budget counter
+    must be independent of the loop's own bound.
     """
-    upserted: list[Mapping[str, Any]] = []
-    requested_pages: list[int] = []
-    pages = {11: _page_response([_item(1, "2026-01-01T00:00:00Z")])}
-
-    def fetch_page(page: int, page_size: int) -> httpx.Response:
-        requested_pages.append(page)
-        return pages[page]
-
-    outcome = walk_paginated_resource(
-        resource_type="repository",
-        provider_label="TestProvider",
-        resource_label="repository",
-        since_cursor=None,
+    requested: list[int] = []
+    outcome = _run_link(
+        {11: _link_response([_item(1, "2026-01-01T00:00:00Z")])},
         resume_cursor="11",
         apply_watermark_stop=False,
-        fetch_page=fetch_page,
-        extract_timestamp=lambda item: item["updated_at"],
-        upsert=upserted.append,
+        requested=requested,
         max_pages_per_call=10,
     )
 
-    assert requested_pages == [11]
+    assert requested == [11]
     assert outcome.status == "succeeded"
     # A resumed backfill call never reports next_cursor -- only the very
     # first backfill call (resume_cursor is None) is allowed to, since a
@@ -149,31 +147,19 @@ def test_backfill_resumes_from_the_given_page_not_page_1() -> None:
     assert outcome.next_cursor is None
 
 
-def test_page_cap_reports_partial_with_the_resume_page_preserved() -> None:
-    call_count = 0
+def test_page_cap_reports_partial_with_the_resume_cursor_preserved() -> None:
+    calls: list[int] = []
 
-    def fetch_page(page: int, page_size: int) -> httpx.Response:
-        nonlocal call_count
-        call_count += 1
-        return _page_response([_item(page, "2026-01-01T00:00:00Z")], next_page=page + 1)
+    def pages(number: int) -> httpx.Response:
+        calls.append(number)
+        return _link_response([_item(number, "2026-01-01T00:00:00Z")], next_page=number + 1)
 
-    outcome = walk_paginated_resource(
-        resource_type="repository",
-        provider_label="TestProvider",
-        resource_label="repository",
-        since_cursor=None,
-        resume_cursor=None,
-        apply_watermark_stop=False,
-        fetch_page=fetch_page,
-        extract_timestamp=lambda item: item["updated_at"],
-        upsert=lambda item: None,
-        max_pages_per_call=3,
-    )
+    outcome = _run_link(pages, apply_watermark_stop=False, max_pages_per_call=3)
 
-    assert call_count == 3
+    assert calls == [1, 2, 3]
     assert outcome.status == "partial"
     assert outcome.items_processed == 3
-    # page advanced past the last page actually fetched (3 -> 4).
+    # cursor advanced past the last page actually fetched (3 -> 4).
     assert outcome.backfill_resume_cursor == "4"
     assert "3-page per-call bound" in (outcome.error_summary or "")
     # This is the *first* backfill call (resume_cursor=None) -- unlike a
@@ -183,24 +169,14 @@ def test_page_cap_reports_partial_with_the_resume_page_preserved() -> None:
 
 def test_backfill_ignores_a_leftover_since_cursor() -> None:
     """`apply_watermark_stop=False` must stay purely page-driven even if a
-    caller passes a non-`None` `since_cursor` -- a regression here (e.g. an
-    accidentally-dropped `and not apply_watermark_stop` guard) would still
-    pass every other test in this file, since they all pair
-    `apply_watermark_stop=False` with `since_cursor=None`.
+    caller passes a non-`None` `since_cursor`.
     """
     upserted: list[Mapping[str, Any]] = []
-    pages = {1: _page_response([_item(1, "2020-01-01T00:00:00Z")])}
-
-    outcome = walk_paginated_resource(
-        resource_type="repository",
-        provider_label="TestProvider",
-        resource_label="repository",
+    outcome = _run_link(
+        {1: _link_response([_item(1, "2020-01-01T00:00:00Z")])},
         since_cursor="2026-01-01T00:00:00Z",  # would stop everything if honored
-        resume_cursor=None,
         apply_watermark_stop=False,
-        fetch_page=lambda *, page, page_size: pages[page],
-        extract_timestamp=lambda item: item["updated_at"],
-        upsert=upserted.append,
+        upserted=upserted,
     )
 
     assert outcome.status == "succeeded"
@@ -208,25 +184,9 @@ def test_backfill_ignores_a_leftover_since_cursor() -> None:
 
 
 def test_empty_first_page_succeeds_with_no_items() -> None:
-    # `next_page=2` (a Link header pointing past this page) makes this a
-    # real regression guard for `if not items: break`, not just a proxy
-    # for "no Link header" -- if that guard were dropped, the empty `for`
-    # loop would no-op, `"next" not in response.links` would be False
-    # (page 2 exists), and the walk would try page 2, hitting the
-    # KeyError below instead of stopping cleanly at page 1.
-    pages = {1: _page_response([], next_page=2)}
-
-    outcome = walk_paginated_resource(
-        resource_type="repository",
-        provider_label="TestProvider",
-        resource_label="repository",
-        since_cursor=None,
-        resume_cursor=None,
-        apply_watermark_stop=True,
-        fetch_page=lambda *, page, page_size: pages[page],
-        extract_timestamp=lambda item: item["updated_at"],
-        upsert=lambda item: None,
-    )
+    # `next_page=2` makes this a real regression guard for the empty-page
+    # break: without it the walk would try page 2 (a KeyError here).
+    outcome = _run_link({1: _link_response([], next_page=2)})
 
     assert outcome.status == "succeeded"
     assert outcome.items_processed == 0
@@ -235,40 +195,19 @@ def test_empty_first_page_succeeds_with_no_items() -> None:
 
 def test_item_with_no_timestamp_is_still_upserted_and_does_not_crash() -> None:
     upserted: list[Mapping[str, Any]] = []
-    pages = {1: _page_response([_item(1, None), _item(2, "2026-01-01T00:00:00Z")])}
-
-    outcome = walk_paginated_resource(
-        resource_type="repository",
-        provider_label="TestProvider",
-        resource_label="repository",
+    outcome = _run_link(
+        {1: _link_response([_item(1, None), _item(2, "2026-01-01T00:00:00Z")])},
         since_cursor="2020-01-01T00:00:00Z",
-        resume_cursor=None,
-        apply_watermark_stop=True,
-        fetch_page=lambda *, page, page_size: pages[page],
-        extract_timestamp=lambda item: item["updated_at"],
-        upsert=upserted.append,
+        upserted=upserted,
     )
 
     assert outcome.status == "succeeded"
-    # A missing timestamp never matches the watermark-stop condition, so
-    # the item is upserted like any other, and never overwrites
-    # newest_updated_at with None.
     assert [item["id"] for item in upserted] == [1, 2]
     assert outcome.next_cursor == "2026-01-01T00:00:00Z"
 
 
-def test_rate_limit_reports_partial_and_preserves_the_current_page() -> None:
-    outcome = walk_paginated_resource(
-        resource_type="repository",
-        provider_label="TestProvider",
-        resource_label="repository",
-        since_cursor=None,
-        resume_cursor="5",
-        apply_watermark_stop=False,
-        fetch_page=lambda page, page_size: None,
-        extract_timestamp=lambda item: item["updated_at"],
-        upsert=lambda item: None,
-    )
+def test_rate_limit_reports_partial_and_preserves_the_current_cursor() -> None:
+    outcome = _run_link(lambda number: None, resume_cursor="5", apply_watermark_stop=False)
 
     assert outcome.status == "partial"
     assert outcome.backfill_resume_cursor == "5"
@@ -276,16 +215,323 @@ def test_rate_limit_reports_partial_and_preserves_the_current_page() -> None:
     assert "rate limit" in (outcome.error_summary or "").lower()
 
 
+def test_rate_limit_on_a_fresh_link_header_backfill_reports_the_explicit_first_page() -> None:
+    """GitHub/GitLab's first page is the explicit cursor "1" (their
+    pre-extraction behavior); `next_cursor` is still reported, since this is
+    a first backfill call.
+    """
+    outcome = _run_link(lambda number: None, apply_watermark_stop=False)
+
+    assert outcome.status == "partial"
+    assert outcome.backfill_resume_cursor == "1"
+
+
 def test_non_200_response_raises() -> None:
     with pytest.raises(RuntimeError, match="TestProvider repository list failed with status 500"):
-        walk_paginated_resource(
-            resource_type="repository",
-            provider_label="TestProvider",
-            resource_label="repository",
-            since_cursor=None,
-            resume_cursor=None,
-            apply_watermark_stop=True,
-            fetch_page=lambda page, page_size: httpx.Response(500),
-            extract_timestamp=lambda item: item["updated_at"],
-            upsert=lambda item: None,
+        _run_link({1: httpx.Response(500)})
+
+
+# --- opaque token cursors (Jira-shaped) -------------------------------------
+
+
+def _run_tokens(
+    pages: Mapping[str | None, httpx.Response],
+    *,
+    resume_cursor: str | None = None,
+    since_cursor: str | None = None,
+    apply_watermark_stop: bool = False,
+    requested: list[str | None] | None = None,
+    upserted: list[Mapping[str, Any]] | None = None,
+    **kwargs: Any,
+) -> SyncOutcome:
+    """Token-paginated walk: an envelope body, the next token in the body,
+    the first page being "no token" -- none of which the walker may assume.
+    """
+
+    def fetch_page(*, cursor: str | None, page_size: int) -> httpx.Response | None:
+        if requested is not None:
+            requested.append(cursor)
+        return pages[cursor]
+
+    def parse_page(response: httpx.Response, *, cursor: str | None) -> walk.Page:
+        body = response.json()
+        return walk.Page(items=body["issues"], next_cursor=body.get("nextPageToken"))
+
+    return walk.walk_paginated_resource(
+        resource_type="work_item",
+        provider_label="TokenProvider",
+        resource_label="work item",
+        since_cursor=since_cursor,
+        resume_cursor=resume_cursor,
+        start_cursor=resume_cursor,
+        apply_watermark_stop=apply_watermark_stop,
+        fetch_page=fetch_page,
+        parse_page=parse_page,
+        extract_timestamp=_ts,
+        upsert=(upserted.append if upserted is not None else lambda item: None),
+        **kwargs,
+    )
+
+
+def _token_page(
+    items: list[dict[str, object]], next_token: str | None = None, status: int = 200
+) -> httpx.Response:
+    body: dict[str, object] = {"issues": items}
+    if next_token is not None:
+        body["nextPageToken"] = next_token
+    return httpx.Response(status, json=body)
+
+
+def test_opaque_token_cursor_walks_pages_and_starts_with_no_cursor() -> None:
+    requested: list[str | None] = []
+    upserted: list[Mapping[str, Any]] = []
+    outcome = _run_tokens(
+        {
+            None: _token_page([_item(1, "2026-01-02T00:00:00Z")], "tok-a"),
+            "tok-a": _token_page([_item(2, "2026-01-01T00:00:00Z")]),
+        },
+        requested=requested,
+        upserted=upserted,
+    )
+
+    assert requested == [None, "tok-a"]
+    assert [item["id"] for item in upserted] == [1, 2]
+    assert outcome.status == "succeeded"
+    assert outcome.next_cursor == "2026-01-02T00:00:00Z"
+
+
+def test_token_page_cap_reports_the_next_token_as_the_resume_cursor() -> None:
+    outcome = _run_tokens(
+        {
+            None: _token_page([_item(1, "2026-01-01T00:00:00Z")], "tok-a"),
+            "tok-a": _token_page([_item(2, "2026-01-01T00:00:00Z")], "tok-b"),
+        },
+        max_pages_per_call=2,
+    )
+
+    assert outcome.status == "partial"
+    assert outcome.backfill_resume_cursor == "tok-b"
+
+
+def test_token_backfill_resumes_from_the_given_token() -> None:
+    requested: list[str | None] = []
+    outcome = _run_tokens(
+        {"tok-z": _token_page([_item(1, "2026-01-01T00:00:00Z")])},
+        resume_cursor="tok-z",
+        requested=requested,
+    )
+
+    assert requested == ["tok-z"]
+    assert outcome.status == "succeeded"
+    assert outcome.next_cursor is None
+
+
+def test_resumed_page_cap_partial_reports_no_next_cursor() -> None:
+    """A resumed call has nothing new to teach the watermark, so even when it
+    hits the page cap it must not report a `next_cursor`.
+    """
+    outcome = _run_tokens(
+        {
+            "tok-a": _token_page([_item(1, "2026-01-01T00:00:00Z")], "tok-b"),
+            "tok-b": _token_page([_item(2, "2026-01-01T00:00:00Z")], "tok-c"),
+        },
+        resume_cursor="tok-a",
+        max_pages_per_call=2,
+    )
+
+    assert outcome.status == "partial"
+    assert outcome.backfill_resume_cursor == "tok-c"
+    assert outcome.next_cursor is None
+
+
+def test_rate_limit_on_a_fresh_token_walk_reports_no_resume_cursor() -> None:
+    outcome = walk.walk_paginated_resource(
+        resource_type="work_item",
+        provider_label="TokenProvider",
+        resource_label="work item",
+        since_cursor=None,
+        resume_cursor=None,
+        start_cursor=None,
+        apply_watermark_stop=False,
+        fetch_page=lambda *, cursor, page_size: None,
+        parse_page=lambda response, *, cursor: walk.Page(items=[], next_cursor=None),
+        extract_timestamp=_ts,
+        upsert=lambda item: None,
+    )
+
+    assert outcome.status == "partial"
+    assert outcome.backfill_resume_cursor is None
+
+
+# --- retry_without_cursor (Jira's stale-token fallback) ---------------------
+
+
+def _stale(response: httpx.Response) -> bool:
+    return response.status_code == 400
+
+
+def test_stale_cursor_is_retried_once_from_the_first_page() -> None:
+    requested: list[str | None] = []
+    outcome = _run_tokens(
+        {
+            "stale": _token_page([], status=400),
+            None: _token_page([_item(1, "2026-01-01T00:00:00Z")]),
+        },
+        resume_cursor="stale",
+        requested=requested,
+        retry_without_cursor=_stale,
+    )
+
+    assert requested == ["stale", None]
+    assert outcome.status == "succeeded"
+    assert outcome.items_processed == 1
+
+
+def test_stale_cursor_retry_draws_from_the_same_page_budget() -> None:
+    """The wasted stale attempt counts against `max_pages_per_call`, not a
+    refund -- otherwise a repeatedly-stale token could double the budget.
+    """
+    requested: list[str | None] = []
+    outcome = _run_tokens(
+        {
+            "stale": _token_page([], status=400),
+            None: _token_page([_item(1, "2026-01-01T00:00:00Z")], "tok-a"),
+            "tok-a": _token_page([_item(2, "2026-01-01T00:00:00Z")]),
+        },
+        resume_cursor="stale",
+        requested=requested,
+        retry_without_cursor=_stale,
+        max_pages_per_call=2,
+    )
+
+    # Budget of 2: the stale attempt + the fresh page 1; "tok-a" is never
+    # fetched, and the call reports partial with more remaining.
+    assert requested == ["stale", None]
+    assert outcome.status == "partial"
+    assert outcome.backfill_resume_cursor == "tok-a"
+
+
+def test_a_failing_first_page_after_a_stale_retry_raises() -> None:
+    with pytest.raises(RuntimeError, match="TokenProvider work item list failed with status 400"):
+        _run_tokens(
+            {"stale": _token_page([], status=400), None: _token_page([], status=400)},
+            resume_cursor="stale",
+            retry_without_cursor=_stale,
         )
+
+
+def test_a_second_stale_cursor_mid_walk_is_not_retried_again() -> None:
+    """The retry flag, not just the `cursor is not None` guard, caps it at
+    one: after restarting from the first page, a *later* page's token going
+    stale must raise rather than loop back to the start a second time.
+    """
+    requested: list[str | None] = []
+    with pytest.raises(RuntimeError, match="status 400"):
+        _run_tokens(
+            {
+                "stale": _token_page([], status=400),
+                None: _token_page([_item(1, "2026-01-01T00:00:00Z")], "tok-a"),
+                "tok-a": _token_page([], status=400),
+            },
+            resume_cursor="stale",
+            requested=requested,
+            retry_without_cursor=_stale,
+        )
+
+    assert requested == ["stale", None, "tok-a"]
+
+
+def test_no_retry_when_the_failed_request_carried_no_cursor() -> None:
+    requested: list[str | None] = []
+    with pytest.raises(RuntimeError, match="status 400"):
+        _run_tokens(
+            {None: _token_page([], status=400)},
+            requested=requested,
+            retry_without_cursor=_stale,
+        )
+    assert requested == [None]
+
+
+def test_no_retry_when_the_callback_declines() -> None:
+    with pytest.raises(RuntimeError, match="status 500"):
+        _run_tokens(
+            {"tok": _token_page([], status=500)},
+            resume_cursor="tok",
+            retry_without_cursor=_stale,
+        )
+
+
+def test_without_a_retry_callback_a_stale_cursor_raises() -> None:
+    with pytest.raises(RuntimeError, match="status 400"):
+        _run_tokens({"tok": _token_page([], status=400)}, resume_cursor="tok")
+
+
+# --- timestamp_key (Jira's DST-safe datetime comparison) --------------------
+
+
+def test_timestamp_key_compares_by_the_derived_key_not_the_raw_string() -> None:
+    """Raw strings would compare "10" <= "9" (lexicographic) and stop
+    immediately; comparing by `int` keeps the newer item.
+    """
+    upserted: list[Mapping[str, Any]] = []
+    outcome = _run_tokens(
+        {None: _token_page([_item(1, "10")])},
+        since_cursor="9",
+        apply_watermark_stop=True,
+        upserted=upserted,
+        timestamp_key=int,
+    )
+
+    assert [item["id"] for item in upserted] == [1]
+    # ...and the raw string is what gets reported back, never the key.
+    assert outcome.next_cursor == "10"
+
+
+def test_a_key_of_none_never_stops_the_walk_or_advances_the_newest_timestamp() -> None:
+    def key(ts: str) -> int | None:
+        return int(ts) if ts.isdigit() else None
+
+    upserted: list[Mapping[str, Any]] = []
+    outcome = _run_tokens(
+        {None: _token_page([_item(1, "not-a-number"), _item(2, "12")])},
+        since_cursor="9",
+        apply_watermark_stop=True,
+        upserted=upserted,
+        timestamp_key=key,
+    )
+
+    assert [item["id"] for item in upserted] == [1, 2]
+    assert outcome.next_cursor == "12"
+
+
+def test_a_falsy_but_valid_key_still_participates_in_comparison() -> None:
+    """A key of `0` is a real value, not "not comparable": it must stop the
+    walk at the watermark and count as the newest seen.
+    """
+    upserted: list[Mapping[str, Any]] = []
+    outcome = _run_tokens(
+        {None: _token_page([_item(1, "0"), _item(2, "-1")])},
+        since_cursor="-1",
+        apply_watermark_stop=True,
+        upserted=upserted,
+        timestamp_key=int,
+    )
+
+    assert [item["id"] for item in upserted] == [1]
+    assert outcome.next_cursor == "0"
+
+
+def test_an_unparseable_since_cursor_never_stops_the_walk() -> None:
+    def key(ts: str) -> int | None:
+        return int(ts) if ts.isdigit() else None
+
+    upserted: list[Mapping[str, Any]] = []
+    _run_tokens(
+        {None: _token_page([_item(1, "5"), _item(2, "3")])},
+        since_cursor="garbage",
+        apply_watermark_stop=True,
+        upserted=upserted,
+        timestamp_key=key,
+    )
+
+    assert [item["id"] for item in upserted] == [1, 2]
