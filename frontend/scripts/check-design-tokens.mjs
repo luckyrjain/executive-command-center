@@ -7,6 +7,7 @@
 //   2. Every var(--name) resolves to a custom property declared in the file.
 //      This is what makes a token rename safe: a stale reference to a deleted
 //      token fails here instead of silently rendering as "unset".
+//   3. No raw px/clamp() font-size outside :root (use a var(--text-*) token).
 //
 // Spacing/radius/shadow are deliberately NOT checked: DESIGN.md documents
 // sanctioned raw numbers for those, so a blanket check would fail on existing,
@@ -24,6 +25,7 @@ const STYLES_PATH = fileURLToPath(new URL('../src/styles.css', import.meta.url))
 const COLOR_PATTERN = /#[0-9a-fA-F]{3,8}\b|\brgba?\(/g
 const VAR_PATTERN = /var\(\s*(--[\w-]+)/g
 const DECLARATION_PATTERN = /(--[\w-]+)\s*:/g
+const RAW_FONT_SIZE_PATTERN = /font-size\s*:\s*(?:[0-9.]+px|clamp\()/
 const ALLOW_MARKER = 'design-tokens-allow'
 
 // Blank out /* ... */ comments while preserving newlines, so line numbers in
@@ -76,6 +78,19 @@ export function findUndefinedVars(source) {
   return violations
 }
 
+export function findRawFontSizes(source) {
+  const lines = source.split('\n')
+  const stripped = stripComments(source).split('\n')
+  const inRoot = rootLineFlags(lines)
+  const violations = []
+  lines.forEach((line, index) => {
+    if (inRoot[index]) return
+    if (line.includes(ALLOW_MARKER)) return
+    if (RAW_FONT_SIZE_PATTERN.test(stripped[index])) violations.push({ line: index + 1, text: line.trim() })
+  })
+  return violations
+}
+
 function report(title, hint, violations, describe) {
   if (violations.length === 0) return false
   console.error(`check-design-tokens: ${violations.length} ${title}`)
@@ -89,6 +104,7 @@ function main() {
   const source = readFileSync(STYLES_PATH, 'utf8')
   const colors = findRawColors(source)
   const undefinedVars = findUndefinedVars(source)
+  const rawFontSizes = findRawFontSizes(source)
 
   const failed = [
     report(
@@ -103,13 +119,19 @@ function main() {
       undefinedVars,
       (v) => `${v.name} -- ${v.text}`,
     ),
+    report(
+      'raw font-size value(s) found outside the :root token block.',
+      'Use a var(--text-*) token from the type scale, or add an inline `/* design-tokens-allow: <reason> */` comment for a deliberate one-off.',
+      rawFontSizes,
+      (v) => v.text,
+    ),
   ].some(Boolean)
 
   if (failed) {
     process.exitCode = 1
     return
   }
-  console.log('check-design-tokens: no raw color values outside :root; every var() resolves. OK.')
+  console.log('check-design-tokens: no raw colors or font sizes outside :root; every var() resolves. OK.')
 }
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) main()
