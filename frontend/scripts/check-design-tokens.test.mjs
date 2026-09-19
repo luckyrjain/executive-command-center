@@ -26,6 +26,11 @@ describe('findRawColors', () => {
     expect(found[0].line).toBe(5)
   })
 
+  it('is not fooled by a :root-looking line inside a comment', () => {
+    const source = `${ROOT}/* prose\n:root {\n*/\n.a { color: #fff; }\n`
+    expect(findRawColors(source)).toHaveLength(1)
+  })
+
   it('honors the design-tokens-allow marker', () => {
     const source = `${ROOT}.a { background: rgba(0, 0, 0, .1); } /* design-tokens-allow: tint */\n`
     expect(findRawColors(source)).toHaveLength(0)
@@ -43,6 +48,13 @@ describe('findUndefinedVars', () => {
     const found = findUndefinedVars(source)
     expect(found).toHaveLength(1)
     expect(found[0]).toMatchObject({ line: 5, name: '--color-gone' })
+  })
+
+  it('still reports an undefined var() on a line carrying the allow marker', () => {
+    const source = `${ROOT}.a { color: var(--color-gone); } /* design-tokens-allow: tint */\n`
+    const found = findUndefinedVars(source)
+    expect(found).toHaveLength(1)
+    expect(found[0]).toMatchObject({ name: '--color-gone' })
   })
 
   it('handles a var() with a fallback', () => {
@@ -80,7 +92,7 @@ describe('findRawFontSizes', () => {
   })
 
   it('ignores the :root block itself', () => {
-    const source = ':root {\n  --text-sm: 13px;\n  --text-x: clamp(1px, 2vw, 3px);\n}\n.a { font-size: var(--text-sm); }\n'
+    const source = ':root {\n  font-size: 16px;\n  --text-sm: 13px;\n}\n.a { font-size: var(--text-sm); }\n'
     expect(findRawFontSizes(source)).toEqual([])
   })
 

@@ -50,7 +50,7 @@ function rootLineFlags(lines) {
 export function findRawColors(source) {
   const lines = source.split('\n')
   const stripped = stripComments(source).split('\n')
-  const inRoot = rootLineFlags(lines)
+  const inRoot = rootLineFlags(stripped)
   const violations = []
   lines.forEach((line, index) => {
     if (inRoot[index]) return
@@ -70,7 +70,6 @@ export function findUndefinedVars(source) {
   }
   const violations = []
   lines.forEach((line, index) => {
-    if (line.includes(ALLOW_MARKER)) return
     for (const match of stripped[index].matchAll(VAR_PATTERN)) {
       if (!defined.has(match[1])) violations.push({ line: index + 1, text: line.trim(), name: match[1] })
     }
@@ -81,7 +80,7 @@ export function findUndefinedVars(source) {
 export function findRawFontSizes(source) {
   const lines = source.split('\n')
   const stripped = stripComments(source).split('\n')
-  const inRoot = rootLineFlags(lines)
+  const inRoot = rootLineFlags(stripped)
   const violations = []
   lines.forEach((line, index) => {
     if (inRoot[index]) return
