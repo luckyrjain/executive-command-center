@@ -487,8 +487,13 @@ class JiraAdapter:
             response: httpx.Response, *, cursor: str | None
         ) -> paginated_resume_walk.Page:
             body = response.json()
+            # A non-string/empty token is not a usable cursor: it would be
+            # persisted as `backfill_resume_cursor` (a text column) and
+            # replayed as a query parameter. Treat it as "no next page".
+            token = body.get("nextPageToken")
             return paginated_resume_walk.Page(
-                items=body.get("issues") or [], next_cursor=body.get("nextPageToken")
+                items=body.get("issues") or [],
+                next_cursor=token if isinstance(token, str) and token else None,
             )
 
         def upsert(issue: Mapping[str, Any]) -> None:

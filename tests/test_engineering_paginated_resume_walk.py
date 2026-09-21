@@ -215,15 +215,102 @@ def test_rate_limit_reports_partial_and_preserves_the_current_cursor() -> None:
     assert "rate limit" in (outcome.error_summary or "").lower()
 
 
-def test_rate_limit_on_a_fresh_link_header_backfill_reports_the_explicit_first_page() -> None:
-    """GitHub/GitLab's first page is the explicit cursor "1" (their
-    pre-extraction behavior); `next_cursor` is still reported, since this is
-    a first backfill call.
+def test_rate_limit_before_any_progress_on_a_first_call_reports_no_resume_cursor() -> None:
+    """Rate-limited at the very first page of a first backfill call there is
+    nothing to resume. Persisting `start_cursor` ("1") as the resume cursor
+    would make the next call look *resumed* -- and a resumed call never
+    reports the watermark a first backfill call must.
     """
     outcome = _run_link(lambda number: None, apply_watermark_stop=False)
 
     assert outcome.status == "partial"
-    assert outcome.backfill_resume_cursor == "1"
+    assert outcome.backfill_resume_cursor is None
+    assert outcome.next_cursor is None
+
+
+def test_rate_limit_mid_walk_on_a_first_backfill_keeps_watermark_and_resume_page() -> None:
+    def pages(number: int) -> httpx.Response | None:
+        if number == 1:
+            return _link_response([_item(1, "2026-01-05T00:00:00Z")], next_page=2)
+        return None
+
+    outcome = _run_link(pages, apply_watermark_stop=False)
+
+    assert outcome.status == "partial"
+    assert outcome.backfill_resume_cursor == "2"
+    assert outcome.next_cursor == "2026-01-05T00:00:00Z"
+
+
+def test_incremental_page_cap_partial_keeps_the_old_watermark() -> None:
+    """Advancing the watermark to page 1's newest item would make the next
+    incremental call stop at its first item and drop pages 2.. for good.
+    """
+
+    def pages(number: int) -> httpx.Response:
+        return _link_response(
+            [_item(number, f"2026-02-{30 - number:02d}T00:00:00Z")], next_page=number + 1
+        )
+
+    outcome = _run_link(pages, since_cursor="2026-01-01T00:00:00Z", max_pages_per_call=3)
+
+    assert outcome.status == "partial"
+    assert outcome.items_processed == 3
+    assert outcome.next_cursor is None
+
+
+def test_incremental_rate_limit_partial_keeps_the_old_watermark() -> None:
+    def pages(number: int) -> httpx.Response | None:
+        if number == 1:
+            return _link_response([_item(1, "2026-02-01T00:00:00Z")], next_page=2)
+        return None
+
+    outcome = _run_link(pages, since_cursor="2026-01-01T00:00:00Z")
+
+    assert outcome.status == "partial"
+    assert outcome.items_processed == 1
+    assert outcome.next_cursor is None
+
+
+def test_incremental_that_completes_still_advances_the_watermark() -> None:
+    outcome = _run_link(
+        {1: _link_response([_item(2, "2026-02-01T00:00:00Z"), _item(1, "2026-01-01T00:00:00Z")])},
+        since_cursor="2026-01-01T00:00:00Z",
+    )
+
+    assert outcome.status == "succeeded"
+    assert outcome.next_cursor == "2026-02-01T00:00:00Z"
+
+
+def test_empty_page_ends_the_walk_even_when_a_next_cursor_is_reported() -> None:
+    requested: list[int] = []
+    outcome = _run_link({1: _link_response([], next_page=2)}, requested=requested)
+
+    assert outcome.status == "succeeded"
+    assert requested == [1]
+
+
+def test_stale_retry_consuming_the_last_budget_slot_reports_partial_with_no_resume() -> None:
+    def fetch_page(*, cursor: str | None, page_size: int) -> httpx.Response | None:
+        return httpx.Response(400) if cursor is not None else _link_response([])
+
+    outcome = walk.walk_paginated_resource(
+        resource_type="repository",
+        provider_label="TestProvider",
+        resource_label="repository",
+        since_cursor=None,
+        resume_cursor="tok",
+        start_cursor="tok",
+        apply_watermark_stop=False,
+        fetch_page=fetch_page,
+        parse_page=lambda response, *, cursor: walk.Page(items=[], next_cursor=None),
+        extract_timestamp=_ts,
+        upsert=lambda item: None,
+        retry_without_cursor=lambda response: True,
+        max_pages_per_call=1,
+    )
+
+    assert outcome.status == "partial"
+    assert outcome.backfill_resume_cursor is None
 
 
 def test_non_200_response_raises() -> None:
@@ -535,3 +622,120 @@ def test_an_unparseable_since_cursor_never_stops_the_walk() -> None:
     )
 
     assert [item["id"] for item in upserted] == [1, 2]
+
+
+# --- gaps found by mutation testing -----------------------------------------
+
+
+def test_rate_limit_mid_walk_reports_progress_and_the_unfetched_page_as_resume_cursor() -> None:
+    """The resume cursor is the page that was *not* fetched (the advanced
+    cursor), not the walk's starting cursor, and the items already upserted
+    plus the first-call watermark are still reported.
+    """
+
+    def pages(number: int) -> httpx.Response | None:
+        if number == 1:
+            return _link_response([_item(1, "2026-01-02T00:00:00Z")], next_page=2)
+        return None
+
+    outcome = _run_link(pages, apply_watermark_stop=False)
+
+    assert outcome.status == "partial"
+    assert outcome.items_processed == 1
+    assert outcome.backfill_resume_cursor == "2"
+    assert outcome.next_cursor == "2026-01-02T00:00:00Z"
+
+
+def test_rate_limit_mid_resumed_walk_never_reports_next_cursor() -> None:
+    def pages(number: int) -> httpx.Response | None:
+        if number == 5:
+            return _link_response([_item(1, "2026-01-02T00:00:00Z")], next_page=6)
+        return None
+
+    outcome = _run_link(pages, resume_cursor="5", apply_watermark_stop=False)
+
+    assert outcome.status == "partial"
+    assert outcome.items_processed == 1
+    assert outcome.backfill_resume_cursor == "6"
+    assert outcome.next_cursor is None
+
+
+@pytest.mark.parametrize("status", [201, 204, 302, 404])
+def test_any_non_200_status_raises(status: int) -> None:
+    with pytest.raises(RuntimeError, match=f"status {status}"):
+        _run_link({1: httpx.Response(status)})
+
+
+def test_watermark_stop_abandons_the_rest_of_the_page() -> None:
+    """The watermark stop exits at the first at-or-before item; nothing after
+    it in the same page (even something that looks newer) is upserted.
+    """
+    upserted: list[Mapping[str, Any]] = []
+    _run_link(
+        {
+            1: _link_response(
+                [
+                    _item(3, "2026-01-05T00:00:00Z"),
+                    _item(2, "2026-01-01T00:00:00Z"),
+                    _item(1, "2026-01-06T00:00:00Z"),
+                ]
+            )
+        },
+        since_cursor="2026-01-03T00:00:00Z",
+        upserted=upserted,
+    )
+
+    assert [item["id"] for item in upserted] == [3]
+
+
+def test_nothing_newer_than_the_watermark_echoes_the_since_cursor() -> None:
+    outcome = _run_link(
+        {1: _link_response([_item(1, "2026-01-01T00:00:00Z")])},
+        since_cursor="2026-01-03T00:00:00Z",
+    )
+
+    assert outcome.items_processed == 0
+    assert outcome.next_cursor == "2026-01-03T00:00:00Z"
+
+
+def test_page_size_and_page_budget_defaults_and_pass_through() -> None:
+    seen: list[int] = []
+
+    def fetch_page(*, cursor: str | None, page_size: int) -> httpx.Response | None:
+        seen.append(page_size)
+        n = len(seen)
+        return _token_page([_item(n, "2026-01-01T00:00:00Z")], f"t{n}")
+
+    def parse_page(response: httpx.Response, *, cursor: str | None) -> walk.Page:
+        body = response.json()
+        return walk.Page(items=body["issues"], next_cursor=body.get("nextPageToken"))
+
+    def call(**kwargs: Any) -> SyncOutcome:
+        seen.clear()
+        return walk.walk_paginated_resource(
+            resource_type="work_item",
+            provider_label="P",
+            resource_label="r",
+            since_cursor=None,
+            resume_cursor=None,
+            start_cursor=None,
+            apply_watermark_stop=False,
+            fetch_page=fetch_page,
+            parse_page=parse_page,
+            extract_timestamp=_ts,
+            upsert=lambda item: None,
+            **kwargs,
+        )
+
+    outcome = call()
+    assert seen == [100] * 10  # defaults: page_size=100, max_pages_per_call=10
+    assert outcome.backfill_resume_cursor == "t10"
+
+    call(page_size=37, max_pages_per_call=2)
+    assert seen == [37, 37]
+
+
+def test_link_header_page_number_defaults_to_the_first_page() -> None:
+    assert walk.link_header_page_number(None) == 1
+    assert walk.link_header_page_number("") == 1
+    assert walk.link_header_page_number("7") == 7

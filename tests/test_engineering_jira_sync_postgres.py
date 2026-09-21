@@ -598,6 +598,29 @@ def test_backfill_then_resync_with_changed_title_updates_row_and_content_hash(
     assert after.content_hash != before.content_hash
 
 
+def test_work_item_search_requests_newest_first_at_the_shared_page_size(
+    seeded_account_context: ConnectorAccountContext,
+) -> None:
+    """The walker's watermark stop is only sound if issues come back
+    newest-first, so the JQL ordering is part of the contract.
+    """
+    from ecc.domains.engineering import jira_adapter as jira_adapter_module
+
+    seen: list[httpx.QueryParams] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.url.params)
+        return _json_response(_search_response([]))
+
+    adapter = JiraAdapter(transport=httpx.MockTransport(handler))
+    adapter.backfill(seeded_account_context, "work_item")
+
+    assert len(seen) == 1
+    assert seen[0]["jql"].endswith("ORDER BY updated DESC")
+    assert seen[0]["maxResults"] == str(jira_adapter_module._PAGE_SIZE)
+    assert "nextPageToken" not in seen[0]
+
+
 def test_incremental_sync_stops_at_prior_cursor(
     seeded_account_context: ConnectorAccountContext,
 ) -> None:
@@ -753,7 +776,7 @@ def test_sync_work_items_raises_on_generic_failure_status() -> None:
         return _json_response({"message": "Server error"}, status_code=500)
 
     adapter = JiraAdapter(transport=httpx.MockTransport(handler))
-    with pytest.raises(RuntimeError, match="500"):
+    with pytest.raises(RuntimeError, match="Jira work item list failed with status 500"):
         adapter.backfill(_account_context(), "work_item")
 
 
@@ -894,6 +917,58 @@ def test_backfill_stale_resume_token_falls_back_to_a_fresh_walk(
     # Exactly one retry: the stale attempt, then a fresh page-1 request
     # with no token at all.
     assert tokens_seen == ["stale-token", None]
+
+
+def test_backfill_resume_token_failing_with_a_non_400_status_is_not_retried(
+    seeded_account_context: ConnectorAccountContext,
+) -> None:
+    """Only a `400` means "stale token"; any other failure on a request that
+    carried a token must raise, not silently restart from page 1.
+    """
+    tokens_seen: list[str | None] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        tokens_seen.append(request.url.params.get("nextPageToken"))
+        return _json_response({"message": "Server error"}, status_code=500)
+
+    adapter = JiraAdapter(transport=httpx.MockTransport(handler))
+    with pytest.raises(RuntimeError, match="status 500"):
+        adapter.backfill(seeded_account_context, "work_item", resume_cursor="some-token")
+    assert tokens_seen == ["some-token"]
+
+
+def test_backfill_tolerates_a_response_with_no_issues_key(
+    seeded_account_context: ConnectorAccountContext,
+) -> None:
+    adapter = JiraAdapter(transport=httpx.MockTransport(lambda request: _json_response({})))
+    outcome = adapter.backfill(seeded_account_context, "work_item")
+    assert outcome.status == "succeeded"
+    assert outcome.items_processed == 0
+
+
+@pytest.mark.parametrize("bad_token", [{"a": 1}, ["x"], 7, True, ""])
+def test_backfill_ignores_a_non_string_or_empty_next_page_token(
+    seeded_account_context: ConnectorAccountContext, bad_token: Any
+) -> None:
+    """A malformed `nextPageToken` is not a usable cursor: it must end the
+    walk cleanly rather than being persisted as a resume cursor / replayed
+    as a query parameter.
+    """
+    requests_seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests_seen.append(str(request.url))
+        body = _search_response(
+            [_issue(1, key="ACME-1", summary="Issue", updated="2024-01-01T00:00:00.000+0000")]
+        )
+        body["nextPageToken"] = bad_token
+        return _json_response(body)
+
+    adapter = JiraAdapter(transport=httpx.MockTransport(handler))
+    outcome = adapter.backfill(seeded_account_context, "work_item")
+    assert outcome.status == "succeeded"
+    assert outcome.backfill_resume_cursor is None
+    assert len(requests_seen) == 1
 
 
 def test_backfill_stale_resume_token_retry_draws_from_the_same_budget(

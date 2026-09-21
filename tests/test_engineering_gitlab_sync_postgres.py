@@ -976,6 +976,30 @@ def test_backfill_paginates_via_link_header(
     assert outcome.next_cursor == "2024-01-05T00:00:00Z"
 
 
+def test_project_list_requests_newest_first_at_the_shared_page_size(
+    seeded_account_context: ConnectorAccountContext,
+) -> None:
+    """The walker's watermark stop is only sound if the provider returns
+    newest-first, so the request's order_by/sort is part of the contract.
+    """
+    from ecc.domains.engineering import gitlab_adapter as gitlab_adapter_module
+
+    seen: list[httpx.QueryParams] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.url.params)
+        return _json_response([])
+
+    adapter = GitLabAdapter(transport=httpx.MockTransport(handler))
+    adapter.backfill(seeded_account_context, "repository")
+
+    assert len(seen) == 1
+    assert (seen[0]["order_by"], seen[0]["sort"]) == ("last_activity_at", "desc")
+    assert seen[0]["membership"] == "true"
+    assert seen[0]["per_page"] == str(gitlab_adapter_module._PAGE_SIZE)
+    assert seen[0]["page"] == "1"
+
+
 def test_incremental_sync_stops_at_prior_cursor(
     seeded_account_context: ConnectorAccountContext,
 ) -> None:
@@ -1107,7 +1131,7 @@ def test_sync_repositories_raises_on_generic_failure_status() -> None:
         return _json_response({"message": "Server error"}, status_code=500)
 
     adapter = GitLabAdapter(transport=httpx.MockTransport(handler))
-    with pytest.raises(RuntimeError, match="500"):
+    with pytest.raises(RuntimeError, match="GitLab project list failed with status 500"):
         adapter.backfill(_account_context(), "repository")
 
 
