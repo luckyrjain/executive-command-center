@@ -401,13 +401,23 @@ select[aria-invalid="true"] { border-color: var(--color-border-danger); backgrou
 .work-heading h1,
 .work-heading h2 { line-height: 1.05; overflow-wrap: anywhere; }
 /* Two-up `.work-grid` (one column at <=800px): each column is about half the
- * content width, and at the panel-title scale "Commitments" is wider than that
- * column from 801px to ~960px, and only just fits beyond it (a 1-6px margin at
- * ~1000px in the default font; a fallback font's wider glyphs break it). Two
- * half-width panels also rank below a page's single primary panel, so their
- * titles sit one step down at every width instead of on a font-dependent cutoff. */
+ * content width, and at the viewport-based panel-title scale "Commitments"
+ * doesn't fit it from 801px to ~960px and only just fits beyond (a 1-6px margin
+ * at ~1000px in the default font; a wider fallback font breaks it). So a title
+ * here is sized from its own panel's width (`cqi`, the panel being the size
+ * container) rather than the viewport: ~11% of the panel's content width, so
+ * the longest single word (~8em in a wide font) stays inside it, held between
+ * the `--text-2xl` floor (below which `overflow-wrap` is the backstop) and the
+ * panel-title ceiling. A narrow column reads at
+ * 28px, a wide one (or the single column at <=800px) reaches the full scale,
+ * with no breakpoint or font-dependent cutoff. The first declaration is the
+ * fallback for a browser without container query units. */
+.work-grid .work-panel { container-type: inline-size; }
 .work-grid .work-heading h1,
-.work-grid .work-heading h2 { font-size: var(--text-2xl); }
+.work-grid .work-heading h2 {
+  font-size: var(--text-2xl);
+  font-size: min(var(--text-display-sm), max(var(--text-2xl), 11cqi));
+}
 .recommendation-heading p:not(.eyebrow),
 .explore-heading p:not(.eyebrow),
 .work-heading p:not(.eyebrow) { max-width: var(--content-reading); margin: 10px 0 0; color: var(--color-text-muted); }

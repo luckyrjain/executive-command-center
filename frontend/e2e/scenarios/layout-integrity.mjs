@@ -3,10 +3,11 @@ import assert from 'node:assert/strict'
 import { createCollaborationStore, createFixtureApi } from '../fixtures.mjs'
 import { assertNoSeriousAccessibilityViolations } from '../accessibility.mjs'
 
-// Two-up `.work-grid` titles use --text-2xl (28px); a workspace title that
-// falls through to the page-hero `h1` rule reaches 78px, and one on the plain
-// panel-title scale (--text-display-sm) reaches 44px.
-const TWO_UP_TITLE_PX = 28
+// A two-up `.work-grid` title is sized from its panel's content width:
+// min(--text-display-sm, max(--text-2xl, 11cqi)). A title that falls through to
+// the page-hero `h1` rule reaches 78px instead.
+const panelTitleScale = (viewport) => Math.min(44, Math.max(28, 0.04 * viewport))
+const twoUpTitleSize = (viewport, panelContentWidth) => Math.min(panelTitleScale(viewport), Math.max(28, 0.11 * panelContentWidth))
 
 function horizontalOverflow(page) {
   return page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)
@@ -39,7 +40,7 @@ export async function run({ page, baseURL }) {
 
   // 820-1100px is where the page-hero h1 scale overflowed a half-width
   // `.work-grid` column (Tasks next to Commitments); 790 is one column, 1440 a
-  // wide desktop -- the two-up title size is the same at every one of them.
+  // wide desktop -- the two-up title size follows its column at each of them.
   for (const width of [790, 820, 900, 965, 1000, 1100, 1440]) {
     await page.setViewportSize({ width, height: 900 })
     await page.goto(`${baseURL}/work`)
@@ -51,15 +52,19 @@ export async function run({ page, baseURL }) {
     if (width >= 900) assert.equal(await horizontalOverflow(page), 0, `/work must not scroll horizontally at ${width}px`)
     const metrics = await titles.evaluateAll((els) => els.map((el) => {
       const style = getComputedStyle(el)
+      const panel = getComputedStyle(el.closest('.work-panel'))
       return {
         fontSize: parseFloat(style.fontSize),
+        panelContentWidth: el.closest('.work-panel').clientWidth - parseFloat(panel.paddingLeft) - parseFloat(panel.paddingRight),
+        viewport: document.documentElement.clientWidth,
         // Rendered lines, and the h1's line-height as a multiple of its font size.
         lines: Math.round(el.getBoundingClientRect().height / parseFloat(style.lineHeight)),
         leading: parseFloat(style.lineHeight) / parseFloat(style.fontSize),
       }
     }))
-    for (const { fontSize, lines, leading } of metrics) {
-      assert.equal(fontSize, TWO_UP_TITLE_PX, `two-up workspace <h1> is ${fontSize}px at ${width}px; expected ${TWO_UP_TITLE_PX}px (--text-2xl)`)
+    for (const { fontSize, panelContentWidth, viewport, lines, leading } of metrics) {
+      const expected = twoUpTitleSize(viewport, panelContentWidth)
+      assert.ok(Math.abs(fontSize - expected) < 0.5, `two-up workspace <h1> is ${fontSize}px at ${width}px (panel ${panelContentWidth}px wide); expected ${expected.toFixed(1)}px`)
       // `overflow-wrap: anywhere` keeps a too-wide title from overflowing, but by
       // breaking it mid-word; at these widths the two-up scale must fit on one line.
       // Only from 1000px: in the narrower two-up columns a wide fallback font (Verdana,
@@ -89,12 +94,19 @@ export async function run({ page, baseURL }) {
   await page.locator('.work-heading h2').first().waitFor()
   const h2Metrics = await page.locator('.work-heading h2').evaluateAll((els) => els.map((el) => {
     const style = getComputedStyle(el)
-    return { leading: parseFloat(style.lineHeight) / parseFloat(style.fontSize), fontSize: parseFloat(style.fontSize) }
+    const panel = getComputedStyle(el.closest('.work-panel'))
+    return {
+      leading: parseFloat(style.lineHeight) / parseFloat(style.fontSize),
+      fontSize: parseFloat(style.fontSize),
+      panelContentWidth: el.closest('.work-panel').clientWidth - parseFloat(panel.paddingLeft) - parseFloat(panel.paddingRight),
+      viewport: document.documentElement.clientWidth,
+    }
   }))
   assert.ok(h2Metrics.length > 0, 'expected .work-heading h2 titles on /knowledge')
-  for (const { leading, fontSize } of h2Metrics) {
+  for (const { leading, fontSize, panelContentWidth, viewport } of h2Metrics) {
     assert.ok(leading < 1.2, `workspace <h2> line-height is ${leading.toFixed(2)}x its font size; expected the tight 1.05`)
-    assert.equal(fontSize, TWO_UP_TITLE_PX, `two-up workspace <h2> is ${fontSize}px; expected ${TWO_UP_TITLE_PX}px (--text-2xl)`)
+    const expected = twoUpTitleSize(viewport, panelContentWidth)
+    assert.ok(Math.abs(fontSize - expected) < 0.5, `two-up workspace <h2> is ${fontSize}px (panel ${panelContentWidth}px wide); expected ${expected.toFixed(1)}px`)
   }
 
   // Backstop: a long unbroken entity name must wrap inside its column, not push

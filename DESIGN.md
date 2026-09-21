@@ -14,7 +14,7 @@ One font, everywhere: `Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacS
 
 | Element | Size | Notes |
 |---|---|---|
-| Panel title (`.work-heading h1, h2`) | `--text-display-sm` (`clamp(28px, 4vw, 44px)`); `--text-2xl` (`28px`) inside a two-up `.work-grid`, at every width | `letter-spacing: -.035em`, `line-height: 1.05`; a title that still can't fit breaks mid-word (`overflow-wrap: anywhere`, `.work-heading` only) rather than overflowing its column |
+| Panel title (`.work-heading h1, h2`) | `--text-display-sm` (`clamp(28px, 4vw, 44px)`); inside a two-up `.work-grid` it is sized from the panel's own width — `min(--text-display-sm, max(--text-2xl, 11cqi))`, i.e. 28px in a narrow column up to the full scale in a wide one — so a title grows with its column instead of overflowing it at a viewport-based cutoff | `letter-spacing: -.035em`, `line-height: 1.05`; a title that still can't fit breaks mid-word (`overflow-wrap: anywhere`, `.work-heading` only) rather than overflowing its column |
 | Section heading | `--text-lg` (`18px`) | weight `700` |
 | Eyebrow label | small, uppercase, muted | sits above a heading, or above a wizard step (`Step N of M · Label`) |
 | Wizard review value (`.wizard-review dd.is-machine-value`) | `--text-sm` (`13px`) | `ui-monospace, SFMono-Regular, Menlo, monospace` — the one deliberate exception to "one font," scoped to genuinely machine-shaped review values (IDs, timestamps, timezones, credential secrets) via an explicit class, not applied to every review value |
