@@ -454,6 +454,24 @@ def test_resumed_page_cap_partial_reports_no_next_cursor() -> None:
     assert outcome.next_cursor is None
 
 
+def test_resumed_backfill_partial_never_echoes_a_leftover_since_cursor() -> None:
+    """Only an *incremental* partial reports `since_cursor` back; a resumed
+    backfill reports `None` even if a caller leaves a `since_cursor` in.
+    """
+    outcome = _run_tokens(
+        {
+            "tok-a": _token_page([_item(1, "2026-01-01T00:00:00Z")], "tok-b"),
+            "tok-b": _token_page([_item(2, "2026-01-01T00:00:00Z")], "tok-c"),
+        },
+        resume_cursor="tok-a",
+        since_cursor="2025-12-01T00:00:00Z",
+        max_pages_per_call=2,
+    )
+
+    assert outcome.status == "partial"
+    assert outcome.next_cursor is None
+
+
 def test_rate_limit_on_a_fresh_token_walk_reports_no_resume_cursor() -> None:
     outcome = walk.walk_paginated_resource(
         resource_type="work_item",
