@@ -144,8 +144,8 @@ def walk_paginated_resource(
     teach the watermark and must not overwrite it with a lower value
     computed from a page deep in the walk. An *incremental* call
     (`apply_watermark_stop=True`) that ends `partial` (page cap or rate
-    limit) reports no `next_cursor` at all, keeping the old watermark: it
-    only saw the newest slice of the changed range, and advancing the
+    limit) reports `since_cursor` back unchanged, keeping the old watermark:
+    it only saw the newest slice of the changed range, and advancing the
     watermark past the unfetched older pages would drop them for good.
 
     `resume_cursor` (the persisted state, used to tell a first backfill
@@ -181,16 +181,24 @@ def walk_paginated_resource(
     "not comparable".
     """
     key = timestamp_key or (lambda ts: ts)
+
     # A `partial` outcome may only advance the watermark for a *first
     # backfill* call (see the docstring above: page 1 of that walk already
     # established the true newest). An *incremental* walk cut short by the
     # page cap or a rate limit has only seen the newest slice of what
     # changed since `since_cursor` -- advancing the watermark to that
     # slice's newest timestamp would make the next call stop at the first
-    # item and never fetch the older, still-unsynced pages, so it reports
-    # `None` (keep the old watermark; the next call re-walks the range,
-    # and upserts are idempotent).
-    partial_next_cursor_reportable = resume_cursor is None and not apply_watermark_stop
+    # item and never fetch the older, still-unsynced pages. It reports
+    # `since_cursor` back unchanged instead: the watermark stays put (the
+    # next call re-walks the range; upserts are idempotent), while the
+    # non-`None` value still makes `connector_sync` upsert the cursor row,
+    # which is what `metrics.py`'s coverage freshness reads. A resumed
+    # backfill call reports `None`, as always.
+    def partial_next_cursor(newest: str | None) -> str | None:
+        if resume_cursor is None and not apply_watermark_stop:
+            return newest
+        return since_cursor if apply_watermark_stop else None
+
     items_processed = 0
     newest_updated_at = since_cursor
     since_key = key(since_cursor) if since_cursor is not None else None
@@ -214,7 +222,7 @@ def walk_paginated_resource(
                 resource_type=resource_type,
                 items_processed=items_processed,
                 status="partial",
-                next_cursor=newest_updated_at if partial_next_cursor_reportable else None,
+                next_cursor=partial_next_cursor(newest_updated_at),
                 error_summary=(
                     f"{provider_label} rate limit exceeded; sync paused, will resume next call"
                 ),
@@ -281,7 +289,7 @@ def walk_paginated_resource(
             resource_type=resource_type,
             items_processed=items_processed,
             status="partial",
-            next_cursor=newest_updated_at if partial_next_cursor_reportable else None,
+            next_cursor=partial_next_cursor(newest_updated_at),
             error_summary=(
                 f"{provider_label} {resource_label} sync hit the {max_pages_per_call}-page "
                 "per-call bound with more pages remaining; sync paused, will resume next call"

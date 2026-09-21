@@ -1272,6 +1272,97 @@ def test_sync_backfill_writes_work_items_then_incremental_only_writes_newer(
     assert titles == {"First", "Second", "Third"}
 
 
+def test_partial_incremental_keeps_the_watermark_refreshes_the_cursor_row_and_loses_nothing(
+    engineering_test_context: tuple[TestClient, UUID, UUID, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An incremental call rate-limited after page 1 must not advance the
+    watermark to page 1's newest item (the older page-2 item would then be
+    skipped for good), but must still touch `sync_cursors.updated_at`
+    (`metrics.py`'s coverage freshness reads it).
+    """
+    client, workspace_id, user_id, token = engineering_test_context
+    account_id = _insert_jira_connector_account(workspace_id, user_id)
+    backfill_watermark = "2024-01-01T00:00:00.000+0000"
+    state = {"call": 0, "second_incremental_page_limited": True}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        state["call"] += 1
+        if state["call"] == 1:  # backfill
+            return _json_response(
+                _search_response(
+                    [_issue(1, key="ACME-1", summary="Old", updated=backfill_watermark)]
+                )
+            )
+        if request.url.params.get("nextPageToken") is None:  # incremental page 1
+            return _json_response(
+                _search_response(
+                    [
+                        _issue(
+                            4,
+                            key="ACME-4",
+                            summary="Newest",
+                            updated="2024-01-04T00:00:00.000+0000",
+                        )
+                    ],
+                    next_page_token="page-2",
+                )
+            )
+        if state["second_incremental_page_limited"]:
+            return _json_response({}, status_code=429)
+        return _json_response(
+            _search_response(
+                [_issue(3, key="ACME-3", summary="Middle", updated="2024-01-03T00:00:00.000+0000")]
+            )
+        )
+
+    registry = ConnectorRegistry()
+    registry.register(JiraAdapter(transport=httpx.MockTransport(handler)))
+    monkeypatch.setattr(connector_accounts_module, "connector_registry", registry)
+
+    def sync(run_type: str) -> dict[str, Any]:
+        response = client.post(
+            f"/api/v1/engineering/connectors/{account_id}/sync",
+            json={"run_type": run_type, "resource_type": "work_item"},
+            headers=_headers(token, key=str(uuid4())),
+        )
+        assert response.status_code == 201, response.text
+        return response.json()
+
+    def cursor_row() -> Any:
+        with engine.begin() as connection:
+            return connection.execute(
+                text(
+                    "SELECT cursor_value, updated_at FROM sync_cursors "
+                    "WHERE connector_account_id = :id AND resource_type = 'work_item'"
+                ),
+                {"id": account_id},
+            ).one()
+
+    sync("backfill")
+    watermark_after_backfill, updated_at_after_backfill = cursor_row()
+    assert watermark_after_backfill == backfill_watermark
+
+    partial = sync("incremental")
+    assert partial["status"] == "partial"
+    watermark_after_partial, updated_at_after_partial = cursor_row()
+    assert watermark_after_partial == backfill_watermark
+    assert updated_at_after_partial > updated_at_after_backfill
+
+    state["second_incremental_page_limited"] = False
+    healed = sync("incremental")
+    assert healed["status"] == "succeeded"
+    with engine.begin() as connection:
+        titles = {
+            row[0]
+            for row in connection.execute(
+                text("SELECT title FROM engineering_work_items WHERE workspace_id = :workspace_id"),
+                {"workspace_id": workspace_id},
+            )
+        }
+    assert titles == {"Old", "Newest", "Middle"}
+
+
 def test_sync_reports_partial_on_rate_limit_and_records_it(
     engineering_test_context: tuple[TestClient, UUID, UUID, str],
     monkeypatch: pytest.MonkeyPatch,

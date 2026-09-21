@@ -255,7 +255,10 @@ def test_incremental_page_cap_partial_keeps_the_old_watermark() -> None:
 
     assert outcome.status == "partial"
     assert outcome.items_processed == 3
-    assert outcome.next_cursor is None
+    # Unchanged (not advanced, not `None`): a non-`None` value keeps
+    # `connector_sync` upserting the cursor row, which `metrics.py`'s
+    # coverage freshness reads.
+    assert outcome.next_cursor == "2026-01-01T00:00:00Z"
 
 
 def test_incremental_rate_limit_partial_keeps_the_old_watermark() -> None:
@@ -268,7 +271,7 @@ def test_incremental_rate_limit_partial_keeps_the_old_watermark() -> None:
 
     assert outcome.status == "partial"
     assert outcome.items_processed == 1
-    assert outcome.next_cursor is None
+    assert outcome.next_cursor == "2026-01-01T00:00:00Z"
 
 
 def test_incremental_that_completes_still_advances_the_watermark() -> None:
