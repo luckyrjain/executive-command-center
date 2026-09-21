@@ -274,6 +274,26 @@ def test_incremental_rate_limit_partial_keeps_the_old_watermark() -> None:
     assert outcome.next_cursor == "2026-01-01T00:00:00Z"
 
 
+def test_first_ever_incremental_walk_cut_short_reports_no_watermark() -> None:
+    """Pins the current decision for an incremental call with no prior
+    watermark (`since_cursor=None`): a capped walk still reports no
+    `next_cursor`, so every later incremental re-walks from the newest page
+    until one completes -- history older than the walked slice is never
+    skipped, at the cost of the watermark not being established here.
+    """
+
+    def pages(number: int) -> httpx.Response:
+        return _link_response(
+            [_item(number, f"2026-02-{30 - number:02d}T00:00:00Z")], next_page=number + 1
+        )
+
+    outcome = _run_link(pages, since_cursor=None, max_pages_per_call=2)
+
+    assert outcome.status == "partial"
+    assert outcome.items_processed == 2
+    assert outcome.next_cursor is None
+
+
 def test_incremental_that_completes_still_advances_the_watermark() -> None:
     outcome = _run_link(
         {1: _link_response([_item(2, "2026-02-01T00:00:00Z"), _item(1, "2026-01-01T00:00:00Z")])},

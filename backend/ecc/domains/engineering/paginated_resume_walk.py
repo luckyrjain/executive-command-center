@@ -159,7 +159,9 @@ def walk_paginated_resource(
 
     `fetch_page(cursor=..., page_size=...)` returning `None` means
     rate-limited beyond `bounded_single_retry`'s own bound -- reported as
-    `partial`, resumable from the same cursor, never raised.
+    `partial`, resumable from the cursor that was being fetched (or from
+    scratch -- `backfill_resume_cursor=None` -- if nothing was fetched yet
+    on a first call), never raised.
 
     `retry_without_cursor(response)`, when given, is consulted for a
     non-200 response on a request that carried a cursor: if it returns
