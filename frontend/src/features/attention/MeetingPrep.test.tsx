@@ -59,6 +59,21 @@ describe('MeetingPrep', () => {
     expect(screen.getByText(/source: note d-1/)).toBeTruthy()
   })
 
+  it('renders every pack section as a .work-subsection, never a nested .dashboard-card', async () => {
+    vi.stubGlobal('fetch', vi.fn(() => response(pack)))
+    const { container } = renderPrep()
+
+    fireEvent.change(screen.getByLabelText('Meeting ID'), { target: { value: 'meeting-1' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Load meeting prep' }))
+
+    await waitFor(() => expect(screen.getByText('Review Q3 numbers')).toBeTruthy())
+    const ids = ['prep-objective', 'prep-participants', 'prep-facts', 'prep-questions', 'prep-suggestions', 'prep-evidence']
+    for (const id of ids) {
+      expect(container.querySelector(`section[aria-labelledby="${id}"]`)?.classList.contains('work-subsection')).toBe(true)
+    }
+    expect(container.querySelector('.dashboard-card')).toBeNull()
+  })
+
   it('shows neutral evidence-gap copy, never alarming language, for missing evidence', async () => {
     vi.stubGlobal('fetch', vi.fn(() => response(pack)))
     renderPrep()

@@ -139,4 +139,33 @@ describe('AttentionQueue', () => {
     await waitFor(() => expect(fetch).toHaveBeenCalledTimes(3))
     expect(fetch.mock.calls[1][0]).toContain('/restore')
   })
+
+  it('names the group in each count badge, singular for exactly one item and plural otherwise', async () => {
+    vi.stubGlobal('fetch', vi.fn(() => response({ items: [item({})] })))
+    const { unmount } = renderQueue()
+
+    await screen.findByText('Finish the board memo')
+    expect(screen.getByLabelText('1 item in Needs action').textContent).toBe('1')
+    expect(screen.getByLabelText('0 items in Waiting on others').textContent).toBe('0')
+    expect(screen.getByLabelText('0 items in Risks').textContent).toBe('0')
+    unmount()
+
+    vi.stubGlobal('fetch', vi.fn(() => response({ items: [item({}), item({ id: 'item-2', entity_id: 'task-2', explanation: 'Send the offer letter' })] })))
+    renderQueue()
+    await screen.findByText('Send the offer letter')
+    expect(screen.getByLabelText('2 items in Needs action').textContent).toBe('2')
+  })
+
+  it('renders each group and the dismissed/deferred list as a .work-subsection, never a nested .dashboard-card', async () => {
+    vi.stubGlobal('fetch', vi.fn(() => response({ items: [item({}), item({ id: 'item-2', explanation: 'Deferred thing', deferred_until: '2026-08-01T00:00:00Z' })] })))
+    const { container } = renderQueue()
+
+    await screen.findByText('Finish the board memo')
+    const groupSections = container.querySelectorAll('section[aria-labelledby^="attention-group-"]')
+    expect(groupSections).toHaveLength(5)
+    const overridden = container.querySelector('section[aria-labelledby="attention-overridden"]')
+    expect(overridden).not.toBeNull()
+    for (const section of [...groupSections, overridden!]) expect(section.classList.contains('work-subsection')).toBe(true)
+    expect(container.querySelector('.dashboard-card')).toBeNull()
+  })
 })

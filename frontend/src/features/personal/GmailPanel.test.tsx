@@ -323,6 +323,14 @@ describe('GmailPanel', () => {
     fireEvent.click(await screen.findByRole('button', { name: 'Signed contract needed by Friday' }))
     expect(await screen.findByText('Please sign and return.')).toBeTruthy()
 
+    // Both the connected-account block and the open-thread region use the
+    // shared card-less .work-subsection (its spacing), not a bare div.
+    expect(screen.getByText('owner@example.test').closest('.work-subsection')).not.toBeNull()
+    expect(screen.getByRole('region', { name: 'Signed contract needed by Friday' }).classList.contains('work-subsection')).toBe(true)
+
+    // A permanent deletion must read as destructive, not as an ordinary button.
+    expect(screen.getByRole('button', { name: 'Forget cached content for this thread' }).classList.contains('btn-destructive')).toBe(true)
+
     fireEvent.click(screen.getByRole('button', { name: 'Forget cached content for this thread' }))
     await waitFor(() => expect(fetch).toHaveBeenCalledWith(
       expect.stringContaining('/api/v1/personal/gmail/threads/thread-1/forget'),
