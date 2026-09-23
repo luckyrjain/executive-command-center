@@ -97,8 +97,18 @@ export const WORKSPACES: ReadonlyArray<WorkspaceEntry> = [
   { view: 'collaboration', label: 'Team', path: '/team', group: 'account', composition: 'canvas' },
 ]
 
+/** Route matching ignores a trailing slash (`<Route path="/notes">` also
+ * matches `/notes/`), so strip one before the exact-path lookup below -- a
+ * bookmarked `/notes/` still renders the workspace and must resolve to its
+ * real view and composition, not fall through to the defaults. Never strips
+ * the root path itself (`'/'` stays `'/'`; nothing in `WORKSPACES` has that
+ * path anyway). */
+function normalizePath(pathname: string): string {
+  return pathname.length > 1 ? pathname.replace(/\/+$/, '') : pathname
+}
+
 export function viewForPath(pathname: string): WorkspaceView | null {
-  return WORKSPACES.find((entry) => entry.path === pathname)?.view ?? null
+  return WORKSPACES.find((entry) => entry.path === normalizePath(pathname))?.view ?? null
 }
 
 export function pathForView(view: WorkspaceView): string {
@@ -108,5 +118,5 @@ export function pathForView(view: WorkspaceView): string {
 /** Unmatched paths (the not-found route) fall back to `cards`, so an
  * unknown URL keeps the app's original look. */
 export function compositionForPath(pathname: string): Composition {
-  return WORKSPACES.find((entry) => entry.path === pathname)?.composition ?? 'cards'
+  return WORKSPACES.find((entry) => entry.path === normalizePath(pathname))?.composition ?? 'cards'
 }

@@ -61,4 +61,15 @@ describe('workspaces', () => {
     expect(compositionForPath('/schedule')).toBe('cards')
     expect(compositionForPath('/does-not-exist')).toBe('cards')
   })
+
+  it('treats a trailing slash as the same path (a route also matches it)', () => {
+    expect(compositionForPath('/notes/')).toBe('canvas')
+    expect(compositionForPath('/today/')).toBe('cards')
+    expect(viewForPath('/notes/')).toBe('notes')
+  })
+
+  it('does not treat the root path itself as a trailing slash to strip', () => {
+    expect(viewForPath('/')).toBeNull()
+    expect(compositionForPath('/')).toBe('cards')
+  })
 })
