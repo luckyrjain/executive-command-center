@@ -96,6 +96,7 @@ describe('WaitingView', () => {
     const invalidateSpy = vi.spyOn(client, 'invalidateQueries')
 
     await waitFor(() => expect(screen.getByText('Waiting on vendor signature')).toBeTruthy())
+    expect(screen.getByRole('button', { name: 'Fulfil waiting item wl-1' }).className).toBe('btn-primary')
     fireEvent.click(screen.getByRole('button', { name: 'Fulfil waiting item wl-1' }))
 
     await waitFor(() => expect(fetch).toHaveBeenCalledTimes(3))

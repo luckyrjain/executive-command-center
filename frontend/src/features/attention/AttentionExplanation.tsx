@@ -345,7 +345,7 @@ export default function AttentionExplanation({ item, aiEnabled = true }: { item:
       </small>
       <p className="empty-state">This does not change the item’s score or ranking.</p>
       <div className="work-actions" role="group" aria-label="AI explanation actions">
-        <button type="button" onClick={requestExplanation}>Regenerate</button>
+        <button type="button" className="btn-primary" onClick={requestExplanation}>Regenerate</button>
         <button type="button" aria-label="Discard AI explanation" onClick={discard}>Discard</button>
       </div>
     </div>

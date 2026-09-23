@@ -150,7 +150,7 @@ export default function WaitingView() {
               {link.note ? <p>{link.note}</p> : null}
             </div>
             <div className="work-actions" role="group" aria-label={`Actions for waiting item ${link.id}`}>
-              <button type="button" disabled={pending} aria-busy={pending} aria-label={`Fulfil waiting item ${link.id}`} onClick={() => terminalMutation.mutate({ link, action: 'fulfil' })}>Fulfil</button>
+              <button type="button" className="btn-primary" disabled={pending} aria-busy={pending} aria-label={`Fulfil waiting item ${link.id}`} onClick={() => terminalMutation.mutate({ link, action: 'fulfil' })}>Fulfil</button>
               <button type="button" disabled={pending} aria-busy={pending} aria-label={`Cancel waiting item ${link.id}`} onClick={() => terminalMutation.mutate({ link, action: 'cancel' })}>Cancel</button>
             </div>
           </li>

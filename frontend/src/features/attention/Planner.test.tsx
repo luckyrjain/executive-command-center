@@ -94,6 +94,7 @@ describe('Planner', () => {
     // Both actions sit in the shared .work-actions row (spacing/wrap), not bare siblings.
     expect(screen.getByRole('button', { name: 'Accept new plan' }).parentElement?.classList.contains('work-actions')).toBe(true)
     expect(screen.getByRole('button', { name: 'Keep reviewing' }).parentElement?.classList.contains('work-actions')).toBe(true)
+    expect(screen.getByRole('button', { name: 'Accept new plan' }).className).toBe('btn-primary')
   })
 
   it('moves a block via keyboard-operable datetime inputs, not drag-and-drop', async () => {
@@ -108,6 +109,7 @@ describe('Planner', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Move Write the board memo' }))
     fireEvent.change(screen.getByLabelText('New start for Write the board memo'), { target: { value: '2026-07-24T11:00' } })
     fireEvent.change(screen.getByLabelText('New end for Write the board memo'), { target: { value: '2026-07-24T11:30' } })
+    expect(screen.getByRole('button', { name: 'Save new time' }).className).toBe('btn-primary')
     fireEvent.click(screen.getByRole('button', { name: 'Save new time' }))
 
     await waitFor(() => expect(fetch).toHaveBeenCalledTimes(3))

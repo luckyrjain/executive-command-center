@@ -286,6 +286,7 @@ describe('EntityDetail', () => {
 
     const valueInput = await screen.findByLabelText(`Correction value for ${existingClaim.id}`)
     fireEvent.change(valueInput, { target: { value: 'Countess of Lovelace' } })
+    expect(screen.getByRole('button', { name: 'Save correction' }).className).toBe('btn-primary')
     fireEvent.click(screen.getByRole('button', { name: 'Save correction' }))
 
     await waitFor(() => expect(supersedeCalled).toBe(true))

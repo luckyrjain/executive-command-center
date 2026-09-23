@@ -352,7 +352,7 @@ export default function EntityDetail({ entityId, onClose }: EntityDetailProps) {
                           }
                         />
                       </label>
-                      <button type="submit" disabled={correctClaimMutation.isPending} aria-busy={correctClaimMutation.isPending}>Save correction</button>
+                      <button type="submit" className="btn-primary" disabled={correctClaimMutation.isPending} aria-busy={correctClaimMutation.isPending}>Save correction</button>
                       <button type="button" onClick={() => setCorrectingClaimId(null)}>Cancel</button>
                     </form>
                   ) : (
