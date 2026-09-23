@@ -88,11 +88,17 @@ describe('RiskWorkspace', () => {
     const invalidateSpy = vi.spyOn(client, 'invalidateQueries')
 
     fireEvent.change(screen.getByLabelText('Risk description'), { target: { value: 'Vendor renewal may lapse' } })
+    // Details step's Continue is the one dominant forward action in its row.
+    expect(screen.getByRole('button', { name: 'Continue' }).className).toBe('btn-primary')
     fireEvent.click(screen.getByRole('button', { name: 'Continue' }))
     fireEvent.change(screen.getByLabelText('Mitigation'), { target: { value: 'Confirm renewal terms' } })
     fireEvent.change(screen.getByLabelText('Trigger'), { target: { value: 'No signed contract' } })
     fireEvent.change(screen.getByLabelText('Review at'), { target: { value: '2026-08-01T00:00' } })
+    // Plan step's Continue, beside an unstyled Back.
+    expect(screen.getByRole('button', { name: 'Continue' }).className).toBe('btn-primary')
     fireEvent.click(screen.getByRole('button', { name: 'Continue' }))
+    // Review step's submit, beside an unstyled Back.
+    expect(screen.getByRole('button', { name: 'Create risk' }).className).toBe('btn-primary')
     fireEvent.click(screen.getByRole('button', { name: 'Create risk' }))
 
     await waitFor(() => expect(fetch).toHaveBeenCalledTimes(3))

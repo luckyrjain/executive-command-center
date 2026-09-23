@@ -198,7 +198,7 @@ export default function PolicyPanel() {
             <label>Data classes (comma separated)
               <input value={draft.dataClasses} onChange={(e) => setDraft({ ...draft, dataClasses: e.target.value })} />
             </label>
-            <div className="work-actions"><button type="button" onClick={goCreateNext}>Continue</button></div>
+            <div className="work-actions"><button type="button" className="btn-primary" onClick={goCreateNext}>Continue</button></div>
           </div>
         ) : createStep === 'limits' ? (
           <div className="field-form">
@@ -218,7 +218,7 @@ export default function PolicyPanel() {
             <label>Schedule note (optional)
               <input value={draft.schedule} onChange={(e) => setDraft({ ...draft, schedule: e.target.value })} />
             </label>
-            <div className="work-actions"><button type="button" onClick={goCreateBack}>Back</button><button type="button" onClick={goCreateNext}>Continue</button></div>
+            <div className="work-actions"><button type="button" onClick={goCreateBack}>Back</button><button type="button" className="btn-primary" onClick={goCreateNext}>Continue</button></div>
           </div>
         ) : (
           <div className="wizard-review">
@@ -233,7 +233,7 @@ export default function PolicyPanel() {
               <div><dt>Approval mode</dt><dd>{draft.approvalMode.replaceAll('_', ' ')}</dd></div>
               <div><dt>Schedule note</dt><dd>{draft.schedule || '—'}</dd></div>
             </dl>
-            <div className="work-actions"><button type="button" onClick={goCreateBack}>Back</button><button type="submit" aria-busy={createMutation.isPending} disabled={pending}>{createMutation.isPending ? 'Creating…' : 'Create policy'}</button></div>
+            <div className="work-actions"><button type="button" onClick={goCreateBack}>Back</button><button type="submit" className="btn-primary" aria-busy={createMutation.isPending} disabled={pending}>{createMutation.isPending ? 'Creating…' : 'Create policy'}</button></div>
           </div>
         )}
       </form>

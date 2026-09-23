@@ -264,7 +264,7 @@ export default function RiskWorkspace() {
           <label>Impact (1-5)<input aria-label="Impact" type="number" min={1} max={5} value={create.impact} onChange={(e) => setCreate({ ...create, impact: Number(e.target.value) })} /></label>
           <label>Status<select value={create.status} onChange={(e) => setCreate({ ...create, status: e.target.value as RiskStatus })}>{STATUSES.map((status) => <option key={status} value={status}>{status}</option>)}</select></label>
           <div className="work-actions">
-            <button type="button" onClick={goCreateNext}>Continue</button>
+            <button type="button" className="btn-primary" onClick={goCreateNext}>Continue</button>
           </div>
         </div>
       ) : createStep === 'plan' ? (
@@ -278,7 +278,7 @@ export default function RiskWorkspace() {
           <label className="field-checkbox"><input type="checkbox" checked={create.pinned} onChange={(e) => setCreate({ ...create, pinned: e.target.checked })} /> Pinned</label>
           <div className="work-actions">
             <button type="button" onClick={goCreateBack}>Back</button>
-            <button type="button" onClick={goCreateNext}>Continue</button>
+            <button type="button" className="btn-primary" onClick={goCreateNext}>Continue</button>
           </div>
         </div>
       ) : (
@@ -298,7 +298,7 @@ export default function RiskWorkspace() {
           </dl>
           <div className="work-actions">
             <button type="button" onClick={goCreateBack}>Back</button>
-            <button type="submit" aria-busy={pending} disabled={pending}>Create risk</button>
+            <button type="submit" className="btn-primary" aria-busy={pending} disabled={pending}>Create risk</button>
           </div>
         </div>
       )}

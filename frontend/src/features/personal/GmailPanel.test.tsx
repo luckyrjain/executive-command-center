@@ -130,7 +130,12 @@ describe('GmailPanel', () => {
   it('starts the OAuth flow and redirects the browser to the returned authorization_url', async () => {
     const fetch = stubFetch({ domains: [], connectors: [] })
     renderPanel()
-    fireEvent.click(await screen.findByRole('button', { name: 'Continue' }))
+    // Step 1's Continue is the one dominant forward action in its row (no Back yet).
+    const continueButton = await screen.findByRole('button', { name: 'Continue' })
+    expect(continueButton.className).toBe('btn-primary')
+    fireEvent.click(continueButton)
+    // Step 2's Connect Gmail, beside an unstyled Back.
+    expect(screen.getByRole('button', { name: 'Connect Gmail' }).className).toBe('btn-primary')
     fireEvent.click(screen.getByRole('button', { name: 'Connect Gmail' }))
     await waitFor(() => expect(fetch).toHaveBeenCalledWith(
       expect.stringContaining('/api/v1/personal/gmail/oauth/start'),

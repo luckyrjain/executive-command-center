@@ -345,7 +345,7 @@ export default function GmailPanel() {
             </li>
           </ul>
           <div className="work-actions">
-            <button type="button" onClick={() => setConnectStep(2)}>Continue</button>
+            <button type="button" className="btn-primary" onClick={() => setConnectStep(2)}>Continue</button>
           </div>
         </div>
       ) : (
@@ -355,7 +355,7 @@ export default function GmailPanel() {
           <p>You'll leave Executive Command Center briefly for Google's own sign-in and consent screen, then land right back here.</p>
           <div className="work-actions">
             <button type="button" onClick={() => setConnectStep(1)}>Back</button>
-            <button type="button" aria-busy={oauthStartMutation.isPending} disabled={oauthStartMutation.isPending} onClick={() => oauthStartMutation.mutate()}>
+            <button type="button" className="btn-primary" aria-busy={oauthStartMutation.isPending} disabled={oauthStartMutation.isPending} onClick={() => oauthStartMutation.mutate()}>
               {oauthStartMutation.isPending ? 'Redirecting to Google…' : 'Connect Gmail'}
             </button>
           </div>

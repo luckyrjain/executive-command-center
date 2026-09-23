@@ -85,10 +85,16 @@ describe('WorkflowList', () => {
 
     await waitFor(() => expect(screen.getByText('No workflows yet. Draft one below.')).toBeTruthy())
     fireEvent.change(screen.getByLabelText('Workflow ID'), { target: { value: 'new-flow' } })
+    // Basics step's Continue is the one dominant forward action in its row.
+    expect(screen.getByRole('button', { name: 'Continue' }).className).toBe('btn-primary')
     fireEvent.click(screen.getByRole('button', { name: 'Continue' }))
     fireEvent.change(screen.getByLabelText('Step ID for step 1'), { target: { value: 's1' } })
     fireEvent.change(screen.getByLabelText('Action reference for step 1'), { target: { value: 'local.create_note' } })
+    // Build step's Continue, beside an unstyled Back.
+    expect(screen.getByRole('button', { name: 'Continue' }).className).toBe('btn-primary')
     fireEvent.click(screen.getByRole('button', { name: 'Continue' }))
+    // Review step's submit, beside an unstyled Back.
+    expect(screen.getByRole('button', { name: 'Create draft' }).className).toBe('btn-primary')
     fireEvent.click(screen.getByRole('button', { name: 'Create draft' }))
 
     await waitFor(() => expect(onSelect).toHaveBeenCalledWith('new-version-1'))

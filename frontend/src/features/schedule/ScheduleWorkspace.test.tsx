@@ -64,8 +64,14 @@ describe('ScheduleWorkspace', () => {
     fireEvent.change(screen.getByLabelText('Event start'), { target: { value: '2026-07-20T10:00' } })
     fireEvent.change(screen.getByLabelText('Event end'), { target: { value: '2026-07-20T11:00' } })
     fireEvent.change(screen.getByLabelText('Event timezone'), { target: { value: 'Asia/Kolkata' } })
+    // Basics step's Continue is the one dominant forward action in its row.
+    expect(eventPanel().getByRole('button', { name: 'Continue' }).className).toBe('btn-primary')
     fireEvent.click(eventPanel().getByRole('button', { name: 'Continue' }))
+    // Details step's Continue, beside an unstyled Back.
+    expect(eventPanel().getByRole('button', { name: 'Continue' }).className).toBe('btn-primary')
     fireEvent.click(eventPanel().getByRole('button', { name: 'Continue' }))
+    // Review step's submit, beside an unstyled Back.
+    expect(eventPanel().getByRole('button', { name: 'Create event' }).className).toBe('btn-primary')
     fireEvent.click(eventPanel().getByRole('button', { name: 'Create event' }))
 
     await waitFor(() => expect(fetch).toHaveBeenCalledTimes(4))
@@ -213,11 +219,17 @@ describe('ScheduleWorkspace', () => {
     fireEvent.change(screen.getByLabelText('Meeting start'), { target: { value: '2026-07-20T10:00' } })
     fireEvent.change(screen.getByLabelText('Meeting end'), { target: { value: '2026-07-20T11:00' } })
     fireEvent.change(screen.getByLabelText('Meeting timezone'), { target: { value: 'Asia/Kolkata' } })
+    // Basics step's Continue is the one dominant forward action in its row.
+    expect(meetingPanel().getByRole('button', { name: 'Continue' }).className).toBe('btn-primary')
     fireEvent.click(meetingPanel().getByRole('button', { name: 'Continue' }))
     fireEvent.change(screen.getByLabelText('Meeting agenda'), { target: { value: 'Goals' } })
     fireEvent.change(screen.getByLabelText('Meeting preparation'), { target: { value: 'Reflect' } })
     fireEvent.change(screen.getByLabelText('Meeting notes summary'), { target: { value: 'Next steps' } })
+    // Notes step's Continue, beside an unstyled Back.
+    expect(meetingPanel().getByRole('button', { name: 'Continue' }).className).toBe('btn-primary')
     fireEvent.click(meetingPanel().getByRole('button', { name: 'Continue' }))
+    // Review step's submit, beside an unstyled Back.
+    expect(meetingPanel().getByRole('button', { name: 'Create standalone meeting' }).className).toBe('btn-primary')
     fireEvent.click(meetingPanel().getByRole('button', { name: 'Create standalone meeting' }))
     await waitFor(() => expect(fetch).toHaveBeenCalledTimes(4))
     expect(JSON.parse(String((fetch.mock.calls[2][1] as RequestInit).body))).toEqual({

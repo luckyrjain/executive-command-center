@@ -142,9 +142,15 @@ describe('PolicyPanel', () => {
 
     await waitFor(() => expect(screen.getByText('No policies recorded yet.')).toBeTruthy())
     fireEvent.change(screen.getByLabelText('Workflow ID'), { target: { value: 'weekly-digest' } })
+    // Scope step's Continue is the one dominant forward action in its row.
+    expect(screen.getByRole('button', { name: 'Continue' }).className).toBe('btn-primary')
     fireEvent.click(screen.getByRole('button', { name: 'Continue' }))
     fireEvent.change(screen.getByLabelText('Count limit'), { target: { value: '25' } })
+    // Limits step's Continue, beside an unstyled Back.
+    expect(screen.getByRole('button', { name: 'Continue' }).className).toBe('btn-primary')
     fireEvent.click(screen.getByRole('button', { name: 'Continue' }))
+    // Review step's submit, beside an unstyled Back.
+    expect(screen.getByRole('button', { name: 'Create policy' }).className).toBe('btn-primary')
     fireEvent.click(screen.getByRole('button', { name: 'Create policy' }))
 
     await waitFor(() => expect(fetch).toHaveBeenCalledTimes(3))
