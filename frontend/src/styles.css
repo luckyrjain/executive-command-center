@@ -539,8 +539,12 @@ button[aria-pressed="true"] { border-color: var(--color-ink); background: var(--
 
 /* Pinned to the viewport so the tinted column stays full-height while a tall
  * page scrolls. Without this it scrolls away and, on a canvas page (white
- * content area), leaves a visible step where the sidebar ends. At scroll
- * position 0 the box is identical to the old `min-height: 100vh`. */
+ * content area), leaves a visible step where the sidebar ends. `height`, not
+ * `min-height`: a sticky box has to be viewport-tall to stay pinned, so on a
+ * window shorter than the nav's own content (about 800px) the column is
+ * clamped and `overflow-y: auto` is what still lets the lower links be
+ * reached. On a taller window the nav content fits and the box renders
+ * exactly as the old `min-height: 100vh` did. */
 .sidebar-nav {
   flex: 0 0 224px;
   background: var(--color-surface-recessed);
