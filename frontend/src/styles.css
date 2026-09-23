@@ -86,6 +86,7 @@
   --content-max: 1440px;
   --content-reading: 720px;
   --content-form: 680px;
+  --content-select: 320px;
 
   /* Radius -- the two systematic radii in use. A handful of components
    * (`.dashboard-card` 20px, `.recommendation-list > li.is-pinned` and
@@ -136,6 +137,11 @@ div.workspace-switcher {
   margin: 0 auto;
   padding: 40px var(--page-gutter) var(--space-4);
 }
+/* The switcher's select is wrapped in `.field-form` for its label/select
+ * layout; that rule's `margin-top: 28px` would stack on the 40px padding
+ * above and its 680px `max-width` would stretch a 2-3 option control across
+ * the page chrome. */
+div.workspace-switcher .field-form { margin-top: 0; max-width: var(--content-select); }
 
 .topbar,
 .brief-heading,
@@ -236,6 +242,7 @@ button[aria-busy="true"]:disabled { cursor: wait; }
 
 .section-heading { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
 .section-heading h2 { margin: 0; font-size: var(--text-lg); letter-spacing: -.01em; }
+
 .section-heading > span {
   min-width: 28px;
   border-radius: 999px;
@@ -245,6 +252,22 @@ button[aria-busy="true"]:disabled { cursor: wait; }
   font-size: var(--text-xs);
   font-weight: 800;
 }
+
+/* A sub-grouping inside a `.work-panel` that needs its own heading without
+ * becoming a second card -- DESIGN.md: "don't nest bordered panels inside
+ * bordered panels ... reach for a heading + spacing, not another card."
+ * Replaces `.dashboard-card` (a distinct, boxed 12-column grid cell) where
+ * it had been reused purely for its box styling inside an already-boxed
+ * `.work-panel` (AttentionQueue.tsx, MeetingPrep.tsx, Planner.tsx), and
+ * the earlier, identical `.nested-section` (GmailPanel.tsx). A direct-child
+ * h2 keeps its UA size (~24px, above MeetingPrep Facts' ~18.7px UA h3
+ * sub-headings, and matching the panel's own "Propose a plan" h2) but loses
+ * its ~20px UA margins. `.empty-state`'s own 50px top margin and centering
+ * are for a whole empty list, not a subsection's one-line note, where they
+ * left the text nearer the next section's heading than its own. */
+.work-subsection { margin-top: var(--space-8); }
+.work-subsection > h2 { margin: 0 0 var(--space-3); }
+.work-subsection .empty-state { margin-top: var(--space-4); text-align: left; }
 
 .item-list { list-style: none; margin: 18px 0 0; padding: 0; }
 .item-list li {
@@ -321,7 +344,7 @@ button[aria-busy="true"]:disabled { cursor: wait; }
 }
 
 .field-hint { margin: -8px 0 14px; color: var(--color-text-muted); font-size: var(--text-sm); }
-.field-hint code { background: var(--color-surface-recessed); color: var(--color-text-secondary); border-radius: 4px; padding: 1px 5px; }
+.field-hint code { background: var(--color-surface-recessed); color: var(--color-text-secondary); border-radius: var(--radius-control); padding: 1px 5px; }
 .field-error { margin: -8px 0 14px; color: var(--color-text-danger-strong); font-size: var(--text-sm); font-weight: 700; }
 
 /* `aria-invalid="true"` is set both by this per-field-as-you-type
@@ -334,7 +357,6 @@ button[aria-busy="true"]:disabled { cursor: wait; }
 input[aria-invalid="true"],
 textarea[aria-invalid="true"],
 select[aria-invalid="true"] { border-color: var(--color-border-danger); background: var(--color-bg-danger); }
-.nested-section { margin-top: var(--space-8); }
 
 .wizard-stepper { display: flex; align-items: center; margin: 20px 0 24px; padding: 0; list-style: none; }
 .wizard-step-node { display: flex; align-items: center; gap: 8px; flex: 1; }
@@ -384,9 +406,54 @@ select[aria-invalid="true"] { border-color: var(--color-border-danger); backgrou
 
 .schedule-workspace { display: grid; gap: 24px; }
 .schedule-workspace > .work-panel { max-width: none; }
+/* `.work-heading h1` alongside `h2` -- most workspace pages (Tasks,
+ * Commitments, Risks, Personal, Engineering, ...) use `<h1>` for their own
+ * page title, which this selector never covered; those titles fell
+ * through to the bare `h1` rule above (clamp(42px, 7vw, 78px), the size for
+ * any `<h1>` not scoped by `.topbar`) instead of this panel-title scale. At
+ * that larger size, a page rendered two-up in `.work-grid` (e.g. Tasks next
+ * to Commitments) could overflow its own column -- "Commitments" alone
+ * forced a ~450-480px-wide heading into a ~250-260px column, causing real
+ * page-wide horizontal scroll around 900-1150px viewports.
+ * `overflow-wrap: anywhere` (on `.work-heading` only: it lets a title shrink
+ * to one character, so beside a non-shrinking sibling -- "Recommendations"
+ * next to its button -- it broke mid-word) is the backstop for a title that
+ * still can't fit, e.g. a long unbroken entity name: it breaks rather than
+ * overflows. `line-height` matches `.topbar h1`: the bare `h1` rule's .94 is
+ * tight enough to crowd a title that wraps onto a second line, and the
+ * `.work-heading h2` titles previously inherited body's 1.55. */
 .recommendation-heading h2,
 .explore-heading h2,
+.work-heading h1,
 .work-heading h2 { margin: 0; font-size: var(--text-display-sm); letter-spacing: -.035em; }
+.work-heading h1,
+.work-heading h2 { line-height: 1.05; overflow-wrap: anywhere; }
+/* Two-up `.work-grid` (one column at <=800px): each column is about half the
+ * content width, and at the viewport-based panel-title scale "Commitments"
+ * doesn't fit it from 801px to ~960px and only just fits beyond (a 1-6px margin
+ * at ~1000px in the default font; a wider fallback font breaks it). So a title
+ * here is sized from the width of its own `.work-heading` (`cqi`; the heading
+ * fills the panel's content box) rather than the viewport: ~11% of it, so the
+ * longest single word (~8em in a wide font) stays inside, held between the
+ * `--text-2xl` floor (below which `overflow-wrap` is the backstop) and the
+ * panel-title ceiling. A narrow column reads at 28px, a wide one (or the single
+ * column at <=800px) reaches the full scale, with no breakpoint or
+ * font-dependent cutoff.
+ * The heading, not the `.work-panel`, is the size container: inline-size
+ * containment drops an element's content from its intrinsic width, and on the
+ * panel that stopped a narrow grid column from growing for its other content (a
+ * nowrap wizard stepper spilled out of the card at 320px). The heading holds
+ * only the title block, so nothing else is affected.
+ * The size is behind `@supports` because a declaration that uses `var()` never
+ * falls back at parse time: without `cqi` support it would compute to the
+ * inherited body size instead of the 28px above it. */
+.work-grid .work-heading { container-type: inline-size; }
+.work-grid .work-heading h1,
+.work-grid .work-heading h2 { font-size: var(--text-2xl); }
+@supports (font-size: 1cqi) {
+  .work-grid .work-heading h1,
+  .work-grid .work-heading h2 { font-size: min(var(--text-display-sm), max(var(--text-2xl), 11cqi)); }
+}
 .recommendation-heading p:not(.eyebrow),
 .explore-heading p:not(.eyebrow),
 .work-heading p:not(.eyebrow) { max-width: var(--content-reading); margin: 10px 0 0; color: var(--color-text-muted); }
@@ -501,7 +568,13 @@ select[aria-invalid="true"] { border-color: var(--color-border-danger); backgrou
 .note-list p { margin: 10px 0 0; color: var(--color-text-body); line-height: 1.55; white-space: pre-wrap; overflow-wrap: anywhere; }
 .note-editor { border-top: 1px solid var(--color-border-subtle); padding-top: 28px; }
 
-.tab-list { display: flex; gap: 8px; }
+/* flex-wrap: a `.tab-list` with more tabs than fit (Engineering's 10) wraps
+ * to a second row instead of overflowing off-edge with no scroll affordance.
+ * flex-shrink: 0: as a flex item beside a title (`.explore-heading`, Search &
+ * Audit's two tabs), wrapping made the list's min-content one button wide, so
+ * it shrank and stacked its tabs from 521px to ~1300px; it keeps its own width
+ * there and still wraps within a full-width parent. */
+.tab-list { display: flex; flex-wrap: wrap; flex-shrink: 0; gap: 8px; }
 .tab-list button[aria-selected="true"] { border-color: var(--color-ink); background: var(--color-ink); color: var(--color-text-on-ink); }
 
 /* A toggle button (`aria-pressed`) previously had no selected-state style

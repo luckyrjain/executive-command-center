@@ -598,6 +598,29 @@ def test_backfill_then_resync_with_changed_title_updates_row_and_content_hash(
     assert after.content_hash != before.content_hash
 
 
+def test_work_item_search_requests_newest_first_at_the_shared_page_size(
+    seeded_account_context: ConnectorAccountContext,
+) -> None:
+    """The walker's watermark stop is only sound if issues come back
+    newest-first, so the JQL ordering is part of the contract.
+    """
+    from ecc.domains.engineering import jira_adapter as jira_adapter_module
+
+    seen: list[httpx.QueryParams] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.url.params)
+        return _json_response(_search_response([]))
+
+    adapter = JiraAdapter(transport=httpx.MockTransport(handler))
+    adapter.backfill(seeded_account_context, "work_item")
+
+    assert len(seen) == 1
+    assert seen[0]["jql"].endswith("ORDER BY updated DESC")
+    assert seen[0]["maxResults"] == str(jira_adapter_module._PAGE_SIZE)
+    assert "nextPageToken" not in seen[0]
+
+
 def test_incremental_sync_stops_at_prior_cursor(
     seeded_account_context: ConnectorAccountContext,
 ) -> None:
@@ -753,7 +776,7 @@ def test_sync_work_items_raises_on_generic_failure_status() -> None:
         return _json_response({"message": "Server error"}, status_code=500)
 
     adapter = JiraAdapter(transport=httpx.MockTransport(handler))
-    with pytest.raises(RuntimeError, match="500"):
+    with pytest.raises(RuntimeError, match="Jira work item list failed with status 500"):
         adapter.backfill(_account_context(), "work_item")
 
 
@@ -894,6 +917,58 @@ def test_backfill_stale_resume_token_falls_back_to_a_fresh_walk(
     # Exactly one retry: the stale attempt, then a fresh page-1 request
     # with no token at all.
     assert tokens_seen == ["stale-token", None]
+
+
+def test_backfill_resume_token_failing_with_a_non_400_status_is_not_retried(
+    seeded_account_context: ConnectorAccountContext,
+) -> None:
+    """Only a `400` means "stale token"; any other failure on a request that
+    carried a token must raise, not silently restart from page 1.
+    """
+    tokens_seen: list[str | None] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        tokens_seen.append(request.url.params.get("nextPageToken"))
+        return _json_response({"message": "Server error"}, status_code=500)
+
+    adapter = JiraAdapter(transport=httpx.MockTransport(handler))
+    with pytest.raises(RuntimeError, match="status 500"):
+        adapter.backfill(seeded_account_context, "work_item", resume_cursor="some-token")
+    assert tokens_seen == ["some-token"]
+
+
+def test_backfill_tolerates_a_response_with_no_issues_key(
+    seeded_account_context: ConnectorAccountContext,
+) -> None:
+    adapter = JiraAdapter(transport=httpx.MockTransport(lambda request: _json_response({})))
+    outcome = adapter.backfill(seeded_account_context, "work_item")
+    assert outcome.status == "succeeded"
+    assert outcome.items_processed == 0
+
+
+@pytest.mark.parametrize("bad_token", [{"a": 1}, ["x"], 7, True, ""])
+def test_backfill_ignores_a_non_string_or_empty_next_page_token(
+    seeded_account_context: ConnectorAccountContext, bad_token: Any
+) -> None:
+    """A malformed `nextPageToken` is not a usable cursor: it must end the
+    walk cleanly rather than being persisted as a resume cursor / replayed
+    as a query parameter.
+    """
+    requests_seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests_seen.append(str(request.url))
+        body = _search_response(
+            [_issue(1, key="ACME-1", summary="Issue", updated="2024-01-01T00:00:00.000+0000")]
+        )
+        body["nextPageToken"] = bad_token
+        return _json_response(body)
+
+    adapter = JiraAdapter(transport=httpx.MockTransport(handler))
+    outcome = adapter.backfill(seeded_account_context, "work_item")
+    assert outcome.status == "succeeded"
+    assert outcome.backfill_resume_cursor is None
+    assert len(requests_seen) == 1
 
 
 def test_backfill_stale_resume_token_retry_draws_from_the_same_budget(
@@ -1195,6 +1270,97 @@ def test_sync_backfill_writes_work_items_then_incremental_only_writes_newer(
             )
         }
     assert titles == {"First", "Second", "Third"}
+
+
+def test_partial_incremental_keeps_the_watermark_refreshes_the_cursor_row_and_loses_nothing(
+    engineering_test_context: tuple[TestClient, UUID, UUID, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An incremental call rate-limited after page 1 must not advance the
+    watermark to page 1's newest item (the older page-2 item would then be
+    skipped for good), but must still touch `sync_cursors.updated_at`
+    (`metrics.py`'s coverage freshness reads it).
+    """
+    client, workspace_id, user_id, token = engineering_test_context
+    account_id = _insert_jira_connector_account(workspace_id, user_id)
+    backfill_watermark = "2024-01-01T00:00:00.000+0000"
+    state = {"call": 0, "second_incremental_page_limited": True}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        state["call"] += 1
+        if state["call"] == 1:  # backfill
+            return _json_response(
+                _search_response(
+                    [_issue(1, key="ACME-1", summary="Old", updated=backfill_watermark)]
+                )
+            )
+        if request.url.params.get("nextPageToken") is None:  # incremental page 1
+            return _json_response(
+                _search_response(
+                    [
+                        _issue(
+                            4,
+                            key="ACME-4",
+                            summary="Newest",
+                            updated="2024-01-04T00:00:00.000+0000",
+                        )
+                    ],
+                    next_page_token="page-2",
+                )
+            )
+        if state["second_incremental_page_limited"]:
+            return _json_response({}, status_code=429)
+        return _json_response(
+            _search_response(
+                [_issue(3, key="ACME-3", summary="Middle", updated="2024-01-03T00:00:00.000+0000")]
+            )
+        )
+
+    registry = ConnectorRegistry()
+    registry.register(JiraAdapter(transport=httpx.MockTransport(handler)))
+    monkeypatch.setattr(connector_accounts_module, "connector_registry", registry)
+
+    def sync(run_type: str) -> dict[str, Any]:
+        response = client.post(
+            f"/api/v1/engineering/connectors/{account_id}/sync",
+            json={"run_type": run_type, "resource_type": "work_item"},
+            headers=_headers(token, key=str(uuid4())),
+        )
+        assert response.status_code == 201, response.text
+        return response.json()
+
+    def cursor_row() -> Any:
+        with engine.begin() as connection:
+            return connection.execute(
+                text(
+                    "SELECT cursor_value, updated_at FROM sync_cursors "
+                    "WHERE connector_account_id = :id AND resource_type = 'work_item'"
+                ),
+                {"id": account_id},
+            ).one()
+
+    sync("backfill")
+    watermark_after_backfill, updated_at_after_backfill = cursor_row()
+    assert watermark_after_backfill == backfill_watermark
+
+    partial = sync("incremental")
+    assert partial["status"] == "partial"
+    watermark_after_partial, updated_at_after_partial = cursor_row()
+    assert watermark_after_partial == backfill_watermark
+    assert updated_at_after_partial > updated_at_after_backfill
+
+    state["second_incremental_page_limited"] = False
+    healed = sync("incremental")
+    assert healed["status"] == "succeeded"
+    with engine.begin() as connection:
+        titles = {
+            row[0]
+            for row in connection.execute(
+                text("SELECT title FROM engineering_work_items WHERE workspace_id = :workspace_id"),
+                {"workspace_id": workspace_id},
+            )
+        }
+    assert titles == {"Old", "Newest", "Middle"}
 
 
 def test_sync_reports_partial_on_rate_limit_and_records_it(

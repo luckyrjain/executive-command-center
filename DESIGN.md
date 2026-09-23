@@ -14,7 +14,7 @@ One font, everywhere: `Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacS
 
 | Element | Size | Notes |
 |---|---|---|
-| Panel title (`.work-heading h2`) | `--text-display-sm` (`clamp(28px, 4vw, 44px)`) | `letter-spacing: -.035em` |
+| Panel title (`.work-heading h1, h2`) | `--text-display-sm` (`clamp(28px, 4vw, 44px)`); inside a two-up `.work-grid` it is sized from the panel's own width — `min(--text-display-sm, max(--text-2xl, 11cqi))`, i.e. 28px in a narrow column up to the full scale in a wide one — so a title grows with its column instead of overflowing it at a viewport-based cutoff | `letter-spacing: -.035em`, `line-height: 1.05`; a title that still can't fit breaks mid-word (`overflow-wrap: anywhere`, `.work-heading` only) rather than overflowing its column |
 | Section heading | `--text-lg` (`18px`) | weight `700` |
 | Eyebrow label | small, uppercase, muted | sits above a heading, or above a wizard step (`Step N of M · Label`) |
 | Wizard review value (`.wizard-review dd.is-machine-value`) | `--text-sm` (`13px`) | `ui-monospace, SFMono-Regular, Menlo, monospace` — the one deliberate exception to "one font," scoped to genuinely machine-shaped review values (IDs, timestamps, timezones, credential secrets) via an explicit class, not applied to every review value |
@@ -66,7 +66,7 @@ A global scale, `--space-1` (4px) through `--space-24` (96px), doubling roughly 
 
 ## Container & grid
 
-`.app-shell` is the app's only page frame, and the tokens name its real values rather than introduce new ones: `--page-gutter: clamp(20px, 4vw, 64px); --content-max: 1440px;`. Two additional tokens exist for content measure: `--content-reading: 720px` (applied to `.work-heading p`/`.recommendation-heading p`/`.explore-heading p`; `.recommendation-copy > p` uses a pre-existing, unreconciled 760px and was left alone rather than silently changed) and `--content-form: 680px`, applied as a `max-width` on `.field-form` — every labeled-fields block in the app, wizard steps included, now caps at a readable measure instead of stretching to its panel's full width.
+`.app-shell` is the app's only page frame, and the tokens name its real values rather than introduce new ones: `--page-gutter: clamp(20px, 4vw, 64px); --content-max: 1440px;`. Two additional tokens exist for content measure: `--content-reading: 720px` (applied to `.work-heading p`/`.recommendation-heading p`/`.explore-heading p`; `.recommendation-copy > p` uses a pre-existing, unreconciled 760px and was left alone rather than silently changed) and `--content-form: 680px`, applied as a `max-width` on `.field-form` — every labeled-fields block in the app, wizard steps included, now caps at a readable measure instead of stretching to its panel's full width. A third, `--content-select: 320px`, caps the workspace switcher's lone select (`div.workspace-switcher .field-form`), which would otherwise inherit the form measure.
 
 ## Layout primitives
 
@@ -74,6 +74,7 @@ A global scale, `--space-1` (4px) through `--space-24` (96px), doubling roughly 
 |---|---|
 | `.work-panel` | Standard card under `cards` composition: `border-radius: var(--radius-panel)`, `--shadow-panel` elevation, `padding: clamp(24px, 4vw, 42px)`. Under `canvas` composition it loses its border, radius, fill, shadow and padding (Composition below) |
 | `.work-heading` | Panel title block: eyebrow + h1/h2 + description |
+| `.work-subsection` | A titled sub-grouping inside a `.work-panel`: `margin-top: var(--space-8)`, no border or background — the sanctioned alternative to nesting a card in a panel. A direct-child `h2` keeps its UA-default size (above the UA-default `h3` sub-headings) with the UA margins reset; an `.empty-state` inside it is left-aligned and tight to its heading. Used by Attention, Meeting prep, Planner and Gmail |
 | `.work-actions` | Button row: `flex`, `wrap`, `gap: 8px` |
 | `.empty-state` | Centered muted text for a zero-item list |
 | `.inline-status` / `.error-panel` | Status and error banners (`role="status"` / `role="alert"`) |
@@ -244,7 +245,7 @@ Two breakpoints, both in `styles.css`'s trailing media queries — there's no se
 | Breakpoint | What changes |
 |---|---|
 | `max-width: 800px` | Dashboard cards go full-width (`grid-column: 1 / -1`); `.recommendation-list` items and `.work-grid` collapse to a single column; `.recommendation-actions` switches from its default column layout to row (wraps), `.audit-list` items switch from row to column, to fit the narrower measure |
-| `max-width: 520px` | Panel heading rows (`.topbar`, `.brief-heading`, etc.) stack vertically instead of side-by-side; panel corner radius shrinks; `.recommendation-actions` flips back to column (a real double-flip: column at rest → row at 800px → column again at 520px, not a typo); `.search-form > div` and `.tab-list` go full-width and stack |
+| `max-width: 520px` | Panel heading rows (`.topbar`, `.brief-heading`, etc.) stack vertically instead of side-by-side; panel corner radius shrinks; `.recommendation-actions` flips back to column (a real double-flip: column at rest → row at 800px → column again at 520px, not a typo); `.search-form > div` and `.tab-list` go full-width and stack (above 520px a `.tab-list` wraps onto extra rows instead, e.g. Engineering's 10 tabs) |
 
 No component-level responsive behavior beyond this — a wizard, a `.field-form`, and a stepper all render identically from mobile through desktop widths; only the surrounding page chrome (headings, card grids, action rows) reflows. If a new surface needs its own breakpoint behavior, it's a deviation from the current pattern, not an extension of it — call that out explicitly rather than adding a third silent breakpoint.
 
@@ -277,7 +278,7 @@ Not every page needs all five — a single-panel page (most of this app) collaps
 - **One dominant anchor per page.** A visitor should be able to say what this page is *for* within a couple seconds — a title, a wizard, a table, one clearly primary panel. If a new page has two `.work-panel`s of equal size fighting for attention above the fold, that's the tell something needs to be demoted to a secondary zone or cut from the first viewport.
 - **Primary, secondary, destructive stay visually distinguishable**, per Buttons: action hierarchy above — a row shouldn't present two equally loud actions.
 - **Whitespace and the type ramp do the grouping work before a new border does.** This app is already sparing with borders (under `cards` composition a `.work-panel` carries one 1px hairline border plus a soft shadow and nothing heavier; under `canvas` composition it carries none at all — see Composition) — reach for a spacing-scale gap or a heading-weight change before wrapping a new box in its own card.
-- **Don't nest bordered panels inside bordered panels.** Nothing in the app currently does this; a new feature that needs a sub-grouping inside a `.work-panel` should reach for a heading + spacing, not another card. Whether the page itself is drawn as a card at all is a separate, page-level decision; see Composition.
+- **Don't nest bordered panels inside bordered panels.** Nothing in the app currently does this; a new feature that needs a sub-grouping inside a `.work-panel` should reach for a heading + spacing (`.work-subsection`), not another card. Whether the page itself is drawn as a card at all is a separate, page-level decision; see Composition.
 - **Left-align by default.** Every page in the app composes left-aligned; centered content is reserved for genuinely centered things (the empty-state message pattern), not page-level layout.
 
 ### New-page recipe

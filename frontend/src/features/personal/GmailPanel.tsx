@@ -49,7 +49,7 @@ function ThreadDetail({ threadId, onForgotten }: { threadId: string; onForgotten
   })
 
   return (
-    <div className="nested-section" role="region" aria-label={thread.data?.subject ?? 'Thread'}>
+    <div className="work-subsection" role="region" aria-label={thread.data?.subject ?? 'Thread'}>
       {thread.isLoading ? <p role="status">Loading thread…</p> : null}
       {thread.isError ? <div role="alert" className="inline-status error-panel">{personalErrorMessage(thread.error)}</div> : null}
       {thread.data ? (
@@ -65,7 +65,7 @@ function ThreadDetail({ threadId, onForgotten }: { threadId: string; onForgotten
             {thread.data.messages.length === 0 ? <li className="empty-state">No message bodies are cached for this thread yet.</li> : null}
           </ul>
           <div className="work-actions">
-            <button type="button" aria-busy={forgetMutation.isPending} disabled={forgetMutation.isPending} onClick={() => forgetMutation.mutate()}>
+            <button type="button" className="btn-destructive" aria-busy={forgetMutation.isPending} disabled={forgetMutation.isPending} onClick={() => forgetMutation.mutate()}>
               {forgetMutation.isPending ? 'Forgetting…' : 'Forget cached content for this thread'}
             </button>
           </div>
@@ -253,7 +253,7 @@ export default function GmailPanel() {
       {syncRuns.isError ? <div role="alert" className="inline-status error-panel">{personalErrorMessage(syncRuns.error)}</div> : null}
 
       {activeAccount ? (
-        <div className="nested-section">
+        <div className="work-subsection">
           <div>
             <strong>{activeAccount.display_name}</strong>
             <small> · last synced {formatTimestamp(activeAccount.last_synced_at)}</small>

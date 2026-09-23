@@ -59,11 +59,12 @@ originally used) in favor of `GET /rest/api/3/search/jql` -- the old
 endpoint now returns `410 Gone` for every request, confirmed live against
 a real Jira Cloud site. The replacement has no `total` count and no
 `startAt` at all: a response carries `nextPageToken` (opaque, echoed back
-verbatim on the next request) when more results remain, and omits it on
-the last page. A caller advances by threading `nextPageToken` through,
-not an offset -- `start_at`/`total` bookkeeping is gone from `_sync_work_
-items` entirely, replaced by an opaque cursor the shared walker threads
-through (`paginated_resume_walk.py`).
+verbatim on the next request; a non-string or empty value is treated as
+absent) when more results remain, and omits it on the last page. A
+caller advances by threading `nextPageToken` through, not an offset --
+`start_at`/`total` bookkeeping is gone from `_sync_work_items` entirely,
+replaced by an opaque cursor the shared walker threads through
+(`paginated_resume_walk.py`).
 
 **Incremental cursor strategy.** JQL's `ORDER BY updated DESC` plus
 walking pages until an issue's own `fields.updated` falls at or before
@@ -487,8 +488,13 @@ class JiraAdapter:
             response: httpx.Response, *, cursor: str | None
         ) -> paginated_resume_walk.Page:
             body = response.json()
+            # A non-string/empty token is not a usable cursor: it would be
+            # persisted as `backfill_resume_cursor` (a text column) and
+            # replayed as a query parameter. Treat it as "no next page".
+            token = body.get("nextPageToken")
             return paginated_resume_walk.Page(
-                items=body.get("issues") or [], next_cursor=body.get("nextPageToken")
+                items=body.get("issues") or [],
+                next_cursor=token if isinstance(token, str) and token else None,
             )
 
         def upsert(issue: Mapping[str, Any]) -> None:

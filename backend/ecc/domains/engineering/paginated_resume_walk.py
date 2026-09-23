@@ -37,10 +37,11 @@ can go stale between calls and is rejected with a `400`; see below).
 - Items arrive newest-first by `extract_timestamp`'s own ordering -- the
   watermark stop exits at the first item at or before `since_cursor`, so
   oldest-first data would silently under-sync everything after it.
-- `parse_page`'s `next_cursor` is the sole pagination-continuation signal.
-  A parser that fails to report a next page a provider actually has makes
-  the walk stop after that page and report `succeeded`, silently -- there
-  is no error to alert on.
+- `parse_page`'s `next_cursor` is the sole pagination-continuation signal
+  -- and only for a non-empty page: an empty `items` list ends the walk as
+  `succeeded` even if `next_cursor` is set. A parser that fails to report a
+  next page a provider actually has makes the walk stop after that page and
+  report `succeeded`, silently -- there is no error to alert on.
 - `resume_cursor` is whatever a previous `partial` outcome reported as
   `backfill_resume_cursor`, round-tripped through storage unchanged.
 """
@@ -141,7 +142,11 @@ def walk_paginated_resource(
     at or older than what page 1 of *that same walk's first call* already
     established as the true newest, so a resumed call has nothing new to
     teach the watermark and must not overwrite it with a lower value
-    computed from a page deep in the walk.
+    computed from a page deep in the walk. An *incremental* call
+    (`apply_watermark_stop=True`) that ends `partial` (page cap or rate
+    limit) reports `since_cursor` back unchanged, keeping the old watermark:
+    it only saw the newest slice of the changed range, and advancing the
+    watermark past the unfetched older pages would drop them for good.
 
     `resume_cursor` (the persisted state, used to tell a first backfill
     call from a resumed one) and `start_cursor` (the cursor to actually
@@ -154,7 +159,9 @@ def walk_paginated_resource(
 
     `fetch_page(cursor=..., page_size=...)` returning `None` means
     rate-limited beyond `bounded_single_retry`'s own bound -- reported as
-    `partial`, resumable from the same cursor, never raised.
+    `partial`, resumable from the cursor that was being fetched (or from
+    scratch -- `backfill_resume_cursor=None` -- if nothing was fetched yet
+    on a first call), never raised.
 
     `retry_without_cursor(response)`, when given, is consulted for a
     non-200 response on a request that carried a cursor: if it returns
@@ -176,6 +183,24 @@ def walk_paginated_resource(
     "not comparable".
     """
     key = timestamp_key or (lambda ts: ts)
+
+    # A `partial` outcome may only advance the watermark for a *first
+    # backfill* call (see the docstring above: page 1 of that walk already
+    # established the true newest). An *incremental* walk cut short by the
+    # page cap or a rate limit has only seen the newest slice of what
+    # changed since `since_cursor` -- advancing the watermark to that
+    # slice's newest timestamp would make the next call stop at the first
+    # item and never fetch the older, still-unsynced pages. It reports
+    # `since_cursor` back unchanged instead: the watermark stays put (the
+    # next call re-walks the range; upserts are idempotent), while the
+    # non-`None` value still makes `connector_sync` upsert the cursor row,
+    # which is what `metrics.py`'s coverage freshness reads. A resumed
+    # backfill call reports `None`, as always.
+    def partial_next_cursor(newest: str | None) -> str | None:
+        if resume_cursor is None and not apply_watermark_stop:
+            return newest
+        return since_cursor if apply_watermark_stop else None
+
     items_processed = 0
     newest_updated_at = since_cursor
     since_key = key(since_cursor) if since_cursor is not None else None
@@ -199,11 +224,18 @@ def walk_paginated_resource(
                 resource_type=resource_type,
                 items_processed=items_processed,
                 status="partial",
-                next_cursor=newest_updated_at if resume_cursor is None else None,
+                next_cursor=partial_next_cursor(newest_updated_at),
                 error_summary=(
                     f"{provider_label} rate limit exceeded; sync paused, will resume next call"
                 ),
-                backfill_resume_cursor=cursor,
+                # Rate-limited before fetching anything on a first call:
+                # there is no progress to resume, so report none -- a
+                # persisted `start_cursor` would make the next call look
+                # like a *resumed* one (`resume_cursor is not None`), which
+                # never reports the watermark a first backfill call must.
+                backfill_resume_cursor=(
+                    None if resume_cursor is None and cursor == start_cursor else cursor
+                ),
             )
         if response.status_code != 200:
             if (
@@ -246,18 +278,20 @@ def walk_paginated_resource(
     else:
         # The loop ran `max_pages_per_call` iterations without ever
         # `break`-ing -- i.e. the last page fetched still had further
-        # pages available. `partial`, not `succeeded` -- silently capping
-        # a large account's backfill with no signal that more remained
-        # was the other half of `93ceaf3`'s fix. `next_cursor` is still
-        # the newest timestamp observed so far, so a subsequent
-        # *incremental* sync call resumes from it.
+        # pages available (or the last budget slot went to a stale-cursor
+        # retry, leaving `cursor=None`: the next call then starts over).
+        # `partial`, not `succeeded` -- silently capping a large account's
+        # backfill with no signal that more remained was the other half of
+        # `93ceaf3`'s fix. On a first backfill call `next_cursor` is the
+        # newest timestamp observed so far, so a subsequent *incremental*
+        # sync call resumes from it.
         # `backfill_resume_cursor=cursor`: `cursor` was already advanced to
         # the last page's `next_cursor`, so it names the next page to fetch.
         return SyncOutcome(
             resource_type=resource_type,
             items_processed=items_processed,
             status="partial",
-            next_cursor=newest_updated_at if resume_cursor is None else None,
+            next_cursor=partial_next_cursor(newest_updated_at),
             error_summary=(
                 f"{provider_label} {resource_label} sync hit the {max_pages_per_call}-page "
                 "per-call bound with more pages remaining; sync paused, will resume next call"

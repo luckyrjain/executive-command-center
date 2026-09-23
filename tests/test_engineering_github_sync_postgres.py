@@ -600,6 +600,40 @@ def test_backfill_paginates_via_link_header(
     assert outcome.next_cursor == "2024-01-05T00:00:00Z"
 
 
+def test_repository_list_raises_on_generic_failure_status(
+    seeded_account_context: ConnectorAccountContext,
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return _json_response({"message": "Server error"}, status_code=500)
+
+    adapter = GitHubAdapter(transport=httpx.MockTransport(handler))
+    with pytest.raises(RuntimeError, match="GitHub repository list failed with status 500"):
+        adapter.backfill(seeded_account_context, "repository")
+
+
+def test_repository_list_requests_newest_first_at_the_shared_page_size(
+    seeded_account_context: ConnectorAccountContext,
+) -> None:
+    """The walker's watermark stop is only sound if the provider returns
+    newest-first, so the request's sort/direction is part of the contract.
+    """
+    from ecc.domains.engineering import github_adapter as github_adapter_module
+
+    seen: list[httpx.QueryParams] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.url.params)
+        return _json_response([])
+
+    adapter = GitHubAdapter(transport=httpx.MockTransport(handler))
+    adapter.backfill(seeded_account_context, "repository")
+
+    assert len(seen) == 1
+    assert (seen[0]["sort"], seen[0]["direction"]) == ("updated", "desc")
+    assert seen[0]["per_page"] == str(github_adapter_module._PAGE_SIZE)
+    assert seen[0]["page"] == "1"
+
+
 def test_incremental_sync_stops_at_prior_cursor(
     seeded_account_context: ConnectorAccountContext,
 ) -> None:

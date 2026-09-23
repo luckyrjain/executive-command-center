@@ -144,7 +144,7 @@ export default function MeetingPrep() {
             </div>
           ) : null}
 
-          <section className="dashboard-card" aria-labelledby="prep-objective">
+          <section className="work-subsection" aria-labelledby="prep-objective">
             <h2 id="prep-objective">Objective and timing</h2>
             <p>{pack.objective}</p>
             <p>
@@ -155,14 +155,14 @@ export default function MeetingPrep() {
             </p>
           </section>
 
-          <section className="dashboard-card" aria-labelledby="prep-participants">
+          <section className="work-subsection" aria-labelledby="prep-participants">
             <h2 id="prep-participants">Participants and known roles</h2>
             {pack.participants.length ? (
               <ul>{pack.participants.map((p) => <li key={p.id}>{p.entity_name} · {p.role}</li>)}</ul>
             ) : <p className="empty-state">No participants linked yet.</p>}
           </section>
 
-          <section className="dashboard-card" aria-labelledby="prep-facts">
+          <section className="work-subsection" aria-labelledby="prep-facts">
             <h2 id="prep-facts">Facts</h2>
             <h3>Relevant recent timeline</h3>
             {pack.timeline.length ? (
@@ -189,19 +189,19 @@ export default function MeetingPrep() {
             ) : <p className="empty-state">No notes attached.</p>}
           </section>
 
-          <section className="dashboard-card" aria-labelledby="prep-questions">
+          <section className="work-subsection" aria-labelledby="prep-questions">
             <h2 id="prep-questions">Open questions</h2>
             {pack.open_questions.length ? (
               <ul>{pack.open_questions.map((q, i) => <li key={i}>{q}</li>)}</ul>
             ) : <p className="empty-state">No open questions recorded.</p>}
           </section>
 
-          <section className="dashboard-card" aria-labelledby="prep-suggestions">
+          <section className="work-subsection" aria-labelledby="prep-suggestions">
             <h2 id="prep-suggestions">Suggested agenda (AI-assisted, kept separate from the sections above)</h2>
             {pack.enrichment.available && pack.enrichment.summary ? <p>{pack.enrichment.summary}</p> : <p className="empty-state">No suggestions available.</p>}
           </section>
 
-          <section className="dashboard-card" aria-labelledby="prep-evidence">
+          <section className="work-subsection" aria-labelledby="prep-evidence">
             <h2 id="prep-evidence">Evidence gaps and source freshness</h2>
             <p>Generated {new Date(pack.generated_at).toLocaleString()}</p>
             {pack.evidence_gaps.length ? (

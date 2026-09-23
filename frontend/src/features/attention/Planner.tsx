@@ -163,7 +163,7 @@ export default function Planner() {
       {query.data && plans.length === 0 ? <p className="empty-state">No active plans for this period.</p> : null}
 
       {pendingDiff ? (
-        <section className="dashboard-card" aria-labelledby="replan-diff-title">
+        <section className="work-subsection" aria-labelledby="replan-diff-title">
           <h2 id="replan-diff-title">Review replan before accepting</h2>
           <ol className="item-list">
             {(pendingDiff.diff ?? []).map((entry, index) => (
@@ -173,8 +173,10 @@ export default function Planner() {
               </li>
             ))}
           </ol>
-          <button type="button" disabled={pending} aria-busy={pending} onClick={() => { acceptMutation.mutate(pendingDiff); setPendingDiff(null) }}>Accept new plan</button>
-          <button type="button" disabled={pending} aria-busy={pending} onClick={() => setPendingDiff(null)}>Keep reviewing</button>
+          <div className="work-actions">
+            <button type="button" disabled={pending} aria-busy={pending} onClick={() => { acceptMutation.mutate(pendingDiff); setPendingDiff(null) }}>Accept new plan</button>
+            <button type="button" disabled={pending} aria-busy={pending} onClick={() => setPendingDiff(null)}>Keep reviewing</button>
+          </div>
         </section>
       ) : null}
 

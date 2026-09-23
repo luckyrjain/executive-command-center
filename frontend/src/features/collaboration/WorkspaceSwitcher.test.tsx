@@ -47,7 +47,13 @@ describe('WorkspaceSwitcher', () => {
     vi.stubGlobal('fetch', fetch)
     renderSwitcher()
 
-    const select = await screen.findByLabelText('Switch workspace') as HTMLSelectElement
+    const select = await screen.findByLabelText('Workspace') as HTMLSelectElement
+    // Accessible name must equal the visible label text ("Workspace"): a bare
+    // findByLabelText also matches the wrapping <label>, so it cannot catch an
+    // aria-label that drifts back to something else.
+    expect(screen.getByRole('combobox', { name: 'Workspace' })).toBe(select)
+    // Framed by the shared .field-form primitive like every other labelled control.
+    expect(select.closest('.field-form')).not.toBeNull()
     expect(select.value).toBe('workspace-1')
     expect(screen.getByRole('option', { name: 'Beta Co' })).toBeTruthy()
 

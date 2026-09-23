@@ -88,6 +88,12 @@ describe('Planner', () => {
     await waitFor(() => expect(screen.getByText('Review replan before accepting')).toBeTruthy())
     expect(screen.getByText('unchanged')).toBeTruthy()
     expect(screen.getByRole('button', { name: 'Accept new plan' })).toBeTruthy()
+    // A sub-grouping inside the already-boxed .work-panel: heading + spacing, not a second card.
+    const diffSection = screen.getByText('Review replan before accepting').closest('section')
+    expect(diffSection?.classList.contains('work-subsection')).toBe(true)
+    // Both actions sit in the shared .work-actions row (spacing/wrap), not bare siblings.
+    expect(screen.getByRole('button', { name: 'Accept new plan' }).parentElement?.classList.contains('work-actions')).toBe(true)
+    expect(screen.getByRole('button', { name: 'Keep reviewing' }).parentElement?.classList.contains('work-actions')).toBe(true)
   })
 
   it('moves a block via keyboard-operable datetime inputs, not drag-and-drop', async () => {

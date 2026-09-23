@@ -174,10 +174,10 @@ export default function AttentionQueue() {
         const items = groups[group]
         const headingId = `attention-group-${group}`
         return (
-          <section key={group} className="dashboard-card" aria-labelledby={headingId}>
+          <section key={group} className="work-subsection" aria-labelledby={headingId}>
             <div className="section-heading">
               <h2 id={headingId}>{GROUP_TITLES[group]}</h2>
-              <span aria-label={`${items.length} items`}>{items.length}</span>
+              <span aria-label={`${items.length} ${items.length === 1 ? 'item' : 'items'} in ${GROUP_TITLES[group]}`}>{items.length}</span>
             </div>
             {items.length ? (
               <ol className="item-list">
@@ -216,7 +216,7 @@ export default function AttentionQueue() {
       }) : null}
 
       {query.data && (query.data.items ?? []).some((item) => item.dismissed_at || item.deferred_until) ? (
-        <section className="dashboard-card" aria-labelledby="attention-overridden">
+        <section className="work-subsection" aria-labelledby="attention-overridden">
           <div className="section-heading"><h2 id="attention-overridden">Dismissed or deferred (reversible)</h2></div>
           <ol className="item-list">
             {(query.data.items ?? []).filter((item) => item.dismissed_at || item.deferred_until).map((item) => (

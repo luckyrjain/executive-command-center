@@ -47,17 +47,18 @@ export default function WorkspaceSwitcher() {
 
   return (
     <div className="workspace-switcher">
-      <label>
-        Workspace
-        <select
-          aria-label="Switch workspace"
-          value={workspace?.id ?? ''}
-          disabled={selectMutation.isPending}
-          onChange={(event) => selectMutation.mutate(event.target.value)}
-        >
-          {options.map((option) => <option key={option.id} value={option.id}>{option.name}</option>)}
-        </select>
-      </label>
+      <div className="field-form">
+        <label>
+          Workspace
+          <select
+            value={workspace?.id ?? ''}
+            disabled={selectMutation.isPending}
+            onChange={(event) => selectMutation.mutate(event.target.value)}
+          >
+            {options.map((option) => <option key={option.id} value={option.id}>{option.name}</option>)}
+          </select>
+        </label>
+      </div>
       {selectMutation.isError ? <div role="alert" className="inline-status error-panel">{collaborationErrorMessage(selectMutation.error)}</div> : null}
     </div>
   )
