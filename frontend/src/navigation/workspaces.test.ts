@@ -72,4 +72,11 @@ describe('workspaces', () => {
     expect(viewForPath('/')).toBeNull()
     expect(compositionForPath('/')).toBe('cards')
   })
+
+  it('gives every workspace a distinct icon component', () => {
+    const icons = WORKSPACES.map((w) => w.icon)
+    expect(icons).toHaveLength(15)
+    expect(icons.every((Icon) => typeof Icon === 'function')).toBe(true)
+    expect(new Set(icons).size).toBe(15)
+  })
 })

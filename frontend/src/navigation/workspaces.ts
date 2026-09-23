@@ -1,4 +1,11 @@
 import type { WorkspaceView } from '../api/types'
+import type { ComponentType, SVGProps } from 'react'
+
+import {
+  AttentionIcon, AutomationIcon, EngineeringIcon, KnowledgeIcon, MeetingPrepIcon,
+  NotesIcon, PersonalIcon, PlannerIcon, RecommendationsIcon, RisksIcon,
+  ScheduleIcon, SearchAuditIcon, TeamIcon, TodayIcon, WorkIcon,
+} from './icons'
 
 export type WorkspaceGroupKey = 'work' | 'risk-knowledge' | 'systems' | 'account'
 
@@ -14,6 +21,7 @@ export type WorkspaceEntry = {
   path: string
   group: WorkspaceGroupKey | null
   composition: Composition
+  icon: ComponentType<SVGProps<SVGSVGElement>>
   // Accessible label for this workspace's sidebar badge count, e.g. "2
   // risks due for review" -- set only on the 6 workspaces
   // useWorkspaceBadgeCounts() gives a real count to (see that file). The
@@ -35,13 +43,14 @@ export const WORKSPACE_GROUP_LABELS: Record<WorkspaceGroupKey, string> = {
 // with the roving-tabindex nav it drove), so a workspace can be added
 // anywhere in its natural group without the old ordering constraint.
 export const WORKSPACES: ReadonlyArray<WorkspaceEntry> = [
-  { view: 'today', label: 'Today', path: '/today', group: null, composition: 'cards' },
+  { view: 'today', label: 'Today', path: '/today', group: null, composition: 'cards', icon: TodayIcon },
   {
     view: 'attention',
     label: 'Attention',
     path: '/attention',
     group: null,
     composition: 'cards',
+    icon: AttentionIcon,
     badgeCountLabel: (n) => `${n} ${n === 1 ? 'item' : 'items'} needing attention`,
   },
   {
@@ -50,6 +59,7 @@ export const WORKSPACES: ReadonlyArray<WorkspaceEntry> = [
     path: '/recommendations',
     group: null,
     composition: 'canvas',
+    icon: RecommendationsIcon,
     badgeCountLabel: (n) => `${n} open ${n === 1 ? 'recommendation' : 'recommendations'}`,
   },
   {
@@ -58,18 +68,20 @@ export const WORKSPACES: ReadonlyArray<WorkspaceEntry> = [
     path: '/work',
     group: 'work',
     composition: 'cards',
+    icon: WorkIcon,
     badgeCountLabel: (n) => `${n} open ${n === 1 ? 'task' : 'tasks'}`,
   },
-  { view: 'notes', label: 'Notes', path: '/notes', group: 'work', composition: 'canvas' },
-  { view: 'schedule', label: 'Schedule', path: '/schedule', group: 'work', composition: 'cards' },
-  { view: 'planner', label: 'Planner', path: '/planner', group: 'work', composition: 'canvas' },
-  { view: 'meeting-prep', label: 'Meeting prep', path: '/meeting-prep', group: 'work', composition: 'canvas' },
+  { view: 'notes', label: 'Notes', path: '/notes', group: 'work', composition: 'canvas', icon: NotesIcon },
+  { view: 'schedule', label: 'Schedule', path: '/schedule', group: 'work', composition: 'cards', icon: ScheduleIcon },
+  { view: 'planner', label: 'Planner', path: '/planner', group: 'work', composition: 'canvas', icon: PlannerIcon },
+  { view: 'meeting-prep', label: 'Meeting prep', path: '/meeting-prep', group: 'work', composition: 'canvas', icon: MeetingPrepIcon },
   {
     view: 'risks',
     label: 'Risks',
     path: '/risks',
     group: 'risk-knowledge',
     composition: 'cards',
+    icon: RisksIcon,
     badgeCountLabel: (n) => `${n} ${n === 1 ? 'risk' : 'risks'} due for review`,
   },
   {
@@ -78,23 +90,25 @@ export const WORKSPACES: ReadonlyArray<WorkspaceEntry> = [
     path: '/knowledge',
     group: 'risk-knowledge',
     composition: 'cards',
+    icon: KnowledgeIcon,
     badgeCountLabel: (n) => `${n} resolution ${n === 1 ? 'candidate' : 'candidates'}`,
   },
-  { view: 'search-audit', label: 'Search & audit', path: '/search-audit', group: 'risk-knowledge', composition: 'canvas' },
+  { view: 'search-audit', label: 'Search & audit', path: '/search-audit', group: 'risk-knowledge', composition: 'canvas', icon: SearchAuditIcon },
   {
     view: 'automation',
     label: 'Automation',
     path: '/automation',
     group: 'systems',
     composition: 'canvas',
+    icon: AutomationIcon,
     badgeCountLabel: (n) => `${n} pending ${n === 1 ? 'approval' : 'approvals'}`,
   },
-  { view: 'engineering', label: 'Engineering', path: '/engineering', group: 'systems', composition: 'canvas' },
-  { view: 'personal', label: 'Personal', path: '/personal', group: 'account', composition: 'canvas' },
+  { view: 'engineering', label: 'Engineering', path: '/engineering', group: 'systems', composition: 'canvas', icon: EngineeringIcon },
+  { view: 'personal', label: 'Personal', path: '/personal', group: 'account', composition: 'canvas', icon: PersonalIcon },
   // "Team", not "Collaboration" -- matches WorkspaceNavigation.tsx's
   // existing visible label. Path is /team for the same reason (a URL a
   // user would actually type/bookmark should match what they read).
-  { view: 'collaboration', label: 'Team', path: '/team', group: 'account', composition: 'canvas' },
+  { view: 'collaboration', label: 'Team', path: '/team', group: 'account', composition: 'canvas', icon: TeamIcon },
 ]
 
 /** Route matching ignores a trailing slash (`<Route path="/notes">` also
