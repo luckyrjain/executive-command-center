@@ -46,7 +46,11 @@
   --surface-translucent: rgba(255, 255, 255, .92);
   --shadow-card: 0 8px 20px rgba(24, 33, 47, .06);
   --shadow-panel: 0 10px 28px rgba(24, 33, 47, .07);
-  --focus-ring: rgba(71, 104, 255, .28);
+  /* Solid, not translucent -- the previous rgba(71, 104, 255, .28) blended
+   * to only ~1.45:1 against a white panel, well under WCAG 2.2's 3:1
+   * non-text contrast minimum for a focus indicator (SC 1.4.11). Same hue,
+   * made opaque: 4.0-4.5:1 against every surface token in this file. */
+  --focus-ring: #4768ff;
 
   /* Spacing scale -- gap/padding/margin values in new CSS should reference
    * one of these rather than a new arbitrary number. Existing rules predate
