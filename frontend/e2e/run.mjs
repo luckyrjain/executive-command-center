@@ -29,6 +29,7 @@ import * as personalDomainLifecycle from './scenarios/personal-domain-lifecycle.
 import * as gmailPanelStates from './scenarios/gmail-panel-states.mjs'
 import * as multiIdentityCollaborationLifecycle from './scenarios/multi-identity-collaboration-lifecycle.mjs'
 import * as membersPanelTextRendering from './scenarios/members-panel-text-rendering.mjs'
+import * as layoutIntegrity from './scenarios/layout-integrity.mjs'
 
 const scenarios = [
   { name: 'tasks', module: tasks },
@@ -69,6 +70,7 @@ const scenarios = [
   { name: 'gmail-panel-states', module: gmailPanelStates },
   { name: 'multi-identity-collaboration-lifecycle', module: multiIdentityCollaborationLifecycle },
   { name: 'members-panel-text-rendering', module: membersPanelTextRendering },
+  { name: 'layout-integrity', module: layoutIntegrity },
 ]
 
 // Where a failing scenario's Playwright trace (DOM snapshots + screenshots

@@ -51,7 +51,6 @@ export default function WorkspaceSwitcher() {
         <label>
           Workspace
           <select
-            aria-label="Workspace"
             value={workspace?.id ?? ''}
             disabled={selectMutation.isPending}
             onChange={(event) => selectMutation.mutate(event.target.value)}

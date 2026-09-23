@@ -173,8 +173,10 @@ export default function Planner() {
               </li>
             ))}
           </ol>
-          <button type="button" disabled={pending} aria-busy={pending} onClick={() => { acceptMutation.mutate(pendingDiff); setPendingDiff(null) }}>Accept new plan</button>
-          <button type="button" disabled={pending} aria-busy={pending} onClick={() => setPendingDiff(null)}>Keep reviewing</button>
+          <div className="work-actions">
+            <button type="button" disabled={pending} aria-busy={pending} onClick={() => { acceptMutation.mutate(pendingDiff); setPendingDiff(null) }}>Accept new plan</button>
+            <button type="button" disabled={pending} aria-busy={pending} onClick={() => setPendingDiff(null)}>Keep reviewing</button>
+          </div>
         </section>
       ) : null}
 
