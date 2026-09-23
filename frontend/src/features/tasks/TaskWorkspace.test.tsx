@@ -104,6 +104,7 @@ describe('TaskWorkspace', () => {
 
     await screen.findByText('Prepare board pack')
     expect(screen.getByRole('button', { name: 'Complete Prepare board pack' })).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'Complete Prepare board pack' }).className).toBe('btn-primary')
     expect(screen.getByRole('button', { name: 'Cancel Prepare board pack' })).toBeTruthy()
     fireEvent.click(screen.getByRole('button', { name: 'Archive Prepare board pack' }))
     await screen.findByRole('button', { name: 'Restore Prepare board pack' })
