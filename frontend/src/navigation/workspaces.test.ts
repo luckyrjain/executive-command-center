@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
-import { pathForView, viewForPath, WORKSPACES } from './workspaces'
+import { compositionForPath, pathForView, viewForPath, WORKSPACES } from './workspaces'
 
 describe('workspaces', () => {
   it('has exactly 15 entries, each with a unique view and a unique path', () => {
@@ -41,5 +41,35 @@ describe('workspaces', () => {
 
     const account = WORKSPACES.filter((w) => w.group === 'account').map((w) => w.view)
     expect(account).toEqual(['personal', 'collaboration'])
+  })
+
+  it('gives every workspace a composition and pins the canvas/cards split', () => {
+    const canvas = WORKSPACES.filter((w) => w.composition === 'canvas').map((w) => w.view)
+    const cards = WORKSPACES.filter((w) => w.composition === 'cards').map((w) => w.view)
+    expect(canvas).toEqual([
+      'recommendations', 'notes', 'planner', 'meeting-prep', 'search-audit',
+      'automation', 'engineering', 'personal', 'collaboration',
+    ])
+    expect(cards).toEqual(['today', 'attention', 'work', 'schedule', 'risks', 'knowledge'])
+    expect(canvas.length + cards.length).toBe(WORKSPACES.length)
+  })
+
+  it('resolves a path to its composition, and falls back to cards for an unknown path', () => {
+    expect(compositionForPath('/notes')).toBe('canvas')
+    expect(compositionForPath('/team')).toBe('canvas')
+    expect(compositionForPath('/today')).toBe('cards')
+    expect(compositionForPath('/schedule')).toBe('cards')
+    expect(compositionForPath('/does-not-exist')).toBe('cards')
+  })
+
+  it('treats a trailing slash as the same path (a route also matches it)', () => {
+    expect(compositionForPath('/notes/')).toBe('canvas')
+    expect(compositionForPath('/today/')).toBe('cards')
+    expect(viewForPath('/notes/')).toBe('notes')
+  })
+
+  it('does not treat the root path itself as a trailing slash to strip', () => {
+    expect(viewForPath('/')).toBeNull()
+    expect(compositionForPath('/')).toBe('cards')
   })
 })

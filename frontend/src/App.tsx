@@ -25,15 +25,15 @@ import CollaborationWorkspace from './features/collaboration/CollaborationWorksp
 import WorkspaceSwitcher from './features/collaboration/WorkspaceSwitcher'
 import MobileWorkspaceNav from './navigation/MobileWorkspaceNav'
 import SidebarNavigation from './navigation/SidebarNavigation'
-import { viewForPath } from './navigation/workspaces'
+import { compositionForPath, viewForPath } from './navigation/workspaces'
 import type { NoteDraftRecoveryStore } from './features/notes/draftRecovery'
 
 type AppShellProps = {
   noteDraftRecovery: NoteDraftRecoveryStore
 }
 
-/** Everything below WorkspaceSwitcher -- split out from App() because
- * computing the ARIA-labelling tab id below needs the current route, and
+/** The whole app body, split out from App() because computing the ARIA
+ * labelling tab id and the composition below needs the current route, and
  * useLocation() only works inside <BrowserRouter>, which App() itself
  * renders (same pattern MobileWorkspaceNav.tsx already uses). */
 function AppShell({ noteDraftRecovery }: AppShellProps) {
@@ -44,57 +44,68 @@ function AppShell({ noteDraftRecovery }: AppShellProps) {
   const currentWorkspaceView = viewForPath(location.pathname) ?? 'today'
 
   return (
-    <div className="app-frame">
-      <SidebarNavigation />
-      <MobileWorkspaceNav />
-      <main id="workspace-main" className="app-shell">
-        {/* This id/role/aria-labelledby trio is what WorkspaceNavigation.tsx's
-            mobile pill tabs (aria-controls="workspace-panel") actually point
-            at -- keeping it on an inner div rather than <main> itself lets
-            <main> stay the page's one landmark while this div carries the
-            tab/tabpanel contract WorkspaceNavigation.test.tsx already
-            exercises against a synthetic harness with this same shape. */}
-        <div
-          id="workspace-panel"
-          role="tabpanel"
-          aria-labelledby={`workspace-tab-${currentWorkspaceView}`}
-        >
-          <Routes>
-            <Route path="/" element={<Navigate to="/today" replace />} />
-            <Route path="/today" element={<TodayPage />} />
-            <Route
-              path="/attention"
-              element={<div className="work-grid"><AttentionQueue /><WaitingView /></div>}
-            />
-            <Route
-              path="/work"
-              element={<div className="work-grid"><TaskWorkspace /><CommitmentWorkspace /></div>}
-            />
-            <Route path="/notes" element={<NoteWorkspace recoveryStore={noteDraftRecovery} />} />
-            <Route path="/schedule" element={<ScheduleWorkspace />} />
-            <Route path="/planner" element={<Planner />} />
-            <Route path="/meeting-prep" element={<MeetingPrep />} />
-            <Route
-              path="/risks"
-              element={<div className="work-grid"><RiskWorkspace /><RiskReviewQueue /></div>}
-            />
-            <Route
-              path="/knowledge"
-              element={<div className="work-grid"><EntityExplorer /><ResolutionInbox /><MergeReview /></div>}
-            />
-            <Route path="/recommendations" element={<RecommendationPanel />} />
-            <Route path="/search-audit" element={<SearchAuditPanel />} />
-            <Route path="/automation" element={<AutomationWorkspace />} />
-            <Route path="/engineering" element={<EngineeringWorkspace />} />
-            <Route path="/personal" element={<PersonalWorkspace />} />
-            <Route path="/team" element={<CollaborationWorkspace />} />
-            <Route
-              path="*"
-              element={<p role="alert">Page not found. <a href="/today">Go to Today</a>.</p>}
-            />
-          </Routes>
-        </div>
-      </main>
+    // `.app-root` carries the route's composition so the canvas surface can
+    // cover the switcher band above the sidebar as well as the content area.
+    <div className="app-root" data-composition={compositionForPath(location.pathname)}>
+      {/* Mounted globally, above the sidebar -- which company workspace an
+          account is viewing applies to every route, not just one; see
+          WorkspaceSwitcher.tsx's own docstring. Framed via its own
+          `.workspace-switcher` CSS rule (styles.css) rather than by nesting
+          it inside `.app-shell`/`.app-frame` -- it's a global org-switcher,
+          not part of either nav or the sidebar+content row. */}
+      <WorkspaceSwitcher />
+      <div className="app-frame">
+        <SidebarNavigation />
+        <MobileWorkspaceNav />
+        <main id="workspace-main" className="app-shell">
+          {/* This id/role/aria-labelledby trio is what WorkspaceNavigation.tsx's
+              mobile pill tabs (aria-controls="workspace-panel") actually point
+              at -- keeping it on an inner div rather than <main> itself lets
+              <main> stay the page's one landmark while this div carries the
+              tab/tabpanel contract WorkspaceNavigation.test.tsx already
+              exercises against a synthetic harness with this same shape. */}
+          <div
+            id="workspace-panel"
+            role="tabpanel"
+            aria-labelledby={`workspace-tab-${currentWorkspaceView}`}
+          >
+            <Routes>
+              <Route path="/" element={<Navigate to="/today" replace />} />
+              <Route path="/today" element={<TodayPage />} />
+              <Route
+                path="/attention"
+                element={<div className="work-grid"><AttentionQueue /><WaitingView /></div>}
+              />
+              <Route
+                path="/work"
+                element={<div className="work-grid"><TaskWorkspace /><CommitmentWorkspace /></div>}
+              />
+              <Route path="/notes" element={<NoteWorkspace recoveryStore={noteDraftRecovery} />} />
+              <Route path="/schedule" element={<ScheduleWorkspace />} />
+              <Route path="/planner" element={<Planner />} />
+              <Route path="/meeting-prep" element={<MeetingPrep />} />
+              <Route
+                path="/risks"
+                element={<div className="work-grid"><RiskWorkspace /><RiskReviewQueue /></div>}
+              />
+              <Route
+                path="/knowledge"
+                element={<div className="work-grid"><EntityExplorer /><ResolutionInbox /><MergeReview /></div>}
+              />
+              <Route path="/recommendations" element={<RecommendationPanel />} />
+              <Route path="/search-audit" element={<SearchAuditPanel />} />
+              <Route path="/automation" element={<AutomationWorkspace />} />
+              <Route path="/engineering" element={<EngineeringWorkspace />} />
+              <Route path="/personal" element={<PersonalWorkspace />} />
+              <Route path="/team" element={<CollaborationWorkspace />} />
+              <Route
+                path="*"
+                element={<p role="alert">Page not found. <a href="/today">Go to Today</a>.</p>}
+              />
+            </Routes>
+          </div>
+        </main>
+      </div>
     </div>
   )
 }
@@ -104,13 +115,6 @@ export default function App() {
 
   return (
     <BrowserRouter>
-      {/* Mounted globally, above the sidebar -- which company workspace an
-          account is viewing applies to every route, not just one; see
-          WorkspaceSwitcher.tsx's own docstring. Framed via its own
-          `.workspace-switcher` CSS rule (styles.css) rather than by nesting
-          it inside `.app-shell`/`.app-frame` -- it's a global org-switcher,
-          not part of either nav or the sidebar+content row. */}
-      <WorkspaceSwitcher />
       <AppShell noteDraftRecovery={noteDraftRecovery} />
     </BrowserRouter>
   )
