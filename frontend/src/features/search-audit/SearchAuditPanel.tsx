@@ -186,7 +186,7 @@ export default function SearchAuditPanel() {
                   <div className="result-copy">
                     <div className="result-meta">
                       <span>{item.entity_type.replaceAll('_', ' ')}</span>
-                      <span>{Math.round(item.score * 100)}%</span>
+                      <span aria-label={`Match score ${Math.round(item.score * 100)}%`}>{Math.round(item.score * 100)}%</span>
                       {item.archived ? <span>archived</span> : null}
                     </div>
                     <h3>{item.title}</h3>
