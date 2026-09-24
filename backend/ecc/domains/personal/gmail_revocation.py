@@ -160,6 +160,7 @@ endpoint`), not here -- see that function's own updated comment.
 from __future__ import annotations
 
 from datetime import datetime
+from uuid import UUID
 
 from sqlalchemy import text
 from sqlalchemy.orm import Session
@@ -181,7 +182,11 @@ _REDACTED_RATIONALE = "Source email no longer available -- email consent was rev
 
 
 def cascade_email_revocation(
-    session: Session, auth: AuthContext, now: datetime
+    session: Session,
+    auth: AuthContext,
+    now: datetime,
+    *,
+    target_owner_id: UUID | None = None,
 ) -> list[PendingGmailRevoke]:
     """Purges this owner's email-derived records (subject to the three
     deliberate exceptions the module docstring's "What is deliberately
@@ -191,8 +196,16 @@ def cascade_email_revocation(
     with whatever domain-level state change triggered it. Returns pending
     Google-side revoke info for the caller to pass to `finish_gmail_
     revocation` after that transaction commits (see module docstring).
+
+    `target_owner_id` names whose email-derived data is purged; it defaults
+    to the acting user (`auth.user_id`), which is every existing caller's
+    self-service disable/delete. A caller acting on *another* member's data
+    passes that member's id: every owner-scoping predicate below (including
+    the purge-log owner and the cross-owner ambiguity check) then uses the
+    target, while actor fields (`updated_by`) still record `auth.user_id`.
     """
-    params = {"workspace_id": auth.workspace_id, "owner_id": auth.user_id}
+    target = target_owner_id or auth.user_id
+    params = {"workspace_id": auth.workspace_id, "owner_id": target}
 
     # `attention_items.owner_id` (migration `0063`'s Phase 8 authz
     # widening) is explicitly set at write time from the underlying
@@ -337,7 +350,7 @@ def cascade_email_revocation(
             ),
             {
                 "workspace_id": auth.workspace_id,
-                "owner_id": auth.user_id,
+                "owner_id": target,
                 "candidate_ids": external_message_ids,
                 "now": now,
             },
@@ -356,7 +369,7 @@ def cascade_email_revocation(
                 ),
                 {
                     "workspace_id": auth.workspace_id,
-                    "owner_id": auth.user_id,
+                    "owner_id": target,
                     "candidate_ids": external_message_ids,
                 },
             )
@@ -444,7 +457,7 @@ def cascade_email_revocation(
 
     # `connector_accounts.owner_id` (migration `0063`) is set explicitly
     # at write time by `gmail_oauth.py`'s own OAuth-callback `INSERT`
-    # (the connecting user, `auth.user_id`), so it is reliable here too.
+    # (the connecting user), so it is reliable here too; scoped by `target`.
     # `FOR UPDATE`: mirrors `connector_accounts.py:get_connector_account
     # (..., for_update=True)`'s own established reason exactly (serializes
     # a concurrent mutator of the same account -- e.g. a racing generic
