@@ -304,7 +304,7 @@ export default function RecommendationPanel({ recommendationType, title }: {
                   {canDecide ? (
                     <>
                       <button className="btn-primary" type="button" onClick={() => mutation.mutate({ item, action: 'confirm' })} disabled={busy || (!isCreateRecommendation(item) && item.expected_version == null)} aria-busy={busy}>Confirm and execute</button>
-                      <button type="button" onClick={() => mutation.mutate({ item, action: 'reject' })} disabled={busy} aria-busy={busy}>Reject</button>
+                      <button type="button" className="btn-destructive" onClick={() => mutation.mutate({ item, action: 'reject' })} disabled={busy} aria-busy={busy}>Reject</button>
                       <button type="button" onClick={() => mutation.mutate({ item, action: 'defer' })} disabled={busy} aria-busy={busy}>Defer 24h</button>
                     </>
                   ) : null}

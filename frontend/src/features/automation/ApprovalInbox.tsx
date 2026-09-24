@@ -109,7 +109,7 @@ function ApprovalCard({ approval, onDecided }: { approval: Approval; onDecided: 
           {attemptedApprove && !digestInput.trim() ? <p role="alert">Enter the exact action digest before approving.</p> : null}
           <div className="work-actions">
             <button type="submit" className="btn-primary" aria-busy={pending && decideMutation.variables?.decision === 'approve'} disabled={expired || pending}>{pending && decideMutation.variables?.decision === 'approve' ? 'Approving…' : 'Approve'}</button>
-            <button type="button" aria-busy={pending && decideMutation.variables?.decision === 'reject'} disabled={expired || pending} onClick={() => decideMutation.mutate({ decision: 'reject' })}>{pending && decideMutation.variables?.decision === 'reject' ? 'Rejecting…' : 'Reject'}</button>
+            <button type="button" className="btn-destructive" aria-busy={pending && decideMutation.variables?.decision === 'reject'} disabled={expired || pending} onClick={() => decideMutation.mutate({ decision: 'reject' })}>{pending && decideMutation.variables?.decision === 'reject' ? 'Rejecting…' : 'Reject'}</button>
           </div>
         </form>
       ) : null}

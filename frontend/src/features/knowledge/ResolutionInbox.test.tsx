@@ -65,6 +65,7 @@ describe('ResolutionInbox', () => {
     await screen.findByText('entity-left', { exact: false })
     fireEvent.change(screen.getByLabelText(`Reason for ${candidate.id}`), { target: { value: 'same identity' } })
     expect(screen.getByRole('button', { name: 'Confirm match' }).className).toBe('btn-primary')
+    expect(screen.getByRole('button', { name: 'Reject' }).className).toBe('btn-destructive')
     fireEvent.click(screen.getByRole('button', { name: 'Confirm match' }))
 
     const confirmCall = await new Promise<[string, RequestInit]>((resolve) => {

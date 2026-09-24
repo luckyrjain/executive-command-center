@@ -91,6 +91,7 @@ function ResolutionCandidateRow({ candidate }: ResolutionCandidateRowProps) {
         </button>
         <button
           type="button"
+          className="btn-destructive"
           disabled={decisionMutation.isPending || !reason.trim()}
           onClick={() => decisionMutation.mutate('reject')}
         >
