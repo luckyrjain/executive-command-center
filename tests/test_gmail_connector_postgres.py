@@ -600,9 +600,13 @@ def test_handle_oauth_callback_rejects_non_allowlisted_account(
         adapter = GmailAdapter(
             transport=_oauth_transport(profile_email=_ALLOWED_EMAIL, revoked_tokens=revoked_tokens)
         )
-        with pytest.raises(AdapterAuthorizationError):
+        with pytest.raises(AdapterAuthorizationError) as excinfo:
             adapter.handle_oauth_callback("auth-code", "state-value")
         assert revoked_tokens == ["refresh-1"]
+        # Spec A S1.6 / T7: the message reaches logs and the 422 `error`
+        # field, so it must not carry the rejected Google account's email.
+        assert str(excinfo.value) == "Gmail account is not on the internal allowlist"
+        assert _ALLOWED_EMAIL not in str(excinfo.value)
     finally:
         get_settings.cache_clear()
 
@@ -2059,6 +2063,65 @@ def test_oauth_complete_redirects_with_a_generic_error_when_callback_raises_a_no
         get_settings.cache_clear()
 
 
+def test_oauth_complete_failure_log_carries_only_a_code_and_exception_class(
+    gmail_test_context: tuple[TestClient, UUID, UUID, str],
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Spec A S1.6 / threat T7: when `/oauth/callback` raises a non-
+    `HTTPException` whose text embeds an email, the OAuth code, and the
+    state (as a DB driver's `DETAIL` line or an adapter message can), the
+    `/oauth/complete` log line must carry only the code-defined error code
+    and the exception class -- no exception text and no traceback."""
+    client, _workspace_id, _user_id, token = gmail_test_context
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_ALLOWLIST", _ALLOWED_EMAIL)
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_CLIENT_ID", "cid")
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_CLIENT_SECRET", "csecret")
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_REDIRECT_URI", "https://ecc.example.test/oauth/complete")
+    monkeypatch.setenv("ECC_FRONTEND_URL", "https://app.example.test")
+    get_settings.cache_clear()
+    oauth_code = "sensitive-oauth-code-4f1c"
+
+    class _LeakyAdapter(GmailAdapter):
+        def handle_oauth_callback(self, code: str, state: str) -> object:
+            raise RuntimeError(
+                f"Key (external_account_id)=({_ALLOWED_EMAIL}) code={code} state={state}"
+            )
+
+    monkeypatch.setattr(gmail_oauth_module, "_adapter", _LeakyAdapter(transport=_oauth_transport()))
+    try:
+        start_response = client.post("/api/v1/personal/gmail/oauth/start", headers=_headers(token))
+        state = httpx.URL(start_response.json()["authorization_url"]).params["state"]
+
+        with caplog.at_level("DEBUG", logger=gmail_oauth_module.__name__):
+            response = client.get(
+                "/api/v1/personal/gmail/oauth/complete",
+                params={"code": oauth_code, "state": state},
+                follow_redirects=False,
+            )
+        assert response.status_code == 302
+        assert (
+            response.headers["location"]
+            == "https://app.example.test/?gmail=error&code=GMAIL_OAUTH_FAILED"
+        )
+
+        records = [r for r in caplog.records if r.name == gmail_oauth_module.__name__]
+        assert len(records) == 1
+        record = records[0]
+        assert record.exc_info is None
+        assert "GMAIL_OAUTH_FAILED" in record.getMessage()
+        assert "builtins.RuntimeError" in record.getMessage()
+        # Every app-side record (the `httpx` logger is the TestClient's own
+        # request line, which necessarily echoes the URL it was given).
+        app_records = [r for r in caplog.records if not r.name.startswith("httpx")]
+        for app_record in app_records:
+            rendered = f"{app_record.getMessage()} {app_record.__dict__!r}"
+            for secret in (_ALLOWED_EMAIL, oauth_code, state):
+                assert secret not in rendered
+    finally:
+        get_settings.cache_clear()
+
+
 def test_oauth_complete_strips_a_trailing_slash_from_frontend_url_before_redirecting(
     gmail_test_context: tuple[TestClient, UUID, UUID, str],
     monkeypatch: pytest.MonkeyPatch,
@@ -2115,6 +2178,41 @@ def test_oauth_callback_returns_422_with_error_envelope_on_google_rejection(
         )
         assert response.status_code == 422
         assert response.json()["error"]["code"] == "GMAIL_OAUTH_FAILED"
+    finally:
+        get_settings.cache_clear()
+
+
+def test_oauth_callback_allowlist_rejection_422_body_carries_no_google_email(
+    gmail_test_context: tuple[TestClient, UUID, UUID, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Spec A S1.6 / T7: an allowlisted ECC caller who authorizes a
+    different, non-allowlisted Google account gets a 422 whose `error`
+    detail no longer echoes that Google account's email."""
+    client, _workspace_id, _user_id, token = gmail_test_context
+    other_google_email = "other-google-account@example.test"
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_ALLOWLIST", _ALLOWED_EMAIL)
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_CLIENT_ID", "cid")
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_CLIENT_SECRET", "csecret")
+    monkeypatch.setenv("ECC_GMAIL_OAUTH_REDIRECT_URI", "https://ecc.example.test/callback")
+    get_settings.cache_clear()
+    monkeypatch.setattr(
+        gmail_oauth_module,
+        "_adapter",
+        GmailAdapter(transport=_oauth_transport(profile_email=other_google_email)),
+    )
+    try:
+        start_response = client.post("/api/v1/personal/gmail/oauth/start", headers=_headers(token))
+        state = httpx.URL(start_response.json()["authorization_url"]).params["state"]
+        response = client.get(
+            "/api/v1/personal/gmail/oauth/callback",
+            params={"code": "auth-code", "state": state},
+        )
+        assert response.status_code == 422
+        error = response.json()["error"]
+        assert error["code"] == "GMAIL_OAUTH_FAILED"
+        assert error["details"]["error"] == "Gmail account is not on the internal allowlist"
+        assert other_google_email not in response.text
     finally:
         get_settings.cache_clear()
 
