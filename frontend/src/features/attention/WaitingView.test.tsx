@@ -97,6 +97,7 @@ describe('WaitingView', () => {
 
     await waitFor(() => expect(screen.getByText('Waiting on vendor signature')).toBeTruthy())
     expect(screen.getByRole('button', { name: 'Fulfil waiting item wl-1' }).className).toBe('btn-primary')
+    expect(screen.getByRole('button', { name: 'Cancel waiting item wl-1' }).className).toBe('btn-destructive')
     fireEvent.click(screen.getByRole('button', { name: 'Fulfil waiting item wl-1' }))
 
     await waitFor(() => expect(fetch).toHaveBeenCalledTimes(3))

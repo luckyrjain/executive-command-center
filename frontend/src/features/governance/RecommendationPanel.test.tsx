@@ -365,6 +365,7 @@ describe('recommendation preview (rendered)', () => {
 
     await screen.findByText('close risk')
     const invalidateSpy = vi.spyOn(client, 'invalidateQueries')
+    expect(screen.getByRole('button', { name: 'Reject' }).className).toBe('btn-destructive')
     fireEvent.click(screen.getByRole('button', { name: 'Reject' }))
 
     await waitFor(() => expect(invalidateSpy).toHaveBeenCalled())
