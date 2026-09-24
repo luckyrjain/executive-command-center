@@ -453,6 +453,42 @@ kill_switch_events_total = _Counter(
     ("scope", "action"),
 )
 
+# ---------------------------------------------------------------------------
+# Connector ownership / personal-data isolation (Spec A "Metrics"). Every
+# label is a code-defined literal (provider name, refusal reason, route/site
+# name, result) -- never an email, account id, workspace id or credential.
+# Incremented synchronously (not deferred like `queue_lifecycle_event`):
+# these count refusals and revoke attempts whose business transaction
+# typically rolls back, so a commit-deferred increment would be dropped.
+# ---------------------------------------------------------------------------
+
+connector_enrollment_refused_total = _Counter(
+    "ecc_connector_enrollment_refused_total",
+    "Connector enrollments refused, by provider and reason.",
+    ("provider", "reason"),
+)
+personal_data_share_refused_total = _Counter(
+    "ecc_personal_data_share_refused_total",
+    "Grant/preview/transfer/delegation attempts refused for personal data, "
+    "by resource type and path.",
+    ("resource_type", "path"),
+)
+connector_revoke_total = _Counter(
+    "ecc_connector_revoke_total",
+    "Provider-side connector credential revoke attempts, by provider, site and result.",
+    ("provider", "site", "result"),
+)
+connector_access_denied_total = _Counter(
+    "ecc_connector_access_denied_total",
+    "Non-owner access to a personal connector refused, by provider and route.",
+    ("provider", "route"),
+)
+gmail_refresh_rejected_total = _Counter(
+    "ecc_gmail_refresh_rejected_total",
+    "Gmail token refreshes rejected by Google, by error class and time since reconnect.",
+    ("error", "since_reconnect"),
+)
+
 _COUNTERS: Final[tuple[_Counter, ...]] = (
     http_requests_total,
     database_failures_total,
@@ -469,6 +505,11 @@ _COUNTERS: Final[tuple[_Counter, ...]] = (
     unknown_outcomes_total,
     compensation_outcomes_total,
     kill_switch_events_total,
+    connector_enrollment_refused_total,
+    personal_data_share_refused_total,
+    connector_revoke_total,
+    connector_access_denied_total,
+    gmail_refresh_rejected_total,
 )
 _HISTOGRAMS: Final[tuple[_Histogram, ...]] = (
     http_request_duration_seconds,
@@ -627,6 +668,32 @@ def record_idempotency_conflict(domain: str) -> None:
 
 def record_audit_outbox_failure(domain: str) -> None:
     audit_outbox_failures_total.inc(domain)
+
+
+# ---------------------------------------------------------------------------
+# Connector ownership / personal-data isolation record_* helpers (Spec A).
+# Called directly, never deferred -- see the instrument comment above.
+# ---------------------------------------------------------------------------
+
+
+def record_connector_enrollment_refused(provider: str, reason: str) -> None:
+    connector_enrollment_refused_total.inc(provider, reason)
+
+
+def record_personal_data_share_refused(resource_type: str, path: str) -> None:
+    personal_data_share_refused_total.inc(resource_type, path)
+
+
+def record_connector_revoke(provider: str, site: str, result: str) -> None:
+    connector_revoke_total.inc(provider, site, result)
+
+
+def record_connector_access_denied(provider: str, route: str) -> None:
+    connector_access_denied_total.inc(provider, route)
+
+
+def record_gmail_refresh_rejected(error: str, since_reconnect: str) -> None:
+    gmail_refresh_rejected_total.inc(error, since_reconnect)
 
 
 # ---------------------------------------------------------------------------
