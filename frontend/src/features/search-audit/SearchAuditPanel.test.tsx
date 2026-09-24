@@ -68,4 +68,23 @@ describe('SearchAuditPanel', () => {
 
     expect((await screen.findByRole('alert', {}, { timeout: 3000 })).textContent).toBe('Search index is rebuilding.')
   })
+
+  it('names a result\'s bare match-score percentage for a screen reader', async () => {
+    vi.stubGlobal('fetch', vi.fn(() => response({
+      items: [{
+        entity_type: 'task', entity_id: 'task-1', title: 'Renew vendor contract',
+        snippet: 'Renewal due end of quarter.', matched_fields: ['title'], score: 0.845,
+        updated_at: '2026-08-01T00:00:00Z', source_type: 'task', archived: false,
+      }],
+      next_cursor: null, degraded: false,
+    })))
+    renderPanel()
+
+    fireEvent.change(screen.getByLabelText('Search tasks, commitments, notes, meetings, events and risks'), { target: { value: 'renewal' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Search' }))
+
+    // The visible text is a bare "85%" -- without this, a screen reader has
+    // no way to tell it apart from any other number on the result.
+    expect(await screen.findByLabelText('Match score 85%')).toHaveProperty('textContent', '85%')
+  })
 })
