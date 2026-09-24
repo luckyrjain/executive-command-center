@@ -103,6 +103,7 @@ describe('CommitmentWorkspace', () => {
 
     await screen.findByText('Send the revised forecast')
     fireEvent.click(screen.getByRole('button', { name: 'Edit Send the revised forecast' }))
+    expect(screen.getByRole('button', { name: 'Save commitment' }).className).toBe('btn-primary')
     fireEvent.change(screen.getByLabelText('Edit commitment summary'), { target: { value: 'My revised promise' } })
     fireEvent.click(screen.getByRole('button', { name: 'Save commitment' }))
     await screen.findByText(/changed while you were editing/i)

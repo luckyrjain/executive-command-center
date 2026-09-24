@@ -126,6 +126,7 @@ describe('TeamSuggestionsPanel', () => {
     renderPanel()
     await screen.findByText('acme')
     fireEvent.change(screen.getByLabelText('Assign team for acme'), { target: { value: 'team-1' } })
+    expect(screen.getByRole('button', { name: 'Confirm' }).className).toBe('btn-primary')
     fireEvent.click(screen.getByRole('button', { name: 'Confirm' }))
 
     await waitFor(() => expect(screen.queryByText('acme')).toBeNull())

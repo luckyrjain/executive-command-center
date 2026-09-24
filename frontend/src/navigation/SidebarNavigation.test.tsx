@@ -73,4 +73,16 @@ describe('SidebarNavigation', () => {
     expect(screen.getByRole('link', { name: /Today/ }).textContent).not.toMatch(/\d/)
     expect(screen.getByRole('link', { name: /Knowledge/ }).textContent).not.toMatch(/\d/)
   })
+
+  it('renders a decorative, aria-hidden icon before every link label', () => {
+    renderAt('/today')
+    const link = screen.getByRole('link', { name: 'Notes' })
+    const icon = link.querySelector('svg')
+    expect(icon).not.toBeNull()
+    expect(icon?.getAttribute('aria-hidden')).toBe('true')
+    // The icon must not be part of the accessible name -- getByRole above
+    // already proves this (it matched on the visible text "Notes" alone),
+    // but assert it explicitly too: the svg carries no text content.
+    expect(icon?.textContent).toBe('')
+  })
 })

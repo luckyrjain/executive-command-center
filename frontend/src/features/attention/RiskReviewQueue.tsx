@@ -127,7 +127,7 @@ export default function RiskReviewQueue() {
           </label>
           <label>Notes<textarea aria-label="Review notes" value={reviewing.draft.notes} onChange={(e) => setReviewing({ ...reviewing, draft: { ...reviewing.draft, notes: e.target.value } })} /></label>
           <label>Next review at<input type="datetime-local" value={reviewing.draft.nextReviewAt} onChange={(e) => setReviewing({ ...reviewing, draft: { ...reviewing.draft, nextReviewAt: e.target.value } })} /></label>
-          <button type="submit" disabled={pending} aria-busy={pending}>Save review</button>
+          <button type="submit" className="btn-primary" disabled={pending} aria-busy={pending}>Save review</button>
           <button type="button" disabled={pending} aria-busy={pending} onClick={() => setReviewing(null)}>Discard</button>
         </form>
       ) : null}

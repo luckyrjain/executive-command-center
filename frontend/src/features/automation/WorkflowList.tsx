@@ -240,7 +240,7 @@ export default function WorkflowList({ onSelect }: { onSelect: (versionId: strin
               <input value={policyRef} onChange={(e) => setPolicyRef(e.target.value)} placeholder="policy UUID" />
             </label>
             <div className="work-actions">
-              <button type="button" onClick={goCreateNext}>Continue</button>
+              <button type="button" className="btn-primary" onClick={goCreateNext}>Continue</button>
             </div>
           </div>
         ) : createStep === 'build' ? (
@@ -291,7 +291,7 @@ export default function WorkflowList({ onSelect }: { onSelect: (versionId: strin
             </fieldset>
             <div className="work-actions">
               <button type="button" onClick={goCreateBack}>Back</button>
-              <button type="button" onClick={goCreateNext}>Continue</button>
+              <button type="button" className="btn-primary" onClick={goCreateNext}>Continue</button>
             </div>
           </div>
         ) : (
@@ -313,7 +313,7 @@ export default function WorkflowList({ onSelect }: { onSelect: (versionId: strin
             </ol>
             <div className="work-actions">
               <button type="button" onClick={goCreateBack}>Back</button>
-              <button type="submit" aria-busy={pending} disabled={pending}>{pending ? 'Creating…' : 'Create draft'}</button>
+              <button type="submit" className="btn-primary" aria-busy={pending} disabled={pending}>{pending ? 'Creating…' : 'Create draft'}</button>
             </div>
           </div>
         )}

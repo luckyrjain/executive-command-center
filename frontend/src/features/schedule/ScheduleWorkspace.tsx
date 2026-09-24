@@ -299,7 +299,7 @@ export default function ScheduleWorkspace() {
             <label>Event title<input value={createEvent.title} onChange={(e) => setCreateEvent({ ...createEvent, title: e.target.value })} /></label>
             <TimingFields prefix="Event" draft={createEvent} onChange={setCreateEvent} />
             <label className="field-checkbox"><input type="checkbox" checked={createEvent.allDay} onChange={(e) => setCreateEvent({ ...createEvent, allDay: e.target.checked })} /> All day</label>
-            <div className="work-actions"><button type="button" onClick={goCreateEventNext}>Continue</button></div>
+            <div className="work-actions"><button type="button" className="btn-primary" onClick={goCreateEventNext}>Continue</button></div>
           </div>
         ) : createEventStep === 'details' ? (
           <div className="field-form">
@@ -307,7 +307,7 @@ export default function ScheduleWorkspace() {
             <h3 ref={createEventStepHeadingRef} tabIndex={-1}>Anything else?</h3>
             <label>Location<input value={createEvent.location} onChange={(e) => setCreateEvent({ ...createEvent, location: e.target.value })} /></label>
             <label>Description<textarea value={createEvent.description} onChange={(e) => setCreateEvent({ ...createEvent, description: e.target.value })} /></label>
-            <div className="work-actions"><button type="button" onClick={goCreateEventBack}>Back</button><button type="button" onClick={goCreateEventNext}>Continue</button></div>
+            <div className="work-actions"><button type="button" onClick={goCreateEventBack}>Back</button><button type="button" className="btn-primary" onClick={goCreateEventNext}>Continue</button></div>
           </div>
         ) : (
           <div className="wizard-review">
@@ -322,7 +322,7 @@ export default function ScheduleWorkspace() {
               <div><dt>Location</dt><dd>{createEvent.location || '—'}</dd></div>
               <div><dt>Description</dt><dd>{createEvent.description || '—'}</dd></div>
             </dl>
-            <div className="work-actions"><button type="button" onClick={goCreateEventBack}>Back</button><button type="submit" aria-busy={pending} disabled={pending}>Create event</button></div>
+            <div className="work-actions"><button type="button" onClick={goCreateEventBack}>Back</button><button type="submit" className="btn-primary" aria-busy={pending} disabled={pending}>Create event</button></div>
           </div>
         )}
         </form>
@@ -347,7 +347,7 @@ export default function ScheduleWorkspace() {
             <label>Meeting title<input value={createMeeting.title} onChange={(e) => setCreateMeeting({ ...createMeeting, title: e.target.value })} /></label>
             {createMeeting.calendarEventId ? <p className="inline-status">Timing will be projected from the selected calendar event.</p> : <TimingFields prefix="Meeting" draft={createMeeting} onChange={setCreateMeeting} />}
             <label>Meeting status<select value={createMeeting.status} onChange={(e) => setCreateMeeting({ ...createMeeting, status: e.target.value as MeetingDraft['status'] })}><option value="planned">planned</option><option value="in_progress">in progress</option><option value="completed">completed</option><option value="cancelled">cancelled</option></select></label>
-            <div className="work-actions"><button type="button" onClick={goCreateMeetingNext}>Continue</button></div>
+            <div className="work-actions"><button type="button" className="btn-primary" onClick={goCreateMeetingNext}>Continue</button></div>
           </div>
         ) : createMeetingStep === 'notes' ? (
           <div className="field-form">
@@ -356,7 +356,7 @@ export default function ScheduleWorkspace() {
             <label>Agenda<textarea aria-label="Meeting agenda" value={createMeeting.agenda} onChange={(e) => setCreateMeeting({ ...createMeeting, agenda: e.target.value })} /></label>
             <label>Preparation<textarea aria-label="Meeting preparation" value={createMeeting.preparation} onChange={(e) => setCreateMeeting({ ...createMeeting, preparation: e.target.value })} /></label>
             <label>Notes summary<textarea aria-label="Meeting notes summary" value={createMeeting.notesSummary} onChange={(e) => setCreateMeeting({ ...createMeeting, notesSummary: e.target.value })} /></label>
-            <div className="work-actions"><button type="button" onClick={goCreateMeetingBack}>Back</button><button type="button" onClick={goCreateMeetingNext}>Continue</button></div>
+            <div className="work-actions"><button type="button" onClick={goCreateMeetingBack}>Back</button><button type="button" className="btn-primary" onClick={goCreateMeetingNext}>Continue</button></div>
           </div>
         ) : (
           <div className="wizard-review">
@@ -375,7 +375,7 @@ export default function ScheduleWorkspace() {
               <div><dt>Preparation</dt><dd>{createMeeting.preparation || '—'}</dd></div>
               <div><dt>Notes summary</dt><dd>{createMeeting.notesSummary || '—'}</dd></div>
             </dl>
-            <div className="work-actions"><button type="button" onClick={goCreateMeetingBack}>Back</button><button type="submit" aria-busy={pending} disabled={pending}>{createMeeting.calendarEventId ? 'Create linked meeting' : 'Create standalone meeting'}</button></div>
+            <div className="work-actions"><button type="button" onClick={goCreateMeetingBack}>Back</button><button type="submit" className="btn-primary" aria-busy={pending} disabled={pending}>{createMeeting.calendarEventId ? 'Create linked meeting' : 'Create standalone meeting'}</button></div>
           </div>
         )}
         </form>
@@ -401,13 +401,13 @@ export default function ScheduleWorkspace() {
       <label>Edit event location<input value={editEvent.location} onChange={(e) => setEditEvent({ ...editEvent, location: e.target.value })} /></label>
       <label>Edit event description<textarea value={editEvent.description} onChange={(e) => setEditEvent({ ...editEvent, description: e.target.value })} /></label>
       <label>Edit event status<select value={editEvent.status} onChange={(e) => setEditEvent({ ...editEvent, status: e.target.value as EventDraft['status'] })}><option value="confirmed">confirmed</option><option value="tentative">tentative</option><option value="cancelled">cancelled</option></select></label>
-      {editEvent.reloadFailed ? <><p role="alert">Could not reload the latest event. Your edits are preserved.</p><button type="button" disabled={pending} onClick={() => void reloadEvent(editEvent.record.id)}>Reload latest event</button></> : editEvent.conflict ? <button type="button" disabled={pending} onClick={() => submitEventEdit()}>Retry event with latest version</button> : <button type="submit" disabled={pending}>Save event</button>}
+      {editEvent.reloadFailed ? <><p role="alert">Could not reload the latest event. Your edits are preserved.</p><button type="button" disabled={pending} onClick={() => void reloadEvent(editEvent.record.id)}>Reload latest event</button></> : editEvent.conflict ? <button type="button" disabled={pending} onClick={() => submitEventEdit()}>Retry event with latest version</button> : <button type="submit" className="btn-primary" disabled={pending}>Save event</button>}
       <button type="button" disabled={pending} onClick={() => setEditEvent(null)}>Discard event edit</button>
     </form></section> : null}
     {editMeeting ? <section className="work-panel"><form className="field-form" onSubmit={submitMeetingEdit}><h2>Edit meeting</h2>
       {editMeeting.record.calendar_event_id ? <><p className="inline-status">Linked meeting timing is controlled by its calendar event and is display-only here.</p><button type="button" disabled={pending} onClick={() => { const eventId = editMeeting.record.calendar_event_id; if (!eventId) return; const authoritative = events.data?.items.find((item) => item.id === eventId); if (authoritative) setEditEvent({ record: authoritative, ...eventDraft(authoritative), latestVersion: authoritative.version, conflict: false, reloadFailed: false }); else eventLookup.mutate(eventId) }}>Reschedule {editMeeting.record.title}</button></> : <TimingFields prefix="Edit meeting" draft={editMeeting} onChange={(value) => setEditMeeting({ ...editMeeting, ...value })} />}
       <label>Edit meeting title<input value={editMeeting.title} onChange={(e) => setEditMeeting({ ...editMeeting, title: e.target.value })} /></label><MeetingFields draft={editMeeting} onChange={(value) => setEditMeeting({ ...editMeeting, ...value })} />
-      {editMeeting.reloadFailed ? <><p role="alert">Could not reload the latest meeting. Your edits are preserved.</p><button type="button" disabled={pending} onClick={() => void reloadMeeting(editMeeting.record.id)}>Reload latest meeting</button></> : editMeeting.conflict ? <button type="button" disabled={pending} onClick={() => submitMeetingEdit()}>Retry meeting with latest version</button> : <button type="submit" disabled={pending}>Save meeting</button>}
+      {editMeeting.reloadFailed ? <><p role="alert">Could not reload the latest meeting. Your edits are preserved.</p><button type="button" disabled={pending} onClick={() => void reloadMeeting(editMeeting.record.id)}>Reload latest meeting</button></> : editMeeting.conflict ? <button type="button" disabled={pending} onClick={() => submitMeetingEdit()}>Retry meeting with latest version</button> : <button type="submit" className="btn-primary" disabled={pending}>Save meeting</button>}
       <button type="button" disabled={pending} onClick={() => setEditMeeting(null)}>Discard meeting edit</button>
     </form></section> : null}
   </section>

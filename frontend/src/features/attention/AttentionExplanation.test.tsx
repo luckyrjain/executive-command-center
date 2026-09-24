@@ -140,6 +140,7 @@ describe('AttentionExplanation', () => {
     expect(screen.getByText(/qwen2\.5:1\.5b-instruct-q4_K_M/)).toBeTruthy()
     expect(screen.getByText(/prompt v3/i)).toBeTruthy()
     expect(screen.getByText(/does not change/i)).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'Regenerate' }).className).toBe('btn-primary')
 
     fireEvent.click(screen.getByRole('button', { name: 'Discard AI explanation' }))
     expect(screen.queryByText('Overdue by two days and pinned for follow-up.')).toBeNull()

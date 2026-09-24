@@ -174,7 +174,7 @@ export default function Planner() {
             ))}
           </ol>
           <div className="work-actions">
-            <button type="button" disabled={pending} aria-busy={pending} onClick={() => { acceptMutation.mutate(pendingDiff); setPendingDiff(null) }}>Accept new plan</button>
+            <button type="button" className="btn-primary" disabled={pending} aria-busy={pending} onClick={() => { acceptMutation.mutate(pendingDiff); setPendingDiff(null) }}>Accept new plan</button>
             <button type="button" disabled={pending} aria-busy={pending} onClick={() => setPendingDiff(null)}>Keep reviewing</button>
           </div>
         </section>
@@ -213,6 +213,7 @@ export default function Planner() {
                           <label>New end<input aria-label={`New end for ${block.rationale}`} type="datetime-local" value={editingBlock.endsAt} onChange={(e) => setEditingBlock({ ...editingBlock, endsAt: e.target.value })} /></label>
                           <button
                             type="button"
+                            className="btn-primary"
                             disabled={pending}
                             aria-busy={pending}
                             onClick={() => { moveBlockMutation.mutate({ plan, block, startsAt: editingBlock.startsAt, endsAt: editingBlock.endsAt }); setEditingBlock(null) }}

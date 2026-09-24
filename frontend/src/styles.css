@@ -657,6 +657,8 @@ button[aria-pressed="true"] { border-color: var(--color-ink); background: var(--
   border-left: 3px solid transparent;
   transition: background var(--motion-fast) var(--ease-standard);
 }
+.sidebar-nav-link-content { display: flex; align-items: center; gap: var(--space-2); }
+.sidebar-nav-icon { width: 18px; height: 18px; flex-shrink: 0; }
 .sidebar-nav a:hover { background: var(--color-surface-panel); }
 .sidebar-nav a[aria-current="page"] {
   background: color-mix(in srgb, var(--color-accent) 12%, var(--color-surface-panel));

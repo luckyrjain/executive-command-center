@@ -224,6 +224,7 @@ function MemberRow({
             </button>
             <button
               type="button"
+              className="btn-quiet"
               onClick={() => {
                 setConfirmRemove(false)
                 removeMutation.reset()

@@ -82,6 +82,7 @@ describe('TaskWorkspace', () => {
 
     await screen.findByText('Prepare board pack')
     fireEvent.click(screen.getByRole('button', { name: 'Edit Prepare board pack' }))
+    expect(screen.getByRole('button', { name: 'Save task' }).className).toBe('btn-primary')
     fireEvent.change(screen.getByLabelText('Edit task title'), { target: { value: 'Prepare final board pack' } })
     fireEvent.click(screen.getByRole('button', { name: 'Save task' }))
 
@@ -104,6 +105,7 @@ describe('TaskWorkspace', () => {
 
     await screen.findByText('Prepare board pack')
     expect(screen.getByRole('button', { name: 'Complete Prepare board pack' })).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'Complete Prepare board pack' }).className).toBe('btn-primary')
     expect(screen.getByRole('button', { name: 'Cancel Prepare board pack' })).toBeTruthy()
     fireEvent.click(screen.getByRole('button', { name: 'Archive Prepare board pack' }))
     await screen.findByRole('button', { name: 'Restore Prepare board pack' })

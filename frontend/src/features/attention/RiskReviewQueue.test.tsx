@@ -60,6 +60,7 @@ describe('RiskReviewQueue', () => {
 
     await waitFor(() => expect(screen.getByText('Vendor concentration risk')).toBeTruthy())
     fireEvent.click(screen.getByRole('button', { name: 'Record review for Vendor concentration risk' }))
+    expect(screen.getByRole('button', { name: 'Save review' }).className).toBe('btn-primary')
     fireEvent.click(screen.getByRole('button', { name: 'Save review' }))
 
     await waitFor(() => expect(fetch).toHaveBeenCalledTimes(3))

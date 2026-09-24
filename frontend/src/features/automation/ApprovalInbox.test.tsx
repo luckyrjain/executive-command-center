@@ -124,6 +124,8 @@ describe('ApprovalInbox', () => {
 
     await waitFor(() => expect(screen.getByText(/Run run-1 · step 0/)).toBeTruthy())
     fireEvent.change(screen.getByLabelText('Echo the action digest above to approve, run run-1 step 0'), { target: { value: 'digest-abc123' } })
+    expect(screen.getByRole('button', { name: 'Approve' }).className).toBe('btn-primary')
+    expect(screen.getByRole('button', { name: 'Reject' }).className).toBe('')
     fireEvent.click(screen.getByRole('button', { name: 'Approve' }))
 
     await waitFor(() => expect(fetch).toHaveBeenCalledTimes(5))

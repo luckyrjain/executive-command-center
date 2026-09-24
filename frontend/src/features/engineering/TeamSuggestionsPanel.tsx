@@ -102,7 +102,7 @@ function SuggestionRow({ group, teamsById }: { group: TeamSuggestionGroup; teams
         </label>
       </div>
       <div className="work-actions">
-        <button type="button" aria-busy={confirmMutation.isPending} disabled={!teamEntityId || busy} onClick={() => confirmMutation.mutate()}>
+        <button type="button" className="btn-primary" aria-busy={confirmMutation.isPending} disabled={!teamEntityId || busy} onClick={() => confirmMutation.mutate()}>
           Confirm
         </button>
         <button type="button" aria-busy={dismissMutation.isPending} disabled={busy} onClick={() => dismissMutation.mutate()}>

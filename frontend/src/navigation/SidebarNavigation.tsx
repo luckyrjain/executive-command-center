@@ -17,7 +17,10 @@ export default function SidebarNavigation() {
             {WORKSPACES.filter((entry) => entry.group === group).map((entry) => (
               <li key={entry.view}>
                 <NavLink to={entry.path} end>
-                  <span>{entry.label}</span>
+                  <span className="sidebar-nav-link-content">
+                    <entry.icon aria-hidden="true" className="sidebar-nav-icon" />
+                    <span>{entry.label}</span>
+                  </span>
                   {counts[entry.view] ? (
                     <span className="sidebar-nav-badge" aria-label={entry.badgeCountLabel?.(counts[entry.view]!) ?? `${counts[entry.view]} items`}>
                       {counts[entry.view]}

@@ -1,5 +1,10 @@
 import { describe, expect, it } from 'vitest'
 
+import {
+  AttentionIcon, AutomationIcon, EngineeringIcon, KnowledgeIcon, MeetingPrepIcon,
+  NotesIcon, PersonalIcon, PlannerIcon, RecommendationsIcon, RisksIcon,
+  ScheduleIcon, SearchAuditIcon, TeamIcon, TodayIcon, WorkIcon,
+} from './icons'
 import { compositionForPath, pathForView, viewForPath, WORKSPACES } from './workspaces'
 
 describe('workspaces', () => {
@@ -71,5 +76,19 @@ describe('workspaces', () => {
   it('does not treat the root path itself as a trailing slash to strip', () => {
     expect(viewForPath('/')).toBeNull()
     expect(compositionForPath('/')).toBe('cards')
+  })
+
+  it('maps each workspace to its own distinct icon component', () => {
+    const expected: Record<string, unknown> = {
+      today: TodayIcon, attention: AttentionIcon, recommendations: RecommendationsIcon,
+      work: WorkIcon, notes: NotesIcon, schedule: ScheduleIcon, planner: PlannerIcon,
+      'meeting-prep': MeetingPrepIcon, risks: RisksIcon, knowledge: KnowledgeIcon,
+      'search-audit': SearchAuditIcon, automation: AutomationIcon, engineering: EngineeringIcon,
+      personal: PersonalIcon, collaboration: TeamIcon,
+    }
+    for (const entry of WORKSPACES) {
+      expect(entry.icon).toBe(expected[entry.view])
+    }
+    expect(new Set(WORKSPACES.map((w) => w.icon)).size).toBe(15)
   })
 })

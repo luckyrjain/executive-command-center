@@ -83,6 +83,7 @@ function ResolutionCandidateRow({ candidate }: ResolutionCandidateRowProps) {
       <div className="work-actions" role="group" aria-label={`Actions for candidate ${candidate.id}`}>
         <button
           type="button"
+          className="btn-primary"
           disabled={decisionMutation.isPending || !reason.trim()}
           onClick={() => decisionMutation.mutate('confirm')}
         >

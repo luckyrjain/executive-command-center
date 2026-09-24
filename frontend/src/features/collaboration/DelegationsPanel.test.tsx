@@ -71,6 +71,7 @@ describe('DelegationsPanel', () => {
     stubFetch({ delegations: [delegation({ recipient_account_id: 'account-me', delegator_account_id: 'account-other' })] })
     renderPanel()
     expect(await screen.findByRole('button', { name: 'Accept' })).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'Accept' }).className).toBe('btn-primary')
     expect(screen.getByRole('button', { name: 'Reject' })).toBeTruthy()
   })
 

@@ -134,6 +134,7 @@ describe('MembersPanel', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Remove' }))
     expect(await screen.findByText(/ends their access immediately/)).toBeTruthy()
     expect(screen.getByRole('button', { name: 'Confirm removal' })).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'Cancel' }).className).toBe('btn-quiet')
   })
 
   it('shows the owned-resources breakdown and an ownership-transfer form when removal is blocked', async () => {
