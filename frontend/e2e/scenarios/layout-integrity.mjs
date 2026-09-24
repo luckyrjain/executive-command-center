@@ -235,12 +235,13 @@ export async function run({ page, baseURL }) {
   }
 
   // /today has no .wizard-stepper, so it can't join the loop above -- a
-  // standalone check instead. .brief-status-heading is the row most likely
-  // to overflow at 320px (a heading plus a button, the same shape the
-  // loop above exists to guard for the wizard-stepper case).
+  // standalone check instead, waiting for real data (not just first-paint
+  // markup) so the overflow measurement reflects the loaded page.
   await page.goto(`${baseURL}/today`)
-  await page.locator('.brief-status-heading').waitFor()
+  await page.locator('.brief-status').getByText(/Generation/).waitFor()
+  await page.locator('.dashboard-grid').waitFor()
   assert.equal(await horizontalOverflow(page), 0, '/today must not scroll horizontally at 320px')
+
   // The connecting line gives way first; the label itself is protected
   // (flex-shrink: 0) so at these labels and viewport it never wraps.
   await page.goto(`${baseURL}/risks`)
