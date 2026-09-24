@@ -287,12 +287,12 @@ button[aria-busy="true"]:disabled { cursor: wait; }
 .item-meta span { border-radius: 999px; background: var(--color-surface-recessed); padding: 4px 8px; font-weight: 800; }
 .empty-state { margin: 50px 0 0; color: var(--color-text-secondary); text-align: center; }
 
-.brief-status { margin-top: 36px; margin-bottom: 20px; }
+.brief-status { margin-top: 36px; margin-bottom: var(--space-10); }
 /* h2 size/tracking matches .section-heading h2 exactly (var(--text-lg),
  * -.01em) -- the same "quiet section heading" precedent already used
  * elsewhere (e.g. AttentionQueue's grouped headings), not a new size. */
 .brief-status-heading h2 { margin: 0; font-size: var(--text-lg); letter-spacing: -.01em; }
-.brief-status-heading p:not(.eyebrow) { margin: 6px 0 0; color: var(--color-text-secondary); }
+.brief-status-heading p:not(.eyebrow) { margin: var(--space-2) 0 0; color: var(--color-text-secondary); }
 
 .recommendation-panel,
 .explore-panel,
