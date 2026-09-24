@@ -336,11 +336,17 @@ describe('GmailPanel', () => {
     // A permanent deletion must read as destructive, not as an ordinary button.
     expect(screen.getByRole('button', { name: 'Forget cached content for this thread' }).classList.contains('btn-destructive')).toBe(true)
 
+    const trigger = screen.getByRole('button', { name: 'Signed contract needed by Friday' })
     fireEvent.click(screen.getByRole('button', { name: 'Forget cached content for this thread' }))
     await waitFor(() => expect(fetch).toHaveBeenCalledWith(
       expect.stringContaining('/api/v1/personal/gmail/threads/thread-1/forget'),
       expect.objectContaining({ method: 'POST' }),
     ))
+
+    // The forget success collapses the thread detail region -- the button
+    // just clicked unmounts with it. Focus must land back on the list row
+    // that opened it, not silently drop to `<body>`.
+    await waitFor(() => expect(document.activeElement).toBe(trigger))
   })
 
   it('shows a genuinely empty message body as empty, not as "not fetched"', async () => {

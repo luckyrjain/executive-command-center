@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
 import { ApiError, apiRequest } from '../../api/client'
@@ -100,6 +100,22 @@ function readOAuthReturnStatus(): OAuthReturnStatus | null {
 export default function GmailPanel() {
   const queryClient = useQueryClient()
   const [selectedThreadId, setSelectedThreadId] = useState<string | null>(null)
+  // `selectedThreadId` only ever goes back to `null` via `ThreadDetail`'s
+  // own "Forget cached content" success (there is no manual collapse
+  // affordance) -- that unmounts the focused button along with the rest of
+  // `ThreadDetail`, dropping focus to `<body>`. The list row that opened it
+  // stays mounted, so restore focus there: same "unmounting the focused
+  // element loses focus to `<body>`" shape `MembersPanel.tsx`'s own removal
+  // flow found, but simpler here since nothing else unmounts.
+  const previousSelectedThreadIdRef = useRef<string | null>(null)
+  const threadTriggerRefs = useRef(new Map<string, HTMLButtonElement>())
+  useEffect(() => {
+    const previous = previousSelectedThreadIdRef.current
+    if (previous !== null && selectedThreadId === null) {
+      threadTriggerRefs.current.get(previous)?.focus()
+    }
+    previousSelectedThreadIdRef.current = selectedThreadId
+  }, [selectedThreadId])
   const [sinceInput, setSinceInput] = useState('')
   // The "Connect Gmail" step -- real-user setup feedback: "should be more
   // like a wizard, natural click, click" (see the connector-setup-wizard
@@ -376,7 +392,15 @@ export default function GmailPanel() {
           <ul className="work-list" aria-label="Gmail threads">
             {threadItems.map((thread) => (
               <li key={thread.id}>
-                <button type="button" onClick={() => setSelectedThreadId(thread.id)} aria-expanded={selectedThreadId === thread.id}>
+                <button
+                  type="button"
+                  ref={(node) => {
+                    if (node) threadTriggerRefs.current.set(thread.id, node)
+                    else threadTriggerRefs.current.delete(thread.id)
+                  }}
+                  onClick={() => setSelectedThreadId(thread.id)}
+                  aria-expanded={selectedThreadId === thread.id}
+                >
                   {thread.subject ?? '(no subject)'}
                 </button>
                 <small>{threadSummaryLine(thread)}{thread.body_cached ? '' : ' · body not yet fetched'}</small>

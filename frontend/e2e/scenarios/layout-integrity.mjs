@@ -213,4 +213,32 @@ export async function run({ page, baseURL }) {
   assert.ok(bare.fontSize > bare.h3FontSize, `.work-subsection h2 (${bare.fontSize}px) must be larger than its h3 sub-headings (${bare.h3FontSize}px)`)
   assert.equal(bare.marginTop, '0px', 'a bare .work-subsection > h2 has no default top margin')
   await assertNoSeriousAccessibilityViolations(page, { include: 'section[aria-labelledby="attention-title"]' })
+
+  // A `.wizard-stepper`'s three nowrap labels ("Details"/"Plan"/"Review" etc.)
+  // could exceed a narrow single-column panel's min-content, blowing the whole
+  // page out past 320px -- RiskWorkspace and ScheduleWorkspace sit inside a
+  // `.work-grid` (a bare `1fr` track's automatic minimum is its content's
+  // min-content), and PolicyPanel/WorkflowList were already within a few px
+  // of it with no grid involved at all.
+  await page.setViewportSize({ width: 320, height: 900 })
+  for (const path of ['/risks', '/schedule']) {
+    await page.goto(`${baseURL}${path}`)
+    const stepper = page.locator('.wizard-stepper').first()
+    await stepper.waitFor()
+    assert.equal(await horizontalOverflow(page), 0, `${path} must not scroll horizontally at 320px`)
+  }
+  await page.goto(`${baseURL}/automation`)
+  for (const tab of ['Workflows', 'Policies']) {
+    await page.getByRole('tab', { name: tab }).click()
+    await page.locator('.wizard-stepper').first().waitFor()
+    assert.equal(await horizontalOverflow(page), 0, `/automation (${tab}) must not scroll horizontally at 320px`)
+  }
+  // The connecting line gives way first; the label itself is protected
+  // (flex-shrink: 0) so at these labels and viewport it never wraps.
+  await page.goto(`${baseURL}/risks`)
+  const stepperLabels = page.locator('.wizard-step-label')
+  await stepperLabels.first().waitFor()
+  const labelLines = await stepperLabels.evaluateAll((els) => els.map((el) =>
+    Math.round(el.getBoundingClientRect().height / parseFloat(getComputedStyle(el).lineHeight))))
+  assert.deepEqual(labelLines, [1, 1, 1], `wizard step labels must stay on one line at 320px, got heights implying ${labelLines} lines`)
 }
