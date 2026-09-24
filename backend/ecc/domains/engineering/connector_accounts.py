@@ -1478,29 +1478,43 @@ def _run_connector_sync(
             # `AND status = 'running'`: see the success-path UPDATE's
             # identical comment below -- must not silently overwrite a
             # reaper's already-recorded terminal status.
-            outcome_session.execute(
+            run_result = outcome_session.execute(
                 text(
                     "UPDATE sync_runs SET status = 'failed', error_summary = :error, "
                     "completed_at = :completed_at WHERE id = :id AND status = 'running'"
                 ),
                 {"error": failure_summary, "completed_at": completed_at, "id": run_id},
             )
-            audit_version = _finalize_account_version(
-                outcome_session,
-                account_id,
-                update_sql=(
-                    "UPDATE connector_accounts SET status = 'error', last_error = :error, "
-                    "updated_at = :now, updated_by = :actor_id, version = version + 1 "
-                    "WHERE id = :id AND status != 'disconnected' "
-                    "RETURNING version"
-                ),
-                params={
-                    "error": failure_summary,
-                    "now": completed_at,
-                    "actor_id": auth.user_id,
-                    "id": account_id,
-                },
-            )
+            # `run_won_the_race` mirrors the success path's identical check
+            # below (see that one for the full mechanism). If this call's
+            # own `sync_runs` row was already reaped as stale by a later,
+            # genuinely concurrent call before this (failed) outcome
+            # finally arrived, the reaper's own terminal status already
+            # stands, and that concurrent call's own phase 3 -- running
+            # separately, on its own row -- is the one whose account-level
+            # state and audit trail should win. There is no correct
+            # `connector_accounts` write or "sync failed" event left to
+            # emit for an outcome the system has already decided to
+            # disregard, so both are skipped, not merely reordered --
+            # exactly the same reasoning the cursor writes below apply.
+            run_won_the_race = cast("CursorResult[Any]", run_result).rowcount > 0
+            if run_won_the_race:
+                audit_version = _finalize_account_version(
+                    outcome_session,
+                    account_id,
+                    update_sql=(
+                        "UPDATE connector_accounts SET status = 'error', last_error = :error, "
+                        "updated_at = :now, updated_by = :actor_id, version = version + 1 "
+                        "WHERE id = :id AND status != 'disconnected' "
+                        "RETURNING version"
+                    ),
+                    params={
+                        "error": failure_summary,
+                        "now": completed_at,
+                        "actor_id": auth.user_id,
+                        "id": account_id,
+                    },
+                )
             run_row = (
                 outcome_session.execute(
                     text(
@@ -1513,26 +1527,27 @@ def _run_connector_sync(
                 .one()
             )
             response = SyncRunResponse(**dict(run_row))
-            audit_outbox.write_audit_and_outbox(
-                outcome_session,
-                auth,
-                request,
-                event_type="connector_account.sync_failed",
-                aggregate_type="connector_account",
-                aggregate_id=account_id,
-                aggregate_version=audit_version,
-                changed_fields=["*"],
-                payload={"aggregate_id": str(account_id), "version": audit_version},
-                now=completed_at,
-                domain="engineering_connector_account",
-                source=source,
-            )
-            queue_lifecycle_event(
-                outcome_session,
-                "engineering_connector_account",
-                "connector_account.sync_failed",
-                "allowed",
-            )
+            if run_won_the_race:
+                audit_outbox.write_audit_and_outbox(
+                    outcome_session,
+                    auth,
+                    request,
+                    event_type="connector_account.sync_failed",
+                    aggregate_type="connector_account",
+                    aggregate_id=account_id,
+                    aggregate_version=audit_version,
+                    changed_fields=["*"],
+                    payload={"aggregate_id": str(account_id), "version": audit_version},
+                    now=completed_at,
+                    domain="engineering_connector_account",
+                    source=source,
+                )
+                queue_lifecycle_event(
+                    outcome_session,
+                    "engineering_connector_account",
+                    "connector_account.sync_failed",
+                    "allowed",
+                )
             if idempotency is not None:
                 store_idempotency(
                     outcome_session,
@@ -1597,8 +1612,27 @@ def _run_connector_sync(
         # as the broader `Result[Any]` regardless of statement kind, so
         # this narrows explicitly rather than silencing the check, the
         # same pattern `triggers.py`'s own `rowcount` check uses.
-        cursor_writes_are_safe = cast("CursorResult[Any]", run_result).rowcount > 0
-        if outcome.next_cursor is not None and cursor_writes_are_safe:
+        #
+        # `run_won_the_race` gates every write below that would otherwise
+        # trust this call's own (possibly stale) `outcome` -- not just the
+        # two cursor writes it originally covered. If this call's own
+        # `sync_runs` row was reaped mid-flight, a second, genuinely
+        # concurrent call has already been dispatched against this account
+        # (`_STALE_RUNNING_SYNC_THRESHOLD`'s own docstring) and may already
+        # have completed its own phase 3 -- its own cursor writes,
+        # `connector_accounts` update, audit/outbox event, and lifecycle
+        # event. This call's late-arriving outcome must not clobber any of
+        # that: not the cursors (the original fix), and, by the same
+        # reasoning, not `connector_accounts.status`/`last_synced_at`/
+        # `last_error` (`_finalize_account_version` below), and not a
+        # `connector_account.synced` audit/outbox or lifecycle event for
+        # an outcome the system has already decided to disregard. The
+        # `SELECT` further below still re-reads the actual row after this
+        # branch, so the response returned (and, if applicable, the value
+        # `store_idempotency` caches) always reflects the database's real,
+        # current state either way.
+        run_won_the_race = cast("CursorResult[Any]", run_result).rowcount > 0
+        if outcome.next_cursor is not None and run_won_the_race:
             _save_sync_cursor(
                 outcome_session,
                 workspace_id=auth.workspace_id,
@@ -1609,9 +1643,9 @@ def _run_connector_sync(
                 now=completed_at,
                 actor_id=auth.user_id,
             )
-        if run_type == "backfill" and cursor_writes_are_safe:
+        if run_type == "backfill" and run_won_the_race:
             # Unconditional (on `outcome.backfill_resume_cursor`, not on
-            # `cursor_writes_are_safe` above) -- unlike the `cursor_value`
+            # `run_won_the_race` above) -- unlike the `cursor_value`
             # write above, this one must run even when `outcome.backfill_
             # resume_cursor` is `None`: that value specifically means
             # "clear whatever resume state was stored," either because
@@ -1632,45 +1666,53 @@ def _run_connector_sync(
                 now=completed_at,
                 actor_id=auth.user_id,
             )
-        # `status = 'active'`, not left untouched: reaching this branch at
-        # all (as opposed to the `adapter_failed` branch above) means the
-        # adapter call actually reached the provider and returned a real
-        # `SyncOutcome` -- true whether `outcome.status` is `succeeded` or
-        # merely `partial` (a budget-exhausted call still proves the
-        # credential and connection both work, it just has more to fetch).
-        # Before this, only the failure branch above ever wrote `status`
-        # (to `'error'`) -- nothing on this, the *success* path, ever
-        # wrote it back to `'active'`, so one past failure permanently
-        # stuck an account's status at `'error'` no matter how many
-        # subsequent syncs succeeded: `last_error` correctly cleared to
-        # `None` each time, but `status` itself never moved, leaving the
-        # Connector Health / Gmail panel UI (`status === 'error'` ->
-        # "Gmail unavailable") stuck reporting a connector as broken
-        # indefinitely after it had actually recovered. Reproduced live: a
-        # Gmail connector that failed once (an expired token, before
-        # reconnecting) then completed 13 consecutive successful/partial
-        # backfill calls still showed "Gmail unavailable" throughout, with
-        # `last_error` already `None`. Also fed `metrics.py`'s own
-        # `WHERE status = 'active'` filters, so this silently excluded any
-        # connector with a past-but-since-recovered failure from delivery/
-        # reliability metrics too, not just the UI banner.
-        audit_version = _finalize_account_version(
-            outcome_session,
-            account_id,
-            update_sql=(
-                "UPDATE connector_accounts SET status = 'active', last_synced_at = :now, "
-                "last_error = :error, updated_at = :now, updated_by = :actor_id, "
-                "version = version + 1 "
-                "WHERE id = :id AND status != 'disconnected' "
-                "RETURNING version"
-            ),
-            params={
-                "now": completed_at,
-                "error": error_summary,
-                "actor_id": auth.user_id,
-                "id": account_id,
-            },
-        )
+        if run_won_the_race:
+            # `status = 'active'`, not left untouched: reaching this branch
+            # at all (as opposed to the `adapter_failed` branch above)
+            # means the adapter call actually reached the provider and
+            # returned a real `SyncOutcome` -- true whether `outcome.
+            # status` is `succeeded` or merely `partial` (a
+            # budget-exhausted call still proves the credential and
+            # connection both work, it just has more to fetch). Before
+            # this, only the failure branch above ever wrote `status` (to
+            # `'error'`) -- nothing on this, the *success* path, ever
+            # wrote it back to `'active'`, so one past failure permanently
+            # stuck an account's status at `'error'` no matter how many
+            # subsequent syncs succeeded: `last_error` correctly cleared to
+            # `None` each time, but `status` itself never moved, leaving
+            # the Connector Health / Gmail panel UI (`status === 'error'`
+            # -> "Gmail unavailable") stuck reporting a connector as broken
+            # indefinitely after it had actually recovered. Reproduced
+            # live: a Gmail connector that failed once (an expired token,
+            # before reconnecting) then completed 13 consecutive
+            # successful/partial backfill calls still showed "Gmail
+            # unavailable" throughout, with `last_error` already `None`.
+            # Also fed `metrics.py`'s own `WHERE status = 'active'`
+            # filters, so this silently excluded any connector with a
+            # past-but-since-recovered failure from delivery/reliability
+            # metrics too, not just the UI banner. Gated on `run_won_the_
+            # race` like the cursor writes above: a reaped call's own
+            # outcome must not resurrect an account to `'active'` (or
+            # touch `last_synced_at`/`last_error`) over whatever a
+            # concurrent, already-completed call's own phase 3 already
+            # wrote for the same account.
+            audit_version = _finalize_account_version(
+                outcome_session,
+                account_id,
+                update_sql=(
+                    "UPDATE connector_accounts SET status = 'active', last_synced_at = :now, "
+                    "last_error = :error, updated_at = :now, updated_by = :actor_id, "
+                    "version = version + 1 "
+                    "WHERE id = :id AND status != 'disconnected' "
+                    "RETURNING version"
+                ),
+                params={
+                    "now": completed_at,
+                    "error": error_summary,
+                    "actor_id": auth.user_id,
+                    "id": account_id,
+                },
+            )
 
         run_row = (
             outcome_session.execute(
@@ -1684,23 +1726,27 @@ def _run_connector_sync(
             .one()
         )
         response = SyncRunResponse(**dict(run_row))
-        audit_outbox.write_audit_and_outbox(
-            outcome_session,
-            auth,
-            request,
-            event_type="connector_account.synced",
-            aggregate_type="connector_account",
-            aggregate_id=account_id,
-            aggregate_version=audit_version,
-            changed_fields=["*"],
-            payload={"aggregate_id": str(account_id), "version": audit_version},
-            now=completed_at,
-            domain="engineering_connector_account",
-            source=source,
-        )
-        queue_lifecycle_event(
-            outcome_session, "engineering_connector_account", "connector_account.synced", "allowed"
-        )
+        if run_won_the_race:
+            audit_outbox.write_audit_and_outbox(
+                outcome_session,
+                auth,
+                request,
+                event_type="connector_account.synced",
+                aggregate_type="connector_account",
+                aggregate_id=account_id,
+                aggregate_version=audit_version,
+                changed_fields=["*"],
+                payload={"aggregate_id": str(account_id), "version": audit_version},
+                now=completed_at,
+                domain="engineering_connector_account",
+                source=source,
+            )
+            queue_lifecycle_event(
+                outcome_session,
+                "engineering_connector_account",
+                "connector_account.synced",
+                "allowed",
+            )
         if idempotency is not None:
             store_idempotency(
                 outcome_session,
