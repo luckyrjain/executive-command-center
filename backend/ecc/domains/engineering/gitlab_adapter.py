@@ -233,6 +233,40 @@ def _default_resolve_host(host: str) -> list[str]:
     return [str(info[4][0]) for info in addr_info]
 
 
+def reject_private_host(
+    host: str, *, resolve_host: Callable[[str], list[str]] = _default_resolve_host
+) -> None:
+    """The SSRF guard itself, as a free function -- `GitLabAdapter._reject_
+    private_host` is a thin wrapper over this using its own injectable
+    `self._resolve_host`, and `write_actions.GitLabAddNoteAdapter.execute`
+    (a request-issuing call site for the same per-credential host, on a
+    class with no `GitLabAdapter` instance to delegate to) calls it
+    directly. Re-checking the host at every such call site -- not just
+    once at `authorize()` time -- is this codebase's answer to the
+    DNS-rebinding limitation `GitLabAdapter._reject_private_host`'s own
+    docstring discloses: a host that resolved to a public IP at connect
+    time could be repointed at a private one before a later call, and
+    without a re-check here, that later call would freely reach it using a
+    credential that was never re-authorized against the new address.
+
+    `resolve_host`'s default performs real DNS; tests inject a fake to
+    avoid a real network call, identical to `GitLabAdapter.__init__`'s own
+    `resolve_host` parameter.
+    """
+    allowlist = {
+        entry.strip().casefold()
+        for entry in get_settings().gitlab_private_host_allowlist.split(",")
+        if entry.strip()
+    }
+    if host.casefold() in allowlist:
+        return
+    for ip_str in resolve_host(host):
+        if _is_private_address(ip_str):
+            raise AdapterAuthorizationError(
+                f"GitLab host '{host}' resolves to a private/internal address; refusing to connect"
+            )
+
+
 def _content_hash(project: Mapping[str, Any]) -> str:
     material = dumps(
         {
@@ -366,11 +400,15 @@ class GitLabAdapter:
         return {"PRIVATE-TOKEN": token, "Accept": "application/json"}
 
     def _reject_private_host(self, host: str) -> None:
-        """Connect-time SSRF guard, called once from `authorize()` -- never
-        from a sync call. See the design doc's Security section for why
-        this cannot use Jira's fixed-suffix-allowlist approach (GitLab
-        self-managed hosts are arbitrary customer domains), and for the
-        disclosed DNS-rebinding limitation of a connect-time-only check.
+        """SSRF guard, called from `authorize()` and from every later call
+        site that issues a request to this same per-credential host
+        (`_sync_repositories`, `refresh_permissions`) -- see the design
+        doc's Security section for why this cannot use Jira's
+        fixed-suffix-allowlist approach (GitLab self-managed hosts are
+        arbitrary customer domains), and `reject_private_host`'s own
+        docstring for why re-checking at every call site, not only once at
+        connect time, is this codebase's mitigation for the disclosed
+        DNS-rebinding limitation.
 
         `ECC_GITLAB_PRIVATE_HOST_ALLOWLIST` (`Settings.gitlab_private_host_
         allowlist`) is an operator-controlled, exact-hostname escape hatch
@@ -379,19 +417,7 @@ class GitLabAdapter:
         host trusted until named). Checked before resolution even runs, so
         an allowlisted host never needs a resolvable/mockable DNS answer.
         """
-        allowlist = {
-            entry.strip().casefold()
-            for entry in get_settings().gitlab_private_host_allowlist.split(",")
-            if entry.strip()
-        }
-        if host.casefold() in allowlist:
-            return
-        for ip_str in self._resolve_host(host):
-            if _is_private_address(ip_str):
-                raise AdapterAuthorizationError(
-                    f"GitLab host '{host}' resolves to a private/internal address; "
-                    "refusing to connect"
-                )
+        reject_private_host(host, resolve_host=self._resolve_host)
 
     def _request_with_rate_limit_retry(
         self,
@@ -536,11 +562,18 @@ class GitLabAdapter:
         docstring for the full reasoning and the bug this extraction gives
         one home instead of three). This method's own
         job is just GitLab's request shape, field name, and upsert call.
+
+        `_reject_private_host` runs here too, not only in `authorize()` --
+        see that method's own docstring for why a periodic sync call is
+        exactly the DNS-rebinding window it closes: a host that resolved
+        public at connect time could be repointed private by the time a
+        later sync call runs.
         """
         try:
             host, token = parse_credential(account.credential)
         except InvalidCredentialError as exc:
             raise RuntimeError(str(exc)) from exc
+        self._reject_private_host(host)
         api_base_url = f"https://{host}/api/v4"
         web_base_url = f"https://{host}"
         headers = self._headers(token)
@@ -635,10 +668,21 @@ class GitLabAdapter:
         recover on its own the way a transient `5xx` can; reporting
         `"active"` for it would hide a real, permanent problem behind
         the same signal a rate limit produces.
+
+        A host that now resolves private (`_reject_private_host`, checked
+        here for the same DNS-rebinding reason `_sync_repositories` checks
+        it) fails closed the same way -- it is this method's own contract
+        to always return a `PermissionState`, never raise, so the guard's
+        `AdapterAuthorizationError` is caught here rather than left to
+        escape.
         """
         try:
             host, token = parse_credential(account.credential)
         except InvalidCredentialError:
+            return "permission_lost"
+        try:
+            self._reject_private_host(host)
+        except AdapterAuthorizationError:
             return "permission_lost"
         try:
             response = self._client.get(

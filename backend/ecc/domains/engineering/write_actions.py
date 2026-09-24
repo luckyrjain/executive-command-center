@@ -115,6 +115,7 @@ documented follow-up if a real caller needs this.
 from __future__ import annotations
 
 from base64 import b64encode
+from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Any
 from urllib.parse import quote
@@ -142,12 +143,19 @@ from sqlalchemy.orm import Session
 import ecc.domains.engineering.connectors  # noqa: F401
 from ecc.database import SessionFactory
 from ecc.domains.automation.adapter_contract import TransientAdapterError
+from ecc.domains.engineering.connectors import AdapterAuthorizationError
 from ecc.domains.engineering.crypto import decrypt_credential
 from ecc.domains.engineering.github_adapter import GITHUB_API_BASE_URL, safe_repo_path_segment
 from ecc.domains.engineering.gitlab_adapter import (
     InvalidCredentialError as _InvalidGitLabCredentialError,
 )
+from ecc.domains.engineering.gitlab_adapter import (
+    _default_resolve_host as _default_gitlab_resolve_host,
+)
 from ecc.domains.engineering.gitlab_adapter import parse_credential as _parse_gitlab_credential
+from ecc.domains.engineering.gitlab_adapter import (
+    reject_private_host as _reject_private_gitlab_host,
+)
 from ecc.domains.engineering.jira_adapter import parse_credential as _parse_jira_credential
 
 # `TransientAdapterError` is imported above from `automation.adapter_
@@ -394,12 +402,20 @@ class GitLabAddNoteAdapter:
     high_impact_categories: frozenset[str] = frozenset({"public"})
 
     def __init__(
-        self, *, transport: httpx.BaseTransport | None = None, timeout_seconds: float = 10.0
+        self,
+        *,
+        transport: httpx.BaseTransport | None = None,
+        timeout_seconds: float = 10.0,
+        resolve_host: Callable[[str], list[str]] | None = None,
     ) -> None:
         client_kwargs: dict[str, Any] = {"timeout": timeout_seconds}
         if transport is not None:
             client_kwargs["transport"] = transport
         self._client = httpx.Client(**client_kwargs)
+        # Tests inject a fake `resolve_host` here, the same way `GitLab
+        # Adapter.__init__`'s own `resolve_host` parameter works, to avoid
+        # a real network call; production leaves it unset and gets real DNS.
+        self._resolve_host = resolve_host or _default_gitlab_resolve_host
 
     def simulate(self, action_input: BaseModel) -> BaseModel:
         """Purely in-memory, with **no database round-trip** -- identical to
@@ -450,6 +466,20 @@ class GitLabAddNoteAdapter:
             raise WriteActionRejected(
                 f"connector_account_id {action_input.connector_account_id} has a stored "
                 f"credential this adapter cannot parse: {exc}"
+            ) from exc
+        # `gitlab_adapter.GitLabAdapter._reject_private_host` runs at
+        # connect time, and again on every later sync call, for the
+        # disclosed DNS-rebinding reason both explain. A write action is a
+        # request-issuing call site for this same per-credential host too,
+        # but this module never called any host check itself -- it relied
+        # entirely on the connector's own authorize()-time check, made
+        # against whatever the host resolved to back then, not now.
+        try:
+            _reject_private_gitlab_host(host, resolve_host=self._resolve_host)
+        except AdapterAuthorizationError as exc:
+            raise WriteActionRejected(
+                f"connector_account_id {action_input.connector_account_id}'s GitLab host "
+                f"is no longer safe to reach: {exc}"
             ) from exc
         headers = {"PRIVATE-TOKEN": token, "Accept": "application/json"}
         encoded_project = quote(action_input.project_path, safe="")

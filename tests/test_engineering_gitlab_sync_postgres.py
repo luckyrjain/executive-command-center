@@ -616,11 +616,34 @@ def test_backfill_single_page(seeded_account_context: ConnectorAccountContext) -
         assert request.url.path == "/api/v4/projects"
         return _json_response(projects)
 
-    adapter = GitLabAdapter(transport=httpx.MockTransport(handler))
+    adapter = GitLabAdapter(
+        transport=httpx.MockTransport(handler), resolve_host=lambda host: ["140.82.112.3"]
+    )
     outcome = adapter.backfill(seeded_account_context, "repository")
     assert outcome.status == "succeeded"
     assert outcome.items_processed == 2
     assert outcome.next_cursor == "2024-01-03T00:00:00Z"
+
+
+def test_backfill_rejects_a_host_that_now_resolves_private(
+    seeded_account_context: ConnectorAccountContext,
+) -> None:
+    """`authorize()`'s own private-host check ran once, when this connector
+    was first created -- against whatever the host resolved to *then*. A
+    periodic sync call re-checks it too, closing the DNS-rebinding window
+    `GitLabAdapter._reject_private_host`'s own docstring discloses: this
+    same host, now repointed at a private address, must not be silently
+    reachable forever after the one connect-time check passed.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError("must not make an HTTP call once the host is rejected")
+
+    adapter = GitLabAdapter(
+        transport=httpx.MockTransport(handler), resolve_host=lambda host: ["169.254.169.254"]
+    )
+    with pytest.raises(AdapterAuthorizationError, match="private/internal"):
+        adapter.backfill(seeded_account_context, "repository")
 
 
 def test_backfill_against_a_self_managed_host_writes_host_scoped_source_urls(
@@ -683,7 +706,9 @@ def test_backfill_against_a_self_managed_host_writes_host_scoped_source_urls(
         assert request.headers["PRIVATE-TOKEN"] == "glpat-private"
         return _json_response(projects)
 
-    adapter = GitLabAdapter(transport=httpx.MockTransport(handler))
+    adapter = GitLabAdapter(
+        transport=httpx.MockTransport(handler), resolve_host=lambda host: ["140.82.112.3"]
+    )
     outcome = adapter.backfill(account, "repository")
     assert outcome.status == "succeeded"
     assert outcome.items_processed == 2
@@ -727,7 +752,9 @@ def test_backfill_with_a_legacy_bare_token_credential_syncs_against_gitlab_com(
         assert request.headers["PRIVATE-TOKEN"] == "glpat-legacy-bare"
         return _json_response([_project(1, path="acme/a", updated_at="2024-01-03T00:00:00Z")])
 
-    adapter = GitLabAdapter(transport=httpx.MockTransport(handler))
+    adapter = GitLabAdapter(
+        transport=httpx.MockTransport(handler), resolve_host=lambda host: ["140.82.112.3"]
+    )
     outcome = adapter.backfill(account, "repository")
     assert outcome.status == "succeeded"
     assert outcome.items_processed == 1
@@ -767,7 +794,10 @@ def test_backfill_populates_suggested_team_name_from_namespace_full_path(
             },
         )
     ]
-    adapter = GitLabAdapter(transport=httpx.MockTransport(lambda r: _json_response(projects)))
+    adapter = GitLabAdapter(
+        transport=httpx.MockTransport(lambda r: _json_response(projects)),
+        resolve_host=lambda host: ["140.82.112.3"],
+    )
     adapter.backfill(seeded_account_context, "repository")
 
     with engine.begin() as connection:
@@ -795,7 +825,10 @@ def test_backfill_suggested_team_name_falls_back_to_name_when_full_path_absent(
             namespace={"id": 9, "name": "Acme Group", "path": "acme", "kind": "group"},
         )
     ]
-    adapter = GitLabAdapter(transport=httpx.MockTransport(lambda r: _json_response(projects)))
+    adapter = GitLabAdapter(
+        transport=httpx.MockTransport(lambda r: _json_response(projects)),
+        resolve_host=lambda host: ["140.82.112.3"],
+    )
     adapter.backfill(seeded_account_context, "repository")
 
     with engine.begin() as connection:
@@ -819,7 +852,10 @@ def test_backfill_suggested_team_name_handles_bare_string_namespace(
     projects = [
         _project(1, path="acme/a", updated_at="2024-01-03T00:00:00Z", namespace="Acme Group")
     ]
-    adapter = GitLabAdapter(transport=httpx.MockTransport(lambda r: _json_response(projects)))
+    adapter = GitLabAdapter(
+        transport=httpx.MockTransport(lambda r: _json_response(projects)),
+        resolve_host=lambda host: ["140.82.112.3"],
+    )
     adapter.backfill(seeded_account_context, "repository")
 
     with engine.begin() as connection:
@@ -841,7 +877,10 @@ def test_incremental_resync_refreshes_suggestion_without_touching_confirmed_team
     UPDATE` clause is authored per-adapter, not shared.
     """
     projects = [_project(1, path="acme/a", updated_at="2024-01-03T00:00:00Z", namespace="Acme")]
-    adapter = GitLabAdapter(transport=httpx.MockTransport(lambda r: _json_response(projects)))
+    adapter = GitLabAdapter(
+        transport=httpx.MockTransport(lambda r: _json_response(projects)),
+        resolve_host=lambda host: ["140.82.112.3"],
+    )
     adapter.backfill(seeded_account_context, "repository")
 
     confirmed_team_id = uuid4()
@@ -870,7 +909,8 @@ def test_incremental_resync_refreshes_suggestion_without_touching_confirmed_team
         _project(1, path="acme/a", updated_at="2024-01-04T00:00:00Z", namespace="Acme Renamed")
     ]
     adapter2 = GitLabAdapter(
-        transport=httpx.MockTransport(lambda r: _json_response(projects_renamed))
+        transport=httpx.MockTransport(lambda r: _json_response(projects_renamed)),
+        resolve_host=lambda host: ["140.82.112.3"],
     )
     adapter2.incremental_sync(seeded_account_context, "repository", "2024-01-03T00:00:00Z")
 
@@ -914,7 +954,10 @@ def test_incremental_resync_clears_dismissed_suggestion_when_namespace_changes(
     projects = [
         _project(1, path="acme/a", updated_at="2024-01-03T00:00:00Z", namespace={"name": "acme"})
     ]
-    adapter = GitLabAdapter(transport=httpx.MockTransport(lambda r: _json_response(projects)))
+    adapter = GitLabAdapter(
+        transport=httpx.MockTransport(lambda r: _json_response(projects)),
+        resolve_host=lambda host: ["140.82.112.3"],
+    )
     adapter.backfill(seeded_account_context, "repository")
 
     with engine.begin() as connection:
@@ -932,7 +975,8 @@ def test_incremental_resync_clears_dismissed_suggestion_when_namespace_changes(
         )
     ]
     adapter2 = GitLabAdapter(
-        transport=httpx.MockTransport(lambda r: _json_response(projects_new_namespace))
+        transport=httpx.MockTransport(lambda r: _json_response(projects_new_namespace)),
+        resolve_host=lambda host: ["140.82.112.3"],
     )
     adapter2.incremental_sync(seeded_account_context, "repository", "2024-01-03T00:00:00Z")
 
@@ -970,7 +1014,9 @@ def test_backfill_paginates_via_link_header(
             return _json_response(page2)
         raise AssertionError(f"unexpected page {page}")
 
-    adapter = GitLabAdapter(transport=httpx.MockTransport(handler))
+    adapter = GitLabAdapter(
+        transport=httpx.MockTransport(handler), resolve_host=lambda host: ["140.82.112.3"]
+    )
     outcome = adapter.backfill(seeded_account_context, "repository")
     assert outcome.items_processed == 2
     assert outcome.next_cursor == "2024-01-05T00:00:00Z"
@@ -990,7 +1036,9 @@ def test_project_list_requests_newest_first_at_the_shared_page_size(
         seen.append(request.url.params)
         return _json_response([])
 
-    adapter = GitLabAdapter(transport=httpx.MockTransport(handler))
+    adapter = GitLabAdapter(
+        transport=httpx.MockTransport(handler), resolve_host=lambda host: ["140.82.112.3"]
+    )
     adapter.backfill(seeded_account_context, "repository")
 
     assert len(seen) == 1
@@ -1011,7 +1059,9 @@ def test_incremental_sync_stops_at_prior_cursor(
     def handler(request: httpx.Request) -> httpx.Response:
         return _json_response(projects)
 
-    adapter = GitLabAdapter(transport=httpx.MockTransport(handler))
+    adapter = GitLabAdapter(
+        transport=httpx.MockTransport(handler), resolve_host=lambda host: ["140.82.112.3"]
+    )
     outcome = adapter.incremental_sync(
         seeded_account_context, "repository", cursor="2024-01-02T00:00:00Z"
     )
@@ -1027,13 +1077,18 @@ def test_incremental_sync_with_no_cursor_behaves_like_backfill(
     def handler(request: httpx.Request) -> httpx.Response:
         return _json_response(projects)
 
-    adapter = GitLabAdapter(transport=httpx.MockTransport(handler))
+    adapter = GitLabAdapter(
+        transport=httpx.MockTransport(handler), resolve_host=lambda host: ["140.82.112.3"]
+    )
     outcome = adapter.incremental_sync(seeded_account_context, "repository", cursor=None)
     assert outcome.items_processed == 1
 
 
 def test_non_repository_resource_type_is_a_zero_item_no_op() -> None:
-    adapter = GitLabAdapter(transport=httpx.MockTransport(lambda r: _json_response([])))
+    adapter = GitLabAdapter(
+        transport=httpx.MockTransport(lambda r: _json_response([])),
+        resolve_host=lambda host: ["140.82.112.3"],
+    )
     outcome = adapter.backfill(_account_context(), "work_item")
     assert outcome.items_processed == 0
     assert outcome.status == "succeeded"
@@ -1054,7 +1109,9 @@ def test_rate_limit_retry_succeeds_after_bounded_wait(
         return _json_response([_project(1, path="acme/a", updated_at="2024-01-01T00:00:00Z")])
 
     adapter = GitLabAdapter(
-        transport=httpx.MockTransport(handler), sleep=lambda seconds: sleeps.append(seconds)
+        transport=httpx.MockTransport(handler),
+        sleep=lambda seconds: sleeps.append(seconds),
+        resolve_host=lambda host: ["140.82.112.3"],
     )
     outcome = adapter.backfill(seeded_account_context, "repository")
     assert outcome.status == "succeeded"
@@ -1068,7 +1125,11 @@ def test_rate_limit_gives_up_beyond_bounded_wait() -> None:
             {"message": "rate limited"}, status_code=429, headers={"Retry-After": "3600"}
         )
 
-    adapter = GitLabAdapter(transport=httpx.MockTransport(handler), sleep=lambda seconds: None)
+    adapter = GitLabAdapter(
+        transport=httpx.MockTransport(handler),
+        sleep=lambda seconds: None,
+        resolve_host=lambda host: ["140.82.112.3"],
+    )
     outcome = adapter.backfill(_account_context(), "repository")
     assert outcome.status == "partial"
     assert outcome.items_processed == 0
@@ -1085,7 +1146,11 @@ def test_rate_limit_still_limited_after_retry_reports_partial_not_failure() -> N
             {"message": "rate limited"}, status_code=429, headers={"Retry-After": "0"}
         )
 
-    adapter = GitLabAdapter(transport=httpx.MockTransport(handler), sleep=lambda seconds: None)
+    adapter = GitLabAdapter(
+        transport=httpx.MockTransport(handler),
+        sleep=lambda seconds: None,
+        resolve_host=lambda host: ["140.82.112.3"],
+    )
     outcome = adapter.backfill(_account_context(), "repository")
     assert outcome.status == "partial"
     assert outcome.items_processed == 0
@@ -1104,7 +1169,11 @@ def test_rate_limit_gives_up_immediately_when_retry_after_header_absent() -> Non
     def handler(request: httpx.Request) -> httpx.Response:
         return _json_response({"message": "rate limited"}, status_code=429)
 
-    adapter = GitLabAdapter(transport=httpx.MockTransport(handler), sleep=lambda seconds: None)
+    adapter = GitLabAdapter(
+        transport=httpx.MockTransport(handler),
+        sleep=lambda seconds: None,
+        resolve_host=lambda host: ["140.82.112.3"],
+    )
     outcome = adapter.backfill(_account_context(), "repository")
     assert outcome.status == "partial"
     assert outcome.items_processed == 0
@@ -1120,7 +1189,11 @@ def test_rate_limit_gives_up_immediately_when_retry_after_malformed() -> None:
             {"message": "rate limited"}, status_code=429, headers={"Retry-After": "soon"}
         )
 
-    adapter = GitLabAdapter(transport=httpx.MockTransport(handler), sleep=lambda seconds: None)
+    adapter = GitLabAdapter(
+        transport=httpx.MockTransport(handler),
+        sleep=lambda seconds: None,
+        resolve_host=lambda host: ["140.82.112.3"],
+    )
     outcome = adapter.backfill(_account_context(), "repository")
     assert outcome.status == "partial"
     assert outcome.items_processed == 0
@@ -1130,7 +1203,9 @@ def test_sync_repositories_raises_on_generic_failure_status() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return _json_response({"message": "Server error"}, status_code=500)
 
-    adapter = GitLabAdapter(transport=httpx.MockTransport(handler))
+    adapter = GitLabAdapter(
+        transport=httpx.MockTransport(handler), resolve_host=lambda host: ["140.82.112.3"]
+    )
     with pytest.raises(RuntimeError, match="GitLab project list failed with status 500"):
         adapter.backfill(_account_context(), "repository")
 
@@ -1147,7 +1222,9 @@ def test_page_cap_reports_partial_with_more_pages_remaining(
             headers={"Link": '<https://gitlab.com/api/v4/projects?page=999>; rel="next"'},
         )
 
-    adapter = GitLabAdapter(transport=httpx.MockTransport(handler))
+    adapter = GitLabAdapter(
+        transport=httpx.MockTransport(handler), resolve_host=lambda host: ["140.82.112.3"]
+    )
     outcome = adapter.backfill(seeded_account_context, "repository")
     assert outcome.status == "partial"
     assert outcome.items_processed == gitlab_adapter_module._MAX_PAGES_PER_CALL
@@ -1184,7 +1261,9 @@ def test_backfill_resumes_across_multiple_calls_instead_of_repeating(
             headers=headers,
         )
 
-    adapter = GitLabAdapter(transport=httpx.MockTransport(handler))
+    adapter = GitLabAdapter(
+        transport=httpx.MockTransport(handler), resolve_host=lambda host: ["140.82.112.3"]
+    )
     first = adapter.backfill(seeded_account_context, "repository")
     assert first.status == "partial"
     assert first.items_processed == gitlab_adapter_module._MAX_PAGES_PER_CALL
@@ -1222,13 +1301,19 @@ def test_refresh_permissions() -> None:
     def active(request: httpx.Request) -> httpx.Response:
         return _json_response(_token_self_response(scopes=["read_api", "read_repository"]))
 
-    lost_adapter = GitLabAdapter(transport=httpx.MockTransport(unauthorized))
+    lost_adapter = GitLabAdapter(
+        transport=httpx.MockTransport(unauthorized), resolve_host=lambda host: ["140.82.112.3"]
+    )
     assert lost_adapter.refresh_permissions(_account_context()) == "permission_lost"
 
-    revoked_adapter = GitLabAdapter(transport=httpx.MockTransport(revoked))
+    revoked_adapter = GitLabAdapter(
+        transport=httpx.MockTransport(revoked), resolve_host=lambda host: ["140.82.112.3"]
+    )
     assert revoked_adapter.refresh_permissions(_account_context()) == "permission_lost"
 
-    active_adapter = GitLabAdapter(transport=httpx.MockTransport(active))
+    active_adapter = GitLabAdapter(
+        transport=httpx.MockTransport(active), resolve_host=lambda host: ["140.82.112.3"]
+    )
     assert active_adapter.refresh_permissions(_account_context()) == "active"
 
 
@@ -1241,7 +1326,9 @@ def test_refresh_permissions_fails_open_on_network_error() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         raise httpx.ConnectError("connection refused")
 
-    adapter = GitLabAdapter(transport=httpx.MockTransport(handler))
+    adapter = GitLabAdapter(
+        transport=httpx.MockTransport(handler), resolve_host=lambda host: ["140.82.112.3"]
+    )
     assert adapter.refresh_permissions(_account_context()) == "active"
 
 
@@ -1267,8 +1354,26 @@ def test_refresh_permissions_returns_permission_lost_for_malformed_credential() 
         external_account_id="gitlab.com:555",
         credential="https://gitlab.com|glpat_test",
     )
-    adapter = GitLabAdapter()
+    adapter = GitLabAdapter(resolve_host=lambda host: ["140.82.112.3"])
     assert adapter.refresh_permissions(context) == "permission_lost"
+
+
+def test_refresh_permissions_returns_permission_lost_for_a_now_private_host() -> None:
+    """Same DNS-rebinding re-check as `_sync_repositories`'s own, but
+    `refresh_permissions`'s own contract is to always return a
+    `PermissionState`, never raise -- the guard's `AdapterAuthorizationError`
+    is caught and reported as `\"permission_lost\"`, the same fail-closed
+    branch a malformed credential already gets, not left to escape and
+    break that contract for whenever this method gets a real caller.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError("must not make an HTTP call once the host is rejected")
+
+    adapter = GitLabAdapter(
+        transport=httpx.MockTransport(handler), resolve_host=lambda host: ["169.254.169.254"]
+    )
+    assert adapter.refresh_permissions(_account_context()) == "permission_lost"
 
 
 def test_disconnect_is_a_no_op() -> None:
@@ -1535,7 +1640,11 @@ def test_sync_backfill_writes_repositories_then_incremental_only_writes_newer(
         )
 
     registry = ConnectorRegistry()
-    registry.register(GitLabAdapter(transport=httpx.MockTransport(handler)))
+    registry.register(
+        GitLabAdapter(
+            transport=httpx.MockTransport(handler), resolve_host=lambda host: ["140.82.112.3"]
+        )
+    )
     monkeypatch.setattr(connector_accounts_module, "connector_registry", registry)
 
     backfill_response = client.post(
@@ -1589,7 +1698,11 @@ def test_sync_reports_partial_on_rate_limit_and_records_it(
 
     registry = ConnectorRegistry()
     registry.register(
-        GitLabAdapter(transport=httpx.MockTransport(handler), sleep=lambda seconds: None)
+        GitLabAdapter(
+            transport=httpx.MockTransport(handler),
+            sleep=lambda seconds: None,
+            resolve_host=lambda host: ["140.82.112.3"],
+        )
     )
     monkeypatch.setattr(connector_accounts_module, "connector_registry", registry)
 
