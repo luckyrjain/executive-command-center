@@ -148,7 +148,7 @@ from fastapi import (
     status,
 )
 from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy import text
+from sqlalchemy import CursorResult, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -1562,7 +1562,7 @@ def _run_connector_sync(
         # below reads whichever status actually won (this update's own, or
         # the reaper's), so the response returned always matches the
         # database rather than trusting the locally-held `outcome`.
-        outcome_session.execute(
+        run_result = outcome_session.execute(
             text(
                 "UPDATE sync_runs SET status = :status, items_processed = :items_processed, "
                 "error_summary = :error_summary, completed_at = :completed_at "
@@ -1576,7 +1576,29 @@ def _run_connector_sync(
                 "id": run_id,
             },
         )
-        if outcome.next_cursor is not None:
+        # `run_result.rowcount == 0` is this same reaped-run case, one step
+        # further: a run reaped *while its adapter call was still in
+        # flight* means a concurrent, later call has already been
+        # dispatched against this account (`_STALE_RUNNING_SYNC_THRESHOLD`'s
+        # own docstring), and by the time this stale outcome finally
+        # arrives, that later call may already have written a newer
+        # `sync_cursors` row. `_save_sync_cursor` is a blind UPSERT with no
+        # ordering check of its own -- writing this reaped call's own
+        # (older, since it's the one still running when the newer call
+        # started) cursor here could clobber the newer one with a stale
+        # value, silently rewinding where the next incremental sync
+        # resumes from. Skipped, not merely reordered: there is no correct
+        # cursor value to write for an outcome the system has already
+        # decided to disregard.
+        #
+        # `session.execute()` against a `text()` UPDATE always returns a
+        # real `CursorResult` at runtime (it has a real `rowcount` from the
+        # DBAPI cursor) -- mypy's stubs type `Session.execute()`'s return
+        # as the broader `Result[Any]` regardless of statement kind, so
+        # this narrows explicitly rather than silencing the check, the
+        # same pattern `triggers.py`'s own `rowcount` check uses.
+        cursor_writes_are_safe = cast("CursorResult[Any]", run_result).rowcount > 0
+        if outcome.next_cursor is not None and cursor_writes_are_safe:
             _save_sync_cursor(
                 outcome_session,
                 workspace_id=auth.workspace_id,
@@ -1587,16 +1609,17 @@ def _run_connector_sync(
                 now=completed_at,
                 actor_id=auth.user_id,
             )
-        if run_type == "backfill":
-            # Unconditional -- unlike the `cursor_value` write above, this
-            # one must run even when `outcome.backfill_resume_cursor` is
-            # `None`: that value specifically means "clear whatever
-            # resume state was stored," either because this resource
-            # type's backfill just genuinely finished, or because nothing
-            # was ever in progress. Skipping the write on `None` (the way
-            # `cursor_value`'s own guard does, correctly, for its own
-            # different meaning of `None`) would leave a stale resume
-            # position in place forever, wrongly resuming a future
+        if run_type == "backfill" and cursor_writes_are_safe:
+            # Unconditional (on `outcome.backfill_resume_cursor`, not on
+            # `cursor_writes_are_safe` above) -- unlike the `cursor_value`
+            # write above, this one must run even when `outcome.backfill_
+            # resume_cursor` is `None`: that value specifically means
+            # "clear whatever resume state was stored," either because
+            # this resource type's backfill just genuinely finished, or
+            # because nothing was ever in progress. Skipping the write on
+            # `None` (the way `cursor_value`'s own guard does, correctly,
+            # for its own different meaning of `None`) would leave a stale
+            # resume position in place forever, wrongly resuming a future
             # backfill from history that's already fully covered.
             # `incremental_sync` never reads or writes this column at all.
             _save_sync_cursor(

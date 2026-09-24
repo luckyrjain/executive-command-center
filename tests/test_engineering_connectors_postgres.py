@@ -3151,6 +3151,148 @@ def test_recent_running_sync_run_is_not_reaped(
     assert response.json()["error"]["code"] == "CONNECTOR_SYNC_IN_PROGRESS"
 
 
+@dataclass
+class _ReapedMidFlightAdapter:
+    """Simulates the race a reaped `running` row leaves open even after
+    the reap itself lands (`_STALE_RUNNING_SYNC_THRESHOLD`'s own
+    docstring): this call's `backfill` reaps its own `sync_runs` row and
+    writes a newer `sync_cursors` value *itself*, standing in for a
+    second, concurrent `/sync` call that reaped this one as stale and
+    then genuinely completed while this call's own adapter request was
+    still in flight -- before returning a `SyncOutcome` for an *older*
+    cursor, exactly the stale outcome phase 3 must not let clobber the
+    newer value.
+    """
+
+    provider: str = "sandbox"
+    required_scopes: frozenset[str] = field(default_factory=frozenset)
+    workspace_id: UUID = field(default_factory=uuid4)
+    connector_account_id: UUID = field(default_factory=uuid4)
+    actor_id: UUID = field(default_factory=uuid4)
+
+    def authorize(self, credential: str) -> ConnectorAuthorization:
+        raise NotImplementedError
+
+    def backfill(
+        self,
+        account: ConnectorAccountContext,
+        resource_type: str,
+        since: datetime | None = None,
+        resume_cursor: str | None = None,
+    ) -> SyncOutcome:
+        now = datetime.now(UTC)
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    "UPDATE sync_runs SET status = 'failed', "
+                    "error_summary = 'reaped: no outcome recorded within the stale threshold', "
+                    "completed_at = :now WHERE workspace_id = :workspace_id "
+                    "AND connector_account_id = :account_id AND status = 'running'"
+                ),
+                {
+                    "now": now,
+                    "workspace_id": self.workspace_id,
+                    "account_id": self.connector_account_id,
+                },
+            )
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO sync_cursors (
+                        id, workspace_id, connector_account_id, resource_type,
+                        cursor_value, updated_at, owner_id, visibility
+                    ) VALUES (
+                        :id, :workspace_id, :account_id, :resource_type,
+                        'newer-cursor-from-concurrent-call', :now, :actor_id, 'workspace'
+                    )
+                    """
+                ),
+                {
+                    "id": uuid4(),
+                    "workspace_id": self.workspace_id,
+                    "account_id": self.connector_account_id,
+                    "resource_type": resource_type,
+                    "now": now,
+                    "actor_id": self.actor_id,
+                },
+            )
+        return SyncOutcome(
+            resource_type=resource_type,
+            items_processed=1,
+            status="succeeded",
+            next_cursor="stale-older-cursor",
+        )
+
+    def incremental_sync(
+        self, account: ConnectorAccountContext, resource_type: str, cursor: str | None
+    ) -> SyncOutcome:
+        raise NotImplementedError
+
+    def handle_webhook(
+        self, account: ConnectorAccountContext, payload: bytes, headers: object
+    ) -> SyncOutcome:
+        raise NotImplementedError
+
+    def refresh_permissions(self, account: ConnectorAccountContext) -> str:
+        return "active"
+
+    def disconnect(self, account: ConnectorAccountContext) -> None:
+        return None
+
+
+def test_sync_run_reaped_mid_flight_does_not_clobber_a_newer_watermark(
+    engineering_test_context: tuple[TestClient, UUID, UUID, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Phase 3's `UPDATE sync_runs ... WHERE status = 'running'` already
+    guards the run's own status against a reaper that won the race first
+    (the two tests above). It does not, on its own, guard the `sync_
+    cursors` write that follows: a call whose row was reaped while its
+    adapter request was still in flight (`_STALE_RUNNING_SYNC_THRESHOLD`'s
+    own docstring -- a slower call than any real adapter's contract-level
+    duration bound, overlapping a second, genuinely concurrent call) must
+    not still write its own now-stale cursor value once phase 3 resumes,
+    or it would silently rewind a newer cursor that concurrent call
+    already wrote.
+    """
+    client, workspace_id, user_id, token = engineering_test_context
+    created = client.post(
+        "/api/v1/engineering/connectors",
+        json={"provider": "sandbox", "credential": "token-reap-race"},
+        headers=_headers(token, key=str(uuid4())),
+    ).json()
+    account_id = UUID(created["id"])
+    adapter = _ReapedMidFlightAdapter(
+        workspace_id=workspace_id, connector_account_id=account_id, actor_id=user_id
+    )
+    monkeypatch.setattr(connector_accounts_module, "connector_registry", _registry_with(adapter))
+
+    response = client.post(
+        f"/api/v1/engineering/connectors/{account_id}/sync",
+        json={"run_type": "backfill", "resource_type": "repository"},
+        headers=_headers(token, key=str(uuid4())),
+    )
+    # The response reflects the database's actual state (reaped), not the
+    # locally-held stale outcome -- the same "read back whichever status
+    # actually won" guarantee the run-level reap tests above already prove.
+    assert response.status_code == 201, response.text
+    assert response.json()["status"] == "failed"
+
+    with engine.begin() as connection:
+        cursor_row = (
+            connection.execute(
+                text(
+                    "SELECT cursor_value FROM sync_cursors WHERE workspace_id = :workspace_id "
+                    "AND connector_account_id = :account_id AND resource_type = 'repository'"
+                ),
+                {"workspace_id": workspace_id, "account_id": account_id},
+            )
+            .mappings()
+            .one()
+        )
+    assert cursor_row["cursor_value"] == "newer-cursor-from-concurrent-call"
+
+
 def test_create_connector_idempotent_retry_racing_phase_three_replays_response(
     engineering_test_context: tuple[TestClient, UUID, UUID, str],
     monkeypatch: pytest.MonkeyPatch,
