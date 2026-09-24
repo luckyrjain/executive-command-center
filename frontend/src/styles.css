@@ -750,7 +750,31 @@ button[aria-pressed="true"] { border-color: var(--color-ink); background: var(--
   .recommendation-actions { min-width: 0; flex-direction: row; flex-wrap: wrap; }
   .audit-list li { flex-direction: column; }
   .audit-meta { min-width: 0; text-align: left; }
-  .work-grid { grid-template-columns: 1fr; }
+  /* minmax(0, 1fr), not a bare 1fr -- unlike the two-up desktop track (which
+   * already uses minmax(0, 1fr) for this exact reason), a bare `1fr` track's
+   * automatic minimum is its content's min-content size. A `.work-panel`
+   * holding a `.wizard-stepper` (RiskWorkspace, ScheduleWorkspace) has one
+   * high enough to blow the column -- and with it the whole page -- out past
+   * a 320px viewport, even though the same content reflows to fit fine once
+   * actually laid out at the narrower width. */
+  .work-grid { grid-template-columns: minmax(0, 1fr); }
+  /* A `.wizard-step-node` is itself a flex item; three of them plus their
+   * circles and connecting lines can still exceed a narrow single-column
+   * panel even after the `minmax(0, 1fr)` fix above (PolicyPanel/
+   * WorkflowList aren't `.work-grid` items at all, so that fix doesn't reach
+   * them, and this was already within a few px of overflowing there before
+   * any grid was involved). The connecting line gives up its width first --
+   * tighter gaps/margins here, and `min-width: 0` instead of the desktop
+   * rule's 8px floor -- so at the current three-step labels ("Details" etc.)
+   * and default font this now fits with no wrapping at all, unlike the
+   * label, which is `flex-shrink: 0` (protected) so it is never the first
+   * thing sacrificed. `overflow-wrap: anywhere` is a last-resort backstop
+   * for a label/font/width combination that still doesn't fit -- the same
+   * one `.work-heading` uses for a title that can't -- so a stepper breaks
+   * rather than ever forcing horizontal page overflow again. */
+  .wizard-step-node { min-width: 0; gap: 4px; }
+  .wizard-step-line { margin: 0 4px; min-width: 0; }
+  .wizard-step-label { flex-shrink: 0; white-space: normal; overflow-wrap: anywhere; }
   .sidebar-nav { display: none; }
   .mobile-workspace-nav { display: block; }
   .app-frame { display: block; }
