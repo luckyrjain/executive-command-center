@@ -659,7 +659,9 @@ def test_gitlab_add_note_success_excludes_body_from_output(
         assert request.headers["PRIVATE-TOKEN"] == "glpat-x"
         return _json_response(201, {"id": 99})
 
-    adapter = GitLabAddNoteAdapter(transport=httpx.MockTransport(handler))
+    adapter = GitLabAddNoteAdapter(
+        transport=httpx.MockTransport(handler), resolve_host=lambda host: ["140.82.112.3"]
+    )
     action_input = GitLabAddNoteInput(
         workspace_id=workspace_id,
         actor_id=user_id,
@@ -688,7 +690,9 @@ def test_gitlab_add_note_execute_self_managed_host(
         assert request.headers["PRIVATE-TOKEN"] == "glpat-private"
         return _json_response(201, {"id": 99})
 
-    adapter = GitLabAddNoteAdapter(transport=httpx.MockTransport(handler))
+    adapter = GitLabAddNoteAdapter(
+        transport=httpx.MockTransport(handler), resolve_host=lambda host: ["140.82.112.3"]
+    )
     result = adapter.execute(
         GitLabAddNoteInput(
             workspace_id=workspace_id,
@@ -725,7 +729,9 @@ def test_gitlab_add_note_execute_with_a_legacy_bare_token_credential(
         assert request.headers["PRIVATE-TOKEN"] == "glpat-legacy-bare"
         return _json_response(201, {"id": 77})
 
-    adapter = GitLabAddNoteAdapter(transport=httpx.MockTransport(handler))
+    adapter = GitLabAddNoteAdapter(
+        transport=httpx.MockTransport(handler), resolve_host=lambda host: ["140.82.112.3"]
+    )
     result = adapter.execute(
         GitLabAddNoteInput(
             workspace_id=workspace_id,
@@ -770,6 +776,42 @@ def test_gitlab_add_note_execute_surfaces_an_unparseable_credential_as_write_act
         body="x",
     )
     with pytest.raises(WriteActionRejected, match="cannot parse"):
+        adapter.execute(action_input)
+
+
+def test_gitlab_add_note_execute_rejects_a_host_that_now_resolves_private(
+    write_actions_test_context: tuple[UUID, UUID],
+) -> None:
+    """This module never checked its GitLab host at all itself -- it relied
+    entirely on the connector's own `authorize()`-time private-host check,
+    made against whatever the host resolved to back then, not now. A write
+    action is a request-issuing call site for this same per-credential
+    host too, so it now re-checks, the same DNS-rebinding closure
+    `gitlab_adapter._sync_repositories`/`refresh_permissions` apply.
+    """
+    workspace_id, user_id = write_actions_test_context
+    account_id = _insert_connector_account(
+        workspace_id,
+        user_id,
+        provider="gitlab",
+        credential="gitlab-internal.example.com|glpat-private",
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError("must not make an HTTP call once the host is rejected")
+
+    adapter = GitLabAddNoteAdapter(
+        transport=httpx.MockTransport(handler), resolve_host=lambda host: ["169.254.169.254"]
+    )
+    action_input = GitLabAddNoteInput(
+        workspace_id=workspace_id,
+        actor_id=user_id,
+        connector_account_id=account_id,
+        project_path="acme/widgets",
+        issue_iid=1,
+        body="x",
+    )
+    with pytest.raises(WriteActionRejected, match="no longer safe to reach"):
         adapter.execute(action_input)
 
 
@@ -1002,7 +1044,9 @@ def test_gitlab_add_note_connection_failure_is_transient(
     def handler(request: httpx.Request) -> httpx.Response:
         raise httpx.ConnectError("connection refused", request=request)
 
-    adapter = GitLabAddNoteAdapter(transport=httpx.MockTransport(handler))
+    adapter = GitLabAddNoteAdapter(
+        transport=httpx.MockTransport(handler), resolve_host=lambda host: ["140.82.112.3"]
+    )
     action_input = GitLabAddNoteInput(
         workspace_id=workspace_id,
         actor_id=user_id,
@@ -1026,7 +1070,9 @@ def test_gitlab_add_note_read_timeout_is_not_transient(
     def handler(request: httpx.Request) -> httpx.Response:
         raise httpx.ReadTimeout("timed out", request=request)
 
-    adapter = GitLabAddNoteAdapter(transport=httpx.MockTransport(handler))
+    adapter = GitLabAddNoteAdapter(
+        transport=httpx.MockTransport(handler), resolve_host=lambda host: ["140.82.112.3"]
+    )
     action_input = GitLabAddNoteInput(
         workspace_id=workspace_id,
         actor_id=user_id,
@@ -1050,7 +1096,9 @@ def test_gitlab_add_note_rate_limited_is_transient(
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(429, headers={"Retry-After": "1"})
 
-    adapter = GitLabAddNoteAdapter(transport=httpx.MockTransport(handler))
+    adapter = GitLabAddNoteAdapter(
+        transport=httpx.MockTransport(handler), resolve_host=lambda host: ["140.82.112.3"]
+    )
     action_input = GitLabAddNoteInput(
         workspace_id=workspace_id,
         actor_id=user_id,
@@ -1074,7 +1122,9 @@ def test_gitlab_add_note_4xx_is_not_transient(
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(404, json={"message": "404 Not found"})
 
-    adapter = GitLabAddNoteAdapter(transport=httpx.MockTransport(handler))
+    adapter = GitLabAddNoteAdapter(
+        transport=httpx.MockTransport(handler), resolve_host=lambda host: ["140.82.112.3"]
+    )
     action_input = GitLabAddNoteInput(
         workspace_id=workspace_id,
         actor_id=user_id,
@@ -1135,7 +1185,9 @@ def test_gitlab_add_note_no_containment_check_by_design(
     def handler(request: httpx.Request) -> httpx.Response:
         return _json_response(201, {"id": 42})
 
-    adapter = GitLabAddNoteAdapter(transport=httpx.MockTransport(handler))
+    adapter = GitLabAddNoteAdapter(
+        transport=httpx.MockTransport(handler), resolve_host=lambda host: ["140.82.112.3"]
+    )
     action_input = GitLabAddNoteInput(
         workspace_id=workspace_id,
         actor_id=user_id,
