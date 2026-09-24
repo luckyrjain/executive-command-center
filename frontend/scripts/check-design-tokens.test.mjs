@@ -1,6 +1,13 @@
 import { describe, expect, it } from 'vitest'
 
-import { findRawColors, findRawFontSizes, findUndefinedVars, stripComments } from './check-design-tokens.mjs'
+import {
+  findRawColors,
+  findRawFontSizes,
+  findRawFontWeights,
+  findRawLetterSpacing,
+  findUndefinedVars,
+  stripComments,
+} from './check-design-tokens.mjs'
 
 const ROOT = `:root {
   --color-ink: #18212f;
@@ -104,5 +111,63 @@ describe('findRawFontSizes', () => {
   it('ignores a font-size mentioned inside a comment', () => {
     const source = `${ROOT}/* was font-size: 12px */\n.a { color: var(--color-ink); }\n`
     expect(findRawFontSizes(source)).toEqual([])
+  })
+})
+
+describe('findRawFontWeights', () => {
+  it('flags a raw font-weight outside :root', () => {
+    const source = `${ROOT}.a { font-weight: 700; }\n`
+    const found = findRawFontWeights(source)
+    expect(found).toHaveLength(1)
+    expect(found[0].line).toBe(5)
+  })
+
+  it('accepts a token reference', () => {
+    const source = `${ROOT}.a { font-weight: var(--font-weight-700); }\n`
+    expect(findRawFontWeights(source)).toEqual([])
+  })
+
+  it('ignores the :root block itself', () => {
+    const source = ':root {\n  --font-weight-700: 700;\n}\n.a { font-weight: var(--font-weight-700); }\n'
+    expect(findRawFontWeights(source)).toEqual([])
+  })
+
+  it('honors the design-tokens-allow marker', () => {
+    const source = `${ROOT}.a { font-weight: 700; } /* design-tokens-allow: one-off */\n`
+    expect(findRawFontWeights(source)).toEqual([])
+  })
+
+  it('ignores a font-weight mentioned inside a comment', () => {
+    const source = `${ROOT}/* was font-weight: 700 */\n.a { color: var(--color-ink); }\n`
+    expect(findRawFontWeights(source)).toEqual([])
+  })
+})
+
+describe('findRawLetterSpacing', () => {
+  it('flags a raw letter-spacing outside :root', () => {
+    const source = `${ROOT}.a { letter-spacing: -.02em; }\n`
+    const found = findRawLetterSpacing(source)
+    expect(found).toHaveLength(1)
+    expect(found[0].line).toBe(5)
+  })
+
+  it('accepts a token reference', () => {
+    const source = `${ROOT}.a { letter-spacing: var(--tracking-neg-02); }\n`
+    expect(findRawLetterSpacing(source)).toEqual([])
+  })
+
+  it('ignores the :root block itself', () => {
+    const source = ':root {\n  --tracking-neg-02: -.02em;\n}\n.a { letter-spacing: var(--tracking-neg-02); }\n'
+    expect(findRawLetterSpacing(source)).toEqual([])
+  })
+
+  it('honors the design-tokens-allow marker', () => {
+    const source = `${ROOT}.a { letter-spacing: -.02em; } /* design-tokens-allow: one-off */\n`
+    expect(findRawLetterSpacing(source)).toEqual([])
+  })
+
+  it('ignores a letter-spacing mentioned inside a comment', () => {
+    const source = `${ROOT}/* was letter-spacing: -.02em */\n.a { color: var(--color-ink); }\n`
+    expect(findRawLetterSpacing(source)).toEqual([])
   })
 })
