@@ -1836,6 +1836,198 @@ def test_sequential_disables_by_two_colliding_owners_do_not_leak_the_first_owner
     )
 
 
+def test_cascade_with_target_owner_purges_only_the_targets_data_not_the_actors(
+    gmail_revocation_context: dict,
+) -> None:
+    """S1.9: `cascade_email_revocation(..., target_owner_id=B)` run by actor
+    A must scope every owner predicate by B, not A. Both members of the
+    same workspace hold Gmail-derived data; only B's is purged/redacted/
+    disconnected, A's identical rows are untouched, the purge log records
+    B as owner, and the connector's `updated_by` still records actor A.
+    """
+    ctx = gmail_revocation_context
+    workspace_id = ctx["workspace_id"]
+    now = ctx["now"]
+    actor_id = ctx["owner_id"]
+    actor_seed = _seed_full_cascade_fixture(ctx)
+    with engine.begin() as connection:
+        actor_executed_id = _insert_recommendation(
+            connection,
+            workspace_id=workspace_id,
+            owner_id=actor_id,
+            evidence_id=None,
+            status="executed",
+            now=now,
+        )
+
+    target_id = uuid4()
+    target_email = f"target-owner-{uuid4()}@example.test"
+    ctx["extra_owner_emails"].append(target_email)
+    target_external_id = f"target-msg-{uuid4()}"
+    # Collides with the actor's own still-live message: must be treated as
+    # ambiguous (actor != target) and its evidence left alone.
+    colliding_external_id = actor_seed["external_message_id"]
+    with engine.begin() as connection:
+        create_identity(
+            connection, workspace_id=workspace_id, user_id=target_id, email=target_email, now=now
+        )
+        _insert_enabled_email_domain(
+            connection, workspace_id=workspace_id, owner_id=target_id, now=now
+        )
+        target_account_id = _insert_gmail_connector_account(
+            connection,
+            workspace_id=workspace_id,
+            owner_id=target_id,
+            external_account_id=target_email,
+            now=now,
+        )
+        target_thread_id = _insert_thread(
+            connection,
+            workspace_id=workspace_id,
+            owner_id=target_id,
+            account_id=target_account_id,
+            now=now,
+        )
+        for external_id in (target_external_id, colliding_external_id):
+            _insert_message(
+                connection,
+                workspace_id=workspace_id,
+                owner_id=target_id,
+                thread_id=target_thread_id,
+                external_message_id=external_id,
+                now=now,
+            )
+        _insert_attention_item(
+            connection,
+            workspace_id=workspace_id,
+            owner_id=target_id,
+            thread_id=target_thread_id,
+            now=now,
+        )
+        target_node_id = _insert_pkos_node(
+            connection, workspace_id=workspace_id, owner_id=target_id, now=now
+        )
+        for ref in (f"gmail:{target_external_id}", f"gmail:detect_action:{target_external_id}"):
+            _insert_pkos_evidence(
+                connection,
+                workspace_id=workspace_id,
+                node_id=target_node_id,
+                source_ref=ref,
+                now=now,
+            )
+        target_proposed_id = _insert_recommendation(
+            connection,
+            workspace_id=workspace_id,
+            owner_id=target_id,
+            evidence_id=None,
+            status="proposed",
+            now=now,
+        )
+        target_executed_id = _insert_recommendation(
+            connection,
+            workspace_id=workspace_id,
+            owner_id=target_id,
+            evidence_id=None,
+            status="executed",
+            now=now,
+        )
+
+    with SessionFactory() as session, session.begin():
+        pending = gmail_revocation.cascade_email_revocation(
+            session,
+            AuthContext(workspace_id=workspace_id, user_id=actor_id, timezone="UTC"),
+            now,
+            target_owner_id=target_id,
+        )
+    assert [context.connector_account_id for _, context in pending] == [target_account_id]
+
+    def _count(sql: str, **params: Any) -> int:
+        with engine.begin() as connection:
+            return connection.execute(
+                text(sql), {"workspace_id": workspace_id, **params}
+            ).scalar_one()
+
+    def _owned(table: str, owner_id: UUID) -> int:
+        return _count(
+            f"SELECT COUNT(*) FROM {table} "  # noqa: S608
+            "WHERE workspace_id = :workspace_id AND owner_id = :owner_id",
+            owner_id=owner_id,
+        )
+
+    def _evidence(source_ref: str) -> int:
+        return _count(
+            "SELECT COUNT(*) FROM pkos_evidence "
+            "WHERE workspace_id = :workspace_id AND source_ref = :source_ref",
+            source_ref=source_ref,
+        )
+
+    # Target: purged / redacted / disconnected.
+    for table in ("email_messages", "email_threads", "attention_items"):
+        assert _owned(table, target_id) == 0, table
+    assert _evidence(f"gmail:{target_external_id}") == 0
+    assert _evidence(f"gmail:detect_action:{target_external_id}") == 0
+    assert (
+        _count(
+            "SELECT COUNT(*) FROM recommendations WHERE workspace_id = :workspace_id AND id = :id",
+            id=target_proposed_id,
+        )
+        == 0
+    )
+    with engine.begin() as connection:
+        rows = {
+            row["id"]: row
+            for row in connection.execute(
+                text(
+                    "SELECT id, rationale, evidence_ids FROM recommendations "
+                    "WHERE workspace_id = :workspace_id AND id = ANY(:ids)"
+                ),
+                {"workspace_id": workspace_id, "ids": [target_executed_id, actor_executed_id]},
+            ).mappings()
+        }
+        target_account = (
+            connection.execute(
+                text(
+                    "SELECT status, updated_by FROM connector_accounts "
+                    "WHERE workspace_id = :workspace_id AND id = :id"
+                ),
+                {"workspace_id": workspace_id, "id": target_account_id},
+            )
+            .mappings()
+            .one()
+        )
+        purge_log = connection.execute(
+            text(
+                "SELECT external_message_id, owner_id FROM email_message_id_purge_log "
+                "WHERE workspace_id = :workspace_id"
+            ),
+            {"workspace_id": workspace_id},
+        ).all()
+    assert rows[target_executed_id]["rationale"] == gmail_revocation._REDACTED_RATIONALE
+    assert target_account["status"] == "disconnected"
+    assert target_account["updated_by"] == actor_id
+    assert sorted(purge_log) == sorted(
+        [(target_external_id, target_id), (colliding_external_id, target_id)]
+    )
+
+    # Colliding id: the actor's own live message makes it ambiguous, so the
+    # actor's evidence for it survives.
+    assert _evidence(f"gmail:{colliding_external_id}") == 1
+    assert _evidence(f"gmail:detect_action:{colliding_external_id}") == 1
+
+    # Actor: every identical row intact.
+    for table in ("email_messages", "email_threads", "attention_items"):
+        assert _owned(table, actor_id) == 1, table
+    assert (
+        _count(
+            "SELECT COUNT(*) FROM recommendations WHERE workspace_id = :workspace_id AND id = :id",
+            id=actor_seed["proposed_recommendation_id"],
+        )
+        == 1
+    )
+    assert rows[actor_executed_id]["rationale"] != gmail_revocation._REDACTED_RATIONALE
+    assert _connector_status(workspace_id, ctx["account_id"]) == "active"
+
+
 def test_revoke_consent_endpoint_rejects_a_stale_already_revoked_consent_id(
     gmail_revocation_context: dict,
 ) -> None:
