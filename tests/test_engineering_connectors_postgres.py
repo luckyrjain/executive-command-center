@@ -3151,6 +3151,319 @@ def test_recent_running_sync_run_is_not_reaped(
     assert response.json()["error"]["code"] == "CONNECTOR_SYNC_IN_PROGRESS"
 
 
+@dataclass
+class _ReapedMidFlightAdapter:
+    """Simulates the race a reaped `running` row leaves open even after
+    the reap itself lands (`_STALE_RUNNING_SYNC_THRESHOLD`'s own
+    docstring): this call's `backfill` reaps its own `sync_runs` row and
+    writes both `sync_cursors` columns -- `cursor_value` *and*
+    `backfill_resume_cursor` -- itself, standing in for a second,
+    concurrent `/sync` call that reaped this one as stale and then
+    genuinely completed while this call's own adapter request was still
+    in flight -- before returning a `SyncOutcome` for an *older* cursor
+    and an *older* resume position, exactly the stale outcome phase 3
+    must not let clobber either newer value.
+    """
+
+    provider: str = "sandbox"
+    required_scopes: frozenset[str] = field(default_factory=frozenset)
+    workspace_id: UUID = field(default_factory=uuid4)
+    connector_account_id: UUID = field(default_factory=uuid4)
+    actor_id: UUID = field(default_factory=uuid4)
+
+    def authorize(self, credential: str) -> ConnectorAuthorization:
+        raise NotImplementedError
+
+    def backfill(
+        self,
+        account: ConnectorAccountContext,
+        resource_type: str,
+        since: datetime | None = None,
+        resume_cursor: str | None = None,
+    ) -> SyncOutcome:
+        now = datetime.now(UTC)
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    "UPDATE sync_runs SET status = 'failed', "
+                    "error_summary = 'reaped: no outcome recorded within the stale threshold', "
+                    "completed_at = :now WHERE workspace_id = :workspace_id "
+                    "AND connector_account_id = :account_id AND status = 'running'"
+                ),
+                {
+                    "now": now,
+                    "workspace_id": self.workspace_id,
+                    "account_id": self.connector_account_id,
+                },
+            )
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO sync_cursors (
+                        id, workspace_id, connector_account_id, resource_type,
+                        cursor_value, backfill_resume_cursor, updated_at, owner_id, visibility
+                    ) VALUES (
+                        :id, :workspace_id, :account_id, :resource_type,
+                        'newer-cursor-from-concurrent-call',
+                        'winner-resume-cursor-from-concurrent-call',
+                        :now, :actor_id, 'workspace'
+                    )
+                    """
+                ),
+                {
+                    "id": uuid4(),
+                    "workspace_id": self.workspace_id,
+                    "account_id": self.connector_account_id,
+                    "resource_type": resource_type,
+                    "now": now,
+                    "actor_id": self.actor_id,
+                },
+            )
+        return SyncOutcome(
+            resource_type=resource_type,
+            items_processed=1,
+            status="succeeded",
+            next_cursor="stale-older-cursor",
+            backfill_resume_cursor="stale-resume-cursor-from-reaped-call",
+        )
+
+    def incremental_sync(
+        self, account: ConnectorAccountContext, resource_type: str, cursor: str | None
+    ) -> SyncOutcome:
+        raise NotImplementedError
+
+    def handle_webhook(
+        self, account: ConnectorAccountContext, payload: bytes, headers: object
+    ) -> SyncOutcome:
+        raise NotImplementedError
+
+    def refresh_permissions(self, account: ConnectorAccountContext) -> str:
+        return "active"
+
+    def disconnect(self, account: ConnectorAccountContext) -> None:
+        return None
+
+
+def test_sync_run_reaped_mid_flight_does_not_clobber_a_newer_watermark(
+    engineering_test_context: tuple[TestClient, UUID, UUID, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Phase 3's `UPDATE sync_runs ... WHERE status = 'running'` already
+    guards the run's own status against a reaper that won the race first
+    (the two tests above). It does not, on its own, guard everything else
+    phase 3 does after it: a call whose row was reaped while its adapter
+    request was still in flight (`_STALE_RUNNING_SYNC_THRESHOLD`'s own
+    docstring -- a slower call than any real adapter's contract-level
+    duration bound, overlapping a second, genuinely concurrent call) must
+    not still act on its own now-stale outcome once phase 3 resumes:
+    not either `sync_cursors` write -- `cursor_value` or `backfill_
+    resume_cursor` -- (either would silently rewind a newer value that
+    concurrent call already wrote), not the `connector_accounts.
+    status`/`last_synced_at`/`last_error` write (it would resurrect/
+    re-stamp the account from this stale outcome over whatever the
+    concurrent call's own phase 3 already wrote), and not the
+    `connector_account.synced` audit/outbox or lifecycle event (there is
+    nothing to disclose about an outcome the system has already decided
+    to disregard). `run_won_the_race` gates all of these the same way.
+    """
+    client, workspace_id, user_id, token = engineering_test_context
+    created = client.post(
+        "/api/v1/engineering/connectors",
+        json={"provider": "sandbox", "credential": "token-reap-race"},
+        headers=_headers(token, key=str(uuid4())),
+    ).json()
+    account_id = UUID(created["id"])
+    assert created["last_synced_at"] is None
+    assert created["version"] == 1
+    adapter = _ReapedMidFlightAdapter(
+        workspace_id=workspace_id, connector_account_id=account_id, actor_id=user_id
+    )
+    monkeypatch.setattr(connector_accounts_module, "connector_registry", _registry_with(adapter))
+
+    response = client.post(
+        f"/api/v1/engineering/connectors/{account_id}/sync",
+        json={"run_type": "backfill", "resource_type": "repository"},
+        headers=_headers(token, key=str(uuid4())),
+    )
+    # The response reflects the database's actual state (reaped), not the
+    # locally-held stale outcome -- the same "read back whichever status
+    # actually won" guarantee the run-level reap tests above already prove.
+    assert response.status_code == 201, response.text
+    assert response.json()["status"] == "failed"
+
+    with engine.begin() as connection:
+        cursor_row = (
+            connection.execute(
+                text(
+                    "SELECT cursor_value, backfill_resume_cursor FROM sync_cursors "
+                    "WHERE workspace_id = :workspace_id "
+                    "AND connector_account_id = :account_id AND resource_type = 'repository'"
+                ),
+                {"workspace_id": workspace_id, "account_id": account_id},
+            )
+            .mappings()
+            .one()
+        )
+        # `_finalize_account_version`'s success-path write (`status =
+        # 'active', last_synced_at = ...`) must also be skipped for a
+        # reaped-mid-flight outcome, not just the cursor write above --
+        # `last_synced_at` staying `None` and `version` staying `1` (its
+        # value since creation) proves this reaped call's own phase 3
+        # never touched `connector_accounts` at all.
+        account_row = (
+            connection.execute(
+                text(
+                    "SELECT status, last_synced_at, version FROM connector_accounts "
+                    "WHERE id = :account_id"
+                ),
+                {"account_id": account_id},
+            )
+            .mappings()
+            .one()
+        )
+        # No `connector_account.synced` audit event either -- there is
+        # nothing true to disclose about an outcome the system has
+        # already decided to disregard.
+        synced_audit_count = connection.execute(
+            text(
+                "SELECT count(*) FROM audit_events WHERE workspace_id = :workspace_id "
+                "AND aggregate_id = :account_id AND event_type = 'connector_account.synced'"
+            ),
+            {"workspace_id": workspace_id, "account_id": account_id},
+        ).scalar_one()
+    assert cursor_row["cursor_value"] == "newer-cursor-from-concurrent-call"
+    assert cursor_row["backfill_resume_cursor"] == "winner-resume-cursor-from-concurrent-call"
+    assert account_row["last_synced_at"] is None
+    assert account_row["version"] == 1
+    assert synced_audit_count == 0
+
+
+@dataclass
+class _ReapedMidFlightFailingAdapter:
+    """Sibling of `_ReapedMidFlightAdapter` above, but for the `adapter_
+    failed` branch: this call's own `backfill` reaps its own `sync_runs`
+    row (standing in for a second, concurrent call that reaped this one as
+    stale and completed) and then raises, landing phase 3 in the failure
+    branch instead of the success branch. Proves `run_won_the_race` gates
+    that branch's `connector_accounts`/audit writes the same way it gates
+    the success branch's.
+    """
+
+    provider: str = "sandbox"
+    required_scopes: frozenset[str] = field(default_factory=frozenset)
+    workspace_id: UUID = field(default_factory=uuid4)
+    connector_account_id: UUID = field(default_factory=uuid4)
+    actor_id: UUID = field(default_factory=uuid4)
+
+    def authorize(self, credential: str) -> ConnectorAuthorization:
+        raise NotImplementedError
+
+    def backfill(
+        self,
+        account: ConnectorAccountContext,
+        resource_type: str,
+        since: datetime | None = None,
+        resume_cursor: str | None = None,
+    ) -> SyncOutcome:
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    "UPDATE sync_runs SET status = 'failed', "
+                    "error_summary = 'reaped: no outcome recorded within the stale threshold', "
+                    "completed_at = :now WHERE workspace_id = :workspace_id "
+                    "AND connector_account_id = :account_id AND status = 'running'"
+                ),
+                {
+                    "now": datetime.now(UTC),
+                    "workspace_id": self.workspace_id,
+                    "account_id": self.connector_account_id,
+                },
+            )
+        raise RuntimeError("adapter call failed after this run was reaped by a concurrent call")
+
+    def incremental_sync(
+        self, account: ConnectorAccountContext, resource_type: str, cursor: str | None
+    ) -> SyncOutcome:
+        raise NotImplementedError
+
+    def handle_webhook(
+        self, account: ConnectorAccountContext, payload: bytes, headers: object
+    ) -> SyncOutcome:
+        raise NotImplementedError
+
+    def refresh_permissions(self, account: ConnectorAccountContext) -> str:
+        return "active"
+
+    def disconnect(self, account: ConnectorAccountContext) -> None:
+        return None
+
+
+def test_sync_run_reaped_mid_flight_failure_does_not_overwrite_concurrent_state(
+    engineering_test_context: tuple[TestClient, UUID, UUID, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The `adapter_failed` branch has its own, separate `UPDATE sync_runs
+    ... WHERE status = 'running'` (untouched by the original fix, which
+    only patched the success branch's cursor writes). If a run's row is
+    reaped mid-flight and the adapter call then *fails* (rather than
+    succeeding, the case the test above covers), that branch must not
+    write this reaped, stale failure onto `connector_accounts` (`status =
+    'error'`, `last_error`) or emit a `connector_account.sync_failed`
+    audit/outbox event either -- a second, concurrent call's own phase 3
+    already owns this account's real current state, and this call's
+    outcome has already been disregarded by the time it arrives.
+    """
+    client, workspace_id, user_id, token = engineering_test_context
+    created = client.post(
+        "/api/v1/engineering/connectors",
+        json={"provider": "sandbox", "credential": "token-reap-race-failure"},
+        headers=_headers(token, key=str(uuid4())),
+    ).json()
+    account_id = UUID(created["id"])
+    assert created["status"] == "active"
+    assert created["last_error"] is None
+    assert created["version"] == 1
+    adapter = _ReapedMidFlightFailingAdapter(
+        workspace_id=workspace_id, connector_account_id=account_id, actor_id=user_id
+    )
+    monkeypatch.setattr(connector_accounts_module, "connector_registry", _registry_with(adapter))
+
+    response = client.post(
+        f"/api/v1/engineering/connectors/{account_id}/sync",
+        json={"run_type": "backfill", "resource_type": "repository"},
+        headers=_headers(token, key=str(uuid4())),
+    )
+    # The response still reflects the database's actual (reaped) status --
+    # the reap raced ahead and wrote 'failed' before this call's own
+    # exception-driven UPDATE could, so both agree on 'failed' here, but
+    # via the reaper's row, not this call's own write.
+    assert response.status_code == 201, response.text
+    assert response.json()["status"] == "failed"
+
+    with engine.begin() as connection:
+        account_row = (
+            connection.execute(
+                text("SELECT status, last_error, version FROM connector_accounts WHERE id = :id"),
+                {"id": account_id},
+            )
+            .mappings()
+            .one()
+        )
+        failed_audit_count = connection.execute(
+            text(
+                "SELECT count(*) FROM audit_events WHERE workspace_id = :workspace_id "
+                "AND aggregate_id = :account_id AND event_type = 'connector_account.sync_failed'"
+            ),
+            {"workspace_id": workspace_id, "account_id": account_id},
+        ).scalar_one()
+    # Untouched: this reaped call's own failure branch never wrote to
+    # `connector_accounts` at all.
+    assert account_row["status"] == "active"
+    assert account_row["last_error"] is None
+    assert account_row["version"] == 1
+    assert failed_audit_count == 0
+
+
 def test_create_connector_idempotent_retry_racing_phase_three_replays_response(
     engineering_test_context: tuple[TestClient, UUID, UUID, str],
     monkeypatch: pytest.MonkeyPatch,
