@@ -90,6 +90,8 @@ It reports any missing model with its exact `ollama pull` command. AI enrichment
 
 Optional embeddings and both AI-enrichment paths are explicitly disabled in `.env.example`. Phase 10 Gmail OAuth also remains inert until all `ECC_GMAIL_OAUTH_*` values are configured and the user is in the internal allowlist. Never place real secrets in `.env.example` or commit `.env`.
 
+Gmail connector ownership and personal-data isolation are controlled by three settings (`backend/ecc/config.py`). `ECC_GMAIL_REVOKE_SCOPE` defaults to `global`: a Google grant is revoked only when no non-disconnected connector row in any workspace still uses that Google account; set it to `none` only once Google revocation is proven per-token. `ECC_PERSONAL_DATA_ISOLATION` (default `false`) is the rollout flag for making Gmail-derived rows private to the mailbox owner and non-shareable. `ECC_GMAIL_REQUIRE_IDENTITY_MATCH` (default `false`) is the rollout flag for making the Gmail OAuth callback refuse a Google account whose email differs from the connecting user's own. Settings are cached per process, so changing any of them requires a backend restart.
+
 Start the backend, then open the printed URL. The URL carries the one-time code in its fragment so it is not sent in HTTP access logs. The backend rotates the code into an opaque `HttpOnly`, `SameSite=Lax` session cookie with a seven-day absolute lifetime, sets the readable CSRF cookie, and redirects to the frontend.
 
 For an isolated remote development database only, explicitly set:

@@ -1,5 +1,6 @@
 from base64 import urlsafe_b64decode
 from functools import lru_cache
+from typing import Literal
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -159,6 +160,28 @@ class Settings(BaseSettings):
     # through the connector UI itself.
     gitlab_private_host_allowlist: str = Field(
         default="", validation_alias="ECC_GITLAB_PRIVATE_HOST_ALLOWLIST"
+    )
+    # Connector ownership / personal-data isolation remediation (Spec A
+    # "Settings"). `global` (the safe default) treats a Google grant as
+    # account-wide: a Gmail token is revoked only when no non-disconnected
+    # `connector_accounts` row in ANY workspace still uses that Google
+    # account (`ecc.platform.connector_security.revoke_is_safe`). Set `none`
+    # only once Google revocation is proven per-token (D2 live test).
+    gmail_revoke_scope: Literal["none", "global"] = Field(
+        default="global", validation_alias="ECC_GMAIL_REVOKE_SCOPE"
+    )
+    # Off by default: when on, personal (Gmail-derived) rows are written
+    # private to the mailbox owner, cannot be granted/transferred/delegated,
+    # and are disconnected on member removal. Rows written while off keep
+    # today's behavior until the backfill ops command runs.
+    personal_data_isolation: bool = Field(
+        default=False, validation_alias="ECC_PERSONAL_DATA_ISOLATION"
+    )
+    # Off by default: when on, the Gmail OAuth callback refuses (403) a
+    # Google account whose email differs from the connecting user's own
+    # account email.
+    gmail_require_identity_match: bool = Field(
+        default=False, validation_alias="ECC_GMAIL_REQUIRE_IDENTITY_MATCH"
     )
 
     @property
