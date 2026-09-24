@@ -35,10 +35,6 @@ function renderBrief() {
   return render(<QueryClientProvider client={client}><MorningBrief /></QueryClientProvider>)
 }
 
-function statValue(label: string) {
-  return screen.getByText(label).nextElementSibling?.textContent
-}
-
 beforeEach(() => {
   document.cookie = 'ecc_csrf=brief-token; Secure; SameSite=Strict'
   vi.stubGlobal('crypto', { randomUUID: vi.fn(() => 'brief-request-id') })
@@ -85,7 +81,7 @@ describe('MorningBrief', () => {
     await screen.findByText(/Generation 2/)
   })
 
-  it('renders a compact count per brief category instead of duplicating full item lists', async () => {
+  it('does not render a stats strip -- the live dashboard already shows these counts, and can show a different one', async () => {
     const populated = {
       ...baseBrief,
       sections: {
@@ -102,10 +98,10 @@ describe('MorningBrief', () => {
     renderBrief()
 
     await screen.findByText(/Generation 1/)
-    expect(statValue('Schedule')).toBe('2')
-    expect(statValue('Priorities')).toBe('1')
-    expect(statValue('Overdue')).toBe('0')
-    expect(statValue('Risks')).toBe('0')
+    expect(screen.queryByText('Schedule')).toBeNull()
+    expect(screen.queryByText('Priorities')).toBeNull()
+    expect(screen.queryByText('Overdue')).toBeNull()
+    expect(screen.queryByText('Risks')).toBeNull()
     expect(screen.queryByText('Board sync')).toBeNull()
   })
 
