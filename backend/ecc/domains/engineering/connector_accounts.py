@@ -2408,42 +2408,31 @@ def list_team_suggestions_endpoint(
     dict merge. Grouping by `suggested_team_name` happens in Python
     instead, over what are already small, pre-filtered row sets.
     """
-    visibility_sql_repo, visibility_params_repo = authz.visible_resource_filter_sql(
-        session, auth, resource_type="repositories", action="read", table_alias="repositories"
+    # `order_by="id"` is arbitrary -- grouping happens in Python below over
+    # the whole result set, so row order from either query has no effect.
+    repo_rows = authz.list_visible_resources(
+        session,
+        auth,
+        resource_type="repositories",
+        columns="id, name, suggested_team_name",
+        order_by="id",
+        extra_clauses=[
+            "team_entity_id IS NULL",
+            "team_suggestion_dismissed_at IS NULL",
+            "suggested_team_name IS NOT NULL",
+        ],
     )
-    repo_rows = (
-        session.execute(
-            text(
-                "SELECT id, name, suggested_team_name FROM repositories "
-                f"WHERE workspace_id = :workspace_id AND ({visibility_sql_repo}) "  # noqa: S608 -- authz fragment; values bound
-                "AND team_entity_id IS NULL AND team_suggestion_dismissed_at IS NULL "
-                "AND suggested_team_name IS NOT NULL"
-            ),
-            {"workspace_id": auth.workspace_id, **visibility_params_repo},
-        )
-        .mappings()
-        .all()
-    )
-
-    visibility_sql_wi, visibility_params_wi = authz.visible_resource_filter_sql(
+    work_item_rows = authz.list_visible_resources(
         session,
         auth,
         resource_type="engineering_work_items",
-        action="read",
-        table_alias="engineering_work_items",
-    )
-    work_item_rows = (
-        session.execute(
-            text(
-                "SELECT id, title AS name, suggested_team_name FROM engineering_work_items "
-                f"WHERE workspace_id = :workspace_id AND ({visibility_sql_wi}) "  # noqa: S608 -- authz fragment; values bound
-                "AND team_entity_id IS NULL AND team_suggestion_dismissed_at IS NULL "
-                "AND suggested_team_name IS NOT NULL"
-            ),
-            {"workspace_id": auth.workspace_id, **visibility_params_wi},
-        )
-        .mappings()
-        .all()
+        columns="id, title AS name, suggested_team_name",
+        order_by="id",
+        extra_clauses=[
+            "team_entity_id IS NULL",
+            "team_suggestion_dismissed_at IS NULL",
+            "suggested_team_name IS NOT NULL",
+        ],
     )
 
     groups: dict[str, dict[str, Any]] = {}
