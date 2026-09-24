@@ -3156,12 +3156,13 @@ class _ReapedMidFlightAdapter:
     """Simulates the race a reaped `running` row leaves open even after
     the reap itself lands (`_STALE_RUNNING_SYNC_THRESHOLD`'s own
     docstring): this call's `backfill` reaps its own `sync_runs` row and
-    writes a newer `sync_cursors` value *itself*, standing in for a
-    second, concurrent `/sync` call that reaped this one as stale and
-    then genuinely completed while this call's own adapter request was
-    still in flight -- before returning a `SyncOutcome` for an *older*
-    cursor, exactly the stale outcome phase 3 must not let clobber the
-    newer value.
+    writes both `sync_cursors` columns -- `cursor_value` *and*
+    `backfill_resume_cursor` -- itself, standing in for a second,
+    concurrent `/sync` call that reaped this one as stale and then
+    genuinely completed while this call's own adapter request was still
+    in flight -- before returning a `SyncOutcome` for an *older* cursor
+    and an *older* resume position, exactly the stale outcome phase 3
+    must not let clobber either newer value.
     """
 
     provider: str = "sandbox"
@@ -3200,10 +3201,12 @@ class _ReapedMidFlightAdapter:
                     """
                     INSERT INTO sync_cursors (
                         id, workspace_id, connector_account_id, resource_type,
-                        cursor_value, updated_at, owner_id, visibility
+                        cursor_value, backfill_resume_cursor, updated_at, owner_id, visibility
                     ) VALUES (
                         :id, :workspace_id, :account_id, :resource_type,
-                        'newer-cursor-from-concurrent-call', :now, :actor_id, 'workspace'
+                        'newer-cursor-from-concurrent-call',
+                        'winner-resume-cursor-from-concurrent-call',
+                        :now, :actor_id, 'workspace'
                     )
                     """
                 ),
@@ -3221,6 +3224,7 @@ class _ReapedMidFlightAdapter:
             items_processed=1,
             status="succeeded",
             next_cursor="stale-older-cursor",
+            backfill_resume_cursor="stale-resume-cursor-from-reaped-call",
         )
 
     def incremental_sync(
@@ -3252,8 +3256,9 @@ def test_sync_run_reaped_mid_flight_does_not_clobber_a_newer_watermark(
     docstring -- a slower call than any real adapter's contract-level
     duration bound, overlapping a second, genuinely concurrent call) must
     not still act on its own now-stale outcome once phase 3 resumes:
-    not the `sync_cursors` write (it would silently rewind a newer cursor
-    that concurrent call already wrote), not the `connector_accounts.
+    not either `sync_cursors` write -- `cursor_value` or `backfill_
+    resume_cursor` -- (either would silently rewind a newer value that
+    concurrent call already wrote), not the `connector_accounts.
     status`/`last_synced_at`/`last_error` write (it would resurrect/
     re-stamp the account from this stale outcome over whatever the
     concurrent call's own phase 3 already wrote), and not the
@@ -3290,7 +3295,8 @@ def test_sync_run_reaped_mid_flight_does_not_clobber_a_newer_watermark(
         cursor_row = (
             connection.execute(
                 text(
-                    "SELECT cursor_value FROM sync_cursors WHERE workspace_id = :workspace_id "
+                    "SELECT cursor_value, backfill_resume_cursor FROM sync_cursors "
+                    "WHERE workspace_id = :workspace_id "
                     "AND connector_account_id = :account_id AND resource_type = 'repository'"
                 ),
                 {"workspace_id": workspace_id, "account_id": account_id},
@@ -3326,6 +3332,7 @@ def test_sync_run_reaped_mid_flight_does_not_clobber_a_newer_watermark(
             {"workspace_id": workspace_id, "account_id": account_id},
         ).scalar_one()
     assert cursor_row["cursor_value"] == "newer-cursor-from-concurrent-call"
+    assert cursor_row["backfill_resume_cursor"] == "winner-resume-cursor-from-concurrent-call"
     assert account_row["last_synced_at"] is None
     assert account_row["version"] == 1
     assert synced_audit_count == 0
