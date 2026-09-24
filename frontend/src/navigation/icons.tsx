@@ -168,10 +168,10 @@ export function PersonalIcon(props: SVGProps<SVGSVGElement>) {
 export function TeamIcon(props: SVGProps<SVGSVGElement>) {
   return (
     <svg {...base} {...props}>
-      <circle cx="9" cy="8" r="3.5" />
-      <path d="M2 20v-1a6 6 0 0 1 11 0v1" />
-      <circle cx="17" cy="9" r="2.8" />
-      <path d="M15 14a5 5 0 0 1 5 5v1" />
+      <circle cx="9" cy="8" r="4" />
+      <path d="M2 21v-2a7 7 0 0 1 14 0v2" />
+      <path d="M17 3.5a4 4 0 0 1 0 7.5" />
+      <path d="M21 21v-2a4 4 0 0 0-3-3.9" />
     </svg>
   )
 }
