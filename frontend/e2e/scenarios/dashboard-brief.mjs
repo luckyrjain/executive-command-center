@@ -50,16 +50,15 @@ export async function run({ page, baseURL }) {
   await briefPanel.getByText('Generation 3 · disabled').waitFor()
   await briefPanel.getByText('AI-assisted sections are disabled; showing deterministic results only.').waitFor()
   await briefPanel.getByText(/This brief is stale: source version changed\. Refresh to regenerate it\./).waitFor()
-  // The brief's item lists duplicated the live dashboard grid one-for-one
-  // (same categories, same items, styled as identical cards) with nothing
-  // distinguishing "live" from "persisted snapshot" -- replaced with a
-  // compact count strip; full item detail already lives in the dashboard
-  // sections above.
-  const briefStats = briefPanel.locator('.brief-stats')
-  await briefStats.getByText('Schedule').waitFor()
-  await briefStats.getByText('Priorities').waitFor()
-  await briefStats.getByText('Overdue').waitFor()
-  await briefStats.getByText('Risks').waitFor()
+  // The brief's item lists used to duplicate the live dashboard grid
+  // one-for-one (same categories, same items, styled as identical cards)
+  // with nothing distinguishing "live" from "persisted snapshot" -- fixed
+  // first with a compact count strip, then that strip was removed entirely
+  // once it turned out the counts could actively disagree with the live
+  // dashboard's own badges (the backend's empty-placeholder rows are
+  // filtered out of the live count but not the brief's). Assert there is
+  // no stats block left to regress back to a stale one.
+  assert.equal(await briefPanel.locator('dl').count(), 0, 'the brief should not render a stats dl')
 
   await briefPanel.getByRole('button', { name: 'Refresh brief' }).click()
   await briefPanel.getByText('Generation 4 · disabled').waitFor()

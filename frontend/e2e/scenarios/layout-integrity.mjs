@@ -233,6 +233,15 @@ export async function run({ page, baseURL }) {
     await page.locator('.wizard-stepper').first().waitFor()
     assert.equal(await horizontalOverflow(page), 0, `/automation (${tab}) must not scroll horizontally at 320px`)
   }
+
+  // /today has no .wizard-stepper, so it can't join the loop above -- a
+  // standalone check instead, waiting for real data (not just first-paint
+  // markup) so the overflow measurement reflects the loaded page.
+  await page.goto(`${baseURL}/today`)
+  await page.locator('.brief-status').getByText(/Generation/).waitFor()
+  await page.locator('.dashboard-grid').waitFor()
+  assert.equal(await horizontalOverflow(page), 0, '/today must not scroll horizontally at 320px')
+
   // The connecting line gives way first; the label itself is protected
   // (flex-shrink: 0) so at these labels and viewport it never wraps.
   await page.goto(`${baseURL}/risks`)

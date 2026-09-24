@@ -35,8 +35,8 @@ export default function MorningBrief() {
   })
 
   return (
-    <section className="brief-panel" aria-labelledby="morning-brief-title">
-      <div className="brief-heading">
+    <section className="brief-status" aria-labelledby="morning-brief-title">
+      <div className="brief-status-heading">
         <div>
           <p className="eyebrow">PERSISTED DAILY BRIEF</p>
           <h2 id="morning-brief-title">Morning Brief</h2>
@@ -57,27 +57,6 @@ export default function MorningBrief() {
         <div className="inline-status degraded-panel" role="status">
           This brief is stale{brief.data.stale_reason ? `: ${brief.data.stale_reason.replaceAll('_', ' ')}` : ''}. Refresh to regenerate it.
         </div>
-      ) : null}
-
-      {brief.data ? (
-        <dl className="brief-stats">
-          <div>
-            <dt>Schedule</dt>
-            <dd>{brief.data.sections.today_schedule?.length ?? 0}</dd>
-          </div>
-          <div>
-            <dt>Priorities</dt>
-            <dd>{brief.data.sections.top_priorities?.length ?? 0}</dd>
-          </div>
-          <div>
-            <dt>Overdue</dt>
-            <dd>{brief.data.sections.overdue_commitments?.length ?? 0}</dd>
-          </div>
-          <div>
-            <dt>Risks</dt>
-            <dd>{brief.data.sections.risks?.length ?? 0}</dd>
-          </div>
-        </dl>
       ) : null}
     </section>
   )
