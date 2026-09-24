@@ -82,6 +82,7 @@ describe('TaskWorkspace', () => {
 
     await screen.findByText('Prepare board pack')
     fireEvent.click(screen.getByRole('button', { name: 'Edit Prepare board pack' }))
+    expect(screen.getByRole('button', { name: 'Save task' }).className).toBe('btn-primary')
     fireEvent.change(screen.getByLabelText('Edit task title'), { target: { value: 'Prepare final board pack' } })
     fireEvent.click(screen.getByRole('button', { name: 'Save task' }))
 

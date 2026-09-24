@@ -233,6 +233,7 @@ describe('RiskWorkspace', () => {
 
     await screen.findByText('Vendor renewal may lapse')
     fireEvent.click(screen.getByRole('button', { name: 'Edit Vendor renewal may lapse' }))
+    expect(screen.getByRole('button', { name: 'Save risk' }).className).toBe('btn-primary')
     fireEvent.change(screen.getByLabelText('Edit risk description'), { target: { value: 'My revised assessment' } })
     fireEvent.click(screen.getByRole('button', { name: 'Save risk' }))
     await screen.findByText(/changed while you were editing/i)
