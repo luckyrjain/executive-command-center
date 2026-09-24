@@ -7,7 +7,13 @@ from sqlalchemy.pool import NullPool
 from ecc.config import get_settings
 
 settings = get_settings()
-engine = create_engine(settings.database_url, pool_pre_ping=True)
+# `hide_parameters=True` on both engines (Spec A S1.6 / threat T7): keeps
+# SQLAlchemy from appending bound parameter values (emails, encrypted
+# credential bytes, OAuth-derived identifiers) to `StatementError`/
+# `DBAPIError` text and to its own statement logging. Note it does *not*
+# scrub the driver's own message (e.g. PostgreSQL's `DETAIL: Key (...)=(...)`),
+# so callers must still avoid logging `str(exc)` for integrity errors.
+engine = create_engine(settings.database_url, pool_pre_ping=True, hide_parameters=True)
 SessionFactory = sessionmaker(bind=engine, expire_on_commit=False)
 
 # A separate, unpooled engine for session-scoped advisory locks
@@ -30,7 +36,7 @@ SessionFactory = sessionmaker(bind=engine, expire_on_commit=False)
 # whole point of the lock), and the connect-listener's 5-second budget
 # (approved for ordinary query latency, not lock-wait time) would otherwise
 # cancel the wait itself under real contention.
-lock_engine = create_engine(settings.database_url, poolclass=NullPool)
+lock_engine = create_engine(settings.database_url, poolclass=NullPool, hide_parameters=True)
 
 # Approved Phase 1 acceptance budget (see
 # docs/superpowers/specs/2026-07-16-phase-1-completion-design.md:178 and

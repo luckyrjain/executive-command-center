@@ -1608,9 +1608,9 @@ class GmailAdapter:
                 raise AdapterAuthorizationError("Gmail profile response missing emailAddress")
 
             if not self.is_account_allowed(email_address):
-                raise AdapterAuthorizationError(
-                    f"Gmail account {email_address!r} is not on the internal allowlist"
-                )
+                # No email in the message (Spec A S1.6 / T7): this text
+                # reaches logs and the 422 `error` field.
+                raise AdapterAuthorizationError("Gmail account is not on the internal allowlist")
         except Exception:
             self._revoke_best_effort(refresh_token or "")
             raise

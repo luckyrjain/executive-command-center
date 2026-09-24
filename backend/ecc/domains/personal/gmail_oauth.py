@@ -665,7 +665,7 @@ def gmail_oauth_complete_endpoint(
         else:
             error_code = exc.detail.get("code", "GMAIL_OAUTH_FAILED")
         query = urlencode({"gmail": "error", "code": error_code})
-    except Exception:
+    except Exception as exc:
         # A non-`HTTPException` escaping `/oauth/callback` (a transient DB
         # error, a dropped connection, an `AssertionError`) would
         # otherwise propagate past this function too -- this app
@@ -679,7 +679,17 @@ def gmail_oauth_complete_endpoint(
         # page) and reported to the frontend as the same generic
         # `GMAIL_OAUTH_FAILED` code `/oauth/callback`'s own `Adapter
         # AuthorizationError` branch already uses.
-        _logger.exception("Unhandled error completing Gmail OAuth")
+        #
+        # Logs only the code-defined error code and the exception *class*
+        # (Spec A S1.6 / threat T7) -- never `str(exc)` or a traceback
+        # (`exc_info`), since a DB driver's message (`DETAIL: Key (...)=
+        # (...)`) or an adapter's text can carry Google emails, OAuth
+        # codes/state, or credential bytes.
+        _logger.error(
+            "Unhandled error completing Gmail OAuth: code=%s error_class=%s",
+            "GMAIL_OAUTH_FAILED",
+            f"{type(exc).__module__}.{type(exc).__qualname__}",
+        )
         query = urlencode({"gmail": "error", "code": "GMAIL_OAUTH_FAILED"})
     else:
         query = urlencode({"gmail": "connected"})
