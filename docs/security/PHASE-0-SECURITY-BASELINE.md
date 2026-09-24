@@ -2,7 +2,7 @@
 id: PHASE-0-SECURITY-BASELINE
 title: Phase 0 Security Baseline
 status: Approved
-version: 1.0.0
+version: 1.1.0
 owner: Lucky Jain
 ---
 
@@ -28,6 +28,12 @@ This document defines the minimum security controls required before Phase 0 can 
 ## Workspace isolation
 
 Every persisted domain, event, PKOS and configuration record MUST include `workspace_id`. User-owned records MUST include `owner_id`. Repository queries MUST require workspace context and tests MUST prove that cross-workspace reads and writes fail.
+
+### Workspace isolation exceptions
+
+- **Background job pickup.** Background jobs that pick up due work across every workspace, such as the automation scheduler (`list_schedule_triggers`) and the workflow worker (`claim_next_run`), then act only inside each claimed row's own workspace. They predate this section and are not a tenant data read; see the [Enterprise Tenancy Contract](../phases/phase-009/TENANCY-CONTRACT.md).
+- **Provider-revocation safety check.** `ecc.platform.connector_security.revoke_is_safe` (scope `global`) runs one existence check on `connector_accounts (provider, external_account_id)` across all workspaces before an OAuth grant is revoked at the provider. It returns a boolean only, never identifiers or row data, and is used for nothing else; a revoke it blocks is counted only as `result="skipped_unsafe"` on `ecc_connector_revoke_total` (provider and call-site labels). It is indexed by `ix_connector_accounts_provider_external_id` (migration `0082_revoke_idx_backfill_log`) and covered by `tests/test_platform_connector_security_postgres.py` and `tests/test_connector_revoke_index_migration_postgres.py`. See the [Enterprise Tenancy Contract](../phases/phase-009/TENANCY-CONTRACT.md#exceptions).
+- **`personal_visibility_backfill_log`.** This ops-only table (same migration) has no `workspace_id`. It is reserved for the `scripts/backfill_personal_visibility.py` ops command (security remediation S1.8(b), not yet landed), which records and restores the visibility and owner of rows it made private. It is not a domain record, is never exposed through the API and is not an authorization resource.
 
 ## Secrets
 
@@ -88,3 +94,8 @@ Verified committed secrets and critical vulnerabilities fail CI unless there is 
 ## Exit evidence
 
 The Phase 0 exit review MUST include links to passing CI runs, generated SBOM artifacts, vulnerability scan summaries and the security test report.
+
+## Changelog
+
+- 1.1.0: Added named workspace-isolation exceptions for the provider-revocation safety check and the `personal_visibility_backfill_log` ops table, and noted existing background job pickup (security remediation S1.12).
+- 1.0.0: Approved baseline.
