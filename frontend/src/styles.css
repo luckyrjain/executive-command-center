@@ -81,6 +81,27 @@
   --text-display-md: clamp(32px, 5vw, 56px);
   --text-display-lg: clamp(42px, 7vw, 78px);
 
+  /* Font weight -- the six values already in use, named for their literal
+   * CSS weight so the token reads the same as the number it replaces. */
+  --font-weight-400: 400;
+  --font-weight-500: 500;
+  --font-weight-600: 600;
+  --font-weight-650: 650;
+  --font-weight-700: 700;
+  --font-weight-800: 800;
+
+  /* Letter spacing -- the seven em values already in use. No standard naming
+   * vocabulary exists for tracking the way "regular/bold" does for weight,
+   * so the token name encodes the literal value it replaces rather than an
+   * invented tight/normal/wide tier. */
+  --tracking-neg-045: -.045em;
+  --tracking-neg-035: -.035em;
+  --tracking-neg-02: -.02em;
+  --tracking-neg-01: -.01em;
+  --tracking-04: .04em;
+  --tracking-08: .08em;
+  --tracking-16: .16em;
+
   /* Container/grid -- .app-shell is the only page frame in the app; these
    * tokens name its actual values rather than introduce new ones. */
   --page-gutter: clamp(20px, 4vw, 64px);
@@ -161,11 +182,11 @@ div.workspace-switcher .field-form { margin-top: 0; max-width: var(--content-sel
   margin: 0 0 8px;
   color: var(--color-text-secondary);
   font-size: var(--text-xs);
-  font-weight: 800;
-  letter-spacing: .16em;
+  font-weight: var(--font-weight-800);
+  letter-spacing: var(--tracking-16);
 }
 
-h1 { margin: 0; font-size: var(--text-display-lg); line-height: .94; letter-spacing: -.045em; }
+h1 { margin: 0; font-size: var(--text-display-lg); line-height: .94; letter-spacing: var(--tracking-neg-045); }
 /* The dashboard's own "Today" h1 -- scoped to `.topbar` (used nowhere else)
  * rather than changing the shared h1 rule above, which every other
  * workspace page's title also uses. At the full 78px hero size, "Today"
@@ -174,9 +195,9 @@ h1 { margin: 0; font-size: var(--text-display-lg); line-height: .94; letter-spac
  * nearly 2x for one orienting word with no informational payload of its
  * own. Still clearly the largest text on the page -- a title should
  * outrank its content -- just not by that much. */
-.topbar h1 { font-size: var(--text-display-md); line-height: 1.05; letter-spacing: -.035em; }
+.topbar h1 { font-size: var(--text-display-md); line-height: 1.05; letter-spacing: var(--tracking-neg-035); }
 .subtitle { margin: 14px 0 0; color: var(--color-text-muted); }
-.kpi-value { font-variant-numeric: tabular-nums; font-weight: 650; letter-spacing: -.02em; }
+.kpi-value { font-variant-numeric: tabular-nums; font-weight: var(--font-weight-650); letter-spacing: var(--tracking-neg-02); }
 
 button {
   border: 1px solid var(--color-border-strong);
@@ -242,7 +263,7 @@ button[aria-busy="true"]:disabled { cursor: wait; }
 }
 
 .section-heading { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
-.section-heading h2 { margin: 0; font-size: var(--text-lg); letter-spacing: -.01em; }
+.section-heading h2 { margin: 0; font-size: var(--text-lg); letter-spacing: var(--tracking-neg-01); }
 
 .section-heading > span {
   min-width: 28px;
@@ -251,7 +272,7 @@ button[aria-busy="true"]:disabled { cursor: wait; }
   padding: 5px 9px;
   text-align: center;
   font-size: var(--text-xs);
-  font-weight: 800;
+  font-weight: var(--font-weight-800);
 }
 
 /* A sub-grouping inside a `.work-panel` that needs its own heading without
@@ -284,14 +305,14 @@ button[aria-busy="true"]:disabled { cursor: wait; }
 .item-list strong { display: block; font-size: var(--text-md); line-height: 1.45; }
 .item-list small { display: block; margin-top: 4px; color: var(--color-text-secondary); }
 .item-meta { display: flex; align-items: center; gap: 8px; color: var(--color-text-secondary); font-size: var(--text-xs); white-space: nowrap; }
-.item-meta span { border-radius: 999px; background: var(--color-surface-recessed); padding: 4px 8px; font-weight: 800; }
+.item-meta span { border-radius: 999px; background: var(--color-surface-recessed); padding: 4px 8px; font-weight: var(--font-weight-800); }
 .empty-state { margin: 50px 0 0; color: var(--color-text-secondary); text-align: center; }
 
 .brief-status { margin-top: 36px; margin-bottom: var(--space-10); }
 /* h2 size/tracking matches .section-heading h2 exactly (var(--text-lg),
  * -.01em) -- the same "quiet section heading" precedent already used
  * elsewhere (e.g. AttentionQueue's grouped headings), not a new size. */
-.brief-status-heading h2 { margin: 0; font-size: var(--text-lg); letter-spacing: -.01em; }
+.brief-status-heading h2 { margin: 0; font-size: var(--text-lg); letter-spacing: var(--tracking-neg-01); }
 .brief-status-heading p:not(.eyebrow) { margin: var(--space-2) 0 0; color: var(--color-text-secondary); }
 
 .recommendation-panel,
@@ -335,7 +356,7 @@ button[aria-busy="true"]:disabled { cursor: wait; }
 
 .field-hint { margin: -8px 0 14px; color: var(--color-text-muted); font-size: var(--text-sm); }
 .field-hint code { background: var(--color-surface-recessed); color: var(--color-text-secondary); border-radius: var(--radius-control); padding: 1px 5px; }
-.field-error { margin: -8px 0 14px; color: var(--color-text-danger-strong); font-size: var(--text-sm); font-weight: 700; }
+.field-error { margin: -8px 0 14px; color: var(--color-text-danger-strong); font-size: var(--text-sm); font-weight: var(--font-weight-700); }
 
 /* `aria-invalid="true"` is set both by this per-field-as-you-type
  * validation (ConnectorHealthPanel's Host step) and by every other
@@ -350,17 +371,17 @@ select[aria-invalid="true"] { border-color: var(--color-border-danger); backgrou
 
 .wizard-stepper { display: flex; align-items: center; margin: 20px 0 24px; padding: 0; list-style: none; }
 .wizard-step-node { display: flex; align-items: center; gap: 8px; flex: 1; }
-.wizard-step-circle { width: 26px; height: 26px; border-radius: 999px; display: flex; align-items: center; justify-content: center; font-size: var(--text-2xs); font-weight: 800; flex-shrink: 0; }
+.wizard-step-circle { width: 26px; height: 26px; border-radius: 999px; display: flex; align-items: center; justify-content: center; font-size: var(--text-2xs); font-weight: var(--font-weight-800); flex-shrink: 0; }
 .wizard-step-circle.done { background: var(--color-ink); color: var(--color-text-on-ink); }
 .wizard-step-circle.active { background: var(--color-surface-panel); border: 2px solid var(--color-ink); color: var(--color-ink); }
 .wizard-step-circle.upcoming { background: var(--color-surface-recessed); color: var(--color-text-secondary); }
-.wizard-step-label { font-size: var(--text-xs); font-weight: 700; color: var(--color-text-muted); white-space: nowrap; }
+.wizard-step-label { font-size: var(--text-xs); font-weight: var(--font-weight-700); color: var(--color-text-muted); white-space: nowrap; }
 .wizard-step-label.on { color: var(--color-ink); }
 .wizard-step-line { flex: 1; height: 2px; margin: 0 8px; min-width: 8px; background: var(--color-border-subtle); }
 .wizard-step-line.done { background: var(--color-ink); }
 .wizard-review dl { display: flex; flex-wrap: wrap; gap: 14px 28px; margin: 16px 0 0; }
 .wizard-review dl div { display: grid; gap: 3px; }
-.wizard-review dt { color: var(--color-text-secondary); font-size: var(--text-2xs); font-weight: 800; letter-spacing: .08em; text-transform: uppercase; }
+.wizard-review dt { color: var(--color-text-secondary); font-size: var(--text-2xs); font-weight: var(--font-weight-800); letter-spacing: var(--tracking-08); text-transform: uppercase; }
 .wizard-review dd { margin: 0; color: var(--color-ink); font-size: var(--text-sm); }
 .wizard-review dd.is-machine-value { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
 
@@ -375,7 +396,7 @@ select[aria-invalid="true"] { border-color: var(--color-border-danger); backgrou
   display: flex; align-items: center; justify-content: center; flex-shrink: 0;
   width: 28px; height: 28px; border-radius: 8px;
   background: var(--color-surface-recessed); color: var(--color-text-secondary);
-  font-weight: 800; font-size: var(--text-xs); letter-spacing: -.02em; text-transform: uppercase;
+  font-weight: var(--font-weight-800); font-size: var(--text-xs); letter-spacing: var(--tracking-neg-02); text-transform: uppercase;
 }
 .provider-picker button[aria-pressed="true"] .provider-glyph { background: rgba(255, 255, 255, .18); color: var(--color-text-on-ink); } /* design-tokens-allow: translucent white tint over the accent fill, not a standalone color -- no token would name this correctly */
 
@@ -390,7 +411,7 @@ select[aria-invalid="true"] { border-color: var(--color-border-danger); backgrou
  * item's own <details> disclosure (RiskWorkspace.tsx). */
 .detail-fields { display: flex; flex-wrap: wrap; gap: 14px 28px; margin: 16px 0 0; }
 .detail-fields div { display: grid; gap: 3px; }
-.detail-fields dt { color: var(--color-text-secondary); font-size: var(--text-2xs); font-weight: 800; letter-spacing: .08em; text-transform: uppercase; }
+.detail-fields dt { color: var(--color-text-secondary); font-size: var(--text-2xs); font-weight: var(--font-weight-800); letter-spacing: var(--tracking-08); text-transform: uppercase; }
 .detail-fields dd { margin: 0; color: var(--color-ink); font-size: var(--text-sm); }
 .detail-fields dd.is-machine-value { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
 
@@ -415,7 +436,7 @@ select[aria-invalid="true"] { border-color: var(--color-border-danger); backgrou
 .recommendation-heading h2,
 .explore-heading h2,
 .work-heading h1,
-.work-heading h2 { margin: 0; font-size: var(--text-display-sm); letter-spacing: -.035em; }
+.work-heading h2 { margin: 0; font-size: var(--text-display-sm); letter-spacing: var(--tracking-neg-035); }
 .work-heading h1,
 .work-heading h2 { line-height: 1.05; overflow-wrap: anywhere; }
 /* Two-up `.work-grid` (one column at <=800px): each column is about half the
@@ -468,14 +489,14 @@ select[aria-invalid="true"] { border-color: var(--color-border-danger); backgrou
   padding: 5px 9px;
   color: var(--color-text-body);
   font-size: var(--text-xs);
-  font-weight: 700;
+  font-weight: var(--font-weight-700);
   text-transform: capitalize;
 }
 .recommendation-copy dl { display: flex; flex-wrap: wrap; gap: 14px 28px; margin: 18px 0 0; }
 .recommendation-copy dl div { display: grid; gap: 3px; }
-.recommendation-copy dt { color: var(--color-text-secondary); font-size: var(--text-2xs); font-weight: 800; letter-spacing: .08em; text-transform: uppercase; }
+.recommendation-copy dt { color: var(--color-text-secondary); font-size: var(--text-2xs); font-weight: var(--font-weight-800); letter-spacing: var(--tracking-08); text-transform: uppercase; }
 .recommendation-copy dd { margin: 0; color: var(--color-ink); font-size: var(--text-sm); text-transform: capitalize; }
-.execution-result { margin-top: 14px !important; color: var(--color-text-success) !important; font-weight: 700; }
+.execution-result { margin-top: 14px !important; color: var(--color-text-success) !important; font-weight: var(--font-weight-700); }
 .recommendation-actions { display: flex; min-width: 190px; flex-direction: column; align-items: stretch; gap: 9px; }
 .recommendation-actions button { text-align: center; }
 .recommendation-actions span { color: var(--color-text-muted); font-size: var(--text-xs); text-align: center; }
@@ -506,12 +527,12 @@ select[aria-invalid="true"] { border-color: var(--color-border-danger); backgrou
   display: flex; align-items: center; justify-content: center; flex-shrink: 0;
   width: 38px; height: 38px; border-radius: 10px;
   background: var(--color-surface-recessed); color: var(--color-text-secondary);
-  font-weight: 800; font-size: var(--text-md); letter-spacing: -.02em; text-transform: uppercase;
+  font-weight: var(--font-weight-800); font-size: var(--text-md); letter-spacing: var(--tracking-neg-02); text-transform: uppercase;
 }
 .connector-identity strong { display: block; font-size: var(--text-md); }
 .connector-identity small { display: block; margin-top: 2px; color: var(--color-text-secondary); }
 
-.status-badge { display: inline-flex; align-items: center; gap: 6px; flex-shrink: 0; border-radius: 999px; padding: 5px 12px; font-size: var(--text-xs); font-weight: 700; white-space: nowrap; }
+.status-badge { display: inline-flex; align-items: center; gap: 6px; flex-shrink: 0; border-radius: 999px; padding: 5px 12px; font-size: var(--text-xs); font-weight: var(--font-weight-700); white-space: nowrap; }
 .status-badge::before { content: ''; width: 7px; height: 7px; border-radius: 999px; background: currentColor; flex-shrink: 0; }
 .status-badge.is-active { background: var(--color-bg-success); border: 1px solid var(--color-border-success); color: var(--color-text-success-strong); }
 .status-badge.is-neutral { background: var(--color-surface-recessed); border: 1px solid var(--color-border-base); color: var(--color-text-secondary); }
@@ -526,7 +547,7 @@ select[aria-invalid="true"] { border-color: var(--color-border-danger); backgrou
  * a dashed border and a tinted background, never the same solid-card
  * treatment `.dashboard-card`/`.item-list` use for deterministic content. */
 .ai-explanation { margin-top: 12px; padding: 14px 16px; border: 1px dashed var(--color-border-ai); border-radius: var(--radius-control); background: var(--color-bg-ai); display: grid; gap: 8px; }
-.ai-explanation-badge { margin: 0; font-size: var(--text-2xs); font-weight: 800; letter-spacing: .04em; text-transform: uppercase; color: var(--color-text-ai-accent); }
+.ai-explanation-badge { margin: 0; font-size: var(--text-2xs); font-weight: var(--font-weight-800); letter-spacing: var(--tracking-04); text-transform: uppercase; color: var(--color-text-ai-accent); }
 .ai-explanation p { margin: 0; }
 .ai-explanation ul { margin: 0; padding-left: 18px; }
 .ai-explanation small { color: var(--color-text-secondary); }
@@ -536,7 +557,7 @@ select[aria-invalid="true"] { border-color: var(--color-border-danger); backgrou
 .recommendation-preview { margin-top: 14px; padding-top: 14px; border-top: 1px dashed var(--color-border-subtle); display: grid; gap: 10px; }
 .evidence-preview { list-style: none; margin: 0; padding: 0; display: flex; flex-wrap: wrap; gap: 8px; }
 .evidence-preview li { border-radius: 999px; padding: 4px 11px; font-size: var(--text-xs); text-transform: capitalize; display: flex; gap: 6px; }
-.evidence-preview li span { font-weight: 700; }
+.evidence-preview li span { font-weight: var(--font-weight-700); }
 .evidence-preview .evidence-available { border: 1px solid var(--color-border-success); background: var(--color-bg-success); color: var(--color-text-success-strong); }
 .evidence-preview .evidence-missing { border: 1px solid var(--color-border-danger); background: var(--color-bg-danger); color: var(--color-text-danger-strong); }
 .risk-factor-preview p { margin: 0; color: var(--color-text-body); font-size: var(--text-sm); }
@@ -545,8 +566,8 @@ select[aria-invalid="true"] { border-color: var(--color-border-danger); backgrou
 
 .field-form { display: grid; gap: 14px; margin-top: 28px; max-width: var(--content-form); }
 .field-form label,
-.note-search { display: grid; gap: 7px; color: var(--color-text-secondary); font-size: var(--text-sm); font-weight: 700; }
-.field-form label.field-checkbox { display: flex; align-items: center; gap: 8px; font-weight: 400; }
+.note-search { display: grid; gap: 7px; color: var(--color-text-secondary); font-size: var(--text-sm); font-weight: var(--font-weight-700); }
+.field-form label.field-checkbox { display: flex; align-items: center; gap: 8px; font-weight: var(--font-weight-400); }
 .field-form input,
 .field-form textarea,
 .field-form select,
@@ -624,8 +645,8 @@ button[aria-pressed="true"] { border-color: var(--color-ink); background: var(--
   margin: 0 0 var(--space-2);
   padding: 0 var(--space-3);
   font-size: var(--text-2xs);
-  font-weight: 600;
-  letter-spacing: .04em;
+  font-weight: var(--font-weight-600);
+  letter-spacing: var(--tracking-04);
   text-transform: uppercase;
   color: var(--color-text-secondary);
 }
@@ -639,7 +660,7 @@ button[aria-pressed="true"] { border-color: var(--color-ink); background: var(--
   padding: 8px 12px;
   color: var(--color-text-secondary);
   text-decoration: none;
-  font-weight: 500;
+  font-weight: var(--font-weight-500);
   border-left: 3px solid transparent;
   transition: background var(--motion-fast) var(--ease-standard);
 }
@@ -650,7 +671,7 @@ button[aria-pressed="true"] { border-color: var(--color-ink); background: var(--
   background: color-mix(in srgb, var(--color-accent) 12%, var(--color-surface-panel));
   border-left-color: var(--color-accent);
   color: var(--color-ink);
-  font-weight: 650;
+  font-weight: var(--font-weight-650);
 }
 .sidebar-nav a:focus-visible { outline: 3px solid var(--focus-ring); outline-offset: -3px; }
 .sidebar-nav-badge {
@@ -658,7 +679,7 @@ button[aria-pressed="true"] { border-color: var(--color-ink); background: var(--
   background: var(--color-surface-recessed);
   color: var(--color-text-secondary);
   font-size: var(--text-xs);
-  font-weight: 700;
+  font-weight: var(--font-weight-700);
   padding: 1px 7px;
 }
 .sidebar-nav a[aria-current="page"] .sidebar-nav-badge { background: var(--color-surface-panel); }
@@ -668,7 +689,7 @@ button[aria-pressed="true"] { border-color: var(--color-ink); background: var(--
 .search-form,
 .audit-toolbar { display: grid; gap: 10px; margin-top: 28px; }
 .search-form label,
-.audit-toolbar label { color: var(--color-text-secondary); font-size: var(--text-sm); font-weight: 700; }
+.audit-toolbar label { color: var(--color-text-secondary); font-size: var(--text-sm); font-weight: var(--font-weight-700); }
 .search-form > div { display: flex; gap: 10px; }
 .search-form input,
 .audit-toolbar input {
@@ -722,9 +743,9 @@ button[aria-pressed="true"] { border-color: var(--color-ink); background: var(--
   background: var(--color-accent-simulation);
   color: var(--color-text-on-ink);
   padding: 8px 16px;
-  font-weight: 800;
+  font-weight: var(--font-weight-800);
   font-size: var(--text-sm);
-  letter-spacing: .04em;
+  letter-spacing: var(--tracking-04);
   text-transform: uppercase;
   display: inline-block;
 }
