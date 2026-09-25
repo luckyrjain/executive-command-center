@@ -69,8 +69,12 @@ class ReviewQueueList(BaseModel):
 def _evidence_state(session: Session, auth: AuthContext, evidence_id: UUID) -> str | None:
     """Same lookup as ``claims.py``'s ``_evidence_state`` -- ``pkos_evidence``
     scoped to the caller's workspace. Returns ``None`` when no such
-    evidence row exists in this workspace at all.
+    evidence row exists in this workspace at all -- or, with
+    ``ECC_PERSONAL_DATA_ISOLATION`` on, when the caller may not read it
+    (Spec A S1.14), so it is rejected exactly like an unknown id.
     """
+    if not authz.cited_evidence_readable(session, auth, evidence_id):
+        return None
     row = session.execute(
         text(
             "SELECT evidence_state FROM pkos_evidence"
