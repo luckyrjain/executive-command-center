@@ -2415,7 +2415,7 @@ def list_team_suggestions_endpoint(
         session.execute(
             text(
                 "SELECT id, name, suggested_team_name FROM repositories "
-                f"WHERE workspace_id = :workspace_id AND ({visibility_sql_repo}) "  # noqa: S608
+                f"WHERE workspace_id = :workspace_id AND ({visibility_sql_repo}) "  # noqa: S608 -- authz fragment; values bound
                 "AND team_entity_id IS NULL AND team_suggestion_dismissed_at IS NULL "
                 "AND suggested_team_name IS NOT NULL"
             ),
@@ -2436,7 +2436,7 @@ def list_team_suggestions_endpoint(
         session.execute(
             text(
                 "SELECT id, title AS name, suggested_team_name FROM engineering_work_items "
-                f"WHERE workspace_id = :workspace_id AND ({visibility_sql_wi}) "  # noqa: S608
+                f"WHERE workspace_id = :workspace_id AND ({visibility_sql_wi}) "  # noqa: S608 -- authz fragment; values bound
                 "AND team_entity_id IS NULL AND team_suggestion_dismissed_at IS NULL "
                 "AND suggested_team_name IS NOT NULL"
             ),
@@ -2511,7 +2511,7 @@ def _lock_and_authorize_suggestion_candidates(
     )
     rows = session.execute(
         text(
-            f"SELECT id FROM {table} WHERE workspace_id = :workspace_id "  # noqa: S608
+            f"SELECT id FROM {table} WHERE workspace_id = :workspace_id "  # noqa: S608 -- see docstring
             f"AND ({visibility_sql}) "
             "AND suggested_team_name = :suggested_team_name "
             "AND team_entity_id IS NULL AND team_suggestion_dismissed_at IS NULL FOR UPDATE"
@@ -2590,7 +2590,7 @@ def confirm_team_suggestion_endpoint(
                 row.id: row.team_assignment_version
                 for row in session.execute(
                     text(
-                        f"UPDATE {table} SET team_entity_id = :team_entity_id, "  # noqa: S608
+                        f"UPDATE {table} SET team_entity_id = :team_entity_id, "  # noqa: S608 -- table from _TEAM_SUGGESTION_TABLES
                         "team_assignment_version = team_assignment_version + 1, "
                         "team_assignment_updated_by = :actor_id, updated_at = :now "
                         "WHERE workspace_id = :workspace_id AND id = ANY(:ids) "
@@ -2670,7 +2670,7 @@ def dismiss_team_suggestion_endpoint(
             # (architecture review).
             session.execute(
                 text(
-                    f"UPDATE {table} SET team_suggestion_dismissed_at = :now "  # noqa: S608
+                    f"UPDATE {table} SET team_suggestion_dismissed_at = :now "  # noqa: S608 -- table from _TEAM_SUGGESTION_TABLES
                     "WHERE workspace_id = :workspace_id AND id = ANY(:ids) "
                     "AND team_entity_id IS NULL AND team_suggestion_dismissed_at IS NULL"
                 ),

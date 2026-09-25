@@ -273,7 +273,7 @@ class ResourceRef:
     visibility: str
 
 
-_IDENTIFIER_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
+_IDENTIFIER_RE = re.compile(r"[a-zA-Z_][a-zA-Z0-9_]*")
 
 
 def require_safe_sql_identifier(value: str, *, label: str) -> None:
@@ -287,7 +287,7 @@ def require_safe_sql_identifier(value: str, *, label: str) -> None:
     `resource_type` does: a programmer error to fix at the call site, not
     a request-shaped error for an endpoint to catch.
     """
-    if not _IDENTIFIER_RE.match(value):
+    if not _IDENTIFIER_RE.fullmatch(value):
         raise UnknownResourceTypeError(f"{label} is not a safe SQL identifier: {value!r}")
 
 
