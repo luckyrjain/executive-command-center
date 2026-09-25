@@ -111,6 +111,12 @@ def _project(row: dict[str, Any]) -> ClaimResponse:
 
 
 def _evidence_state(session: Session, auth: AuthContext, evidence_id: UUID) -> str | None:
+    """`None` when no such evidence exists in the caller's workspace -- or,
+    with `ECC_PERSONAL_DATA_ISOLATION` on, when it exists but the caller
+    may not read it (Spec A S1.14): citing evidence you cannot read is
+    reported exactly like citing an unknown id."""
+    if not authz.cited_evidence_readable(session, auth, evidence_id):
+        return None
     row = session.execute(
         text(
             "SELECT evidence_state FROM pkos_evidence"
