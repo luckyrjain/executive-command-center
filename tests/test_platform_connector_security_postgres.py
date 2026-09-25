@@ -1,16 +1,18 @@
 """`ecc.platform.connector_security` (Spec A "Shared definitions") against a
 real Postgres database: the personal-data predicates, `revoke_is_safe`
 under both scopes, `IntegrityError` classification, the out-of-transaction
-refusal audit, `revoke_guarded`, the membership-mutation lock key, the new
-connector-security counters, and the three new settings' defaults.
-
-No production code path calls these helpers yet (T01 is foundation only).
+refusal audit, `revoke_guarded`, the membership-mutation lock key (as member
+removal really takes it), the new connector-security counters, and the
+three new settings' defaults.
 """
 
 from __future__ import annotations
 
+import hmac
 import json
 import logging
+import threading
+import time
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from hashlib import sha256
@@ -18,6 +20,7 @@ from typing import Any
 from uuid import UUID, uuid4
 
 import pytest
+from fastapi.testclient import TestClient
 from identity_fixtures import create_identity
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
@@ -28,11 +31,13 @@ from ecc.config import Settings, get_settings
 from ecc.database import SessionFactory, engine
 from ecc.domains.ai_runtime.router import TASK_REQUIREMENTS
 from ecc.logging import JsonFormatter
-from ecc.platform import connector_security
+from ecc.main import app
+from ecc.platform import authz, connector_security
 from ecc.platform.connector_security import (
     EMAIL_TASK_TYPES,
     PERSONAL_PROVIDERS,
     PERSONAL_RESOURCE_TYPES,
+    PERSONAL_ROW_PREDICATES,
     PersonalDataNotGrantable,
     integrity_error_log_fields,
     is_personal_resource,
@@ -586,6 +591,16 @@ def test_is_personal_resource_per_type(
         require_not_personal_data(session, resource_type, other_id)
 
 
+def test_removal_exclusions_are_exactly_the_personal_data_set() -> None:
+    """`authz`'s member-removal exclusions are derived from the one
+    personal-data definition (review B-NB-1): same tables, same SQL, and
+    `pkos_nodes` is never excluded (Gmail-only nodes are re-owned first;
+    any node still owned blocks)."""
+    assert dict(authz._PERSONAL_ROWS_NOT_BLOCKING_REMOVAL) == dict(PERSONAL_ROW_PREDICATES)
+    assert set(authz._PERSONAL_ROWS_NOT_BLOCKING_REMOVAL) == PERSONAL_RESOURCE_TYPES
+    assert "pkos_nodes" not in authz._PERSONAL_ROWS_NOT_BLOCKING_REMOVAL
+
+
 def test_is_personal_resource_other_resource_type_is_false(
     personal_and_other_rows: dict[str, dict[str, UUID]],
 ) -> None:
@@ -1086,14 +1101,78 @@ def test_revoke_if_safe_safety_check_failure_fails_closed(
 # ---------------------------------------------------------------------------
 
 
-def test_membership_mutation_lock_key_matches_removal_format() -> None:
-    workspace_id = UUID("12345678-1234-5678-1234-567812345678")
-    # The literal format `identity/membership_removal.py` uses today
-    # (f"membership-mutation:{auth.workspace_id}").
-    assert membership_mutation_lock_key(workspace_id) == (
-        "membership-mutation:12345678-1234-5678-1234-567812345678"
-    )
-    assert membership_mutation_lock_key(workspace_id) == f"membership-mutation:{workspace_id}"
+def test_member_removal_waits_on_the_helper_lock_key() -> None:
+    """Removal's own advisory lock is exactly `membership_mutation_lock_key`
+    (the key the Gmail callback / sync take the shared side of): while
+    another connection holds that key, `DELETE .../members/{id}` blocks on
+    it, and proceeds once it is released."""
+    now = datetime.now(UTC)
+    with engine.begin() as connection:
+        workspace_id, user_id = _create_workspace(connection, now=now)
+        token = f"session-{uuid4()}"
+        connection.execute(
+            text(
+                "INSERT INTO sessions (id, workspace_id, user_id, token_hash, expires_at, "
+                "last_seen_at) VALUES (:id, :ws, :u, :hash, :expires, :now)"
+            ),
+            {
+                "id": uuid4(),
+                "ws": workspace_id,
+                "u": user_id,
+                "hash": sha256(token.encode()).hexdigest(),
+                "expires": now + timedelta(hours=1),
+                "now": now,
+            },
+        )
+    key = membership_mutation_lock_key(workspace_id)
+    csrf = hmac.new(settings.session_secret.encode(), token.encode(), "sha256").hexdigest()
+    result: dict[str, Any] = {}
+    holder = engine.connect()
+    try:
+        holder.execute(text("SELECT pg_advisory_lock(hashtextextended(:k, 0))"), {"k": key})
+        holder.commit()
+        with TestClient(app) as client:
+            client.cookies.set("ecc_session", token)
+
+            def remove() -> None:
+                result["response"] = client.delete(
+                    f"/api/v1/identity/workspaces/{workspace_id}/members/{uuid4()}",
+                    headers={"X-CSRF-Token": csrf},
+                )
+
+            worker = threading.Thread(target=remove)
+            worker.start()
+            waiting = False
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline and not waiting:
+                waiting = bool(
+                    holder.execute(
+                        text(
+                            "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE locktype = 'advisory' "
+                            "AND NOT granted AND ((classid::bigint << 32) | objid::bigint) "
+                            "= hashtextextended(:k, 0))"
+                        ),
+                        {"k": key},
+                    ).scalar_one()
+                )
+                holder.commit()
+                if not waiting:
+                    time.sleep(0.05)
+            assert "response" not in result
+            holder.execute(text("SELECT pg_advisory_unlock(hashtextextended(:k, 0))"), {"k": key})
+            holder.commit()
+            worker.join(timeout=10)
+        assert waiting, "removal never waited on membership_mutation_lock_key's lock"
+        assert result["response"].status_code == 404, result["response"].text
+    finally:
+        holder.execute(text("SELECT pg_advisory_unlock_all()"))
+        holder.commit()
+        holder.close()
+        with engine.begin() as connection:
+            connection.execute(
+                text("DELETE FROM sessions WHERE workspace_id = :ws"), {"ws": workspace_id}
+            )
+        _cleanup_workspace(workspace_id)
 
 
 # ---------------------------------------------------------------------------
