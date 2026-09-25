@@ -14,10 +14,11 @@ from pydantic import BaseModel, Field
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from ecc.auth import AuthDep
+from ecc.auth import AuthContext, AuthDep
 from ecc.config import get_settings
 from ecc.database import get_session
 from ecc.observability import record_search
+from ecc.platform import authz
 
 router = APIRouter(prefix="/api/v1/search", tags=["search"])
 SessionDep = Annotated[Session, Depends(get_session)]
@@ -116,6 +117,47 @@ def _decode_cursor(cursor: str) -> CursorPayload:
         raise HTTPException(status_code=400, detail="INVALID_CURSOR") from None
 
 
+# Every table the candidate CTE below reads, as (authz resource_type, the
+# alias that table has in its FROM/JOIN clause, bind-param prefix). Each gets
+# `authz.visible_resource_filter_sql`'s standard read predicate (owner, active
+# grantee of a `shared_explicitly` row, or `workspace`-visible; nothing for a
+# caller without an active membership) -- including the calendar event a
+# meeting LEFT JOINs for its `timestamp_context`, so a readable meeting never
+# surfaces an unreadable event's time (the rule
+# `calendar.events.get_calendar_event_summary` applies to the meetings API).
+_VISIBILITY_SCOPES: tuple[tuple[str, str, str], ...] = (
+    ("tasks", "tasks", "task_"),
+    ("commitments", "commitments", "commitment_"),
+    ("notes", "notes", "note_"),
+    ("meetings", "m", "meeting_"),
+    ("calendar_events", "ce", "meeting_event_"),
+    ("calendar_events", "calendar_events", "event_"),
+    ("risks", "risks", "risk_"),
+)
+
+
+def _visibility_filters(
+    session: Session, auth: AuthContext
+) -> tuple[dict[str, str], dict[str, object]]:
+    """`{table_alias: sql_fragment}` plus the merged bind params for every
+    entry of `_VISIBILITY_SCOPES`. Unflagged: honoring visibility is always
+    correct, and is a no-op for `workspace`-visible rows."""
+    fragments: dict[str, str] = {}
+    params: dict[str, object] = {}
+    for resource_type, alias, prefix in _VISIBILITY_SCOPES:
+        fragment, fragment_params = authz.visible_resource_filter_sql(
+            session,
+            auth,
+            resource_type=resource_type,
+            action="read",
+            table_alias=alias,
+            param_prefix=prefix,
+        )
+        fragments[alias] = fragment
+        params.update(fragment_params)
+    return fragments, params
+
+
 def _snippet(value: str | None) -> str:
     if not value:
         return ""
@@ -139,9 +181,13 @@ def search(
     _validate_range(updated_from, updated_to)
     selected_types = list(entity_types or _TYPE_ORDER)
     cursor_payload = _decode_cursor(cursor) if cursor else None
+    visible, visibility_params = _visibility_filters(session, auth)
 
+    # Only authz-built visibility fragments are interpolated below (every
+    # identifier in them is allowlisted/validated by
+    # `visible_resource_filter_sql`, every value is a bind param).
     sql = text(
-        """
+        f"""
         WITH candidates AS (
             SELECT 'task'::text AS entity_type, id AS entity_id, title,
                    description AS body, updated_at, due_at AS timestamp_context,
@@ -155,7 +201,7 @@ def search(
                    ) AS fulltext_score,
                    NULL::uuid AS evidence_id
             FROM tasks
-            WHERE workspace_id = :workspace_id
+            WHERE workspace_id = :workspace_id AND {visible["tasks"]}
 
             UNION ALL
             SELECT 'commitment'::text, id, summary, description, updated_at, due_at,
@@ -167,7 +213,7 @@ def search(
                      plainto_tsquery('simple', :query)
                    ), evidence_id
             FROM commitments
-            WHERE workspace_id = :workspace_id
+            WHERE workspace_id = :workspace_id AND {visible["commitments"]}
 
             UNION ALL
             SELECT 'note'::text, id, coalesce(title, 'Untitled note'), body, updated_at,
@@ -176,7 +222,7 @@ def search(
                    similarity(lower(coalesce(title, '')), :query),
                    ts_rank_cd(search_document, plainto_tsquery('simple', :query)), NULL::uuid
             FROM notes
-            WHERE workspace_id = :workspace_id
+            WHERE workspace_id = :workspace_id AND {visible["notes"]}
 
             UNION ALL
             SELECT 'meeting'::text, m.id, m.title,
@@ -193,7 +239,8 @@ def search(
             FROM meetings m
             LEFT JOIN calendar_events ce
               ON ce.workspace_id = m.workspace_id AND ce.id = m.calendar_event_id
-            WHERE m.workspace_id = :workspace_id
+              AND {visible["ce"]}
+            WHERE m.workspace_id = :workspace_id AND {visible["m"]}
 
             UNION ALL
             SELECT 'calendar_event'::text, id, title, concat_ws('. ', description, location),
@@ -205,7 +252,7 @@ def search(
                      plainto_tsquery('simple', :query)
                    ), NULL::uuid
             FROM calendar_events
-            WHERE workspace_id = :workspace_id
+            WHERE workspace_id = :workspace_id AND {visible["calendar_events"]}
 
             UNION ALL
             SELECT 'risk'::text, id, left(description, 500),
@@ -218,7 +265,7 @@ def search(
                      plainto_tsquery('simple', :query)
                    ), NULL::uuid
             FROM risks
-            WHERE workspace_id = :workspace_id
+            WHERE workspace_id = :workspace_id AND {visible["risks"]}
         ), ranked AS (
             SELECT *,
               least(1.0,
@@ -295,10 +342,11 @@ def search(
           END ASC,
           entity_id ASC
         LIMIT :fetch_limit
-        """
+        """  # noqa: S608
     )
 
     params = {
+        **visibility_params,
         "workspace_id": auth.workspace_id,
         "query": query,
         "entity_types": selected_types,

@@ -81,6 +81,7 @@ Standalone meetings require all three API fields. Linked Meeting responses expos
 ## Search
 
 `GET /search`: q 1..500, types[]=task|commitment|note|meeting|calendar_event|risk, include_archived=false, cursor, limit. Results include entity type/id, title, snippet, matched_fields, score_components, source, updated_at, archived and evidence references.
+Every searched entity type is filtered by the standard read visibility (`authz.visible_resource_filter_sql`: owner, active grantee of a `shared_explicitly` row, or `workspace`-visible) before ranking and pagination, so hidden rows never contribute a hit, snippet or `next_cursor`; a caller without an active membership gets no results. A meeting's `timestamp_context` never comes from a calendar event the caller cannot read.
 
 ## Audit
 
