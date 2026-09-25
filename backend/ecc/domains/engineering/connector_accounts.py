@@ -155,13 +155,18 @@ from sqlalchemy.orm import Session
 from ecc.auth import AuthContext, AuthDep, CsrfDep
 from ecc.database import SessionFactory, get_session
 from ecc.observability import (
+    ConnectorAccessDeniedRoute,
     queue_lifecycle_event,
+    record_connector_access_denied,
     record_idempotency_conflict,
 )
 from ecc.platform import audit_outbox, authz
 from ecc.platform.connector_security import (
+    PERSONAL_PROVIDERS,
     integrity_error_log_fields,
     is_unique_violation,
+    personal_content_scope,
+    personal_data_isolation_enabled,
     revoke_if_safe,
 )
 from ecc.platform.idempotency import load_cached, lock_idempotency, request_hash, store_idempotency
@@ -326,7 +331,7 @@ def _sanitize_adapter_error(message: str) -> str:
 _ACCOUNT_FIELDS = """
     id, workspace_id, provider, external_account_id, display_name,
     granted_scopes, status, status_detail, last_synced_at, last_error,
-    disconnected_at, version, created_at, updated_at
+    disconnected_at, version, created_at, updated_at, owner_id
 """
 
 
@@ -346,6 +351,11 @@ class ConnectorAccount:
     version: int
     created_at: datetime
     updated_at: datetime
+    # Internal only (Spec A S1.8): which member a personal connector's
+    # `sync_runs`/`sync_cursors` belong to, and the owner the route-level
+    # personal-connector check compares against. Never serialized --
+    # `ConnectorAccountResponse` deliberately has no `owner_id` (plan N1).
+    owner_id: UUID | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -369,6 +379,7 @@ def _row_to_account(row: dict[str, Any]) -> ConnectorAccount:
         version=row["version"],
         created_at=row["created_at"],
         updated_at=row["updated_at"],
+        owner_id=row["owner_id"],
     )
 
 
@@ -1207,6 +1218,34 @@ class _IdempotencyArgs:
     req_hash: str
 
 
+@dataclass(frozen=True, slots=True)
+class _SyncRowScope:
+    """`owner_id`/`visibility` for the `sync_runs`/`sync_cursors` rows one
+    sync of one connector account writes."""
+
+    owner_id: UUID
+    visibility: Literal["private", "workspace"]
+
+
+def _sync_row_scope(account: ConnectorAccount, actor_id: UUID) -> _SyncRowScope:
+    """Spec A S1.8(a), `ECC_PERSONAL_DATA_ISOLATION`: a personal-provider
+    connector's runs and cursors are `private` to the connector's own owner
+    (the mailbox owner -- never the acting user, and never request input).
+    Every other case -- flag off, or an engineering provider -- keeps the
+    previous values exactly: owned by the acting user, `workspace`.
+
+    Only newly inserted rows are affected: the cursor UPSERT's conflict
+    branch leaves an existing row's owner/visibility alone, so rows written
+    while the flag was off are moved by the visibility backfill (T15, with
+    its restore log), not silently here.
+    """
+    if account.provider in PERSONAL_PROVIDERS and account.owner_id is not None:
+        scope = personal_content_scope(account.owner_id)
+        if scope.owner_id is not None:
+            return _SyncRowScope(owner_id=scope.owner_id, visibility=scope.visibility)
+    return _SyncRowScope(owner_id=actor_id, visibility="workspace")
+
+
 def _save_sync_cursor(
     session: Session,
     *,
@@ -1216,7 +1255,7 @@ def _save_sync_cursor(
     column: Literal["cursor_value", "backfill_resume_cursor"],
     value: str | None,
     now: datetime,
-    actor_id: UUID,
+    row_scope: _SyncRowScope,
 ) -> None:
     """Collapses the two near-identical `sync_cursors` UPSERTs `_run_
     connector_sync` used to write inline -- `cursor_value` (the
@@ -1247,7 +1286,7 @@ def _save_sync_cursor(
                 {column}, updated_at, owner_id, visibility
             ) VALUES (
                 :id, :workspace_id, :connector_account_id, :resource_type,
-                :value, :now, :actor_id, 'workspace'
+                :value, :now, :owner_id, :visibility
             )
             ON CONFLICT (workspace_id, connector_account_id, resource_type)
             DO UPDATE SET {column} = EXCLUDED.{column},
@@ -1261,7 +1300,8 @@ def _save_sync_cursor(
             "resource_type": resource_type,
             "value": value,
             "now": now,
-            "actor_id": actor_id,
+            "owner_id": row_scope.owner_id,
+            "visibility": row_scope.visibility,
         },
     )
 
@@ -1436,6 +1476,7 @@ def _run_connector_sync(
             },
         )
 
+        row_scope = _sync_row_scope(account, auth.user_id)
         run_id = uuid4()
         try:
             session.execute(
@@ -1446,7 +1487,7 @@ def _run_connector_sync(
                         items_processed, started_at, created_at, owner_id, visibility
                     ) VALUES (
                         :id, :workspace_id, :connector_account_id, :run_type, 'running',
-                        0, :started_at, :started_at, :actor_id, 'workspace'
+                        0, :started_at, :started_at, :owner_id, :visibility
                     )
                     """
                 ),
@@ -1456,7 +1497,8 @@ def _run_connector_sync(
                     "connector_account_id": account_id,
                     "run_type": run_type,
                     "started_at": now,
-                    "actor_id": auth.user_id,
+                    "owner_id": row_scope.owner_id,
+                    "visibility": row_scope.visibility,
                 },
             )
         except IntegrityError as exc:
@@ -1701,7 +1743,7 @@ def _run_connector_sync(
                 column="cursor_value",
                 value=outcome.next_cursor,
                 now=completed_at,
-                actor_id=auth.user_id,
+                row_scope=row_scope,
             )
         if run_type == "backfill" and run_won_the_race:
             # Unconditional (on `outcome.backfill_resume_cursor`, not on
@@ -1724,7 +1766,7 @@ def _run_connector_sync(
                 column="backfill_resume_cursor",
                 value=outcome.backfill_resume_cursor,
                 now=completed_at,
-                actor_id=auth.user_id,
+                row_scope=row_scope,
             )
         if run_won_the_race:
             # `status = 'active'`, not left untouched: reaching this branch
@@ -1867,6 +1909,46 @@ def _run_connector_sync(
     return response
 
 
+def _deny_non_owner_personal_connector(
+    session: Session, auth: AuthContext, account_id: UUID, route: ConnectorAccessDeniedRoute
+) -> None:
+    """Spec A S1.8(d), `ECC_PERSONAL_DATA_ISOLATION`: the route-level second
+    layer for mutating a *personal* connector (`PERSONAL_PROVIDERS`). A
+    caller who is not the connector's owner gets the same `404
+    CONNECTOR_NOT_FOUND` a nonexistent id gets (no existence disclosure),
+    and `ecc_connector_access_denied_total{provider, route}` is counted.
+
+    Runs *before* authz, and independently of it: with the flag on a
+    personal connector is written `private`, so authz already hides it from
+    everyone else -- this layer still refuses when that does not hold (a
+    row written while the flag was off and not yet backfilled, a grant, a
+    workspace owner/admin role), and it is the one place the denial is
+    counted. Rows of other providers, and nonexistent/cross-workspace ids,
+    fall through to authz unchanged. Flag off -> no query, exactly the
+    previous behavior.
+    """
+    if not personal_data_isolation_enabled():
+        return
+    row = (
+        session.execute(
+            text(
+                "SELECT provider, owner_id FROM connector_accounts "
+                "WHERE workspace_id = :workspace_id AND id = :id"
+            ),
+            {"workspace_id": auth.workspace_id, "id": account_id},
+        )
+        .mappings()
+        .one_or_none()
+    )
+    if row is None or row["provider"] not in PERSONAL_PROVIDERS:
+        return
+    if row["owner_id"] == auth.user_id:
+        return
+    session.rollback()
+    record_connector_access_denied(row["provider"], route)
+    raise HTTPException(status_code=404, detail="CONNECTOR_NOT_FOUND")
+
+
 @router.post(
     "/connectors/{account_id}/sync",
     response_model=SyncRunResponse,
@@ -1887,6 +1969,7 @@ def sync_connector_endpoint(
     codes -- see that function's own docstring for the actual reserve/
     call/record logic.
     """
+    _deny_non_owner_personal_connector(session, auth, account_id, "sync")
     if not authz.authorize(
         session, auth, resource_type="connector_accounts", resource_id=account_id, action="read"
     ):
@@ -2002,6 +2085,7 @@ def disable_connector_endpoint(
     _csrf: CsrfDep,
     idempotency_key: IdempotencyHeader,
 ) -> ConnectorAccountResponse:
+    _deny_non_owner_personal_connector(session, auth, account_id, "disable")
     if not authz.authorize(
         session, auth, resource_type="connector_accounts", resource_id=account_id, action="read"
     ):
