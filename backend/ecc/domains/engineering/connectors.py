@@ -25,7 +25,7 @@ distinct post-authorization revalidation step from a fresh credential.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Literal, Protocol, runtime_checkable
@@ -356,7 +356,12 @@ class OAuth2ConnectorAdapter(Protocol):
         """
         ...
 
-    def ensure_fresh_credential(self, credential: str) -> str:
+    def ensure_fresh_credential(
+        self,
+        credential: str,
+        *,
+        reconnected_at: Callable[[], datetime | None] | None = None,
+    ) -> str:
         """Returns `credential` unchanged if it is not close to expiring,
         or a newly-obtained (and not yet persisted) credential string if
         it refreshed one. `sync_connector_endpoint` is this method's one
@@ -368,6 +373,11 @@ class OAuth2ConnectorAdapter(Protocol):
         rejects the refresh) -- the caller records that the same way it
         records any other adapter failure, never proceeding to a sync call
         with a credential it could not confirm is current.
+
+        `reconnected_at` (Spec A S1.13) is an optional lazy lookup of the
+        account's latest (re)connect time, used only for refresh-failure
+        observability. Implementers must accept this keyword (the sync
+        path always passes it) but may ignore its value.
         """
         ...
 

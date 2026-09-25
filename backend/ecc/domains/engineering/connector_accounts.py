@@ -468,6 +468,26 @@ def get_encrypted_credential(session: Session, workspace_id: UUID, account_id: U
     return result
 
 
+def latest_reconnect_at(session: Session, workspace_id: UUID, account_id: UUID) -> datetime | None:
+    """Spec A S1.13: when this connector account was last (re)connected --
+    the newest `connector_account.reconnected`/`.created` audit row's
+    `occurred_at`. Deliberately not `connector_accounts.updated_at`, which
+    every successful token refresh also bumps. Runs in a savepoint so a
+    failure here cannot abort the caller's open transaction.
+    """
+    with session.begin_nested():
+        value = session.execute(
+            text(
+                "SELECT max(occurred_at) FROM audit_events "
+                "WHERE workspace_id = :workspace_id "
+                "AND aggregate_type = 'connector_account' AND aggregate_id = :id "
+                "AND event_type IN ('connector_account.reconnected', 'connector_account.created')"
+            ),
+            {"workspace_id": workspace_id, "id": account_id},
+        ).scalar_one_or_none()
+    return cast("datetime | None", value)
+
+
 # --- GET|POST /api/v1/engineering/connectors, sync, disable, sync-runs -----
 
 router = APIRouter(prefix="/api/v1/engineering", tags=["engineering"])
@@ -1361,7 +1381,13 @@ def _run_connector_sync(
         credential_refresh_error: str | None = None
         if isinstance(adapter, OAuth2ConnectorAdapter):
             try:
-                refreshed_credential = adapter.ensure_fresh_credential(credential)
+                # S1.13 canary: lazy -- only queried if the refresh fails.
+                refreshed_credential = adapter.ensure_fresh_credential(
+                    credential,
+                    reconnected_at=lambda: latest_reconnect_at(
+                        session, auth.workspace_id, account_id
+                    ),
+                )
             except AdapterAuthorizationError as exc:
                 credential_refresh_error = str(exc)
             else:
