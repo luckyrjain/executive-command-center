@@ -111,6 +111,7 @@ from sqlalchemy.engine import RowMapping
 from sqlalchemy.orm import Session
 
 from ecc.auth import AuthContext
+from ecc.platform.connector_security import PERSONAL_ROW_PREDICATES, personal_sql_params
 
 Role = Literal["owner", "admin", "member", "viewer"]
 Action = Literal["read", "write"]
@@ -382,9 +383,22 @@ def users_id_for_account(session: Session, *, workspace_id: UUID, account_id: UU
 
 _UNOWNABLE_FOR_REMOVAL_PURPOSES: frozenset[str] = frozenset({"audit_events"})
 
+# Spec A S1.4(a) (`ECC_PERSONAL_DATA_ISOLATION`): per-table predicates
+# selecting the member-owned rows that do NOT block member removal --
+# exactly § "Personal data set" (retained, never transferred: DS2), taken
+# from `connector_security.PERSONAL_ROW_PREDICATES` (the one definition,
+# shared with `is_personal_resource`). `pkos_nodes` is deliberately absent:
+# `membership_removal` re-owns Gmail-only person nodes *before* this check,
+# so every node the member still owns here blocks.
+_PERSONAL_ROWS_NOT_BLOCKING_REMOVAL: Mapping[str, str] = PERSONAL_ROW_PREDICATES
+
 
 def owned_resource_summary(
-    session: Session, *, workspace_id: UUID, users_id: UUID
+    session: Session,
+    *,
+    workspace_id: UUID,
+    users_id: UUID,
+    exclude_personal_data: bool = False,
 ) -> list[dict[str, object]]:
     """Every grantable `resource_type` (excluding `UNGRANTABLE_RESOURCE_
     TYPES` -- Phase 7 personal-domain data is never workspace-transferable,
@@ -413,18 +427,32 @@ def owned_resource_summary(
     (`OWNED_RESOURCES_BLOCK_REMOVAL` on `audit_events` after the real,
     intentionally-owned `incidents` row had already been transferred away).
 
+    `exclude_personal_data=True` (the caller passes `ECC_PERSONAL_DATA_
+    ISOLATION`) additionally skips `_PERSONAL_ROWS_NOT_BLOCKING_REMOVAL`'s
+    rows. `COALESCE(..., false)`: a NULL predicate (e.g. a NULL
+    `task_type`) counts the row as blocking -- never silently unblocks.
+
     Read-only -- see `current_role`'s own docstring for why this never
     calls `session.rollback()`.
     """
     summary: list[dict[str, object]] = []
     excluded = UNGRANTABLE_RESOURCE_TYPES | _UNOWNABLE_FOR_REMOVAL_PURPOSES
+    params: dict[str, object] = {"workspace_id": workspace_id, "users_id": users_id}
+    if exclude_personal_data:
+        params.update(personal_sql_params())
     for resource_type in sorted(_RESOURCE_TABLES - excluded):
+        not_blocking = (
+            _PERSONAL_ROWS_NOT_BLOCKING_REMOVAL.get(resource_type)
+            if exclude_personal_data
+            else None
+        )
+        extra = f" AND NOT COALESCE(({not_blocking}), false)" if not_blocking else ""
         count = session.execute(
             text(
                 f"SELECT count(*) FROM {resource_type} "  # noqa: S608
-                "WHERE workspace_id = :workspace_id AND owner_id = :users_id"
+                f"WHERE workspace_id = :workspace_id AND owner_id = :users_id{extra}"
             ),
-            {"workspace_id": workspace_id, "users_id": users_id},
+            params,
         ).scalar_one()
         if count:
             summary.append({"resource_type": resource_type, "count": count})

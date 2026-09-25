@@ -36,7 +36,13 @@ Phase 7 personal-domain data is deliberately excluded from this check --
 it is never workspace-transferable by design (`UNGRANTABLE_RESOURCE_
 TYPES`), so a removed member's own private vault content is governed
 entirely by `ecc.domains.personal.export_deletion`'s own separate flow,
-not by this one.
+not by this one. With `ECC_PERSONAL_DATA_ISOLATION` on (Security
+Remediation Spec A S1.4), the member's Gmail-derived personal rows are
+excluded from that check too: their personal connectors are disconnected
+in the removal transaction (provider grant revoked after commit, iff
+`revoke_is_safe`), their Gmail-only person nodes are re-owned to the
+earliest-joined other active owner, and every other personal row is
+retained untouched (DS2: no purge, `domain_consents` unchanged).
 
 **"Offers export before finalizing" (the plan's own phrase) is the
 removal response's own `export` field** -- a snapshot of the removed
@@ -81,6 +87,8 @@ transitions every delegation naming the removed member as either party to
 
 from __future__ import annotations
 
+import logging
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Annotated, Any
 from uuid import UUID
@@ -90,12 +98,27 @@ from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
-from ecc.auth import AuthDep, CsrfDep
-from ecc.database import get_session
+from ecc.auth import AuthContext, AuthDep, CsrfDep
+from ecc.config import get_settings
+from ecc.database import SessionFactory, get_session
 from ecc.domains.automation.worker import cancel_runs_for_removed_member
 from ecc.domains.collaboration.delegations import cancel_delegations_for_removed_member
-from ecc.observability import queue_lifecycle_event
+from ecc.domains.engineering.connector_accounts import get_encrypted_credential
+from ecc.domains.engineering.connectors import ConnectorAccountContext
+from ecc.domains.engineering.crypto import decrypt_credential
+from ecc.domains.personal import gmail_revocation
+from ecc.observability import queue_lifecycle_event, record_connector_revoke
 from ecc.platform import audit_outbox, authz
+from ecc.platform.connector_security import (
+    GMAIL_ONLY_PERSON_NODE_PREDICATE,
+    membership_mutation_lock_key,
+    personal_sql_params,
+    record_revoke_skipped_unsafe,
+    revoke_guarded,
+    revoke_is_safe,
+)
+
+_logger = logging.getLogger("ecc.domains.identity.membership_removal")
 
 router = APIRouter(prefix="/api/v1/identity", tags=["identity"])
 SessionDep = Annotated[Session, Depends(get_session)]
@@ -154,6 +177,251 @@ def _member_row(session: Session, *, workspace_id: UUID, user_id: UUID) -> dict[
         .one_or_none()
     )
     return dict(row) if row is not None else None
+
+
+@dataclass(frozen=True)
+class _PendingRemovalRevoke:
+    """A personal connector disconnected by a removal, whose provider grant
+    is revoked (iff safe) only after the removal transaction commits."""
+
+    provider: str
+    connector_account_id: UUID
+    external_account_id: str
+    # None when the stored credential could not be read/decrypted: the row
+    # is still disconnected, but the grant cannot be revoked from here.
+    context: ConnectorAccountContext | None
+    unavailable_error_class: str | None = None
+
+
+def _disconnect_personal_connectors(
+    session: Session,
+    auth: AuthContext,
+    request: Request,
+    *,
+    removed_users_id: UUID,
+    now: datetime,
+) -> list[_PendingRemovalRevoke]:
+    """Spec A S1.4(b): disconnect every non-disconnected personal-provider
+    connector the removed member owns in this workspace, inside the removal
+    transaction. Credentials are decrypted best-effort here (fast, local);
+    a row whose credential cannot be decrypted is still disconnected, just
+    never revoked. The provider revoke itself is deferred to
+    `_revoke_after_removal` (after commit, no DB connection held). The
+    member's other personal rows are retained untouched (DS2).
+    """
+    rows = session.execute(
+        text(
+            "SELECT id, provider, external_account_id FROM connector_accounts "
+            "WHERE workspace_id = :workspace_id AND owner_id = :owner_id "
+            "AND provider = ANY(:providers) AND status <> 'disconnected' "
+            "ORDER BY id FOR UPDATE"
+        ),
+        {
+            "workspace_id": auth.workspace_id,
+            "owner_id": removed_users_id,
+            "providers": personal_sql_params()["providers"],
+        },
+    ).all()
+    pending: list[_PendingRemovalRevoke] = []
+    for account_id, provider, external_account_id in rows:
+        try:
+            encrypted = get_encrypted_credential(session, auth.workspace_id, account_id)
+            pending.append(
+                _PendingRemovalRevoke(
+                    provider=provider,
+                    connector_account_id=account_id,
+                    external_account_id=external_account_id,
+                    context=ConnectorAccountContext(
+                        workspace_id=auth.workspace_id,
+                        connector_account_id=account_id,
+                        external_account_id=external_account_id,
+                        credential=decrypt_credential(encrypted),
+                    ),
+                )
+            )
+        except Exception as exc:  # noqa: BLE001 -- best-effort, never blocks the disconnect
+            # The grant can no longer be revoked from here; reported (logged
+            # + counted) only after commit, so a rolled-back 409 never counts.
+            pending.append(
+                _PendingRemovalRevoke(
+                    provider=provider,
+                    connector_account_id=account_id,
+                    external_account_id=external_account_id,
+                    context=None,
+                    unavailable_error_class=type(exc).__name__,
+                )
+            )
+        version = session.execute(
+            text(
+                "UPDATE connector_accounts SET status = 'disconnected', "
+                "disconnected_at = :now, updated_at = :now, updated_by = :actor_id, "
+                "version = version + 1 WHERE id = :id RETURNING version"
+            ),
+            {"now": now, "actor_id": auth.user_id, "id": account_id},
+        ).scalar_one()
+        # Same event/aggregate/domain as `connector_accounts.py:disable_
+        # connector_endpoint`, plus the reason.
+        audit_outbox.write_audit_and_outbox(
+            session,
+            auth,
+            request,
+            event_type="connector_account.disabled",
+            aggregate_type="connector_account",
+            aggregate_id=account_id,
+            aggregate_version=version,
+            changed_fields=["*"],
+            payload={
+                "aggregate_id": str(account_id),
+                "version": version,
+                "reason": "member_removed",
+            },
+            now=now,
+            domain="engineering_connector_account",
+            metadata={"reason": "member_removed"},
+        )
+        queue_lifecycle_event(
+            session, "engineering_connector_account", "connector_account.disabled", "allowed"
+        )
+    return pending
+
+
+def _gmail_only_person_nodes(session: Session, *, workspace_id: UUID, owner_id: UUID) -> list[UUID]:
+    rows = session.execute(
+        text(
+            "SELECT pkos_nodes.id FROM pkos_nodes "  # noqa: S608 -- code-defined fragment
+            "WHERE pkos_nodes.workspace_id = :workspace_id AND pkos_nodes.owner_id = :owner_id "
+            f"AND {GMAIL_ONLY_PERSON_NODE_PREDICATE} ORDER BY pkos_nodes.id FOR UPDATE"
+        ),
+        {"workspace_id": workspace_id, "owner_id": owner_id, **personal_sql_params()},
+    ).all()
+    return [row[0] for row in rows]
+
+
+def _reassignment_target(
+    session: Session, *, workspace_id: UUID, removed_users_id: UUID
+) -> UUID | None:
+    """The earliest-joined active `owner` other than the removed member --
+    never the acting user as such: self-removal is allowed, so the actor
+    may be the member being removed."""
+    target: UUID | None = session.execute(
+        text(
+            "SELECT users_id FROM workspace_memberships "
+            "WHERE workspace_id = :workspace_id AND role = 'owner' AND status = 'active' "
+            "AND users_id <> :removed_users_id ORDER BY created_at ASC, id ASC LIMIT 1"
+        ),
+        {"workspace_id": workspace_id, "removed_users_id": removed_users_id},
+    ).scalar_one_or_none()
+    return target
+
+
+def _reassign_nodes(
+    session: Session,
+    auth: AuthContext,
+    request: Request,
+    *,
+    node_ids: list[UUID],
+    removed_users_id: UUID,
+    target_users_id: UUID,
+    now: datetime,
+) -> None:
+    """Spec A S1.4(c): re-own the removed member's Gmail-only person nodes
+    (shared workspace knowledge, no message content) to `target_users_id`,
+    with one `pkos_node.ownership_reassigned` audit row per node actually
+    re-owned.
+
+    The Gmail-only predicate is re-evaluated HERE, in a new statement, after
+    `_gmail_only_person_nodes` holds the row locks: that select's EXISTS/
+    NOT EXISTS subqueries ran on its own snapshot, and a concurrent non-Gmail
+    evidence insert (which holds FOR KEY SHARE on the node until it commits)
+    is waited out without Postgres rechecking them. This statement's
+    snapshot sees that committed evidence, so such a node is not returned,
+    stays owned by the member, and the caller's owned check blocks removal
+    (409, full rollback). Our FOR UPDATE lock keeps later inserts out."""
+    rows = session.execute(
+        text(
+            "UPDATE pkos_nodes SET owner_id = :target, updated_at = :now, "  # noqa: S608
+            "version = version + 1 WHERE pkos_nodes.id = ANY(:ids) "
+            "AND pkos_nodes.workspace_id = :workspace_id AND pkos_nodes.owner_id = :removed "
+            f"AND {GMAIL_ONLY_PERSON_NODE_PREDICATE} "
+            "RETURNING pkos_nodes.id, pkos_nodes.version"
+        ),
+        {
+            "target": target_users_id,
+            "now": now,
+            "ids": node_ids,
+            "workspace_id": auth.workspace_id,
+            "removed": removed_users_id,
+            **personal_sql_params(),
+        },
+    ).all()
+    for node_id, version in sorted(rows):
+        audit_outbox.write_audit_and_outbox(
+            session,
+            auth,
+            request,
+            event_type="pkos_node.ownership_reassigned",
+            aggregate_type="pkos_node",
+            aggregate_id=node_id,
+            aggregate_version=version,
+            changed_fields=["owner_id"],
+            payload={
+                "aggregate_id": str(node_id),
+                "version": version,
+                "reason": "member_removed",
+                "from_owner_id": str(removed_users_id),
+                "to_owner_id": str(target_users_id),
+            },
+            now=now,
+            domain="identity",
+            metadata={"reason": "member_removed"},
+        )
+
+
+def _revoke_after_removal(pending: list[_PendingRemovalRevoke]) -> None:
+    """Call only after the removal transaction has committed and the
+    request session's connection is released. Decides revoke safety for
+    every entry on one short-lived session (closed before any network
+    call), then revokes each safe entry, guarded (never raises)."""
+    revocable: list[tuple[_PendingRemovalRevoke, ConnectorAccountContext]] = []
+    for entry in pending:
+        if entry.context is None:
+            # Exception class only -- never its message or the credential.
+            _logger.warning(
+                f"removal_revoke_credential_unavailable error_class={entry.unavailable_error_class}"
+            )
+            record_connector_revoke(entry.provider, "removal", "error")
+        else:
+            revocable.append((entry, entry.context))
+    if not revocable:
+        return
+    scope = get_settings().gmail_revoke_scope
+    try:
+        with SessionFactory() as check_session:
+            decisions = [
+                revoke_is_safe(
+                    check_session,
+                    provider=entry.provider,
+                    external_account_id=entry.external_account_id,
+                    token_kind="disconnected_row",
+                    exclude_row_id=entry.connector_account_id,
+                    scope=scope,
+                )
+                for entry, _context in revocable
+            ]
+            check_session.rollback()
+    except Exception as exc:  # noqa: BLE001 -- the removal already committed
+        # Cannot prove any revoke safe -> revoke nothing (fail closed).
+        _logger.warning(f"removal_revoke_safety_check_failed error_class={type(exc).__name__}")
+        decisions = [False] * len(revocable)
+    for (entry, context), safe in zip(revocable, decisions, strict=True):
+        if not safe:
+            record_revoke_skipped_unsafe(provider=entry.provider, site="removal")
+            continue
+        if entry.provider != "gmail":
+            continue  # no revoking adapter wired for another personal provider yet
+        # Read at call time (not bound at import) so the module-level
+        # adapter stays patchable, exactly like the cascade's own use.
+        revoke_guarded(gmail_revocation._adapter, context, provider=entry.provider, site="removal")
 
 
 def _is_sole_active_owner(session: Session, *, workspace_id: UUID, users_id: UUID) -> bool:
@@ -246,7 +514,7 @@ def update_member_role_endpoint(
         # FOR UPDATE` across an unbounded number of owner rows.
         session.execute(
             text("SELECT pg_advisory_xact_lock(hashtextextended(:lock_key, 0))"),
-            {"lock_key": f"membership-mutation:{auth.workspace_id}"},
+            {"lock_key": membership_mutation_lock_key(auth.workspace_id)},
         )
         member = _member_row(session, workspace_id=auth.workspace_id, user_id=user_id)
         if member is None or member["status"] != "active":
@@ -331,7 +599,7 @@ def remove_member_endpoint(
         # closes the identical concurrent-owner-removal race for `DELETE`.
         session.execute(
             text("SELECT pg_advisory_xact_lock(hashtextextended(:lock_key, 0))"),
-            {"lock_key": f"membership-mutation:{auth.workspace_id}"},
+            {"lock_key": membership_mutation_lock_key(auth.workspace_id)},
         )
         member = _member_row(session, workspace_id=auth.workspace_id, user_id=user_id)
         if member is None or member["status"] != "active":
@@ -352,8 +620,52 @@ def remove_member_endpoint(
                 status_code=status.HTTP_409_CONFLICT, detail="LAST_OWNER_CANNOT_BE_REMOVED"
             )
 
+        # Spec A S1.4 (`ECC_PERSONAL_DATA_ISOLATION`): the member's personal
+        # (Gmail-derived) rows and Gmail-only person nodes no longer block
+        # removal -- connectors are disconnected, nodes re-owned, the rest
+        # retained (DS2). Flag off: exactly the pre-existing behavior.
+        isolation = get_settings().personal_data_isolation
+        now = datetime.now(UTC)
+        pending_revokes: list[_PendingRemovalRevoke] = []
+        if isolation:
+            # Mutate FIRST, check SECOND, all in this one transaction (a 409
+            # below rolls every disconnect/re-own/audit back). Lock order:
+            # membership advisory lock (above) -> connector rows -> nodes.
+            pending_revokes = _disconnect_personal_connectors(
+                session, auth, request, removed_users_id=user_id, now=now
+            )
+            reassign_node_ids = _gmail_only_person_nodes(
+                session, workspace_id=auth.workspace_id, owner_id=user_id
+            )
+            reassign_target = (
+                _reassignment_target(
+                    session, workspace_id=auth.workspace_id, removed_users_id=user_id
+                )
+                if reassign_node_ids
+                else None
+            )
+            # No other active owner (only reachable with anomalous
+            # membership data -- removing the last owner is refused above):
+            # nodes stay owned by the member and block below, as before.
+            if reassign_target is not None:
+                _reassign_nodes(
+                    session,
+                    auth,
+                    request,
+                    node_ids=reassign_node_ids,
+                    removed_users_id=user_id,
+                    target_users_id=reassign_target,
+                    now=now,
+                )
+        # With isolation, the member's personal rows no longer block, but
+        # every `pkos_nodes` row still owned after the re-own above does --
+        # so a node whose evidence changed concurrently is either re-owned
+        # or blocks, never silently left owned by a removed member.
         owned = authz.owned_resource_summary(
-            session, workspace_id=auth.workspace_id, users_id=user_id
+            session,
+            workspace_id=auth.workspace_id,
+            users_id=user_id,
+            exclude_personal_data=isolation,
         )
         if owned:
             raise HTTPException(
@@ -361,7 +673,6 @@ def remove_member_endpoint(
                 detail={"code": "OWNED_RESOURCES_BLOCK_REMOVAL", "owned_resources": owned},
             )
 
-        now = datetime.now(UTC)
         cancel_delegations_for_removed_member(
             session, workspace_id=auth.workspace_id, account_id=member["account_id"], now=now
         )
@@ -402,6 +713,10 @@ def remove_member_endpoint(
             domain="identity",
         )
         queue_lifecycle_event(session, "identity", "member.removed", "allowed")
+    # Committed. Release the pooled connection before any provider revoke's
+    # blocking network call (same ordering as `disable_connector_endpoint`).
+    session.close()
+    _revoke_after_removal(pending_revokes)
     return MemberRemovalResponse(
         user_id=user_id,
         export=MemberExportSnapshot(
