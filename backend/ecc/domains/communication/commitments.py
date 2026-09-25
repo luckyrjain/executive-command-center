@@ -235,6 +235,8 @@ def insert_commitment(
     correlation_id: UUID,
     idempotency_key: str,
     now: datetime,
+    owner_id: UUID | None = None,
+    visibility: Literal["private", "workspace"] = "workspace",
 ) -> CommitmentResponse:
     """The actual row-write + audit/outbox emission behind `POST /api/v1/commitments`,
     split out so `ecc.domains.governance.recommendation_targets.execute_target`'s
@@ -243,6 +245,10 @@ def insert_commitment(
     Deliberately excludes `session.begin()`/idempotency-key locking/replay
     (both callers already run inside their own already-open transaction and
     idempotency scheme; nesting a second `session.begin()` here would raise).
+
+    `owner_id`/`visibility` default to the actor / `workspace` (the column
+    default). Only a confirmed personal-data recommendation passes others
+    (`connector_security.personal_derived_row_scope`, Spec A plan note N23).
     """
     commitment_id = uuid4()
     initial_status = payload.status
@@ -256,20 +262,21 @@ def insert_commitment(
                     direction, counterparty_person_id, counterparty_name,
                     status, due_date, due_at, importance, evidence_id,
                     confidence, pinned, created_by, updated_by,
-                    created_at, updated_at, version
+                    created_at, updated_at, version, visibility
                 ) VALUES (
                     :id, :workspace_id, :owner_id, :summary, :description,
                     :direction, :counterparty_person_id, :counterparty_name,
                     :status, :due_date, :due_at, :importance, :evidence_id,
                     :confidence, :pinned, :actor_id, :actor_id,
-                    :now, :now, 1
+                    :now, :now, 1, :visibility
                 ) RETURNING {_SELECT_FIELDS}
                 """
             ),
             {
                 "id": commitment_id,
                 "workspace_id": auth.workspace_id,
-                "owner_id": auth.user_id,
+                "owner_id": owner_id if owner_id is not None else auth.user_id,
+                "visibility": visibility,
                 "actor_id": auth.user_id,
                 "now": now,
                 **payload.model_dump(),

@@ -37,6 +37,10 @@ from ecc.domains.governance.recommendation_targets import (
     validate_action,
 )
 from ecc.platform import authz
+from ecc.platform.connector_security import (
+    EMAIL_RECOMMENDATION_TYPE,
+    personal_derived_row_scope,
+)
 
 router = APIRouter(prefix="/api/v1/recommendations", tags=["recommendations"])
 SessionDep = Annotated[Session, Depends(get_session)]
@@ -257,6 +261,25 @@ def generate_recommendation(
     session: SessionDep,
     idempotency_key: IdempotencyHeader,
 ) -> RecommendationResponse:
+    # Spec A plan note N19(2): `email_action_detected` is reserved for the
+    # Gmail action-detection hook (the only writer of a real, Gmail-derived,
+    # mailbox-owner-private one). A member-created row of that type would
+    # match the personal-data predicate -- share-refused and not blocking
+    # the creator's removal -- while being neither private nor from Gmail.
+    # Refused whatever `ECC_PERSONAL_DATA_ISOLATION` says, in the same
+    # `VALIDATION_ERROR` shape a `RecommendationCreate` field violation has
+    # (the model itself is shared with the hook, so it cannot refuse it).
+    if payload.recommendation_type == EMAIL_RECOMMENDATION_TYPE:
+        raise HTTPException(
+            status_code=422,
+            detail=[
+                {
+                    "type": "value_error",
+                    "loc": ["body", "recommendation_type"],
+                    "msg": "recommendation_type is reserved",
+                }
+            ],
+        )
     return create_recommendation(session, auth, payload, request, idempotency_key)
 
 
@@ -551,6 +574,10 @@ def confirm_recommendation(
         row["proposed_action"],
         int(row["expected_version"]) if row["expected_version"] is not None else None,
         row["proposed_fields"],
+        # Spec A plan note N23: a personal-data recommendation's created
+        # target copies its email-derived content -- with the flag on it is
+        # the recommendation owner's and `private`, never workspace-visible.
+        personal_derived_row_scope(session, "recommendations", recommendation_id),
     )
     executed_at = datetime.now(UTC)
     executed = (

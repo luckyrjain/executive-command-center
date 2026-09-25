@@ -22,6 +22,7 @@ from ecc.domains.planning.tasks import (
     set_task_status_write,
 )
 from ecc.platform import audit_outbox, authz
+from ecc.platform.connector_security import PersonalRowScope
 
 # Commitment status values a recommendation may target -- "confirmed" is
 # deliberately absent: it's `CommitmentCreate`'s own create-time-only value
@@ -161,6 +162,7 @@ def _execute_create(
     recommendation_id: UUID,
     target_type: str,
     proposed_fields: dict[str, Any] | None,
+    derived_scope: PersonalRowScope | None = None,
 ) -> dict[str, Any]:
     """Confirming an `operation="create"` recommendation calls the exact
     same `insert_task`/`insert_commitment`/`insert_risk` helper `POST
@@ -171,7 +173,18 @@ def _execute_create(
     not just at generation time (`RecommendationCreate`'s own model
     validator already did this once) -- defense in depth against a stored
     JSONB payload that predates a later, stricter version of that model.
+
+    `derived_scope` (Spec A plan note N23): set by `confirm_recommendation`
+    for a personal-data recommendation with `ECC_PERSONAL_DATA_ISOLATION`
+    on -- the new row copies email-derived content, so it is written with
+    the recommendation's owner and `private` instead of the actor and the
+    workspace default. None -> exactly the row a manual create writes.
     """
+    scope: dict[str, Any] = (
+        {"owner_id": derived_scope.owner_id, "visibility": derived_scope.visibility}
+        if derived_scope is not None
+        else {}
+    )
     if not proposed_fields:
         raise HTTPException(status_code=422, detail="PROPOSED_FIELDS_REQUIRED")
     now = datetime.now(UTC)
@@ -190,6 +203,7 @@ def _execute_create(
             correlation_id=correlation_id,
             idempotency_key=idempotency_key,
             now=now,
+            **scope,
         )
         return {
             "target_type": "task",
@@ -210,6 +224,7 @@ def _execute_create(
             correlation_id=correlation_id,
             idempotency_key=idempotency_key,
             now=now,
+            **scope,
         )
         return {
             "target_type": "commitment",
@@ -222,7 +237,7 @@ def _execute_create(
             risk_payload = RiskCreate(**proposed_fields)
         except ValidationError as exc:
             raise HTTPException(status_code=422, detail="INVALID_PROPOSED_FIELDS") from exc
-        risk_response = insert_risk(session, auth, risk_payload, request, now)
+        risk_response = insert_risk(session, auth, risk_payload, request, now, **scope)
         return {
             "target_type": "risk",
             "target_id": str(risk_response.id),
@@ -324,12 +339,19 @@ def execute_target(
     action: dict[str, Any],
     expected_version: int | None,
     proposed_fields: dict[str, Any] | None,
+    derived_scope: PersonalRowScope | None = None,
 ) -> dict[str, Any]:
     validate_action(target_type, action)
     operation = action["operation"]
     if operation == "create":
         return _execute_create(
-            session, auth, request, recommendation_id, target_type, proposed_fields
+            session,
+            auth,
+            request,
+            recommendation_id,
+            target_type,
+            proposed_fields,
+            derived_scope,
         )
     if target_id is None or expected_version is None:
         # `RecommendationCreate`'s own model validator guarantees every

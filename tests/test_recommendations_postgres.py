@@ -426,15 +426,17 @@ def test_list_filters_by_recommendation_type_server_side(
     # `email_action_detected`) used to filter the already-paginated page
     # client-side, which could silently hide its own items behind a
     # workspace-wide backlog of other-typed recommendations. `recommendation_
-    # type` is now filtered server-side, before `limit` applies.
+    # type` is now filtered server-side, before `limit` applies. (Any second
+    # type works; `email_action_detected` itself is reserved for the Gmail
+    # hook and refused by `POST /api/v1/recommendations`, Spec A N19(2).)
     client, workspace_id, user_id, token = recommendation_context
     priority_task = _task(workspace_id, user_id, "Priority target")
     other_task = _task(workspace_id, user_id, "Other target")
     priority = _generate(client, token, priority_task, recommendation_type="task_priority")
-    other = _generate(client, token, other_task, recommendation_type="email_action_detected")
+    other = _generate(client, token, other_task, recommendation_type="task_followup")
 
     filtered = client.get(
-        "/api/v1/recommendations", params={"recommendation_type": "email_action_detected"}
+        "/api/v1/recommendations", params={"recommendation_type": "task_followup"}
     )
     assert filtered.status_code == 200
     filtered_ids = [item["id"] for item in filtered.json()["items"]]
